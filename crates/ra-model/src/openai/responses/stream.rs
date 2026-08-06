@@ -1,1 +1,1 @@
-//! Responses SSE 事件 -> StreamEvent。
+//! Responses SSE 事件 -> `StreamEvent`。

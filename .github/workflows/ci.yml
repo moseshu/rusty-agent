@@ -1,0 +1,45 @@
+# R0-6 八条门禁里最先能落地的三条。
+# 其余五条（schema 字节稳定 / prompt dump / guard 登记表对账 / token 预算 /
+# no-inline-tests）等对应阶段有被测对象后再加，见 xtask。
+#
+# 注意：行为测试位于独立的 tests/ workspace，该目录不进版本库，
+# 因此 CI 跑不到测试——本地用 `cargo xtask test` 跑。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链由 rust-toolchain.toml 固定（1.97.1 + rustfmt/clippy），
+      # rustup 在首次调用 cargo 时自动安装，无需额外 action。
+      - name: 工具链版本
+        run: rustc --version && cargo --version && cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all --check
+
+      # workspace.lints 已 deny unwrap_used / dbg_macro，
+      # 这里再把所有 warning 提升为错误，含 missing_docs 与 clippy::pedantic。
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 编译
+        run: cargo check --workspace --all-targets
