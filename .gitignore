@@ -19,3 +19,12 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# 测试 workspace —— 独立于主 workspace，不进版本库（见 tests/README.md）
+/tests/
+
+# eval fixture 输出
+/fixtures/out/
+
+# 开发文档（不上传 GitHub）——整目录忽略，避免子目录 md 漏传
+/Docs/
