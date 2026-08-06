@@ -1,0 +1,1 @@
+//! `PermissionMode` / `PermissionDecision` / `PermissionRule`。

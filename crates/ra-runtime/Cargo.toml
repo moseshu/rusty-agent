@@ -1,0 +1,25 @@
+[package]
+name = "ra-runtime"
+description = "Loop 内核。公开 API 必须能跑任何 agent，不含任何业务词汇。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ra-core = { workspace = true }
+ra-prompt = { workspace = true }
+ra-context = { workspace = true }
+ra-model = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

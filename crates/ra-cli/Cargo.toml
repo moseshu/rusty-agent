@@ -1,0 +1,27 @@
+[package]
+name = "ra-cli"
+description = "rusty-agent 命令行入口：REPL、单命令执行、doctor。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ra"
+path = "src/main.rs"
+
+[dependencies]
+ra-core = { workspace = true }
+ra-coding = { workspace = true }
+ra-runtime = { workspace = true }
+ra-protocol = { workspace = true }
+ra-eval = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

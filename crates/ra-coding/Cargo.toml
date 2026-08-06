@@ -1,0 +1,27 @@
+[package]
+name = "ra-coding"
+description = "编码 agent（产品层）：15 个工具 + 提示词内容 + 编码纪律 + 装配。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ra-core = { workspace = true }
+ra-runtime = { workspace = true }
+ra-prompt = { workspace = true }
+ra-context = { workspace = true }
+ra-exec = { workspace = true }
+ra-mcp = { workspace = true }
+ra-patch = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }

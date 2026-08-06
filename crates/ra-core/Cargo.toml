@@ -1,0 +1,21 @@
+[package]
+name = "ra-core"
+description = "内核类型与契约：零实现，只有类型、trait、常量。框架宪法。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+schemars = { workspace = true }

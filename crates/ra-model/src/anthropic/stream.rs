@@ -1,0 +1,1 @@
+//! Anthropic SSE -> StreamEvent。
