@@ -1,0 +1,96 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/moseshu/rusty-agent"
+authors = ["moses"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+# --- 内部 crate ---
+ra-core = { path = "crates/ra-core" }
+ra-macros = { path = "crates/ra-macros" }
+ra-model = { path = "crates/ra-model" }
+ra-prompt = { path = "crates/ra-prompt" }
+ra-context = { path = "crates/ra-context" }
+ra-runtime = { path = "crates/ra-runtime" }
+ra-session = { path = "crates/ra-session" }
+ra-exec = { path = "crates/ra-exec" }
+ra-mcp = { path = "crates/ra-mcp" }
+ra-protocol = { path = "crates/ra-protocol" }
+ra-eval = { path = "crates/ra-eval" }
+ra-patch = { path = "crates/ra-patch" }
+ra-coding = { path = "crates/ra-coding" }
+
+# --- 运行时 ---
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "fs",
+    "sync",
+    "time",
+    "io-util",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- 序列化 ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+toml = "0.8"
+
+# --- 错误与日志 ---
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- 网络 ---
+reqwest = { version = "0.12", features = [
+    "json",
+    "stream",
+    "rustls-tls",
+], default-features = false }
+
+# --- 存储与进程 ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+portable-pty = "0.8"
+
+# --- 杂项 ---
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+# --- 宏 ---
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+# --- 测试 ---
+insta = { version = "1", features = ["json", "redactions"] }
+wiremock = "0.6"
+rstest = "0.23"
