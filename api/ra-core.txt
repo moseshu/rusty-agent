@@ -124,6 +124,30 @@ const fn ra_core::item::tool::ToolCallOutput::output(& self) -> & Value
 const fn ra_core::item::tool::ToolCallOutput::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::tool::ToolCallOutput::unknown(& self) -> & Unknown
 const fn ra_core::item::tool::ToolCallOutput::with_error(mut self, is_error : bool) -> Self
+const fn ra_core::model::protocol::ApiProtocol::as_str(self) -> & 'static str
+const fn ra_core::model::protocol::ApiProtocol::capabilities(self) -> ProtocolCapabilities
+const fn ra_core::model::protocol::PromptCacheSupport::automatic_prefix_matching(self) -> bool
+const fn ra_core::model::protocol::PromptCacheSupport::cache_control_breakpoints(self) -> bool
+const fn ra_core::model::protocol::PromptCacheSupport::explicit_cache_key(self) -> bool
+const fn ra_core::model::protocol::PromptCacheSupport::is_supported(self) -> bool
+const fn ra_core::model::protocol::PromptCacheSupport::requires_explicit_breakpoints(self) -> bool
+const fn ra_core::model::protocol::ProtocolCapabilities::has_first_class_reasoning(self) -> bool
+const fn ra_core::model::protocol::ProtocolCapabilities::prompt_cache(self) -> PromptCacheSupport
+const fn ra_core::model::protocol::ProtocolCapabilities::reasoning_carrier(self) -> ReasoningCarrier
+const fn ra_core::model::protocol::ProtocolCapabilities::reasoning_replay(self) -> ReasoningReplay
+const fn ra_core::model::protocol::ProtocolCapabilities::server_conversation(self) -> ServerConversationSupport
+const fn ra_core::model::protocol::ProtocolCapabilities::stable_prefix(self) -> StablePrefixLocation
+const fn ra_core::model::protocol::ProtocolCapabilities::structured_output(self) -> StructuredOutputLocation
+const fn ra_core::model::protocol::ProtocolCapabilities::supports_conversation_id(self) -> bool
+const fn ra_core::model::protocol::ProtocolCapabilities::supports_previous_response_id(self) -> bool
+const fn ra_core::model::protocol::ProtocolCapabilities::supports_server_conversation(self) -> bool
+const fn ra_core::model::protocol::ProtocolCapabilities::tool_call(self) -> ToolCallCarrier
+const fn ra_core::model::protocol::ProtocolCapabilities::tool_result(self) -> ToolResultCarrier
+const fn ra_core::model::protocol::ReasoningCarrier::is_first_class(self) -> bool
+const fn ra_core::model::protocol::ReasoningReplay::is_required(self) -> bool
+const fn ra_core::model::protocol::ServerConversationSupport::is_supported(self) -> bool
+const fn ra_core::model::protocol::ServerConversationSupport::supports_conversation_id(self) -> bool
+const fn ra_core::model::protocol::ServerConversationSupport::supports_previous_response_id(self) -> bool
 const fn ra_core::model::retry::ModelRetrySettings::backoff(& self) -> Option < & RetryBackoffSettings >
 const fn ra_core::model::retry::ModelRetrySettings::max_retries(& self) -> Option < u32 >
 const fn ra_core::model::retry::ModelRetrySettings::schema_version(& self) -> SchemaVersion
@@ -216,6 +240,7 @@ const ra_core::item::message::MESSAGE_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::message::MODEL_RESPONSE_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::reasoning::REASONING_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::tool::TOOL_ITEM_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::protocol::ApiProtocol::ALL: & 'static [Self]
 const ra_core::model::retry::MODEL_RETRY_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
@@ -265,6 +290,14 @@ enum ra_core::item::content::ContentBlock
 enum ra_core::item::content::ImageSource
 enum ra_core::item::message::MessageRole
 enum ra_core::item::phase::OutputPhase
+enum ra_core::model::protocol::ApiProtocol
+enum ra_core::model::protocol::ReasoningCarrier
+enum ra_core::model::protocol::ReasoningReplay
+enum ra_core::model::protocol::ServerConversationSupport
+enum ra_core::model::protocol::StablePrefixLocation
+enum ra_core::model::protocol::StructuredOutputLocation
+enum ra_core::model::protocol::ToolCallCarrier
+enum ra_core::model::protocol::ToolResultCarrier
 enum ra_core::model::settings::Effort
 enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
@@ -514,6 +547,8 @@ struct ra_core::item::reasoning::Reasoning
 struct ra_core::item::tool::ToolApproval
 struct ra_core::item::tool::ToolCall
 struct ra_core::item::tool::ToolCallOutput
+struct ra_core::model::protocol::PromptCacheSupport
+struct ra_core::model::protocol::ProtocolCapabilities
 struct ra_core::model::retry::ModelRetrySettings
 struct ra_core::model::retry::RetryBackoffSettings
 struct ra_core::model::settings::McpToolChoice
@@ -630,6 +665,29 @@ variant ra_core::item::message::MessageRole::System
 variant ra_core::item::message::MessageRole::User
 variant ra_core::item::phase::OutputPhase::Commentary
 variant ra_core::item::phase::OutputPhase::Final
+variant ra_core::model::protocol::ApiProtocol::AnthropicMessages
+variant ra_core::model::protocol::ApiProtocol::OpenAiChatCompletions
+variant ra_core::model::protocol::ApiProtocol::OpenAiResponses
+variant ra_core::model::protocol::ReasoningCarrier::FirstClassItem
+variant ra_core::model::protocol::ReasoningCarrier::None
+variant ra_core::model::protocol::ReasoningCarrier::ThinkingBlock
+variant ra_core::model::protocol::ReasoningReplay::EncryptedContent
+variant ra_core::model::protocol::ReasoningReplay::None
+variant ra_core::model::protocol::ReasoningReplay::ThinkingSignature
+variant ra_core::model::protocol::ServerConversationSupport::None
+variant ra_core::model::protocol::ServerConversationSupport::PreviousResponseIdAndConversationId
+variant ra_core::model::protocol::StablePrefixLocation::FirstSystemMessage
+variant ra_core::model::protocol::StablePrefixLocation::SystemBlockArray
+variant ra_core::model::protocol::StablePrefixLocation::TopLevelInstructions
+variant ra_core::model::protocol::StructuredOutputLocation::OutputFormat
+variant ra_core::model::protocol::StructuredOutputLocation::ResponseFormat
+variant ra_core::model::protocol::StructuredOutputLocation::TextFormat
+variant ra_core::model::protocol::ToolCallCarrier::FunctionCallItem
+variant ra_core::model::protocol::ToolCallCarrier::MessageToolCalls
+variant ra_core::model::protocol::ToolCallCarrier::ToolUseBlock
+variant ra_core::model::protocol::ToolResultCarrier::FunctionCallOutputItem
+variant ra_core::model::protocol::ToolResultCarrier::ToolResultBlock
+variant ra_core::model::protocol::ToolResultCarrier::ToolRoleMessage
 variant ra_core::model::settings::Effort::High
 variant ra_core::model::settings::Effort::Low
 variant ra_core::model::settings::Effort::Max
