@@ -1,0 +1,22 @@
+[package]
+name = "it-e2e"
+description = "跨 crate 端到端测试：CLI / app-server / 真实 provider 门禁。"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-core = { path = "../../crates/ra-core" }
+ra-runtime = { path = "../../crates/ra-runtime" }
+ra-model = { path = "../../crates/ra-model" }
+ra-patch = { path = "../../crates/ra-patch" }
+ra-coding = { path = "../../crates/ra-coding" }
+ra-protocol = { path = "../../crates/ra-protocol" }
+ra-eval = { path = "../../crates/ra-eval" }
+insta = { version = "1", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+wiremock = "0.6"
+serde_json = "1"

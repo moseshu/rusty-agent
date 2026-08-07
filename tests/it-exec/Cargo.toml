@@ -1,0 +1,16 @@
+[package]
+name = "it-exec"
+description = "ra-exec 的集成测试。不随主 workspace 发布。"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-exec = { path = "../../crates/ra-exec" }
+insta = { version = "1", features = ["json", "redactions"] }
+rstest = "0.23"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde_json = "1"

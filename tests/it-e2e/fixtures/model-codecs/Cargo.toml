@@ -1,0 +1,11 @@
+[package]
+name = "boundary-model-codecs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ra-model = { path = "../../../../crates/ra-model", features = ["anthropic"] }
+

@@ -1,0 +1,11 @@
+[package]
+name = "boundary-runtime-internals"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ra-runtime = { path = "../../../../crates/ra-runtime" }
+

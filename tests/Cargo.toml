@@ -1,0 +1,28 @@
+# 测试 workspace —— 与主 workspace 分离，但进版本库（见 README.md）。
+#
+# 分离的原因：insta / wiremock / rstest 这类测试专用依赖不该出现在主 workspace 的
+# 依赖图里。主仓库 `cargo build --workspace` 与 `cargo tree` 因此只看得到产品依赖。
+#
+# 运行：cargo test --manifest-path tests/Cargo.toml
+# 或：  cargo xtask test
+[workspace]
+resolver = "3"
+# 个人实验，不是正式测试宿主；它有自己的 Cargo.toml，不 exclude 会被 cargo 认成
+# "属于本 workspace 却没登记"。
+exclude = ["test-gemini"]
+members = [
+    "it-core",
+    "it-macros",
+    "it-model",
+    "it-prompt",
+    "it-context",
+    "it-runtime",
+    "it-session",
+    "it-exec",
+    "it-mcp",
+    "it-protocol",
+    "it-eval",
+    "it-patch",
+    "it-coding",
+    "it-e2e",
+]

@@ -1,0 +1,11 @@
+[package]
+name = "boundary-patch-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ra-patch = { path = "../../../../crates/ra-patch" }
+

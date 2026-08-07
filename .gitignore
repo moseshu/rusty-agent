@@ -18,10 +18,16 @@ target
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
 
-# 测试 workspace —— 独立于主 workspace，不进版本库（见 tests/README.md）
-/tests/
+# 测试 workspace —— 独立于主 workspace，但**进版本库**（见 tests/README.md）。
+# 只忽略构建产物与个人实验：断言本身必须能被 review、能在 CI 里跑。
+/tests/target/
+/tests/*/target/
+/tests/Cargo.lock
+/tests/test-gemini/
+# 抓取第三方系统提示词的调研产物，不进公开仓库。
+/tests/extracted_prompts.json
 
 # eval fixture 输出
 /fixtures/out/
