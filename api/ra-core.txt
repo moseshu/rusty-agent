@@ -59,8 +59,24 @@ const fn ra_core::item::RunItem::unknown(& self) -> & Unknown
 const fn ra_core::item::RunItemKind::label(& self) -> & 'static str
 const fn ra_core::item::compaction::Compaction::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::compaction::Compaction::unknown(& self) -> & Unknown
+const fn ra_core::item::content::Base64ImageSource::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::Base64ImageSource::unknown(& self) -> & Unknown
+const fn ra_core::item::content::ContentBlock::as_image(& self) -> Option < & ImageBlock >
+const fn ra_core::item::content::ContentBlock::as_thinking(& self) -> Option < & ThinkingBlock >
+const fn ra_core::item::content::ContentBlock::label(& self) -> & 'static str
+const fn ra_core::item::content::ImageBlock::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::ImageBlock::source(& self) -> & ImageSource
+const fn ra_core::item::content::ImageBlock::unknown(& self) -> & Unknown
+const fn ra_core::item::content::ImageSource::as_base64(& self) -> Option < & Base64ImageSource >
+const fn ra_core::item::content::ImageSource::as_local_path(& self) -> Option < & LocalImageSource >
+const fn ra_core::item::content::LocalImageSource::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::LocalImageSource::unknown(& self) -> & Unknown
+const fn ra_core::item::content::RefusalBlock::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::RefusalBlock::unknown(& self) -> & Unknown
 const fn ra_core::item::content::TextBlock::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::TextBlock::unknown(& self) -> & Unknown
+const fn ra_core::item::content::ThinkingBlock::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::ThinkingBlock::unknown(& self) -> & Unknown
 const fn ra_core::item::handoff::HandoffCall::arguments(& self) -> & Value
 const fn ra_core::item::handoff::HandoffCall::call_id(& self) -> & CallId
 const fn ra_core::item::handoff::HandoffCall::schema_version(& self) -> SchemaVersion
@@ -182,6 +198,7 @@ enum ra_core::error::ToolErrorKind
 enum ra_core::item::ModelInputItem
 enum ra_core::item::RunItemKind
 enum ra_core::item::content::ContentBlock
+enum ra_core::item::content::ImageSource
 enum ra_core::item::message::MessageRole
 enum ra_core::item::phase::OutputPhase
 enum ra_core::trace::SpanKind
@@ -258,10 +275,30 @@ fn ra_core::item::SessionData::new() -> Self
 fn ra_core::item::compaction::Compaction::compacted_items(& self) -> & [ItemId]
 fn ra_core::item::compaction::Compaction::new(summary : impl Into < String >, compacted_items : Vec < ItemId >) -> Self
 fn ra_core::item::compaction::Compaction::summary(& self) -> & str
+fn ra_core::item::content::Base64ImageSource::data(& self) -> & str
+fn ra_core::item::content::Base64ImageSource::media_type(& self) -> & str
+fn ra_core::item::content::Base64ImageSource::new(media_type : impl Into < String >, data : impl Into < String >) -> Self
+fn ra_core::item::content::ContentBlock::as_refusal(& self) -> Option < & str >
 fn ra_core::item::content::ContentBlock::as_text(& self) -> Option < & str >
+fn ra_core::item::content::ContentBlock::image(source : ImageSource) -> Self
+fn ra_core::item::content::ContentBlock::image_base64(media_type : impl Into < String >, data : impl Into < String >) -> Self
+fn ra_core::item::content::ContentBlock::image_path(path : impl Into < PathBuf >) -> Self
+fn ra_core::item::content::ContentBlock::refusal(refusal : impl Into < String >) -> Self
 fn ra_core::item::content::ContentBlock::text(text : impl Into < String >) -> Self
+fn ra_core::item::content::ContentBlock::thinking(thinking : impl Into < String >, signature : impl Into < String >) -> Self
+fn ra_core::item::content::ImageBlock::new(source : ImageSource) -> Self
+fn ra_core::item::content::ImageSource::base64(media_type : impl Into < String >, data : impl Into < String >) -> Self
+fn ra_core::item::content::ImageSource::local_path(path : impl Into < PathBuf >) -> Self
+fn ra_core::item::content::LocalImageSource::new(path : impl Into < PathBuf >) -> Self
+fn ra_core::item::content::LocalImageSource::path(& self) -> & Path
+fn ra_core::item::content::LocalImageSource::try_new(path : impl Into < PathBuf >) -> Result < Self , PathBuf >
+fn ra_core::item::content::RefusalBlock::new(refusal : impl Into < String >) -> Self
+fn ra_core::item::content::RefusalBlock::refusal(& self) -> & str
 fn ra_core::item::content::TextBlock::new(text : impl Into < String >) -> Self
 fn ra_core::item::content::TextBlock::text(& self) -> & str
+fn ra_core::item::content::ThinkingBlock::new(thinking : impl Into < String >, signature : impl Into < String >) -> Self
+fn ra_core::item::content::ThinkingBlock::signature(& self) -> & str
+fn ra_core::item::content::ThinkingBlock::thinking(& self) -> & str
 fn ra_core::item::handoff::HandoffCall::new(call_id : CallId, target_agent : AgentId, arguments : Value) -> Self
 fn ra_core::item::handoff::HandoffOutput::new(call_id : CallId, source_agent : AgentId, target_agent : AgentId) -> Self
 fn ra_core::item::handoff::HandoffOutput::note(& self) -> Option < & str >
@@ -284,6 +321,7 @@ fn ra_core::item::mcp::McpTool::with_description(mut self, description : impl In
 fn ra_core::item::message::Message::assistant(text : impl Into < String >, phase : OutputPhase) -> Self
 fn ra_core::item::message::Message::content(& self) -> & [ContentBlock]
 fn ra_core::item::message::Message::new(role : MessageRole, content : Vec < ContentBlock >) -> Self
+fn ra_core::item::message::Message::refusal_content(& self) -> Option < String >
 fn ra_core::item::message::Message::system(text : impl Into < String >) -> Self
 fn ra_core::item::message::Message::text(role : MessageRole, text : impl Into < String >) -> Self
 fn ra_core::item::message::Message::text_content(& self) -> String
@@ -373,7 +411,12 @@ struct ra_core::item::RawProviderItem
 struct ra_core::item::RunItem
 struct ra_core::item::SessionData
 struct ra_core::item::compaction::Compaction
+struct ra_core::item::content::Base64ImageSource
+struct ra_core::item::content::ImageBlock
+struct ra_core::item::content::LocalImageSource
+struct ra_core::item::content::RefusalBlock
 struct ra_core::item::content::TextBlock
+struct ra_core::item::content::ThinkingBlock
 struct ra_core::item::handoff::HandoffCall
 struct ra_core::item::handoff::HandoffOutput
 struct ra_core::item::mcp::McpApprovalRequest
@@ -484,7 +527,12 @@ variant ra_core::item::RunItemKind::Reasoning(Reasoning)
 variant ra_core::item::RunItemKind::ToolApproval(ToolApproval)
 variant ra_core::item::RunItemKind::ToolCall(ToolCall)
 variant ra_core::item::RunItemKind::ToolCallOutput(ToolCallOutput)
+variant ra_core::item::content::ContentBlock::Image(ImageBlock)
+variant ra_core::item::content::ContentBlock::Refusal(RefusalBlock)
 variant ra_core::item::content::ContentBlock::Text(TextBlock)
+variant ra_core::item::content::ContentBlock::Thinking(ThinkingBlock)
+variant ra_core::item::content::ImageSource::Base64(Base64ImageSource)
+variant ra_core::item::content::ImageSource::LocalPath(LocalImageSource)
 variant ra_core::item::message::MessageRole::Assistant
 variant ra_core::item::message::MessageRole::System
 variant ra_core::item::message::MessageRole::User

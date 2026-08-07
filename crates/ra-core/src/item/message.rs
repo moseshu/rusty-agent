@@ -120,13 +120,29 @@ impl Message {
         &self.unknown
     }
 
-    /// Concatenates all text blocks. Non-text blocks introduced by R1-2 are skipped.
+    /// Concatenates all text blocks and skips every non-text block.
+    ///
+    /// A refusal is not text and never appears here; ask [`Self::refusal_content`] for it.
     #[must_use]
     pub fn text_content(&self) -> String {
         self.content
             .iter()
             .filter_map(ContentBlock::as_text)
             .collect()
+    }
+
+    /// Concatenates all refusal blocks, or `None` when the model did not refuse.
+    ///
+    /// This is the mechanical signal R1-12 escalates on. Matching refusal wording inside
+    /// [`Self::text_content`] would be a guess about provider phrasing.
+    #[must_use]
+    pub fn refusal_content(&self) -> Option<String> {
+        let refusal: String = self
+            .content
+            .iter()
+            .filter_map(ContentBlock::as_refusal)
+            .collect();
+        (!refusal.is_empty()).then_some(refusal)
     }
 }
 

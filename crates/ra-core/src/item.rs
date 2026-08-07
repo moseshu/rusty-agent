@@ -25,7 +25,10 @@ pub mod reasoning;
 pub mod tool;
 
 pub use compaction::Compaction;
-pub use content::{ContentBlock, TextBlock};
+pub use content::{
+    Base64ImageSource, ContentBlock, ImageBlock, ImageSource, LocalImageSource, RefusalBlock,
+    TextBlock, ThinkingBlock,
+};
 pub use handoff::{HandoffCall, HandoffOutput};
 pub use mcp::{McpApprovalRequest, McpApprovalResponse, McpListTools, McpTool};
 pub use message::{Message, MessageRole, ModelResponse};
