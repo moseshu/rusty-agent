@@ -26,6 +26,12 @@
 //!   Kimi return it; first-party `OpenAI` never does, and GPT and Gemini expose reasoning through
 //!   entirely different shapes. Chat Completions therefore carries no reasoning at the protocol
 //!   level, and gateways that add it are described by `Quirks`.
+//!
+//! Both of those were pushed onto `Quirks` by this module, so R1-6b owes two questions its current
+//! field list does not cover: **does this endpoint accept `prompt_cache_key`**, and **does this
+//! gateway return `reasoning_content`**. Without them the two facts have nowhere to live, and the
+//! adapter falls back to guessing from the protocol — which is exactly what this matrix stopped
+//! doing.
 
 use std::fmt;
 

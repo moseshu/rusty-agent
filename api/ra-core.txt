@@ -2,6 +2,9 @@
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
+async fn ra_core::model::Model::close(& self) -> Result < () >
+async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
+async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
 const fn ra_core::cancel::CancelOnDrop::scope(& self) -> & CancelScope
 const fn ra_core::cancel::CancelReason::is_expiry(& self) -> bool
 const fn ra_core::cancel::CancelReason::is_user_initiated(& self) -> bool
@@ -148,11 +151,41 @@ const fn ra_core::model::protocol::ReasoningReplay::is_required(self) -> bool
 const fn ra_core::model::protocol::ServerConversationSupport::is_supported(self) -> bool
 const fn ra_core::model::protocol::ServerConversationSupport::supports_conversation_id(self) -> bool
 const fn ra_core::model::protocol::ServerConversationSupport::supports_previous_response_id(self) -> bool
+const fn ra_core::model::request::ConversationContinuation::is_server_managed(& self) -> bool
+const fn ra_core::model::request::ModelHandoffDefinition::input_schema(& self) -> & Value
+const fn ra_core::model::request::ModelHandoffDefinition::strict(& self) -> bool
+const fn ra_core::model::request::ModelHandoffDefinition::target_agent(& self) -> & AgentId
+const fn ra_core::model::request::ModelHandoffDefinition::with_strict(mut self, strict : bool) -> Self
+const fn ra_core::model::request::ModelOutputSchema::schema(& self) -> & Value
+const fn ra_core::model::request::ModelOutputSchema::strict(& self) -> bool
+const fn ra_core::model::request::ModelOutputSchema::with_strict(mut self, strict : bool) -> Self
+const fn ra_core::model::request::ModelRequest::continuation(& self) -> & ConversationContinuation
+const fn ra_core::model::request::ModelRequest::model_settings(& self) -> & ResolvedModelSettings
+const fn ra_core::model::request::ModelRequest::output_schema(& self) -> Option < & ModelOutputSchema >
+const fn ra_core::model::request::ModelRequest::tracing(& self) -> ModelTracing
+const fn ra_core::model::request::ModelRequest::with_tracing(mut self, tracing : ModelTracing) -> Self
+const fn ra_core::model::request::ModelToolDefinition::input_schema(& self) -> & Value
+const fn ra_core::model::request::ModelToolDefinition::strict(& self) -> bool
+const fn ra_core::model::request::ModelToolDefinition::with_strict(mut self, strict : bool) -> Self
+const fn ra_core::model::request::ModelTracing::include_data(self) -> bool
+const fn ra_core::model::request::ModelTracing::is_disabled(self) -> bool
+const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::attempt(& self) -> u32
+const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::continuation(& self) -> & ConversationContinuation
+const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::error(& self) -> & Error
+const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::is_streaming(& self) -> bool
+const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::new(error : & 'a Error, attempt : u32, streaming : bool, continuation : & 'a ConversationContinuation) -> Self
 const fn ra_core::model::retry::ModelRetrySettings::backoff(& self) -> Option < & RetryBackoffSettings >
 const fn ra_core::model::retry::ModelRetrySettings::max_retries(& self) -> Option < u32 >
 const fn ra_core::model::retry::ModelRetrySettings::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::retry::ModelRetrySettings::unknown(& self) -> & Unknown
 const fn ra_core::model::retry::ModelRetrySettings::with_max_retries(mut self, max_retries : u32) -> Self
+const fn ra_core::model::retry::RetryAdvice::new() -> Self
+const fn ra_core::model::retry::RetryAdvice::replay_safety(& self) -> ReplaySafety
+const fn ra_core::model::retry::RetryAdvice::retry_after(& self) -> Option < Duration >
+const fn ra_core::model::retry::RetryAdvice::suggested(& self) -> Option < bool >
+const fn ra_core::model::retry::RetryAdvice::with_replay_safety(mut self, replay_safety : ReplaySafety) -> Self
+const fn ra_core::model::retry::RetryAdvice::with_retry_after(mut self, retry_after : Duration) -> Self
+const fn ra_core::model::retry::RetryAdvice::with_suggested(mut self, suggested : bool) -> Self
 const fn ra_core::model::retry::RetryBackoffSettings::initial_delay(& self) -> Option < Duration >
 const fn ra_core::model::retry::RetryBackoffSettings::jitter(& self) -> Option < bool >
 const fn ra_core::model::retry::RetryBackoffSettings::max_delay(& self) -> Option < Duration >
@@ -208,6 +241,12 @@ const fn ra_core::model::settings::ResolvedModelSettings::thinking(& self) -> Op
 const fn ra_core::model::settings::ResolvedModelSettings::timeout(& self) -> Option < Duration >
 const fn ra_core::model::settings::ResolvedModelSettings::tool_choice(& self) -> Option < & ToolChoice >
 const fn ra_core::model::settings::ResolvedModelSettings::top_p(& self) -> Option < f64 >
+const fn ra_core::model::stream::RawResponseEvent::payload(& self) -> & Value
+const fn ra_core::model::stream::RawResponseEvent::provider(& self) -> & ProviderKey
+const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
+const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
 const fn ra_core::trace::SpanKind::level(& self) -> Level
 const fn ra_core::trace::SpanKind::required_fields(& self) -> & 'static [& 'static str]
 const fn ra_core::trace::SpanKind::span_name(& self) -> & 'static str
@@ -245,6 +284,7 @@ const ra_core::model::retry::MODEL_RETRY_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
 const ra_core::trace::field::AGENT_NAME: & str
 const ra_core::trace::field::ALL: & [& str]
 const ra_core::trace::field::CANCEL_REASON: & str
@@ -298,9 +338,13 @@ enum ra_core::model::protocol::StablePrefixLocation
 enum ra_core::model::protocol::StructuredOutputLocation
 enum ra_core::model::protocol::ToolCallCarrier
 enum ra_core::model::protocol::ToolResultCarrier
+enum ra_core::model::request::ConversationContinuation
+enum ra_core::model::request::ModelTracing
+enum ra_core::model::retry::ReplaySafety
 enum ra_core::model::settings::Effort
 enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
+enum ra_core::model::stream::ModelStreamEvent
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
@@ -451,8 +495,37 @@ fn ra_core::item::tool::ToolApproval::with_namespace(mut self, namespace : impl 
 fn ra_core::item::tool::ToolCall::name(& self) -> & str
 fn ra_core::item::tool::ToolCall::new(call_id : CallId, name : impl Into < String >, arguments : Value) -> Self
 fn ra_core::item::tool::ToolCallOutput::new(call_id : CallId, output : Value) -> Self
+fn ra_core::model::Model::get_retry_advice(& self, _request : & ModelRetryAdviceRequest < '_ >) -> Option < RetryAdvice >
+fn ra_core::model::Model::stream_response(& self, request : ModelRequest) -> ModelStream < '_ >
+fn ra_core::model::ModelProvider::get_model(& self, model_name : Option < & str >) -> Result < Arc < dyn Model > >
+fn ra_core::model::request::ConversationContinuation::conversation_id(& self) -> Option < & str >
+fn ra_core::model::request::ConversationContinuation::previous_response_id(& self) -> Option < & str >
+fn ra_core::model::request::ModelHandoffDefinition::description(& self) -> Option < & str >
+fn ra_core::model::request::ModelHandoffDefinition::name(& self) -> & str
+fn ra_core::model::request::ModelHandoffDefinition::new(target_agent : AgentId, name : impl Into < String >, input_schema : Value) -> Self
+fn ra_core::model::request::ModelHandoffDefinition::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::model::request::ModelOutputSchema::name(& self) -> & str
+fn ra_core::model::request::ModelOutputSchema::new(name : impl Into < String >, schema : Value) -> Self
+fn ra_core::model::request::ModelRequest::handoffs(& self) -> & [ModelHandoffDefinition]
+fn ra_core::model::request::ModelRequest::input(& self) -> & [ModelInputItem]
+fn ra_core::model::request::ModelRequest::new(input : Vec < ModelInputItem >, model_settings : ResolvedModelSettings) -> Self
+fn ra_core::model::request::ModelRequest::system_instructions(& self) -> Option < & str >
+fn ra_core::model::request::ModelRequest::tools(& self) -> & [ModelToolDefinition]
+fn ra_core::model::request::ModelRequest::with_continuation(mut self, continuation : ConversationContinuation) -> Self
+fn ra_core::model::request::ModelRequest::with_conversation_id(mut self, conversation_id : impl Into < String >) -> Self
+fn ra_core::model::request::ModelRequest::with_handoffs(mut self, handoffs : Vec < ModelHandoffDefinition >) -> Self
+fn ra_core::model::request::ModelRequest::with_output_schema(mut self, output_schema : ModelOutputSchema) -> Self
+fn ra_core::model::request::ModelRequest::with_previous_response_id(mut self, response_id : impl Into < String >) -> Self
+fn ra_core::model::request::ModelRequest::with_system_instructions(mut self, instructions : impl Into < String >) -> Self
+fn ra_core::model::request::ModelRequest::with_tools(mut self, tools : Vec < ModelToolDefinition >) -> Self
+fn ra_core::model::request::ModelToolDefinition::description(& self) -> Option < & str >
+fn ra_core::model::request::ModelToolDefinition::name(& self) -> & str
+fn ra_core::model::request::ModelToolDefinition::new(name : impl Into < String >, input_schema : Value) -> Self
+fn ra_core::model::request::ModelToolDefinition::with_description(mut self, description : impl Into < String >) -> Self
 fn ra_core::model::retry::ModelRetrySettings::new() -> Self
 fn ra_core::model::retry::ModelRetrySettings::with_backoff(mut self, backoff : RetryBackoffSettings) -> Self
+fn ra_core::model::retry::RetryAdvice::reason(& self) -> Option < & str >
+fn ra_core::model::retry::RetryAdvice::with_reason(mut self, reason : impl Into < String >) -> Self
 fn ra_core::model::retry::RetryBackoffSettings::new() -> Self
 fn ra_core::model::settings::McpToolChoice::name(& self) -> & str
 fn ra_core::model::settings::McpToolChoice::new(server : impl Into < String >, name : impl Into < String >) -> Self
@@ -469,6 +542,11 @@ fn ra_core::model::settings::ModelSettings::with_tool_choice(mut self, tool_choi
 fn ra_core::model::settings::ProviderKey::as_str(& self) -> & str
 fn ra_core::model::settings::ProviderKey::new(value : impl Into < String >) -> Self
 fn ra_core::model::settings::ResolvedModelSettings::to_traceable_value(& self) -> serde_json :: Result < Value >
+fn ra_core::model::stream::RawResponseEvent::event_type(& self) -> & str
+fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_type : impl Into < String >, payload : Value) -> Self
+fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
+fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
+fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
 fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
 fn ra_core::trace::SpanKind::label(& self) -> & str
 fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope : & ScopeKind)
@@ -549,15 +627,26 @@ struct ra_core::item::tool::ToolCall
 struct ra_core::item::tool::ToolCallOutput
 struct ra_core::model::protocol::PromptCacheSupport
 struct ra_core::model::protocol::ProtocolCapabilities
+struct ra_core::model::request::ModelHandoffDefinition
+struct ra_core::model::request::ModelOutputSchema
+struct ra_core::model::request::ModelRequest
+struct ra_core::model::request::ModelToolDefinition
+struct ra_core::model::retry::ModelRetryAdviceRequest
 struct ra_core::model::retry::ModelRetrySettings
+struct ra_core::model::retry::RetryAdvice
 struct ra_core::model::retry::RetryBackoffSettings
 struct ra_core::model::settings::McpToolChoice
 struct ra_core::model::settings::ModelSettings
 struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
+struct ra_core::model::stream::RawResponseEvent
+struct ra_core::model::stream::RunItemStreamEvent
 struct ra_core::usage::Usage
+trait ra_core::model::Model
+trait ra_core::model::ModelProvider
 type ra_core::error::BoxError
 type ra_core::error::Result
+type ra_core::model::ModelStream
 type ra_core::model::settings::JsonMap
 variant ra_core::cancel::CancelReason::Custom(Cow < 'static , str >)
 variant ra_core::cancel::CancelReason::Deadline
@@ -688,6 +777,15 @@ variant ra_core::model::protocol::ToolCallCarrier::ToolUseBlock
 variant ra_core::model::protocol::ToolResultCarrier::FunctionCallOutputItem
 variant ra_core::model::protocol::ToolResultCarrier::ToolResultBlock
 variant ra_core::model::protocol::ToolResultCarrier::ToolRoleMessage
+variant ra_core::model::request::ConversationContinuation::ConversationId(String)
+variant ra_core::model::request::ConversationContinuation::None
+variant ra_core::model::request::ConversationContinuation::PreviousResponseId(String)
+variant ra_core::model::request::ModelTracing::Disabled
+variant ra_core::model::request::ModelTracing::Enabled
+variant ra_core::model::request::ModelTracing::EnabledWithoutData
+variant ra_core::model::retry::ReplaySafety::Safe
+variant ra_core::model::retry::ReplaySafety::Unknown
+variant ra_core::model::retry::ReplaySafety::Unsafe
 variant ra_core::model::settings::Effort::High
 variant ra_core::model::settings::Effort::Low
 variant ra_core::model::settings::Effort::Max
@@ -701,6 +799,8 @@ variant ra_core::model::settings::ToolChoice::Mcp(McpToolChoice)
 variant ra_core::model::settings::ToolChoice::None
 variant ra_core::model::settings::ToolChoice::Required
 variant ra_core::model::settings::ToolChoice::Tool(String)
+variant ra_core::model::stream::ModelStreamEvent::RawResponse(RawResponseEvent)
+variant ra_core::model::stream::ModelStreamEvent::RunItem(RunItemStreamEvent)
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function
