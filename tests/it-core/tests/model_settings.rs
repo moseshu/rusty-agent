@@ -205,6 +205,43 @@ fn max_tokens_只被模型层封顶_agent_默认不是天花板() {
 }
 
 #[test]
+fn 注册方默认里模型层压过_provider_兜底() {
+    // provider 兜底存在的理由是"有些端点这个字段必填"（Anthropic 就是），它不该压过一个
+    // 正因为该模型不一样才写下的 per-model 值——最粗的一层压过最具体的一层是反的。
+    let key = provider("anthropic");
+    let empty = ModelSettings::new();
+    let provider_fallback = ModelSettings::new().with_max_tokens(4_096);
+    let model_limit = ModelSettings::new().with_max_tokens(64_000);
+
+    assert_eq!(
+        provider_fallback
+            .resolve(&key, &empty, &model_limit, &empty)
+            .max_tokens(),
+        Some(64_000),
+        "更具体的模型注册应胜出"
+    );
+    assert_eq!(
+        provider_fallback
+            .resolve(&key, &empty, &empty, &empty)
+            .max_tokens(),
+        Some(4_096),
+        "模型没自己说时兜底才生效"
+    );
+    assert_eq!(
+        provider_fallback
+            .resolve(
+                &key,
+                &ModelSettings::new().with_max_tokens(1_000),
+                &model_limit,
+                &empty
+            )
+            .max_tokens(),
+        Some(1_000),
+        "用户意图压过两种注册方默认"
+    );
+}
+
+#[test]
 fn extra_body_按四层递归合并且不修改来源() {
     let key = provider("vllm");
     let provider_defaults = ModelSettings::new().with_extra_body(

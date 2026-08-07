@@ -7,12 +7,23 @@
 //!
 //! # `max_tokens` and `timeout` are constrained differently
 //!
-//! Only the resolved-model layer states a hard fact. `max_tokens` therefore takes the ordinary
-//! later-layer-wins value across provider, agent, and run, and then clamps it to the model's
-//! limit: asking for more than the model accepts only buys a 400, but an agent's default is a
-//! preference, not a ceiling. Clamping to the minimum of every layer would mean an agent that sets
-//! `max_tokens` for short answers could never be raised for one run that needs a long one — the
-//! user's explicit run value would vanish with no diagnostic.
+//! `max_tokens` is the one setting where the four layers do not simply stack, because three
+//! different kinds of statement share the field:
+//!
+//! | Role | Layers | Rule |
+//! | --- | --- | --- |
+//! | registry default — "use this unless told otherwise" | provider, then model | later wins, so the model-specific value beats the provider-wide one |
+//! | user intent — "I want this much" | agent, then run | later wins, and any intent beats a registry default |
+//! | hard ceiling — "more than this only buys a 400" | model | clamps whatever the two rules above produced |
+//!
+//! Two failure modes this avoids, both of which silently discard a value someone wrote down:
+//!
+//! - Clamping to the minimum of every layer would make an agent's short-answer default an
+//!   unraisable ceiling, so a run that legitimately needs a long answer could never ask for one.
+//! - Letting the provider layer supply the value would make the coarsest registration beat the most
+//!   specific one. A provider-wide fallback exists because some endpoints require the field at all
+//!   — Anthropic does — and it must not override a per-model limit that was registered precisely
+//!   because that model is different.
 //!
 //! `timeout` is the opposite and does take the minimum of all four layers. It is a latency bound
 //! rather than a capability: any layer that wants to wait less has standing to say so, and a
@@ -386,8 +397,8 @@ impl ModelSettings {
     /// `self` is the provider-registration layer. Later arguments have increasing precedence.
     /// Only the active provider's request-body bucket is copied into the result.
     ///
-    /// `max_tokens` is clamped to `model_defaults` rather than to every layer, and `timeout` takes
-    /// the shortest of all four; see the module documentation for why the two differ.
+    /// `max_tokens` resolves through three roles rather than plain layer stacking, and `timeout`
+    /// takes the shortest of all four; see the module documentation for both rules.
     #[must_use]
     pub fn resolve(
         &self,
@@ -397,8 +408,10 @@ impl ModelSettings {
         run_overrides: &Self,
     ) -> ResolvedModelSettings {
         let layers = [self, agent_defaults, model_defaults, run_overrides];
-        let requested_max_tokens =
-            last_some([self, agent_defaults, run_overrides].map(|layer| layer.max_tokens));
+        // See the module docs: registry defaults and user intent are separate lanes, and the model
+        // layer additionally clamps whichever of them produced a value.
+        let registry_default = last_some([self, model_defaults].map(|layer| layer.max_tokens));
+        let user_intent = last_some([agent_defaults, run_overrides].map(|layer| layer.max_tokens));
 
         ResolvedModelSettings {
             provider: provider.clone(),
@@ -406,7 +419,7 @@ impl ModelSettings {
             top_p: last_some(layers.map(|layer| layer.top_p)),
             frequency_penalty: last_some(layers.map(|layer| layer.frequency_penalty)),
             presence_penalty: last_some(layers.map(|layer| layer.presence_penalty)),
-            max_tokens: clamp_to_limit(requested_max_tokens, model_defaults.max_tokens),
+            max_tokens: clamp_to_limit(user_intent.or(registry_default), model_defaults.max_tokens),
             timeout: strictest(layers.map(|layer| layer.timeout)),
             tool_choice: layers
                 .iter()
@@ -724,8 +737,8 @@ fn strictest<T: Ord>(values: impl IntoIterator<Item = Option<T>>) -> Option<T> {
 
 /// Applies a hard capability limit to a requested value.
 ///
-/// An absent limit leaves the request alone, and an absent request falls back to the limit — the
-/// model layer supplies both the default and the ceiling.
+/// An absent limit leaves the request alone, and an absent request falls back to the limit, so a
+/// model registration that states only a ceiling still supplies a usable value.
 fn clamp_to_limit<T: Ord>(requested: Option<T>, limit: Option<T>) -> Option<T> {
     match (requested, limit) {
         (Some(requested), Some(limit)) => Some(requested.min(limit)),

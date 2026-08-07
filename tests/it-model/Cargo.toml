@@ -9,7 +9,10 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+ra-core = { path = "../../crates/ra-core" }
 ra-model = { path = "../../crates/ra-model" }
+async-trait = "0.1"
+futures = "0.3"
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -1,5 +1,46 @@
 # ra-model 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
+const fn ra_model::provider::ModelRegistration::defaults(& self) -> & ModelSettings
+const fn ra_model::provider::ModelSelector::protocol(& self) -> ApiProtocol
+const fn ra_model::provider::ModelSelector::provider(& self) -> & ProviderKey
+const fn ra_model::provider::ProviderRegistration::defaults(& self) -> & ModelSettings
+const fn ra_model::provider::ProviderRegistration::key(& self) -> & ProviderKey
+const fn ra_model::provider::ProviderRegistration::protocol(& self) -> ApiProtocol
+const fn ra_model::provider::ProviderRegistry::default_provider(& self) -> & ProviderKey
+const fn ra_model::provider::ProviderRegistry::unknown_prefix_policy(& self) -> & UnknownPrefixPolicy
+const fn ra_model::provider::ResolvedModel::model(& self) -> & Arc < dyn Model >
+const fn ra_model::provider::ResolvedModel::model_defaults(& self) -> & ModelSettings
+const fn ra_model::provider::ResolvedModel::provider_defaults(& self) -> & ModelSettings
+const fn ra_model::provider::ResolvedModel::selector(& self) -> & ModelSelector
+enum ra_model::provider::UnknownPrefixPolicy
+fn ra_model::provider::ModelRegistration::aliases(& self) -> & [String]
+fn ra_model::provider::ModelRegistration::name(& self) -> & str
+fn ra_model::provider::ModelRegistration::new(name : impl Into < String >) -> Self
+fn ra_model::provider::ModelRegistration::with_alias(mut self, alias : impl Into < String >) -> Self
+fn ra_model::provider::ModelRegistration::with_defaults(mut self, defaults : ModelSettings) -> Self
+fn ra_model::provider::ModelSelector::model(& self) -> Option < & str >
+fn ra_model::provider::ProviderFactory::create(& self) -> Result < Arc < dyn ModelProvider > >
+fn ra_model::provider::ProviderRegistration::aliases(& self) -> & [String]
+fn ra_model::provider::ProviderRegistration::models(& self) -> & [ModelRegistration]
+fn ra_model::provider::ProviderRegistration::new(key : ProviderKey, protocol : ApiProtocol, factory : impl ProviderFactory) -> Self
+fn ra_model::provider::ProviderRegistration::static_extra_body(& self) -> Option < & JsonMap >
+fn ra_model::provider::ProviderRegistration::with_alias(mut self, alias : impl Into < String >) -> Self
+fn ra_model::provider::ProviderRegistration::with_defaults(mut self, defaults : ModelSettings) -> Self
+fn ra_model::provider::ProviderRegistration::with_model(mut self, model : ModelRegistration) -> Self
+fn ra_model::provider::ProviderRegistration::with_static_extra_body(mut self, body : JsonMap) -> Self
+fn ra_model::provider::ProviderRegistry::builder(default_provider : ProviderKey) -> ProviderRegistryBuilder
+fn ra_model::provider::ProviderRegistry::registration(& self, provider : & ProviderKey) -> Option < & ProviderRegistration >
+fn ra_model::provider::ProviderRegistry::registration_for_prefix(& self, prefix : & str) -> Option < & ProviderRegistration >
+fn ra_model::provider::ProviderRegistry::registrations(& self) -> impl Iterator < Item = & ProviderRegistration >
+fn ra_model::provider::ProviderRegistry::resolve_model(& self, model_name : Option < & str >) -> Result < ResolvedModel >
+fn ra_model::provider::ProviderRegistry::select_model(& self, model_name : Option < & str >) -> Result < ModelSelector >
+fn ra_model::provider::ProviderRegistryBuilder::build(self) -> Result < ProviderRegistry >
+fn ra_model::provider::ProviderRegistryBuilder::new(default_provider : ProviderKey) -> Self
+fn ra_model::provider::ProviderRegistryBuilder::register(mut self, registration : ProviderRegistration) -> Self
+fn ra_model::provider::ProviderRegistryBuilder::unknown_prefix_policy(mut self, policy : UnknownPrefixPolicy) -> Self
+fn ra_model::provider::ResolvedModel::into_model(self) -> Arc < dyn Model >
+fn ra_model::provider::ResolvedModel::resolve_settings(& self, agent_defaults : & ModelSettings, run_overrides : & ModelSettings) -> ResolvedModelSettings
 mod ra_model::anthropic
 mod ra_model::anthropic::betas
 mod ra_model::compat
@@ -13,3 +54,12 @@ mod ra_model::protocol
 mod ra_model::provider
 mod ra_model::retry
 mod ra_model::usage
+struct ra_model::provider::ModelRegistration
+struct ra_model::provider::ModelSelector
+struct ra_model::provider::ProviderRegistration
+struct ra_model::provider::ProviderRegistry
+struct ra_model::provider::ProviderRegistryBuilder
+struct ra_model::provider::ResolvedModel
+trait ra_model::provider::ProviderFactory
+variant ra_model::provider::UnknownPrefixPolicy::Error
+variant ra_model::provider::UnknownPrefixPolicy::ForwardTo(ProviderKey)
