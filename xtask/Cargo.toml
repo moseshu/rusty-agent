@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "仓库任务：schema 字节稳定性、prompt dump、guard 登记表校验、token 预算。"
+description = "仓库门禁：依赖分层、无内联测试、公开 API 对账、schema 稳定性、prompt dump、guard 登记表、token 预算、测试 workspace。"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 clap = { workspace = true }
+serde_json = { workspace = true }

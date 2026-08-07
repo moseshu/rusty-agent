@@ -5,7 +5,9 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+# 跟着锁文件里真实需要的最低版本走：`time` 0.3.47（RUSTSEC-2026-0009 的修复版）
+# 要求 1.88。工具链固定在 1.97.1，这个下限只对下游消费者有意义。
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/moseshu/rusty-agent"
 authors = ["moses"]
@@ -28,19 +30,19 @@ missing_panics_doc = "allow"
 
 [workspace.dependencies]
 # --- 内部 crate ---
-ra-core = { path = "crates/ra-core" }
-ra-macros = { path = "crates/ra-macros" }
-ra-model = { path = "crates/ra-model" }
-ra-prompt = { path = "crates/ra-prompt" }
-ra-context = { path = "crates/ra-context" }
-ra-runtime = { path = "crates/ra-runtime" }
-ra-session = { path = "crates/ra-session" }
-ra-exec = { path = "crates/ra-exec" }
-ra-mcp = { path = "crates/ra-mcp" }
-ra-protocol = { path = "crates/ra-protocol" }
-ra-eval = { path = "crates/ra-eval" }
-ra-patch = { path = "crates/ra-patch" }
-ra-coding = { path = "crates/ra-coding" }
+ra-core = { path = "crates/ra-core", version = "0.0.1" }
+ra-macros = { path = "crates/ra-macros", version = "0.0.1" }
+ra-model = { path = "crates/ra-model", version = "0.0.1" }
+ra-prompt = { path = "crates/ra-prompt", version = "0.0.1" }
+ra-context = { path = "crates/ra-context", version = "0.0.1" }
+ra-runtime = { path = "crates/ra-runtime", version = "0.0.1" }
+ra-session = { path = "crates/ra-session", version = "0.0.1" }
+ra-exec = { path = "crates/ra-exec", version = "0.0.1" }
+ra-mcp = { path = "crates/ra-mcp", version = "0.0.1" }
+ra-protocol = { path = "crates/ra-protocol", version = "0.0.1" }
+ra-eval = { path = "crates/ra-eval", version = "0.0.1" }
+ra-patch = { path = "crates/ra-patch", version = "0.0.1" }
+ra-coding = { path = "crates/ra-coding", version = "0.0.1" }
 
 # --- 运行时 ---
 tokio = { version = "1", features = [
@@ -78,7 +80,7 @@ reqwest = { version = "0.12", features = [
 
 # --- 存储与进程 ---
 rusqlite = { version = "0.32", features = ["bundled"] }
-portable-pty = "0.8"
+portable-pty = "0.9"
 
 # --- 杂项 ---
 uuid = { version = "1", features = ["v4", "v7", "serde"] }

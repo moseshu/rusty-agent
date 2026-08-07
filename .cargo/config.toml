@@ -1,0 +1,4 @@
+# `cargo xtask <门禁>` 的别名。没有它就得写 `cargo run -p xtask --`，
+# 于是没人会跑门禁——入口的摩擦决定它是否被使用。
+[alias]
+xtask = "run --quiet --package xtask --"

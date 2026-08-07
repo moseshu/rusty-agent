@@ -1,0 +1,53 @@
+# cargo-deny：依赖审计（R0-6）。
+#
+# 查四件事：已知漏洞、许可证、重复版本与来源。跑法：
+#   cargo deny check all
+#
+# 判据不是「越严越好」，而是**每一条拒绝都要有人能处理**。因此重复版本只 warn
+# （传递依赖的版本收敛不由我们决定），而未知来源与通配版本直接 deny（那两件都是
+# 自己写出来的）。
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# 撤回的版本不给用：它被撤回通常正是因为有问题。
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# 允许的许可证。新增依赖若不在此列，CI 会失败并要求显式决定——
+# 许可证是法律问题，不该由一次顺手的 `cargo add` 悄悄引入。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# ring 的 LICENSE 是 ISC / MIT / OpenSSL 三段拼接，不是标准 SPDX 表达式，
+# 需要显式澄清；它经由 rustls 进来，是 TLS 栈的必需件。
+[[licenses.clarify]]
+crate = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0e_ed23 }]
+
+[bans]
+# 重复版本只警告：传递依赖的版本收敛不在我们控制之内，报错会让 CI 长期红着，
+# 而长期红着的门禁等于没有门禁。
+multiple-versions = "warn"
+# 通配版本是自己写出来的，没有借口。
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

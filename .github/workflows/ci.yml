@@ -1,9 +1,10 @@
-# R0-6 八条门禁里最先能落地的三条。
-# 其余五条（schema 字节稳定 / prompt dump / guard 登记表对账 / token 预算 /
-# no-inline-tests）等对应阶段有被测对象后再加，见 xtask。
+# R0-6 的门禁。
 #
-# 注意：行为测试位于独立的 tests/ workspace，该目录不进版本库，
-# 因此 CI 跑不到测试——本地用 `cargo xtask test` 跑。
+# 分三个 job：编译期检查、xtask 八条门禁、依赖审计。三者互不阻塞，一次 push
+# 能同时看到三类问题，不用修一条再等一轮。
+#
+# 注意：行为测试位于独立的 tests/ workspace，该目录不进版本库，因此 CI 跑不到
+# 测试——`cargo xtask all` 里的 test 一条会如实报 SKIP，本地用 `cargo xtask test`。
 name: CI
 
 on:
@@ -43,3 +44,26 @@ jobs:
 
       - name: 编译
         run: cargo check --workspace --all-targets
+
+  gates:
+    name: xtask 八条门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      # 只有 FAIL 让这一步变红；被测对象尚未存在的几条报 SKIP 并在汇总里计数，
+      # 每次 CI 输出都会提醒还欠几条。
+      - name: 八条门禁
+        run: cargo xtask all
+
+  deny:
+    name: 依赖审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用官方 action 而不是 cargo install：后者每次 CI 都要重新编译。
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all
