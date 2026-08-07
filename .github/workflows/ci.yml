@@ -1,10 +1,12 @@
 # R0-6 的门禁。
 #
-# 分三个 job：编译期检查、xtask 八条门禁、依赖审计。三者互不阻塞，一次 push
+# 分三个 job：编译期检查、xtask 九条门禁、依赖审计。三者互不阻塞，一次 push
 # 能同时看到三类问题，不用修一条再等一轮。
 #
-# 注意：行为测试位于独立的 tests/ workspace，该目录不进版本库，因此 CI 跑不到
-# 测试——`cargo xtask all` 里的 test 一条会如实报 SKIP，本地用 `cargo xtask test`。
+# 注意：行为测试位于独立的 tests/ workspace（进版本库，只忽略 target/）。
+# `cargo xtask all` 里的 test 一条会真跑它，feature-matrix 一条逐 crate 验
+# feature 全关/全开——后者必须逐 crate，workspace 级 --no-default-features
+# 不穿透 crate 之间的依赖边。
 name: CI
 
 on:
@@ -46,7 +48,7 @@ jobs:
         run: cargo check --workspace --all-targets
 
   gates:
-    name: xtask 八条门禁
+    name: xtask 九条门禁
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +56,7 @@ jobs:
 
       # 只有 FAIL 让这一步变红；被测对象尚未存在的几条报 SKIP 并在汇总里计数，
       # 每次 CI 输出都会提醒还欠几条。
-      - name: 八条门禁
+      - name: 九条门禁
         run: cargo xtask all
 
   deny:

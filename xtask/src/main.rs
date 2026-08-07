@@ -1,17 +1,19 @@
 //! `cargo xtask` —— 把开发计划里的硬约束变成 CI 门禁。
 //!
-//! 八条门禁（R0-6）。`cargo xtask all` 全跑一遍并给出汇总，**只有 FAIL 让 CI 变红**，
+//! 九条门禁（R0-6）。`cargo xtask all` 全跑一遍并给出汇总，**只有 FAIL 让 CI 变红**，
 //! SKIP 单独计数——见 [`gate::Outcome`] 对三态的说明。
 //!
 //! ```text
 //! cargo xtask all                # 全部
 //! cargo xtask layering           # 依赖方向四条铁律
 //! cargo xtask no-inline-tests    # crates/ 下无测试代码
+//! cargo xtask feature-matrix     # 逐 crate 验 feature 全关 / 全开
 //! cargo xtask test -p it-core    # 跑独立测试 workspace，参数透传给 cargo test
 //! ```
 
 mod api;
 mod extension_safety;
+mod feature_matrix;
 mod gate;
 mod inline_tests;
 mod layering;
@@ -33,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
-    /// 跑全部八条门禁并汇总。
+    /// 跑全部九条门禁并汇总。
     All,
     /// 断言工具 schema 连续渲染 100 次字节全同。
     SchemaStability,
@@ -62,6 +64,8 @@ enum Task {
     },
     /// 依赖方向四条铁律：内核 / 可复用件 / 产品的依赖不得逆流。
     Layering,
+    /// 逐 crate 验 feature 全关 / 全开都能编译。
+    FeatureMatrix,
 }
 
 /// 门禁清单。顺序即 `all` 的执行顺序：**先快后慢**，静态检查排在跑测试前面。
@@ -74,6 +78,7 @@ fn all_gates() -> Vec<(&'static str, Outcome)> {
         ("prompt-dump", pending::prompt_dump()),
         ("guard-registry", pending::guard_registry()),
         ("token-budget", pending::token_budget()),
+        ("feature-matrix", feature_matrix::run()),
         ("test", tests_workspace::run(&[])),
     ]
 }
@@ -88,6 +93,7 @@ fn main() -> std::process::ExitCode {
         Task::PromptDump => vec![("prompt-dump", pending::prompt_dump())],
         Task::GuardRegistry => vec![("guard-registry", pending::guard_registry())],
         Task::TokenBudget => vec![("token-budget", pending::token_budget())],
+        Task::FeatureMatrix => vec![("feature-matrix", feature_matrix::run())],
         Task::Test { args } => vec![("test", tests_workspace::run(&args))],
     };
 
