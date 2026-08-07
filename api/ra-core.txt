@@ -124,6 +124,66 @@ const fn ra_core::item::tool::ToolCallOutput::output(& self) -> & Value
 const fn ra_core::item::tool::ToolCallOutput::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::tool::ToolCallOutput::unknown(& self) -> & Unknown
 const fn ra_core::item::tool::ToolCallOutput::with_error(mut self, is_error : bool) -> Self
+const fn ra_core::model::retry::ModelRetrySettings::backoff(& self) -> Option < & RetryBackoffSettings >
+const fn ra_core::model::retry::ModelRetrySettings::max_retries(& self) -> Option < u32 >
+const fn ra_core::model::retry::ModelRetrySettings::schema_version(& self) -> SchemaVersion
+const fn ra_core::model::retry::ModelRetrySettings::unknown(& self) -> & Unknown
+const fn ra_core::model::retry::ModelRetrySettings::with_max_retries(mut self, max_retries : u32) -> Self
+const fn ra_core::model::retry::RetryBackoffSettings::initial_delay(& self) -> Option < Duration >
+const fn ra_core::model::retry::RetryBackoffSettings::jitter(& self) -> Option < bool >
+const fn ra_core::model::retry::RetryBackoffSettings::max_delay(& self) -> Option < Duration >
+const fn ra_core::model::retry::RetryBackoffSettings::multiplier(& self) -> Option < f64 >
+const fn ra_core::model::retry::RetryBackoffSettings::schema_version(& self) -> SchemaVersion
+const fn ra_core::model::retry::RetryBackoffSettings::unknown(& self) -> & Unknown
+const fn ra_core::model::retry::RetryBackoffSettings::with_initial_delay(mut self, delay : Duration) -> Self
+const fn ra_core::model::retry::RetryBackoffSettings::with_jitter(mut self, jitter : bool) -> Self
+const fn ra_core::model::retry::RetryBackoffSettings::with_max_delay(mut self, delay : Duration) -> Self
+const fn ra_core::model::retry::RetryBackoffSettings::with_multiplier(mut self, multiplier : f64) -> Self
+const fn ra_core::model::settings::Effort::label(self) -> & 'static str
+const fn ra_core::model::settings::McpToolChoice::schema_version(& self) -> SchemaVersion
+const fn ra_core::model::settings::McpToolChoice::unknown(& self) -> & Unknown
+const fn ra_core::model::settings::ModelSettings::effort(& self) -> Option < Effort >
+const fn ra_core::model::settings::ModelSettings::extra_body(& self) -> & BTreeMap < ProviderKey , JsonMap >
+const fn ra_core::model::settings::ModelSettings::extra_headers(& self) -> & BTreeMap < String , String >
+const fn ra_core::model::settings::ModelSettings::extra_query(& self) -> & JsonMap
+const fn ra_core::model::settings::ModelSettings::frequency_penalty(& self) -> Option < f64 >
+const fn ra_core::model::settings::ModelSettings::max_tokens(& self) -> Option < u64 >
+const fn ra_core::model::settings::ModelSettings::metadata(& self) -> & BTreeMap < String , String >
+const fn ra_core::model::settings::ModelSettings::parallel_tool_calls(& self) -> Option < bool >
+const fn ra_core::model::settings::ModelSettings::presence_penalty(& self) -> Option < f64 >
+const fn ra_core::model::settings::ModelSettings::retry(& self) -> Option < & ModelRetrySettings >
+const fn ra_core::model::settings::ModelSettings::schema_version(& self) -> SchemaVersion
+const fn ra_core::model::settings::ModelSettings::temperature(& self) -> Option < f64 >
+const fn ra_core::model::settings::ModelSettings::thinking(& self) -> Option < ThinkingConfig >
+const fn ra_core::model::settings::ModelSettings::timeout(& self) -> Option < Duration >
+const fn ra_core::model::settings::ModelSettings::tool_choice(& self) -> Option < & ToolChoice >
+const fn ra_core::model::settings::ModelSettings::top_p(& self) -> Option < f64 >
+const fn ra_core::model::settings::ModelSettings::unknown(& self) -> & Unknown
+const fn ra_core::model::settings::ModelSettings::with_effort(mut self, effort : Effort) -> Self
+const fn ra_core::model::settings::ModelSettings::with_frequency_penalty(mut self, penalty : f64) -> Self
+const fn ra_core::model::settings::ModelSettings::with_max_tokens(mut self, max_tokens : u64) -> Self
+const fn ra_core::model::settings::ModelSettings::with_parallel_tool_calls(mut self, enabled : bool) -> Self
+const fn ra_core::model::settings::ModelSettings::with_presence_penalty(mut self, penalty : f64) -> Self
+const fn ra_core::model::settings::ModelSettings::with_temperature(mut self, temperature : f64) -> Self
+const fn ra_core::model::settings::ModelSettings::with_thinking(mut self, thinking : ThinkingConfig) -> Self
+const fn ra_core::model::settings::ModelSettings::with_timeout(mut self, timeout : Duration) -> Self
+const fn ra_core::model::settings::ModelSettings::with_top_p(mut self, top_p : f64) -> Self
+const fn ra_core::model::settings::ResolvedModelSettings::effort(& self) -> Option < Effort >
+const fn ra_core::model::settings::ResolvedModelSettings::extra_body(& self) -> & JsonMap
+const fn ra_core::model::settings::ResolvedModelSettings::extra_headers(& self) -> & BTreeMap < String , String >
+const fn ra_core::model::settings::ResolvedModelSettings::extra_query(& self) -> & JsonMap
+const fn ra_core::model::settings::ResolvedModelSettings::frequency_penalty(& self) -> Option < f64 >
+const fn ra_core::model::settings::ResolvedModelSettings::max_tokens(& self) -> Option < u64 >
+const fn ra_core::model::settings::ResolvedModelSettings::metadata(& self) -> & BTreeMap < String , String >
+const fn ra_core::model::settings::ResolvedModelSettings::parallel_tool_calls(& self) -> Option < bool >
+const fn ra_core::model::settings::ResolvedModelSettings::presence_penalty(& self) -> Option < f64 >
+const fn ra_core::model::settings::ResolvedModelSettings::provider(& self) -> & ProviderKey
+const fn ra_core::model::settings::ResolvedModelSettings::retry(& self) -> Option < & ModelRetrySettings >
+const fn ra_core::model::settings::ResolvedModelSettings::temperature(& self) -> Option < f64 >
+const fn ra_core::model::settings::ResolvedModelSettings::thinking(& self) -> Option < ThinkingConfig >
+const fn ra_core::model::settings::ResolvedModelSettings::timeout(& self) -> Option < Duration >
+const fn ra_core::model::settings::ResolvedModelSettings::tool_choice(& self) -> Option < & ToolChoice >
+const fn ra_core::model::settings::ResolvedModelSettings::top_p(& self) -> Option < f64 >
 const fn ra_core::trace::SpanKind::level(& self) -> Level
 const fn ra_core::trace::SpanKind::required_fields(& self) -> & 'static [& 'static str]
 const fn ra_core::trace::SpanKind::span_name(& self) -> & 'static str
@@ -156,6 +216,10 @@ const ra_core::item::message::MESSAGE_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::message::MODEL_RESPONSE_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::reasoning::REASONING_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::tool::TOOL_ITEM_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::retry::MODEL_RETRY_SETTINGS_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::trace::field::AGENT_NAME: & str
 const ra_core::trace::field::ALL: & [& str]
 const ra_core::trace::field::CANCEL_REASON: & str
@@ -201,6 +265,9 @@ enum ra_core::item::content::ContentBlock
 enum ra_core::item::content::ImageSource
 enum ra_core::item::message::MessageRole
 enum ra_core::item::phase::OutputPhase
+enum ra_core::model::settings::Effort
+enum ra_core::model::settings::ThinkingConfig
+enum ra_core::model::settings::ToolChoice
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
@@ -351,6 +418,24 @@ fn ra_core::item::tool::ToolApproval::with_namespace(mut self, namespace : impl 
 fn ra_core::item::tool::ToolCall::name(& self) -> & str
 fn ra_core::item::tool::ToolCall::new(call_id : CallId, name : impl Into < String >, arguments : Value) -> Self
 fn ra_core::item::tool::ToolCallOutput::new(call_id : CallId, output : Value) -> Self
+fn ra_core::model::retry::ModelRetrySettings::new() -> Self
+fn ra_core::model::retry::ModelRetrySettings::with_backoff(mut self, backoff : RetryBackoffSettings) -> Self
+fn ra_core::model::retry::RetryBackoffSettings::new() -> Self
+fn ra_core::model::settings::McpToolChoice::name(& self) -> & str
+fn ra_core::model::settings::McpToolChoice::new(server : impl Into < String >, name : impl Into < String >) -> Self
+fn ra_core::model::settings::McpToolChoice::server(& self) -> & str
+fn ra_core::model::settings::ModelSettings::new() -> Self
+fn ra_core::model::settings::ModelSettings::resolve(& self, provider : & ProviderKey, agent_defaults : & Self, model_defaults : & Self, run_overrides : & Self) -> ResolvedModelSettings
+fn ra_core::model::settings::ModelSettings::with_extra_body(mut self, provider : ProviderKey, body : JsonMap) -> Self
+fn ra_core::model::settings::ModelSettings::with_extra_body_value(mut self, provider : ProviderKey, key : impl Into < String >, value : impl Into < Value >) -> Self
+fn ra_core::model::settings::ModelSettings::with_extra_header(mut self, key : impl Into < String >, value : impl Into < String >) -> Self
+fn ra_core::model::settings::ModelSettings::with_extra_query(mut self, key : impl Into < String >, value : impl Into < Value >) -> Self
+fn ra_core::model::settings::ModelSettings::with_metadata(mut self, key : impl Into < String >, value : impl Into < String >) -> Self
+fn ra_core::model::settings::ModelSettings::with_retry(mut self, retry : ModelRetrySettings) -> Self
+fn ra_core::model::settings::ModelSettings::with_tool_choice(mut self, tool_choice : ToolChoice) -> Self
+fn ra_core::model::settings::ProviderKey::as_str(& self) -> & str
+fn ra_core::model::settings::ProviderKey::new(value : impl Into < String >) -> Self
+fn ra_core::model::settings::ResolvedModelSettings::to_traceable_value(& self) -> serde_json :: Result < Value >
 fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
 fn ra_core::trace::SpanKind::label(& self) -> & str
 fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope : & ScopeKind)
@@ -429,9 +514,16 @@ struct ra_core::item::reasoning::Reasoning
 struct ra_core::item::tool::ToolApproval
 struct ra_core::item::tool::ToolCall
 struct ra_core::item::tool::ToolCallOutput
+struct ra_core::model::retry::ModelRetrySettings
+struct ra_core::model::retry::RetryBackoffSettings
+struct ra_core::model::settings::McpToolChoice
+struct ra_core::model::settings::ModelSettings
+struct ra_core::model::settings::ProviderKey
+struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::usage::Usage
 type ra_core::error::BoxError
 type ra_core::error::Result
+type ra_core::model::settings::JsonMap
 variant ra_core::cancel::CancelReason::Custom(Cow < 'static , str >)
 variant ra_core::cancel::CancelReason::Deadline
 variant ra_core::cancel::CancelReason::PeerFailure
@@ -538,6 +630,19 @@ variant ra_core::item::message::MessageRole::System
 variant ra_core::item::message::MessageRole::User
 variant ra_core::item::phase::OutputPhase::Commentary
 variant ra_core::item::phase::OutputPhase::Final
+variant ra_core::model::settings::Effort::High
+variant ra_core::model::settings::Effort::Low
+variant ra_core::model::settings::Effort::Max
+variant ra_core::model::settings::Effort::Medium
+variant ra_core::model::settings::Effort::XHigh
+variant ra_core::model::settings::ThinkingConfig::Adaptive
+variant ra_core::model::settings::ThinkingConfig::Disabled
+variant ra_core::model::settings::ThinkingConfig::Enabled { budget_tokens: u64 }
+variant ra_core::model::settings::ToolChoice::Auto
+variant ra_core::model::settings::ToolChoice::Mcp(McpToolChoice)
+variant ra_core::model::settings::ToolChoice::None
+variant ra_core::model::settings::ToolChoice::Required
+variant ra_core::model::settings::ToolChoice::Tool(String)
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function

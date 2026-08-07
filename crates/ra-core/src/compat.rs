@@ -153,6 +153,21 @@ impl Unknown {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.0.iter()
     }
+
+    /// Folds another layer's unknown fields in, with the incoming layer winning on conflict.
+    ///
+    /// Crate-internal on purpose: unknown fields are produced by deserialization, not by callers.
+    /// Layered resolution is the one place that legitimately combines two of these sets, and a
+    /// merged value that silently carried fewer fields than the layer it came from would defeat
+    /// the whole point of retaining them.
+    pub(crate) fn extend_from(&mut self, other: &Self) {
+        self.0.extend(
+            other
+                .0
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
 }
 
 impl<'a> IntoIterator for &'a Unknown {
