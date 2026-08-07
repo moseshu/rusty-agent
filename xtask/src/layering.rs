@@ -169,12 +169,21 @@ pub(crate) fn run() -> Outcome {
 
     violations.extend(check_declared_boundaries(&graph));
     violations.extend(check_dependencies(&graph));
-    violations.extend(check_product_references(&graph));
+    let (product_violations, exemptions) = check_product_references(&graph);
+    violations.extend(product_violations);
     violations.extend(check_module_layout());
 
+    let exempted = if exemptions == 0 {
+        String::new()
+    } else {
+        format!("（{exemptions} 处 `{ALLOW_MARKER}` 显式例外）")
+    };
     Outcome::from_violations(
         violations,
-        format!("{} 个 crate，依赖边界与现代模块布局全部满足", graph.len()),
+        format!(
+            "{} 个 crate，依赖边界与现代模块布局全部满足{exempted}",
+            graph.len()
+        ),
     )
 }
 
@@ -395,10 +404,27 @@ const fn forbidden(from: Layer, to: Layer) -> Option<&'static str> {
 // 源码侧：铁律 3 的 `use` 与铁律 4 的产品名分支
 // ---------------------------------------------------------------------------
 
+/// Marker that exempts a single line from the product-name scan.
+///
+/// Some protocol vocabulary collides with a product name: `assistant` is a model role, so
+/// `MessageRole::Assistant => "assistant"` is not a product branch.
+///
+/// The obvious alternative — teaching the scanner which syntactic positions count as a "branch"
+/// — was tried and reverted. It let four ordinary ways of branching on a product through: a
+/// `const` holding the name, a `let` binding used in a later comparison, a map lookup, and a
+/// lookup table of product names. Rule 4 is a hard constraint (R18-8, "出现即 CI 失败"), so the
+/// rule stays maximally strict and each exception is written on the line it applies to, where
+/// review sees it and `rg layering-allow` counts it. A marker without a reason does not count.
+const ALLOW_MARKER: &str = "layering-allow:";
+
 /// 框架 crate 里出现产品名——不管是 `use` 还是字符串分支。
-fn check_product_references(graph: &Graph) -> Vec<String> {
+///
+/// 返回违规列表与放行的显式例外条数。例外条数会进汇总输出：它只能逐条增加，
+/// 每次 CI 都看得见涨没涨。
+fn check_product_references(graph: &Graph) -> (Vec<String>, usize) {
     let root = source::workspace_root();
     let mut violations = Vec::new();
+    let mut exemptions = 0_usize;
 
     for name in graph.keys() {
         let Some(layer) = layer_of(name) else {
@@ -417,6 +443,10 @@ fn check_product_references(graph: &Graph) -> Vec<String> {
                 if source::is_comment(line) {
                     continue;
                 }
+                if is_allowed_exception(line) {
+                    exemptions += 1;
+                    continue;
+                }
                 for product in PRODUCTS {
                     let snake = product.replace('-', "_");
                     // `use ra_coding::…` / `ra_coding::Foo`（铁律 3）
@@ -425,7 +455,8 @@ fn check_product_references(graph: &Graph) -> Vec<String> {
                     if line.contains(&snake) || line.contains(&quoted) {
                         violations.push(format!(
                             "{}:{}：框架 crate `{}`（{}）里出现产品名 `{}` —— \
-                             铁律 3/4：差异只能由 profile / capability / prompt / guard 注册表达",
+                             铁律 3/4：差异只能由 profile / capability / prompt / guard 注册表达。\
+                             确属协议词汇撞名时，在该行末尾加 `// {ALLOW_MARKER} <理由>`",
                             source::relative(&file),
                             index + 1,
                             name,
@@ -438,5 +469,11 @@ fn check_product_references(graph: &Graph) -> Vec<String> {
         }
     }
 
-    violations
+    (violations, exemptions)
+}
+
+/// Whether a line carries an explicit, justified exemption marker.
+fn is_allowed_exception(line: &str) -> bool {
+    line.split_once(ALLOW_MARKER)
+        .is_some_and(|(_, reason)| !reason.trim().is_empty())
 }

@@ -39,18 +39,107 @@ const fn ra_core::error::Error::recoverability(& self) -> Recoverability
 const fn ra_core::error::Recoverability::is_failure(self) -> bool
 const fn ra_core::error::Recoverability::is_recoverable(self) -> bool
 const fn ra_core::error::Recoverability::is_retryable(self) -> bool
+const fn ra_core::item::ItemProvenance::agent_id(& self) -> & AgentId
+const fn ra_core::item::ItemProvenance::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::ItemProvenance::unknown(& self) -> & Unknown
+const fn ra_core::item::ModelInputItem::call_id(& self) -> Option < & CallId >
+const fn ra_core::item::ModelInputItem::label(& self) -> & 'static str
+const fn ra_core::item::RawProviderItem::payload(& self) -> & Value
+const fn ra_core::item::RawProviderItem::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::RawProviderItem::unknown(& self) -> & Unknown
+const fn ra_core::item::RunItem::call_id(& self) -> Option < & CallId >
+const fn ra_core::item::RunItem::id(& self) -> & ItemId
+const fn ra_core::item::RunItem::is_model_input(& self) -> bool
+const fn ra_core::item::RunItem::kind(& self) -> & RunItemKind
+const fn ra_core::item::RunItem::provenance(& self) -> Option < & ItemProvenance >
+const fn ra_core::item::RunItem::raw_provider_item(& self) -> Option < & RawProviderItem >
+const fn ra_core::item::RunItem::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::RunItem::session_data(& self) -> & SessionData
+const fn ra_core::item::RunItem::unknown(& self) -> & Unknown
+const fn ra_core::item::RunItemKind::label(& self) -> & 'static str
+const fn ra_core::item::compaction::Compaction::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::compaction::Compaction::unknown(& self) -> & Unknown
+const fn ra_core::item::content::TextBlock::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::TextBlock::unknown(& self) -> & Unknown
+const fn ra_core::item::handoff::HandoffCall::arguments(& self) -> & Value
+const fn ra_core::item::handoff::HandoffCall::call_id(& self) -> & CallId
+const fn ra_core::item::handoff::HandoffCall::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::handoff::HandoffCall::target_agent(& self) -> & AgentId
+const fn ra_core::item::handoff::HandoffCall::unknown(& self) -> & Unknown
+const fn ra_core::item::handoff::HandoffOutput::call_id(& self) -> & CallId
+const fn ra_core::item::handoff::HandoffOutput::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::handoff::HandoffOutput::source_agent(& self) -> & AgentId
+const fn ra_core::item::handoff::HandoffOutput::target_agent(& self) -> & AgentId
+const fn ra_core::item::handoff::HandoffOutput::unknown(& self) -> & Unknown
+const fn ra_core::item::mcp::McpApprovalRequest::arguments(& self) -> & Value
+const fn ra_core::item::mcp::McpApprovalRequest::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::mcp::McpApprovalRequest::unknown(& self) -> & Unknown
+const fn ra_core::item::mcp::McpApprovalResponse::approved(& self) -> bool
+const fn ra_core::item::mcp::McpApprovalResponse::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::mcp::McpApprovalResponse::unknown(& self) -> & Unknown
+const fn ra_core::item::mcp::McpListTools::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::mcp::McpListTools::unknown(& self) -> & Unknown
+const fn ra_core::item::mcp::McpTool::input_schema(& self) -> & Value
+const fn ra_core::item::mcp::McpTool::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::mcp::McpTool::unknown(& self) -> & Unknown
+const fn ra_core::item::message::Message::phase(& self) -> Option < OutputPhase >
+const fn ra_core::item::message::Message::role(& self) -> MessageRole
+const fn ra_core::item::message::Message::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::message::Message::unknown(& self) -> & Unknown
+const fn ra_core::item::message::MessageRole::label(self) -> & 'static str
+const fn ra_core::item::message::ModelResponse::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::message::ModelResponse::unknown(& self) -> & Unknown
+const fn ra_core::item::message::ModelResponse::usage(& self) -> & Usage
+const fn ra_core::item::phase::OutputPhase::label(self) -> & 'static str
+const fn ra_core::item::reasoning::Reasoning::provider_data(& self) -> Option < & Value >
+const fn ra_core::item::reasoning::Reasoning::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::reasoning::Reasoning::unknown(& self) -> & Unknown
+const fn ra_core::item::tool::ToolApproval::arguments(& self) -> & Value
+const fn ra_core::item::tool::ToolApproval::call_id(& self) -> & CallId
+const fn ra_core::item::tool::ToolApproval::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::tool::ToolApproval::unknown(& self) -> & Unknown
+const fn ra_core::item::tool::ToolCall::arguments(& self) -> & Value
+const fn ra_core::item::tool::ToolCall::call_id(& self) -> & CallId
+const fn ra_core::item::tool::ToolCall::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::tool::ToolCall::unknown(& self) -> & Unknown
+const fn ra_core::item::tool::ToolCallOutput::call_id(& self) -> & CallId
+const fn ra_core::item::tool::ToolCallOutput::is_error(& self) -> bool
+const fn ra_core::item::tool::ToolCallOutput::output(& self) -> & Value
+const fn ra_core::item::tool::ToolCallOutput::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::tool::ToolCallOutput::unknown(& self) -> & Unknown
+const fn ra_core::item::tool::ToolCallOutput::with_error(mut self, is_error : bool) -> Self
 const fn ra_core::trace::SpanKind::level(& self) -> Level
 const fn ra_core::trace::SpanKind::required_fields(& self) -> & 'static [& 'static str]
 const fn ra_core::trace::SpanKind::span_name(& self) -> & 'static str
 const fn ra_core::trace::SpanOutcome::as_str(self) -> & 'static str
 const fn ra_core::trace::SpanOutcome::is_failure(self) -> bool
 const fn ra_core::trace::level_for(recoverability : Recoverability) -> Level
+const fn ra_core::usage::Usage::cached_input_tokens(& self) -> u64
+const fn ra_core::usage::Usage::input_tokens(& self) -> u64
+const fn ra_core::usage::Usage::output_tokens(& self) -> u64
+const fn ra_core::usage::Usage::reasoning_tokens(& self) -> u64
+const fn ra_core::usage::Usage::schema_version(& self) -> SchemaVersion
+const fn ra_core::usage::Usage::total_tokens(& self) -> u64
+const fn ra_core::usage::Usage::unknown(& self) -> & Unknown
+const fn ra_core::usage::Usage::with_cached_input_tokens(mut self, tokens : u64) -> Self
+const fn ra_core::usage::Usage::with_reasoning_tokens(mut self, tokens : u64) -> Self
 const ra_core::cancel::DRAIN_GRACE: Duration
 const ra_core::config::CONFIG_DIR_NAME: & str
 const ra_core::config::CONFIG_FILE_NAME: & str
 const ra_core::config::ENV_PREFIX: & str
 const ra_core::config::LOCAL_CONFIG_FILE_NAME: & str
 const ra_core::config::SettingSource::ALL: & 'static [Self]
+const ra_core::item::ITEM_PROVENANCE_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::RAW_PROVIDER_ITEM_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::RUN_ITEM_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::compaction::COMPACTION_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::content::CONTENT_BLOCK_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::handoff::HANDOFF_ITEM_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::mcp::MCP_ITEM_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::message::MESSAGE_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::message::MODEL_RESPONSE_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::reasoning::REASONING_SCHEMA_VERSION: SchemaVersion
+const ra_core::item::tool::TOOL_ITEM_SCHEMA_VERSION: SchemaVersion
 const ra_core::trace::field::AGENT_NAME: & str
 const ra_core::trace::field::ALL: & [& str]
 const ra_core::trace::field::CANCEL_REASON: & str
@@ -75,6 +164,7 @@ const ra_core::trace::field::USAGE_CACHED_INPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_INPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_OUTPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_REASONING_TOKENS: & str
+const ra_core::usage::USAGE_SCHEMA_VERSION: SchemaVersion
 enum ra_core::cancel::CancelReason
 enum ra_core::cancel::ScopeKind
 enum ra_core::compat::Compatibility
@@ -89,6 +179,11 @@ enum ra_core::error::Recoverability
 enum ra_core::error::SandboxErrorKind
 enum ra_core::error::SessionErrorKind
 enum ra_core::error::ToolErrorKind
+enum ra_core::item::ModelInputItem
+enum ra_core::item::RunItemKind
+enum ra_core::item::content::ContentBlock
+enum ra_core::item::message::MessageRole
+enum ra_core::item::phase::OutputPhase
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
@@ -140,11 +235,90 @@ fn ra_core::error::Error::session(kind : SessionErrorKind, message : impl Into <
 fn ra_core::error::Error::tool(kind : ToolErrorKind, tool : impl Into < String >, message : impl Into < String >) -> Self
 fn ra_core::error::Error::user_message(& self) -> String
 fn ra_core::error::Error::with_source(mut self, src : impl Into < BoxError >) -> Self
+fn ra_core::item::AgentId::as_str(& self) -> & str
+fn ra_core::item::AgentId::new(value : impl Into < String >) -> Self
+fn ra_core::item::CallId::as_str(& self) -> & str
+fn ra_core::item::CallId::new(value : impl Into < String >) -> Self
+fn ra_core::item::ItemId::as_str(& self) -> & str
+fn ra_core::item::ItemId::new(value : impl Into < String >) -> Self
+fn ra_core::item::ItemProvenance::agent_name(& self) -> Option < & str >
+fn ra_core::item::ItemProvenance::new(agent_id : AgentId) -> Self
+fn ra_core::item::ItemProvenance::with_agent_name(mut self, name : impl Into < String >) -> Self
+fn ra_core::item::RawProviderItem::new(provider : impl Into < String >, payload : Value) -> Self
+fn ra_core::item::RawProviderItem::provider(& self) -> & str
+fn ra_core::item::RunItem::new(id : ItemId, kind : RunItemKind) -> Self
+fn ra_core::item::RunItem::to_model_input(& self) -> Option < ModelInputItem >
+fn ra_core::item::RunItem::with_provenance(mut self, provenance : ItemProvenance) -> Self
+fn ra_core::item::RunItem::with_raw_provider_item(mut self, raw : RawProviderItem) -> Self
+fn ra_core::item::RunItem::with_session_data(mut self, key : impl Into < String >, value : Value) -> Self
+fn ra_core::item::SessionData::get(& self, key : & str) -> Option < & Value >
+fn ra_core::item::SessionData::is_empty(& self) -> bool
+fn ra_core::item::SessionData::iter(& self) -> impl Iterator < Item = (& String , & Value) >
+fn ra_core::item::SessionData::new() -> Self
+fn ra_core::item::compaction::Compaction::compacted_items(& self) -> & [ItemId]
+fn ra_core::item::compaction::Compaction::new(summary : impl Into < String >, compacted_items : Vec < ItemId >) -> Self
+fn ra_core::item::compaction::Compaction::summary(& self) -> & str
+fn ra_core::item::content::ContentBlock::as_text(& self) -> Option < & str >
+fn ra_core::item::content::ContentBlock::text(text : impl Into < String >) -> Self
+fn ra_core::item::content::TextBlock::new(text : impl Into < String >) -> Self
+fn ra_core::item::content::TextBlock::text(& self) -> & str
+fn ra_core::item::handoff::HandoffCall::new(call_id : CallId, target_agent : AgentId, arguments : Value) -> Self
+fn ra_core::item::handoff::HandoffOutput::new(call_id : CallId, source_agent : AgentId, target_agent : AgentId) -> Self
+fn ra_core::item::handoff::HandoffOutput::note(& self) -> Option < & str >
+fn ra_core::item::handoff::HandoffOutput::with_note(mut self, note : impl Into < String >) -> Self
+fn ra_core::item::mcp::McpApprovalRequest::new(request_id : impl Into < String >, server : impl Into < String >, tool_name : impl Into < String >, arguments : Value) -> Self
+fn ra_core::item::mcp::McpApprovalRequest::request_id(& self) -> & str
+fn ra_core::item::mcp::McpApprovalRequest::server(& self) -> & str
+fn ra_core::item::mcp::McpApprovalRequest::tool_name(& self) -> & str
+fn ra_core::item::mcp::McpApprovalResponse::new(request_id : impl Into < String >, approved : bool) -> Self
+fn ra_core::item::mcp::McpApprovalResponse::reason(& self) -> Option < & str >
+fn ra_core::item::mcp::McpApprovalResponse::request_id(& self) -> & str
+fn ra_core::item::mcp::McpApprovalResponse::with_reason(mut self, reason : impl Into < String >) -> Self
+fn ra_core::item::mcp::McpListTools::new(server : impl Into < String >, tools : Vec < McpTool >) -> Self
+fn ra_core::item::mcp::McpListTools::server(& self) -> & str
+fn ra_core::item::mcp::McpListTools::tools(& self) -> & [McpTool]
+fn ra_core::item::mcp::McpTool::description(& self) -> Option < & str >
+fn ra_core::item::mcp::McpTool::name(& self) -> & str
+fn ra_core::item::mcp::McpTool::new(name : impl Into < String >, input_schema : Value) -> Self
+fn ra_core::item::mcp::McpTool::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::item::message::Message::assistant(text : impl Into < String >, phase : OutputPhase) -> Self
+fn ra_core::item::message::Message::content(& self) -> & [ContentBlock]
+fn ra_core::item::message::Message::new(role : MessageRole, content : Vec < ContentBlock >) -> Self
+fn ra_core::item::message::Message::system(text : impl Into < String >) -> Self
+fn ra_core::item::message::Message::text(role : MessageRole, text : impl Into < String >) -> Self
+fn ra_core::item::message::Message::text_content(& self) -> String
+fn ra_core::item::message::Message::user(text : impl Into < String >) -> Self
+fn ra_core::item::message::ModelResponse::new(output : Vec < RunItem >) -> Self
+fn ra_core::item::message::ModelResponse::output(& self) -> & [RunItem]
+fn ra_core::item::message::ModelResponse::request_id(& self) -> Option < & str >
+fn ra_core::item::message::ModelResponse::response_id(& self) -> Option < & str >
+fn ra_core::item::message::ModelResponse::to_input_items(& self) -> Vec < ModelInputItem >
+fn ra_core::item::message::ModelResponse::with_request_id(mut self, request_id : impl Into < String >) -> Self
+fn ra_core::item::message::ModelResponse::with_response_id(mut self, response_id : impl Into < String >) -> Self
+fn ra_core::item::message::ModelResponse::with_usage(mut self, usage : Usage) -> Self
+fn ra_core::item::reasoning::Reasoning::content(& self) -> & [String]
+fn ra_core::item::reasoning::Reasoning::encrypted_content(& self) -> Option < & str >
+fn ra_core::item::reasoning::Reasoning::id(& self) -> Option < & str >
+fn ra_core::item::reasoning::Reasoning::new() -> Self
+fn ra_core::item::reasoning::Reasoning::summary(& self) -> & [String]
+fn ra_core::item::reasoning::Reasoning::with_content(mut self, content : Vec < String >) -> Self
+fn ra_core::item::reasoning::Reasoning::with_encrypted_content(mut self, encrypted : impl Into < String >) -> Self
+fn ra_core::item::reasoning::Reasoning::with_id(mut self, id : impl Into < String >) -> Self
+fn ra_core::item::reasoning::Reasoning::with_provider_data(mut self, data : Value) -> Self
+fn ra_core::item::reasoning::Reasoning::with_summary(mut self, summary : Vec < String >) -> Self
+fn ra_core::item::tool::ToolApproval::namespace(& self) -> Option < & str >
+fn ra_core::item::tool::ToolApproval::new(call_id : CallId, tool_name : impl Into < String >, arguments : Value) -> Self
+fn ra_core::item::tool::ToolApproval::tool_name(& self) -> & str
+fn ra_core::item::tool::ToolApproval::with_namespace(mut self, namespace : impl Into < String >) -> Self
+fn ra_core::item::tool::ToolCall::name(& self) -> & str
+fn ra_core::item::tool::ToolCall::new(call_id : CallId, name : impl Into < String >, arguments : Value) -> Self
+fn ra_core::item::tool::ToolCallOutput::new(call_id : CallId, output : Value) -> Self
 fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
 fn ra_core::trace::SpanKind::label(& self) -> & str
 fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope : & ScopeKind)
 fn ra_core::trace::record_error(span : & Span, err : & Error)
 fn ra_core::trace::record_outcome(span : & Span, outcome : SpanOutcome)
+fn ra_core::usage::Usage::new(input_tokens : u64, output_tokens : u64) -> Self
 mod ra_core::budget
 mod ra_core::cancel
 mod ra_core::capability
@@ -154,9 +328,14 @@ mod ra_core::error
 mod ra_core::guard
 mod ra_core::hook
 mod ra_core::item
+mod ra_core::item::compaction
 mod ra_core::item::content
+mod ra_core::item::handoff
+mod ra_core::item::mcp
 mod ra_core::item::message
 mod ra_core::item::phase
+mod ra_core::item::reasoning
+mod ra_core::item::tool
 mod ra_core::model
 mod ra_core::model::protocol
 mod ra_core::model::request
@@ -186,6 +365,28 @@ struct ra_core::config::LayerReport
 struct ra_core::config::Layered
 struct ra_core::config::SourceSelection
 struct ra_core::config::Sourced
+struct ra_core::item::AgentId
+struct ra_core::item::CallId
+struct ra_core::item::ItemId
+struct ra_core::item::ItemProvenance
+struct ra_core::item::RawProviderItem
+struct ra_core::item::RunItem
+struct ra_core::item::SessionData
+struct ra_core::item::compaction::Compaction
+struct ra_core::item::content::TextBlock
+struct ra_core::item::handoff::HandoffCall
+struct ra_core::item::handoff::HandoffOutput
+struct ra_core::item::mcp::McpApprovalRequest
+struct ra_core::item::mcp::McpApprovalResponse
+struct ra_core::item::mcp::McpListTools
+struct ra_core::item::mcp::McpTool
+struct ra_core::item::message::Message
+struct ra_core::item::message::ModelResponse
+struct ra_core::item::reasoning::Reasoning
+struct ra_core::item::tool::ToolApproval
+struct ra_core::item::tool::ToolCall
+struct ra_core::item::tool::ToolCallOutput
+struct ra_core::usage::Usage
 type ra_core::error::BoxError
 type ra_core::error::Result
 variant ra_core::cancel::CancelReason::Custom(Cow < 'static , str >)
@@ -262,6 +463,33 @@ variant ra_core::error::ToolErrorKind::ExecutionFailed
 variant ra_core::error::ToolErrorKind::InvalidInput
 variant ra_core::error::ToolErrorKind::NotFound
 variant ra_core::error::ToolErrorKind::Timeout
+variant ra_core::item::ModelInputItem::Compaction(Compaction)
+variant ra_core::item::ModelInputItem::HandoffCall(HandoffCall)
+variant ra_core::item::ModelInputItem::HandoffOutput(HandoffOutput)
+variant ra_core::item::ModelInputItem::McpApprovalRequest(McpApprovalRequest)
+variant ra_core::item::ModelInputItem::McpApprovalResponse(McpApprovalResponse)
+variant ra_core::item::ModelInputItem::McpListTools(McpListTools)
+variant ra_core::item::ModelInputItem::Message(Message)
+variant ra_core::item::ModelInputItem::Reasoning(Reasoning)
+variant ra_core::item::ModelInputItem::ToolCall(ToolCall)
+variant ra_core::item::ModelInputItem::ToolCallOutput(ToolCallOutput)
+variant ra_core::item::RunItemKind::Compaction(Compaction)
+variant ra_core::item::RunItemKind::HandoffCall(HandoffCall)
+variant ra_core::item::RunItemKind::HandoffOutput(HandoffOutput)
+variant ra_core::item::RunItemKind::McpApprovalRequest(McpApprovalRequest)
+variant ra_core::item::RunItemKind::McpApprovalResponse(McpApprovalResponse)
+variant ra_core::item::RunItemKind::McpListTools(McpListTools)
+variant ra_core::item::RunItemKind::Message(Message)
+variant ra_core::item::RunItemKind::Reasoning(Reasoning)
+variant ra_core::item::RunItemKind::ToolApproval(ToolApproval)
+variant ra_core::item::RunItemKind::ToolCall(ToolCall)
+variant ra_core::item::RunItemKind::ToolCallOutput(ToolCallOutput)
+variant ra_core::item::content::ContentBlock::Text(TextBlock)
+variant ra_core::item::message::MessageRole::Assistant
+variant ra_core::item::message::MessageRole::System
+variant ra_core::item::message::MessageRole::User
+variant ra_core::item::phase::OutputPhase::Commentary
+variant ra_core::item::phase::OutputPhase::Final
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function
