@@ -185,11 +185,45 @@ pub enum StablePrefixLocation {
 ///
 /// Whether a specific endpoint honours the key is a separate, provider-level question for
 /// `Quirks`: a third-party gateway speaking Chat Completions may reject it.
+///
+/// # Known gap: `OpenAI` explicit breakpoints are not represented yet
+///
+/// Both `OpenAI` protocols now take a request-level `prompt_cache_options` plus a
+/// `prompt_cache_breakpoint` on content blocks, on the stable surface — `response_create_params`
+/// and `completion_create_params` for the options, `response_input_text_param` and
+/// `chat_completion_content_part_text_param` for the breakpoint.
+///
+/// **Do not express that by setting [`cache_control_breakpoints`](Self::cache_control_breakpoints).**
+/// That flag describes Anthropic's mechanism, and the two differ where it matters:
+///
+/// | | `OpenAI` | Anthropic |
+/// | --- | --- | --- |
+/// | With no breakpoints | still cached, via an implicit one | nothing is cached |
+/// | Turning automatic off | `prompt_cache_options.mode = "explicit"` | not applicable |
+/// | TTL | request-level, on the options object | per breakpoint |
+///
+/// Reusing the Anthropic flag would tell an adapter both that caching requires marks and that TTL
+/// travels with each mark. Neither holds for `OpenAI`. A separate capability is the right shape.
+///
+/// Two things this gap also exposes, worth settling when the capability lands:
+///
+/// - [`automatic_prefix_matching`](Self::automatic_prefix_matching) is `OpenAI`'s **default mode**,
+///   not an invariant: `mode = "explicit"` disables the implicit breakpoint per request. The flag
+///   currently reads as though the behaviour were fixed.
+/// - The feature is documented as available on `gpt-5.6` and later, so it is gated by **model**,
+///   which is a third axis this matrix does not have. Protocol lives here and provider lives in
+///   `Quirks`; model capability most plausibly belongs to the resolved-model layer of the R1-2b
+///   four-layer settings, decided in R1-3a.
+///
+/// Deliberately not implemented ahead of a consumer: no adapter exists yet (R1-4 / R1-6), so the
+/// shape would be guessed from documentation rather than from a request that actually round-trips.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PromptCacheSupport {
     automatic_prefix_matching: bool,
     explicit_cache_key: bool,
+    /// Anthropic `cache_control` only. See the type documentation before reusing this for
+    /// `OpenAI`'s `prompt_cache_breakpoint`.
     cache_control_breakpoints: bool,
 }
 
