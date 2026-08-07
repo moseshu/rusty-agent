@@ -2,6 +2,9 @@
 //!
 //! 过程宏：`#[derive(ToolInput)]` 与 `#[tool]`。
 //!
+//! **边界**：只在编译期生成 `ra-core` 契约所需的样板与 schema，不包含运行时注册、
+//! I/O 或 provider 逻辑。
+//!
 //! proc-macro crate 只能导出宏本身，因此内部模块一律私有。
 //!
 //! **稳定性分级**：宏的调用形式是 `Stable`，**展开产物是 `Internal`**——不要依赖

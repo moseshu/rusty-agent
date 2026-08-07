@@ -10,12 +10,16 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 ra-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 uuid = { workspace = true }
 time = { workspace = true }
 thiserror = { workspace = true }

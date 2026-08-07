@@ -10,10 +10,16 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["stdio"]
+stdio = []
+sse = ["dep:reqwest"]
+http = ["dep:reqwest"]
+
 [dependencies]
 ra-core = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }

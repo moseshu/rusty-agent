@@ -1,6 +1,5 @@
 # ra-patch 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 mod ra_patch::apply
-mod ra_patch::fuzz
 mod ra_patch::parse
 mod ra_patch::render

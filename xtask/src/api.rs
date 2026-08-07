@@ -48,7 +48,7 @@ pub(crate) fn snapshot(crate_name: &str) -> Result<Vec<String>, String> {
     Ok(items.into_iter().collect())
 }
 
-/// 文件路径 → 模块路径。`src/model/mod.rs` → `ra_core::model`。
+/// 文件路径 → 模块路径。`src/model.rs` → `ra_core::model`。
 fn module_path(root: &str, src: &Path, file: &Path) -> String {
     let Ok(relative) = file.strip_prefix(src) else {
         return root.to_owned();
@@ -66,7 +66,9 @@ fn module_path(root: &str, src: &Path, file: &Path) -> String {
             continue;
         }
         let stem = component.trim_end_matches(".rs");
-        // lib.rs 与 mod.rs 不贡献一层路径。
+        // `lib.rs` 不贡献一层路径。`mod.rs` 同样跳过：`layering` 已经禁掉了旧式入口，
+        // 正常情况下走不到这个分支，但真出现一个时应当算出 `foo` 而不是 `foo::mod`
+        // ——否则 public-api 会在 layering 已经报出根因之后再刷一屏无关的基线 diff。
         if stem != "lib" && stem != "mod" {
             segments.push(stem.to_owned());
         }

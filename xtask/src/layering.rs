@@ -1,15 +1,16 @@
-//! `layering` 门禁：依赖方向四条铁律。
+//! `layering` 门禁：直接依赖白名单 + 依赖方向四条铁律 + 现代模块布局。
 //!
 //! 铁律出自[开发计划](../../Docs/Rusty_Agent_Framework_Development_Plan.md)的 crate
 //! 表与[项目结构](../../Docs/Rusty_Agent_Project_Structure.md) §1：
 //!
-//! 1. **内核**（`ra-core` / `ra-macros` / `ra-runtime`）不依赖可复用件与产品；
-//! 2. **可复用件**不依赖产品；
-//! 3. **产品之间零依赖**，且框架 crate 不得 `use ra_coding` / `use ra_assistant`；
-//! 4. **框架 crate 里零按产品名分支**（R18-8）。
+//! 1. 每个 crate 只能依赖职责表允许的内部 crate；
+//! 2. **内核**（`ra-core` / `ra-macros` / `ra-runtime`）不依赖可复用件与产品；
+//! 3. **可复用件**不依赖产品；
+//! 4. **产品之间零依赖**，且框架 crate 不得引用产品实现；
+//! 5. **框架 crate 里零按产品名分支**（R18-8）。
 //!
-//! 前三条查依赖图（**含传递依赖**——`ra-core → X → ra-coding` 同样是违规，只查直接
-//! 依赖会漏），第四条查源码。
+//! 前四条查依赖图（**含传递依赖**——`ra-core → X → ra-coding` 同样是违规，只查直接
+//! 依赖会漏），第五条查源码。
 //!
 //! 层级表是**白名单**：新建一个没登记的 crate 会让门禁直接失败。这是刻意的——
 //! 新 crate 落在哪一层是必须当场做的决定，不是可以以后再说的事。
@@ -75,6 +76,66 @@ const LAYERS: &[(&str, Layer)] = &[
     ("xtask", Layer::Binary),
 ];
 
+/// crate 职责表允许的直接内部依赖。
+///
+/// 分层规则只能拦住明显倒挂，拦不住 `ra-core -> ra-model` 这种“同属框架但职责已经
+/// 反了”的边。这里把开发计划的 crate 表变成白名单；新增依赖必须先回答它为什么属于
+/// 这条边界。尚未创建的三个 crate 也预登记，创建当天即受约束。
+///
+/// **这张表是依赖图的唯一事实来源**，[项目结构](../../Docs/Rusty_Agent_Project_Structure.md)
+/// §1 的依赖图必须跟它一致；两边不一致时以这里为准，并当场改文档——白名单存在的
+/// 意义就是消灭那种“图上是一回事、Cargo.toml 是另一回事”的漂移。
+///
+/// # `ra-runtime` 只依赖 `ra-core`，是一条承诺不是一次省略
+///
+/// Loop 内核不认识 `ra-model` / `ra-prompt` / `ra-context`。它调模型只能通过
+/// `ra-core` 里的 trait，提示词装配与上下文压缩只能由装配层注入。**代价是**：
+/// runner 想直接 `ra_prompt::Assembler::new()` 一下是不可能的，得先把能力表达成
+/// `ra-core` 的契约。这正是要的效果——凡是绕不过去的地方，说明那个契约本来就该
+/// 存在于内核里，而不是让内核去认识某个具体实现。
+const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
+    ("ra-core", &[]),
+    ("ra-macros", &[]),
+    // 见上：依赖倒置，不是还没来得及加。
+    ("ra-runtime", &["ra-core"]),
+    ("ra-model", &["ra-core"]),
+    ("ra-prompt", &["ra-core"]),
+    ("ra-context", &["ra-core"]),
+    ("ra-exec", &["ra-core"]),
+    ("ra-session", &["ra-core"]),
+    ("ra-mcp", &["ra-core"]),
+    ("ra-protocol", &["ra-core", "ra-session"]),
+    (
+        "ra-eval",
+        &["ra-core", "ra-runtime", "ra-model", "ra-protocol"],
+    ),
+    ("ra-tools", &["ra-core", "ra-exec", "ra-mcp"]),
+    ("ra-flow", &["ra-core", "ra-runtime"]),
+    ("ra-patch", &[]),
+    (
+        "ra-coding",
+        &[
+            "ra-core",
+            "ra-runtime",
+            "ra-prompt",
+            "ra-context",
+            "ra-exec",
+            "ra-mcp",
+            "ra-patch",
+            "ra-tools",
+        ],
+    ),
+    (
+        "ra-assistant",
+        &["ra-core", "ra-runtime", "ra-tools", "ra-flow", "ra-prompt"],
+    ),
+    (
+        "ra-cli",
+        &["ra-coding", "ra-assistant", "ra-protocol", "ra-eval"],
+    ),
+    ("xtask", &[]),
+];
+
 fn layer_of(name: &str) -> Option<Layer> {
     LAYERS
         .iter()
@@ -106,13 +167,59 @@ pub(crate) fn run() -> Outcome {
         return Outcome::Fail(violations);
     }
 
+    violations.extend(check_declared_boundaries(&graph));
     violations.extend(check_dependencies(&graph));
     violations.extend(check_product_references(&graph));
+    violations.extend(check_module_layout());
 
     Outcome::from_violations(
         violations,
-        format!("{} 个 crate，四条铁律全部满足", graph.len()),
+        format!("{} 个 crate，依赖边界与现代模块布局全部满足", graph.len()),
     )
+}
+
+/// Rust 2018 起子模块不再需要 `mod.rs`；统一使用 `foo.rs + foo/`，入口在文件列表中
+/// 一眼可见，也避免两套布局长期混用。
+fn check_module_layout() -> Vec<String> {
+    let crates = source::workspace_root().join("crates");
+    source::rust_files(&crates)
+        .into_iter()
+        .filter(|file| file.file_name().is_some_and(|name| name == "mod.rs"))
+        .map(|file| {
+            format!(
+                "{}：禁止旧式 `mod.rs`，请迁移为同级 `foo.rs + foo/`",
+                source::relative(&file),
+            )
+        })
+        .collect()
+}
+
+/// 检查 crate 表里逐条声明的直接依赖边界。
+fn check_declared_boundaries(graph: &Graph) -> Vec<String> {
+    let allowed: BTreeMap<&str, BTreeSet<&str>> = ALLOWED_INTERNAL_DEPS
+        .iter()
+        .map(|(name, deps)| (*name, deps.iter().copied().collect()))
+        .collect();
+    let mut violations = Vec::new();
+
+    for (name, deps) in graph {
+        let Some(expected) = allowed.get(name.as_str()) else {
+            violations.push(format!(
+                "crate `{name}` 缺直接依赖白名单——请在 ALLOWED_INTERNAL_DEPS 登记"
+            ));
+            continue;
+        };
+        for dep in deps {
+            if !expected.contains(dep.name.as_str()) {
+                violations.push(format!(
+                    "{name} 直接依赖了职责表未允许的 {} [{}]——若这是新契约，先更新 crate 边界文档与白名单",
+                    dep.name, dep.kind,
+                ));
+            }
+        }
+    }
+
+    violations
 }
 
 // ---------------------------------------------------------------------------

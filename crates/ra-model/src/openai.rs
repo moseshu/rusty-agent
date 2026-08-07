@@ -2,6 +2,6 @@
 
 pub mod auth;
 pub mod chat;
-pub mod error;
+pub(crate) mod error;
 pub mod responses;
-pub mod sse;
+pub(crate) mod sse;

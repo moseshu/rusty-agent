@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 ra-core = { workspace = true }
 ra-runtime = { workspace = true }
+ra-model = { workspace = true }
+ra-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

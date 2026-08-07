@@ -15,9 +15,7 @@ name = "ra"
 path = "src/main.rs"
 
 [dependencies]
-ra-core = { workspace = true }
 ra-coding = { workspace = true }
-ra-runtime = { workspace = true }
 ra-protocol = { workspace = true }
 ra-eval = { workspace = true }
 tokio = { workspace = true }

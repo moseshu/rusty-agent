@@ -916,10 +916,8 @@ dependencies = [
  "anyhow",
  "clap",
  "ra-coding",
- "ra-core",
  "ra-eval",
  "ra-protocol",
- "ra-runtime",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -975,6 +973,8 @@ name = "ra-eval"
 version = "0.0.1"
 dependencies = [
  "ra-core",
+ "ra-model",
+ "ra-protocol",
  "ra-runtime",
  "serde",
  "serde_json",
@@ -1074,10 +1074,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures",
- "ra-context",
  "ra-core",
- "ra-model",
- "ra-prompt",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

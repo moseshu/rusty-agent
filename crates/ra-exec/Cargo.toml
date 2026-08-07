@@ -10,6 +10,17 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 后端 feature 可叠加。**默认开原生后端**：`seatbelt` 与 `bwrap` 在 `sandbox.rs` 里
+# 各自再由 `target_os` 门一层，所以 macOS 与 Linux 的默认构建都拿得到真沙箱，另一
+# 边的 feature 只是空开关。`default = []` 会让默认构建静默退化成只有 unix_local，
+# 对一个执行任意命令的 crate，"默认更安全"要压过"默认更好编译"。
+# `docker` 依赖外部 daemon，保持显式 opt-in。
+default = ["seatbelt", "bwrap"]
+seatbelt = []
+bwrap = []
+docker = []
+
 [dependencies]
 ra-core = { workspace = true }
 tokio = { workspace = true }
