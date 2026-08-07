@@ -1,0 +1,9 @@
+# ra-prompt 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_prompt::assembler
+mod ra_prompt::cache_plan
+mod ra_prompt::dump
+mod ra_prompt::reminder
+mod ra_prompt::role
+mod ra_prompt::section
+mod ra_prompt::stability

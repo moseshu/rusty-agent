@@ -1,0 +1,275 @@
+# ra-core 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_core::cancel::CancelScope::cancelled(& self)
+async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
+const fn ra_core::cancel::CancelOnDrop::scope(& self) -> & CancelScope
+const fn ra_core::cancel::CancelReason::is_expiry(& self) -> bool
+const fn ra_core::cancel::CancelReason::is_user_initiated(& self) -> bool
+const fn ra_core::cancel::CancelScope::deadline(& self) -> Option < Deadline >
+const fn ra_core::cancel::CancelScope::kind(& self) -> & ScopeKind
+const fn ra_core::cancel::CancelScope::token(& self) -> & CancellationToken
+const fn ra_core::cancel::Deadline::at(instant : Instant) -> Self
+const fn ra_core::cancel::Deadline::instant(self) -> Instant
+const fn ra_core::compat::Compatibility::label(self) -> & 'static str
+const fn ra_core::compat::Compatibility::needs_migration(self) -> bool
+const fn ra_core::compat::SchemaVersion::compatibility(self, local : Self) -> Compatibility
+const fn ra_core::compat::SchemaVersion::get(self) -> u32
+const fn ra_core::compat::SchemaVersion::new(version : u32) -> Self
+const fn ra_core::config::LayerReport::source(& self) -> SettingSource
+const fn ra_core::config::LayerReport::status(& self) -> LayerStatus
+const fn ra_core::config::LayerStatus::label(self) -> & 'static str
+const fn ra_core::config::Layered < T >::new() -> Self
+const fn ra_core::config::SettingSource::is_discovered(self) -> bool
+const fn ra_core::config::SettingSource::is_file(self) -> bool
+const fn ra_core::config::SettingSource::label(self) -> & 'static str
+const fn ra_core::config::SettingSource::precedence(self) -> u16
+const fn ra_core::config::SourceSelection::all() -> Self
+const fn ra_core::config::SourceSelection::allows(self, source : SettingSource) -> bool
+const fn ra_core::config::SourceSelection::is_isolated(self) -> bool
+const fn ra_core::config::SourceSelection::isolated() -> Self
+const fn ra_core::config::SourceSelection::with(mut self, source : SettingSource) -> Self
+const fn ra_core::config::SourceSelection::without(mut self, source : SettingSource) -> Self
+const fn ra_core::config::Sourced < T >::new(source : SettingSource, value : T) -> Self
+const fn ra_core::config::Sourced < T >::source(& self) -> SettingSource
+const fn ra_core::config::Sourced < T >::value(& self) -> & T
+const fn ra_core::error::Error::code(& self) -> & 'static str
+const fn ra_core::error::Error::is_cancelled(& self) -> bool
+const fn ra_core::error::Error::is_retryable(& self) -> bool
+const fn ra_core::error::Error::recoverability(& self) -> Recoverability
+const fn ra_core::error::Recoverability::is_failure(self) -> bool
+const fn ra_core::error::Recoverability::is_recoverable(self) -> bool
+const fn ra_core::error::Recoverability::is_retryable(self) -> bool
+const fn ra_core::trace::SpanKind::level(& self) -> Level
+const fn ra_core::trace::SpanKind::required_fields(& self) -> & 'static [& 'static str]
+const fn ra_core::trace::SpanKind::span_name(& self) -> & 'static str
+const fn ra_core::trace::SpanOutcome::as_str(self) -> & 'static str
+const fn ra_core::trace::SpanOutcome::is_failure(self) -> bool
+const fn ra_core::trace::level_for(recoverability : Recoverability) -> Level
+const ra_core::cancel::DRAIN_GRACE: Duration
+const ra_core::config::CONFIG_DIR_NAME: & str
+const ra_core::config::CONFIG_FILE_NAME: & str
+const ra_core::config::ENV_PREFIX: & str
+const ra_core::config::LOCAL_CONFIG_FILE_NAME: & str
+const ra_core::config::SettingSource::ALL: & 'static [Self]
+const ra_core::trace::field::AGENT_NAME: & str
+const ra_core::trace::field::ALL: & [& str]
+const ra_core::trace::field::CANCEL_REASON: & str
+const ra_core::trace::field::CANCEL_SCOPE: & str
+const ra_core::trace::field::ERROR_CODE: & str
+const ra_core::trace::field::GEN_PROTOCOL: & str
+const ra_core::trace::field::GUARDRAIL_ID: & str
+const ra_core::trace::field::GUARDRAIL_STAGE: & str
+const ra_core::trace::field::GUARDRAIL_TRIGGERED: & str
+const ra_core::trace::field::HANDOFF_FROM: & str
+const ra_core::trace::field::HANDOFF_TO: & str
+const ra_core::trace::field::MCP_SERVER: & str
+const ra_core::trace::field::MODEL_NAME: & str
+const ra_core::trace::field::MODEL_PROVIDER: & str
+const ra_core::trace::field::OUTCOME: & str
+const ra_core::trace::field::SPAN_KIND: & str
+const ra_core::trace::field::SPAN_LABEL: & str
+const ra_core::trace::field::TOOL_CALL_ID: & str
+const ra_core::trace::field::TOOL_NAME: & str
+const ra_core::trace::field::TURN_INDEX: & str
+const ra_core::trace::field::USAGE_CACHED_INPUT_TOKENS: & str
+const ra_core::trace::field::USAGE_INPUT_TOKENS: & str
+const ra_core::trace::field::USAGE_OUTPUT_TOKENS: & str
+const ra_core::trace::field::USAGE_REASONING_TOKENS: & str
+enum ra_core::cancel::CancelReason
+enum ra_core::cancel::ScopeKind
+enum ra_core::compat::Compatibility
+enum ra_core::config::LayerStatus
+enum ra_core::config::SettingSource
+enum ra_core::error::BudgetKind
+enum ra_core::error::Error
+enum ra_core::error::GuardrailStage
+enum ra_core::error::ProtocolErrorKind
+enum ra_core::error::ProviderErrorKind
+enum ra_core::error::Recoverability
+enum ra_core::error::SandboxErrorKind
+enum ra_core::error::SessionErrorKind
+enum ra_core::error::ToolErrorKind
+enum ra_core::trace::SpanKind
+enum ra_core::trace::SpanOutcome
+fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
+fn ra_core::cancel::CancelReason::code(& self) -> & str
+fn ra_core::cancel::CancelReason::custom(label : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::cancel::CancelReason::user_message(& self) -> String
+fn ra_core::cancel::CancelScope::cancel(& self, reason : CancelReason)
+fn ra_core::cancel::CancelScope::cancel_on_drop(self, reason : CancelReason) -> CancelOnDrop
+fn ra_core::cancel::CancelScope::child(& self, kind : ScopeKind) -> Self
+fn ra_core::cancel::CancelScope::ensure_not_cancelled(& self) -> Result < () , Error >
+fn ra_core::cancel::CancelScope::is_cancelled(& self) -> bool
+fn ra_core::cancel::CancelScope::reason(& self) -> Option < CancelReason >
+fn ra_core::cancel::CancelScope::root() -> Self
+fn ra_core::cancel::CancelScope::with_deadline(mut self, deadline : Deadline) -> Self
+fn ra_core::cancel::Deadline::after(after : Duration) -> Self
+fn ra_core::cancel::Deadline::is_expired(self) -> bool
+fn ra_core::cancel::Deadline::remaining(self) -> Duration
+fn ra_core::cancel::ScopeKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::cancel::ScopeKind::label(& self) -> & str
+fn ra_core::compat::Unknown::get(& self, key : & str) -> Option < & Value >
+fn ra_core::compat::Unknown::is_empty(& self) -> bool
+fn ra_core::compat::Unknown::iter(& self) -> impl Iterator < Item = (& String , & Value) >
+fn ra_core::compat::Unknown::len(& self) -> usize
+fn ra_core::compat::Unknown::new() -> Self
+fn ra_core::config::FieldReport::effective(& self) -> Option < & LayerReport >
+fn ra_core::config::FieldReport::has_ineffective_layers(& self) -> bool
+fn ra_core::config::FieldReport::key(& self) -> & str
+fn ra_core::config::FieldReport::layers(& self) -> & [LayerReport]
+fn ra_core::config::LayerReport::value(& self) -> & str
+fn ra_core::config::Layered < T >::builtin(value : T) -> Self
+fn ra_core::config::Layered < T >::get(& self, source : SettingSource) -> Option < & T >
+fn ra_core::config::Layered < T >::is_empty(& self) -> bool
+fn ra_core::config::Layered < T >::report(& self, key : impl Into < String >, selection : SourceSelection) -> FieldReport
+fn ra_core::config::Layered < T >::resolve(& self, selection : SourceSelection) -> Option < Sourced < & T > >
+fn ra_core::config::Layered < T >::set(& mut self, source : SettingSource, value : T) -> & mut Self
+fn ra_core::config::Layered < T >::sources(& self) -> impl Iterator < Item = SettingSource >
+fn ra_core::config::Layered < T >::value(& self, selection : SourceSelection) -> Option < & T >
+fn ra_core::config::Sourced < T >::into_value(self) -> T
+fn ra_core::config::env_key(path : & str) -> String
+fn ra_core::error::Error::budget(kind : BudgetKind, message : impl Into < String >) -> Self
+fn ra_core::error::Error::caller(message : impl Into < String >) -> Self
+fn ra_core::error::Error::cancelled(reason : impl Into < String >) -> Self
+fn ra_core::error::Error::config(message : impl Into < String >) -> Self
+fn ra_core::error::Error::guardrail(stage : GuardrailStage, guardrail : impl Into < String >, message : impl Into < String >) -> Self
+fn ra_core::error::Error::protocol(kind : ProtocolErrorKind, message : impl Into < String >) -> Self
+fn ra_core::error::Error::provider(kind : ProviderErrorKind, message : impl Into < String >) -> Self
+fn ra_core::error::Error::sandbox(kind : SandboxErrorKind, message : impl Into < String >) -> Self
+fn ra_core::error::Error::session(kind : SessionErrorKind, message : impl Into < String >) -> Self
+fn ra_core::error::Error::tool(kind : ToolErrorKind, tool : impl Into < String >, message : impl Into < String >) -> Self
+fn ra_core::error::Error::user_message(& self) -> String
+fn ra_core::error::Error::with_source(mut self, src : impl Into < BoxError >) -> Self
+fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::trace::SpanKind::label(& self) -> & str
+fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope : & ScopeKind)
+fn ra_core::trace::record_error(span : & Span, err : & Error)
+fn ra_core::trace::record_outcome(span : & Span, outcome : SpanOutcome)
+mod ra_core::budget
+mod ra_core::cancel
+mod ra_core::capability
+mod ra_core::compat
+mod ra_core::config
+mod ra_core::error
+mod ra_core::guard
+mod ra_core::hook
+mod ra_core::item
+mod ra_core::item::content
+mod ra_core::item::message
+mod ra_core::item::phase
+mod ra_core::model
+mod ra_core::model::protocol
+mod ra_core::model::request
+mod ra_core::model::retry
+mod ra_core::model::settings
+mod ra_core::model::stream
+mod ra_core::permission
+mod ra_core::prompt
+mod ra_core::session
+mod ra_core::state
+mod ra_core::step
+mod ra_core::tool
+mod ra_core::tool::namespace
+mod ra_core::tool::origin
+mod ra_core::tool::output
+mod ra_core::tool::schema
+mod ra_core::trace
+mod ra_core::trace::field
+mod ra_core::usage
+struct ra_core::cancel::CancelOnDrop
+struct ra_core::cancel::CancelScope
+struct ra_core::cancel::Deadline
+struct ra_core::compat::SchemaVersion
+struct ra_core::compat::Unknown
+struct ra_core::config::FieldReport
+struct ra_core::config::LayerReport
+struct ra_core::config::Layered
+struct ra_core::config::SourceSelection
+struct ra_core::config::Sourced
+type ra_core::error::BoxError
+type ra_core::error::Result
+variant ra_core::cancel::CancelReason::Custom(Cow < 'static , str >)
+variant ra_core::cancel::CancelReason::Deadline
+variant ra_core::cancel::CancelReason::PeerFailure
+variant ra_core::cancel::CancelReason::Shutdown
+variant ra_core::cancel::CancelReason::Superseded
+variant ra_core::cancel::CancelReason::Timeout
+variant ra_core::cancel::CancelReason::Unspecified
+variant ra_core::cancel::CancelReason::UserInterrupt
+variant ra_core::cancel::ScopeKind::Custom(Cow < 'static , str >)
+variant ra_core::cancel::ScopeKind::Process
+variant ra_core::cancel::ScopeKind::Run
+variant ra_core::cancel::ScopeKind::Tool
+variant ra_core::cancel::ScopeKind::Turn
+variant ra_core::compat::Compatibility::Newer
+variant ra_core::compat::Compatibility::Older
+variant ra_core::compat::Compatibility::Same
+variant ra_core::config::LayerStatus::Effective
+variant ra_core::config::LayerStatus::Excluded
+variant ra_core::config::LayerStatus::Shadowed
+variant ra_core::config::SettingSource::Builtin
+variant ra_core::config::SettingSource::Env
+variant ra_core::config::SettingSource::Explicit
+variant ra_core::config::SettingSource::LocalFile
+variant ra_core::config::SettingSource::ProjectFile
+variant ra_core::config::SettingSource::UserFile
+variant ra_core::error::BudgetKind::Cost
+variant ra_core::error::BudgetKind::MaxTurns
+variant ra_core::error::BudgetKind::Tokens
+variant ra_core::error::BudgetKind::WallClock
+variant ra_core::error::Error::Budget { kind: BudgetKind, message: String }
+variant ra_core::error::Error::Caller { message: String, source: Option < BoxError > }
+variant ra_core::error::Error::Cancelled { reason: String }
+variant ra_core::error::Error::Config { message: String, source: Option < BoxError > }
+variant ra_core::error::Error::Guardrail { stage: GuardrailStage, guardrail: String, message: String }
+variant ra_core::error::Error::Protocol { kind: ProtocolErrorKind, message: String, source: Option < BoxError > }
+variant ra_core::error::Error::Provider { kind: ProviderErrorKind, message: String, source: Option < BoxError > }
+variant ra_core::error::Error::Sandbox { kind: SandboxErrorKind, message: String, source: Option < BoxError > }
+variant ra_core::error::Error::Session { kind: SessionErrorKind, message: String, source: Option < BoxError > }
+variant ra_core::error::Error::Tool { kind: ToolErrorKind, tool: String, message: String, source: Option < BoxError > }
+variant ra_core::error::GuardrailStage::Input
+variant ra_core::error::GuardrailStage::Output
+variant ra_core::error::GuardrailStage::ToolInput
+variant ra_core::error::GuardrailStage::ToolOutput
+variant ra_core::error::ProtocolErrorKind::Frame
+variant ra_core::error::ProtocolErrorKind::Handshake
+variant ra_core::error::ProtocolErrorKind::Timeout
+variant ra_core::error::ProtocolErrorKind::Transport
+variant ra_core::error::ProviderErrorKind::Auth
+variant ra_core::error::ProviderErrorKind::BadRequest
+variant ra_core::error::ProviderErrorKind::Behavior
+variant ra_core::error::ProviderErrorKind::ContextOverflow
+variant ra_core::error::ProviderErrorKind::Network
+variant ra_core::error::ProviderErrorKind::RateLimit
+variant ra_core::error::ProviderErrorKind::Refusal
+variant ra_core::error::ProviderErrorKind::ServerError
+variant ra_core::error::ProviderErrorKind::Timeout
+variant ra_core::error::Recoverability::Cancelled
+variant ra_core::error::Recoverability::Fatal
+variant ra_core::error::Recoverability::NeedsIntervention
+variant ra_core::error::Recoverability::Retryable
+variant ra_core::error::Recoverability::RetryableWithChange
+variant ra_core::error::SandboxErrorKind::Denied
+variant ra_core::error::SandboxErrorKind::ResourceLimit
+variant ra_core::error::SandboxErrorKind::Setup
+variant ra_core::error::SandboxErrorKind::Unavailable
+variant ra_core::error::SessionErrorKind::Corrupted
+variant ra_core::error::SessionErrorKind::Io
+variant ra_core::error::SessionErrorKind::NotFound
+variant ra_core::error::SessionErrorKind::VersionMismatch
+variant ra_core::error::ToolErrorKind::Cancelled
+variant ra_core::error::ToolErrorKind::ExecutionFailed
+variant ra_core::error::ToolErrorKind::InvalidInput
+variant ra_core::error::ToolErrorKind::NotFound
+variant ra_core::error::ToolErrorKind::Timeout
+variant ra_core::trace::SpanKind::Agent
+variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
+variant ra_core::trace::SpanKind::Function
+variant ra_core::trace::SpanKind::Generation
+variant ra_core::trace::SpanKind::Guardrail
+variant ra_core::trace::SpanKind::Handoff
+variant ra_core::trace::SpanKind::McpListTools
+variant ra_core::trace::SpanKind::Turn
+variant ra_core::trace::SpanOutcome::Cancelled
+variant ra_core::trace::SpanOutcome::Error
+variant ra_core::trace::SpanOutcome::Ok

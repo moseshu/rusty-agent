@@ -10,6 +10,8 @@
 //! cargo xtask test -p it-core    # 跑独立测试 workspace，参数透传给 cargo test
 //! ```
 
+mod api;
+mod extension_safety;
 mod gate;
 mod inline_tests;
 mod layering;
@@ -52,8 +54,12 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// 公开 API 与入库基线对账，未标注的破坏性变更失败。
-    PublicApi,
+    /// 公开面契约：基线对账 + 扩展安全 ①② + 稳定性分级。
+    PublicApi {
+        /// 重写基线快照而不是对账。改动公开 API 后跑一次，让 diff 进 review。
+        #[arg(long)]
+        bless: bool,
+    },
     /// 依赖方向四条铁律：内核 / 可复用件 / 产品的依赖不得逆流。
     Layering,
 }
@@ -63,7 +69,7 @@ fn all_gates() -> Vec<(&'static str, Outcome)> {
     vec![
         ("layering", layering::run()),
         ("no-inline-tests", inline_tests::run()),
-        ("public-api", public_api::run()),
+        ("public-api", public_api::run(false)),
         ("schema-stability", pending::schema_stability()),
         ("prompt-dump", pending::prompt_dump()),
         ("guard-registry", pending::guard_registry()),
@@ -77,7 +83,7 @@ fn main() -> std::process::ExitCode {
         Task::All => all_gates(),
         Task::Layering => vec![("layering", layering::run())],
         Task::NoInlineTests => vec![("no-inline-tests", inline_tests::run())],
-        Task::PublicApi => vec![("public-api", public_api::run())],
+        Task::PublicApi { bless } => vec![("public-api", public_api::run(bless))],
         Task::SchemaStability => vec![("schema-stability", pending::schema_stability())],
         Task::PromptDump => vec![("prompt-dump", pending::prompt_dump())],
         Task::GuardRegistry => vec![("guard-registry", pending::guard_registry())],

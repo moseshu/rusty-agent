@@ -1,0 +1,22 @@
+# ra-runtime 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_runtime::agent
+mod ra_runtime::budget
+mod ra_runtime::capability
+mod ra_runtime::circuit
+mod ra_runtime::guard
+mod ra_runtime::guard::dispatch
+mod ra_runtime::hook
+mod ra_runtime::permission
+mod ra_runtime::runner
+mod ra_runtime::tool
+mod ra_runtime::tool::dispatch
+mod ra_runtime::tool::profile
+mod ra_runtime::tool::registry
+mod ra_runtime::tool::render
+mod ra_runtime::tool::search
+mod ra_runtime::turn
+mod ra_runtime::turn::batch
+mod ra_runtime::turn::interrupt
+mod ra_runtime::turn::process
+mod ra_runtime::turn::resolve

@@ -1,0 +1,9 @@
+# ra-eval 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_eval::assert
+mod ra_eval::assert::cost
+mod ra_eval::assert::discipline
+mod ra_eval::assert::react
+mod ra_eval::fixture
+mod ra_eval::replay
+mod ra_eval::report

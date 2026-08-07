@@ -1,0 +1,10 @@
+# ra-context 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_context::archive
+mod ra_context::budget
+mod ra_context::compaction
+mod ra_context::compaction::anchor
+mod ra_context::compaction::summary
+mod ra_context::eviction
+mod ra_context::preflight
+mod ra_context::window

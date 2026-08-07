@@ -1,0 +1,14 @@
+# ra-exec 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_exec::command
+mod ra_exec::job
+mod ra_exec::output
+mod ra_exec::pty
+mod ra_exec::sandbox
+mod ra_exec::sandbox::bwrap
+mod ra_exec::sandbox::docker
+mod ra_exec::sandbox::manifest
+mod ra_exec::sandbox::network
+mod ra_exec::sandbox::seatbelt
+mod ra_exec::sandbox::unix_local
+mod ra_exec::session

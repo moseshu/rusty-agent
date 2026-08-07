@@ -1,0 +1,29 @@
+# ra-model 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_model::anthropic
+mod ra_model::anthropic::betas
+mod ra_model::anthropic::cache
+mod ra_model::anthropic::convert
+mod ra_model::anthropic::request
+mod ra_model::anthropic::stream
+mod ra_model::compat
+mod ra_model::compat::quirks
+mod ra_model::fallback
+mod ra_model::openai
+mod ra_model::openai::auth
+mod ra_model::openai::chat
+mod ra_model::openai::chat::convert
+mod ra_model::openai::chat::reasoning
+mod ra_model::openai::chat::request
+mod ra_model::openai::chat::stream
+mod ra_model::openai::error
+mod ra_model::openai::responses
+mod ra_model::openai::responses::cache
+mod ra_model::openai::responses::convert
+mod ra_model::openai::responses::request
+mod ra_model::openai::responses::stream
+mod ra_model::openai::sse
+mod ra_model::protocol
+mod ra_model::provider
+mod ra_model::retry
+mod ra_model::usage

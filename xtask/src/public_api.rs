@@ -1,106 +1,103 @@
-//! `public-api` 门禁：公开 API 的破坏性变更必须是显式的。
+//! `public-api` 门禁：公开面契约。
 //!
-//! 拿 `cargo public-api` 导出的当前公开 API 与入库的基线快照逐行对比，有差异就失败，
-//! 要求改动者**要么撤销，要么更新基线**——后者是一次显式的、会出现在 diff 里的动作。
+//! 查三件事，都是「下游能不能安全依赖这个 crate」的组成部分：
 //!
-//! # 分工
+//! 1. **基线对账**——公开项被删、签名变了、悄悄多了一个，都要在 diff 里现形；
+//! 2. **扩展安全 ①②**——公开枚举 `#[non_exhaustive]`、公开结构体无公开字段；
+//! 3. **稳定性分级**——每个 crate 的 `lib.rs` 标注 `Stable` / `Evolving` / `Internal`。
 //!
-//! 本门禁负责**对账**；基线快照的建立归 R0-8（扩展安全第 7 条）。两个前置任一不满足
-//! 就跳过：
-//! - `cargo public-api` 未安装（它需要 nightly 的 rustdoc JSON：
-//!   `cargo install cargo-public-api` + `rustup toolchain install nightly`）；
-//! - `api/<crate>.txt` 基线尚未入库。
+//! 基线变更**不是错误，是需要被看见的决定**：改完跑 `cargo xtask public-api --bless`
+//! 重新生成，让那份 diff 出现在 code review 里。门禁拦的是「悄悄变了」，不是「变了」。
 
-use std::path::PathBuf;
-use std::process::Command;
-
+use crate::api;
+use crate::extension_safety;
 use crate::gate::Outcome;
-use crate::source;
 
-/// 纳入 API 基线的 crate。**只放对外契约**——`ra-cli` / `xtask` 是二进制，没有下游。
-const TRACKED: &[&str] = &["ra-core"];
+/// 纳入公开面契约的 crate。
+///
+/// 只放**下游会依赖**的。`ra-cli` / `xtask` 是二进制，`ra-coding` 是参考产品——
+/// 产品的公开面不是框架契约，它随业务改是正常的。
+const TRACKED: &[&str] = &[
+    "ra-core",
+    "ra-macros",
+    "ra-model",
+    "ra-prompt",
+    "ra-context",
+    "ra-runtime",
+    "ra-session",
+    "ra-exec",
+    "ra-mcp",
+    "ra-protocol",
+    "ra-eval",
+    "ra-patch",
+];
 
-/// 执行门禁。
-pub(crate) fn run() -> Outcome {
-    if !tool_available() {
-        return Outcome::skip(
-            "R0-8",
-            "未安装 cargo-public-api（`cargo install cargo-public-api`，需 nightly rustdoc）",
-        );
-    }
-
-    let baseline_dir = source::workspace_root().join("api");
-    let missing: Vec<&str> = TRACKED
-        .iter()
-        .copied()
-        .filter(|name| !baseline_path(&baseline_dir, name).is_file())
-        .collect();
-    if !missing.is_empty() {
-        return Outcome::skip("R0-8", format!("尚无基线快照：{}", missing.join(" / ")));
-    }
-
+/// 执行门禁。`bless` 为真时重写基线而不是对账。
+pub(crate) fn run(bless: bool) -> Outcome {
     let mut violations = Vec::new();
+    let mut blessed = 0_usize;
+    let mut missing = Vec::new();
+
     for name in TRACKED {
-        match diff_against_baseline(&baseline_dir, name) {
-            Ok(diff) => violations.extend(diff),
-            Err(err) => violations.push(format!("{name}：{err}")),
+        let items = match api::snapshot(name) {
+            Ok(items) => items,
+            Err(err) => {
+                violations.push(format!("{name}：{err}"));
+                continue;
+            }
+        };
+
+        if bless {
+            match api::write_baseline(name, &items) {
+                Ok(()) => blessed += 1,
+                Err(err) => violations.push(format!("{name}：写基线失败 {err}")),
+            }
+            continue;
         }
+
+        match api::read_baseline(name) {
+            Some(baseline) => violations.extend(diff(name, &baseline, &items)),
+            None => missing.push(*name),
+        }
+    }
+
+    if bless {
+        return Outcome::from_violations(violations, format!("已重写 {blessed} 份基线"));
+    }
+
+    if !missing.is_empty() {
+        violations.push(format!(
+            "缺基线快照：{}——跑 `cargo xtask public-api --bless` 生成",
+            missing.join(" / ")
+        ));
+    }
+
+    for name in TRACKED {
+        violations.extend(extension_safety::check(name));
     }
 
     Outcome::from_violations(
         violations,
-        format!("{} 个 crate 的公开 API 与基线一致", TRACKED.len()),
+        format!("{} 个 crate 的公开面与基线一致", TRACKED.len()),
     )
 }
 
-fn baseline_path(dir: &std::path::Path, name: &str) -> PathBuf {
-    dir.join(format!("{name}.txt"))
-}
+/// 逐行对账。**删除与新增分开报**：前者是破坏性的，后者只是要更新基线。
+fn diff(name: &str, baseline: &[String], current: &[String]) -> Vec<String> {
+    let mut violations = Vec::new();
 
-fn tool_available() -> bool {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    Command::new(cargo)
-        .args(["public-api", "--version"])
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-/// 与基线逐行对比，返回差异描述。
-fn diff_against_baseline(dir: &std::path::Path, name: &str) -> Result<Vec<String>, String> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let output = Command::new(cargo)
-        .args(["public-api", "-p", name])
-        .current_dir(source::workspace_root())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-
-    let current = String::from_utf8_lossy(&output.stdout);
-    let baseline = std::fs::read_to_string(baseline_path(dir, name)).map_err(|e| e.to_string())?;
-
-    let current_items: Vec<&str> = current
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let baseline_items: Vec<&str> = baseline
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-
-    let mut diffs = Vec::new();
-    for item in &baseline_items {
-        if !current_items.contains(item) {
-            diffs.push(format!("{name}：公开项消失（破坏性）— {item}"));
+    for item in baseline {
+        if !current.contains(item) {
+            violations.push(format!(
+                "{name}：公开项消失或签名改变（**破坏性**）— {item}"
+            ));
         }
     }
-    for item in &current_items {
-        if !baseline_items.contains(item) {
-            diffs.push(format!("{name}：新增公开项，需更新基线 — {item}"));
+    for item in current {
+        if !baseline.contains(item) {
+            violations.push(format!("{name}：新增公开项，需 --bless 更新基线 — {item}"));
         }
     }
-    Ok(diffs)
+
+    violations
 }
