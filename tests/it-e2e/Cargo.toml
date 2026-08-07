@@ -16,6 +16,7 @@ ra-patch = { path = "../../crates/ra-patch" }
 ra-coding = { path = "../../crates/ra-coding" }
 ra-protocol = { path = "../../crates/ra-protocol" }
 ra-eval = { path = "../../crates/ra-eval" }
+xtask = { path = "../../xtask" }
 insta = { version = "1", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
 wiremock = "0.6"

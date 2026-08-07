@@ -33,7 +33,7 @@ impl MessageRole {
         match self {
             Self::System => "system",
             Self::User => "user",
-            Self::Assistant => "assistant", // layering-allow: model role, not a product
+            Self::Assistant => "assistant", // layering-allow: assistant = model role, not a product
         }
     }
 }

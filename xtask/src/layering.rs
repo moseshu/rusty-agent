@@ -20,6 +20,7 @@ use std::process::Command;
 
 use crate::gate::Outcome;
 use crate::source;
+use xtask::layering_policy::{ALLOW_MARKER, scan_product_references};
 
 /// crate 所属的层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,9 +143,6 @@ fn layer_of(name: &str) -> Option<Layer> {
         .find(|(crate_name, _)| *crate_name == name)
         .map(|(_, layer)| *layer)
 }
-
-/// 产品 crate 的名字，用于第 3、4 条的源码扫描。
-const PRODUCTS: &[&str] = &["ra-coding", "ra-assistant"];
 
 /// 执行门禁。
 pub(crate) fn run() -> Outcome {
@@ -404,25 +402,16 @@ const fn forbidden(from: Layer, to: Layer) -> Option<&'static str> {
 // 源码侧：铁律 3 的 `use` 与铁律 4 的产品名分支
 // ---------------------------------------------------------------------------
 
-/// Marker that exempts a single line from the product-name scan.
-///
-/// Some protocol vocabulary collides with a product name: `assistant` is a model role, so
-/// `MessageRole::Assistant => "assistant"` is not a product branch.
-///
-/// The obvious alternative — teaching the scanner which syntactic positions count as a "branch"
-/// — was tried and reverted. It let four ordinary ways of branching on a product through: a
-/// `const` holding the name, a `let` binding used in a later comparison, a map lookup, and a
-/// lookup table of product names. Rule 4 is a hard constraint (R18-8, "出现即 CI 失败"), so the
-/// rule stays maximally strict and each exception is written on the line it applies to, where
-/// review sees it and `rg layering-allow` counts it. A marker without a reason does not count.
-const ALLOW_MARKER: &str = "layering-allow:";
-
 /// 框架 crate 里出现产品名——不管是 `use` 还是字符串分支。
 ///
 /// 返回违规列表与放行的显式例外条数。例外条数会进汇总输出：它只能逐条增加，
 /// 每次 CI 都看得见涨没涨。
 fn check_product_references(graph: &Graph) -> (Vec<String>, usize) {
     let root = source::workspace_root();
+    let products: Vec<_> = LAYERS
+        .iter()
+        .filter_map(|(name, layer)| (*layer == Layer::Product).then_some(*name))
+        .collect();
     let mut violations = Vec::new();
     let mut exemptions = 0_usize;
 
@@ -439,41 +428,21 @@ fn check_product_references(graph: &Graph) -> (Vec<String>, usize) {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            for (index, line) in text.lines().enumerate() {
-                if source::is_comment(line) {
-                    continue;
-                }
-                if is_allowed_exception(line) {
-                    exemptions += 1;
-                    continue;
-                }
-                for product in PRODUCTS {
-                    let snake = product.replace('-', "_");
-                    // `use ra_coding::…` / `ra_coding::Foo`（铁律 3）
-                    // `"coding"` / `"assistant"` 这类按产品名分支（铁律 4）
-                    let quoted = format!("\"{}\"", product.trim_start_matches("ra-"));
-                    if line.contains(&snake) || line.contains(&quoted) {
-                        violations.push(format!(
-                            "{}:{}：框架 crate `{}`（{}）里出现产品名 `{}` —— \
-                             铁律 3/4：差异只能由 profile / capability / prompt / guard 注册表达。\
-                             确属协议词汇撞名时，在该行末尾加 `// {ALLOW_MARKER} <理由>`",
-                            source::relative(&file),
-                            index + 1,
-                            name,
-                            layer.label(),
-                            product,
-                        ));
-                    }
-                }
+            let scan = scan_product_references(&text, &products);
+            exemptions += scan.exemptions();
+            for violation in scan.violations() {
+                violations.push(format!(
+                    "{}:{}：框架 crate `{}`（{}）违反产品隔离：{}。\
+                     协议词汇确实撞名时使用 `// {ALLOW_MARKER} <alias> = <理由>`",
+                    source::relative(&file),
+                    violation.line(),
+                    name,
+                    layer.label(),
+                    violation.message(),
+                ));
             }
         }
     }
 
     (violations, exemptions)
-}
-
-/// Whether a line carries an explicit, justified exemption marker.
-fn is_allowed_exception(line: &str) -> bool {
-    line.split_once(ALLOW_MARKER)
-        .is_some_and(|(_, reason)| !reason.trim().is_empty())
 }
