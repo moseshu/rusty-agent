@@ -16,4 +16,5 @@ pub mod session;
 pub mod state;
 pub mod step;
 pub mod tool;
+pub mod trace;
 pub mod usage;
