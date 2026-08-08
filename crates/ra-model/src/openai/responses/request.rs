@@ -94,11 +94,11 @@ pub(crate) async fn build_request_body(model: &str, request: &ModelRequest) -> R
     }
 
     let tools = merge_tools(&mut body, request.tools(), request.handoffs())?;
-    if tools {
+    if tools.populated {
         if let Some(tool_choice) = request.model_settings().tool_choice() {
             body.insert(
                 "tool_choice".to_owned(),
-                lower_tool_choice(Some(tool_choice))?,
+                lower_tool_choice(Some(tool_choice), &tools.function_names)?,
             );
         } else if !body.contains_key("tool_choice") {
             body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
@@ -116,7 +116,7 @@ pub(crate) async fn build_request_body(model: &str, request: &ModelRequest) -> R
         }
         body.insert(
             "tool_choice".to_owned(),
-            lower_tool_choice(Some(tool_choice))?,
+            lower_tool_choice(Some(tool_choice), &tools.function_names)?,
         );
     }
 
@@ -478,21 +478,33 @@ fn output_string(output: &Value) -> Result<String> {
 /// can only be requested through `extra_body`. Replacing the array would make the two mutually
 /// exclusive; the names are checked across both sources so a collision fails locally instead of
 /// producing an ambiguous call. Returns whether the merged array is non-empty.
+struct MergedTools {
+    populated: bool,
+    function_names: BTreeSet<String>,
+}
+
 fn merge_tools(
     body: &mut Map<String, Value>,
     tools: &[ModelToolDefinition],
     handoffs: &[ModelHandoffDefinition],
-) -> Result<bool> {
+) -> Result<MergedTools> {
     let mut lowered = match body.remove("tools") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(existing)) => existing,
         Some(_) => return Err(Error::caller("OpenAI extra_body.tools must be an array")),
     };
-    let mut names = lowered
+    let mut names = BTreeSet::new();
+    for name in lowered
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    {
+        validate_function_name(name)?;
+        if !names.insert(name.to_owned()) {
+            return Err(Error::caller(format!(
+                "duplicate OpenAI tool/handoff name `{name}`"
+            )));
+        }
+    }
     lowered.reserve(tools.len() + handoffs.len());
 
     let neutral = tools
@@ -527,7 +539,10 @@ fn merge_tools(
     if populated {
         body.insert("tools".to_owned(), Value::Array(lowered));
     }
-    Ok(populated)
+    Ok(MergedTools {
+        populated,
+        function_names: names,
+    })
 }
 
 /// Rejects a name the endpoint will reject, while the call site is still visible.
@@ -561,12 +576,23 @@ fn function_tool(name: &str, description: Option<&str>, schema: &Value, strict: 
     tool
 }
 
-fn lower_tool_choice(choice: Option<&ToolChoice>) -> Result<Value> {
+fn lower_tool_choice(
+    choice: Option<&ToolChoice>,
+    function_names: &BTreeSet<String>,
+) -> Result<Value> {
     match choice.unwrap_or(&ToolChoice::Auto) {
         ToolChoice::Auto => Ok(Value::String("auto".to_owned())),
         ToolChoice::Required => Ok(Value::String("required".to_owned())),
         ToolChoice::None => Ok(Value::String("none".to_owned())),
-        ToolChoice::Tool(name) => Ok(json!({"type": "function", "name": name})),
+        ToolChoice::Tool(name) => {
+            validate_function_name(name)?;
+            if !function_names.contains(name) {
+                return Err(Error::caller(format!(
+                    "OpenAI tool_choice names unavailable function `{name}`"
+                )));
+            }
+            Ok(json!({"type": "function", "name": name}))
+        }
         ToolChoice::Mcp(_) => Err(Error::caller(
             "OpenAI Responses MCP tool choice requires a hosted MCP tool definition",
         )),

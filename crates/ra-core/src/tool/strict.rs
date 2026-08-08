@@ -83,11 +83,19 @@ fn normalize_node(node: &mut Value, root: &Value, state: &mut NormalizeState) ->
                 object.insert("additionalProperties".to_owned(), Value::Bool(false));
             }
             Some(Value::Bool(false)) => {}
+            // An open map (`BTreeMap<String, _>`, `serde_json::Map`) is the usual way to reach
+            // this: strict mode has no way to express a value-typed, open-keyed object.
             Some(_) => {
                 return Err(Error::config(
-                    "additionalProperties must be false for a strict object schema",
+                    "additionalProperties must be false for a strict object schema; \
+                     an open key-value map cannot be described in strict mode",
                 ));
             }
+        }
+        // A tool that takes no arguments still has to say so explicitly. Without this the
+        // normalized schema would fail the strict verification it is supposed to satisfy.
+        if !object.contains_key("properties") {
+            object.insert("properties".to_owned(), Value::Object(Map::new()));
         }
     } else if object
         .get("additionalProperties")
@@ -346,34 +354,60 @@ fn verify_node(node: &Value, path: &str) -> Result<()> {
     // at all: the provider checks the keyword, not whether the object happens to be empty.
     let properties = object.get("properties").and_then(Value::as_object);
     let is_object = properties.is_some()
-        || matches!(object.get("type"), Some(Value::String(kind)) if kind == "object");
+        || matches!(object.get("type"), Some(Value::String(kind)) if kind == "object")
+        || object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "object"));
     if is_object {
         if object.get("additionalProperties") != Some(&Value::Bool(false)) {
             return Err(Error::config(format!(
                 "strict tool input schema requires `additionalProperties: false` at `{path}`"
             )));
         }
-        let properties = properties.cloned().unwrap_or_default();
-        let required = object
+        let properties = properties.ok_or_else(|| {
+            Error::config(format!(
+                "strict tool input schema requires an object `properties` map at `{path}`"
+            ))
+        })?;
+        let required_values = object
             .get("required")
             .and_then(Value::as_array)
-            .map(|names| {
-                names
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        if let Some(missing) = properties
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "strict tool input schema requires a `required` string array at `{path}`"
+                ))
+            })?;
+        let mut required = BTreeSet::new();
+        for name in required_values {
+            let name = name.as_str().ok_or_else(|| {
+                Error::config(format!(
+                    "strict tool input schema requires only strings in `required` at `{path}`"
+                ))
+            })?;
+            if !required.insert(name) {
+                return Err(Error::config(format!(
+                    "strict tool input schema has duplicate `required` entry `{name}` at `{path}`"
+                )));
+            }
+        }
+        let declared = properties
             .keys()
-            .find(|name| !required.contains(name.as_str()))
-        {
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = declared.difference(&required).next() {
             return Err(Error::config(format!(
                 "strict tool input schema requires every property in `required`; \
                  `{path}.{missing}` is missing"
             )));
         }
-        for (name, property) in &properties {
+        if let Some(unexpected) = required.difference(&declared).next() {
+            return Err(Error::config(format!(
+                "strict tool input schema has undeclared `required` entry \
+                 `{path}.{unexpected}`"
+            )));
+        }
+        for (name, property) in properties {
             verify_node(property, &format!("{path}.{name}"))?;
         }
     }

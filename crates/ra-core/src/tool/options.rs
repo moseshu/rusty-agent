@@ -112,7 +112,7 @@ impl<'de> Deserialize<'de> for ToolGuardrailId {
 /// a persisted config. `Dynamic` and `Custom` values announce which default `Tool` method the
 /// executor must call.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolOptions {
     schema_version: SchemaVersion,
     #[serde(default)]
@@ -140,6 +140,58 @@ pub struct ToolOptions {
     failure_handling: ToolFailureHandling,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+}
+
+#[derive(Deserialize)]
+struct ToolOptionsWire {
+    schema_version: SchemaVersion,
+    #[serde(default)]
+    availability: ToolAvailability,
+    #[serde(default)]
+    approval: ToolApprovalPolicy,
+    #[serde(default)]
+    defer_loading: bool,
+    #[serde(default)]
+    allowed_callers: Option<Vec<ToolCaller>>,
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    timeout: Option<Duration>,
+    #[serde(default)]
+    timeout_behavior: ToolTimeoutBehavior,
+    #[serde(default)]
+    input_guardrails: Vec<ToolGuardrailId>,
+    #[serde(default)]
+    output_guardrails: Vec<ToolGuardrailId>,
+    #[serde(default)]
+    failure_handling: ToolFailureHandling,
+    #[serde(flatten, default)]
+    unknown: Unknown,
+}
+
+impl<'de> Deserialize<'de> for ToolOptions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ToolOptionsWire::deserialize(deserializer)?;
+        let mut allowed_callers = wire.allowed_callers;
+        if let Some(callers) = &mut allowed_callers {
+            callers.sort_unstable();
+            callers.dedup();
+        }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            availability: wire.availability,
+            approval: wire.approval,
+            defer_loading: wire.defer_loading,
+            allowed_callers,
+            timeout: wire.timeout,
+            timeout_behavior: wire.timeout_behavior,
+            input_guardrails: deduplicate_guardrails(wire.input_guardrails),
+            output_guardrails: deduplicate_guardrails(wire.output_guardrails),
+            failure_handling: wire.failure_handling,
+            unknown: wire.unknown,
+        })
+    }
 }
 
 impl Default for ToolOptions {
@@ -312,6 +364,14 @@ fn push_unique(values: &mut Vec<ToolGuardrailId>, value: ToolGuardrailId) {
     if !values.contains(&value) {
         values.push(value);
     }
+}
+
+fn deduplicate_guardrails(values: Vec<ToolGuardrailId>) -> Vec<ToolGuardrailId> {
+    let mut deduplicated = Vec::with_capacity(values.len());
+    for value in values {
+        push_unique(&mut deduplicated, value);
+    }
+    deduplicated
 }
 
 // `#[serde(serialize_with)]` fixes this signature to `&Option<T>`.

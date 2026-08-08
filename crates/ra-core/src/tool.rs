@@ -26,7 +26,10 @@ pub use options::{
     TOOL_OPTIONS_SCHEMA_VERSION, ToolApprovalPolicy, ToolAvailability, ToolFailureHandling,
     ToolGuardrailId, ToolOptions, ToolTimeoutBehavior,
 };
-pub use origin::{TOOL_ORIGIN_SCHEMA_VERSION, ToolLookupKey, ToolLookupKind, ToolOrigin};
+pub use origin::{
+    TOOL_LOOKUP_KEY_SCHEMA_VERSION, TOOL_ORIGIN_SCHEMA_VERSION, ToolLookupKey, ToolLookupKind,
+    ToolOrigin,
+};
 pub use output::ToolOutput;
 pub use schema::{
     DecodedToolInput, FUNC_SCHEMA_VERSION, FuncSchema, TOOL_SCHEMA_VERSION, ToolInput, ToolSchema,

@@ -1,4 +1,4 @@
-use ra_core::tool::{FuncSchema, ToolInput};
+use core_contract::tool::{FuncSchema, ToolInput};
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -122,6 +122,35 @@ fn 仍被引用的_definition_保留_元组按位置展开() {
     );
 }
 
+/// A tool that takes no arguments.
+#[derive(Debug, Deserialize, JsonSchema, ToolInput)]
+struct NoArgsInput {}
+
+#[test]
+fn 无参数工具也能生成合法的_strict_schema() {
+    // schemars describes an empty struct as bare `{"type":"object"}`. Normalization has to
+    // complete it into an explicitly closed empty object, or the result fails the strict
+    // verification it is meant to satisfy — and argument-less tools are a common shape.
+    let schema = NoArgsInput::tool_schema("no_args").unwrap();
+
+    assert_eq!(
+        schema.input_schema(),
+        &json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    );
+    assert!(schema.strict_json_schema());
+    assert!(
+        NoArgsInput::func_schema("no_args")
+            .unwrap()
+            .decode_arguments("{}")
+            .is_ok()
+    );
+}
+
 /// 自引用类型无法表达成 strict schema，必须是错误而不是让进程崩掉。
 #[derive(Debug, Deserialize, JsonSchema, ToolInput)]
 struct RecursiveInput {
@@ -224,11 +253,11 @@ fn tool_schema_反序列化会验证_hash_且兼容旧记录缺少_hash() {
     let schema = SearchInput::tool_schema("catalog_search").unwrap();
     let mut wire = serde_json::to_value(&schema).unwrap();
     wire["input_schema_hash"] = Value::String("0".repeat(64));
-    assert!(serde_json::from_value::<ra_core::tool::ToolSchema>(wire).is_err());
+    assert!(serde_json::from_value::<core_contract::tool::ToolSchema>(wire).is_err());
 
     let mut old_wire = serde_json::to_value(schema).unwrap();
     old_wire.as_object_mut().unwrap().remove("input_schema_hash");
-    let restored: ra_core::tool::ToolSchema = serde_json::from_value(old_wire).unwrap();
+    let restored: core_contract::tool::ToolSchema = serde_json::from_value(old_wire).unwrap();
     assert_eq!(restored.input_schema_hash().len(), 64);
 }
 

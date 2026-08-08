@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ra_core::{
+    compat::SchemaVersion,
     error::{Error, Result},
     item::CallId,
     tool::{
@@ -49,6 +50,7 @@ fn lookup_key_三种形状互不等价且能稳定序列化() {
     assert_eq!(
         serde_json::to_value(&namespaced).unwrap(),
         json!({
+            "schema_version": 1,
             "kind": "namespaced",
             "namespace": "plugin.catalog",
             "name": "search"
@@ -57,6 +59,49 @@ fn lookup_key_三种形状互不等价且能稳定序列化() {
     assert_eq!(
         serde_json::from_value::<ToolLookupKey>(serde_json::to_value(&deferred).unwrap()).unwrap(),
         deferred
+    );
+}
+
+#[test]
+fn lookup_key_未来字段原样往返但不参与身份() {
+    let first_wire = json!({
+        "schema_version": 2,
+        "kind": "bare",
+        "name": "search",
+        "future_hint": {"tier": "a"}
+    });
+    let second_wire = json!({
+        "schema_version": 2,
+        "kind": "bare",
+        "name": "search",
+        "future_hint": {"tier": "b"}
+    });
+
+    let first: ToolLookupKey = serde_json::from_value(first_wire.clone()).unwrap();
+    let second: ToolLookupKey = serde_json::from_value(second_wire).unwrap();
+
+    // Fidelity: the version and the unknown fields are written back verbatim.
+    assert_eq!(first.schema_version().get(), 2);
+    assert_eq!(
+        first.unknown().get("future_hint"),
+        Some(&json!({"tier": "a"}))
+    );
+    assert_eq!(serde_json::to_value(&first).unwrap(), first_wire);
+
+    // Identity is kind + name + namespace only. `Compatibility::Newer` requires a record from a
+    // newer build to stay readable and usable; letting an arbitrary added field join identity
+    // would turn that promise into a silent routing miss for every older build.
+    assert_eq!(first, second);
+
+    // A genuine new identity dimension arrives as a `ToolLookupKind`. That enum is closed, so an
+    // older build fails outright instead of guessing a route from a field it cannot interpret.
+    assert!(
+        serde_json::from_value::<ToolLookupKey>(json!({
+            "schema_version": 3,
+            "kind": "partitioned",
+            "name": "search"
+        }))
+        .is_err()
     );
 }
 
@@ -110,6 +155,38 @@ fn origin_跨版本回写未知字段且拒绝矛盾身份() {
 }
 
 #[test]
+fn 更高版本写下的_key_仍然路由得到同一个工具() {
+    let key = ToolLookupKey::bare("search").unwrap();
+    let mut registry = BTreeMap::new();
+    registry.insert(key.clone(), "实现");
+
+    // Unknown fields and the schema version are forward-compatibility material, not identity:
+    // folding them in turns "written by a newer build, read by an older one" into a lost route.
+    let mut wire = serde_json::to_value(&key).unwrap();
+    wire["schema_version"] = json!(2);
+    wire["future_routing_hint"] = json!({"tier": 2});
+    let restored: ToolLookupKey = serde_json::from_value(wire).unwrap();
+
+    assert_eq!(restored, key);
+    assert_eq!(registry.get(&restored), Some(&"实现"));
+    assert_eq!(
+        restored.unknown().get("future_routing_hint"),
+        Some(&json!({"tier": 2}))
+    );
+    assert_eq!(restored.schema_version(), SchemaVersion::new(2));
+
+    // A real identity difference is still distinguished.
+    assert_ne!(restored, ToolLookupKey::deferred_top_level("search").unwrap());
+    assert_ne!(restored, ToolLookupKey::bare("other").unwrap());
+
+    // A whole-origin round trip stays routable too; that is the path R9 restore takes.
+    let mut wire = serde_json::to_value(ToolOrigin::new("search").unwrap()).unwrap();
+    wire["lookup_key"]["future_routing_hint"] = json!({"tier": 2});
+    let origin: ToolOrigin = serde_json::from_value(wire).unwrap();
+    assert_eq!(registry.get(origin.lookup_key()), Some(&"实现"));
+}
+
+#[test]
 fn identity_值对象反序列化也不能绕过校验() {
     assert!(serde_json::from_value::<ToolNamespace>(json!(" namespace ")).is_err());
     assert!(
@@ -155,15 +232,28 @@ fn tool_options_集中承载执行策略并按毫秒往返() {
 
     let mut wire = serde_json::to_value(&options).unwrap();
     assert_eq!(wire["timeout"], 750);
+    wire["allowed_callers"] = json!(["programmatic", "direct", "direct"]);
+    wire["input_guardrails"] = json!(["read_before_edit", "read_before_edit"]);
+    wire["output_guardrails"] = json!(["secret_scan", "secret_scan"]);
     wire["future_executor_policy"] = json!({"version": 2});
     let restored = serde_json::from_value::<ToolOptions>(wire).unwrap();
     assert_eq!(restored.availability(), options.availability());
     assert_eq!(restored.approval(), options.approval());
     assert_eq!(restored.timeout(), options.timeout());
     assert_eq!(
+        restored.allowed_callers(),
+        Some([ToolCaller::Direct, ToolCaller::Programmatic].as_slice())
+    );
+    assert_eq!(restored.input_guardrails().len(), 1);
+    assert_eq!(restored.output_guardrails().len(), 1);
+    assert_eq!(
         restored.unknown().get("future_executor_policy"),
         Some(&json!({"version": 2}))
     );
+    let normalized = serde_json::to_value(restored).unwrap();
+    assert_eq!(normalized["allowed_callers"], json!(["direct", "programmatic"]));
+    assert_eq!(normalized["input_guardrails"], json!(["read_before_edit"]));
+    assert_eq!(normalized["output_guardrails"], json!(["secret_scan"]));
 }
 
 #[derive(Debug)]
@@ -310,6 +400,26 @@ fn 手写_schema_不能只声明_strict_而不满足_strict() {
         )
         .is_err()
     );
+
+    for invalid_required in [
+        json!("city"),
+        json!(["city", "city"]),
+        json!(["city", 7]),
+        json!(["city", "undeclared"]),
+    ] {
+        assert!(
+            ToolSchema::new(
+                "weather",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": invalid_required,
+                    "properties": {"city": {"type": "string"}}
+                })
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

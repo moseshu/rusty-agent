@@ -415,6 +415,22 @@ async fn tool_names_the_endpoint_would_reject_fail_locally() {
         .await
         .expect_err("a dotted tool name is not accepted by OpenAI");
     assert_eq!(error.code(), "caller");
+
+    for choice in ["bad.name", "missing"] {
+        let request = ModelRequest::new(
+            vec![],
+            resolved(ModelSettings::new().with_tool_choice(ToolChoice::Tool(choice.to_owned()))),
+        )
+        .with_tools(vec![ModelToolDefinition::new(
+            "lookup",
+            json!({"type": "object"}),
+        )]);
+        let error = model
+            .get_response(request)
+            .await
+            .expect_err("named tool choice must be valid and present in the request");
+        assert_eq!(error.code(), "caller");
+    }
     assert!(
         server
             .received_requests()

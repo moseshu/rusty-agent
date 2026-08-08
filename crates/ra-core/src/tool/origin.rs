@@ -1,5 +1,10 @@
 //! Serializable tool identity used by dispatch and state restoration.
 
+use core::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+};
+
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use super::{ToolNamespace, namespace::validate_namespace};
@@ -10,6 +15,8 @@ use crate::{
 
 /// Current tool-origin schema version.
 pub const TOOL_ORIGIN_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+/// Current tool lookup-key schema version.
+pub const TOOL_LOOKUP_KEY_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
 /// Shape of a [`ToolLookupKey`].
 #[non_exhaustive]
@@ -28,13 +35,22 @@ pub enum ToolLookupKind {
 ///
 /// Private fields force every constructed or deserialized value through shape validation. In
 /// particular, a deferred top-level tool is not equivalent to a bare tool with the same name.
+///
+/// Identity is exactly `kind` + `name` + `namespace`. `schema_version` and retained unknown fields
+/// round-trip but stay out of `Eq` / `Ord` / `Hash`: a key restored from a record written by a
+/// newer build must still find its tool, and folding those fields into identity would turn
+/// forward compatibility into a silent routing miss. A future identity dimension arrives as a new
+/// [`ToolLookupKind`], which an older build rejects outright instead of mis-routing.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolLookupKey {
+    schema_version: SchemaVersion,
     kind: ToolLookupKind,
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     namespace: Option<ToolNamespace>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
 }
 
 impl ToolLookupKey {
@@ -43,9 +59,11 @@ impl ToolLookupKey {
         let name = name.into();
         validate_tool_name(&name)?;
         Ok(Self {
+            schema_version: TOOL_LOOKUP_KEY_SCHEMA_VERSION,
             kind: ToolLookupKind::Bare,
             name,
             namespace: None,
+            unknown: Unknown::new(),
         })
     }
 
@@ -59,9 +77,11 @@ impl ToolLookupKey {
             ));
         }
         Ok(Self {
+            schema_version: TOOL_LOOKUP_KEY_SCHEMA_VERSION,
             kind: ToolLookupKind::Namespaced,
             name,
             namespace: Some(namespace),
+            unknown: Unknown::new(),
         })
     }
 
@@ -70,9 +90,11 @@ impl ToolLookupKey {
         let name = name.into();
         validate_tool_name(&name)?;
         Ok(Self {
+            schema_version: TOOL_LOOKUP_KEY_SCHEMA_VERSION,
             kind: ToolLookupKind::DeferredTopLevel,
             name,
             namespace: None,
+            unknown: Unknown::new(),
         })
     }
 
@@ -87,6 +109,12 @@ impl ToolLookupKey {
             Some(namespace) => Self::namespaced(namespace, name),
             None => Self::bare(name),
         }
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
     }
 
     /// Routing shape.
@@ -112,14 +140,24 @@ impl ToolLookupKey {
     pub const fn is_deferred_top_level(&self) -> bool {
         matches!(self.kind, ToolLookupKind::DeferredTopLevel)
     }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
 }
 
 #[derive(Deserialize)]
 struct ToolLookupKeyWire {
+    #[serde(default = "tool_lookup_key_schema_version")]
+    schema_version: SchemaVersion,
     kind: ToolLookupKind,
     name: String,
     #[serde(default)]
     namespace: Option<ToolNamespace>,
+    #[serde(flatten, default)]
+    unknown: Unknown,
 }
 
 impl<'de> Deserialize<'de> for ToolLookupKey {
@@ -128,15 +166,53 @@ impl<'de> Deserialize<'de> for ToolLookupKey {
         D: Deserializer<'de>,
     {
         let wire = ToolLookupKeyWire::deserialize(deserializer)?;
-        let key = match (wire.kind, wire.namespace) {
+        let mut key = match (wire.kind, wire.namespace) {
             (ToolLookupKind::Bare, None) => Self::bare(wire.name),
             (ToolLookupKind::Namespaced, Some(namespace)) => Self::namespaced(namespace, wire.name),
             (ToolLookupKind::DeferredTopLevel, None) => Self::deferred_top_level(wire.name),
             (kind, namespace) => Err(Error::caller(format!(
                 "tool lookup key shape `{kind:?}` has invalid namespace {namespace:?}"
             ))),
-        };
-        key.map_err(D::Error::custom)
+        }
+        .map_err(D::Error::custom)?;
+        key.schema_version = wire.schema_version;
+        key.unknown = wire.unknown;
+        Ok(key)
+    }
+}
+
+/// Identity triple shared by `Eq`, `Ord`, and `Hash` so the three can never disagree.
+type LookupIdentity<'a> = (ToolLookupKind, &'a str, Option<&'a ToolNamespace>);
+
+impl ToolLookupKey {
+    const fn identity(&self) -> LookupIdentity<'_> {
+        (self.kind, self.name.as_str(), self.namespace.as_ref())
+    }
+}
+
+impl PartialEq for ToolLookupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for ToolLookupKey {}
+
+impl PartialOrd for ToolLookupKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ToolLookupKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.identity().cmp(&other.identity())
+    }
+}
+
+impl Hash for ToolLookupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
     }
 }
 
@@ -272,6 +348,10 @@ fn qualify(name: &str, namespace: Option<&ToolNamespace>) -> String {
         || name.to_owned(),
         |namespace| format!("{namespace}.{name}"),
     )
+}
+
+const fn tool_lookup_key_schema_version() -> SchemaVersion {
+    TOOL_LOOKUP_KEY_SCHEMA_VERSION
 }
 
 fn validate_lookup_key(key: &ToolLookupKey) -> Result<()> {

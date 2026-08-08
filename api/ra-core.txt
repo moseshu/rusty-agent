@@ -284,6 +284,8 @@ const fn ra_core::tool::options::ToolOptions::with_timeout_behavior(mut self, be
 const fn ra_core::tool::origin::ToolLookupKey::is_deferred_top_level(& self) -> bool
 const fn ra_core::tool::origin::ToolLookupKey::kind(& self) -> ToolLookupKind
 const fn ra_core::tool::origin::ToolLookupKey::namespace(& self) -> Option < & ToolNamespace >
+const fn ra_core::tool::origin::ToolLookupKey::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::origin::ToolLookupKey::unknown(& self) -> & Unknown
 const fn ra_core::tool::origin::ToolOrigin::lookup_key(& self) -> & ToolLookupKey
 const fn ra_core::tool::origin::ToolOrigin::namespace(& self) -> Option < & ToolNamespace >
 const fn ra_core::tool::origin::ToolOrigin::schema_version(& self) -> SchemaVersion
@@ -338,6 +340,7 @@ const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::origin::TOOL_LOOKUP_KEY_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_ORIGIN_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::schema::FUNC_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::schema::TOOL_SCHEMA_VERSION: SchemaVersion
