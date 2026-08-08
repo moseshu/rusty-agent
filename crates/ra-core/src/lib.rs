@@ -12,6 +12,11 @@
 //! fields in [`state`] and the field names in [`trace::field`] are `Evolving` (they may grow but
 //! not shrink), and the turn-settlement intermediates in [`step`] are `Internal` (once they leak
 //! into the public API, R1 and R3 can no longer be refactored).
+//!
+//! [`finish::FinishReason`] is `Stable` and lives in its own module rather than beside `NextStep`
+//! for exactly that reason: the run's stopping reason is something hosts, graph edges, and the
+//! closeout step all read, so it must not inherit the `Internal` grade of the settlement
+//! intermediate that produces it.
 
 pub mod agent;
 pub mod budget;
@@ -20,6 +25,7 @@ pub mod capability;
 pub mod compat;
 pub mod config;
 pub mod error;
+pub mod finish;
 pub mod guard;
 pub mod hook;
 pub mod item;

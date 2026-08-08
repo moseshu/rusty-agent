@@ -315,6 +315,29 @@ impl RunItemKind {
             Self::ToolApproval(_) => "tool_approval",
         }
     }
+
+    /// Whether this item is a pending decision the host has to answer before the run continues.
+    ///
+    /// [`NextStep::Interruption`](crate::step::NextStep::Interruption) carries exactly these, and
+    /// R3-2 classifies a response with the same predicate, so the two cannot drift apart. The match
+    /// is exhaustive on purpose: a new item kind must be classified here rather than defaulting to
+    /// "not an interruption", because that default is the silent one — the run would continue past
+    /// a decision nobody made.
+    #[must_use]
+    pub const fn is_interruption(&self) -> bool {
+        match self {
+            Self::ToolApproval(_) | Self::McpApprovalRequest(_) => true,
+            Self::Message(_)
+            | Self::Reasoning(_)
+            | Self::ToolCall(_)
+            | Self::ToolCallOutput(_)
+            | Self::HandoffCall(_)
+            | Self::HandoffOutput(_)
+            | Self::McpListTools(_)
+            | Self::McpApprovalResponse(_)
+            | Self::Compaction(_) => false,
+        }
+    }
 }
 
 /// A complete authoritative session record.
