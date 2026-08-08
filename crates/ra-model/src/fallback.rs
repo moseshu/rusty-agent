@@ -1,1 +1,1 @@
-//! 拒答/错误自动升级模型（运行时硬机制，非提示词请求）。
+//! Automatic model escalation on refusal or error (a runtime mechanism, not a prompt request).

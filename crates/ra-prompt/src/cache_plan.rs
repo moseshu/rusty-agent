@@ -1,1 +1,1 @@
-//! 每 provider 的缓存断点计划。
+//! Per-provider cache breakpoint plan.

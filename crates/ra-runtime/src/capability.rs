@@ -1,1 +1,1 @@
-//! Capability 装配与依赖拓扑校验。
+//! Capability assembly and dependency-topology validation.

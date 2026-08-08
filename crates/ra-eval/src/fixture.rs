@@ -1,1 +1,1 @@
-//! 确定性 fixture 与 mock provider。
+//! Deterministic fixtures and a mock provider.

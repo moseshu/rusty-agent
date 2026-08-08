@@ -1,1 +1,1 @@
-//! 工具偏好（软倾向，非硬门）。
+//! Tool preferences (a soft leaning, not a hard gate).

@@ -1,11 +1,12 @@
 //! # `ra-eval`
 //!
-//! eval / replay / trace 断言 / 回归飞轮。
+//! Eval, replay, trace assertions, the regression flywheel.
 //!
-//! **边界**：消费框架的公开结果与 trace，不参与线上 run 的控制流，不向框架内核
-//! 注入产品特例，也不作为生产持久化后端。
+//! **Boundary**: it consumes the framework's public results and traces. It takes no part in the
+//! control flow of a live run, injects no product special cases into the kernel, and is not a
+//! production persistence backend.
 //!
-//! **稳定性分级**：`Evolving`。断言与报表 API 随 eval 需求调整。
+//! **Stability**: `Evolving`. Assertion and reporting APIs follow eval needs.
 
 pub mod assert;
 pub mod fixture;

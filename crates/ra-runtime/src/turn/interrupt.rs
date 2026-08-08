@@ -1,1 +1,1 @@
-//! 中断态的产生与恢复。
+//! How an interrupted state is produced and resumed.

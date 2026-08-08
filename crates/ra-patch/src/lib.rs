@@ -1,11 +1,13 @@
 //! # `ra-patch`
 //!
-//! V4A 补丁格式的解析与应用。
+//! Parsing and application of the V4A patch format.
 //!
-//! **边界**：只处理补丁语法、匹配、应用和 diff 渲染，不负责文件权限、审批、沙箱
-//! 或编码 agent 的编辑纪律。模糊匹配器是实现细节，不进入公开 API。
+//! **Boundary**: it handles patch syntax, matching, application, and diff rendering only — not
+//! file permissions, approval, sandboxing, or the coding agent's editing discipline. The fuzzy
+//! matcher is an implementation detail and stays out of the public API.
 //!
-//! **稳定性分级**：`Evolving`。V4A 格式本身由上游定义，这里的解析器 API 可加不可删。
+//! **Stability**: `Evolving`. The V4A format itself is defined upstream; this parser's API may
+//! grow but not shrink.
 
 pub mod apply;
 pub(crate) mod fuzz;

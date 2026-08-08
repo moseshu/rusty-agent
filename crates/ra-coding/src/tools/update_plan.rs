@@ -1,1 +1,1 @@
-//! 计划板：plan[].{step, status}。
+//! Plan board: `plan[].{step, status}`.

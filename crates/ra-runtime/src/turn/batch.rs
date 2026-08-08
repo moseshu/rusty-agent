@@ -1,1 +1,1 @@
-//! 一思 -> 批量并行动作 -> 批量观察。只读并行，写类串行加锁。
+//! One thought -> a batch of parallel actions -> a batch of observations. Reads run in parallel, writes are serialized under a lock.

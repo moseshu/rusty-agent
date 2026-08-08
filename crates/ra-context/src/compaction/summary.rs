@@ -1,1 +1,1 @@
-//! 结构化 summary 的槽位契约（段落内容由产品层填）。
+//! Slot contract for a structured summary; the product layer fills in the section content.

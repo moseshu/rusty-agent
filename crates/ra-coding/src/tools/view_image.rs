@@ -1,1 +1,1 @@
-//! 本地图片进多模态上下文。
+//! Brings a local image into the multimodal context.

@@ -1,4 +1,4 @@
-//! `tool` 模块。
+//! Tool registry, dispatch, and profiles.
 
 pub(crate) mod dispatch;
 pub mod profile;

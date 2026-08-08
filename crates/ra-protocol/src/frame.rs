@@ -1,1 +1,1 @@
-//! 帧类型与 `request_id` 关联。
+//! Frame types and their `request_id` correlation.

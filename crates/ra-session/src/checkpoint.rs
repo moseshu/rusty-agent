@@ -1,1 +1,1 @@
-//! 崩溃安全增量 checkpoint。
+//! Crash-safe incremental checkpoints.

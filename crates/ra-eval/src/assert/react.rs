@@ -1,1 +1,1 @@
-//! `ReAct` 证据链断言：报幕 -> 工具 -> 观察 -> 自纠 -> 验证 -> 结论。
+//! `ReAct` evidence-chain assertions: narration -> tool -> observation -> correction -> verification -> conclusion.

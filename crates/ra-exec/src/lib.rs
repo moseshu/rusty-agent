@@ -1,12 +1,13 @@
 //! # `ra-exec`
 //!
-//! 进程执行、PTY、后台 job、沙箱隔离。
+//! Process execution, PTY, background jobs, sandbox isolation.
 //!
-//! **边界**：只执行已经成型的命令与安全策略，不决定工具是否应该被调用，也不包含
-//! 产品默认权限；审批策略属于 runtime / 产品装配，命令内容属于调用方。
+//! **Boundary**: it runs commands and security policies that are already fully formed. It does not
+//! decide whether a tool should be called and carries no product default permissions; approval
+//! policy belongs to the runtime and product assembly, command content to the caller.
 //!
-//! **稳定性分级**：`SandboxBackend` 是 extension trait，`Stable`；沙箱策略与
-//! manifest 字段是 `Evolving`（平台后端会增加）。
+//! **Stability**: `SandboxBackend` is an extension trait and is `Stable`; sandbox policy and
+//! manifest fields are `Evolving` (platform backends will be added).
 
 pub mod command;
 pub mod job;

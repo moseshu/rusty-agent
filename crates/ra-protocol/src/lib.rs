@@ -1,12 +1,14 @@
 //! # `ra-protocol`
 //!
-//! 双向控制协议、transport、app-server。
+//! The bidirectional control protocol, transports, and the app server.
 //!
-//! **边界**：负责宿主与 agent 进程之间的线协议和生命周期，不实现 runner、会话
-//! 存储或 UI；持久化委托 `ra-session`，执行委托上层装配。
+//! **Boundary**: it owns the wire protocol and lifecycle between the host and the agent process.
+//! It implements no runner, no session storage, and no UI; persistence is delegated to
+//! `ra-session` and execution to the assembly above.
 //!
-//! **稳定性分级**：`Evolving`。帧是与宿主之间的线协议，**只能加字段不能删**，
-//! 且未知字段必须原样保留——两端版本不会同步升级。
+//! **Stability**: `Evolving`. Frames are the wire protocol shared with the host, so **fields may
+//! only be added, never removed**, and unknown fields must be preserved verbatim — the two sides
+//! do not upgrade in lockstep.
 
 pub mod control;
 pub mod frame;

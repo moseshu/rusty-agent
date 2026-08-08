@@ -1,1 +1,1 @@
-//! trait Guard + `GuardOutcome` 四态（框架纪律机制，非用户 hook）。
+//! `trait Guard` plus the four `GuardOutcome` states (framework discipline, not a user hook).

@@ -1,3 +1,3 @@
-//! `it-model` —— `ra-model` 的集成测试宿主。
+//! `it-model` --- the integration-test host for `ra-model`.
 //!
-//! 本 crate 本身不含产品代码；测试用例全部在 `tests/` 下。
+//! This crate holds no product code; the cases all live under `tests/`.

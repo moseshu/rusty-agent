@@ -1,1 +1,1 @@
-//! 未读即改的软提醒与高风险硬拦截。
+//! Soft reminder for unread edits, hard block for high-risk ones.

@@ -1,1 +1,1 @@
-//! 结构化提问 1-3 问 + 超时自动决议。
+//! Structured questions, 1-3 at a time, with an automatic timeout resolution.

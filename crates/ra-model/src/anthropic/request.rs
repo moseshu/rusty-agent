@@ -1,1 +1,1 @@
-//! system 3-block 数组 + `cache_control` 断点摆位（易变头隔离在缓存段之外）。
+//! Three-block system array plus `cache_control` breakpoint placement (the volatile head stays outside the cached span).

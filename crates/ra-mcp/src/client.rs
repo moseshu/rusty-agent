@@ -1,4 +1,4 @@
-//! MCP client 公共层。
+//! Shared MCP client layer.
 
 #[cfg(feature = "http")]
 pub mod http;

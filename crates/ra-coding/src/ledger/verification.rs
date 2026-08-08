@@ -1,1 +1,1 @@
-//! 验证账本：closeout 判断的唯一数据源。
+//! Verification ledger: the single source of truth for closeout decisions.

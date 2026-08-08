@@ -1,1 +1,1 @@
-//! PTY 支持；tty 模式与控制字符（Ctrl-C 中断）。
+//! PTY support: tty mode and control characters (Ctrl-C interrupts).

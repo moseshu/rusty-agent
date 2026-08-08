@@ -1,1 +1,1 @@
-//! 向运行中会话写输入并返回最近输出。
+//! Writes input to a running session and returns its most recent output.

@@ -1,1 +1,1 @@
-//! `压缩前完整消息链的可寻址归档（archive_ref`）。
+//! Addressable archive of the full message chain before compaction (`archive_ref`).

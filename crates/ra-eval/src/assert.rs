@@ -1,4 +1,4 @@
-//! 断言集合。
+//! Assertion set.
 
 pub mod cost;
 pub mod discipline;

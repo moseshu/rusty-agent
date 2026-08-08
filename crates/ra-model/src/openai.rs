@@ -1,4 +1,4 @@
-//! `OpenAI` provider 家族：Responses 与 Chat 两套协议共享鉴权、错误映射与 SSE 基础。
+//! The `OpenAI` provider family: the Responses and Chat protocols share auth, error mapping, and SSE plumbing.
 
 pub mod auth;
 pub mod chat;

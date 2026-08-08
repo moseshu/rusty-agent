@@ -1,1 +1,1 @@
-//! 增量 fold 摘要，避免列会话要 load 每个会话。
+//! Incremental fold summaries, so listing sessions does not have to load each one.

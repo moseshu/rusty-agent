@@ -1,14 +1,15 @@
 //! # `ra-runtime`
 //!
-//! Loop 内核。公开 API 必须能跑任何 agent，不含任何业务词汇。
+//! The loop kernel. Its public API must be able to run any agent and contains no business vocabulary.
 //!
-//! **边界**：只依赖 `ra-core` 的协议中立契约。公开面是 agent 定义、runner 入口、
-//! tool profile / registry 与 guard registry；turn 结算、派发、预算执行、熔断和审批
-//! 流都是 crate 内实现，不能被下游绕过。
+//! **Boundary**: it depends only on the protocol-neutral contracts in `ra-core`. The public surface
+//! is the agent definition, the runner entry, the tool profile / registry, and the guard registry;
+//! turn settlement, dispatch, budget enforcement, the loop breaker, and the approval flow are all
+//! crate-internal and cannot be bypassed downstream.
 //!
-//! **稳定性分级**：`Runner` 的入口签名是 `Stable`（在 Stable API 清单里），
-//! turn 结算中间态是 `Internal`——`ProcessedResponse` / `ToolExecutionPlan` /
-//! `SingleStepResult` 随时可重构，不要在外部依赖它们。
+//! **Stability**: the `Runner` entry signature is `Stable` (it is on the Stable API list); the
+//! turn-settlement intermediates are `Internal` — `ProcessedResponse` / `ToolExecutionPlan` /
+//! `SingleStepResult` may be refactored at any time, so do not depend on them from outside.
 
 pub mod agent;
 pub(crate) mod budget;

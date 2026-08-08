@@ -1,1 +1,1 @@
-//! `HookEvent` 十事件 + 强类型 IO（用户扩展点，与 Guard 分离）。
+//! Ten `HookEvent` variants with strongly typed IO (a user extension point, separate from Guard).

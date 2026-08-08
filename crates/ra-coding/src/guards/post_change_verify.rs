@@ -1,1 +1,1 @@
-//! 改后验证的 freshness 反馈。
+//! Verification-freshness feedback after a change.

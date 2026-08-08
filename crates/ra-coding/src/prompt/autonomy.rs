@@ -1,1 +1,1 @@
-//! 自主性与持久推进。
+//! Autonomy and persistent progress.

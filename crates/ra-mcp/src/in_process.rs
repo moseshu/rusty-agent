@@ -1,1 +1,1 @@
-//! 进程内工具服务器：宿主注册工具，零 IPC。
+//! In-process tool server: the host registers tools with zero IPC.

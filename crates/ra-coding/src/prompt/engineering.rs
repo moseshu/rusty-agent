@@ -1,1 +1,1 @@
-//! 工程判断：沿用仓库既有模式、最小改动、测试与风险匹配。
+//! Engineering judgment: follow existing repository patterns, minimal changes, tests matched to risk.

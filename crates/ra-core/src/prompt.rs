@@ -1,1 +1,1 @@
-//! `PromptSection` / Stability / Position / CachePlan（类型；装配在 ra-prompt）。
+//! `PromptSection` / Stability / Position / `CachePlan` (types only; assembly lives in `ra-prompt`).

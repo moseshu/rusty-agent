@@ -1,1 +1,1 @@
-//! macOS sandbox-exec；读侧降级必须透明化。
+//! macOS `sandbox-exec`; a downgrade on the read side must be made visible.

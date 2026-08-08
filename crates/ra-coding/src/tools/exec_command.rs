@@ -1,1 +1,1 @@
-//! PTY 里跑命令；返回输出或 `session_id` 转后台。收编 rg/sed/git/jq/find。
+//! Runs a command in a PTY; returns output or a `session_id` for background work. Subsumes rg/sed/git/jq/find.

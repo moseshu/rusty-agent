@@ -1,1 +1,1 @@
-//! 前端设计指令（按信号懒加载，不进常驻前缀）。
+//! Frontend design instructions, lazily loaded on signal and kept out of the resident prefix.

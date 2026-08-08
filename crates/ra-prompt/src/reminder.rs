@@ -1,1 +1,1 @@
-//! RuntimeReminder：只能产出尾部 delta 消息，不提供改 system prompt 的能力。
+//! `RuntimeReminder`: it can only produce tail delta messages, never rewrite the system prompt.

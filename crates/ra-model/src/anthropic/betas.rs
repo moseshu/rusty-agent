@@ -1,1 +1,1 @@
-//! beta 开关：interleaved-thinking / mid-conversation-system / effort。
+//! Beta switches: interleaved-thinking / mid-conversation-system / effort.

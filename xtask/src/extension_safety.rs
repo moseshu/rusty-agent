@@ -31,8 +31,8 @@ const PUBLIC_FIELDS_ALLOWED: &[&str] = &[];
 /// 稳定性级别的合法取值。
 const LEVELS: &[&str] = &["Stable", "Evolving", "Internal"];
 
-/// 分级标注的标记词。
-const GRADE_MARKER: &str = "稳定性分级";
+/// 分级标注的标记词。`.rs` 注释统一英文后，这里跟着改；它匹配的是源码文本，不是输出。
+const GRADE_MARKER: &str = "**Stability**";
 
 /// 检查一个 crate，返回违规列表。
 pub(crate) fn check(crate_name: &str) -> Vec<String> {

@@ -1,1 +1,1 @@
-//! 装配：Stable 段进前缀，Volatile 段强制进尾部。
+//! Assembly: stable sections go into the prefix, volatile sections are forced to the tail.

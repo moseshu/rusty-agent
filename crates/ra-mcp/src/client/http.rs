@@ -1,1 +1,1 @@
-//! streamable HTTP 传输。
+//! Streamable HTTP transport.

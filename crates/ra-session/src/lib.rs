@@ -1,12 +1,13 @@
 //! # `ra-session`
 //!
-//! 双通道 rollout 事件日志、SessionStore、resume、fork、checkpoint。
+//! The dual-channel rollout event log, `SessionStore`, resume, fork, checkpoint.
 //!
-//! **边界**：只保存和重放已经定义的会话事件，不运行模型或工具，不解释产品语义，
-//! 也不把具体本地存储结构暴露成 `ra-core` 契约。
+//! **Boundary**: it stores and replays session events that are already defined. It runs no model
+//! or tool, interprets no product semantics, and does not expose a concrete local storage layout
+//! as a `ra-core` contract.
 //!
-//! **稳定性分级**：`Evolving`。rollout 事件 payload 与存储 schema 可加不可删，
-//! 且必须能读旧版本——resume 依赖它。
+//! **Stability**: `Evolving`. Rollout event payloads and the storage schema may grow but not
+//! shrink, and must stay readable across versions — resume depends on it.
 
 pub mod chain;
 pub mod checkpoint;

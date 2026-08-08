@@ -1,3 +1,3 @@
-//! `GuardRegistry` + 预算校验（硬阻断 <= 8）。
+//! `GuardRegistry` plus budget validation (at most 8 hard blocks).
 
 pub(crate) mod dispatch;

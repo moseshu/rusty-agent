@@ -1,1 +1,1 @@
-//! 决定 `NextStep` 四态。控制流的唯一收口。
+//! Decides which of the four `NextStep` states applies. The single point where control flow converges.

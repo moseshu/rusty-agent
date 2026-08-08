@@ -1,1 +1,1 @@
-//! `it-e2e` —— 跨 crate 端到端测试宿主。
+//! `it-e2e` --- the cross-crate end-to-end test host.

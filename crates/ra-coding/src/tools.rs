@@ -1,4 +1,4 @@
-//! 工具集注册。
+//! Tool-set registration.
 
 pub(crate) mod agent_ns;
 pub(crate) mod apply_patch;

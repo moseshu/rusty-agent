@@ -1,1 +1,1 @@
-//! 成本指标：total token / uncached / `cache_hit_rate`。
+//! Cost metrics: total tokens, uncached tokens, `cache_hit_rate`.

@@ -1,4 +1,4 @@
-//! `SessionStore` 的必需/可选方法运行时探测。
+//! Runtime probing of the required and optional `SessionStore` methods.
 
 #[cfg(feature = "sqlite")]
 pub mod local;

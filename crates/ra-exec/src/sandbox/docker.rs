@@ -1,1 +1,1 @@
-//! 容器后端：强隔离与可复现环境。
+//! Container backend: strong isolation and a reproducible environment.

@@ -1,1 +1,1 @@
-//! 人格与价值观；反客套禁令。
+//! Personality and values; the no-pleasantries prohibition.

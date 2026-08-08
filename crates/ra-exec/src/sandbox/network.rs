@@ -1,1 +1,1 @@
-//! 网络策略：默认放行/deny + 域名 allowlist。
+//! Network policy: allow-by-default or deny, plus a domain allowlist.

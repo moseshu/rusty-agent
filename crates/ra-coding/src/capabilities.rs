@@ -1,1 +1,1 @@
-//! Shell / Filesystem / Search / Plan / Compaction 的组合。
+//! Composition of Shell / Filesystem / Search / Plan / Compaction.

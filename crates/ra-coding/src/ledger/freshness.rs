@@ -1,1 +1,1 @@
-//! 最后一次持久化编辑之后的验证新鲜度。
+//! Verification freshness since the last persisted edit.

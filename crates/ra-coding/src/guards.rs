@@ -1,4 +1,4 @@
-//! 编码纪律 guard 注册；硬阻断 <= 8。
+//! Coding-discipline guard registry; at most 8 hard blocks.
 
 pub(crate) mod background_closeout;
 pub(crate) mod destructive_git;

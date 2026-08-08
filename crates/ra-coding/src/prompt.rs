@@ -1,4 +1,4 @@
-//! 注册全部 `PromptSection`。
+//! Registration of every `PromptSection`.
 
 pub(crate) mod autonomy;
 pub(crate) mod channels;

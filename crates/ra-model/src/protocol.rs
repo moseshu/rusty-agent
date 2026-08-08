@@ -1,1 +1,1 @@
-//! `ApiProtocol` 与能力矩阵：Responses / Chat / `AnthropicMessages` 的差异在这里显式建模，上层不得假设某一种。
+//! `ApiProtocol` and its capability matrix: the differences between Responses, Chat, and `AnthropicMessages` are modeled explicitly here so no upper layer assumes one of them.

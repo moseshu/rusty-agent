@@ -1,6 +1,6 @@
-//! `ra` —— rusty-agent 命令行入口。
+//! `ra` --- the rusty-agent command-line entry point.
 //!
-//! 这是唯一使用 `anyhow` 的 crate；库层一律用各自的 `thiserror` 错误。
+//! This is the only crate that uses `anyhow`; library layers use their own `thiserror` errors.
 
 use clap::{Parser, Subcommand};
 
@@ -13,12 +13,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 执行一次任务。
+    /// Runs one task.
     Run {
-        /// 任务描述。
+        /// Task description.
         prompt: String,
     },
-    /// 环境自检：config / sandbox / prompt / mcp / provider。
+    /// Environment self-check: config / sandbox / prompt / mcp / provider.
     Doctor,
 }
 

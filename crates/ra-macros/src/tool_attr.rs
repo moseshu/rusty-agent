@@ -1,1 +1,1 @@
-//! #[tool(name=..., namespace=...)] 属性宏。
+//! The `#[tool(name = ..., namespace = ...)]` attribute macro.

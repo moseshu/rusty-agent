@@ -1,1 +1,1 @@
-//! 会话回放。
+//! Session replay.

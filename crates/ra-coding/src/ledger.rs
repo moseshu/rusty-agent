@@ -1,4 +1,4 @@
-//! `ledger` 模块。
+//! Verification ledger.
 
 pub(crate) mod freshness;
 pub(crate) mod verification;

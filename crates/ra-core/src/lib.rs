@@ -1,15 +1,17 @@
 //! # `ra-core`
 //!
-//! 内核类型与契约：零实现，只有类型、trait、常量。框架宪法。
+//! Kernel types and contracts: no implementation, only types, traits, and constants. The
+//! constitution of the framework.
 //!
-//! **边界**：本 crate 只定义跨层共享的协议中立类型，不做 I/O、不选择 provider、
-//! 不装配 loop，也不包含任何产品词汇。实现型服务必须依赖本 crate，而不能反向把
-//! 服务实现引入这里。
+//! **Boundary**: this crate defines the protocol-neutral types shared across layers and nothing
+//! else. It performs no IO, chooses no provider, assembles no loop, and contains no product
+//! vocabulary. Service implementations must depend on this crate, never the reverse.
 //!
-//! **稳定性分级**：`Stable`——它是框架宪法，下游直接 match 这里的枚举、实现这里的
-//! trait。两处例外：[`state`] 的 `RunState` 字段与 [`trace::field`] 的字段名是
-//! `Evolving`（可加不可删），[`step`] 的 turn 结算中间态是 `Internal`（一旦泄漏成
-//! 公共 API，R1/R3 就再也重构不动）。
+//! **Stability**: `Stable` — it is the framework constitution, and downstream code matches on
+//! these enums and implements these traits directly. Two deliberate exceptions: the `RunState`
+//! fields in [`state`] and the field names in [`trace::field`] are `Evolving` (they may grow but
+//! not shrink), and the turn-settlement intermediates in [`step`] are `Internal` (once they leak
+//! into the public API, R1 and R3 can no longer be refactored).
 
 pub mod budget;
 pub mod cancel;

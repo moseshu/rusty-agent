@@ -1,1 +1,1 @@
-//! closeout fast path（窄触发）。
+//! Closeout fast path (narrow trigger).

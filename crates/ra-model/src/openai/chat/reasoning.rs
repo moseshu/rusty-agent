@@ -1,1 +1,1 @@
-//! `reasoning_content` 的回放：Chat 协议没有一等 reasoning item，需要单独还原。
+//! Replay of `reasoning_content`: the Chat protocol has no first-class reasoning item, so it is reconstructed here.

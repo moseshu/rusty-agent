@@ -1,1 +1,1 @@
-//! 本地权威存储：SQLite 索引 + JSONL transcript。
+//! Authoritative local storage: a `SQLite` index plus a JSONL transcript.

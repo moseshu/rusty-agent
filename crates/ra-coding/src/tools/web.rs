@@ -1,1 +1,1 @@
-//! `web_search` / `web_fetch（含` URL 信任边界）。
+//! `web_search` / `web_fetch`, including the URL trust boundary.

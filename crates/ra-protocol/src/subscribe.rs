@@ -1,1 +1,1 @@
-//! 事件订阅 + 断线后按 offset 补拉。
+//! Event subscription plus offset-based catch-up after a disconnect.

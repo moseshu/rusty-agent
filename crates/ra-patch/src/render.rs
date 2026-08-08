@@ -1,1 +1,1 @@
-//! 生成 diff 用于展示与审批。
+//! Renders a diff for display and approval.

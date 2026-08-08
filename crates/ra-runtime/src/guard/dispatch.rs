@@ -1,1 +1,1 @@
-//! 触发时机：PreTool / `PostTool` / `PreFinal`。
+//! Trigger points: `PreTool`, `PostTool`, `PreFinal`.

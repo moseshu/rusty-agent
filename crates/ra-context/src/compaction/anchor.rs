@@ -1,1 +1,1 @@
-//! `preserved_segment{head`, anchor, tail} 锚点保留。
+//! Anchor retention of `preserved_segment{head, anchor, tail}`.

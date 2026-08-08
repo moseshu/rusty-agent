@@ -1,1 +1,1 @@
-//! `call_id` 配对（不靠顺序对齐）。
+//! `call_id` pairing (never positional alignment).

@@ -1,1 +1,1 @@
-//! 模型上下文窗口表 + 配置覆盖。
+//! Model context-window table plus configuration overrides.

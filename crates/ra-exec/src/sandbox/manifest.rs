@@ -1,1 +1,1 @@
-//! 工作区清单、快照、物化。
+//! Workspace manifest, snapshots, materialization.

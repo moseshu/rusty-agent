@@ -1,1 +1,1 @@
-//! 用户 hook 的并发派发。与 guard 完全分离，不承载框架纪律。
+//! Concurrent dispatch of user hooks. Fully separate from Guard; it carries no framework discipline.

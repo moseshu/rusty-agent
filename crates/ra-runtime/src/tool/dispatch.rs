@@ -1,1 +1,1 @@
-//! 执行、并发上限、超时、失败成型。
+//! Execution, concurrency ceiling, timeout, failure shaping.

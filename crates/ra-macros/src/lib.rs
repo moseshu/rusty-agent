@@ -1,14 +1,15 @@
 //! # `ra-macros`
 //!
-//! 过程宏：`#[derive(ToolInput)]`。（`#[tool]` 属性宏见 R2-4，尚未落地。）
+//! Procedural macros: `#[derive(ToolInput)]`. (The `#[tool]` attribute macro is R2-4, not yet
+//! implemented.)
 //!
-//! **边界**：只在编译期生成 `ra-core` 契约所需的样板与 schema，不包含运行时注册、
-//! I/O 或 provider 逻辑。
+//! **Boundary**: it generates only the boilerplate and schema that the `ra-core` contracts need,
+//! at compile time. It contains no runtime registration, IO, or provider logic.
 //!
-//! proc-macro crate 只能导出宏本身，因此内部模块一律私有。
+//! A proc-macro crate can export nothing but macros, so every internal module stays private.
 //!
-//! **稳定性分级**：宏的调用形式是 `Stable`，**展开产物是 `Internal`**——不要依赖
-//! 生成代码的具体形状，那是实现细节。
+//! **Stability**: the macro's call shape is `Stable`, **its expansion is `Internal`** — do not
+//! depend on the exact form of the generated code, which is an implementation detail.
 
 mod strict;
 mod tool_attr;

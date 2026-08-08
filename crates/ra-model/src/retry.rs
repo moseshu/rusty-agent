@@ -1,1 +1,1 @@
-//! 归一化错误 -> backoff 决策；流式已吐 token 的请求不可盲目重放。
+//! Normalized error -> backoff decision; a stream that already emitted tokens must not be blindly replayed.

@@ -1,1 +1,1 @@
-//! 各家中转的已知差异：工具调用格式、SSE 结束标记、usage 字段缺失等。
+//! Known per-gateway differences: tool-call shape, SSE terminator, missing usage fields, and so on.

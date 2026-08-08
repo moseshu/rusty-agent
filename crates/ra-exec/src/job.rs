@@ -1,1 +1,1 @@
-//! 后台 job 生命周期 + wait{until: done|timeout|match}。
+//! Background job lifecycle plus `wait{until: done|timeout|match}`.

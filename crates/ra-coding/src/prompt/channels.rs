@@ -1,1 +1,1 @@
-//! commentary / final 双通道规则。
+//! Commentary / final dual-channel rules.

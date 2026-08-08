@@ -1,1 +1,1 @@
-//! `PromptSection` 的构造与校验。
+//! Construction and validation of a `PromptSection`.

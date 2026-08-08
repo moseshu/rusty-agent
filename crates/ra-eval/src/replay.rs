@@ -1,1 +1,1 @@
-//! trace 回放。
+//! Trace replay.

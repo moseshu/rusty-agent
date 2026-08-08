@@ -1,1 +1,1 @@
-//! 身份句。
+//! Identity statement.

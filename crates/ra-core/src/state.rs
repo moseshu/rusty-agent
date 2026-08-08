@@ -1,1 +1,1 @@
-//! RunState：整 run 可序列化状态 + schema 版本。
+//! `RunState`: the serializable state of a whole run, with a schema version.

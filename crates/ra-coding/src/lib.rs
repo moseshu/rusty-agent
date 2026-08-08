@@ -1,12 +1,14 @@
 //! # `ra-coding`
 //!
-//! 编码 agent（产品层）：15 个工具 + 提示词内容 + 编码纪律 + 装配。
+//! The coding agent (product layer): 15 tools, prompt content, coding discipline, assembly.
 //!
-//! **边界**：这是框架的消费者，只通过其他 crate 的公开 API 完成装配。它不定义
-//! 可复用框架契约；下游最终只消费 `build_agent` 一类装配入口，模块树全部为 crate 内部。
+//! **Boundary**: this is a consumer of the framework and assembles itself purely through the
+//! public APIs of the other crates. It defines no reusable framework contract; downstream only
+//! ever consumes an assembly entry such as `build_agent`, and the module tree stays crate-internal.
 //!
-//! **稳定性分级**：`Internal`。**它是参考产品，不是框架契约**——提示词、工具集、
-//! 纪律判据都随业务改，任何 crate 都不得依赖它（由 layering 门禁强制）。
+//! **Stability**: `Internal`. **It is a reference product, not a framework contract** — prompts,
+//! tool set, and discipline criteria all change with the business, and no crate may depend on it
+//! (enforced by the layering gate).
 
 pub(crate) mod capabilities;
 pub(crate) mod closeout;

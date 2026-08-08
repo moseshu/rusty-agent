@@ -1,1 +1,1 @@
-//! SSE 传输。
+//! SSE transport.

@@ -1,1 +1,1 @@
-//! 渐进式披露的技能加载。
+//! Progressive-disclosure skill loading.

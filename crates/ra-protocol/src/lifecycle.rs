@@ -1,1 +1,1 @@
-//! result 帧 != run 结束；在途任务集合与可延迟收尾的类型白名单。
+//! A result frame is not the end of a run: in-flight task sets and the type allowlist that may finish late.

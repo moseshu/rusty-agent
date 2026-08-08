@@ -1,1 +1,1 @@
-//! 破坏性 git 命令拦截。
+//! Interception of destructive git commands.

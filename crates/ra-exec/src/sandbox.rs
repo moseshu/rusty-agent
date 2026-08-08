@@ -1,11 +1,12 @@
-//! trait `SandboxBackend` + `SecurityPolicy`。
+//! Sandbox backends.
 //!
-//! 后端按 feature × 平台双重门控：feature 表达"我要这个后端"，`target_os` 表达
-//! "这个平台上它才存在"。默认构建在 macOS 得到 [`seatbelt`]、在 Linux 得到
-//! [`bwrap`]，[`unix_local`] 是两边都在的基线。
+//! A backend is gated twice, by feature and by platform: the feature says "I want this backend"
+//! and `target_os` says "it only exists on this platform". A default build gets [`seatbelt`] on
+//! macOS and [`bwrap`] on Linux, with [`unix_local`] as the baseline present on both.
 //!
-//! **不可静默降级**：某个平台上没有任何真沙箱后端可用时，构造阶段必须报错并说清
-//! 缺的是什么，不能悄悄退回 [`unix_local`] 让调用方以为自己被隔离着。
+//! **No silent downgrade**: when a platform has no real sandbox backend available, construction
+//! must fail and say what is missing. It must not quietly fall back to [`unix_local`] while the
+//! caller believes it is isolated.
 
 #[cfg(all(feature = "bwrap", target_os = "linux"))]
 pub mod bwrap;

@@ -1,1 +1,1 @@
-//! 老工具结果的最近引用轮次追踪与选择性淘汰。
+//! Last-referenced-turn tracking and selective eviction of stale tool results.

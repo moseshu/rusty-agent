@@ -1,1 +1,1 @@
-//! messages[] 装配；稳定前缀落在 messages[0] 的 system。
+//! `messages[]` assembly; the stable prefix lands in the system message at `messages[0]`.

@@ -1,1 +1,1 @@
-//! 多模态读取统一入口 + 窗口与预算截断元数据。
+//! One multimodal read entry plus window and budget truncation metadata.

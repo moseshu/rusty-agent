@@ -1,1 +1,1 @@
-//! head/tail + stat 的列表页快速读取。
+//! Fast listing reads from head/tail plus stat.

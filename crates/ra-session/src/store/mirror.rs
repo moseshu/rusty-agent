@@ -1,1 +1,1 @@
-//! 批量镜像 batched/eager，result 前强制 flush，失败降级为消息。
+//! Batched or eager mirroring, a forced flush before the result, and a downgrade to a message on failure.

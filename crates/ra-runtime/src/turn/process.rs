@@ -1,1 +1,1 @@
-//! 模型响应 -> `ProcessedResponse` 分类。
+//! Model response -> `ProcessedResponse` classification.

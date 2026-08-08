@@ -1,1 +1,1 @@
-//! 物化 + subkey + 路径穿越校验。
+//! Materialization, subkeys, and path-traversal validation.

@@ -1,1 +1,1 @@
-//! oversized input preflight：发请求前拦截超大单条输入。
+//! Oversized-input preflight: rejects an outsized single input before the request goes out.

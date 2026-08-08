@@ -1,1 +1,1 @@
-//! 工具面档位：core / `codex_like` / full。
+//! Tool-surface profiles: core / `codex_like` / full.

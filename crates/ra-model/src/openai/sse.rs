@@ -1,1 +1,1 @@
-//! 共享 SSE 帧解析。
+//! Shared SSE frame parsing.

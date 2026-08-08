@@ -1,1 +1,1 @@
-//! 基线后端：工作区根限制 + 环境清理 + 资源上限。
+//! Baseline backend: workspace-root confinement, environment scrubbing, resource ceilings.

@@ -1,11 +1,12 @@
 //! # `ra-mcp`
 //!
-//! MCP client（stdio/sse/http）与进程内工具服务器。
+//! MCP clients (stdio/sse/http) and the in-process tool server.
 //!
-//! **边界**：负责 MCP 协议、连接与工具过滤，不运行 agent loop，不把 MCP 类型泄漏
-//! 进 `ra-core`，也不替产品决定默认信任或审批策略。
+//! **Boundary**: it owns the MCP protocol, connections, and tool filtering. It does not run the
+//! agent loop, does not leak MCP types into `ra-core`, and does not decide a product's default
+//! trust or approval policy.
 //!
-//! **稳定性分级**：`Evolving`。MCP 侧的传输与过滤配置随上游协议演进。
+//! **Stability**: `Evolving`. MCP transports and filter configuration follow the upstream protocol.
 
 pub mod approval;
 pub mod client;

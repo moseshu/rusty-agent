@@ -1,4 +1,4 @@
-//! 单轮结算。
+//! Single-turn settlement.
 
 pub(crate) mod batch;
 pub(crate) mod interrupt;

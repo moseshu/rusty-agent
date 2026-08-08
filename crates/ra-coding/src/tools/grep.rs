@@ -1,1 +1,1 @@
-//! 匹配数 / 扫描统计 / 截断原因 / 收窄建议。
+//! Match count, scan statistics, truncation reason, narrowing hints.

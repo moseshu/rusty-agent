@@ -1,1 +1,1 @@
-//! 工具结果 byte/token 双上限，截断必须标注原因与原始规模。
+//! Byte and token ceilings for tool results; truncation must record its reason and the original size.

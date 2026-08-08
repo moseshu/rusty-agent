@@ -1,1 +1,1 @@
-//! 文件模式查找，结果确定排序。
+//! File-pattern lookup with a deterministic result order.

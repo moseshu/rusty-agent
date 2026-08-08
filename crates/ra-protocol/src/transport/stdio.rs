@@ -1,1 +1,1 @@
-//! 行分帧 + buffer 上限 guard + stderr 独立通道。
+//! Line framing, a buffer-ceiling guard, and a separate stderr channel.

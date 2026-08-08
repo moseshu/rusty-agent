@@ -1,1 +1,1 @@
-//! final answer 格式规则。
+//! Final-answer formatting rules.

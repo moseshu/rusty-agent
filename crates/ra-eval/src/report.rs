@@ -1,1 +1,1 @@
-//! 按 agent / category 两级聚合。
+//! Two-level aggregation by agent and by category.

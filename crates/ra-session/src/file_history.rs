@@ -1,1 +1,1 @@
-//! 文件编辑前快照与 rewind。
+//! Pre-edit file snapshots and rewind.

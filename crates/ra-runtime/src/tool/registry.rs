@@ -1,1 +1,1 @@
-//! ToolRegistry：advertise 集 vs 全量 registry（advertise != 拥有）。
+//! `ToolRegistry`: the advertised set versus the full registry (advertising is not owning).

@@ -1,1 +1,1 @@
-//! 行级 append-only 写入，崩溃不破坏已写内容。
+//! Line-level append-only writes; a crash never damages what was already written.

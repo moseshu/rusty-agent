@@ -1,1 +1,1 @@
-//! 输出模式：Minimal / Engineering / `EvidenceBrief` / `AnalysisReport` / `ArtifactSummary`。
+//! Output modes: Minimal / Engineering / `EvidenceBrief` / `AnalysisReport` / `ArtifactSummary`.

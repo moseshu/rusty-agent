@@ -1,1 +1,1 @@
-//! 工具 schema 的字节级稳定渲染。
+//! Byte-stable rendering of a tool schema.

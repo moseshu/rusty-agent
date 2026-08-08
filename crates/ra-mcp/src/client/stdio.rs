@@ -1,1 +1,1 @@
-//! stdio 传输。
+//! stdio transport.

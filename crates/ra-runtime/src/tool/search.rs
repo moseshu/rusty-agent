@@ -1,1 +1,1 @@
-//! `tool_search：deferred` 工具的按需发现。
+//! `tool_search`: on-demand discovery of deferred tools.

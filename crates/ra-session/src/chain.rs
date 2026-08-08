@@ -1,1 +1,1 @@
-//! `parent_uuid` 对话链重建与分叉选优。
+//! `parent_uuid` conversation-chain reconstruction and branch selection.

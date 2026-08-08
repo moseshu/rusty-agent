@@ -1,1 +1,1 @@
-//! turns / usd / token / deadline 的执行与软结束。
+//! Enforcement and soft termination for turns, USD, tokens, and deadlines.

@@ -1,4 +1,4 @@
-//! `/v1/chat/completions` 协议实现。第一等公民，不是兼容层的附属品。
+//! `/v1/chat/completions` protocol implementation. A first-class citizen, not an appendage of the compat layer.
 
 pub(crate) mod convert;
 pub(crate) mod reasoning;

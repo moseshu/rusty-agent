@@ -1,1 +1,1 @@
-//! `Runner::run` / `run_streamed：agent` 循环主体。
+//! `Runner::run` and `run_streamed`: the body of the agent loop.
