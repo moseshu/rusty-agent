@@ -1,1 +1,3 @@
-//! `prompt_cache_key` == `thread_id，每会话恒定`。
+//! Stable instructions use the top-level `instructions` field; runtime-supplied dynamic system
+//! messages remain in the `input` array. Session prompt-cache keys and explicit breakpoints land
+//! in R1-13.

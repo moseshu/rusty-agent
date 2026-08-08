@@ -1,6 +1,7 @@
 # ra-model 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
+const fn ra_model::openai::auth::OpenAiAuth::default_headers(& self) -> & BTreeMap < String , String >
 const fn ra_model::provider::ModelRegistration::defaults(& self) -> & ModelSettings
 const fn ra_model::provider::ModelSelector::protocol(& self) -> ApiProtocol
 const fn ra_model::provider::ModelSelector::provider(& self) -> & ProviderKey
@@ -14,6 +15,18 @@ const fn ra_model::provider::ResolvedModel::model_defaults(& self) -> & ModelSet
 const fn ra_model::provider::ResolvedModel::provider_defaults(& self) -> & ModelSettings
 const fn ra_model::provider::ResolvedModel::selector(& self) -> & ModelSelector
 enum ra_model::provider::UnknownPrefixPolicy
+fn ra_model::openai::auth::OpenAiAuth::base_url(& self) -> & str
+fn ra_model::openai::auth::OpenAiAuth::new(api_key : impl Into < String >) -> Self
+fn ra_model::openai::auth::OpenAiAuth::organization(& self) -> Option < & str >
+fn ra_model::openai::auth::OpenAiAuth::project(& self) -> Option < & str >
+fn ra_model::openai::auth::OpenAiAuth::with_base_url(mut self, base_url : impl Into < String >) -> Self
+fn ra_model::openai::auth::OpenAiAuth::with_default_header(mut self, name : impl Into < String >, value : impl Into < String >) -> Self
+fn ra_model::openai::auth::OpenAiAuth::with_organization(mut self, organization : impl Into < String >) -> Self
+fn ra_model::openai::auth::OpenAiAuth::with_project(mut self, project : impl Into < String >) -> Self
+fn ra_model::openai::responses::OpenAiResponsesModel::model(& self) -> & str
+fn ra_model::openai::responses::OpenAiResponsesModel::new(model : impl Into < String >, auth : OpenAiAuth) -> Result < Self >
+fn ra_model::openai::responses::OpenAiResponsesProvider::default_model(& self) -> & str
+fn ra_model::openai::responses::OpenAiResponsesProvider::new(auth : OpenAiAuth, default_model : impl Into < String >) -> Result < Self >
 fn ra_model::provider::ModelRegistration::aliases(& self) -> & [String]
 fn ra_model::provider::ModelRegistration::name(& self) -> & str
 fn ra_model::provider::ModelRegistration::new(name : impl Into < String >) -> Self
@@ -54,6 +67,9 @@ mod ra_model::protocol
 mod ra_model::provider
 mod ra_model::retry
 mod ra_model::usage
+struct ra_model::openai::auth::OpenAiAuth
+struct ra_model::openai::responses::OpenAiResponsesModel
+struct ra_model::openai::responses::OpenAiResponsesProvider
 struct ra_model::provider::ModelRegistration
 struct ra_model::provider::ModelSelector
 struct ra_model::provider::ProviderRegistration

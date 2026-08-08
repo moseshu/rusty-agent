@@ -105,6 +105,7 @@ const fn ra_core::item::message::Message::phase(& self) -> Option < OutputPhase 
 const fn ra_core::item::message::Message::role(& self) -> MessageRole
 const fn ra_core::item::message::Message::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::message::Message::unknown(& self) -> & Unknown
+const fn ra_core::item::message::Message::with_phase(mut self, phase : OutputPhase) -> Self
 const fn ra_core::item::message::MessageRole::label(self) -> & 'static str
 const fn ra_core::item::message::ModelResponse::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::message::ModelResponse::unknown(& self) -> & Unknown
@@ -454,6 +455,8 @@ fn ra_core::item::content::ThinkingBlock::new(thinking : impl Into < String >, s
 fn ra_core::item::content::ThinkingBlock::signature(& self) -> & str
 fn ra_core::item::content::ThinkingBlock::thinking(& self) -> & str
 fn ra_core::item::handoff::HandoffCall::new(call_id : CallId, target_agent : AgentId, arguments : Value) -> Self
+fn ra_core::item::handoff::HandoffCall::tool_name(& self) -> Option < & str >
+fn ra_core::item::handoff::HandoffCall::with_tool_name(mut self, tool_name : impl Into < String >) -> Self
 fn ra_core::item::handoff::HandoffOutput::new(call_id : CallId, source_agent : AgentId, target_agent : AgentId) -> Self
 fn ra_core::item::handoff::HandoffOutput::note(& self) -> Option < & str >
 fn ra_core::item::handoff::HandoffOutput::with_note(mut self, note : impl Into < String >) -> Self

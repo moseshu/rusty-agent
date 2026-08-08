@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = ["openai"]
-openai = ["dep:reqwest"]
+openai = ["dep:reqwest", "dep:base64"]
 anthropic = ["dep:reqwest"]
 # 兼容端点复用 OpenAI Chat codec；这是加法依赖，不与其他 provider 互斥。
 compat = ["openai"]
@@ -25,5 +25,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -10,12 +10,19 @@ use crate::compat::{SchemaVersion, Unknown};
 pub const HANDOFF_ITEM_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
 /// A model request to transfer control to another agent.
+///
+/// `tool_name` records the name the model actually called. A handoff reaches the wire as an
+/// ordinary function call, so replaying this item on a later turn needs that name — and the agent
+/// that receives control normally no longer advertises the handoff that led to it, which makes a
+/// reverse lookup by [`AgentId`] unavailable exactly when replay matters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HandoffCall {
     schema_version: SchemaVersion,
     call_id: CallId,
     target_agent: AgentId,
     arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -29,8 +36,16 @@ impl HandoffCall {
             call_id,
             target_agent,
             arguments,
+            tool_name: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records the tool name the model used to request this handoff.
+    #[must_use]
+    pub fn with_tool_name(mut self, tool_name: impl Into<String>) -> Self {
+        self.tool_name = Some(tool_name.into());
+        self
     }
 
     /// Schema version.
@@ -55,6 +70,12 @@ impl HandoffCall {
     #[must_use]
     pub const fn arguments(&self) -> &Value {
         &self.arguments
+    }
+
+    /// Tool name the model called, when the producing adapter recorded it.
+    #[must_use]
+    pub fn tool_name(&self) -> Option<&str> {
+        self.tool_name.as_deref()
     }
 
     /// Unknown fields retained during deserialization.

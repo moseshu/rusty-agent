@@ -90,6 +90,13 @@ impl Message {
         message
     }
 
+    /// Sets the assistant output phase while preserving all content blocks.
+    #[must_use]
+    pub const fn with_phase(mut self, phase: OutputPhase) -> Self {
+        self.phase = Some(phase);
+        self
+    }
+
     /// Schema version.
     #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
