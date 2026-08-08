@@ -20,3 +20,4 @@ futures = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 schemars = { workspace = true }
+sha2 = { workspace = true }

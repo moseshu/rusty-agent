@@ -81,6 +81,12 @@ impl Reasoning {
         self
     }
 
+    /// Removes only the provider item ID while retaining every replay-bearing field.
+    pub(super) fn without_id(mut self) -> Self {
+        self.id = None;
+        self
+    }
+
     /// Schema version.
     #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {

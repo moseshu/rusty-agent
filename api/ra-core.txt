@@ -109,6 +109,14 @@ const fn ra_core::item::message::MessageRole::label(self) -> & 'static str
 const fn ra_core::item::message::ModelResponse::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::message::ModelResponse::unknown(& self) -> & Unknown
 const fn ra_core::item::message::ModelResponse::usage(& self) -> & Usage
+const fn ra_core::item::normalization::InputItemNormalizer::new() -> Self
+const fn ra_core::item::normalization::InputItemNormalizer::with_orphan_policy(mut self, policy : OrphanPolicy) -> Self
+const fn ra_core::item::normalization::InputItemNormalizer::with_reasoning_id_policy(mut self, policy : ReasoningIdPolicy) -> Self
+const fn ra_core::item::normalization::InputItemOccurrenceKey::digest(& self) -> & InputItemDigest
+const fn ra_core::item::normalization::InputItemOccurrenceKey::item_id(& self) -> & ItemId
+const fn ra_core::item::normalization::InputItemOccurrenceKey::new(item_id : ItemId, digest : InputItemDigest) -> Self
+const fn ra_core::item::normalization::NormalizedInputItem::item(& self) -> & ModelInputItem
+const fn ra_core::item::normalization::NormalizedInputItem::occurrence_key(& self) -> Option < & InputItemOccurrenceKey >
 const fn ra_core::item::phase::OutputPhase::label(self) -> & 'static str
 const fn ra_core::item::reasoning::Reasoning::provider_data(& self) -> Option < & Value >
 const fn ra_core::item::reasoning::Reasoning::schema_version(& self) -> SchemaVersion
@@ -329,6 +337,8 @@ enum ra_core::item::RunItemKind
 enum ra_core::item::content::ContentBlock
 enum ra_core::item::content::ImageSource
 enum ra_core::item::message::MessageRole
+enum ra_core::item::normalization::OrphanPolicy
+enum ra_core::item::normalization::ReasoningIdPolicy
 enum ra_core::item::phase::OutputPhase
 enum ra_core::model::protocol::ApiProtocol
 enum ra_core::model::protocol::ReasoningCarrier
@@ -478,6 +488,12 @@ fn ra_core::item::message::ModelResponse::to_input_items(& self) -> Vec < ModelI
 fn ra_core::item::message::ModelResponse::with_request_id(mut self, request_id : impl Into < String >) -> Self
 fn ra_core::item::message::ModelResponse::with_response_id(mut self, response_id : impl Into < String >) -> Self
 fn ra_core::item::message::ModelResponse::with_usage(mut self, usage : Usage) -> Self
+fn ra_core::item::normalization::InputItemDigest::as_str(& self) -> & str
+fn ra_core::item::normalization::InputItemDigest::compute(item : & ModelInputItem) -> Result < Self , serde_json :: Error >
+fn ra_core::item::normalization::InputItemNormalizer::normalize_model_items(& self, items : & [ModelInputItem]) -> Result < NormalizedInput , serde_json :: Error >
+fn ra_core::item::normalization::InputItemNormalizer::normalize_run_items(& self, items : & [RunItem]) -> Result < NormalizedInput , serde_json :: Error >
+fn ra_core::item::normalization::NormalizedInput::entries(& self) -> & [NormalizedInputItem]
+fn ra_core::item::normalization::NormalizedInput::into_items(self) -> Vec < ModelInputItem >
 fn ra_core::item::reasoning::Reasoning::content(& self) -> & [String]
 fn ra_core::item::reasoning::Reasoning::encrypted_content(& self) -> Option < & str >
 fn ra_core::item::reasoning::Reasoning::id(& self) -> Option < & str >
@@ -567,6 +583,7 @@ mod ra_core::item::content
 mod ra_core::item::handoff
 mod ra_core::item::mcp
 mod ra_core::item::message
+mod ra_core::item::normalization
 mod ra_core::item::phase
 mod ra_core::item::reasoning
 mod ra_core::item::tool
@@ -621,6 +638,11 @@ struct ra_core::item::mcp::McpListTools
 struct ra_core::item::mcp::McpTool
 struct ra_core::item::message::Message
 struct ra_core::item::message::ModelResponse
+struct ra_core::item::normalization::InputItemDigest
+struct ra_core::item::normalization::InputItemNormalizer
+struct ra_core::item::normalization::InputItemOccurrenceKey
+struct ra_core::item::normalization::NormalizedInput
+struct ra_core::item::normalization::NormalizedInputItem
 struct ra_core::item::reasoning::Reasoning
 struct ra_core::item::tool::ToolApproval
 struct ra_core::item::tool::ToolCall
@@ -752,6 +774,11 @@ variant ra_core::item::content::ImageSource::LocalPath(LocalImageSource)
 variant ra_core::item::message::MessageRole::Assistant
 variant ra_core::item::message::MessageRole::System
 variant ra_core::item::message::MessageRole::User
+variant ra_core::item::normalization::OrphanPolicy::DropCallsWithoutOutputs
+variant ra_core::item::normalization::OrphanPolicy::DropUnpaired
+variant ra_core::item::normalization::OrphanPolicy::Preserve
+variant ra_core::item::normalization::ReasoningIdPolicy::Omit
+variant ra_core::item::normalization::ReasoningIdPolicy::Preserve
 variant ra_core::item::phase::OutputPhase::Commentary
 variant ra_core::item::phase::OutputPhase::Final
 variant ra_core::model::protocol::ApiProtocol::AnthropicMessages

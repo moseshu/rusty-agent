@@ -20,6 +20,8 @@ pub mod content;
 pub mod handoff;
 pub mod mcp;
 pub mod message;
+#[doc(hidden)]
+pub mod normalization;
 pub mod phase;
 pub mod reasoning;
 pub mod tool;
@@ -32,6 +34,11 @@ pub use content::{
 pub use handoff::{HandoffCall, HandoffOutput};
 pub use mcp::{McpApprovalRequest, McpApprovalResponse, McpListTools, McpTool};
 pub use message::{Message, MessageRole, ModelResponse};
+#[doc(hidden)]
+pub use normalization::{
+    InputItemDigest, InputItemNormalizer, InputItemOccurrenceKey, NormalizedInput,
+    NormalizedInputItem, OrphanPolicy, ReasoningIdPolicy,
+};
 pub use phase::OutputPhase;
 pub use reasoning::Reasoning;
 pub use tool::{ToolApproval, ToolCall, ToolCallOutput};
