@@ -396,6 +396,35 @@ async fn hosted_tools_from_extra_body_survive_alongside_function_tools() {
 }
 
 #[tokio::test]
+async fn tool_names_the_endpoint_would_reject_fail_locally() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({"id": "resp_name", "output": []})),
+    )
+    .await;
+
+    // `ra-core` keeps tool names open because the character set is an OpenAI fact, so the
+    // constraint has to be enforced here rather than discovered as a 400.
+    let error = model
+        .get_response(
+            ModelRequest::new(vec![], resolved(ModelSettings::new())).with_tools(vec![
+                ModelToolDefinition::new("mcp.github.search", json!({"type": "object"})),
+            ]),
+        )
+        .await
+        .expect_err("a dotted tool name is not accepted by OpenAI");
+    assert_eq!(error.code(), "caller");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock should answer")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn truncated_responses_are_not_reported_as_finished_answers() {
     let server = MockServer::start().await;
     let model = mounted_model(

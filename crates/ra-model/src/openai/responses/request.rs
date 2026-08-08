@@ -514,6 +514,7 @@ fn merge_tools(
             )
         }));
     for (name, description, schema, strict) in neutral {
+        validate_function_name(name)?;
         if !names.insert(name.to_owned()) {
             return Err(Error::caller(format!(
                 "duplicate OpenAI tool/handoff name `{name}`"
@@ -527,6 +528,24 @@ fn merge_tools(
         body.insert("tools".to_owned(), Value::Array(lowered));
     }
     Ok(populated)
+}
+
+/// Rejects a name the endpoint will reject, while the call site is still visible.
+///
+/// `ra-core` keeps tool names open on purpose — the character set is an `OpenAI` fact, not a
+/// protocol-neutral one — so the constraint is enforced here, at the boundary that owns it.
+fn validate_function_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(Error::caller(format!(
+            "OpenAI tool name `{name}` must be 1-64 characters of [A-Za-z0-9_-]"
+        )));
+    }
+    Ok(())
 }
 
 fn function_tool(name: &str, description: Option<&str>, schema: &Value, strict: bool) -> Value {

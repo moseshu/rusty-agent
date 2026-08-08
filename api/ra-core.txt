@@ -5,6 +5,10 @@ async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :
 async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
+async fn ra_core::tool::Tool::call(& self, invocation : ToolInvocation < '_ >) -> Result < ToolOutput >
+async fn ra_core::tool::Tool::handle_failure(& self, _invocation : & ToolInvocation < '_ >, _error : & crate :: error :: Error) -> Result < Option < ToolOutput > >
+async fn ra_core::tool::Tool::is_enabled(& self, _context : & dyn ToolRuntimeContext) -> Result < bool >
+async fn ra_core::tool::Tool::needs_approval(& self, _invocation : & ToolInvocation < '_ >) -> Result < bool >
 const fn ra_core::cancel::CancelOnDrop::scope(& self) -> & CancelScope
 const fn ra_core::cancel::CancelReason::is_expiry(& self) -> bool
 const fn ra_core::cancel::CancelReason::is_user_initiated(& self) -> bool
@@ -256,6 +260,45 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::arguments(& self) -> & Value
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::call_id(& self) -> & CallId
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::caller(& self) -> ToolCaller
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::context(& self) -> & dyn ToolRuntimeContext
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::new(call_id : & 'a CallId, arguments : & 'a Value) -> Self
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::with_context(mut self, context : & 'a dyn ToolRuntimeContext) -> Self
+const fn ra_core::tool::options::ToolOptions::approval(& self) -> ToolApprovalPolicy
+const fn ra_core::tool::options::ToolOptions::availability(& self) -> ToolAvailability
+const fn ra_core::tool::options::ToolOptions::defer_loading(& self) -> bool
+const fn ra_core::tool::options::ToolOptions::failure_handling(& self) -> ToolFailureHandling
+const fn ra_core::tool::options::ToolOptions::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::options::ToolOptions::timeout(& self) -> Option < Duration >
+const fn ra_core::tool::options::ToolOptions::timeout_behavior(& self) -> ToolTimeoutBehavior
+const fn ra_core::tool::options::ToolOptions::unknown(& self) -> & Unknown
+const fn ra_core::tool::options::ToolOptions::with_approval(mut self, approval : ToolApprovalPolicy) -> Self
+const fn ra_core::tool::options::ToolOptions::with_availability(mut self, availability : ToolAvailability) -> Self
+const fn ra_core::tool::options::ToolOptions::with_defer_loading(mut self, defer_loading : bool) -> Self
+const fn ra_core::tool::options::ToolOptions::with_failure_handling(mut self, handling : ToolFailureHandling) -> Self
+const fn ra_core::tool::options::ToolOptions::with_timeout(mut self, timeout : Duration) -> Self
+const fn ra_core::tool::options::ToolOptions::with_timeout_behavior(mut self, behavior : ToolTimeoutBehavior) -> Self
+const fn ra_core::tool::origin::ToolLookupKey::is_deferred_top_level(& self) -> bool
+const fn ra_core::tool::origin::ToolLookupKey::kind(& self) -> ToolLookupKind
+const fn ra_core::tool::origin::ToolLookupKey::namespace(& self) -> Option < & ToolNamespace >
+const fn ra_core::tool::origin::ToolOrigin::lookup_key(& self) -> & ToolLookupKey
+const fn ra_core::tool::origin::ToolOrigin::namespace(& self) -> Option < & ToolNamespace >
+const fn ra_core::tool::origin::ToolOrigin::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::origin::ToolOrigin::unknown(& self) -> & Unknown
+const fn ra_core::tool::schema::DecodedToolInput::type_name(& self) -> & 'static str
+const fn ra_core::tool::schema::FuncSchema::inject_tool_context(& self) -> bool
+const fn ra_core::tool::schema::FuncSchema::input_type_name(& self) -> & 'static str
+const fn ra_core::tool::schema::FuncSchema::return_type_name(& self) -> Option < & 'static str >
+const fn ra_core::tool::schema::FuncSchema::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::schema::FuncSchema::tool_schema(& self) -> & ToolSchema
+const fn ra_core::tool::schema::FuncSchema::with_tool_context(mut self, inject : bool) -> Self
+const fn ra_core::tool::schema::ToolSchema::input_schema(& self) -> & Value
+const fn ra_core::tool::schema::ToolSchema::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::schema::ToolSchema::strict_json_schema(& self) -> bool
+const fn ra_core::tool::schema::ToolSchema::unknown(& self) -> & Unknown
 const fn ra_core::trace::SpanKind::level(& self) -> Level
 const fn ra_core::trace::SpanKind::required_fields(& self) -> & 'static [& 'static str]
 const fn ra_core::trace::SpanKind::span_name(& self) -> & 'static str
@@ -294,6 +337,10 @@ const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersio
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::origin::TOOL_ORIGIN_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::schema::FUNC_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::schema::TOOL_SCHEMA_VERSION: SchemaVersion
 const ra_core::trace::field::AGENT_NAME: & str
 const ra_core::trace::field::ALL: & [& str]
 const ra_core::trace::field::CANCEL_REASON: & str
@@ -356,6 +403,13 @@ enum ra_core::model::settings::Effort
 enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
 enum ra_core::model::stream::ModelStreamEvent
+enum ra_core::tool::invocation::ToolCaller
+enum ra_core::tool::options::ToolApprovalPolicy
+enum ra_core::tool::options::ToolAvailability
+enum ra_core::tool::options::ToolFailureHandling
+enum ra_core::tool::options::ToolTimeoutBehavior
+enum ra_core::tool::origin::ToolLookupKind
+enum ra_core::tool::output::ToolOutput
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
@@ -566,6 +620,54 @@ fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_t
 fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
+fn ra_core::tool::Tool::model_definition(& self) -> ModelToolDefinition
+fn ra_core::tool::Tool::options(& self) -> ToolOptions
+fn ra_core::tool::Tool::origin(& self) -> & ToolOrigin
+fn ra_core::tool::Tool::schema(& self) -> & ToolSchema
+fn ra_core::tool::Tool::validate(& self) -> Result < () >
+fn ra_core::tool::invocation::ToolRuntimeContext::as_any(& self) -> & (dyn Any + Send + Sync)
+fn ra_core::tool::namespace::ToolNamespace::as_str(& self) -> & str
+fn ra_core::tool::namespace::ToolNamespace::new(value : impl Into < String >) -> Result < Self >
+fn ra_core::tool::options::ToolGuardrailId::as_str(& self) -> & str
+fn ra_core::tool::options::ToolGuardrailId::new(value : impl Into < String >) -> Result < Self >
+fn ra_core::tool::options::ToolOptions::allowed_callers(& self) -> Option < & [ToolCaller] >
+fn ra_core::tool::options::ToolOptions::allows_caller(& self, caller : ToolCaller) -> bool
+fn ra_core::tool::options::ToolOptions::input_guardrails(& self) -> & [ToolGuardrailId]
+fn ra_core::tool::options::ToolOptions::new() -> Self
+fn ra_core::tool::options::ToolOptions::output_guardrails(& self) -> & [ToolGuardrailId]
+fn ra_core::tool::options::ToolOptions::with_allowed_callers(mut self, callers : impl IntoIterator < Item = ToolCaller >) -> Self
+fn ra_core::tool::options::ToolOptions::with_input_guardrail(mut self, guardrail : ToolGuardrailId) -> Self
+fn ra_core::tool::options::ToolOptions::with_output_guardrail(mut self, guardrail : ToolGuardrailId) -> Self
+fn ra_core::tool::origin::ToolLookupKey::bare(name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::origin::ToolLookupKey::deferred_top_level(name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::origin::ToolLookupKey::for_call(name : impl Into < String >, namespace : Option < ToolNamespace >) -> Result < Self >
+fn ra_core::tool::origin::ToolLookupKey::name(& self) -> & str
+fn ra_core::tool::origin::ToolLookupKey::namespaced(namespace : ToolNamespace, name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::origin::ToolOrigin::deferred_top_level(name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::origin::ToolOrigin::from_lookup_key(lookup_key : ToolLookupKey) -> Result < Self >
+fn ra_core::tool::origin::ToolOrigin::name(& self) -> & str
+fn ra_core::tool::origin::ToolOrigin::namespaced(namespace : ToolNamespace, name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::origin::ToolOrigin::new(name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::origin::ToolOrigin::qualified_name(& self) -> & str
+fn ra_core::tool::origin::ToolOrigin::validate(& self) -> Result < () >
+fn ra_core::tool::output::ToolOutput::as_text(& self) -> Option < & str >
+fn ra_core::tool::output::ToolOutput::text(text : impl Into < String >) -> Self
+fn ra_core::tool::schema::DecodedToolInput::downcast< T : ToolInput >(self) -> Result < T >
+fn ra_core::tool::schema::DecodedToolInput::downcast_ref< T : ToolInput >(& self) -> Option < & T >
+fn ra_core::tool::schema::FuncSchema::decode_arguments(& self, arguments : & str) -> Result < DecodedToolInput >
+fn ra_core::tool::schema::FuncSchema::for_input< T : ToolInput >(name : impl Into < String >) -> Result < Self >
+fn ra_core::tool::schema::FuncSchema::with_return_type< T : 'static >(mut self) -> Self
+fn ra_core::tool::schema::ToolInput::func_schema(name : impl Into < String >) -> Result < FuncSchema > where Self : Sized ,
+fn ra_core::tool::schema::ToolInput::tool_schema(name : impl Into < String >) -> Result < ToolSchema > where Self : Sized ,
+fn ra_core::tool::schema::ToolSchema::canonical_json(& self) -> Result < String >
+fn ra_core::tool::schema::ToolSchema::description(& self) -> Option < & str >
+fn ra_core::tool::schema::ToolSchema::input_schema_hash(& self) -> & str
+fn ra_core::tool::schema::ToolSchema::loose(name : impl Into < String >, input_schema : Value) -> Result < Self >
+fn ra_core::tool::schema::ToolSchema::name(& self) -> & str
+fn ra_core::tool::schema::ToolSchema::new(name : impl Into < String >, input_schema : Value) -> Result < Self >
+fn ra_core::tool::schema::ToolSchema::to_model_definition(& self) -> ModelToolDefinition
+fn ra_core::tool::schema::ToolSchema::validate(& self) -> Result < () >
+fn ra_core::tool::schema::ToolSchema::with_description(mut self, description : impl Into < String >) -> Self
 fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
 fn ra_core::trace::SpanKind::label(& self) -> & str
 fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope : & ScopeKind)
@@ -602,7 +704,9 @@ mod ra_core::session
 mod ra_core::state
 mod ra_core::step
 mod ra_core::tool
+mod ra_core::tool::invocation
 mod ra_core::tool::namespace
+mod ra_core::tool::options
 mod ra_core::tool::origin
 mod ra_core::tool::output
 mod ra_core::tool::schema
@@ -666,9 +770,22 @@ struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
+struct ra_core::tool::invocation::ToolInvocation
+struct ra_core::tool::namespace::ToolNamespace
+struct ra_core::tool::options::ToolGuardrailId
+struct ra_core::tool::options::ToolOptions
+struct ra_core::tool::origin::ToolLookupKey
+struct ra_core::tool::origin::ToolOrigin
+struct ra_core::tool::schema::DecodedToolInput
+struct ra_core::tool::schema::FuncSchema
+struct ra_core::tool::schema::ToolSchema
 struct ra_core::usage::Usage
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
+trait ra_core::tool::Tool
+trait ra_core::tool::invocation::ToolRuntimeContext
+trait ra_core::tool::schema::ToolInput
+trait ra_core::tool::schema::ToolInputRequirements
 type ra_core::error::BoxError
 type ra_core::error::Result
 type ra_core::model::ModelStream
@@ -831,6 +948,23 @@ variant ra_core::model::settings::ToolChoice::Required
 variant ra_core::model::settings::ToolChoice::Tool(String)
 variant ra_core::model::stream::ModelStreamEvent::RawResponse(RawResponseEvent)
 variant ra_core::model::stream::ModelStreamEvent::RunItem(RunItemStreamEvent)
+variant ra_core::tool::invocation::ToolCaller::Direct
+variant ra_core::tool::invocation::ToolCaller::Programmatic
+variant ra_core::tool::options::ToolApprovalPolicy::Always
+variant ra_core::tool::options::ToolApprovalPolicy::Dynamic
+variant ra_core::tool::options::ToolApprovalPolicy::Never
+variant ra_core::tool::options::ToolAvailability::Disabled
+variant ra_core::tool::options::ToolAvailability::Dynamic
+variant ra_core::tool::options::ToolAvailability::Enabled
+variant ra_core::tool::options::ToolFailureHandling::Custom
+variant ra_core::tool::options::ToolFailureHandling::ModelVisible
+variant ra_core::tool::options::ToolFailureHandling::Propagate
+variant ra_core::tool::options::ToolTimeoutBehavior::ModelVisible
+variant ra_core::tool::options::ToolTimeoutBehavior::Propagate
+variant ra_core::tool::origin::ToolLookupKind::Bare
+variant ra_core::tool::origin::ToolLookupKind::DeferredTopLevel
+variant ra_core::tool::origin::ToolLookupKind::Namespaced
+variant ra_core::tool::output::ToolOutput::Text { text: String }
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function
