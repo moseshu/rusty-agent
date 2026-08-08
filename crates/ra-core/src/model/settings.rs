@@ -43,7 +43,11 @@
 //!   in a protocol-neutral type would violate the R1 rule that protocol-specific facts stay out of
 //!   the neutral layer. It belongs to the adapter (R1-11 / R1-14).
 
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -576,6 +580,41 @@ pub struct ResolvedModelSettings {
 }
 
 impl ResolvedModelSettings {
+    /// Drops tool-selection settings that the turn's advertised tool surface cannot satisfy.
+    ///
+    /// `tool_choice` and `parallel_tool_calls` are the two settings whose meaning depends on which
+    /// tools exist, and the surface is not final until dynamic availability has been resolved.
+    /// This is why turn preparation resolves settings *after* tools rather than before: without
+    /// this step a selector that survived the four-layer merge can name a tool that this turn does
+    /// not advertise, and every provider has to reject the request on its own.
+    ///
+    /// Unsatisfiable selections **degrade to the provider default instead of erroring**. A tool
+    /// switched off for one turn is the intended use of dynamic availability, and ending the run
+    /// over it would make that feature unusable. Two selections survive an empty surface:
+    /// [`ToolChoice::None`] still says something true, and [`ToolChoice::Mcp`] names a
+    /// server-hosted tool that never appears in the neutral surface.
+    #[must_use]
+    pub fn reconcile_tool_surface<'a>(
+        mut self,
+        advertised: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let advertised: BTreeSet<&str> = advertised.into_iter().collect();
+
+        self.tool_choice = match self.tool_choice.take() {
+            Some(choice @ (ToolChoice::None | ToolChoice::Mcp(_))) => Some(choice),
+            Some(ToolChoice::Tool(name)) => advertised
+                .contains(name.as_str())
+                .then_some(ToolChoice::Tool(name)),
+            Some(_) if advertised.is_empty() => None,
+            other => other,
+        };
+        if advertised.is_empty() {
+            self.parallel_tool_calls = None;
+        }
+
+        self
+    }
+
     /// Active provider registration key.
     #[must_use]
     pub const fn provider(&self) -> &ProviderKey {

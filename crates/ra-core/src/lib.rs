@@ -13,6 +13,7 @@
 //! not shrink), and the turn-settlement intermediates in [`step`] are `Internal` (once they leak
 //! into the public API, R1 and R3 can no longer be refactored).
 
+pub mod agent;
 pub mod budget;
 pub mod cancel;
 pub mod capability;

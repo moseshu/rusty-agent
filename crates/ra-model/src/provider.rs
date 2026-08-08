@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result},
     model::{
-        ApiProtocol, JsonMap, Model, ModelProvider, ModelSettings, ProviderKey,
-        ResolvedModelSettings,
+        ApiProtocol, JsonMap, Model, ModelProvider, ModelResolver, ModelSelector, ModelSettings,
+        ProviderKey, ResolvedModel,
     },
 };
 
@@ -303,103 +303,6 @@ impl ProviderRegistryBuilder {
     }
 }
 
-/// Parsed and canonicalized provider/model selection.
-///
-/// `provider` is always the canonical registration key, never the input alias. `model` is the
-/// provider-facing model identifier after local alias resolution. A missing model delegates to the
-/// provider's own default.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelSelector {
-    provider: ProviderKey,
-    model: Option<String>,
-    protocol: ApiProtocol,
-}
-
-impl ModelSelector {
-    /// Canonical provider registration key.
-    #[must_use]
-    pub const fn provider(&self) -> &ProviderKey {
-        &self.provider
-    }
-
-    /// Provider-facing model identifier, or `None` for the provider default.
-    #[must_use]
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-
-    /// Wire protocol selected by the provider registration.
-    #[must_use]
-    pub const fn protocol(&self) -> ApiProtocol {
-        self.protocol
-    }
-}
-
-/// A selected model plus the two registration-owned settings layers needed by the runtime.
-pub struct ResolvedModel {
-    selector: ModelSelector,
-    model: Arc<dyn Model>,
-    provider_defaults: ModelSettings,
-    model_defaults: ModelSettings,
-}
-
-impl ResolvedModel {
-    /// Canonical provider/model selection used for this instance.
-    #[must_use]
-    pub const fn selector(&self) -> &ModelSelector {
-        &self.selector
-    }
-
-    /// Resolved model trait object.
-    #[must_use]
-    pub const fn model(&self) -> &Arc<dyn Model> {
-        &self.model
-    }
-
-    /// Provider-registration settings layer.
-    #[must_use]
-    pub const fn provider_defaults(&self) -> &ModelSettings {
-        &self.provider_defaults
-    }
-
-    /// Resolved-model settings layer.
-    #[must_use]
-    pub const fn model_defaults(&self) -> &ModelSettings {
-        &self.model_defaults
-    }
-
-    /// Completes the four-layer immutable settings merge for this selected model.
-    #[must_use]
-    pub fn resolve_settings(
-        &self,
-        agent_defaults: &ModelSettings,
-        run_overrides: &ModelSettings,
-    ) -> ResolvedModelSettings {
-        self.provider_defaults.resolve(
-            self.selector.provider(),
-            agent_defaults,
-            &self.model_defaults,
-            run_overrides,
-        )
-    }
-
-    /// Consumes the resolution and returns the model trait object.
-    #[must_use]
-    pub fn into_model(self) -> Arc<dyn Model> {
-        self.model
-    }
-}
-
-impl fmt::Debug for ResolvedModel {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ResolvedModel")
-            .field("selector", &self.selector)
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Default)]
 struct ProviderCache {
     closed: bool,
@@ -507,6 +410,10 @@ impl ProviderRegistry {
     }
 
     /// Resolves a selector through a cached provider instance.
+    ///
+    /// This is the inherent form of [`ModelResolver::resolve_model`], which the registry also
+    /// implements so the loop kernel can take a resolver without depending on this crate. Both
+    /// return the same [`ResolvedModel`], so which one a call site picks is not observable.
     pub fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
         let (selector, model_defaults) = self.select_with_defaults(model_name)?;
         let registration = self
@@ -516,12 +423,12 @@ impl ProviderRegistry {
         let provider = self.provider_instance(registration)?;
         let model = provider.get_model(selector.model())?;
 
-        Ok(ResolvedModel {
+        Ok(ResolvedModel::new(
             selector,
             model,
-            provider_defaults: registration.defaults.clone(),
+            registration.defaults.clone(),
             model_defaults,
-        })
+        ))
     }
 
     /// Closes every cached provider instance exactly once.
@@ -562,11 +469,7 @@ impl ProviderRegistry {
         let (model, model_defaults) = registration.resolve_model(routed_model.as_deref());
 
         Ok((
-            ModelSelector {
-                provider,
-                model,
-                protocol: registration.protocol,
-            },
+            ModelSelector::new(provider, model, registration.protocol),
             model_defaults,
         ))
     }
@@ -650,6 +553,12 @@ impl ModelProvider for ProviderRegistry {
 
     async fn close(&self) -> Result<()> {
         ProviderRegistry::close(self).await
+    }
+}
+
+impl ModelResolver for ProviderRegistry {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        Self::resolve_model(self, model_name)
     }
 }
 

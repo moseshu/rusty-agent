@@ -14,6 +14,7 @@ use crate::{error::Result, item::ModelResponse};
 pub(crate) mod duration;
 pub mod protocol;
 pub mod request;
+pub mod resolution;
 pub mod retry;
 pub mod settings;
 pub mod stream;
@@ -27,6 +28,7 @@ pub use request::{
     ConversationContinuation, ModelHandoffDefinition, ModelOutputSchema, ModelRequest,
     ModelToolDefinition, ModelTracing,
 };
+pub use resolution::{ModelSelector, ResolvedModel};
 pub use retry::{
     ModelRetryAdviceRequest, ModelRetrySettings, ReplaySafety, RetryAdvice, RetryBackoffSettings,
 };
@@ -72,4 +74,15 @@ pub trait ModelProvider: Send + Sync + 'static {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Resolves an application-level model selector across provider registrations.
+///
+/// [`ModelProvider`] resolves a name inside one already-selected provider. This higher-level
+/// contract also preserves the canonical provider identity, wire protocol, and the two
+/// registration-owned settings layers needed by turn preparation. Keeping the contract in core
+/// lets the loop kernel depend on an injected resolver without depending on `ra-model`.
+pub trait ModelResolver: Send + Sync + 'static {
+    /// Resolves a selector, or the resolver's configured defaults when it is absent.
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel>;
 }

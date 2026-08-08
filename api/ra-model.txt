@@ -3,17 +3,11 @@
 async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
 const fn ra_model::openai::auth::OpenAiAuth::default_headers(& self) -> & BTreeMap < String , String >
 const fn ra_model::provider::ModelRegistration::defaults(& self) -> & ModelSettings
-const fn ra_model::provider::ModelSelector::protocol(& self) -> ApiProtocol
-const fn ra_model::provider::ModelSelector::provider(& self) -> & ProviderKey
 const fn ra_model::provider::ProviderRegistration::defaults(& self) -> & ModelSettings
 const fn ra_model::provider::ProviderRegistration::key(& self) -> & ProviderKey
 const fn ra_model::provider::ProviderRegistration::protocol(& self) -> ApiProtocol
 const fn ra_model::provider::ProviderRegistry::default_provider(& self) -> & ProviderKey
 const fn ra_model::provider::ProviderRegistry::unknown_prefix_policy(& self) -> & UnknownPrefixPolicy
-const fn ra_model::provider::ResolvedModel::model(& self) -> & Arc < dyn Model >
-const fn ra_model::provider::ResolvedModel::model_defaults(& self) -> & ModelSettings
-const fn ra_model::provider::ResolvedModel::provider_defaults(& self) -> & ModelSettings
-const fn ra_model::provider::ResolvedModel::selector(& self) -> & ModelSelector
 enum ra_model::provider::UnknownPrefixPolicy
 fn ra_model::openai::auth::OpenAiAuth::base_url(& self) -> & str
 fn ra_model::openai::auth::OpenAiAuth::new(api_key : impl Into < String >) -> Self
@@ -32,7 +26,6 @@ fn ra_model::provider::ModelRegistration::name(& self) -> & str
 fn ra_model::provider::ModelRegistration::new(name : impl Into < String >) -> Self
 fn ra_model::provider::ModelRegistration::with_alias(mut self, alias : impl Into < String >) -> Self
 fn ra_model::provider::ModelRegistration::with_defaults(mut self, defaults : ModelSettings) -> Self
-fn ra_model::provider::ModelSelector::model(& self) -> Option < & str >
 fn ra_model::provider::ProviderFactory::create(& self) -> Result < Arc < dyn ModelProvider > >
 fn ra_model::provider::ProviderRegistration::aliases(& self) -> & [String]
 fn ra_model::provider::ProviderRegistration::models(& self) -> & [ModelRegistration]
@@ -52,8 +45,6 @@ fn ra_model::provider::ProviderRegistryBuilder::build(self) -> Result < Provider
 fn ra_model::provider::ProviderRegistryBuilder::new(default_provider : ProviderKey) -> Self
 fn ra_model::provider::ProviderRegistryBuilder::register(mut self, registration : ProviderRegistration) -> Self
 fn ra_model::provider::ProviderRegistryBuilder::unknown_prefix_policy(mut self, policy : UnknownPrefixPolicy) -> Self
-fn ra_model::provider::ResolvedModel::into_model(self) -> Arc < dyn Model >
-fn ra_model::provider::ResolvedModel::resolve_settings(& self, agent_defaults : & ModelSettings, run_overrides : & ModelSettings) -> ResolvedModelSettings
 mod ra_model::anthropic
 mod ra_model::anthropic::betas
 mod ra_model::compat
@@ -71,11 +62,9 @@ struct ra_model::openai::auth::OpenAiAuth
 struct ra_model::openai::responses::OpenAiResponsesModel
 struct ra_model::openai::responses::OpenAiResponsesProvider
 struct ra_model::provider::ModelRegistration
-struct ra_model::provider::ModelSelector
 struct ra_model::provider::ProviderRegistration
 struct ra_model::provider::ProviderRegistry
 struct ra_model::provider::ProviderRegistryBuilder
-struct ra_model::provider::ResolvedModel
 trait ra_model::provider::ProviderFactory
 variant ra_model::provider::UnknownPrefixPolicy::Error
 variant ra_model::provider::UnknownPrefixPolicy::ForwardTo(ProviderKey)

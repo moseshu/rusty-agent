@@ -9,6 +9,9 @@ async fn ra_core::tool::Tool::call(& self, invocation : ToolInvocation < '_ >) -
 async fn ra_core::tool::Tool::handle_failure(& self, _invocation : & ToolInvocation < '_ >, _error : & crate :: error :: Error) -> Result < Option < ToolOutput > >
 async fn ra_core::tool::Tool::is_enabled(& self, _context : & dyn ToolRuntimeContext) -> Result < bool >
 async fn ra_core::tool::Tool::needs_approval(& self, _invocation : & ToolInvocation < '_ >) -> Result < bool >
+const fn ra_core::agent::AgentSpec::id(& self) -> & AgentId
+const fn ra_core::agent::AgentSpec::instructions(& self) -> Option < & AgentInstructions >
+const fn ra_core::agent::AgentSpec::model_settings(& self) -> & ModelSettings
 const fn ra_core::cancel::CancelOnDrop::scope(& self) -> & CancelScope
 const fn ra_core::cancel::CancelReason::is_expiry(& self) -> bool
 const fn ra_core::cancel::CancelReason::is_user_initiated(& self) -> bool
@@ -182,6 +185,12 @@ const fn ra_core::model::request::ModelToolDefinition::strict(& self) -> bool
 const fn ra_core::model::request::ModelToolDefinition::with_strict(mut self, strict : bool) -> Self
 const fn ra_core::model::request::ModelTracing::include_data(self) -> bool
 const fn ra_core::model::request::ModelTracing::is_disabled(self) -> bool
+const fn ra_core::model::resolution::ModelSelector::protocol(& self) -> ApiProtocol
+const fn ra_core::model::resolution::ModelSelector::provider(& self) -> & ProviderKey
+const fn ra_core::model::resolution::ResolvedModel::model(& self) -> & Arc < dyn Model >
+const fn ra_core::model::resolution::ResolvedModel::model_defaults(& self) -> & ModelSettings
+const fn ra_core::model::resolution::ResolvedModel::provider_defaults(& self) -> & ModelSettings
+const fn ra_core::model::resolution::ResolvedModel::selector(& self) -> & ModelSelector
 const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::attempt(& self) -> u32
 const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::continuation(& self) -> & ConversationContinuation
 const fn ra_core::model::retry::ModelRetryAdviceRequest < 'a >::error(& self) -> & Error
@@ -415,6 +424,25 @@ enum ra_core::tool::origin::ToolLookupKind
 enum ra_core::tool::output::ToolOutput
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
+fn ra_core::agent::AgentInstructions::as_static(& self) -> Option < & str >
+fn ra_core::agent::AgentInstructions::static_text(text : impl Into < String >) -> Self
+fn ra_core::agent::AgentSpec::builder() -> AgentSpecBuilder
+fn ra_core::agent::AgentSpec::model(& self) -> Option < & str >
+fn ra_core::agent::AgentSpec::name(& self) -> & str
+fn ra_core::agent::AgentSpec::to_builder(& self) -> AgentSpecBuilder
+fn ra_core::agent::AgentSpec::tools(& self) -> & [Arc < dyn Tool >]
+fn ra_core::agent::AgentSpecBuilder::build(self) -> Result < Arc < AgentSpec > >
+fn ra_core::agent::AgentSpecBuilder::clear_instructions(mut self) -> Self
+fn ra_core::agent::AgentSpecBuilder::clear_model(mut self) -> Self
+fn ra_core::agent::AgentSpecBuilder::clear_tools(mut self) -> Self
+fn ra_core::agent::AgentSpecBuilder::id(mut self, id : AgentId) -> Self
+fn ra_core::agent::AgentSpecBuilder::instructions(mut self, instructions : impl Into < String >) -> Self
+fn ra_core::agent::AgentSpecBuilder::model(mut self, model : impl Into < String >) -> Self
+fn ra_core::agent::AgentSpecBuilder::model_settings(mut self, model_settings : ModelSettings) -> Self
+fn ra_core::agent::AgentSpecBuilder::name(mut self, name : impl Into < String >) -> Self
+fn ra_core::agent::AgentSpecBuilder::new() -> Self
+fn ra_core::agent::AgentSpecBuilder::tool(mut self, tool : Arc < dyn Tool >) -> Self
+fn ra_core::agent::AgentSpecBuilder::tools(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
 fn ra_core::cancel::CancelReason::code(& self) -> & str
 fn ra_core::cancel::CancelReason::custom(label : impl Into < Cow < 'static , str > >) -> Self
@@ -574,6 +602,7 @@ fn ra_core::item::tool::ToolCallOutput::new(call_id : CallId, output : Value) ->
 fn ra_core::model::Model::get_retry_advice(& self, _request : & ModelRetryAdviceRequest < '_ >) -> Option < RetryAdvice >
 fn ra_core::model::Model::stream_response(& self, request : ModelRequest) -> ModelStream < '_ >
 fn ra_core::model::ModelProvider::get_model(& self, model_name : Option < & str >) -> Result < Arc < dyn Model > >
+fn ra_core::model::ModelResolver::resolve_model(& self, model_name : Option < & str >) -> Result < ResolvedModel >
 fn ra_core::model::request::ConversationContinuation::conversation_id(& self) -> Option < & str >
 fn ra_core::model::request::ConversationContinuation::previous_response_id(& self) -> Option < & str >
 fn ra_core::model::request::ModelHandoffDefinition::description(& self) -> Option < & str >
@@ -598,6 +627,11 @@ fn ra_core::model::request::ModelToolDefinition::description(& self) -> Option <
 fn ra_core::model::request::ModelToolDefinition::name(& self) -> & str
 fn ra_core::model::request::ModelToolDefinition::new(name : impl Into < String >, input_schema : Value) -> Self
 fn ra_core::model::request::ModelToolDefinition::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::model::resolution::ModelSelector::model(& self) -> Option < & str >
+fn ra_core::model::resolution::ModelSelector::new(provider : ProviderKey, model : Option < String >, protocol : ApiProtocol) -> Self
+fn ra_core::model::resolution::ResolvedModel::into_model(self) -> Arc < dyn Model >
+fn ra_core::model::resolution::ResolvedModel::new(selector : ModelSelector, model : Arc < dyn Model >, provider_defaults : ModelSettings, model_defaults : ModelSettings) -> Self
+fn ra_core::model::resolution::ResolvedModel::resolve_settings(& self, agent_defaults : & ModelSettings, run_overrides : & ModelSettings) -> ResolvedModelSettings
 fn ra_core::model::retry::ModelRetrySettings::new() -> Self
 fn ra_core::model::retry::ModelRetrySettings::with_backoff(mut self, backoff : RetryBackoffSettings) -> Self
 fn ra_core::model::retry::RetryAdvice::reason(& self) -> Option < & str >
@@ -617,6 +651,7 @@ fn ra_core::model::settings::ModelSettings::with_retry(mut self, retry : ModelRe
 fn ra_core::model::settings::ModelSettings::with_tool_choice(mut self, tool_choice : ToolChoice) -> Self
 fn ra_core::model::settings::ProviderKey::as_str(& self) -> & str
 fn ra_core::model::settings::ProviderKey::new(value : impl Into < String >) -> Self
+fn ra_core::model::settings::ResolvedModelSettings::reconcile_tool_surface< 'a >(mut self, advertised : impl IntoIterator < Item = & 'a str >) -> Self
 fn ra_core::model::settings::ResolvedModelSettings::to_traceable_value(& self) -> serde_json :: Result < Value >
 fn ra_core::model::stream::RawResponseEvent::event_type(& self) -> & str
 fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_type : impl Into < String >, payload : Value) -> Self
@@ -677,6 +712,7 @@ fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope :
 fn ra_core::trace::record_error(span : & Span, err : & Error)
 fn ra_core::trace::record_outcome(span : & Span, outcome : SpanOutcome)
 fn ra_core::usage::Usage::new(input_tokens : u64, output_tokens : u64) -> Self
+mod ra_core::agent
 mod ra_core::budget
 mod ra_core::cancel
 mod ra_core::capability
@@ -698,6 +734,7 @@ mod ra_core::item::tool
 mod ra_core::model
 mod ra_core::model::protocol
 mod ra_core::model::request
+mod ra_core::model::resolution
 mod ra_core::model::retry
 mod ra_core::model::settings
 mod ra_core::model::stream
@@ -716,6 +753,9 @@ mod ra_core::tool::schema
 mod ra_core::trace
 mod ra_core::trace::field
 mod ra_core::usage
+struct ra_core::agent::AgentInstructions
+struct ra_core::agent::AgentSpec
+struct ra_core::agent::AgentSpecBuilder
 struct ra_core::cancel::CancelOnDrop
 struct ra_core::cancel::CancelScope
 struct ra_core::cancel::Deadline
@@ -763,6 +803,8 @@ struct ra_core::model::request::ModelHandoffDefinition
 struct ra_core::model::request::ModelOutputSchema
 struct ra_core::model::request::ModelRequest
 struct ra_core::model::request::ModelToolDefinition
+struct ra_core::model::resolution::ModelSelector
+struct ra_core::model::resolution::ResolvedModel
 struct ra_core::model::retry::ModelRetryAdviceRequest
 struct ra_core::model::retry::ModelRetrySettings
 struct ra_core::model::retry::RetryAdvice
@@ -785,6 +827,7 @@ struct ra_core::tool::schema::ToolSchema
 struct ra_core::usage::Usage
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
+trait ra_core::model::ModelResolver
 trait ra_core::tool::Tool
 trait ra_core::tool::invocation::ToolRuntimeContext
 trait ra_core::tool::schema::ToolInput

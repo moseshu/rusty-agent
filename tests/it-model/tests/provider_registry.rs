@@ -11,7 +11,8 @@ use ra_core::{
     error::{Error, Result},
     item::ModelResponse,
     model::{
-        ApiProtocol, Model, ModelProvider, ModelRequest, ModelSettings, ModelStream, ProviderKey,
+        ApiProtocol, Model, ModelProvider, ModelRequest, ModelResolver, ModelSettings, ModelStream,
+        ProviderKey,
     },
 };
 use ra_model::provider::{
@@ -181,13 +182,22 @@ fn 裸模型和_none_都走显式默认_provider() {
     assert_eq!(bare.selector().provider().as_str(), "default");
     assert_eq!(bare.selector().model(), Some("model-without-prefix"));
 
-    let provider_default = registry
+    // 注入 runner 时走的是 trait object 那条路；它和固有方法必须是同一个解析，不是两套。
+    let resolver: &dyn ModelResolver = &registry;
+    let provider_default = resolver
         .resolve_model(None)
         .expect("provider default should resolve");
     assert_eq!(provider_default.selector().model(), None);
     assert_eq!(
+        registry
+            .resolve_model(None)
+            .expect("inherent resolution should agree")
+            .selector(),
+        provider_default.selector()
+    );
+    assert_eq!(
         default.requested_models(),
-        vec![Some("model-without-prefix".to_owned()), None]
+        vec![Some("model-without-prefix".to_owned()), None, None]
     );
 }
 

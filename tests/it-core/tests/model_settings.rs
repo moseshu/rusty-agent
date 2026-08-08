@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use insta::assert_json_snapshot;
 use ra_core::model::{
-    Effort, JsonMap, ModelRetrySettings, ModelSettings, ProviderKey, RetryBackoffSettings,
-    ThinkingConfig, ToolChoice,
+    Effort, JsonMap, McpToolChoice, ModelRetrySettings, ModelSettings, ProviderKey,
+    RetryBackoffSettings, ThinkingConfig, ToolChoice,
 };
 use serde_json::{Value, json};
 
@@ -156,6 +156,65 @@ fn 未设置不会覆盖_显式零值与_false_会覆盖() {
     let overridden = base.resolve(&key, &unset, &unset, &explicit);
     assert_eq!(overridden.temperature(), Some(0.0));
     assert_eq!(overridden.parallel_tool_calls(), Some(false));
+}
+
+#[test]
+fn 工具选择按本轮真实广播面收敛而不是报错() {
+    // Turn preparation resolves settings after tools precisely so this can happen: a selector that
+    // survived the four-layer merge may name something this turn no longer advertises. Dynamic
+    // availability is a feature, so an unsatisfiable selection degrades instead of ending the run.
+    let key = provider("openai");
+    let unset = ModelSettings::new();
+    let required = ModelSettings::new()
+        .with_tool_choice(ToolChoice::Required)
+        .with_parallel_tool_calls(true);
+
+    let empty_surface = required
+        .resolve(&key, &unset, &unset, &unset)
+        .reconcile_tool_surface([]);
+    assert_eq!(empty_surface.tool_choice(), None);
+    assert_eq!(empty_surface.parallel_tool_calls(), None);
+
+    let live_surface = required
+        .resolve(&key, &unset, &unset, &unset)
+        .reconcile_tool_surface(["read_file"]);
+    assert_eq!(live_surface.tool_choice(), Some(&ToolChoice::Required));
+    assert_eq!(live_surface.parallel_tool_calls(), Some(true));
+
+    let pinned = ModelSettings::new().with_tool_choice(ToolChoice::Tool("read_file".to_owned()));
+    assert_eq!(
+        pinned
+            .resolve(&key, &unset, &unset, &unset)
+            .reconcile_tool_surface(["read_file", "write_file"])
+            .tool_choice(),
+        Some(&ToolChoice::Tool("read_file".to_owned()))
+    );
+    assert_eq!(
+        pinned
+            .resolve(&key, &unset, &unset, &unset)
+            .reconcile_tool_surface(["write_file"])
+            .tool_choice(),
+        None
+    );
+
+    // Two selections outlive an empty surface: "no tools" stays true, and a server-hosted tool
+    // never shows up in the neutral surface to begin with.
+    let none = ModelSettings::new().with_tool_choice(ToolChoice::None);
+    assert_eq!(
+        none.resolve(&key, &unset, &unset, &unset)
+            .reconcile_tool_surface([])
+            .tool_choice(),
+        Some(&ToolChoice::None)
+    );
+    let hosted = ModelSettings::new()
+        .with_tool_choice(ToolChoice::Mcp(McpToolChoice::new("docs", "search")));
+    assert_eq!(
+        hosted
+            .resolve(&key, &unset, &unset, &unset)
+            .reconcile_tool_surface([])
+            .tool_choice(),
+        Some(&ToolChoice::Mcp(McpToolChoice::new("docs", "search")))
+    );
 }
 
 #[test]
