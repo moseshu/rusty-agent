@@ -1,27 +1,31 @@
-//! `ra-core`：配置分层与来源追踪（R0-5）的行为断言。
+//! `ra-core`: behavioral assertions for configuration layering and provenance (R0-5).
 //!
-//! 这里锁住的是**契约**，不是实现细节：
-//! - 优先级顺序：内置 < 用户 < 项目 < 个人 < 环境 < 显式传入
-//! - 默认不读任何外部配置——库被嵌进别人的进程时不该偷读用户主目录
-//! - 隔离开关下磁盘配置**完全不生效**，但在诊断里**仍然看得见**
-//! - 「被盖了」与「没启用」是两种不同的没生效，修法不同，不能混成一种
+//! What is locked down here is the **contract**, not implementation detail:
+//! - the precedence order: builtin < user < project < local < environment < explicit
+//! - nothing external is read by default — a library embedded in someone else's process has no
+//!   business reading their home directory
+//! - under isolation, on-disk configuration is **entirely inert** yet **still visible** in
+//!   diagnostics
+//! - "shadowed" and "not enabled" are two different kinds of inert with different fixes, and must
+//!   not collapse into one
 
 use ra_core::config::{
     CONFIG_DIR_NAME, CONFIG_FILE_NAME, ENV_PREFIX, FieldReport, LOCAL_CONFIG_FILE_NAME,
     LayerStatus, Layered, SettingSource, SourceSelection, env_key,
 };
 
-/// 生效值。`Layered::value` 直接给 `&T`，比从 `resolve` 里剥两层引用可读。
+/// The effective value. `Layered::value` hands back `&T` directly, which reads better than
+/// peeling two layers of reference off `resolve`.
 fn 生效值(layered: &Layered<&'static str>, 选择: SourceSelection) -> Option<&'static str> {
     layered.value(选择).copied()
 }
 
-/// 生效值来自哪一层。
+/// Which layer the effective value came from.
 fn 生效来源(layered: &Layered<&'static str>, 选择: SourceSelection) -> Option<SettingSource> {
     layered.resolve(选择).map(|s| s.source())
 }
 
-/// 六层各给一个值的配置项。
+/// A configuration item with a value from each of the six layers.
 fn 六层齐全() -> Layered<&'static str> {
     let mut layered = Layered::builtin("内置");
     layered
@@ -34,12 +38,12 @@ fn 六层齐全() -> Layered<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// 优先级
+// precedence
 // ---------------------------------------------------------------------------
 
 #[test]
 fn 优先级顺序是契约() {
-    // 越贴近这一次调用的，越有权决定。
+    // The closer to this particular call, the more say it gets.
     let 期望 = [
         SettingSource::Builtin,
         SettingSource::UserFile,
@@ -95,7 +99,7 @@ fn 缺层不影响解析() {
 
 #[test]
 fn 同层重复写入是覆盖不是追加() {
-    // 一个文件对一层，重复只可能来自解析同一层两次。
+    // One file per layer, so a repeat can only mean the same layer was parsed twice.
     let mut layered: Layered<&str> = Layered::new();
     layered.set(SettingSource::Env, "先");
     layered.set(SettingSource::Env, "后");
@@ -113,12 +117,13 @@ fn 无人给值时没有生效值() {
 }
 
 // ---------------------------------------------------------------------------
-// 来源选择与隔离
+// source selection and isolation
 // ---------------------------------------------------------------------------
 
 #[test]
 fn 默认不读任何外部配置() {
-    // 框架被嵌进别人的进程时，偷读 ~/.rusty-agent/config.toml 是不可接受的。
+    // When the framework is embedded in someone else's process, quietly reading
+    // ~/.rusty-agent/config.toml is unacceptable.
     let 默认 = SourceSelection::default();
     assert!(默认.is_isolated(), "默认必须是隔离的");
     assert_eq!(默认, SourceSelection::isolated());
@@ -130,7 +135,7 @@ fn 默认不读任何外部配置() {
 
 #[test]
 fn 隔离模式下磁盘与环境完全不生效() {
-    // 对齐 strict_mcp_config：只用显式传入的，忽略发现来的。
+    // Mirrors strict_mcp_config: use only what was passed explicitly, ignore what was discovered.
     let layered = 六层齐全();
     assert_eq!(
         生效值(&layered, SourceSelection::isolated()),
@@ -151,7 +156,8 @@ fn 隔离模式下磁盘与环境完全不生效() {
 
 #[test]
 fn 内置与显式两档关不掉() {
-    // 关掉内置就没有兜底值，关掉显式就等于无视本次调用的意图——两者都是荒谬状态。
+    // Disabling builtin would leave no fallback and disabling explicit would ignore the intent of
+    // this very call; both are absurd states.
     let 选择 = SourceSelection::all()
         .without(SettingSource::Builtin)
         .without(SettingSource::Explicit);
@@ -202,13 +208,13 @@ fn ci_场景只认环境变量() {
 #[test]
 fn 来源分类自洽() {
     for source in SettingSource::ALL {
-        // 发现来的 ⟺ 可被来源选择关掉
+        // discovered if and only if source selection can turn it off
         assert_eq!(
             source.is_discovered(),
             !SourceSelection::isolated().allows(*source),
             "`{source}` 的 is_discovered 与隔离行为不一致"
         );
-        // 文件层一定是发现来的
+        // a file layer is always discovered
         if source.is_file() {
             assert!(source.is_discovered(), "`{source}` 是文件却不算发现来的");
         }
@@ -233,7 +239,8 @@ fn 来源标签唯一且稳定() {
 
 #[test]
 fn 来源选择的_debug_可读() {
-    // 这个类型出现的场合几乎都是诊断，派生的 `discovered: 5` 帮不上忙。
+    // This type shows up almost exclusively in diagnostics, where a derived `discovered: 5` helps
+    // nobody.
     assert_eq!(
         format!("{:?}", SourceSelection::isolated()),
         "SourceSelection(isolated)"
@@ -249,7 +256,7 @@ fn 来源选择的_debug_可读() {
 }
 
 // ---------------------------------------------------------------------------
-// 诊断
+// diagnostics
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -273,8 +280,8 @@ fn 报告按优先级从高到低列出所有层() {
 
 #[test]
 fn 报告区分被盖住与未启用() {
-    // 这是本模块存在的一半理由：两种「没生效」的修法完全不同。
-    // 被盖住 → 改更高层的配置；未启用 → 改来源选择。
+    // This is half the reason the module exists: the two kinds of inert have different fixes.
+    // Shadowed -> change a higher layer's configuration; not enabled -> change source selection.
     let 选择 = SourceSelection::all().without(SettingSource::UserFile);
     let report = 六层齐全().report("model.name", 选择);
 
@@ -293,7 +300,8 @@ fn 报告区分被盖住与未启用() {
 
 #[test]
 fn 未启用的层在报告里仍然看得见() {
-    // 只显示生效值的话，用户会困在「我明明写了配置为什么没用」里。
+    // Showing only the effective value strands the user on "I clearly wrote that, why is it
+    // ignored".
     let report = 六层齐全().report("model.name", SourceSelection::isolated());
 
     assert_eq!(report.layers().len(), 6, "隔离模式不该让配置从报告里消失");
@@ -349,7 +357,7 @@ fn 报告的一行摘要带来源() {
 
 #[test]
 fn 报告值被字符串化以便同表展示() {
-    // doctor 要把不同类型的配置项排在同一张表里。
+    // doctor has to line up items of different types in one table.
     let 数字: FieldReport = Layered::builtin(42_u32).report("turn.max", SourceSelection::all());
     assert_eq!(数字.effective().expect("应有生效层").value(), "42");
 
@@ -359,7 +367,7 @@ fn 报告值被字符串化以便同表展示() {
 }
 
 // ---------------------------------------------------------------------------
-// 路径与环境变量约定
+// path and environment-variable conventions
 // ---------------------------------------------------------------------------
 
 #[test]

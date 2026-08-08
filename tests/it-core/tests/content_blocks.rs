@@ -35,7 +35,8 @@ fn 四种内容块都能稳定往返() {
 
 #[test]
 fn 内容块在_run_item_信封里同样无损() {
-    // 信封是 flatten + 相邻标记枚举的嵌套，块自身往返通过不代表套进 RunItem 也通过。
+    // The envelope nests a flatten inside an adjacently tagged enum, so a block round-tripping on
+    // its own does not mean it round-trips inside a RunItem.
     let message = Message::new(MessageRole::Assistant, 所有内容块());
     let item = RunItem::new(ItemId::new("item-1"), RunItemKind::Message(message));
 
@@ -69,8 +70,8 @@ fn 图片明确区分_base64_与本地路径() {
 
 #[test]
 fn 本地路径必须是_utf8_否则整条记录写不出去() {
-    // PathBuf 的 Serialize 对非 UTF-8 直接报错，炸的是整条 RunItem 而不是单个块。
-    // try_new 把这个失败提前到构造期。
+    // PathBuf's Serialize errors outright on non-UTF-8, taking down the whole RunItem rather than
+    // one block. try_new moves that failure forward to construction time.
     #[cfg(unix)]
     {
         use std::ffi::OsString;
@@ -100,8 +101,9 @@ fn thinking_签名原样保留() {
 
 #[test]
 fn 工具调用只住在顶层项而不是内容块里() {
-    // R1-17 的配对与孤儿裁剪只看项级 CallId。工具调用一旦能藏进 message content，
-    // 它们就会静默漏掉，所以内容块层根本不提供这种表示。
+    // R1-17's pairing and orphan pruning look only at item-level CallIds. Once a tool call could
+    // hide inside message content they would miss it silently, so the content-block layer offers
+    // no such representation at all.
     let labels: Vec<&str> = 所有内容块()
         .iter()
         .map(ContentBlock::label)
@@ -129,7 +131,8 @@ fn 工具调用只住在顶层项而不是内容块里() {
 
 #[test]
 fn 拒答是独立信号而不是文本() {
-    // R1-12 靠这个信号升级模型；混进 text_content 就只能去猜厂商措辞。
+    // R1-12 escalates models on this signal; folding it into text_content would leave nothing but
+    // guessing at each vendor's wording.
     let refused = Message::new(
         MessageRole::Assistant,
         vec![

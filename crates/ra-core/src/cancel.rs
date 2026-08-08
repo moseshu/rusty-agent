@@ -1,32 +1,35 @@
-//! 取消契约：`run -> turn -> tool -> 子进程` 的 [`CancellationToken`] 树。
+//! The cancellation contract: a [`CancellationToken`] tree over `run -> turn -> tool -> child
+//! process`.
 //!
-//! # 为什么取消需要一份契约
+//! # Why cancellation needs a contract
 //!
-//! Rust 里「取消一个 future」就是把它 drop 掉，看上去不需要任何机制。真正的问题
-//! 在于**不是所有在途工作都被 future 拥有**：`tokio::spawn` 出去的任务、
-//! `Command::spawn` 出去的子进程、MCP 的远端调用，drop 掉句柄只断开引用，活儿还在
-//! 跑。所以取消必须是一个**显式的、可传播的信号**，而不是隐式的 drop。
+//! In Rust, "cancelling a future" means dropping it, which looks like it needs no machinery at
+//! all. The real problem is that **not all in-flight work is owned by a future**: a task from
+//! `tokio::spawn`, a child process from `Command::spawn`, a remote MCP call — dropping the handle
+//! only severs a reference while the work keeps running. Cancellation therefore has to be an
+//! **explicit, propagable signal** rather than an implicit drop.
 //!
-//! # 三个不变量
+//! # Three invariants
 //!
-//! | 不变量 | 由谁保证 |
+//! | Invariant | Guaranteed by |
 //! | --- | --- |
-//! | 取消**只向下**传播：取消一个工具不会杀掉整个 run | [`CancelScope::child`] 的 token 树 |
-//! | 根因**先到先得**：传播不改写子作用域自己的取消原因 | [`CancelScope::cancel`] 与 [`CancelScope::reason`] |
-//! | 取消**不是失败**：不计失败率、不触发重试 | [`Error::recoverability`] 投影为 `Cancelled` |
+//! | Cancellation propagates **downward only**: cancelling a tool does not kill the run | the token tree of [`CancelScope::child`] |
+//! | The root cause is **first-writer-wins**: propagation never rewrites a child scope's own reason | [`CancelScope::cancel`] and [`CancelScope::reason`] |
+//! | Cancellation is **not failure**: no failure rate, no retry | [`Error::recoverability`] projects to `Cancelled` |
 //!
-//! 第二条是刻意的设计：**不设 `ParentCancelled` 这种原因**。工具因超时被取消、
-//! 随后整个 run 因用户中断被取消，工具那一层仍然报 [`CancelReason::Timeout`]——
-//! 否则归因在传播的第一跳就丢了。
+//! The second invariant is deliberate: **there is no `ParentCancelled` reason**. When a tool is
+//! cancelled by a timeout and the whole run is then cancelled by the user, that tool still reports
+//! [`CancelReason::Timeout`] — otherwise attribution is lost on the very first propagation hop.
 //!
-//! # 本模块的边界
+//! # This module's boundary
 //!
-//! `ra-core` 不持有运行时，因此这里**不 arm 任何定时器**。[`Deadline`] 是纯数据，
-//! 到点触发取消由持有 runtime 的一方（`ra-runtime`）负责；作为兜底，任何检查点
-//! （[`CancelScope::ensure_not_cancelled`] / [`CancelScope::run`]）观察到 deadline
-//! 过期都会就地把它转成一次真正的取消。
+//! `ra-core` owns no runtime, so it **arms no timer**. [`Deadline`] is pure data; firing a
+//! cancellation when it expires belongs to whoever holds the runtime (`ra-runtime`). As a
+//! backstop, any checkpoint ([`CancelScope::ensure_not_cancelled`], [`CancelScope::run`]) that
+//! observes an expired deadline converts it into a real cancellation on the spot.
 //!
-//! 完整规则、分层责任与反例见 `Docs/Cancellation_Contract.md`。
+//! The full rules, the per-layer responsibilities, and the counterexamples are in
+//! `Docs/Cancellation_Contract.md`.
 
 use core::fmt;
 use core::future::Future;
@@ -40,62 +43,69 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 
-/// 取消信号发出后，等待在途任务 drain 到终态的宽限期；超过则强制终止。
+/// Grace period for in-flight work to drain to a terminal state after a cancellation signal;
+/// past it, work is killed.
 ///
-/// 这是契约的一部分而不是调优参数：**取消后直接 drop `JoinHandle` 会在 Rust 里
-/// 留下正在跑的子进程**（R3-4c ③）。任何 spawn 了任务或子进程的一层，都必须在
-/// 取消后等到终态再返回，等不到就在宽限期结束时强杀。
+/// This is part of the contract, not a tuning knob: **dropping a `JoinHandle` after cancelling
+/// leaves a running child process behind in Rust** (R3-4c ③). Any layer that spawned a task or a
+/// child process must wait for a terminal state before returning, and kill it when the grace
+/// period ends.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
-// 取消原因
+// cancellation reasons
 // ---------------------------------------------------------------------------
 
-/// 取消的根因。进 trace 标签与 eval 归因，因此**必须可枚举**，不能只是一句话。
+/// Root cause of a cancellation. It becomes a trace label and an eval attribution, so it **has to
+/// be enumerable** rather than a sentence.
 ///
-/// 与 [`Error`] 的关系：`Error::Cancelled` 只携带面向人的文本，机器归因走
-/// [`CancelReason::code`]——**不要去解析错误文本**反推原因。
+/// How it relates to [`Error`]: `Error::Cancelled` carries human-facing text only, while machine
+/// attribution goes through [`CancelReason::code`] — **do not parse the error text** to recover
+/// the reason.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CancelReason {
-    /// 用户主动中断：Ctrl-C、UI 上的停止按钮。
+    /// The user interrupted deliberately: Ctrl-C, or a stop button in the UI.
     UserInterrupt,
-    /// 进程收到终止信号，整体收摊。
+    /// The process received a termination signal and is shutting down.
     Shutdown,
-    /// 墙钟预算耗尽（`Budget::deadline`）。整个 run 或某一层的时限到了。
+    /// The wall-clock budget ran out (`Budget::deadline`): a whole run, or one layer, hit its
+    /// deadline.
     Deadline,
-    /// 单个操作自己的超时：工具超时（R2-7）、在途协议请求超时（R13）。
+    /// One operation's own timeout: a tool timeout (R2-7), an in-flight protocol request (R13).
     ///
-    /// 与 [`Self::Deadline`] 的区别是**谁的时限**：`Deadline` 是上层预算到点，
-    /// `Timeout` 是这个操作本身跑太久。两者的处置不同——前者该结束任务，后者
-    /// 通常只该放弃这一个操作。
+    /// It differs from [`Self::Deadline`] in **whose limit** expired: `Deadline` is an upper
+    /// layer's budget, `Timeout` is this operation running too long. The responses differ — the
+    /// first should end the task, the second usually only abandons this one operation.
     Timeout,
-    /// 结果已不再被需要：`any` / `quorum` join 的落败分支（R17-4）、被新输入
-    /// 取代的在途请求。**不是错误，也不是超时**。
+    /// The result is no longer wanted: a losing branch of an `any` or `quorum` join (R17-4), or
+    /// an in-flight request superseded by new input. **Neither an error nor a timeout.**
     Superseded,
-    /// 同批次的另一个任务失败，整批继续下去已无意义（R3-4c 的批量结算）。
+    /// Another task in the same batch failed and continuing the batch is pointless (the batch
+    /// settlement of R3-4c).
     PeerFailure,
-    /// 未记录根因。
+    /// No root cause was recorded.
     ///
-    /// 只应出现在**绕过本模块、直接 cancel 裸 [`CancellationToken`]** 的路径上
-    /// （第三方库持有 token 时无法避免）。框架内部禁止显式构造它——出现即说明
-    /// 有一条取消路径没走 [`CancelScope::cancel`]，归因会断。
+    /// It should only appear on a path that **bypasses this module and cancels a bare
+    /// [`CancellationToken`] directly** (unavoidable when a third-party library holds the token).
+    /// Constructing it explicitly inside the framework is forbidden: seeing it means some
+    /// cancellation path skipped [`CancelScope::cancel`], and attribution is broken there.
     Unspecified,
-    /// 扩展点：产品或第三方自定义的原因（扩展安全第 5 条）。
+    /// Extension point: a reason defined by a product or third party (extension-safety rule 5).
     ///
-    /// 标签用 `snake_case`，建议带自有前缀（如 `myapp_quota`），避免与内置
-    /// [`Self::code`] 撞名。
+    /// Use `snake_case` for the label and prefer an own prefix (such as `myapp_quota`) so it
+    /// cannot collide with a built-in [`Self::code`].
     Custom(Cow<'static, str>),
 }
 
 impl CancelReason {
-    /// 构造[自定义原因](Self::Custom)。
+    /// Creates a [custom reason](Self::Custom).
     #[must_use]
     pub fn custom(label: impl Into<Cow<'static, str>>) -> Self {
         Self::Custom(label.into())
     }
 
-    /// 稳定的机器可读标识。用于 trace 标签与指标维度值。
+    /// Stable machine-readable identity, used as a trace label and a metric dimension value.
     #[must_use]
     pub fn code(&self) -> &str {
         match self {
@@ -110,25 +120,27 @@ impl CancelReason {
         }
     }
 
-    /// 是否因为时间到了。
+    /// Whether time ran out.
     ///
-    /// 这两档该进 eval 的「超时率」，不该混进「用户中断率」——把它们分开统计是
-    /// 这个投影存在的唯一理由。
+    /// These two tiers belong in eval's "timeout rate" and not in its "user interrupt rate";
+    /// keeping those apart is the only reason this projection exists.
     #[must_use]
     pub const fn is_expiry(&self) -> bool {
         matches!(self, Self::Deadline | Self::Timeout)
     }
 
-    /// 是否由人发起（用户中断或进程被终止），而非系统内部的调度决定。
+    /// Whether a human initiated it (a user interrupt or process termination) rather than an
+    /// internal scheduling decision.
     ///
-    /// UI 对这两档要显示「已停止」，对 [`Self::Superseded`] 之类则**什么都不该
-    /// 显示**——那是框架的内部编排，用户不需要知道。
+    /// The UI should show "stopped" for these two tiers and **show nothing at all** for the likes
+    /// of [`Self::Superseded`] — that is internal framework orchestration the user need not know
+    /// about.
     #[must_use]
     pub const fn is_user_initiated(&self) -> bool {
         matches!(self, Self::UserInterrupt | Self::Shutdown)
     }
 
-    /// 面向用户的短语。会成为 `Error::Cancelled` 的 `reason` 字段。
+    /// User-facing phrase. It becomes the `reason` field of `Error::Cancelled`.
     #[must_use]
     pub fn user_message(&self) -> String {
         match self {
@@ -151,46 +163,49 @@ impl fmt::Display for CancelReason {
 }
 
 impl From<CancelReason> for Error {
-    /// 收敛成 [`Error::Cancelled`]，可恢复性投影为 `Cancelled`（不是失败）。
+    /// Converges into [`Error::Cancelled`], whose recoverability projects to `Cancelled` (not a
+    /// failure).
     ///
-    /// **机器可读的原因在这一步丢失**，这是刻意的：`Error` 面向「怎么处置」，
-    /// 归因面向「为什么发生」，后者走 trace 里的 [`CancelReason::code`]。
+    /// **The machine-readable reason is lost at this step**, deliberately: `Error` answers "what
+    /// to do about it" while attribution answers "why it happened", and the latter travels as
+    /// [`CancelReason::code`] in the trace.
     fn from(reason: CancelReason) -> Self {
         Self::cancelled(reason.user_message())
     }
 }
 
 // ---------------------------------------------------------------------------
-// 作用域层级
+// scope levels
 // ---------------------------------------------------------------------------
 
-/// 作用域在取消树里的层级。只用于诊断与 trace 标注，不影响传播语义。
+/// A scope's level in the cancellation tree. Used for diagnostics and trace labels only; it does
+/// not affect propagation semantics.
 ///
-/// 规范嵌套是 `Run -> Turn -> Tool -> Process`；子 agent（R12）是挂在 `Tool`
-/// 下面的又一个 `Run`，因此**不强制层级单调递减**。
+/// The canonical nesting is `Run -> Turn -> Tool -> Process`. A sub-agent (R12) is another `Run`
+/// hanging under a `Tool`, so **levels are not required to decrease monotonically**.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScopeKind {
-    /// 一整个 run。子 agent 的 run 也是这一档。
+    /// An entire run. A sub-agent's run is also this level.
     Run,
-    /// 一个 turn（一次模型往返 + 其后的工具批次）。
+    /// One turn: a model round trip plus the tool batch that follows it.
     Turn,
-    /// 一次工具调用。
+    /// One tool call.
     Tool,
-    /// 一个子进程 / PTY 会话。
+    /// One child process or PTY session.
     Process,
-    /// 扩展点：图节点等自定义层级（扩展安全第 5 条）。
+    /// Extension point: a custom level such as a graph node (extension-safety rule 5).
     Custom(Cow<'static, str>),
 }
 
 impl ScopeKind {
-    /// 构造[自定义层级](Self::Custom)。
+    /// Creates a [custom level](Self::Custom).
     #[must_use]
     pub fn custom(label: impl Into<Cow<'static, str>>) -> Self {
         Self::Custom(label.into())
     }
 
-    /// 稳定的机器可读标识。
+    /// Stable machine-readable identity.
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
@@ -210,48 +225,50 @@ impl fmt::Display for ScopeKind {
 }
 
 // ---------------------------------------------------------------------------
-// 墙钟时限
+// wall-clock deadlines
 // ---------------------------------------------------------------------------
 
-/// 绝对时间点形式的时限。
+/// A deadline expressed as an absolute instant.
 ///
-/// 用绝对时间而不是 `Duration`，是因为时限要跨层继承：子作用域拿到的必须是「还
-/// 剩多久」的同一个终点，而不是从自己开始重新计时的一段时长——后者会让每嵌套一
-/// 层就白送一次完整时长。
+/// An instant rather than a `Duration`, because deadlines are inherited across layers: a child
+/// scope must receive the same endpoint, not a fresh duration measured from its own start — the
+/// latter would hand out a full duration again at every level of nesting.
 ///
-/// **不可序列化**：[`Instant`] 是单调时钟上的点，跨进程无意义。因此 `Deadline`
-/// 不进 `RunState`；需要持久化的时限存绝对墙钟时间，加载时再换算。
+/// **Not serializable**: [`Instant`] is a point on a monotonic clock and means nothing across
+/// processes. `Deadline` therefore stays out of `RunState`; a deadline that must be persisted is
+/// stored as absolute wall-clock time and converted back on load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Deadline(Instant);
 
 impl Deadline {
-    /// 以一个绝对时间点构造。
+    /// Creates one from an absolute instant.
     #[must_use]
     pub const fn at(instant: Instant) -> Self {
         Self(instant)
     }
 
-    /// 从现在起 `after` 之后到期。
+    /// Expires `after` from now.
     #[must_use]
     pub fn after(after: Duration) -> Self {
         Self(Instant::now() + after)
     }
 
-    /// 到期时间点。`ra-runtime` 用它 arm 定时器（`tokio::time::Instant::from_std`）。
+    /// The expiry instant. `ra-runtime` arms its timer from it
+    /// (`tokio::time::Instant::from_std`).
     #[must_use]
     pub const fn instant(self) -> Instant {
         self.0
     }
 
-    /// 距离到期还剩多久；已过期则为零。
+    /// Time left before expiry; zero once expired.
     #[must_use]
     pub fn remaining(self) -> Duration {
         self.0.saturating_duration_since(Instant::now())
     }
 
-    /// 是否已过期。
+    /// Whether it has expired.
     ///
-    /// 过期**不等于已取消**——见 [`CancelScope::ensure_not_cancelled`]。
+    /// Expired **is not the same as cancelled**; see [`CancelScope::ensure_not_cancelled`].
     #[must_use]
     pub fn is_expired(self) -> bool {
         self.remaining().is_zero()
@@ -259,14 +276,14 @@ impl Deadline {
 }
 
 // ---------------------------------------------------------------------------
-// 取消作用域
+// cancellation scopes
 // ---------------------------------------------------------------------------
 
-/// 取消原因的存储槽：自己一格，外加指向父槽的链。
+/// Storage slot for a cancellation reason: one cell of its own plus a link to the parent slot.
 ///
-/// 子作用域没有自己的原因时沿链上溯，于是「传播保留根因」不需要在取消时向下写
-/// 任何东西——**根因是查出来的投影，不是复制出来的副本**，与 `Recoverability`
-/// 同一个路子。
+/// A child scope without its own reason walks up the chain, so "propagation preserves the root
+/// cause" requires writing nothing downward at cancellation time — **the root cause is a looked-up
+/// projection, not a copied duplicate**, the same approach as `Recoverability`.
 #[derive(Debug)]
 struct ReasonSlot {
     own: OnceLock<CancelReason>,
@@ -282,19 +299,19 @@ impl ReasonSlot {
     }
 }
 
-/// 取消树上的一个作用域：一个 [`CancellationToken`] 加上它的根因与时限。
+/// One scope in the cancellation tree: a [`CancellationToken`] plus its root cause and deadline.
 ///
-/// [`Clone`] 得到的是**同一个作用域的另一个句柄**（共享 token 与根因），用于把
-/// 作用域交给 spawn 出去的任务；要派生新层级用 [`Self::child`]。
+/// [`Clone`] yields **another handle to the same scope** (sharing the token and the root cause),
+/// which is how a scope is handed to a spawned task. To derive a new level, use [`Self::child`].
 ///
-/// # 用法
+/// # Usage
 ///
 /// ```ignore
 /// let run = CancelScope::root().with_deadline(Deadline::after(TEN_MINUTES));
 /// let turn = run.child(ScopeKind::Turn);
 /// let tool = turn.child(ScopeKind::Tool).with_deadline(Deadline::after(THIRTY_SECONDS));
 ///
-/// // 每个 await 点都可取消：
+/// // Every await point is cancellable:
 /// let output = tool.run(call_the_tool()).await?;
 /// ```
 #[derive(Debug, Clone)]
@@ -306,7 +323,7 @@ pub struct CancelScope {
 }
 
 impl CancelScope {
-    /// 新建一棵取消树的根，层级为 [`ScopeKind::Run`]。
+    /// Creates the root of a new cancellation tree, at level [`ScopeKind::Run`].
     #[must_use]
     pub fn root() -> Self {
         Self {
@@ -320,10 +337,12 @@ impl CancelScope {
         }
     }
 
-    /// 派生一个子作用域：父取消会传播到它，它取消不影响父。
+    /// Derives a child scope: a parent cancellation propagates into it, its own does not
+    /// propagate back up.
     ///
-    /// 时限按**创建时快照**继承。之后再收紧父作用域不会追溯到已创建的子作用域；
-    /// 需要立刻生效的收紧走 [`Self::cancel`]。
+    /// The deadline is inherited as a **snapshot taken at creation**. Tightening the parent
+    /// later does not reach back into children that already exist; a tightening that must take
+    /// effect immediately goes through [`Self::cancel`].
     #[must_use]
     pub fn child(&self, kind: ScopeKind) -> Self {
         Self {
@@ -337,9 +356,11 @@ impl CancelScope {
         }
     }
 
-    /// 设置时限。**只能收紧不能放宽**——比已继承的时限更晚的输入会被忽略。
+    /// Sets the deadline. **It can only tighten, never loosen**: an input later than the
+    /// inherited deadline is ignored.
     ///
-    /// 否则一个工具就能给自己批一个比整个 run 更长的时限，run 级预算形同虚设。
+    /// Otherwise a single tool could grant itself more time than the whole run, and the run-level
+    /// budget would mean nothing.
     #[must_use]
     pub fn with_deadline(mut self, deadline: Deadline) -> Self {
         self.deadline = Some(
@@ -349,41 +370,44 @@ impl CancelScope {
         self
     }
 
-    /// 本作用域的层级。
+    /// This scope's level.
     #[must_use]
     pub const fn kind(&self) -> &ScopeKind {
         &self.kind
     }
 
-    /// 生效中的时限（含从父作用域继承的）。
+    /// The deadline in effect, including one inherited from a parent.
     #[must_use]
     pub const fn deadline(&self) -> Option<Deadline> {
         self.deadline
     }
 
-    /// 底层 token，用于把取消传给只认 [`CancellationToken`] 的第三方库。
+    /// The underlying token, for handing cancellation to a third-party library that only speaks
+    /// [`CancellationToken`].
     ///
-    /// **通过它取消会丢失根因**（降级为 [`CancelReason::Unspecified`]）。只在
-    /// 接口不给选择时才这么用。
+    /// **Cancelling through it loses the root cause** (it degrades to
+    /// [`CancelReason::Unspecified`]). Use it only when an interface leaves no choice.
     #[must_use]
     pub const fn token(&self) -> &CancellationToken {
         &self.token
     }
 
-    /// 是否已被取消。
+    /// Whether it has been cancelled.
     ///
-    /// 只看取消信号，**不看时限**：时限过期但没人 arm 定时器时，这里仍返回
-    /// `false`，直到某个检查点把它转成真取消。这样 `is_cancelled()` 与
-    /// [`Self::token`] 的视图永远一致。
+    /// It reads the cancellation signal only, **not the deadline**: when a deadline has expired
+    /// but nobody armed a timer, this still returns `false` until some checkpoint converts it into
+    /// a real cancellation. That keeps `is_cancelled()` and [`Self::token`] permanently in
+    /// agreement.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
 
-    /// 取消的根因；未取消时为 `None`。
+    /// The cancellation root cause; `None` while not cancelled.
     ///
-    /// 已取消时**必定**返回 `Some`：链上查不到就降级为
-    /// [`CancelReason::Unspecified`]，因此「已取消却没有原因」这种状态不存在。
+    /// Once cancelled it **always** returns `Some`: a lookup that finds nothing on the chain
+    /// degrades to [`CancelReason::Unspecified`], so "cancelled but reasonless" is not a
+    /// reachable state.
     #[must_use]
     pub fn reason(&self) -> Option<CancelReason> {
         if !self.is_cancelled() {
@@ -392,35 +416,38 @@ impl CancelScope {
         Some(self.slot.lookup().unwrap_or(CancelReason::Unspecified))
     }
 
-    /// 取消本作用域及其全部后代。对父作用域**无影响**。
+    /// Cancels this scope and every descendant. The parent is **unaffected**.
     ///
-    /// 已取消时是无操作：**先到的根因不被后到的覆盖**。因此工具超时之后整个 run
-    /// 又被用户中断，工具那一层仍然报 `Timeout`。
+    /// A no-op once already cancelled: **the first root cause is never overwritten by a later
+    /// one**. So when a tool times out and the user then interrupts the whole run, that tool still
+    /// reports `Timeout`.
     pub fn cancel(&self, reason: CancelReason) {
         if self.token.is_cancelled() {
             return;
         }
-        // 先记原因再发信号：反过来会让醒来的等待方读到空的槽。
-        // 并发下以 OnceLock 的先到者为准。
+        // Record the reason before signalling: the other order lets a woken waiter read an empty
+        // slot. Under concurrency the `OnceLock` first-writer wins.
         let _ = self.slot.own.set(reason);
         self.token.cancel();
     }
 
-    /// 等待本作用域被取消。
+    /// Waits until this scope is cancelled.
     ///
-    /// 注意时限**不会**自己唤醒它——没有 arm 定时器的话，过期的 deadline 只在
-    /// 检查点被发现。要靠时限醒来，由持有 runtime 的一方 arm。
+    /// Note a deadline **does not** wake it on its own: with no timer armed, an expired deadline
+    /// is only noticed at a checkpoint. Waking on a deadline requires whoever holds the runtime to
+    /// arm one.
     pub async fn cancelled(&self) {
         self.token.cancelled().await;
     }
 
-    /// 检查点：已取消则返回带根因的错误。
+    /// Checkpoint: returns an error carrying the root cause when already cancelled.
     ///
-    /// 顺带兜底时限——观察到 deadline 过期就**就地转成一次真正的取消**（原因为
-    /// [`CancelReason::Deadline`]，并传播给后代）。所以即使没有任何定时器，超时
-    /// 也一定会在下一个检查点生效，只是不那么及时。
+    /// It also backstops deadlines: observing an expired one **converts it into a real
+    /// cancellation on the spot** (with reason [`CancelReason::Deadline`], propagated to
+    /// descendants). So even with no timer at all, a timeout still takes effect at the next
+    /// checkpoint, just less promptly.
     ///
-    /// 长循环、两次 await 之间的同步计算段，都该插一次。
+    /// Insert one in a long loop and in any synchronous stretch between two awaits.
     pub fn ensure_not_cancelled(&self) -> Result<(), Error> {
         if let Some(deadline) = self.deadline
             && deadline.is_expired()
@@ -433,19 +460,22 @@ impl CancelScope {
         }
     }
 
-    /// 在本作用域内跑一个 future：取消即刻返回带根因的 `Err`。
+    /// Runs a future inside this scope: cancellation returns an `Err` carrying the root cause
+    /// immediately.
     ///
-    /// 这是「每个 await 点可取消」的默认写法。已取消的作用域**不会启动新工作**，
-    /// 即便 future 早已就绪也直接返回 `Err`。
+    /// This is the default way to make every await point cancellable. An already-cancelled scope
+    /// **starts no new work**: it returns `Err` even when the future is long since ready.
     ///
-    /// 时限只在**入口**检查一次：等待期间到期不会自己醒来，得靠 `ra-runtime`
-    /// arm 的定时器 cancel 这棵树。没有定时器时，超时推迟到下一个检查点才生效。
+    /// The deadline is checked **once, at entry**: expiring mid-wait does not wake anything, so a
+    /// timer armed by `ra-runtime` has to cancel the tree. Without a timer, the timeout is
+    /// deferred to the next checkpoint.
     ///
-    /// # 什么时候不能用
+    /// # When not to use it
     ///
-    /// 取消时 `fut` 被 **drop**。纯 future 这样处理是安全的；但如果 future 背后
-    /// 拥有 spawn 出去的任务或子进程，drop 只是撒手不管，进程还在跑——那种情况
-    /// 必须走 drain 协议（[`DRAIN_GRACE`]），不能用这个 helper。
+    /// On cancellation `fut` is **dropped**. That is safe for a pure future, but if the future
+    /// owns a spawned task or a child process behind it, dropping only lets go while the process
+    /// keeps running — that case must follow the drain protocol ([`DRAIN_GRACE`]) instead of this
+    /// helper.
     pub async fn run<F>(&self, fut: F) -> Result<F::Output, Error>
     where
         F: Future,
@@ -462,11 +492,12 @@ impl CancelScope {
         }
     }
 
-    /// 绑定 RAII 守卫：守卫 drop 时用 `reason` 取消本作用域。
+    /// Binds an RAII guard that cancels this scope with `reason` when the guard drops.
     ///
-    /// 解决的是**忘记取消**：作用域被 drop 并不会取消它的 token，于是等在
-    /// [`Self::cancelled`] 上的后代任务会永远等下去。凡是把作用域交给了 spawn
-    /// 任务的地方，都该用守卫而不是靠记得在每条退出路径上调 [`Self::cancel`]。
+    /// It addresses **forgetting to cancel**: dropping a scope does not cancel its token, so a
+    /// descendant waiting on [`Self::cancelled`] waits forever. Anywhere a scope is handed to a
+    /// spawned task, use the guard rather than remembering to call [`Self::cancel`] on every exit
+    /// path.
     #[must_use]
     pub fn cancel_on_drop(self, reason: CancelReason) -> CancelOnDrop {
         CancelOnDrop {
@@ -476,7 +507,7 @@ impl CancelScope {
     }
 }
 
-/// [`CancelScope::cancel_on_drop`] 的 RAII 守卫。
+/// The RAII guard from [`CancelScope::cancel_on_drop`].
 #[derive(Debug)]
 pub struct CancelOnDrop {
     scope: CancelScope,
@@ -484,13 +515,13 @@ pub struct CancelOnDrop {
 }
 
 impl CancelOnDrop {
-    /// 被守卫的作用域。
+    /// The guarded scope.
     #[must_use]
     pub const fn scope(&self) -> &CancelScope {
         &self.scope
     }
 
-    /// 解除守卫：工作已正常收尾，drop 时不再取消。
+    /// Disarms the guard: the work finished normally, so dropping it cancels nothing.
     #[must_use]
     pub fn disarm(mut self) -> CancelScope {
         self.reason = None;

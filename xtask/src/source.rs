@@ -1,17 +1,17 @@
-//! 源码遍历的公共 helper。
+//! Shared helpers for walking the source tree.
 
 use std::path::{Path, PathBuf};
 
-/// workspace 根目录。
+/// The workspace root.
 ///
-/// 从编译期的 `CARGO_MANIFEST_DIR` 推，不看当前工作目录——门禁在哪儿调用都该查
-/// 同一份代码。
+/// Derived from the compile-time `CARGO_MANIFEST_DIR` rather than the current directory: a gate
+/// should inspect the same code no matter where it was invoked.
 pub(crate) fn workspace_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest.parent().unwrap_or(manifest).to_path_buf()
 }
 
-/// 相对 workspace 根的路径，用于报错信息。
+/// A path relative to the workspace root, for error messages.
 pub(crate) fn relative(path: &Path) -> String {
     path.strip_prefix(workspace_root())
         .unwrap_or(path)
@@ -19,10 +19,11 @@ pub(crate) fn relative(path: &Path) -> String {
         .to_string()
 }
 
-/// 递归收集目录下的 `.rs` 文件。目录不存在时返回空。
+/// Recursively collects the `.rs` files under a directory. Returns empty when it does not exist.
 ///
-/// **跳过 `target/`**：构建产物里有 build script 生成的 `.rs`（`tests/target/` 光目录
-/// 就有 4 GB），它们既不是源码，也不该被任何门禁当成源码扫。
+/// **`target/` is skipped**: build output contains build-script-generated `.rs` files
+/// (`tests/target/` alone is 4 GB), which are neither source nor anything a gate should scan as
+/// source.
 pub(crate) fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect(dir, &mut files);
@@ -47,7 +48,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `crates/` 下的全部 crate 名，字典序。
+/// Every crate name under `crates/`, in lexical order.
 pub(crate) fn crate_names() -> Vec<String> {
     let mut names = Vec::new();
     let Ok(entries) = std::fs::read_dir(workspace_root().join("crates")) else {
@@ -65,10 +66,11 @@ pub(crate) fn crate_names() -> Vec<String> {
     names
 }
 
-/// `crates/` 下的库 crate 名（有 `src/lib.rs` 的），字典序。
+/// The library crate names under `crates/` (those with `src/lib.rs`), in lexical order.
 ///
-/// 门禁不维护 crate 清单——清单就是文件系统。新建一个库 crate，测试宿主与 feature
-/// 矩阵当天就把它算进去，不需要谁记得回来改常量表。
+/// The gates keep no crate list — the filesystem is the list. Create a library crate and the test
+/// host and the feature matrix account for it the same day, with nobody having to remember to come
+/// back and edit a constant table.
 pub(crate) fn library_crates() -> Vec<String> {
     let root = workspace_root().join("crates");
     crate_names()
@@ -77,11 +79,11 @@ pub(crate) fn library_crates() -> Vec<String> {
         .collect()
 }
 
-/// 整行是注释。
+/// Whether the whole line is a comment.
 ///
-/// 只认行首注释，**不做词法分析**：门禁宁可漏报也不该误报——把一条合法代码判成
-/// 违规会让人开始怀疑门禁本身，那比漏一条更糟。行尾注释里的关键字会被漏掉，这是
-/// 已知且可接受的代价。
+/// Only leading comments count and **no lexing is done**: a gate should rather miss something
+/// than cry wolf — flagging valid code makes people distrust the gate itself, which is worse than
+/// one miss. Keywords inside trailing comments are therefore missed, a known and accepted cost.
 pub(crate) fn is_comment(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*')

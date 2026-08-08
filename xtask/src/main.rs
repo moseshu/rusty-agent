@@ -1,14 +1,14 @@
-//! `cargo xtask` —— 把开发计划里的硬约束变成 CI 门禁。
+//! `cargo xtask` --- turns the development plan's hard constraints into CI gates.
 //!
-//! 九条门禁（R0-6）。`cargo xtask all` 全跑一遍并给出汇总，**只有 FAIL 让 CI 变红**，
-//! SKIP 单独计数——见 [`gate::Outcome`] 对三态的说明。
+//! Nine gates (R0-6). `cargo xtask all` runs them all and prints a summary; **only FAIL turns CI
+//! red**, and SKIP is counted separately — see [`gate::Outcome`] on the three states.
 //!
 //! ```text
-//! cargo xtask all                # 全部
-//! cargo xtask layering           # 依赖方向四条铁律
-//! cargo xtask no-inline-tests    # crates/ 下无测试代码
-//! cargo xtask feature-matrix     # 逐 crate 验 feature 全关 / 全开
-//! cargo xtask test -p it-core    # 跑独立测试 workspace，参数透传给 cargo test
+//! cargo xtask all                # everything
+//! cargo xtask layering           # the four dependency-direction rules
+//! cargo xtask no-inline-tests    # no test code under crates/
+//! cargo xtask feature-matrix     # per crate, all features off / on
+//! cargo xtask test -p it-core    # runs the separate test workspace, args pass through
 //! ```
 
 mod api;
@@ -35,40 +35,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
-    /// 跑全部九条门禁并汇总。
+    /// Runs all nine gates and summarizes.
     All,
-    /// 断言工具 schema 连续渲染 100 次字节全同。
+    /// Asserts a tool schema renders byte-identically 100 times in a row.
     SchemaStability,
-    /// 导出各 provider 的 prompt 分段、hash、token、缓存断点。
+    /// Dumps each provider's prompt sections, hashes, tokens, and cache breakpoints.
     PromptDump,
-    /// 校验 `Guard_Registry.md` 与代码一致，且硬阻断 guard <= 8。
+    /// Checks `Guard_Registry.md` against the code, and that hard-blocking guards number <= 8.
     GuardRegistry,
-    /// 校验工具 schema <= 20KB、各 prompt 段 token 上限。
+    /// Checks tool schemas are <= 20KB and each prompt section is within its token ceiling.
     TokenBudget,
-    /// 校验 `crates/` 下没有任何测试代码（测试一律在 tests/ workspace）。
+    /// Checks there is no test code under `crates/` (tests all live in the tests/ workspace).
     NoInlineTests,
-    /// 运行独立测试 workspace，额外参数透传给 `cargo test`。
+    /// Runs the separate test workspace, passing extra arguments through to `cargo test`.
     Test {
-        /// 透传给 `cargo test` 的参数，如 `-p it-core`。
+        /// Arguments passed through to `cargo test`, such as `-p it-core`.
         ///
-        /// `allow_hyphen_values` 必须开：否则 `-p` 会被 clap 当成本命令的选项，
-        /// 逼着调用方写 `cargo xtask test -- -p it-core`。
+        /// `allow_hyphen_values` has to be on: otherwise clap claims `-p` as an option of this
+        /// command and forces callers to write `cargo xtask test -- -p it-core`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// 公开面契约：基线对账 + 扩展安全 ①② + 稳定性分级。
+    /// The public-surface contract: baseline reconciliation, extension safety 1 and 2, stability
+    /// grades.
     PublicApi {
-        /// 重写基线快照而不是对账。改动公开 API 后跑一次，让 diff 进 review。
+        /// Rewrites the baseline snapshot instead of reconciling. Run it after changing a public
+        /// API so the diff lands in review.
         #[arg(long)]
         bless: bool,
     },
-    /// 依赖方向四条铁律：内核 / 可复用件 / 产品的依赖不得逆流。
+    /// The four dependency-direction rules: kernel, reusable pieces, and product may not depend
+    /// upward.
     Layering,
-    /// 逐 crate 验 feature 全关 / 全开都能编译。
+    /// Per crate, checks that all features off and all features on both compile.
     FeatureMatrix,
 }
 
-/// 门禁清单。顺序即 `all` 的执行顺序：**先快后慢**，静态检查排在跑测试前面。
+/// The gate list. Its order is the execution order of `all`: **fast before slow**, with static
+/// checks ahead of running tests.
 fn all_gates() -> Vec<(&'static str, Outcome)> {
     vec![
         ("layering", layering::run()),
@@ -100,9 +104,9 @@ fn main() -> std::process::ExitCode {
     report(&outcomes)
 }
 
-/// 打印结果并给出退出码。
+/// Prints the results and sets the exit code.
 fn report(outcomes: &[(&str, Outcome)]) -> std::process::ExitCode {
-    // 违规明细先打，免得被汇总表挤到屏幕外面。
+    // Violation detail comes first, so the summary table does not push it off screen.
     for (name, outcome) in outcomes {
         if let Outcome::Fail(violations) = outcome {
             println!("\n{name} 未通过：");

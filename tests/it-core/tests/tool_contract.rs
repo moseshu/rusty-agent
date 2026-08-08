@@ -371,21 +371,22 @@ fn trait_validation_拒绝_schema_与_origin_名称漂移() {
 
 #[test]
 fn 手写_schema_不能只声明_strict_而不满足_strict() {
-    // 少 additionalProperties / required 的 schema 配 strict=true 必被 provider 拒绝，
-    // 所以构造期就要挡住——手写与 MCP 工具走的正是这条路径，不经过 derive 的规范化。
+    // A schema missing additionalProperties or required, paired with strict=true, is certain to
+    // be rejected by the provider, so construction has to stop it. Hand-written and MCP tools take
+    // exactly this path and never pass through the derive's normalization.
     let incomplete = json!({
         "type": "object",
         "properties": {"city": {"type": "string"}}
     });
     assert!(ToolSchema::new("weather", incomplete.clone()).is_err());
 
-    // 显式声明不要 strict 时，同一份 schema 可以原样使用。
+    // Declared non-strict, the very same schema is usable as is.
     let loose = ToolSchema::loose("weather", incomplete).unwrap();
     assert!(!loose.strict_json_schema());
     assert!(loose.validate().is_ok());
     assert!(!loose.to_model_definition().strict());
 
-    // 嵌套对象同样受检，不只是根。
+    // Nested objects are checked too, not just the root.
     assert!(
         ToolSchema::new(
             "weather",

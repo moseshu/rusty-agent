@@ -1,20 +1,23 @@
-//! 公开 API 快照：抽取与对账。
+//! Public API snapshots: extraction and reconciliation.
 //!
-//! # 为什么不是 `cargo public-api`
+//! # Why not `cargo public-api`
 //!
-//! 开发计划原本指定 `cargo public-api`。它更精确（走 rustdoc JSON，能解析
-//! re-export 与 impl），但**要求 nightly**，而本仓库把工具链钉在 1.97.1 stable
-//! （`rust-toolchain.toml`）。为一条门禁让 CI 装第二套工具链，代价大于收益。
+//! The development plan originally specified `cargo public-api`. It is more precise (it works from
+//! rustdoc JSON and can resolve re-exports and impls) but **requires nightly**, while this
+//! repository pins the toolchain to 1.97.1 stable (`rust-toolchain.toml`). Making CI install a
+//! second toolchain for one gate costs more than it returns.
 //!
-//! 这里改用 `syn` 直接扫源码。**精度确实不如**：`pub use` 再导出、`#[cfg]` 条件
-//! 编译、泛型 impl 的展开都看不见。但门禁要抓的是「公开项被删了 / 签名变了 /
-//! 悄悄多了一个」，这三件源码级扫描全都抓得到，够用。哪天真上了 nightly，换回
-//! `cargo public-api` 只需替换本模块，基线格式与门禁逻辑不变。
+//! This scans source directly with `syn` instead. **It is genuinely less precise**: `pub use`
+//! re-exports, `#[cfg]` conditional compilation, and generic impl expansion are all invisible to
+//! it. But what the gate has to catch is "a public item was deleted / a signature changed / one
+//! quietly appeared", and a source-level scan catches all three, which is enough. If nightly ever
+//! becomes acceptable, switching back to `cargo public-api` means replacing this module only —
+//! the baseline format and the gate logic stay as they are.
 //!
-//! # 快照格式
+//! # Snapshot format
 //!
-//! 每行一个公开项，`<种类> <路径><签名>`，按字典序排序。逐行 diff，因此
-//! **行的顺序不构成契约，行的内容构成契约**。
+//! One public item per line, `<kind> <path><signature>`, sorted lexically. The diff is line by
+//! line, so **the order of lines is not a contract while their content is**.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -24,7 +27,7 @@ use syn::{ImplItem, Item, Visibility};
 
 use crate::source;
 
-/// 抽取一个 crate 的公开 API 快照。
+/// Extracts one crate's public API snapshot.
 pub(crate) fn snapshot(crate_name: &str) -> Result<Vec<String>, String> {
     let src = source::workspace_root()
         .join("crates")
@@ -48,7 +51,7 @@ pub(crate) fn snapshot(crate_name: &str) -> Result<Vec<String>, String> {
     Ok(items.into_iter().collect())
 }
 
-/// 文件路径 → 模块路径。`src/model.rs` → `ra_core::model`。
+/// File path -> module path. `src/model.rs` -> `ra_core::model`.
 fn module_path(root: &str, src: &Path, file: &Path) -> String {
     let Ok(relative) = file.strip_prefix(src) else {
         return root.to_owned();
@@ -66,9 +69,11 @@ fn module_path(root: &str, src: &Path, file: &Path) -> String {
             continue;
         }
         let stem = component.trim_end_matches(".rs");
-        // `lib.rs` 不贡献一层路径。`mod.rs` 同样跳过：`layering` 已经禁掉了旧式入口，
-        // 正常情况下走不到这个分支，但真出现一个时应当算出 `foo` 而不是 `foo::mod`
-        // ——否则 public-api 会在 layering 已经报出根因之后再刷一屏无关的基线 diff。
+        // `lib.rs` contributes no path segment, and `mod.rs` is skipped for the same reason:
+        // `layering` already bans the old-style entry, so this branch is normally unreachable, but
+        // if one does appear it should resolve to `foo` rather than `foo::mod` — otherwise
+        // public-api would print a screen of unrelated baseline diff after layering already
+        // reported the root cause.
         if stem != "lib" && stem != "mod" {
             segments.push(stem.to_owned());
         }
@@ -80,10 +85,11 @@ fn is_public(vis: &Visibility) -> bool {
     matches!(vis, Visibility::Public(_))
 }
 
-/// 拆签名：限定符、名字、名字之后的部分。
+/// Splits a signature into qualifiers, name, and everything after the name.
 ///
-/// 不直接 dump 整个 `Signature`，因为那样会渲染成 `fn 路径::const fn 名字(...)`
-/// ——`const` 跑到了路径后面。拆开重排，限定符归到行首。
+/// Dumping the whole `Signature` directly would render as `fn <path>::const fn <name>(...)`, with
+/// `const` stranded after the path. Splitting and reordering moves the qualifiers to the front of
+/// the line.
 fn sig_parts(sig: &syn::Signature) -> (String, String, String) {
     let mut kind = String::new();
     if sig.constness.is_some() {
@@ -109,8 +115,9 @@ fn sig_parts(sig: &syn::Signature) -> (String, String, String) {
         ret @ syn::ReturnType::Type(..) => format!(" {}", one_line(ret)),
     };
 
-    // where 子句是契约的一部分（放宽/收紧 bound 会影响下游），而 `Generics` 的
-    // ToTokens 只渲染 `<...>`，得单独取。
+    // A where clause is part of the contract (loosening or tightening a bound affects
+    // downstream), but the `ToTokens` of `Generics` renders only `<...>`, so it is fetched
+    // separately.
     let where_clause = sig
         .generics
         .where_clause
@@ -124,10 +131,11 @@ fn sig_parts(sig: &syn::Signature) -> (String, String, String) {
     )
 }
 
-/// 渲染变体的字段部分。
+/// Renders the field portion of a variant.
 ///
-/// **不渲染属性**：doc 注释是属性，把它写进快照会让每一次改注释都撞门禁——
-/// 那会让人很快学会无脑 `--bless`，门禁也就废了。
+/// **Attributes are not rendered**: a doc comment is an attribute, and putting it in the snapshot
+/// would make every comment edit trip the gate — which teaches people to `--bless` reflexively,
+/// and then the gate is worthless.
 fn variant_fields(variant: &syn::Variant) -> String {
     match &variant.fields {
         syn::Fields::Unit => String::new(),
@@ -152,7 +160,8 @@ fn variant_fields(variant: &syn::Variant) -> String {
     }
 }
 
-/// 把 token 流压成单行：签名里的换行与缩进不是契约。
+/// Flattens a token stream onto one line: newlines and indentation inside a signature are not a
+/// contract.
 fn one_line(tokens: impl ToTokens) -> String {
     let raw = tokens.to_token_stream().to_string();
     let mut out = String::with_capacity(raw.len());
@@ -237,7 +246,8 @@ fn collect(items: &[Item], module: &str, out: &mut BTreeSet<String>) {
 }
 
 fn collect_impl(item: &syn::ItemImpl, module: &str, out: &mut BTreeSet<String>) {
-    // trait impl 不进快照：它由 trait 与类型共同决定，签名本身不是新增的公开面。
+    // A trait impl stays out of the snapshot: it is determined jointly by the trait and the type,
+    // and its signature is not newly exposed surface.
     if item.trait_.is_some() {
         return;
     }
@@ -260,14 +270,14 @@ fn collect_impl(item: &syn::ItemImpl, module: &str, out: &mut BTreeSet<String>) 
     }
 }
 
-/// 基线文件路径。
+/// Baseline file path.
 pub(crate) fn baseline_path(crate_name: &str) -> std::path::PathBuf {
     source::workspace_root()
         .join("api")
         .join(format!("{crate_name}.txt"))
 }
 
-/// 读取基线；不存在时返回 `None`。
+/// Reads the baseline; returns `None` when it does not exist.
 pub(crate) fn read_baseline(crate_name: &str) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(baseline_path(crate_name)).ok()?;
     Some(
@@ -279,7 +289,7 @@ pub(crate) fn read_baseline(crate_name: &str) -> Option<Vec<String>> {
     )
 }
 
-/// 写入基线（`--bless`）。
+/// Writes the baseline (`--bless`).
 pub(crate) fn write_baseline(crate_name: &str, items: &[String]) -> Result<(), String> {
     let path = baseline_path(crate_name);
     if let Some(parent) = path.parent() {

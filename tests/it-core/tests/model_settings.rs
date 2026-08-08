@@ -160,7 +160,8 @@ fn 未设置不会覆盖_显式零值与_false_会覆盖() {
 
 #[test]
 fn timeout_取全层最短() {
-    // 超时是延迟边界不是能力：任何一层想等得更短都有资格说话，请求只是被更早放弃。
+    // A timeout is a latency bound, not a capability: any layer wanting to wait less has standing,
+    // and the request is simply abandoned sooner.
     let key = provider("anthropic");
     let provider_defaults = ModelSettings::new().with_timeout(Duration::from_secs(60));
     let agent_defaults = ModelSettings::new().with_timeout(Duration::from_secs(15));
@@ -174,8 +175,9 @@ fn timeout_取全层最短() {
 
 #[test]
 fn max_tokens_只被模型层封顶_agent_默认不是天花板() {
-    // 只有模型层陈述硬事实。agent 写 max_tokens 表达的是"平时够用"，不是"永不超过"；
-    // 把四层一起取 min 会让某次要长回答的 run 显式设的值静默消失。
+    // Only the model layer states a hard fact. An agent writing max_tokens means "usually enough",
+    // not "never more"; taking the min across all four layers would silently erase the value a run
+    // set explicitly because it wanted a long answer.
     let key = provider("anthropic");
     let empty = ModelSettings::new();
     let model_limit = ModelSettings::new().with_max_tokens(8_192);
@@ -206,8 +208,9 @@ fn max_tokens_只被模型层封顶_agent_默认不是天花板() {
 
 #[test]
 fn 注册方默认里模型层压过_provider_兜底() {
-    // provider 兜底存在的理由是"有些端点这个字段必填"（Anthropic 就是），它不该压过一个
-    // 正因为该模型不一样才写下的 per-model 值——最粗的一层压过最具体的一层是反的。
+    // The provider fallback exists because "some endpoints require this field" (Anthropic does),
+    // which is no reason to override a per-model value written precisely because that model
+    // differs — the coarsest layer beating the most specific one is backwards.
     let key = provider("anthropic");
     let empty = ModelSettings::new();
     let provider_fallback = ModelSettings::new().with_max_tokens(4_096);
@@ -405,7 +408,8 @@ fn retry_与_backoff_深合并且保留_falsey_值() {
 
 #[test]
 fn retry_合并保留各层的未知字段() {
-    // 合并结果从空对象起手，不显式带上就会比它的来源层信息更少——正是 Unknown 要防的。
+    // A merge starts from an empty object, so anything not carried over explicitly ends up knowing
+    // less than the layer it came from — exactly what Unknown exists to prevent.
     let key = provider("compat");
     let newer_layer: ModelRetrySettings = serde_json::from_value(json!({
         "schema_version": 1,
@@ -428,8 +432,8 @@ fn retry_合并保留各层的未知字段() {
 
 #[test]
 fn 时长按毫秒整数上线而不是_rust_专有形状() {
-    // schema_version 已经承诺"任何语言的读取方一眼看懂"，Duration 默认的
-    // {"secs":N,"nanos":M} 不满足这条。
+    // schema_version already promises "obvious to a reader in any language", and Duration's
+    // default {"secs":N,"nanos":M} does not meet that bar.
     let settings = ModelSettings::new()
         .with_timeout(Duration::from_millis(1_500))
         .with_retry(ModelRetrySettings::new().with_backoff(

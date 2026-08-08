@@ -1,19 +1,25 @@
-//! `layering` 门禁：直接依赖白名单 + 依赖方向四条铁律 + 现代模块布局。
+//! The `layering` gate: a direct-dependency allowlist, the four dependency-direction rules, and
+//! the modern module layout.
 //!
-//! 铁律出自[开发计划](../../Docs/Rusty_Agent_Framework_Development_Plan.md)的 crate
-//! 表与[项目结构](../../Docs/Rusty_Agent_Project_Structure.md) §1：
+//! The rules come from the crate table in
+//! [the development plan](../../Docs/Rusty_Agent_Framework_Development_Plan.md) and from
+//! [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §1:
 //!
-//! 1. 每个 crate 只能依赖职责表允许的内部 crate；
-//! 2. **内核**（`ra-core` / `ra-macros` / `ra-runtime`）不依赖可复用件与产品；
-//! 3. **可复用件**不依赖产品；
-//! 4. **产品之间零依赖**，且框架 crate 不得引用产品实现；
-//! 5. **框架 crate 里零按产品名分支**（R18-8）。
+//! 1. every crate may depend only on the internal crates its responsibility table allows;
+//! 2. the **kernel** (`ra-core`, `ra-macros`, `ra-runtime`) depends on no reusable piece and no
+//!    product;
+//! 3. **reusable pieces** do not depend on products;
+//! 4. **products depend on no other product**, and no framework crate references a product
+//!    implementation;
+//! 5. **no framework crate branches on a product name** (R18-8).
 //!
-//! 前四条查依赖图（**含传递依赖**——`ra-core → X → ra-coding` 同样是违规，只查直接
-//! 依赖会漏），第五条查源码。
+//! The first four inspect the dependency graph (**including transitive edges** — `ra-core -> X ->
+//! ra-coding` is equally a violation, and checking direct dependencies alone would miss it); the
+//! fifth inspects source.
 //!
-//! 层级表是**白名单**：新建一个没登记的 crate 会让门禁直接失败。这是刻意的——
-//! 新 crate 落在哪一层是必须当场做的决定，不是可以以后再说的事。
+//! The layer table is an **allowlist**: creating an unregistered crate fails the gate outright.
+//! That is deliberate — which layer a new crate belongs to is a decision that has to be made on
+//! the spot, not deferred.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -22,18 +28,18 @@ use crate::gate::Outcome;
 use crate::source;
 use xtask::layering_policy::{ALLOW_MARKER, scan_product_references};
 
-/// crate 所属的层。
+/// Which layer a crate belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layer {
-    /// 内核：零业务的框架机制。
+    /// Kernel: framework machinery with zero business content.
     Kernel,
-    /// 通用服务：provider、沙箱、会话等。
+    /// General services: providers, sandboxes, sessions, and so on.
     Service,
-    /// 可复用件：换业务不改，但每个产品都要用。
+    /// Reusable pieces: unchanged across businesses, needed by every product.
     Reusable,
-    /// 参考产品：业务内容。
+    /// The reference product: business content.
     Product,
-    /// 二进制入口。装配者，允许依赖产品。
+    /// Binary entry point. As the assembler, it may depend on products.
     Binary,
 }
 
@@ -48,14 +54,15 @@ impl Layer {
         }
     }
 
-    /// 是否属于框架（与「产品内容」和「装配者」相对）。
+    /// Whether it belongs to the framework, as opposed to product content or the assembler.
     const fn is_framework(self) -> bool {
         matches!(self, Self::Kernel | Self::Service | Self::Reusable)
     }
 }
 
-/// 层级白名单。目标形态 17 个 crate，尚未建的（`ra-tools` / `ra-flow` /
-/// `ra-assistant`）先登记着，建出来当天就受门禁约束。
+/// The layer allowlist. The target shape is 17 crates; the ones not yet created (`ra-tools`,
+/// `ra-flow`, `ra-assistant`) are registered in advance so the gate binds them the day they
+/// appear.
 const LAYERS: &[(&str, Layer)] = &[
     ("ra-core", Layer::Kernel),
     ("ra-macros", Layer::Kernel),
@@ -77,27 +84,30 @@ const LAYERS: &[(&str, Layer)] = &[
     ("xtask", Layer::Binary),
 ];
 
-/// crate 职责表允许的直接内部依赖。
+/// The direct internal dependencies each crate's responsibility table allows.
 ///
-/// 分层规则只能拦住明显倒挂，拦不住 `ra-core -> ra-model` 这种“同属框架但职责已经
-/// 反了”的边。这里把开发计划的 crate 表变成白名单；新增依赖必须先回答它为什么属于
-/// 这条边界。尚未创建的三个 crate 也预登记，创建当天即受约束。
+/// Layer rules catch an obvious inversion but not an edge like `ra-core -> ra-model`, where both
+/// sides are framework yet the responsibilities are already backwards. This turns the development
+/// plan's crate table into an allowlist; a new dependency has to answer why it belongs on that
+/// boundary first. The three not-yet-created crates are pre-registered and bound from day one.
 ///
-/// **这张表是依赖图的唯一事实来源**，[项目结构](../../Docs/Rusty_Agent_Project_Structure.md)
-/// §1 的依赖图必须跟它一致；两边不一致时以这里为准，并当场改文档——白名单存在的
-/// 意义就是消灭那种“图上是一回事、Cargo.toml 是另一回事”的漂移。
+/// **This table is the single source of truth for the dependency graph**; the graph in
+/// [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §1 has to agree with it.
+/// When they disagree this wins and the document is fixed on the spot — the whole point of an
+/// allowlist is to eliminate the drift where the diagram says one thing and `Cargo.toml` another.
 ///
-/// # `ra-runtime` 只依赖 `ra-core`，是一条承诺不是一次省略
+/// # `ra-runtime` depending only on `ra-core` is a promise, not an omission
 ///
-/// Loop 内核不认识 `ra-model` / `ra-prompt` / `ra-context`。它调模型只能通过
-/// `ra-core` 里的 trait，提示词装配与上下文压缩只能由装配层注入。**代价是**：
-/// runner 想直接 `ra_prompt::Assembler::new()` 一下是不可能的，得先把能力表达成
-/// `ra-core` 的契约。这正是要的效果——凡是绕不过去的地方，说明那个契约本来就该
-/// 存在于内核里，而不是让内核去认识某个具体实现。
+/// The loop kernel does not know `ra-model`, `ra-prompt`, or `ra-context`. It can only reach a
+/// model through a trait in `ra-core`, and prompt assembly and context compaction have to be
+/// injected by the assembly layer. **The cost is** that the runner cannot simply call
+/// `ra_prompt::Assembler::new()`; the capability has to be expressed as a `ra-core` contract
+/// first. That is precisely the intent — wherever this proves unavoidable, the contract belonged
+/// in the kernel all along, rather than the kernel learning about one concrete implementation.
 const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-core", &[]),
     ("ra-macros", &[]),
-    // 见上：依赖倒置，不是还没来得及加。
+    // See above: this is dependency inversion, not something nobody got around to adding.
     ("ra-runtime", &["ra-core"]),
     ("ra-model", &["ra-core"]),
     ("ra-prompt", &["ra-core"]),
@@ -144,7 +154,7 @@ fn layer_of(name: &str) -> Option<Layer> {
         .map(|(_, layer)| *layer)
 }
 
-/// 执行门禁。
+/// Runs the gate.
 pub(crate) fn run() -> Outcome {
     let graph = match workspace_graph() {
         Ok(graph) => graph,
@@ -153,7 +163,8 @@ pub(crate) fn run() -> Outcome {
 
     let mut violations = Vec::new();
 
-    // 未登记的 crate 先拦下来：没有层级就无从判断它的依赖是否合法。
+    // An unregistered crate is stopped first: without a layer there is no way to judge its
+    // dependencies.
     for name in graph.keys() {
         if layer_of(name).is_none() {
             violations.push(format!(
@@ -185,8 +196,9 @@ pub(crate) fn run() -> Outcome {
     )
 }
 
-/// Rust 2018 起子模块不再需要 `mod.rs`；统一使用 `foo.rs + foo/`，入口在文件列表中
-/// 一眼可见，也避免两套布局长期混用。
+/// Since Rust 2018 a submodule no longer needs `mod.rs`. Using `foo.rs` plus `foo/` throughout
+/// keeps the entry visible at a glance in a file listing and avoids two layouts coexisting
+/// indefinitely.
 fn check_module_layout() -> Vec<String> {
     let crates = source::workspace_root().join("crates");
     source::rust_files(&crates)
@@ -201,7 +213,7 @@ fn check_module_layout() -> Vec<String> {
         .collect()
 }
 
-/// 检查 crate 表里逐条声明的直接依赖边界。
+/// Checks the direct-dependency boundaries declared entry by entry in the crate table.
 fn check_declared_boundaries(graph: &Graph) -> Vec<String> {
     let allowed: BTreeMap<&str, BTreeSet<&str>> = ALLOWED_INTERNAL_DEPS
         .iter()
@@ -230,17 +242,18 @@ fn check_declared_boundaries(graph: &Graph) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// 依赖图
+// dependency graph
 // ---------------------------------------------------------------------------
 
-/// 一条内部依赖。
+/// One internal dependency.
 struct Dep {
     name: String,
-    /// `normal` / `dev` / `build`。dev 依赖同样受约束——测试里绕过分层也是绕过。
+    /// `normal` / `dev` / `build`. Dev dependencies are bound too: bypassing layering in a test
+    /// is still bypassing it.
     kind: String,
 }
 
-/// 内部依赖图：crate 名 → 它直接依赖的内部 crate。
+/// The internal dependency graph: crate name -> the internal crates it depends on directly.
 type Graph = BTreeMap<String, Vec<Dep>>;
 
 fn workspace_graph() -> Result<Graph, String> {
@@ -280,7 +293,8 @@ fn workspace_graph() -> Result<Graph, String> {
                 deps.iter()
                     .filter_map(|d| {
                         let dep_name = d.get("name").and_then(serde_json::Value::as_str)?;
-                        // 只关心内部 crate；第三方依赖不参与分层。
+                        // Only internal crates matter; third-party dependencies are outside
+                        // layering.
                         if !names.contains(dep_name) {
                             return None;
                         }
@@ -302,7 +316,7 @@ fn workspace_graph() -> Result<Graph, String> {
     Ok(graph)
 }
 
-/// 从 `start` 出发能到达的全部内部 crate，附一条抵达路径。
+/// Every internal crate reachable from `start`, each with a path that reaches it.
 fn reachable(graph: &Graph, start: &str) -> BTreeMap<String, Vec<String>> {
     let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut queue = VecDeque::new();
@@ -325,10 +339,11 @@ fn reachable(graph: &Graph, start: &str) -> BTreeMap<String, Vec<String>> {
     seen
 }
 
-/// 铁律 1-3 的依赖侧。
+/// The dependency side of rules 1 through 3.
 ///
-/// **直接违规排在传递违规前面**：一条错误的 `Cargo.toml` 依赖会在下游炸出十几条
-/// 传递违规，把唯一需要动手的那一行埋在中间。根因先行，读第一条就能修。
+/// **Direct violations are listed before transitive ones**: one wrong `Cargo.toml` dependency
+/// explodes into a dozen transitive violations downstream and buries the single line that needs
+/// editing. Root cause first, so reading the first entry is enough to fix it.
 fn check_dependencies(graph: &Graph) -> Vec<String> {
     let mut direct = Vec::new();
     let mut transitive = Vec::new();
@@ -338,7 +353,7 @@ fn check_dependencies(graph: &Graph) -> Vec<String> {
             continue;
         };
 
-        // 直接依赖：能给出 kind，报错信息更有用。
+        // Direct dependency: the kind is available, which makes the message more useful.
         for dep in deps {
             let Some(dep_layer) = layer_of(&dep.name) else {
                 continue;
@@ -355,7 +370,7 @@ fn check_dependencies(graph: &Graph) -> Vec<String> {
             }
         }
 
-        // 传递依赖：只查直接依赖会漏掉 ra-core -> X -> ra-coding。
+        // Transitive dependency: checking only direct edges would miss ra-core -> X -> ra-coding.
         for (target, path) in reachable(graph, name) {
             let Some(target_layer) = layer_of(&target) else {
                 continue;
@@ -381,11 +396,12 @@ fn check_dependencies(graph: &Graph) -> Vec<String> {
     direct
 }
 
-/// `from` 依赖 `to` 是否违规；违规则返回被违反的铁律。
+/// Whether `from` depending on `to` is a violation; if so, returns the rule it breaks.
 ///
-/// 只编码被明确禁止的组合，**不发明一个全序**：`ra-eval`（服务）依赖 `ra-runtime`
-/// （内核）与 `ra-coding`（产品）依赖 `ra-runtime`（内核）都是合法的，说明层级之间
-/// 本来就不是单向可比的。
+/// Only the explicitly forbidden combinations are encoded; **no total order is invented**.
+/// `ra-eval` (a service) depending on `ra-runtime` (kernel) and `ra-coding` (a product) depending
+/// on `ra-runtime` (kernel) are both legal, which shows the layers were never comparable in one
+/// direction to begin with.
 const fn forbidden(from: Layer, to: Layer) -> Option<&'static str> {
     match (from, to) {
         (Layer::Kernel, Layer::Reusable | Layer::Product) => {
@@ -399,13 +415,14 @@ const fn forbidden(from: Layer, to: Layer) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// 源码侧：铁律 3 的 `use` 与铁律 4 的产品名分支
+// source side: the `use` of rule 3 and the product-name branching of rule 4
 // ---------------------------------------------------------------------------
 
-/// 框架 crate 里出现产品名——不管是 `use` 还是字符串分支。
+/// A product name appearing in a framework crate, whether as a `use` or as a string branch.
 ///
-/// 返回违规列表与放行的显式例外条数。例外条数会进汇总输出：它只能逐条增加，
-/// 每次 CI 都看得见涨没涨。
+/// Returns the violations plus the number of explicit exemptions allowed through. That count goes
+/// into the summary output: it can only grow one entry at a time, and every CI run shows whether
+/// it did.
 fn check_product_references(graph: &Graph) -> (Vec<String>, usize) {
     let root = source::workspace_root();
     let products: Vec<_> = LAYERS

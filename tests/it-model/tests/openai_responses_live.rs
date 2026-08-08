@@ -1,6 +1,6 @@
-//! 打真实端点的冒烟测试。默认 `#[ignore]`，离线 CI 不会跑到。
+//! Smoke tests against a real endpoint. `#[ignore]` by default, so offline CI never reaches them.
 //!
-//! 运行：
+//! Run with:
 //! ```text
 //! RA_LIVE_OPENAI_BASE_URL=https://api.bianxie.ai/v1 \
 //! RA_LIVE_OPENAI_API_KEY="$OPENAI_API_KEY1" \
@@ -8,9 +8,10 @@
 //! cargo test --manifest-path tests/Cargo.toml -p it-model --test openai_responses_live -- --ignored --nocapture
 //! ```
 //!
-//! 这些用例的价值不在断言，而在**打印出来的实测事实**：第三方端点认不认
-//! `include: reasoning.encrypted_content`、reasoning 能不能原样回放、`cached_tokens` 与
-//! `x-request-id` 透不透传。结论应当回写进 R1-6b 的 `Quirks` 与 R1-8 的 usage 明细。
+//! The value of these cases is not in their assertions but in the **measured facts they print**:
+//! whether a third-party endpoint honors `include: reasoning.encrypted_content`, whether reasoning
+//! replays verbatim, and whether `cached_tokens` and `x-request-id` survive the hop. The findings
+//! belong back in the `Quirks` of R1-6b and the usage detail of R1-8.
 
 use ra_core::{
     item::{ModelInputItem, RunItemKind, ToolCallOutput},
@@ -21,7 +22,7 @@ use serde_json::json;
 
 fn required_env(name: &str) -> String {
     std::env::var(name)
-        .unwrap_or_else(|_| panic!("实测用例需要环境变量 {name}；见本文件顶部的运行命令"))
+        .unwrap_or_else(|_| panic!("live test requires env var {name}; see the command at the top of this file"))
 }
 
 fn live_model() -> OpenAiResponsesModel {
@@ -30,7 +31,7 @@ fn live_model() -> OpenAiResponsesModel {
         OpenAiAuth::new(required_env("RA_LIVE_OPENAI_API_KEY"))
             .with_base_url(required_env("RA_LIVE_OPENAI_BASE_URL")),
     )
-    .expect("实测模型应当能构造")
+    .expect("the live model should build")
 }
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
@@ -78,9 +79,9 @@ fn report(label: &str, response: &ra_core::item::ModelResponse) {
     }
 }
 
-/// 一轮最小往返：请求形状能否被真实服务端接受。
+/// One minimal round trip: whether a real server accepts the request shape.
 #[tokio::test]
-#[ignore = "打真实端点，需要凭据"]
+#[ignore = "hits a real endpoint and needs credentials"]
 async fn live_minimal_turn_round_trips() {
     let model = live_model();
     let response = model
@@ -94,19 +95,21 @@ async fn live_minimal_turn_round_trips() {
             .with_system_instructions("You are a terse test fixture."),
         )
         .await
-        .expect("最小往返应当成功");
+        .expect("the minimal round trip should succeed");
 
-    report("最小往返", &response);
-    assert!(response.response_id().is_some(), "服务端应返回 response id");
-    assert!(response.usage().input_tokens() > 0, "usage 应当有输入 token");
+    report("minimal round trip", &response);
+    assert!(response.response_id().is_some(), "the server should return a response id");
+    assert!(response.usage().input_tokens() > 0, "usage should report input tokens");
 }
 
-/// 两轮：把第一轮的 reasoning 与 tool call 原样回放，验证 `encrypted_content` 回传路径。
+/// Two turns: replays the first turn's reasoning and tool call verbatim to exercise the
+/// `encrypted_content` path.
 ///
-/// 这是 R1-4 最容易在真实端点上翻车的一条：`store=false` 时 reasoning 必须靠
-/// `include: reasoning.encrypted_content` 拿到回放材料，中转站很可能把它吞掉。
+/// This is the part of R1-4 most likely to break against a real endpoint: with `store=false`,
+/// reasoning depends on `include: reasoning.encrypted_content` for its replay material, and a
+/// relay may well swallow it.
 #[tokio::test]
-#[ignore = "打真实端点，需要凭据"]
+#[ignore = "hits a real endpoint and needs credentials"]
 async fn live_reasoning_and_tool_call_replay() {
     let model = live_model();
     let tools = vec![
@@ -122,8 +125,9 @@ async fn live_reasoning_and_tool_call_replay() {
         .with_description("Return the current weather for a city."),
     ];
 
-    // effort 拉高 + 需要推演的问法：只有这样第一轮才会同时产出 reasoning 与工具调用，
-    // 回放路径才真正被走到。简单问句会让模型直接调工具、reasoning 为 0，测不出东西。
+    // High effort plus a question that requires deduction: only then does the first turn produce
+    // both reasoning and a tool call, which is what actually exercises the replay path. A simple
+    // question makes the model call the tool directly with zero reasoning, testing nothing.
     let settings = || {
         resolved(
             ModelSettings::new()
@@ -144,8 +148,8 @@ async fn live_reasoning_and_tool_call_replay() {
             .with_tools(tools.clone()),
         )
         .await
-        .expect("第一轮应当成功");
-    report("第一轮（期望 reasoning + 工具调用）", &first);
+        .expect("the first turn should succeed");
+    report("first turn (expecting reasoning plus a tool call)", &first);
 
     let call_id = first
         .output()
@@ -154,9 +158,10 @@ async fn live_reasoning_and_tool_call_replay() {
             RunItemKind::ToolCall(call) => Some(call.call_id().clone()),
             _ => None,
         })
-        .expect("第一轮应当产生一次工具调用");
-    // 模型这一轮出不出 reasoning 由它自己决定，不作断言；但只要出了，就必须带回放材料——
-    // 缺了它就说明中转站把 `include: reasoning.encrypted_content` 吞了，属于 R1-6b 的 quirk。
+        .expect("the first turn should produce one tool call");
+    // Whether the model emits reasoning this turn is its own call and is not asserted; but if it
+    // does, the replay material has to come with it. Missing material means the relay swallowed
+    // `include: reasoning.encrypted_content`, which is an R1-6b quirk.
     let reasoning_items = first
         .output()
         .iter()
@@ -165,12 +170,12 @@ async fn live_reasoning_and_tool_call_replay() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    eprintln!("reasoning 项数 = {}", reasoning_items.len());
+    eprintln!("reasoning items = {}", reasoning_items.len());
     assert!(
         reasoning_items
             .iter()
             .all(|reasoning| reasoning.encrypted_content().is_some()),
-        "端点回传了 reasoning 却没有 encrypted_content：store=false 下无法回放"
+        "the endpoint returned reasoning without encrypted_content: it cannot be replayed under store=false"
     );
 
     let mut input = first.to_input_items();
@@ -182,13 +187,13 @@ async fn live_reasoning_and_tool_call_replay() {
     let second = model
         .get_response(ModelRequest::new(input, settings()).with_tools(tools))
         .await
-        .expect("回放第一轮的 reasoning 与工具调用后，第二轮应当成功");
-    report("第二轮（回放）", &second);
+        .expect("the second turn should succeed after replaying the first turn");
+    report("second turn (replay)", &second);
     assert!(
         second
             .output()
             .iter()
             .any(|item| matches!(item.kind(), RunItemKind::Message(_))),
-        "第二轮应当给出文本答复"
+        "the second turn should produce a text reply"
     );
 }

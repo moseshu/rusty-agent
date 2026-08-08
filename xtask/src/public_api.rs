@@ -1,22 +1,26 @@
-//! `public-api` 门禁：公开面契约。
+//! The `public-api` gate: the public-surface contract.
 //!
-//! 查三件事，都是「下游能不能安全依赖这个 crate」的组成部分：
+//! It checks three things, each part of "can downstream safely depend on this crate":
 //!
-//! 1. **基线对账**——公开项被删、签名变了、悄悄多了一个，都要在 diff 里现形；
-//! 2. **扩展安全 ①②**——公开枚举 `#[non_exhaustive]`、公开结构体无公开字段；
-//! 3. **稳定性分级**——每个 crate 的 `lib.rs` 标注 `Stable` / `Evolving` / `Internal`。
+//! 1. **Baseline reconciliation** — a deleted public item, a changed signature, or one that
+//!    quietly appeared must all show up in the diff;
+//! 2. **Extension safety 1 and 2** — public enums are `#[non_exhaustive]`, public structs have no
+//!    public fields;
+//! 3. **Stability grades** — every crate's `lib.rs` states `Stable` / `Evolving` / `Internal`.
 //!
-//! 基线变更**不是错误，是需要被看见的决定**：改完跑 `cargo xtask public-api --bless`
-//! 重新生成，让那份 diff 出现在 code review 里。门禁拦的是「悄悄变了」，不是「变了」。
+//! A baseline change **is not an error, it is a decision that has to be seen**: regenerate with
+//! `cargo xtask public-api --bless` and let the diff appear in code review. The gate stops
+//! "changed quietly", not "changed".
 
 use crate::api;
 use crate::extension_safety;
 use crate::gate::Outcome;
 
-/// 纳入公开面契约的 crate。
+/// The crates covered by the public-surface contract.
 ///
-/// 只放**下游会依赖**的。`ra-cli` / `xtask` 是二进制，`ra-coding` 是参考产品——
-/// 产品的公开面不是框架契约，它随业务改是正常的。
+/// Only the ones **downstream depends on**. `ra-cli` and `xtask` are binaries and `ra-coding` is
+/// the reference product — a product's public surface is not a framework contract, and it changing
+/// with the business is normal.
 const TRACKED: &[&str] = &[
     "ra-core",
     "ra-macros",
@@ -32,7 +36,7 @@ const TRACKED: &[&str] = &[
     "ra-patch",
 ];
 
-/// 执行门禁。`bless` 为真时重写基线而不是对账。
+/// Runs the gate. When `bless` is true it rewrites the baseline instead of reconciling.
 pub(crate) fn run(bless: bool) -> Outcome {
     let mut violations = Vec::new();
     let mut blessed = 0_usize;
@@ -82,7 +86,8 @@ pub(crate) fn run(bless: bool) -> Outcome {
     )
 }
 
-/// 逐行对账。**删除与新增分开报**：前者是破坏性的，后者只是要更新基线。
+/// Reconciles line by line. **Removals and additions are reported separately**: the first is
+/// breaking, the second only needs a baseline refresh.
 fn diff(name: &str, baseline: &[String], current: &[String]) -> Vec<String> {
     let mut violations = Vec::new();
 

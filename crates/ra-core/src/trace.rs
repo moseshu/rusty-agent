@@ -1,56 +1,60 @@
-//! span 分类与字段词表。所有 crate 打日志时共用这一套名字。
+//! Span taxonomy and the field vocabulary. Every crate logs through these names.
 //!
-//! # 三条边界
+//! # Three boundaries
 //!
-//! 1. **这里只定词表**：span 名、字段名、级别约定。不实现任何 subscriber，更不
-//!    接任何外部上报后端——装配 subscriber 是 `ra-cli` 的事，接不接后端是用户
-//!    的事。
-//! 2. **tracing 通道面向开发者与 eval，不是 UI 事件流。** 用户可见的事件走 R9
-//!    rollout 的 `event_msg` 双通道，两者不可互相替代：日志可以随时调级别、可以
-//!    丢，事件流不能。
-//! 3. **span 字段只放标识与计数，不放内容。** 模型输入输出、工具入参、文件内容
-//!    一律不进 span——它们体量大、含敏感数据，且已经在 rollout 通道里有权威副本。
-//!    这条让「关掉敏感数据」不至于把 span 拓扑一起关掉（R14-2）。
+//! 1. **This module defines vocabulary only**: span names, field names, level conventions. It
+//!    implements no subscriber and wires up no external reporting backend — assembling a
+//!    subscriber is `ra-cli`'s job, and choosing a backend is the user's.
+//! 2. **The tracing channel serves developers and eval, not the UI event stream.** User-visible
+//!    events go through the `event_msg` channel of the R9 rollout. The two are not
+//!    interchangeable: logs can change level or be dropped at any time, the event stream cannot.
+//! 3. **Span fields carry identifiers and counts, never content.** Model input and output, tool
+//!    arguments, and file contents never enter a span: they are large, they contain sensitive
+//!    data, and the rollout channel already holds an authoritative copy. This is what keeps
+//!    "turn off sensitive data" from also turning off the span topology (R14-2).
 //!
-//! # 为什么要有词表
+//! # Why a vocabulary
 //!
-//! 字段名是**契约**：eval 归因（R14-2）、成本报表、指标聚合都按名字取值。散落在
-//! 各 crate 里手写字符串，迟早出现 `tool.name` 与 `tool_name` 并存，聚合出来的
-//! 数字就是错的。所以名字在这里定一次，[`field::ALL`] 是全集。
+//! Field names are a **contract**: eval attribution (R14-2), cost reports, and metric aggregation
+//! all look values up by name. Hand-written strings scattered across crates eventually produce
+//! both `tool.name` and `tool_name`, and the aggregated numbers are simply wrong. So the names are
+//! fixed once here, and [`field::ALL`] is the complete set.
 //!
-//! # 级别约定
+//! # Level conventions
 //!
-//! span 的级别由 [`SpanKind::level`] 定，错误事件的级别由 [`level_for`] 从可恢复性
-//! 投影。其余事件按下表，判据是**默认级别下的日志量应当与任务规模成正比，而不是
-//! 与 token 数成正比**：
+//! A span's level comes from [`SpanKind::level`] and an error event's level is projected from
+//! recoverability by [`level_for`]. Everything else follows the table below, whose criterion is
+//! that **at the default level the log volume should scale with task size, not with token
+//! count**:
 //!
-//! | 级别 | 放什么 | 量级 |
+//! | Level | Contents | Volume |
 //! | --- | --- | --- |
-//! | ERROR | 不干预就过不去的事 | 一次 run 零到一条 |
-//! | WARN | 框架自己能处理但值得知道：重试、模型回退、drain 超时强杀、护栏拦截 | 每次发生一条 |
-//! | INFO | run 的骨架：agent / turn / generation / function / handoff | 每 turn 个位数 |
-//! | DEBUG | 逐工具、逐请求的细节；guardrail 与 `mcp_list_tools` | 每 turn 几十条 |
-//! | TRACE | 逐 SSE 事件、逐 chunk、逐 token | 不设上限 |
+//! | ERROR | Something that cannot proceed without intervention | zero or one per run |
+//! | WARN | The framework handles it but you should know: retry, model fallback, drain-timeout kill, guard block | one per occurrence |
+//! | INFO | The skeleton of a run: agent / turn / generation / function / handoff | single digits per turn |
+//! | DEBUG | Per-tool and per-request detail; guardrail and `mcp_list_tools` | tens per turn |
+//! | TRACE | Per SSE event, per chunk, per token | no ceiling |
 //!
-//! # 与 `tracing` 宏的配合
+//! # Working with the `tracing` macros
 //!
-//! `tracing` 的宏要求字段在**创建 span 时**就声明，之后才能 `record`。因此终态
-//! 类字段（[`field::OUTCOME`] / [`field::ERROR_CODE`] / usage 那几项）必须在
-//! callsite 用 [`tracing::field::Empty`] 占位：
+//! The `tracing` macros require a field to be declared **when the span is created** before it can
+//! be `record`ed. Terminal fields ([`field::OUTCOME`], [`field::ERROR_CODE`], the usage entries)
+//! therefore have to be reserved at the callsite with [`tracing::field::Empty`]:
 //!
 //! ```ignore
 //! let span = tracing::info_span!(
 //!     "generation",
 //!     span.kind = SpanKind::Generation.label(),
 //!     model.name = %model,
-//!     outcome = tracing::field::Empty,         // ← 不占位，record 就是静默失败
+//!     outcome = tracing::field::Empty,         // <- without this, `record` silently does nothing
 //!     usage.cached_input_tokens = tracing::field::Empty,
 //! );
 //! ```
 //!
-//! 宏的字段名只能写成点分标识符的字面形式，**没法把常量插进去**；常量服务于
-//! [`record_outcome`] 这类 helper 与 eval 侧断言。两边靠
-//! `tests/it-core/tests/span_taxonomy.rs` 的最后一条断言对齐。
+//! A macro field name can only be written as a literal dotted identifier, so **a constant cannot
+//! be interpolated there**; the constants serve helpers such as [`record_outcome`] and the
+//! assertions on the eval side. The last assertion in `tests/it-core/tests/span_taxonomy.rs` keeps
+//! the two in sync.
 
 use core::fmt;
 use std::borrow::Cow;
@@ -60,87 +64,92 @@ use tracing::{Level, Span};
 use crate::cancel::{CancelReason, ScopeKind};
 use crate::error::{Error, Recoverability};
 
-/// 字段名词表。**改名等同破坏性变更**——下游的报表与断言都按名字取值。
+/// The field-name vocabulary. **Renaming one is a breaking change** — downstream reports and
+/// assertions look values up by name.
 pub mod field {
-    // -- 每个 span 都有 ----------------------------------------------------
+    // -- present on every span ---------------------------------------------
 
-    /// span 分类，取值为 [`super::SpanKind::label`]。
+    /// Span kind, valued by [`super::SpanKind::label`].
     ///
-    /// 与 span 名的区别见 [`super::SpanKind::span_name`]：**归因以本字段为准**。
+    /// See [`super::SpanKind::span_name`] for how this differs from the span name:
+    /// **attribution goes by this field**.
     pub const SPAN_KIND: &str = "span.kind";
-    /// 自定义分类的标签，仅 [`super::SpanKind::Custom`] 有。
+    /// Label of a custom kind; only [`super::SpanKind::Custom`] carries it.
     pub const SPAN_LABEL: &str = "span.label";
-    /// 终态，取值为 [`super::SpanOutcome::as_str`]。span 关闭前 record。
+    /// Terminal state, valued by [`super::SpanOutcome::as_str`]. Recorded before the span closes.
     pub const OUTCOME: &str = "outcome";
 
-    // -- 失败与取消 --------------------------------------------------------
+    // -- failure and cancellation ------------------------------------------
 
-    /// 错误的机器可读标识，取值为 `Error::code()`。**不记错误文本**。
+    /// Machine-readable error identity, valued by `Error::code()`. **The error text is not
+    /// recorded.**
     pub const ERROR_CODE: &str = "error.code";
-    /// 取消根因，取值为 `CancelReason::code()`。
+    /// Cancellation root cause, valued by `CancelReason::code()`.
     pub const CANCEL_REASON: &str = "cancel.reason";
-    /// 发起取消的作用域层级，取值为 `ScopeKind::label()`。
+    /// Scope level that initiated the cancellation, valued by `ScopeKind::label()`.
     pub const CANCEL_SCOPE: &str = "cancel.scope";
 
     // -- agent -------------------------------------------------------------
 
-    /// agent 名。
+    /// Agent name.
     pub const AGENT_NAME: &str = "agent.name";
 
     // -- turn --------------------------------------------------------------
 
-    /// turn 序号，从 0 起。
+    /// Turn index, starting at 0.
     pub const TURN_INDEX: &str = "turn.index";
 
     // -- generation --------------------------------------------------------
 
-    /// 模型名（最终解析出来的那个，不是用户写的别名）。
+    /// Model name: the one finally resolved, not the alias the user wrote.
     pub const MODEL_NAME: &str = "model.name";
-    /// provider 标识。
+    /// Provider identity.
     pub const MODEL_PROVIDER: &str = "model.provider";
-    /// 协议路径：`responses` / `chat` / `messages` / `compat`（R1）。
+    /// Protocol path: `responses` / `chat` / `messages` / `compat` (R1).
     pub const GEN_PROTOCOL: &str = "gen.protocol";
-    /// 本次请求的输入 token 数。
+    /// Input tokens for this request.
     pub const USAGE_INPUT_TOKENS: &str = "usage.input_tokens";
-    /// 其中命中缓存的部分。
+    /// The cached portion of those input tokens.
     ///
-    /// **这一项单列不是为了好看**：缓存命中率是成本主因，把它折进
-    /// [`USAGE_INPUT_TOKENS`] 就再也算不出命中率，也就看不见成本问题。
+    /// **This is not broken out for tidiness**: cache hit rate is the dominant cost driver, and
+    /// folding it into [`USAGE_INPUT_TOKENS`] makes the hit rate — and therefore the cost problem
+    /// — impossible to compute.
     pub const USAGE_CACHED_INPUT_TOKENS: &str = "usage.cached_input_tokens";
-    /// 输出 token 数。
+    /// Output tokens.
     pub const USAGE_OUTPUT_TOKENS: &str = "usage.output_tokens";
-    /// 其中的推理 token（若 provider 单列）。
+    /// The reasoning tokens among them, when the provider reports them separately.
     pub const USAGE_REASONING_TOKENS: &str = "usage.reasoning_tokens";
 
-    // -- function（工具调用）-----------------------------------------------
+    // -- function (tool call) ----------------------------------------------
 
-    /// 工具的限定名，来自 `ToolOrigin`。
+    /// Qualified tool name, from `ToolOrigin`.
     pub const TOOL_NAME: &str = "tool.name";
-    /// 模型侧的调用 id，用于和结果配对（不靠顺序配对）。
+    /// Model-side call id, used to pair with the result (never positional pairing).
     pub const TOOL_CALL_ID: &str = "tool.call_id";
 
     // -- handoff -----------------------------------------------------------
 
-    /// 交接的来源 agent。
+    /// Source agent of the handoff.
     pub const HANDOFF_FROM: &str = "handoff.from";
-    /// 交接的目标 agent。
+    /// Target agent of the handoff.
     pub const HANDOFF_TO: &str = "handoff.to";
 
     // -- guardrail ---------------------------------------------------------
 
-    /// 护栏标识，来自 guard 登记表（R7-0）。
+    /// Guard identity, from the guard registry (R7-0).
     pub const GUARDRAIL_ID: &str = "guardrail.id";
-    /// 触发位置，取值为 `GuardrailStage` 的小写名。
+    /// Trigger point, valued by the lowercase name of `GuardrailStage`.
     pub const GUARDRAIL_STAGE: &str = "guardrail.stage";
-    /// 是否真的拦下了（tripwire 是否触发）。
+    /// Whether it actually blocked (whether the tripwire fired).
     pub const GUARDRAIL_TRIGGERED: &str = "guardrail.triggered";
 
     // -- mcp ---------------------------------------------------------------
 
-    /// MCP server 标识。
+    /// MCP server identity.
     pub const MCP_SERVER: &str = "mcp.server";
 
-    /// 全集。eval 与门禁用它校验「字段名必须在词表内」。
+    /// The complete set. Eval and the gates use it to check that every field name is in the
+    /// vocabulary.
     pub const ALL: &[&str] = &[
         SPAN_KIND,
         SPAN_LABEL,
@@ -169,46 +178,50 @@ pub mod field {
 }
 
 // ---------------------------------------------------------------------------
-// span 分类
+// span taxonomy
 // ---------------------------------------------------------------------------
 
-/// span 分类。对齐 openai `tracing/span_data.py`，去掉语音那三类，加上 `turn`。
+/// Span kind. Aligned with openai `tracing/span_data.py`, dropping the three voice kinds and
+/// adding `turn`.
 ///
-/// `turn` 是我们自己的：openai 用 `response` 表示一次模型往返，但**一个 turn 可能
-/// 包含重试、模型回退和一整批工具**，没有这一层就没法回答「这一轮花了多少钱」。
+/// `turn` is ours: openai uses `response` for one model round trip, but **a single turn can
+/// contain retries, a model fallback, and a whole batch of tools**. Without this level there is no
+/// way to answer "what did this turn cost".
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SpanKind {
-    /// 一个 agent 的整段执行。子 agent（R12）各自一个。
+    /// One agent's entire execution. Each sub-agent (R12) gets its own.
     Agent,
-    /// 一轮：模型往返 + 其后的工具批次。
+    /// One turn: a model round trip plus the tool batch that follows it.
     Turn,
-    /// 一次模型调用（含重试与回退，各自一个 span）。
+    /// One model call. Retries and fallbacks each get their own span.
     Generation,
-    /// 一次工具调用。名字沿用 openai 的 `function`，涵盖所有 `Tool` 实现。
+    /// One tool call. The name follows openai's `function` and covers every `Tool` implementation.
     Function,
-    /// 一次 agent 交接。
+    /// One agent handoff.
     Handoff,
-    /// 一次护栏检查（R7）。
+    /// One guard check (R7).
     Guardrail,
-    /// 一次 MCP 工具列表拉取——它是启动延迟与缓存失效的常见源头，值得单列。
+    /// One MCP tool-list fetch. It is a common source of startup latency and cache invalidation,
+    /// which earns it its own kind.
     McpListTools,
-    /// 扩展点：产品或第三方自定义的分类（扩展安全第 5 条）。
+    /// Extension point: a kind defined by a product or a third party (extension-safety rule 5).
     Custom(Cow<'static, str>),
 }
 
 impl SpanKind {
-    /// 构造[自定义分类](Self::Custom)。
+    /// Creates a [custom kind](Self::Custom).
     #[must_use]
     pub fn custom(label: impl Into<Cow<'static, str>>) -> Self {
         Self::Custom(label.into())
     }
 
-    /// 用作 `tracing` span 名。
+    /// Used as the `tracing` span name.
     ///
-    /// `tracing` 要求 span 名是 `&'static str`，自定义标签给不了，因此
-    /// [`Self::Custom`] 一律叫 `custom`，真实标签进 [`field::SPAN_LABEL`]。
-    /// **归因不要按 span 名分组**，按 [`field::SPAN_KIND`] 分。
+    /// `tracing` requires a span name to be a `&'static str`, which a custom label cannot
+    /// provide, so [`Self::Custom`] is always called `custom` and the real label goes into
+    /// [`field::SPAN_LABEL`]. **Do not group attribution by span name**; group by
+    /// [`field::SPAN_KIND`].
     #[must_use]
     pub const fn span_name(&self) -> &'static str {
         match self {
@@ -223,7 +236,7 @@ impl SpanKind {
         }
     }
 
-    /// [`field::SPAN_KIND`] 的取值。自定义分类返回它自己的标签。
+    /// The value of [`field::SPAN_KIND`]. A custom kind returns its own label.
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
@@ -232,12 +245,12 @@ impl SpanKind {
         }
     }
 
-    /// 该分类的 span 应该打在哪一级。
+    /// Which level a span of this kind belongs at.
     ///
-    /// 分档的判据是**一次正常的 run 在 INFO 下应当读得完**：run 骨架（agent /
-    /// turn / generation / function / handoff）进 INFO；高频且多数时候无事发生的
-    /// （guardrail / `mcp_list_tools`）进 DEBUG——护栏真拦下来的时候另发一条 WARN
-    /// 事件，那才是要看的东西。
+    /// The criterion is that **a normal run should be readable end to end at INFO**: the run
+    /// skeleton (agent / turn / generation / function / handoff) goes to INFO, while the frequent
+    /// and usually uneventful ones (guardrail, `mcp_list_tools`) go to DEBUG — when a guard
+    /// actually blocks, a separate WARN event carries the part worth reading.
     #[must_use]
     pub const fn level(&self) -> Level {
         match self {
@@ -251,10 +264,11 @@ impl SpanKind {
         }
     }
 
-    /// 创建该分类的 span 时**必须**带上的字段。
+    /// Fields that **must** be present when a span of this kind is created.
     ///
-    /// 只列创建时就知道的标识类字段；终态字段（[`field::OUTCOME`]、usage 等）用
-    /// [`tracing::field::Empty`] 占位后再 record，不在这里要求。
+    /// Only identifying fields that are known at creation time are listed. Terminal fields
+    /// ([`field::OUTCOME`], usage, and so on) are reserved with [`tracing::field::Empty`] and
+    /// recorded later, so they are not required here.
     #[must_use]
     pub const fn required_fields(&self) -> &'static [&'static str] {
         match self {
@@ -281,24 +295,25 @@ impl fmt::Display for SpanKind {
 }
 
 // ---------------------------------------------------------------------------
-// 终态
+// terminal state
 // ---------------------------------------------------------------------------
 
-/// span 的终态。**取消单列一档**，不并进 `Error`——理由同 R0-2：取消不是失败，
-/// 混在一起会让失败率指标在用户按停止键时飙升。
+/// Terminal state of a span. **Cancellation gets its own tier** rather than being folded into
+/// `Error`, for the same reason as R0-2: cancellation is not failure, and merging them makes the
+/// failure-rate metric spike every time a user presses stop.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpanOutcome {
-    /// 正常完成。
+    /// Completed normally.
     Ok,
-    /// 以失败告终。
+    /// Ended in failure.
     Error,
-    /// 被取消。
+    /// Was cancelled.
     Cancelled,
 }
 
 impl SpanOutcome {
-    /// [`field::OUTCOME`] 的取值。
+    /// The value of [`field::OUTCOME`].
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -308,7 +323,7 @@ impl SpanOutcome {
         }
     }
 
-    /// 是否算一次失败。取消不算。
+    /// Whether this counts as a failure. Cancellation does not.
     #[must_use]
     pub const fn is_failure(self) -> bool {
         matches!(self, Self::Error)
@@ -322,7 +337,7 @@ impl fmt::Display for SpanOutcome {
 }
 
 impl From<&Error> for SpanOutcome {
-    /// 走 `Error::is_cancelled()` 的投影，不匹配变体、不看文本。
+    /// Projected through `Error::is_cancelled()`; it matches no variant and reads no text.
     fn from(err: &Error) -> Self {
         if err.is_cancelled() {
             Self::Cancelled
@@ -333,19 +348,20 @@ impl From<&Error> for SpanOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// 级别投影
+// level projection
 // ---------------------------------------------------------------------------
 
-/// 一个错误该打在哪一级。**从可恢复性投影得到**，不由 callsite 自己拍。
+/// Which level an error belongs at. **Projected from recoverability**, never chosen by the
+/// callsite.
 ///
-/// | 可恢复性 | 级别 | 理由 |
+/// | Recoverability | Level | Reason |
 /// | --- | --- | --- |
-/// | `Retryable` / `RetryableWithChange` | WARN | 框架会自己处理，人不需要动手 |
-/// | `NeedsIntervention` / `Fatal` | ERROR | 不干预就过不去 |
-/// | `Cancelled` | INFO | 取消是正常终态，刷 ERROR 会淹掉真错误 |
+/// | `Retryable` / `RetryableWithChange` | WARN | the framework handles it; nobody has to act |
+/// | `NeedsIntervention` / `Fatal` | ERROR | it cannot proceed without intervention |
+/// | `Cancelled` | INFO | cancellation is a normal ending; logging it as ERROR drowns real errors |
 ///
-/// 让 callsite 自己选级别的后果是可预见的：重试前的每次失败都打 ERROR，日志里
-/// 全是红的，真正需要人看的那条反而被淹掉。
+/// Letting the callsite pick the level has a predictable outcome: every pre-retry failure logs as
+/// ERROR, the log turns red end to end, and the one line that actually needs a human is buried.
 #[must_use]
 pub const fn level_for(recoverability: Recoverability) -> Level {
     match recoverability {
@@ -359,27 +375,28 @@ pub const fn level_for(recoverability: Recoverability) -> Level {
 // record helper
 // ---------------------------------------------------------------------------
 
-/// 记录终态。
+/// Records the terminal state.
 ///
-/// 字段必须在创建 span 时用 [`tracing::field::Empty`] 占过位，否则 `record` 静默
-/// 无效——这是 `tracing` 的语义，不是本函数的疏漏。
+/// The field must have been reserved with [`tracing::field::Empty`] when the span was created,
+/// or `record` silently does nothing — that is `tracing` semantics, not an oversight here.
 pub fn record_outcome(span: &Span, outcome: SpanOutcome) {
     span.record(field::OUTCOME, outcome.as_str());
 }
 
-/// 记录一个错误的终态：[`field::ERROR_CODE`] + [`field::OUTCOME`]。
+/// Records an error terminal state: [`field::ERROR_CODE`] plus [`field::OUTCOME`].
 ///
-/// 只落 `code()`，**不落错误文本**：文本会变、会含路径与密钥，且按文本聚合就是
-/// R7-10 禁止的词表式判断。取消会被记成 [`SpanOutcome::Cancelled`] 而不是
+/// Only `code()` is stored, **never the error text**: text changes, it can contain paths and
+/// secrets, and aggregating by text is exactly the vocabulary-matching that R7-10 forbids. A
+/// cancellation is recorded as [`SpanOutcome::Cancelled`] rather than
 /// `Error`。
 pub fn record_error(span: &Span, err: &Error) {
     span.record(field::ERROR_CODE, err.code());
     record_outcome(span, SpanOutcome::from(err));
 }
 
-/// 记录一次取消：根因、发起层级与终态。
+/// Records a cancellation: root cause, initiating level, and terminal state.
 ///
-/// 这是取消契约（R0-4）里承诺的两个字段的唯一写入口。
+/// This is the only write path for the two fields promised by the cancellation contract (R0-4).
 pub fn record_cancel(span: &Span, reason: &CancelReason, scope: &ScopeKind) {
     span.record(field::CANCEL_REASON, reason.code());
     span.record(field::CANCEL_SCOPE, scope.label());

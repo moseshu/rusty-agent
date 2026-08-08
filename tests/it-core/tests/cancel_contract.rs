@@ -1,10 +1,13 @@
-//! `ra-core`：取消契约（R0-4）的行为断言。
+//! `ra-core`: behavioral assertions for the cancellation contract (R0-4).
 //!
-//! 这里锁住的是**契约**，不是实现细节：
-//! - 取消只向下传播，且传播不改写子作用域自己的根因——归因不在第一跳就丢
-//! - 「已取消」与「有根因」永远同时成立——不存在查不出原因的取消
-//! - 时限只能收紧不能放宽，且过期一定会在检查点生效（哪怕没人 arm 定时器）
-//! - 取消不是失败：不计失败率、不触发重试
+//! What is locked down here is the **contract**, not implementation detail:
+//! - cancellation propagates downward only, and propagation never rewrites a child scope's own
+//!   root cause — attribution does not die on the first hop
+//! - "cancelled" and "has a root cause" always hold together — there is no cancellation whose
+//!   reason cannot be recovered
+//! - a deadline can only tighten, and an expired one always takes effect at a checkpoint even when
+//!   nobody armed a timer
+//! - cancellation is not failure: no failure rate, no retry
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +16,7 @@ use std::time::Duration;
 use ra_core::cancel::{CancelReason, CancelScope, DRAIN_GRACE, Deadline, ScopeKind};
 use ra_core::error::Recoverability;
 
-/// 每个原因各一个实例。新增变体时必须同步补进来。
+/// One instance of every reason. Adding a variant means adding it here too.
 fn all_reasons() -> Vec<CancelReason> {
     vec![
         CancelReason::UserInterrupt,
@@ -27,7 +30,7 @@ fn all_reasons() -> Vec<CancelReason> {
     ]
 }
 
-/// 规范的四层树：run -> turn -> tool -> process。
+/// The canonical four-level tree: run -> turn -> tool -> process.
 fn 四层树() -> (CancelScope, CancelScope, CancelScope, CancelScope) {
     let run = CancelScope::root();
     let turn = run.child(ScopeKind::Turn);
@@ -37,13 +40,13 @@ fn 四层树() -> (CancelScope, CancelScope, CancelScope, CancelScope) {
 }
 
 // ---------------------------------------------------------------------------
-// 传播方向
+// propagation direction
 // ---------------------------------------------------------------------------
 
 #[test]
 fn 取消传播到所有后代含孙子层() {
-    // 「父图取消必须能杀到孙子 run 的子进程」是最容易漏的一处泄漏，
-    // 所以这里断言的是整条链，不只是直接子节点。
+    // "cancelling the parent has to reach the child process of a grandchild run" is the easiest
+    // leak to miss, so this asserts the whole chain rather than the direct child alone.
     let (run, turn, tool, process) = 四层树();
     assert!(!process.is_cancelled(), "初始状态不该是已取消");
 
@@ -60,8 +63,8 @@ fn 取消传播到所有后代含孙子层() {
 
 #[test]
 fn 取消不向上传播() {
-    // 一个工具超时不该把整个 run 干掉——否则 loop 没法把超时当成一次工具失败
-    // 继续走下去。
+    // One tool timing out must not take the whole run with it, or the loop could not treat the
+    // timeout as a single tool failure and carry on.
     let (run, turn, tool, process) = 四层树();
 
     tool.cancel(CancelReason::Timeout);
@@ -73,7 +76,7 @@ fn 取消不向上传播() {
 }
 
 // ---------------------------------------------------------------------------
-// 根因归因
+// root-cause attribution
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -94,8 +97,9 @@ fn 后代沿链继承根因() {
 
 #[test]
 fn 先到的根因不被后到的覆盖() {
-    // 工具先超时，随后用户中断整个 run：工具那一层仍然是超时。
-    // 这正是不设 `ParentCancelled` 的收益——每一层报的都是自己的真实死因。
+    // The tool times out first, then the user interrupts the whole run: that tool still reports a
+    // timeout. This is exactly what having no `ParentCancelled` buys — every level reports how it
+    // actually died.
     let (run, turn, tool, _process) = 四层树();
 
     tool.cancel(CancelReason::Timeout);
@@ -140,8 +144,9 @@ fn 已取消与有根因永远同时成立() {
 
 #[test]
 fn 裸_token_取消降级为_unspecified() {
-    // 第三方库只认 CancellationToken，绕过 cancel() 是无法避免的。
-    // 契约要求这种路径**仍然可查**，只是根因降级——而不是出现「已取消但没有原因」。
+    // A third-party library only speaks CancellationToken, so bypassing cancel() is unavoidable.
+    // The contract requires such a path to **stay inspectable** with a degraded root cause, rather
+    // than producing "cancelled but reasonless".
     let scope = CancelScope::root();
     let child = scope.child(ScopeKind::Tool);
 
@@ -153,12 +158,12 @@ fn 裸_token_取消降级为_unspecified() {
 }
 
 // ---------------------------------------------------------------------------
-// 时限
+// deadlines
 // ---------------------------------------------------------------------------
 
 #[test]
 fn 时限只能收紧不能放宽() {
-    // 否则一个工具就能给自己批一个比整个 run 更长的时限。
+    // Otherwise a single tool could grant itself more time than the whole run.
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::from_secs(600)));
     let 原始 = run.deadline().expect("run 应带时限");
 
@@ -195,7 +200,8 @@ fn 子作用域继承时限() {
 
 #[test]
 fn 过期时限不等于已取消() {
-    // deadline 是纯数据，ra-core 不 arm 定时器：没人看它的时候它不会自己触发。
+    // A deadline is pure data and ra-core arms no timer: with nobody looking at it, it never
+    // fires on its own.
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::ZERO));
 
     assert!(run.deadline().expect("应有时限").is_expired());
@@ -242,7 +248,7 @@ fn deadline_剩余时间随到期而归零() {
 }
 
 // ---------------------------------------------------------------------------
-// 可取消的 await 点
+// cancellable await points
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -254,7 +260,8 @@ async fn run_正常完成时透传结果() {
 
 #[tokio::test]
 async fn 已取消的作用域不再启动新工作() {
-    // 即便 future 早已就绪也不给它机会跑：取消之后不该再产生任何副作用。
+    // Even a future that is long since ready gets no chance to run: nothing should produce a side
+    // effect after cancellation.
     let scope = CancelScope::root();
     scope.cancel(CancelReason::Superseded);
 
@@ -319,18 +326,18 @@ async fn cancelled_在被取消时唤醒() {
         取消端.cancel(CancelReason::PeerFailure);
     });
 
-    // 没被唤醒就会挂死在这里，由测试超时兜底。
+    // Without a wake-up this hangs here, and the test timeout is the backstop.
     tool.cancelled().await;
     assert!(tool.is_cancelled());
 }
 
 // ---------------------------------------------------------------------------
-// 句柄语义
+// handle semantics
 // ---------------------------------------------------------------------------
 
 #[test]
 fn clone_是同一个作用域而不是新层级() {
-    // 交给 spawn 出去的任务用 clone，派生新层级用 child——两者不能混。
+    // Hand a spawned task a clone and derive a new level with child; the two must not be mixed.
     let scope = CancelScope::root();
     let 句柄 = scope.clone();
 
@@ -342,8 +349,8 @@ fn clone_是同一个作用域而不是新层级() {
 
 #[test]
 fn 作用域被_drop_不会取消它() {
-    // 这是 tokio-util 的语义，也是 CancelOnDrop 存在的理由：
-    // 忘记取消不会报错，只会让后代永远等下去。
+    // This is tokio-util semantics and the very reason CancelOnDrop exists: forgetting to cancel
+    // raises no error, it just leaves descendants waiting forever.
     let run = CancelScope::root();
     let tool = run.child(ScopeKind::Tool);
     let 子进程 = tool.child(ScopeKind::Process);
@@ -402,7 +409,7 @@ fn disarm_之后不再取消() {
 }
 
 // ---------------------------------------------------------------------------
-// 原因的分类与投影
+// reason classification and projections
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -465,7 +472,7 @@ fn user_message_非空且不是_code() {
 }
 
 // ---------------------------------------------------------------------------
-// 与错误分类学的对接
+// interface with the error taxonomy
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -497,18 +504,19 @@ fn 检查点错误携带面向人的原因文本() {
 }
 
 // ---------------------------------------------------------------------------
-// 常量
+// constants
 // ---------------------------------------------------------------------------
 
 #[test]
 fn drain_宽限期是有限的正值() {
-    // 零会让「等到终态」退化成「直接强杀」，无穷会让取消挂死。
+    // Zero would degrade "wait for a terminal state" into "kill immediately", and infinity would
+    // make cancellation hang.
     assert!(DRAIN_GRACE > Duration::ZERO);
     assert!(DRAIN_GRACE <= Duration::from_secs(30));
 }
 
 // ---------------------------------------------------------------------------
-// 层级标签
+// level labels
 // ---------------------------------------------------------------------------
 
 #[test]

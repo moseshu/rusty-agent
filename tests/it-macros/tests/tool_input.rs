@@ -118,7 +118,7 @@ fn 仍被引用的_definition_保留_元组按位置展开() {
             .unwrap()
             .decode_arguments(r#"{"filters":{"include_archived":null,"labels":[]},"tuple":["seven",7]}"#)
             .is_err(),
-        "位置化元组必须逐位校验类型"
+        "a positional tuple must be type-checked element by element"
     );
 }
 
@@ -151,10 +151,11 @@ fn 无参数工具也能生成合法的_strict_schema() {
     );
 }
 
-/// 自引用类型无法表达成 strict schema，必须是错误而不是让进程崩掉。
+/// A self-referential type cannot be expressed as a strict schema; that has to be an error rather
+/// than a crashed process.
 #[derive(Debug, Deserialize, JsonSchema, ToolInput)]
 struct RecursiveInput {
-    /// 下一个节点。
+    /// The next node.
     next: Box<RecursiveInput>,
 }
 

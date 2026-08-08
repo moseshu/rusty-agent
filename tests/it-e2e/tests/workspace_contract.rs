@@ -1,11 +1,12 @@
-//! R0-7 独立测试 workspace 的结构契约。
+//! Structural contract of the separate test workspace (R0-7).
 //!
-//! 宿主清单不写死：从 `crates/` 推导，跟 `cargo xtask test` 用同一条规则。写死的表
-//! 会在新建 crate 那天忘记更新，而那正是契约最该说话的时刻。
+//! The host list is not hard-coded: it is derived from `crates/` by the same rule `cargo xtask
+//! test` uses. A hard-coded table only ever gets forgotten on the day a crate is created, which is
+//! exactly when the contract should speak.
 
 use std::path::{Path, PathBuf};
 
-/// 跨 crate 契约的宿主，不对应任何单个被测 crate。
+/// The host for cross-crate contracts; it corresponds to no single crate under test.
 const CROSS_CRATE_HOST: &str = "it-e2e";
 
 #[test]
@@ -127,7 +128,8 @@ fn repository_root() -> PathBuf {
         .expect("repository root should exist")
 }
 
-/// `crates/` 下有 `src/lib.rs` 的 crate。`ra-cli` 是 bin，不在其列。
+/// The crates under `crates/` that have a `src/lib.rs`. `ra-cli` is a binary and is not among
+/// them.
 fn library_crates(root: &Path) -> Vec<String> {
     let crates = root.join("crates");
     let mut names = Vec::new();
@@ -153,8 +155,9 @@ fn read(path: &Path) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
-/// 匹配属性名而不是整行：`#[tokio::test(flavor = "multi_thread")]` 与带参
-/// `#[rstest(..)]` 也是真测试，整行比较会把它们误判成空占位。
+/// Match the attribute name rather than the whole line: `#[tokio::test(flavor = "multi_thread")]`
+/// and a parameterized `#[rstest(..)]` are real tests too, and a whole-line comparison would
+/// misjudge them as empty placeholders.
 fn has_test_attribute(text: &str) -> bool {
     const MARKERS: &[&str] = &["test", "tokio::test", "rstest", "test_case"];
     text.lines().any(|line| {

@@ -45,8 +45,9 @@ fn responses_能力矩阵完整() {
 fn chat_completions_能力矩阵完整() {
     let capabilities = ApiProtocol::OpenAiChatCompletions.capabilities();
 
-    // reasoning_content 是 Qwen / DeepSeek / Kimi 网关的约定，不是 Chat Completions 字段；
-    // 第一方 OpenAI 从不回传，GPT / Gemini 的思考走完全不同的形状。
+    // reasoning_content is a convention of the Qwen / DeepSeek / Kimi gateways, not a Chat
+    // Completions field: first-party OpenAI never returns it, and GPT / Gemini shape their
+    // thinking completely differently.
     assert_eq!(capabilities.reasoning_carrier(), ReasoningCarrier::None);
     assert_eq!(capabilities.reasoning_replay(), ReasoningReplay::None);
     assert!(!capabilities.reasoning_replay().is_required());
@@ -58,8 +59,9 @@ fn chat_completions_能力矩阵完整() {
         capabilities.stable_prefix(),
         StablePrefixLocation::FirstSystemMessage
     );
-    // prompt_cache_key 在 Chat 上同样存在（openai-python chat/completion_create_params.py）。
-    // 某个网关认不认它是 provider 事实，归 Quirks，不归协议矩阵。
+    // prompt_cache_key exists on Chat too (openai-python chat/completion_create_params.py).
+    // Whether a given gateway honors it is a provider fact and belongs to Quirks, not to the
+    // protocol matrix.
     assert!(capabilities.prompt_cache().automatic_prefix_matching());
     assert!(capabilities.prompt_cache().explicit_cache_key());
     assert!(!capabilities.prompt_cache().cache_control_breakpoints());
@@ -134,15 +136,16 @@ fn runtime_必须通过能力判断而非假设_responses_语义() {
     assert!(!anthropic.supports_previous_response_id());
     assert!(!anthropic.supports_conversation_id());
 
-    // 两条 OpenAI 协议在缓存机制上是同构的——把它们区分开会让 R1-13 在 Chat 上漏发
-    // prompt_cache_key。差异只在 Anthropic：不打断点就完全不缓存。
+    // The two OpenAI protocols are isomorphic on caching; separating them would make R1-13 skip
+    // prompt_cache_key on Chat. The difference is Anthropic-only: without a breakpoint it does not
+    // cache at all.
     assert_eq!(responses.prompt_cache(), chat.prompt_cache());
     assert_ne!(responses.prompt_cache(), anthropic.prompt_cache());
     assert!(responses.prompt_cache().is_supported());
     assert!(chat.prompt_cache().is_supported());
     assert!(anthropic.prompt_cache().is_supported());
 
-    // 只有 Chat 在协议层完全没有 reasoning 回传面。
+    // Chat alone has no reasoning return surface at the protocol level.
     assert!(!chat.reasoning_replay().is_required());
     assert!(responses.reasoning_replay().is_required());
     assert!(anthropic.reasoning_replay().is_required());

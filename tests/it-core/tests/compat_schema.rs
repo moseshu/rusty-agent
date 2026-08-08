@@ -1,24 +1,25 @@
-//! `ra-core`：跨版本兼容（R0-8 第 6 条）的行为断言。
+//! `ra-core`: behavioral assertions for cross-version compatibility (R0-8 rule 6).
 //!
-//! 这里锁住的是**降级读取不丢数据**：新版本写出的记录被旧版本读到、再写回去，
-//! 多出来的字段必须原封不动地还在。默认的 serde 行为是静默丢弃——那会让用户看到
-//! 「resume 之后某些状态没了」，且无从追查。
+//! What is locked down here is that **a downgrade read loses nothing**: when a record written by a
+//! newer build is read by an older one and written back, the extra fields must still be there
+//! untouched. serde's default is to drop them silently — which shows up to the user as "some state
+//! vanished after a resume", with no way to trace it.
 
 use ra_core::compat::{Compatibility, SchemaVersion, Unknown};
 use serde::{Deserialize, Serialize};
 
-/// 模拟「旧版本代码」眼里的记录：只认识两个字段。
+/// The record as "older code" sees it: it knows only two fields.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct 旧版记录 {
     schema_version: SchemaVersion,
     #[serde(default)]
     max_turns: u32,
-    /// flatten 必须在最后：它会吃掉所有没被前面字段认领的键。
+    /// flatten has to come last: it claims every key the preceding fields did not.
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
 
-/// 新版本写出来的 JSON：多了两个旧版不认识的字段。
+/// The JSON a newer build writes: two fields the older one does not know.
 const 新版写出的: &str = r#"{
     "schema_version": 2,
     "max_turns": 12,
@@ -27,7 +28,7 @@ const 新版写出的: &str = r#"{
 }"#;
 
 // ---------------------------------------------------------------------------
-// 未知字段保留
+// unknown-field retention
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -50,7 +51,7 @@ fn 已知字段不会跑进未知集() {
 
 #[test]
 fn 回写时未知字段原样带回() {
-    // 「新版写 → 旧版读 → 旧版再写」这条路径不能丢数据。
+    // The "new writes, old reads, old writes again" path must not lose data.
     let 记录: 旧版记录 = serde_json::from_str(新版写出的).expect("应能解析");
     let 回写 = serde_json::to_string(&记录).expect("应能序列化");
     let 解析: serde_json::Value = serde_json::from_str(&回写).expect("回写结果应是合法 JSON");
@@ -79,8 +80,8 @@ fn 干净的记录不写出空对象() {
 
 #[test]
 fn 未知字段回写顺序确定() {
-    // 用 BTreeMap 而不是 HashMap：顺序不定会让同一份数据每次写出的字节不同，
-    // 快照测试与内容寻址全部失效。
+    // BTreeMap rather than HashMap: an unstable order makes the same data serialize to different
+    // bytes each time, which breaks snapshot tests and content addressing.
     let json = r#"{"schema_version":1,"max_turns":1,"z":1,"a":2,"m":3}"#;
     let 记录: 旧版记录 = serde_json::from_str(json).expect("应能解析");
 
@@ -94,7 +95,7 @@ fn 未知字段回写顺序确定() {
 
 #[test]
 fn 缺字段的旧记录能被新代码读出() {
-    // 第 2 条：新增字段一律 #[serde(default)]。
+    // Rule 2: every added field is #[serde(default)].
     let 旧数据 = r#"{"schema_version":1}"#;
     let 记录: 旧版记录 = serde_json::from_str(旧数据).expect("缺字段应走默认值而不是报错");
 
@@ -103,12 +104,12 @@ fn 缺字段的旧记录能被新代码读出() {
 }
 
 // ---------------------------------------------------------------------------
-// schema 版本
+// schema versions
 // ---------------------------------------------------------------------------
 
 #[test]
 fn 版本号序列化成裸整数() {
-    // 宿主可能不是 Rust 写的，版本号要一眼看得懂。
+    // The host may not be written in Rust, so the version has to be obvious at a glance.
     let json = serde_json::to_string(&SchemaVersion::new(7)).expect("应能序列化");
     assert_eq!(json, "7");
 
@@ -136,7 +137,8 @@ fn 兼容性判定三档() {
 
 #[test]
 fn 只有旧记录需要迁移() {
-    // 新记录不迁移：字段只增不删 + 未知字段保留，降级读取本来就是安全的。
+    // A newer record needs no migration: fields only grow and unknown ones are retained, which
+    // already makes a downgrade read safe.
     assert!(Compatibility::Older.needs_migration());
     assert!(!Compatibility::Same.needs_migration());
     assert!(
@@ -147,7 +149,7 @@ fn 只有旧记录需要迁移() {
 
 #[test]
 fn 版本更新的记录仍然能读() {
-    // 这一条是策略本体：报错等于「装了旧版客户端就打不开会话」。
+    // This is the policy itself: failing would mean "an older client cannot open the session".
     let 记录: 旧版记录 = serde_json::from_str(新版写出的).expect("更新的 schema 版本不该阻止读取");
     assert_eq!(记录.schema_version, SchemaVersion::new(2));
 }

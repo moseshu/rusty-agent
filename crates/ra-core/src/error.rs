@@ -1,76 +1,82 @@
-//! 错误分类学。跨层通用变体只放这里；各 crate 有自己的 Error。
+//! Error taxonomy. Only the cross-layer variants live here; each crate has its own Error.
 //!
-//! # 两个正交维度
+//! # Two orthogonal dimensions
 //!
-//! | 维度 | 类型 | 回答 |
+//! | Dimension | Type | Answers |
 //! | --- | --- | --- |
-//! | 子系统 | [`Error`] 的变体 | 错误**发生在哪一层** |
-//! | 可恢复性 | [`Recoverability`] | 拿到错误之后**该怎么办** |
+//! | Subsystem | the [`Error`] variants | **which layer** the error happened in |
+//! | Recoverability | [`Recoverability`] | **what to do** once you hold the error |
 //!
-//! 可恢复性是从子系统与 kind **推导出来的投影**，不是存储的字段——因此两者
-//! 不可能出现不一致。这也是不把两个维度做成两个并列枚举的原因。
+//! Recoverability is a **projection derived** from the subsystem and kind, not a stored field, so
+//! the two can never disagree. That is also why the two dimensions are not two parallel enums.
 //!
-//! # 与各 crate 自有错误的关系
+//! # Relationship to each crate's own errors
 //!
-//! `ra-model` / `ra-exec` / `ra-session` 等有各自更详细的错误类型，它们在跨越
-//! crate 边界时收敛成本模块的 [`Error`]。因此这里的变体只需携带**判定可恢复性
-//! 与生成用户消息所必需的信息**，不复刻下层的全部细节；细节走 `source`。
+//! `ra-model`, `ra-exec`, `ra-session` and others have their own, more detailed error types, which
+//! converge into this module's [`Error`] when they cross a crate boundary. A variant here
+//! therefore only needs to carry **what is required to decide recoverability and to produce a user
+//! message**; it does not reproduce every detail of the layer below, which travels in `source`.
 //!
-//! # 扩展安全
+//! # Extension safety
 //!
-//! 所有对外枚举都是 `#[non_exhaustive]`（扩展安全第 1 条）：新增变体不破坏下游。
-//! 结构体变体同样标注，因此外部只能通过本模块的构造函数创建（扩展安全第 2 条）。
+//! Every public enum is `#[non_exhaustive]` (extension-safety rule 1): adding a variant does not
+//! break downstream code. Struct variants carry the same attribute, so outside code can only
+//! construct them through this module's constructors (extension-safety rule 2).
 
 use core::fmt;
 use std::error::Error as StdError;
 
-/// 装箱的底层错误源。
+/// Boxed underlying error source.
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
-/// 框架通用结果类型。
+/// The framework's common result type.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 // ---------------------------------------------------------------------------
-// 维度二：可恢复性
+// dimension two: recoverability
 // ---------------------------------------------------------------------------
 
-/// 拿到错误之后该怎么办。与 [`Error`] 的子系统维度正交。
+/// What to do once you hold the error. Orthogonal to the subsystem dimension of [`Error`].
 ///
-/// 这是控制流的判据：重试策略（R1-9b）、模型回退（R1-12）、错误处理器
-/// （R3-8）都只读这个投影，不解析错误文本。
+/// This is the control-flow criterion: the retry policy (R1-9b), model fallback (R1-12), and the
+/// error handler (R3-8) all read this projection only and never parse error text.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recoverability {
-    /// 原样重试可能成功：网络抖动、429、5xx、瞬时超时。
+    /// Retrying unchanged may succeed: network jitter, 429, 5xx, a transient timeout.
     Retryable,
-    /// 原样重试无用，**换模型 / 参数 / 策略**可能成功：模型拒答、输出不合协议、
-    /// 上下文超限。R1-12 的模型回退只对这一档生效。
+    /// Retrying unchanged is useless, but **a different model, parameters, or strategy** may
+    /// succeed: a refusal, output that violates the protocol, an exceeded context window. The
+    /// R1-12 model fallback applies to this tier only.
     RetryableWithChange,
-    /// 需要人介入：凭据无效、配置缺失、沙箱不可用、权限被拒。
+    /// A human has to step in: invalid credentials, missing configuration, an unavailable
+    /// sandbox, a denied permission.
     NeedsIntervention,
-    /// 重试永远无用：调用方用错 API、状态已不可恢复。
+    /// Retrying never helps: the caller misused the API, or the state is unrecoverable.
     Fatal,
-    /// 主动取消。**不是失败**，不计入失败率，不触发重试。
+    /// A deliberate cancellation. **Not a failure**: it does not count toward the failure rate
+    /// and triggers no retry.
     Cancelled,
 }
 
 impl Recoverability {
-    /// 是否可以原样重试同一个请求。
+    /// Whether the same request may be retried unchanged.
     ///
-    /// 注意这**不等于**「值得再试一次」：[`Self::RetryableWithChange`] 也值得再试，
-    /// 但必须先改变某个输入，否则只是重复烧钱。
+    /// Note this is **not** the same as "worth another attempt": [`Self::RetryableWithChange`] is
+    /// also worth retrying, but only after some input changes — otherwise it just burns money
+    /// twice.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         matches!(self, Self::Retryable)
     }
 
-    /// 是否值得在改变输入后再试（含原样重试）。
+    /// Whether it is worth retrying after changing an input (this includes retrying unchanged).
     #[must_use]
     pub const fn is_recoverable(self) -> bool {
         matches!(self, Self::Retryable | Self::RetryableWithChange)
     }
 
-    /// 是否算一次真正的失败。取消不算。
+    /// Whether this counts as a real failure. Cancellation does not.
     #[must_use]
     pub const fn is_failure(self) -> bool {
         !matches!(self, Self::Cancelled)
@@ -91,253 +97,258 @@ impl fmt::Display for Recoverability {
 }
 
 // ---------------------------------------------------------------------------
-// 各子系统的失败原因
+// per-subsystem failure reasons
 // ---------------------------------------------------------------------------
 
-/// provider 调用的失败原因。决定 [`Recoverability`] 与重试策略。
+/// Why a provider call failed. Determines [`Recoverability`] and the retry policy.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderErrorKind {
-    /// 网络不可达、连接重置、DNS 失败。
+    /// Network unreachable, connection reset, DNS failure.
     Network,
-    /// 触发限流（HTTP 429）。
+    /// Rate limited (HTTP 429).
     RateLimit,
-    /// 请求超时。
+    /// The request timed out.
     Timeout,
-    /// 服务端错误（HTTP 5xx）。
+    /// Server error (HTTP 5xx).
     ServerError,
-    /// 凭据无效或权限不足（HTTP 401 / 403）。
+    /// Invalid credentials or insufficient permission (HTTP 401 / 403).
     Auth,
-    /// 请求不合法（HTTP 400）。通常是本地构造错误，重试无用。
+    /// Malformed request (HTTP 400). Usually a local construction bug, so retrying is useless.
     BadRequest,
-    /// 模型拒答。触发 R1-12 的模型回退。
+    /// The model refused. Triggers the R1-12 model fallback.
     Refusal,
-    /// 模型输出不符合协议：工具调用参数非法 JSON、结构化输出不匹配 schema。
+    /// Model output violates the protocol: invalid JSON tool arguments, structured output that
+    /// does not match the schema.
     Behavior,
-    /// 输入超出模型上下文窗口。需要先压缩再重试（R5）。
+    /// Input exceeds the model context window. Compact first, then retry (R5).
     ContextOverflow,
 }
 
-/// 工具执行的失败原因。
+/// Why a tool execution failed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolErrorKind {
-    /// 模型调用了不存在的工具，或 `ToolOrigin` 反查不到实现。
+    /// The model called a tool that does not exist, or `ToolOrigin` resolved to no implementation.
     NotFound,
-    /// 入参不合 schema。
+    /// Arguments do not match the schema.
     InvalidInput,
-    /// 单工具超时（R2-7）。
+    /// A single tool timed out (R2-7).
     Timeout,
-    /// 工具自身执行失败。
+    /// The tool itself failed while executing.
     ExecutionFailed,
-    /// 工具被取消（含 MCP 侧取消）。
+    /// The tool was cancelled (including a cancellation on the MCP side).
     Cancelled,
 }
 
-/// 沙箱与隔离的失败原因。
+/// Why sandboxing or isolation failed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SandboxErrorKind {
-    /// 操作越界被拒：写工作区之外、访问敏感路径、网络策略拦截。
+    /// An out-of-bounds operation was denied: a write outside the workspace, access to a
+    /// sensitive path, a network policy block.
     Denied,
-    /// 后端不可用：缺 `bwrap` / `sandbox-exec` / docker daemon 未启动。
+    /// The backend is unavailable: no `bwrap`, no `sandbox-exec`, or the docker daemon is not
+    /// running.
     Unavailable,
-    /// 触及资源上限：内存、进程数、输出体量。
+    /// A resource ceiling was hit: memory, process count, output size.
     ResourceLimit,
-    /// 沙箱环境准备失败。
+    /// Preparing the sandbox environment failed.
     Setup,
 }
 
-/// 会话持久化的失败原因。
+/// Why session persistence failed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionErrorKind {
-    /// 目标会话不存在。
+    /// The target session does not exist.
     NotFound,
-    /// 记录损坏、JSONL 行不可解析、`call_id` 配不上对。
+    /// A corrupt record, an unparsable JSONL line, or a `call_id` that pairs with nothing.
     Corrupted,
-    /// 底层读写失败。
+    /// The underlying read or write failed.
     Io,
-    /// `schema_version` 不兼容且无法迁移（R6-6）。
+    /// The `schema_version` is incompatible and cannot be migrated (R6-6).
     VersionMismatch,
 }
 
-/// 控制协议的失败原因。
+/// Why the control protocol failed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolErrorKind {
-    /// 帧不可解析，或超出 `max_buffer_size`。
+    /// An unparsable frame, or one beyond `max_buffer_size`.
     Frame,
-    /// 传输层断开。
+    /// The transport disconnected.
     Transport,
-    /// 握手失败：版本不兼容、能力协商失败。
+    /// Handshake failure: incompatible versions or failed capability negotiation.
     Handshake,
-    /// 在途请求超时未收到响应。
+    /// An in-flight request timed out without a response.
     Timeout,
 }
 
-/// 预算耗尽的种类。
+/// Which budget was exhausted.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BudgetKind {
-    /// 达到 `max_turns`。
+    /// Reached `max_turns`.
     MaxTurns,
-    /// 达到 token 预算。
+    /// Reached the token budget.
     Tokens,
-    /// 达到费用预算。
+    /// Reached the spend budget.
     Cost,
-    /// 达到墙钟 deadline。
+    /// Reached the wall-clock deadline.
     WallClock,
 }
 
-/// 护栏触发的位置。对应 R7-1 / R7-3 的四类 tripwire。
+/// Where a guard fired. Matches the four tripwire classes of R7-1 / R7-3.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GuardrailStage {
-    /// 首个 agent 运行前的输入护栏。
+    /// The input guard, before the first agent runs.
     Input,
-    /// 最终输出后的输出护栏。
+    /// The output guard, after the final output.
     Output,
-    /// 工具入参护栏。
+    /// The tool-argument guard.
     ToolInput,
-    /// 工具结果护栏。
+    /// The tool-result guard.
     ToolOutput,
 }
 
 // ---------------------------------------------------------------------------
-// 维度一：按子系统
+// dimension one: by subsystem
 // ---------------------------------------------------------------------------
 
-/// 框架通用错误。变体按**子系统**划分，即错误发生在哪一层。
+/// The framework's common error. Variants are split by **subsystem**: which layer it happened in.
 ///
-/// 「该怎么办」由 [`Error::recoverability`] 投影得到，不要靠匹配变体或解析
-/// 文本来判断——那正是 R7-10 去词表化禁止的做法。
+/// "What to do" is projected by [`Error::recoverability`]. Do not decide it by matching variants
+/// or parsing text — that is exactly the vocabulary matching R7-10 forbids.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// 配置错误：缺失、非法、来源冲突。
+    /// Configuration error: missing, invalid, or conflicting sources.
     #[error("配置错误：{message}")]
     #[non_exhaustive]
     Config {
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 调用方用错 API：参数组合非法、状态机被违规驱动、契约未被遵守。
+    /// The caller misused the API: an invalid argument combination, an illegal state-machine
+    /// transition, a contract that was not honored.
     ///
-    /// 这类错误**永远不该重试**——它是代码缺陷，不是运行时状况。
+    /// This class **must never be retried**: it is a code defect, not a runtime condition.
     #[error("调用方错误：{message}")]
     #[non_exhaustive]
     Caller {
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 模型 provider 调用失败。
+    /// A model provider call failed.
     #[error("provider 错误（{kind:?}）：{message}")]
     #[non_exhaustive]
     Provider {
-        /// 失败原因，决定可恢复性。
+        /// Failure reason, which determines recoverability.
         kind: ProviderErrorKind,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 工具执行失败。
+    /// A tool execution failed.
     #[error("工具 `{tool}` 失败（{kind:?}）：{message}")]
     #[non_exhaustive]
     Tool {
-        /// 失败原因。
+        /// Failure reason.
         kind: ToolErrorKind,
-        /// 工具的限定名，来自 `ToolOrigin`。
+        /// Qualified tool name, from `ToolOrigin`.
         tool: String,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 沙箱与隔离失败。
+    /// Sandboxing or isolation failed.
     #[error("沙箱错误（{kind:?}）：{message}")]
     #[non_exhaustive]
     Sandbox {
-        /// 失败原因。
+        /// Failure reason.
         kind: SandboxErrorKind,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 会话持久化失败。
+    /// Session persistence failed.
     #[error("会话错误（{kind:?}）：{message}")]
     #[non_exhaustive]
     Session {
-        /// 失败原因。
+        /// Failure reason.
         kind: SessionErrorKind,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 控制协议失败。
+    /// The control protocol failed.
     #[error("协议错误（{kind:?}）：{message}")]
     #[non_exhaustive]
     Protocol {
-        /// 失败原因。
+        /// Failure reason.
         kind: ProtocolErrorKind,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
-        /// 底层错误源。
+        /// Underlying error source.
         source: Option<BoxError>,
     },
 
-    /// 预算耗尽。
+    /// A budget was exhausted.
     ///
-    /// 它进入 loop 时应走 `NextStep::FinalOutput` 的**软结束**而非中止
-    /// （R3-8），因此可恢复性是 [`Recoverability::NeedsIntervention`]：
-    /// 要么用户提高预算，要么接受当前结果。
+    /// Reaching the loop, it should take the **soft ending** of `NextStep::FinalOutput` rather
+    /// than aborting (R3-8), which is why its recoverability is
+    /// [`Recoverability::NeedsIntervention`]: either the user raises the budget or accepts the
+    /// current result.
     #[error("预算耗尽（{kind:?}）：{message}")]
     #[non_exhaustive]
     Budget {
-        /// 耗尽的是哪一项预算。
+        /// Which budget ran out.
         kind: BudgetKind,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
     },
 
-    /// 护栏 tripwire 触发。
+    /// A guard tripwire fired.
     #[error("护栏 `{guardrail}` 在 {stage:?} 阶段触发：{message}")]
     #[non_exhaustive]
     Guardrail {
-        /// 触发位置。
+        /// Where it fired.
         stage: GuardrailStage,
-        /// 护栏标识，来自 guard 登记表（R7-0）。
+        /// Guard identity, from the guard registry (R7-0).
         guardrail: String,
-        /// 面向开发者的描述。
+        /// Developer-facing description.
         message: String,
     },
 
-    /// 主动取消。**不是失败**。
+    /// A deliberate cancellation. **Not a failure.**
     #[error("已取消：{reason}")]
     #[non_exhaustive]
     Cancelled {
-        /// 取消原因，供 UI 与 trace 显示。
+        /// Cancellation reason, for the UI and the trace to display.
         reason: String,
     },
 }
 
 impl Error {
-    // -- 构造函数（变体是 non_exhaustive，外部只能走这里） -------------------
+    // -- constructors (the variants are non_exhaustive, so this is the only way in) --------
 
-    /// 构造[配置错误](Error::Config)。
+    /// Creates a [configuration error](Error::Config).
     #[must_use]
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config {
@@ -346,7 +357,7 @@ impl Error {
         }
     }
 
-    /// 构造[调用方错误](Error::Caller)。
+    /// Creates a [caller error](Error::Caller).
     #[must_use]
     pub fn caller(message: impl Into<String>) -> Self {
         Self::Caller {
@@ -355,7 +366,7 @@ impl Error {
         }
     }
 
-    /// 构造 [provider 错误](Error::Provider)。
+    /// Creates a [provider error](Error::Provider).
     #[must_use]
     pub fn provider(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
         Self::Provider {
@@ -365,7 +376,7 @@ impl Error {
         }
     }
 
-    /// 构造[工具错误](Error::Tool)。
+    /// Creates a [tool error](Error::Tool).
     #[must_use]
     pub fn tool(kind: ToolErrorKind, tool: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Tool {
@@ -376,7 +387,7 @@ impl Error {
         }
     }
 
-    /// 构造[沙箱错误](Error::Sandbox)。
+    /// Creates a [sandbox error](Error::Sandbox).
     #[must_use]
     pub fn sandbox(kind: SandboxErrorKind, message: impl Into<String>) -> Self {
         Self::Sandbox {
@@ -386,7 +397,7 @@ impl Error {
         }
     }
 
-    /// 构造[会话错误](Error::Session)。
+    /// Creates a [session error](Error::Session).
     #[must_use]
     pub fn session(kind: SessionErrorKind, message: impl Into<String>) -> Self {
         Self::Session {
@@ -396,7 +407,7 @@ impl Error {
         }
     }
 
-    /// 构造[协议错误](Error::Protocol)。
+    /// Creates a [protocol error](Error::Protocol).
     #[must_use]
     pub fn protocol(kind: ProtocolErrorKind, message: impl Into<String>) -> Self {
         Self::Protocol {
@@ -406,7 +417,7 @@ impl Error {
         }
     }
 
-    /// 构造[预算耗尽](Error::Budget)。
+    /// Creates a [budget-exhausted error](Error::Budget).
     #[must_use]
     pub fn budget(kind: BudgetKind, message: impl Into<String>) -> Self {
         Self::Budget {
@@ -415,7 +426,7 @@ impl Error {
         }
     }
 
-    /// 构造[护栏触发](Error::Guardrail)。
+    /// Creates a [guard tripwire error](Error::Guardrail).
     #[must_use]
     pub fn guardrail(
         stage: GuardrailStage,
@@ -429,7 +440,7 @@ impl Error {
         }
     }
 
-    /// 构造[取消](Error::Cancelled)。
+    /// Creates a [cancellation](Error::Cancelled).
     #[must_use]
     pub fn cancelled(reason: impl Into<String>) -> Self {
         Self::Cancelled {
@@ -437,8 +448,8 @@ impl Error {
         }
     }
 
-    /// 附加底层错误源。在不携带 source 的变体（`Budget` / `Guardrail` /
-    /// `Cancelled`）上调用是无操作。
+    /// Attaches an underlying error source. Calling this on a variant that carries no source
+    /// (`Budget`, `Guardrail`, `Cancelled`) is a no-op.
     #[must_use]
     pub fn with_source(mut self, src: impl Into<BoxError>) -> Self {
         match &mut self {
@@ -454,31 +465,32 @@ impl Error {
         self
     }
 
-    // -- 投影：第二个维度 ---------------------------------------------------
+    // -- projection: the second dimension ----------------------------------
 
-    /// 拿到这个错误之后该怎么办。
+    /// What to do once you hold this error.
     ///
-    /// **这是唯一的控制流判据**——重试（R1-9b）、模型回退（R1-12）、错误处理器
-    /// （R3-8）都只读它，不匹配变体、不解析文本。
-    // 这个 match 是一张**决策表**：每个变体的映射是一条独立的、单独说明理由的
-    // 决定。两条今天恰好落在同一档，不代表它们是同一个决定——合并分支会让理由
-    // 注释无处安放，也会掩盖将来分化的可能。因此刻意不合并。
+    /// **This is the only control-flow criterion**: retry (R1-9b), model fallback (R1-12), and
+    /// the error handler (R3-8) all read it alone, matching no variant and parsing no text.
+    // This match is a **decision table**: each variant's mapping is an independent decision with
+    // its own stated reason. Two arms landing on the same tier today does not make them the same
+    // decision — merging them would leave the reasoning with nowhere to live and would hide the
+    // possibility that they diverge later. They are deliberately kept apart.
     #[allow(clippy::match_same_arms)]
     #[must_use]
     pub const fn recoverability(&self) -> Recoverability {
         match self {
             Self::Cancelled { .. } => Recoverability::Cancelled,
 
-            // 调用方缺陷：重试永远无用。
+            // A caller defect: retrying never helps.
             Self::Caller { .. } => Recoverability::Fatal,
 
-            // 配置问题一律需要人改配置。
+            // A configuration problem always needs a human to change the configuration.
             Self::Config { .. } => Recoverability::NeedsIntervention,
 
-            // 预算耗尽：要么用户提额，要么接受当前结果。
+            // Budget exhausted: the user either raises it or accepts the current result.
             Self::Budget { .. } => Recoverability::NeedsIntervention,
 
-            // 护栏触发是刻意拦截，不是可重试的故障。
+            // A guard firing is a deliberate block, not a retryable fault.
             Self::Guardrail { .. } => Recoverability::Fatal,
 
             Self::Provider { kind, .. } => match kind {
@@ -486,7 +498,8 @@ impl Error {
                 | ProviderErrorKind::RateLimit
                 | ProviderErrorKind::Timeout
                 | ProviderErrorKind::ServerError => Recoverability::Retryable,
-                // 拒答换模型、输出不合协议换提示、上下文超限先压缩。
+                // Refusal -> change model; protocol violation -> change prompt; context
+                // overflow -> compact first.
                 ProviderErrorKind::Refusal
                 | ProviderErrorKind::Behavior
                 | ProviderErrorKind::ContextOverflow => Recoverability::RetryableWithChange,
@@ -496,7 +509,7 @@ impl Error {
 
             Self::Tool { kind, .. } => match kind {
                 ToolErrorKind::Timeout => Recoverability::Retryable,
-                // 换参数或换工具可能成功。
+                // Different arguments or a different tool may succeed.
                 ToolErrorKind::InvalidInput | ToolErrorKind::ExecutionFailed => {
                     Recoverability::RetryableWithChange
                 }
@@ -528,22 +541,22 @@ impl Error {
         }
     }
 
-    /// 是否可以原样重试。等价于 `self.recoverability().is_retryable()`。
+    /// Whether it may be retried unchanged. Equivalent to `self.recoverability().is_retryable()`.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         self.recoverability().is_retryable()
     }
 
-    /// 是否是主动取消而非失败。
+    /// Whether this is a deliberate cancellation rather than a failure.
     #[must_use]
     pub const fn is_cancelled(&self) -> bool {
         matches!(self.recoverability(), Recoverability::Cancelled)
     }
 
-    /// 稳定的机器可读标识，形如 `provider.rate_limit`、`tool.timeout`。
+    /// Stable machine-readable identity, shaped like `provider.rate_limit` or `tool.timeout`.
     ///
-    /// 用于 trace 标签、eval 归因与指标聚合。**它是契约的一部分**，改动等同于
-    /// 破坏性变更（稳定性分级 `Evolving`）。
+    /// Used for trace labels, eval attribution, and metric aggregation. **It is part of the
+    /// contract**, so changing one is a breaking change (stability grade `Evolving`).
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -601,10 +614,11 @@ impl Error {
         }
     }
 
-    /// 面向**用户**的消息：说清发生了什么、下一步能做什么。
+    /// The **user**-facing message: what happened, and what can be done next.
     ///
-    /// 与 `Display` 的区别：`Display` 面向开发者与日志，保留内部术语；本方法
-    /// 面向 UI，不暴露内部细节，且总是给出可操作的下一步。
+    /// How it differs from `Display`: `Display` targets developers and logs and keeps internal
+    /// terminology, while this method targets the UI, exposes no internal detail, and always
+    /// offers an actionable next step.
     #[must_use]
     pub fn user_message(&self) -> String {
         match self {

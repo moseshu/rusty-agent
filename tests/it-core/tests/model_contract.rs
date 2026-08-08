@@ -278,9 +278,10 @@ fn raw_stream_信封保留未知字段() {
 
 #[test]
 fn 模型事件通道不含_run_级事实() {
-    // adapter 只知道一次线调用，不知道 agent 与 handoff。让它能发"公开 agent 变了"
-    // 就是让类型允许一个永远无效的状态；run 通道由 runner 在 ra-runtime 里包一层
-    // （R1-7 / R13），而不是扩这个枚举。
+    // An adapter knows one wire call and nothing about agents or handoffs. Letting it announce
+    // "the public agent changed" would make the type permit a permanently invalid state; the run
+    // channel is wrapped by the runner inside ra-runtime (R1-7 / R13) rather than by widening this
+    // enum.
     let labels: Vec<String> = [
         ModelStreamEvent::RawResponse(RawResponseEvent::new(
             ProviderKey::new("test"),

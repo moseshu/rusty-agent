@@ -1,7 +1,7 @@
-//! R0-1 crate 边界契约。
+//! The crate boundary contract (R0-1).
 //!
-//! 正向路径由本测试自身的 import 编译保证；负向路径用四个独立 fixture 交给 rustc，
-//! 防止未来误把内部模块改回 `pub`。
+//! The positive path is guaranteed by this test's own imports compiling; the negative path hands
+//! four separate fixtures to rustc, so an internal module cannot quietly be made `pub` again.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

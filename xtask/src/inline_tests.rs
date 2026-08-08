@@ -1,21 +1,22 @@
-//! `no-inline-tests` 门禁：`crates/` 下不允许任何测试代码。
+//! The `no-inline-tests` gate: no test code is allowed under `crates/`.
 //!
-//! 约束本身见[项目结构](../../Docs/Rusty_Agent_Project_Structure.md) §5.5：行为测试
-//! 一律在独立的 `tests/` workspace 里。这条**靠人自觉守不住**——写实现时顺手加个
-//! `#[cfg(test)] mod tests` 是最自然的动作，所以要有门禁。
+//! The constraint itself is in [the project structure](../../Docs/Rusty_Agent_Project_Structure.md)
+//! §5.5: behavioral tests all live in the separate `tests/` workspace. **Discipline alone cannot
+//! hold this** — dropping a `#[cfg(test)] mod tests` next to the implementation is the most
+//! natural thing to do while writing it, which is why there is a gate.
 //!
-//! 查两样：
-//! - `crates/**/*.rs` 里的 `cfg(test` 与 `#[test]`；
-//! - `crates/*/tests/` 目录（Cargo 的集成测试位）。
+//! Two things are checked:
+//! - `cfg(test` and `#[test]` inside `crates/**/*.rs`;
+//! - the `crates/*/tests/` directory (Cargo's integration-test slot).
 //!
-//! **明确例外**：`#[cfg(feature = "test-api")]` 不在此列——`ra-patch` 的 fuzz 匹配与
-//! `ra-model` 的 chat convert/stream 允许用它把 test-only 入口暴露给宿主 crate。它
-//! 不含 `cfg(test`，因此天然不会被误伤。
+//! **An explicit exception**: `#[cfg(feature = "test-api")]` is not covered — `ra-patch`'s fuzzy
+//! matcher and `ra-model`'s chat convert/stream may use it to expose a test-only entry to their
+//! host crate. It contains no `cfg(test`, so it is never caught by accident.
 
 use crate::gate::Outcome;
 use crate::source;
 
-/// 执行门禁。
+/// Runs the gate.
 pub(crate) fn run() -> Outcome {
     let crates_dir = source::workspace_root().join("crates");
     let mut violations = Vec::new();
@@ -48,7 +49,8 @@ pub(crate) fn run() -> Outcome {
         }
     }
 
-    // Cargo 的集成测试位同样禁止：它绕过 tests/ workspace，且会被主 workspace 构建。
+    // Cargo's integration-test slot is banned too: it bypasses the tests/ workspace and gets
+    // built by the main workspace.
     if let Ok(entries) = std::fs::read_dir(&crates_dir) {
         for entry in entries.flatten() {
             let tests_dir = entry.path().join("tests");

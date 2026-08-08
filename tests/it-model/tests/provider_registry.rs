@@ -223,8 +223,9 @@ fn 模型别名携带模型层默认_provider_层补出必填_max_tokens() {
         vec![Some("claude-sonnet-current".to_owned())]
     );
 
-    // 模型注册说了这个模型能出 8192，就该是 8192——4096 只是"没自己说的模型用这个"的
-    // provider 兜底，最粗的那层不该压过最具体的那层。
+    // The model registration says this model can emit 8192, so 8192 it is. 4096 is only the
+    // provider fallback for "models that did not say", and the coarsest layer must not beat the
+    // most specific one.
     let settings = resolved.resolve_settings(&ModelSettings::new(), &ModelSettings::new());
     assert_eq!(settings.max_tokens(), Some(8_192));
     assert_eq!(

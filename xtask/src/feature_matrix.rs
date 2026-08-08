@@ -1,27 +1,29 @@
-//! `feature-matrix` 门禁：每个声明了 feature 的 crate，在两个极端下都必须编译。
+//! The `feature-matrix` gate: every crate that declares features must compile at both extremes.
 //!
-//! # 为什么不能用 `cargo check --workspace --no-default-features`
+//! # Why `cargo check --workspace --no-default-features` will not do
 //!
-//! **它不穿透 crate 之间的依赖边。** `--no-default-features` 只作用于命令行选中的
-//! 包；`ra-eval → ra-model` 这条边上仍然写着 `default-features = true`，于是
-//! `ra-model` 照样带着 `openai` 被编译进来。整个 workspace 一起关默认 feature，看着
-//! 覆盖面最大，实际上恰恰漏掉了要验的那一格。
+//! **It does not travel along the edges between crates.** `--no-default-features` applies only to
+//! the packages named on the command line; the `ra-eval -> ra-model` edge still says
+//! `default-features = true`, so `ra-model` is compiled with `openai` anyway. Turning default
+//! features off across the whole workspace looks like the broadest coverage while missing exactly
+//! the cell under test.
 //!
-//! 所以这里**逐 crate** 跑 `-p <crate> --no-default-features` —— 只有这种形式才真的
-//! 让被测 crate 在零 feature 下过一遍编译器。
+//! So this runs `-p <crate> --no-default-features` **one crate at a time** — only that form
+//! actually puts the crate under test through the compiler with zero features.
 //!
-//! # 为什么只测两个极端
+//! # Why only the two extremes
 //!
-//! 全排列是 2^n 次编译，`ra-exec` 一个 crate 就 8 种。两个极端（全关 / 全开）能抓住
-//! 绝大多数漏掉的 `#[cfg]`：漏加 cfg 的代码在全关时找不到符号，漏写 cfg 的 feature
-//! 在全开时撞冲突。默认组合由 `cargo check --workspace` 覆盖，不重复跑。
+//! The full permutation is 2^n compilations, and `ra-exec` alone has 8. The two extremes (all off,
+//! all on) catch the vast majority of missing `#[cfg]`s: code that forgot a cfg fails to resolve
+//! symbols with everything off, and a feature that forgot a cfg collides with everything on. The
+//! default combination is covered by `cargo check --workspace` and is not repeated here.
 
 use std::process::Command;
 
 use crate::gate::Outcome;
 use crate::source;
 
-/// 执行门禁。
+/// Runs the gate.
 pub(crate) fn run() -> Outcome {
     let crates: Vec<String> = source::crate_names()
         .into_iter()
@@ -47,7 +49,7 @@ pub(crate) fn run() -> Outcome {
     )
 }
 
-/// crate 是否声明了 `[features]`。没有 feature 的 crate 不需要进矩阵。
+/// Whether a crate declares `[features]`. One without features needs no matrix.
 fn declares_features(name: &str) -> bool {
     let manifest = source::workspace_root()
         .join("crates")

@@ -1,18 +1,21 @@
-//! `ra-core`：错误分类学（R0-2）的行为断言。
+//! `ra-core`: behavioral assertions for the error taxonomy (R0-2).
 //!
-//! 这里锁住的是**契约**，不是实现细节：
-//! - `code()` 全局唯一且格式稳定——它进 trace 标签与 eval 归因，串了就归因错
-//! - 可恢复性投影与 `is_retryable()` 永不矛盾——这是「投影而非存储」的收益
-//! - 调用方缺陷永不可重试、取消不算失败——两条 R0-2 明确的硬判据
+//! What is locked down here is the **contract**, not implementation detail:
+//! - `code()` is globally unique and stably formatted — it becomes a trace label and an eval
+//!   attribution, so a collision misattributes
+//! - the recoverability projection and `is_retryable()` never disagree — that is what "project,
+//!   do not store" buys
+//! - a caller defect is never retryable and a cancellation is never a failure — two hard criteria
+//!   R0-2 states outright
 
 use ra_core::error::{
     BudgetKind, Error, GuardrailStage, ProtocolErrorKind, ProviderErrorKind, Recoverability,
     SandboxErrorKind, SessionErrorKind, ToolErrorKind,
 };
 
-/// 每个 (变体 × kind) 组合各一个实例。新增变体或 kind 时必须同步补进来——
-/// 下面的唯一性与格式断言会因为漏补而变弱，但 `code()` 的 `match` 是穷尽的，
-/// 编译器会先一步拦住忘记处理的新变体。
+/// One instance of every (variant x kind) combination. Adding a variant or a kind means adding it
+/// here too: the uniqueness and format assertions below weaken if one is missed, though the
+/// `match` in `code()` is exhaustive, so the compiler stops a forgotten variant first.
 fn all_errors() -> Vec<Error> {
     let mut v = vec![
         Error::config("缺少 model"),
@@ -93,7 +96,7 @@ fn all_errors() -> Vec<Error> {
 }
 
 // ---------------------------------------------------------------------------
-// code()：机器可读标识
+// code(): the machine-readable identity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -133,7 +136,7 @@ fn code_格式稳定() {
 }
 
 // ---------------------------------------------------------------------------
-// 可恢复性投影
+// recoverability projection
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -189,7 +192,7 @@ fn 取消不算失败() {
 
 #[test]
 fn 模型拒答走换模型而非原样重试() {
-    // R1-12：拒答触发模型回退，原样重试只会再被拒一次。
+    // R1-12: a refusal triggers the model fallback; retrying unchanged only gets refused again.
     let err = Error::provider(ProviderErrorKind::Refusal, "refused");
     assert_eq!(err.recoverability(), Recoverability::RetryableWithChange);
     assert!(!err.is_retryable(), "拒答原样重试无意义");
@@ -198,7 +201,7 @@ fn 模型拒答走换模型而非原样重试() {
 
 #[test]
 fn 上下文超限先压缩再重试() {
-    // R5：不是原样重试，要先把上下文压下去。
+    // R5: not a plain retry — the context has to be compacted first.
     let err = Error::provider(ProviderErrorKind::ContextOverflow, "too long");
     assert_eq!(err.recoverability(), Recoverability::RetryableWithChange);
     assert!(!err.is_retryable());
@@ -226,7 +229,7 @@ fn 认证失败需要人介入而非重试() {
 
 #[test]
 fn 预算耗尽不是可重试故障() {
-    // R3-8：预算耗尽走 NextStep::FinalOutput 的软结束，不是重试。
+    // R3-8: an exhausted budget takes the soft ending of NextStep::FinalOutput, not a retry.
     for kind in [
         BudgetKind::MaxTurns,
         BudgetKind::Tokens,
@@ -254,14 +257,14 @@ fn 护栏触发是刻意拦截不是故障() {
 }
 
 // ---------------------------------------------------------------------------
-// 消息：两个受众
+// messages: two audiences
 // ---------------------------------------------------------------------------
 
-/// `Display` 与 `user_message` 允许相同的变体。
+/// Variants whose `Display` and `user_message` are allowed to match.
 ///
-/// 取消不是故障，没有任何内部细节需要对用户隐藏——两个受众看到同一句话是
-/// **正确的**，不是偷懒。除此之外的变体，Display 都带着 `{kind:?}` 之类的
-/// 技术标注，必须为 UI 另写一版。
+/// A cancellation is not a fault and has no internal detail to hide from the user, so both
+/// audiences seeing the same sentence is **correct** rather than lazy. Every other variant carries
+/// technical annotation such as `{kind:?}` in `Display` and needs a separate wording for the UI.
 const 允许两者相同: &[&str] = &["cancelled"];
 
 #[test]
@@ -293,7 +296,7 @@ fn user_message_非空且区别于_display() {
 
 #[test]
 fn user_message_不泄露内部枚举名() {
-    // Display 里带 `{kind:?}` 是刻意的（给日志看）；user_message 不该出现。
+    // `{kind:?}` in Display is deliberate (it is for logs); it must not reach user_message.
     let internal_tokens = [
         "ProviderErrorKind",
         "ToolErrorKind",
@@ -335,8 +338,8 @@ fn with_source_在支持的变体上生效() {
 fn with_source_在不支持的变体上是无操作() {
     use std::error::Error as _;
 
-    // Budget / Guardrail / Cancelled 不携带 source：附加应被静默忽略，
-    // 而不是 panic，也不是悄悄换成别的变体。
+    // Budget / Guardrail / Cancelled carry no source: attaching one should be ignored silently,
+    // not panic, and not quietly turn into a different variant.
     let io = std::io::Error::other("无关错误");
     let err = Error::budget(BudgetKind::MaxTurns, "达到上限").with_source(io);
 
@@ -345,7 +348,7 @@ fn with_source_在不支持的变体上是无操作() {
 }
 
 // ---------------------------------------------------------------------------
-// Recoverability 自身
+// Recoverability itself
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -359,11 +362,11 @@ fn recoverability_的三个谓词互相自洽() {
     ];
 
     for r in all {
-        // 可原样重试 ⟹ 可恢复
+        // retryable unchanged implies recoverable
         if r.is_retryable() {
             assert!(r.is_recoverable(), "{r} 可重试却不可恢复，自相矛盾");
         }
-        // 取消 ⟺ 非失败
+        // cancelled if and only if not a failure
         assert_eq!(
             r == Recoverability::Cancelled,
             !r.is_failure(),

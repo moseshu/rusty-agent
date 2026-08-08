@@ -1,10 +1,11 @@
-//! `test` 门禁：跑独立测试 workspace。
+//! The `test` gate: runs the separate test workspace.
 //!
-//! 测试不在主 workspace 里（见[项目结构](../../Docs/Rusty_Agent_Project_Structure.md)
-//! §5.5），`cargo test --workspace` 跑不到任何行为断言。这条门禁就是那个入口。
+//! Tests do not live in the main workspace (see
+//! [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §5.5), so
+//! `cargo test --workspace` reaches no behavioral assertion at all. This gate is that entry point.
 //!
-//! `tests/` **进版本库**，因此缺少它不是"本机没有"而是 checkout 坏了——直接 FAIL，
-//! 不跳过。
+//! `tests/` **is committed**, so its absence does not mean "not on this machine" but a broken
+//! checkout — that is a FAIL, not a skip.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,10 +13,10 @@ use std::process::Command;
 use crate::gate::Outcome;
 use crate::source;
 
-/// 跨 crate 契约的宿主，不对应任何单个被测 crate。
+/// The host for cross-crate contracts; it corresponds to no single crate under test.
 const CROSS_CRATE_HOST: &str = "it-e2e";
 
-/// 执行门禁。`args` 透传给 `cargo test`（如 `-p it-core`）。
+/// Runs the gate. `args` passes through to `cargo test` (for example `-p it-core`).
 pub(crate) fn run(args: &[String]) -> Outcome {
     let manifest = source::workspace_root().join("tests").join("Cargo.toml");
     if !manifest.is_file() {
@@ -46,15 +47,17 @@ pub(crate) fn run(args: &[String]) -> Outcome {
     }
 }
 
-/// 被测 crate → 它的测试宿主名。`ra-core` → `it-core`。
+/// Crate under test -> its test host name. `ra-core` -> `it-core`.
 fn host_of(crate_name: &str) -> String {
     format!("it-{}", crate_name.trim_start_matches("ra-"))
 }
 
-/// 在启动 Cargo 前先拒绝两类“假绿”：漏宿主，以及只有注释、没有断言的测试文件。
+/// Rejects two kinds of false green before Cargo even starts: a missing host, and a test file that
+/// holds comments but no assertion.
 ///
-/// 宿主清单**从 `crates/` 推导**而不是写死：写死的表只会在新建 crate 那天忘记更新，
-/// 而那正是门禁最该说话的时刻。
+/// The host list is **derived from `crates/`** rather than hard-coded: a hard-coded table only
+/// ever gets forgotten on the day a crate is created, which is exactly when the gate should
+/// speak.
 fn validate_layout(manifest: &Path) -> Vec<String> {
     let tests_root = manifest.parent().unwrap_or(manifest);
     let workspace = std::fs::read_to_string(manifest).unwrap_or_default();
@@ -93,8 +96,9 @@ fn validate_layout(manifest: &Path) -> Vec<String> {
     let mut test_files = 0_usize;
     let mut test_cases = 0_usize;
     for host in &hosts {
-        // 只看 Cargo 的外部测试位：`src/` 是空 lib，`fixtures/` 是编译期负向夹具，
-        // 两者都不该被当成"缺断言的测试文件"。
+        // Only Cargo's external test slot counts: `src/` is an empty lib and `fixtures/` holds
+        // compile-time negative fixtures, and neither should read as "a test file with no
+        // assertions".
         for file in source::rust_files(&tests_root.join(host).join("tests")) {
             test_files += 1;
             let text = std::fs::read_to_string(&file).unwrap_or_default();
@@ -116,11 +120,12 @@ fn validate_layout(manifest: &Path) -> Vec<String> {
     violations
 }
 
-/// 一行是否是测试标记属性。
+/// Whether a line is a test-marking attribute.
 ///
-/// **匹配属性名，不比较整行**：`#[tokio::test(flavor = "multi_thread")]` 与
-/// `#[rstest(case(1), case(2))]` 都是真测试，按整行精确比较会把只写参数化测试的
-/// 文件判成空占位——门禁误报比漏报更糟（理由同 [`source::is_comment`]）。
+/// **Match the attribute name, do not compare whole lines**: `#[tokio::test(flavor =
+/// "multi_thread")]` and `#[rstest(case(1), case(2))]` are both real tests, and an exact
+/// whole-line comparison would judge a file of parameterized tests to be an empty placeholder — a
+/// false positive is worse than a miss (same reasoning as [`source::is_comment`]).
 fn is_test_attribute(line: &str) -> bool {
     const MARKERS: &[&str] = &["test", "tokio::test", "rstest", "test_case"];
     let Some(rest) = line.trim().strip_prefix("#[") else {
@@ -128,8 +133,9 @@ fn is_test_attribute(line: &str) -> bool {
     };
     MARKERS.iter().any(|marker| {
         rest.strip_prefix(marker)
-            // `]` 是无参属性，`(` 是带参属性。靠这一步把 `#[test]` 跟 `#[test_case(..)]`
-            // 和 `#[should_panic]` 区分开——前缀匹配不加这层会全都算成测试。
+            // `]` means an attribute without arguments, `(` one with them. This is what tells
+            // `#[test]` apart from `#[test_case(..)]` and `#[should_panic]`; without it, prefix
+            // matching would count them all as tests.
             .is_some_and(|tail| tail.starts_with(']') || tail.starts_with('('))
     })
 }

@@ -1,11 +1,13 @@
-//! `ra-core`：span 分类与字段词表（R0-3）的行为断言。
+//! `ra-core`: behavioral assertions for the span taxonomy and field vocabulary (R0-3).
 //!
-//! 这里锁住的是**词表**，不是实现细节：
-//! - 名字唯一且格式稳定——散一个 `tool_name` 出去，聚合出来的成本数字就是错的
-//! - 级别是从可恢复性投影出来的，不由 callsite 自己拍——否则重试前的失败全打
-//!   ERROR，真要人看的那条被淹掉
-//! - 取消记成 `cancelled` 而不是 `error`——与 R0-2 / R0-4 同一条判据
-//! - `record` 的字段必须先占位，否则静默无效：这条 `tracing` 语义值得钉死
+//! What is locked down here is the **vocabulary**, not implementation detail:
+//! - names are unique and stably formatted — let one stray `tool_name` out and the aggregated cost
+//!   numbers are simply wrong
+//! - the level is projected from recoverability rather than chosen by the callsite — otherwise
+//!   every pre-retry failure logs as ERROR and the one line that matters is buried
+//! - a cancellation records as `cancelled` rather than `error` — the same criterion as R0-2 / R0-4
+//! - a field must be reserved before `record`, or it silently does nothing: a `tracing` semantic
+//!   worth nailing down
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -22,7 +24,7 @@ use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-/// 每个分类各一个实例。新增变体时必须同步补进来。
+/// One instance of every kind. Adding a variant means adding it here too.
 fn all_kinds() -> Vec<SpanKind> {
     vec![
         SpanKind::Agent,
@@ -36,7 +38,7 @@ fn all_kinds() -> Vec<SpanKind> {
     ]
 }
 
-/// 内置分类（不含 `Custom`）。
+/// The built-in kinds, excluding `Custom`.
 fn builtin_kinds() -> Vec<SpanKind> {
     let mut kinds = all_kinds();
     kinds.retain(|k| !matches!(k, SpanKind::Custom(_)));
@@ -44,7 +46,7 @@ fn builtin_kinds() -> Vec<SpanKind> {
 }
 
 // ---------------------------------------------------------------------------
-// span 名与分类标签
+// span names and kind labels
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -72,8 +74,8 @@ fn span_name_全局唯一且格式稳定() {
 
 #[test]
 fn 自定义分类的_span_名收敛到_custom_但标签保留() {
-    // tracing 的 span 名必须是 &'static str，自定义标签给不了。
-    // 所以名字收敛、标签另走字段——归因按标签，不按名字。
+    // A tracing span name has to be a &'static str, which a custom label cannot supply. So names
+    // collapse and the label travels in a field instead — attribution goes by label, not by name.
     let kind = SpanKind::custom("flow_node");
     assert_eq!(kind.span_name(), "custom");
     assert_eq!(kind.label(), "flow_node");
@@ -96,12 +98,12 @@ fn 内置分类的名字与标签一致() {
 }
 
 // ---------------------------------------------------------------------------
-// 级别分档
+// level tiers
 // ---------------------------------------------------------------------------
 
 #[test]
 fn run_骨架进_info_高频检查进_debug() {
-    // 判据：一次正常的 run 在 INFO 下应当读得完。
+    // The criterion: a normal run should be readable end to end at INFO.
     for kind in [
         SpanKind::Agent,
         SpanKind::Turn,
@@ -123,7 +125,8 @@ fn run_骨架进_info_高频检查进_debug() {
 
 #[test]
 fn 没有任何_span_默认进_error_或_trace() {
-    // span 是结构，不是告警：出事该发事件，不该把整个 span 提到 ERROR。
+    // A span is structure, not an alert: something going wrong should emit an event rather than
+    // promote the whole span to ERROR.
     for kind in all_kinds() {
         assert!(
             matches!(kind.level(), Level::INFO | Level::DEBUG),
@@ -134,7 +137,7 @@ fn 没有任何_span_默认进_error_或_trace() {
 }
 
 // ---------------------------------------------------------------------------
-// 字段词表
+// field vocabulary
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -194,8 +197,8 @@ fn 每个分类的必填字段都在词表内且含分类标识() {
 
 #[test]
 fn 必填字段只要创建时就知道的标识() {
-    // 终态字段要用 Empty 占位后再 record，不能出现在必填清单里——
-    // 否则 callsite 只能先造一个假值填进去。
+    // A terminal field is reserved with Empty and recorded later, so it must not appear in the
+    // required list — otherwise the callsite would have to invent a fake value to fill it.
     let 终态字段 = [
         field::OUTCOME,
         field::ERROR_CODE,
@@ -220,13 +223,14 @@ fn 必填字段只要创建时就知道的标识() {
 
 #[test]
 fn 缓存_token_单列() {
-    // 缓存命中率是成本主因；折进 input_tokens 就再也算不出命中率。
+    // Cache hit rate is the dominant cost driver; folding it into input_tokens makes the hit rate
+    // impossible to compute.
     assert!(field::ALL.contains(&field::USAGE_CACHED_INPUT_TOKENS));
     assert_ne!(field::USAGE_CACHED_INPUT_TOKENS, field::USAGE_INPUT_TOKENS);
 }
 
 // ---------------------------------------------------------------------------
-// 终态投影
+// terminal-state projection
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -291,7 +295,7 @@ fn outcome_取值稳定() {
 }
 
 // ---------------------------------------------------------------------------
-// 级别投影
+// level projection
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -304,7 +308,7 @@ fn 可自愈的失败进_warn_需要人介入的进_error() {
 
 #[test]
 fn 取消不进_error_级() {
-    // 用户按停止键不该在日志里刷红，否则真错误会被淹掉。
+    // A user pressing stop should not paint the log red, or real errors get buried.
     assert_eq!(level_for(Recoverability::Cancelled), Level::INFO);
 }
 
@@ -327,10 +331,10 @@ fn 需要人介入的错误才配拿到_error_级() {
 }
 
 // ---------------------------------------------------------------------------
-// record helper：字段真的落进去了
+// record helpers: the field really lands
 // ---------------------------------------------------------------------------
 
-/// 把 fmt 层的输出捕获到内存里。
+/// Captures the fmt layer's output in memory.
 #[derive(Clone, Default)]
 struct 捕获(Arc<Mutex<Vec<u8>>>);
 
@@ -359,7 +363,7 @@ impl<'a> MakeWriter<'a> for 捕获 {
     }
 }
 
-/// 在一个只输出 span 关闭事件的 subscriber 下跑 `f`，返回捕获到的文本。
+/// Runs `f` under a subscriber that emits span-close events only, and returns the captured text.
 fn 捕获_span_关闭(f: impl FnOnce()) -> String {
     let sink = 捕获::default();
     let subscriber = tracing_subscriber::fmt()
@@ -391,8 +395,9 @@ fn record_outcome_写进_span_字段() {
 
 #[test]
 fn 未占位的字段_record_无效() {
-    // 这是 tracing 的语义，不是 helper 的缺陷。钉住它，免得将来有人以为
-    // record 失败会报错——它只会静默丢掉，日志里少一个字段没人会注意到。
+    // This is tracing semantics, not a flaw in the helper. Pinning it down keeps someone from
+    // later assuming a failed record reports an error — it just drops silently, and nobody
+    // notices one missing field in a log.
     let out = 捕获_span_关闭(|| {
         let span = tracing::info_span!("turn", span.kind = SpanKind::Turn.label());
         record_outcome(&span, SpanOutcome::Ok);
@@ -449,7 +454,7 @@ fn record_error_对取消记成_cancelled() {
 
 #[test]
 fn record_cancel_落根因与发起层级() {
-    // 取消契约（R0-4）承诺的两个字段，唯一写入口。
+    // The two fields promised by the cancellation contract (R0-4), and their only write path.
     let out = 捕获_span_关闭(|| {
         let span = tracing::info_span!(
             "function",
@@ -470,8 +475,9 @@ fn record_cancel_落根因与发起层级() {
 
 #[test]
 fn 字段常量与宏_callsite_的字面量一致() {
-    // 宏的字段名只能写字面量，没法把常量插进去，两边只能靠这条断言对齐。
-    // 上面几个 callsite 用到的字面量都列在这里。
+    // A macro field name can only be a literal, so no constant can be interpolated and this
+    // assertion is the only thing keeping the two sides aligned. Every literal used by the
+    // callsites above is listed here.
     assert_eq!(field::SPAN_KIND, "span.kind");
     assert_eq!(field::OUTCOME, "outcome");
     assert_eq!(field::ERROR_CODE, "error.code");
