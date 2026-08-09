@@ -77,6 +77,14 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
     let processed = request.processed;
     let mut execution = TurnExecution::default();
 
+    // The checkpoint belongs at the entry, not only in the loop below. A response that bound no
+    // executable call still *settles* — into another turn, into a question for the host, or into
+    // `FinishReason::Final` — and settling a cancelled run as `Final` is the worst of the three:
+    // `is_complete()` would say the agent reached its own conclusion, so R15 sees no closeout owed
+    // and R17-3 takes the success edge. Whether a cancelled turn reports as cancelled must not
+    // depend on whether the model happened to name a tool that resolved.
+    request.cancel.ensure_not_cancelled()?;
+
     // A transfer of control cannot be executed without the agent registry that resolves an
     // `AgentId` to a declaration, which R17 owns. The branch is unreachable today — preparation
     // advertises no handoffs, so classification can produce none — and it fails loudly rather than
@@ -116,6 +124,10 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
             }
         }
     }
+
+    // Not redundant with the entry check: the loop above awaits, and a cancellation that arrives
+    // while the last dispatch is completing can lose that race and leave the scope cancelled here.
+    request.cancel.ensure_not_cancelled()?;
 
     // A name the turn never advertised still owes an output. Answering it in the same structured
     // shape a failing tool uses means the model reads one error format, not two.

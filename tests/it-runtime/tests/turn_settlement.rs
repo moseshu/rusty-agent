@@ -524,6 +524,60 @@ async fn 已取消的作用域一个工具都不跑() {
 }
 
 #[tokio::test]
+async fn 已取消时不看模型这轮要了什么都报成取消() {
+    // 上一条测试只覆盖了「解析得到工具」那一格。真正的契约是：一轮是否报成取消，
+    // 不能取决于模型这次恰好点了什么名字——而剩下三格各自会settle成一个不同的谎。
+    let cases: [(&str, Vec<RunItem>); 3] = [
+        // 只有未解析调用：会生成 `tool.not_found` 观察并settle成 `RunAgain`。
+        (
+            "not_found",
+            vec![tool_call("call-item-1", "call-1", "vanished")],
+        ),
+        // 只有 MCP 审批：会settle成 `Interruption`，向宿主要一个此刻没人该回答的决定。
+        (
+            "mcp_approval",
+            vec![item(
+                "approval-1",
+                RunItemKind::McpApprovalRequest(McpApprovalRequest::new(
+                    "req-1",
+                    "docs",
+                    "search",
+                    json!({ "query": "x" }),
+                )),
+            )],
+        ),
+        // 纯消息、无动作：最糟的一格——会settle成 `FinalOutput{Final}`，而 `is_complete()`
+        // 为真意味着 R15 认为不欠收尾、R17-3 走成功边。取消被报成了「agent 自己做完了」。
+        ("no_action", vec![message("msg-1", "完事了")]),
+    ];
+
+    for (label, output) in cases {
+        let response = ModelResponse::new(output);
+        let cancel = CancelScope::root();
+        cancel.cancel(CancelReason::UserInterrupt);
+
+        let settled = settle_turn(TurnSettlementRequest::new(
+            &response,
+            &surface(vec![Arc::new(ScriptedTool::new(
+                "write_file",
+                Behavior::Succeed("ok"),
+            ))]),
+            &Host,
+            &cancel,
+        ))
+        .await;
+
+        let error = settled
+            .map(|settled| format!("{:?}", settled.next_step()))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Cancelled { .. }),
+            "{label} 应当报成取消，实际是：{error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn 不接受这个调用方类别的工具从模型侧看就是不存在() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Succeed("ok"))
