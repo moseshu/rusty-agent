@@ -1,11 +1,24 @@
 # ra-runtime 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest < '_ >) -> Result < ToolDispatch >
+async fn ra_runtime::turn::batch::execute_actions(request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
+async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
+const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tracing(mut self, tracing : ModelTracing) -> Self
+enum ra_runtime::tool::dispatch::ToolDispatch
+fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::new(tool : & 'a Arc < dyn Tool >, call_id : & 'a CallId, arguments : & 'a Value, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
+fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
+fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
+fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]
+fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
 fn ra_runtime::turn::prepare::PreparedTurn::tools(& self) -> & [Arc < dyn Tool >]
@@ -20,15 +33,26 @@ fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a Ag
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model(mut self, model : impl Into < String >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >
+fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedResponse, execution : & TurnExecution) -> Result < NextStep >
+fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution) -> Vec < RunItem >
 mod ra_runtime::agent
 mod ra_runtime::guard
 mod ra_runtime::runner
 mod ra_runtime::tool
+mod ra_runtime::tool::dispatch
 mod ra_runtime::tool::profile
 mod ra_runtime::tool::registry
 mod ra_runtime::turn
+mod ra_runtime::turn::batch
 mod ra_runtime::turn::prepare
 mod ra_runtime::turn::process
+mod ra_runtime::turn::resolve
+struct ra_runtime::tool::dispatch::ToolDispatchRequest
+struct ra_runtime::turn::TurnSettlementRequest
+struct ra_runtime::turn::batch::TurnExecution
+struct ra_runtime::turn::batch::TurnExecutionRequest
 struct ra_runtime::turn::prepare::PreparedTurn
 struct ra_runtime::turn::prepare::TurnActionSurface
 struct ra_runtime::turn::prepare::TurnPreparationRequest
+variant ra_runtime::tool::dispatch::ToolDispatch::AwaitingApproval(ToolApproval)
+variant ra_runtime::tool::dispatch::ToolDispatch::Observed(ToolCallOutput)
