@@ -338,6 +338,32 @@ impl RunItemKind {
             | Self::Compaction(_) => false,
         }
     }
+
+    /// Whether response classification has to bind this item to an action it can answer.
+    ///
+    /// These are the kinds that leave the conversation invalid when nothing answers them: a call
+    /// with no paired output makes the next request malformed, and a hosted approval request with
+    /// no decision leaves the server waiting. R3-2's classification must claim every one of them,
+    /// which is what stops an unanswered call from being filed as an inert record.
+    ///
+    /// [`Self::ToolApproval`] is deliberately `false` even though it also awaits an answer: it is a
+    /// control-plane record the model never produces, and [`Self::is_interruption`] is the
+    /// predicate that carries it. The match is exhaustive for the same reason as that one — a new
+    /// kind has to say which side it is on rather than defaulting to the silent one.
+    #[must_use]
+    pub const fn requires_action_binding(&self) -> bool {
+        match self {
+            Self::ToolCall(_) | Self::HandoffCall(_) | Self::McpApprovalRequest(_) => true,
+            Self::Message(_)
+            | Self::Reasoning(_)
+            | Self::ToolCallOutput(_)
+            | Self::HandoffOutput(_)
+            | Self::McpListTools(_)
+            | Self::McpApprovalResponse(_)
+            | Self::Compaction(_)
+            | Self::ToolApproval(_) => false,
+        }
+    }
 }
 
 /// A complete authoritative session record.

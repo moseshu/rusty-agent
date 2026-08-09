@@ -8,8 +8,9 @@
 //! are not part of it.
 //!
 //! **Stability**: the `Runner` entry signature is `Stable` (it is on the Stable API list); the
-//! turn-settlement intermediates are `Internal` — `ProcessedResponse` / `ToolExecutionPlan` /
-//! `SingleStepResult` may be refactored at any time, so do not depend on them from outside.
+//! turn-settlement machinery is `Internal` — the stage functions here and the `ProcessedResponse` /
+//! `ToolExecutionPlan` / `SingleStepResult` types they produce in `ra-core::step` may be refactored
+//! at any time, so do not depend on them from outside.
 //!
 //! [`turn`] is `Internal` but technically reachable, and that is a deliberate trade rather than an
 //! oversight: tests live in a separate workspace (no test code under `crates/`), so a module with

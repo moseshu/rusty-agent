@@ -1,7 +1,9 @@
-//! The four `NextStep` states, `SingleStepResult`, and `ProcessedResponse`.
+//! The four `NextStep` states, `ProcessedResponse`, and `SingleStepResult`.
 //!
-//! [`NextStep`] is the single place the loop's control flow converges. `SingleStepResult` (R3-3)
-//! and `ProcessedResponse` (R3-2) join it here once turn settlement lands.
+//! One turn moves through the three in order: [`ProcessedResponse`] (R3-2) says what the model
+//! asked for, [`NextStep`] (R3-1) is where the loop's control flow converges, and
+//! [`SingleStepResult`] (R3-3) is the single product that carries both plus everything the turn
+//! generated.
 //!
 //! **Stability**: `Internal` — these are turn-settlement intermediates. Once they leak into
 //! downstream code, R1 and R3 can no longer be refactored.
@@ -14,6 +16,15 @@ use crate::{
     finish::FinishReason,
     item::RunItem,
 };
+
+pub mod processed;
+pub mod single;
+
+pub use processed::{
+    ProcessedResponse, ProcessedResponseBuilder, ToolNotFound, ToolRunApproval, ToolRunFunction,
+    ToolRunHandoff, ToolUse,
+};
+pub use single::{SingleStepResult, SingleStepResultBuilder};
 
 /// What the loop does after one settled turn.
 ///

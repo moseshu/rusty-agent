@@ -10,14 +10,14 @@
 //! Every stage that can block runs inside the caller's [`CancelScope`]: dynamic availability calls
 //! third-party `async` code, which the cancellation contract does not allow to be awaited bare.
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use futures::future::try_join_all;
 use ra_core::{
     agent::AgentSpec,
     cancel::CancelScope,
     error::{Error, Result},
-    item::ModelInputItem,
+    item::{AgentId, ModelInputItem},
     model::{
         Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
         ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing, ResolvedModelSettings,
@@ -86,16 +86,16 @@ impl<'a> TurnPreparationRequest<'a> {
     }
 }
 
-/// Fully prepared model call plus the executable tool bindings for turn settlement.
+/// Fully prepared model call plus the executable bindings for turn settlement.
 ///
-/// [`ModelRequest`] contains model-facing tool projections. `tools` retains the corresponding
-/// executable objects; the two are produced from the same enabled-tool snapshot.
+/// [`ModelRequest`] contains model-facing tool projections. [`TurnActionSurface`] retains the
+/// corresponding executable objects; the two are produced from the same enabled-tool snapshot.
 #[non_exhaustive]
 pub struct PreparedTurn {
     selector: ModelSelector,
     model: Arc<dyn Model>,
     request: ModelRequest,
-    tools: Vec<Arc<dyn Tool>>,
+    surface: TurnActionSurface,
 }
 
 impl PreparedTurn {
@@ -120,15 +120,34 @@ impl PreparedTurn {
     /// Enabled executable tools matching the request's tool definitions.
     #[must_use]
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
-        &self.tools
+        self.surface.tools()
     }
 
-    /// Takes ownership of the request for the model call.
+    /// The action surface this turn advertises, for settlement to resolve names against.
+    ///
+    /// It is built and validated during preparation rather than here, so an ambiguous surface
+    /// fails before the model call is paid for rather than at settlement afterwards.
+    #[must_use]
+    pub const fn action_surface(&self) -> &TurnActionSurface {
+        &self.surface
+    }
+
+    /// Takes ownership of the surface and the request together.
+    ///
+    /// This is the exit settlement uses. The surface has to survive the model call — resolving the
+    /// response's names against anything else would resolve them against the agent's *declared*
+    /// tools rather than this turn's enabled snapshot, and a tool `is_enabled` turned off would
+    /// become callable again.
+    #[must_use]
+    pub fn into_call(self) -> (TurnActionSurface, ModelRequest) {
+        (self.surface, self.request)
+    }
+
+    /// Takes ownership of the request alone, for a caller that does not settle the turn.
     ///
     /// [`Model::get_response`] takes the request by value, and it is the one part of a preparation
-    /// that is expensive to copy — it holds the turn's whole input history. Read [`Self::model`],
-    /// [`Self::selector`], and [`Self::tools`] first if settlement needs them; those are all
-    /// reference-counted or short.
+    /// that is expensive to copy — it holds the turn's whole input history. Use [`Self::into_call`]
+    /// instead whenever the response will be classified.
     #[must_use]
     pub fn into_request(self) -> ModelRequest {
         self.request
@@ -137,11 +156,6 @@ impl PreparedTurn {
 
 impl fmt::Debug for PreparedTurn {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let tools = self
-            .tools
-            .iter()
-            .map(|tool| tool.origin().qualified_name())
-            .collect::<Vec<_>>();
         formatter
             .debug_struct("PreparedTurn")
             .field("selector", &self.selector)
@@ -150,7 +164,108 @@ impl fmt::Debug for PreparedTurn {
                 "has_system_instructions",
                 &self.request.system_instructions().is_some(),
             )
+            .field("surface", &self.surface)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What one turn advertised, retained across the model call.
+///
+/// The model answers with names, and settlement has to map each name back to the exact object the
+/// turn offered. Keeping tools and handoffs together in one snapshot is what makes that mapping
+/// total: a name resolves to a tool, to a handoff, or to nothing — never to two things at once,
+/// because construction rejects a surface where the two overlap.
+#[non_exhaustive]
+pub struct TurnActionSurface {
+    tools: Vec<Arc<dyn Tool>>,
+    handoffs: Vec<ModelHandoffDefinition>,
+}
+
+impl TurnActionSurface {
+    /// Builds a snapshot, rejecting a surface that advertises one name twice.
+    ///
+    /// Handoffs share the tool namespace on the wire, so a duplicate is not a theoretical concern:
+    /// it makes the model's call ambiguous, and any resolution order picked here would be an
+    /// arbitrary one that silently favours one meaning over the other.
+    pub fn new(tools: Vec<Arc<dyn Tool>>, handoffs: Vec<ModelHandoffDefinition>) -> Result<Self> {
+        let mut names = BTreeSet::new();
+        let advertised = tools
+            .iter()
+            .map(|tool| tool.origin().name())
+            .chain(handoffs.iter().map(ModelHandoffDefinition::name));
+        for name in advertised {
+            if !names.insert(name) {
+                return Err(Error::config(format!(
+                    "the turn advertises the name `{name}` more than once; a model call on it \
+                     would be ambiguous"
+                )));
+            }
+        }
+        Ok(Self { tools, handoffs })
+    }
+
+    /// Executable tools this turn advertised.
+    #[must_use]
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// Handoffs this turn advertised.
+    #[must_use]
+    pub fn handoffs(&self) -> &[ModelHandoffDefinition] {
+        &self.handoffs
+    }
+
+    /// Resolves a model-facing name to its executable tool.
+    #[must_use]
+    pub fn find_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.iter().find(|tool| tool.origin().name() == name)
+    }
+
+    /// Resolves a model-facing name to its handoff definition.
+    #[must_use]
+    pub fn find_handoff(&self, name: &str) -> Option<&ModelHandoffDefinition> {
+        self.handoffs.iter().find(|handoff| handoff.name() == name)
+    }
+
+    /// Whether this turn offered a transfer to the given agent.
+    #[must_use]
+    pub fn advertises_handoff_to(&self, target: &AgentId) -> bool {
+        self.handoffs
+            .iter()
+            .any(|handoff| handoff.target_agent() == target)
+    }
+
+    /// Every name this turn puts in front of the model.
+    ///
+    /// Settings reconciliation and response classification both ask this question, and they have to
+    /// get the same answer: a `tool_choice` kept for a name the surface cannot resolve is a request
+    /// that fails at the provider, while one dropped for a name it can resolve silently disables a
+    /// forced call.
+    pub fn advertised_names(&self) -> impl Iterator<Item = &str> {
+        self.tools
+            .iter()
+            .map(|tool| tool.origin().name())
+            .chain(self.handoffs.iter().map(ModelHandoffDefinition::name))
+    }
+}
+
+impl fmt::Debug for TurnActionSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tools = self
+            .tools
+            .iter()
+            .map(|tool| tool.origin().qualified_name())
+            .collect::<Vec<_>>();
+        let handoffs = self
+            .handoffs
+            .iter()
+            .map(ModelHandoffDefinition::name)
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("TurnActionSurface")
             .field("tools", &tools)
+            .field("handoffs", &handoffs)
             .finish_non_exhaustive()
     }
 }
@@ -162,8 +277,11 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let tool_definitions: Vec<ModelToolDefinition> =
         tools.iter().map(|tool| tool.model_definition()).collect();
 
-    // 2. Resolve enabled handoffs after tools. R17 owns the concrete handoff contract.
+    // 2. Resolve enabled handoffs after tools. R17 owns the concrete handoff contract. Sealing the
+    // two into one surface here — not lazily at settlement — is what makes an ambiguous surface
+    // fail before the model call is paid for instead of after it.
     let handoffs = resolve_handoffs(request.agent);
+    let surface = TurnActionSurface::new(tools, handoffs)?;
 
     // 3. Resolve structured output after handoffs. R1-16 owns the output parser contract.
     let output_schema = resolve_output_schema(request.agent);
@@ -179,21 +297,25 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // settled before the turn knows which tools it will advertise.
     let model_settings = resolved_model
         .resolve_settings(request.agent.model_settings(), &request.model_settings)
-        .reconcile_tool_surface(advertised_names(&tool_definitions, &handoffs));
+        .reconcile_tool_surface(surface.advertised_names());
 
     let instructions = resolve_instructions(request.agent)?;
 
     // 6. Model-input filters are always last, so a filter sees the final tool surface and the
     // settings that go with it. R10-6b will replace this identity implementation with the
     // report-producing filter chain without changing the surrounding stage order.
-    let (input, instructions) =
-        apply_model_input_filters(request.input, instructions, &tools, &model_settings);
+    let (input, instructions) = apply_model_input_filters(
+        request.input,
+        instructions,
+        surface.tools(),
+        &model_settings,
+    );
 
     let selector = resolved_model.selector().clone();
     let model = Arc::clone(resolved_model.model());
     let mut model_request = ModelRequest::new(input, model_settings)
         .with_tools(tool_definitions)
-        .with_handoffs(handoffs)
+        .with_handoffs(surface.handoffs().to_vec())
         .with_tracing(request.tracing);
     if let Some(instructions) = instructions {
         model_request = model_request.with_system_instructions(instructions);
@@ -206,7 +328,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         selector,
         model,
         request: model_request,
-        tools,
+        surface,
     })
 }
 
@@ -246,18 +368,6 @@ fn resolve_output_schema(_agent: &AgentSpec) -> Option<ModelOutputSchema> {
     None
 }
 
-/// Names the turn advertises to the model. Handoffs share the tool namespace on the wire, so a
-/// selector may legitimately point at either.
-fn advertised_names<'a>(
-    tools: &'a [ModelToolDefinition],
-    handoffs: &'a [ModelHandoffDefinition],
-) -> impl Iterator<Item = &'a str> {
-    tools
-        .iter()
-        .map(ModelToolDefinition::name)
-        .chain(handoffs.iter().map(ModelHandoffDefinition::name))
-}
-
 /// Projects the agent's instruction source onto the stable system-instruction slot.
 ///
 /// The failure branch is the point: when R4-11 adds a dynamic prompt source, a turn that cannot
@@ -265,14 +375,16 @@ fn advertised_names<'a>(
 fn resolve_instructions(agent: &AgentSpec) -> Result<Option<String>> {
     match agent.instructions() {
         None => Ok(None),
-        Some(instructions) => instructions.as_static().map(str::to_owned).map(Some).ok_or_else(
-            || {
+        Some(instructions) => instructions
+            .as_static()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| {
                 Error::config(format!(
                     "agent `{}` uses an instruction source that turn preparation cannot render yet",
                     agent.id()
                 ))
-            },
-        ),
+            }),
     }
 }
 

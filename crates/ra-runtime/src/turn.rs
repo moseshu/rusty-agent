@@ -4,5 +4,6 @@ pub(crate) mod batch;
 pub(crate) mod interrupt;
 #[doc(hidden)]
 pub mod prepare;
-pub(crate) mod process;
+#[doc(hidden)]
+pub mod process;
 pub(crate) mod resolve;

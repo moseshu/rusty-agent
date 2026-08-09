@@ -1,15 +1,25 @@
 # ra-runtime 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
+const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tracing(mut self, tracing : ModelTracing) -> Self
+fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
 fn ra_runtime::turn::prepare::PreparedTurn::tools(& self) -> & [Arc < dyn Tool >]
+fn ra_runtime::turn::prepare::TurnActionSurface::advertised_names(& self) -> impl Iterator < Item = & str >
+fn ra_runtime::turn::prepare::TurnActionSurface::advertises_handoff_to(& self, target : & AgentId) -> bool
+fn ra_runtime::turn::prepare::TurnActionSurface::find_handoff(& self, name : & str) -> Option < & ModelHandoffDefinition >
+fn ra_runtime::turn::prepare::TurnActionSurface::find_tool(& self, name : & str) -> Option < & Arc < dyn Tool > >
+fn ra_runtime::turn::prepare::TurnActionSurface::handoffs(& self) -> & [ModelHandoffDefinition]
+fn ra_runtime::turn::prepare::TurnActionSurface::new(tools : Vec < Arc < dyn Tool > >, handoffs : Vec < ModelHandoffDefinition >) -> Result < Self >
+fn ra_runtime::turn::prepare::TurnActionSurface::tools(& self) -> & [Arc < dyn Tool >]
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a AgentSpec, model_resolver : & 'a dyn ModelResolver, tool_context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model(mut self, model : impl Into < String >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings(mut self, model_settings : ModelSettings) -> Self
+fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >
 mod ra_runtime::agent
 mod ra_runtime::guard
 mod ra_runtime::runner
@@ -18,5 +28,7 @@ mod ra_runtime::tool::profile
 mod ra_runtime::tool::registry
 mod ra_runtime::turn
 mod ra_runtime::turn::prepare
+mod ra_runtime::turn::process
 struct ra_runtime::turn::prepare::PreparedTurn
+struct ra_runtime::turn::prepare::TurnActionSurface
 struct ra_runtime::turn::prepare::TurnPreparationRequest

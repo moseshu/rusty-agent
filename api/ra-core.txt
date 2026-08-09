@@ -72,6 +72,7 @@ const fn ra_core::item::RunItem::session_data(& self) -> & SessionData
 const fn ra_core::item::RunItem::unknown(& self) -> & Unknown
 const fn ra_core::item::RunItemKind::is_interruption(& self) -> bool
 const fn ra_core::item::RunItemKind::label(& self) -> & 'static str
+const fn ra_core::item::RunItemKind::requires_action_binding(& self) -> bool
 const fn ra_core::item::compaction::Compaction::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::compaction::Compaction::unknown(& self) -> & Unknown
 const fn ra_core::item::content::Base64ImageSource::schema_version(& self) -> SchemaVersion
@@ -274,6 +275,22 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::step::processed::ToolNotFound::call(& self) -> & ToolCall
+const fn ra_core::step::processed::ToolNotFound::call_id(& self) -> & CallId
+const fn ra_core::step::processed::ToolNotFound::item_id(& self) -> & ItemId
+const fn ra_core::step::processed::ToolRunApproval::item_id(& self) -> & ItemId
+const fn ra_core::step::processed::ToolRunApproval::request(& self) -> & McpApprovalRequest
+const fn ra_core::step::processed::ToolRunFunction::call(& self) -> & ToolCall
+const fn ra_core::step::processed::ToolRunFunction::call_id(& self) -> & CallId
+const fn ra_core::step::processed::ToolRunFunction::item_id(& self) -> & ItemId
+const fn ra_core::step::processed::ToolRunFunction::tool(& self) -> & Arc < dyn Tool >
+const fn ra_core::step::processed::ToolRunHandoff::call(& self) -> & HandoffCall
+const fn ra_core::step::processed::ToolRunHandoff::call_id(& self) -> & CallId
+const fn ra_core::step::processed::ToolRunHandoff::item_id(& self) -> & ItemId
+const fn ra_core::step::processed::ToolRunHandoff::target_agent(& self) -> & AgentId
+const fn ra_core::step::single::SingleStepResult::model_response(& self) -> & ModelResponse
+const fn ra_core::step::single::SingleStepResult::next_step(& self) -> & NextStep
+const fn ra_core::step::single::SingleStepResult::processed_response(& self) -> & ProcessedResponse
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::arguments(& self) -> & Value
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::call_id(& self) -> & CallId
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::caller(& self) -> ToolCaller
@@ -422,6 +439,7 @@ enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
 enum ra_core::model::stream::ModelStreamEvent
 enum ra_core::step::NextStep
+enum ra_core::step::processed::ToolUse
 enum ra_core::tool::invocation::ToolCaller
 enum ra_core::tool::options::ToolApprovalPolicy
 enum ra_core::tool::options::ToolAvailability
@@ -666,6 +684,42 @@ fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
 fn ra_core::step::NextStep::interruption(items : Vec < RunItem >) -> Result < Self >
+fn ra_core::step::processed::ProcessedResponse::builder() -> ProcessedResponseBuilder
+fn ra_core::step::processed::ProcessedResponse::functions(& self) -> & [ToolRunFunction]
+fn ra_core::step::processed::ProcessedResponse::handoffs(& self) -> & [ToolRunHandoff]
+fn ra_core::step::processed::ProcessedResponse::has_interruptions(& self) -> bool
+fn ra_core::step::processed::ProcessedResponse::has_tools_or_approvals_to_run(& self) -> bool
+fn ra_core::step::processed::ProcessedResponse::interruptions(& self) -> impl Iterator < Item = & RunItem >
+fn ra_core::step::processed::ProcessedResponse::mcp_approval_requests(& self) -> & [ToolRunApproval]
+fn ra_core::step::processed::ProcessedResponse::new_items(& self) -> & [RunItem]
+fn ra_core::step::processed::ProcessedResponse::tools_not_found(& self) -> & [ToolNotFound]
+fn ra_core::step::processed::ProcessedResponse::tools_used(& self) -> Vec < ToolUse >
+fn ra_core::step::processed::ProcessedResponseBuilder::build(self) -> Result < ProcessedResponse >
+fn ra_core::step::processed::ProcessedResponseBuilder::function(mut self, item : RunItem, tool : Arc < dyn Tool >) -> Result < Self >
+fn ra_core::step::processed::ProcessedResponseBuilder::handoff(mut self, item : RunItem, target_agent : AgentId) -> Result < Self >
+fn ra_core::step::processed::ProcessedResponseBuilder::item(mut self, item : RunItem) -> Self
+fn ra_core::step::processed::ProcessedResponseBuilder::mcp_approval(mut self, item : RunItem) -> Result < Self >
+fn ra_core::step::processed::ProcessedResponseBuilder::new() -> Self
+fn ra_core::step::processed::ProcessedResponseBuilder::tool_not_found(mut self, item : RunItem) -> Result < Self >
+fn ra_core::step::processed::ToolNotFound::name(& self) -> & str
+fn ra_core::step::processed::ToolRunApproval::request_id(& self) -> & str
+fn ra_core::step::single::SingleStepResult::builder() -> SingleStepResultBuilder
+fn ra_core::step::single::SingleStepResult::generated_items(& self) -> impl Iterator < Item = & RunItem >
+fn ra_core::step::single::SingleStepResult::nested_history_owned_items(& self) -> & [ItemId]
+fn ra_core::step::single::SingleStepResult::new_step_items(& self) -> & [RunItem]
+fn ra_core::step::single::SingleStepResult::original_input(& self) -> & [ModelInputItem]
+fn ra_core::step::single::SingleStepResult::pre_step_items(& self) -> & [RunItem]
+fn ra_core::step::single::SingleStepResult::session_step_items(& self) -> & [RunItem]
+fn ra_core::step::single::SingleStepResultBuilder::build(self) -> Result < SingleStepResult >
+fn ra_core::step::single::SingleStepResultBuilder::model_response(mut self, response : ModelResponse) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::nested_history_owned_items(mut self, item_ids : Vec < ItemId >) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::new() -> Self
+fn ra_core::step::single::SingleStepResultBuilder::new_step_items(mut self, items : Vec < RunItem >) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::next_step(mut self, next_step : NextStep) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::original_input(mut self, input : Vec < ModelInputItem >) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::pre_step_items(mut self, items : Vec < RunItem >) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::processed_response(mut self, processed : ProcessedResponse) -> Self
+fn ra_core::step::single::SingleStepResultBuilder::session_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_core::tool::Tool::model_definition(& self) -> ModelToolDefinition
 fn ra_core::tool::Tool::options(& self) -> ToolOptions
 fn ra_core::tool::Tool::origin(& self) -> & ToolOrigin
@@ -752,6 +806,8 @@ mod ra_core::prompt
 mod ra_core::session
 mod ra_core::state
 mod ra_core::step
+mod ra_core::step::processed
+mod ra_core::step::single
 mod ra_core::tool
 mod ra_core::tool::invocation
 mod ra_core::tool::namespace
@@ -824,6 +880,14 @@ struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
+struct ra_core::step::processed::ProcessedResponse
+struct ra_core::step::processed::ProcessedResponseBuilder
+struct ra_core::step::processed::ToolNotFound
+struct ra_core::step::processed::ToolRunApproval
+struct ra_core::step::processed::ToolRunFunction
+struct ra_core::step::processed::ToolRunHandoff
+struct ra_core::step::single::SingleStepResult
+struct ra_core::step::single::SingleStepResultBuilder
 struct ra_core::tool::invocation::ToolInvocation
 struct ra_core::tool::namespace::ToolNamespace
 struct ra_core::tool::options::ToolGuardrailId
@@ -1014,6 +1078,10 @@ variant ra_core::step::NextStep::FinalOutput { reason: FinishReason }
 variant ra_core::step::NextStep::Handoff { new_agent: Arc < AgentSpec > }
 variant ra_core::step::NextStep::Interruption { items: Vec < RunItem > }
 variant ra_core::step::NextStep::RunAgain
+variant ra_core::step::processed::ToolUse::Handoff(AgentId)
+variant ra_core::step::processed::ToolUse::Mcp { server: String, tool_name: String }
+variant ra_core::step::processed::ToolUse::Tool(ToolLookupKey)
+variant ra_core::step::processed::ToolUse::Unresolved(String)
 variant ra_core::tool::invocation::ToolCaller::Direct
 variant ra_core::tool::invocation::ToolCaller::Programmatic
 variant ra_core::tool::options::ToolApprovalPolicy::Always
