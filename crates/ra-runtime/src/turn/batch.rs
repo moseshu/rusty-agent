@@ -12,7 +12,8 @@
 use ra_core::{
     cancel::CancelScope,
     error::{Error, Result, ToolErrorKind},
-    item::{CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
+    item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
+    state::ToolUseTracker,
     step::ProcessedResponse,
     tool::ToolRuntimeContext,
 };
@@ -53,6 +54,8 @@ impl TurnExecution {
 #[non_exhaustive]
 pub struct TurnExecutionRequest<'a> {
     processed: &'a ProcessedResponse,
+    agent_id: &'a AgentId,
+    tool_use: &'a ToolUseTracker,
     context: &'a dyn ToolRuntimeContext,
     cancel: &'a CancelScope,
 }
@@ -61,11 +64,15 @@ impl<'a> TurnExecutionRequest<'a> {
     /// Creates a request.
     pub fn new(
         processed: &'a ProcessedResponse,
+        agent_id: &'a AgentId,
+        tool_use: &'a ToolUseTracker,
         context: &'a dyn ToolRuntimeContext,
         cancel: &'a CancelScope,
     ) -> Self {
         Self {
             processed,
+            agent_id,
+            tool_use,
             context,
             cancel,
         }
@@ -99,12 +106,19 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
 
     for action in processed.functions() {
         request.cancel.ensure_not_cancelled()?;
+        // Asked of the action, never rebuilt from its parts: settlement recorded this turn under
+        // `identity()` a moment ago, and a second derivation that drifted would look up something
+        // nothing ever recorded and hand the breaker a permanent zero.
+        let repeat_streak = request
+            .tool_use
+            .repeat_streak(request.agent_id, &action.identity());
         let dispatch = dispatch_tool(ToolDispatchRequest::new(
             action.tool(),
             action.call_id(),
             action.call().arguments(),
             request.context,
             request.cancel,
+            repeat_streak,
         ))
         .await?;
 

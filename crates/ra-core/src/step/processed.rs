@@ -29,13 +29,22 @@ use std::{
     sync::Arc,
 };
 
+use serde_json::Value;
+
 use crate::{
     error::{Error, Result},
     item::{
         AgentId, CallId, HandoffCall, ItemId, McpApprovalRequest, RunItem, RunItemKind, ToolCall,
     },
-    tool::{Tool, ToolLookupKey},
+    state::ToolUseAttempt,
+    tool::Tool,
 };
+
+/// Re-exported so classification and the run state it feeds name one type.
+///
+/// The definition lives in [`state`](crate::state) because persistence pins its wire format; see
+/// that module on why an `Internal` grade would be the wrong promise for it.
+pub use crate::state::ToolUse;
 
 /// A model call bound to the executable tool that will run it.
 ///
@@ -74,6 +83,17 @@ impl ToolRunFunction {
     #[must_use]
     pub const fn tool(&self) -> &Arc<dyn Tool> {
         &self.tool
+    }
+
+    /// How the tool-use tracker identifies this call.
+    ///
+    /// Ask the action rather than rebuilding the value from its parts. R3-6b records what the model
+    /// asked for under this identity and R3-6's breaker looks the streak up by it, so a second
+    /// derivation that drifted would query something nothing ever recorded, read zero forever, and
+    /// let the loop keep running — with no test in a position to notice.
+    #[must_use]
+    pub fn identity(&self) -> ToolUse {
+        ToolUse::Tool(self.tool.origin().lookup_key().clone())
     }
 }
 
@@ -125,6 +145,12 @@ impl ToolRunHandoff {
     pub const fn target_agent(&self) -> &AgentId {
         self.call.target_agent()
     }
+
+    /// How the tool-use tracker identifies this call. See [`ToolRunFunction::identity`].
+    #[must_use]
+    pub fn identity(&self) -> ToolUse {
+        ToolUse::Handoff(self.target_agent().clone())
+    }
 }
 
 /// A hosted-tool call the host has to approve before the server may run it.
@@ -152,6 +178,15 @@ impl ToolRunApproval {
     #[must_use]
     pub fn request_id(&self) -> &str {
         self.request.request_id()
+    }
+
+    /// How the tool-use tracker identifies this call. See [`ToolRunFunction::identity`].
+    #[must_use]
+    pub fn identity(&self) -> ToolUse {
+        ToolUse::Mcp {
+            server: self.request.server().to_owned(),
+            tool_name: self.request.tool_name().to_owned(),
+        }
     }
 }
 
@@ -191,30 +226,12 @@ impl ToolNotFound {
     pub fn name(&self) -> &str {
         self.call.name()
     }
-}
 
-/// One action identity the model invoked during a turn.
-///
-/// R3-6b tracks repeat calls on these values, so a plain name would not do: a namespaced tool and
-/// a bare tool can legitimately share a model-facing name across agents, and counting them as one
-/// is exactly the "统计按可重名的 tool name" mistake that milestone names.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ToolUse {
-    /// A local tool, identified by its collision-free routing key.
-    Tool(ToolLookupKey),
-    /// A control transfer to another agent.
-    Handoff(AgentId),
-    /// A hosted MCP tool on a named server.
-    Mcp {
-        /// Registered server name.
-        server: String,
-        /// Tool name on that server.
-        tool_name: String,
-    },
-    /// A name the turn did not advertise. It still counts as an attempt, which is what
-    /// `reset_tool_choice` (R3-6) reacts to.
-    Unresolved(String),
+    /// How the tool-use tracker identifies this call. See [`ToolRunFunction::identity`].
+    #[must_use]
+    pub fn identity(&self) -> ToolUse {
+        ToolUse::Unresolved(self.name().to_owned())
+    }
 }
 
 /// One model response, classified.
@@ -305,49 +322,100 @@ impl ProcessedResponse {
             || !self.tools_not_found.is_empty()
     }
 
+    /// Every call the model made, in response order, ready for
+    /// [`ToolUseTracker::record_turn`](crate::state::ToolUseTracker::record_turn).
+    ///
+    /// This is the one walk that sees each attempt exactly once and in the order the model produced
+    /// it — including the ones that resolved to nothing, which the tracker counts because the model
+    /// tried. A caller that instead iterated the four category lists would get them grouped by
+    /// category, and a repeat streak read off that order would be a property of this type's field
+    /// layout rather than of what the model did.
+    #[must_use]
+    pub fn attempts(&self) -> Vec<ToolUseAttempt> {
+        self.ordered_actions()
+            .into_iter()
+            .map(|action| ToolUseAttempt::new(action.identity, action.call_id, action.arguments))
+            .collect()
+    }
+
     /// Action identities invoked this turn, in response order, without repeats.
     #[must_use]
     pub fn tools_used(&self) -> Vec<ToolUse> {
-        let mut by_item: BTreeMap<&ItemId, ToolUse> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        self.ordered_actions()
+            .into_iter()
+            .filter(|action| seen.insert(action.identity.clone()))
+            .map(|action| action.identity)
+            .collect()
+    }
+
+    /// Indexes the four categories back onto the response's own order.
+    ///
+    /// The categories are stored separately because settlement treats them differently, but the
+    /// order the model asked in is only recoverable from `new_items`. Both public projections go
+    /// through this so they cannot disagree about it.
+    ///
+    /// Every identity comes from the action's own `identity()` rather than being rebuilt here, so
+    /// this walk and a later consumer asking the same action the same question cannot answer
+    /// differently.
+    fn ordered_actions(&self) -> Vec<OrderedAction<'_>> {
+        let mut by_item: BTreeMap<&ItemId, OrderedAction<'_>> = BTreeMap::new();
         for action in &self.functions {
             by_item.insert(
                 &action.item_id,
-                ToolUse::Tool(action.tool.origin().lookup_key().clone()),
+                OrderedAction {
+                    identity: action.identity(),
+                    call_id: action.call_id().clone(),
+                    arguments: action.call.arguments(),
+                },
             );
         }
         for action in &self.handoffs {
             by_item.insert(
                 &action.item_id,
-                ToolUse::Handoff(action.target_agent().clone()),
+                OrderedAction {
+                    identity: action.identity(),
+                    call_id: action.call_id().clone(),
+                    arguments: action.call.arguments(),
+                },
             );
         }
         for action in &self.mcp_approval_requests {
             by_item.insert(
                 &action.item_id,
-                ToolUse::Mcp {
-                    server: action.request.server().to_owned(),
-                    tool_name: action.request.tool_name().to_owned(),
+                OrderedAction {
+                    identity: action.identity(),
+                    // A hosted approval pairs on its `request_id`, not on a `CallId` the model
+                    // minted. `CallId` is the framework's pairing ID for a tool, handoff, or MCP
+                    // call alike, and the identity beside it says which of the three this is.
+                    call_id: CallId::new(action.request_id()),
+                    arguments: action.request.arguments(),
                 },
             );
         }
         for action in &self.tools_not_found {
             by_item.insert(
                 &action.item_id,
-                ToolUse::Unresolved(action.name().to_owned()),
+                OrderedAction {
+                    identity: action.identity(),
+                    call_id: action.call_id().clone(),
+                    arguments: action.call.arguments(),
+                },
             );
         }
 
-        let mut seen = BTreeSet::new();
-        let mut used = Vec::new();
-        for item in &self.new_items {
-            if let Some(use_) = by_item.get(item.id())
-                && seen.insert(use_.clone())
-            {
-                used.push(use_.clone());
-            }
-        }
-        used
+        self.new_items
+            .iter()
+            .filter_map(|item| by_item.remove(item.id()))
+            .collect()
     }
+}
+
+/// One bound action projected back onto the response's order.
+struct OrderedAction<'a> {
+    identity: ToolUse,
+    call_id: CallId,
+    arguments: &'a Value,
 }
 
 impl fmt::Debug for ProcessedResponse {

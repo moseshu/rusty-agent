@@ -12,7 +12,8 @@
 use ra_core::{
     cancel::CancelScope,
     error::Result,
-    item::{ModelInputItem, ModelResponse, RunItem},
+    item::{AgentId, ModelInputItem, ModelResponse, RunItem},
+    state::ToolUseTracker,
     step::SingleStepResult,
     tool::ToolRuntimeContext,
 };
@@ -33,13 +34,21 @@ use process::process_model_response;
 use resolve::{resolve_next_step, step_items};
 
 /// Inputs for settling one turn.
+///
+/// [`ToolUseTracker`] is run-scoped state and the only `&mut` here, which is deliberate: it is what
+/// makes the per-turn counts a fact about the run rather than about one function call. It is also
+/// **required rather than optional** — a caller that could omit it would get a run whose repeat
+/// streaks silently never advance, and R3-6's loop breaker would read zero forever while the model
+/// looped.
 #[must_use]
 #[non_exhaustive]
 pub struct TurnSettlementRequest<'a> {
+    agent_id: &'a AgentId,
     response: &'a ModelResponse,
     surface: &'a TurnActionSurface,
     context: &'a dyn ToolRuntimeContext,
     cancel: &'a CancelScope,
+    tool_use: &'a mut ToolUseTracker,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
 }
@@ -50,17 +59,24 @@ impl<'a> TurnSettlementRequest<'a> {
     /// `surface` has to be the one this turn advertised — take it from the preparation with
     /// [`PreparedTurn::into_call`](prepare::PreparedTurn::into_call) rather than rebuilding it, or
     /// settlement resolves names against tools the turn never offered.
+    ///
+    /// `agent_id` is the **public** agent identity (R3-12): tool-use history is attributed where the
+    /// user configured it, not to whatever sandbox-prepared clone happened to execute the turn.
     pub fn new(
+        agent_id: &'a AgentId,
         response: &'a ModelResponse,
         surface: &'a TurnActionSurface,
         context: &'a dyn ToolRuntimeContext,
         cancel: &'a CancelScope,
+        tool_use: &'a mut ToolUseTracker,
     ) -> Self {
         Self {
+            agent_id,
             response,
             surface,
             context,
             cancel,
+            tool_use,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
         }
@@ -85,10 +101,25 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     // answer it, so no later stage has to re-read a provider payload to find out what it is.
     let processed = process_model_response(request.response, request.surface)?;
 
+    // 1b. Record what the model asked for, before anything acts on it. This is not a fifth stage:
+    // it produces no decision and nothing branches on it here. Its position is the point — R3-6's
+    // loop breaker lives inside `dispatch_tool`, which runs below, so this turn's attempts have to
+    // already be in the tracker when it looks. Recording after execution would show the breaker
+    // every turn but the one it is being asked about.
+    //
+    // Attempts are recorded, not results: a call that is refused, times out, or resolves to nothing
+    // is still the model asking for the same thing again, and that is exactly what `reset_tool_choice`
+    // and the breaker react to.
+    request
+        .tool_use
+        .record_turn(request.agent_id, processed.attempts());
+
     // 2. Answer every bound action. Interruptions come back rather than blocking: a pending
     // approval is a state the run can be saved in, not an `await` somebody is stuck on.
     let execution = execute_actions(TurnExecutionRequest::new(
         &processed,
+        request.agent_id,
+        request.tool_use,
         request.context,
         request.cancel,
     ))

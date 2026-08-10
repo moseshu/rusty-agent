@@ -9,10 +9,10 @@ use ra_core::{
         AgentId, CallId, ItemId, McpApprovalRequest, Message, OutputPhase, RunItem, RunItemKind,
         ToolApproval, ToolCall, ToolCallOutput,
     },
-    step::{ProcessedResponse, ToolUse},
-    tool::{
-        Tool, ToolInvocation, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema,
+    step::{
+        ProcessedResponse, ToolNotFound, ToolRunApproval, ToolRunFunction, ToolRunHandoff, ToolUse,
     },
+    tool::{Tool, ToolInvocation, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema},
 };
 use serde_json::json;
 
@@ -97,7 +97,10 @@ fn 每条动作都和它的记录一起进入分类结果() {
             "msg-1",
             RunItemKind::Message(Message::assistant("先说一句", OutputPhase::Commentary)),
         ))
-        .function(tool_call("call-item-1", "call-1", "write_file"), bare_tool("write_file"))
+        .function(
+            tool_call("call-item-1", "call-1", "write_file"),
+            bare_tool("write_file"),
+        )
         .unwrap()
         .handoff(
             tool_call("call-item-2", "call-2", "transfer_to_reviewer"),
@@ -230,10 +233,7 @@ fn 同一个_call_id_不允许被两个动作认领() {
     assert!(error.to_string().contains("same-call"));
 
     let duplicate_item = ProcessedResponse::builder()
-        .item(item(
-            "msg-1",
-            RunItemKind::Message(Message::user("hi")),
-        ))
+        .item(item("msg-1", RunItemKind::Message(Message::user("hi"))))
         .item(item(
             "msg-1",
             RunItemKind::Message(Message::user("hi again")),
@@ -248,7 +248,10 @@ fn 欠着答复的调用不能当成无动作记录混进去() {
     // 走 `item()` 的调用会让 `has_tools_or_approvals_to_run()` 答「没事可做」，
     // 而响应里还压着一个没人会回的 call——症状要到下一次请求才现形。
     for (label, unclassified) in [
-        ("tool_call", tool_call("call-item-1", "call-1", "write_file")),
+        (
+            "tool_call",
+            tool_call("call-item-1", "call-1", "write_file"),
+        ),
         (
             "handoff_call",
             item(
@@ -395,5 +398,33 @@ fn tools_used_按查找键统计而不是按可重名的名字() {
     let ToolUse::Tool(first) = &used[0] else {
         panic!("第一条应当是本地工具");
     };
-    assert_eq!(first.namespace().map(ra_core::tool::ToolNamespace::as_str), Some("mcp.github"));
+    assert_eq!(
+        first.namespace().map(ra_core::tool::ToolNamespace::as_str),
+        Some("mcp.github")
+    );
+
+    // 动作自己报的身份，必须就是投影记账用的那个。R3-6 的熔断器按 `identity()` 查连续段，
+    // 而 R3-6b 按投影记账；两边一旦各算各的，查到的是一个从没被记过的身份——永远读到 0，
+    // 环还在转，而且没有任何断言会挂。
+    let mut from_actions = Vec::new();
+    from_actions.extend(processed.functions().iter().map(ToolRunFunction::identity));
+    from_actions.extend(processed.handoffs().iter().map(ToolRunHandoff::identity));
+    from_actions.extend(
+        processed
+            .mcp_approval_requests()
+            .iter()
+            .map(ToolRunApproval::identity),
+    );
+    from_actions.extend(
+        processed
+            .tools_not_found()
+            .iter()
+            .map(ToolNotFound::identity),
+    );
+    from_actions.sort();
+    from_actions.dedup();
+
+    let mut from_projection = used;
+    from_projection.sort();
+    assert_eq!(from_actions, from_projection);
 }

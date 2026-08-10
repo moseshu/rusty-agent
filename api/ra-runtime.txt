@@ -11,14 +11,14 @@ const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequ
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tracing(mut self, tracing : ModelTracing) -> Self
 enum ra_runtime::tool::dispatch::ToolDispatch
-fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::new(tool : & 'a Arc < dyn Tool >, call_id : & 'a CallId, arguments : & 'a Value, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
-fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::new(tool : & 'a Arc < dyn Tool >, call_id : & 'a CallId, arguments : & 'a Value, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, repeat_streak : u32) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent_id : & 'a AgentId, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
 fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]
-fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
 fn ra_runtime::turn::prepare::PreparedTurn::tools(& self) -> & [Arc < dyn Tool >]
