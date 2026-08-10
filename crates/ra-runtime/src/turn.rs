@@ -12,11 +12,13 @@
 use ra_core::{
     cancel::CancelScope,
     error::Result,
-    item::{AgentId, ModelInputItem, ModelResponse, RunItem},
+    item::{ModelInputItem, ModelResponse, RunItem},
     state::ToolUseTracker,
     step::SingleStepResult,
     tool::ToolRuntimeContext,
 };
+
+use crate::agent::AgentBinding;
 
 #[doc(hidden)]
 pub mod batch;
@@ -43,7 +45,7 @@ use resolve::{resolve_next_step, step_items};
 #[must_use]
 #[non_exhaustive]
 pub struct TurnSettlementRequest<'a> {
-    agent_id: &'a AgentId,
+    agent: &'a AgentBinding,
     response: &'a ModelResponse,
     surface: &'a TurnActionSurface,
     context: &'a dyn ToolRuntimeContext,
@@ -60,10 +62,12 @@ impl<'a> TurnSettlementRequest<'a> {
     /// [`PreparedTurn::into_call`](prepare::PreparedTurn::into_call) rather than rebuilding it, or
     /// settlement resolves names against tools the turn never offered.
     ///
-    /// `agent_id` is the **public** agent identity (R3-12): tool-use history is attributed where the
-    /// user configured it, not to whatever sandbox-prepared clone happened to execute the turn.
+    /// `agent` is a binding rather than an ID because settlement is the stage that *files* things —
+    /// records, counts, and later hooks and spans. It reads
+    /// [`public_id`](AgentBinding::public_id) and nothing else, so no caller is in a position to
+    /// hand it a sandbox-prepared clone's identity by mistake (R3-12).
     pub fn new(
-        agent_id: &'a AgentId,
+        agent: &'a AgentBinding,
         response: &'a ModelResponse,
         surface: &'a TurnActionSurface,
         context: &'a dyn ToolRuntimeContext,
@@ -71,7 +75,7 @@ impl<'a> TurnSettlementRequest<'a> {
         tool_use: &'a mut ToolUseTracker,
     ) -> Self {
         Self {
-            agent_id,
+            agent,
             response,
             surface,
             context,
@@ -110,15 +114,16 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     // Attempts are recorded, not results: a call that is refused, times out, or resolves to nothing
     // is still the model asking for the same thing again, and that is exactly what `reset_tool_choice`
     // and the breaker react to.
+    let public_id = request.agent.public_id();
     request
         .tool_use
-        .record_turn(request.agent_id, processed.attempts());
+        .record_turn(public_id, processed.attempts());
 
     // 2. Answer every bound action. Interruptions come back rather than blocking: a pending
     // approval is a state the run can be saved in, not an `await` somebody is stuck on.
     let execution = execute_actions(TurnExecutionRequest::new(
         &processed,
-        request.agent_id,
+        public_id,
         request.tool_use,
         request.context,
         request.cancel,
@@ -131,7 +136,7 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     // 4. Record. `new_step_items` and `session_step_items` are the same list this turn: nothing
     // filters the model-facing view yet, and R5's budgeting is what will make them diverge. The
     // builder's checks are what keeps that future divergence from quietly dropping history.
-    let items = step_items(&processed, &execution);
+    let items = step_items(&processed, &execution, request.agent.public());
     SingleStepResult::builder()
         .original_input(request.original_input)
         .model_response(request.response.clone())

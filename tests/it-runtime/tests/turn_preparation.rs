@@ -18,7 +18,10 @@ use ra_core::{
         ToolRuntimeContext, ToolSchema,
     },
 };
-use ra_runtime::turn::prepare::{TurnPreparationRequest, prepare_turn};
+use ra_runtime::{
+    agent::AgentBinding,
+    turn::prepare::{TurnPreparationRequest, prepare_turn},
+};
 use serde_json::json;
 
 type Events = Arc<Mutex<Vec<String>>>;
@@ -28,7 +31,9 @@ struct FakeModel;
 #[async_trait]
 impl Model for FakeModel {
     async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
-        Err(Error::caller("fake model is not invoked during preparation"))
+        Err(Error::caller(
+            "fake model is not invoked during preparation",
+        ))
     }
 
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
@@ -176,6 +181,12 @@ fn dynamic_tool(name: &str, events: &Events, enabled: bool) -> Arc<dyn Tool> {
     ))
 }
 
+/// Wraps a plain agent as the binding preparation and settlement take (R3-12). These tests are not
+/// about a prepared instance, so both identities are the same object.
+fn direct(agent: &Arc<AgentSpec>) -> AgentBinding {
+    AgentBinding::direct(Arc::clone(agent))
+}
+
 fn host() -> HostContext {
     HostContext {
         dynamic_tools_enabled: true,
@@ -217,7 +228,7 @@ async fn 动态工具先于模型解析且最终快照同时驱动请求与执�
     let input = vec![ModelInputItem::Message(Message::user("hello"))];
 
     let prepared = prepare_turn(
-        TurnPreparationRequest::new(&agent, &resolver, &context, &cancel, input.clone())
+        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, input.clone())
             .with_model("run/model")
             .with_model_settings(
                 ModelSettings::new()
@@ -299,7 +310,7 @@ async fn 动态工具失败会在模型解析前终止准备() {
     let cancel = CancelScope::root();
 
     let error = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -327,7 +338,7 @@ async fn agent_模型在没有_run_override_时传给_resolver() {
     let cancel = CancelScope::root();
 
     prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -352,7 +363,7 @@ async fn 没有模型选择器时_resolver_收到_none_走注册表默认() {
     let cancel = CancelScope::root();
 
     prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -379,7 +390,7 @@ async fn 已取消的作用域不启动任何准备工作() {
     cancel.cancel(CancelReason::UserInterrupt);
 
     let error = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -408,7 +419,7 @@ async fn turn_作用域取消随父作用域传播进准备阶段() {
     run.cancel(CancelReason::Shutdown);
 
     let error = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &turn,
@@ -443,7 +454,7 @@ async fn 工具面被动态清空时_required_不会带着空工具表发出去(
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -478,7 +489,7 @@ async fn 指名一个本轮未广播的工具时选择器降级而不是终止_r
     let cancel = CancelScope::root();
 
     let pinned_to_live_tool = prepare_turn(
-        TurnPreparationRequest::new(&agent, &resolver, &context, &cancel, Vec::new())
+        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
             .with_model_settings(
                 ModelSettings::new().with_tool_choice(ToolChoice::Tool("still_here".to_owned())),
             ),
@@ -491,9 +502,10 @@ async fn 指名一个本轮未广播的工具时选择器降级而不是终止_r
     );
 
     let pinned_to_disabled_tool = prepare_turn(
-        TurnPreparationRequest::new(&agent, &resolver, &context, &cancel, Vec::new())
+        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
             .with_model_settings(
-                ModelSettings::new().with_tool_choice(ToolChoice::Tool("gone_this_turn".to_owned())),
+                ModelSettings::new()
+                    .with_tool_choice(ToolChoice::Tool("gone_this_turn".to_owned())),
             ),
     )
     .await
@@ -521,7 +533,7 @@ async fn tracing_三态可从准备请求设置() {
     let cancel = CancelScope::root();
 
     let default = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -532,7 +544,7 @@ async fn tracing_三态可从准备请求设置() {
     assert!(default.request().tracing().is_disabled());
 
     let with_data = prepare_turn(
-        TurnPreparationRequest::new(&agent, &resolver, &context, &cancel, Vec::new())
+        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
             .with_tracing(ModelTracing::Enabled),
     )
     .await
@@ -540,7 +552,7 @@ async fn tracing_三态可从准备请求设置() {
     assert!(with_data.request().tracing().include_data());
 
     let without_data = prepare_turn(
-        TurnPreparationRequest::new(&agent, &resolver, &context, &cancel, Vec::new())
+        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
             .with_tracing(ModelTracing::EnabledWithoutData),
     )
     .await
@@ -563,7 +575,7 @@ async fn into_request_交出请求所有权而不复制输入历史() {
     let input = vec![ModelInputItem::Message(Message::user("hello"))];
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,

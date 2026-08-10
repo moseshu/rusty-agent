@@ -25,6 +25,8 @@ use ra_core::{
     tool::{Tool, ToolAvailability, ToolRuntimeContext},
 };
 
+use crate::agent::AgentBinding;
+
 /// Inputs needed to prepare one model call.
 ///
 /// The selected model and settings can be overridden for one run without mutating the agent.
@@ -32,7 +34,7 @@ use ra_core::{
 #[must_use]
 #[non_exhaustive]
 pub struct TurnPreparationRequest<'a> {
-    agent: &'a AgentSpec,
+    agent: &'a AgentBinding,
     model_resolver: &'a dyn ModelResolver,
     tool_context: &'a dyn ToolRuntimeContext,
     cancel: &'a CancelScope,
@@ -45,11 +47,16 @@ pub struct TurnPreparationRequest<'a> {
 impl<'a> TurnPreparationRequest<'a> {
     /// Creates a request using the agent's model selection and no run-level setting overrides.
     ///
+    /// `agent` is a binding rather than a spec because preparation is the stage that decides what
+    /// the model may call, and that has to come from the instance that will run — see
+    /// [`AgentBinding`]. Passing the public agent when a prepared instance exists would advertise
+    /// tools the executor does not have.
+    ///
     /// `cancel` is required rather than optional: preparation awaits third-party `is_enabled`
     /// implementations, so a caller that could omit the scope would have a run that cannot be
     /// interrupted while a tool decides whether it is available.
     pub fn new(
-        agent: &'a AgentSpec,
+        agent: &'a AgentBinding,
         model_resolver: &'a dyn ModelResolver,
         tool_context: &'a dyn ToolRuntimeContext,
         cancel: &'a CancelScope,
@@ -272,23 +279,28 @@ impl fmt::Debug for TurnActionSurface {
 
 /// Prepares one turn in the only permitted stage order.
 pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<PreparedTurn> {
+    // Every stage below reads the **execution** instance. Preparation decides what the model is
+    // offered, and offering what the public agent declares would hand the model tools whichever
+    // capability or sandbox step produced this instance may have removed.
+    let agent = request.agent.execution();
+
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
-    let tools = resolve_enabled_tools(request.agent, request.tool_context, request.cancel).await?;
+    let tools = resolve_enabled_tools(agent, request.tool_context, request.cancel).await?;
     let tool_definitions: Vec<ModelToolDefinition> =
         tools.iter().map(|tool| tool.model_definition()).collect();
 
     // 2. Resolve enabled handoffs after tools. R17 owns the concrete handoff contract. Sealing the
     // two into one surface here — not lazily at settlement — is what makes an ambiguous surface
     // fail before the model call is paid for instead of after it.
-    let handoffs = resolve_handoffs(request.agent);
+    let handoffs = resolve_handoffs(agent);
     let surface = TurnActionSurface::new(tools, handoffs)?;
 
     // 3. Resolve structured output after handoffs. R1-16 owns the output parser contract.
-    let output_schema = resolve_output_schema(request.agent);
+    let output_schema = resolve_output_schema(agent);
 
     // 4. Resolve the provider and model only after the advertised action surface is stable.
     request.cancel.ensure_not_cancelled()?;
-    let model_name = request.model_override.as_deref().or(request.agent.model());
+    let model_name = request.model_override.as_deref().or(agent.model());
     let resolved_model = request.model_resolver.resolve_model(model_name)?;
 
     // 5. Complete provider -> agent -> model -> run settings resolution, then reconcile the result
@@ -296,10 +308,10 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // bearing rather than merely conventional: `tool_choice` and `parallel_tool_calls` cannot be
     // settled before the turn knows which tools it will advertise.
     let model_settings = resolved_model
-        .resolve_settings(request.agent.model_settings(), &request.model_settings)
+        .resolve_settings(agent.model_settings(), &request.model_settings)
         .reconcile_tool_surface(surface.advertised_names());
 
-    let instructions = resolve_instructions(request.agent)?;
+    let instructions = resolve_instructions(agent, request.agent.public_id())?;
 
     // 6. Model-input filters are always last, so a filter sees the final tool surface and the
     // settings that go with it. R10-6b will replace this identity implementation with the
@@ -372,7 +384,11 @@ fn resolve_output_schema(_agent: &AgentSpec) -> Option<ModelOutputSchema> {
 ///
 /// The failure branch is the point: when R4-11 adds a dynamic prompt source, a turn that cannot
 /// render it must say so rather than quietly send a request with no instructions at all.
-fn resolve_instructions(agent: &AgentSpec) -> Result<Option<String>> {
+///
+/// The source is read from the execution instance but the error names `public_id`. A configuration
+/// error has to point at the agent the user wrote down; naming a prepared clone would send them
+/// looking for something that is not in their configuration at all.
+fn resolve_instructions(agent: &AgentSpec, public_id: &AgentId) -> Result<Option<String>> {
     match agent.instructions() {
         None => Ok(None),
         Some(instructions) => instructions
@@ -381,8 +397,8 @@ fn resolve_instructions(agent: &AgentSpec) -> Result<Option<String>> {
             .map(Some)
             .ok_or_else(|| {
                 Error::config(format!(
-                    "agent `{}` uses an instruction source that turn preparation cannot render yet",
-                    agent.id()
+                    "agent `{public_id}` uses an instruction source that turn preparation cannot \
+                     render yet"
                 ))
             }),
     }

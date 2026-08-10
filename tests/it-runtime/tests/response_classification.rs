@@ -22,9 +22,12 @@ use ra_core::{
         ToolRuntimeContext, ToolSchema,
     },
 };
-use ra_runtime::turn::{
-    prepare::{TurnActionSurface, TurnPreparationRequest, prepare_turn},
-    process::process_model_response,
+use ra_runtime::{
+    agent::AgentBinding,
+    turn::{
+        prepare::{TurnActionSurface, TurnPreparationRequest, prepare_turn},
+        process::process_model_response,
+    },
 };
 use serde_json::json;
 
@@ -129,6 +132,12 @@ fn handoff(name: &str, target: &str) -> ModelHandoffDefinition {
     )
 }
 
+/// Wraps a plain agent as the binding preparation and settlement take (R3-12). These tests are not
+/// about a prepared instance, so both identities are the same object.
+fn direct(agent: &Arc<AgentSpec>) -> AgentBinding {
+    AgentBinding::direct(Arc::clone(agent))
+}
+
 fn item(id: &str, kind: RunItemKind) -> RunItem {
     RunItem::new(ItemId::new(id), kind)
 }
@@ -225,7 +234,7 @@ async fn 结算阶段解析的是本轮启用快照而不是_agent_声明的工�
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,
@@ -267,7 +276,7 @@ async fn 动作面在准备阶段就建好_歧义不会拖到花完钱之后才�
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
-        &agent,
+        &direct(&agent),
         &resolver,
         &context,
         &cancel,

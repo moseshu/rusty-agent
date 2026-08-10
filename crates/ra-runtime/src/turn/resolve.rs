@@ -9,9 +9,10 @@
 //! and anything still owed an answer outranks concluding.
 
 use ra_core::{
+    agent::AgentSpec,
     error::Result,
     finish::FinishReason,
-    item::RunItem,
+    item::{ItemProvenance, RunItem},
     step::{NextStep, ProcessedResponse},
 };
 
@@ -64,9 +65,33 @@ const fn check_for_final_output_from_tools(
 
 /// Everything this turn generated, in the order it happened: what the model said, then what
 /// answering it produced.
+///
+/// This is also where the turn's records are attributed (R3-12), because it is the one place that
+/// sees all of them. `public` is the user's agent even when a prepared instance executed the turn:
+/// a session read back later has to say who produced a record in terms the user recognises, and an
+/// execution-time clone is not something they ever configured.
 #[must_use]
-pub fn step_items(processed: &ProcessedResponse, execution: &TurnExecution) -> Vec<RunItem> {
+pub fn step_items(
+    processed: &ProcessedResponse,
+    execution: &TurnExecution,
+    public: &AgentSpec,
+) -> Vec<RunItem> {
     let mut items = processed.new_items().to_vec();
     items.extend(execution.new_items().iter().cloned());
     items
+        .into_iter()
+        .map(|item| attribute(item, public))
+        .collect()
+}
+
+/// Files one record under the public agent, leaving an existing attribution alone.
+///
+/// Only fills what is empty. A record that already names a producer got it from something that
+/// knew better — R12's nested runs will attribute their own items to the sub-agent — and
+/// overwriting that would re-label a sub-agent's work as the parent's.
+fn attribute(item: RunItem, public: &AgentSpec) -> RunItem {
+    if item.provenance().is_some() {
+        return item;
+    }
+    item.with_provenance(ItemProvenance::new(public.id().clone()).with_agent_name(public.name()))
 }

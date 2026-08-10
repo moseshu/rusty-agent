@@ -7,6 +7,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use ra_core::{
+    agent::AgentSpec,
     cancel::CancelScope,
     error::{Error, Result, ToolErrorKind},
     item::{
@@ -20,7 +21,10 @@ use ra_core::{
         ToolOutput, ToolSchema,
     },
 };
-use ra_runtime::turn::{TurnSettlementRequest, prepare::TurnActionSurface, settle_turn};
+use ra_runtime::{
+    agent::AgentBinding,
+    turn::{TurnSettlementRequest, prepare::TurnActionSurface, settle_turn},
+};
 use serde_json::{Value, json};
 
 /// What the tool does when the settlement finally reaches it.
@@ -103,6 +107,18 @@ fn agent() -> AgentId {
     AgentId::new("main")
 }
 
+/// The binding a settlement runs under. `direct` because these tests are about what gets recorded,
+/// not about the public/execution split — that has its own file.
+fn binding(id: &str) -> AgentBinding {
+    AgentBinding::direct(
+        AgentSpec::builder()
+            .id(AgentId::new(id))
+            .name(id)
+            .build()
+            .unwrap(),
+    )
+}
+
 fn item(id: &str, kind: RunItemKind) -> RunItem {
     RunItem::new(ItemId::new(id), kind)
 }
@@ -130,7 +146,7 @@ async fn settle(
 ) -> Result<()> {
     let cancel = CancelScope::root();
     settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding("main"),
         response,
         surface,
         &Host,
@@ -329,7 +345,7 @@ async fn 归属跟着传进来的公共_agent_身份走() {
 
     for id in ["planner", "executor"] {
         settle_turn(TurnSettlementRequest::new(
-            &AgentId::new(id),
+            &binding(id),
             &response,
             &surface,
             &Host,

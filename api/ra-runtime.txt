@@ -4,6 +4,8 @@ async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest
 async fn ra_runtime::turn::batch::execute_actions(request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
+const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
@@ -11,8 +13,12 @@ const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequ
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tracing(mut self, tracing : ModelTracing) -> Self
 enum ra_runtime::tool::dispatch::ToolDispatch
+fn ra_runtime::agent::AgentBinding::direct(agent : Arc < AgentSpec >) -> Self
+fn ra_runtime::agent::AgentBinding::is_prepared(& self) -> bool
+fn ra_runtime::agent::AgentBinding::prepared(public : Arc < AgentSpec >, execution : Arc < AgentSpec >) -> Self
+fn ra_runtime::agent::AgentBinding::public_id(& self) -> & AgentId
 fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::new(tool : & 'a Arc < dyn Tool >, call_id : & 'a CallId, arguments : & 'a Value, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, repeat_streak : u32) -> Self
-fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent_id : & 'a AgentId, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
@@ -29,12 +35,12 @@ fn ra_runtime::turn::prepare::TurnActionSurface::find_tool(& self, name : & str)
 fn ra_runtime::turn::prepare::TurnActionSurface::handoffs(& self) -> & [ModelHandoffDefinition]
 fn ra_runtime::turn::prepare::TurnActionSurface::new(tools : Vec < Arc < dyn Tool > >, handoffs : Vec < ModelHandoffDefinition >) -> Result < Self >
 fn ra_runtime::turn::prepare::TurnActionSurface::tools(& self) -> & [Arc < dyn Tool >]
-fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a AgentSpec, model_resolver : & 'a dyn ModelResolver, tool_context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, input : Vec < ModelInputItem >) -> Self
+fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a AgentBinding, model_resolver : & 'a dyn ModelResolver, tool_context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model(mut self, model : impl Into < String >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >
 fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedResponse, execution : & TurnExecution) -> Result < NextStep >
-fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution) -> Vec < RunItem >
+fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution, public : & AgentSpec) -> Vec < RunItem >
 mod ra_runtime::agent
 mod ra_runtime::guard
 mod ra_runtime::runner
@@ -47,6 +53,7 @@ mod ra_runtime::turn::batch
 mod ra_runtime::turn::prepare
 mod ra_runtime::turn::process
 mod ra_runtime::turn::resolve
+struct ra_runtime::agent::AgentBinding
 struct ra_runtime::tool::dispatch::ToolDispatchRequest
 struct ra_runtime::turn::TurnSettlementRequest
 struct ra_runtime::turn::batch::TurnExecution

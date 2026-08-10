@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::AgentId,
+    agent::{AgentId, AgentSpec},
     cancel::{CancelReason, CancelScope},
     error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
@@ -26,7 +26,10 @@ use ra_core::{
         ToolOrigin, ToolOutput, ToolRuntimeContext, ToolSchema, ToolTimeoutBehavior,
     },
 };
-use ra_runtime::turn::{TurnSettlementRequest, prepare::TurnActionSurface, settle_turn};
+use ra_runtime::{
+    agent::AgentBinding,
+    turn::{TurnSettlementRequest, prepare::TurnActionSurface, settle_turn},
+};
 use serde_json::{Value, json};
 
 /// What a `ScriptedTool` does when it is finally invoked.
@@ -121,9 +124,16 @@ impl Tool for ScriptedTool {
 
 struct Host;
 
-/// The public agent identity every settlement here runs under (R3-12).
-fn agent() -> AgentId {
-    AgentId::new("main")
+/// The binding every settlement here runs under. Nothing prepared an execution instance, so the
+/// two identities are the same object; the public/execution split has its own test file.
+fn binding() -> AgentBinding {
+    AgentBinding::direct(
+        AgentSpec::builder()
+            .id(AgentId::new("main"))
+            .name("Main")
+            .build()
+            .unwrap(),
+    )
 }
 
 fn item(id: &str, kind: RunItemKind) -> RunItem {
@@ -175,7 +185,7 @@ async fn 什么都没要的响应直接结算成最终输出() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -211,7 +221,7 @@ async fn 工具跑完后回到模型_输出按_call_id_配对() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -247,7 +257,7 @@ async fn 叫不出名字的工具也拿到一份配对失败观察并逼出下�
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -277,7 +287,7 @@ async fn 需要审批时干净地停下来而不是阻塞在一个_await_上() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -328,7 +338,7 @@ async fn 响应里的_mcp_审批与工具审批一起被问全() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -357,7 +367,7 @@ async fn 工具失败默认变成模型读得懂的观察而不是终止_run() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -402,7 +412,7 @@ async fn 声明_propagate_的工具失败会终止这一轮() {
     let cancel = CancelScope::root();
 
     let error = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -433,7 +443,7 @@ async fn custom_失败处理让工具自己写给模型看的解释() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -462,7 +472,7 @@ async fn 超时按声明的行为分流() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface(vec![visible]),
         &Host,
@@ -483,7 +493,7 @@ async fn 超时按声明的行为分流() {
         ),
     );
     let error = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface(vec![propagating]),
         &Host,
@@ -518,7 +528,7 @@ async fn 取消永远不会被降级成一条工具观察() {
     });
 
     let error = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -542,7 +552,7 @@ async fn 已取消的作用域一个工具都不跑() {
     cancel.cancel(CancelReason::Shutdown);
 
     let error = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -590,7 +600,7 @@ async fn 已取消时不看模型这轮要了什么都报成取消() {
         cancel.cancel(CancelReason::UserInterrupt);
 
         let settled = settle_turn(TurnSettlementRequest::new(
-            &agent(),
+            &binding(),
             &response,
             &surface(vec![Arc::new(ScriptedTool::new(
                 "write_file",
@@ -624,7 +634,7 @@ async fn 不接受这个调用方类别的工具从模型侧看就是不存在()
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -661,7 +671,7 @@ async fn 交接落到_r17_之前明确报错而不是当成模型什么都没要
     let cancel = CancelScope::root();
 
     let error = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -688,7 +698,7 @@ async fn 一轮里的多个调用各自拿到自己的观察() {
     let cancel = CancelScope::root();
 
     let settled = settle_turn(TurnSettlementRequest::new(
-        &agent(),
+        &binding(),
         &response,
         &surface,
         &Host,
@@ -718,7 +728,7 @@ async fn 结算结果带着原始输入与前序项且通过全部对账() {
 
     let settled = settle_turn(
         TurnSettlementRequest::new(
-            &agent(),
+            &binding(),
             &response,
             &surface,
             &Host,
@@ -767,7 +777,7 @@ async fn 结算结果可跨_await_共享() {
     let cancel = CancelScope::root();
     let settled = Arc::new(
         settle_turn(TurnSettlementRequest::new(
-            &agent(),
+            &binding(),
             &response,
             &surface,
             &Host,
