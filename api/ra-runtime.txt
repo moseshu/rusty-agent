@@ -1,22 +1,51 @@
 # ra-runtime 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_runtime::runner::Runner::run(request : RunRequest) -> Result < RunResult >
+async fn ra_runtime::runner::stream::RunStream::finish(self) -> Result < RunResult >
+async fn ra_runtime::runner::stream::RunStream::next_event(& mut self) -> Option < RunStreamEvent >
 async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest < '_ >) -> Result < ToolDispatch >
 async fn ra_runtime::turn::batch::execute_actions(request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::runner::RunConfig::max_turns(& self) -> u32
+const fn ra_runtime::runner::RunConfig::with_max_turns(mut self, max_turns : u32) -> Self
+const fn ra_runtime::runner::RunConfig::with_tracing(mut self, tracing : ModelTracing) -> Self
+const fn ra_runtime::runner::result::RunOutcome::finish_reason(& self) -> Option < FinishReason >
+const fn ra_runtime::runner::result::RunResult::last_agent(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::runner::result::RunResult::outcome(& self) -> & RunOutcome
+const fn ra_runtime::runner::result::RunResult::tool_use(& self) -> & ToolUseTracker
+const fn ra_runtime::runner::result::RunResult::turns(& self) -> u32
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tracing(mut self, tracing : ModelTracing) -> Self
+const ra_runtime::runner::DEFAULT_MAX_TURNS: u32
+enum ra_runtime::runner::result::ContinuationInput
+enum ra_runtime::runner::result::RunOutcome
+enum ra_runtime::runner::stream::RunStreamEvent
 enum ra_runtime::tool::dispatch::ToolDispatch
 fn ra_runtime::agent::AgentBinding::direct(agent : Arc < AgentSpec >) -> Self
 fn ra_runtime::agent::AgentBinding::is_prepared(& self) -> bool
 fn ra_runtime::agent::AgentBinding::prepared(public : Arc < AgentSpec >, execution : Arc < AgentSpec >) -> Self
 fn ra_runtime::agent::AgentBinding::public_id(& self) -> & AgentId
+fn ra_runtime::runner::RunConfig::new() -> Self
+fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < String >) -> Self
+fn ra_runtime::runner::RunConfig::with_model_settings(mut self, model_settings : ModelSettings) -> Self
+fn ra_runtime::runner::RunRequest::new(agent : AgentBinding, model_resolver : Arc < dyn ModelResolver >, tool_context : Arc < dyn ToolRuntimeContext >, cancel : CancelScope, input : Vec < ModelInputItem >) -> Self
+fn ra_runtime::runner::RunRequest::with_config(mut self, config : RunConfig) -> Self
+fn ra_runtime::runner::RunRequest::with_tool_use(mut self, tool_use : ToolUseTracker) -> Self
+fn ra_runtime::runner::Runner::run_streamed(mut request : RunRequest) -> RunStream
+fn ra_runtime::runner::result::RunOutcome::interruptions(& self) -> & [RunItem]
+fn ra_runtime::runner::result::RunResult::continuation_input(& self, policy : ContinuationInput) -> Vec < ModelInputItem >
+fn ra_runtime::runner::result::RunResult::final_message(& self) -> Option < & Message >
+fn ra_runtime::runner::result::RunResult::model_responses(& self) -> & [ModelResponse]
+fn ra_runtime::runner::result::RunResult::new_items(& self) -> & [RunItem]
+fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInputItem]
+fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
 fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::new(tool : & 'a Arc < dyn Tool >, call_id : & 'a CallId, arguments : & 'a Value, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, repeat_streak : u32) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
@@ -44,6 +73,8 @@ fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execut
 mod ra_runtime::agent
 mod ra_runtime::guard
 mod ra_runtime::runner
+mod ra_runtime::runner::result
+mod ra_runtime::runner::stream
 mod ra_runtime::tool
 mod ra_runtime::tool::dispatch
 mod ra_runtime::tool::profile
@@ -54,6 +85,11 @@ mod ra_runtime::turn::prepare
 mod ra_runtime::turn::process
 mod ra_runtime::turn::resolve
 struct ra_runtime::agent::AgentBinding
+struct ra_runtime::runner::RunConfig
+struct ra_runtime::runner::RunRequest
+struct ra_runtime::runner::Runner
+struct ra_runtime::runner::result::RunResult
+struct ra_runtime::runner::stream::RunStream
 struct ra_runtime::tool::dispatch::ToolDispatchRequest
 struct ra_runtime::turn::TurnSettlementRequest
 struct ra_runtime::turn::batch::TurnExecution
@@ -61,5 +97,12 @@ struct ra_runtime::turn::batch::TurnExecutionRequest
 struct ra_runtime::turn::prepare::PreparedTurn
 struct ra_runtime::turn::prepare::TurnActionSurface
 struct ra_runtime::turn::prepare::TurnPreparationRequest
+variant ra_runtime::runner::result::ContinuationInput::Normalized
+variant ra_runtime::runner::result::ContinuationInput::PreserveAll
+variant ra_runtime::runner::result::RunOutcome::Completed { reason: FinishReason }
+variant ra_runtime::runner::result::RunOutcome::Interrupted { items: Vec < RunItem > }
+variant ra_runtime::runner::stream::RunStreamEvent::Finished(RunOutcome)
+variant ra_runtime::runner::stream::RunStreamEvent::Item(RunItem)
+variant ra_runtime::runner::stream::RunStreamEvent::TurnStarted { turn: u32, agent: AgentId }
 variant ra_runtime::tool::dispatch::ToolDispatch::AwaitingApproval(ToolApproval)
 variant ra_runtime::tool::dispatch::ToolDispatch::Observed(ToolCallOutput)
