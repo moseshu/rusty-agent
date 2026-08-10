@@ -856,6 +856,7 @@ fn ra_core::tool::output::ObservationMetadata::truncations(& self) -> & [Truncat
 fn ra_core::tool::output::ObservationMetadata::with_guidance(mut self, guidance : impl Into < String >) -> Self
 fn ra_core::tool::output::ObservationMetadata::with_truncation(mut self, truncation : Truncation) -> Self
 fn ra_core::tool::output::ToolOutput::as_text(& self) -> Option < & str >
+fn ra_core::tool::output::ToolOutput::block(block : ToolOutputBlock) -> Self
 fn ra_core::tool::output::ToolOutput::blocks(& self) -> & [ToolOutputBlock]
 fn ra_core::tool::output::ToolOutput::from_stored(payload : & Value) -> Result < Option < Self > >
 fn ra_core::tool::output::ToolOutput::metadata_mut(& mut self) -> & mut ObservationMetadata

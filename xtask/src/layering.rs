@@ -120,7 +120,10 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
         "ra-eval",
         &["ra-core", "ra-runtime", "ra-model", "ra-protocol"],
     ),
-    ("ra-tools", &["ra-core", "ra-exec", "ra-mcp"]),
+    // `ra-macros` is the schema derive (R2-2). Every crate that *declares* a tool needs it, and it
+    // is a kernel crate with no dependencies of its own, so this widens nothing: the alternative is
+    // hand-written JSON schemas that skip strict normalization and the typed decoder.
+    ("ra-tools", &["ra-core", "ra-exec", "ra-mcp", "ra-macros"]),
     ("ra-flow", &["ra-core", "ra-runtime"]),
     ("ra-patch", &[]),
     (

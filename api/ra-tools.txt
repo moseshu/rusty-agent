@@ -1,13 +1,31 @@
 # ra-tools 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+const fn ra_tools::read_file::ReadFileLimits::default_line_limit(& self) -> u32
+const fn ra_tools::read_file::ReadFileLimits::max_binary_bytes(& self) -> usize
+const fn ra_tools::read_file::ReadFileLimits::max_line_bytes(& self) -> usize
+const fn ra_tools::read_file::ReadFileLimits::max_output_bytes(& self) -> usize
+const fn ra_tools::read_file::ReadFileLimits::new() -> Self
+const fn ra_tools::read_file::ReadFileLimits::with_default_line_limit(mut self, lines : u32) -> Self
+const fn ra_tools::read_file::ReadFileLimits::with_max_binary_bytes(mut self, bytes : usize) -> Self
+const fn ra_tools::read_file::ReadFileLimits::with_max_line_bytes(mut self, bytes : usize) -> Self
+const fn ra_tools::read_file::ReadFileLimits::with_max_output_bytes(mut self, bytes : usize) -> Self
+const fn ra_tools::read_file::ReadFileTool::limits(& self) -> & ReadFileLimits
+const fn ra_tools::read_file::ReadFileTool::with_limits(mut self, limits : ReadFileLimits) -> Self
+fn ra_tools::read_file::ReadFileTool::new() -> Result < Self >
+fn ra_tools::read_file::ReadFileTool::root(& self) -> Option < & Path >
+fn ra_tools::read_file::ReadFileTool::rooted(root : impl AsRef < Path >) -> Result < Self >
 mod ra_tools::agent_ns
 mod ra_tools::ask_user
 mod ra_tools::exec_command
 mod ra_tools::glob
 mod ra_tools::grep
+mod ra_tools::mcp_ns
 mod ra_tools::read_file
 mod ra_tools::skill
+mod ra_tools::tool_search
 mod ra_tools::update_plan
 mod ra_tools::view_image
 mod ra_tools::web
 mod ra_tools::write_stdin
+struct ra_tools::read_file::ReadFileLimits
+struct ra_tools::read_file::ReadFileTool

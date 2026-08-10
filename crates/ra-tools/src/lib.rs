@@ -14,6 +14,11 @@
 //! cheap moment is before the first one is written. Everything below therefore lands here
 //! directly rather than being relocated.
 //!
+//! **The module list is R2-8's advertised set of 15 minus `apply_patch`**, and it is complete
+//! before the tools are: a module that does not exist yet is a module the next implementer fills
+//! in somewhere else. Most are still one-line stubs, which is a statement about scheduling
+//! (R8-1..R8-6) rather than about where they belong.
+//!
 //! **Boundary in the other direction**: these are tool *entry points*. The work itself belongs to
 //! the service crates — process execution to [`ra_exec`], MCP transport and lifecycle to
 //! [`ra_mcp`] — and this crate only binds it to a [`Tool`](ra_core::tool::Tool) implementation
@@ -28,8 +33,10 @@ pub mod ask_user;
 pub mod exec_command;
 pub mod glob;
 pub mod grep;
+pub mod mcp_ns;
 pub mod read_file;
 pub mod skill;
+pub mod tool_search;
 pub mod update_plan;
 pub mod view_image;
 pub mod web;

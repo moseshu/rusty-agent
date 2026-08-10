@@ -14,6 +14,12 @@ workspace = true
 ra-core = { workspace = true }
 ra-exec = { workspace = true }
 ra-mcp = { workspace = true }
+# 工具 schema 的唯一正规来源是 R2-2 的 derive；手写 JSON schema 会绕开 strict 规范化、
+# 类型化 decoder 与字节稳定（R2-9）三件事，每绕一次都要在这里重写一遍。
+ra-macros = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }

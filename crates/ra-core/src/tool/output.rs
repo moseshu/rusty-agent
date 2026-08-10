@@ -165,9 +165,19 @@ impl ToolOutput {
     /// Creates a text result.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
+        Self::block(ToolOutputBlock::text(text))
+    }
+
+    /// Creates a single-block result.
+    ///
+    /// Infallible where [`Self::new`] is not, because one block is never zero blocks. Without it,
+    /// a tool that answers with one image has to handle an error that cannot occur, and the usual
+    /// way that gets written is an `unwrap`.
+    #[must_use]
+    pub fn block(block: ToolOutputBlock) -> Self {
         Self {
             schema_version: TOOL_OUTPUT_SCHEMA_VERSION,
-            blocks: vec![ToolOutputBlock::text(text)],
+            blocks: vec![block],
             metadata: ObservationMetadata::new(),
             unknown: Unknown::new(),
         }
