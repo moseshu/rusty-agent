@@ -375,6 +375,7 @@ dependencies = [
  "ra-patch",
  "ra-prompt",
  "ra-runtime",
+ "ra-tools",
  "schemars",
  "serde",
  "serde_json",
@@ -467,6 +468,18 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "ra-tools"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "ra-core",
+ "ra-exec",
+ "ra-mcp",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

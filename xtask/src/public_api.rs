@@ -34,6 +34,7 @@ const TRACKED: &[&str] = &[
     "ra-protocol",
     "ra-eval",
     "ra-patch",
+    "ra-tools",
 ];
 
 /// Runs the gate. When `bless` is true it rewrites the baseline instead of reconciling.

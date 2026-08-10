@@ -1,0 +1,13 @@
+# ra-tools 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
+# 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+mod ra_tools::agent_ns
+mod ra_tools::ask_user
+mod ra_tools::exec_command
+mod ra_tools::glob
+mod ra_tools::grep
+mod ra_tools::read_file
+mod ra_tools::skill
+mod ra_tools::update_plan
+mod ra_tools::view_image
+mod ra_tools::web
+mod ra_tools::write_stdin

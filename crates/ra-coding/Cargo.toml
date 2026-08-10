@@ -18,6 +18,7 @@ ra-context = { workspace = true }
 ra-exec = { workspace = true }
 ra-mcp = { workspace = true }
 ra-patch = { workspace = true }
+ra-tools = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

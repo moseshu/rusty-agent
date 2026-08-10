@@ -42,6 +42,7 @@ ra-mcp = { path = "crates/ra-mcp", version = "0.0.1" }
 ra-protocol = { path = "crates/ra-protocol", version = "0.0.1" }
 ra-eval = { path = "crates/ra-eval", version = "0.0.1" }
 ra-patch = { path = "crates/ra-patch", version = "0.0.1" }
+ra-tools = { path = "crates/ra-tools", version = "0.0.1" }
 ra-coding = { path = "crates/ra-coding", version = "0.0.1" }
 
 # --- 运行时 ---

@@ -23,6 +23,7 @@ members = [
     "it-protocol",
     "it-eval",
     "it-patch",
+    "it-tools",
     "it-coding",
     "it-e2e",
 ]
