@@ -4,14 +4,15 @@ use futures::StreamExt;
 use ra_core::{
     error::Recoverability,
     item::{
-        AgentId, CallId, Compaction, ContentBlock, HandoffCall, HandoffOutput, ImageSource, ItemId,
-        Message, MessageRole, ModelInputItem, OutputPhase, Reasoning, RunItemKind, ToolCall,
-        ToolCallOutput,
+        AgentId, CallId, Compaction, ContentBlock, FileBlock, FileSource, HandoffCall,
+        HandoffOutput, ImageBlock, ImageDetail, ImageSource, ItemId, Message, MessageRole,
+        ModelInputItem, OutputPhase, Reasoning, RunItemKind, ToolCall, ToolCallOutput,
     },
     model::{
         Effort, Model, ModelHandoffDefinition, ModelProvider, ModelRequest, ModelSettings,
         ModelStreamEvent, ModelToolDefinition, ProviderKey, ToolChoice,
     },
+    tool::{ObservationMetadata, ToolOutput, ToolOutputBlock, Truncation, TruncationStage},
 };
 use ra_model::openai::{
     auth::OpenAiAuth,
@@ -624,4 +625,149 @@ async fn unsupported_responses_settings_fail_before_http() {
         .await
         .expect("wiremock should answer")
         .is_empty());
+}
+
+#[tokio::test]
+async fn 结构化工具结果下发成内容块数组而元数据排在最前() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({"id": "resp_output", "output": []})),
+    )
+    .await;
+
+    // R2-3: the structured value is what the session stores; this is the one point where its
+    // metadata becomes model-visible, and it becomes prose rather than fields.
+    let output = ToolOutput::new(vec![
+        ToolOutputBlock::text("hit-1"),
+        ToolOutputBlock::Image(
+            ImageBlock::new(ImageSource::provider_file("file-1")).with_detail(ImageDetail::Low),
+        ),
+        ToolOutputBlock::File(FileBlock::new(FileSource::url("https://example.com/a.pdf"))),
+    ])
+    .expect("blocks are non-empty")
+    .with_metadata(
+        ObservationMetadata::new()
+            .with_truncation(Truncation::new(TruncationStage::Tool, 9_000, 200))
+            .with_guidance("narrow the search with a path prefix"),
+    );
+    let input = vec![ModelInputItem::ToolCallOutput(ToolCallOutput::new(
+        CallId::new("call_structured"),
+        serde_json::to_value(&output).expect("tool output should serialize"),
+    ))];
+
+    model
+        .get_response(ModelRequest::new(input, resolved(ModelSettings::new())))
+        .await
+        .expect("structured tool output should lower");
+
+    let requests = server.received_requests().await.expect("request should exist");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
+    let parts = body["input"][0]["output"]
+        .as_array()
+        .expect("structured output must lower to a content-part array");
+
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0]["type"], "input_text");
+    let note = parts[0]["text"].as_str().expect("metadata block is text");
+    assert!(note.contains("truncated by tool"));
+    assert!(note.contains("narrow the search with a path prefix"));
+    assert_eq!(parts[1], json!({"type": "input_text", "text": "hit-1"}));
+    assert_eq!(
+        parts[2],
+        json!({"type": "input_image", "file_id": "file-1", "detail": "low"})
+    );
+    assert_eq!(
+        parts[3],
+        json!({"type": "input_file", "file_url": "https://example.com/a.pdf"})
+    );
+}
+
+#[tokio::test]
+async fn 不是结构化结果的宿主载荷仍按字符串下发() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({"id": "resp_legacy", "output": []})),
+    )
+    .await;
+
+    // Hosts stored bare values before R2-3 existed, and a resumed session replays them. Failing
+    // here would make an old transcript unreplayable for a shape the framework itself once wrote.
+    let input = vec![ModelInputItem::ToolCallOutput(ToolCallOutput::new(
+        CallId::new("call_legacy"),
+        json!({"rows": 2}),
+    ))];
+
+    model
+        .get_response(ModelRequest::new(input, resolved(ModelSettings::new())))
+        .await
+        .expect("host payloads should still lower");
+
+    let requests = server.received_requests().await.expect("request should exist");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
+    assert_eq!(body["input"][0]["output"], json!("{\"rows\":2}"));
+}
+
+#[tokio::test]
+async fn r2_1_文本结果续跑时仍按原文下发() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({"id": "resp_legacy_text", "output": []})),
+    )
+    .await;
+
+    let input = vec![ModelInputItem::ToolCallOutput(ToolCallOutput::new(
+        CallId::new("call_legacy_text"),
+        json!({"type": "text", "text": "written before R2-3"}),
+    ))];
+
+    model
+        .get_response(ModelRequest::new(input, resolved(ModelSettings::new())))
+        .await
+        .expect("R2-1 tool output should replay");
+
+    let requests = server.received_requests().await.expect("request should exist");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
+    assert_eq!(
+        body["input"][0]["output"],
+        json!([{"type": "input_text", "text": "written before R2-3"}])
+    );
+}
+
+#[tokio::test]
+async fn 读不了的工具结果当场失败而不是被字符串化进上下文() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({"id": "resp_unreadable", "output": []})),
+    )
+    .await;
+
+    // A record a newer build wrote: it claims to be a tool result and this build has no variant
+    // for its block kind. Falling back to stringification would paste that JSON into the model's
+    // context, which is the failure the structured shape exists to end.
+    let input = vec![ModelInputItem::ToolCallOutput(ToolCallOutput::new(
+        CallId::new("call_unreadable"),
+        json!({
+            "schema_version": 1,
+            "blocks": [{"type": "hologram", "data": "…"}]
+        }),
+    ))];
+
+    let error = model
+        .get_response(ModelRequest::new(input, resolved(ModelSettings::new())))
+        .await
+        .expect_err("an unreadable tool result must not be silently stringified");
+
+    assert!(error.to_string().contains("unreadable"));
+    assert!(error.to_string().contains("hologram"));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock should answer")
+            .is_empty()
+    );
 }

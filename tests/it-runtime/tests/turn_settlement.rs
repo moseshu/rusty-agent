@@ -175,6 +175,18 @@ fn output_for<'a>(items: &'a [RunItem], call_id: &str) -> &'a ra_core::item::Too
         .unwrap_or_else(|| panic!("call `{call_id}` 没有配对输出"))
 }
 
+/// Reads a stored payload back as the typed result the tool returned.
+///
+/// Asserted through the type rather than by indexing the stored JSON: the payload's shape is
+/// R2-3's to change, and a test that spelled it out by hand would fail on every change instead of
+/// on the ones that alter what the tool actually said.
+fn stored_text(output: &ra_core::item::ToolCallOutput) -> Option<String> {
+    serde_json::from_value::<ToolOutput>(output.output().clone())
+        .ok()?
+        .as_text()
+        .map(str::to_owned)
+}
+
 #[tokio::test]
 async fn 什么都没要的响应直接结算成最终输出() {
     let surface = surface(vec![Arc::new(ScriptedTool::new(
@@ -244,7 +256,7 @@ async fn 工具跑完后回到模型_输出按_call_id_配对() {
 
     let output = output_for(settled.new_step_items(), "call-1");
     assert!(!output.is_error());
-    assert_eq!(output.output()["text"], json!("written"));
+    assert_eq!(stored_text(&output), Some("written".to_owned()));
 }
 
 #[tokio::test]
@@ -457,8 +469,8 @@ async fn custom_失败处理让工具自己写给模型看的解释() {
     let output = output_for(settled.new_step_items(), "call-1");
     // 这是唯一一条把散文送进模型上下文的路径，而且写它的是工具自己。
     assert_eq!(
-        output.output()["text"],
-        json!("tool wrote its own explanation")
+        stored_text(&output),
+        Some("tool wrote its own explanation".to_owned())
     );
 }
 

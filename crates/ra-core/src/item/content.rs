@@ -278,6 +278,8 @@ impl RefusalBlock {
 pub struct ImageBlock {
     schema_version: SchemaVersion,
     source: ImageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<ImageDetail>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -289,8 +291,16 @@ impl ImageBlock {
         Self {
             schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
             source,
+            detail: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Sets how much vision detail the provider should spend.
+    #[must_use]
+    pub const fn with_detail(mut self, detail: ImageDetail) -> Self {
+        self.detail = Some(detail);
+        self
     }
 
     /// Schema version.
@@ -303,6 +313,12 @@ impl ImageBlock {
     #[must_use]
     pub const fn source(&self) -> &ImageSource {
         &self.source
+    }
+
+    /// Requested vision detail, when the producer asked for one.
+    #[must_use]
+    pub const fn detail(&self) -> Option<ImageDetail> {
+        self.detail
     }
 
     /// Unknown fields retained during deserialization.
@@ -321,6 +337,10 @@ pub enum ImageSource {
     Base64(Base64ImageSource),
     /// A local file path to be read by an I/O-capable layer.
     LocalPath(LocalImageSource),
+    /// A URL the provider fetches, including a `data:` URL.
+    Url(UrlSource),
+    /// A file already uploaded to the provider, referenced by its identifier.
+    ProviderFile(ProviderFileSource),
 }
 
 impl ImageSource {
@@ -334,6 +354,18 @@ impl ImageSource {
     #[must_use]
     pub fn local_path(path: impl Into<PathBuf>) -> Self {
         Self::LocalPath(LocalImageSource::new(path))
+    }
+
+    /// Creates a URL source.
+    #[must_use]
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url(UrlSource::new(url))
+    }
+
+    /// Creates a provider-file source.
+    #[must_use]
+    pub fn provider_file(file_id: impl Into<String>) -> Self {
+        Self::ProviderFile(ProviderFileSource::new(file_id))
     }
 
     /// Returns the source when it contains inline base64 data.
@@ -352,6 +384,279 @@ impl ImageSource {
             Self::LocalPath(source) => Some(source),
             _ => None,
         }
+    }
+
+    /// Returns the source when it is a URL.
+    #[must_use]
+    pub const fn as_url(&self) -> Option<&UrlSource> {
+        match self {
+            Self::Url(source) => Some(source),
+            _ => None,
+        }
+    }
+
+    /// Returns the source when it references an uploaded provider file.
+    #[must_use]
+    pub const fn as_provider_file(&self) -> Option<&ProviderFileSource> {
+        match self {
+            Self::ProviderFile(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Vision detail a provider should spend on an image.
+///
+/// A cost knob, not a content field: `High` buys resolution with tokens. Absent means the provider
+/// decides, which is the right default because the ceiling differs per model.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    /// Fewest tokens.
+    Low,
+    /// Most tokens, most resolution.
+    High,
+    /// Provider's choice.
+    Auto,
+}
+
+impl ImageDetail {
+    /// Stable machine-readable label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl core::fmt::Display for ImageDetail {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A URL the provider fetches for itself.
+///
+/// Kept opaque on purpose: a `data:` URL and an `https:` URL are the same thing to every adapter
+/// that forwards it, and parsing one here would only produce a second opinion about a string the
+/// provider is the authority on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UrlSource {
+    schema_version: SchemaVersion,
+    url: String,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl UrlSource {
+    /// Creates a URL source.
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
+            url: url.into(),
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// The URL, forwarded verbatim.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// A file already uploaded to the provider.
+///
+/// The identifier is provider-scoped, so a record carrying one is only replayable against the
+/// provider that minted it. That is a property of the reference, not a defect: the alternative is
+/// re-uploading bytes the provider already has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFileSource {
+    schema_version: SchemaVersion,
+    file_id: String,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl ProviderFileSource {
+    /// Creates a provider-file reference.
+    #[must_use]
+    pub fn new(file_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
+            file_id: file_id.into(),
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Provider-scoped file identifier.
+    #[must_use]
+    pub fn file_id(&self) -> &str {
+        &self.file_id
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// Storage used by a file block.
+///
+/// Mirrors [`ImageSource`] rather than reusing it: a file carries a `filename` the model reads as
+/// a hint, and an image carries a media type and a detail level. One enum covering both would make
+/// every consumer handle fields that cannot apply.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum FileSource {
+    /// Inline base64 file bytes.
+    Base64(Base64FileSource),
+    /// A URL the provider fetches.
+    Url(UrlSource),
+    /// A file already uploaded to the provider.
+    ProviderFile(ProviderFileSource),
+}
+
+impl FileSource {
+    /// Creates an inline base64 file source.
+    #[must_use]
+    pub fn base64(data: impl Into<String>) -> Self {
+        Self::Base64(Base64FileSource::new(data))
+    }
+
+    /// Creates a URL source.
+    #[must_use]
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url(UrlSource::new(url))
+    }
+
+    /// Creates a provider-file source.
+    #[must_use]
+    pub fn provider_file(file_id: impl Into<String>) -> Self {
+        Self::ProviderFile(ProviderFileSource::new(file_id))
+    }
+}
+
+/// Inline base64 file data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Base64FileSource {
+    schema_version: SchemaVersion,
+    data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl Base64FileSource {
+    /// Creates an inline source. Encoding validation is deferred to the provider adapter.
+    #[must_use]
+    pub fn new(data: impl Into<String>) -> Self {
+        Self {
+            schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
+            data: data.into(),
+            filename: None,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Sets the name the model sees for this file.
+    #[must_use]
+    pub fn with_filename(mut self, filename: impl Into<String>) -> Self {
+        self.filename = Some(filename.into());
+        self
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Base64-encoded file bytes without a data-URL prefix.
+    #[must_use]
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    /// Name hint, when one was supplied.
+    #[must_use]
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// A file content block.
+///
+/// Deliberately **not** a [`ContentBlock`] variant yet: whether a message may carry a file is R1's
+/// contract to change, and adding the variant later costs nothing because that enum is
+/// `#[non_exhaustive]`. Tool results are the only producer today (R2-3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileBlock {
+    schema_version: SchemaVersion,
+    source: FileSource,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl FileBlock {
+    /// Creates a file block.
+    #[must_use]
+    pub fn new(source: FileSource) -> Self {
+        Self {
+            schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
+            source,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// File data location.
+    #[must_use]
+    pub const fn source(&self) -> &FileSource {
+        &self.source
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
     }
 }
 

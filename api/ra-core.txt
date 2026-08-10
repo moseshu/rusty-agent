@@ -75,24 +75,38 @@ const fn ra_core::item::RunItemKind::label(& self) -> & 'static str
 const fn ra_core::item::RunItemKind::requires_action_binding(& self) -> bool
 const fn ra_core::item::compaction::Compaction::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::compaction::Compaction::unknown(& self) -> & Unknown
+const fn ra_core::item::content::Base64FileSource::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::Base64FileSource::unknown(& self) -> & Unknown
 const fn ra_core::item::content::Base64ImageSource::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::Base64ImageSource::unknown(& self) -> & Unknown
 const fn ra_core::item::content::ContentBlock::as_image(& self) -> Option < & ImageBlock >
 const fn ra_core::item::content::ContentBlock::as_thinking(& self) -> Option < & ThinkingBlock >
 const fn ra_core::item::content::ContentBlock::label(& self) -> & 'static str
+const fn ra_core::item::content::FileBlock::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::FileBlock::source(& self) -> & FileSource
+const fn ra_core::item::content::FileBlock::unknown(& self) -> & Unknown
+const fn ra_core::item::content::ImageBlock::detail(& self) -> Option < ImageDetail >
 const fn ra_core::item::content::ImageBlock::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::ImageBlock::source(& self) -> & ImageSource
 const fn ra_core::item::content::ImageBlock::unknown(& self) -> & Unknown
+const fn ra_core::item::content::ImageBlock::with_detail(mut self, detail : ImageDetail) -> Self
+const fn ra_core::item::content::ImageDetail::label(self) -> & 'static str
 const fn ra_core::item::content::ImageSource::as_base64(& self) -> Option < & Base64ImageSource >
 const fn ra_core::item::content::ImageSource::as_local_path(& self) -> Option < & LocalImageSource >
+const fn ra_core::item::content::ImageSource::as_provider_file(& self) -> Option < & ProviderFileSource >
+const fn ra_core::item::content::ImageSource::as_url(& self) -> Option < & UrlSource >
 const fn ra_core::item::content::LocalImageSource::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::LocalImageSource::unknown(& self) -> & Unknown
+const fn ra_core::item::content::ProviderFileSource::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::ProviderFileSource::unknown(& self) -> & Unknown
 const fn ra_core::item::content::RefusalBlock::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::RefusalBlock::unknown(& self) -> & Unknown
 const fn ra_core::item::content::TextBlock::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::TextBlock::unknown(& self) -> & Unknown
 const fn ra_core::item::content::ThinkingBlock::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::ThinkingBlock::unknown(& self) -> & Unknown
+const fn ra_core::item::content::UrlSource::schema_version(& self) -> SchemaVersion
+const fn ra_core::item::content::UrlSource::unknown(& self) -> & Unknown
 const fn ra_core::item::handoff::HandoffCall::arguments(& self) -> & Value
 const fn ra_core::item::handoff::HandoffCall::call_id(& self) -> & CallId
 const fn ra_core::item::handoff::HandoffCall::schema_version(& self) -> SchemaVersion
@@ -343,6 +357,17 @@ const fn ra_core::tool::origin::ToolOrigin::lookup_key(& self) -> & ToolLookupKe
 const fn ra_core::tool::origin::ToolOrigin::namespace(& self) -> Option < & ToolNamespace >
 const fn ra_core::tool::origin::ToolOrigin::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::origin::ToolOrigin::unknown(& self) -> & Unknown
+const fn ra_core::tool::output::ObservationMetadata::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::output::ObservationMetadata::unknown(& self) -> & Unknown
+const fn ra_core::tool::output::ToolOutput::metadata(& self) -> & ObservationMetadata
+const fn ra_core::tool::output::ToolOutput::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::output::ToolOutput::unknown(& self) -> & Unknown
+const fn ra_core::tool::output::Truncation::original_bytes(& self) -> u64
+const fn ra_core::tool::output::Truncation::retained_bytes(& self) -> u64
+const fn ra_core::tool::output::Truncation::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::output::Truncation::stage(& self) -> TruncationStage
+const fn ra_core::tool::output::Truncation::unknown(& self) -> & Unknown
+const fn ra_core::tool::output::TruncationStage::label(self) -> & 'static str
 const fn ra_core::tool::schema::DecodedToolInput::type_name(& self) -> & 'static str
 const fn ra_core::tool::schema::FuncSchema::inject_tool_context(& self) -> bool
 const fn ra_core::tool::schema::FuncSchema::input_type_name(& self) -> & 'static str
@@ -398,6 +423,9 @@ const ra_core::state::tool_use::TOOL_USE_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_LOOKUP_KEY_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_ORIGIN_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::output::OBSERVATION_METADATA_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::output::TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::output::TRUNCATION_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::schema::FUNC_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::schema::TOOL_SCHEMA_VERSION: SchemaVersion
 const ra_core::trace::field::AGENT_NAME: & str
@@ -443,6 +471,8 @@ enum ra_core::finish::FinishReason
 enum ra_core::item::ModelInputItem
 enum ra_core::item::RunItemKind
 enum ra_core::item::content::ContentBlock
+enum ra_core::item::content::FileSource
+enum ra_core::item::content::ImageDetail
 enum ra_core::item::content::ImageSource
 enum ra_core::item::message::MessageRole
 enum ra_core::item::normalization::OrphanPolicy
@@ -471,7 +501,8 @@ enum ra_core::tool::options::ToolAvailability
 enum ra_core::tool::options::ToolFailureHandling
 enum ra_core::tool::options::ToolTimeoutBehavior
 enum ra_core::tool::origin::ToolLookupKind
-enum ra_core::tool::output::ToolOutput
+enum ra_core::tool::output::ToolOutputBlock
+enum ra_core::tool::output::TruncationStage
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::agent::AgentInstructions::as_static(& self) -> Option < & str >
@@ -566,6 +597,10 @@ fn ra_core::item::SessionData::new() -> Self
 fn ra_core::item::compaction::Compaction::compacted_items(& self) -> & [ItemId]
 fn ra_core::item::compaction::Compaction::new(summary : impl Into < String >, compacted_items : Vec < ItemId >) -> Self
 fn ra_core::item::compaction::Compaction::summary(& self) -> & str
+fn ra_core::item::content::Base64FileSource::data(& self) -> & str
+fn ra_core::item::content::Base64FileSource::filename(& self) -> Option < & str >
+fn ra_core::item::content::Base64FileSource::new(data : impl Into < String >) -> Self
+fn ra_core::item::content::Base64FileSource::with_filename(mut self, filename : impl Into < String >) -> Self
 fn ra_core::item::content::Base64ImageSource::data(& self) -> & str
 fn ra_core::item::content::Base64ImageSource::media_type(& self) -> & str
 fn ra_core::item::content::Base64ImageSource::new(media_type : impl Into < String >, data : impl Into < String >) -> Self
@@ -577,12 +612,20 @@ fn ra_core::item::content::ContentBlock::image_path(path : impl Into < PathBuf >
 fn ra_core::item::content::ContentBlock::refusal(refusal : impl Into < String >) -> Self
 fn ra_core::item::content::ContentBlock::text(text : impl Into < String >) -> Self
 fn ra_core::item::content::ContentBlock::thinking(thinking : impl Into < String >, signature : impl Into < String >) -> Self
+fn ra_core::item::content::FileBlock::new(source : FileSource) -> Self
+fn ra_core::item::content::FileSource::base64(data : impl Into < String >) -> Self
+fn ra_core::item::content::FileSource::provider_file(file_id : impl Into < String >) -> Self
+fn ra_core::item::content::FileSource::url(url : impl Into < String >) -> Self
 fn ra_core::item::content::ImageBlock::new(source : ImageSource) -> Self
 fn ra_core::item::content::ImageSource::base64(media_type : impl Into < String >, data : impl Into < String >) -> Self
 fn ra_core::item::content::ImageSource::local_path(path : impl Into < PathBuf >) -> Self
+fn ra_core::item::content::ImageSource::provider_file(file_id : impl Into < String >) -> Self
+fn ra_core::item::content::ImageSource::url(url : impl Into < String >) -> Self
 fn ra_core::item::content::LocalImageSource::new(path : impl Into < PathBuf >) -> Self
 fn ra_core::item::content::LocalImageSource::path(& self) -> & Path
 fn ra_core::item::content::LocalImageSource::try_new(path : impl Into < PathBuf >) -> Result < Self , PathBuf >
+fn ra_core::item::content::ProviderFileSource::file_id(& self) -> & str
+fn ra_core::item::content::ProviderFileSource::new(file_id : impl Into < String >) -> Self
 fn ra_core::item::content::RefusalBlock::new(refusal : impl Into < String >) -> Self
 fn ra_core::item::content::RefusalBlock::refusal(& self) -> & str
 fn ra_core::item::content::TextBlock::new(text : impl Into < String >) -> Self
@@ -590,6 +633,8 @@ fn ra_core::item::content::TextBlock::text(& self) -> & str
 fn ra_core::item::content::ThinkingBlock::new(thinking : impl Into < String >, signature : impl Into < String >) -> Self
 fn ra_core::item::content::ThinkingBlock::signature(& self) -> & str
 fn ra_core::item::content::ThinkingBlock::thinking(& self) -> & str
+fn ra_core::item::content::UrlSource::new(url : impl Into < String >) -> Self
+fn ra_core::item::content::UrlSource::url(& self) -> & str
 fn ra_core::item::handoff::HandoffCall::new(call_id : CallId, target_agent : AgentId, arguments : Value) -> Self
 fn ra_core::item::handoff::HandoffCall::tool_name(& self) -> Option < & str >
 fn ra_core::item::handoff::HandoffCall::with_tool_name(mut self, tool_name : impl Into < String >) -> Self
@@ -802,8 +847,25 @@ fn ra_core::tool::origin::ToolOrigin::namespaced(namespace : ToolNamespace, name
 fn ra_core::tool::origin::ToolOrigin::new(name : impl Into < String >) -> Result < Self >
 fn ra_core::tool::origin::ToolOrigin::qualified_name(& self) -> & str
 fn ra_core::tool::origin::ToolOrigin::validate(& self) -> Result < () >
+fn ra_core::tool::output::ObservationMetadata::guidance(& self) -> & [String]
+fn ra_core::tool::output::ObservationMetadata::is_truncated(& self) -> bool
+fn ra_core::tool::output::ObservationMetadata::new() -> Self
+fn ra_core::tool::output::ObservationMetadata::push_truncation(& mut self, truncation : Truncation)
+fn ra_core::tool::output::ObservationMetadata::render(& self) -> Option < String >
+fn ra_core::tool::output::ObservationMetadata::truncations(& self) -> & [Truncation]
+fn ra_core::tool::output::ObservationMetadata::with_guidance(mut self, guidance : impl Into < String >) -> Self
+fn ra_core::tool::output::ObservationMetadata::with_truncation(mut self, truncation : Truncation) -> Self
 fn ra_core::tool::output::ToolOutput::as_text(& self) -> Option < & str >
+fn ra_core::tool::output::ToolOutput::blocks(& self) -> & [ToolOutputBlock]
+fn ra_core::tool::output::ToolOutput::from_stored(payload : & Value) -> Result < Option < Self > >
+fn ra_core::tool::output::ToolOutput::metadata_mut(& mut self) -> & mut ObservationMetadata
+fn ra_core::tool::output::ToolOutput::model_blocks(& self) -> Vec < ToolOutputBlock >
+fn ra_core::tool::output::ToolOutput::new(blocks : Vec < ToolOutputBlock >) -> Result < Self >
 fn ra_core::tool::output::ToolOutput::text(text : impl Into < String >) -> Self
+fn ra_core::tool::output::ToolOutput::with_metadata(mut self, metadata : ObservationMetadata) -> Self
+fn ra_core::tool::output::ToolOutputBlock::as_text(& self) -> Option < & str >
+fn ra_core::tool::output::ToolOutputBlock::text(text : impl Into < String >) -> Self
+fn ra_core::tool::output::Truncation::new(stage : TruncationStage, original_bytes : u64, retained_bytes : u64) -> Self
 fn ra_core::tool::schema::DecodedToolInput::downcast< T : ToolInput >(self) -> Result < T >
 fn ra_core::tool::schema::DecodedToolInput::downcast_ref< T : ToolInput >(& self) -> Option < & T >
 fn ra_core::tool::schema::FuncSchema::decode_arguments(& self, arguments : & str) -> Result < DecodedToolInput >
@@ -895,12 +957,16 @@ struct ra_core::item::RawProviderItem
 struct ra_core::item::RunItem
 struct ra_core::item::SessionData
 struct ra_core::item::compaction::Compaction
+struct ra_core::item::content::Base64FileSource
 struct ra_core::item::content::Base64ImageSource
+struct ra_core::item::content::FileBlock
 struct ra_core::item::content::ImageBlock
 struct ra_core::item::content::LocalImageSource
+struct ra_core::item::content::ProviderFileSource
 struct ra_core::item::content::RefusalBlock
 struct ra_core::item::content::TextBlock
 struct ra_core::item::content::ThinkingBlock
+struct ra_core::item::content::UrlSource
 struct ra_core::item::handoff::HandoffCall
 struct ra_core::item::handoff::HandoffOutput
 struct ra_core::item::mcp::McpApprovalRequest
@@ -957,6 +1023,9 @@ struct ra_core::tool::options::ToolGuardrailId
 struct ra_core::tool::options::ToolOptions
 struct ra_core::tool::origin::ToolLookupKey
 struct ra_core::tool::origin::ToolOrigin
+struct ra_core::tool::output::ObservationMetadata
+struct ra_core::tool::output::ToolOutput
+struct ra_core::tool::output::Truncation
 struct ra_core::tool::schema::DecodedToolInput
 struct ra_core::tool::schema::FuncSchema
 struct ra_core::tool::schema::ToolSchema
@@ -1079,8 +1148,16 @@ variant ra_core::item::content::ContentBlock::Image(ImageBlock)
 variant ra_core::item::content::ContentBlock::Refusal(RefusalBlock)
 variant ra_core::item::content::ContentBlock::Text(TextBlock)
 variant ra_core::item::content::ContentBlock::Thinking(ThinkingBlock)
+variant ra_core::item::content::FileSource::Base64(Base64FileSource)
+variant ra_core::item::content::FileSource::ProviderFile(ProviderFileSource)
+variant ra_core::item::content::FileSource::Url(UrlSource)
+variant ra_core::item::content::ImageDetail::Auto
+variant ra_core::item::content::ImageDetail::High
+variant ra_core::item::content::ImageDetail::Low
 variant ra_core::item::content::ImageSource::Base64(Base64ImageSource)
 variant ra_core::item::content::ImageSource::LocalPath(LocalImageSource)
+variant ra_core::item::content::ImageSource::ProviderFile(ProviderFileSource)
+variant ra_core::item::content::ImageSource::Url(UrlSource)
 variant ra_core::item::message::MessageRole::Assistant
 variant ra_core::item::message::MessageRole::System
 variant ra_core::item::message::MessageRole::User
@@ -1162,7 +1239,11 @@ variant ra_core::tool::options::ToolTimeoutBehavior::Propagate
 variant ra_core::tool::origin::ToolLookupKind::Bare
 variant ra_core::tool::origin::ToolLookupKind::DeferredTopLevel
 variant ra_core::tool::origin::ToolLookupKind::Namespaced
-variant ra_core::tool::output::ToolOutput::Text { text: String }
+variant ra_core::tool::output::ToolOutputBlock::File(FileBlock)
+variant ra_core::tool::output::ToolOutputBlock::Image(ImageBlock)
+variant ra_core::tool::output::ToolOutputBlock::Text { text: String }
+variant ra_core::tool::output::TruncationStage::ContextBudget
+variant ra_core::tool::output::TruncationStage::Tool
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function

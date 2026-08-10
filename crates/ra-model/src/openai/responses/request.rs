@@ -6,13 +6,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ra_core::{
     error::{Error, Result},
     item::{
-        ContentBlock, ImageSource, InputItemNormalizer, Message, MessageRole, ModelInputItem,
-        OutputPhase,
+        ContentBlock, FileBlock, FileSource, ImageBlock, ImageSource, InputItemNormalizer, Message,
+        MessageRole, ModelInputItem, OutputPhase,
     },
     model::{
         ConversationContinuation, Effort, ModelHandoffDefinition, ModelRequest,
         ModelToolDefinition, ThinkingConfig, ToolChoice,
     },
+    tool::{ToolOutput, ToolOutputBlock},
 };
 use serde_json::{Map, Value, json};
 
@@ -260,7 +261,7 @@ async fn lower_input_item(item: &ModelInputItem, request: &ModelRequest) -> Resu
         ModelInputItem::ToolCallOutput(output) => Ok(json!({
             "type": "function_call_output",
             "call_id": output.call_id().as_str(),
-            "output": output_string(output.output())?
+            "output": lower_tool_output(output.output()).await?
         })),
         ModelInputItem::HandoffCall(call) => {
             // The agent that received control does not advertise the handoff that led to it, so
@@ -406,31 +407,7 @@ async fn lower_content(block: &ContentBlock, role: MessageRole) -> Result<Value>
                     "OpenAI Responses assistant history cannot contain an image block",
                 ));
             }
-            let image_url = match image.source() {
-                ImageSource::Base64(source) => {
-                    format!("data:{};base64,{}", source.media_type(), source.data())
-                }
-                ImageSource::LocalPath(source) => {
-                    let bytes = tokio::fs::read(source.path()).await.map_err(|error| {
-                        Error::caller(format!(
-                            "could not read local image `{}`",
-                            source.path().display()
-                        ))
-                        .with_source(error)
-                    })?;
-                    format!(
-                        "data:{};base64,{}",
-                        infer_media_type(source.path()),
-                        STANDARD.encode(bytes)
-                    )
-                }
-                _ => {
-                    return Err(Error::caller(
-                        "unsupported image source for OpenAI Responses",
-                    ));
-                }
-            };
-            Ok(json!({"type": "input_image", "image_url": image_url}))
+            lower_image(image).await
         }
         ContentBlock::Refusal(refusal) if matches!(role, MessageRole::Assistant) => {
             Ok(json!({"type": "refusal", "refusal": refusal.refusal()}))
@@ -445,6 +422,102 @@ async fn lower_content(block: &ContentBlock, role: MessageRole) -> Result<Value>
             "unsupported content block for OpenAI Responses",
         )),
     }
+}
+
+/// Lowers one image block to an `input_image` part.
+///
+/// Shared by message content and tool results so the two cannot disagree about how a source
+/// becomes a wire field — a second copy is what makes a base64 image work in a user message and
+/// fail in a tool result.
+async fn lower_image(image: &ImageBlock) -> Result<Value> {
+    let mut part = match image.source() {
+        ImageSource::Base64(source) => json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", source.media_type(), source.data())
+        }),
+        ImageSource::LocalPath(source) => {
+            let bytes = tokio::fs::read(source.path()).await.map_err(|error| {
+                Error::caller(format!(
+                    "could not read local image `{}`",
+                    source.path().display()
+                ))
+                .with_source(error)
+            })?;
+            json!({
+                "type": "input_image",
+                "image_url": format!(
+                    "data:{};base64,{}",
+                    infer_media_type(source.path()),
+                    STANDARD.encode(bytes)
+                )
+            })
+        }
+        ImageSource::Url(source) => json!({"type": "input_image", "image_url": source.url()}),
+        ImageSource::ProviderFile(source) => {
+            json!({"type": "input_image", "file_id": source.file_id()})
+        }
+        _ => {
+            return Err(Error::caller(
+                "unsupported image source for OpenAI Responses",
+            ));
+        }
+    };
+    if let Some(detail) = image.detail() {
+        part["detail"] = Value::String(detail.label().to_owned());
+    }
+    Ok(part)
+}
+
+/// Lowers one file block to an `input_file` part.
+fn lower_file(file: &FileBlock) -> Result<Value> {
+    match file.source() {
+        FileSource::Base64(source) => {
+            let mut part = json!({"type": "input_file", "file_data": source.data()});
+            if let Some(filename) = source.filename() {
+                part["filename"] = Value::String(filename.to_owned());
+            }
+            Ok(part)
+        }
+        FileSource::Url(source) => Ok(json!({"type": "input_file", "file_url": source.url()})),
+        FileSource::ProviderFile(source) => {
+            Ok(json!({"type": "input_file", "file_id": source.file_id()}))
+        }
+        _ => Err(Error::caller(
+            "unsupported file source for OpenAI Responses",
+        )),
+    }
+}
+
+/// Lowers a tool result's stored payload into what `function_call_output.output` accepts.
+///
+/// A structured [`ToolOutput`] becomes the content-part array — which is where R2-3's observation
+/// metadata turns into a leading `input_text` block, and the only point at which any of it becomes
+/// model-visible. Anything else is a host-supplied value from before that contract and is
+/// stringified, which is what this adapter has always done.
+///
+/// **A payload that claims to be a tool result and cannot be read is an error, not a fallback.**
+/// The classification is [`ToolOutput::from_stored`]'s precisely so this stays a three-way
+/// decision: treating "unreadable" as "not one of ours" would take a record a newer build wrote
+/// and paste its raw JSON into the model's context, which is the failure the structured shape
+/// exists to end.
+async fn lower_tool_output(payload: &Value) -> Result<Value> {
+    let Some(output) = ToolOutput::from_stored(payload)? else {
+        return output_string(payload).map(Value::String);
+    };
+    let mut parts = Vec::new();
+    for block in output.model_blocks() {
+        parts.push(match block {
+            ToolOutputBlock::Text { text } => json!({"type": "input_text", "text": text}),
+            ToolOutputBlock::Image(image) => lower_image(&image).await?,
+            ToolOutputBlock::File(file) => lower_file(&file)?,
+            _ => {
+                return Err(Error::caller(
+                    "unsupported tool-output block for OpenAI Responses",
+                ));
+            }
+        });
+    }
+    Ok(Value::Array(parts))
 }
 
 fn infer_media_type(path: &std::path::Path) -> &'static str {

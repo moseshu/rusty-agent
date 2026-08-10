@@ -28,8 +28,9 @@ pub mod tool;
 
 pub use compaction::Compaction;
 pub use content::{
-    Base64ImageSource, ContentBlock, ImageBlock, ImageSource, LocalImageSource, RefusalBlock,
-    TextBlock, ThinkingBlock,
+    Base64FileSource, Base64ImageSource, ContentBlock, FileBlock, FileSource, ImageBlock,
+    ImageDetail, ImageSource, LocalImageSource, ProviderFileSource, RefusalBlock, TextBlock,
+    ThinkingBlock, UrlSource,
 };
 pub use handoff::{HandoffCall, HandoffOutput};
 pub use mcp::{McpApprovalRequest, McpApprovalResponse, McpListTools, McpTool};
