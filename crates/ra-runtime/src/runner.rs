@@ -203,7 +203,13 @@ impl Runner {
     /// Runs the agent, announcing each turn's records as they are produced.
     ///
     /// Same loop, same settlement. The run starts immediately on a background task and is
-    /// cancelled if the returned [`RunStream`] is dropped before [`RunStream::finish`].
+    /// cancelled if the returned [`RunStream`] is dropped — or if the [`RunStream::finish`] future
+    /// is dropped part-way — rather than being left detached and still paying a provider.
+    ///
+    /// **Requires a Tokio runtime with the time driver enabled.** Cleanup gives a cancelled run
+    /// [`DRAIN_GRACE`](ra_core::cancel::DRAIN_GRACE) to reach a terminal state before aborting it,
+    /// and that grace period is a timer. Without one the abort backstop is lost; cancellation
+    /// itself still reaches the run.
     #[must_use]
     pub fn run_streamed(mut request: RunRequest) -> RunStream {
         let (sender, receiver) = mpsc::unbounded_channel();

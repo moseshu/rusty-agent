@@ -12,7 +12,12 @@
 //! call in [`super::run_loop`]. Until then a subscriber sees a turn's records the moment that turn
 //! settles, which is already incremental across a multi-turn run.
 
-use ra_core::{cancel::CancelOnDrop, error::Result, item::AgentId, item::RunItem};
+use ra_core::{
+    cancel::{CancelOnDrop, CancelReason, DRAIN_GRACE},
+    error::Result,
+    item::AgentId,
+    item::RunItem,
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::result::{RunOutcome, RunResult};
@@ -52,8 +57,8 @@ pub enum RunStreamEvent {
 #[derive(Debug)]
 pub struct RunStream {
     events: mpsc::UnboundedReceiver<RunStreamEvent>,
-    task: JoinHandle<Result<RunResult>>,
-    cancel: CancelOnDrop,
+    task: Option<JoinHandle<Result<RunResult>>>,
+    cancel: Option<CancelOnDrop>,
 }
 
 impl RunStream {
@@ -64,8 +69,8 @@ impl RunStream {
     ) -> Self {
         Self {
             events,
-            task,
-            cancel,
+            task: Some(task),
+            cancel: Some(cancel),
         }
     }
 
@@ -79,11 +84,37 @@ impl RunStream {
     /// Any events still buffered are dropped, which is the point of them being a separate view: a
     /// caller that only wants the outcome does not have to read the narration first.
     pub async fn finish(self) -> Result<RunResult> {
-        // Disarm before awaiting. Leaving the guard armed would cancel the very run being waited
-        // on the moment this scope's locals drop.
-        let _scope = self.cancel.disarm();
-        drop(self.events);
-        match self.task.await {
+        let mut stream = self;
+        stream.events.close();
+
+        // Keep `task` in `self` while awaiting. If this future is dropped, `RunStream::drop` still
+        // owns the handle and the armed guard, so it can cancel and reap the background run instead
+        // of silently detaching it.
+        // Both `None` arms below are unreachable by construction: the two slots are emptied only by
+        // a completed `finish` — which consumed the stream — or by `Drop`, which runs after this
+        // function returns. They answer rather than unwrap because an `Option` that can only be
+        // `Some` today is exactly the kind of assumption a later refactor invalidates quietly.
+        let joined = match stream.task.as_mut() {
+            Some(task) => task.await,
+            None => {
+                return Err(ra_core::error::Error::caller(
+                    "the run task was already handed to cancellation cleanup",
+                ));
+            }
+        };
+        drop(stream.task.take());
+
+        // The task has reached a terminal state, so dropping the stream must not retroactively
+        // cancel its completed run scope.
+        let _scope = match stream.cancel.take() {
+            Some(cancel) => cancel.disarm(),
+            None => {
+                return Err(ra_core::error::Error::caller(
+                    "the run cancellation guard was already handed to cleanup",
+                ));
+            }
+        };
+        match joined {
             Ok(result) => result,
             Err(error) => Err(ra_core::error::Error::caller(
                 "the run task ended without producing a result",
@@ -91,4 +122,49 @@ impl RunStream {
             .with_source(error)),
         }
     }
+}
+
+impl Drop for RunStream {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+
+        // Signal before detaching from the caller. The guard remains armed as a backstop for every
+        // early-return path in this destructor.
+        if let Some(cancel) = &self.cancel {
+            cancel.scope().cancel(CancelReason::UserInterrupt);
+        }
+        reap_cancelled_task(task);
+    }
+}
+
+/// Waits briefly for a cancelled run, then stops a task that did not cooperate with cancellation.
+///
+/// `Drop` cannot await. Handing the join handle to this short-lived reaper keeps the spawned task
+/// supervised instead of making its lifetime depend on a receiver the host has already discarded.
+///
+/// # The grace period needs a timer
+///
+/// [`DRAIN_GRACE`] is enforced with [`tokio::time::timeout`], which requires the ambient runtime to
+/// have its time driver enabled — see [`Runner::run_streamed`](super::Runner::run_streamed). On a
+/// runtime without one this reaper panics, the panic dies with the detached reaper, and an
+/// uncooperative run degrades to the plain detach this function exists to prevent. It is the
+/// **backstop** that is lost, not the cancellation: the signal was already sent before this call,
+/// and a run that observes its scope stops at its next checkpoint regardless.
+fn reap_cancelled_task(mut task: JoinHandle<Result<RunResult>>) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // `run_streamed` required a Tokio runtime to create this handle. A stream can nevertheless
+        // be moved and dropped after that runtime has gone away; aborting is the only synchronous
+        // cleanup available in that situation.
+        task.abort();
+        return;
+    };
+
+    drop(runtime.spawn(async move {
+        if tokio::time::timeout(DRAIN_GRACE, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }));
 }

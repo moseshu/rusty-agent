@@ -1,8 +1,11 @@
 //! R3-7 contracts for the agent loop and its two entry points.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -32,6 +35,7 @@ use ra_runtime::{
     runner::{ContinuationInput, RunConfig, RunOutcome, RunRequest, RunStreamEvent, Runner},
 };
 use serde_json::json;
+use tokio::{sync::oneshot, time::timeout};
 
 /// Replays a fixed script of responses, one per turn, and records the input it was handed.
 struct ScriptedModel {
@@ -69,6 +73,53 @@ impl Model for ScriptedModel {
     }
 }
 
+/// A model call that only ends by being cancelled. Its drop notification makes cancellation of an
+/// in-flight runner observable without relying on timing or a provider implementation.
+struct PendingModel {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    dropped: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl PendingModel {
+    fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+        let (started_sender, started) = oneshot::channel();
+        let (dropped_sender, dropped) = oneshot::channel();
+        (
+            Arc::new(Self {
+                started: Mutex::new(Some(started_sender)),
+                dropped: Arc::new(Mutex::new(Some(dropped_sender))),
+            }),
+            started,
+            dropped,
+        )
+    }
+}
+
+struct NotifyWhenDropped(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+
+impl Drop for NotifyWhenDropped {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[async_trait]
+impl Model for PendingModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        let _notify = NotifyWhenDropped(Arc::clone(&self.dropped));
+        if let Some(sender) = self.started.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        futures::future::pending().await
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        stream::empty().boxed()
+    }
+}
+
 struct FixedResolver {
     model: Arc<ScriptedModel>,
     selectors: Arc<Mutex<Vec<Option<String>>>>,
@@ -87,6 +138,25 @@ impl ModelResolver for FixedResolver {
                 ApiProtocol::OpenAiResponses,
             ),
             Arc::clone(&self.model) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+struct SingleModelResolver {
+    model: Arc<dyn Model>,
+}
+
+impl ModelResolver for SingleModelResolver {
+    fn resolve_model(&self, _model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some("canonical-model".to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.model),
             ModelSettings::new(),
             ModelSettings::new(),
         ))
@@ -210,6 +280,16 @@ fn request_recording(
             model: Arc::clone(model),
             selectors,
         }),
+        Arc::new(Host),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
+    )
+}
+
+fn pending_request(model: Arc<PendingModel>, cancel: &CancelScope) -> RunRequest {
+    RunRequest::new(
+        agent(Vec::new()),
+        Arc::new(SingleModelResolver { model }),
         Arc::new(Host),
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
@@ -434,6 +514,24 @@ async fn 只要终态时不必先把事件读完() {
 }
 
 #[tokio::test]
+async fn 中途丢掉_finish_仍会取消后台_run() {
+    let (model, started, dropped) = PendingModel::new();
+    let cancel = CancelScope::root();
+    let stream = Runner::run_streamed(pending_request(model, &cancel));
+    let finish = tokio::spawn(async move { stream.finish().await });
+
+    started.await.unwrap();
+    finish.abort();
+    let _ = finish.await;
+
+    timeout(Duration::from_millis(250), dropped)
+        .await
+        .expect("dropping finish must cancel the background run")
+        .unwrap();
+    assert!(!cancel.is_cancelled());
+}
+
+#[tokio::test]
 async fn 两条路径产出同一个结果() {
     let script = || {
         vec![
@@ -566,14 +664,19 @@ async fn 工具轨迹随结果交回以便下一段接着数() {
 
 #[tokio::test]
 async fn 丢掉流不会连累调用方自己的作用域() {
-    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "完事了")])]);
+    let (model, started, dropped) = PendingModel::new();
     let cancel = CancelScope::root();
 
-    let stream = Runner::run_streamed(request(Vec::new(), &model, &cancel));
+    let stream = Runner::run_streamed(pending_request(model, &cancel));
+    started.await.unwrap();
     drop(stream);
 
     // 丢掉流会取消**这一次** run（否则 provider 还在为没人等的结果花钱），但它取消的是
     // 一个子作用域。连调用方的作用域一起取消，等于一个 run 的生命周期决定了整个宿主的。
+    timeout(Duration::from_millis(250), dropped)
+        .await
+        .expect("dropping the stream must cancel and reap its run")
+        .unwrap();
     assert!(!cancel.is_cancelled());
 
     // 同一个作用域还能再起一次 run。
