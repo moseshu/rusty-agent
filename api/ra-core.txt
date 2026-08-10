@@ -275,6 +275,9 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::run::RunState::tool_use(& self) -> & ToolUseTracker
+const fn ra_core::state::run::RunState::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_use::AgentToolUse::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::tool_use::AgentToolUse::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_use::ToolUseAttempt::call_id(& self) -> & CallId
@@ -315,6 +318,8 @@ const fn ra_core::tool::invocation::ToolInvocation < 'a >::context(& self) -> & 
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::new(call_id : & 'a CallId, arguments : & 'a Value) -> Self
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::with_context(mut self, context : & 'a dyn ToolRuntimeContext) -> Self
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::with_work_state(mut self, work_state : & 'a dyn WorkStateHandle) -> Self
+const fn ra_core::tool::invocation::ToolInvocation < 'a >::work_state(& self) -> Option < & dyn WorkStateHandle >
 const fn ra_core::tool::options::ToolOptions::approval(& self) -> ToolApprovalPolicy
 const fn ra_core::tool::options::ToolOptions::availability(& self) -> ToolAvailability
 const fn ra_core::tool::options::ToolOptions::defer_loading(& self) -> bool
@@ -387,6 +392,7 @@ const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersio
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
+const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_use::TOOL_USE_RECENT_LIMIT: usize
 const ra_core::state::tool_use::TOOL_USE_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
@@ -549,6 +555,7 @@ fn ra_core::item::RawProviderItem::new(provider : impl Into < String >, payload 
 fn ra_core::item::RawProviderItem::provider(& self) -> & str
 fn ra_core::item::RunItem::new(id : ItemId, kind : RunItemKind) -> Self
 fn ra_core::item::RunItem::to_model_input(& self) -> Option < ModelInputItem >
+fn ra_core::item::RunItem::with_output_phase(mut self, phase : OutputPhase) -> Self
 fn ra_core::item::RunItem::with_provenance(mut self, provenance : ItemProvenance) -> Self
 fn ra_core::item::RunItem::with_raw_provider_item(mut self, raw : RawProviderItem) -> Self
 fn ra_core::item::RunItem::with_session_data(mut self, key : impl Into < String >, value : Value) -> Self
@@ -702,6 +709,9 @@ fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_t
 fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
+fn ra_core::state::run::RunState::new() -> Self
+fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker
+fn ra_core::state::run::RunState::with_tool_use(mut self, tool_use : ToolUseTracker) -> Self
 fn ra_core::state::tool_use::AgentToolUse::entries(& self) -> & [ToolUseEntry]
 fn ra_core::state::tool_use::AgentToolUse::entry(& self, identity : & ToolUse) -> Option < & ToolUseEntry >
 fn ra_core::state::tool_use::AgentToolUse::run_calls(& self) -> u32
@@ -718,7 +728,9 @@ fn ra_core::state::tool_use::ToolUseTracker::new() -> Self
 fn ra_core::state::tool_use::ToolUseTracker::record_turn(& mut self, agent : & AgentId, attempts : impl IntoIterator < Item = ToolUseAttempt >)
 fn ra_core::state::tool_use::ToolUseTracker::repeat_streak(& self, agent : & AgentId, identity : & ToolUse) -> u32
 fn ra_core::state::tool_use::ToolUseTracker::used_any_this_turn(& self, agent : & AgentId) -> bool
+fn ra_core::state::work::WorkStateHandle::as_any(& self) -> & (dyn Any + Send + Sync)
 fn ra_core::step::NextStep::interruption(items : Vec < RunItem >) -> Result < Self >
+fn ra_core::step::phase::resolve_output_phases(items : Vec < RunItem >, next_step : & NextStep) -> Vec < RunItem >
 fn ra_core::step::processed::ProcessedResponse::attempts(& self) -> Vec < ToolUseAttempt >
 fn ra_core::step::processed::ProcessedResponse::builder() -> ProcessedResponseBuilder
 fn ra_core::step::processed::ProcessedResponse::functions(& self) -> & [ToolRunFunction]
@@ -845,8 +857,11 @@ mod ra_core::permission
 mod ra_core::prompt
 mod ra_core::session
 mod ra_core::state
+mod ra_core::state::run
 mod ra_core::state::tool_use
+mod ra_core::state::work
 mod ra_core::step
+mod ra_core::step::phase
 mod ra_core::step::processed
 mod ra_core::step::single
 mod ra_core::tool
@@ -921,6 +936,7 @@ struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
+struct ra_core::state::run::RunState
 struct ra_core::state::tool_use::AgentToolUse
 struct ra_core::state::tool_use::ArgumentFingerprint
 struct ra_core::state::tool_use::ToolUseAttempt
@@ -948,6 +964,7 @@ struct ra_core::usage::Usage
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
+trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
 trait ra_core::tool::invocation::ToolRuntimeContext
 trait ra_core::tool::schema::ToolInput

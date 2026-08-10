@@ -5,6 +5,7 @@ use ra_core::{
     compat::SchemaVersion,
     error::{Error, Result},
     item::CallId,
+    state::WorkStateHandle,
     tool::{
         Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolFailureHandling,
         ToolGuardrailId, ToolInvocation, ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin,
@@ -341,6 +342,36 @@ async fn tool_trait_对象安全且上下文_审批_与模型投影都可用() {
 
     let output = tool.call(invocation).await.unwrap();
     assert_eq!(output.as_text(), Some("host:hello"));
+}
+
+#[tokio::test]
+async fn 任务态句柄透传到工具且不挂时是_none() {
+    struct TaskState {
+        plan: &'static str,
+    }
+    impl WorkStateHandle for TaskState {
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    let call_id = CallId::new("call_work_state");
+    let arguments = json!({"text": "hello"});
+    let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "第三步" });
+
+    // R3-13 留的位：工具读得到宿主挂上来的任务态，且拿得回自己的具体类型。
+    let invocation = ToolInvocation::new(&call_id, &arguments).with_work_state(task_state.as_ref());
+    let seen = invocation
+        .work_state()
+        .expect("挂了任务态就该读得到")
+        .as_any()
+        .downcast_ref::<TaskState>()
+        .expect("必须能取回宿主自己的类型");
+    assert_eq!(seen.plan, "第三步");
+    assert!(format!("{invocation:?}").contains("work_state"));
+
+    // 不属于任何任务的 run 是常态，不是缺失。
+    assert!(ToolInvocation::new(&call_id, &arguments).work_state().is_none());
 }
 
 #[tokio::test]

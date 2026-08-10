@@ -15,9 +15,13 @@ const fn ra_runtime::runner::RunConfig::with_tracing(mut self, tracing : ModelTr
 const fn ra_runtime::runner::result::RunOutcome::finish_reason(& self) -> Option < FinishReason >
 const fn ra_runtime::runner::result::RunResult::last_agent(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::runner::result::RunResult::outcome(& self) -> & RunOutcome
+const fn ra_runtime::runner::result::RunResult::state(& self) -> & RunState
 const fn ra_runtime::runner::result::RunResult::tool_use(& self) -> & ToolUseTracker
 const fn ra_runtime::runner::result::RunResult::turns(& self) -> u32
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
+const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
+const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
+const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
@@ -37,7 +41,8 @@ fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < Strin
 fn ra_runtime::runner::RunConfig::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::runner::RunRequest::new(agent : AgentBinding, model_resolver : Arc < dyn ModelResolver >, tool_context : Arc < dyn ToolRuntimeContext >, cancel : CancelScope, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::runner::RunRequest::with_config(mut self, config : RunConfig) -> Self
-fn ra_runtime::runner::RunRequest::with_tool_use(mut self, tool_use : ToolUseTracker) -> Self
+fn ra_runtime::runner::RunRequest::with_state(mut self, state : RunState) -> Self
+fn ra_runtime::runner::RunRequest::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_runtime::runner::Runner::run_streamed(mut request : RunRequest) -> RunStream
 fn ra_runtime::runner::result::RunOutcome::interruptions(& self) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::continuation_input(& self, policy : ContinuationInput) -> Vec < ModelInputItem >
@@ -69,7 +74,7 @@ fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model(mut self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >
 fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedResponse, execution : & TurnExecution) -> Result < NextStep >
-fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution, public : & AgentSpec) -> Vec < RunItem >
+fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution, public : & AgentSpec, next_step : & NextStep) -> Vec < RunItem >
 mod ra_runtime::agent
 mod ra_runtime::guard
 mod ra_runtime::runner

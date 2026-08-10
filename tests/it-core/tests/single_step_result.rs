@@ -6,8 +6,8 @@ use ra_core::{
     agent::{AgentId, AgentSpec},
     finish::FinishReason,
     item::{
-        CallId, ItemId, ItemProvenance, McpApprovalRequest, Message, ModelInputItem, ModelResponse,
-        OutputPhase, RunItem, RunItemKind, ToolApproval,
+        CallId, ItemId, ItemProvenance, McpApprovalRequest, Message, MessageRole, ModelInputItem,
+        ModelResponse, OutputPhase, RunItem, RunItemKind, ToolApproval,
     },
     step::{NextStep, ProcessedResponse, SingleStepResult},
 };
@@ -142,7 +142,10 @@ fn 送给模型的项必须是存进会话那份的子集() {
     // 反过来是允许的：会话保留了模型这轮看不到的完整记录。
     settled()
         .new_step_items(vec![message("msg-1", "完事了")])
-        .session_step_items(vec![message("msg-1", "完事了"), message("msg-2", "内部记录")])
+        .session_step_items(vec![
+            message("msg-1", "完事了"),
+            tool_approval("approval-1"),
+        ])
         .build()
         .unwrap();
 
@@ -213,7 +216,10 @@ fn 中断项必须在会话里否则恢复时永远答不上() {
     // 所以只要求会话里有它，不要求它出现在 `processed_response` 里。
     settled()
         .next_step(NextStep::interruption(vec![tool_approval("approval-1")]).unwrap())
-        .session_step_items(vec![message("msg-1", "完事了"), tool_approval("approval-1")])
+        .session_step_items(vec![
+            message("msg-1", "完事了").with_output_phase(OutputPhase::Commentary),
+            tool_approval("approval-1"),
+        ])
         .build()
         .unwrap();
 }
@@ -314,6 +320,170 @@ fn 模型说过的话必须进会话哪怕这轮不往下带() {
 }
 
 #[test]
+fn 存下来的记录只许按结算结果改模型回包的通道() {
+    // R3-10：通道是「这一轮怎么收的场」的结论，provider 说了不算——它完全可以一边要工具
+    // 一边把消息标成 final。所以结算改这一个字段并把改过的那份存下去是允许的。
+    SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![message("msg-1", "完事了")]))
+        .processed_response(quiet_response())
+        .next_step(NextStep::RunAgain)
+        .new_step_items(vec![item(
+            "msg-1",
+            RunItemKind::Message(Message::assistant("完事了", OutputPhase::Commentary)),
+        )])
+        .session_step_items(vec![item(
+            "msg-1",
+            RunItemKind::Message(Message::assistant("完事了", OutputPhase::Commentary)),
+        )])
+        .build()
+        .unwrap();
+
+    // 松的只有这一格：正文变了照样是把模型说过的话换掉。
+    let error = SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![message("msg-1", "完事了")]))
+        .processed_response(quiet_response())
+        .next_step(NextStep::RunAgain)
+        .new_step_items(vec![item(
+            "msg-1",
+            RunItemKind::Message(Message::assistant(
+                "被换成另一句话",
+                OutputPhase::Commentary,
+            )),
+        )])
+        .session_step_items(vec![item(
+            "msg-1",
+            RunItemKind::Message(Message::assistant(
+                "被换成另一句话",
+                OutputPhase::Commentary,
+            )),
+        )])
+        .build()
+        .unwrap_err();
+    assert!(error.to_string().contains("payload differs"));
+}
+
+#[test]
+fn 已存通道必须符合这一轮的结算结果() {
+    // 终态轮唯一的 assistant 消息是交付；把它存成 commentary 会让 `final_message()` 说
+    // `None`，即使 `NextStep` 已经说这轮结束了。
+    let error = settled()
+        .new_step_items(Vec::new())
+        .session_step_items(vec![item(
+            "msg-1",
+            RunItemKind::Message(Message::assistant("完事了", OutputPhase::Commentary)),
+        )])
+        .build()
+        .unwrap_err();
+    assert!(error.to_string().contains("requires `final`"));
+
+    // 反过来，尚要继续的轮绝不能把模型的预判提前当成交付。
+    let error = SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![message("msg-1", "完事了")]))
+        .processed_response(quiet_response())
+        .next_step(NextStep::RunAgain)
+        .new_step_items(vec![message("msg-1", "完事了")])
+        .session_step_items(vec![message("msg-1", "完事了")])
+        .build()
+        .unwrap_err();
+    assert!(error.to_string().contains("requires `commentary`"));
+
+    // 一条都没定过通道的 assistant 消息同样过不去：R3-10 的两个通道是**必选一个**，
+    // 「没标」不是第三种状态，UI 与 `final_message()` 都没有它的位置。
+    let error = settled()
+        .new_step_items(Vec::new())
+        .session_step_items(vec![item(
+            "msg-1",
+            RunItemKind::Message(Message::text(MessageRole::Assistant, "完事了")),
+        )])
+        .build()
+        .unwrap_err();
+    assert!(error.to_string().contains("channel `none`"));
+}
+
+#[test]
+fn 生产者定好的通道一定过得了这道闸门() {
+    // 规则只有一处推导：`resolve_output_phases` 与 `build()` 里的闸门读同一个模块。这条
+    // 测试是那句话的可执行形式——生产者的产物必须原样通过闸门，两边一旦分头演化就在这里红。
+    let narration = message("msg-1", "先说明思路");
+    let delivery = message("msg-2", "最后交付");
+    let output = message("call-1.output", "工具结果");
+    let processed = ProcessedResponse::builder()
+        .item(narration.clone())
+        .item(delivery.clone())
+        .build()
+        .unwrap();
+
+    for next_step in [
+        NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        },
+        NextStep::RunAgain,
+        NextStep::Handoff {
+            new_agent: AgentSpec::builder()
+                .id(AgentId::new("reviewer"))
+                .name("Reviewer")
+                .build()
+                .unwrap(),
+        },
+    ] {
+        let resolved = ra_core::step::resolve_output_phases(
+            vec![narration.clone(), delivery.clone(), output.clone()],
+            &next_step,
+        );
+        SingleStepResult::builder()
+            .model_response(ModelResponse::new(vec![
+                narration.clone(),
+                delivery.clone(),
+            ]))
+            .processed_response(processed.clone())
+            .next_step(next_step)
+            .new_step_items(resolved.clone())
+            .session_step_items(resolved)
+            .build()
+            .unwrap();
+    }
+}
+
+#[test]
+fn 终态轮只有最后一条_assistant_消息是_final() {
+    let first = message("msg-1", "先说明思路");
+    let last = message("msg-2", "最后交付");
+    let processed = ProcessedResponse::builder()
+        .item(first.clone())
+        .item(last.clone())
+        .build()
+        .unwrap();
+    let resolved = vec![
+        first.clone().with_output_phase(OutputPhase::Commentary),
+        last.clone(),
+    ];
+
+    SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![first.clone(), last.clone()]))
+        .processed_response(processed.clone())
+        .next_step(NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        })
+        .new_step_items(resolved.clone())
+        .session_step_items(resolved)
+        .build()
+        .unwrap();
+
+    // 同一个 ItemId 在 carried 与 session 里也不能各自有一份不同的 phase。
+    let error = SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![first.clone(), last.clone()]))
+        .processed_response(processed)
+        .next_step(NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        })
+        .new_step_items(vec![first.clone(), last.clone()])
+        .session_step_items(vec![first.with_output_phase(OutputPhase::Commentary), last])
+        .build()
+        .unwrap_err();
+    assert!(error.to_string().contains("payload differs"));
+}
+
+#[test]
 fn 绕过校验构造器的中断形状在结算时仍然过不去() {
     // `NextStep::Interruption` 刻意可以直接构造（结算在框架内部），所以那个构造器
     // 是约定不是闸门。闸门放在这里：混进一条非审批项，run 会永远等一个没人被问到的决定。
@@ -371,7 +541,10 @@ fn 嵌套归属只记_id_且必须指向真实存在的记录() {
     assert!(error.to_string().contains("ghost"));
 
     let result = settled()
-        .session_step_items(vec![message("msg-1", "完事了"), message("nested-1", "子 run")])
+        .session_step_items(vec![
+            message("msg-1", "完事了").with_output_phase(OutputPhase::Commentary),
+            message("nested-1", "子 run"),
+        ])
         .nested_history_owned_items(vec![ItemId::new("nested-1")])
         .build()
         .unwrap();

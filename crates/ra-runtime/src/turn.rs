@@ -9,11 +9,13 @@
 //! The streaming path (R3-7) consumes this same function. Two settlement paths would be two loops,
 //! and the second one drifts.
 
+use std::sync::Arc;
+
 use ra_core::{
     cancel::CancelScope,
     error::Result,
     item::{ModelInputItem, ModelResponse, RunItem},
-    state::ToolUseTracker,
+    state::{ToolUseTracker, WorkStateHandle},
     step::SingleStepResult,
     tool::ToolRuntimeContext,
 };
@@ -51,6 +53,7 @@ pub struct TurnSettlementRequest<'a> {
     context: &'a dyn ToolRuntimeContext,
     cancel: &'a CancelScope,
     tool_use: &'a mut ToolUseTracker,
+    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
 }
@@ -81,9 +84,16 @@ impl<'a> TurnSettlementRequest<'a> {
             context,
             cancel,
             tool_use,
+            work_state: None,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
         }
+    }
+
+    /// Sets the task state this run participates in, for the tools this turn calls (R3-13).
+    pub const fn with_work_state(mut self, work_state: &'a Arc<dyn WorkStateHandle>) -> Self {
+        self.work_state = Some(work_state);
+        self
     }
 
     /// Sets the input the run started from.
@@ -121,14 +131,17 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
 
     // 2. Answer every bound action. Interruptions come back rather than blocking: a pending
     // approval is a state the run can be saved in, not an `await` somebody is stuck on.
-    let execution = execute_actions(TurnExecutionRequest::new(
+    let mut execution_request = TurnExecutionRequest::new(
         &processed,
         public_id,
         request.tool_use,
         request.context,
         request.cancel,
-    ))
-    .await?;
+    );
+    if let Some(work_state) = request.work_state {
+        execution_request = execution_request.with_work_state(work_state);
+    }
+    let execution = execute_actions(execution_request).await?;
 
     // 3. Decide. One function, four states, priority written down once.
     let next_step = resolve_next_step(&processed, &execution)?;
@@ -136,7 +149,13 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     // 4. Record. `new_step_items` and `session_step_items` are the same list this turn: nothing
     // filters the model-facing view yet, and R5's budgeting is what will make them diverge. The
     // builder's checks are what keeps that future divergence from quietly dropping history.
-    let items = step_items(&processed, &execution, request.agent.public());
+    //
+    // Recording reads the decision above, because R3-10's two channels are a fact about how the
+    // turn settled rather than about what the provider wrote. Doing it here instead of in the
+    // runner is what keeps one record from having two phases — a settled turn is what R9 stores
+    // and what R12 attributes, and a copy the runner corrected afterwards would leave the
+    // authoritative one saying something else.
+    let items = step_items(&processed, &execution, request.agent.public(), &next_step);
     SingleStepResult::builder()
         .original_input(request.original_input)
         .model_response(request.response.clone())

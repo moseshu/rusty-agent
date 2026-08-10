@@ -9,11 +9,13 @@
 //! writes serialised under a lock — and R3-4c owns how a batch of concurrent calls is collected and
 //! cancelled. Both replace the body of [`execute_actions`] without moving the stage.
 
+use std::sync::Arc;
+
 use ra_core::{
     cancel::CancelScope,
     error::{Error, Result, ToolErrorKind},
     item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
-    state::ToolUseTracker,
+    state::{ToolUseTracker, WorkStateHandle},
     step::ProcessedResponse,
     tool::ToolRuntimeContext,
 };
@@ -58,6 +60,7 @@ pub struct TurnExecutionRequest<'a> {
     tool_use: &'a ToolUseTracker,
     context: &'a dyn ToolRuntimeContext,
     cancel: &'a CancelScope,
+    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
 }
 
 impl<'a> TurnExecutionRequest<'a> {
@@ -75,7 +78,14 @@ impl<'a> TurnExecutionRequest<'a> {
             tool_use,
             context,
             cancel,
+            work_state: None,
         }
+    }
+
+    /// Sets the task state every tool in this batch is handed (R3-13).
+    pub const fn with_work_state(mut self, work_state: &'a Arc<dyn WorkStateHandle>) -> Self {
+        self.work_state = Some(work_state);
+        self
     }
 }
 
@@ -112,15 +122,18 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
         let repeat_streak = request
             .tool_use
             .repeat_streak(request.agent_id, &action.identity());
-        let dispatch = dispatch_tool(ToolDispatchRequest::new(
+        let mut dispatch_request = ToolDispatchRequest::new(
             action.tool(),
             action.call_id(),
             action.call().arguments(),
             request.context,
             request.cancel,
             repeat_streak,
-        ))
-        .await?;
+        );
+        if let Some(work_state) = request.work_state {
+            dispatch_request = dispatch_request.with_work_state(work_state);
+        }
+        let dispatch = dispatch_tool(dispatch_request).await?;
 
         match dispatch {
             ToolDispatch::Observed(output) => {

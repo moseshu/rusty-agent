@@ -13,7 +13,7 @@ use ra_core::{
     error::Result,
     finish::FinishReason,
     item::{ItemProvenance, RunItem},
-    step::{NextStep, ProcessedResponse},
+    step::{NextStep, ProcessedResponse, resolve_output_phases},
 };
 
 use super::batch::TurnExecution;
@@ -66,22 +66,28 @@ const fn check_for_final_output_from_tools(
 /// Everything this turn generated, in the order it happened: what the model said, then what
 /// answering it produced.
 ///
-/// This is also where the turn's records are attributed (R3-12), because it is the one place that
-/// sees all of them. `public` is the user's agent even when a prepared instance executed the turn:
-/// a session read back later has to say who produced a record in terms the user recognises, and an
-/// execution-time clone is not something they ever configured.
+/// This is also where the turn's records are attributed (R3-12) and where each assistant message
+/// gets its output channel (R3-10), because it is the one place that sees all of them. `public` is
+/// the user's agent even when a prepared instance executed the turn: a session read back later has
+/// to say who produced a record in terms the user recognises, and an execution-time clone is not
+/// something they ever configured.
 #[must_use]
 pub fn step_items(
     processed: &ProcessedResponse,
     execution: &TurnExecution,
     public: &AgentSpec,
+    next_step: &NextStep,
 ) -> Vec<RunItem> {
     let mut items = processed.new_items().to_vec();
     items.extend(execution.new_items().iter().cloned());
-    items
+    let items = items
         .into_iter()
         .map(|item| attribute(item, public))
-        .collect()
+        .collect();
+    // R3-10's rule lives in `ra-core::step::phase`, where the `SingleStepResult` gate reads it
+    // too. Restating it here would make the producer and the gate two statements of one rule, and
+    // the day they disagreed the gate would be checking its own copy.
+    resolve_output_phases(items, next_step)
 }
 
 /// Files one record under the public agent, leaving an existing attribution alone.

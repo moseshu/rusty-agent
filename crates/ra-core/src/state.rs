@@ -1,14 +1,22 @@
 //! `RunState`: the serializable state of a whole run, with a schema version.
 //!
-//! R6-6 owns `RunState` itself. What already lives here is the run-scoped state R3 produces, and it
-//! lives here rather than beside its producer for one reason: **persistence pins a wire format**.
-//! The turn-settlement intermediates in [`step`](crate::step) are graded `Internal` and may be
-//! refactored at any time; a value a saved checkpoint has to remain readable with cannot be, so it
-//! takes this module's `Evolving` grade instead.
+//! The run-scoped state R3 produces lives here rather than beside its producer for one reason:
+//! **persistence pins a wire format**. The turn-settlement intermediates in [`step`](crate::step)
+//! are graded `Internal` and may be refactored at any time; a value a saved checkpoint has to
+//! remain readable with cannot be, so it takes this module's `Evolving` grade instead. R6-6 grows
+//! [`RunState`] into the full checkpoint by adding fields to it.
+//!
+//! [`work`] is the other half of R3-13's separation and holds no state at all: the task that spans
+//! runs is reached through a handle, so a run's checkpoint cannot come to contain a private copy of
+//! it.
 
+pub mod run;
 pub mod tool_use;
+pub mod work;
 
+pub use run::{RUN_STATE_SCHEMA_VERSION, RunState};
 pub use tool_use::{
     AgentToolUse, ArgumentFingerprint, TOOL_USE_RECENT_LIMIT, TOOL_USE_SCHEMA_VERSION, ToolUse,
     ToolUseAttempt, ToolUseEntry, ToolUseRecord, ToolUseTracker,
 };
+pub use work::WorkStateHandle;

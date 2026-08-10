@@ -17,9 +17,11 @@ use crate::{
     item::RunItem,
 };
 
+pub mod phase;
 pub mod processed;
 pub mod single;
 
+pub use phase::resolve_output_phases;
 pub use processed::{
     ProcessedResponse, ProcessedResponseBuilder, ToolNotFound, ToolRunApproval, ToolRunFunction,
     ToolRunHandoff, ToolUse,

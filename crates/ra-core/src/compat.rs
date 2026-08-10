@@ -2,7 +2,11 @@
 //!
 //! # The problem
 //!
-//! `RunState`, `WorkState`, and rollout lines are all read and written across versions.
+//! [`RunState`](crate::state::RunState) and rollout lines are read and written across versions
+//! today, and R17-1's `WorkState` joins them when it lands. Its R3-13 mount point,
+//! [`WorkStateHandle`](crate::state::WorkStateHandle), is deliberately **not** one of them: it
+//! reaches task state that lives outside the run, so nothing here ever serializes it.
+//!
 //! **Downgrade reads are the hard half**: a record written by a newer build reaches an older one
 //! carrying fields it does not know. serde's default is to **drop them silently**, which turns
 //! "new writes, old reads, old writes again" into **silent data deletion** — the user only sees
@@ -20,7 +24,7 @@
 //!
 //! ```ignore
 //! #[derive(Serialize, Deserialize)]
-//! struct RunState {
+//! struct Checkpoint {
 //!     schema_version: SchemaVersion,
 //!     #[serde(default)]
 //!     max_turns: u32,

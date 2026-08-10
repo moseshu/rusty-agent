@@ -251,6 +251,34 @@ fn message_角色与双通道是协议字段而不是文本约定() {
 }
 
 #[test]
+fn 改写消息通道会保留_run_item_包络并忽略非_assistant() {
+    let original = 记录(
+        "message",
+        RunItemKind::Message(Message::assistant("完成", OutputPhase::Final)),
+    )
+    .with_provenance(ItemProvenance::new(AgentId::new("coder")).with_agent_name("Coder"))
+    .with_raw_provider_item(RawProviderItem::new("provider", json!({"id": "raw-1"})))
+    .with_session_data("ui", json!({"expanded": true}));
+
+    let rewritten = original.clone().with_output_phase(OutputPhase::Commentary);
+    assert_eq!(rewritten.id(), original.id());
+    assert_eq!(rewritten.provenance(), original.provenance());
+    assert_eq!(rewritten.raw_provider_item(), original.raw_provider_item());
+    assert_eq!(rewritten.session_data(), original.session_data());
+    let RunItemKind::Message(message) = rewritten.kind() else {
+        panic!("改写后必须仍是 message");
+    };
+    assert_eq!(message.phase(), Some(OutputPhase::Commentary));
+
+    let user = 记录("user", RunItemKind::Message(Message::user("继续")))
+        .with_output_phase(OutputPhase::Final);
+    let RunItemKind::Message(message) = user.kind() else {
+        panic!("必须仍是 message");
+    };
+    assert_eq!(message.phase(), None);
+}
+
+#[test]
 fn 新版未知字段在_run_item_和_payload_两层都原样回写() {
     let original = 记录("item", RunItemKind::Message(Message::user("hello")));
     let mut value = serde_json::to_value(original).expect("应可转 JSON");

@@ -437,6 +437,21 @@ impl RunItem {
         &self.kind
     }
 
+    /// Sets the output phase on an assistant message while preserving this record's envelope.
+    ///
+    /// Other record kinds, and messages from user or system roles, are left untouched. Turn
+    /// settlement uses this once it knows how the turn ended: a provider is not authoritative
+    /// about whether what it just said was progress or the run's closing delivery.
+    #[must_use]
+    pub fn with_output_phase(mut self, phase: OutputPhase) -> Self {
+        if let RunItemKind::Message(message) = &mut self.kind
+            && matches!(message.role(), MessageRole::Assistant)
+        {
+            message.set_phase(phase);
+        }
+        self
+    }
+
     /// Producer information.
     #[must_use]
     pub const fn provenance(&self) -> Option<&ItemProvenance> {

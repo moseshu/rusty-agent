@@ -93,8 +93,24 @@ impl Message {
     /// Sets the assistant output phase while preserving all content blocks.
     #[must_use]
     pub const fn with_phase(mut self, phase: OutputPhase) -> Self {
-        self.phase = Some(phase);
+        self.set_phase(phase);
         self
+    }
+
+    /// In-place form, so rewriting one field does not copy the content blocks.
+    pub(crate) const fn set_phase(&mut self, phase: OutputPhase) {
+        self.phase = Some(phase);
+    }
+
+    /// Whether two messages agree on everything except the output channel.
+    ///
+    /// Compared by aligning the one field and testing the whole value, rather than by listing the
+    /// others: a field added to this struct later has to be covered by the comparison without
+    /// anyone remembering to extend it here.
+    pub(crate) fn matches_ignoring_phase(&self, other: &Self) -> bool {
+        let mut aligned = self.clone();
+        aligned.phase = other.phase;
+        aligned == *other
     }
 
     /// Schema version.

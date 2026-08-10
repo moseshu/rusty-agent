@@ -23,7 +23,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel,
     },
-    state::ToolUse,
+    state::{ToolUse, WorkStateHandle},
     tool::{
         Tool, ToolApprovalPolicy, ToolInvocation, ToolLookupKey, ToolOptions, ToolOrigin,
         ToolOutput, ToolSchema,
@@ -32,7 +32,9 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
-    runner::{ContinuationInput, RunConfig, RunOutcome, RunRequest, RunStreamEvent, Runner},
+    runner::{
+        ContinuationInput, RunConfig, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
+    },
 };
 use serde_json::json;
 use tokio::{sync::oneshot, time::timeout};
@@ -41,6 +43,7 @@ use tokio::{sync::oneshot, time::timeout};
 struct ScriptedModel {
     script: Mutex<Vec<ModelResponse>>,
     inputs: Mutex<Vec<usize>>,
+    input_items: Mutex<Vec<Vec<ModelInputItem>>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -49,6 +52,7 @@ impl ScriptedModel {
         Arc::new(Self {
             script: Mutex::new(script),
             inputs: Mutex::new(Vec::new()),
+            input_items: Mutex::new(Vec::new()),
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -59,6 +63,10 @@ impl Model for ScriptedModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inputs.lock().unwrap().push(request.input().len());
+        self.input_items
+            .lock()
+            .unwrap()
+            .push(request.input().to_vec());
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
             // The loop asked for a turn the script did not plan for. Answering with a final
@@ -168,6 +176,7 @@ struct ScriptedTool {
     schema: ToolSchema,
     options: ToolOptions,
     calls: Arc<AtomicUsize>,
+    work_states: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl ScriptedTool {
@@ -186,6 +195,7 @@ impl ScriptedTool {
             .unwrap(),
             options: ToolOptions::new(),
             calls: Arc::new(AtomicUsize::new(0)),
+            work_states: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -209,8 +219,14 @@ impl Tool for ScriptedTool {
         self.options.clone()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.work_states.lock().unwrap().push(
+            invocation
+                .work_state()
+                .and_then(|state| state.as_any().downcast_ref::<TaskState>())
+                .map(|state| state.plan.to_owned()),
+        );
         Ok(ToolOutput::text("done"))
     }
 
@@ -224,15 +240,39 @@ impl Tool for ScriptedTool {
 
 struct Host;
 
+/// Stand-in for the cross-run task state R17-1 will supply (R3-13).
+struct TaskState {
+    plan: &'static str,
+}
+
+impl WorkStateHandle for TaskState {
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
 fn item(id: &str, kind: RunItemKind) -> RunItem {
     RunItem::new(ItemId::new(id), kind)
 }
 
 fn message(id: &str, text: &str) -> RunItem {
-    item(
-        id,
-        RunItemKind::Message(Message::assistant(text, OutputPhase::Final)),
-    )
+    message_with_phase(id, text, OutputPhase::Final)
+}
+
+fn message_with_phase(id: &str, text: &str, phase: OutputPhase) -> RunItem {
+    item(id, RunItemKind::Message(Message::assistant(text, phase)))
+}
+
+/// The run's message channels in generation order (R3-10).
+fn phases(result: &RunResult) -> Vec<OutputPhase> {
+    result
+        .new_items()
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::Message(message) => message.phase(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
@@ -337,6 +377,121 @@ async fn 工具调用与最终回答之间来回直到模型不再要东西() {
 }
 
 #[tokio::test]
+async fn 结算结果决定消息通道并传给下一轮() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        // Provider can label this Final, but its tool call means the runner must treat it as
+        // progress.
+        ModelResponse::new(vec![
+            message_with_phase("msg-1", "我先写入文件", OutputPhase::Final),
+            tool_call("c-1", "call-1", "write_file"),
+        ]),
+        // The inverse must also be corrected: a terminal turn is the final delivery.
+        ModelResponse::new(vec![message_with_phase(
+            "msg-2",
+            "文件已写入",
+            OutputPhase::Commentary,
+        )]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request(vec![tool], &model, &cancel))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        phases(&result),
+        [OutputPhase::Commentary, OutputPhase::Final]
+    );
+    assert_eq!(result.final_message().unwrap().text_content(), "文件已写入");
+
+    let inputs = model.input_items.lock().unwrap();
+    let Some(ModelInputItem::Message(first_message)) = inputs[1].get(1) else {
+        panic!("第二轮必须收到第一轮的 assistant message");
+    };
+    assert_eq!(first_message.phase(), Some(OutputPhase::Commentary));
+}
+
+#[tokio::test]
+async fn 一轮里报幕与交付并存时只有最后一条算交付() {
+    // One response carrying narration and then the answer is the shape this milestone is modelled
+    // on. Stamping the whole turn `Final` costs twice: the UI renders two closing deliveries, and
+    // the record goes back to the model as input next turn, teaching it that pre-tool narration is
+    // what a final answer looks like.
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![
+        message_with_phase("msg-1", "我先说一下思路", OutputPhase::Commentary),
+        message_with_phase("msg-2", "结论是这样", OutputPhase::Final),
+    ])]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request(Vec::new(), &model, &cancel))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        phases(&result),
+        [OutputPhase::Commentary, OutputPhase::Final]
+    );
+    assert_eq!(result.final_message().unwrap().text_content(), "结论是这样");
+}
+
+#[tokio::test]
+async fn 撞上轮次上限的_run_没有交付消息() {
+    // The cap fires between turns, so the last thing the model said is still work in progress.
+    // R3-8's error handler is what turns that into a delivered result; until then this has to be
+    // `None` rather than promoting a progress update to the run's conclusion.
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(
+        (0..8)
+            .map(|turn| {
+                ModelResponse::new(vec![
+                    message_with_phase(
+                        &format!("msg-{turn}"),
+                        "我接着写下一个文件",
+                        OutputPhase::Final,
+                    ),
+                    tool_call(&format!("c-{turn}"), &format!("call-{turn}"), "write_file"),
+                ])
+            })
+            .collect(),
+    );
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(
+        request(vec![tool], &model, &cancel).with_config(RunConfig::new().with_max_turns(2)),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::MaxTurns
+        }
+    ));
+    assert_eq!(
+        phases(&result),
+        [OutputPhase::Commentary, OutputPhase::Commentary]
+    );
+    assert!(result.final_message().is_none());
+}
+
+#[tokio::test]
+async fn final_message_不会把非_assistant_消息当成交付() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![item(
+        "user-1",
+        RunItemKind::Message(Message::user("不是模型交付").with_phase(OutputPhase::Final)),
+    )])]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request(Vec::new(), &model, &cancel))
+        .await
+        .unwrap();
+
+    assert!(result.final_message().is_none());
+}
+
+#[tokio::test]
 async fn 到达轮次上限时软收尾而不是报错() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
     // 模型每一轮都要工具，永远不收尾。
@@ -392,11 +547,10 @@ async fn 待审批停下来是一种结局而不是一个错误() {
             .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
     );
     let tool_calls = Arc::clone(&gated.calls);
-    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
-        "c-1",
-        "call-1",
-        "write_file",
-    )])]);
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![
+        message_with_phase("msg-1", "我需要写入文件", OutputPhase::Final),
+        tool_call("c-1", "call-1", "write_file"),
+    ])]);
     let cancel = CancelScope::root();
 
     let result = Runner::run(request(vec![gated], &model, &cancel))
@@ -412,6 +566,11 @@ async fn 待审批停下来是一种结局而不是一个错误() {
     assert_eq!(result.outcome().finish_reason(), None);
     assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
     assert_eq!(result.turns(), 1);
+    let RunItemKind::Message(message) = result.new_items()[0].kind() else {
+        panic!("第一项必须是模型消息");
+    };
+    assert_eq!(message.phase(), Some(OutputPhase::Commentary));
+    assert!(result.final_message().is_none());
 }
 
 #[tokio::test]
@@ -494,6 +653,39 @@ async fn 流式路径把每一轮的记录当场推出来并且照样给出终�
     let result = stream.finish().await.unwrap();
     assert_eq!(result.turns(), 2);
     assert_eq!(result.new_items().len(), 3);
+}
+
+#[tokio::test]
+async fn 流事件带上结算后归一化的消息通道() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            message_with_phase("msg-1", "我先写入文件", OutputPhase::Final),
+            tool_call("c-1", "call-1", "write_file"),
+        ]),
+        ModelResponse::new(vec![message_with_phase(
+            "msg-2",
+            "文件已写入",
+            OutputPhase::Commentary,
+        )]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let mut stream = Runner::run_streamed(request(vec![tool], &model, &cancel));
+    let mut phases = Vec::new();
+    while let Some(event) = stream.next_event().await {
+        if let RunStreamEvent::Item(item) = event
+            && let RunItemKind::Message(message) = item.kind()
+        {
+            phases.push(message.phase());
+        }
+    }
+
+    assert_eq!(
+        phases,
+        [Some(OutputPhase::Commentary), Some(OutputPhase::Final)]
+    );
+    assert_eq!(stream.finish().await.unwrap().turns(), 2);
 }
 
 #[tokio::test]
@@ -609,7 +801,7 @@ async fn run_级别的模型覆盖每一轮都生效() {
 }
 
 #[tokio::test]
-async fn 工具轨迹随结果交回以便下一段接着数() {
+async fn 运行态随结果交回以便下一段接着数() {
     // 每一段用各自的 call_id：provider 每次调用都会新铸一个，而 tracker 的重放判据
     // 正是按 call_id 认的——复用它会让第二段被当成第一段的重放。
     let script = |segment: u32| {
@@ -640,8 +832,9 @@ async fn 工具轨迹随结果交回以便下一段接着数() {
         1
     );
 
-    // 接着跑第二段时把它带上。换成一个空 tracker，连续段会归零——
-    // 「暂停再继续」就成了绕开 R3-6 熔断器的办法。
+    // 接着跑第二段时把整份运行态带上。换成一个空状态，连续段会归零——「暂停再继续」
+    // 就成了绕开 R3-6 熔断器的办法；而以后加入的运行期事实也不会被这个续接入口遗漏，
+    // 因为它收的是整个 `RunState` 而不是其中某个字段。
     let second_model = ScriptedModel::new(script(2));
     let second = Runner::run(
         request(
@@ -649,7 +842,7 @@ async fn 工具轨迹随结果交回以便下一段接着数() {
             &second_model,
             &cancel,
         )
-        .with_tool_use(first.tool_use().clone()),
+        .with_state(first.state().clone()),
     )
     .await
     .unwrap();
@@ -660,6 +853,44 @@ async fn 工具轨迹随结果交回以便下一段接着数() {
             .repeat_streak(&AgentId::new("coder"), &identity),
         2
     );
+}
+
+#[tokio::test]
+async fn 任务态句柄一路透传到工具() {
+    // This chain is what R3-13 buys: attached once on the run, it reaches the tool through
+    // settlement, batch, and dispatch, so R17 adds channel operations to the handle rather than a
+    // parameter to four layers and to every third-party `Tool::call`.
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let seen = Arc::clone(&tool.work_states);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "改完了")]),
+    ]);
+    let cancel = CancelScope::root();
+    let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "第三步" });
+
+    Runner::run(request(vec![tool], &model, &cancel).with_work_state(task_state))
+        .await
+        .unwrap();
+
+    assert_eq!(seen.lock().unwrap().as_slice(), [Some("第三步".to_owned())]);
+}
+
+#[tokio::test]
+async fn 没挂任务态的_run_让工具读到_none_而不是空壳() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let seen = Arc::clone(&tool.work_states);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "改完了")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    Runner::run(request(vec![tool], &model, &cancel))
+        .await
+        .unwrap();
+
+    assert_eq!(seen.lock().unwrap().as_slice(), [None]);
 }
 
 #[tokio::test]

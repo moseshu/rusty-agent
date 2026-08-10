@@ -29,10 +29,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{NextStep, ProcessedResponse};
+use super::{
+    NextStep, ProcessedResponse,
+    phase::{delivery_index, is_assistant_message, phase_at},
+};
 use crate::{
     error::{Error, Result},
-    item::{ItemId, ModelInputItem, ModelResponse, RunItem},
+    item::{ItemId, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
 };
 
 type ItemsById<'a> = BTreeMap<&'a ItemId, &'a RunItem>;
@@ -221,6 +224,7 @@ impl SingleStepResultBuilder {
         check_session_items_are_new(&session_items, &pre_items)?;
         check_nested_ownership(&self.nested_history_owned_items, &session_items)?;
         check_next_step(&next_step, &processed_response, &session_items)?;
+        check_resolved_output_phases(&next_step, &session_step_items)?;
 
         Ok(SingleStepResult {
             original_input: self.original_input,
@@ -281,15 +285,64 @@ fn index_unique_items<'a>(items: &'a [RunItem], list_name: &str) -> Result<Items
 }
 
 /// The session may enrich a record's metadata, but may not replace its model-visible payload.
+///
+/// Both sides of this comparison are already settled records, so the match is exact — including
+/// the output channel. Two settled copies of one ID that disagree about the channel is the
+/// model-facing view and the session telling different stories about the same message.
 fn check_stored_payload(expected: &RunItem, stored: &RunItem, relation: &str) -> Result<()> {
     if expected.kind() == stored.kind() {
         return Ok(());
     }
-    Err(Error::caller(format!(
-        "item `{}` is {relation}, but its stored payload differs; session metadata may be \
-         enriched but the record's payload must remain unchanged",
+    Err(payload_differs(
+        expected,
+        relation,
+        "session metadata may be enriched but the record's payload must remain unchanged",
+    ))
+}
+
+fn payload_differs(expected: &RunItem, relation: &str, rule: &str) -> Error {
+    Error::caller(format!(
+        "item `{}` is {relation}, but its stored payload differs; {rule}",
         expected.id()
-    )))
+    ))
+}
+
+/// Whether a stored record still carries the model response's payload.
+///
+/// Equal payloads are the ordinary case, and the reason this is not plain equality is narrow:
+/// **an assistant message's output phase belongs to the turn, not to the provider** (R3-10). A
+/// model can mark a message final in the same response it requests a tool, so settlement resolves
+/// the channel from how the turn actually ended and stores the resolved record. That one field is
+/// therefore allowed to differ from what the adapter handed over.
+///
+/// Everything else stays verbatim — role, content, and unknown fields — which is what still stops
+/// a same-ID message from standing in for the tool call the model actually made.
+fn model_payload_matches(expected: &RunItemKind, stored: &RunItemKind) -> bool {
+    match (expected, stored) {
+        (RunItemKind::Message(expected), RunItemKind::Message(stored))
+            if matches!(expected.role(), MessageRole::Assistant) =>
+        {
+            stored.matches_ignoring_phase(expected)
+        }
+        _ => expected == stored,
+    }
+}
+
+/// The provider's phase is preliminary; session storage carries the settled one.
+fn check_model_payload_in_session(
+    expected: &RunItem,
+    stored: &RunItem,
+    relation: &str,
+) -> Result<()> {
+    if model_payload_matches(expected.kind(), stored.kind()) {
+        return Ok(());
+    }
+    Err(payload_differs(
+        expected,
+        relation,
+        "settlement may resolve an assistant message's output channel, and nothing else about \
+         what the model produced",
+    ))
 }
 
 /// Whatever the model produced has to reach the session.
@@ -313,7 +366,7 @@ fn check_response_reaches_the_session(
                 item.id()
             )));
         };
-        check_stored_payload(item, stored, "from the model response")?;
+        check_model_payload_in_session(item, stored, "from the model response")?;
     }
     Ok(())
 }
@@ -394,6 +447,39 @@ fn check_next_step(
         }
         NextStep::RunAgain | NextStep::Handoff { .. } | NextStep::FinalOutput { .. } => Ok(()),
     }
+}
+
+/// Session records are the authoritative R3-10 channels, not a second interpretation of them.
+///
+/// The raw provider response is deliberately allowed to disagree: a provider emits before the turn
+/// knows whether it will need another model call. Once the result is settled, though, every copy
+/// that participates in the session has to carry the decision the turn made. Otherwise a
+/// `FinalOutput` can report no delivery, or a later turn can receive an earlier message as final.
+///
+/// The rule itself is not restated here — it is read from [`phase`](crate::step::phase), the same
+/// place [`resolve_output_phases`](crate::step::resolve_output_phases) derives it for the producer.
+/// A gate that re-derived what it is checking would pass on the day the two disagreed about
+/// something other than the value in front of it.
+fn check_resolved_output_phases(next_step: &NextStep, session_items: &[RunItem]) -> Result<()> {
+    let delivery = delivery_index(session_items, next_step);
+    for (index, item) in session_items.iter().enumerate() {
+        if !is_assistant_message(item) {
+            continue;
+        }
+        let RunItemKind::Message(message) = item.kind() else {
+            continue;
+        };
+        let expected = phase_at(index, delivery);
+        if message.phase() != Some(expected) {
+            return Err(Error::caller(format!(
+                "assistant message `{}` is stored on channel `{}`, but this settled turn requires \
+                 `{expected}`",
+                item.id(),
+                message.phase().map_or("none", OutputPhase::label),
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn check_interruption(

@@ -23,6 +23,7 @@ use ra_core::{
     cancel::CancelScope,
     error::{Error, Result, ToolErrorKind},
     item::{CallId, ToolApproval, ToolCallOutput},
+    state::WorkStateHandle,
     tool::{
         Tool, ToolApprovalPolicy, ToolCaller, ToolFailureHandling, ToolInvocation, ToolOptions,
         ToolOutput, ToolRuntimeContext, ToolTimeoutBehavior,
@@ -52,6 +53,7 @@ pub struct ToolDispatchRequest<'a> {
     cancel: &'a CancelScope,
     repeat_streak: u32,
     caller: ToolCaller,
+    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
 }
 
 impl<'a> ToolDispatchRequest<'a> {
@@ -76,6 +78,7 @@ impl<'a> ToolDispatchRequest<'a> {
             cancel,
             repeat_streak,
             caller: ToolCaller::Direct,
+            work_state: None,
         }
     }
 
@@ -85,10 +88,20 @@ impl<'a> ToolDispatchRequest<'a> {
         self
     }
 
+    /// Sets the task state the tool is handed (R3-13).
+    pub const fn with_work_state(mut self, work_state: &'a Arc<dyn WorkStateHandle>) -> Self {
+        self.work_state = Some(work_state);
+        self
+    }
+
     fn invocation(&self) -> ToolInvocation<'a> {
-        ToolInvocation::new(self.call_id, self.arguments)
+        let invocation = ToolInvocation::new(self.call_id, self.arguments)
             .with_caller(self.caller)
-            .with_context(self.context)
+            .with_context(self.context);
+        match self.work_state {
+            Some(work_state) => invocation.with_work_state(work_state.as_ref()),
+            None => invocation,
+        }
     }
 }
 

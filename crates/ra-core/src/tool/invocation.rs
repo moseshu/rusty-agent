@@ -5,7 +5,7 @@ use core::{any::Any, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::item::CallId;
+use crate::{item::CallId, state::WorkStateHandle};
 
 /// How a tool invocation entered the runtime.
 #[non_exhaustive]
@@ -49,6 +49,7 @@ pub struct ToolInvocation<'a> {
     arguments: &'a Value,
     caller: ToolCaller,
     context: &'a dyn ToolRuntimeContext,
+    work_state: Option<&'a dyn WorkStateHandle>,
 }
 
 impl<'a> ToolInvocation<'a> {
@@ -60,6 +61,7 @@ impl<'a> ToolInvocation<'a> {
             arguments,
             caller: ToolCaller::Direct,
             context: &EMPTY_CONTEXT,
+            work_state: None,
         }
     }
 
@@ -74,6 +76,13 @@ impl<'a> ToolInvocation<'a> {
     #[must_use]
     pub const fn with_context(mut self, context: &'a dyn ToolRuntimeContext) -> Self {
         self.context = context;
+        self
+    }
+
+    /// Attaches the task state this run participates in (R3-13).
+    #[must_use]
+    pub const fn with_work_state(mut self, work_state: &'a dyn WorkStateHandle) -> Self {
+        self.work_state = Some(work_state);
         self
     }
 
@@ -100,6 +109,17 @@ impl<'a> ToolInvocation<'a> {
     pub const fn context(&self) -> &dyn ToolRuntimeContext {
         self.context
     }
+
+    /// The task state spanning this run, when the host attached one.
+    ///
+    /// `None` is the ordinary case, not a failure: a run belongs to a task only when something
+    /// above it says so. R17-1 puts the typed channel operations on [`WorkStateHandle`]; this
+    /// accessor does not change when it does, which is the whole reason the slot exists now
+    /// (R3-13).
+    #[must_use]
+    pub const fn work_state(&self) -> Option<&dyn WorkStateHandle> {
+        self.work_state
+    }
 }
 
 impl fmt::Debug for ToolInvocation<'_> {
@@ -109,6 +129,7 @@ impl fmt::Debug for ToolInvocation<'_> {
             .field("arguments", &"<redacted>")
             .field("caller", &self.caller)
             .field("context", &"<runtime-context>")
+            .field("work_state", &self.work_state.map(|_| "<work-state>"))
             .finish()
     }
 }

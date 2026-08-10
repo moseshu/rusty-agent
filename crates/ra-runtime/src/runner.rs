@@ -37,7 +37,7 @@ use ra_core::{
     finish::FinishReason,
     item::{ModelInputItem, ModelResponse, RunItem},
     model::{ModelResolver, ModelSettings, ModelTracing},
-    state::ToolUseTracker,
+    state::{RunState, WorkStateHandle},
     step::NextStep,
     tool::ToolRuntimeContext,
 };
@@ -143,7 +143,8 @@ pub struct RunRequest {
     cancel: CancelScope,
     input: Vec<ModelInputItem>,
     config: RunConfig,
-    tool_use: ToolUseTracker,
+    state: RunState,
+    work_state: Option<Arc<dyn WorkStateHandle>>,
 }
 
 impl RunRequest {
@@ -166,7 +167,8 @@ impl RunRequest {
             cancel,
             input,
             config: RunConfig::new(),
-            tool_use: ToolUseTracker::new(),
+            state: RunState::new(),
+            work_state: None,
         }
     }
 
@@ -176,12 +178,26 @@ impl RunRequest {
         self
     }
 
-    /// Continues with tool-use history from an earlier run segment.
+    /// Continues from an earlier segment's [`RunState`].
     ///
-    /// Resuming with a fresh tracker would reset every repeat streak, which turns "pause and
-    /// continue" into a way to defeat R3-6's loop breaker (R3-6b).
-    pub fn with_tool_use(mut self, tool_use: ToolUseTracker) -> Self {
-        self.tool_use = tool_use;
+    /// **The whole state, not a field of it.** Resuming with a fresh tracker would reset every
+    /// repeat streak, which turns "pause and continue" into a way to defeat R3-6's loop breaker
+    /// (R3-6b) — and a per-field entry point has that same failure mode waiting for every fact
+    /// R3-8 and R6-6 add, since a caller who carried the fields they knew about would silently
+    /// drop the rest. Set one field with
+    /// [`RunState::with_tool_use`](ra_core::state::RunState::with_tool_use) and pass the result.
+    pub fn with_state(mut self, state: RunState) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// Attaches the task state this run participates in (R3-13).
+    ///
+    /// Held as a handle rather than a value: the task spans runs and, at R17, nodes, so a run that
+    /// owned a copy would checkpoint a snapshot that goes stale as soon as anything else advances
+    /// it. Every tool this run dispatches is handed the same handle, and R7's guards will be.
+    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
+        self.work_state = Some(work_state);
         self
     }
 }
@@ -237,7 +253,8 @@ async fn run_loop(
         cancel,
         input: original_input,
         config,
-        mut tool_use,
+        mut state,
+        work_state,
     } = request;
 
     if config.max_turns == 0 {
@@ -297,19 +314,20 @@ async fn run_loop(
         // `ModelResponse` either way.
         let response = turn_scope.run(model.get_response(model_request)).await??;
 
-        let settled = settle_turn(
-            TurnSettlementRequest::new(
-                &agent,
-                &response,
-                &surface,
-                tool_context.as_ref(),
-                &turn_scope,
-                &mut tool_use,
-            )
-            .with_original_input(original_input.clone())
-            .with_pre_step_items(generated.clone()),
+        let mut settlement = TurnSettlementRequest::new(
+            &agent,
+            &response,
+            &surface,
+            tool_context.as_ref(),
+            &turn_scope,
+            state.tool_use_mut(),
         )
-        .await?;
+        .with_original_input(original_input.clone())
+        .with_pre_step_items(generated.clone());
+        if let Some(work_state) = &work_state {
+            settlement = settlement.with_work_state(work_state);
+        }
+        let settled = settle_turn(settlement).await?;
 
         model_responses.push(response);
         for item in settled.session_step_items() {
@@ -344,7 +362,7 @@ async fn run_loop(
         generated,
         model_responses,
         turns,
-        tool_use,
+        state,
     );
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)

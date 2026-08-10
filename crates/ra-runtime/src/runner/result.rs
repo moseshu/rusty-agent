@@ -18,8 +18,11 @@
 use ra_core::{
     agent::AgentSpec,
     finish::FinishReason,
-    item::{InputItemNormalizer, Message, ModelInputItem, ModelResponse, RunItem, RunItemKind},
-    state::ToolUseTracker,
+    item::{
+        InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase,
+        RunItem, RunItemKind,
+    },
+    state::{RunState, ToolUseTracker},
     usage::Usage,
 };
 use std::sync::Arc;
@@ -100,7 +103,7 @@ pub struct RunResult {
     new_items: Vec<RunItem>,
     model_responses: Vec<ModelResponse>,
     turns: u32,
-    tool_use: ToolUseTracker,
+    state: RunState,
 }
 
 impl RunResult {
@@ -111,7 +114,7 @@ impl RunResult {
         new_items: Vec<RunItem>,
         model_responses: Vec<ModelResponse>,
         turns: u32,
-        tool_use: ToolUseTracker,
+        state: RunState,
     ) -> Self {
         Self {
             outcome,
@@ -120,7 +123,7 @@ impl RunResult {
             new_items,
             model_responses,
             turns,
-            tool_use,
+            state,
         }
     }
 
@@ -162,13 +165,22 @@ impl RunResult {
 
     /// Tool-use history as of the last turn (R3-6b).
     ///
-    /// Handed back rather than consumed, because the run that continues from an interruption
-    /// has to carry it forward: starting the next segment with a fresh tracker resets every
-    /// repeat streak, which turns "pause and resume" into a way to defeat the loop breaker.
-    /// Feed it to [`RunRequest::with_tool_use`](super::RunRequest::with_tool_use).
+    /// A read-only projection of [`Self::state`], for callers that only want to inspect the
+    /// streaks. Continuing a run carries the whole [`RunState`], not this field.
     #[must_use]
     pub const fn tool_use(&self) -> &ToolUseTracker {
-        &self.tool_use
+        self.state.tool_use()
+    }
+
+    /// The run's own state as of the last settled turn.
+    ///
+    /// Handed back rather than consumed, because a run that continues from an interruption has to
+    /// carry it forward: starting the next segment with fresh state resets every repeat streak,
+    /// which turns "pause and resume" into a way to defeat the loop breaker. Feed it to
+    /// [`RunRequest::with_state`](super::RunRequest::with_state).
+    #[must_use]
+    pub const fn state(&self) -> &RunState {
+        &self.state
     }
 
     /// Token usage across every call this run made.
@@ -191,19 +203,29 @@ impl RunResult {
             })
     }
 
-    /// The last thing the model said, if it said anything.
+    /// The message that delivered the run, if it produced one.
     ///
-    /// Structural: the final assistant message in generation order. It deliberately does **not**
-    /// filter on [`OutputPhase`](ra_core::item::OutputPhase) yet — R3-10 is what makes the
-    /// commentary/final split load bearing — and it does not parse the text, which is R1-16's
-    /// structured-output contract.
+    /// Structural: the assistant message settlement put on
+    /// [`OutputPhase::Final`](ra_core::item::OutputPhase::Final) (R3-10). It does not parse the
+    /// text, which is R1-16's structured-output contract.
+    ///
+    /// **`None` is a real answer, not just "the model said nothing".** A run that stopped for an
+    /// approval has not delivered anything yet, and neither has one that hit
+    /// [`FinishReason::MaxTurns`] — the cap fires between turns, so the last thing the model said
+    /// was work in progress. R3-8's error handler is what turns those into a delivered result;
+    /// until it lands, a host that needs to show *something* reads [`Self::new_items`].
     #[must_use]
     pub fn final_message(&self) -> Option<&Message> {
         self.new_items
             .iter()
             .rev()
             .find_map(|item| match item.kind() {
-                RunItemKind::Message(message) => Some(message),
+                RunItemKind::Message(message)
+                    if matches!(message.role(), MessageRole::Assistant)
+                        && message.phase() == Some(OutputPhase::Final) =>
+                {
+                    Some(message)
+                }
                 _ => None,
             })
     }
