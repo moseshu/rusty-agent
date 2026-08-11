@@ -7,9 +7,9 @@ use ra_core::{
     item::CallId,
     state::WorkStateHandle,
     tool::{
-        Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolFailureHandling,
-        ToolGuardrailId, ToolInvocation, ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin,
-        ToolOutput, ToolSchema, ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolConcurrency, ToolExposure,
+        ToolFailureHandling, ToolGuardrailId, ToolInvocation, ToolLookupKey, ToolNamespace,
+        ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -210,7 +210,8 @@ fn tool_options_集中承载执行策略并按毫秒往返() {
     let options = ToolOptions::new()
         .with_availability(ToolAvailability::Dynamic)
         .with_approval(ToolApprovalPolicy::Always)
-        .with_defer_loading(true)
+        .with_exposure(ToolExposure::Deferred)
+        .with_concurrency(ToolConcurrency::Parallel)
         .with_allowed_callers([
             ToolCaller::Programmatic,
             ToolCaller::Direct,
@@ -240,6 +241,8 @@ fn tool_options_集中承载执行策略并按毫秒往返() {
     let restored = serde_json::from_value::<ToolOptions>(wire).unwrap();
     assert_eq!(restored.availability(), options.availability());
     assert_eq!(restored.approval(), options.approval());
+    assert_eq!(restored.exposure(), ToolExposure::Deferred);
+    assert_eq!(restored.concurrency(), ToolConcurrency::Parallel);
     assert_eq!(restored.timeout(), options.timeout());
     assert_eq!(
         restored.allowed_callers(),
@@ -255,6 +258,44 @@ fn tool_options_集中承载执行策略并按毫秒往返() {
     assert_eq!(normalized["allowed_callers"], json!(["direct", "programmatic"]));
     assert_eq!(normalized["input_guardrails"], json!(["read_before_edit"]));
     assert_eq!(normalized["output_guardrails"], json!(["secret_scan"]));
+}
+
+#[test]
+fn 两个默认都是保守的那一边() {
+    let options = ToolOptions::new();
+
+    // A tool written before either field existed must not become concurrently executable or
+    // invisible by omission. Both defaults are the answer that costs nothing to be wrong about.
+    assert_eq!(options.concurrency(), ToolConcurrency::Exclusive);
+    assert_eq!(options.exposure(), ToolExposure::Advertised);
+    assert!(options.is_advertised());
+    assert!(!options.is_discoverable());
+}
+
+#[test]
+fn hidden_既不广播也不可被发现() {
+    let hidden = ToolOptions::new().with_exposure(ToolExposure::Hidden);
+    let deferred = ToolOptions::new().with_exposure(ToolExposure::Deferred);
+
+    // `is_discoverable` is not `!is_advertised()`: `Hidden` is neither, and defining discovery as
+    // the negation of advertising would index exactly the tools that must never be offered.
+    assert!(!hidden.is_advertised());
+    assert!(!hidden.is_discoverable());
+    assert!(!deferred.is_advertised());
+    assert!(deferred.is_discoverable());
+}
+
+#[test]
+fn defer_loading_这个旧键当场拒收而不是落进_unknown() {
+    // It used to be this field. Left unrecognized it would round-trip into `unknown` and the tool
+    // would read as `Advertised` — schema budget spent every turn, and nothing says so.
+    let error = serde_json::from_value::<ToolOptions>(json!({
+        "schema_version": 1,
+        "defer_loading": true
+    }))
+    .unwrap_err();
+
+    assert!(error.to_string().contains("exposure"), "{error}");
 }
 
 #[derive(Debug)]

@@ -336,15 +336,19 @@ const fn ra_core::tool::invocation::ToolInvocation < 'a >::with_work_state(mut s
 const fn ra_core::tool::invocation::ToolInvocation < 'a >::work_state(& self) -> Option < & dyn WorkStateHandle >
 const fn ra_core::tool::options::ToolOptions::approval(& self) -> ToolApprovalPolicy
 const fn ra_core::tool::options::ToolOptions::availability(& self) -> ToolAvailability
-const fn ra_core::tool::options::ToolOptions::defer_loading(& self) -> bool
+const fn ra_core::tool::options::ToolOptions::concurrency(& self) -> ToolConcurrency
+const fn ra_core::tool::options::ToolOptions::exposure(& self) -> ToolExposure
 const fn ra_core::tool::options::ToolOptions::failure_handling(& self) -> ToolFailureHandling
+const fn ra_core::tool::options::ToolOptions::is_advertised(& self) -> bool
+const fn ra_core::tool::options::ToolOptions::is_discoverable(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::options::ToolOptions::timeout(& self) -> Option < Duration >
 const fn ra_core::tool::options::ToolOptions::timeout_behavior(& self) -> ToolTimeoutBehavior
 const fn ra_core::tool::options::ToolOptions::unknown(& self) -> & Unknown
 const fn ra_core::tool::options::ToolOptions::with_approval(mut self, approval : ToolApprovalPolicy) -> Self
 const fn ra_core::tool::options::ToolOptions::with_availability(mut self, availability : ToolAvailability) -> Self
-const fn ra_core::tool::options::ToolOptions::with_defer_loading(mut self, defer_loading : bool) -> Self
+const fn ra_core::tool::options::ToolOptions::with_concurrency(mut self, concurrency : ToolConcurrency) -> Self
+const fn ra_core::tool::options::ToolOptions::with_exposure(mut self, exposure : ToolExposure) -> Self
 const fn ra_core::tool::options::ToolOptions::with_failure_handling(mut self, handling : ToolFailureHandling) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout(mut self, timeout : Duration) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout_behavior(mut self, behavior : ToolTimeoutBehavior) -> Self
@@ -498,6 +502,8 @@ enum ra_core::step::NextStep
 enum ra_core::tool::invocation::ToolCaller
 enum ra_core::tool::options::ToolApprovalPolicy
 enum ra_core::tool::options::ToolAvailability
+enum ra_core::tool::options::ToolConcurrency
+enum ra_core::tool::options::ToolExposure
 enum ra_core::tool::options::ToolFailureHandling
 enum ra_core::tool::options::ToolTimeoutBehavior
 enum ra_core::tool::origin::ToolLookupKind
@@ -1232,6 +1238,11 @@ variant ra_core::tool::options::ToolApprovalPolicy::Never
 variant ra_core::tool::options::ToolAvailability::Disabled
 variant ra_core::tool::options::ToolAvailability::Dynamic
 variant ra_core::tool::options::ToolAvailability::Enabled
+variant ra_core::tool::options::ToolConcurrency::Exclusive
+variant ra_core::tool::options::ToolConcurrency::Parallel
+variant ra_core::tool::options::ToolExposure::Advertised
+variant ra_core::tool::options::ToolExposure::Deferred
+variant ra_core::tool::options::ToolExposure::Hidden
 variant ra_core::tool::options::ToolFailureHandling::Custom
 variant ra_core::tool::options::ToolFailureHandling::ModelVisible
 variant ra_core::tool::options::ToolFailureHandling::Propagate

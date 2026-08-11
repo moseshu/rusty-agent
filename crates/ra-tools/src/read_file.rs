@@ -50,9 +50,9 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
     tool::{
-        ObservationMetadata, Tool, ToolFailureHandling, ToolInput as _, ToolInvocation,
-        ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema, Truncation,
-        TruncationStage,
+        ObservationMetadata, Tool, ToolConcurrency, ToolFailureHandling, ToolInput as _,
+        ToolInvocation, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema,
+        Truncation, TruncationStage,
     },
 };
 use ra_macros::ToolInput;
@@ -428,7 +428,14 @@ impl Tool for ReadFileTool {
     fn options(&self) -> ToolOptions {
         // `Custom` is what buys the model a sentence instead of a bare error code. Approval stays
         // at the default: whether a given path needs one is host policy (R7), not this tool's.
-        ToolOptions::new().with_failure_handling(ToolFailureHandling::Custom)
+        //
+        // `Parallel` is the whole point of the batch shape (R3-4b): three reads of three files
+        // are one wall-clock read, and a read cannot observe another call's writes because it
+        // holds no lock on anything. The measured slice this imitates is Codex issuing three
+        // `sed` calls off one reasoning block.
+        ToolOptions::new()
+            .with_failure_handling(ToolFailureHandling::Custom)
+            .with_concurrency(ToolConcurrency::Parallel)
     }
 
     async fn handle_failure(

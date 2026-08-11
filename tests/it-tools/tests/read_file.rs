@@ -2,7 +2,7 @@
 
 use ra_core::{
     item::CallId,
-    tool::{Tool, ToolInvocation, ToolOutput, ToolOutputBlock, TruncationStage},
+    tool::{Tool, ToolConcurrency, ToolInvocation, ToolOutput, ToolOutputBlock, TruncationStage},
 };
 use ra_tools::read_file::{ReadFileLimits, ReadFileTool};
 use serde_json::{Value, json};
@@ -55,6 +55,16 @@ async fn 工具身份与_schema_名一致且参数是_strict() {
     // Strict mode requires *every* property in `required`, optional ones included; they express
     // optionality as a nullable union instead.
     assert_eq!(schema["required"], json!(["limit", "offset", "path"]));
+}
+
+#[tokio::test]
+async fn 读是并行的因为它不锁任何东西() {
+    // R3-4b's batch shape reads this declaration to pick a read or a write lock. Three reads of
+    // three files are one wall-clock read, and a read cannot observe another call's writes.
+    let tool = ReadFileTool::new().expect("read_file builds");
+
+    assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
+    assert!(tool.options().is_advertised());
 }
 
 #[tokio::test]

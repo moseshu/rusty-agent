@@ -27,6 +27,64 @@ pub enum ToolAvailability {
     Dynamic,
 }
 
+/// How much of the model's tool surface a registered tool occupies.
+///
+/// **Registered and advertised are different questions**, which is why this is not a boolean.
+/// Every variant here is registered and dispatchable; they differ only in what the model can see,
+/// and each one has a consumer that has to tell them apart:
+///
+/// | Variant | In the turn's tool list | Found by `tool_search` |
+/// | --- | --- | --- |
+/// | [`Advertised`](Self::Advertised) | yes | — |
+/// | [`Deferred`](Self::Deferred) | no | yes |
+/// | [`Hidden`](Self::Hidden) | no | no |
+///
+/// [`Deferred`](Self::Deferred) is the mechanism behind a 15-entry tool surface with 40-plus
+/// reachable capabilities (R2-5c): the schema costs nothing until the model asks for it.
+///
+/// # Why three states and not Codex's six
+///
+/// Codex crosses two axes into one enum — visibility (direct / deferred / hidden) times surface
+/// (model / nested code-mode) — giving `DirectModelOnly`, `CodeModeOnly`, and so on. This project
+/// already carries the second axis as [`ToolOptions::allowed_callers`], so crossing it in again
+/// would create pairs that can contradict each other: a tool exposed only to a programmatic
+/// caller whose allowlist admits only [`ToolCaller::Direct`] is a state with no meaning and no
+/// error. One axis per field, and the two are combined where they are read.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExposure {
+    /// In every turn's tool list, and paying for its schema every turn.
+    #[default]
+    Advertised,
+    /// Withheld from the tool list until discovery surfaces it (R2-5c).
+    Deferred,
+    /// Never shown to the model; reachable only when something else dispatches it.
+    Hidden,
+}
+
+/// Whether a tool may run while other tools from the same response are running.
+///
+/// **The default is [`Exclusive`](Self::Exclusive)**: a tool that has not said it tolerates
+/// company gets none. The opposite default would make every tool written before this field
+/// existed silently eligible for concurrent execution.
+///
+/// Measured, not assumed: Codex's `exec_command` and `shell_command` both declare parallel, and
+/// `apply_patch` declares nothing and therefore serializes — one writer against every reader is
+/// the whole rule. The batch executor (R3-4b) reads this to pick a read or a write lock, which is
+/// why a tool cannot express "parallel with these, not with those": that would need a resource
+/// identity, and a resource identity is what a later variant here would carry.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolConcurrency {
+    /// Runs alone: nothing else from the same response overlaps it.
+    #[default]
+    Exclusive,
+    /// Runs alongside other parallel-declared calls from the same response.
+    Parallel,
+}
+
 /// Whether host approval is needed before invocation.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -120,7 +178,9 @@ pub struct ToolOptions {
     #[serde(default)]
     approval: ToolApprovalPolicy,
     #[serde(default)]
-    defer_loading: bool,
+    exposure: ToolExposure,
+    #[serde(default)]
+    concurrency: ToolConcurrency,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     allowed_callers: Option<Vec<ToolCaller>>,
     #[serde(
@@ -150,7 +210,9 @@ struct ToolOptionsWire {
     #[serde(default)]
     approval: ToolApprovalPolicy,
     #[serde(default)]
-    defer_loading: bool,
+    exposure: ToolExposure,
+    #[serde(default)]
+    concurrency: ToolConcurrency,
     #[serde(default)]
     allowed_callers: Option<Vec<ToolCaller>>,
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
@@ -173,6 +235,15 @@ impl<'de> Deserialize<'de> for ToolOptions {
         D: Deserializer<'de>,
     {
         let wire = ToolOptionsWire::deserialize(deserializer)?;
+        // `defer_loading: bool` was this field before `exposure` split "not advertised" from
+        // "not discoverable". Rejecting it is the point: an unknown key round-trips into
+        // `unknown` and the tool would read as `Advertised`, which is the one wrong answer that
+        // costs schema budget every turn without anyone noticing.
+        if wire.unknown.get("defer_loading").is_some() {
+            return Err(D::Error::custom(
+                "`defer_loading` was replaced by `exposure`: use \"deferred\" or \"hidden\"",
+            ));
+        }
         let mut allowed_callers = wire.allowed_callers;
         if let Some(callers) = &mut allowed_callers {
             callers.sort_unstable();
@@ -182,7 +253,8 @@ impl<'de> Deserialize<'de> for ToolOptions {
             schema_version: wire.schema_version,
             availability: wire.availability,
             approval: wire.approval,
-            defer_loading: wire.defer_loading,
+            exposure: wire.exposure,
+            concurrency: wire.concurrency,
             allowed_callers,
             timeout: wire.timeout,
             timeout_behavior: wire.timeout_behavior,
@@ -200,7 +272,8 @@ impl Default for ToolOptions {
             schema_version: TOOL_OPTIONS_SCHEMA_VERSION,
             availability: ToolAvailability::Enabled,
             approval: ToolApprovalPolicy::Never,
-            defer_loading: false,
+            exposure: ToolExposure::Advertised,
+            concurrency: ToolConcurrency::Exclusive,
             allowed_callers: None,
             timeout: None,
             timeout_behavior: ToolTimeoutBehavior::ModelVisible,
@@ -233,10 +306,17 @@ impl ToolOptions {
         self
     }
 
-    /// Hides the schema from the default advertise set while keeping the tool registered.
+    /// Sets how much of the model's tool surface this tool occupies.
     #[must_use]
-    pub const fn with_defer_loading(mut self, defer_loading: bool) -> Self {
-        self.defer_loading = defer_loading;
+    pub const fn with_exposure(mut self, exposure: ToolExposure) -> Self {
+        self.exposure = exposure;
+        self
+    }
+
+    /// Declares whether this tool tolerates running beside other calls from the same response.
+    #[must_use]
+    pub const fn with_concurrency(mut self, concurrency: ToolConcurrency) -> Self {
+        self.concurrency = concurrency;
         self
     }
 
@@ -303,10 +383,35 @@ impl ToolOptions {
         self.approval
     }
 
-    /// Whether this tool is discoverable only on demand.
+    /// Model-surface exposure.
     #[must_use]
-    pub const fn defer_loading(&self) -> bool {
-        self.defer_loading
+    pub const fn exposure(&self) -> ToolExposure {
+        self.exposure
+    }
+
+    /// Concurrency declaration read by the batch executor (R3-4b).
+    #[must_use]
+    pub const fn concurrency(&self) -> ToolConcurrency {
+        self.concurrency
+    }
+
+    /// Whether this tool belongs in the turn's advertised tool list.
+    ///
+    /// The consumer is turn preparation (R3-0 stage 1). Named rather than left as a `match` at
+    /// the call site because the same question is asked by the R2-10 schema budget, and two
+    /// spellings of it would eventually disagree about `Hidden`.
+    #[must_use]
+    pub const fn is_advertised(&self) -> bool {
+        matches!(self.exposure, ToolExposure::Advertised)
+    }
+
+    /// Whether discovery may surface this tool to the model.
+    ///
+    /// The consumer is `tool_search` (R2-5c). Deliberately **not** `!is_advertised()`:
+    /// [`Hidden`](ToolExposure::Hidden) is neither, and a negation would quietly index it.
+    #[must_use]
+    pub const fn is_discoverable(&self) -> bool {
+        matches!(self.exposure, ToolExposure::Deferred)
     }
 
     /// Explicit caller allowlist, or `None` for unrestricted.
