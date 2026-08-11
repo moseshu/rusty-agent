@@ -29,3 +29,4 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+cap-std = { workspace = true }

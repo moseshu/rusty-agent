@@ -32,7 +32,7 @@ pub mod process;
 #[doc(hidden)]
 pub mod resolve;
 
-use batch::{TurnExecutionRequest, execute_actions};
+use batch::{DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, TurnExecutionRequest, execute_actions};
 use prepare::TurnActionSurface;
 use process::process_model_response;
 use resolve::{resolve_next_step, step_items};
@@ -54,6 +54,7 @@ pub struct TurnSettlementRequest<'a> {
     cancel: &'a CancelScope,
     tool_use: &'a mut ToolUseTracker,
     work_state: Option<&'a Arc<dyn WorkStateHandle>>,
+    max_function_tool_concurrency: usize,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
 }
@@ -85,6 +86,7 @@ impl<'a> TurnSettlementRequest<'a> {
             cancel,
             tool_use,
             work_state: None,
+            max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
         }
@@ -93,6 +95,12 @@ impl<'a> TurnSettlementRequest<'a> {
     /// Sets the task state this run participates in, for the tools this turn calls (R3-13).
     pub const fn with_work_state(mut self, work_state: &'a Arc<dyn WorkStateHandle>) -> Self {
         self.work_state = Some(work_state);
+        self
+    }
+
+    /// Sets the per-turn cap for concurrently dispatched function tools.
+    pub const fn with_max_function_tool_concurrency(mut self, max: usize) -> Self {
+        self.max_function_tool_concurrency = max;
         self
     }
 
@@ -141,6 +149,8 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     if let Some(work_state) = request.work_state {
         execution_request = execution_request.with_work_state(work_state);
     }
+    execution_request =
+        execution_request.with_max_function_tool_concurrency(request.max_function_tool_concurrency);
     let execution = execute_actions(execution_request).await?;
 
     // 3. Decide. One function, four states, priority written down once.

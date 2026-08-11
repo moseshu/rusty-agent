@@ -30,17 +30,19 @@ pub enum ToolAvailability {
 /// How much of the model's tool surface a registered tool occupies.
 ///
 /// **Registered and advertised are different questions**, which is why this is not a boolean.
-/// Every variant here is registered and dispatchable; they differ only in what the model can see,
-/// and each one has a consumer that has to tell them apart:
+/// Every variant here remains registered; they differ in what the direct model surface may expose.
+/// `Deferred` additionally requires a discovery implementation that can carry a discovered-tool
+/// snapshot across turns. Until R2-5c installs that implementation, `ra-runtime` rejects an
+/// enabled deferred tool rather than silently making it unreachable.
 ///
 /// | Variant | In the turn's tool list | Found by `tool_search` |
 /// | --- | --- | --- |
 /// | [`Advertised`](Self::Advertised) | yes | — |
-/// | [`Deferred`](Self::Deferred) | no | yes |
+/// | [`Deferred`](Self::Deferred) | no | after R2-5c only |
 /// | [`Hidden`](Self::Hidden) | no | no |
 ///
-/// [`Deferred`](Self::Deferred) is the mechanism behind a 15-entry tool surface with 40-plus
-/// reachable capabilities (R2-5c): the schema costs nothing until the model asks for it.
+/// [`Deferred`](Self::Deferred) is reserved for R2-5c's 15-entry tool surface with 40-plus
+/// reachable capabilities: its schema will cost nothing until the model asks for it.
 ///
 /// # Why three states and not Codex's six
 ///
@@ -57,7 +59,7 @@ pub enum ToolExposure {
     /// In every turn's tool list, and paying for its schema every turn.
     #[default]
     Advertised,
-    /// Withheld from the tool list until discovery surfaces it (R2-5c).
+    /// Withheld from the tool list until R2-5c discovery surfaces it.
     Deferred,
     /// Never shown to the model; reachable only when something else dispatches it.
     Hidden,
@@ -405,10 +407,11 @@ impl ToolOptions {
         matches!(self.exposure, ToolExposure::Advertised)
     }
 
-    /// Whether discovery may surface this tool to the model.
+    /// Whether this tool requests deferred discovery.
     ///
-    /// The consumer is `tool_search` (R2-5c). Deliberately **not** `!is_advertised()`:
-    /// [`Hidden`](ToolExposure::Hidden) is neither, and a negation would quietly index it.
+    /// R2-5c's `tool_search` will consume this. Until then, turn preparation rejects an enabled
+    /// deferred tool. Deliberately **not** `!is_advertised()`: [`Hidden`](ToolExposure::Hidden)
+    /// is neither, and a negation would quietly index it.
     #[must_use]
     pub const fn is_discoverable(&self) -> bool {
         matches!(self.exposure, ToolExposure::Deferred)

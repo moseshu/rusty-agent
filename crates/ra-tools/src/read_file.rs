@@ -42,6 +42,7 @@ use std::{
     borrow::Cow,
     fmt,
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -55,12 +56,15 @@ use ra_core::{
         Truncation, TruncationStage,
     },
 };
+use ra_exec::fs::{RootedFileSystem, RootedOpenError};
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::io::AsyncReadExt as _;
 
 /// The advertised name. Identity and schema must agree on it or [`Tool::validate`] refuses.
 const TOOL_NAME: &str = "read_file";
+const INITIAL_READ_BUFFER_CAPACITY: usize = 8 * 1024;
 
 // The doc comment below is the model-facing description, so it says what the model needs and
 // stops. R2-11's measurement: the tools that do the work carry very short descriptions (Codex's
@@ -171,12 +175,23 @@ impl ReadFileLimits {
 }
 
 /// The `read_file` tool.
-#[derive(Debug)]
 pub struct ReadFileTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     root: Option<PathBuf>,
+    rooted_filesystem: Option<Arc<RootedFileSystem>>,
     limits: ReadFileLimits,
+}
+
+impl fmt::Debug for ReadFileTool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadFileTool")
+            .field("origin", &self.origin)
+            .field("root", &self.root)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReadFileTool {
@@ -187,17 +202,18 @@ impl ReadFileTool {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ReadFileInput::tool_schema(TOOL_NAME)?,
             root: None,
+            rooted_filesystem: None,
             limits: ReadFileLimits::new(),
         })
     }
 
     /// Creates a tool confined to `root`, which must exist.
     ///
-    /// This is the minimal form of R8-5's workspace boundary and not the whole of it: `..` is
-    /// resolved lexically before the check and symlinks are re-checked after canonicalization, but
-    /// the real path policy — the shared normalization every file API uses, per-path denies, mount
-    /// points — is R8-5's. It is here now because a tool that reads `~/.ssh/id_rsa` on request is
-    /// not something to leave for a later milestone.
+    /// This is the minimal form of R8-5's workspace boundary. It converts the root into a stable
+    /// directory capability and resolves every later component from that handle, following a
+    /// symbolic link only as far as the link stays below the root. The broader shared path policy
+    /// — per-path denies and mount policy — remains R8-5, but a check-then-open escape is not left
+    /// for that milestone.
     pub fn rooted(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let canonical = std::fs::canonicalize(root).map_err(|error| {
@@ -207,8 +223,16 @@ impl ReadFileTool {
             ))
             .with_source(error)
         })?;
+        let rooted_filesystem = RootedFileSystem::open(&canonical).map_err(|error| {
+            Error::config(format!(
+                "read_file workspace root `{}` cannot be opened",
+                root.display()
+            ))
+            .with_source(error)
+        })?;
         Ok(Self {
             root: Some(canonical),
+            rooted_filesystem: Some(Arc::new(rooted_filesystem)),
             ..Self::new()?
         })
     }
@@ -232,78 +256,139 @@ impl ReadFileTool {
         self.root.as_deref()
     }
 
-    /// Resolves a model-supplied path, refusing one that leaves the root.
-    fn resolve(&self, requested: &str) -> ReadResult<PathBuf> {
+    /// Resolves a model-supplied path into one this tool will open, or into the reason it will
+    /// not.
+    ///
+    /// Two different reasons, deliberately: a path that **left the workspace** and a path spelled
+    /// with **`..`** are refused by different rules and produce different sentences. Only the
+    /// first is a boundary violation; the second is a spelling this tool declines to interpret,
+    /// and it is often a file that is perfectly well inside the root.
+    ///
+    /// **An absolute path inside the workspace is accepted.** It is the same request written
+    /// another way, and it is the way a model writes it after reading one out of a search result;
+    /// refusing it would buy nothing, because what survives the strip is resolved through the
+    /// capability exactly like any other relative path. The comparison is lexical against the
+    /// canonical root, so a host alias for the same directory — `/tmp` for `/private/tmp` — is not
+    /// recognized. Recognizing it would mean canonicalizing model input before the open, which is
+    /// the first half of the race this tool is built to avoid.
+    fn resolve(&self, requested: &str) -> ReadResult<ResolvedPath> {
         let requested_path = Path::new(requested);
-        let joined = match (&self.root, requested_path.is_absolute()) {
-            (Some(root), false) => root.join(requested_path),
-            _ => requested_path.to_path_buf(),
+        let Some(root) = &self.root else {
+            // Let the OS resolve ambient paths exactly as it normally would.  In particular,
+            // normalizing `link/../file` before opening changes POSIX's symbolic-link semantics.
+            return Ok(ResolvedPath::Ambient(requested_path.to_path_buf()));
         };
-        let normalized = normalize_lexically(&joined);
-        match &self.root {
-            Some(root) if !normalized.starts_with(root) => {
-                Err(ReadFileFailure::OutsideRoot(requested.to_owned()))
+        let relative = if requested_path.is_absolute() {
+            match requested_path.strip_prefix(root) {
+                Ok(relative) => relative.to_path_buf(),
+                Err(_) => return Err(ReadFileFailure::OutsideRoot(requested.to_owned())),
             }
-            _ => Ok(normalized),
-        }
-    }
-
-    /// Resolves, canonicalizes, and re-checks the boundary against the real path.
-    async fn locate(&self, requested: &str) -> ReadResult<PathBuf> {
-        let normalized = self.resolve(requested)?;
-        // Canonicalizing is what turns a symlink that sits inside the root and points outside it
-        // into a path the boundary check can see. It answers "does this exist" in the same call.
-        let real = tokio::fs::canonicalize(&normalized)
-            .await
-            .map_err(|error| ReadFileFailure::from_io(requested, &error))?;
-        match &self.root {
-            Some(root) if !real.starts_with(root) => {
-                Err(ReadFileFailure::OutsideRoot(requested.to_owned()))
+        } else {
+            requested_path.to_path_buf()
+        };
+        for component in relative.components() {
+            match component {
+                // `..` is refused rather than normalized away, because normalizing it changes
+                // which file was asked for: POSIX pops a symbolic link's *target*, so `a/b/../c`
+                // and `a/c` name different files whenever `a/b` is a link.
+                //
+                // It gets its own refusal instead of sharing one with a path that left the
+                // workspace, because the two are not the same news. `src/../README.md` may well
+                // be inside the root, and telling the model it is outside sends it looking for a
+                // boundary problem it does not have — while the thing it can actually do, spell
+                // the path without `..`, goes unsaid.
+                Component::ParentDir => {
+                    return Err(ReadFileFailure::AmbiguousParent(requested.to_owned()));
+                }
+                // Reachable on Windows, where `C:file` is relative and still carries a prefix.
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(ReadFileFailure::OutsideRoot(requested.to_owned()));
+                }
+                Component::CurDir | Component::Normal(_) => {}
             }
-            _ => Ok(real),
         }
+        Ok(ResolvedPath::Rooted(relative))
     }
 
     async fn read(&self, input: &ReadFileInput) -> ReadResult<ToolOutput> {
-        let path = self.locate(&input.path).await?;
-        let metadata = tokio::fs::metadata(&path)
+        let path = self.resolve(&input.path)?;
+        let mut file = self.open_file(&input.path, &path).await?;
+        let metadata = file
+            .metadata()
             .await
             .map_err(|error| ReadFileFailure::from_io(&input.path, &error))?;
         if !metadata.is_file() {
             return Err(ReadFileFailure::NotAFile(input.path.clone()));
         }
 
-        match Media::of(&path) {
+        match Media::of(path.as_path()) {
             Media::Image(media_type) => {
-                let bytes = self.read_whole(&input.path, &path, metadata.len()).await?;
+                let bytes = self
+                    .read_whole(&input.path, &mut file, metadata.len())
+                    .await?;
                 Ok(ToolOutput::block(ToolOutputBlock::Image(ImageBlock::new(
                     ImageSource::base64(media_type, BASE64.encode(bytes)),
                 ))))
             }
             Media::Pdf => {
-                let bytes = self.read_whole(&input.path, &path, metadata.len()).await?;
+                let bytes = self
+                    .read_whole(&input.path, &mut file, metadata.len())
+                    .await?;
                 let mut source = Base64FileSource::new(BASE64.encode(bytes));
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                if let Some(name) = path.as_path().file_name().and_then(|name| name.to_str()) {
                     source = source.with_filename(name);
                 }
                 Ok(ToolOutput::block(ToolOutputBlock::File(FileBlock::new(
                     FileSource::Base64(source),
                 ))))
             }
-            Media::Text => {
-                let bytes = tokio::fs::read(&path)
+            Media::Text => self.render_text_stream(input, &mut file).await,
+        }
+    }
+
+    /// Opens once and returns the descriptor every later operation must use.
+    async fn open_file(&self, requested: &str, path: &ResolvedPath) -> ReadResult<tokio::fs::File> {
+        match path {
+            ResolvedPath::Ambient(path) => tokio::fs::File::open(path)
+                .await
+                .map_err(|error| ReadFileFailure::from_io(requested, &error)),
+            ResolvedPath::Rooted(path) => {
+                let filesystem = Arc::clone(self.rooted_filesystem.as_ref().ok_or_else(|| {
+                    ReadFileFailure::Unreadable(requested.to_owned(), std::io::ErrorKind::Other)
+                })?);
+                let path = path.clone();
+                let result = tokio::task::spawn_blocking(move || filesystem.open_read(&path))
                     .await
-                    .map_err(|error| ReadFileFailure::from_io(&input.path, &error))?;
-                if is_binary(&bytes) {
-                    return Err(ReadFileFailure::Binary(input.path.clone()));
+                    .map_err(|_| {
+                        ReadFileFailure::Unreadable(requested.to_owned(), std::io::ErrorKind::Other)
+                    })?;
+                match result {
+                    Ok(file) => Ok(tokio::fs::File::from_std(file)),
+                    Err(RootedOpenError::OutsideRoot) => {
+                        Err(ReadFileFailure::OutsideRoot(requested.to_owned()))
+                    }
+                    Err(RootedOpenError::Io(error)) => {
+                        Err(ReadFileFailure::from_io(requested, &error))
+                    }
+                    // A refusal this crate cannot name yet is still a refusal. `RootedOpenError`
+                    // is `#[non_exhaustive]`, so the wildcard is mandatory; what matters is that
+                    // it lands on a failure rather than on anything that could read as a file.
+                    Err(_) => Err(ReadFileFailure::Unreadable(
+                        requested.to_owned(),
+                        std::io::ErrorKind::Other,
+                    )),
                 }
-                Ok(self.render_text(input, &bytes))
             }
         }
     }
 
     /// Reads a whole file that will be sent as one block, refusing one over the ceiling.
-    async fn read_whole(&self, requested: &str, path: &Path, size: u64) -> ReadResult<Vec<u8>> {
+    async fn read_whole(
+        &self,
+        requested: &str,
+        file: &mut tokio::fs::File,
+        size: u64,
+    ) -> ReadResult<Vec<u8>> {
         let ceiling = as_u64(self.limits.max_binary_bytes);
         if size > ceiling {
             return Err(ReadFileFailure::TooLarge {
@@ -312,48 +397,144 @@ impl ReadFileTool {
                 ceiling,
             });
         }
-        tokio::fs::read(path)
+        // Metadata is only a preflight: the file can grow after it was queried.  Reading through
+        // this same descriptor and taking one byte beyond the cap preserves the descriptor-level
+        // TOCTOU guarantee while keeping the allocation bounded.
+        // This is only an allocation hint.  A public configuration may deliberately have a large
+        // ceiling, but opening a tiny media file must not reserve that entire ceiling up front.
+        let capacity = usize::try_from(size.min(ceiling))
+            .unwrap_or(INITIAL_READ_BUFFER_CAPACITY)
+            .min(INITIAL_READ_BUFFER_CAPACITY)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut reader = file.take(ceiling.saturating_add(1));
+        reader
+            .read_to_end(&mut bytes)
             .await
-            .map_err(|error| ReadFileFailure::from_io(requested, &error))
+            .map_err(|error| ReadFileFailure::from_io(requested, &error))?;
+        if bytes.len() > self.limits.max_binary_bytes {
+            return Err(ReadFileFailure::TooLarge {
+                path: requested.to_owned(),
+                bytes: as_u64(bytes.len()),
+                ceiling,
+            });
+        }
+        Ok(bytes)
     }
 
-    /// Renders the selected window and records what the rendering had to leave out.
-    fn render_text(&self, input: &ReadFileInput, bytes: &[u8]) -> ToolOutput {
-        if bytes.is_empty() {
-            return ToolOutput::text("The file is empty (0 bytes).");
+    /// Streams text in bounded chunks, retaining only the current line's display prefix.
+    async fn render_text_stream(
+        &self,
+        input: &ReadFileInput,
+        file: &mut tokio::fs::File,
+    ) -> ReadResult<ToolOutput> {
+        const CHUNK_BYTES: usize = 8 * 1024;
+        let requested_start = to_usize(input.offset.unwrap_or(1)).max(1) - 1;
+        let requested_limit =
+            to_usize(input.limit.unwrap_or(self.limits.default_line_limit)).max(1);
+        let requested_end = requested_start.saturating_add(requested_limit);
+        // Do not reserve the configured maximum before a byte has been read.  The builder still
+        // retains at most `max_line_bytes + 4` bytes, but grows only as the source actually proves
+        // it needs them; a hostile or mistaken `usize::MAX` configuration cannot OOM on open.
+        let prefix_capacity = self.limits.max_line_bytes.saturating_add(4);
+        let mut renderer = StreamRenderer::new(&self.limits);
+        let mut line = SourceLineBuilder::new(requested_start == 0, prefix_capacity);
+        let mut buffer = [0_u8; CHUNK_BYTES];
+        let mut total = 0_usize;
+        let mut bytes_seen = 0_usize;
+        let mut bytes_from_window_start = 0_usize;
+        let mut utf8 = Utf8LossyDetector::new();
+
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|error| ReadFileFailure::from_io(&input.path, &error))?;
+            if read == 0 {
+                break;
+            }
+            for byte in &buffer[..read] {
+                utf8.push(*byte);
+                if bytes_seen < 8 * 1024 && *byte == 0 {
+                    return Err(ReadFileFailure::Binary(input.path.clone()));
+                }
+                bytes_seen = bytes_seen.saturating_add(1);
+                if *byte == b'\n' {
+                    let source = line.finish(true);
+                    observe_line(
+                        &source,
+                        total,
+                        requested_start,
+                        requested_end,
+                        &mut bytes_from_window_start,
+                        &mut renderer,
+                    );
+                    total = total.saturating_add(1);
+                    line = SourceLineBuilder::new(
+                        total >= requested_start && total < requested_end,
+                        prefix_capacity,
+                    );
+                } else {
+                    line.push(*byte);
+                }
+            }
         }
 
-        // Lossy rather than refused: a Latin-1 source file is still a source file, and a line
-        // saying which bytes were replaced is a better observation than no read at all.
-        let text = String::from_utf8_lossy(bytes);
-        let lossy = matches!(text, Cow::Owned(_));
-        // `lines` folds CRLF and does not invent a trailing empty line for a file that ends in a
-        // newline, which is the count every other tool reports for the same file.
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
+        if bytes_seen == 0 {
+            return Ok(ToolOutput::text("The file is empty (0 bytes)."));
+        }
+        if line.has_content() {
+            let source = line.finish(false);
+            observe_line(
+                &source,
+                total,
+                requested_start,
+                requested_end,
+                &mut bytes_from_window_start,
+                &mut renderer,
+            );
+            total = total.saturating_add(1);
+        }
 
-        let window = Window::select(
-            total,
-            input.offset,
-            input.limit,
-            self.limits.default_line_limit,
-        );
+        let window = Window {
+            start: requested_start.min(total),
+            end: requested_end.min(total),
+        };
         if window.is_empty() {
             // The offset the model sent, not the clamped one it turned into: told "no lines at
             // offset 3" after asking for 9, the model has to work out which of the two numbers is
             // its own.
-            return ToolOutput::text(format!(
+            return Ok(ToolOutput::text(format!(
                 "No lines at offset {}; the file has {total} lines.",
                 input.offset.unwrap_or(1)
             ))
             .with_metadata(
                 ObservationMetadata::new()
                     .with_guidance(format!("Read again with an offset between 1 and {total}.")),
-            );
+            ));
         }
 
-        let selected = &lines[window.start..window.end];
-        let rendered = render_lines(selected, window.start + 1, &self.limits);
+        let (rendering, rendered_lossy) = renderer.finish();
+        Ok(self.finish_text_output(
+            input,
+            total,
+            &window,
+            bytes_from_window_start,
+            rendering,
+            rendered_lossy || utf8.finish(),
+        ))
+    }
+
+    /// Attaches raw-source truncation facts after the streaming pass knows the file's total size.
+    fn finish_text_output(
+        &self,
+        input: &ReadFileInput,
+        total: usize,
+        window: &Window,
+        bytes_from_window_start: usize,
+        rendering: RenderedLines,
+        lossy: bool,
+    ) -> ToolOutput {
         let mut metadata = ObservationMetadata::new();
 
         // A window the *model* chose is not a truncation: it asked for those lines and got them.
@@ -362,22 +543,22 @@ impl ReadFileTool {
         if window.end < total && input.limit.is_none() {
             metadata = metadata.with_truncation(Truncation::new(
                 TruncationStage::Tool,
-                as_u64(content_bytes(&lines[window.start..])),
-                as_u64(rendered.window_bytes),
+                as_u64(bytes_from_window_start),
+                as_u64(rendering.window_bytes),
             ));
         }
         // The ceiling and the long-line cut are one truncation, not two: both are this tool
         // declining to render bytes it had already selected, and both mean the same thing to the
         // model. Keeping them apart would only make the rendered note longer.
-        if rendered.hit_ceiling || rendered.long_lines > 0 {
+        if rendering.hit_ceiling || rendering.long_lines > 0 {
             metadata = metadata.with_truncation(Truncation::new(
                 TruncationStage::Tool,
-                as_u64(rendered.window_bytes),
-                as_u64(rendered.emitted_bytes),
+                as_u64(rendering.window_bytes),
+                as_u64(rendering.emitted_bytes),
             ));
         }
 
-        let shown_end = window.start + rendered.emitted_lines;
+        let shown_end = window.start + rendering.emitted_lines;
         if shown_end < total {
             metadata = metadata.with_guidance(format!(
                 "Showing lines {}-{shown_end} of {total}; continue from offset {}.",
@@ -385,13 +566,13 @@ impl ReadFileTool {
                 shown_end.saturating_add(1)
             ));
         }
-        if rendered.long_lines > 0 {
+        if rendering.long_lines > 0 {
             metadata = metadata.with_guidance(format!(
                 "{} line(s) over {} bytes were cut to fit.",
-                rendered.long_lines, self.limits.max_line_bytes
+                rendering.long_lines, self.limits.max_line_bytes
             ));
         }
-        if rendered.hit_ceiling {
+        if rendering.hit_ceiling {
             metadata = metadata.with_guidance(format!(
                 "Output stopped at the {} byte ceiling; narrow the range with offset and limit.",
                 self.limits.max_output_bytes
@@ -402,7 +583,7 @@ impl ReadFileTool {
                 .with_guidance("The file is not valid UTF-8; undecodable bytes were replaced.");
         }
 
-        ToolOutput::text(rendered.body).with_metadata(metadata)
+        ToolOutput::text(rendering.body).with_metadata(metadata)
     }
 }
 
@@ -459,6 +640,20 @@ impl Tool for ReadFileTool {
 
 type ReadResult<T> = std::result::Result<T, ReadFileFailure>;
 
+/// A normalized path whose access policy is already selected.
+enum ResolvedPath {
+    Ambient(PathBuf),
+    Rooted(PathBuf),
+}
+
+impl ResolvedPath {
+    fn as_path(&self) -> &Path {
+        match self {
+            Self::Ambient(path) | Self::Rooted(path) => path,
+        }
+    }
+}
+
 /// Why a read could not happen at all.
 ///
 /// It travels in an [`Error`]'s source rather than in its message so the model-facing sentence is
@@ -473,6 +668,8 @@ enum ReadFileFailure {
     NotAFile(String),
     /// Outside the configured workspace root.
     OutsideRoot(String),
+    /// Spelled with `..`, which this tool refuses to resolve on the model's behalf.
+    AmbiguousParent(String),
     /// It exists and could not be opened.
     Unreadable(String, std::io::ErrorKind),
     /// Not text, and not a media type a model can be handed.
@@ -501,6 +698,7 @@ impl ReadFileFailure {
             | Self::NotFound(_)
             | Self::NotAFile(_)
             | Self::OutsideRoot(_)
+            | Self::AmbiguousParent(_)
             | Self::Binary(_) => ToolErrorKind::InvalidInput,
             Self::Unreadable(..) | Self::TooLarge { .. } => ToolErrorKind::ExecutionFailed,
         }
@@ -522,6 +720,7 @@ impl ReadFileFailure {
             Self::NotFound(_) | Self::OutsideRoot(_) => {
                 "Check the path, or search for the file before reading it."
             }
+            Self::AmbiguousParent(_) => "Send the path without `..`.",
             Self::NotAFile(_) => "List its entries instead of reading it.",
             Self::Unreadable(..) => "Read something else, or ask the user to grant access.",
             Self::Binary(_) => "read_file returns text, images, and PDFs only.",
@@ -539,6 +738,9 @@ impl fmt::Display for ReadFileFailure {
             Self::NotFound(path) => write!(f, "No such file: `{path}`."),
             Self::NotAFile(path) => write!(f, "`{path}` is not a regular file."),
             Self::OutsideRoot(path) => write!(f, "`{path}` is outside the workspace."),
+            Self::AmbiguousParent(path) => {
+                write!(f, "`{path}` uses `..`, which this tool does not resolve.")
+            }
             Self::Unreadable(path, kind) => write!(f, "`{path}` cannot be read: {kind}."),
             Self::Binary(path) => write!(f, "`{path}` is binary, not text."),
             Self::TooLarge {
@@ -590,17 +792,6 @@ struct Window {
 }
 
 impl Window {
-    fn select(total: usize, offset: Option<u32>, limit: Option<u32>, default_limit: u32) -> Self {
-        // A 0 offset and a 0 limit are clamped rather than refused. The schema says 1-based, and
-        // spending a turn to say "you sent 0" buys nothing that clamping does not.
-        let start = (to_usize(offset.unwrap_or(1)).max(1) - 1).min(total);
-        let limit = to_usize(limit.unwrap_or(default_limit)).max(1);
-        Self {
-            start,
-            end: start.saturating_add(limit).min(total),
-        }
-    }
-
     const fn is_empty(&self) -> bool {
         self.start >= self.end
     }
@@ -619,83 +810,229 @@ struct RenderedLines {
     hit_ceiling: bool,
 }
 
-fn render_lines(lines: &[&str], first_number: usize, limits: &ReadFileLimits) -> RenderedLines {
-    let mut rendered = RenderedLines {
-        body: String::new(),
-        window_bytes: 0,
-        emitted_bytes: 0,
-        emitted_lines: 0,
-        long_lines: 0,
-        hit_ceiling: false,
-    };
-
-    for (index, line) in lines.iter().enumerate() {
-        // Counted even after the ceiling stops emission: the truncation records how much was
-        // there, and stopping the count reports a smaller loss than the one that happened.
-        rendered.window_bytes += line.len() + 1;
-        if rendered.hit_ceiling {
-            continue;
-        }
-        let (shown, cut) = cut_to(line, limits.max_line_bytes);
-        let entry = format!("{:>6}\t{shown}\n", first_number + index);
-        // The first line is emitted whatever it costs: a result whose body is empty says less
-        // than one over budget, and the truncation reports the overrun either way.
-        if !rendered.body.is_empty() && rendered.body.len() + entry.len() > limits.max_output_bytes
-        {
-            rendered.hit_ceiling = true;
-            continue;
-        }
-        rendered.body.push_str(&entry);
-        rendered.emitted_bytes += shown.len() + 1;
-        rendered.emitted_lines += 1;
-        if cut {
-            rendered.long_lines += 1;
-        }
-    }
-
-    rendered
+/// The tiny, bounded state retained for the line currently crossing a stream chunk boundary.
+struct SourceLineBuilder {
+    capture: bool,
+    prefix_capacity: usize,
+    prefix: Vec<u8>,
+    content_bytes: usize,
+    last_byte: Option<u8>,
 }
 
-/// Cuts to at most `max` bytes, on a character boundary.
-fn cut_to(line: &str, max: usize) -> (&str, bool) {
-    if line.len() <= max {
-        return (line, false);
+impl SourceLineBuilder {
+    fn new(capture: bool, prefix_capacity: usize) -> Self {
+        Self {
+            capture,
+            prefix_capacity,
+            prefix: Vec::with_capacity(prefix_capacity.min(8 * 1024)),
+            content_bytes: 0,
+            last_byte: None,
+        }
     }
-    let mut end = max;
-    while end > 0 && !line.is_char_boundary(end) {
+
+    fn push(&mut self, byte: u8) {
+        self.content_bytes = self.content_bytes.saturating_add(1);
+        self.last_byte = Some(byte);
+        if self.capture && self.prefix.len() < self.prefix_capacity {
+            self.prefix.push(byte);
+        }
+    }
+
+    const fn has_content(&self) -> bool {
+        self.content_bytes > 0
+    }
+
+    fn finish(self, has_newline: bool) -> SourceLine {
+        let crlf = has_newline && self.last_byte == Some(b'\r');
+        SourceLine {
+            raw_bytes: self.content_bytes.saturating_add(usize::from(has_newline)),
+            content_bytes: self.content_bytes.saturating_sub(usize::from(crlf)),
+            prefix: self.prefix,
+        }
+    }
+}
+
+/// One physical source line, with byte counts kept separately from the lossy display string.
+struct SourceLine {
+    /// Original source bytes for this line, including its actual LF/CRLF delimiter when present.
+    raw_bytes: usize,
+    /// Source bytes available as visible content after stripping the CR in a CRLF delimiter.
+    content_bytes: usize,
+    /// At most `max_line_bytes + 4` initial content bytes, enough to cut at a UTF-8 boundary.
+    prefix: Vec<u8>,
+}
+
+/// Constant-space UTF-8 validator used for metadata about bytes outside the selected window.
+///
+/// Rendering uses `from_utf8_lossy` for the shown prefix; this detector preserves the previous
+/// whole-file guidance without ever materializing the whole file.  `pending` holds only an
+/// incomplete scalar (at most three bytes) between stream chunks.
+struct Utf8LossyDetector {
+    pending: Vec<u8>,
+    lossy: bool,
+}
+
+impl Utf8LossyDetector {
+    const fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            lossy: false,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.pending.push(byte);
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(_) => {
+                    self.pending.clear();
+                    return;
+                }
+                Err(error) => match error.error_len() {
+                    Some(invalid_bytes) => {
+                        self.lossy = true;
+                        let consumed = error.valid_up_to().saturating_add(invalid_bytes);
+                        self.pending.drain(..consumed);
+                        if self.pending.is_empty() {
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+            }
+        }
+    }
+
+    fn finish(self) -> bool {
+        self.lossy || !self.pending.is_empty()
+    }
+}
+
+/// Incremental renderer for a selected stream window.
+struct StreamRenderer<'a> {
+    limits: &'a ReadFileLimits,
+    rendered: RenderedLines,
+    lossy: bool,
+}
+
+impl<'a> StreamRenderer<'a> {
+    fn new(limits: &'a ReadFileLimits) -> Self {
+        Self {
+            limits,
+            rendered: RenderedLines {
+                body: String::new(),
+                window_bytes: 0,
+                emitted_bytes: 0,
+                emitted_lines: 0,
+                long_lines: 0,
+                hit_ceiling: false,
+            },
+            lossy: false,
+        }
+    }
+
+    fn push(&mut self, line: &SourceLine, number: usize) {
+        // Counted even after the ceiling stops emission: a truncation has to describe all source
+        // bytes selected by the window, not only the prefix that happened to fit.
+        self.rendered.window_bytes = self.rendered.window_bytes.saturating_add(line.raw_bytes);
+        if self.rendered.hit_ceiling {
+            return;
+        }
+
+        let cut = line.content_bytes > self.limits.max_line_bytes;
+        let shown_bytes = if cut {
+            cut_raw_to_utf8_boundary(&line.prefix, self.limits.max_line_bytes)
+        } else {
+            line.content_bytes
+        };
+        // A complete short line always fits in the prefix.  For a long line, the prefix includes
+        // four look-ahead bytes, so the boundary search above never needs the rest of the file.
+        let shown = String::from_utf8_lossy(&line.prefix[..shown_bytes.min(line.prefix.len())]);
+        self.lossy |= matches!(shown, Cow::Owned(_));
+        let entry = format!("{number:>6}\t{shown}\n");
+        // The first line is emitted whatever it costs: a result whose body is empty says less
+        // than one over budget, and the truncation records the overrun either way.
+        if !self.rendered.body.is_empty()
+            && self.rendered.body.len().saturating_add(entry.len()) > self.limits.max_output_bytes
+        {
+            self.rendered.hit_ceiling = true;
+            return;
+        }
+        self.rendered.body.push_str(&entry);
+        // Retained bytes are source bytes, never the normalized display newline.  A cut line has
+        // not retained its original delimiter; an uncut CRLF line has retained both delimiter
+        // bytes even though its display projection uses one LF.
+        self.rendered.emitted_bytes = self.rendered.emitted_bytes.saturating_add(if cut {
+            shown_bytes
+        } else {
+            line.raw_bytes
+        });
+        self.rendered.emitted_lines = self.rendered.emitted_lines.saturating_add(1);
+        if cut {
+            self.rendered.long_lines = self.rendered.long_lines.saturating_add(1);
+        }
+    }
+
+    fn finish(self) -> (RenderedLines, bool) {
+        (self.rendered, self.lossy)
+    }
+}
+
+/// Feeds one complete source line into accounting and, when selected, rendering.
+fn observe_line(
+    line: &SourceLine,
+    index: usize,
+    start: usize,
+    end: usize,
+    bytes_from_window_start: &mut usize,
+    renderer: &mut StreamRenderer<'_>,
+) {
+    if index >= start {
+        *bytes_from_window_start = bytes_from_window_start.saturating_add(line.raw_bytes);
+    }
+    if index >= start && index < end {
+        renderer.push(line, index.saturating_add(1));
+    }
+}
+
+/// Returns a raw-byte cutoff that never splits a valid UTF-8 scalar.
+fn cut_raw_to_utf8_boundary(bytes: &[u8], max: usize) -> usize {
+    let mut end = bytes.len().min(max);
+    while end > 0 && !is_utf8_boundary(bytes, end) {
         end -= 1;
     }
-    (&line[..end], true)
+    end
 }
 
-fn content_bytes(lines: &[&str]) -> usize {
-    lines.iter().map(|line| line.len() + 1).sum()
-}
-
-/// A NUL byte in the first block is the test `git` uses to call a file binary.
-fn is_binary(bytes: &[u8]) -> bool {
-    const SNIFF: usize = 8 * 1024;
-    bytes[..bytes.len().min(SNIFF)].contains(&0)
-}
-
-/// Resolves `.` and `..` without touching the filesystem.
-///
-/// Done before the boundary check so `../../etc/passwd` is refused rather than followed, and
-/// before canonicalization so a path that does not exist is still refused for the right reason.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(Component::ParentDir);
-                }
-            }
-            other => normalized.push(other),
-        }
+fn is_utf8_boundary(bytes: &[u8], end: usize) -> bool {
+    if end == 0 || end == bytes.len() {
+        return true;
     }
-    normalized
+    let mut start = end;
+    while start > 0 && is_utf8_continuation(bytes[start - 1]) {
+        start -= 1;
+    }
+    if start == end {
+        return utf8_width(bytes[end - 1]).is_none_or(|width| width == 1);
+    }
+    if start == 0 {
+        return true;
+    }
+    utf8_width(bytes[start - 1]).is_none_or(|width| end - (start - 1) >= width)
+}
+
+const fn is_utf8_continuation(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
+}
+
+const fn utf8_width(byte: u8) -> Option<usize> {
+    match byte {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
 }
 
 fn to_usize(value: u32) -> usize {

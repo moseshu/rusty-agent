@@ -541,6 +541,22 @@ async fn 上限为零当场拒绝而不是当成不限() {
 }
 
 #[tokio::test]
+async fn 工具并发上限为零在模型调用前拒绝() {
+    let model = ScriptedModel::new(Vec::new());
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(
+        request(Vec::new(), &model, &cancel)
+            .with_config(RunConfig::new().with_max_function_tool_concurrency(0)),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("max_function_tool_concurrency"));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn 待审批停下来是一种结局而不是一个错误() {
     let gated = Arc::new(
         ScriptedTool::new("write_file")

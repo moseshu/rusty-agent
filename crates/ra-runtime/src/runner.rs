@@ -53,6 +53,7 @@ use crate::{
     agent::AgentBinding,
     turn::{
         TurnSettlementRequest,
+        batch::DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
         prepare::{TurnPreparationRequest, prepare_turn},
         settle_turn,
     },
@@ -74,6 +75,7 @@ pub const DEFAULT_MAX_TURNS: u32 = 32;
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     max_turns: u32,
+    max_function_tool_concurrency: usize,
     model: Option<String>,
     model_settings: ModelSettings,
     tracing: ModelTracing,
@@ -90,6 +92,7 @@ impl RunConfig {
     pub fn new() -> Self {
         Self {
             max_turns: DEFAULT_MAX_TURNS,
+            max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             model: None,
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
@@ -100,6 +103,16 @@ impl RunConfig {
     /// "unlimited".
     pub const fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    /// Sets the maximum number of function-tool dispatch chains one turn may run at once.
+    ///
+    /// This caps the whole dispatch chain, rather than only a particular tool implementation, so
+    /// a model response cannot exhaust file descriptors, child-process slots, or MCP connections
+    /// by naming an unbounded number of `Parallel` tools. Zero is rejected when the run starts.
+    pub const fn with_max_function_tool_concurrency(mut self, max: usize) -> Self {
+        self.max_function_tool_concurrency = max;
         self
     }
 
@@ -125,6 +138,12 @@ impl RunConfig {
     #[must_use]
     pub const fn max_turns(&self) -> u32 {
         self.max_turns
+    }
+
+    /// The per-turn function-tool dispatch cap.
+    #[must_use]
+    pub const fn max_function_tool_concurrency(&self) -> usize {
+        self.max_function_tool_concurrency
     }
 }
 
@@ -257,12 +276,7 @@ async fn run_loop(
         work_state,
     } = request;
 
-    if config.max_turns == 0 {
-        return Err(Error::config(
-            "`max_turns` must be at least 1; a run that may not take a turn cannot produce \
-             anything, and zero is too easy to reach by arithmetic on a caller's own budget",
-        ));
-    }
+    validate_config(&config)?;
 
     let mut generated: Vec<RunItem> = Vec::new();
     let mut model_responses: Vec<ModelResponse> = Vec::new();
@@ -327,6 +341,8 @@ async fn run_loop(
         if let Some(work_state) = &work_state {
             settlement = settlement.with_work_state(work_state);
         }
+        settlement =
+            settlement.with_max_function_tool_concurrency(config.max_function_tool_concurrency);
         let settled = settle_turn(settlement).await?;
 
         model_responses.push(response);
@@ -366,6 +382,22 @@ async fn run_loop(
     );
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)
+}
+
+fn validate_config(config: &RunConfig) -> Result<()> {
+    if config.max_turns == 0 {
+        return Err(Error::config(
+            "`max_turns` must be at least 1; a run that may not take a turn cannot produce \
+             anything, and zero is too easy to reach by arithmetic on a caller's own budget",
+        ));
+    }
+    if config.max_function_tool_concurrency == 0 {
+        return Err(Error::config(
+            "`max_function_tool_concurrency` must be at least 1; zero would permanently queue \
+             every tool call",
+        ));
+    }
+    Ok(())
 }
 
 /// Builds the next call's input: what was asked, then everything produced since.

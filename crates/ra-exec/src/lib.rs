@@ -10,6 +10,7 @@
 //! manifest fields are `Evolving` (platform backends will be added).
 
 pub mod command;
+pub mod fs;
 pub mod job;
 pub mod output;
 pub mod pty;

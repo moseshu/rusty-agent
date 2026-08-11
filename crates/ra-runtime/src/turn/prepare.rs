@@ -96,7 +96,7 @@ impl<'a> TurnPreparationRequest<'a> {
 /// Fully prepared model call plus the executable bindings for turn settlement.
 ///
 /// [`ModelRequest`] contains model-facing tool projections. [`TurnActionSurface`] retains the
-/// corresponding executable objects; the two are produced from the same enabled-tool snapshot.
+/// corresponding executable objects; the two are produced from the same advertised-tool snapshot.
 #[non_exhaustive]
 pub struct PreparedTurn {
     selector: ModelSelector,
@@ -286,14 +286,17 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
 
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
     let tools = resolve_enabled_tools(agent, request.tool_context, request.cancel).await?;
-    let tool_definitions: Vec<ModelToolDefinition> =
-        tools.iter().map(|tool| tool.model_definition()).collect();
+    let tool_definitions: Vec<ModelToolDefinition> = tools
+        .advertised
+        .iter()
+        .map(|tool| tool.model_definition())
+        .collect();
 
     // 2. Resolve enabled handoffs after tools. R17 owns the concrete handoff contract. Sealing the
     // two into one surface here — not lazily at settlement — is what makes an ambiguous surface
     // fail before the model call is paid for instead of after it.
     let handoffs = resolve_handoffs(agent);
-    let surface = TurnActionSurface::new(tools, handoffs)?;
+    let surface = TurnActionSurface::new(tools.advertised, handoffs)?;
 
     // 3. Resolve structured output after handoffs. R1-16 owns the output parser contract.
     let output_schema = resolve_output_schema(agent);
@@ -344,11 +347,15 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     })
 }
 
+struct EnabledTools {
+    advertised: Vec<Arc<dyn Tool>>,
+}
+
 async fn resolve_enabled_tools(
     agent: &AgentSpec,
     context: &dyn ToolRuntimeContext,
     cancel: &CancelScope,
-) -> Result<Vec<Arc<dyn Tool>>> {
+) -> Result<EnabledTools> {
     let decisions = cancel
         .run(try_join_all(agent.tools().iter().map(|tool| async move {
             match tool.options().availability() {
@@ -363,13 +370,30 @@ async fn resolve_enabled_tools(
         })))
         .await??;
 
-    Ok(agent
-        .tools()
-        .iter()
-        .zip(decisions)
-        .filter(|(_, enabled)| *enabled)
-        .map(|(tool, _)| Arc::clone(tool))
-        .collect())
+    let mut advertised = Vec::new();
+    for (tool, enabled) in agent.tools().iter().zip(decisions) {
+        if !enabled {
+            continue;
+        }
+        if tool.options().is_advertised() {
+            advertised.push(Arc::clone(tool));
+        } else if tool.options().is_discoverable() {
+            // `ToolExposure::Deferred` is a promise that a model-visible `tool_search` call can
+            // find the tool and promote it into a subsequent turn's advertised snapshot.  R2-5c
+            // has not installed that state machine yet.  Treating the tool as merely omitted is
+            // worse than rejecting it: it makes an enabled capability silently unreachable and
+            // still lets the rest of the run look successful.
+            return Err(Error::config(format!(
+                "tool `{}` uses Deferred exposure, but deferred discovery (R2-5c) is not \
+                 implemented; use Advertised or Hidden",
+                tool.origin().qualified_name()
+            )));
+        }
+        // Hidden tools remain registered for host/programmatic dispatch but are deliberately
+        // absent from every model-owned surface.
+    }
+
+    Ok(EnabledTools { advertised })
 }
 
 fn resolve_handoffs(_agent: &AgentSpec) -> Vec<ModelHandoffDefinition> {

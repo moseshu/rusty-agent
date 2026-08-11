@@ -1,5 +1,7 @@
 //! R2-8 `read_file`: one multimodal read entry, plus the window and ceiling facts it reports.
 
+use std::io::Write as _;
+
 use ra_core::{
     item::CallId,
     tool::{Tool, ToolConcurrency, ToolInvocation, ToolOutput, ToolOutputBlock, TruncationStage},
@@ -183,7 +185,9 @@ async fn 超长行按字符边界切开不会切碎多字节字符() {
     assert_eq!(truncations.len(), 1);
     assert_eq!(truncations[0].stage(), TruncationStage::Tool);
     assert_eq!(truncations[0].original_bytes(), 25);
-    assert_eq!(truncations[0].retained_bytes(), 13);
+    // The cut first line did not retain the source LF.  The display adds one for readability, but
+    // truncation metadata is source-byte accounting rather than rendered-string accounting.
+    assert_eq!(truncations[0].retained_bytes(), 12);
     assert_eq!(
         output.metadata().guidance(),
         ["1 line(s) over 7 bytes were cut to fit."]
@@ -232,7 +236,77 @@ async fn 两次截断按顺序累加而不是互相抹掉() {
     assert_eq!(truncations[0].original_bytes(), 27);
     assert_eq!(truncations[0].retained_bytes(), 18);
     assert_eq!(truncations[1].original_bytes(), 18);
-    assert_eq!(truncations[1].retained_bytes(), 10);
+    assert_eq!(truncations[1].retained_bytes(), 8);
+}
+
+#[tokio::test]
+async fn 截断统计保留原始_crlf和最后一行无换行的字节数() {
+    let dir = workspace("windows.txt", b"a\r\nb\r\nc");
+    let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_default_line_limit(1));
+
+    let output = read(&tool, &json!({ "path": "windows.txt" }))
+        .await
+        .expect("a readable CRLF file");
+
+    assert_eq!(body(&output), "     1\ta\n");
+    let truncation = &output.metadata().truncations()[0];
+    // `a\r\n` is three source bytes, and the unshown `b\r\nc` is four more.  Counting display
+    // lines as `line.len() + 1` would incorrectly report five and invent a final newline.
+    assert_eq!(truncation.original_bytes(), 7);
+    assert_eq!(truncation.retained_bytes(), 3);
+}
+
+#[tokio::test]
+async fn 非_utf8_截断仍按原始字节而非替换字符计数() {
+    let dir = workspace("latin.txt", b"caf\xe9\nz\n");
+    let tool = rooted(&dir).with_limits(
+        ReadFileLimits::new()
+            .with_default_line_limit(2)
+            .with_max_line_bytes(3),
+    );
+
+    let output = read(&tool, &json!({ "path": "latin.txt" }))
+        .await
+        .expect("a Latin-1 source file is still readable");
+
+    assert_eq!(body(&output), "     1\tcaf\n     2\tz\n");
+    let truncation = &output.metadata().truncations()[0];
+    assert_eq!(truncation.original_bytes(), 7);
+    // `\xe9` was omitted; its U+FFFD display form must not turn that one source byte into three.
+    assert_eq!(truncation.retained_bytes(), 5);
+}
+
+#[tokio::test]
+async fn 跨多个块的超长文本行只保留受限的显示前缀() {
+    let dir = tempfile::tempdir().expect("a temporary workspace");
+    let mut file = std::fs::File::create(dir.path().join("large.txt")).expect("fixture opens");
+    for _ in 0..256 {
+        file.write_all(&[b'a'; 8 * 1024])
+            .expect("fixture chunk writes");
+    }
+    file.write_all(b"\nb\n").expect("fixture tail writes");
+
+    let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_max_line_bytes(4));
+    let output = read(&tool, &json!({ "path": "large.txt" }))
+        .await
+        .expect("the line is streamed rather than read wholesale");
+
+    assert_eq!(body(&output), "     1\taaaa\n     2\tb\n");
+    let truncation = &output.metadata().truncations()[0];
+    assert_eq!(truncation.original_bytes(), (256 * 8 * 1024 + 3) as u64);
+    assert_eq!(truncation.retained_bytes(), 6);
+}
+
+#[tokio::test]
+async fn 极大行上限不会在打开小文件时巨型预分配() {
+    let dir = workspace("small.txt", "ok\n");
+    let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_max_line_bytes(usize::MAX));
+
+    let output = read(&tool, &json!({ "path": "small.txt" }))
+        .await
+        .expect("a huge configured limit must not reserve huge memory before reading");
+
+    assert_eq!(body(&output), "     1\tok\n");
 }
 
 #[tokio::test]
@@ -247,6 +321,24 @@ async fn 非_utf8_的文件照读并说明哪些字节被替换了() {
         output.metadata().guidance(),
         ["The file is not valid UTF-8; undecodable bytes were replaced."]
     );
+}
+
+#[tokio::test]
+async fn 未选中的非_utf8_行也保留解码提示() {
+    let dir = workspace("latin.txt", b"ok\n\xe9\n");
+    let output = read(
+        &rooted(&dir),
+        &json!({ "path": "latin.txt", "offset": 1, "limit": 1 }),
+    )
+    .await
+    .expect("a Latin-1 source file is still readable");
+
+    assert_eq!(body(&output), "     1\tok\n");
+    assert!(output
+        .metadata()
+        .guidance()
+        .iter()
+        .any(|guidance| guidance == "The file is not valid UTF-8; undecodable bytes were replaced."));
 }
 
 #[tokio::test]
@@ -321,13 +413,92 @@ async fn 工作区之外的路径在碰硬盘之前就被拒绝() {
 
     // One path that exists on this host and one that does not, answered identically: the boundary
     // is decided lexically, before anything is opened, so the refusal cannot leak which is which.
-    for escape in ["/etc/passwd", "../../nowhere/at/all"] {
+    for escape in ["/etc/passwd", "/nowhere/at/all"] {
         let output = observe(&rooted(&dir), &json!({ "path": escape })).await;
         assert_eq!(
             body(&output),
             format!("`{escape}` is outside the workspace.")
         );
     }
+}
+
+#[tokio::test]
+async fn 带_parent_的路径拒得和越界不一样因为它常常并没有越界() {
+    let dir = workspace("hello.txt", "alpha\n");
+    std::fs::create_dir(dir.path().join("nested")).expect("a nested directory");
+
+    // The first climbs out of the workspace and the second does not — and the answer is the same
+    // for both, because the reason is the spelling rather than where it happens to land. Saying
+    // "outside the workspace" for the second would be false, and would send the model looking for
+    // a boundary problem instead of doing the one thing that fixes it.
+    for requested in ["../../nowhere/at/all", "nested/../hello.txt"] {
+        let output = observe(&rooted(&dir), &json!({ "path": requested })).await;
+        assert_eq!(
+            body(&output),
+            format!("`{requested}` uses `..`, which this tool does not resolve.")
+        );
+        assert_eq!(output.metadata().guidance(), ["Send the path without `..`."]);
+    }
+}
+
+#[tokio::test]
+async fn 工作区内的绝对路径按相对路径一样读() {
+    let dir = workspace("hello.txt", "alpha\n");
+    let tool = rooted(&dir);
+    // The canonical root, not `dir.path()`: on a host where the temporary directory is itself
+    // reached through an alias, the two spell the same directory differently and only the
+    // canonical one is what the boundary compares against.
+    let absolute = tool
+        .root()
+        .expect("a rooted tool knows its root")
+        .join("hello.txt");
+
+    let output = read(
+        &tool,
+        &json!({ "path": absolute.to_str().expect("a UTF-8 fixture path") }),
+    )
+    .await
+    .expect("an absolute path inside the workspace is the same request written another way");
+
+    assert_eq!(body(&output), "     1\talpha\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn 工作区内的符号链接照读() {
+    let dir = workspace("hello.txt", "alpha\n");
+    std::fs::create_dir(dir.path().join("nested")).expect("a nested directory");
+    // Relative, which is what a repository stores. An absolute target is refused even when it
+    // points back inside, because an absolute path means nothing relative to a directory handle.
+    std::os::unix::fs::symlink("../hello.txt", dir.path().join("nested/link"))
+        .expect("a symlink inside the workspace");
+
+    let output = read(&rooted(&dir), &json!({ "path": "nested/link" }))
+        .await
+        .expect("a workspace whose paths are symlinked is an ordinary workspace");
+
+    assert_eq!(body(&output), "     1\talpha\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn 含符号链接与_parent_的_rooted_路径明确拒绝而不静默改写() {
+    let dir = workspace("hello.txt", "alpha\n");
+    std::fs::create_dir(dir.path().join("nested")).expect("a nested directory");
+    std::os::unix::fs::symlink("../somewhere", dir.path().join("nested/link"))
+        .expect("a relative link");
+    let requested = "nested/link/../hello.txt";
+
+    let output = observe(&rooted(&dir), &json!({ "path": requested })).await;
+
+    // POSIX resolves `..` after following a symlink, while lexical normalization would first turn
+    // this into `nested/hello.txt`.  The capability boundary deliberately refuses this ambiguous
+    // spelling rather than choosing a different workspace file on the model's behalf — and it says
+    // so, because `nested/hello.txt` would have been a perfectly ordinary read.
+    assert_eq!(
+        body(&output),
+        format!("`{requested}` uses `..`, which this tool does not resolve.")
+    );
 }
 
 #[cfg(unix)]
@@ -341,6 +512,27 @@ async fn 符号链接指到工作区外一样拦得住() {
         .expect("a symlink out of the workspace");
 
     let output = observe(&rooted(&dir), &json!({ "path": "link" })).await;
+
+    assert_eq!(body(&output), "`link` is outside the workspace.");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn 相对符号链接爬出工作区一样拦得住() {
+    let parent = tempfile::tempdir().expect("a directory containing both fixtures");
+    let root = parent.path().join("workspace");
+    let secret = parent.path().join("secret");
+    std::fs::create_dir(&root).expect("the workspace");
+    std::fs::create_dir(&secret).expect("the outside directory");
+    std::fs::write(secret.join("id_rsa"), "PRIVATE KEY").expect("the secret");
+    std::os::unix::fs::symlink("../secret/id_rsa", root.join("link"))
+        .expect("a relative link that escapes the workspace");
+
+    let output = observe(
+        &ReadFileTool::rooted(&root).expect("a rooted tool"),
+        &json!({ "path": "link" }),
+    )
+    .await;
 
     assert_eq!(body(&output), "`link` is outside the workspace.");
 }

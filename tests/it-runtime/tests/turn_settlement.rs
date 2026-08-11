@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -22,8 +22,9 @@ use ra_core::{
     state::ToolUseTracker,
     step::NextStep,
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolFailureHandling, ToolInvocation, ToolOptions,
-        ToolOrigin, ToolOutput, ToolRuntimeContext, ToolSchema, ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolFailureHandling,
+        ToolInvocation, ToolOptions, ToolOrigin, ToolOutput, ToolRuntimeContext, ToolSchema,
+        ToolTimeoutBehavior,
     },
 };
 use ra_runtime::{
@@ -122,6 +123,75 @@ impl Tool for ScriptedTool {
     }
 }
 
+/// A tool that cannot finish until the test releases the whole batch.
+///
+/// It makes scheduler overlap observable without depending on elapsed wall-clock time, which is
+/// noisy under CI.  If the second parallel call were not polled, its `entered` counter could never
+/// reach one while the first is waiting for release.
+struct GatedTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    concurrency: ToolConcurrency,
+    entered: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
+    completed: Arc<AtomicUsize>,
+    output: &'static str,
+}
+
+impl GatedTool {
+    fn new(
+        name: &str,
+        concurrency: ToolConcurrency,
+        entered: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+        completed: Arc<AtomicUsize>,
+        output: &'static str,
+    ) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            concurrency,
+            entered,
+            release,
+            completed,
+            output,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GatedTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_concurrency(self.concurrency)
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::text(self.output))
+    }
+}
+
 struct Host;
 
 /// The binding every settlement here runs under. Nothing prepared an execution instance, so the
@@ -185,6 +255,16 @@ fn stored_text(output: &ra_core::item::ToolCallOutput) -> Option<String> {
         .ok()?
         .as_text()
         .map(str::to_owned)
+}
+
+async fn wait_for_count(counter: &AtomicUsize, count: usize) {
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while counter.load(Ordering::SeqCst) < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("counter did not reach {count}"));
 }
 
 #[tokio::test]
@@ -257,6 +337,178 @@ async fn 工具跑完后回到模型_输出按_call_id_配对() {
     let output = output_for(settled.new_step_items(), "call-1");
     assert!(!output.is_error());
     assert_eq!(stored_text(&output), Some("written".to_owned()));
+}
+
+#[tokio::test]
+async fn parallel_工具在同一批次重叠且输出仍按模型顺序记录() {
+    let release = Arc::new(AtomicBool::new(false));
+    let first_entered = Arc::new(AtomicUsize::new(0));
+    let second_entered = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let first: Arc<dyn Tool> = Arc::new(GatedTool::new(
+        "first_read",
+        ToolConcurrency::Parallel,
+        Arc::clone(&first_entered),
+        Arc::clone(&release),
+        Arc::clone(&completed),
+        "first",
+    ));
+    let second: Arc<dyn Tool> = Arc::new(GatedTool::new(
+        "second_read",
+        ToolConcurrency::Parallel,
+        Arc::clone(&second_entered),
+        Arc::clone(&release),
+        Arc::clone(&completed),
+        "second",
+    ));
+
+    let task = tokio::spawn(async move {
+        let binding = binding();
+        let surface = surface(vec![first, second]);
+        let response = ModelResponse::new(vec![
+            tool_call("call-item-1", "call-1", "first_read"),
+            tool_call("call-item-2", "call-2", "second_read"),
+        ]);
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        settle_turn(TurnSettlementRequest::new(
+            &binding,
+            &response,
+            &surface,
+            &Host,
+            &cancel,
+            &mut tracker,
+        ))
+        .await
+    });
+
+    wait_for_count(&first_entered, 1).await;
+    wait_for_count(&second_entered, 1).await;
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+
+    let settled = task.await.expect("settlement task joins").unwrap();
+    assert_eq!(completed.load(Ordering::SeqCst), 2);
+    let outputs = settled
+        .new_step_items()
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) => Some(output.call_id().as_str().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outputs, ["call-1", "call-2"]);
+    assert_eq!(stored_text(output_for(settled.new_step_items(), "call-1")), Some("first".to_owned()));
+    assert_eq!(stored_text(output_for(settled.new_step_items(), "call-2")), Some("second".to_owned()));
+}
+
+#[tokio::test]
+async fn 并发上限限制已开始的_parallel_工具数() {
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let tool: Arc<dyn Tool> = Arc::new(GatedTool::new(
+        "read",
+        ToolConcurrency::Parallel,
+        Arc::clone(&entered),
+        Arc::clone(&release),
+        Arc::clone(&completed),
+        "content",
+    ));
+
+    let task = tokio::spawn(async move {
+        let binding = binding();
+        let surface = surface(vec![tool]);
+        let response = ModelResponse::new(vec![
+            tool_call("call-item-1", "call-1", "read"),
+            tool_call("call-item-2", "call-2", "read"),
+            tool_call("call-item-3", "call-3", "read"),
+        ]);
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        settle_turn(
+            TurnSettlementRequest::new(
+                &binding,
+                &response,
+                &surface,
+                &Host,
+                &cancel,
+                &mut tracker,
+            )
+            .with_max_function_tool_concurrency(1),
+        )
+        .await
+    });
+
+    wait_for_count(&entered, 1).await;
+    // The other two futures are scheduled but still waiting for a semaphore permit.  They have
+    // not reached `Tool::call`, so one model response cannot create unbounded active work.
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+
+    task.await
+        .expect("settlement task joins")
+        .expect("all calls settle after permits are released");
+    assert_eq!(entered.load(Ordering::SeqCst), 3);
+    assert_eq!(completed.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn exclusive_工具等待正在运行的_parallel_工具完成() {
+    let release = Arc::new(AtomicBool::new(false));
+    let parallel_entered = Arc::new(AtomicUsize::new(0));
+    let exclusive_entered = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let parallel: Arc<dyn Tool> = Arc::new(GatedTool::new(
+        "read",
+        ToolConcurrency::Parallel,
+        Arc::clone(&parallel_entered),
+        Arc::clone(&release),
+        Arc::clone(&completed),
+        "read",
+    ));
+    let exclusive: Arc<dyn Tool> = Arc::new(GatedTool::new(
+        "patch",
+        ToolConcurrency::Exclusive,
+        Arc::clone(&exclusive_entered),
+        Arc::clone(&release),
+        Arc::clone(&completed),
+        "patch",
+    ));
+
+    let task = tokio::spawn(async move {
+        let binding = binding();
+        let surface = surface(vec![parallel, exclusive]);
+        let response = ModelResponse::new(vec![
+            tool_call("call-item-1", "call-1", "read"),
+            tool_call("call-item-2", "call-2", "patch"),
+        ]);
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        settle_turn(TurnSettlementRequest::new(
+            &binding,
+            &response,
+            &surface,
+            &Host,
+            &cancel,
+            &mut tracker,
+        ))
+        .await
+    });
+
+    wait_for_count(&parallel_entered, 1).await;
+    // The exclusive future has been started, but it cannot enter Tool::call while the read permit
+    // is held by the still-blocked `read` call.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(exclusive_entered.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+
+    task.await
+        .expect("settlement task joins")
+        .expect("both actions settle");
+    assert_eq!(completed.load(Ordering::SeqCst), 2);
+    assert_eq!(exclusive_entered.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

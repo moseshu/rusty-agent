@@ -9,7 +9,9 @@ async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationReques
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::runner::RunConfig::max_function_tool_concurrency(& self) -> usize
 const fn ra_runtime::runner::RunConfig::max_turns(& self) -> u32
+const fn ra_runtime::runner::RunConfig::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::runner::RunConfig::with_max_turns(mut self, max_turns : u32) -> Self
 const fn ra_runtime::runner::RunConfig::with_tracing(mut self, tracing : ModelTracing) -> Self
 const fn ra_runtime::runner::result::RunOutcome::finish_reason(& self) -> Option < FinishReason >
@@ -20,7 +22,9 @@ const fn ra_runtime::runner::result::RunResult::tool_use(& self) -> & ToolUseTra
 const fn ra_runtime::runner::result::RunResult::turns(& self) -> u32
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
+const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
+const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >

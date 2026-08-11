@@ -60,6 +60,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
+cap-std = "4.0.2"
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }

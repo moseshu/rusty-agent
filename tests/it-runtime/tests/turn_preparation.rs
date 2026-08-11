@@ -14,7 +14,7 @@ use ra_core::{
         ModelTracing, ProviderKey, ResolvedModel, ToolChoice,
     },
     tool::{
-        Tool, ToolAvailability, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput,
+        Tool, ToolAvailability, ToolExposure, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput,
         ToolRuntimeContext, ToolSchema,
     },
 };
@@ -125,6 +125,11 @@ impl RecordingTool {
             events,
             dynamic_result,
         }
+    }
+
+    fn with_options(mut self, options: ToolOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
@@ -288,6 +293,96 @@ async fn 动态工具先于模型解析且最终快照同时驱动请求与执�
         settings.metadata().get("run").map(String::as_str),
         Some("yes")
     );
+}
+
+#[tokio::test]
+async fn advertised_与_hidden_工具分别进入或离开模型面() {
+    let event_log = Arc::new(Mutex::new(Vec::new()));
+    let advertised: Arc<dyn Tool> = Arc::new(RecordingTool::new(
+        "advertised",
+        ToolAvailability::Enabled,
+        Arc::clone(&event_log),
+        Ok(true),
+    ));
+    let hidden: Arc<dyn Tool> = Arc::new(
+        RecordingTool::new(
+            "hidden",
+            ToolAvailability::Enabled,
+            Arc::clone(&event_log),
+            Ok(true),
+        )
+        .with_options(ToolOptions::new().with_exposure(ToolExposure::Hidden)),
+    );
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("worker"))
+        .name("Worker")
+        .tools([advertised, hidden])
+        .build()
+        .unwrap();
+    let resolver = RecordingResolver::new(event_log);
+    let context = host();
+    let cancel = CancelScope::root();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+
+    let request_names = prepared
+        .request()
+        .tools()
+        .iter()
+        .map(|tool| tool.name())
+        .collect::<Vec<_>>();
+    let surface_names = prepared
+        .tools()
+        .iter()
+        .map(|tool| tool.origin().name())
+        .collect::<Vec<_>>();
+    assert_eq!(request_names, ["advertised"]);
+    assert_eq!(surface_names, ["advertised"]);
+    assert!(prepared.action_surface().find_tool("hidden").is_none());
+}
+
+#[tokio::test]
+async fn enabled_deferred_工具在_tool_search_落地前明确拒绝() {
+    let event_log = Arc::new(Mutex::new(Vec::new()));
+    let deferred: Arc<dyn Tool> = Arc::new(
+        RecordingTool::new(
+            "deferred",
+            ToolAvailability::Enabled,
+            Arc::clone(&event_log),
+            Ok(true),
+        )
+        .with_options(ToolOptions::new().with_exposure(ToolExposure::Deferred)),
+    );
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("worker"))
+        .name("Worker")
+        .tools([deferred])
+        .build()
+        .unwrap();
+    let resolver = RecordingResolver::new(event_log);
+    let context = host();
+    let cancel = CancelScope::root();
+
+    let error = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        Vec::new(),
+    ))
+    .await
+    .expect_err("deferred tools cannot silently disappear before tool_search exists");
+
+    assert!(error.to_string().contains("Deferred exposure"));
+    assert!(error.to_string().contains("R2-5c"));
 }
 
 #[tokio::test]
