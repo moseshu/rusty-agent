@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::{AgentId, AgentInstructions, AgentSpec},
+    agent::{AgentId, AgentInstructions, AgentSpec, ToolUseBehavior},
     error::Result,
     model::ModelSettings,
     tool::{Tool, ToolInvocation, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema},
@@ -258,4 +258,34 @@ fn debug_不泄漏指令或模型设置中的敏感值() {
 fn shared_spec_满足并发与静态生命周期契约() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<Arc<AgentSpec>>();
+}
+
+#[test]
+fn tool_use_behavior_默认继续模型并在派生时保留() {
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("worker"))
+        .name("Worker")
+        .tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
+        .build()
+        .unwrap();
+    assert!(matches!(
+        agent.tool_use_behavior(),
+        ToolUseBehavior::StopOnFirstTool
+    ));
+
+    let variant = agent.to_builder().name("Worker v2").build().unwrap();
+    assert!(matches!(
+        variant.tool_use_behavior(),
+        ToolUseBehavior::StopOnFirstTool
+    ));
+
+    let default_agent = AgentSpec::builder()
+        .id(AgentId::new("default-worker"))
+        .name("Default Worker")
+        .build()
+        .unwrap();
+    assert!(matches!(
+        default_agent.tool_use_behavior(),
+        ToolUseBehavior::RunLlmAgain
+    ));
 }

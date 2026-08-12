@@ -1,5 +1,6 @@
 # ra-core 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_core::agent::ToolUseBehaviorHandler::should_stop(& self, tool_results : & [ToolUseResult]) -> Result < bool >
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
 async fn ra_core::model::Model::close(& self) -> Result < () >
@@ -12,6 +13,10 @@ async fn ra_core::tool::Tool::needs_approval(& self, _invocation : & ToolInvocat
 const fn ra_core::agent::AgentSpec::id(& self) -> & AgentId
 const fn ra_core::agent::AgentSpec::instructions(& self) -> Option < & AgentInstructions >
 const fn ra_core::agent::AgentSpec::model_settings(& self) -> & ModelSettings
+const fn ra_core::agent::AgentSpec::tool_use_behavior(& self) -> & ToolUseBehavior
+const fn ra_core::agent::ToolUseResult::call_id(& self) -> & CallId
+const fn ra_core::agent::ToolUseResult::output(& self) -> & ToolCallOutput
+const fn ra_core::agent::ToolUseResult::tool(& self) -> & ToolOrigin
 const fn ra_core::cancel::CancelOnDrop::scope(& self) -> & CancelScope
 const fn ra_core::cancel::CancelReason::is_expiry(& self) -> bool
 const fn ra_core::cancel::CancelReason::is_user_initiated(& self) -> bool
@@ -457,6 +462,7 @@ const ra_core::trace::field::USAGE_INPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_OUTPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_REASONING_TOKENS: & str
 const ra_core::usage::USAGE_SCHEMA_VERSION: SchemaVersion
+enum ra_core::agent::ToolUseBehavior
 enum ra_core::cancel::CancelReason
 enum ra_core::cancel::ScopeKind
 enum ra_core::compat::Compatibility
@@ -529,7 +535,11 @@ fn ra_core::agent::AgentSpecBuilder::model_settings(mut self, model_settings : M
 fn ra_core::agent::AgentSpecBuilder::name(mut self, name : impl Into < String >) -> Self
 fn ra_core::agent::AgentSpecBuilder::new() -> Self
 fn ra_core::agent::AgentSpecBuilder::tool(mut self, tool : Arc < dyn Tool >) -> Self
+fn ra_core::agent::AgentSpecBuilder::tool_use_behavior(mut self, tool_use_behavior : ToolUseBehavior) -> Self
 fn ra_core::agent::AgentSpecBuilder::tools(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
+fn ra_core::agent::ToolUseBehavior::custom(handler : Arc < dyn ToolUseBehaviorHandler >) -> Self
+fn ra_core::agent::ToolUseBehavior::stop_at_tools(names : impl IntoIterator < Item = impl Into < String > >) -> Self
+fn ra_core::agent::ToolUseResult::new(tool : ToolOrigin, output : ToolCallOutput) -> Self
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
 fn ra_core::cancel::CancelReason::code(& self) -> & str
 fn ra_core::cancel::CancelReason::custom(label : impl Into < Cow < 'static , str > >) -> Self
@@ -946,6 +956,7 @@ mod ra_core::usage
 struct ra_core::agent::AgentInstructions
 struct ra_core::agent::AgentSpec
 struct ra_core::agent::AgentSpecBuilder
+struct ra_core::agent::ToolUseResult
 struct ra_core::cancel::CancelOnDrop
 struct ra_core::cancel::CancelScope
 struct ra_core::cancel::Deadline
@@ -1037,6 +1048,7 @@ struct ra_core::tool::schema::DecodedToolInput
 struct ra_core::tool::schema::FuncSchema
 struct ra_core::tool::schema::ToolSchema
 struct ra_core::usage::Usage
+trait ra_core::agent::ToolUseBehaviorHandler
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
@@ -1049,6 +1061,10 @@ type ra_core::error::BoxError
 type ra_core::error::Result
 type ra_core::model::ModelStream
 type ra_core::model::settings::JsonMap
+variant ra_core::agent::ToolUseBehavior::Custom(Arc < dyn ToolUseBehaviorHandler >)
+variant ra_core::agent::ToolUseBehavior::RunLlmAgain
+variant ra_core::agent::ToolUseBehavior::StopAtTools { names: BTreeSet < String > }
+variant ra_core::agent::ToolUseBehavior::StopOnFirstTool
 variant ra_core::cancel::CancelReason::Custom(Cow < 'static , str >)
 variant ra_core::cancel::CancelReason::Deadline
 variant ra_core::cancel::CancelReason::PeerFailure

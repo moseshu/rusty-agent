@@ -9,8 +9,9 @@
 //! and anything still owed an answer outranks concluding.
 
 use ra_core::{
-    agent::AgentSpec,
-    error::Result,
+    agent::{AgentSpec, ToolUseBehavior},
+    cancel::CancelScope,
+    error::{Error, Result},
     finish::FinishReason,
     item::{ItemProvenance, RunItem},
     step::{NextStep, ProcessedResponse, resolve_output_phases},
@@ -19,9 +20,11 @@ use ra_core::{
 use super::batch::TurnExecution;
 
 /// Settles one turn into exactly one of the four states.
-pub fn resolve_next_step(
+pub async fn resolve_next_step(
     processed: &ProcessedResponse,
     execution: &TurnExecution,
+    tool_use_behavior: &ToolUseBehavior,
+    cancel: &CancelScope,
 ) -> Result<NextStep> {
     if execution.has_interruptions() {
         return NextStep::interruption(execution.interruptions().to_vec());
@@ -31,8 +34,10 @@ pub fn resolve_next_step(
     // resolving a target to a runnable agent is R17's contract. When R17 lands, this is where the
     // resolved declaration becomes `NextStep::Handoff`.
 
-    if let Some(reason) = check_for_final_output_from_tools(processed, execution) {
-        return Ok(NextStep::FinalOutput { reason });
+    if check_for_final_output_from_tools(execution, tool_use_behavior, cancel).await? {
+        return Ok(NextStep::FinalOutput {
+            reason: FinishReason::ToolStop,
+        });
     }
 
     // Something was owed an answer and now has one — including a call that resolved to nothing,
@@ -50,17 +55,61 @@ pub fn resolve_next_step(
     })
 }
 
-/// R3-5's insertion point for `tool_use_behavior`.
+/// Applies `tool_use_behavior` (R3-5): whether this response's tool results end the run.
 ///
-/// The default behaviour is to run the model again, so this always declines. `StopOnFirstTool`,
-/// `StopAtTools`, and the custom form all answer here, and they answer with a
-/// [`FinishReason::ToolStop`] rather than a boolean so the run result says *why* it stopped without
-/// the host having to reconstruct it.
-const fn check_for_final_output_from_tools(
-    _processed: &ProcessedResponse,
-    _execution: &TurnExecution,
-) -> Option<FinishReason> {
-    None
+/// Only the answer is returned. The [`FinishReason::ToolStop`] that goes with it is written at the
+/// single call site above, because every policy here stops for the same reason — the caller would
+/// only be choosing between one value and itself.
+///
+/// The decision reads [`TurnExecution::tool_results`], not `new_items`: what a policy is allowed to
+/// promote is decided where the batch settles, not by re-inspecting records here.
+///
+/// Whether the policy is one this runtime understands is checked **before** the results are looked
+/// at. [`ToolUseBehavior`] is `#[non_exhaustive]` and lives in another crate, so a catch-all is
+/// mandatory rather than a choice — but a configuration error that surfaced only on the turns where
+/// the model happened to call a tool would be the same defect the entry checkpoint in
+/// [`execute_actions`](super::batch::execute_actions) exists to prevent. That arm is unreachable
+/// from the test workspace for the same `#[non_exhaustive]` reason: no variant outside this list
+/// exists to construct yet.
+async fn check_for_final_output_from_tools(
+    execution: &TurnExecution,
+    tool_use_behavior: &ToolUseBehavior,
+    cancel: &CancelScope,
+) -> Result<bool> {
+    let tool_results = execution.tool_results();
+    match tool_use_behavior {
+        ToolUseBehavior::RunLlmAgain => Ok(false),
+        ToolUseBehavior::StopOnFirstTool => Ok(!tool_results.is_empty()),
+        ToolUseBehavior::StopAtTools { names } => Ok(tool_results.iter().any(|result| {
+            names.contains(result.tool().name()) || names.contains(result.tool().qualified_name())
+        })),
+        ToolUseBehavior::Custom(handler) => {
+            if tool_results.is_empty() {
+                return Ok(false);
+            }
+            // Third-party `async` code, so it is never awaited bare — the cancellation contract's
+            // one rule. A handler that ignored a stop signal would otherwise keep the whole run
+            // alive after the user asked it to stop, with no tool left running to blame. There is
+            // no entry check here because `CancelScope::run` already refuses to start work on an
+            // already-cancelled scope; a second one would only restate its contract.
+            let stop = cancel.run(handler.should_stop(tool_results)).await??;
+
+            // The exit check is not symmetry with that entry check, and it is not optional.
+            // `CancelScope::run` polls the handler *before* it looks at the cancellation, so a
+            // handler that becomes ready in the very wake-up that delivered the interrupt wins the
+            // race and returns normally — the same `select` ordering the batch drain in
+            // `super::batch` relies on, read from the other side. Nothing downstream would catch
+            // it: settlement does no further awaiting and the runner breaks straight out of the
+            // loop on `FinalOutput`. The run would report `FinishReason::ToolStop`, whose
+            // `is_complete()` tells R15 that no closeout is owed and R17-3 to take the success
+            // edge — the run claiming the agent finished on the turn the user stopped it.
+            cancel.ensure_not_cancelled()?;
+            Ok(stop)
+        }
+        _ => Err(Error::config(
+            "this runtime does not support the configured tool-use behavior",
+        )),
+    }
 }
 
 /// Everything this turn generated, in the order it happened: what the model said, then what

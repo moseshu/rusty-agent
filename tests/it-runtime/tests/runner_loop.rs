@@ -1,19 +1,22 @@
 //! R3-7 contracts for the agent loop and its two entry points.
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
-    agent::{AgentId, AgentSpec},
+    agent::{AgentId, AgentSpec, ToolUseBehavior, ToolUseBehaviorHandler, ToolUseResult},
     cancel::{CancelReason, CancelScope},
-    error::{Error, Result},
+    error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
@@ -25,8 +28,8 @@ use ra_core::{
     },
     state::{ToolUse, WorkStateHandle},
     tool::{
-        Tool, ToolApprovalPolicy, ToolInvocation, ToolLookupKey, ToolOptions, ToolOrigin,
-        ToolOutput, ToolSchema,
+        Tool, ToolApprovalPolicy, ToolCaller, ToolInvocation, ToolLookupKey, ToolNamespace,
+        ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
     usage::Usage,
 };
@@ -203,6 +206,12 @@ impl ScriptedTool {
         self.options = options;
         self
     }
+
+    fn namespaced(namespace: &str, name: &str) -> Self {
+        let mut tool = Self::new(name);
+        tool.origin = ToolOrigin::namespaced(ToolNamespace::new(namespace).unwrap(), name).unwrap();
+        tool
+    }
 }
 
 #[async_trait]
@@ -287,12 +296,20 @@ fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
 }
 
 fn agent(tools: Vec<Arc<dyn Tool>>) -> AgentBinding {
+    agent_with_tool_use_behavior(tools, ToolUseBehavior::RunLlmAgain)
+}
+
+fn agent_with_tool_use_behavior(
+    tools: Vec<Arc<dyn Tool>>,
+    tool_use_behavior: ToolUseBehavior,
+) -> AgentBinding {
     AgentBinding::direct(
         AgentSpec::builder()
             .id(AgentId::new("coder"))
             .name("Coder")
             .instructions("do the thing")
             .tools(tools)
+            .tool_use_behavior(tool_use_behavior)
             .build()
             .unwrap(),
     )
@@ -306,6 +323,24 @@ fn request(
     cancel: &CancelScope,
 ) -> RunRequest {
     request_recording(tools, model, cancel, Arc::new(Mutex::new(Vec::new())))
+}
+
+fn request_with_tool_use_behavior(
+    tools: Vec<Arc<dyn Tool>>,
+    tool_use_behavior: ToolUseBehavior,
+    model: &Arc<ScriptedModel>,
+    cancel: &CancelScope,
+) -> RunRequest {
+    RunRequest::new(
+        agent_with_tool_use_behavior(tools, tool_use_behavior),
+        Arc::new(FixedResolver {
+            model: Arc::clone(model),
+            selectors: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(Host),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
+    )
 }
 
 fn request_recording(
@@ -374,6 +409,453 @@ async fn 工具调用与最终回答之间来回直到模型不再要东西() {
     assert_eq!(result.usage().input_tokens(), 30);
     assert_eq!(result.usage().output_tokens(), 10);
     assert_eq!(result.model_responses().len(), 2);
+}
+
+#[tokio::test]
+async fn stop_on_first_tool_执行整批工具但不再调用模型() {
+    let first = Arc::new(ScriptedTool::new("read_file"));
+    let second = Arc::new(ScriptedTool::new("write_file"));
+    let first_calls = Arc::clone(&first.calls);
+    let second_calls = Arc::clone(&second.calls);
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![
+        message("msg-1", "我先读再写"),
+        tool_call("c-1", "call-1", "read_file"),
+        tool_call("c-2", "call-2", "write_file"),
+    ])]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request_with_tool_use_behavior(
+        vec![first, second],
+        ToolUseBehavior::StopOnFirstTool,
+        &model,
+        &cancel,
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::ToolStop
+        }
+    ));
+    assert!(result.final_message().is_none());
+    assert!(matches!(
+        result.new_items()[3].kind(),
+        RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-1"
+    ));
+    assert!(matches!(
+        result.new_items()[4].kind(),
+        RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-2"
+    ));
+}
+
+#[tokio::test]
+async fn stop_at_tools_仅在名字命中时结束且支持限定名() {
+    let non_match = Arc::new(ScriptedTool::new("read_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "read_file")]),
+        ModelResponse::new(vec![message("msg-1", "继续后的最终回答")]),
+    ]);
+    let cancel = CancelScope::root();
+    let continued = Runner::run(request_with_tool_use_behavior(
+        vec![non_match],
+        ToolUseBehavior::stop_at_tools(["write_file"]),
+        &model,
+        &cancel,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        continued.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::Final
+        }
+    ));
+
+    let matched = Arc::new(ScriptedTool::namespaced("workspace", "write_file"));
+    let matching_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-2",
+        "call-2",
+        "write_file",
+    )])]);
+    let matched_cancel = CancelScope::root();
+    let stopped = Runner::run(request_with_tool_use_behavior(
+        vec![matched],
+        ToolUseBehavior::stop_at_tools(["workspace.write_file"]),
+        &matching_model,
+        &matched_cancel,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(matching_model.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        stopped.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::ToolStop
+        }
+    ));
+}
+
+#[tokio::test]
+async fn custom_tool_use_behavior_看见有序完整结果并决定是否停止() {
+    let observed = Arc::new(Mutex::new(Vec::<Vec<(String, String, bool)>>::new()));
+    let observed_by_handler = Arc::clone(&observed);
+    let handler = Arc::new(move |results: &[ToolUseResult]| -> Result<bool> {
+        observed_by_handler.lock().unwrap().push(
+            results
+                .iter()
+                .map(|result| {
+                    (
+                        result.call_id().as_str().to_owned(),
+                        result.tool().qualified_name().to_owned(),
+                        result.output().is_error(),
+                    )
+                })
+                .collect(),
+        );
+        Ok(results
+            .iter()
+            .any(|result| result.tool().name() == "write_file"))
+    });
+    let read = Arc::new(ScriptedTool::new("read_file"));
+    let write = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![
+        tool_call("c-1", "call-1", "read_file"),
+        tool_call("c-2", "call-2", "write_file"),
+    ])]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request_with_tool_use_behavior(
+        vec![read, write],
+        ToolUseBehavior::custom(handler),
+        &model,
+        &cancel,
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        [[
+            ("call-1".to_owned(), "read_file".to_owned(), false),
+            ("call-2".to_owned(), "write_file".to_owned(), false),
+        ]]
+    );
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::ToolStop
+        }
+    ));
+}
+
+#[tokio::test]
+async fn custom_tool_use_behavior_可以让模型继续() {
+    let handler = Arc::new(|_results: &[ToolUseResult]| -> Result<bool> { Ok(false) });
+    let tool = Arc::new(ScriptedTool::new("read_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "read_file")]),
+        ModelResponse::new(vec![message("msg-1", "工具结果已处理")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request_with_tool_use_behavior(
+        vec![tool],
+        ToolUseBehavior::custom(handler),
+        &model,
+        &cancel,
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::Final
+        }
+    ));
+}
+
+#[tokio::test]
+async fn tool_stop_不会越过待审批中断() {
+    let gated = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request_with_tool_use_behavior(
+        vec![gated],
+        ToolUseBehavior::StopOnFirstTool,
+        &model,
+        &cancel,
+    ))
+    .await
+    .unwrap();
+
+    assert!(matches!(result.outcome(), RunOutcome::Interrupted { .. }));
+}
+
+/// A tool that always fails, so its observation carries `is_error`.
+struct FailingTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+}
+
+impl FailingTool {
+    fn new(name: &str) -> Self {
+        let scripted = ScriptedTool::new(name);
+        Self {
+            origin: scripted.origin,
+            schema: scripted.schema,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FailingTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new()
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        Err(Error::tool(
+            ToolErrorKind::ExecutionFailed,
+            self.origin.qualified_name(),
+            "磁盘满了",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn 不是每条观察都算一个可以据以收尾的结果() {
+    // Both rows answer the model with a `tool.*` observation, and neither is a value any policy
+    // could promote. Stopping on one would report `FinishReason::ToolStop`, whose `is_complete()`
+    // is true — R15 sees no closeout owed and R17-3 takes the success edge — over a call that
+    // failed, or one that never ran at all.
+    let cases: [(&str, Arc<dyn Tool>); 2] =
+        [
+            // Caller admission refused it, so from the model's side the tool does not exist. The other
+            // half of that same story — a name the turn never advertised — is already excluded.
+            (
+                "not_admitted",
+                Arc::new(ScriptedTool::new("write_file").with_options(
+                    ToolOptions::new().with_allowed_callers([ToolCaller::Programmatic]),
+                )),
+            ),
+            // It ran and failed. The model has not read the failure yet, which is exactly why the turn
+            // owes it another round.
+            ("failed", Arc::new(FailingTool::new("write_file"))),
+        ];
+
+    for (label, tool) in cases {
+        let model = ScriptedModel::new(vec![
+            ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+            ModelResponse::new(vec![message("msg-1", "第二轮的最终回答")]),
+        ]);
+        let cancel = CancelScope::root();
+
+        let result = Runner::run(request_with_tool_use_behavior(
+            vec![tool],
+            ToolUseBehavior::StopOnFirstTool,
+            &model,
+            &cancel,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            2,
+            "{label} 应当逼出下一轮，而不是当场收尾"
+        );
+        assert!(
+            matches!(
+                result.outcome(),
+                RunOutcome::Completed {
+                    reason: FinishReason::Final
+                }
+            ),
+            "{label} 的结局是：{:?}",
+            result.outcome()
+        );
+        // Still answered: excluding it from the policy's view must not drop the record the next
+        // request pairs to this call.
+        assert!(
+            result.new_items().iter().any(|item| matches!(
+                item.kind(),
+                RunItemKind::ToolCallOutput(output)
+                    if output.call_id().as_str() == "call-1" && output.is_error()
+            )),
+            "{label} 丢了配对给 call-1 的观察"
+        );
+    }
+}
+
+/// What a `CancellationRacingHandler` does once the test lets it reach a decision.
+#[derive(Clone, Copy)]
+enum HandlerRace {
+    /// Never becomes ready, so only cancellation can end the run.
+    NeverReady,
+    /// Becomes ready without waking anything, so the poll that observes it is provably the one
+    /// cancellation triggered — and `CancelScope::run` looks at the handler first.
+    ReadyInTheCancellingPoll,
+}
+
+/// Ready from a flag, and **never registers a waker**: arming it schedules nothing.
+struct ReadyWithoutWaking(Arc<AtomicBool>);
+
+impl Future for ReadyWithoutWaking {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct CancellationRacingHandler {
+    entered: Arc<AtomicUsize>,
+    ready: Arc<AtomicBool>,
+    race: HandlerRace,
+}
+
+#[async_trait]
+impl ToolUseBehaviorHandler for CancellationRacingHandler {
+    async fn should_stop(&self, _tool_results: &[ToolUseResult]) -> Result<bool> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        match self.race {
+            HandlerRace::NeverReady => {
+                std::future::pending::<()>().await;
+                unreachable!("a pending handler can only leave through cancellation")
+            }
+            HandlerRace::ReadyInTheCancellingPoll => {
+                ReadyWithoutWaking(Arc::clone(&self.ready)).await;
+                // The most dangerous answer it could give: stop the run and call it finished.
+                Ok(true)
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn 取消赢过_custom_策略无论它有没有作答() {
+    let cases: [(&str, HandlerRace); 2] = [
+        // A bare `.await` would leave the run alive here with nothing running to blame, and no
+        // tool left for the drain protocol to reach.
+        ("handler_never_answers", HandlerRace::NeverReady),
+        // The harder half. `CancelScope::run` polls the handler before the cancellation, so a
+        // handler that is ready in that same wake-up returns normally and the scope is never
+        // consulted. Nothing downstream would catch it — settlement does no further awaiting and
+        // the runner breaks straight out of the loop on `FinalOutput` — so without an exit
+        // checkpoint a stopped run settles as `FinishReason::ToolStop`: `is_complete()`, success
+        // edge, no closeout owed.
+        (
+            "handler_answers_stop_in_the_cancelling_poll",
+            HandlerRace::ReadyInTheCancellingPoll,
+        ),
+    ];
+
+    for (label, race) in cases {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(CancellationRacingHandler {
+            entered: Arc::clone(&entered),
+            ready: Arc::clone(&ready),
+            race,
+        });
+        let tool = Arc::new(ScriptedTool::new("read_file"));
+        let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+            "c-1",
+            "call-1",
+            "read_file",
+        )])]);
+        let cancel = CancelScope::root();
+        let scope = cancel.clone();
+
+        let task = tokio::spawn(Runner::run(request_with_tool_use_behavior(
+            vec![tool],
+            ToolUseBehavior::custom(handler),
+            &model,
+            &cancel,
+        )));
+
+        timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label}: 策略应当被问到"));
+
+        // Arming before cancelling is what makes this deterministic rather than timed: it wakes
+        // nothing, so the next poll the handler receives is the one `cancel` delivers.
+        ready.store(true, Ordering::SeqCst);
+        scope.cancel(CancelReason::UserInterrupt);
+
+        let settled = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap_or_else(|_| panic!("{label}: 取消后 run 必须返回"))
+            .expect("run 任务 join");
+        let error = match settled {
+            Ok(result) => panic!("{label}: 取消的 run 交付了结果 {:?}", result.outcome()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::Cancelled { .. }),
+            "{label} 报成了：{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_tool_use_behavior_的错误原样传播() {
+    // Not folded into stop or continue: a policy that could not decide has not decided, and
+    // picking either outcome for it would be the framework inventing an answer.
+    let handler = Arc::new(|_results: &[ToolUseResult]| -> Result<bool> {
+        Err(Error::caller("这个策略拿不定主意"))
+    });
+    let tool = Arc::new(ScriptedTool::new("read_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "read_file",
+    )])]);
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(request_with_tool_use_behavior(
+        vec![tool],
+        ToolUseBehavior::custom(handler),
+        &model,
+        &cancel,
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::Caller { .. }));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

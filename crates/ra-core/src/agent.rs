@@ -6,21 +6,157 @@
 //! the value as an [`Arc`](std::sync::Arc), while intentional variants go through
 //! [`AgentSpec::to_builder`].
 //!
-//! Several agent concerns have dedicated later milestones. Dynamic prompts, output schemas,
-//! tool-use behavior, hooks, guardrails, capabilities, and handoffs must be added here only after
-//! their own protocol-neutral contracts exist. Private fields and the non-exhaustive public types
-//! let those additions remain source compatible; placeholder strings would freeze the wrong
-//! identities and callback shapes.
+//! Several agent concerns have dedicated later milestones. Dynamic prompts, output schemas, hooks,
+//! guardrails, capabilities, and handoffs must be added here only after their own protocol-neutral
+//! contracts exist. Private fields and the non-exhaustive public types let those additions remain
+//! source compatible; placeholder strings would freeze the wrong identities and callback shapes.
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use crate::{
     error::{Error, Result},
+    item::{CallId, ToolCallOutput},
     model::ModelSettings,
-    tool::Tool,
+    tool::{Tool, ToolOrigin},
 };
+use async_trait::async_trait;
 
 pub use crate::item::AgentId;
+
+/// One function-tool result that a [`ToolUseBehavior`] may inspect.
+///
+/// These values exist only for the duration of a turn, and they are the settled, model-order view
+/// of the calls that **ran and produced a value**. Everything a stop policy could otherwise mistake
+/// for an answer is excluded at the source: a request awaiting approval, a name the turn never
+/// advertised, a propagating failure that became the turn's error, and — the two that are easy to
+/// miss — a call the dispatch chain refused before it ran, and a call that ran and failed.
+///
+/// That last exclusion is the invariant every policy here depends on: `StopOnFirstTool` and
+/// `StopAtTools` have no way to inspect what they are stopping on, so a run that ended because a
+/// tool *failed* would report [`FinishReason::ToolStop`](crate::finish::FinishReason::ToolStop),
+/// whose [`is_complete`](crate::finish::FinishReason::is_complete) is true — telling R15 no closeout
+/// is owed and R17-3 to take the success edge, over an error the model never even read.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ToolUseResult {
+    tool: ToolOrigin,
+    output: ToolCallOutput,
+}
+
+impl ToolUseResult {
+    /// Creates the result for one successful function-tool call.
+    #[must_use]
+    pub fn new(tool: ToolOrigin, output: ToolCallOutput) -> Self {
+        Self { tool, output }
+    }
+
+    /// ID of the call this result answers.
+    #[must_use]
+    pub const fn call_id(&self) -> &CallId {
+        self.output.call_id()
+    }
+
+    /// Stable identity of the tool that produced the result.
+    #[must_use]
+    pub const fn tool(&self) -> &ToolOrigin {
+        &self.tool
+    }
+
+    /// Model-visible output observed for the call.
+    #[must_use]
+    pub const fn output(&self) -> &ToolCallOutput {
+        &self.output
+    }
+}
+
+/// Decides whether a response's function-tool results end the current run.
+///
+/// The callback receives every [`ToolUseResult`] the response produced, in model order, and is
+/// asked only when there is at least one. Returning `true` stops with
+/// [`FinishReason::ToolStop`](crate::finish::FinishReason::ToolStop); returning `false` asks the
+/// model for its next response. A returned error is propagated rather than silently changing the
+/// policy to one of those outcomes.
+///
+/// # Cancellation
+///
+/// This is third-party `async` code, so the runtime awaits it inside the turn's cancellation scope
+/// rather than bare. On cancellation the returned future is **dropped**, which is safe for a pure
+/// future: an implementation that spawns a task or a child process owns draining it, exactly as a
+/// [`Tool`] does.
+#[async_trait]
+pub trait ToolUseBehaviorHandler: Send + Sync + 'static {
+    /// Returns whether this batch of tool results should end the run.
+    async fn should_stop(&self, tool_results: &[ToolUseResult]) -> Result<bool>;
+}
+
+#[async_trait]
+impl<F> ToolUseBehaviorHandler for F
+where
+    F: Fn(&[ToolUseResult]) -> Result<bool> + Send + Sync + 'static,
+{
+    async fn should_stop(&self, tool_results: &[ToolUseResult]) -> Result<bool> {
+        self(tool_results)
+    }
+}
+
+/// The policy applied after a response's function tools have settled.
+///
+/// The default is [`Self::RunLlmAgain`], preserving the ordinary tool-call loop. Every policy reads
+/// [`ToolUseResult`]s and nothing else, so an approval stays an interruption and a propagated
+/// failure stays the turn error that produced it.
+#[non_exhaustive]
+#[derive(Clone, Default)]
+pub enum ToolUseBehavior {
+    /// Send tool results back to the model for another response.
+    #[default]
+    RunLlmAgain,
+    /// Stop once this response produced at least one [`ToolUseResult`].
+    StopOnFirstTool,
+    /// Stop once any [`ToolUseResult`] came from a listed tool.
+    ///
+    /// Entries may be either the bare model-facing tool name or the tool's qualified name.
+    ///
+    /// **Names are not checked against the agent's tools**, deliberately: the turn's action surface
+    /// is not knowable when the declaration is built — dynamic availability narrows it per turn and
+    /// R13 adds MCP tools at run time — so validating here would reject names that are about to
+    /// become real. The cost is that a misspelled name simply never matches.
+    StopAtTools {
+        /// Bare model-facing or qualified tool names that end the run.
+        names: BTreeSet<String>,
+    },
+    /// Let application policy inspect every result before deciding.
+    Custom(Arc<dyn ToolUseBehaviorHandler>),
+}
+
+impl ToolUseBehavior {
+    /// Creates a name-matching stop policy.
+    #[must_use]
+    pub fn stop_at_tools(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::StopAtTools {
+            names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Creates a custom asynchronous policy.
+    #[must_use]
+    pub fn custom(handler: Arc<dyn ToolUseBehaviorHandler>) -> Self {
+        Self::Custom(handler)
+    }
+}
+
+impl fmt::Debug for ToolUseBehavior {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RunLlmAgain => formatter.write_str("ToolUseBehavior::RunLlmAgain"),
+            Self::StopOnFirstTool => formatter.write_str("ToolUseBehavior::StopOnFirstTool"),
+            Self::StopAtTools { names } => formatter
+                .debug_struct("ToolUseBehavior::StopAtTools")
+                .field("names", names)
+                .finish(),
+            Self::Custom(_) => formatter.write_str("ToolUseBehavior::Custom(..)"),
+        }
+    }
+}
 
 /// Instructions attached to an agent declaration.
 ///
@@ -91,6 +227,7 @@ pub struct AgentSpec {
     model: Option<String>,
     model_settings: ModelSettings,
     tools: Vec<Arc<dyn Tool>>,
+    tool_use_behavior: ToolUseBehavior,
 }
 
 impl AgentSpec {
@@ -111,6 +248,7 @@ impl AgentSpec {
             model: self.model.clone(),
             model_settings: self.model_settings.clone(),
             tools: self.tools.clone(),
+            tool_use_behavior: self.tool_use_behavior.clone(),
         }
     }
 
@@ -149,6 +287,12 @@ impl AgentSpec {
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
     }
+
+    /// Policy applied after this agent's function tools produce observations.
+    #[must_use]
+    pub const fn tool_use_behavior(&self) -> &ToolUseBehavior {
+        &self.tool_use_behavior
+    }
 }
 
 impl fmt::Debug for AgentSpec {
@@ -165,6 +309,7 @@ impl fmt::Debug for AgentSpec {
             .field("instructions", &self.instructions)
             .field("model", &self.model)
             .field("tools", &tools)
+            .field("tool_use_behavior", &self.tool_use_behavior)
             .finish_non_exhaustive()
     }
 }
@@ -178,6 +323,7 @@ pub struct AgentSpecBuilder {
     model: Option<String>,
     model_settings: ModelSettings,
     tools: Vec<Arc<dyn Tool>>,
+    tool_use_behavior: ToolUseBehavior,
 }
 
 impl AgentSpecBuilder {
@@ -190,6 +336,7 @@ impl AgentSpecBuilder {
             model: None,
             model_settings: ModelSettings::new(),
             tools: Vec::new(),
+            tool_use_behavior: ToolUseBehavior::default(),
         }
     }
 
@@ -232,6 +379,12 @@ impl AgentSpecBuilder {
     /// Replaces the agent layer of model settings.
     pub fn model_settings(mut self, model_settings: ModelSettings) -> Self {
         self.model_settings = model_settings;
+        self
+    }
+
+    /// Sets the policy applied after this agent's function tools produce observations.
+    pub fn tool_use_behavior(mut self, tool_use_behavior: ToolUseBehavior) -> Self {
+        self.tool_use_behavior = tool_use_behavior;
         self
     }
 
@@ -302,6 +455,7 @@ impl AgentSpecBuilder {
             model: self.model,
             model_settings: self.model_settings,
             tools: self.tools,
+            tool_use_behavior: self.tool_use_behavior,
         }))
     }
 }

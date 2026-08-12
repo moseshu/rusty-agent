@@ -154,7 +154,13 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     let execution = execute_actions(execution_request).await?;
 
     // 3. Decide. One function, four states, priority written down once.
-    let next_step = resolve_next_step(&processed, &execution)?;
+    let next_step = resolve_next_step(
+        &processed,
+        &execution,
+        request.agent.public().tool_use_behavior(),
+        request.cancel,
+    )
+    .await?;
 
     // 4. Record. `new_step_items` and `session_step_items` are the same list this turn: nothing
     // filters the model-facing view yet, and R5's budgeting is what will make them diverge. The

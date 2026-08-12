@@ -25,7 +25,10 @@
 //! [`SingleStepResult`]: crate::step::SingleStepResult
 
 use super::NextStep;
-use crate::item::{MessageRole, OutputPhase, RunItem, RunItemKind};
+use crate::{
+    finish::FinishReason,
+    item::{MessageRole, OutputPhase, RunItem, RunItemKind},
+};
 
 /// Puts every assistant message of one settled turn on its channel.
 ///
@@ -42,12 +45,18 @@ pub fn resolve_output_phases(items: Vec<RunItem>, next_step: &NextStep) -> Vec<R
 
 /// Which record of a settled turn delivered the run, if any did.
 ///
-/// `None` for every non-terminal outcome: a turn that hands off, asks for an approval, or owes the
-/// model another call has not delivered anything, however the provider labelled it.
+/// `None` for every non-terminal outcome, and for [`FinishReason::ToolStop`]: a tool-stop ends
+/// the loop on a tool observation rather than on something the assistant delivered. Its model
+/// narration is therefore commentary even though the run itself is terminal.
 pub(crate) fn delivery_index(items: &[RunItem], next_step: &NextStep) -> Option<usize> {
     match next_step {
+        NextStep::FinalOutput {
+            reason: FinishReason::ToolStop,
+        }
+        | NextStep::RunAgain
+        | NextStep::Handoff { .. }
+        | NextStep::Interruption { .. } => None,
         NextStep::FinalOutput { .. } => items.iter().rposition(is_assistant_message),
-        NextStep::RunAgain | NextStep::Handoff { .. } | NextStep::Interruption { .. } => None,
     }
 }
 

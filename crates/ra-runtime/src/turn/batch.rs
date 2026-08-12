@@ -38,12 +38,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use ra_core::{
+    agent::ToolUseResult,
     cancel::{CancelReason, CancelScope, DRAIN_GRACE, ScopeKind},
     error::{Error, Result, ToolErrorKind},
     item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
     state::{ToolUseTracker, WorkStateHandle},
     step::ProcessedResponse,
-    tool::{ToolConcurrency, ToolRuntimeContext},
+    tool::{ToolConcurrency, ToolOrigin, ToolRuntimeContext},
 };
 use serde_json::json;
 use tokio::{
@@ -67,12 +68,14 @@ pub(crate) const DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY: usize = 8;
 pub struct TurnExecution {
     new_items: Vec<RunItem>,
     interruptions: Vec<RunItem>,
+    tool_results: Vec<ToolUseResult>,
 }
 
 /// One completed task, retained until the whole batch is known to be safe to settle.
 struct CompletedDispatch {
     order: usize,
     call_id: CallId,
+    tool: ToolOrigin,
     dispatch: ToolDispatch,
 }
 
@@ -80,6 +83,7 @@ struct CompletedDispatch {
 struct DispatchTaskResult {
     order: usize,
     call_id: CallId,
+    tool: ToolOrigin,
     result: Result<ToolDispatch>,
 }
 
@@ -127,6 +131,16 @@ impl TurnExecution {
     #[must_use]
     pub fn has_interruptions(&self) -> bool {
         !self.interruptions.is_empty()
+    }
+
+    /// Function-tool results, in the response's model order.
+    ///
+    /// The structured policy input for R3-5, and **narrower than `new_items`** on purpose: it holds
+    /// only calls that ran and produced a value. See [`settle_dispatches`] for what that leaves out
+    /// and why.
+    #[must_use]
+    pub fn tool_results(&self) -> &[ToolUseResult] {
+        &self.tool_results
     }
 }
 
@@ -236,6 +250,7 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
         let slots = Arc::clone(&slots);
         let concurrency = action.tool().options().concurrency();
         let call_id = action.call_id().clone();
+        let tool = action.tool().origin().clone();
         let cancel = tool_scope;
         tool_scopes.push(cancel.clone());
         let handle = dispatches.spawn(async move {
@@ -273,6 +288,7 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
             DispatchTaskResult {
                 order,
                 call_id,
+                tool,
                 result,
             }
         });
@@ -437,6 +453,7 @@ fn record_task_result(
                 Ok(dispatch) => collected.completed.push(CompletedDispatch {
                     order: task.order,
                     call_id: task.call_id,
+                    tool: task.tool,
                     dispatch,
                 }),
                 Err(error) if ignore_cancellation && error.is_cancelled() => {}
@@ -551,6 +568,27 @@ fn merge_failure(
 
 /// Converts a fully collected batch into records in model order. This is intentionally the only
 /// place that mutates `TurnExecution` from tool completions.
+///
+/// # Why an observation is not automatically a result
+///
+/// Every observation is answered to the model; only some become a [`ToolUseResult`] that R3-5's
+/// policies may promote to the run's outcome. The dividing line is `is_error`, and it is the
+/// invariant those policies rest on — **a result is a value a tool successfully produced**.
+/// `StopOnFirstTool` and `StopAtTools` cannot inspect what they stop on, so anything else would let
+/// a run report [`FinishReason::ToolStop`](ra_core::finish::FinishReason::ToolStop), whose
+/// `is_complete()` is true, over something that went wrong.
+///
+/// Two observations look like results and are not:
+///
+/// - **A call the chain refused before running it.** Caller admission answers `tool.not_found`, so
+///   from the model's side that tool does not exist — and `execute_actions` already keeps the other
+///   half of that same story, a name the turn never advertised, out of `tool_results`. Reporting a
+///   completed run over a tool that never executed is the sharper version of the problem.
+/// - **A call that ran and failed** under `ToolFailureHandling::ModelVisible`. The model has not
+///   even read the failure yet, which is precisely why settlement owes it another turn.
+///
+/// A tool that handled its own failure through `ToolFailureHandling::Custom` *does* produce a
+/// result: it returned a value it means the model to act on, and it wrote that value itself.
 fn settle_dispatches(
     mut collected: CollectedDispatches,
     execution: &mut TurnExecution,
@@ -563,6 +601,11 @@ fn settle_dispatches(
     for completed in collected.completed {
         match completed.dispatch {
             ToolDispatch::Observed(output) => {
+                if !output.is_error() {
+                    execution
+                        .tool_results
+                        .push(ToolUseResult::new(completed.tool, output.clone()));
+                }
                 execution
                     .new_items
                     .push(output_item(&completed.call_id, output));

@@ -6,6 +6,7 @@ async fn ra_runtime::runner::stream::RunStream::next_event(& mut self) -> Option
 async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest) -> Result < ToolDispatch >
 async fn ra_runtime::turn::batch::execute_actions(request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
+async fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedResponse, execution : & TurnExecution, tool_use_behavior : & ToolUseBehavior, cancel : & CancelScope) -> Result < NextStep >
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
@@ -61,6 +62,7 @@ fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_work_state(mut self, wor
 fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
 fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]
+fn ra_runtime::turn::batch::TurnExecution::tool_results(& self) -> & [ToolUseResult]
 fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope) -> Self
 fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
@@ -77,7 +79,6 @@ fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a Ag
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model(mut self, model : impl Into < String >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >
-fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedResponse, execution : & TurnExecution) -> Result < NextStep >
 fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution, public : & AgentSpec, next_step : & NextStep) -> Vec < RunItem >
 mod ra_runtime::agent
 mod ra_runtime::guard
