@@ -1,12 +1,12 @@
 //! `RunState`: the serializable state of a whole run, with a schema version.
 //!
-//! The run-scoped state R3 produces lives here rather than beside its producer for one reason:
-//! **persistence pins a wire format**. The turn-settlement intermediates in [`step`](crate::step)
-//! are graded `Internal` and may be refactored at any time; a value a saved checkpoint has to
-//! remain readable with cannot be, so it takes this module's `Evolving` grade instead. R6-6 grows
-//! [`RunState`] into the full checkpoint by adding fields to it.
+//! The run-scoped state turn settlement produces lives here rather than beside its producer for
+//! one reason: **persistence pins a wire format**. The turn-settlement intermediates in
+//! [`step`](crate::step) are graded `Internal` and may be refactored at any time; a value a saved
+//! checkpoint has to remain readable with cannot be, so it takes this module's `Evolving` grade
+//! instead. A future migration grows [`RunState`] into the full checkpoint by adding fields to it.
 //!
-//! [`work`] is the other half of R3-13's separation and holds no state at all: the task that spans
+//! [`work`] is the other half of that separation and holds no state at all: the task that spans
 //! runs is reached through a handle, so a run's checkpoint cannot come to contain a private copy of
 //! it.
 

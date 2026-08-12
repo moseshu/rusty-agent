@@ -13,8 +13,8 @@
 //! # This matrix answers protocol questions only
 //!
 //! "Does this wire format have a place to put X" belongs here. "Does this particular endpoint
-//! accept X" does not — that is a provider fact and lives in `Quirks` (R1-6b) alongside the
-//! provider's `extra_body` bucket, so onboarding a vendor stays a one-file change.
+//! accept X" does not — that is a provider fact and belongs in a future `Quirks` type alongside
+//! the provider's `extra_body` bucket, so onboarding a vendor stays a one-file change.
 //!
 //! The distinction is easy to get wrong in both directions:
 //!
@@ -27,11 +27,11 @@
 //!   entirely different shapes. Chat Completions therefore carries no reasoning at the protocol
 //!   level, and gateways that add it are described by `Quirks`.
 //!
-//! Both of those were pushed onto `Quirks` by this module, so R1-6b owes two questions its current
-//! field list does not cover: **does this endpoint accept `prompt_cache_key`**, and **does this
-//! gateway return `reasoning_content`**. Without them the two facts have nowhere to live, and the
-//! adapter falls back to guessing from the protocol — which is exactly what this matrix stopped
-//! doing.
+//! Both of those were pushed onto `Quirks` by this module, so that future type owes two questions
+//! its current field list does not cover: **does this endpoint accept `prompt_cache_key`**, and
+//! **does this gateway return `reasoning_content`**. Without them the two facts have nowhere to
+//! live, and the adapter falls back to guessing from the protocol — which is exactly what this
+//! matrix stopped doing.
 
 use std::fmt;
 
@@ -186,8 +186,8 @@ pub enum StablePrefixLocation {
 /// A set rather than a single choice, because protocols really do offer more than one at a time:
 /// Responses and Chat Completions both cache a stable prefix automatically **and** accept an
 /// explicit `prompt_cache_key` to steer routing. Modelling this as one value forces a wrong answer
-/// on whichever mechanism loses, and R1-13 would then skip sending the key on a protocol that
-/// accepts it.
+/// on whichever mechanism loses, and per-session cache-key handling would then skip sending the
+/// key on a protocol that accepts it.
 ///
 /// Whether a specific endpoint honours the key is a separate, provider-level question for
 /// `Quirks`: a third-party gateway speaking Chat Completions may reject it.
@@ -218,11 +218,11 @@ pub enum StablePrefixLocation {
 ///   currently reads as though the behaviour were fixed.
 /// - The feature is documented as available on `gpt-5.6` and later, so it is gated by **model**,
 ///   which is a third axis this matrix does not have. Protocol lives here and provider lives in
-///   `Quirks`; model capability most plausibly belongs to the resolved-model layer of the R1-2b
-///   four-layer settings, decided in R1-3a.
+///   `Quirks`; model capability most plausibly belongs to the resolved-model layer of the
+///   four-layer settings stack, a decision still to be made there.
 ///
-/// Deliberately not implemented ahead of a consumer: no adapter exists yet (R1-4 / R1-6), so the
-/// shape would be guessed from documentation rather than from a request that actually round-trips.
+/// Deliberately not implemented ahead of a consumer: no adapter exists yet, so the shape would be
+/// guessed from documentation rather than from a request that actually round-trips.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PromptCacheSupport {

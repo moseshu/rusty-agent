@@ -1,8 +1,8 @@
 //! Retry configuration shared by model-setting resolution and the later retry runtime.
 //!
-//! R1-2b defines the serializable configuration surface. R1-3 adds the minimal provider-advice
-//! contract required by [`super::Model`]. R1-9 will add normalized provider errors and runtime
-//! policy decisions without changing the model trait.
+//! This module defines the serializable configuration surface, plus the minimal provider-advice
+//! contract required by [`super::Model`]. A later milestone will add normalized provider errors
+//! and runtime policy decisions without changing the model trait.
 
 use std::time::Duration;
 

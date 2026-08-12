@@ -82,8 +82,9 @@ impl ConversationContinuation {
 
 /// Model-facing projection of an executable tool.
 ///
-/// R2's `ToolSpec` owns invocation, approval, timeout, guards, and identity. None of those are
-/// provider request fields, so the model boundary receives only this advertiseable definition.
+/// [`Tool`](crate::tool::Tool) and its [`ToolOptions`](crate::tool::ToolOptions) own invocation,
+/// approval, timeout, guards, and identity. None of those are provider request fields, so the
+/// model boundary receives only this advertiseable definition.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelToolDefinition {
@@ -215,8 +216,9 @@ impl ModelHandoffDefinition {
 
 /// Model-facing structured-output schema.
 ///
-/// `None` on [`ModelRequest::output_schema`] means ordinary text output. R1-16 will add parsing
-/// and validation above this projection without leaking those runtime concerns to adapters.
+/// `None` on [`ModelRequest::output_schema`] means ordinary text output. A future milestone will
+/// add parsing and validation above this projection without leaking those runtime concerns to
+/// adapters.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelOutputSchema {
@@ -272,13 +274,13 @@ impl ModelOutputSchema {
 /// **Reusable prompt objects.** The reference `Model.get_response` takes a `prompt` parameter, and
 /// its Chat implementation rejects it outright because only Responses supports reusable prompts.
 /// That makes it protocol-specific, so it travels in the `OpenAI` provider's `extra_body` bucket
-/// rather than here — the same treatment as `store` and `response_include` in R1-2b. Its absence is
-/// a decision, not an oversight.
+/// rather than here — the same treatment as `store` and `response_include`. Its absence is a
+/// decision, not an oversight.
 ///
-/// **A per-session prompt cache key.** R1-13 wants `prompt_cache_key` held constant for a whole
-/// session, equal to the thread id. That is a runtime value with a session lifetime, so
-/// `extra_body` is the wrong home for it — that bucket is static provider registration data. When
-/// R1-13 lands, the key belongs on this type as a new field; the type is `#[non_exhaustive]`
+/// **A per-session prompt cache key.** A future milestone wants `prompt_cache_key` held constant
+/// for a whole session, equal to the thread id. That is a runtime value with a session lifetime,
+/// so `extra_body` is the wrong home for it — that bucket is static provider registration data.
+/// When that lands, the key belongs on this type as a new field; the type is `#[non_exhaustive]`
 /// precisely so adding one is not a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]

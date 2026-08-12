@@ -15,11 +15,12 @@
 //! implementation keeps the same split — `Model.stream_response` yields provider events, while the
 //! consumer-facing union adds the run-level variants on top.
 //!
-//! The run channel arrives with the runner (R1-7 / R13) and lives in `ra-runtime`, wrapping this
-//! enum rather than extending it. Keeping them apart also means adding a run event later does not
-//! change the return type of every provider adapter.
+//! The run channel lives in `ra-runtime`, wrapping this enum rather than extending it. Keeping
+//! them apart also means adding a run event later does not change the return type of every
+//! provider adapter.
 //!
-//! R1-7 defines delta aggregation and terminal backfill on top of this envelope.
+//! Delta aggregation and terminal backfill on top of this envelope are a future consumer of
+//! `ra-runtime`'s own.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,10 +136,10 @@ impl RunItemStreamEvent {
     /// Open string rather than a closed enum, for now. The vocabulary that drives a UI —
     /// `message_output_created`, `tool_called`, `tool_output`, `reasoning_item_created`, the
     /// `mcp_*` and `handoff_*` families — is produced by the runner mapping step items, which does
-    /// not exist yet (R1-7 / R3-1). Closing the set here would mean guessing it from the reference
+    /// not exist yet. Closing the set here would mean guessing it from the reference
     /// implementation instead of from the code that emits it, and a wrong closed set is harder to
-    /// correct than an open one. R1-7 closes it; until then a typo yields an event no consumer
-    /// handles, which is the known cost.
+    /// correct than an open one. A future milestone closes it; until then a typo yields an event
+    /// no consumer handles, which is the known cost.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

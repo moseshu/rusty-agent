@@ -34,8 +34,9 @@ pub use crate::item::AgentId;
 /// That last exclusion is the invariant every policy here depends on: `StopOnFirstTool` and
 /// `StopAtTools` have no way to inspect what they are stopping on, so a run that ended because a
 /// tool *failed* would report [`FinishReason::ToolStop`](crate::finish::FinishReason::ToolStop),
-/// whose [`is_complete`](crate::finish::FinishReason::is_complete) is true — telling R15 no closeout
-/// is owed and R17-3 to take the success edge, over an error the model never even read.
+/// whose [`is_complete`](crate::finish::FinishReason::is_complete) is true — telling anything
+/// downstream that watches for it that no closeout is owed and the run reached its own success
+/// edge, over an error the model never even read.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ToolUseResult {
@@ -118,8 +119,8 @@ pub enum ToolUseBehavior {
     ///
     /// **Names are not checked against the agent's tools**, deliberately: the turn's action surface
     /// is not knowable when the declaration is built — dynamic availability narrows it per turn and
-    /// R13 adds MCP tools at run time — so validating here would reject names that are about to
-    /// become real. The cost is that a misspelled name simply never matches.
+    /// a future milestone adds MCP tools at run time — so validating here would reject names that
+    /// are about to become real. The cost is that a misspelled name simply never matches.
     StopAtTools {
         /// Bare model-facing or qualified tool names that end the run.
         names: BTreeSet<String>,
@@ -160,9 +161,9 @@ impl fmt::Debug for ToolUseBehavior {
 
 /// Instructions attached to an agent declaration.
 ///
-/// R3-1c supports static instructions. The private representation deliberately leaves room for
-/// R4-11 to add a dynamic prompt source without changing [`AgentSpec::instructions`] or exposing
-/// runtime context through the core type prematurely.
+/// Only static instructions are supported today. The private representation deliberately leaves
+/// room for a future dynamic prompt source to be added without changing
+/// [`AgentSpec::instructions`] or exposing runtime context through the core type prematurely.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct AgentInstructions {

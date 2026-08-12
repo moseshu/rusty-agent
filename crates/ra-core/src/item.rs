@@ -103,8 +103,8 @@ impl core::fmt::Display for CallId {
 
 /// Public identity of the agent that produced an item.
 ///
-/// Only the stable ID is stored here. Immutable `AgentSpec` and execution-agent bindings arrive
-/// in R3-1c/R3-12; a session item must not retain an entire agent configuration.
+/// Only the stable ID is stored here. Immutable `AgentSpec` and execution-agent bindings live
+/// elsewhere; a session item must not retain an entire agent configuration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentId(String);
@@ -320,7 +320,7 @@ impl RunItemKind {
     /// Whether this item is a pending decision the host has to answer before the run continues.
     ///
     /// [`NextStep::Interruption`](crate::step::NextStep::Interruption) carries exactly these, and
-    /// R3-2 classifies a response with the same predicate, so the two cannot drift apart. The match
+    /// response classification uses the same predicate, so the two cannot drift apart. The match
     /// is exhaustive on purpose: a new item kind must be classified here rather than defaulting to
     /// "not an interruption", because that default is the silent one — the run would continue past
     /// a decision nobody made.
@@ -344,8 +344,8 @@ impl RunItemKind {
     ///
     /// These are the kinds that leave the conversation invalid when nothing answers them: a call
     /// with no paired output makes the next request malformed, and a hosted approval request with
-    /// no decision leaves the server waiting. R3-2's classification must claim every one of them,
-    /// which is what stops an unanswered call from being filed as an inert record.
+    /// no decision leaves the server waiting. Response classification must claim every one of
+    /// them, which is what stops an unanswered call from being filed as an inert record.
     ///
     /// [`Self::ToolApproval`] is deliberately `false` even though it also awaits an answer: it is a
     /// control-plane record the model never produces, and [`Self::is_interruption`] is the

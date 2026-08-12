@@ -3,7 +3,7 @@
 //! # The problem
 //!
 //! [`RunState`](crate::state::RunState) and rollout lines are read and written across versions
-//! today, and R17-1's `WorkState` joins them when it lands. Its R3-13 mount point,
+//! today, and a future cross-run task state will join them when it lands. Its mount point,
 //! [`WorkStateHandle`](crate::state::WorkStateHandle), is deliberately **not** one of them: it
 //! reaches task state that lives outside the run, so nothing here ever serializes it.
 //!
@@ -12,7 +12,7 @@
 //! "new writes, old reads, old writes again" into **silent data deletion** — the user only sees
 //! that some state vanished after a resume, with no way to trace it.
 //!
-//! Three policies were therefore fixed in R0:
+//! Three policies were therefore fixed from the start:
 //!
 //! | # | Policy | Carrier |
 //! | ---: | --- | --- |
@@ -108,7 +108,7 @@ impl Compatibility {
     }
 
     /// Whether a migration is required before the record can be used safely (the entry point
-    /// for the R6-6 migration chain).
+    /// for the future migration chain).
     #[must_use]
     pub const fn needs_migration(self) -> bool {
         matches!(self, Self::Older)

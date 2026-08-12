@@ -21,10 +21,10 @@
 //! are visible from outside:
 //!
 //! 1. **The drain needs a time driver.** It measures the grace period with
-//!    [`tokio::time::timeout`], which panics on a runtime built without `enable_time`. Unlike
-//!    R3-7's stream reaper — a detached task, where losing the timer only loses the abort backstop
-//!    — this runs on the settlement path, so the panic reaches the caller. Every cancelled turn
-//!    takes this path, not just exotic ones.
+//!    [`tokio::time::timeout`], which panics on a runtime built without `enable_time`. Unlike the
+//!    streaming runner's own reaper — a detached task, where losing the timer only loses the abort
+//!    backstop — this runs on the settlement path, so the panic reaches the caller. Every cancelled
+//!    turn takes this path, not just exotic ones.
 //! 2. **The final join after `abort_all` has no deadline.** A task that never reaches an await
 //!    point is never aborted, and this function waits for it. That is the deliberate half of the
 //!    trade: the alternative is dropping the [`JoinSet`], which detaches the task and leaves its
@@ -87,7 +87,7 @@ struct DispatchTaskResult {
     result: Result<ToolDispatch>,
 }
 
-/// The error classes R3-4c uses to choose one batch-level outcome.
+/// The error classes used to choose one batch-level outcome when several calls fail together.
 ///
 /// `Cancelled` is above the four failure classes because it is a terminal control-flow outcome,
 /// not a failure observation that a competing tool result may overwrite.
@@ -135,9 +135,9 @@ impl TurnExecution {
 
     /// Function-tool results, in the response's model order.
     ///
-    /// The structured policy input for R3-5, and **narrower than `new_items`** on purpose: it holds
-    /// only calls that ran and produced a value. See [`settle_dispatches`] for what that leaves out
-    /// and why.
+    /// The structured input a tool-use stop policy reads, and **narrower than `new_items`** on
+    /// purpose: it holds only calls that ran and produced a value. See [`settle_dispatches`] for
+    /// what that leaves out and why.
     #[must_use]
     pub fn tool_results(&self) -> &[ToolUseResult] {
         &self.tool_results
@@ -519,7 +519,7 @@ impl RankedFailure {
     }
 }
 
-/// The R3-4c failure arbitration table. Higher priority wins; equal classes retain model order.
+/// The failure arbitration table. Higher priority wins; equal classes retain model order.
 fn failure_priority(error: &Error) -> FailurePriority {
     if error.is_cancelled() {
         return FailurePriority::Cancelled;
@@ -571,8 +571,8 @@ fn merge_failure(
 ///
 /// # Why an observation is not automatically a result
 ///
-/// Every observation is answered to the model; only some become a [`ToolUseResult`] that R3-5's
-/// policies may promote to the run's outcome. The dividing line is `is_error`, and it is the
+/// Every observation is answered to the model; only some become a [`ToolUseResult`] that a
+/// tool-use stop policy may promote to the run's outcome. The dividing line is `is_error`, and it is the
 /// invariant those policies rest on — **a result is a value a tool successfully produced**.
 /// `StopOnFirstTool` and `StopAtTools` cannot inspect what they stop on, so anything else would let
 /// a run report [`FinishReason::ToolStop`](ra_core::finish::FinishReason::ToolStop), whose

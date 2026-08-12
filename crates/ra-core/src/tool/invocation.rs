@@ -20,9 +20,9 @@ pub enum ToolCaller {
 
 /// Type-erased host context made available to tool implementations.
 ///
-/// `ra-runtime` will provide its concrete `ToolContext` in R3-9. Keeping this tiny trait in core
-/// avoids a reverse dependency while still allowing business tools to downcast to their host
-/// context today.
+/// `ra-runtime` will provide its concrete `ToolContext` in a future milestone. Keeping this tiny
+/// trait in core avoids a reverse dependency while still allowing business tools to downcast to
+/// their host context today.
 pub trait ToolRuntimeContext: Any + Send + Sync {
     /// Enables checked downcasting to an application-owned context type.
     fn as_any(&self) -> &(dyn Any + Send + Sync);
@@ -79,7 +79,7 @@ impl<'a> ToolInvocation<'a> {
         self
     }
 
-    /// Attaches the task state this run participates in (R3-13).
+    /// Attaches the task state this run participates in.
     #[must_use]
     pub const fn with_work_state(mut self, work_state: &'a dyn WorkStateHandle) -> Self {
         self.work_state = Some(work_state);
@@ -113,9 +113,9 @@ impl<'a> ToolInvocation<'a> {
     /// The task state spanning this run, when the host attached one.
     ///
     /// `None` is the ordinary case, not a failure: a run belongs to a task only when something
-    /// above it says so. R17-1 puts the typed channel operations on [`WorkStateHandle`]; this
-    /// accessor does not change when it does, which is the whole reason the slot exists now
-    /// (R3-13).
+    /// above it says so. A future milestone puts the typed channel operations on
+    /// [`WorkStateHandle`]; this accessor does not change when it does, which is the whole reason
+    /// the slot exists now.
     #[must_use]
     pub const fn work_state(&self) -> Option<&dyn WorkStateHandle> {
         self.work_state

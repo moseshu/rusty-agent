@@ -47,9 +47,9 @@ use crate::error::Error;
 /// past it, work is killed.
 ///
 /// This is part of the contract, not a tuning knob: **dropping a `JoinHandle` after cancelling
-/// leaves a running child process behind in Rust** (R3-4c ③). Any layer that spawned a task or a
-/// child process must wait for a terminal state before returning, and kill it when the grace
-/// period ends.
+/// leaves a running child process behind in Rust**. Any layer that spawned a task or a child
+/// process must wait for a terminal state before returning, and kill it when the grace period
+/// ends.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
@@ -72,17 +72,16 @@ pub enum CancelReason {
     /// The wall-clock budget ran out (`Budget::deadline`): a whole run, or one layer, hit its
     /// deadline.
     Deadline,
-    /// One operation's own timeout: a tool timeout (R2-7), an in-flight protocol request (R13).
+    /// One operation's own timeout: a tool call's own timeout, or an in-flight protocol request.
     ///
     /// It differs from [`Self::Deadline`] in **whose limit** expired: `Deadline` is an upper
     /// layer's budget, `Timeout` is this operation running too long. The responses differ — the
     /// first should end the task, the second usually only abandons this one operation.
     Timeout,
-    /// The result is no longer wanted: a losing branch of an `any` or `quorum` join (R17-4), or
-    /// an in-flight request superseded by new input. **Neither an error nor a timeout.**
+    /// The result is no longer wanted: a losing branch of an `any` or `quorum` join, or an
+    /// in-flight request superseded by new input. **Neither an error nor a timeout.**
     Superseded,
-    /// Another task in the same batch failed and continuing the batch is pointless (the batch
-    /// settlement of R3-4c).
+    /// Another task in the same batch failed and continuing the batch is pointless.
     PeerFailure,
     /// No root cause was recorded.
     ///
@@ -181,7 +180,7 @@ impl From<CancelReason> for Error {
 /// A scope's level in the cancellation tree. Used for diagnostics and trace labels only; it does
 /// not affect propagation semantics.
 ///
-/// The canonical nesting is `Run -> Turn -> Tool -> Process`. A sub-agent (R12) is another `Run`
+/// The canonical nesting is `Run -> Turn -> Tool -> Process`. A sub-agent's run is another `Run`
 /// hanging under a `Tool`, so **levels are not required to decrease monotonically**.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

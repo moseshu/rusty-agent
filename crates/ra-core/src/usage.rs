@@ -1,8 +1,8 @@
 //! Token totals for a single model response.
 //!
-//! R1-1 only requires `ModelResponse` to carry stable totals. R1-8 will add per-request
-//! `RequestUsage`, cache-write tokens, and cost aggregation. This type does not claim that later
-//! work is complete.
+//! Only stable totals on `ModelResponse` are required today. A future milestone will add
+//! per-request `RequestUsage`, cache-write tokens, and cost aggregation. This type does not claim
+//! that later work is complete.
 
 use serde::{Deserialize, Serialize};
 

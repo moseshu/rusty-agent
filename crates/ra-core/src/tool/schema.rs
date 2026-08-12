@@ -50,7 +50,7 @@ pub trait ToolInput: ToolInputRequirements {
         })?;
         if let Some(root) = input_schema.as_object_mut() {
             // These belong to the function envelope, not the parameter schema. Keeping them here
-            // duplicates the derive docs on every request and wastes the R2-10 schema budget.
+            // duplicates the derive docs on every request and wastes the schema token budget.
             root.remove("$schema");
             root.remove("title");
             root.remove("description");

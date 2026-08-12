@@ -1,4 +1,4 @@
-//! The run's own resumable state (R6-6's skeleton).
+//! The run's own resumable state (the skeleton a future migration grows into the full checkpoint).
 //!
 //! A run has facts that are neither agent configuration nor session history: tool-use accounting,
 //! future budget counters, and state owned by the loop itself. Keeping those values as independent
@@ -6,15 +6,16 @@
 //! let a continuation accidentally carry one fact but not another. `RunState` is the single carrier
 //! that crosses a run-segment boundary.
 //!
-//! It deliberately belongs to `ra-core`: R6-6 grows this same value into the full serializable run
-//! state (generated items, model responses, pending approvals, guardrail results), and a persisted
-//! wire type cannot live in `ra-runtime` without reversing the dependency direction.
+//! It deliberately belongs to `ra-core`: a future migration grows this same value into the full
+//! serializable run state (generated items, model responses, pending approvals, guardrail
+//! results), and a persisted wire type cannot live in `ra-runtime` without reversing the
+//! dependency direction.
 //!
 //! # Not to be confused with `WorkState`
 //!
-//! This is a **single run's** recoverable state. R17-1's `WorkState`, reached through
+//! This is a **single run's** recoverable state. A future cross-run `WorkState`, reached through
 //! [`WorkStateHandle`](crate::state::work::WorkStateHandle), is the **cross-run, cross-node task**
-//! state — owned by whoever spans those runs, not by this value. R3-13 forbids mixing them, and the
+//! state — owned by whoever spans those runs, not by this value. Mixing them is forbidden, and the
 //! reason is concrete: a checkpoint of this value is scoped to one run's resume, while task state
 //! outlives every run that touches it. Folding the second into the first would make a resumed run
 //! restore a stale copy of state another node has since advanced.
@@ -66,7 +67,7 @@ impl RunState {
 
     /// Replaces the carried tool-use history, leaving every other field alone.
     ///
-    /// This is the seam for code that persisted the R3-6b tracker on its own before `RunState`
+    /// This is the seam for code that persisted the `ToolUseTracker` on its own before `RunState`
     /// existed: build the state, then set the one field it has.
     #[must_use]
     pub fn with_tool_use(mut self, tool_use: ToolUseTracker) -> Self {

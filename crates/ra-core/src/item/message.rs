@@ -156,7 +156,7 @@ impl Message {
 
     /// Concatenates all refusal blocks, or `None` when the model did not refuse.
     ///
-    /// This is the mechanical signal R1-12 escalates on. Matching refusal wording inside
+    /// This is the mechanical signal model fallback escalates on. Matching refusal wording inside
     /// [`Self::text_content`] would be a guess about provider phrasing.
     #[must_use]
     pub fn refusal_content(&self) -> Option<String> {

@@ -55,7 +55,7 @@ pub async fn resolve_next_step(
     })
 }
 
-/// Applies `tool_use_behavior` (R3-5): whether this response's tool results end the run.
+/// Applies `tool_use_behavior`: whether this response's tool results end the run.
 ///
 /// Only the answer is returned. The [`FinishReason::ToolStop`] that goes with it is written at the
 /// single call site above, because every policy here stops for the same reason — the caller would
@@ -101,8 +101,9 @@ async fn check_for_final_output_from_tools(
             // `super::batch` relies on, read from the other side. Nothing downstream would catch
             // it: settlement does no further awaiting and the runner breaks straight out of the
             // loop on `FinalOutput`. The run would report `FinishReason::ToolStop`, whose
-            // `is_complete()` tells R15 that no closeout is owed and R17-3 to take the success
-            // edge — the run claiming the agent finished on the turn the user stopped it.
+            // `is_complete()` tells anything downstream that no closeout is owed and the run
+            // reached its own success edge — claiming the agent finished on the turn the user
+            // stopped it.
             cancel.ensure_not_cancelled()?;
             Ok(stop)
         }

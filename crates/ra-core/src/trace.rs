@@ -6,16 +6,16 @@
 //!    implements no subscriber and wires up no external reporting backend — assembling a
 //!    subscriber is `ra-cli`'s job, and choosing a backend is the user's.
 //! 2. **The tracing channel serves developers and eval, not the UI event stream.** User-visible
-//!    events go through the `event_msg` channel of the R9 rollout. The two are not
-//!    interchangeable: logs can change level or be dropped at any time, the event stream cannot.
+//!    events go through the rollout's `event_msg` channel. The two are not interchangeable: logs
+//!    can change level or be dropped at any time, the event stream cannot.
 //! 3. **Span fields carry identifiers and counts, never content.** Model input and output, tool
 //!    arguments, and file contents never enter a span: they are large, they contain sensitive
 //!    data, and the rollout channel already holds an authoritative copy. This is what keeps
-//!    "turn off sensitive data" from also turning off the span topology (R14-2).
+//!    "turn off sensitive data" from also turning off the span topology.
 //!
 //! # Why a vocabulary
 //!
-//! Field names are a **contract**: eval attribution (R14-2), cost reports, and metric aggregation
+//! Field names are a **contract**: eval attribution, cost reports, and metric aggregation
 //! all look values up by name. Hand-written strings scattered across crates eventually produce
 //! both `tool.name` and `tool_name`, and the aggregated numbers are simply wrong. So the names are
 //! fixed once here, and [`field::ALL`] is the complete set.
@@ -105,7 +105,7 @@ pub mod field {
     pub const MODEL_NAME: &str = "model.name";
     /// Provider identity.
     pub const MODEL_PROVIDER: &str = "model.provider";
-    /// Protocol path: `responses` / `chat` / `messages` / `compat` (R1).
+    /// Protocol path: `responses` / `chat` / `messages` / `compat`.
     pub const GEN_PROTOCOL: &str = "gen.protocol";
     /// Input tokens for this request.
     pub const USAGE_INPUT_TOKENS: &str = "usage.input_tokens";
@@ -136,7 +136,7 @@ pub mod field {
 
     // -- guardrail ---------------------------------------------------------
 
-    /// Guard identity, from the guard registry (R7-0).
+    /// Guard identity, from the guard registry.
     pub const GUARDRAIL_ID: &str = "guardrail.id";
     /// Trigger point, valued by the lowercase name of `GuardrailStage`.
     pub const GUARDRAIL_STAGE: &str = "guardrail.stage";
@@ -190,7 +190,7 @@ pub mod field {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SpanKind {
-    /// One agent's entire execution. Each sub-agent (R12) gets its own.
+    /// One agent's entire execution. Each sub-agent's run gets its own.
     Agent,
     /// One turn: a model round trip plus the tool batch that follows it.
     Turn,
@@ -200,7 +200,7 @@ pub enum SpanKind {
     Function,
     /// One agent handoff.
     Handoff,
-    /// One guard check (R7).
+    /// One guard check.
     Guardrail,
     /// One MCP tool-list fetch. It is a common source of startup latency and cache invalidation,
     /// which earns it its own kind.
@@ -299,8 +299,8 @@ impl fmt::Display for SpanKind {
 // ---------------------------------------------------------------------------
 
 /// Terminal state of a span. **Cancellation gets its own tier** rather than being folded into
-/// `Error`, for the same reason as R0-2: cancellation is not failure, and merging them makes the
-/// failure-rate metric spike every time a user presses stop.
+/// `Error`, for the same reason cancellation is not a failure everywhere else in this framework:
+/// merging them makes the failure-rate metric spike every time a user presses stop.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpanOutcome {
@@ -386,7 +386,7 @@ pub fn record_outcome(span: &Span, outcome: SpanOutcome) {
 /// Records an error terminal state: [`field::ERROR_CODE`] plus [`field::OUTCOME`].
 ///
 /// Only `code()` is stored, **never the error text**: text changes, it can contain paths and
-/// secrets, and aggregating by text is exactly the vocabulary-matching that R7-10 forbids. A
+/// secrets, and aggregating by text is exactly the vocabulary-matching this framework forbids. A
 /// cancellation is recorded as [`SpanOutcome::Cancelled`] rather than
 /// `Error`。
 pub fn record_error(span: &Span, err: &Error) {
@@ -396,7 +396,7 @@ pub fn record_error(span: &Span, err: &Error) {
 
 /// Records a cancellation: root cause, initiating level, and terminal state.
 ///
-/// This is the only write path for the two fields promised by the cancellation contract (R0-4).
+/// This is the only write path for the two fields the cancellation contract promises.
 pub fn record_cancel(span: &Span, reason: &CancelReason, scope: &ScopeKind) {
     span.record(field::CANCEL_REASON, reason.code());
     span.record(field::CANCEL_SCOPE, scope.label());

@@ -11,7 +11,7 @@
 //! these enums and implements these traits directly. Two deliberate exceptions: the `RunState`
 //! fields in [`state`] and the field names in [`trace::field`] are `Evolving` (they may grow but
 //! not shrink), and the turn-settlement intermediates in [`step`] are `Internal` (once they leak
-//! into the public API, R1 and R3 can no longer be refactored).
+//! into the public API, the settlement pipeline that produces them can no longer be refactored).
 //!
 //! [`finish::FinishReason`] is `Stable` and lives in its own module rather than beside `NextStep`
 //! for exactly that reason: the run's stopping reason is something hosts, graph edges, and the

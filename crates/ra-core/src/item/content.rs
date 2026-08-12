@@ -21,14 +21,14 @@
 //! original kept in [`RawProviderItem`](super::RawProviderItem) for replay.
 //!
 //! Modelling both shapes in `ra-core` would mean every consumer has to look in two places for the
-//! same fact. Pairing and orphan pruning (R1-17) walk item-level `CallId`s; a call hidden inside
-//! message content would be silently invisible to them.
+//! same fact. Pairing and orphan pruning walk item-level `CallId`s; a call hidden inside message
+//! content would be silently invisible to them.
 //!
 //! # Refusals are not text
 //!
 //! [`Refusal`](ContentBlock::Refusal) is a distinct block rather than prose in a text block,
-//! because R1-12 escalates to a stronger model on refusal. That decision needs a mechanical
-//! signal, not a string match against whatever wording the provider chose.
+//! because model fallback escalates to a stronger model on refusal. That decision needs a
+//! mechanical signal, not a string match against whatever wording the provider chose.
 //!
 //! Provider adapters lower these blocks into their wire representation. Local image paths stay
 //! inert data in `ra-core`; reading and encoding the file belongs to an I/O layer such as
@@ -109,7 +109,7 @@ impl ContentBlock {
     /// Returns the text when this is a text block.
     ///
     /// A refusal is deliberately not text: surfacing it here would let it be concatenated into
-    /// ordinary output and lose the signal R1-12 needs.
+    /// ordinary output and lose the signal model fallback needs.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -619,9 +619,9 @@ impl Base64FileSource {
 
 /// A file content block.
 ///
-/// Deliberately **not** a [`ContentBlock`] variant yet: whether a message may carry a file is R1's
-/// contract to change, and adding the variant later costs nothing because that enum is
-/// `#[non_exhaustive]`. Tool results are the only producer today (R2-3).
+/// Deliberately **not** a [`ContentBlock`] variant yet: whether a message may carry a file is the
+/// model-protocol layer's contract to change, and adding the variant later costs nothing because
+/// that enum is `#[non_exhaustive]`. Tool results are the only producer today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileBlock {
     schema_version: SchemaVersion,

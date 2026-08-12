@@ -1,12 +1,11 @@
 //! The four `NextStep` states, `ProcessedResponse`, and `SingleStepResult`.
 //!
-//! One turn moves through the three in order: [`ProcessedResponse`] (R3-2) says what the model
-//! asked for, [`NextStep`] (R3-1) is where the loop's control flow converges, and
-//! [`SingleStepResult`] (R3-3) is the single product that carries both plus everything the turn
-//! generated.
+//! One turn moves through the three in order: [`ProcessedResponse`] says what the model asked
+//! for, [`NextStep`] is where the loop's control flow converges, and [`SingleStepResult`] is the
+//! single product that carries both plus everything the turn generated.
 //!
 //! **Stability**: `Internal` — these are turn-settlement intermediates. Once they leak into
-//! downstream code, R1 and R3 can no longer be refactored.
+//! downstream code, the settlement pipeline that produces them can no longer be refactored.
 
 use std::sync::Arc;
 
@@ -42,8 +41,8 @@ pub use single::{SingleStepResult, SingleStepResultBuilder};
 /// outward-facing data: a `ToolOutput` variant added to a closed enum breaks every third-party
 /// `match`, so those must stay open. `NextStep` is the opposite — the framework is the only thing
 /// that matches on it, and **adding a control-flow state must break every match until each one
-/// says what it does about it**. R3's acceptance criterion states the same rule from the other
-/// side: no `_ =>` arm when matching this.
+/// says what it does about it**. The turn-settlement acceptance criterion states the same rule
+/// from the other side: no `_ =>` arm when matching this.
 ///
 /// For the same reason there is no `is_terminal()` or `should_continue()` helper. A boolean
 /// projection is exactly the early-return shortcut this type replaces: it would let a call site
@@ -55,7 +54,7 @@ pub enum NextStep {
     RunAgain,
     /// Transfer control to another agent, which runs the next turn.
     Handoff {
-        /// The agent taking over. R3-12 binds the public and execution identities around it; this
+        /// The agent taking over. The public/execution identity binding wraps around it; this
         /// is the public one, so events and results stay attributed where the user expects.
         new_agent: Arc<AgentSpec>,
     },
@@ -64,7 +63,7 @@ pub enum NextStep {
     ///
     /// [`FinishReason::Cancelled`] and [`FinishReason::GuardrailTripped`] usually reach the run
     /// result through the error path rather than this variant, but the type does not forbid them:
-    /// an R3-8 error handler can turn either into a settled final output.
+    /// a future error handler can turn either into a settled final output.
     FinalOutput {
         /// Why the loop settled.
         reason: FinishReason,

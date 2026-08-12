@@ -1,11 +1,11 @@
-//! Model-visible output of one tool invocation (R2-3).
+//! Model-visible output of one tool invocation.
 //!
 //! # Two audiences, one value
 //!
-//! A tool result is read by two consumers with opposite needs. The **host** — R5-1's budget
-//! trimmer, the UI, the rollout log — needs to know *as data* that output was cut and how much of
-//! it there was. The **model** needs to be told the same thing in a sentence it can act on, and
-//! every byte it is told costs tokens on this turn and on every turn after it.
+//! A tool result is read by two consumers with opposite needs. The **host** — a future context
+//! budget trimmer, the UI, the rollout log — needs to know *as data* that output was cut and how
+//! much of it there was. The **model** needs to be told the same thing in a sentence it can act
+//! on, and every byte it is told costs tokens on this turn and on every turn after it.
 //!
 //! So the structure holds facts and the projection produces prose: [`ObservationMetadata`] is
 //! typed and stays typed, and [`ToolOutput::model_blocks`] renders it into a leading text block
@@ -26,12 +26,11 @@
 //! costs the project has already paid once: nothing records that the meaning changed, and an
 //! untyped bag invites control flow that reads `meta["truncated"]` instead of a field. Adding a
 //! typed field later is free — these structs are `#[non_exhaustive]` with private fields — so the
-//! asymmetry that justified reserving a slot in R3-13 does not apply here.
+//! asymmetry that justified reserving a slot for cross-run task state does not apply here.
 //!
 //! **Per-tool statistics.** `grep`'s scanned/skipped counts and `exec_command`'s wall time and
-//! exit code are named in R2-3's brief, but they belong to one tool each. They arrive as typed
-//! fields with their tools (R8-1, R8-6), which costs nothing and keeps a generic value from
-//! carrying fields most tools leave empty.
+//! exit code belong to one tool each. They arrive as typed fields with their tools, which costs
+//! nothing and keeps a generic value from carrying fields most tools leave empty.
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
@@ -70,9 +69,9 @@ struct StructuredToolOutputWire {
     unknown: Unknown,
 }
 
-/// R2-1 persisted a text result as `{"type":"text","text":"..."}` and nothing else — that enum
-/// carried neither a schema version nor an unknown-field bag, so those two keys are the whole of
-/// the shape and there is nothing else to carry forward.
+/// The previous schema version persisted a text result as `{"type":"text","text":"..."}` and
+/// nothing else — that enum carried neither a schema version nor an unknown-field bag, so those
+/// two keys are the whole of the shape and there is nothing else to carry forward.
 #[derive(Deserialize)]
 struct LegacyTextToolOutputWire {
     text: String,
@@ -83,7 +82,7 @@ struct LegacyTextToolOutputWire {
 enum StoredShape {
     /// This build's shape: `schema_version` and a `blocks` array.
     Structured,
-    /// R2-1's shape: `{"type":"text","text":"..."}`.
+    /// The previous schema version's shape: `{"type":"text","text":"..."}`.
     LegacyText,
 }
 
@@ -104,7 +103,7 @@ fn stored_shape(payload: &Value) -> Option<StoredShape> {
     if map.contains_key("schema_version") && map.contains_key("blocks") {
         return Some(StoredShape::Structured);
     }
-    // `type` could only ever be `text`: R2-1's enum had exactly one variant.
+    // `type` could only ever be `text`: the previous schema version's enum had exactly one variant.
     if map.get("type").and_then(Value::as_str) == Some("text") && map.contains_key("text") {
         return Some(StoredShape::LegacyText);
     }
@@ -133,7 +132,7 @@ impl<'de> Deserialize<'de> for ToolOutput {
         match stored_shape(&payload) {
             Some(shape) => Self::read_stored(&payload, shape).map_err(D::Error::custom),
             None => Err(D::Error::custom(
-                "not a tool result: expected a `blocks` array, or R2-1's `{\"type\":\"text\"}` form",
+                "not a tool result: expected a `blocks` array, or the legacy `{\"type\":\"text\"}` form",
             )),
         }
     }
@@ -196,9 +195,9 @@ impl ToolOutput {
     /// [`Deserialize`] call:
     ///
     /// - `Ok(Some(_))` — a tool result this build understands;
-    /// - `Ok(None)` — **not a tool result at all**. Hosts stored bare JSON here before R2-3 gave
-    ///   the payload a shape, and a resumed session replays it; a caller stringifies it and moves
-    ///   on;
+    /// - `Ok(None)` — **not a tool result at all**. Hosts stored bare JSON here before this type
+    ///   gave the payload a shape, and a resumed session replays it; a caller stringifies it and
+    ///   moves on;
     /// - `Err(_)` — it *is* a tool result and this build cannot read it, because a newer build
     ///   wrote a block kind this one has no variant for.
     ///
@@ -231,7 +230,7 @@ impl ToolOutput {
             StoredShape::LegacyText => LegacyTextToolOutputWire::deserialize(payload)
                 .map(|wire| Self::text(wire.text))
                 .map_err(|error| {
-                    Error::caller(format!("stored R2-1 tool result is unreadable: {error}"))
+                    Error::caller(format!("stored legacy tool result is unreadable: {error}"))
                 }),
         }
     }
@@ -256,8 +255,8 @@ impl ToolOutput {
 
     /// Mutable metadata, for the stages that observe a result after the tool returned.
     ///
-    /// R5-1's budget trimmer is the caller this exists for: it cuts a stored result long after
-    /// dispatch and has to *append* its own truncation rather than replace the tool's.
+    /// A future context-budget trimmer is the caller this exists for: it cuts a stored result long
+    /// after dispatch and has to *append* its own truncation rather than replace the tool's.
     pub fn metadata_mut(&mut self) -> &mut ObservationMetadata {
         &mut self.metadata
     }
@@ -334,8 +333,8 @@ impl ToolOutputBlock {
 ///
 /// Everything here is a *fact about the result*, never an instruction to the framework. In
 /// particular [`guidance`](Self::guidance) is prose written for the model to read; nothing in the
-/// framework may branch on it, because control flow that reads free text is what R7-10 forbids and
-/// what a vocabulary-matching agent fails at the moment its user switches language.
+/// framework may branch on it, because control flow that reads free text is what this framework
+/// forbids and what a vocabulary-matching agent fails at the moment its user switches language.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationMetadata {
@@ -370,9 +369,10 @@ impl ObservationMetadata {
     /// Records that something cut this result, keeping every earlier cut.
     ///
     /// **Appending is the contract.** A result can be cut twice by different stages — the tool
-    /// stops at its own output ceiling, then R5-1 trims the stored record to fit the context
-    /// budget — and a field that held one truncation would let the second silently erase the
-    /// first, leaving the model told about a smaller loss than actually happened.
+    /// stops at its own output ceiling, then a future context-budget trimmer cuts the stored
+    /// record to fit the context budget — and a field that held one truncation would let the
+    /// second silently erase the first, leaving the model told about a smaller loss than actually
+    /// happened.
     #[must_use]
     pub fn with_truncation(mut self, truncation: Truncation) -> Self {
         self.truncations.push(truncation);
@@ -424,7 +424,7 @@ impl ObservationMetadata {
     /// **This is the only place metadata becomes model-visible**, which is what makes "how much of
     /// this is worth paying for" a decision that can be changed without migrating stored records.
     /// The wording is not settled: a rendering that reads well is a measurable property, and
-    /// R3-11's snapshots plus an eval decide it rather than one reading of one log.
+    /// future eval snapshots decide it rather than one reading of one log.
     #[must_use]
     pub fn render(&self) -> Option<String> {
         if self.truncations.is_empty() && self.guidance.is_empty() {
@@ -473,7 +473,7 @@ impl Truncation {
     /// Records a cut from `original_bytes` down to `retained_bytes`.
     ///
     /// Bytes, not characters or tokens: bytes are the one unit every stage can measure without
-    /// agreeing on an encoding or owning a tokenizer, and R5-1's token ceiling converts into it.
+    /// agreeing on an encoding or owning a tokenizer, and a future token ceiling converts into it.
     #[must_use]
     pub fn new(stage: TruncationStage, original_bytes: u64, retained_bytes: u64) -> Self {
         Self {
@@ -543,7 +543,7 @@ const fn truncation_schema_version() -> SchemaVersion {
 pub enum TruncationStage {
     /// The tool stopped at its own output ceiling.
     Tool,
-    /// The context budget trimmed a stored result (R5-1).
+    /// The context budget trimmed a stored result.
     ContextBudget,
 }
 

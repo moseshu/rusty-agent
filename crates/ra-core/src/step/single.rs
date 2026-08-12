@@ -1,4 +1,4 @@
-//! R3-3: the one product of settling a single turn.
+//! The one product of settling a single turn.
 //!
 //! Everything a turn decided lives here — what went in, what the model said, what was generated,
 //! what the session must store, and what happens next. The streaming and non-streaming paths
@@ -18,14 +18,14 @@
 //!
 //! # What is deliberately absent
 //!
-//! **The four guardrail result lists.** R3-3 names input, output, tool-input, and tool-output
-//! guardrail results as fields here, and they do belong here — but `InputGuardrailResult`,
-//! `OutputGuardrailResult`, and the three-state tool guardrail result are R7-1 and R7-3's types and
-//! do not exist yet. Standing in a `Vec<Value>` or a bare `bool` freezes the wrong shape before the
-//! contract is written, which is the same call R3-1 made when it gave `FinalOutput` a
-//! [`FinishReason`](crate::finish::FinishReason) instead of a placeholder output value. This struct
-//! is `#[non_exhaustive]` with private fields and a builder precisely so R7 can add them without a
-//! breaking change.
+//! **The four guardrail result lists.** Input, output, tool-input, and tool-output guardrail
+//! results are named as fields here, and they do belong here — but `InputGuardrailResult`,
+//! `OutputGuardrailResult`, and the three-state tool guardrail result are the guardrail
+//! subsystem's types and do not exist yet. Standing in a `Vec<Value>` or a bare `bool` freezes the
+//! wrong shape before the contract is written, which is the same call made when `FinalOutput` got
+//! a [`FinishReason`](crate::finish::FinishReason) instead of a placeholder output value. This
+//! struct is `#[non_exhaustive]` with private fields and a builder precisely so the guardrail
+//! subsystem can add them without a breaking change.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,10 +94,10 @@ impl SingleStepResult {
     /// Which stored items belong to a nested run rather than this one.
     ///
     /// Recorded as IDs, not copies: the record itself already lives in
-    /// [`Self::session_step_items`], and a second copy is a second thing to keep in sync. R12-2
-    /// attributes nested results with this, and R9-12 reconciles history with it, so neither has to
-    /// re-derive ownership from list position — which stops being true the moment a handoff
-    /// rewrites history.
+    /// [`Self::session_step_items`], and a second copy is a second thing to keep in sync. A future
+    /// sub-agent attribution step and a future history reconciliation step both use this, so
+    /// neither has to re-derive ownership from list position — which stops being true the moment
+    /// a handoff rewrites history.
     #[must_use]
     pub fn nested_history_owned_items(&self) -> &[ItemId] {
         &self.nested_history_owned_items
@@ -310,7 +310,7 @@ fn payload_differs(expected: &RunItem, relation: &str, rule: &str) -> Error {
 /// Whether a stored record still carries the model response's payload.
 ///
 /// Equal payloads are the ordinary case, and the reason this is not plain equality is narrow:
-/// **an assistant message's output phase belongs to the turn, not to the provider** (R3-10). A
+/// **an assistant message's output phase belongs to the turn, not to the provider**. A
 /// model can mark a message final in the same response it requests a tool, so settlement resolves
 /// the channel from how the turn actually ended and stores the resolved record. That one field is
 /// therefore allowed to differ from what the adapter handed over.
@@ -449,7 +449,7 @@ fn check_next_step(
     }
 }
 
-/// Session records are the authoritative R3-10 channels, not a second interpretation of them.
+/// Session records are the authoritative output-phase channels, not a second interpretation of them.
 ///
 /// The raw provider response is deliberately allowed to disagree: a provider emits before the turn
 /// knows whether it will need another model call. Once the result is settled, though, every copy

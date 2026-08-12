@@ -1,4 +1,4 @@
-//! R3-10's rule for assigning the two output channels, derived in exactly one place.
+//! The rule for assigning the two output channels, derived in exactly one place.
 //!
 //! [`item::phase`](crate::item::phase) owns the *value* an assistant message carries. This module
 //! owns *who decides it*: the settled turn. Both the producer — `ra-runtime`'s turn settlement,
@@ -13,14 +13,14 @@
 //! says "final" for turns that turned out to be the middle of the work.
 //!
 //! **Only the last assistant message of a settled turn is the delivery.** One response can carry
-//! narration and then the answer — that is the shape this milestone is modelled on — and stamping
+//! narration and then the answer — that is the shape this rule is modelled on — and stamping
 //! both `Final` costs twice: the UI renders two closing deliveries instead of the
-//! intent → action → result chain R3-10 exists to produce, and the record goes back to the model as
-//! input next turn, teaching it that pre-tool narration is what a final answer looks like.
+//! intent → action → result chain this module exists to produce, and the record goes back to the
+//! model as input next turn, teaching it that pre-tool narration is what a final answer looks like.
 //!
 //! Nothing here reads message text. Which channel a message belongs to follows from how the turn
-//! settled, and inferring it from what the model wrote is the text-driven control flow R7-10
-//! forbids.
+//! settled, and inferring it from what the model wrote is the text-driven control flow this
+//! framework forbids.
 //!
 //! [`SingleStepResult`]: crate::step::SingleStepResult
 

@@ -35,13 +35,13 @@
 //!   omit the field when unset, but Anthropic Messages rejects a request without `max_tokens`. So
 //!   for that provider the resolved-model layer is not only a ceiling, it is a mandatory fallback:
 //!   all four layers resolving to `None` must still produce a value. Supplying it belongs to
-//!   provider registration (R1-3a), not here — `ra-core` does not know which endpoint is in play.
+//!   provider registration, not here — `ra-core` does not know which endpoint is in play.
 //! - **It is coupled to the thinking budget.** Anthropic requires `max_tokens` to exceed
 //!   `thinking.budget_tokens`, so [`ThinkingConfig::Enabled`] with a large budget and a small
 //!   `max_tokens` is a request that can only 400. The check is not performed here on purpose: the
 //!   constraint is Anthropic's, `OpenAI`'s `Effort` has no equivalent relationship, and encoding it
-//!   in a protocol-neutral type would violate the R1 rule that protocol-specific facts stay out of
-//!   the neutral layer. It belongs to the adapter (R1-11 / R1-14).
+//!   in a protocol-neutral type would violate the rule that protocol-specific facts stay out of
+//!   the neutral layer. It belongs to the adapter.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

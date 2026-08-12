@@ -265,8 +265,8 @@ fn expand_ref_with_siblings(
 /// Drops definitions that no surviving `$ref` points at.
 ///
 /// Sibling expansion copies a definition into the node that referenced it. Leaving the original
-/// behind ships the same type twice in every request, which is pure waste against the R2-10
-/// schema budget and the cached prompt prefix.
+/// behind ships the same type twice in every request, which is pure waste against the schema
+/// token budget and the cached prompt prefix.
 fn prune_unreferenced_definitions(schema: &mut Value) {
     // Mark from the schema body outwards: a reference that only exists inside an unreachable
     // definition must not keep that definition — or a self-referential one — alive.

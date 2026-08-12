@@ -109,7 +109,7 @@ impl ToolCallOutput {
         &self.call_id
     }
 
-    /// Output JSON. R2-7 will add the execution layer's typed multimodal `ToolOutput`.
+    /// Output JSON. A future execution layer will add a typed multimodal `ToolOutput`.
     #[must_use]
     pub const fn output(&self) -> &Value {
         &self.output

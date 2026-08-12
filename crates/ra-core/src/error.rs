@@ -38,16 +38,16 @@ pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 /// What to do once you hold the error. Orthogonal to the subsystem dimension of [`Error`].
 ///
-/// This is the control-flow criterion: the retry policy (R1-9b), model fallback (R1-12), and the
-/// error handler (R3-8) all read this projection only and never parse error text.
+/// This is the control-flow criterion: the retry policy, model fallback, and the error handler
+/// all read this projection only and never parse error text.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recoverability {
     /// Retrying unchanged may succeed: network jitter, 429, 5xx, a transient timeout.
     Retryable,
     /// Retrying unchanged is useless, but **a different model, parameters, or strategy** may
-    /// succeed: a refusal, output that violates the protocol, an exceeded context window. The
-    /// R1-12 model fallback applies to this tier only.
+    /// succeed: a refusal, output that violates the protocol, an exceeded context window. Model
+    /// fallback applies to this tier only.
     RetryableWithChange,
     /// A human has to step in: invalid credentials, missing configuration, an unavailable
     /// sandbox, a denied permission.
@@ -116,12 +116,12 @@ pub enum ProviderErrorKind {
     Auth,
     /// Malformed request (HTTP 400). Usually a local construction bug, so retrying is useless.
     BadRequest,
-    /// The model refused. Triggers the R1-12 model fallback.
+    /// The model refused. Triggers model fallback.
     Refusal,
     /// Model output violates the protocol: invalid JSON tool arguments, structured output that
     /// does not match the schema.
     Behavior,
-    /// Input exceeds the model context window. Compact first, then retry (R5).
+    /// Input exceeds the model context window. Compact first, then retry.
     ContextOverflow,
 }
 
@@ -133,7 +133,7 @@ pub enum ToolErrorKind {
     NotFound,
     /// Arguments do not match the schema.
     InvalidInput,
-    /// A single tool timed out (R2-7).
+    /// A single tool timed out.
     Timeout,
     /// The tool itself failed while executing.
     ExecutionFailed,
@@ -167,7 +167,7 @@ pub enum SessionErrorKind {
     Corrupted,
     /// The underlying read or write failed.
     Io,
-    /// The `schema_version` is incompatible and cannot be migrated (R6-6).
+    /// The `schema_version` is incompatible and cannot be migrated.
     VersionMismatch,
 }
 
@@ -199,7 +199,7 @@ pub enum BudgetKind {
     WallClock,
 }
 
-/// Where a guard fired. Matches the four tripwire classes of R7-1 / R7-3.
+/// Where a guard fired. Matches the four tripwire classes the guardrail contract defines.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GuardrailStage {
@@ -220,7 +220,7 @@ pub enum GuardrailStage {
 /// The framework's common error. Variants are split by **subsystem**: which layer it happened in.
 ///
 /// "What to do" is projected by [`Error::recoverability`]. Do not decide it by matching variants
-/// or parsing text — that is exactly the vocabulary matching R7-10 forbids.
+/// or parsing text — that is exactly the text-driven control flow this framework forbids.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -312,7 +312,7 @@ pub enum Error {
     /// A budget was exhausted.
     ///
     /// Reaching the loop, it should take the **soft ending** of `NextStep::FinalOutput` rather
-    /// than aborting (R3-8), which is why its recoverability is
+    /// than aborting, which is why its recoverability is
     /// [`Recoverability::NeedsIntervention`]: either the user raises the budget or accepts the
     /// current result.
     #[error("预算耗尽（{kind:?}）：{message}")]
@@ -330,7 +330,7 @@ pub enum Error {
     Guardrail {
         /// Where it fired.
         stage: GuardrailStage,
-        /// Guard identity, from the guard registry (R7-0).
+        /// Guard identity, from the guard registry.
         guardrail: String,
         /// Developer-facing description.
         message: String,
@@ -469,8 +469,8 @@ impl Error {
 
     /// What to do once you hold this error.
     ///
-    /// **This is the only control-flow criterion**: retry (R1-9b), model fallback (R1-12), and
-    /// the error handler (R3-8) all read it alone, matching no variant and parsing no text.
+    /// **This is the only control-flow criterion**: retry, model fallback, and the error handler
+    /// all read it alone, matching no variant and parsing no text.
     // This match is a **decision table**: each variant's mapping is an independent decision with
     // its own stated reason. Two arms landing on the same tier today does not make them the same
     // decision — merging them would leave the reasoning with nowhere to live and would hide the

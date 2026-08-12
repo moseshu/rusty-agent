@@ -1,4 +1,4 @@
-//! R3-6b: what each agent has already asked for, recorded on identities that cannot collide.
+//! What each agent has already asked for, recorded on identities that cannot collide.
 //!
 //! Four later stages ask a question about the past rather than about this response:
 //! `reset_tool_choice` asks whether the agent used anything at all this turn, the semantic loop
@@ -54,7 +54,8 @@ pub const TOOL_USE_RECENT_LIMIT: usize = 8;
 /// One action identity the model invoked during a turn.
 ///
 /// A plain name would not do: a namespaced tool and a bare tool can legitimately share a
-/// model-facing name across agents, and counting them as one is exactly the mistake R3-6b names.
+/// model-facing name across agents, and counting them as one is exactly the mistake this type
+/// exists to prevent.
 ///
 /// This type lives beside the tracker rather than beside the classification that produces it
 /// because persistence is what pins its wire format. The settlement intermediates in
@@ -76,7 +77,7 @@ pub enum ToolUse {
         tool_name: String,
     },
     /// A name the turn did not advertise. It still counts as an attempt, which is what
-    /// `reset_tool_choice` (R3-6) reacts to.
+    /// `reset_tool_choice` reacts to.
     Unresolved(String),
 }
 
@@ -394,7 +395,7 @@ impl AgentToolUse {
 
     /// Whether the agent asked for anything at all this turn.
     ///
-    /// This is the question `reset_tool_choice` (R3-6) answers: a forced `tool_choice` that stays
+    /// This is the question `reset_tool_choice` answers: a forced `tool_choice` that stays
     /// forced after the model complied is how a run spends every remaining turn calling the same
     /// tool. Unresolved names count — the model tried.
     #[must_use]
@@ -515,7 +516,7 @@ impl ToolUseTracker {
     ///
     /// Settling one response twice is the ordinary shape of resuming an interruption, and a double
     /// count there would make the model look exactly twice as repetitive as it was — on the number
-    /// R3-6's breaker acts on. Two tiers guarantee it does not:
+    /// the semantic loop breaker acts on. Two tiers guarantee it does not:
     ///
     /// 1. **The turn just recorded, at any length.** A digest of the whole ordered turn is kept per
     ///    agent, so re-recording it is recognized before any entry is touched.
@@ -591,15 +592,16 @@ impl ToolUseTracker {
 
     /// How many consecutive calls of one identity carried the same arguments.
     ///
-    /// Zero when the agent has never invoked it. This is the value R3-6's loop breaker compares
-    /// against its threshold, and reading it here rather than re-deriving it per call site is what
-    /// keeps "what counts as a repeat" a single definition.
+    /// Zero when the agent has never invoked it. This is the value the semantic loop breaker
+    /// compares against its threshold, and reading it here rather than re-deriving it per call
+    /// site is what keeps "what counts as a repeat" a single definition.
     ///
     /// **It counts the whole turn already recorded, not the calls settled so far.** Settlement
     /// records a turn before it executes any of it, so `N` identical parallel calls in one response
     /// all read `N`, including the first one to be dispatched. A threshold of `N` therefore refuses
     /// all of them rather than letting the first through — deliberate, since `N` identical calls in
-    /// one response is itself the pathology, but it is a policy R3-6 inherits rather than chooses.
+    /// one response is itself the pathology, but it is a policy the breaker inherits rather than
+    /// chooses.
     #[must_use]
     pub fn repeat_streak(&self, agent: &AgentId, identity: &ToolUse) -> u32 {
         self.agent(agent)
