@@ -14,7 +14,6 @@ pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub(crate) mod final_answer;
 pub(crate) mod guards;
-pub(crate) mod ledger;
 pub(crate) mod profile;
 pub(crate) mod prompt;
 pub(crate) mod tools;
