@@ -3,7 +3,7 @@
 async fn ra_runtime::runner::Runner::run(request : RunRequest) -> Result < RunResult >
 async fn ra_runtime::runner::stream::RunStream::finish(self) -> Result < RunResult >
 async fn ra_runtime::runner::stream::RunStream::next_event(& mut self) -> Option < RunStreamEvent >
-async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest < '_ >) -> Result < ToolDispatch >
+async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest) -> Result < ToolDispatch >
 async fn ra_runtime::turn::batch::execute_actions(request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
@@ -20,12 +20,9 @@ const fn ra_runtime::runner::result::RunResult::outcome(& self) -> & RunOutcome
 const fn ra_runtime::runner::result::RunResult::state(& self) -> & RunState
 const fn ra_runtime::runner::result::RunResult::tool_use(& self) -> & ToolUseTracker
 const fn ra_runtime::runner::result::RunResult::turns(& self) -> u32
-const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_caller(mut self, caller : ToolCaller) -> Self
-const fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
+const fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
-const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
-const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_work_state(mut self, work_state : & 'a Arc < dyn WorkStateHandle >) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
@@ -55,14 +52,17 @@ fn ra_runtime::runner::result::RunResult::model_responses(& self) -> & [ModelRes
 fn ra_runtime::runner::result::RunResult::new_items(& self) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInputItem]
 fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
-fn ra_runtime::tool::dispatch::ToolDispatchRequest < 'a >::new(tool : & 'a Arc < dyn Tool >, call_id : & 'a CallId, arguments : & 'a Value, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, repeat_streak : u32) -> Self
-fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
+fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, context : Arc < dyn ToolRuntimeContext >, cancel : CancelScope, repeat_streak : u32) -> Self
+fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
 fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]
-fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
 fn ra_runtime::turn::prepare::PreparedTurn::tools(& self) -> & [Arc < dyn Tool >]

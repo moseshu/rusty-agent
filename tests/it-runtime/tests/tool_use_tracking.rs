@@ -149,7 +149,7 @@ async fn settle(
         &binding("main"),
         response,
         surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         tracker,
     ))
@@ -348,7 +348,7 @@ async fn 归属跟着传进来的公共_agent_身份走() {
             &binding(id),
             &response,
             &surface,
-            &Host,
+            Arc::new(Host),
             &cancel,
             &mut tracker,
         ))

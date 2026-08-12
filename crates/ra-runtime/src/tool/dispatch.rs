@@ -45,29 +45,29 @@ pub enum ToolDispatch {
 /// Inputs for one invocation.
 #[must_use]
 #[non_exhaustive]
-pub struct ToolDispatchRequest<'a> {
-    tool: &'a Arc<dyn Tool>,
-    call_id: &'a CallId,
-    arguments: &'a Value,
-    context: &'a dyn ToolRuntimeContext,
-    cancel: &'a CancelScope,
+pub struct ToolDispatchRequest {
+    tool: Arc<dyn Tool>,
+    call_id: CallId,
+    arguments: Value,
+    context: Arc<dyn ToolRuntimeContext>,
+    cancel: CancelScope,
     repeat_streak: u32,
     caller: ToolCaller,
-    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
+    work_state: Option<Arc<dyn WorkStateHandle>>,
 }
 
-impl<'a> ToolDispatchRequest<'a> {
+impl ToolDispatchRequest {
     /// Creates a request for a call the model made directly.
     ///
     /// `cancel` is required rather than optional for the same reason it is in turn preparation:
     /// [`Tool::call`] is third-party `async` code, and the cancellation contract does not allow it
     /// to be awaited bare.
     pub fn new(
-        tool: &'a Arc<dyn Tool>,
-        call_id: &'a CallId,
-        arguments: &'a Value,
-        context: &'a dyn ToolRuntimeContext,
-        cancel: &'a CancelScope,
+        tool: Arc<dyn Tool>,
+        call_id: CallId,
+        arguments: Value,
+        context: Arc<dyn ToolRuntimeContext>,
+        cancel: CancelScope,
         repeat_streak: u32,
     ) -> Self {
         Self {
@@ -89,16 +89,16 @@ impl<'a> ToolDispatchRequest<'a> {
     }
 
     /// Sets the task state the tool is handed (R3-13).
-    pub const fn with_work_state(mut self, work_state: &'a Arc<dyn WorkStateHandle>) -> Self {
+    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
         self.work_state = Some(work_state);
         self
     }
 
-    fn invocation(&self) -> ToolInvocation<'a> {
-        let invocation = ToolInvocation::new(self.call_id, self.arguments)
+    fn invocation(&self) -> ToolInvocation<'_> {
+        let invocation = ToolInvocation::new(&self.call_id, &self.arguments)
             .with_caller(self.caller)
-            .with_context(self.context);
-        match self.work_state {
+            .with_context(self.context.as_ref());
+        match &self.work_state {
             Some(work_state) => invocation.with_work_state(work_state.as_ref()),
             None => invocation,
         }
@@ -106,8 +106,8 @@ impl<'a> ToolDispatchRequest<'a> {
 }
 
 /// Runs one call through the fixed chain.
-pub async fn dispatch_tool(request: ToolDispatchRequest<'_>) -> Result<ToolDispatch> {
-    let tool = request.tool;
+pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch> {
+    let tool = &request.tool;
     let options = tool.options();
     let name = tool.origin().qualified_name().to_owned();
 
@@ -116,7 +116,7 @@ pub async fn dispatch_tool(request: ToolDispatchRequest<'_>) -> Result<ToolDispa
     // than inventing a second way to say "you may not call this".
     if !options.allows_caller(request.caller) {
         return Ok(observed_failure(
-            request.call_id,
+            &request.call_id,
             &name,
             &Error::tool(
                 ToolErrorKind::NotFound,
@@ -148,7 +148,7 @@ pub async fn dispatch_tool(request: ToolDispatchRequest<'_>) -> Result<ToolDispa
     // so its position relative to approval is decided here rather than per call site.
     check_input_guardrails(&options)?;
 
-    let outcome = invoke(tool, request.invocation(), &options, request.cancel, &name).await;
+    let outcome = invoke(tool, request.invocation(), &options, &request.cancel, &name).await;
 
     let output = match outcome {
         Ok(output) => output,
@@ -158,7 +158,7 @@ pub async fn dispatch_tool(request: ToolDispatchRequest<'_>) -> Result<ToolDispa
     // 5. Output guardrail, on the result the tool actually produced.
     check_output_guardrails(&options)?;
 
-    observed_success(request.call_id, &output)
+    observed_success(&request.call_id, &output)
 }
 
 /// Invokes the tool, applying its per-call time limit.
@@ -186,7 +186,7 @@ async fn invoke(
 /// Turns an invocation failure into either a model-visible observation or a stopped turn.
 async fn shape_failure(
     tool: &Arc<dyn Tool>,
-    request: &ToolDispatchRequest<'_>,
+    request: &ToolDispatchRequest,
     options: &ToolOptions,
     name: &str,
     error: Error,
@@ -208,7 +208,7 @@ async fn shape_failure(
     if timed_out {
         return match options.timeout_behavior() {
             ToolTimeoutBehavior::ModelVisible => {
-                Ok(observed_failure(request.call_id, name, &error))
+                Ok(observed_failure(&request.call_id, name, &error))
             }
             ToolTimeoutBehavior::Propagate => Err(error),
             behavior => Err(Error::caller(format!(
@@ -218,7 +218,7 @@ async fn shape_failure(
     }
 
     match options.failure_handling() {
-        ToolFailureHandling::ModelVisible => Ok(observed_failure(request.call_id, name, &error)),
+        ToolFailureHandling::ModelVisible => Ok(observed_failure(&request.call_id, name, &error)),
         ToolFailureHandling::Propagate => Err(error),
         // The one path where a tool writes its own model-facing failure text. Returning `None`
         // means the tool declined to handle it, and an unhandled failure propagates.
@@ -229,7 +229,7 @@ async fn shape_failure(
                 .run(tool.handle_failure(&invocation, &error))
                 .await??
             {
-                Some(output) => observed_success(request.call_id, &output),
+                Some(output) => observed_success(&request.call_id, &output),
                 None => Err(error),
             }
         }
@@ -242,7 +242,7 @@ async fn shape_failure(
 async fn needs_approval(
     tool: &Arc<dyn Tool>,
     options: &ToolOptions,
-    request: &ToolDispatchRequest<'_>,
+    request: &ToolDispatchRequest,
 ) -> Result<bool> {
     match options.approval() {
         ToolApprovalPolicy::Never => Ok(false),

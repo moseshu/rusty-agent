@@ -1,10 +1,13 @@
 //! R3-4 contracts for the fixed order that settles one turn.
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -12,7 +15,7 @@ use async_trait::async_trait;
 use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::{CancelReason, CancelScope},
-    error::{Error, Result, ToolErrorKind},
+    error::{Error, GuardrailStage, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
         CallId, ItemId, McpApprovalRequest, Message, ModelResponse, OutputPhase, RunItem,
@@ -22,9 +25,8 @@ use ra_core::{
     state::ToolUseTracker,
     step::NextStep,
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolFailureHandling,
-        ToolInvocation, ToolOptions, ToolOrigin, ToolOutput, ToolRuntimeContext, ToolSchema,
-        ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolFailureHandling, ToolInvocation,
+        ToolOptions, ToolOrigin, ToolOutput, ToolRuntimeContext, ToolSchema, ToolTimeoutBehavior,
     },
 };
 use ra_runtime::{
@@ -136,6 +138,370 @@ struct GatedTool {
     release: Arc<AtomicBool>,
     completed: Arc<AtomicUsize>,
     output: &'static str,
+}
+
+/// Failure classes that must propagate out of a batch and therefore participate in R3-4c's
+/// arbitration rather than becoming a model-visible observation.
+#[derive(Clone, Copy)]
+enum PropagatingFailure {
+    Other,
+    User,
+    Guardrail,
+    Timeout,
+}
+
+impl PropagatingFailure {
+    fn error(self, tool: &str) -> Error {
+        match self {
+            Self::Other => Error::tool(
+                ToolErrorKind::ExecutionFailed,
+                tool,
+                "ordinary tool failure",
+            ),
+            Self::User => Error::caller("the caller supplied an invalid run input"),
+            Self::Guardrail => Error::guardrail(
+                GuardrailStage::ToolOutput,
+                "test",
+                "guardrail rejected output",
+            ),
+            Self::Timeout => Error::tool(ToolErrorKind::Timeout, tool, "the tool timed out"),
+        }
+    }
+}
+
+/// Makes two failures happen at the same synchronization point. This catches the old collector's
+/// accidental "first completion wins" behavior without relying on timing.
+struct BarrierFailureTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    barrier: Arc<tokio::sync::Barrier>,
+    entered: Arc<AtomicUsize>,
+    failure: PropagatingFailure,
+}
+
+impl BarrierFailureTool {
+    fn new(
+        name: &str,
+        barrier: Arc<tokio::sync::Barrier>,
+        entered: Arc<AtomicUsize>,
+        failure: PropagatingFailure,
+    ) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            barrier,
+            entered,
+            failure,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BarrierFailureTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        // Both switches are required, and the timeout one is the easy thing to forget: dispatch
+        // routes *any* `ToolErrorKind::Timeout` through `timeout_behavior`, whose default is
+        // `ModelVisible`. Declaring only `failure_handling` would turn the timeout arm of this
+        // tool into an observation, and the timeout tier of the arbitration table would silently
+        // never be exercised by a test that claims to cover it.
+        ToolOptions::new()
+            .with_concurrency(ToolConcurrency::Parallel)
+            .with_failure_handling(ToolFailureHandling::Propagate)
+            .with_timeout_behavior(ToolTimeoutBehavior::Propagate)
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.barrier.wait().await;
+        Err(self.failure.error(self.origin.qualified_name()))
+    }
+}
+
+/// Fails only once the test releases it, so a peer can be parked first and the teardown can be
+/// started on demand.
+struct GateThenFailTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    release: Arc<AtomicBool>,
+    entered: Arc<AtomicUsize>,
+    failure: PropagatingFailure,
+}
+
+impl GateThenFailTool {
+    fn new(
+        name: &str,
+        release: Arc<AtomicBool>,
+        entered: Arc<AtomicUsize>,
+        failure: PropagatingFailure,
+    ) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            release,
+            entered,
+            failure,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GateThenFailTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new()
+            .with_concurrency(ToolConcurrency::Parallel)
+            .with_failure_handling(ToolFailureHandling::Propagate)
+            .with_timeout_behavior(ToolTimeoutBehavior::Propagate)
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        Err(self.failure.error(self.origin.qualified_name()))
+    }
+}
+
+/// Becomes ready from a flag and **never registers a waker**, so setting the flag schedules
+/// nothing.
+///
+/// This is how the file pins down the one ordering in which a tool's own failure reaches the drain
+/// loop. In production that ordering is a race — the call's result lands in the same wake-up as
+/// the peer-failure cancellation — and `CancelScope::run` resolves it in the call's favour because
+/// `futures::future::select` polls the call before it looks at the cancellation. Nothing here fakes
+/// that resolution: the flag only controls *when* the call becomes ready, and the next poll it gets
+/// is genuinely the one cancellation triggers.
+struct ReadyWithoutWaking(Arc<AtomicBool>);
+
+impl Future for ReadyWithoutWaking {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// A call whose own propagating failure can only be observed after the batch started tearing down.
+struct LateFailureTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    ready: Arc<AtomicBool>,
+    entered: Arc<AtomicUsize>,
+    failure: PropagatingFailure,
+}
+
+impl LateFailureTool {
+    fn new(
+        name: &str,
+        ready: Arc<AtomicBool>,
+        entered: Arc<AtomicUsize>,
+        failure: PropagatingFailure,
+    ) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            ready,
+            entered,
+            failure,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for LateFailureTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new()
+            .with_concurrency(ToolConcurrency::Parallel)
+            .with_failure_handling(ToolFailureHandling::Propagate)
+            .with_timeout_behavior(ToolTimeoutBehavior::Propagate)
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        ReadyWithoutWaking(Arc::clone(&self.ready)).await;
+        Err(self.failure.error(self.origin.qualified_name()))
+    }
+}
+
+/// A call whose supervised *task* dies while being torn down, rather than returning a failure.
+///
+/// This is the second of the two ways a failure can reach `drain_dispatches`, and it is the one
+/// [`LateFailureTool`] cannot reach: it arrives as a `JoinError` instead of as an `Err` the tool
+/// returned, so it is ranked by `RankedFailure::task_failure` rather than by the error's own class.
+/// Failing from `Drop` is what a real cleanup path does when it cannot finish.
+struct PanicOnTeardownTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    barrier: Arc<tokio::sync::Barrier>,
+    entered: Arc<AtomicUsize>,
+}
+
+impl PanicOnTeardownTool {
+    fn new(name: &str, barrier: Arc<tokio::sync::Barrier>, entered: Arc<AtomicUsize>) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            barrier,
+            entered,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for PanicOnTeardownTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_concurrency(ToolConcurrency::Parallel)
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        struct FailOnDrop;
+
+        impl Drop for FailOnDrop {
+            fn drop(&mut self) {
+                panic!("cleanup for this call could not complete");
+            }
+        }
+
+        // Armed before the barrier, not after: the guard then fires even if this call is torn down
+        // while still parked, so the test does not depend on getting one more poll first.
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _fail_on_drop = FailOnDrop;
+        self.barrier.wait().await;
+        std::future::pending::<()>().await;
+        unreachable!("a pending test tool can only leave through cancellation")
+    }
+}
+
+/// Reports when a cancelled `Tool::call` future is actually dropped. Both calls wait forever, so
+/// the only legal way this test can finish is for the batch collector to send cancellation and
+/// supervise both task teardowns.
+struct DropReportingTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    entered: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl DropReportingTool {
+    fn new(name: &str, entered: Arc<AtomicUsize>, dropped: Arc<AtomicUsize>) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            entered,
+            dropped,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DropReportingTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_concurrency(ToolConcurrency::Parallel)
+    }
+
+    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        struct ReportDrop(Arc<AtomicUsize>);
+
+        impl Drop for ReportDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _report = ReportDrop(Arc::clone(&self.dropped));
+        std::future::pending::<()>().await;
+        unreachable!("a pending test tool can only leave through cancellation")
+    }
 }
 
 impl GatedTool {
@@ -280,7 +646,7 @@ async fn 什么都没要的响应直接结算成最终输出() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -316,7 +682,7 @@ async fn 工具跑完后回到模型_输出按_call_id_配对() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -375,7 +741,7 @@ async fn parallel_工具在同一批次重叠且输出仍按模型顺序记录()
             &binding,
             &response,
             &surface,
-            &Host,
+            Arc::new(Host),
             &cancel,
             &mut tracker,
         ))
@@ -398,8 +764,14 @@ async fn parallel_工具在同一批次重叠且输出仍按模型顺序记录()
         })
         .collect::<Vec<_>>();
     assert_eq!(outputs, ["call-1", "call-2"]);
-    assert_eq!(stored_text(output_for(settled.new_step_items(), "call-1")), Some("first".to_owned()));
-    assert_eq!(stored_text(output_for(settled.new_step_items(), "call-2")), Some("second".to_owned()));
+    assert_eq!(
+        stored_text(output_for(settled.new_step_items(), "call-1")),
+        Some("first".to_owned())
+    );
+    assert_eq!(
+        stored_text(output_for(settled.new_step_items(), "call-2")),
+        Some("second".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -431,7 +803,7 @@ async fn 并发上限限制已开始的_parallel_工具数() {
                 &binding,
                 &response,
                 &surface,
-                &Host,
+                Arc::new(Host),
                 &cancel,
                 &mut tracker,
             )
@@ -454,6 +826,12 @@ async fn 并发上限限制已开始的_parallel_工具数() {
     assert_eq!(completed.load(Ordering::SeqCst), 3);
 }
 
+/// Has to stay on the single-threaded test runtime. Dispatch order is the order the batch spawns
+/// its tasks, which only equals model order while one thread runs them FIFO; on a multi-threaded
+/// runtime `patch` could take the write permit first, `read` would then never reach `Tool::call`,
+/// and the release below would never fire. The batch promises the two permits are mutually
+/// exclusive, **not** that the model's order decides who takes one first — resource-level
+/// admission is R3-4d's.
 #[tokio::test]
 async fn exclusive_工具等待正在运行的_parallel_工具完成() {
     let release = Arc::new(AtomicBool::new(false));
@@ -490,7 +868,7 @@ async fn exclusive_工具等待正在运行的_parallel_工具完成() {
             &binding,
             &response,
             &surface,
-            &Host,
+            Arc::new(Host),
             &cancel,
             &mut tracker,
         ))
@@ -511,6 +889,297 @@ async fn exclusive_工具等待正在运行的_parallel_工具完成() {
     assert_eq!(exclusive_entered.load(Ordering::SeqCst), 1);
 }
 
+/// Settles one batch in which every call fails at the same barrier, and returns the batch-level
+/// error. One shared barrier is what makes completion order unusable as an explanation for the
+/// result: no call can finish before all of them have arrived.
+async fn settle_simultaneous_failures(classes: &[PropagatingFailure]) -> Error {
+    let expected = classes.len();
+    let barrier = Arc::new(tokio::sync::Barrier::new(expected));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let tools = classes
+        .iter()
+        .enumerate()
+        .map(|(order, class)| {
+            Arc::new(BarrierFailureTool::new(
+                &format!("failure_{order}"),
+                Arc::clone(&barrier),
+                Arc::clone(&entered),
+                *class,
+            )) as Arc<dyn Tool>
+        })
+        .collect::<Vec<_>>();
+    let calls = (0..expected)
+        .map(|order| {
+            tool_call(
+                &format!("call-item-{order}"),
+                &format!("call-{order}"),
+                &format!("failure_{order}"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let task = tokio::spawn(async move {
+        let binding = binding();
+        let surface = surface(tools);
+        let response = ModelResponse::new(calls);
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        settle_turn(TurnSettlementRequest::new(
+            &binding,
+            &response,
+            &surface,
+            Arc::new(Host),
+            &cancel,
+            &mut tracker,
+        ))
+        .await
+    });
+
+    wait_for_count(&entered, expected).await;
+    task.await
+        .expect("settlement task joins")
+        .expect_err("a batch of propagating failures cannot settle")
+}
+
+#[tokio::test]
+async fn 并发的传播失败按错误类别择优而不是按完成顺序() {
+    use PropagatingFailure::{Guardrail, Other, Timeout, User};
+
+    // Each row's expected winner is declared *last*, so both "whichever finished first" and
+    // "whichever the model asked for first" give the wrong answer for every row but the last.
+    let cases: [(&str, Vec<PropagatingFailure>, &str); 4] = [
+        (
+            "user_error_outranks_everything",
+            vec![Other, Timeout, Guardrail, User],
+            "caller",
+        ),
+        (
+            "guardrail_outranks_timeout_and_other",
+            vec![Other, Timeout, Guardrail],
+            "guardrail.tool_output",
+        ),
+        (
+            "timeout_outranks_other",
+            vec![Other, Other, Timeout],
+            "tool.timeout",
+        ),
+        // Nothing left to arbitrate: equal classes fall back to model order.
+        (
+            "equal_classes_fall_back_to_model_order",
+            vec![Other, Other, Other],
+            "tool.execution_failed",
+        ),
+    ];
+
+    for (label, classes, expected_code) in cases {
+        let error = settle_simultaneous_failures(&classes).await;
+        assert_eq!(error.code(), expected_code, "{label} 选错了主失败：{error}");
+    }
+}
+
+#[tokio::test]
+async fn 同类失败之间由模型顺序决胜() {
+    let error = settle_simultaneous_failures(&[PropagatingFailure::Other; 3]).await;
+
+    // The class cannot separate these three, so the reported one has to be the call the model
+    // asked for first — otherwise the batch's error is whichever task the scheduler polled first.
+    match error {
+        Error::Tool { tool, .. } => assert_eq!(tool, "failure_0"),
+        other => panic!("应当报成工具失败，实际是：{other}"),
+    }
+}
+
+#[tokio::test]
+async fn 工具自己的迟到失败在排空里被合并() {
+    // The late call is model order 1 and completion order last, so neither "the model asked for it
+    // first" nor "it finished first" can explain a row where it wins.
+    let cases: [(&str, PropagatingFailure, PropagatingFailure, &str); 2] = [
+        // Wins on class alone. The drain loop has to merge what it joins rather than keep whatever
+        // collection already selected, and it has to treat a non-cancellation result arriving
+        // during teardown as a real outcome rather than teardown noise.
+        (
+            "late_user_error_outranks_the_peer_that_started_the_teardown",
+            PropagatingFailure::Other,
+            PropagatingFailure::User,
+            "caller",
+        ),
+        // The reverse guard: arriving late is not itself a claim to the batch outcome.
+        (
+            "a_late_failure_does_not_outrank_a_higher_class",
+            PropagatingFailure::Guardrail,
+            PropagatingFailure::Other,
+            "guardrail.tool_output",
+        ),
+    ];
+
+    for (label, peer_failure, late_failure, expected_code) in cases {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release_peer = Arc::new(AtomicBool::new(false));
+        let late_ready = Arc::new(AtomicBool::new(false));
+        let peer: Arc<dyn Tool> = Arc::new(GateThenFailTool::new(
+            "starts_the_teardown",
+            Arc::clone(&release_peer),
+            Arc::clone(&entered),
+            peer_failure,
+        ));
+        let late: Arc<dyn Tool> = Arc::new(LateFailureTool::new(
+            "fails_after_teardown_began",
+            Arc::clone(&late_ready),
+            Arc::clone(&entered),
+            late_failure,
+        ));
+
+        let task = tokio::spawn(async move {
+            let binding = binding();
+            let surface = surface(vec![peer, late]);
+            let response = ModelResponse::new(vec![
+                tool_call("call-item-1", "call-1", "starts_the_teardown"),
+                tool_call("call-item-2", "call-2", "fails_after_teardown_began"),
+            ]);
+            let cancel = CancelScope::root();
+            let mut tracker = ToolUseTracker::new();
+            settle_turn(TurnSettlementRequest::new(
+                &binding,
+                &response,
+                &surface,
+                Arc::new(Host),
+                &cancel,
+                &mut tracker,
+            ))
+            .await
+        });
+
+        // Both calls are inside `Tool::call`, and the late one is parked on a future that will
+        // never wake it. Arming it therefore schedules nothing: the batch stays exactly as it is
+        // until the peer is released, and the next poll the late call gets is the one that
+        // `cancel_tool_scopes` triggers.
+        wait_for_count(&entered, 2).await;
+        late_ready.store(true, Ordering::SeqCst);
+        release_peer.store(true, Ordering::SeqCst);
+
+        let error = task
+            .await
+            .expect("settlement task joins")
+            .expect_err("a propagating failure stops the batch");
+        assert_eq!(error.code(), expected_code, "{label} 选错了主失败：{error}");
+    }
+}
+
+#[tokio::test]
+async fn 排空期间的清理异常被记录并参与仲裁() {
+    // Distinct from the test above: this failure is not a tool result at all, it is the supervised
+    // task dying during teardown, which reaches arbitration as a `JoinError` rather than as an
+    // `Err` the tool returned. Model order 0 is the call that fails while being torn down and
+    // model order 1 is the one that starts the teardown, so each row turns on exactly one rule.
+    let cases: [(&str, PropagatingFailure, &str); 2] = [
+        // Equal classes: the cleanup failure wins on model order.
+        (
+            "cleanup_failure_merges_and_wins_on_order",
+            PropagatingFailure::Other,
+            "caller",
+        ),
+        // A task that died during cleanup is a runtime defect, not the public `UserError` class of
+        // the error container that carries it — so it must not outrank a guardrail tripwire that
+        // lost on model order.
+        (
+            "guardrail_outranks_a_cleanup_failure",
+            PropagatingFailure::Guardrail,
+            "guardrail.tool_output",
+        ),
+    ];
+
+    for (label, peer_failure, expected_code) in cases {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let late: Arc<dyn Tool> = Arc::new(PanicOnTeardownTool::new(
+            "fails_while_tearing_down",
+            Arc::clone(&barrier),
+            Arc::clone(&entered),
+        ));
+        let peer: Arc<dyn Tool> = Arc::new(BarrierFailureTool::new(
+            "starts_the_teardown",
+            barrier,
+            Arc::clone(&entered),
+            peer_failure,
+        ));
+
+        let task = tokio::spawn(async move {
+            let binding = binding();
+            let surface = surface(vec![late, peer]);
+            let response = ModelResponse::new(vec![
+                tool_call("call-item-1", "call-1", "fails_while_tearing_down"),
+                tool_call("call-item-2", "call-2", "starts_the_teardown"),
+            ]);
+            let cancel = CancelScope::root();
+            let mut tracker = ToolUseTracker::new();
+            settle_turn(TurnSettlementRequest::new(
+                &binding,
+                &response,
+                &surface,
+                Arc::new(Host),
+                &cancel,
+                &mut tracker,
+            ))
+            .await
+        });
+
+        wait_for_count(&entered, 2).await;
+        let error = task
+            .await
+            .expect("settlement task joins")
+            .expect_err("a propagating failure stops the batch");
+        assert_eq!(error.code(), expected_code, "{label} 选错了主失败：{error}");
+    }
+}
+
+#[tokio::test]
+async fn 父取消会排空所有并发调用后才返回() {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let first: Arc<dyn Tool> = Arc::new(DropReportingTool::new(
+        "first_waiter",
+        Arc::clone(&entered),
+        Arc::clone(&dropped),
+    ));
+    let second: Arc<dyn Tool> = Arc::new(DropReportingTool::new(
+        "second_waiter",
+        Arc::clone(&entered),
+        Arc::clone(&dropped),
+    ));
+    let cancel = CancelScope::root();
+    let scope = cancel.clone();
+
+    let task = tokio::spawn(async move {
+        let binding = binding();
+        let surface = surface(vec![first, second]);
+        let response = ModelResponse::new(vec![
+            tool_call("call-item-1", "call-1", "first_waiter"),
+            tool_call("call-item-2", "call-2", "second_waiter"),
+        ]);
+        let mut tracker = ToolUseTracker::new();
+        settle_turn(TurnSettlementRequest::new(
+            &binding,
+            &response,
+            &surface,
+            Arc::new(Host),
+            &cancel,
+            &mut tracker,
+        ))
+        .await
+    });
+
+    wait_for_count(&entered, 2).await;
+    scope.cancel(CancelReason::UserInterrupt);
+
+    let error = task
+        .await
+        .expect("settlement task joins")
+        .expect_err("the parent cancellation leaves the turn cancelled");
+    assert!(matches!(error, Error::Cancelled { .. }));
+    // Observing the error is not enough: both task-local cleanup guards must already have run.
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn 叫不出名字的工具也拿到一份配对失败观察并逼出下一轮() {
     let surface = surface(vec![Arc::new(ScriptedTool::new(
@@ -524,7 +1193,7 @@ async fn 叫不出名字的工具也拿到一份配对失败观察并逼出下�
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -554,7 +1223,7 @@ async fn 需要审批时干净地停下来而不是阻塞在一个_await_上() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -605,7 +1274,7 @@ async fn 响应里的_mcp_审批与工具审批一起被问全() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -634,7 +1303,7 @@ async fn 工具失败默认变成模型读得懂的观察而不是终止_run() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -679,7 +1348,7 @@ async fn 声明_propagate_的工具失败会终止这一轮() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -710,7 +1379,7 @@ async fn custom_失败处理让工具自己写给模型看的解释() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -739,7 +1408,7 @@ async fn 超时按声明的行为分流() {
         &binding(),
         &response,
         &surface(vec![visible]),
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -760,7 +1429,7 @@ async fn 超时按声明的行为分流() {
         &binding(),
         &response,
         &surface(vec![propagating]),
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -795,7 +1464,7 @@ async fn 取消永远不会被降级成一条工具观察() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -819,7 +1488,7 @@ async fn 已取消的作用域一个工具都不跑() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -870,7 +1539,7 @@ async fn 已取消时不看模型这轮要了什么都报成取消() {
                 "write_file",
                 Behavior::Succeed("ok"),
             ))]),
-            &Host,
+            Arc::new(Host),
             &cancel,
             &mut ToolUseTracker::new(),
         ))
@@ -901,7 +1570,7 @@ async fn 不接受这个调用方类别的工具从模型侧看就是不存在()
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -938,7 +1607,7 @@ async fn 交接落到_r17_之前明确报错而不是当成模型什么都没要
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -965,7 +1634,7 @@ async fn 一轮里的多个调用各自拿到自己的观察() {
         &binding(),
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
     ))
@@ -995,7 +1664,7 @@ async fn 结算结果带着原始输入与前序项且通过全部对账() {
             &binding(),
             &response,
             &surface,
-            &Host,
+            Arc::new(Host),
             &cancel,
             &mut ToolUseTracker::new(),
         )
@@ -1044,7 +1713,7 @@ async fn 结算结果可跨_await_共享() {
             &binding(),
             &response,
             &surface,
-            &Host,
+            Arc::new(Host),
             &cancel,
             &mut ToolUseTracker::new(),
         ))

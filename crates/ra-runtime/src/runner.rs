@@ -332,14 +332,14 @@ async fn run_loop(
             &agent,
             &response,
             &surface,
-            tool_context.as_ref(),
+            Arc::clone(&tool_context),
             &turn_scope,
             state.tool_use_mut(),
         )
         .with_original_input(original_input.clone())
         .with_pre_step_items(generated.clone());
         if let Some(work_state) = &work_state {
-            settlement = settlement.with_work_state(work_state);
+            settlement = settlement.with_work_state(Arc::clone(work_state));
         }
         settlement =
             settlement.with_max_function_tool_concurrency(config.max_function_tool_concurrency);

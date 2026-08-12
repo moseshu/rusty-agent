@@ -238,7 +238,7 @@ async fn 归属跟着公共身份而不是跑起来的那个() {
         &binding,
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut tracker,
     ))
@@ -283,7 +283,7 @@ async fn 已经有归属的记录不会被改写成父_agent() {
         &binding,
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut tracker,
     ))
@@ -316,7 +316,7 @@ async fn 直接绑定时归属就是用户那个_agent() {
         &binding,
         &response,
         &surface,
-        &Host,
+        Arc::new(Host),
         &cancel,
         &mut tracker,
     ))

@@ -50,10 +50,10 @@ pub struct TurnSettlementRequest<'a> {
     agent: &'a AgentBinding,
     response: &'a ModelResponse,
     surface: &'a TurnActionSurface,
-    context: &'a dyn ToolRuntimeContext,
+    context: Arc<dyn ToolRuntimeContext>,
     cancel: &'a CancelScope,
     tool_use: &'a mut ToolUseTracker,
-    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
+    work_state: Option<Arc<dyn WorkStateHandle>>,
     max_function_tool_concurrency: usize,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
@@ -74,7 +74,7 @@ impl<'a> TurnSettlementRequest<'a> {
         agent: &'a AgentBinding,
         response: &'a ModelResponse,
         surface: &'a TurnActionSurface,
-        context: &'a dyn ToolRuntimeContext,
+        context: Arc<dyn ToolRuntimeContext>,
         cancel: &'a CancelScope,
         tool_use: &'a mut ToolUseTracker,
     ) -> Self {
@@ -93,7 +93,7 @@ impl<'a> TurnSettlementRequest<'a> {
     }
 
     /// Sets the task state this run participates in, for the tools this turn calls (R3-13).
-    pub const fn with_work_state(mut self, work_state: &'a Arc<dyn WorkStateHandle>) -> Self {
+    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
         self.work_state = Some(work_state);
         self
     }
@@ -143,11 +143,11 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
         &processed,
         public_id,
         request.tool_use,
-        request.context,
+        Arc::clone(&request.context),
         request.cancel,
     );
-    if let Some(work_state) = request.work_state {
-        execution_request = execution_request.with_work_state(work_state);
+    if let Some(work_state) = &request.work_state {
+        execution_request = execution_request.with_work_state(Arc::clone(work_state));
     }
     execution_request =
         execution_request.with_max_function_tool_concurrency(request.max_function_tool_concurrency);
