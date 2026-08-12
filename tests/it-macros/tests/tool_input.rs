@@ -37,7 +37,7 @@ struct GenericInput<T> {
 }
 
 #[test]
-fn derive_把类型与字段文档带进_schema() {
+fn test_tool_input_01() {
     let schema = SearchInput::tool_schema("catalog_search").unwrap();
 
     assert_eq!(
@@ -56,7 +56,7 @@ fn derive_把类型与字段文档带进_schema() {
 }
 
 #[test]
-fn strict_schema_关闭额外字段_全字段_required_并保留_option_nullable() {
+fn test_tool_input_02() {
     let schema = SearchInput::tool_schema("catalog_search").unwrap();
     let root = schema.input_schema();
 
@@ -88,7 +88,7 @@ struct ReferencingInput {
 }
 
 #[test]
-fn 仍被引用的_definition_保留_元组按位置展开() {
+fn test_tool_input_03() {
     let schema = ReferencingInput::tool_schema("referencing").unwrap();
     let root = schema.input_schema();
 
@@ -127,7 +127,7 @@ fn 仍被引用的_definition_保留_元组按位置展开() {
 struct NoArgsInput {}
 
 #[test]
-fn 无参数工具也能生成合法的_strict_schema() {
+fn test_tool_input_04() {
     // schemars describes an empty struct as bare `{"type":"object"}`. Normalization has to
     // complete it into an explicitly closed empty object, or the result fails the strict
     // verification it is meant to satisfy — and argument-less tools are a common shape.
@@ -160,7 +160,7 @@ struct RecursiveInput {
 }
 
 #[test]
-fn 自引用类型报错而不是撑爆调用栈() {
+fn test_tool_input_05() {
     let error = RecursiveInput::tool_schema("recursive")
         .expect_err("self-referential input must not be expanded forever");
     assert!(
@@ -170,7 +170,7 @@ fn 自引用类型报错而不是撑爆调用栈() {
 }
 
 #[test]
-fn 非_strict_模式保留_schemars_原始可选语义() {
+fn test_tool_input_06() {
     let schema = LooseInput::tool_schema("loose").unwrap();
 
     assert!(!schema.strict_json_schema());
@@ -181,7 +181,7 @@ fn 非_strict_模式保留_schemars_原始可选语义() {
 }
 
 #[test]
-fn func_schema_的_decoder_与生成_schema_绑定同一输入类型() {
+fn test_tool_input_07() {
     let schema = SearchInput::func_schema("catalog_search").unwrap();
     let decoded = schema
         .decode_arguments(
@@ -215,7 +215,7 @@ fn func_schema_的_decoder_与生成_schema_绑定同一输入类型() {
 }
 
 #[test]
-fn func_schema_记录_context_注入与返回类型但不把它们放进模型参数() {
+fn test_tool_input_08() {
     let schema = FuncSchema::for_input::<SearchInput>("catalog_search")
         .unwrap()
         .with_tool_context(true)
@@ -232,7 +232,7 @@ fn func_schema_记录_context_注入与返回类型但不把它们放进模型�
 }
 
 #[test]
-fn canonical_schema_与_hash_跨重复生成保持字节稳定() {
+fn test_tool_input_09() {
     let first = GenericInput::<String>::tool_schema("generic")
         .unwrap()
         .canonical_json()
@@ -250,7 +250,7 @@ fn canonical_schema_与_hash_跨重复生成保持字节稳定() {
 }
 
 #[test]
-fn tool_schema_反序列化会验证_hash_且兼容旧记录缺少_hash() {
+fn test_tool_input_10() {
     let schema = SearchInput::tool_schema("catalog_search").unwrap();
     let mut wire = serde_json::to_value(&schema).unwrap();
     wire["input_schema_hash"] = Value::String("0".repeat(64));

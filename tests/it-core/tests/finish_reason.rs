@@ -19,7 +19,7 @@ fn all_reasons() -> Vec<FinishReason> {
 }
 
 #[test]
-fn code_全局唯一且格式稳定() {
+fn test_finish_reason_01() {
     let reasons = all_reasons();
     let mut codes: Vec<&str> = reasons.iter().copied().map(FinishReason::code).collect();
     codes.sort_unstable();
@@ -38,14 +38,14 @@ fn code_全局唯一且格式稳定() {
 }
 
 #[test]
-fn display_就是_code() {
+fn test_finish_reason_02() {
     for reason in all_reasons() {
         assert_eq!(reason.to_string(), reason.code());
     }
 }
 
 #[test]
-fn 线格式与_code_一致否则同一个值在两处记法不同() {
+fn test_finish_reason_03() {
     // R6-6a 把它作为 `RunState` 字段落盘，R9-0 写进 rollout 行，R0-3 写进 trace 字段。
     // 三处记法不一致的话，replay 与指标就对不上。
     for reason in all_reasons() {
@@ -59,7 +59,7 @@ fn 线格式与_code_一致否则同一个值在两处记法不同() {
 }
 
 #[test]
-fn 未知的终止原因不会被静默当成正常收尾() {
+fn test_finish_reason_04() {
     // 旧版本读到新版本写的值，必须是显式失败而不是落到某个默认变体上——
     // 后者会让「被 guard 拦下」在旧版本里显示成「正常完成」。
     let unknown = serde_json::from_value::<FinishReason>(json!("teleported"));
@@ -67,7 +67,7 @@ fn 未知的终止原因不会被静默当成正常收尾() {
 }
 
 #[test]
-fn is_complete_只认循环自己走到的收尾() {
+fn test_finish_reason_05() {
     // 区分的是「谁结束了这个 run」，不是「答得好不好」：模型答错了也仍然是它自己收的尾。
     assert!(FinishReason::Final.is_complete());
     assert!(FinishReason::ToolStop.is_complete());
@@ -84,7 +84,7 @@ fn is_complete_只认循环自己走到的收尾() {
 }
 
 #[test]
-fn is_resumable_严格窄于_非完成态() {
+fn test_finish_reason_06() {
     // 「没跑完」不等于「接着跑有意义」：guard 拦下与 error handler 收尾再跑一遍是同样的结果。
     for reason in [
         FinishReason::MaxTurns,
@@ -109,7 +109,7 @@ fn is_resumable_严格窄于_非完成态() {
 }
 
 #[test]
-fn 预算种类到终止原因是_四对二_而不是逐一对应() {
+fn test_finish_reason_07() {
     // max_turns 单独留一个原因：宿主对它的反应通常是「agent 在打转」，
     // 而不是「活儿太大」——后三种才是额度不够。
     assert_eq!(

@@ -628,7 +628,7 @@ async fn unsupported_responses_settings_fail_before_http() {
 }
 
 #[tokio::test]
-async fn 结构化工具结果下发成内容块数组而元数据排在最前() {
+async fn test_openai_responses_01() {
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,
@@ -684,7 +684,7 @@ async fn 结构化工具结果下发成内容块数组而元数据排在最前()
 }
 
 #[tokio::test]
-async fn 不是结构化结果的宿主载荷仍按字符串下发() {
+async fn test_openai_responses_02() {
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,
@@ -710,7 +710,7 @@ async fn 不是结构化结果的宿主载荷仍按字符串下发() {
 }
 
 #[tokio::test]
-async fn r2_1_文本结果续跑时仍按原文下发() {
+async fn test_openai_responses_03() {
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,
@@ -737,7 +737,7 @@ async fn r2_1_文本结果续跑时仍按原文下发() {
 }
 
 #[tokio::test]
-async fn 读不了的工具结果当场失败而不是被字符串化进上下文() {
+async fn test_openai_responses_04() {
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,

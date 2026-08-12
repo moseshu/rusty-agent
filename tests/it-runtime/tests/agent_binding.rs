@@ -166,7 +166,7 @@ fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
 }
 
 #[test]
-fn 没有准备步骤时两个身份就是同一个对象() {
+fn test_agent_binding_01() {
     let agent = public_agent();
     let binding = AgentBinding::direct(Arc::clone(&agent));
 
@@ -179,7 +179,7 @@ fn 没有准备步骤时两个身份就是同一个对象() {
 }
 
 #[test]
-fn 准备与否看的是对象而不是_id() {
+fn test_agent_binding_02() {
     // 一个 sandbox clone 完全可以沿用公共 agent 的 ID——它还是同一个 agent，只是装配方式不同。
     // 「两个 ID 不一样吗」这个问法会对这种情形答 false，而被换掉的恰恰是要跑的那套工具。
     let public = public_agent();
@@ -199,7 +199,7 @@ fn 准备与否看的是对象而不是_id() {
 }
 
 #[tokio::test]
-async fn 准备阶段读的是执行实例而不是用户配置() {
+async fn test_agent_binding_03() {
     let binding = AgentBinding::prepared(public_agent(), prepared_agent());
     let resolver = RecordingResolver::new();
     let cancel = CancelScope::root();
@@ -227,7 +227,7 @@ async fn 准备阶段读的是执行实例而不是用户配置() {
 }
 
 #[tokio::test]
-async fn 归属跟着公共身份而不是跑起来的那个() {
+async fn test_agent_binding_04() {
     let binding = AgentBinding::prepared(public_agent(), prepared_agent());
     let surface = TurnActionSurface::new(vec![tool("read_file")], Vec::new()).unwrap();
     let response = ModelResponse::new(vec![tool_call("c-1", "call-1", "read_file")]);
@@ -266,7 +266,7 @@ async fn 归属跟着公共身份而不是跑起来的那个() {
 }
 
 #[tokio::test]
-async fn 已经有归属的记录不会被改写成父_agent() {
+async fn test_agent_binding_05() {
     let binding = AgentBinding::direct(public_agent());
     let surface = TurnActionSurface::new(Vec::new(), Vec::new()).unwrap();
     // 一条已经声明了产出者的记录——R12 的嵌套子 run 就会这么标它自己的项。
@@ -302,7 +302,7 @@ async fn 已经有归属的记录不会被改写成父_agent() {
 }
 
 #[tokio::test]
-async fn 直接绑定时归属就是用户那个_agent() {
+async fn test_agent_binding_06() {
     let binding = AgentBinding::direct(public_agent());
     let surface = TurnActionSurface::new(Vec::new(), Vec::new()).unwrap();
     let response = ModelResponse::new(vec![item(

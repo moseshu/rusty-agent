@@ -8,13 +8,13 @@ use ra_core::{
 };
 use serde_json::json;
 
-fn 记一次调用(state: &mut RunState, agent: &AgentId, identity: &ToolUse, call: &str) {
+fn record_call(state: &mut RunState, agent: &AgentId, identity: &ToolUse, call: &str) {
     let attempt = ToolUseAttempt::new(identity.clone(), CallId::new(call), &json!({"path":"a"}));
     state.tool_use_mut().record_turn(agent, [attempt]);
 }
 
 #[test]
-fn 默认状态是当前版本且没有工具轨迹() {
+fn test_run_state_01() {
     let state = RunState::new();
 
     assert_eq!(state.schema_version(), RUN_STATE_SCHEMA_VERSION);
@@ -23,11 +23,11 @@ fn 默认状态是当前版本且没有工具轨迹() {
 }
 
 #[test]
-fn 工具轨迹作为完整状态的一部分续接() {
+fn test_run_state_02() {
     let agent = AgentId::new("coder");
     let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
     let mut state = RunState::new();
-    记一次调用(&mut state, &agent, &identity, "call-1");
+    record_call(&mut state, &agent, &identity, "call-1");
 
     let restored: RunState =
         serde_json::from_str(&serde_json::to_string(&state).expect("run state must serialize"))
@@ -37,7 +37,7 @@ fn 工具轨迹作为完整状态的一部分续接() {
 }
 
 #[test]
-fn 换掉工具轨迹不动同一份状态里的其它字段() {
+fn test_run_state_03() {
     // 守的是「按字段续接」那个失败模式：R3-8 与 R6-6 往这里加的东西，不能因为调用方只
     // 认识 tool_use 就被顺手抹掉。今天唯一的其它字段是更高版本写下的未知字段。
     let stored = r#"{ "schema_version": 7, "future_policy": { "enabled": true } }"#;
@@ -46,7 +46,7 @@ fn 换掉工具轨迹不动同一份状态里的其它字段() {
     let agent = AgentId::new("coder");
     let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
     let mut carried = RunState::new();
-    记一次调用(&mut carried, &agent, &identity, "call-1");
+    record_call(&mut carried, &agent, &identity, "call-1");
     let state = state.with_tool_use(carried.tool_use().clone());
 
     assert_eq!(state.tool_use().repeat_streak(&agent, &identity), 1);
@@ -56,7 +56,7 @@ fn 换掉工具轨迹不动同一份状态里的其它字段() {
 }
 
 #[test]
-fn 缺少后来加入的字段仍能读出且未知字段会回写() {
+fn test_run_state_04() {
     let stored = r#"{
         "schema_version": 7,
         "future_policy": { "enabled": true }

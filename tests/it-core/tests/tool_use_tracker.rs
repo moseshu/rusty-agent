@@ -30,7 +30,7 @@ fn entry<'a>(tracker: &'a ToolUseTracker, agent: &AgentId, identity: &ToolUse) -
 }
 
 #[test]
-fn 两个_agent_各记各的账而不是并进一个计数器() {
+fn test_tool_use_tracker_01() {
     let planner = AgentId::new("planner");
     let executor = AgentId::new("executor");
     let read = bare("read_file");
@@ -65,7 +65,7 @@ fn 两个_agent_各记各的账而不是并进一个计数器() {
 }
 
 #[test]
-fn 同名不同来源的工具是两个身份() {
+fn test_tool_use_tracker_02() {
     let agent = AgentId::new("main");
     let github = namespaced("mcp.github", "search");
     let gitlab = namespaced("mcp.gitlab", "search");
@@ -100,7 +100,7 @@ fn 同名不同来源的工具是两个身份() {
 }
 
 #[test]
-fn 参数指纹归一化键序但区分取值() {
+fn test_tool_use_tracker_03() {
     let same_a = ArgumentFingerprint::compute(&json!({ "path": "a.txt", "limit": 10 }));
     let same_b = ArgumentFingerprint::compute(&json!({ "limit": 10, "path": "a.txt" }));
     let nested_a = ArgumentFingerprint::compute(&json!({ "o": { "x": 1, "y": 2 } }));
@@ -120,7 +120,7 @@ fn 参数指纹归一化键序但区分取值() {
 }
 
 #[test]
-fn 连续重复只被同一工具的参数变化打断() {
+fn test_tool_use_tracker_04() {
     let agent = AgentId::new("main");
     let grep = bare("grep");
     let read = bare("read_file");
@@ -153,7 +153,7 @@ fn 连续重复只被同一工具的参数变化打断() {
 }
 
 #[test]
-fn 本轮计数每轮重置而全_run_计数累计() {
+fn test_tool_use_tracker_05() {
     let agent = AgentId::new("main");
     let read = bare("read_file");
     let write = bare("write_file");
@@ -190,7 +190,7 @@ fn 本轮计数每轮重置而全_run_计数累计() {
 }
 
 #[test]
-fn 叫不出名字的调用也算用过工具() {
+fn test_tool_use_tracker_06() {
     let agent = AgentId::new("main");
     let vanished = ToolUse::Unresolved("vanished".to_owned());
     let mut tracker = ToolUseTracker::new();
@@ -223,7 +223,7 @@ fn 叫不出名字的调用也算用过工具() {
 }
 
 #[test]
-fn 最近窗口有上限而累计次数与连续段不受它限制() {
+fn test_tool_use_tracker_07() {
     let agent = AgentId::new("main");
     let read = bare("read_file");
     let total = TOOL_USE_RECENT_LIMIT + 3;
@@ -255,7 +255,7 @@ fn 最近窗口有上限而累计次数与连续段不受它限制() {
 }
 
 #[test]
-fn 同一个_call_id_记两次不会把重复度翻倍() {
+fn test_tool_use_tracker_08() {
     let agent = AgentId::new("main");
     let read = bare("read_file");
     let mut tracker = ToolUseTracker::new();
@@ -280,7 +280,7 @@ fn 同一个_call_id_记两次不会把重复度翻倍() {
 }
 
 #[test]
-fn 超过最近窗口的单轮重放仍然完全幂等() {
+fn test_tool_use_tracker_09() {
     let agent = AgentId::new("main");
     let read = bare("read_file");
     let mut tracker = ToolUseTracker::new();
@@ -311,7 +311,7 @@ fn 超过最近窗口的单轮重放仍然完全幂等() {
 }
 
 #[test]
-fn 序列化往返后继续记账且原始参数不进快照() {
+fn test_tool_use_tracker_10() {
     let agent = AgentId::new("main");
     let read = bare("read_file");
     let mut tracker = ToolUseTracker::new();
@@ -353,7 +353,7 @@ fn 序列化往返后继续记账且原始参数不进快照() {
 }
 
 #[test]
-fn 更高版本写下的字段原样回写() {
+fn test_tool_use_tracker_11() {
     let stored = json!({
         "schema_version": 9,
         "agents": {
@@ -403,7 +403,7 @@ fn 更高版本写下的字段原样回写() {
 }
 
 #[test]
-fn 一个身份出现在两条记录里当场被拒() {
+fn test_tool_use_tracker_12() {
     let identity = json!({ "type": "tool", "data": {
         "schema_version": 1, "kind": "bare", "name": "read_file"
     }});
@@ -427,7 +427,7 @@ fn 一个身份出现在两条记录里当场被拒() {
 }
 
 #[test]
-fn tool_use_四个变体都能稳定往返() {
+fn test_tool_use_tracker_13() {
     for identity in [
         bare("read_file"),
         namespaced("mcp.github", "search"),
@@ -452,7 +452,7 @@ fn tool_use_四个变体都能稳定往返() {
 }
 
 #[test]
-fn agent_视图的合计是投影而不是第二份计数() {
+fn test_tool_use_tracker_14() {
     let agent = AgentId::new("main");
     let mut tracker = ToolUseTracker::new();
     tracker.record_turn(

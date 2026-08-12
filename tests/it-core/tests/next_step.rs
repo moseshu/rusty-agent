@@ -52,7 +52,7 @@ fn mcp_approval(request_id: &str) -> RunItem {
 ///
 /// It is a compile-time assertion. Adding a fifth state has to break this function, and every
 /// other site that matches, until each one says what it does about the new state.
-fn 收口(step: &NextStep) -> String {
+fn summarize_step(step: &NextStep) -> String {
     match step {
         NextStep::RunAgain => "run_again".to_owned(),
         NextStep::Handoff { new_agent } => format!("handoff:{}", new_agent.id()),
@@ -62,7 +62,7 @@ fn 收口(step: &NextStep) -> String {
 }
 
 #[test]
-fn 四态穷尽匹配无兜底分支() {
+fn test_next_step_01() {
     let steps = [
         NextStep::RunAgain,
         NextStep::Handoff {
@@ -74,7 +74,7 @@ fn 四态穷尽匹配无兜底分支() {
         NextStep::interruption(vec![tool_approval("call-1")]).unwrap(),
     ];
 
-    let labels = steps.iter().map(收口).collect::<Vec<_>>();
+    let labels = steps.iter().map(summarize_step).collect::<Vec<_>>();
     assert_eq!(
         labels,
         [
@@ -87,7 +87,7 @@ fn 四态穷尽匹配无兜底分支() {
 }
 
 #[test]
-fn handoff_携带的是可共享的_public_agent_而不是拷贝() {
+fn test_next_step_02() {
     let reviewer = agent("reviewer");
     let step = NextStep::Handoff {
         new_agent: Arc::clone(&reviewer),
@@ -102,7 +102,7 @@ fn handoff_携带的是可共享的_public_agent_而不是拷贝() {
 }
 
 #[test]
-fn final_output_必须说明为什么停() {
+fn test_next_step_03() {
     // 一个变体背四种含义正是 R3-1b 要拆掉的东西：宿主对这两种的反应完全不同。
     let concluded = NextStep::FinalOutput {
         reason: FinishReason::Final,
@@ -127,7 +127,7 @@ fn final_output_必须说明为什么停() {
 }
 
 #[test]
-fn interruption_构造器接受两类审批项() {
+fn test_next_step_04() {
     let step = NextStep::interruption(vec![tool_approval("call-1"), mcp_approval("req-1")]).unwrap();
     let NextStep::Interruption { items } = step else {
         panic!("应当是 interruption");
@@ -137,7 +137,7 @@ fn interruption_构造器接受两类审批项() {
 }
 
 #[test]
-fn interruption_构造器拒绝宿主答不了的项() {
+fn test_next_step_05() {
     // 混进一条非审批项，run 会永远等一个没人被问到的决定，而症状（挂住）离病因很远。
     let error = NextStep::interruption(vec![
         tool_approval("call-1"),
@@ -154,7 +154,7 @@ fn interruption_构造器拒绝宿主答不了的项() {
 }
 
 #[test]
-fn is_interruption_只认两类审批项() {
+fn test_next_step_06() {
     assert!(
         RunItemKind::ToolApproval(ToolApproval::new(
             CallId::new("call-1"),

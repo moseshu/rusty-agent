@@ -32,7 +32,7 @@ const 新版写出的: &str = r#"{
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 未知字段被兜住而不是丢弃() {
+fn test_compat_schema_01() {
     let 记录: 旧版记录 = serde_json::from_str(新版写出的).expect("旧版应当能读新版记录");
 
     assert_eq!(记录.max_turns, 12, "已知字段照常解析");
@@ -42,7 +42,7 @@ fn 未知字段被兜住而不是丢弃() {
 }
 
 #[test]
-fn 已知字段不会跑进未知集() {
+fn test_compat_schema_02() {
     let 记录: 旧版记录 = serde_json::from_str(新版写出的).expect("应能解析");
 
     assert!(记录.unknown.get("max_turns").is_none());
@@ -50,7 +50,7 @@ fn 已知字段不会跑进未知集() {
 }
 
 #[test]
-fn 回写时未知字段原样带回() {
+fn test_compat_schema_03() {
     // The "new writes, old reads, old writes again" path must not lose data.
     let 记录: 旧版记录 = serde_json::from_str(新版写出的).expect("应能解析");
     let 回写 = serde_json::to_string(&记录).expect("应能序列化");
@@ -63,7 +63,7 @@ fn 回写时未知字段原样带回() {
 }
 
 #[test]
-fn 干净的记录不写出空对象() {
+fn test_compat_schema_04() {
     let 记录 = 旧版记录 {
         schema_version: SchemaVersion::new(2),
         max_turns: 5,
@@ -79,7 +79,7 @@ fn 干净的记录不写出空对象() {
 }
 
 #[test]
-fn 未知字段回写顺序确定() {
+fn test_compat_schema_05() {
     // BTreeMap rather than HashMap: an unstable order makes the same data serialize to different
     // bytes each time, which breaks snapshot tests and content addressing.
     let json = r#"{"schema_version":1,"max_turns":1,"z":1,"a":2,"m":3}"#;
@@ -94,7 +94,7 @@ fn 未知字段回写顺序确定() {
 }
 
 #[test]
-fn 缺字段的旧记录能被新代码读出() {
+fn test_compat_schema_06() {
     // Rule 2: every added field is #[serde(default)].
     let 旧数据 = r#"{"schema_version":1}"#;
     let 记录: 旧版记录 = serde_json::from_str(旧数据).expect("缺字段应走默认值而不是报错");
@@ -108,7 +108,7 @@ fn 缺字段的旧记录能被新代码读出() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 版本号序列化成裸整数() {
+fn test_compat_schema_07() {
     // The host may not be written in Rust, so the version has to be obvious at a glance.
     let json = serde_json::to_string(&SchemaVersion::new(7)).expect("应能序列化");
     assert_eq!(json, "7");
@@ -118,7 +118,7 @@ fn 版本号序列化成裸整数() {
 }
 
 #[test]
-fn 兼容性判定三档() {
+fn test_compat_schema_08() {
     let 本地 = SchemaVersion::new(3);
 
     assert_eq!(
@@ -136,7 +136,7 @@ fn 兼容性判定三档() {
 }
 
 #[test]
-fn 只有旧记录需要迁移() {
+fn test_compat_schema_09() {
     // A newer record needs no migration: fields only grow and unknown ones are retained, which
     // already makes a downgrade read safe.
     assert!(Compatibility::Older.needs_migration());
@@ -148,14 +148,14 @@ fn 只有旧记录需要迁移() {
 }
 
 #[test]
-fn 版本更新的记录仍然能读() {
+fn test_compat_schema_10() {
     // This is the policy itself: failing would mean "an older client cannot open the session".
     let 记录: 旧版记录 = serde_json::from_str(新版写出的).expect("更新的 schema 版本不该阻止读取");
     assert_eq!(记录.schema_version, SchemaVersion::new(2));
 }
 
 #[test]
-fn 兼容性标签稳定() {
+fn test_compat_schema_11() {
     assert_eq!(Compatibility::Same.label(), "same");
     assert_eq!(Compatibility::Older.label(), "older");
     assert_eq!(Compatibility::Newer.label(), "newer");
@@ -169,6 +169,6 @@ fn 兼容性标签稳定() {
 }
 
 #[test]
-fn 版本_display_带_v_前缀() {
+fn test_compat_schema_12() {
     assert_eq!(SchemaVersion::new(1).to_string(), "v1");
 }

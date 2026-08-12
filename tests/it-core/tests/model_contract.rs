@@ -32,7 +32,7 @@ fn request() -> ModelRequest {
 }
 
 #[test]
-fn model_request_覆盖完整协议中立参数面() {
+fn test_model_contract_01() {
     let tool = ModelToolDefinition::new(
         "search",
         json!({"type": "object", "properties": {"query": {"type": "string"}}}),
@@ -76,7 +76,7 @@ fn model_request_覆盖完整协议中立参数面() {
 }
 
 #[test]
-fn 两种服务端续接模式在类型上互斥() {
+fn test_model_contract_02() {
     let request = request()
         .with_previous_response_id("resp-old")
         .with_conversation_id("conv-new");
@@ -90,7 +90,7 @@ fn 两种服务端续接模式在类型上互斥() {
 }
 
 #[test]
-fn tracing_拓扑与敏感数据是两个开关语义() {
+fn test_model_contract_03() {
     assert!(ModelTracing::Disabled.is_disabled());
     assert!(!ModelTracing::Disabled.include_data());
     assert!(!ModelTracing::Enabled.is_disabled());
@@ -169,7 +169,7 @@ impl ModelProvider for FakeProvider {
 }
 
 #[tokio::test]
-async fn model_与_provider_trait_可作为动态对象使用() {
+async fn test_model_contract_04() {
     let concrete = Arc::new(FakeModel::default());
     let model: Arc<dyn Model> = concrete.clone();
     let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider {
@@ -221,7 +221,7 @@ async fn model_与_provider_trait_可作为动态对象使用() {
 }
 
 #[test]
-fn 默认_retry_advice_为空() {
+fn test_model_contract_05() {
     struct MinimalModel;
 
     #[async_trait]
@@ -249,7 +249,7 @@ fn 默认_retry_advice_为空() {
 }
 
 #[test]
-fn raw_stream_信封保留未知字段() {
+fn test_model_contract_06() {
     let encoded = json!({
         "type": "raw_response",
         "data": {
@@ -277,7 +277,7 @@ fn raw_stream_信封保留未知字段() {
 }
 
 #[test]
-fn 模型事件通道不含_run_级事实() {
+fn test_model_contract_07() {
     // An adapter knows one wire call and nothing about agents or handoffs. Letting it announce
     // "the public agent changed" would make the type permit a permanently invalid state; the run
     // channel is wrapped by the runner inside ra-runtime (R1-7 / R13) rather than by widening this

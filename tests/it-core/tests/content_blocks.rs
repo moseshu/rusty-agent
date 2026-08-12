@@ -8,7 +8,7 @@ use ra_core::item::{
 };
 use serde_json::json;
 
-fn 所有内容块() -> Vec<ContentBlock> {
+fn all_content_blocks() -> Vec<ContentBlock> {
     vec![
         ContentBlock::text("结果"),
         ContentBlock::thinking("先读取文件", "sig-1"),
@@ -19,8 +19,8 @@ fn 所有内容块() -> Vec<ContentBlock> {
 }
 
 #[test]
-fn 四种内容块都能稳定往返() {
-    let blocks = 所有内容块();
+fn test_content_blocks_01() {
+    let blocks = all_content_blocks();
     assert_eq!(
         blocks.iter().map(ContentBlock::label).collect::<Vec<_>>(),
         vec!["text", "thinking", "image", "image", "refusal"]
@@ -34,10 +34,10 @@ fn 四种内容块都能稳定往返() {
 }
 
 #[test]
-fn 内容块在_run_item_信封里同样无损() {
+fn test_content_blocks_02() {
     // The envelope nests a flatten inside an adjacently tagged enum, so a block round-tripping on
     // its own does not mean it round-trips inside a RunItem.
-    let message = Message::new(MessageRole::Assistant, 所有内容块());
+    let message = Message::new(MessageRole::Assistant, all_content_blocks());
     let item = RunItem::new(ItemId::new("item-1"), RunItemKind::Message(message));
 
     let encoded = serde_json::to_string(&item).expect("RunItem 应可序列化");
@@ -46,7 +46,7 @@ fn 内容块在_run_item_信封里同样无损() {
 }
 
 #[test]
-fn 图片明确区分_base64_与本地路径() {
+fn test_content_blocks_03() {
     let inline = ContentBlock::image_base64("image/webp", "UklGRg==");
     let path = ContentBlock::image_path("assets/screenshot.png");
 
@@ -69,7 +69,7 @@ fn 图片明确区分_base64_与本地路径() {
 }
 
 #[test]
-fn 本地路径必须是_utf8_否则整条记录写不出去() {
+fn test_content_blocks_04() {
     // PathBuf's Serialize errors outright on non-UTF-8, taking down the whole RunItem rather than
     // one block. try_new moves that failure forward to construction time.
     #[cfg(unix)]
@@ -85,7 +85,7 @@ fn 本地路径必须是_utf8_否则整条记录写不出去() {
 }
 
 #[test]
-fn thinking_签名原样保留() {
+fn test_content_blocks_05() {
     let thinking = ThinkingBlock::new("检查边界", "opaque-signature");
     assert_eq!(thinking.thinking(), "检查边界");
     assert_eq!(thinking.signature(), "opaque-signature");
@@ -100,11 +100,11 @@ fn thinking_签名原样保留() {
 }
 
 #[test]
-fn 工具调用只住在顶层项而不是内容块里() {
+fn test_content_blocks_06() {
     // R1-17's pairing and orphan pruning look only at item-level CallIds. Once a tool call could
     // hide inside message content they would miss it silently, so the content-block layer offers
     // no such representation at all.
-    let labels: Vec<&str> = 所有内容块()
+    let labels: Vec<&str> = all_content_blocks()
         .iter()
         .map(ContentBlock::label)
         .collect::<std::collections::BTreeSet<_>>()
@@ -130,7 +130,7 @@ fn 工具调用只住在顶层项而不是内容块里() {
 }
 
 #[test]
-fn 拒答是独立信号而不是文本() {
+fn test_content_blocks_07() {
     // R1-12 escalates models on this signal; folding it into text_content would leave nothing but
     // guessing at each vendor's wording.
     let refused = Message::new(
@@ -155,8 +155,8 @@ fn 拒答是独立信号而不是文本() {
 }
 
 #[test]
-fn message_文本投影跳过所有非文本块() {
-    let mut content = 所有内容块();
+fn test_content_blocks_08() {
+    let mut content = all_content_blocks();
     content.insert(3, ContentBlock::text("完成"));
     let message = Message::new(MessageRole::Assistant, content);
 
@@ -164,7 +164,7 @@ fn message_文本投影跳过所有非文本块() {
 }
 
 #[test]
-fn 未知字段在块与图片来源两层都原样回写() {
+fn test_content_blocks_09() {
     let original = ContentBlock::image_base64("image/png", "AAAA");
     let mut value = serde_json::to_value(original).expect("应可转 JSON");
     value["data"]
@@ -188,7 +188,7 @@ fn 未知字段在块与图片来源两层都原样回写() {
 }
 
 #[test]
-fn 本地路径图片也能往返而不只是序列化() {
+fn test_content_blocks_10() {
     let block = ContentBlock::image_path("assets/a.png");
     let encoded = serde_json::to_string(&block).expect("应可序列化");
     let decoded: ContentBlock = serde_json::from_str(&encoded).expect("应可反序列化");

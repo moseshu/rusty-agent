@@ -79,7 +79,7 @@ fn settled() -> ra_core::step::SingleStepResultBuilder {
 }
 
 #[test]
-fn 四份必需事实缺一个就不算结算完() {
+fn test_single_step_result_01() {
     for (label, builder) in [
         (
             "model_response",
@@ -119,7 +119,7 @@ fn 四份必需事实缺一个就不算结算完() {
 }
 
 #[test]
-fn 会话项没有默认值因为默认值只会静默丢历史() {
+fn test_single_step_result_02() {
     let error = SingleStepResult::builder()
         .model_response(ModelResponse::new(Vec::new()))
         .processed_response(quiet_response())
@@ -131,7 +131,7 @@ fn 会话项没有默认值因为默认值只会静默丢历史() {
 }
 
 #[test]
-fn 送给模型的项必须是存进会话那份的子集() {
+fn test_single_step_result_03() {
     let error = settled()
         .new_step_items(vec![message("msg-1", "完事了"), message("msg-2", "还有一句")])
         .session_step_items(vec![message("msg-1", "完事了")])
@@ -158,7 +158,7 @@ fn 送给模型的项必须是存进会话那份的子集() {
 }
 
 #[test]
-fn 前序项与本轮项不许重叠() {
+fn test_single_step_result_04() {
     let error = settled()
         .pre_step_items(vec![message("msg-1", "完事了")])
         .new_step_items(vec![message("msg-1", "完事了")])
@@ -168,7 +168,7 @@ fn 前序项与本轮项不许重叠() {
 }
 
 #[test]
-fn 有待审批时不允许settle成继续跑的状态() {
+fn test_single_step_result_05() {
     let session = vec![mcp_approval("approval-1"), message("msg-1", "完事了")];
 
     for next_step in [
@@ -204,7 +204,7 @@ fn 有待审批时不允许settle成继续跑的状态() {
 }
 
 #[test]
-fn 中断项必须在会话里否则恢复时永远答不上() {
+fn test_single_step_result_06() {
     let error = settled()
         .next_step(NextStep::interruption(vec![tool_approval("approval-1")]).unwrap())
         .session_step_items(vec![message("msg-1", "完事了")])
@@ -225,7 +225,7 @@ fn 中断项必须在会话里否则恢复时永远答不上() {
 }
 
 #[test]
-fn 响应里提出的待决项一个都不能漏问() {
+fn test_single_step_result_07() {
     let session = vec![mcp_approval("approval-1"), tool_approval("approval-2")];
 
     // 停下来却只问其中一部分，剩下那条要等一个永远不会来的轮次。
@@ -251,7 +251,7 @@ fn 响应里提出的待决项一个都不能漏问() {
 }
 
 #[test]
-fn 分类结果必须是这条模型响应的分类() {
+fn test_single_step_result_08() {
     // 别的都拦不住这种错配：用量记的是一次调用，绑定的动作来自另一次，
     // resume 重放的又是第三个故事。
     let error = settled()
@@ -288,7 +288,7 @@ fn 分类结果必须是这条模型响应的分类() {
 }
 
 #[test]
-fn 模型说过的话必须进会话哪怕这轮不往下带() {
+fn test_single_step_result_09() {
     // `new_step_items` 允许被过滤，过滤成空时「送模型的项是会话的子集」那条
     // 恒成立——真正危险的正是这一格：模型确实产出了记录，会话一条没存。
     let error = settled()
@@ -320,7 +320,7 @@ fn 模型说过的话必须进会话哪怕这轮不往下带() {
 }
 
 #[test]
-fn 存下来的记录只许按结算结果改模型回包的通道() {
+fn test_single_step_result_10() {
     // R3-10：通道是「这一轮怎么收的场」的结论，provider 说了不算——它完全可以一边要工具
     // 一边把消息标成 final。所以结算改这一个字段并把改过的那份存下去是允许的。
     SingleStepResult::builder()
@@ -363,7 +363,7 @@ fn 存下来的记录只许按结算结果改模型回包的通道() {
 }
 
 #[test]
-fn 已存通道必须符合这一轮的结算结果() {
+fn test_single_step_result_11() {
     // 终态轮唯一的 assistant 消息是交付；把它存成 commentary 会让 `final_message()` 说
     // `None`，即使 `NextStep` 已经说这轮结束了。
     let error = settled()
@@ -401,7 +401,7 @@ fn 已存通道必须符合这一轮的结算结果() {
 }
 
 #[test]
-fn 生产者定好的通道一定过得了这道闸门() {
+fn test_single_step_result_12() {
     // 规则只有一处推导：`resolve_output_phases` 与 `build()` 里的闸门读同一个模块。这条
     // 测试是那句话的可执行形式——生产者的产物必须原样通过闸门，两边一旦分头演化就在这里红。
     let narration = message("msg-1", "先说明思路");
@@ -445,7 +445,7 @@ fn 生产者定好的通道一定过得了这道闸门() {
 }
 
 #[test]
-fn 终态轮只有最后一条_assistant_消息是_final() {
+fn test_single_step_result_13() {
     let first = message("msg-1", "先说明思路");
     let last = message("msg-2", "最后交付");
     let processed = ProcessedResponse::builder()
@@ -484,7 +484,7 @@ fn 终态轮只有最后一条_assistant_消息是_final() {
 }
 
 #[test]
-fn 绕过校验构造器的中断形状在结算时仍然过不去() {
+fn test_single_step_result_14() {
     // `NextStep::Interruption` 刻意可以直接构造（结算在框架内部），所以那个构造器
     // 是约定不是闸门。闸门放在这里：混进一条非审批项，run 会永远等一个没人被问到的决定。
     let error = settled()
@@ -504,7 +504,7 @@ fn 绕过校验构造器的中断形状在结算时仍然过不去() {
 }
 
 #[test]
-fn 结算中的_item_id_不能重复或跨轮复用() {
+fn test_single_step_result_15() {
     let error = settled()
         .pre_step_items(vec![message("old-1", "上一轮"), message("old-1", "又一份")])
         .build()
@@ -533,7 +533,7 @@ fn 结算中的_item_id_不能重复或跨轮复用() {
 }
 
 #[test]
-fn 嵌套归属只记_id_且必须指向真实存在的记录() {
+fn test_single_step_result_16() {
     let error = settled()
         .nested_history_owned_items(vec![ItemId::new("ghost")])
         .build()
@@ -552,7 +552,7 @@ fn 嵌套归属只记_id_且必须指向真实存在的记录() {
 }
 
 #[test]
-fn generated_items_按前序在前本轮在后拼接() {
+fn test_single_step_result_17() {
     let result = settled()
         .original_input(vec![ModelInputItem::Message(Message::user("开始"))])
         .pre_step_items(vec![message("msg-0", "上一轮")])

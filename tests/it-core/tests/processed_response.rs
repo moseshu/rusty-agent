@@ -91,7 +91,7 @@ fn mcp_approval(id: &str, request_id: &str) -> RunItem {
 }
 
 #[test]
-fn 每条动作都和它的记录一起进入分类结果() {
+fn test_processed_response_01() {
     let processed = ProcessedResponse::builder()
         .item(item(
             "msg-1",
@@ -147,7 +147,7 @@ fn 每条动作都和它的记录一起进入分类结果() {
 }
 
 #[test]
-fn handoff_的_wire_形态保留模型实际调用的名字() {
+fn test_processed_response_02() {
     let processed = ProcessedResponse::builder()
         .handoff(
             tool_call("call-item-1", "call-1", "transfer_to_reviewer"),
@@ -169,7 +169,7 @@ fn handoff_的_wire_形态保留模型实际调用的名字() {
 }
 
 #[test]
-fn 已类型化的_handoff_目标与本轮解析结果不一致时拒绝() {
+fn test_processed_response_03() {
     let typed = item(
         "call-item-1",
         RunItemKind::HandoffCall(ra_core::item::HandoffCall::new(
@@ -194,7 +194,7 @@ fn 已类型化的_handoff_目标与本轮解析结果不一致时拒绝() {
 }
 
 #[test]
-fn 绑定错工具的调用当场被拒绝() {
+fn test_processed_response_04() {
     // 名字对不上意味着结算阶段会用模型没点名的实现去跑，然后照样报成功。
     let error = ProcessedResponse::builder()
         .function(
@@ -218,7 +218,7 @@ fn 绑定错工具的调用当场被拒绝() {
 }
 
 #[test]
-fn 同一个_call_id_不允许被两个动作认领() {
+fn test_processed_response_05() {
     // 两个动作各回一份输出，provider 要么整条请求报错，要么留下错的那份。
     let error = ProcessedResponse::builder()
         .function(
@@ -244,7 +244,7 @@ fn 同一个_call_id_不允许被两个动作认领() {
 }
 
 #[test]
-fn 欠着答复的调用不能当成无动作记录混进去() {
+fn test_processed_response_06() {
     // 走 `item()` 的调用会让 `has_tools_or_approvals_to_run()` 答「没事可做」，
     // 而响应里还压着一个没人会回的 call——症状要到下一次请求才现形。
     for (label, unclassified) in [
@@ -294,7 +294,7 @@ fn 欠着答复的调用不能当成无动作记录混进去() {
 }
 
 #[test]
-fn 未解析的调用也算欠着一份输出() {
+fn test_processed_response_07() {
     let only_missing = ProcessedResponse::builder()
         .tool_not_found(tool_call("call-item-1", "call-1", "vanished"))
         .unwrap()
@@ -318,7 +318,7 @@ fn 未解析的调用也算欠着一份输出() {
 }
 
 #[test]
-fn 待审批项同时是要跑的活和要问的人() {
+fn test_processed_response_08() {
     let processed = ProcessedResponse::builder()
         .mcp_approval(mcp_approval("approval-1", "req-1"))
         .unwrap()
@@ -349,7 +349,7 @@ fn 待审批项同时是要跑的活和要问的人() {
 }
 
 #[test]
-fn tools_used_按查找键统计而不是按可重名的名字() {
+fn test_processed_response_09() {
     let processed = ProcessedResponse::builder()
         .function(
             tool_call("call-item-1", "call-1", "search"),

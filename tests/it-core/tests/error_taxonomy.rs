@@ -100,7 +100,7 @@ fn all_errors() -> Vec<Error> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn code_全局唯一() {
+fn test_error_taxonomy_01() {
     let errors = all_errors();
     let mut codes: Vec<&str> = errors.iter().map(Error::code).collect();
     codes.sort_unstable();
@@ -115,7 +115,7 @@ fn code_全局唯一() {
 }
 
 #[test]
-fn code_格式稳定() {
+fn test_error_taxonomy_02() {
     for err in all_errors() {
         let code = err.code();
         assert!(!code.is_empty(), "code 不能为空");
@@ -140,7 +140,7 @@ fn code_格式稳定() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn is_retryable_与投影永不矛盾() {
+fn test_error_taxonomy_03() {
     for err in all_errors() {
         assert_eq!(
             err.is_retryable(),
@@ -152,7 +152,7 @@ fn is_retryable_与投影永不矛盾() {
 }
 
 #[test]
-fn is_cancelled_与投影永不矛盾() {
+fn test_error_taxonomy_04() {
     for err in all_errors() {
         assert_eq!(
             err.is_cancelled(),
@@ -164,7 +164,7 @@ fn is_cancelled_与投影永不矛盾() {
 }
 
 #[test]
-fn 调用方缺陷永不可重试() {
+fn test_error_taxonomy_05() {
     let err = Error::caller("参数组合非法");
     assert_eq!(err.recoverability(), Recoverability::Fatal);
     assert!(!err.is_retryable());
@@ -175,7 +175,7 @@ fn 调用方缺陷永不可重试() {
 }
 
 #[test]
-fn 取消不算失败() {
+fn test_error_taxonomy_06() {
     for err in [
         Error::cancelled("用户中断"),
         Error::tool(ToolErrorKind::Cancelled, "exec_command", "已取消"),
@@ -191,7 +191,7 @@ fn 取消不算失败() {
 }
 
 #[test]
-fn 模型拒答走换模型而非原样重试() {
+fn test_error_taxonomy_07() {
     // R1-12: a refusal triggers the model fallback; retrying unchanged only gets refused again.
     let err = Error::provider(ProviderErrorKind::Refusal, "refused");
     assert_eq!(err.recoverability(), Recoverability::RetryableWithChange);
@@ -200,7 +200,7 @@ fn 模型拒答走换模型而非原样重试() {
 }
 
 #[test]
-fn 上下文超限先压缩再重试() {
+fn test_error_taxonomy_08() {
     // R5: not a plain retry — the context has to be compacted first.
     let err = Error::provider(ProviderErrorKind::ContextOverflow, "too long");
     assert_eq!(err.recoverability(), Recoverability::RetryableWithChange);
@@ -208,7 +208,7 @@ fn 上下文超限先压缩再重试() {
 }
 
 #[test]
-fn 瞬时故障可原样重试() {
+fn test_error_taxonomy_09() {
     for kind in [
         ProviderErrorKind::Network,
         ProviderErrorKind::RateLimit,
@@ -221,14 +221,14 @@ fn 瞬时故障可原样重试() {
 }
 
 #[test]
-fn 认证失败需要人介入而非重试() {
+fn test_error_taxonomy_10() {
     let err = Error::provider(ProviderErrorKind::Auth, "invalid api key");
     assert_eq!(err.recoverability(), Recoverability::NeedsIntervention);
     assert!(!err.is_retryable(), "换个 key 之前重试多少次都没用");
 }
 
 #[test]
-fn 预算耗尽不是可重试故障() {
+fn test_error_taxonomy_11() {
     // R3-8: an exhausted budget takes the soft ending of NextStep::FinalOutput, not a retry.
     for kind in [
         BudgetKind::MaxTurns,
@@ -243,7 +243,7 @@ fn 预算耗尽不是可重试故障() {
 }
 
 #[test]
-fn 护栏触发是刻意拦截不是故障() {
+fn test_error_taxonomy_12() {
     for stage in [
         GuardrailStage::Input,
         GuardrailStage::Output,
@@ -268,7 +268,7 @@ fn 护栏触发是刻意拦截不是故障() {
 const 允许两者相同: &[&str] = &["cancelled"];
 
 #[test]
-fn user_message_非空且区别于_display() {
+fn test_error_taxonomy_13() {
     for err in all_errors() {
         let user = err.user_message();
         let dev = err.to_string();
@@ -295,7 +295,7 @@ fn user_message_非空且区别于_display() {
 }
 
 #[test]
-fn user_message_不泄露内部枚举名() {
+fn test_error_taxonomy_14() {
     // `{kind:?}` in Display is deliberate (it is for logs); it must not reach user_message.
     let internal_tokens = [
         "ProviderErrorKind",
@@ -324,7 +324,7 @@ fn user_message_不泄露内部枚举名() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn with_source_在支持的变体上生效() {
+fn test_error_taxonomy_15() {
     use std::error::Error as _;
 
     let io = std::io::Error::other("底层 io 失败");
@@ -335,7 +335,7 @@ fn with_source_在支持的变体上生效() {
 }
 
 #[test]
-fn with_source_在不支持的变体上是无操作() {
+fn test_error_taxonomy_16() {
     use std::error::Error as _;
 
     // Budget / Guardrail / Cancelled carry no source: attaching one should be ignored silently,
@@ -352,7 +352,7 @@ fn with_source_在不支持的变体上是无操作() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recoverability_的三个谓词互相自洽() {
+fn test_error_taxonomy_17() {
     let all = [
         Recoverability::Retryable,
         Recoverability::RetryableWithChange,
@@ -379,7 +379,7 @@ fn recoverability_的三个谓词互相自洽() {
 }
 
 #[test]
-fn recoverability_display_是稳定的_snake_case() {
+fn test_error_taxonomy_18() {
     assert_eq!(Recoverability::Retryable.to_string(), "retryable");
     assert_eq!(
         Recoverability::RetryableWithChange.to_string(),

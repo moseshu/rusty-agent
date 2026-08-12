@@ -6,7 +6,7 @@ use ra_core::model::{
 };
 
 #[test]
-fn responses_能力矩阵完整() {
+fn test_api_protocol_01() {
     let capabilities = ApiProtocol::OpenAiResponses.capabilities();
 
     assert_eq!(
@@ -42,7 +42,7 @@ fn responses_能力矩阵完整() {
 }
 
 #[test]
-fn chat_completions_能力矩阵完整() {
+fn test_api_protocol_02() {
     let capabilities = ApiProtocol::OpenAiChatCompletions.capabilities();
 
     // reasoning_content is a convention of the Qwen / DeepSeek / Kimi gateways, not a Chat
@@ -77,7 +77,7 @@ fn chat_completions_能力矩阵完整() {
 }
 
 #[test]
-fn anthropic_messages_能力矩阵完整() {
+fn test_api_protocol_03() {
     let capabilities = ApiProtocol::AnthropicMessages.capabilities();
 
     assert_eq!(
@@ -116,7 +116,7 @@ fn anthropic_messages_能力矩阵完整() {
 }
 
 #[test]
-fn runtime_必须通过能力判断而非假设_responses_语义() {
+fn test_api_protocol_04() {
     let responses = ApiProtocol::OpenAiResponses.capabilities();
     let chat = ApiProtocol::OpenAiChatCompletions.capabilities();
     let anthropic = ApiProtocol::AnthropicMessages.capabilities();
@@ -152,7 +152,7 @@ fn runtime_必须通过能力判断而非假设_responses_语义() {
 }
 
 #[test]
-fn 协议配置名稳定且可往返() {
+fn test_api_protocol_05() {
     let expected = [
         (ApiProtocol::OpenAiResponses, "openai_responses"),
         (

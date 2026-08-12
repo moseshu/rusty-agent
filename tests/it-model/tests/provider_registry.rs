@@ -87,7 +87,7 @@ fn registration(
 }
 
 #[test]
-fn 显式注册优先_未知前缀完整交给兼容_provider() {
+fn test_provider_registry_01() {
     let native = Arc::new(FakeProvider::new(false));
     let compat = Arc::new(FakeProvider::new(false));
     let explicit = Arc::new(FakeProvider::new(false));
@@ -143,7 +143,7 @@ fn 显式注册优先_未知前缀完整交给兼容_provider() {
 }
 
 #[test]
-fn 厂商名没有内建分支_是否特殊只由注册项决定() {
+fn test_provider_registry_02() {
     let compat = Arc::new(FakeProvider::new(false));
     let registry = ProviderRegistry::builder(ProviderKey::new("compat"))
         .unknown_prefix_policy(UnknownPrefixPolicy::ForwardTo(ProviderKey::new("compat")))
@@ -165,7 +165,7 @@ fn 厂商名没有内建分支_是否特殊只由注册项决定() {
 }
 
 #[test]
-fn 裸模型和_none_都走显式默认_provider() {
+fn test_provider_registry_03() {
     let default = Arc::new(FakeProvider::new(false));
     let registry = ProviderRegistry::builder(ProviderKey::new("default"))
         .register(registration(
@@ -202,7 +202,7 @@ fn 裸模型和_none_都走显式默认_provider() {
 }
 
 #[test]
-fn 模型别名携带模型层默认_provider_层补出必填_max_tokens() {
+fn test_provider_registry_04() {
     let provider = Arc::new(FakeProvider::new(false));
     let extra_body = Map::from_iter([("routing".to_owned(), json!({"region": "us"}))]);
     let registration = registration(
@@ -251,7 +251,7 @@ fn 模型别名携带模型层默认_provider_层补出必填_max_tokens() {
 }
 
 #[test]
-fn factory_按注册键懒加载且只创建一次() {
+fn test_provider_registry_05() {
     let provider = Arc::new(FakeProvider::new(false));
     let creates = Arc::new(AtomicUsize::new(0));
     let factory_provider = Arc::clone(&provider);
@@ -285,7 +285,7 @@ fn factory_按注册键懒加载且只创建一次() {
 }
 
 #[tokio::test]
-async fn registry_本身满足_model_provider_契约() {
+async fn test_provider_registry_06() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<ProviderRegistry>();
 
@@ -313,7 +313,7 @@ async fn registry_本身满足_model_provider_契约() {
 }
 
 #[tokio::test]
-async fn close_去重并排空所有_provider_关闭后不可重开() {
+async fn test_provider_registry_07() {
     let shared = Arc::new(FakeProvider::new(true));
     let healthy = Arc::new(FakeProvider::new(false));
     let registry = ProviderRegistry::builder(ProviderKey::new("a"))
@@ -355,7 +355,7 @@ async fn close_去重并排空所有_provider_关闭后不可重开() {
 }
 
 #[test]
-fn fail_fast_拒绝未知或畸形前缀() {
+fn test_provider_registry_08() {
     let provider = Arc::new(FakeProvider::new(false));
     let registry = ProviderRegistry::builder(ProviderKey::new("known"))
         .register(registration(
@@ -375,7 +375,7 @@ fn fail_fast_拒绝未知或畸形前缀() {
 }
 
 #[test]
-fn build_拒绝身份冲突_悬空_fallback_和错误_extra_body_桶() {
+fn test_provider_registry_09() {
     let one = Arc::new(FakeProvider::new(false));
     let two = Arc::new(FakeProvider::new(false));
     let collision = ProviderRegistry::builder(ProviderKey::new("one"))

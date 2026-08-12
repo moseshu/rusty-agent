@@ -15,7 +15,7 @@ use ra_core::{
 use serde_json::{Value, json};
 
 #[test]
-fn 两个_mcp_server_的同名工具靠_lookup_key_消歧() {
+fn test_tool_contract_01() {
     let github = ToolOrigin::namespaced(ToolNamespace::new("mcp.github").unwrap(), "search")
         .unwrap();
     let internal = ToolOrigin::namespaced(ToolNamespace::new("mcp.internal").unwrap(), "search")
@@ -39,7 +39,7 @@ fn 两个_mcp_server_的同名工具靠_lookup_key_消歧() {
 }
 
 #[test]
-fn lookup_key_三种形状互不等价且能稳定序列化() {
+fn test_tool_contract_02() {
     let bare = ToolLookupKey::bare("search").unwrap();
     let namespaced =
         ToolLookupKey::namespaced(ToolNamespace::new("plugin.catalog").unwrap(), "search")
@@ -64,7 +64,7 @@ fn lookup_key_三种形状互不等价且能稳定序列化() {
 }
 
 #[test]
-fn lookup_key_未来字段原样往返但不参与身份() {
+fn test_tool_contract_03() {
     let first_wire = json!({
         "schema_version": 2,
         "kind": "bare",
@@ -107,7 +107,7 @@ fn lookup_key_未来字段原样往返但不参与身份() {
 }
 
 #[test]
-fn synthetic_namespace_恢复为_deferred_而不是普通_namespaced() {
+fn test_tool_contract_04() {
     let restored = ToolLookupKey::for_call(
         "tool_search",
         Some(ToolNamespace::new("tool_search").unwrap()),
@@ -125,7 +125,7 @@ fn synthetic_namespace_恢复为_deferred_而不是普通_namespaced() {
 }
 
 #[test]
-fn origin_跨版本回写未知字段且拒绝矛盾身份() {
+fn test_tool_contract_05() {
     let origin =
         ToolOrigin::namespaced(ToolNamespace::new("agent.reviewer").unwrap(), "inspect").unwrap();
     let mut wire = serde_json::to_value(&origin).unwrap();
@@ -156,7 +156,7 @@ fn origin_跨版本回写未知字段且拒绝矛盾身份() {
 }
 
 #[test]
-fn 更高版本写下的_key_仍然路由得到同一个工具() {
+fn test_tool_contract_06() {
     let key = ToolLookupKey::bare("search").unwrap();
     let mut registry = BTreeMap::new();
     registry.insert(key.clone(), "实现");
@@ -188,7 +188,7 @@ fn 更高版本写下的_key_仍然路由得到同一个工具() {
 }
 
 #[test]
-fn identity_值对象反序列化也不能绕过校验() {
+fn test_tool_contract_07() {
     assert!(serde_json::from_value::<ToolNamespace>(json!(" namespace ")).is_err());
     assert!(
         serde_json::from_value::<ToolLookupKey>(json!({"kind": "bare", "name": ""})).is_err()
@@ -204,7 +204,7 @@ fn identity_值对象反序列化也不能绕过校验() {
 }
 
 #[test]
-fn tool_options_集中承载执行策略并按毫秒往返() {
+fn test_tool_contract_08() {
     let input_guard = ToolGuardrailId::new("read_before_edit").unwrap();
     let output_guard = ToolGuardrailId::new("secret_scan").unwrap();
     let options = ToolOptions::new()
@@ -261,7 +261,7 @@ fn tool_options_集中承载执行策略并按毫秒往返() {
 }
 
 #[test]
-fn 两个默认都是保守的那一边() {
+fn test_tool_contract_09() {
     let options = ToolOptions::new();
 
     // A tool written before either field existed must not become concurrently executable or
@@ -273,7 +273,7 @@ fn 两个默认都是保守的那一边() {
 }
 
 #[test]
-fn hidden_既不广播也不可被发现() {
+fn test_tool_contract_10() {
     let hidden = ToolOptions::new().with_exposure(ToolExposure::Hidden);
     let deferred = ToolOptions::new().with_exposure(ToolExposure::Deferred);
 
@@ -286,7 +286,7 @@ fn hidden_既不广播也不可被发现() {
 }
 
 #[test]
-fn defer_loading_这个旧键当场拒收而不是落进_unknown() {
+fn test_tool_contract_11() {
     // It used to be this field. Left unrecognized it would round-trip into `unknown` and the tool
     // would read as `Advertised` — schema budget spent every turn, and nothing says so.
     let error = serde_json::from_value::<ToolOptions>(json!({
@@ -359,7 +359,7 @@ impl Tool for EchoTool {
 }
 
 #[tokio::test]
-async fn tool_trait_对象安全且上下文_审批_与模型投影都可用() {
+async fn test_tool_contract_12() {
     let tool: Arc<dyn Tool> = Arc::new(EchoTool::new());
     let call_id = CallId::new("call_1");
     let arguments = json!({"text": "hello"});
@@ -386,7 +386,7 @@ async fn tool_trait_对象安全且上下文_审批_与模型投影都可用() {
 }
 
 #[tokio::test]
-async fn 任务态句柄透传到工具且不挂时是_none() {
+async fn test_tool_contract_13() {
     struct TaskState {
         plan: &'static str,
     }
@@ -416,7 +416,7 @@ async fn 任务态句柄透传到工具且不挂时是_none() {
 }
 
 #[tokio::test]
-async fn dynamic_policy_没有对应实现时明确失败而不是静默启用() {
+async fn test_tool_contract_14() {
     let mut tool = EchoTool::new();
     tool.options = ToolOptions::new()
         .with_availability(ToolAvailability::Dynamic)
@@ -430,7 +430,7 @@ async fn dynamic_policy_没有对应实现时明确失败而不是静默启用()
 }
 
 #[test]
-fn trait_validation_拒绝_schema_与_origin_名称漂移() {
+fn test_tool_contract_15() {
     let mut tool = EchoTool::new();
     tool.schema = ToolSchema::new(
         "different_name",
@@ -442,7 +442,7 @@ fn trait_validation_拒绝_schema_与_origin_名称漂移() {
 }
 
 #[test]
-fn 手写_schema_不能只声明_strict_而不满足_strict() {
+fn test_tool_contract_16() {
     // A schema missing additionalProperties or required, paired with strict=true, is certain to
     // be rejected by the provider, so construction has to stop it. Hand-written and MCP tools take
     // exactly this path and never pass through the derive's normalization.
@@ -496,7 +496,7 @@ fn 手写_schema_不能只声明_strict_而不满足_strict() {
 }
 
 #[test]
-fn 伪造的_strict_声明在反序列化时也过不去() {
+fn test_tool_contract_17() {
     let schema = ToolSchema::loose(
         "weather",
         json!({"type": "object", "properties": {"city": {"type": "string"}}}),

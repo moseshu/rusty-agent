@@ -158,7 +158,7 @@ async fn settle(
 }
 
 #[tokio::test]
-async fn 结算把本轮四类动作按响应原序全部记下() {
+async fn test_tool_use_tracking_01() {
     let surface = surface(vec![Arc::new(ScriptedTool::new(
         "write_file",
         Behavior::Succeed,
@@ -208,7 +208,7 @@ async fn 结算把本轮四类动作按响应原序全部记下() {
 }
 
 #[tokio::test]
-async fn 连续两轮点同一个调用连续段累加参数一变归零() {
+async fn test_tool_use_tracking_02() {
     let tool = Arc::new(ScriptedTool::new("read_file", Behavior::Succeed));
     let surface = surface(vec![tool]);
     let read = tool_identity("read_file");
@@ -241,7 +241,7 @@ async fn 连续两轮点同一个调用连续段累加参数一变归零() {
 }
 
 #[tokio::test]
-async fn 记的是模型要了什么而不是执行成没成() {
+async fn test_tool_use_tracking_03() {
     let failing = Arc::new(ScriptedTool::new("write_file", Behavior::Fail));
     let calls = Arc::clone(&failing.calls);
     let surface = surface(vec![failing]);
@@ -269,7 +269,7 @@ async fn 记的是模型要了什么而不是执行成没成() {
 }
 
 #[tokio::test]
-async fn 停下来要审批的那一轮也算模型要过工具() {
+async fn test_tool_use_tracking_04() {
     let gated = Arc::new(
         ScriptedTool::new("write_file", Behavior::Succeed)
             .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
@@ -296,7 +296,7 @@ async fn 停下来要审批的那一轮也算模型要过工具() {
 }
 
 #[tokio::test]
-async fn 这一轮报错也不会让已经要过的东西消失() {
+async fn test_tool_use_tracking_05() {
     let handoff = ModelHandoffDefinition::new(
         AgentId::new("reviewer"),
         "transfer_to_reviewer",
@@ -329,7 +329,7 @@ async fn 这一轮报错也不会让已经要过的东西消失() {
 }
 
 #[tokio::test]
-async fn 归属跟着传进来的公共_agent_身份走() {
+async fn test_tool_use_tracking_06() {
     let surface = surface(vec![Arc::new(ScriptedTool::new(
         "read_file",
         Behavior::Succeed,

@@ -16,17 +16,17 @@ use ra_core::config::{
 
 /// The effective value. `Layered::value` hands back `&T` directly, which reads better than
 /// peeling two layers of reference off `resolve`.
-fn 生效值(layered: &Layered<&'static str>, 选择: SourceSelection) -> Option<&'static str> {
-    layered.value(选择).copied()
+fn effective_value(layered: &Layered<&'static str>, selection: SourceSelection) -> Option<&'static str> {
+    layered.value(selection).copied()
 }
 
 /// Which layer the effective value came from.
-fn 生效来源(layered: &Layered<&'static str>, 选择: SourceSelection) -> Option<SettingSource> {
-    layered.resolve(选择).map(|s| s.source())
+fn effective_source(layered: &Layered<&'static str>, selection: SourceSelection) -> Option<SettingSource> {
+    layered.resolve(selection).map(|s| s.source())
 }
 
 /// A configuration item with a value from each of the six layers.
-fn 六层齐全() -> Layered<&'static str> {
+fn all_six_layers() -> Layered<&'static str> {
     let mut layered = Layered::builtin("内置");
     layered
         .set(SettingSource::UserFile, "用户")
@@ -42,7 +42,7 @@ fn 六层齐全() -> Layered<&'static str> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 优先级顺序是契约() {
+fn test_config_layering_01() {
     // The closer to this particular call, the more say it gets.
     let 期望 = [
         SettingSource::Builtin,
@@ -66,7 +66,7 @@ fn 优先级顺序是契约() {
 }
 
 #[test]
-fn 优先级两两不同() {
+fn test_config_layering_02() {
     let mut 优先级: Vec<u16> = SettingSource::ALL.iter().map(|s| s.precedence()).collect();
     优先级.sort_unstable();
     let total = 优先级.len();
@@ -75,30 +75,30 @@ fn 优先级两两不同() {
 }
 
 #[test]
-fn 最高层胜出() {
-    let layered = 六层齐全();
+fn test_config_layering_03() {
+    let layered = all_six_layers();
 
-    assert_eq!(生效值(&layered, SourceSelection::all()), Some("显式"));
+    assert_eq!(effective_value(&layered, SourceSelection::all()), Some("显式"));
     assert_eq!(
-        生效来源(&layered, SourceSelection::all()),
+        effective_source(&layered, SourceSelection::all()),
         Some(SettingSource::Explicit)
     );
 }
 
 #[test]
-fn 缺层不影响解析() {
+fn test_config_layering_04() {
     let mut layered = Layered::builtin("内置");
     layered.set(SettingSource::ProjectFile, "项目");
 
-    assert_eq!(生效值(&layered, SourceSelection::all()), Some("项目"));
+    assert_eq!(effective_value(&layered, SourceSelection::all()), Some("项目"));
     assert_eq!(
-        生效来源(&layered, SourceSelection::all()),
+        effective_source(&layered, SourceSelection::all()),
         Some(SettingSource::ProjectFile)
     );
 }
 
 #[test]
-fn 同层重复写入是覆盖不是追加() {
+fn test_config_layering_05() {
     // One file per layer, so a repeat can only mean the same layer was parsed twice.
     let mut layered: Layered<&str> = Layered::new();
     layered.set(SettingSource::Env, "先");
@@ -109,7 +109,7 @@ fn 同层重复写入是覆盖不是追加() {
 }
 
 #[test]
-fn 无人给值时没有生效值() {
+fn test_config_layering_06() {
     let layered: Layered<&str> = Layered::new();
     assert!(layered.is_empty());
     assert!(layered.resolve(SourceSelection::all()).is_none());
@@ -121,7 +121,7 @@ fn 无人给值时没有生效值() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 默认不读任何外部配置() {
+fn test_config_layering_07() {
     // When the framework is embedded in someone else's process, quietly reading
     // ~/.rusty-agent/config.toml is unacceptable.
     let 默认 = SourceSelection::default();
@@ -134,11 +134,11 @@ fn 默认不读任何外部配置() {
 }
 
 #[test]
-fn 隔离模式下磁盘与环境完全不生效() {
+fn test_config_layering_08() {
     // Mirrors strict_mcp_config: use only what was passed explicitly, ignore what was discovered.
-    let layered = 六层齐全();
+    let layered = all_six_layers();
     assert_eq!(
-        生效值(&layered, SourceSelection::isolated()),
+        effective_value(&layered, SourceSelection::isolated()),
         Some("显式"),
         "显式传入不受隔离影响"
     );
@@ -148,14 +148,14 @@ fn 隔离模式下磁盘与环境完全不生效() {
         .set(SettingSource::ProjectFile, "项目")
         .set(SettingSource::Env, "环境");
     assert_eq!(
-        生效值(&无显式, SourceSelection::isolated()),
+        effective_value(&无显式, SourceSelection::isolated()),
         Some("内置"),
         "隔离模式下应退回内置默认值"
     );
 }
 
 #[test]
-fn 内置与显式两档关不掉() {
+fn test_config_layering_09() {
     // Disabling builtin would leave no fallback and disabling explicit would ignore the intent of
     // this very call; both are absurd states.
     let 选择 = SourceSelection::all()
@@ -167,7 +167,7 @@ fn 内置与显式两档关不掉() {
 }
 
 #[test]
-fn 逐个来源可开可关() {
+fn test_config_layering_10() {
     for source in SettingSource::ALL.iter().filter(|s| s.is_discovered()) {
         let 只开这个 = SourceSelection::isolated().with(*source);
         assert!(只开这个.allows(*source), "`{source}` 打开失败");
@@ -188,25 +188,25 @@ fn 逐个来源可开可关() {
 }
 
 #[test]
-fn ci_场景只认环境变量() {
+fn test_config_layering_11() {
     let 选择 = SourceSelection::isolated().with(SettingSource::Env);
-    let layered = 六层齐全();
+    let layered = all_six_layers();
 
     let mut 无显式 = Layered::builtin("内置");
     无显式
         .set(SettingSource::ProjectFile, "项目")
         .set(SettingSource::Env, "环境");
 
-    assert_eq!(生效值(&无显式, 选择), Some("环境"));
+    assert_eq!(effective_value(&无显式, 选择), Some("环境"));
     assert_eq!(
-        生效值(&layered, 选择),
+        effective_value(&layered, 选择),
         Some("显式"),
         "显式传入仍然压过环境变量"
     );
 }
 
 #[test]
-fn 来源分类自洽() {
+fn test_config_layering_12() {
     for source in SettingSource::ALL {
         // discovered if and only if source selection can turn it off
         assert_eq!(
@@ -222,7 +222,7 @@ fn 来源分类自洽() {
 }
 
 #[test]
-fn 来源标签唯一且稳定() {
+fn test_config_layering_13() {
     let mut labels: Vec<&str> = SettingSource::ALL.iter().map(|s| s.label()).collect();
     labels.sort_unstable();
     let total = labels.len();
@@ -238,7 +238,7 @@ fn 来源标签唯一且稳定() {
 }
 
 #[test]
-fn 来源选择的_debug_可读() {
+fn test_config_layering_14() {
     // This type shows up almost exclusively in diagnostics, where a derived `discovered: 5` helps
     // nobody.
     assert_eq!(
@@ -260,8 +260,8 @@ fn 来源选择的_debug_可读() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 报告按优先级从高到低列出所有层() {
-    let report = 六层齐全().report("model.name", SourceSelection::all());
+fn test_config_layering_15() {
+    let report = all_six_layers().report("model.name", SourceSelection::all());
 
     let 顺序: Vec<SettingSource> = report.layers().iter().map(|l| l.source()).collect();
     assert_eq!(
@@ -279,11 +279,11 @@ fn 报告按优先级从高到低列出所有层() {
 }
 
 #[test]
-fn 报告区分被盖住与未启用() {
+fn test_config_layering_16() {
     // This is half the reason the module exists: the two kinds of inert have different fixes.
     // Shadowed -> change a higher layer's configuration; not enabled -> change source selection.
     let 选择 = SourceSelection::all().without(SettingSource::UserFile);
-    let report = 六层齐全().report("model.name", 选择);
+    let report = all_six_layers().report("model.name", 选择);
 
     let 状态 = |source: SettingSource| {
         report
@@ -299,10 +299,10 @@ fn 报告区分被盖住与未启用() {
 }
 
 #[test]
-fn 未启用的层在报告里仍然看得见() {
+fn test_config_layering_17() {
     // Showing only the effective value strands the user on "I clearly wrote that, why is it
     // ignored".
-    let report = 六层齐全().report("model.name", SourceSelection::isolated());
+    let report = all_six_layers().report("model.name", SourceSelection::isolated());
 
     assert_eq!(report.layers().len(), 6, "隔离模式不该让配置从报告里消失");
 
@@ -319,8 +319,8 @@ fn 未启用的层在报告里仍然看得见() {
 }
 
 #[test]
-fn 报告能指出生效值与来源() {
-    let report = 六层齐全().report("model.name", SourceSelection::all());
+fn test_config_layering_18() {
+    let report = all_six_layers().report("model.name", SourceSelection::all());
     let 生效 = report.effective().expect("应有生效层");
 
     assert_eq!(生效.source(), SettingSource::Explicit);
@@ -329,7 +329,7 @@ fn 报告能指出生效值与来源() {
 }
 
 #[test]
-fn 只有一层时没有未生效的层() {
+fn test_config_layering_19() {
     let report = Layered::builtin("内置").report("model.name", SourceSelection::all());
 
     assert!(!report.has_ineffective_layers());
@@ -340,7 +340,7 @@ fn 只有一层时没有未生效的层() {
 }
 
 #[test]
-fn 全被排除时没有生效值() {
+fn test_config_layering_20() {
     let mut layered: Layered<&str> = Layered::new();
     layered.set(SettingSource::Env, "环境");
 
@@ -350,13 +350,13 @@ fn 全被排除时没有生效值() {
 }
 
 #[test]
-fn 报告的一行摘要带来源() {
-    let report = 六层齐全().report("model.name", SourceSelection::all());
+fn test_config_layering_21() {
+    let report = all_six_layers().report("model.name", SourceSelection::all());
     assert_eq!(report.to_string(), "model.name = 显式 (explicit)");
 }
 
 #[test]
-fn 报告值被字符串化以便同表展示() {
+fn test_config_layering_22() {
     // doctor has to line up items of different types in one table.
     let 数字: FieldReport = Layered::builtin(42_u32).report("turn.max", SourceSelection::all());
     assert_eq!(数字.effective().expect("应有生效层").value(), "42");
@@ -371,14 +371,14 @@ fn 报告值被字符串化以便同表展示() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 环境变量名映射稳定() {
+fn test_config_layering_23() {
     assert_eq!(env_key("model.name"), "RA_MODEL_NAME");
     assert_eq!(env_key("sandbox.network.allow"), "RA_SANDBOX_NETWORK_ALLOW");
     assert_eq!(env_key("verbose"), "RA_VERBOSE");
 }
 
 #[test]
-fn 环境变量名总是带前缀且全大写() {
+fn test_config_layering_24() {
     for path in ["model.name", "a", "x.y.z"] {
         let key = env_key(path);
         assert!(key.starts_with(ENV_PREFIX), "`{key}` 缺前缀");
@@ -388,7 +388,7 @@ fn 环境变量名总是带前缀且全大写() {
 }
 
 #[test]
-fn 配置文件名约定稳定() {
+fn test_config_layering_25() {
     assert_eq!(CONFIG_DIR_NAME, ".rusty-agent");
     assert_eq!(CONFIG_FILE_NAME, "config.toml");
     assert_eq!(LOCAL_CONFIG_FILE_NAME, "config.local.toml");

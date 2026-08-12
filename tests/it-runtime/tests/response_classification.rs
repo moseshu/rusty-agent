@@ -156,7 +156,7 @@ fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
 struct Host;
 
 #[test]
-fn 名字按本轮广播的动作面解析成三类结果() {
+fn test_response_classification_01() {
     let surface = TurnActionSurface::new(
         vec![tool("write_file"), tool("read_file")],
         vec![handoff("transfer_to_reviewer", "reviewer")],
@@ -206,7 +206,7 @@ fn 名字按本轮广播的动作面解析成三类结果() {
 }
 
 #[test]
-fn 叫不出名字的工具不会终止_run() {
+fn test_response_classification_02() {
     let surface = TurnActionSurface::new(vec![tool("write_file")], Vec::new()).unwrap();
     let response = ModelResponse::new(vec![tool_call("call-item-1", "call-1", "wrte_file")]);
 
@@ -222,7 +222,7 @@ fn 叫不出名字的工具不会终止_run() {
 }
 
 #[tokio::test]
-async fn 结算阶段解析的是本轮启用快照而不是_agent_声明的工具() {
+async fn test_response_classification_03() {
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")
@@ -264,7 +264,7 @@ async fn 结算阶段解析的是本轮启用快照而不是_agent_声明的工�
 }
 
 #[tokio::test]
-async fn 动作面在准备阶段就建好_歧义不会拖到花完钱之后才发现() {
+async fn test_response_classification_04() {
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")
@@ -301,7 +301,7 @@ async fn 动作面在准备阶段就建好_歧义不会拖到花完钱之后才�
 }
 
 #[test]
-fn 一个名字同时是工具和交接时动作面直接拒绝() {
+fn test_response_classification_05() {
     // handoff 与 tool 共用线上命名空间；留着它就得在结算里随便挑一边，那是静默的错。
     let error = TurnActionSurface::new(
         vec![tool("transfer_to_reviewer")],
@@ -316,7 +316,7 @@ fn 一个名字同时是工具和交接时动作面直接拒绝() {
 }
 
 #[test]
-fn 交接到本轮没广播的_agent_会被拒绝() {
+fn test_response_classification_06() {
     let surface = TurnActionSurface::new(
         vec![tool("write_file")],
         vec![handoff("transfer_to_reviewer", "reviewer")],
@@ -348,7 +348,7 @@ fn 交接到本轮没广播的_agent_会被拒绝() {
 }
 
 #[test]
-fn 分类不改写记录_会话里存的还是_provider_发来的那条() {
+fn test_response_classification_07() {
     let surface = TurnActionSurface::new(
         Vec::new(),
         vec![handoff("transfer_to_reviewer", "reviewer")],
@@ -369,7 +369,7 @@ fn 分类不改写记录_会话里存的还是_provider_发来的那条() {
 }
 
 #[test]
-fn 没有动作的响应两个判据都为假() {
+fn test_response_classification_08() {
     let surface = TurnActionSurface::new(vec![tool("write_file")], Vec::new()).unwrap();
     let response = ModelResponse::new(vec![item(
         "msg-1",

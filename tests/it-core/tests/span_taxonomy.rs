@@ -50,7 +50,7 @@ fn builtin_kinds() -> Vec<SpanKind> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn span_name_全局唯一且格式稳定() {
+fn test_span_taxonomy_01() {
     let kinds = builtin_kinds();
     let mut names: Vec<&str> = kinds.iter().map(SpanKind::span_name).collect();
     names.sort_unstable();
@@ -73,7 +73,7 @@ fn span_name_全局唯一且格式稳定() {
 }
 
 #[test]
-fn 自定义分类的_span_名收敛到_custom_但标签保留() {
+fn test_span_taxonomy_02() {
     // A tracing span name has to be a &'static str, which a custom label cannot supply. So names
     // collapse and the label travels in a field instead — attribution goes by label, not by name.
     let kind = SpanKind::custom("flow_node");
@@ -86,7 +86,7 @@ fn 自定义分类的_span_名收敛到_custom_但标签保留() {
 }
 
 #[test]
-fn 内置分类的名字与标签一致() {
+fn test_span_taxonomy_03() {
     for kind in builtin_kinds() {
         assert_eq!(
             kind.span_name(),
@@ -102,7 +102,7 @@ fn 内置分类的名字与标签一致() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn run_骨架进_info_高频检查进_debug() {
+fn test_span_taxonomy_04() {
     // The criterion: a normal run should be readable end to end at INFO.
     for kind in [
         SpanKind::Agent,
@@ -124,7 +124,7 @@ fn run_骨架进_info_高频检查进_debug() {
 }
 
 #[test]
-fn 没有任何_span_默认进_error_或_trace() {
+fn test_span_taxonomy_05() {
     // A span is structure, not an alert: something going wrong should emit an event rather than
     // promote the whole span to ERROR.
     for kind in all_kinds() {
@@ -141,7 +141,7 @@ fn 没有任何_span_默认进_error_或_trace() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 字段名全局唯一() {
+fn test_span_taxonomy_06() {
     let mut names = field::ALL.to_vec();
     names.sort_unstable();
 
@@ -151,7 +151,7 @@ fn 字段名全局唯一() {
 }
 
 #[test]
-fn 字段名格式稳定() {
+fn test_span_taxonomy_07() {
     for name in field::ALL {
         assert!(!name.is_empty(), "字段名不能为空");
         assert!(
@@ -171,7 +171,7 @@ fn 字段名格式稳定() {
 }
 
 #[test]
-fn 每个分类的必填字段都在词表内且含分类标识() {
+fn test_span_taxonomy_08() {
     for kind in all_kinds() {
         let required = kind.required_fields();
 
@@ -196,7 +196,7 @@ fn 每个分类的必填字段都在词表内且含分类标识() {
 }
 
 #[test]
-fn 必填字段只要创建时就知道的标识() {
+fn test_span_taxonomy_09() {
     // A terminal field is reserved with Empty and recorded later, so it must not appear in the
     // required list — otherwise the callsite would have to invent a fake value to fill it.
     let 终态字段 = [
@@ -222,7 +222,7 @@ fn 必填字段只要创建时就知道的标识() {
 }
 
 #[test]
-fn 缓存_token_单列() {
+fn test_span_taxonomy_10() {
     // Cache hit rate is the dominant cost driver; folding it into input_tokens makes the hit rate
     // impossible to compute.
     assert!(field::ALL.contains(&field::USAGE_CACHED_INPUT_TOKENS));
@@ -234,7 +234,7 @@ fn 缓存_token_单列() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 取消收敛成_cancelled_而不是_error() {
+fn test_span_taxonomy_11() {
     for err in [
         Error::cancelled("用户中断"),
         Error::tool(ToolErrorKind::Cancelled, "exec_command", "已取消"),
@@ -251,7 +251,7 @@ fn 取消收敛成_cancelled_而不是_error() {
 }
 
 #[test]
-fn 非取消的错误收敛成_error() {
+fn test_span_taxonomy_12() {
     for err in [
         Error::config("缺少 model"),
         Error::caller("状态机被违规驱动"),
@@ -267,7 +267,7 @@ fn 非取消的错误收敛成_error() {
 }
 
 #[test]
-fn 终态投影与错误自身的判据永不矛盾() {
+fn test_span_taxonomy_13() {
     for err in [
         Error::cancelled("用户中断"),
         Error::tool(ToolErrorKind::Cancelled, "exec_command", "已取消"),
@@ -284,7 +284,7 @@ fn 终态投影与错误自身的判据永不矛盾() {
 }
 
 #[test]
-fn outcome_取值稳定() {
+fn test_span_taxonomy_14() {
     assert_eq!(SpanOutcome::Ok.as_str(), "ok");
     assert_eq!(SpanOutcome::Error.as_str(), "error");
     assert_eq!(SpanOutcome::Cancelled.as_str(), "cancelled");
@@ -299,7 +299,7 @@ fn outcome_取值稳定() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 可自愈的失败进_warn_需要人介入的进_error() {
+fn test_span_taxonomy_15() {
     assert_eq!(level_for(Recoverability::Retryable), Level::WARN);
     assert_eq!(level_for(Recoverability::RetryableWithChange), Level::WARN);
     assert_eq!(level_for(Recoverability::NeedsIntervention), Level::ERROR);
@@ -307,13 +307,13 @@ fn 可自愈的失败进_warn_需要人介入的进_error() {
 }
 
 #[test]
-fn 取消不进_error_级() {
+fn test_span_taxonomy_16() {
     // A user pressing stop should not paint the log red, or real errors get buried.
     assert_eq!(level_for(Recoverability::Cancelled), Level::INFO);
 }
 
 #[test]
-fn 需要人介入的错误才配拿到_error_级() {
+fn test_span_taxonomy_17() {
     for recoverability in [
         Recoverability::Retryable,
         Recoverability::RetryableWithChange,
@@ -339,7 +339,7 @@ fn 需要人介入的错误才配拿到_error_级() {
 struct 捕获(Arc<Mutex<Vec<u8>>>);
 
 impl 捕获 {
-    fn 文本(&self) -> String {
+    fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 }
@@ -364,7 +364,7 @@ impl<'a> MakeWriter<'a> for 捕获 {
 }
 
 /// Runs `f` under a subscriber that emits span-close events only, and returns the captured text.
-fn 捕获_span_关闭(f: impl FnOnce()) -> String {
+fn capture_span_close(f: impl FnOnce()) -> String {
     let sink = 捕获::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(sink.clone())
@@ -374,12 +374,12 @@ fn 捕获_span_关闭(f: impl FnOnce()) -> String {
         .finish();
 
     tracing::subscriber::with_default(subscriber, f);
-    sink.文本()
+    sink.text()
 }
 
 #[test]
-fn record_outcome_写进_span_字段() {
-    let out = 捕获_span_关闭(|| {
+fn test_span_taxonomy_18() {
+    let out = capture_span_close(|| {
         let span = tracing::info_span!(
             "turn",
             span.kind = SpanKind::Turn.label(),
@@ -394,11 +394,11 @@ fn record_outcome_写进_span_字段() {
 }
 
 #[test]
-fn 未占位的字段_record_无效() {
+fn test_span_taxonomy_19() {
     // This is tracing semantics, not a flaw in the helper. Pinning it down keeps someone from
     // later assuming a failed record reports an error — it just drops silently, and nobody
     // notices one missing field in a log.
-    let out = 捕获_span_关闭(|| {
+    let out = capture_span_close(|| {
         let span = tracing::info_span!("turn", span.kind = SpanKind::Turn.label());
         record_outcome(&span, SpanOutcome::Ok);
     });
@@ -410,8 +410,8 @@ fn 未占位的字段_record_无效() {
 }
 
 #[test]
-fn record_error_只落_code_不落文本() {
-    let out = 捕获_span_关闭(|| {
+fn test_span_taxonomy_20() {
+    let out = capture_span_close(|| {
         let span = tracing::info_span!(
             "generation",
             span.kind = SpanKind::Generation.label(),
@@ -433,8 +433,8 @@ fn record_error_只落_code_不落文本() {
 }
 
 #[test]
-fn record_error_对取消记成_cancelled() {
-    let out = 捕获_span_关闭(|| {
+fn test_span_taxonomy_21() {
+    let out = capture_span_close(|| {
         let span = tracing::info_span!(
             "function",
             span.kind = SpanKind::Function.label(),
@@ -453,9 +453,9 @@ fn record_error_对取消记成_cancelled() {
 }
 
 #[test]
-fn record_cancel_落根因与发起层级() {
+fn test_span_taxonomy_22() {
     // The two fields promised by the cancellation contract (R0-4), and their only write path.
-    let out = 捕获_span_关闭(|| {
+    let out = capture_span_close(|| {
         let span = tracing::info_span!(
             "function",
             span.kind = SpanKind::Function.label(),
@@ -474,7 +474,7 @@ fn record_cancel_落根因与发起层级() {
 }
 
 #[test]
-fn 字段常量与宏_callsite_的字面量一致() {
+fn test_span_taxonomy_23() {
     // A macro field name can only be a literal, so no constant can be interpolated and this
     // assertion is the only thing keeping the two sides aligned. Every literal used by the
     // callsites above is listed here.

@@ -23,7 +23,7 @@ fn object(value: Value) -> JsonMap {
 }
 
 #[test]
-fn 四层_resolve_快照锁住逐字段语义() {
+fn test_model_settings_01() {
     let key = provider("openrouter");
     let provider_defaults = ModelSettings::new()
         .with_temperature(0.8)
@@ -139,7 +139,7 @@ fn 四层_resolve_快照锁住逐字段语义() {
 }
 
 #[test]
-fn 未设置不会覆盖_显式零值与_false_会覆盖() {
+fn test_model_settings_02() {
     let key = provider("compat");
     let base = ModelSettings::new()
         .with_temperature(0.7)
@@ -159,7 +159,7 @@ fn 未设置不会覆盖_显式零值与_false_会覆盖() {
 }
 
 #[test]
-fn 工具选择按本轮真实广播面收敛而不是报错() {
+fn test_model_settings_03() {
     // Turn preparation resolves settings after tools precisely so this can happen: a selector that
     // survived the four-layer merge may name something this turn no longer advertises. Dynamic
     // availability is a feature, so an unsatisfiable selection degrades instead of ending the run.
@@ -218,7 +218,7 @@ fn 工具选择按本轮真实广播面收敛而不是报错() {
 }
 
 #[test]
-fn timeout_取全层最短() {
+fn test_model_settings_04() {
     // A timeout is a latency bound, not a capability: any layer wanting to wait less has standing,
     // and the request is simply abandoned sooner.
     let key = provider("anthropic");
@@ -233,7 +233,7 @@ fn timeout_取全层最短() {
 }
 
 #[test]
-fn max_tokens_只被模型层封顶_agent_默认不是天花板() {
+fn test_model_settings_05() {
     // Only the model layer states a hard fact. An agent writing max_tokens means "usually enough",
     // not "never more"; taking the min across all four layers would silently erase the value a run
     // set explicitly because it wanted a long answer.
@@ -266,7 +266,7 @@ fn max_tokens_只被模型层封顶_agent_默认不是天花板() {
 }
 
 #[test]
-fn 注册方默认里模型层压过_provider_兜底() {
+fn test_model_settings_06() {
     // The provider fallback exists because "some endpoints require this field" (Anthropic does),
     // which is no reason to override a per-model value written precisely because that model
     // differs — the coarsest layer beating the most specific one is backwards.
@@ -304,7 +304,7 @@ fn 注册方默认里模型层压过_provider_兜底() {
 }
 
 #[test]
-fn extra_body_按四层递归合并且不修改来源() {
+fn test_model_settings_07() {
     let key = provider("vllm");
     let provider_defaults = ModelSettings::new().with_extra_body(
         key.clone(),
@@ -375,7 +375,7 @@ fn extra_body_按四层递归合并且不修改来源() {
 }
 
 #[test]
-fn 切换_provider_不会下发前一个桶() {
+fn test_model_settings_08() {
     let vllm = provider("vllm");
     let openrouter = provider("openrouter");
     let settings = ModelSettings::new()
@@ -399,7 +399,7 @@ fn 切换_provider_不会下发前一个桶() {
 }
 
 #[test]
-fn trace_投影排除所有_transport_extras() {
+fn test_model_settings_09() {
     let key = provider("compat");
     let settings = ModelSettings::new()
         .with_temperature(0.5)
@@ -432,7 +432,7 @@ fn trace_投影排除所有_transport_extras() {
 }
 
 #[test]
-fn retry_与_backoff_深合并且保留_falsey_值() {
+fn test_model_settings_10() {
     let key = provider("openai");
     let provider_defaults = ModelSettings::new().with_retry(
         ModelRetrySettings::new()
@@ -466,7 +466,7 @@ fn retry_与_backoff_深合并且保留_falsey_值() {
 }
 
 #[test]
-fn retry_合并保留各层的未知字段() {
+fn test_model_settings_11() {
     // A merge starts from an empty object, so anything not carried over explicitly ends up knowing
     // less than the layer it came from — exactly what Unknown exists to prevent.
     let key = provider("compat");
@@ -490,7 +490,7 @@ fn retry_合并保留各层的未知字段() {
 }
 
 #[test]
-fn 时长按毫秒整数上线而不是_rust_专有形状() {
+fn test_model_settings_12() {
     // schema_version already promises "obvious to a reader in any language", and Duration's
     // default {"secs":N,"nanos":M} does not meet that bar.
     let settings = ModelSettings::new()
@@ -509,7 +509,7 @@ fn 时长按毫秒整数上线而不是_rust_专有形状() {
 }
 
 #[test]
-fn 配置序列化稳定并保留未知字段() {
+fn test_model_settings_13() {
     let key = provider("compat");
     let settings = ModelSettings::new()
         .with_temperature(0.0)

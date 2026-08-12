@@ -11,17 +11,17 @@ use ra_core::{
 };
 use serde_json::{Value, json};
 
-fn 记录(id: &str, kind: RunItemKind) -> RunItem {
+fn item(id: &str, kind: RunItemKind) -> RunItem {
     RunItem::new(ItemId::new(id), kind)
 }
 
-fn 所有项() -> Vec<RunItem> {
+fn all_items() -> Vec<RunItem> {
     vec![
-        记录(
+        item(
             "item-message",
             RunItemKind::Message(Message::assistant("完成", OutputPhase::Final)),
         ),
-        记录(
+        item(
             "item-reasoning",
             RunItemKind::Reasoning(
                 Reasoning::new()
@@ -32,7 +32,7 @@ fn 所有项() -> Vec<RunItem> {
                     .with_provider_data(json!({"thinking_blocks": [{"signature": "s1"}]})),
             ),
         ),
-        记录(
+        item(
             "item-call",
             RunItemKind::ToolCall(ToolCall::new(
                 CallId::new("call-1"),
@@ -40,14 +40,14 @@ fn 所有项() -> Vec<RunItem> {
                 json!({"path": "Cargo.toml"}),
             )),
         ),
-        记录(
+        item(
             "item-output",
             RunItemKind::ToolCallOutput(ToolCallOutput::new(
                 CallId::new("call-1"),
                 json!({"text": "workspace"}),
             )),
         ),
-        记录(
+        item(
             "item-handoff-call",
             RunItemKind::HandoffCall(HandoffCall::new(
                 CallId::new("handoff-1"),
@@ -55,7 +55,7 @@ fn 所有项() -> Vec<RunItem> {
                 json!({"focus": "correctness"}),
             )),
         ),
-        记录(
+        item(
             "item-handoff-output",
             RunItemKind::HandoffOutput(
                 HandoffOutput::new(
@@ -66,7 +66,7 @@ fn 所有项() -> Vec<RunItem> {
                 .with_note("请检查边界"),
             ),
         ),
-        记录(
+        item(
             "item-mcp-list",
             RunItemKind::McpListTools(McpListTools::new(
                 "filesystem",
@@ -77,7 +77,7 @@ fn 所有项() -> Vec<RunItem> {
                 .with_description("读取文本")],
             )),
         ),
-        记录(
+        item(
             "item-mcp-request",
             RunItemKind::McpApprovalRequest(McpApprovalRequest::new(
                 "approval-1",
@@ -86,20 +86,20 @@ fn 所有项() -> Vec<RunItem> {
                 json!({"path": "a.txt"}),
             )),
         ),
-        记录(
+        item(
             "item-mcp-response",
             RunItemKind::McpApprovalResponse(
                 McpApprovalResponse::new("approval-1", false).with_reason("只读任务"),
             ),
         ),
-        记录(
+        item(
             "item-compaction",
             RunItemKind::Compaction(Compaction::new(
                 "此前已检查 workspace",
                 vec![ItemId::new("item-message")],
             )),
         ),
-        记录(
+        item(
             "item-tool-approval",
             RunItemKind::ToolApproval(
                 ToolApproval::new(
@@ -114,8 +114,8 @@ fn 所有项() -> Vec<RunItem> {
 }
 
 #[test]
-fn 十一种_run_item_都能稳定往返() {
-    let items = 所有项();
+fn test_item_model_01() {
+    let items = all_items();
     assert_eq!(items.len(), 11);
 
     for item in items {
@@ -126,8 +126,8 @@ fn 十一种_run_item_都能稳定往返() {
 }
 
 #[test]
-fn 模型投影在类型层排除工具审批项() {
-    let items = 所有项();
+fn test_item_model_02() {
+    let items = all_items();
     let response = ModelResponse::new(items);
     let input = response.to_input_items();
 
@@ -137,8 +137,8 @@ fn 模型投影在类型层排除工具审批项() {
 }
 
 #[test]
-fn 模型投影不会泄漏归属_raw_provider_与_session_data() {
-    let item = 记录(
+fn test_item_model_03() {
+    let item = item(
         "item-1",
         RunItemKind::Message(Message::user("检查项目")),
     )
@@ -172,8 +172,8 @@ fn 模型投影不会泄漏归属_raw_provider_与_session_data() {
 }
 
 #[test]
-fn 工具调用与输出只按_call_id_配对() {
-    let call = 记录(
+fn test_item_model_04() {
+    let call = item(
         "a",
         RunItemKind::ToolCall(ToolCall::new(
             CallId::new("same-call"),
@@ -181,7 +181,7 @@ fn 工具调用与输出只按_call_id_配对() {
             json!({}),
         )),
     );
-    let output = 记录(
+    let output = item(
         "完全不同的-item-id",
         RunItemKind::ToolCallOutput(ToolCallOutput::new(
             CallId::new("same-call"),
@@ -195,7 +195,7 @@ fn 工具调用与输出只按_call_id_配对() {
 }
 
 #[test]
-fn reasoning_签名和完整_provider_序列在投影中保真() {
+fn test_item_model_05() {
     let reasoning = Reasoning::new()
         .with_id("r-1")
         .with_content(vec![String::new(), "visible".into()])
@@ -204,7 +204,7 @@ fn reasoning_签名和完整_provider_序列在投影中保真() {
             {"type": "thinking", "thinking": "", "signature": "sig-a"},
             {"type": "redacted_thinking", "data": "opaque"}
         ]));
-    let item = 记录(
+    let item = item(
         "reasoning",
         RunItemKind::Reasoning(reasoning.clone()),
     );
@@ -218,8 +218,8 @@ fn reasoning_签名和完整_provider_序列在投影中保真() {
 }
 
 #[test]
-fn model_response_保留双_id_usage_并生成下一轮输入() {
-    let response = ModelResponse::new(vec![记录(
+fn test_item_model_06() {
+    let response = ModelResponse::new(vec![item(
         "message",
         RunItemKind::Message(Message::assistant("结果", OutputPhase::Final)),
     )])
@@ -239,7 +239,7 @@ fn model_response_保留双_id_usage_并生成下一轮输入() {
 }
 
 #[test]
-fn message_角色与双通道是协议字段而不是文本约定() {
+fn test_item_model_07() {
     let commentary = Message::assistant("正在检查", OutputPhase::Commentary);
     let final_message = Message::assistant("检查完成", OutputPhase::Final);
 
@@ -251,8 +251,8 @@ fn message_角色与双通道是协议字段而不是文本约定() {
 }
 
 #[test]
-fn 改写消息通道会保留_run_item_包络并忽略非_assistant() {
-    let original = 记录(
+fn test_item_model_08() {
+    let original = item(
         "message",
         RunItemKind::Message(Message::assistant("完成", OutputPhase::Final)),
     )
@@ -270,7 +270,7 @@ fn 改写消息通道会保留_run_item_包络并忽略非_assistant() {
     };
     assert_eq!(message.phase(), Some(OutputPhase::Commentary));
 
-    let user = 记录("user", RunItemKind::Message(Message::user("继续")))
+    let user = item("user", RunItemKind::Message(Message::user("继续")))
         .with_output_phase(OutputPhase::Final);
     let RunItemKind::Message(message) = user.kind() else {
         panic!("必须仍是 message");
@@ -279,8 +279,8 @@ fn 改写消息通道会保留_run_item_包络并忽略非_assistant() {
 }
 
 #[test]
-fn 新版未知字段在_run_item_和_payload_两层都原样回写() {
-    let original = 记录("item", RunItemKind::Message(Message::user("hello")));
+fn test_item_model_09() {
+    let original = item("item", RunItemKind::Message(Message::user("hello")));
     let mut value = serde_json::to_value(original).expect("应可转 JSON");
     let object = value.as_object_mut().expect("RunItem 应是对象");
     object.insert("future_envelope".into(), json!({"keep": true}));
@@ -305,8 +305,8 @@ fn 新版未知字段在_run_item_和_payload_两层都原样回写() {
 }
 
 #[test]
-fn session_data_序列化次序确定且不会混入未知字段() {
-    let item = 记录(
+fn test_item_model_10() {
+    let item = item(
         "item",
         RunItemKind::Message(Message::system("system")),
     )

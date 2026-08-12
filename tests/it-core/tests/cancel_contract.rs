@@ -31,7 +31,7 @@ fn all_reasons() -> Vec<CancelReason> {
 }
 
 /// The canonical four-level tree: run -> turn -> tool -> process.
-fn 四层树() -> (CancelScope, CancelScope, CancelScope, CancelScope) {
+fn four_level_tree() -> (CancelScope, CancelScope, CancelScope, CancelScope) {
     let run = CancelScope::root();
     let turn = run.child(ScopeKind::Turn);
     let tool = turn.child(ScopeKind::Tool);
@@ -44,10 +44,10 @@ fn 四层树() -> (CancelScope, CancelScope, CancelScope, CancelScope) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 取消传播到所有后代含孙子层() {
+fn test_cancel_contract_01() {
     // "cancelling the parent has to reach the child process of a grandchild run" is the easiest
     // leak to miss, so this asserts the whole chain rather than the direct child alone.
-    let (run, turn, tool, process) = 四层树();
+    let (run, turn, tool, process) = four_level_tree();
     assert!(!process.is_cancelled(), "初始状态不该是已取消");
 
     run.cancel(CancelReason::UserInterrupt);
@@ -62,10 +62,10 @@ fn 取消传播到所有后代含孙子层() {
 }
 
 #[test]
-fn 取消不向上传播() {
+fn test_cancel_contract_02() {
     // One tool timing out must not take the whole run with it, or the loop could not treat the
     // timeout as a single tool failure and carry on.
-    let (run, turn, tool, process) = 四层树();
+    let (run, turn, tool, process) = four_level_tree();
 
     tool.cancel(CancelReason::Timeout);
 
@@ -80,8 +80,8 @@ fn 取消不向上传播() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 后代沿链继承根因() {
-    let (run, turn, tool, process) = 四层树();
+fn test_cancel_contract_03() {
+    let (run, turn, tool, process) = four_level_tree();
 
     run.cancel(CancelReason::UserInterrupt);
 
@@ -96,11 +96,11 @@ fn 后代沿链继承根因() {
 }
 
 #[test]
-fn 先到的根因不被后到的覆盖() {
+fn test_cancel_contract_04() {
     // The tool times out first, then the user interrupts the whole run: that tool still reports a
     // timeout. This is exactly what having no `ParentCancelled` buys — every level reports how it
     // actually died.
-    let (run, turn, tool, _process) = 四层树();
+    let (run, turn, tool, _process) = four_level_tree();
 
     tool.cancel(CancelReason::Timeout);
     run.cancel(CancelReason::UserInterrupt);
@@ -115,7 +115,7 @@ fn 先到的根因不被后到的覆盖() {
 }
 
 #[test]
-fn 重复取消不改写根因() {
+fn test_cancel_contract_05() {
     let scope = CancelScope::root();
 
     scope.cancel(CancelReason::Timeout);
@@ -125,8 +125,8 @@ fn 重复取消不改写根因() {
 }
 
 #[test]
-fn 已取消与有根因永远同时成立() {
-    let (run, _turn, tool, _process) = 四层树();
+fn test_cancel_contract_06() {
+    let (run, _turn, tool, _process) = four_level_tree();
     assert!(run.reason().is_none(), "未取消时不该有根因");
     assert!(tool.reason().is_none());
 
@@ -143,7 +143,7 @@ fn 已取消与有根因永远同时成立() {
 }
 
 #[test]
-fn 裸_token_取消降级为_unspecified() {
+fn test_cancel_contract_07() {
     // A third-party library only speaks CancellationToken, so bypassing cancel() is unavoidable.
     // The contract requires such a path to **stay inspectable** with a degraded root cause, rather
     // than producing "cancelled but reasonless".
@@ -162,7 +162,7 @@ fn 裸_token_取消降级为_unspecified() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 时限只能收紧不能放宽() {
+fn test_cancel_contract_08() {
     // Otherwise a single tool could grant itself more time than the whole run.
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::from_secs(600)));
     let 原始 = run.deadline().expect("run 应带时限");
@@ -182,7 +182,7 @@ fn 时限只能收紧不能放宽() {
 }
 
 #[test]
-fn 子作用域继承时限() {
+fn test_cancel_contract_09() {
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::from_secs(600)));
     let tool = run.child(ScopeKind::Tool);
 
@@ -199,7 +199,7 @@ fn 子作用域继承时限() {
 }
 
 #[test]
-fn 过期时限不等于已取消() {
+fn test_cancel_contract_10() {
     // A deadline is pure data and ra-core arms no timer: with nobody looking at it, it never
     // fires on its own.
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::ZERO));
@@ -212,7 +212,7 @@ fn 过期时限不等于已取消() {
 }
 
 #[test]
-fn 过期时限在检查点转成真取消并传播() {
+fn test_cancel_contract_11() {
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::ZERO));
     let tool = run.child(ScopeKind::Tool);
 
@@ -227,13 +227,13 @@ fn 过期时限在检查点转成真取消并传播() {
 }
 
 #[test]
-fn 未到期时检查点放行() {
+fn test_cancel_contract_12() {
     let run = CancelScope::root().with_deadline(Deadline::after(Duration::from_secs(600)));
     assert!(run.ensure_not_cancelled().is_ok());
 }
 
 #[test]
-fn deadline_剩余时间随到期而归零() {
+fn test_cancel_contract_13() {
     let 未到期 = Deadline::after(Duration::from_secs(600));
     assert!(!未到期.is_expired());
     assert!(未到期.remaining() > Duration::from_secs(500));
@@ -252,14 +252,14 @@ fn deadline_剩余时间随到期而归零() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn run_正常完成时透传结果() {
+async fn test_cancel_contract_14() {
     let scope = CancelScope::root();
     let out = scope.run(async { 42 }).await.expect("未取消不该失败");
     assert_eq!(out, 42);
 }
 
 #[tokio::test]
-async fn 已取消的作用域不再启动新工作() {
+async fn test_cancel_contract_15() {
     // Even a future that is long since ready gets no chance to run: nothing should produce a side
     // effect after cancellation.
     let scope = CancelScope::root();
@@ -277,7 +277,7 @@ async fn 已取消的作用域不再启动新工作() {
 }
 
 #[tokio::test]
-async fn run_在中途取消时返回带根因的错误() {
+async fn test_cancel_contract_16() {
     let scope = CancelScope::root();
     let 取消端 = scope.clone();
 
@@ -296,7 +296,7 @@ async fn run_在中途取消时返回带根因的错误() {
 }
 
 #[tokio::test]
-async fn 子作用域的_run_随父取消而返回() {
+async fn test_cancel_contract_17() {
     let run = CancelScope::root();
     let tool = run.child(ScopeKind::Tool);
     let 取消端 = run.clone();
@@ -316,7 +316,7 @@ async fn 子作用域的_run_随父取消而返回() {
 }
 
 #[tokio::test]
-async fn cancelled_在被取消时唤醒() {
+async fn test_cancel_contract_18() {
     let run = CancelScope::root();
     let tool = run.child(ScopeKind::Tool);
     let 取消端 = run.clone();
@@ -336,7 +336,7 @@ async fn cancelled_在被取消时唤醒() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn clone_是同一个作用域而不是新层级() {
+fn test_cancel_contract_19() {
     // Hand a spawned task a clone and derive a new level with child; the two must not be mixed.
     let scope = CancelScope::root();
     let 句柄 = scope.clone();
@@ -348,7 +348,7 @@ fn clone_是同一个作用域而不是新层级() {
 }
 
 #[test]
-fn 作用域被_drop_不会取消它() {
+fn test_cancel_contract_20() {
     // This is tokio-util semantics and the very reason CancelOnDrop exists: forgetting to cancel
     // raises no error, it just leaves descendants waiting forever.
     let run = CancelScope::root();
@@ -361,7 +361,7 @@ fn 作用域被_drop_不会取消它() {
 }
 
 #[test]
-fn cancel_on_drop_在_drop_时取消() {
+fn test_cancel_contract_21() {
     let run = CancelScope::root();
     let 兄弟 = run.child(ScopeKind::Tool);
     let 观察 = run.child(ScopeKind::Tool);
@@ -378,7 +378,7 @@ fn cancel_on_drop_在_drop_时取消() {
 }
 
 #[test]
-fn cancel_on_drop_取消的是被守卫的那一层及其后代() {
+fn test_cancel_contract_22() {
     let run = CancelScope::root();
     let 子进程 = {
         let 守卫 = run
@@ -395,7 +395,7 @@ fn cancel_on_drop_取消的是被守卫的那一层及其后代() {
 }
 
 #[test]
-fn disarm_之后不再取消() {
+fn test_cancel_contract_23() {
     let run = CancelScope::root();
     let tool = {
         let 守卫 = run
@@ -413,7 +413,7 @@ fn disarm_之后不再取消() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn reason_code_全局唯一且格式稳定() {
+fn test_cancel_contract_24() {
     let reasons = all_reasons();
     let mut codes: Vec<&str> = reasons.iter().map(CancelReason::code).collect();
     codes.sort_unstable();
@@ -436,14 +436,14 @@ fn reason_code_全局唯一且格式稳定() {
 }
 
 #[test]
-fn display_就是_code() {
+fn test_cancel_contract_25() {
     for reason in all_reasons() {
         assert_eq!(reason.to_string(), reason.code());
     }
 }
 
 #[test]
-fn 超时类与人为中断类互斥() {
+fn test_cancel_contract_26() {
     for reason in all_reasons() {
         assert!(
             !(reason.is_expiry() && reason.is_user_initiated()),
@@ -460,7 +460,7 @@ fn 超时类与人为中断类互斥() {
 }
 
 #[test]
-fn user_message_非空且不是_code() {
+fn test_cancel_contract_27() {
     for reason in all_reasons() {
         let msg = reason.user_message();
         assert!(!msg.trim().is_empty(), "`{reason}` 的 user_message 为空");
@@ -476,7 +476,7 @@ fn user_message_非空且不是_code() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 任何原因收敛成的错误都是取消而非失败() {
+fn test_cancel_contract_28() {
     for reason in all_reasons() {
         let err = ra_core::error::Error::from(reason.clone());
         assert!(err.is_cancelled(), "`{reason}` 应收敛成取消");
@@ -490,7 +490,7 @@ fn 任何原因收敛成的错误都是取消而非失败() {
 }
 
 #[test]
-fn 检查点错误携带面向人的原因文本() {
+fn test_cancel_contract_29() {
     let scope = CancelScope::root();
     scope.cancel(CancelReason::UserInterrupt);
 
@@ -508,7 +508,7 @@ fn 检查点错误携带面向人的原因文本() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn drain_宽限期是有限的正值() {
+fn test_cancel_contract_30() {
     // Zero would degrade "wait for a terminal state" into "kill immediately", and infinity would
     // make cancellation hang.
     assert!(DRAIN_GRACE > Duration::ZERO);
@@ -520,7 +520,7 @@ fn drain_宽限期是有限的正值() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn scope_kind_标签稳定() {
+fn test_cancel_contract_31() {
     assert_eq!(ScopeKind::Run.label(), "run");
     assert_eq!(ScopeKind::Turn.label(), "turn");
     assert_eq!(ScopeKind::Tool.label(), "tool");

@@ -199,7 +199,7 @@ fn host() -> HostContext {
 }
 
 #[tokio::test]
-async fn 动态工具先于模型解析且最终快照同时驱动请求与执行绑定() {
+async fn test_turn_preparation_01() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let enabled = dynamic_tool("dynamic_enabled", &event_log, true);
     let static_enabled: Arc<dyn Tool> = Arc::new(RecordingTool::new(
@@ -296,7 +296,7 @@ async fn 动态工具先于模型解析且最终快照同时驱动请求与执�
 }
 
 #[tokio::test]
-async fn advertised_与_hidden_工具分别进入或离开模型面() {
+async fn test_turn_preparation_02() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let advertised: Arc<dyn Tool> = Arc::new(RecordingTool::new(
         "advertised",
@@ -350,7 +350,7 @@ async fn advertised_与_hidden_工具分别进入或离开模型面() {
 }
 
 #[tokio::test]
-async fn enabled_deferred_工具在_tool_search_落地前明确拒绝() {
+async fn test_turn_preparation_03() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let deferred: Arc<dyn Tool> = Arc::new(
         RecordingTool::new(
@@ -386,7 +386,7 @@ async fn enabled_deferred_工具在_tool_search_落地前明确拒绝() {
 }
 
 #[tokio::test]
-async fn 动态工具失败会在模型解析前终止准备() {
+async fn test_turn_preparation_04() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let broken: Arc<dyn Tool> = Arc::new(RecordingTool::new(
         "broken",
@@ -420,7 +420,7 @@ async fn 动态工具失败会在模型解析前终止准备() {
 }
 
 #[tokio::test]
-async fn agent_模型在没有_run_override_时传给_resolver() {
+async fn test_turn_preparation_05() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -446,7 +446,7 @@ async fn agent_模型在没有_run_override_时传给_resolver() {
 }
 
 #[tokio::test]
-async fn 没有模型选择器时_resolver_收到_none_走注册表默认() {
+async fn test_turn_preparation_06() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -471,7 +471,7 @@ async fn 没有模型选择器时_resolver_收到_none_走注册表默认() {
 }
 
 #[tokio::test]
-async fn 已取消的作用域不启动任何准备工作() {
+async fn test_turn_preparation_07() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -499,7 +499,7 @@ async fn 已取消的作用域不启动任何准备工作() {
 }
 
 #[tokio::test]
-async fn turn_作用域取消随父作用域传播进准备阶段() {
+async fn test_turn_preparation_08() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -531,7 +531,7 @@ async fn turn_作用域取消随父作用域传播进准备阶段() {
 }
 
 #[tokio::test]
-async fn 工具面被动态清空时_required_不会带着空工具表发出去() {
+async fn test_turn_preparation_09() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -568,7 +568,7 @@ async fn 工具面被动态清空时_required_不会带着空工具表发出去(
 }
 
 #[tokio::test]
-async fn 指名一个本轮未广播的工具时选择器降级而不是终止_run() {
+async fn test_turn_preparation_10() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -616,7 +616,7 @@ async fn 指名一个本轮未广播的工具时选择器降级而不是终止_r
 }
 
 #[tokio::test]
-async fn tracing_三态可从准备请求设置() {
+async fn test_turn_preparation_11() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -657,7 +657,7 @@ async fn tracing_三态可从准备请求设置() {
 }
 
 #[tokio::test]
-async fn into_request_交出请求所有权而不复制输入历史() {
+async fn test_turn_preparation_12() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))

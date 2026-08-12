@@ -45,7 +45,7 @@ fn body(output: &ToolOutput) -> &str {
 }
 
 #[tokio::test]
-async fn 工具身份与_schema_名一致且参数是_strict() {
+async fn test_read_file_01() {
     let tool = ReadFileTool::new().expect("read_file builds");
 
     tool.validate().expect("identity and schema must agree");
@@ -60,7 +60,7 @@ async fn 工具身份与_schema_名一致且参数是_strict() {
 }
 
 #[tokio::test]
-async fn 读是并行的因为它不锁任何东西() {
+async fn test_read_file_02() {
     // R3-4b's batch shape reads this declaration to pick a read or a write lock. Three reads of
     // three files are one wall-clock read, and a read cannot observe another call's writes.
     let tool = ReadFileTool::new().expect("read_file builds");
@@ -70,7 +70,7 @@ async fn 读是并行的因为它不锁任何东西() {
 }
 
 #[tokio::test]
-async fn 没有截断的读取不多占一个_token() {
+async fn test_read_file_03() {
     let dir = workspace("hello.txt", "alpha\nbeta\n");
     let output = read(&rooted(&dir), &json!({ "path": "hello.txt" }))
         .await
@@ -85,7 +85,7 @@ async fn 没有截断的读取不多占一个_token() {
 }
 
 #[tokio::test]
-async fn 行号是显示不是内容() {
+async fn test_read_file_04() {
     let dir = workspace("hello.txt", "alpha\n");
     let output = read(&rooted(&dir), &json!({ "path": "hello.txt" }))
         .await
@@ -95,7 +95,7 @@ async fn 行号是显示不是内容() {
 }
 
 #[tokio::test]
-async fn 工具自己选的窗口既记事实也给下一步() {
+async fn test_read_file_05() {
     // No `limit` in the arguments: the 2-line ceiling is this tool's choice, so the model was
     // never told how much it did not receive. That is what makes it a truncation.
     let dir = workspace("many.txt", "a\nb\nc\nd\ne\n");
@@ -126,7 +126,7 @@ async fn 工具自己选的窗口既记事实也给下一步() {
 }
 
 #[tokio::test]
-async fn 模型自己给的窗口不算截断但仍然告诉它还有多少() {
+async fn test_read_file_06() {
     let dir = workspace("many.txt", "a\nb\nc\nd\ne\n");
     let output = read(
         &rooted(&dir),
@@ -146,7 +146,7 @@ async fn 模型自己给的窗口不算截断但仍然告诉它还有多少() {
 }
 
 #[tokio::test]
-async fn offset_超出末尾是一次成功的观察而不是失败() {
+async fn test_read_file_07() {
     let dir = workspace("short.txt", "a\nb\n");
     let output = read(&rooted(&dir), &json!({ "path": "short.txt", "offset": 9 }))
         .await
@@ -160,7 +160,7 @@ async fn offset_超出末尾是一次成功的观察而不是失败() {
 }
 
 #[tokio::test]
-async fn 空文件也答一句话因为空结果会让历史畸形() {
+async fn test_read_file_08() {
     let dir = workspace("empty.txt", "");
     let output = read(&rooted(&dir), &json!({ "path": "empty.txt" }))
         .await
@@ -171,7 +171,7 @@ async fn 空文件也答一句话因为空结果会让历史畸形() {
 }
 
 #[tokio::test]
-async fn 超长行按字符边界切开不会切碎多字节字符() {
+async fn test_read_file_09() {
     let dir = workspace("wide.txt", "汉字汉字汉字\nshort\n");
     // Seven bytes lands mid-character on the third 3-byte char; the cut must fall back to six.
     let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_max_line_bytes(7));
@@ -195,7 +195,7 @@ async fn 超长行按字符边界切开不会切碎多字节字符() {
 }
 
 #[tokio::test]
-async fn 撞上输出上限时第一行仍然出现并说明怎么收窄() {
+async fn test_read_file_10() {
     let dir = workspace("many.txt", "alpha\nbeta\ngamma\n");
     let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_max_output_bytes(1));
 
@@ -217,7 +217,7 @@ async fn 撞上输出上限时第一行仍然出现并说明怎么收窄() {
 }
 
 #[tokio::test]
-async fn 两次截断按顺序累加而不是互相抹掉() {
+async fn test_read_file_11() {
     let dir = workspace("many.txt", "aaaaaaaa\nbbbbbbbb\ncccccccc\n");
     let tool = rooted(&dir).with_limits(
         ReadFileLimits::new()
@@ -240,7 +240,7 @@ async fn 两次截断按顺序累加而不是互相抹掉() {
 }
 
 #[tokio::test]
-async fn 截断统计保留原始_crlf和最后一行无换行的字节数() {
+async fn test_read_file_12() {
     let dir = workspace("windows.txt", b"a\r\nb\r\nc");
     let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_default_line_limit(1));
 
@@ -257,7 +257,7 @@ async fn 截断统计保留原始_crlf和最后一行无换行的字节数() {
 }
 
 #[tokio::test]
-async fn 非_utf8_截断仍按原始字节而非替换字符计数() {
+async fn test_read_file_13() {
     let dir = workspace("latin.txt", b"caf\xe9\nz\n");
     let tool = rooted(&dir).with_limits(
         ReadFileLimits::new()
@@ -277,7 +277,7 @@ async fn 非_utf8_截断仍按原始字节而非替换字符计数() {
 }
 
 #[tokio::test]
-async fn 跨多个块的超长文本行只保留受限的显示前缀() {
+async fn test_read_file_14() {
     let dir = tempfile::tempdir().expect("a temporary workspace");
     let mut file = std::fs::File::create(dir.path().join("large.txt")).expect("fixture opens");
     for _ in 0..256 {
@@ -298,7 +298,7 @@ async fn 跨多个块的超长文本行只保留受限的显示前缀() {
 }
 
 #[tokio::test]
-async fn 极大行上限不会在打开小文件时巨型预分配() {
+async fn test_read_file_15() {
     let dir = workspace("small.txt", "ok\n");
     let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_max_line_bytes(usize::MAX));
 
@@ -310,7 +310,7 @@ async fn 极大行上限不会在打开小文件时巨型预分配() {
 }
 
 #[tokio::test]
-async fn 非_utf8_的文件照读并说明哪些字节被替换了() {
+async fn test_read_file_16() {
     let dir = workspace("latin.txt", b"caf\xe9\n");
     let output = read(&rooted(&dir), &json!({ "path": "latin.txt" }))
         .await
@@ -324,7 +324,7 @@ async fn 非_utf8_的文件照读并说明哪些字节被替换了() {
 }
 
 #[tokio::test]
-async fn 未选中的非_utf8_行也保留解码提示() {
+async fn test_read_file_17() {
     let dir = workspace("latin.txt", b"ok\n\xe9\n");
     let output = read(
         &rooted(&dir),
@@ -342,7 +342,7 @@ async fn 未选中的非_utf8_行也保留解码提示() {
 }
 
 #[tokio::test]
-async fn 图片走多模态块而不是被当成文本() {
+async fn test_read_file_18() {
     // A one-pixel PNG. The point is the block kind and the media type, not the pixels.
     let png: &[u8] = &[
         0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
@@ -363,7 +363,7 @@ async fn 图片走多模态块而不是被当成文本() {
 }
 
 #[tokio::test]
-async fn 二进制文件被拒并说清楚这个工具能给什么() {
+async fn test_read_file_19() {
     let dir = workspace("blob.bin", b"\x00\x01\x02binary");
     let output = observe(&rooted(&dir), &json!({ "path": "blob.bin" })).await;
 
@@ -375,7 +375,7 @@ async fn 二进制文件被拒并说清楚这个工具能给什么() {
 }
 
 #[tokio::test]
-async fn 找不到文件时模型读到一句话而不是一个错误码() {
+async fn test_read_file_20() {
     let dir = workspace("hello.txt", "alpha\n");
     let tool = rooted(&dir);
 
@@ -398,7 +398,7 @@ async fn 找不到文件时模型读到一句话而不是一个错误码() {
 }
 
 #[tokio::test]
-async fn 目录不是文件() {
+async fn test_read_file_21() {
     let dir = workspace("hello.txt", "alpha\n");
     std::fs::create_dir(dir.path().join("src")).expect("a directory to point at");
 
@@ -408,7 +408,7 @@ async fn 目录不是文件() {
 }
 
 #[tokio::test]
-async fn 工作区之外的路径在碰硬盘之前就被拒绝() {
+async fn test_read_file_22() {
     let dir = workspace("hello.txt", "alpha\n");
 
     // One path that exists on this host and one that does not, answered identically: the boundary
@@ -423,7 +423,7 @@ async fn 工作区之外的路径在碰硬盘之前就被拒绝() {
 }
 
 #[tokio::test]
-async fn 带_parent_的路径拒得和越界不一样因为它常常并没有越界() {
+async fn test_read_file_23() {
     let dir = workspace("hello.txt", "alpha\n");
     std::fs::create_dir(dir.path().join("nested")).expect("a nested directory");
 
@@ -442,7 +442,7 @@ async fn 带_parent_的路径拒得和越界不一样因为它常常并没有越
 }
 
 #[tokio::test]
-async fn 工作区内的绝对路径按相对路径一样读() {
+async fn test_read_file_24() {
     let dir = workspace("hello.txt", "alpha\n");
     let tool = rooted(&dir);
     // The canonical root, not `dir.path()`: on a host where the temporary directory is itself
@@ -465,7 +465,7 @@ async fn 工作区内的绝对路径按相对路径一样读() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn 工作区内的符号链接照读() {
+async fn test_read_file_25() {
     let dir = workspace("hello.txt", "alpha\n");
     std::fs::create_dir(dir.path().join("nested")).expect("a nested directory");
     // Relative, which is what a repository stores. An absolute target is refused even when it
@@ -482,7 +482,7 @@ async fn 工作区内的符号链接照读() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn 含符号链接与_parent_的_rooted_路径明确拒绝而不静默改写() {
+async fn test_read_file_26() {
     let dir = workspace("hello.txt", "alpha\n");
     std::fs::create_dir(dir.path().join("nested")).expect("a nested directory");
     std::os::unix::fs::symlink("../somewhere", dir.path().join("nested/link"))
@@ -503,7 +503,7 @@ async fn 含符号链接与_parent_的_rooted_路径明确拒绝而不静默改�
 
 #[cfg(unix)]
 #[tokio::test]
-async fn 符号链接指到工作区外一样拦得住() {
+async fn test_read_file_27() {
     let secret = tempfile::tempdir().expect("a directory outside the workspace");
     std::fs::write(secret.path().join("id_rsa"), "PRIVATE KEY").expect("the secret");
     let dir = workspace("hello.txt", "alpha\n");
@@ -518,7 +518,7 @@ async fn 符号链接指到工作区外一样拦得住() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn 相对符号链接爬出工作区一样拦得住() {
+async fn test_read_file_28() {
     let parent = tempfile::tempdir().expect("a directory containing both fixtures");
     let root = parent.path().join("workspace");
     let secret = parent.path().join("secret");
@@ -538,7 +538,7 @@ async fn 相对符号链接爬出工作区一样拦得住() {
 }
 
 #[tokio::test]
-async fn 没有根目录时相对路径落在进程工作目录上() {
+async fn test_read_file_29() {
     let tool = ReadFileTool::new().expect("read_file builds");
     assert!(tool.root().is_none());
 
@@ -550,7 +550,7 @@ async fn 没有根目录时相对路径落在进程工作目录上() {
 }
 
 #[tokio::test]
-async fn 多出来的参数当场拒收并且拒得让模型能改() {
+async fn test_read_file_30() {
     let dir = workspace("hello.txt", "alpha\n");
     let tool = rooted(&dir);
     let arguments = json!({ "path": "hello.txt", "recursive": true });
@@ -576,7 +576,7 @@ async fn 多出来的参数当场拒收并且拒得让模型能改() {
 }
 
 #[tokio::test]
-async fn 干活工具的_schema_必须便宜() {
+async fn test_read_file_31() {
     // R2-10 gives all 15 entries 20 KB, and the measurement behind it is that the tools doing the
     // work are the cheap ones: Codex spends 1,635 B on `exec_command` and 554 B on `view_image`,
     // and keeps its budget for the orchestration tools. This is the ceiling for one advertised
@@ -591,7 +591,7 @@ async fn 干活工具的_schema_必须便宜() {
 }
 
 #[tokio::test]
-async fn 同一个配置渲染一百次字节全同() {
+async fn test_read_file_32() {
     // R2-9's property, checked on the first real tool: Codex's 16 schemas were byte-identical
     // across 82 requests, and a schema that jitters is a cache prefix that never hits.
     let first = ReadFileTool::new()

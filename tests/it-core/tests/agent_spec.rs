@@ -60,7 +60,7 @@ impl Tool for EchoTool {
 }
 
 #[test]
-fn builder_缺少必填身份时返回明确错误() {
+fn builder_returns_clear_error_when_required_identity_is_missing() {
     let missing_id = AgentSpec::builder().name("Reviewer").build().unwrap_err();
     assert!(missing_id.to_string().contains("requires a stable `id`"));
 
@@ -91,7 +91,7 @@ fn builder_缺少必填身份时返回明确错误() {
 }
 
 #[test]
-fn spec_保存未解析模型与四层合并中的_agent_层() {
+fn spec_preserves_unresolved_model_and_agent_layer_in_four_layer_merge() {
     let settings = ModelSettings::new()
         .with_temperature(0.2)
         .with_max_tokens(1_024);
@@ -116,7 +116,7 @@ fn spec_保存未解析模型与四层合并中的_agent_层() {
 }
 
 #[test]
-fn 同名_agent_以稳定_id_区分并可反查() {
+fn agents_with_same_name_are_distinguished_and_looked_up_by_stable_id() {
     let first = AgentSpec::builder()
         .id(AgentId::new("reviewer-primary"))
         .name("Reviewer")
@@ -140,7 +140,7 @@ fn 同名_agent_以稳定_id_区分并可反查() {
 }
 
 #[test]
-fn spec_通过_arc_共享且派生_builder_复用工具实现() {
+fn spec_is_shared_by_arc_and_derived_builder_reuses_tool_implementations() {
     let tool: Arc<dyn Tool> = Arc::new(EchoTool::new());
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
@@ -162,7 +162,7 @@ fn spec_通过_arc_共享且派生_builder_复用工具实现() {
 }
 
 #[test]
-fn builder_拒绝重复工具身份() {
+fn builder_rejects_duplicate_tool_identities() {
     let first: Arc<dyn Tool> = Arc::new(EchoTool::new());
     let second: Arc<dyn Tool> = Arc::new(EchoTool::new());
 
@@ -177,11 +177,12 @@ fn builder_拒绝重复工具身份() {
 }
 
 #[test]
-fn builder_拒绝两个投射到同一模型面名字的工具() {
+fn builder_rejects_tools_projecting_to_the_same_model_facing_name() {
     let first: Arc<dyn Tool> = Arc::new(EchoTool::namespaced("server_a"));
     let second: Arc<dyn Tool> = Arc::new(EchoTool::namespaced("server_b"));
 
-    // 查找键不同（命名空间把它们分开了），模型面名字相同——分不开就会每轮栽在 provider 上。
+    // Their lookup keys differ because namespaces separate them, but their model-facing names
+    // collide. Without this check, every turn would fail at the provider boundary.
     assert_ne!(
         first.origin().lookup_key(),
         second.origin().lookup_key(),
@@ -211,7 +212,7 @@ fn builder_拒绝两个投射到同一模型面名字的工具() {
 }
 
 #[test]
-fn 派生的_builder_能清空继承来的可选字段() {
+fn derived_builder_can_clear_inherited_optional_fields() {
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")
@@ -232,14 +233,14 @@ fn 派生的_builder_能清空继承来的可选字段() {
     assert!(stripped.instructions().is_none());
     assert_eq!(stripped.model(), None);
     assert!(stripped.tools().is_empty());
-    // 派生不动原件：不可变契约的全部意义就在这里。
+    // Derivation must not mutate the original; that is the point of the immutability contract.
     assert!(agent.instructions().is_some());
     assert_eq!(agent.model(), Some("openai/gpt-5"));
     assert_eq!(agent.tools().len(), 1);
 }
 
 #[test]
-fn debug_不泄漏指令或模型设置中的敏感值() {
+fn debug_does_not_leak_sensitive_instruction_or_model_setting_values() {
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")
@@ -255,13 +256,13 @@ fn debug_不泄漏指令或模型设置中的敏感值() {
 }
 
 #[test]
-fn shared_spec_满足并发与静态生命周期契约() {
+fn shared_spec_satisfies_concurrency_and_static_lifetime_contract() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<Arc<AgentSpec>>();
 }
 
 #[test]
-fn tool_use_behavior_默认继续模型并在派生时保留() {
+fn tool_use_behavior_defaults_to_continue_and_is_preserved_by_derivation() {
     let agent = AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")

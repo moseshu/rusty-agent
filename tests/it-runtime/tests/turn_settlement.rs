@@ -140,7 +140,7 @@ struct GatedTool {
     output: &'static str,
 }
 
-/// Failure classes that must propagate out of a batch and therefore participate in R3-4c's
+/// Failure classes that must propagate out of a batch and therefore participate in the batch's
 /// arbitration rather than becoming a model-visible observation.
 #[derive(Clone, Copy)]
 enum PropagatingFailure {
@@ -634,7 +634,7 @@ async fn wait_for_count(counter: &AtomicUsize, count: usize) {
 }
 
 #[tokio::test]
-async fn 什么都没要的响应直接结算成最终输出() {
+async fn test_turn_settlement_01() {
     let surface = surface(vec![Arc::new(ScriptedTool::new(
         "write_file",
         Behavior::Succeed("ok"),
@@ -665,7 +665,7 @@ async fn 什么都没要的响应直接结算成最终输出() {
 }
 
 #[tokio::test]
-async fn 工具跑完后回到模型_输出按_call_id_配对() {
+async fn test_turn_settlement_02() {
     let tool = Arc::new(ScriptedTool::new(
         "write_file",
         Behavior::Succeed("written"),
@@ -706,7 +706,7 @@ async fn 工具跑完后回到模型_输出按_call_id_配对() {
 }
 
 #[tokio::test]
-async fn parallel_工具在同一批次重叠且输出仍按模型顺序记录() {
+async fn test_turn_settlement_03() {
     let release = Arc::new(AtomicBool::new(false));
     let first_entered = Arc::new(AtomicUsize::new(0));
     let second_entered = Arc::new(AtomicUsize::new(0));
@@ -775,7 +775,7 @@ async fn parallel_工具在同一批次重叠且输出仍按模型顺序记录()
 }
 
 #[tokio::test]
-async fn 并发上限限制已开始的_parallel_工具数() {
+async fn test_turn_settlement_04() {
     let release = Arc::new(AtomicBool::new(false));
     let entered = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
@@ -831,9 +831,9 @@ async fn 并发上限限制已开始的_parallel_工具数() {
 /// runtime `patch` could take the write permit first, `read` would then never reach `Tool::call`,
 /// and the release below would never fire. The batch promises the two permits are mutually
 /// exclusive, **not** that the model's order decides who takes one first — resource-level
-/// admission is R3-4d's.
+/// admission belongs to a later milestone, this one only owns the read/write permit.
 #[tokio::test]
-async fn exclusive_工具等待正在运行的_parallel_工具完成() {
+async fn test_turn_settlement_05() {
     let release = Arc::new(AtomicBool::new(false));
     let parallel_entered = Arc::new(AtomicUsize::new(0));
     let exclusive_entered = Arc::new(AtomicUsize::new(0));
@@ -942,7 +942,7 @@ async fn settle_simultaneous_failures(classes: &[PropagatingFailure]) -> Error {
 }
 
 #[tokio::test]
-async fn 并发的传播失败按错误类别择优而不是按完成顺序() {
+async fn test_turn_settlement_06() {
     use PropagatingFailure::{Guardrail, Other, Timeout, User};
 
     // Each row's expected winner is declared *last*, so both "whichever finished first" and
@@ -978,7 +978,7 @@ async fn 并发的传播失败按错误类别择优而不是按完成顺序() {
 }
 
 #[tokio::test]
-async fn 同类失败之间由模型顺序决胜() {
+async fn test_turn_settlement_07() {
     let error = settle_simultaneous_failures(&[PropagatingFailure::Other; 3]).await;
 
     // The class cannot separate these three, so the reported one has to be the call the model
@@ -990,7 +990,7 @@ async fn 同类失败之间由模型顺序决胜() {
 }
 
 #[tokio::test]
-async fn 工具自己的迟到失败在排空里被合并() {
+async fn test_turn_settlement_08() {
     // The late call is model order 1 and completion order last, so neither "the model asked for it
     // first" nor "it finished first" can explain a row where it wins.
     let cases: [(&str, PropagatingFailure, PropagatingFailure, &str); 2] = [
@@ -1066,7 +1066,7 @@ async fn 工具自己的迟到失败在排空里被合并() {
 }
 
 #[tokio::test]
-async fn 排空期间的清理异常被记录并参与仲裁() {
+async fn test_turn_settlement_09() {
     // Distinct from the test above: this failure is not a tool result at all, it is the supervised
     // task dying during teardown, which reaches arbitration as a `JoinError` rather than as an
     // `Err` the tool returned. Model order 0 is the call that fails while being torn down and
@@ -1133,7 +1133,7 @@ async fn 排空期间的清理异常被记录并参与仲裁() {
 }
 
 #[tokio::test]
-async fn 父取消会排空所有并发调用后才返回() {
+async fn test_turn_settlement_10() {
     let entered = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let first: Arc<dyn Tool> = Arc::new(DropReportingTool::new(
@@ -1181,7 +1181,7 @@ async fn 父取消会排空所有并发调用后才返回() {
 }
 
 #[tokio::test]
-async fn 叫不出名字的工具也拿到一份配对失败观察并逼出下一轮() {
+async fn test_turn_settlement_11() {
     let surface = surface(vec![Arc::new(ScriptedTool::new(
         "write_file",
         Behavior::Succeed("ok"),
@@ -1209,7 +1209,7 @@ async fn 叫不出名字的工具也拿到一份配对失败观察并逼出下�
 }
 
 #[tokio::test]
-async fn 需要审批时干净地停下来而不是阻塞在一个_await_上() {
+async fn test_turn_settlement_12() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Succeed("ok"))
             .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
@@ -1250,7 +1250,7 @@ async fn 需要审批时干净地停下来而不是阻塞在一个_await_上() {
 }
 
 #[tokio::test]
-async fn 响应里的_mcp_审批与工具审批一起被问全() {
+async fn test_turn_settlement_13() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Succeed("ok"))
             .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Dynamic)),
@@ -1293,7 +1293,7 @@ async fn 响应里的_mcp_审批与工具审批一起被问全() {
 }
 
 #[tokio::test]
-async fn 工具失败默认变成模型读得懂的观察而不是终止_run() {
+async fn test_turn_settlement_14() {
     let tool = Arc::new(ScriptedTool::new("write_file", Behavior::Fail));
     let surface = surface(vec![tool]);
     let response = ModelResponse::new(vec![tool_call("call-item-1", "call-1", "write_file")]);
@@ -1335,7 +1335,7 @@ async fn 工具失败默认变成模型读得懂的观察而不是终止_run() {
 }
 
 #[tokio::test]
-async fn 声明_propagate_的工具失败会终止这一轮() {
+async fn test_turn_settlement_15() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Fail)
             .with_options(ToolOptions::new().with_failure_handling(ToolFailureHandling::Propagate)),
@@ -1365,7 +1365,7 @@ async fn 声明_propagate_的工具失败会终止这一轮() {
 }
 
 #[tokio::test]
-async fn custom_失败处理让工具自己写给模型看的解释() {
+async fn test_turn_settlement_16() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Fail)
             .with_options(ToolOptions::new().with_failure_handling(ToolFailureHandling::Custom)),
@@ -1396,7 +1396,7 @@ async fn custom_失败处理让工具自己写给模型看的解释() {
 }
 
 #[tokio::test]
-async fn 超时按声明的行为分流() {
+async fn test_turn_settlement_17() {
     let visible = Arc::new(
         ScriptedTool::new("slow", Behavior::Sleep(Duration::from_millis(80)))
             .with_options(ToolOptions::new().with_timeout(Duration::from_millis(5))),
@@ -1445,7 +1445,7 @@ async fn 超时按声明的行为分流() {
 }
 
 #[tokio::test]
-async fn 取消永远不会被降级成一条工具观察() {
+async fn test_turn_settlement_18() {
     let tool = Arc::new(ScriptedTool::new(
         "slow",
         Behavior::Sleep(Duration::from_secs(30)),
@@ -1476,7 +1476,7 @@ async fn 取消永远不会被降级成一条工具观察() {
 }
 
 #[tokio::test]
-async fn 已取消的作用域一个工具都不跑() {
+async fn test_turn_settlement_19() {
     let tool = Arc::new(ScriptedTool::new("write_file", Behavior::Succeed("ok")));
     let calls = Arc::clone(&tool.calls);
     let surface = surface(vec![tool]);
@@ -1500,7 +1500,7 @@ async fn 已取消的作用域一个工具都不跑() {
 }
 
 #[tokio::test]
-async fn 已取消时不看模型这轮要了什么都报成取消() {
+async fn test_turn_settlement_20() {
     // 上一条测试只覆盖了「解析得到工具」那一格。真正的契约是：一轮是否报成取消，
     // 不能取决于模型这次恰好点了什么名字——而剩下三格各自会settle成一个不同的谎。
     let cases: [(&str, Vec<RunItem>); 3] = [
@@ -1556,7 +1556,7 @@ async fn 已取消时不看模型这轮要了什么都报成取消() {
 }
 
 #[tokio::test]
-async fn 不接受这个调用方类别的工具从模型侧看就是不存在() {
+async fn test_turn_settlement_21() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Succeed("ok"))
             .with_options(ToolOptions::new().with_allowed_callers([ToolCaller::Programmatic])),
@@ -1584,7 +1584,7 @@ async fn 不接受这个调用方类别的工具从模型侧看就是不存在()
 }
 
 #[tokio::test]
-async fn 交接落到_r17_之前明确报错而不是当成模型什么都没要() {
+async fn test_turn_settlement_22() {
     let handoff = ModelHandoffDefinition::new(
         AgentId::new("reviewer"),
         "transfer_to_reviewer",
@@ -1619,7 +1619,7 @@ async fn 交接落到_r17_之前明确报错而不是当成模型什么都没要
 }
 
 #[tokio::test]
-async fn 一轮里的多个调用各自拿到自己的观察() {
+async fn test_turn_settlement_23() {
     let ok = Arc::new(ScriptedTool::new("read_file", Behavior::Succeed("content")));
     let failing = Arc::new(ScriptedTool::new("write_file", Behavior::Fail));
     let surface = surface(vec![ok, failing]);
@@ -1649,7 +1649,7 @@ async fn 一轮里的多个调用各自拿到自己的观察() {
 }
 
 #[tokio::test]
-async fn 结算结果带着原始输入与前序项且通过全部对账() {
+async fn test_turn_settlement_24() {
     let tool = Arc::new(ScriptedTool::new("write_file", Behavior::Succeed("ok")));
     let surface = surface(vec![tool]);
     let response = ModelResponse::new(vec![tool_call("call-item-1", "call-1", "write_file")]);
@@ -1691,7 +1691,7 @@ async fn 结算结果带着原始输入与前序项且通过全部对账() {
 
 /// 上一条测试的前提：`Error` 的 Display 确实是面向人的中文模板，所以它绝不能进模型上下文。
 #[test]
-fn 框架错误的显示文案确实是面向人的中文() {
+fn test_turn_settlement_25() {
     let error = Error::tool(ToolErrorKind::ExecutionFailed, "write_file", "boom");
     let rendered: String = error.to_string();
     assert!(rendered.contains("失败"));
@@ -1704,7 +1704,7 @@ fn 框架错误的显示文案确实是面向人的中文() {
 
 /// A settled turn is shareable, like everything else the loop carries across an `await`.
 #[tokio::test]
-async fn 结算结果可跨_await_共享() {
+async fn test_turn_settlement_26() {
     let surface = surface(Vec::new());
     let response = ModelResponse::new(vec![message("msg-1", "完事了")]);
     let cancel = CancelScope::root();
@@ -1729,6 +1729,6 @@ async fn 结算结果可跨_await_共享() {
 
 /// The lock is only here to prove `Host` stays `Send + Sync` as a runtime context.
 #[allow(dead_code)]
-fn 上下文可跨线程(_context: &dyn ToolRuntimeContext) {
+fn context_is_thread_safe(_context: &dyn ToolRuntimeContext) {
     let _guard: Mutex<()> = Mutex::new(());
 }

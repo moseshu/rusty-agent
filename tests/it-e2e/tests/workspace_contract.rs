@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 const CROSS_CRATE_HOST: &str = "it-e2e";
 
 #[test]
-fn 每个库_crate_都有独立宿主和路径依赖() {
+fn test_workspace_contract_01() {
     let root = repository_root();
     let tests_manifest = read(&root.join("tests/Cargo.toml"));
     let crates = library_crates(&root);
@@ -45,7 +45,7 @@ fn 每个库_crate_都有独立宿主和路径依赖() {
 }
 
 #[test]
-fn 测试_workspace_独立于主_workspace_且断言进版本库() {
+fn test_workspace_contract_02() {
     let root = repository_root();
     let main_manifest = read(&root.join("Cargo.toml"));
     let ignore = read(&root.join(".gitignore"));
@@ -66,7 +66,7 @@ fn 测试_workspace_独立于主_workspace_且断言进版本库() {
 }
 
 #[test]
-fn crates_里没有测试代码和旧式_mod_rs() {
+fn test_workspace_contract_03() {
     let crates = repository_root().join("crates");
     for file in rust_files(&crates) {
         assert_ne!(
@@ -97,7 +97,7 @@ fn crates_里没有测试代码和旧式_mod_rs() {
 }
 
 #[test]
-fn 每个测试源文件都至少包含一个真实测试() {
+fn test_workspace_contract_04() {
     let root = repository_root();
     let tests = root.join("tests");
     let mut sources = 0_usize;
