@@ -1,5 +1,6 @@
 //! Declarative tool policies consumed by the common executor.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
@@ -12,6 +13,18 @@ use crate::{
 
 /// Current tool-options schema version.
 pub const TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// The repeat threshold a tool usually wants when it opts into the loop breaker.
+///
+/// It is a suggested value, not a default: [`ToolOptions`] leaves the breaker off. A refused call
+/// is still recorded as an attempt, so the streak keeps growing while the tool is being refused —
+/// the limit is a latch, and a tool whose arguments cannot vary (`run_tests()` with no arguments)
+/// stays refused for the rest of the run. Until the breaker can tell a repeat that produced new
+/// evidence from one that did not, that is a decision each tool makes for itself.
+pub const DEFAULT_MAX_REPEAT_STREAK: NonZeroU32 = match NonZeroU32::new(3) {
+    Some(value) => value,
+    None => unreachable!(),
+};
 
 /// Whether a tool is available in the current run.
 #[non_exhaustive]
@@ -200,6 +213,8 @@ pub struct ToolOptions {
     output_guardrails: Vec<ToolGuardrailId>,
     #[serde(default)]
     failure_handling: ToolFailureHandling,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_repeat_streak: Option<NonZeroU32>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -227,6 +242,8 @@ struct ToolOptionsWire {
     output_guardrails: Vec<ToolGuardrailId>,
     #[serde(default)]
     failure_handling: ToolFailureHandling,
+    #[serde(default)]
+    max_repeat_streak: Option<NonZeroU32>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -263,6 +280,7 @@ impl<'de> Deserialize<'de> for ToolOptions {
             input_guardrails: deduplicate_guardrails(wire.input_guardrails),
             output_guardrails: deduplicate_guardrails(wire.output_guardrails),
             failure_handling: wire.failure_handling,
+            max_repeat_streak: wire.max_repeat_streak,
             unknown: wire.unknown,
         })
     }
@@ -282,6 +300,7 @@ impl Default for ToolOptions {
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
             failure_handling: ToolFailureHandling::ModelVisible,
+            max_repeat_streak: None,
             unknown: Unknown::new(),
         }
     }
@@ -364,6 +383,24 @@ impl ToolOptions {
     #[must_use]
     pub const fn with_failure_handling(mut self, handling: ToolFailureHandling) -> Self {
         self.failure_handling = handling;
+        self
+    }
+
+    /// Opts this tool into the semantic loop breaker at the given threshold.
+    ///
+    /// The count is of consecutive calls carrying identical arguments, and it is not reset by
+    /// another tool being called in between — a model alternating between two repeated calls is
+    /// repeating both. See [`DEFAULT_MAX_REPEAT_STREAK`] for why this is opt-in.
+    #[must_use]
+    pub const fn with_max_repeat_streak(mut self, max: NonZeroU32) -> Self {
+        self.max_repeat_streak = Some(max);
+        self
+    }
+
+    /// Removes a repeat threshold set earlier in the chain, restoring the default of no breaker.
+    #[must_use]
+    pub const fn without_repeat_limit(mut self) -> Self {
+        self.max_repeat_streak = None;
         self
     }
 
@@ -459,6 +496,12 @@ impl ToolOptions {
     #[must_use]
     pub const fn failure_handling(&self) -> ToolFailureHandling {
         self.failure_handling
+    }
+
+    /// Repeat streak threshold for the semantic loop breaker, or `None` when it is off.
+    #[must_use]
+    pub const fn max_repeat_streak(&self) -> Option<NonZeroU32> {
+        self.max_repeat_streak
     }
 
     /// Unknown fields retained during deserialization.

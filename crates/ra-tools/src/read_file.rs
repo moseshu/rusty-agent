@@ -614,6 +614,16 @@ impl Tool for ReadFileTool {
         // are one wall-clock read, and a read cannot observe another call's writes because it
         // holds no lock on anything. The measured slice this imitates is Codex issuing three
         // `sed` calls off one reasoning block.
+        //
+        // The repeat breaker stays off, and that is a decision rather than an omission. It compares
+        // arguments, and for a read of mutable state identical arguments do not mean identical
+        // evidence: re-reading a file after editing it is how the edit gets verified, and it is
+        // the answer that changed, not the question. The streak also survives the calls in
+        // between, so `read -> edit -> read -> edit -> read` reaches three without anything having
+        // gone wrong. A different request resets the streak, but requiring the model to change the
+        // request merely to verify a write is still the wrong policy. A breaker that can tell a
+        // repeat carrying new evidence from one carrying none is what this tool needs before it
+        // opts in.
         ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
             .with_concurrency(ToolConcurrency::Parallel)

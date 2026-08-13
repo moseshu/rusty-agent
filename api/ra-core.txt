@@ -346,6 +346,7 @@ const fn ra_core::tool::options::ToolOptions::exposure(& self) -> ToolExposure
 const fn ra_core::tool::options::ToolOptions::failure_handling(& self) -> ToolFailureHandling
 const fn ra_core::tool::options::ToolOptions::is_advertised(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::is_discoverable(& self) -> bool
+const fn ra_core::tool::options::ToolOptions::max_repeat_streak(& self) -> Option < NonZeroU32 >
 const fn ra_core::tool::options::ToolOptions::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::options::ToolOptions::timeout(& self) -> Option < Duration >
 const fn ra_core::tool::options::ToolOptions::timeout_behavior(& self) -> ToolTimeoutBehavior
@@ -355,8 +356,10 @@ const fn ra_core::tool::options::ToolOptions::with_availability(mut self, availa
 const fn ra_core::tool::options::ToolOptions::with_concurrency(mut self, concurrency : ToolConcurrency) -> Self
 const fn ra_core::tool::options::ToolOptions::with_exposure(mut self, exposure : ToolExposure) -> Self
 const fn ra_core::tool::options::ToolOptions::with_failure_handling(mut self, handling : ToolFailureHandling) -> Self
+const fn ra_core::tool::options::ToolOptions::with_max_repeat_streak(mut self, max : NonZeroU32) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout(mut self, timeout : Duration) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout_behavior(mut self, behavior : ToolTimeoutBehavior) -> Self
+const fn ra_core::tool::options::ToolOptions::without_repeat_limit(mut self) -> Self
 const fn ra_core::tool::origin::ToolLookupKey::is_deferred_top_level(& self) -> bool
 const fn ra_core::tool::origin::ToolLookupKey::kind(& self) -> ToolLookupKind
 const fn ra_core::tool::origin::ToolLookupKey::namespace(& self) -> Option < & ToolNamespace >
@@ -429,6 +432,7 @@ const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_use::TOOL_USE_RECENT_LIMIT: usize
 const ra_core::state::tool_use::TOOL_USE_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::options::DEFAULT_MAX_REPEAT_STREAK: NonZeroU32
 const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_LOOKUP_KEY_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_ORIGIN_SCHEMA_VERSION: SchemaVersion
@@ -764,6 +768,7 @@ fn ra_core::model::settings::ModelSettings::with_tool_choice(mut self, tool_choi
 fn ra_core::model::settings::ProviderKey::as_str(& self) -> & str
 fn ra_core::model::settings::ProviderKey::new(value : impl Into < String >) -> Self
 fn ra_core::model::settings::ResolvedModelSettings::reconcile_tool_surface< 'a >(mut self, advertised : impl IntoIterator < Item = & 'a str >) -> Self
+fn ra_core::model::settings::ResolvedModelSettings::reset_tool_choice(mut self) -> Self
 fn ra_core::model::settings::ResolvedModelSettings::to_traceable_value(& self) -> serde_json :: Result < Value >
 fn ra_core::model::stream::RawResponseEvent::event_type(& self) -> & str
 fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_type : impl Into < String >, payload : Value) -> Self
@@ -1138,6 +1143,7 @@ variant ra_core::error::ToolErrorKind::Cancelled
 variant ra_core::error::ToolErrorKind::ExecutionFailed
 variant ra_core::error::ToolErrorKind::InvalidInput
 variant ra_core::error::ToolErrorKind::NotFound
+variant ra_core::error::ToolErrorKind::RepeatedCall
 variant ra_core::error::ToolErrorKind::Timeout
 variant ra_core::finish::FinishReason::BudgetExhausted
 variant ra_core::finish::FinishReason::Cancelled

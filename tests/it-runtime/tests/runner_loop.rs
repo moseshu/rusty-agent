@@ -2,6 +2,7 @@
 
 use std::{
     future::Future,
+    num::NonZeroU32,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -24,7 +25,7 @@ use ra_core::{
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ProviderKey, ResolvedModel,
+        ProviderKey, ResolvedModel, ToolChoice,
     },
     state::{ToolUse, WorkStateHandle},
     tool::{
@@ -47,6 +48,7 @@ struct ScriptedModel {
     script: Mutex<Vec<ModelResponse>>,
     inputs: Mutex<Vec<usize>>,
     input_items: Mutex<Vec<Vec<ModelInputItem>>>,
+    tool_choices: Mutex<Vec<Option<ToolChoice>>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -56,6 +58,7 @@ impl ScriptedModel {
             script: Mutex::new(script),
             inputs: Mutex::new(Vec::new()),
             input_items: Mutex::new(Vec::new()),
+            tool_choices: Mutex::new(Vec::new()),
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -70,6 +73,10 @@ impl Model for ScriptedModel {
             .lock()
             .unwrap()
             .push(request.input().to_vec());
+        self.tool_choices
+            .lock()
+            .unwrap()
+            .push(request.model_settings().tool_choice().cloned());
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
             // The loop asked for a turn the script did not plan for. Answering with a final
@@ -1302,6 +1309,98 @@ async fn run_level_model_override_applies_to_every_turn() {
             Some("run/override".to_owned()),
             Some("run/override".to_owned())
         ]
+    );
+}
+
+#[tokio::test]
+async fn forced_tool_choice_resets_after_the_model_uses_a_tool() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    Runner::run(request(vec![tool], &model, &cancel).with_config(
+        RunConfig::new().with_model_settings(
+            ModelSettings::new().with_tool_choice(ToolChoice::Tool("write_file".to_owned())),
+        ),
+    ))
+    .await
+    .unwrap();
+
+    // The second turn carries no selection at all rather than an explicit "auto": the release
+    // happens on the resolved value, so there is nothing left to send.
+    assert_eq!(
+        model.tool_choices.lock().unwrap().clone(),
+        [Some(ToolChoice::Tool("write_file".to_owned())), None]
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_disabled_tool_calls_keeps_them_disabled() {
+    // The model called a tool it was told not to call. Treating that as consent to lift the
+    // restriction would let the model's own misbehaviour rewrite the host's setting for the rest
+    // of the run, which is the opposite of what a forced-choice release is for.
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    Runner::run(
+        request(vec![tool], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_model_settings(ModelSettings::new().with_tool_choice(ToolChoice::None)),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        model.tool_choices.lock().unwrap().clone(),
+        [Some(ToolChoice::None), Some(ToolChoice::None)]
+    );
+}
+
+#[tokio::test]
+async fn repeated_identical_tool_call_is_refused_without_ending_the_run() {
+    // A refusal the model cannot read teaches it nothing, so it arrives as an observation: the
+    // run keeps its items, the other calls in the batch are not cancelled, and the next turn can
+    // try something else.
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_max_repeat_streak(NonZeroU32::new(2).unwrap())),
+    );
+    let tool_calls = Arc::clone(&tool.calls);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![tool_call("c-2", "call-2", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "changing approach")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request(vec![tool], &model, &cancel))
+        .await
+        .unwrap();
+
+    // The second call carries the same arguments as the first, so it is refused before running.
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    let refusal = result
+        .new_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-2" => {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .expect("the refused call still answers its `call_id`");
+    assert!(refusal.is_error());
+    assert_eq!(
+        refusal.output()["error"]["code"],
+        json!("tool.repeated_call")
     );
 }
 

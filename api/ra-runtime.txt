@@ -75,7 +75,7 @@ fn ra_runtime::turn::prepare::TurnActionSurface::find_tool(& self, name : & str)
 fn ra_runtime::turn::prepare::TurnActionSurface::handoffs(& self) -> & [ModelHandoffDefinition]
 fn ra_runtime::turn::prepare::TurnActionSurface::new(tools : Vec < Arc < dyn Tool > >, handoffs : Vec < ModelHandoffDefinition >) -> Result < Self >
 fn ra_runtime::turn::prepare::TurnActionSurface::tools(& self) -> & [Arc < dyn Tool >]
-fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a AgentBinding, model_resolver : & 'a dyn ModelResolver, tool_context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, input : Vec < ModelInputItem >) -> Self
+fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::new(agent : & 'a AgentBinding, model_resolver : & 'a dyn ModelResolver, tool_context : & 'a dyn ToolRuntimeContext, cancel : & 'a CancelScope, tool_use : & 'a ToolUseTracker, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model(mut self, model : impl Into < String >) -> Self
 fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >

@@ -137,6 +137,12 @@ pub enum ToolErrorKind {
     Timeout,
     /// The tool itself failed while executing.
     ExecutionFailed,
+    /// The call was refused before it ran, because it repeated an earlier call verbatim.
+    ///
+    /// Distinct from [`Self::ExecutionFailed`] on purpose: nothing ran, so nothing about the tool
+    /// or the environment failed. What the reader has to know is that the *same* call has already
+    /// been made and that repeating it will keep being refused.
+    RepeatedCall,
     /// The tool was cancelled (including a cancellation on the MCP side).
     Cancelled,
 }
@@ -513,6 +519,8 @@ impl Error {
                 ToolErrorKind::InvalidInput | ToolErrorKind::ExecutionFailed => {
                     Recoverability::RetryableWithChange
                 }
+                // The identical call is the one thing that cannot work; anything else still can.
+                ToolErrorKind::RepeatedCall => Recoverability::RetryableWithChange,
                 ToolErrorKind::NotFound => Recoverability::Fatal,
                 ToolErrorKind::Cancelled => Recoverability::Cancelled,
             },
@@ -591,6 +599,7 @@ impl Error {
                 ToolErrorKind::InvalidInput => "tool.invalid_input",
                 ToolErrorKind::Timeout => "tool.timeout",
                 ToolErrorKind::ExecutionFailed => "tool.execution_failed",
+                ToolErrorKind::RepeatedCall => "tool.repeated_call",
                 ToolErrorKind::Cancelled => "tool.cancelled",
             },
             Self::Sandbox { kind, .. } => match kind {
@@ -664,6 +673,9 @@ impl Error {
                 ToolErrorKind::InvalidInput => format!("工具 `{tool}` 的参数不正确，正在重试。"),
                 ToolErrorKind::Timeout => format!("工具 `{tool}` 执行超时。"),
                 ToolErrorKind::ExecutionFailed => format!("工具 `{tool}` 执行失败。"),
+                ToolErrorKind::RepeatedCall => {
+                    format!("工具 `{tool}` 被连续以相同参数调用，已拦截。")
+                }
                 ToolErrorKind::Cancelled => format!("工具 `{tool}` 已取消。"),
             },
 

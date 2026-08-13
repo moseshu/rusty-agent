@@ -31,6 +31,8 @@ use ra_core::{
 };
 use serde_json::{Value, json};
 
+use crate::circuit;
+
 /// What the chain decided about one call.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
@@ -126,9 +128,13 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch>
         ));
     }
 
-    // 2. Repeat admission. R3-6 puts the semantic loop breaker here — one insertion point rather
-    // than a check bolted onto whichever call site notices the repetition first.
-    admit_repeat(&options, request.repeat_streak)?;
+    // 2. Repeat admission, before approval so a host is not asked about a call that will not run.
+    // The loop breaker lives behind one insertion point rather than being bolted onto whichever
+    // call site notices the repetition first, and it refuses the way this stage chain refuses:
+    // with an observation the model can react to.
+    if let Some(refusal) = circuit::admit_repeat(&options, request.repeat_streak, &name) {
+        return Ok(observed_failure(&request.call_id, &name, &refusal));
+    }
 
     // 3. Approval, before anything runs. Static policies are answered from the declaration and
     // never enter third-party code, exactly as dynamic availability is handled in preparation.
@@ -258,26 +264,10 @@ async fn needs_approval(
     }
 }
 
-// The three stages below always succeed today and will not once their owning milestones land.
+// The two stages below always succeed today and will not once their owning milestone lands.
 // Narrowing the return type now would take the `?` off the call sites, and a stage that reads like
 // a no-op is a stage someone tidies away — which is exactly what having one insertion point per
 // milestone is meant to prevent.
-
-/// R3-6's insertion point for the semantic loop breaker.
-///
-/// The evidence it needs already exists: settlement records this turn's attempts into
-/// [`ToolUseTracker`](ra_core::state::ToolUseTracker) *before* execution reaches here, then the
-/// batch projects the current per-agent, per-tool `repeat_streak` into this request. What is
-/// missing is the threshold and the refusal, both of which are R3-6's to define.
-///
-/// One property to decide against rather than discover: because the turn is recorded before any of
-/// it runs, `repeat_streak` already includes every call in this response. `N` identical parallel
-/// calls all arrive here reading `N`, so a threshold of `N` refuses the first one too. See
-/// [`ToolUseTracker::repeat_streak`](ra_core::state::ToolUseTracker::repeat_streak).
-#[allow(clippy::unnecessary_wraps)]
-const fn admit_repeat(_options: &ToolOptions, _repeat_streak: u32) -> Result<()> {
-    Ok(())
-}
 
 /// R7-3's insertion point for tool input guardrails.
 #[allow(clippy::unnecessary_wraps)]

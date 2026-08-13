@@ -209,6 +209,7 @@ async fn test_agent_binding_03() {
         &resolver,
         &Host,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await

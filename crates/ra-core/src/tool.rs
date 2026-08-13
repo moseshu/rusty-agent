@@ -23,8 +23,9 @@ mod strict;
 pub use invocation::{ToolCaller, ToolInvocation, ToolRuntimeContext};
 pub use namespace::ToolNamespace;
 pub use options::{
-    TOOL_OPTIONS_SCHEMA_VERSION, ToolApprovalPolicy, ToolAvailability, ToolConcurrency,
-    ToolExposure, ToolFailureHandling, ToolGuardrailId, ToolOptions, ToolTimeoutBehavior,
+    DEFAULT_MAX_REPEAT_STREAK, TOOL_OPTIONS_SCHEMA_VERSION, ToolApprovalPolicy, ToolAvailability,
+    ToolConcurrency, ToolExposure, ToolFailureHandling, ToolGuardrailId, ToolOptions,
+    ToolTimeoutBehavior,
 };
 pub use origin::{
     TOOL_LOOKUP_KEY_SCHEMA_VERSION, TOOL_ORIGIN_SCHEMA_VERSION, ToolLookupKey, ToolLookupKind,

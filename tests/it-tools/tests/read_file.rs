@@ -67,6 +67,13 @@ async fn test_read_file_02() {
 
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
     assert!(tool.options().is_advertised());
+
+    // The repeat breaker is deliberately off here, and this assertion is what makes turning it on
+    // a decision someone has to state. It compares arguments, and a re-read after an edit carries
+    // the same arguments and different evidence — the tool this breaker would refuse first is the
+    // one verifying that a write landed. Different arguments reset the streak, but requiring that
+    // change merely to verify a write is still the wrong policy.
+    assert_eq!(tool.options().max_repeat_streak(), None);
 }
 
 #[tokio::test]

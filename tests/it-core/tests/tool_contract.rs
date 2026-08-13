@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ra_core::{
@@ -7,9 +7,10 @@ use ra_core::{
     item::CallId,
     state::WorkStateHandle,
     tool::{
-        Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolConcurrency, ToolExposure,
-        ToolFailureHandling, ToolGuardrailId, ToolInvocation, ToolLookupKey, ToolNamespace,
-        ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolTimeoutBehavior,
+        DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller,
+        ToolConcurrency, ToolExposure, ToolFailureHandling, ToolGuardrailId, ToolInvocation,
+        ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -222,7 +223,8 @@ fn test_tool_contract_08() {
         .with_input_guardrail(input_guard.clone())
         .with_input_guardrail(input_guard)
         .with_output_guardrail(output_guard)
-        .with_failure_handling(ToolFailureHandling::Custom);
+        .with_failure_handling(ToolFailureHandling::Custom)
+        .with_max_repeat_streak(NonZeroU32::new(5).unwrap());
 
     assert_eq!(
         options.allowed_callers(),
@@ -250,6 +252,7 @@ fn test_tool_contract_08() {
     );
     assert_eq!(restored.input_guardrails().len(), 1);
     assert_eq!(restored.output_guardrails().len(), 1);
+    assert_eq!(restored.max_repeat_streak(), NonZeroU32::new(5));
     assert_eq!(
         restored.unknown().get("future_executor_policy"),
         Some(&json!({"version": 2}))
@@ -270,6 +273,18 @@ fn test_tool_contract_09() {
     assert_eq!(options.exposure(), ToolExposure::Advertised);
     assert!(options.is_advertised());
     assert!(!options.is_discoverable());
+
+    // The loop breaker is off until a tool asks for it. A refused call is still recorded as an
+    // attempt, so a threshold latches: once reached, that tool stays refused for every identical
+    // call in the run, and a tool whose arguments never vary has no way back.
+    assert_eq!(options.max_repeat_streak(), None);
+    assert_eq!(
+        ToolOptions::new()
+            .with_max_repeat_streak(DEFAULT_MAX_REPEAT_STREAK)
+            .without_repeat_limit()
+            .max_repeat_streak(),
+        None
+    );
 }
 
 #[test]

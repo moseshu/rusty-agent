@@ -615,6 +615,33 @@ impl ResolvedModelSettings {
         self
     }
 
+    /// Releases a forced tool selection once the agent has already called a tool.
+    ///
+    /// A selection that keeps forcing after the model complied is how a run spends every remaining
+    /// turn calling the same tool: the provider is told a tool call is mandatory, the model obeys,
+    /// and the next turn says the same thing again. Releasing it gives the model the turn it needs
+    /// to report what the tool produced.
+    ///
+    /// **It applies to the resolved value, not to a layer.** Writing "auto" into one of the four
+    /// input layers would resolve to a value that outranks every other layer for the rest of the
+    /// run — including the selection a *different* agent declares for itself after a handoff. The
+    /// release is a property of one turn, so it is applied where a turn's settings become final.
+    ///
+    /// Only selections that force a call are released. [`ToolChoice::None`] is the host disabling
+    /// tool calls, and re-enabling them here would use the model's own misbehaviour — calling a
+    /// tool when it was told not to — as permission to lift the restriction. [`ToolChoice::Auto`]
+    /// already forces nothing. A variant added later is left alone rather than guessed at, on the
+    /// same reasoning as [`Self::reconcile_tool_surface`]: degrading a selection nobody here
+    /// understands is the change that cannot be undone by the caller.
+    #[must_use]
+    pub fn reset_tool_choice(mut self) -> Self {
+        self.tool_choice = match self.tool_choice.take() {
+            Some(ToolChoice::Required | ToolChoice::Tool(_) | ToolChoice::Mcp(_)) => None,
+            other => other,
+        };
+        self
+    }
+
     /// Active provider registration key.
     #[must_use]
     pub const fn provider(&self) -> &ProviderKey {

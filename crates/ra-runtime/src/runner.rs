@@ -311,6 +311,7 @@ async fn run_loop(
             model_resolver.as_ref(),
             tool_context.as_ref(),
             &turn_scope,
+            state.tool_use(),
             input,
         )
         .with_model_settings(config.model_settings.clone())

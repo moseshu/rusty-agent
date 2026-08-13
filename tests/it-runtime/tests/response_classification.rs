@@ -16,6 +16,7 @@ use ra_core::{
         ApiProtocol, Model, ModelHandoffDefinition, ModelRequest, ModelResolver, ModelSelector,
         ModelSettings, ModelStream, ProviderKey, ResolvedModel,
     },
+    state::ToolUseTracker,
     step::ToolUse,
     tool::{
         Tool, ToolAvailability, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput,
@@ -238,6 +239,7 @@ async fn test_response_classification_03() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -280,6 +282,7 @@ async fn test_response_classification_04() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await

@@ -8,11 +8,12 @@ use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::{CancelReason, CancelScope, ScopeKind},
     error::{Error, Result},
-    item::{Message, ModelInputItem, ModelResponse},
+    item::{CallId, Message, ModelInputItem, ModelResponse},
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelTracing, ProviderKey, ResolvedModel, ToolChoice,
     },
+    state::{ToolUse, ToolUseAttempt, ToolUseTracker},
     tool::{
         Tool, ToolAvailability, ToolExposure, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput,
         ToolRuntimeContext, ToolSchema,
@@ -233,15 +234,22 @@ async fn test_turn_preparation_01() {
     let input = vec![ModelInputItem::Message(Message::user("hello"))];
 
     let prepared = prepare_turn(
-        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, input.clone())
-            .with_model("run/model")
-            .with_model_settings(
-                ModelSettings::new()
-                    .with_temperature(0.3)
-                    .with_max_tokens(2_000)
-                    .with_tool_choice(ToolChoice::Required)
-                    .with_metadata("run", "yes"),
-            ),
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            input.clone(),
+        )
+        .with_model("run/model")
+        .with_model_settings(
+            ModelSettings::new()
+                .with_temperature(0.3)
+                .with_max_tokens(2_000)
+                .with_tool_choice(ToolChoice::Required)
+                .with_metadata("run", "yes"),
+        ),
     )
     .await
     .unwrap();
@@ -328,6 +336,7 @@ async fn test_turn_preparation_02() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -376,6 +385,7 @@ async fn test_turn_preparation_03() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -409,6 +419,7 @@ async fn test_turn_preparation_04() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -437,6 +448,7 @@ async fn test_turn_preparation_05() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -462,6 +474,7 @@ async fn test_turn_preparation_06() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -489,6 +502,7 @@ async fn test_turn_preparation_07() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -518,6 +532,7 @@ async fn test_turn_preparation_08() {
         &resolver,
         &context,
         &turn,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -553,6 +568,7 @@ async fn test_turn_preparation_09() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -584,10 +600,17 @@ async fn test_turn_preparation_10() {
     let cancel = CancelScope::root();
 
     let pinned_to_live_tool = prepare_turn(
-        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
-            .with_model_settings(
-                ModelSettings::new().with_tool_choice(ToolChoice::Tool("still_here".to_owned())),
-            ),
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_model_settings(
+            ModelSettings::new().with_tool_choice(ToolChoice::Tool("still_here".to_owned())),
+        ),
     )
     .await
     .unwrap();
@@ -597,11 +620,17 @@ async fn test_turn_preparation_10() {
     );
 
     let pinned_to_disabled_tool = prepare_turn(
-        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
-            .with_model_settings(
-                ModelSettings::new()
-                    .with_tool_choice(ToolChoice::Tool("gone_this_turn".to_owned())),
-            ),
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_model_settings(
+            ModelSettings::new().with_tool_choice(ToolChoice::Tool("gone_this_turn".to_owned())),
+        ),
     )
     .await
     .unwrap();
@@ -632,6 +661,7 @@ async fn test_turn_preparation_11() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         Vec::new(),
     ))
     .await
@@ -639,16 +669,30 @@ async fn test_turn_preparation_11() {
     assert!(default.request().tracing().is_disabled());
 
     let with_data = prepare_turn(
-        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
-            .with_tracing(ModelTracing::Enabled),
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_tracing(ModelTracing::Enabled),
     )
     .await
     .unwrap();
     assert!(with_data.request().tracing().include_data());
 
     let without_data = prepare_turn(
-        TurnPreparationRequest::new(&direct(&agent), &resolver, &context, &cancel, Vec::new())
-            .with_tracing(ModelTracing::EnabledWithoutData),
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_tracing(ModelTracing::EnabledWithoutData),
     )
     .await
     .unwrap();
@@ -674,6 +718,7 @@ async fn test_turn_preparation_12() {
         &resolver,
         &context,
         &cancel,
+        &ToolUseTracker::new(),
         input.clone(),
     ))
     .await
@@ -683,4 +728,80 @@ async fn test_turn_preparation_12() {
     let request = prepared.into_request();
     assert_eq!(request.input(), input);
     assert!(model.get_response(request).await.is_err());
+}
+
+#[tokio::test]
+async fn test_turn_preparation_13() {
+    // The release reads the agent's own record and applies to the resolved value. Both halves
+    // matter: a selection released for the agent that complied must not follow the run into
+    // another agent's turn, and one that a *layer* was rewritten with could never be un-forced.
+    let event_log = Arc::new(Mutex::new(Vec::new()));
+    let worker = AgentId::new("worker");
+    let agent = AgentSpec::builder()
+        .id(worker.clone())
+        .name("Worker")
+        .tool(dynamic_tool("write_file", &event_log, true))
+        .model_settings(ModelSettings::new().with_tool_choice(ToolChoice::Required))
+        .build()
+        .unwrap();
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+    let context = host();
+    let cancel = CancelScope::root();
+
+    let untouched = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        untouched.request().model_settings().tool_choice(),
+        Some(&ToolChoice::Required)
+    );
+
+    let mut tool_use = ToolUseTracker::new();
+    tool_use.record_turn(&worker, [write_file_attempt("call-1")]);
+
+    let released = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &tool_use,
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(released.request().model_settings().tool_choice(), None);
+
+    // A different agent complied; this one still owes its forced call.
+    let mut other_agent_only = ToolUseTracker::new();
+    other_agent_only.record_turn(&AgentId::new("reviewer"), [write_file_attempt("call-2")]);
+
+    let still_forced = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &other_agent_only,
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        still_forced.request().model_settings().tool_choice(),
+        Some(&ToolChoice::Required)
+    );
+}
+
+fn write_file_attempt(call_id: &str) -> ToolUseAttempt {
+    ToolUseAttempt::new(
+        ToolUse::Tool(ToolOrigin::new("write_file").unwrap().lookup_key().clone()),
+        CallId::new(call_id),
+        &json!({ "path": "a.txt" }),
+    )
 }

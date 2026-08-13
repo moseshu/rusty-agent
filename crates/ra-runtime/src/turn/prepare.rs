@@ -22,6 +22,7 @@ use ra_core::{
         Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
         ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing, ResolvedModelSettings,
     },
+    state::ToolUseTracker,
     tool::{Tool, ToolAvailability, ToolRuntimeContext},
 };
 
@@ -38,6 +39,7 @@ pub struct TurnPreparationRequest<'a> {
     model_resolver: &'a dyn ModelResolver,
     tool_context: &'a dyn ToolRuntimeContext,
     cancel: &'a CancelScope,
+    tool_use: &'a ToolUseTracker,
     input: Vec<ModelInputItem>,
     model_override: Option<String>,
     model_settings: ModelSettings,
@@ -55,11 +57,17 @@ impl<'a> TurnPreparationRequest<'a> {
     /// `cancel` is required rather than optional: preparation awaits third-party `is_enabled`
     /// implementations, so a caller that could omit the scope would have a run that cannot be
     /// interrupted while a tool decides whether it is available.
+    ///
+    /// `tool_use` is required for the same class of reason. It is what releases a forced
+    /// `tool_choice` after the model has complied, and a caller allowed to omit it would have a
+    /// run that forces the same call on every turn until the turn cap — silently, and only when a
+    /// forced selection is configured.
     pub fn new(
         agent: &'a AgentBinding,
         model_resolver: &'a dyn ModelResolver,
         tool_context: &'a dyn ToolRuntimeContext,
         cancel: &'a CancelScope,
+        tool_use: &'a ToolUseTracker,
         input: Vec<ModelInputItem>,
     ) -> Self {
         Self {
@@ -67,6 +75,7 @@ impl<'a> TurnPreparationRequest<'a> {
             model_resolver,
             tool_context,
             cancel,
+            tool_use,
             input,
             model_override: None,
             model_settings: ModelSettings::new(),
@@ -310,9 +319,20 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // against the surface stages 1 and 2 produced. This is the stage that makes the order load
     // bearing rather than merely conventional: `tool_choice` and `parallel_tool_calls` cannot be
     // settled before the turn knows which tools it will advertise.
-    let model_settings = resolved_model
+    //
+    // Releasing a forced selection belongs to the same stage and to the resolved value, never to
+    // one of the four input layers: a layer carries the caller's standing intent, while this is a
+    // fact about the turn just settled. The two must not be conflated, or complying once would
+    // permanently overwrite what the agent asked for.
+    let mut model_settings = resolved_model
         .resolve_settings(agent.model_settings(), &request.model_settings)
         .reconcile_tool_surface(surface.advertised_names());
+    if request
+        .tool_use
+        .used_any_this_turn(request.agent.public_id())
+    {
+        model_settings = model_settings.reset_tool_choice();
+    }
 
     let instructions = resolve_instructions(agent, request.agent.public_id())?;
 
