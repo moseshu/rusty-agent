@@ -135,9 +135,11 @@ pub struct Unknown(BTreeMap<String, Value>);
 
 impl Unknown {
     /// An empty set.
+    ///
+    /// Const so a record whose own constructor is const can hold one.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
     }
 
     /// Whether there are no unknown fields. Used as `skip_serializing_if` so a clean record does

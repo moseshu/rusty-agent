@@ -1,10 +1,12 @@
 //! R6-6 的 `RunState` 骨架：一次 run 自己的可续接状态（与 R3-13 的任务态分属两处）。
 
 use ra_core::{
+    budget::BudgetSnapshot,
     compat::SchemaVersion,
     item::{AgentId, CallId},
     state::{RUN_STATE_SCHEMA_VERSION, RunState, ToolUse, ToolUseAttempt},
     tool::ToolLookupKey,
+    usage::Usage,
 };
 use serde_json::json;
 
@@ -26,7 +28,10 @@ fn test_run_state_01() {
 fn test_run_state_02() {
     let agent = AgentId::new("coder");
     let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
-    let mut state = RunState::new();
+    let mut budget = BudgetSnapshot::new();
+    budget.record_turn();
+    budget.record_usage(&Usage::new(3, 4));
+    let mut state = RunState::new().with_budget(budget);
     record_call(&mut state, &agent, &identity, "call-1");
 
     let restored: RunState =
@@ -34,6 +39,8 @@ fn test_run_state_02() {
             .expect("run state must deserialize");
 
     assert_eq!(restored.tool_use().repeat_streak(&agent, &identity), 1);
+    assert_eq!(restored.budget().turns_used(), 1);
+    assert_eq!(restored.budget().tokens_used(), 7);
 }
 
 #[test]

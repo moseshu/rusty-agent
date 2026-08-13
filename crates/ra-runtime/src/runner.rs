@@ -20,11 +20,11 @@
 //!
 //! # Deliberately absent
 //!
-//! **Budgets other than the turn cap.** Cost, tokens, wall clock, and telling the model how much
-//! allowance is left are R3-8's, along with the error handler that turns a refusal or an invalid
-//! final output into a settled result. [`RunConfig::max_turns`] is here anyway because it is not a
-//! budget — it is the loop's own termination condition, and shipping a loop that can only be
-//! stopped from outside would make every other milestone's tests a hang risk.
+//! **Budget policy beyond the shared value types.** Turns, tokens, and a wall-clock deadline are
+//! enforced here through [`BudgetLimit`](ra_core::budget::BudgetLimit); spend is not a dimension,
+//! because pricing is the host's. Provider refusal fallback and structured-output validation remain
+//! at their provider and output-contract seams; when either produces a terminal [`Error`], they use
+//! the same [`RunErrorHandler`] contract.
 //!
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
@@ -32,10 +32,14 @@
 use std::sync::Arc;
 
 use ra_core::{
-    cancel::{CancelReason, CancelScope, ScopeKind},
-    error::{Error, Result},
+    budget::BudgetLimit,
+    cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
+    error::{BudgetKind, Error, Result},
     finish::FinishReason,
-    item::{ModelInputItem, ModelResponse, RunItem},
+    item::{
+        ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
+        RunItemKind,
+    },
     model::{ModelResolver, ModelSettings, ModelTracing},
     state::{RunState, WorkStateHandle},
     step::NextStep,
@@ -46,7 +50,10 @@ use tokio::sync::mpsc;
 pub mod result;
 pub mod stream;
 
-pub use result::{ContinuationInput, RunOutcome, RunResult};
+pub use result::{
+    ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
+    RunOutcome, RunResult,
+};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
@@ -59,10 +66,12 @@ use crate::{
     },
 };
 
+use crate::budget::budget_reminder;
+
 /// Default turn cap.
 ///
 /// It exists to stop a loop, not to size a task: a model that keeps calling the same tool has to
-/// hit something. Sizing the work is R3-8's job, with budgets the model can be told about.
+/// hit something. Sizing the work is what the rest of [`BudgetLimit`] is for.
 pub const DEFAULT_MAX_TURNS: u32 = 32;
 
 /// Run-level settings applied to every turn.
@@ -72,13 +81,14 @@ pub const DEFAULT_MAX_TURNS: u32 = 32;
 /// does not re-supply them per turn and cannot supply them inconsistently.
 #[must_use]
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunConfig {
-    max_turns: u32,
+    budget: BudgetLimit,
     max_function_tool_concurrency: usize,
     model: Option<String>,
     model_settings: ModelSettings,
     tracing: ModelTracing,
+    error_handler: Option<Arc<dyn RunErrorHandler>>,
 }
 
 impl Default for RunConfig {
@@ -91,18 +101,46 @@ impl RunConfig {
     /// Creates the default configuration.
     pub fn new() -> Self {
         Self {
-            max_turns: DEFAULT_MAX_TURNS,
+            budget: BudgetLimit::new().with_max_turns(DEFAULT_MAX_TURNS),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             model: None,
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
+            error_handler: None,
         }
     }
 
     /// Sets the turn cap. Zero is rejected when the run starts rather than silently meaning
     /// "unlimited".
     pub const fn with_max_turns(mut self, max_turns: u32) -> Self {
-        self.max_turns = max_turns;
+        self.budget = self.budget.with_max_turns(max_turns);
+        self
+    }
+
+    /// Replaces every budget dimension at once.
+    ///
+    /// The supplied limit must carry a turn cap. This is the one entry point that can drop the
+    /// default one, and a loop with no cap of its own can only be stopped from outside — so a
+    /// budget without one is rejected when the run starts rather than turning a scripted test or a
+    /// looping model into a hang.
+    pub const fn with_budget(mut self, budget: BudgetLimit) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Sets the total token ceiling while retaining the other configured dimensions.
+    pub const fn with_max_tokens(mut self, max_tokens: u64) -> Self {
+        self.budget = self.budget.with_max_tokens(max_tokens);
+        self
+    }
+
+    /// Sets the wall-clock deadline while retaining the other configured dimensions.
+    ///
+    /// **Requires a Tokio runtime with the time driver enabled.** The run arms a timer from it and
+    /// cancels itself when it fires; without a time driver the deadline degrades to the scope's own
+    /// checkpoint handling and takes effect later.
+    pub const fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.budget = self.budget.with_deadline(deadline);
         self
     }
 
@@ -134,16 +172,52 @@ impl RunConfig {
         self
     }
 
-    /// The turn cap.
+    /// Installs the handler used to turn terminal budget conditions into a final delivery.
+    pub fn with_error_handler(mut self, error_handler: Arc<dyn RunErrorHandler>) -> Self {
+        self.error_handler = Some(error_handler);
+        self
+    }
+
+    /// Budget dimensions governing this run.
+    #[must_use]
+    pub const fn budget(&self) -> &BudgetLimit {
+        &self.budget
+    }
+
+    /// The configured turn cap.
+    ///
+    /// This compatibility accessor retains the original public signature. `0` means a caller
+    /// replaced the budget with one that has no turn cap; [`Runner::run`] rejects that invalid
+    /// configuration before making a model call.
     #[must_use]
     pub const fn max_turns(&self) -> u32 {
-        self.max_turns
+        match self.budget.max_turns() {
+            Some(max_turns) => max_turns,
+            None => 0,
+        }
     }
 
     /// The per-turn function-tool dispatch cap.
     #[must_use]
     pub const fn max_function_tool_concurrency(&self) -> usize {
         self.max_function_tool_concurrency
+    }
+}
+
+impl std::fmt::Debug for RunConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunConfig")
+            .field("budget", &self.budget)
+            .field(
+                "max_function_tool_concurrency",
+                &self.max_function_tool_concurrency,
+            )
+            .field("model", &self.model)
+            .field("model_settings", &self.model_settings)
+            .field("tracing", &self.tracing)
+            .field("has_error_handler", &self.error_handler.is_some())
+            .finish()
     }
 }
 
@@ -258,6 +332,30 @@ impl Runner {
     }
 }
 
+/// Everything one turn reads but never changes.
+///
+/// It exists so the loop can live in its own function: the alternative is a dozen parameters, and
+/// the alternative to *that* is one function long enough that the budget checks and the settlement
+/// hand-off stop being visible together.
+struct TurnLoopContext<'a> {
+    model_resolver: &'a Arc<dyn ModelResolver>,
+    tool_context: &'a Arc<dyn ToolRuntimeContext>,
+    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
+    cancel: &'a CancelScope,
+    closeout_cancel: &'a CancelScope,
+    config: &'a RunConfig,
+    original_input: &'a [ModelInputItem],
+    events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
+}
+
+/// What the loop produces, whichever way it ends.
+struct TurnLoopProgress {
+    generated: Vec<RunItem>,
+    model_responses: Vec<ModelResponse>,
+    turns: u32,
+    budget_stop: Option<BudgetKind>,
+}
+
 /// The loop both entry points share.
 ///
 /// `events` is the only difference between them.
@@ -278,38 +376,112 @@ async fn run_loop(
 
     validate_config(&config)?;
 
-    let mut generated: Vec<RunItem> = Vec::new();
-    let mut model_responses: Vec<ModelResponse> = Vec::new();
-    let mut turns: u32 = 0;
+    // The run gets its own scope, so either its configured deadline or an inherited caller
+    // deadline stops this run without cancelling the caller's tree. An armed timer turns the
+    // effective deadline — pure data in `ra-core` — into a real cancellation. Every descendant
+    // sees it at the same instant: the model call in flight, the tools running under settlement,
+    // and the loop's own checkpoint alike.
+    let budget_deadline = config.budget.deadline();
+    let closeout_cancel = cancel.child(ScopeKind::Run);
+    let cancel = cancel.child(ScopeKind::Run);
+    let cancel = match budget_deadline {
+        Some(deadline) => cancel.with_deadline(deadline),
+        None => cancel,
+    };
+    let _deadline = arm_deadline(&cancel);
 
+    let context = TurnLoopContext {
+        model_resolver: &model_resolver,
+        tool_context: &tool_context,
+        work_state: work_state.as_ref(),
+        cancel: &cancel,
+        closeout_cancel: &closeout_cancel,
+        config: &config,
+        original_input: &original_input,
+        events: events.as_ref(),
+    };
+    let mut progress = TurnLoopProgress {
+        generated: Vec::new(),
+        model_responses: Vec::new(),
+        turns: 0,
+        budget_stop: None,
+    };
+
+    // The one place an expired wall clock is read back as a budget stop. Everything under the run
+    // scope reports expiry the same way any other cancellation is reported, which is what lets the
+    // loop stay free of deadline special cases; translating it here — rather than at each of the
+    // four `?` inside — is why exactly one kind of stop can be a soft one.
+    let outcome = match run_turns(&context, &mut agent, &mut state, &mut progress).await {
+        Ok(outcome) => outcome,
+        Err(error) if is_wall_clock_expiry(&error, &cancel, budget_deadline) => {
+            progress.budget_stop = Some(BudgetKind::WallClock);
+            RunOutcome::Completed {
+                reason: FinishReason::BudgetExhausted,
+            }
+        }
+        Err(error) => return Err(error),
+    };
+
+    let final_message = deliver_budget_closeout(&context, &agent, &mut progress, &state).await?;
+
+    let mut result = RunResult::new(
+        outcome.clone(),
+        Arc::clone(agent.public()),
+        original_input,
+        progress.generated,
+        progress.model_responses,
+        progress.turns,
+        state,
+    );
+    if let Some(message) = final_message {
+        result = result.with_final_message(message);
+    }
+    emit(events.as_ref(), RunStreamEvent::Finished(outcome));
+    Ok(result)
+}
+
+/// Runs turns until something says to stop.
+async fn run_turns(
+    context: &TurnLoopContext<'_>,
+    agent: &mut AgentBinding,
+    state: &mut RunState,
+    progress: &mut TurnLoopProgress,
+) -> Result<RunOutcome> {
+    let config = context.config;
     let outcome = loop {
-        // Checked before the turn cap so a cancelled run reports as cancelled rather than as
-        // having exhausted its turns — the reason a host reacts to is different for each.
-        cancel.ensure_not_cancelled()?;
+        // Checked before the budget so a cancelled run reports as cancelled rather than as having
+        // exhausted its turns — the reason a host reacts to is different for each.
+        context.cancel.ensure_not_cancelled()?;
 
-        if turns >= config.max_turns {
+        if let Some(kind) = state.budget().exhausted_kind(config.budget()) {
+            progress.budget_stop = Some(kind);
             break RunOutcome::Completed {
-                reason: FinishReason::MaxTurns,
+                reason: FinishReason::from_budget_kind(kind),
             };
         }
-        turns += 1;
+        progress.turns += 1;
+        state.budget_mut().record_turn();
         emit(
-            events.as_ref(),
+            context.events,
             RunStreamEvent::TurnStarted {
-                turn: turns,
+                turn: progress.turns,
                 agent: agent.public_id().clone(),
             },
         );
 
-        // One scope per turn, so a per-turn deadline (R3-8) has somewhere to attach without the
-        // run's own scope inheriting it.
-        let turn_scope = cancel.child(ScopeKind::Turn);
+        // One scope per turn, so anything that must not outlive this turn has somewhere to attach
+        // without the run's own scope inheriting it.
+        let turn_scope = context.cancel.child(ScopeKind::Turn);
 
-        let input = next_input(&original_input, &generated);
+        let input = next_input(
+            context.original_input,
+            &progress.generated,
+            budget_reminder(state.budget(), config.budget()),
+        );
         let mut preparation = TurnPreparationRequest::new(
-            &agent,
-            model_resolver.as_ref(),
-            tool_context.as_ref(),
+            agent,
+            context.model_resolver.as_ref(),
+            context.tool_context.as_ref(),
             &turn_scope,
             state.tool_use(),
             input,
@@ -329,30 +501,45 @@ async fn run_loop(
         // `ModelResponse` either way.
         let response = turn_scope.run(model.get_response(model_request)).await??;
 
+        // Both facts about a completed call are recorded here, before settlement, and the stop
+        // either may cause is *not* taken here. The response has already been paid for, so its
+        // items belong in history and its tool calls belong to the turn that requested them; the
+        // check at the top of the next iteration is what ends the run, one turn later and with the
+        // work intact.
+        //
+        // Recording before settling is also what keeps the two facts agreeing when a deadline
+        // interrupts settlement below: the session projection may then be incomplete, but usage
+        // accounting, provider diagnostics, and an error handler's snapshot must not deny that the
+        // call ran. The copy is what that costs, next to the two history copies this turn already
+        // makes for settlement.
+        state.budget_mut().record_usage(response.usage());
+        progress.model_responses.push(response.clone());
+
         let (tool_use, tool_failure) = state.trackers_mut();
         let mut settlement = TurnSettlementRequest::new(
-            &agent,
+            agent,
             &response,
             &surface,
-            Arc::clone(&tool_context),
+            Arc::clone(context.tool_context),
             &turn_scope,
             tool_use,
             tool_failure,
         )
-        .with_original_input(original_input.clone())
-        .with_pre_step_items(generated.clone());
-        if let Some(work_state) = &work_state {
+        .with_original_input(context.original_input.to_vec())
+        .with_pre_step_items(progress.generated.clone());
+        if let Some(work_state) = context.work_state {
             settlement = settlement.with_work_state(Arc::clone(work_state));
         }
         settlement =
             settlement.with_max_function_tool_concurrency(config.max_function_tool_concurrency);
         let settled = settle_turn(settlement).await?;
 
-        model_responses.push(response);
         for item in settled.session_step_items() {
-            emit(events.as_ref(), RunStreamEvent::Item(item.clone()));
+            emit(context.events, RunStreamEvent::Item(item.clone()));
         }
-        generated.extend(settled.session_step_items().iter().cloned());
+        progress
+            .generated
+            .extend(settled.session_step_items().iter().cloned());
 
         // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
         // fifth state has to be answered here rather than fall through to "keep going".
@@ -369,29 +556,99 @@ async fn run_loop(
             // instance has no say over who runs the next one. Unreachable until R17 — settlement
             // refuses handoffs — but the state machine has to say what it does about it.
             NextStep::Handoff { new_agent } => {
-                agent = AgentBinding::direct(Arc::clone(new_agent));
+                *agent = AgentBinding::direct(Arc::clone(new_agent));
             }
         }
     };
+    Ok(outcome)
+}
 
-    let result = RunResult::new(
-        outcome.clone(),
-        Arc::clone(agent.public()),
-        original_input,
-        generated,
-        model_responses,
-        turns,
-        state,
+/// Asks the configured handler to turn an exhausted budget into something deliverable.
+async fn deliver_budget_closeout(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    progress: &mut TurnLoopProgress,
+    state: &RunState,
+) -> Result<Option<Message>> {
+    let (Some(kind), Some(handler)) = (progress.budget_stop, context.config.error_handler.as_ref())
+    else {
+        return Ok(None);
+    };
+
+    let error = Error::budget(kind, "the configured run budget was exhausted");
+    let data = RunErrorData::new(
+        agent.public(),
+        context.original_input,
+        &progress.generated,
+        &progress.model_responses,
+        progress.turns,
+        state.budget().clone(),
     );
-    emit(events.as_ref(), RunStreamEvent::Finished(outcome));
-    Ok(result)
+    // A deadline cancels the run scope, so this uses its sibling: budget exhaustion still gets a
+    // chance to produce a closeout, while an interrupt on the caller's scope cancels both paths.
+    // A deadline the caller put on its *own* scope reaches this sibling too, so a run that exhausts
+    // its budget at the moment the caller's clock also runs out ends as a cancellation with nothing
+    // delivered. That is the caller's limit winning, which is the same order every other path uses.
+    let Some(closeout) = context
+        .closeout_cancel
+        .run(handler.handle(RunErrorHandlerInput::new(&error, data)))
+        .await??
+    else {
+        // Declined. The run ends the way it would have with no handler at all.
+        return Ok(None);
+    };
+    validate_error_handler_message(closeout.message())?;
+
+    let message = closeout.message().clone();
+    if closeout.write_to_history() {
+        let item = RunItem::new(
+            next_error_item_id(&progress.generated, progress.turns),
+            RunItemKind::Message(message.clone()),
+        );
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+        progress.generated.push(item);
+    } else {
+        emit(
+            context.events,
+            RunStreamEvent::FinalMessage(message.clone()),
+        );
+    }
+    Ok(Some(message))
+}
+
+/// Checks that a closeout can stand where the model's own answer would have stood.
+///
+/// Shape is all this can check today, because an agent cannot yet declare an output schema.
+/// **Once one can, a closeout has to satisfy it here too** — otherwise a run whose contract
+/// promises structured output can end with free text that every caller parsing
+/// [`RunResult::final_message`] chokes on, and it will have arrived through the framework's own
+/// delivery path rather than the model's.
+fn validate_error_handler_message(message: &Message) -> Result<()> {
+    if message.role() != MessageRole::Assistant || message.phase() != Some(OutputPhase::Final) {
+        return Err(Error::caller(
+            "a run error handler must return an assistant message with final output phase",
+        ));
+    }
+    Ok(())
+}
+
+fn next_error_item_id(items: &[RunItem], turns: u32) -> ItemId {
+    let mut suffix = 0_u32;
+    loop {
+        let id = ItemId::new(format!("run-error-{turns}-{suffix}"));
+        if !items.iter().any(|item| item.id() == &id) {
+            return id;
+        }
+        suffix = suffix.saturating_add(1);
+    }
 }
 
 fn validate_config(config: &RunConfig) -> Result<()> {
-    if config.max_turns == 0 {
+    config.budget.validate()?;
+    if config.budget.max_turns().is_none() {
         return Err(Error::config(
-            "`max_turns` must be at least 1; a run that may not take a turn cannot produce \
-             anything, and zero is too easy to reach by arithmetic on a caller's own budget",
+            "`max_turns` must be set; it is the loop's own termination condition, and a run that \
+             can only be stopped from outside is a hang whenever the model keeps calling tools",
         ));
     }
     if config.max_function_tool_concurrency == 0 {
@@ -403,14 +660,72 @@ fn validate_config(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-/// Builds the next call's input: what was asked, then everything produced since.
+/// Cancels its scope when the run's wall clock expires; aborts the timer when dropped.
+///
+/// Dropping matters as much as firing: a finished run must not go on to cancel anything, and the
+/// scope it holds outlives this task by design.
+struct DeadlineTimer(tokio::task::JoinHandle<()>);
+
+impl Drop for DeadlineTimer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Arms the timer that converts `scope`'s deadline into a real cancellation.
+///
+/// `ra-core` owns no runtime and so arms no timer; this is the one place that obligation is met.
+/// Without it a deadline still takes effect, but only at the next checkpoint that happens to look —
+/// which a model call or a long tool can postpone indefinitely.
+fn arm_deadline(scope: &CancelScope) -> Option<DeadlineTimer> {
+    let deadline = scope.deadline()?;
+    let scope = scope.clone();
+    Some(DeadlineTimer(tokio::spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.instant())).await;
+        scope.cancel(CancelReason::Deadline);
+    })))
+}
+
+/// Whether a failure is this run's wall clock expiring rather than an interruption.
+///
+/// The reason is read from the scope, never parsed out of the error text: `CancelReason` is the
+/// machine-readable attribution the cancellation contract designates, and `Error::Cancelled`
+/// carries only a display string. A tool's own timeout cancels the tool's scope, not this one, so
+/// it stays a failure — as it should.
+///
+/// The configured budget deadline is checked separately from the effective scope deadline.
+/// `CancelScope::deadline` includes an inherited caller deadline, which must remain cancellation
+/// rather than being relabelled as this run's exhausted budget.
+fn is_wall_clock_expiry(
+    error: &Error,
+    scope: &CancelScope,
+    budget_deadline: Option<Deadline>,
+) -> bool {
+    error.is_cancelled()
+        && budget_deadline.is_some_and(Deadline::is_expired)
+        && scope
+            .reason()
+            .is_some_and(|reason| matches!(reason, CancelReason::Deadline))
+}
+
+/// Builds the next call's input: what was asked, then everything produced since, then `reminder`.
 ///
 /// Projection happens here rather than being accumulated as the run goes, so the model-facing view
 /// is always derived from the authoritative records. Adapters normalize it again before sending
 /// (R1-17); this stage only decides *which* records go.
-fn next_input(original_input: &[ModelInputItem], generated: &[RunItem]) -> Vec<ModelInputItem> {
+///
+/// A reminder goes **last and is not a record**: it never enters `generated`, so it is regenerated
+/// from the current allowance each turn and leaves no trace in session history. Last is also the
+/// only position that costs nothing, since everything ahead of it stays byte-identical between
+/// turns and remains eligible for the provider's prefix cache.
+fn next_input(
+    original_input: &[ModelInputItem],
+    generated: &[RunItem],
+    reminder: Option<Message>,
+) -> Vec<ModelInputItem> {
     let mut input = original_input.to_vec();
     input.extend(generated.iter().filter_map(RunItem::to_model_input));
+    input.extend(reminder.map(ModelInputItem::Message));
     input
 }
 

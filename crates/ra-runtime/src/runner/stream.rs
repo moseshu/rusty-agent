@@ -15,8 +15,7 @@
 use ra_core::{
     cancel::{CancelOnDrop, CancelReason, DRAIN_GRACE},
     error::Result,
-    item::AgentId,
-    item::RunItem,
+    item::{AgentId, Message, RunItem},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -39,7 +38,17 @@ pub enum RunStreamEvent {
         agent: AgentId,
     },
     /// One record the turn produced, already attributed.
+    ///
+    /// A closeout that *was* recorded arrives here rather than as [`Self::FinalMessage`], because
+    /// by then it is a record like any other.
     Item(RunItem),
+    /// A final delivery that was intentionally not added to session history.
+    ///
+    /// **A subscriber that renders the delivered answer has to watch this and [`Self::Item`].**
+    /// Which one carries it is decided by the error handler's `write_to_history`, and the split is
+    /// the point: a record the run chose not to keep must not reach a subscriber as one, or a host
+    /// persisting what it observes would store exactly what the run declined to store.
+    FinalMessage(Message),
     /// The run reached its end. Also available from [`RunStream::finish`]; emitted here so a
     /// subscriber watching only events does not have to infer why the stream stopped.
     Finished(RunOutcome),

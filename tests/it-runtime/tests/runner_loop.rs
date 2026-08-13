@@ -16,18 +16,19 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
     agent::{AgentId, AgentSpec, ToolUseBehavior, ToolUseBehaviorHandler, ToolUseResult},
-    cancel::{CancelReason, CancelScope},
+    budget::{BudgetLimit, BudgetSnapshot},
+    cancel::{CancelReason, CancelScope, Deadline},
     error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
-        CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
-        ToolCall,
+        CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
+        RunItemKind, ToolCall,
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel, ToolChoice,
     },
-    state::{ToolUse, WorkStateHandle},
+    state::{RunState, ToolUse, WorkStateHandle},
     tool::{
         Tool, ToolApprovalPolicy, ToolCaller, ToolInvocation, ToolLookupKey, ToolNamespace,
         ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
@@ -37,7 +38,8 @@ use ra_core::{
 use ra_runtime::{
     agent::AgentBinding,
     runner::{
-        ContinuationInput, RunConfig, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
+        ContinuationInput, RunConfig, RunErrorHandler, RunErrorHandlerInput,
+        RunErrorHandlerResult, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
     },
 };
 use serde_json::json;
@@ -48,6 +50,7 @@ struct ScriptedModel {
     script: Mutex<Vec<ModelResponse>>,
     inputs: Mutex<Vec<usize>>,
     input_items: Mutex<Vec<Vec<ModelInputItem>>>,
+    instructions: Mutex<Vec<Option<String>>>,
     tool_choices: Mutex<Vec<Option<ToolChoice>>>,
     calls: Arc<AtomicUsize>,
 }
@@ -58,6 +61,7 @@ impl ScriptedModel {
             script: Mutex::new(script),
             inputs: Mutex::new(Vec::new()),
             input_items: Mutex::new(Vec::new()),
+            instructions: Mutex::new(Vec::new()),
             tool_choices: Mutex::new(Vec::new()),
             calls: Arc::new(AtomicUsize::new(0)),
         })
@@ -73,6 +77,10 @@ impl Model for ScriptedModel {
             .lock()
             .unwrap()
             .push(request.input().to_vec());
+        self.instructions
+            .lock()
+            .unwrap()
+            .push(request.system_instructions().map(str::to_owned));
         self.tool_choices
             .lock()
             .unwrap()
@@ -256,6 +264,110 @@ impl Tool for ScriptedTool {
 
 struct Host;
 
+const CLOSEOUT_TEXT: &str = "The budget was reached; save this progress and continue with a new \
+                             allowance.";
+
+/// Delivers a closeout message, optionally recording it in session history.
+struct BudgetCloseoutHandler {
+    write_to_history: bool,
+}
+
+#[async_trait]
+impl RunErrorHandler for BudgetCloseoutHandler {
+    async fn handle(
+        &self,
+        input: RunErrorHandlerInput<'_>,
+    ) -> Result<Option<RunErrorHandlerResult>> {
+        assert!(input.error().code().starts_with("budget."));
+        assert!(input.data().turns() > 0);
+        // The public declaration, which is whose place the closeout speaks in.
+        assert_eq!(input.data().last_agent().name(), "Coder");
+        assert_eq!(input.data().last_agent().id().as_str(), "coder");
+        Ok(Some(
+            RunErrorHandlerResult::new(Message::assistant(CLOSEOUT_TEXT, OutputPhase::Final))
+                .with_write_to_history(self.write_to_history),
+        ))
+    }
+}
+
+/// Returns something that is not a final answer, which the runner has to refuse.
+struct MisbehavingCloseoutHandler;
+
+#[async_trait]
+impl RunErrorHandler for MisbehavingCloseoutHandler {
+    async fn handle(
+        &self,
+        _input: RunErrorHandlerInput<'_>,
+    ) -> Result<Option<RunErrorHandlerResult>> {
+        Ok(Some(RunErrorHandlerResult::new(Message::user(
+            "please carry on",
+        ))))
+    }
+}
+
+/// Looks at the condition, decides it is not one it speaks for, and says nothing.
+struct DecliningCloseoutHandler {
+    seen: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RunErrorHandler for DecliningCloseoutHandler {
+    async fn handle(
+        &self,
+        _input: RunErrorHandlerInput<'_>,
+    ) -> Result<Option<RunErrorHandlerResult>> {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+/// A handler that makes entry observable and then waits for cancellation.
+struct PendingCloseoutHandler {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+#[async_trait]
+impl RunErrorHandler for PendingCloseoutHandler {
+    async fn handle(
+        &self,
+        _input: RunErrorHandlerInput<'_>,
+    ) -> Result<Option<RunErrorHandlerResult>> {
+        if let Some(sender) = self.started.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        futures::future::pending().await
+    }
+}
+
+/// A tool that outlives any deadline a test would set, unless something cancels it.
+struct SlowTool {
+    inner: Arc<ScriptedTool>,
+}
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+
+    fn options(&self) -> ToolOptions {
+        self.inner.options()
+    }
+
+    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        self.inner.call(invocation).await
+    }
+
+    async fn needs_approval(&self, invocation: &ToolInvocation<'_>) -> Result<bool> {
+        self.inner.needs_approval(invocation).await
+    }
+}
+
 /// Stand-in for the cross-run task state R17-1 will supply (R3-13).
 struct TaskState {
     plan: &'static str,
@@ -277,6 +389,16 @@ fn message(id: &str, text: &str) -> RunItem {
 
 fn message_with_phase(id: &str, text: &str, phase: OutputPhase) -> RunItem {
     item(id, RunItemKind::Message(Message::assistant(text, phase)))
+}
+
+/// The trailing system message one model call was handed, which is where a reminder belongs.
+fn reminder_text(input: &[ModelInputItem]) -> String {
+    match input.last() {
+        Some(ModelInputItem::Message(message)) if message.role() == MessageRole::System => {
+            message.text_content()
+        }
+        other => panic!("expected a trailing system reminder, found {other:?}"),
+    }
 }
 
 /// The run's message channels in generation order (R3-10).
@@ -1014,6 +1136,437 @@ async fn reaching_turn_limit_ends_softly_instead_of_erroring() {
         }
     ));
     assert_eq!(result.model_responses().len(), 3);
+}
+
+/// The remaining allowance is told to the model at the **tail of the input**, never in the system
+/// instructions: a number that changes every turn would break the provider's prefix cache on every
+/// call. The reminder is also not a record — it never reaches session history.
+#[tokio::test]
+async fn the_token_budget_reminder_rides_the_input_tail_and_leaves_the_prefix_alone() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
+            .with_usage(Usage::new(7, 5)),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let result = Runner::run(
+        request(vec![tool_for_run], &model, &cancel)
+            .with_config(RunConfig::new().with_max_tokens(1_000)),
+    )
+    .await
+    .unwrap();
+
+    let instructions = model.instructions.lock().unwrap().clone();
+    assert_eq!(instructions[0], instructions[1]);
+    assert!(!instructions[0]
+        .as_deref()
+        .is_some_and(|text| text.contains("Task token budget")));
+
+    let inputs = model.input_items.lock().unwrap().clone();
+    assert_eq!(
+        [reminder_text(&inputs[0]), reminder_text(&inputs[1])],
+        [
+            "Task token budget: 1000 tokens remain. Pace the remaining work accordingly.",
+            "Task token budget: 988 tokens remain. Pace the remaining work accordingly."
+        ]
+    );
+    assert!(!result.new_items().iter().any(|item| matches!(
+        item.kind(),
+        RunItemKind::Message(message) if message.role() == MessageRole::System
+    )));
+}
+
+/// The response that crosses the ceiling has already been paid for, so the turn it belongs to is
+/// settled in full. The run stops at the next turn boundary instead, with the work intact.
+#[tokio::test]
+async fn an_exhausting_response_still_gets_its_turn_settled() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
+            .with_usage(Usage::new(7, 5)),
+    ]);
+    let cancel = CancelScope::root();
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let result = Runner::run(
+        request(vec![tool_for_run], &model, &cancel)
+            .with_config(RunConfig::new().with_max_tokens(12)),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::BudgetExhausted
+        }
+    ));
+    assert_eq!(result.state().budget().tokens_used(), 12);
+    assert_eq!(result.model_responses().len(), 1);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.new_items().len(), 2);
+}
+
+/// The model answered and the answer was paid for; that the same response also exhausted the
+/// budget must not turn a delivered result into an empty one.
+#[tokio::test]
+async fn a_final_answer_survives_the_response_that_exhausts_the_budget() {
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![message("msg-1", "here is the answer")])
+            .with_usage(Usage::new(6, 6)),
+    ]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(
+        request(Vec::new(), &model, &cancel).with_config(RunConfig::new().with_max_tokens(12)),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::Final
+        }
+    ));
+    assert_eq!(
+        result.final_message().unwrap().text_content(),
+        "here is the answer"
+    );
+    assert_eq!(result.state().budget().tokens_used(), 12);
+}
+
+#[tokio::test]
+async fn terminal_budget_handler_can_deliver_and_record_a_closeout_message() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let result = Runner::run(
+        request(vec![tool_for_run], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(1)
+                .with_error_handler(Arc::new(BudgetCloseoutHandler {
+                    write_to_history: true,
+                })),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_message().unwrap().text_content(), CLOSEOUT_TEXT);
+    assert_eq!(phases(&result), [OutputPhase::Final]);
+    assert_eq!(result.new_items().len(), 3);
+}
+
+/// Declining to record is a real choice: the host shows the closeout, and a continuation resumes
+/// from the work itself rather than from an apology the model would then have to answer.
+#[tokio::test]
+async fn a_closeout_can_be_delivered_without_entering_history() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let result = Runner::run(
+        request(vec![tool_for_run], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(1)
+                .with_error_handler(Arc::new(BudgetCloseoutHandler {
+                    write_to_history: false,
+                })),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_message().unwrap().text_content(), CLOSEOUT_TEXT);
+    assert_eq!(result.new_items().len(), 2);
+    assert!(phases(&result).is_empty());
+}
+
+#[tokio::test]
+async fn a_non_persisted_closeout_is_emitted_as_a_stream_delivery() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let mut stream = Runner::run_streamed(
+        request(vec![tool_for_run], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(1)
+                .with_error_handler(Arc::new(BudgetCloseoutHandler {
+                    write_to_history: false,
+                })),
+        ),
+    );
+    let mut deliveries = Vec::new();
+    while let Some(event) = stream.next_event().await {
+        if let RunStreamEvent::FinalMessage(message) = event {
+            deliveries.push(message.text_content());
+        }
+    }
+
+    assert_eq!(deliveries, [CLOSEOUT_TEXT]);
+    let result = stream.finish().await.unwrap();
+    assert_eq!(result.final_message().unwrap().text_content(), CLOSEOUT_TEXT);
+    assert_eq!(result.new_items().len(), 2);
+}
+
+/// One handler answers for every terminal condition, so it has to be able to say "not mine".
+/// Declining leaves the run exactly as it would have ended with no handler installed.
+#[tokio::test]
+async fn a_handler_that_declines_leaves_the_run_untouched() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let result = Runner::run(
+        request(vec![tool_for_run], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(1)
+                .with_error_handler(Arc::new(DecliningCloseoutHandler {
+                    seen: Arc::clone(&seen),
+                })),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::MaxTurns
+        }
+    ));
+    assert!(result.final_message().is_none());
+    assert_eq!(result.new_items().len(), 2);
+}
+
+#[tokio::test]
+async fn a_closeout_that_is_not_a_final_answer_is_rejected() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let error = Runner::run(
+        request(vec![tool_for_run], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(1)
+                .with_error_handler(Arc::new(MisbehavingCloseoutHandler)),
+        ),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::Caller { .. }));
+}
+
+#[tokio::test]
+async fn wall_clock_budget_cancels_an_in_flight_model_call_and_ends_softly() {
+    let (model, started, dropped) = PendingModel::new();
+    let cancel = CancelScope::root();
+    let deadline = Deadline::after(Duration::from_millis(20));
+
+    let run = Runner::run(
+        pending_request(model, &cancel).with_config(RunConfig::new().with_deadline(deadline)),
+    );
+    let result = timeout(Duration::from_secs(1), run).await.unwrap().unwrap();
+
+    assert!(started.await.is_ok());
+    assert!(dropped.await.is_ok());
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::BudgetExhausted
+        }
+    ));
+    assert_eq!(result.turns(), 1);
+    // The run's own scope absorbed the expiry; the caller's is left for the caller to decide about.
+    assert!(!cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn an_inherited_deadline_remains_cancellation_not_a_budget_closeout() {
+    let (model, started, dropped) = PendingModel::new();
+    let cancel = CancelScope::root().with_deadline(Deadline::after(Duration::from_millis(20)));
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    let run = Runner::run(pending_request(model, &cancel).with_config(
+        RunConfig::new().with_error_handler(Arc::new(DecliningCloseoutHandler {
+            seen: Arc::clone(&seen),
+        })),
+    ));
+    let error = timeout(Duration::from_secs(1), run)
+        .await
+        .unwrap()
+        .unwrap_err();
+
+    assert!(started.await.is_ok());
+    assert!(dropped.await.is_ok());
+    assert!(matches!(error, Error::Cancelled { .. }));
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+}
+
+/// A wall clock that only bounded the model call would be no wall clock at all: one slow tool
+/// would carry the run past it by however long the tool takes.
+#[tokio::test]
+async fn the_wall_clock_stops_a_running_tool_too() {
+    let inner = Arc::new(ScriptedTool::new("write_file"));
+    let tool: Arc<dyn Tool> = Arc::new(SlowTool {
+        inner: Arc::clone(&inner),
+    });
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
+            .with_usage(Usage::new(3, 4)),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let run = Runner::run(
+        request(vec![tool], &model, &cancel)
+            .with_config(RunConfig::new().with_deadline(Deadline::after(Duration::from_millis(20)))),
+    );
+    let result = timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::BudgetExhausted
+        }
+    ));
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(result.model_responses().len(), 1);
+    assert_eq!(result.usage().total_tokens(), 7);
+}
+
+#[tokio::test]
+async fn cancelling_the_caller_stops_a_pending_budget_closeout_handler() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let (started_sender, started) = oneshot::channel();
+    let handler = Arc::new(PendingCloseoutHandler {
+        started: Mutex::new(Some(started_sender)),
+    });
+    let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
+
+    let task = tokio::spawn(Runner::run(
+        request(vec![tool_for_run], &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(1)
+                .with_error_handler(handler),
+        ),
+    ));
+    started.await.unwrap();
+    cancel.cancel(CancelReason::UserInterrupt);
+
+    let error = timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, Error::Cancelled { .. }));
+}
+
+/// Both conditions hold at once, and the host reacts to each differently: an interrupted run is
+/// resumed on the user's word, an exhausted one on a larger allowance.
+#[tokio::test]
+async fn cancellation_outranks_an_exhausted_turn_budget() {
+    let model = ScriptedModel::new(Vec::new());
+    let cancel = CancelScope::root();
+    let mut spent = BudgetSnapshot::new();
+    spent.record_turn();
+    cancel.cancel(CancelReason::UserInterrupt);
+
+    let error = Runner::run(
+        request(Vec::new(), &model, &cancel)
+            .with_config(RunConfig::new().with_max_turns(1))
+            .with_state(RunState::new().with_budget(spent)),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::Cancelled { .. }));
+}
+
+/// Spend crosses a continuation boundary, so the second segment starts against what the first one
+/// already used rather than against a fresh allowance.
+#[tokio::test]
+async fn a_continuation_is_measured_against_what_an_earlier_segment_spent() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "done")])]);
+    let cancel = CancelScope::root();
+    let mut spent = BudgetSnapshot::new();
+    spent.record_turn();
+    spent.record_usage(&Usage::new(6, 6));
+
+    let result = Runner::run(
+        request(Vec::new(), &model, &cancel)
+            .with_config(RunConfig::new().with_max_tokens(12))
+            .with_state(RunState::new().with_budget(spent)),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::BudgetExhausted
+        }
+    ));
+    assert_eq!(result.turns(), 0);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+}
+
+/// The turn cap is the loop's own termination condition, so the one call that can drop it has to
+/// answer for it.
+#[tokio::test]
+async fn a_budget_without_a_turn_cap_is_rejected() {
+    let model = ScriptedModel::new(Vec::new());
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(
+        request(Vec::new(), &model, &cancel)
+            .with_config(RunConfig::new().with_budget(BudgetLimit::new().with_max_tokens(100))),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::Config { .. }));
+    assert!(error.to_string().contains("max_turns"));
 }
 
 #[tokio::test]

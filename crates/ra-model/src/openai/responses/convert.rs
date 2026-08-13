@@ -238,12 +238,18 @@ fn convert_usage(value: Option<&Value>) -> Usage {
         .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Reported only by newer API versions; an older response simply leaves it at zero.
+    let cache_write = value
+        .and_then(|usage| usage.pointer("/input_tokens_details/cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning = value
         .and_then(|usage| usage.pointer("/output_tokens_details/reasoning_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     Usage::new(input, output)
         .with_cached_input_tokens(cached)
+        .with_cache_write_tokens(cache_write)
         .with_reasoning_tokens(reasoning)
 }
 

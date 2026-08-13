@@ -1,7 +1,7 @@
 //! The run's own resumable state (the skeleton a future migration grows into the full checkpoint).
 //!
 //! A run has facts that are neither agent configuration nor session history: tool-use accounting,
-//! future budget counters, and state owned by the loop itself. Keeping those values as independent
+//! budget counters, and state owned by the loop itself. Keeping those values as independent
 //! fields on the runner would make a new fact a signature change across every entry point and would
 //! let a continuation accidentally carry one fact but not another. `RunState` is the single carrier
 //! that crosses a run-segment boundary.
@@ -23,6 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    budget::BudgetSnapshot,
     compat::{SchemaVersion, Unknown},
     state::{ToolFailureTracker, ToolUseTracker},
 };
@@ -46,6 +47,8 @@ pub struct RunState {
     tool_use: ToolUseTracker,
     #[serde(default)]
     tool_failure: ToolFailureTracker,
+    #[serde(default)]
+    budget: BudgetSnapshot,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -64,6 +67,7 @@ impl RunState {
             schema_version: RUN_STATE_SCHEMA_VERSION,
             tool_use: ToolUseTracker::new(),
             tool_failure: ToolFailureTracker::new(),
+            budget: BudgetSnapshot::new(),
             unknown: Unknown::new(),
         }
     }
@@ -107,6 +111,25 @@ impl RunState {
     #[must_use]
     pub const fn tool_failure(&self) -> &ToolFailureTracker {
         &self.tool_failure
+    }
+
+    /// Recoverable budget accounting as of the most recently completed operation.
+    #[must_use]
+    pub const fn budget(&self) -> &BudgetSnapshot {
+        &self.budget
+    }
+
+    /// Replaces budget accounting while preserving all other run state.
+    #[must_use]
+    pub fn with_budget(mut self, budget: BudgetSnapshot) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Mutable budget accounting for the runner.
+    #[doc(hidden)]
+    pub fn budget_mut(&mut self) -> &mut BudgetSnapshot {
+        &mut self.budget
     }
 
     /// Both trackers at once, for the settlement path that records into each.

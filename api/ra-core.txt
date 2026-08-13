@@ -17,6 +17,18 @@ const fn ra_core::agent::AgentSpec::tool_use_behavior(& self) -> & ToolUseBehavi
 const fn ra_core::agent::ToolUseResult::call_id(& self) -> & CallId
 const fn ra_core::agent::ToolUseResult::output(& self) -> & ToolCallOutput
 const fn ra_core::agent::ToolUseResult::tool(& self) -> & ToolOrigin
+const fn ra_core::budget::BudgetLimit::deadline(& self) -> Option < Deadline >
+const fn ra_core::budget::BudgetLimit::max_tokens(& self) -> Option < u64 >
+const fn ra_core::budget::BudgetLimit::max_turns(& self) -> Option < u32 >
+const fn ra_core::budget::BudgetLimit::new() -> Self
+const fn ra_core::budget::BudgetLimit::with_deadline(mut self, deadline : Deadline) -> Self
+const fn ra_core::budget::BudgetLimit::with_max_tokens(mut self, max_tokens : u64) -> Self
+const fn ra_core::budget::BudgetLimit::with_max_turns(mut self, max_turns : u32) -> Self
+const fn ra_core::budget::BudgetSnapshot::new() -> Self
+const fn ra_core::budget::BudgetSnapshot::schema_version(& self) -> SchemaVersion
+const fn ra_core::budget::BudgetSnapshot::tokens_used(& self) -> u64
+const fn ra_core::budget::BudgetSnapshot::turns_used(& self) -> u32
+const fn ra_core::budget::BudgetSnapshot::unknown(& self) -> & Unknown
 const fn ra_core::cancel::CancelOnDrop::scope(& self) -> & CancelScope
 const fn ra_core::cancel::CancelReason::is_expiry(& self) -> bool
 const fn ra_core::cancel::CancelReason::is_user_initiated(& self) -> bool
@@ -30,6 +42,7 @@ const fn ra_core::compat::Compatibility::needs_migration(self) -> bool
 const fn ra_core::compat::SchemaVersion::compatibility(self, local : Self) -> Compatibility
 const fn ra_core::compat::SchemaVersion::get(self) -> u32
 const fn ra_core::compat::SchemaVersion::new(version : u32) -> Self
+const fn ra_core::compat::Unknown::new() -> Self
 const fn ra_core::config::LayerReport::source(& self) -> SettingSource
 const fn ra_core::config::LayerReport::status(& self) -> LayerStatus
 const fn ra_core::config::LayerStatus::label(self) -> & 'static str
@@ -294,6 +307,7 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::state::run::RunState::budget(& self) -> & BudgetSnapshot
 const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::run::RunState::tool_failure(& self) -> & ToolFailureTracker
 const fn ra_core::state::run::RunState::tool_use(& self) -> & ToolUseTracker
@@ -422,6 +436,7 @@ const fn ra_core::trace::SpanKind::span_name(& self) -> & 'static str
 const fn ra_core::trace::SpanOutcome::as_str(self) -> & 'static str
 const fn ra_core::trace::SpanOutcome::is_failure(self) -> bool
 const fn ra_core::trace::level_for(recoverability : Recoverability) -> Level
+const fn ra_core::usage::Usage::cache_write_tokens(& self) -> u64
 const fn ra_core::usage::Usage::cached_input_tokens(& self) -> u64
 const fn ra_core::usage::Usage::input_tokens(& self) -> u64
 const fn ra_core::usage::Usage::output_tokens(& self) -> u64
@@ -429,8 +444,10 @@ const fn ra_core::usage::Usage::reasoning_tokens(& self) -> u64
 const fn ra_core::usage::Usage::schema_version(& self) -> SchemaVersion
 const fn ra_core::usage::Usage::total_tokens(& self) -> u64
 const fn ra_core::usage::Usage::unknown(& self) -> & Unknown
+const fn ra_core::usage::Usage::with_cache_write_tokens(mut self, tokens : u64) -> Self
 const fn ra_core::usage::Usage::with_cached_input_tokens(mut self, tokens : u64) -> Self
 const fn ra_core::usage::Usage::with_reasoning_tokens(mut self, tokens : u64) -> Self
+const ra_core::budget::BUDGET_SNAPSHOT_SCHEMA_VERSION: SchemaVersion
 const ra_core::cancel::DRAIN_GRACE: Duration
 const ra_core::config::CONFIG_DIR_NAME: & str
 const ra_core::config::CONFIG_FILE_NAME: & str
@@ -572,6 +589,13 @@ fn ra_core::agent::AgentSpecBuilder::tools(mut self, tools : impl IntoIterator <
 fn ra_core::agent::ToolUseBehavior::custom(handler : Arc < dyn ToolUseBehaviorHandler >) -> Self
 fn ra_core::agent::ToolUseBehavior::stop_at_tools(names : impl IntoIterator < Item = impl Into < String > >) -> Self
 fn ra_core::agent::ToolUseResult::new(tool : ToolOrigin, output : ToolCallOutput) -> Self
+fn ra_core::budget::BudgetLimit::remaining_wall_clock(& self) -> Option < Duration >
+fn ra_core::budget::BudgetLimit::validate(& self) -> crate :: error :: Result < () >
+fn ra_core::budget::BudgetSnapshot::exhausted_kind(& self, limit : & BudgetLimit) -> Option < BudgetKind >
+fn ra_core::budget::BudgetSnapshot::record_turn(& mut self)
+fn ra_core::budget::BudgetSnapshot::record_usage(& mut self, usage : & Usage)
+fn ra_core::budget::BudgetSnapshot::remaining_tokens(& self, limit : & BudgetLimit) -> Option < u64 >
+fn ra_core::budget::BudgetSnapshot::remaining_turns(& self, limit : & BudgetLimit) -> Option < u32 >
 fn ra_core::cancel::CancelOnDrop::disarm(mut self) -> CancelScope
 fn ra_core::cancel::CancelReason::code(& self) -> & str
 fn ra_core::cancel::CancelReason::custom(label : impl Into < Cow < 'static , str > >) -> Self
@@ -593,7 +617,6 @@ fn ra_core::compat::Unknown::get(& self, key : & str) -> Option < & Value >
 fn ra_core::compat::Unknown::is_empty(& self) -> bool
 fn ra_core::compat::Unknown::iter(& self) -> impl Iterator < Item = (& String , & Value) >
 fn ra_core::compat::Unknown::len(& self) -> usize
-fn ra_core::compat::Unknown::new() -> Self
 fn ra_core::config::FieldReport::effective(& self) -> Option < & LayerReport >
 fn ra_core::config::FieldReport::has_ineffective_layers(& self) -> bool
 fn ra_core::config::FieldReport::key(& self) -> & str
@@ -803,9 +826,11 @@ fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_t
 fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
+fn ra_core::state::run::RunState::budget_mut(& mut self) -> & mut BudgetSnapshot
 fn ra_core::state::run::RunState::new() -> Self
 fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker
 fn ra_core::state::run::RunState::trackers_mut(& mut self) -> (& mut ToolUseTracker , & mut ToolFailureTracker)
+fn ra_core::state::run::RunState::with_budget(mut self, budget : BudgetSnapshot) -> Self
 fn ra_core::state::run::RunState::with_tool_failure(mut self, tool_failure : ToolFailureTracker) -> Self
 fn ra_core::state::run::RunState::with_tool_use(mut self, tool_use : ToolUseTracker) -> Self
 fn ra_core::state::tool_failure::AgentToolFailures::entries(& self) -> & [ToolFailureEntry]
@@ -1009,6 +1034,8 @@ struct ra_core::agent::AgentInstructions
 struct ra_core::agent::AgentSpec
 struct ra_core::agent::AgentSpecBuilder
 struct ra_core::agent::ToolUseResult
+struct ra_core::budget::BudgetLimit
+struct ra_core::budget::BudgetSnapshot
 struct ra_core::cancel::CancelOnDrop
 struct ra_core::cancel::CancelScope
 struct ra_core::cancel::Deadline
