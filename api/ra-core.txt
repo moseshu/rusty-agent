@@ -295,8 +295,30 @@ const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
 const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::run::RunState::tool_failure(& self) -> & ToolFailureTracker
 const fn ra_core::state::run::RunState::tool_use(& self) -> & ToolUseTracker
 const fn ra_core::state::run::RunState::unknown(& self) -> & Unknown
+const fn ra_core::state::tool_failure::AgentToolFailures::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::tool_failure::AgentToolFailures::unknown(& self) -> & Unknown
+const fn ra_core::state::tool_failure::ToolFailureEntry::identity(& self) -> & ToolUse
+const fn ra_core::state::tool_failure::ToolFailureEntry::last_evidence(& self) -> Option < & EvidenceFingerprint >
+const fn ra_core::state::tool_failure::ToolFailureEntry::no_progress_streak(& self) -> u32
+const fn ra_core::state::tool_failure::ToolFailureEntry::run_failures(& self) -> u32
+const fn ra_core::state::tool_failure::ToolFailureEntry::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::tool_failure::ToolFailureEntry::unknown(& self) -> & Unknown
+const fn ra_core::state::tool_failure::ToolFailureRecord::call_id(& self) -> & CallId
+const fn ra_core::state::tool_failure::ToolFailureRecord::evidence(& self) -> & EvidenceFingerprint
+const fn ra_core::state::tool_failure::ToolFailureRecord::input(& self) -> & ArgumentFingerprint
+const fn ra_core::state::tool_failure::ToolFailureRecord::new_evidence(& self) -> bool
+const fn ra_core::state::tool_failure::ToolFailureRecord::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::tool_failure::ToolFailureRecord::unknown(& self) -> & Unknown
+const fn ra_core::state::tool_failure::ToolFailureTracker::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::tool_failure::ToolFailureTracker::unknown(& self) -> & Unknown
+const fn ra_core::state::tool_failure::ToolOutcome::call_id(& self) -> & CallId
+const fn ra_core::state::tool_failure::ToolOutcome::evidence(& self) -> & EvidenceFingerprint
+const fn ra_core::state::tool_failure::ToolOutcome::identity(& self) -> & ToolUse
+const fn ra_core::state::tool_failure::ToolOutcome::input(& self) -> & ArgumentFingerprint
+const fn ra_core::state::tool_failure::ToolOutcome::is_refusal(& self) -> bool
 const fn ra_core::state::tool_use::AgentToolUse::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::tool_use::AgentToolUse::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_use::ToolUseAttempt::call_id(& self) -> & CallId
@@ -346,6 +368,7 @@ const fn ra_core::tool::options::ToolOptions::exposure(& self) -> ToolExposure
 const fn ra_core::tool::options::ToolOptions::failure_handling(& self) -> ToolFailureHandling
 const fn ra_core::tool::options::ToolOptions::is_advertised(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::is_discoverable(& self) -> bool
+const fn ra_core::tool::options::ToolOptions::max_no_progress_streak(& self) -> Option < NonZeroU32 >
 const fn ra_core::tool::options::ToolOptions::max_repeat_streak(& self) -> Option < NonZeroU32 >
 const fn ra_core::tool::options::ToolOptions::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::options::ToolOptions::timeout(& self) -> Option < Duration >
@@ -356,9 +379,11 @@ const fn ra_core::tool::options::ToolOptions::with_availability(mut self, availa
 const fn ra_core::tool::options::ToolOptions::with_concurrency(mut self, concurrency : ToolConcurrency) -> Self
 const fn ra_core::tool::options::ToolOptions::with_exposure(mut self, exposure : ToolExposure) -> Self
 const fn ra_core::tool::options::ToolOptions::with_failure_handling(mut self, handling : ToolFailureHandling) -> Self
+const fn ra_core::tool::options::ToolOptions::with_max_no_progress_streak(mut self, max : NonZeroU32) -> Self
 const fn ra_core::tool::options::ToolOptions::with_max_repeat_streak(mut self, max : NonZeroU32) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout(mut self, timeout : Duration) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout_behavior(mut self, behavior : ToolTimeoutBehavior) -> Self
+const fn ra_core::tool::options::ToolOptions::without_no_progress_limit(mut self) -> Self
 const fn ra_core::tool::options::ToolOptions::without_repeat_limit(mut self) -> Self
 const fn ra_core::tool::origin::ToolLookupKey::is_deferred_top_level(& self) -> bool
 const fn ra_core::tool::origin::ToolLookupKey::kind(& self) -> ToolLookupKind
@@ -430,8 +455,11 @@ const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
+const ra_core::state::tool_failure::TOOL_FAILURE_RECENT_LIMIT: usize
+const ra_core::state::tool_failure::TOOL_FAILURE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_use::TOOL_USE_RECENT_LIMIT: usize
 const ra_core::state::tool_use::TOOL_USE_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::options::DEFAULT_MAX_NO_PROGRESS_STREAK: NonZeroU32
 const ra_core::tool::options::DEFAULT_MAX_REPEAT_STREAK: NonZeroU32
 const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_LOOKUP_KEY_SCHEMA_VERSION: SchemaVersion
@@ -777,7 +805,25 @@ fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
 fn ra_core::state::run::RunState::new() -> Self
 fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker
+fn ra_core::state::run::RunState::trackers_mut(& mut self) -> (& mut ToolUseTracker , & mut ToolFailureTracker)
+fn ra_core::state::run::RunState::with_tool_failure(mut self, tool_failure : ToolFailureTracker) -> Self
 fn ra_core::state::run::RunState::with_tool_use(mut self, tool_use : ToolUseTracker) -> Self
+fn ra_core::state::tool_failure::AgentToolFailures::entries(& self) -> & [ToolFailureEntry]
+fn ra_core::state::tool_failure::AgentToolFailures::entry(& self, identity : & ToolUse) -> Option < & ToolFailureEntry >
+fn ra_core::state::tool_failure::AgentToolFailures::run_failures(& self) -> u32
+fn ra_core::state::tool_failure::EvidenceFingerprint::as_str(& self) -> & str
+fn ra_core::state::tool_failure::EvidenceFingerprint::compute(observation : & Value) -> Self
+fn ra_core::state::tool_failure::ToolFailureEntry::recent(& self) -> & [ToolFailureRecord]
+fn ra_core::state::tool_failure::ToolFailureRecord::code(& self) -> & str
+fn ra_core::state::tool_failure::ToolFailureTracker::agent(& self, agent : & AgentId) -> Option < & AgentToolFailures >
+fn ra_core::state::tool_failure::ToolFailureTracker::agents(& self) -> impl Iterator < Item = (& AgentId , & AgentToolFailures) >
+fn ra_core::state::tool_failure::ToolFailureTracker::new() -> Self
+fn ra_core::state::tool_failure::ToolFailureTracker::no_progress_streak(& self, agent : & AgentId, identity : & ToolUse) -> u32
+fn ra_core::state::tool_failure::ToolFailureTracker::record_turn(& mut self, agent : & AgentId, outcomes : impl IntoIterator < Item = ToolOutcome >)
+fn ra_core::state::tool_failure::ToolOutcome::failed(identity : ToolUse, call_id : CallId, arguments : & Value, observation : & Value, code : impl Into < String >) -> Self
+fn ra_core::state::tool_failure::ToolOutcome::failure_code(& self) -> Option < & str >
+fn ra_core::state::tool_failure::ToolOutcome::refused(identity : ToolUse, call_id : CallId, arguments : & Value, observation : & Value) -> Self
+fn ra_core::state::tool_failure::ToolOutcome::succeeded(identity : ToolUse, call_id : CallId, arguments : & Value, observation : & Value) -> Self
 fn ra_core::state::tool_use::AgentToolUse::entries(& self) -> & [ToolUseEntry]
 fn ra_core::state::tool_use::AgentToolUse::entry(& self, identity : & ToolUse) -> Option < & ToolUseEntry >
 fn ra_core::state::tool_use::AgentToolUse::run_calls(& self) -> u32
@@ -942,6 +988,7 @@ mod ra_core::prompt
 mod ra_core::session
 mod ra_core::state
 mod ra_core::state::run
+mod ra_core::state::tool_failure
 mod ra_core::state::tool_use
 mod ra_core::state::work
 mod ra_core::step
@@ -1026,6 +1073,12 @@ struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
 struct ra_core::state::run::RunState
+struct ra_core::state::tool_failure::AgentToolFailures
+struct ra_core::state::tool_failure::EvidenceFingerprint
+struct ra_core::state::tool_failure::ToolFailureEntry
+struct ra_core::state::tool_failure::ToolFailureRecord
+struct ra_core::state::tool_failure::ToolFailureTracker
+struct ra_core::state::tool_failure::ToolOutcome
 struct ra_core::state::tool_use::AgentToolUse
 struct ra_core::state::tool_use::ArgumentFingerprint
 struct ra_core::state::tool_use::ToolUseAttempt
@@ -1142,6 +1195,7 @@ variant ra_core::error::SessionErrorKind::VersionMismatch
 variant ra_core::error::ToolErrorKind::Cancelled
 variant ra_core::error::ToolErrorKind::ExecutionFailed
 variant ra_core::error::ToolErrorKind::InvalidInput
+variant ra_core::error::ToolErrorKind::NoProgress
 variant ra_core::error::ToolErrorKind::NotFound
 variant ra_core::error::ToolErrorKind::RepeatedCall
 variant ra_core::error::ToolErrorKind::Timeout

@@ -118,7 +118,7 @@ impl core::fmt::Display for ArgumentFingerprint {
 /// additive feature: any crate anywhere in the dependency graph can switch `Map` to an `IndexMap`,
 /// and the fingerprints of an entire deployment would then change with the linked feature set
 /// rather than with the data. Sorting here makes the digest a property of the value.
-fn canonicalize(value: &Value) -> Value {
+pub(crate) fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut sorted: Vec<(&String, &Value)> = map.iter().collect();
@@ -643,7 +643,7 @@ fn fingerprint_turn(attempts: &[ToolUseAttempt]) -> TurnFingerprint {
 }
 
 /// Adds the equality-defining portion of one action identity to a turn digest.
-fn update_identity_digest(digest: &mut Sha256, identity: &ToolUse) {
+pub(crate) fn update_identity_digest(digest: &mut Sha256, identity: &ToolUse) {
     match identity {
         ToolUse::Tool(key) => {
             update_digest(digest, b"type", b"tool");
@@ -677,7 +677,7 @@ fn update_identity_digest(digest: &mut Sha256, identity: &ToolUse) {
 }
 
 /// Length-prefixes every segment so adjacent attempts cannot produce an ambiguous byte stream.
-fn update_digest(digest: &mut Sha256, label: &[u8], value: impl AsRef<[u8]>) {
+pub(crate) fn update_digest(digest: &mut Sha256, label: &[u8], value: impl AsRef<[u8]>) {
     let value = value.as_ref();
     digest.update((label.len() as u64).to_be_bytes());
     digest.update(label);

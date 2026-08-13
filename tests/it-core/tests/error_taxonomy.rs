@@ -42,6 +42,7 @@ fn all_errors() -> Vec<Error> {
         ToolErrorKind::Timeout,
         ToolErrorKind::ExecutionFailed,
         ToolErrorKind::RepeatedCall,
+        ToolErrorKind::NoProgress,
         ToolErrorKind::Cancelled,
     ] {
         v.push(Error::tool(kind, "exec_command", "工具失败"));

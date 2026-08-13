@@ -16,7 +16,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel,
     },
-    state::ToolUseTracker,
+    state::{ToolFailureTracker, ToolUseTracker},
     tool::{Tool, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::{
@@ -242,6 +242,7 @@ async fn test_agent_binding_04() {
         Arc::new(Host),
         &cancel,
         &mut tracker,
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -287,6 +288,7 @@ async fn test_agent_binding_05() {
         Arc::new(Host),
         &cancel,
         &mut tracker,
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -320,6 +322,7 @@ async fn test_agent_binding_06() {
         Arc::new(Host),
         &cancel,
         &mut tracker,
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();

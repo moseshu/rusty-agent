@@ -15,7 +15,7 @@ use ra_core::{
     cancel::CancelScope,
     error::Result,
     item::{ModelInputItem, ModelResponse, RunItem},
-    state::{ToolUseTracker, WorkStateHandle},
+    state::{ToolFailureTracker, ToolUseTracker, WorkStateHandle},
     step::SingleStepResult,
     tool::ToolRuntimeContext,
 };
@@ -39,11 +39,12 @@ use resolve::{resolve_next_step, step_items};
 
 /// Inputs for settling one turn.
 ///
-/// [`ToolUseTracker`] is run-scoped state and the only `&mut` here, which is deliberate: it is what
-/// makes the per-turn counts a fact about the run rather than about one function call. It is also
-/// **required rather than optional** — a caller that could omit it would get a run whose repeat
-/// streaks silently never advance, and R3-6's loop breaker would read zero forever while the model
-/// looped.
+/// The two trackers are run-scoped state and the only `&mut` here, which is deliberate: they are
+/// what make the counts a fact about the run rather than about one function call. Both are
+/// **required rather than optional** — a caller that could omit either would get a run whose
+/// streaks silently never advance, and the loop breakers would read zero forever while the model
+/// looped. [`RunState::trackers_mut`](ra_core::state::RunState::trackers_mut) hands over both at
+/// once, because they are two fields of the same state.
 #[must_use]
 #[non_exhaustive]
 pub struct TurnSettlementRequest<'a> {
@@ -53,6 +54,7 @@ pub struct TurnSettlementRequest<'a> {
     context: Arc<dyn ToolRuntimeContext>,
     cancel: &'a CancelScope,
     tool_use: &'a mut ToolUseTracker,
+    tool_failure: &'a mut ToolFailureTracker,
     work_state: Option<Arc<dyn WorkStateHandle>>,
     max_function_tool_concurrency: usize,
     original_input: Vec<ModelInputItem>,
@@ -77,6 +79,7 @@ impl<'a> TurnSettlementRequest<'a> {
         context: Arc<dyn ToolRuntimeContext>,
         cancel: &'a CancelScope,
         tool_use: &'a mut ToolUseTracker,
+        tool_failure: &'a mut ToolFailureTracker,
     ) -> Self {
         Self {
             agent,
@@ -85,6 +88,7 @@ impl<'a> TurnSettlementRequest<'a> {
             context,
             cancel,
             tool_use,
+            tool_failure,
             work_state: None,
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             original_input: Vec::new(),
@@ -143,6 +147,7 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
         &processed,
         public_id,
         request.tool_use,
+        request.tool_failure,
         Arc::clone(&request.context),
         request.cancel,
     );
@@ -152,6 +157,18 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     execution_request =
         execution_request.with_max_function_tool_concurrency(request.max_function_tool_concurrency);
     let execution = execute_actions(execution_request).await?;
+
+    // 2b. Record how it turned out, the mirror of 1b and for the mirror-image reason. Attempts have
+    // to be filed before execution so the repeat breaker sees the turn it is being asked about;
+    // outcomes cannot be, because they do not exist until the calls have run. Filing them here
+    // rather than inside the batch keeps one settled turn producing one set of records.
+    //
+    // What is recorded is what came back, classified: a call that failed and a call that succeeded
+    // are the difference between a streak advancing and a streak clearing, and a call that never
+    // ran is neither.
+    request
+        .tool_failure
+        .record_turn(public_id, execution.outcomes().to_vec());
 
     // 3. Decide. One function, four states, priority written down once.
     let next_step = resolve_next_step(

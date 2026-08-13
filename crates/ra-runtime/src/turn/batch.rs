@@ -42,18 +42,18 @@ use ra_core::{
     cancel::{CancelReason, CancelScope, DRAIN_GRACE, ScopeKind},
     error::{Error, Result, ToolErrorKind},
     item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
-    state::{ToolUseTracker, WorkStateHandle},
-    step::ProcessedResponse,
+    state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker, WorkStateHandle},
+    step::{ProcessedResponse, ToolRunFunction},
     tool::{ToolConcurrency, ToolOrigin, ToolRuntimeContext},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     sync::{RwLock, Semaphore},
     task::{Id, JoinError, JoinSet},
 };
 use tracing::{error, warn};
 
-use crate::tool::dispatch::{ToolDispatch, ToolDispatchRequest, dispatch_tool};
+use crate::tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool};
 
 /// Default cap for all function-tool dispatch chains in one model response.
 ///
@@ -69,6 +69,7 @@ pub struct TurnExecution {
     new_items: Vec<RunItem>,
     interruptions: Vec<RunItem>,
     tool_results: Vec<ToolUseResult>,
+    outcomes: Vec<ToolOutcome>,
 }
 
 /// One completed task, retained until the whole batch is known to be safe to settle.
@@ -142,6 +143,18 @@ impl TurnExecution {
     pub fn tool_results(&self) -> &[ToolUseResult] {
         &self.tool_results
     }
+
+    /// How each answered call turned out, in the response's model order.
+    ///
+    /// Three things distinguish this from `new_items`. A call still awaiting approval is absent —
+    /// it has not turned out any way yet. A call the chain refused is present *as a refusal*, which
+    /// says nothing about the tool and clears whatever streak was running, rather than as a
+    /// failure. And a call whose tool shaped its own failure text is present **as a failure**,
+    /// which is the classification the rendered result deliberately does not carry.
+    #[must_use]
+    pub fn outcomes(&self) -> &[ToolOutcome] {
+        &self.outcomes
+    }
 }
 
 /// Inputs for answering one classified response.
@@ -151,6 +164,7 @@ pub struct TurnExecutionRequest<'a> {
     processed: &'a ProcessedResponse,
     agent_id: &'a AgentId,
     tool_use: &'a ToolUseTracker,
+    tool_failure: &'a ToolFailureTracker,
     context: Arc<dyn ToolRuntimeContext>,
     cancel: &'a CancelScope,
     work_state: Option<Arc<dyn WorkStateHandle>>,
@@ -163,6 +177,7 @@ impl<'a> TurnExecutionRequest<'a> {
         processed: &'a ProcessedResponse,
         agent_id: &'a AgentId,
         tool_use: &'a ToolUseTracker,
+        tool_failure: &'a ToolFailureTracker,
         context: Arc<dyn ToolRuntimeContext>,
         cancel: &'a CancelScope,
     ) -> Self {
@@ -170,6 +185,7 @@ impl<'a> TurnExecutionRequest<'a> {
             processed,
             agent_id,
             tool_use,
+            tool_failure,
             context,
             cancel,
             work_state: None,
@@ -231,9 +247,15 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
         // Asked of the action, never rebuilt from its parts: settlement recorded this turn under
         // `identity()` a moment ago, and a second derivation that drifted would look up something
         // nothing ever recorded and hand the breaker a permanent zero.
-        let repeat_streak = request
-            .tool_use
-            .repeat_streak(request.agent_id, &action.identity());
+        let identity = action.identity();
+        // Admission reads the run's records as they stood when this response arrived; see
+        // `circuit::admit_progress` for what that means for several calls in one response.
+        let history = CallHistory::new(
+            request.tool_use.repeat_streak(request.agent_id, &identity),
+            request
+                .tool_failure
+                .no_progress_streak(request.agent_id, &identity),
+        );
         let tool_scope = request.cancel.child(ScopeKind::Tool);
         let mut dispatch_request = ToolDispatchRequest::new(
             Arc::clone(action.tool()),
@@ -241,7 +263,7 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
             action.call().arguments().clone(),
             Arc::clone(&request.context),
             tool_scope.clone(),
-            repeat_streak,
+            history,
         );
         if let Some(work_state) = &request.work_state {
             dispatch_request = dispatch_request.with_work_state(Arc::clone(work_state));
@@ -313,7 +335,7 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
     // has already driven every spawned task to a terminal state before this line, so returning
     // here can neither detach a tool task nor leave half a batch written.
     request.cancel.ensure_not_cancelled()?;
-    settle_dispatches(collected, &mut execution)?;
+    settle_dispatches(collected, processed, &mut execution)?;
 
     // A name the turn never advertised still owes an output. Answering it in the same structured
     // shape a failing tool uses means the model reads one error format, not two.
@@ -578,19 +600,29 @@ fn merge_failure(
 /// a run report [`FinishReason::ToolStop`](ra_core::finish::FinishReason::ToolStop), whose
 /// `is_complete()` is true, over something that went wrong.
 ///
-/// Two observations look like results and are not:
+/// Two answers look like results and are not:
 ///
-/// - **A call the chain refused before running it.** Caller admission answers `tool.not_found`, so
-///   from the model's side that tool does not exist — and `execute_actions` already keeps the other
-///   half of that same story, a name the turn never advertised, out of `tool_results`. Reporting a
-///   completed run over a tool that never executed is the sharper version of the problem.
+/// - **A call the chain refused before running it**, which is [`ToolDispatch::Refused`] and so is
+///   excluded by the match rather than by inspecting what it rendered. `execute_actions` keeps the
+///   other half of that same story, a name the turn never advertised, out of `tool_results` too.
+///   Reporting a completed run over a tool that never executed is the sharper version of the
+///   problem.
 /// - **A call that ran and failed** under `ToolFailureHandling::ModelVisible`. The model has not
 ///   even read the failure yet, which is precisely why settlement owes it another turn.
 ///
 /// A tool that handled its own failure through `ToolFailureHandling::Custom` *does* produce a
 /// result: it returned a value it means the model to act on, and it wrote that value itself.
+///
+/// # Why the outcome record is built here and not from the items
+///
+/// The no-progress records need the identity, the arguments, the result, and whether the call
+/// failed. The first two come from the action the response bound, the last two from the dispatch —
+/// and only here are all four in scope at once. Rebuilding any of them later would mean reading a
+/// classification back out of a rendered item, which is exactly the derivation
+/// [`ToolObservation`](crate::tool::dispatch::ToolObservation) exists to make unnecessary.
 fn settle_dispatches(
     mut collected: CollectedDispatches,
+    processed: &ProcessedResponse,
     execution: &mut TurnExecution,
 ) -> Result<()> {
     if let Some(failure) = collected.failure {
@@ -600,7 +632,23 @@ fn settle_dispatches(
     collected.completed.sort_by_key(|completed| completed.order);
     for completed in collected.completed {
         match completed.dispatch {
-            ToolDispatch::Observed(output) => {
+            ToolDispatch::Observed(observation) => {
+                // `order` indexes the same list the dispatch was spawned from, so the action it
+                // names is the one this observation answers.
+                if let Some(action) = processed.functions().get(completed.order) {
+                    let result = observation.output().output();
+                    execution.outcomes.push(match observation.failure_code() {
+                        None => outcome(action, ToolOutcome::succeeded, result),
+                        Some(code) => ToolOutcome::failed(
+                            action.identity(),
+                            action.call_id().clone(),
+                            action.call().arguments(),
+                            result,
+                            code,
+                        ),
+                    });
+                }
+                let output = observation.into_output();
                 if !output.is_error() {
                     execution
                         .tool_results
@@ -609,6 +657,21 @@ fn settle_dispatches(
                 execution
                     .new_items
                     .push(output_item(&completed.call_id, output));
+            }
+            ToolDispatch::Refused(refusal) => {
+                if let Some(action) = processed.functions().get(completed.order) {
+                    execution.outcomes.push(outcome(
+                        action,
+                        ToolOutcome::refused,
+                        refusal.output().output(),
+                    ));
+                }
+                // Never a `ToolUseResult`: a stop policy cannot inspect what it stops on, and a run
+                // reporting `FinishReason::ToolStop` over a call that never ran would be reporting
+                // that the agent reached its own conclusion.
+                execution
+                    .new_items
+                    .push(output_item(&completed.call_id, refusal.into_output()));
             }
             ToolDispatch::AwaitingApproval(approval) => {
                 let item = RunItem::new(
@@ -621,6 +684,25 @@ fn settle_dispatches(
         }
     }
     Ok(())
+}
+
+/// Builds the record of how one call turned out.
+///
+/// The identity is asked of the action rather than rebuilt from its parts, for the reason the
+/// attempt trail is: settlement recorded this turn under `identity()`, and a second derivation that
+/// drifted would file the outcome under something nothing ever counted, leaving the breaker on a
+/// permanent zero.
+fn outcome(
+    action: &ToolRunFunction,
+    build: fn(ToolUse, CallId, &Value, &Value) -> ToolOutcome,
+    result: &Value,
+) -> ToolOutcome {
+    build(
+        action.identity(),
+        action.call_id().clone(),
+        action.call().arguments(),
+        result,
+    )
 }
 
 /// R17's insertion point for executing a transfer of control.

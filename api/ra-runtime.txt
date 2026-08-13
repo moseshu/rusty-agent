@@ -21,7 +21,17 @@ const fn ra_runtime::runner::result::RunResult::outcome(& self) -> & RunOutcome
 const fn ra_runtime::runner::result::RunResult::state(& self) -> & RunState
 const fn ra_runtime::runner::result::RunResult::tool_use(& self) -> & ToolUseTracker
 const fn ra_runtime::runner::result::RunResult::turns(& self) -> u32
+const fn ra_runtime::tool::dispatch::CallHistory::new(repeat_streak : u32, no_progress_streak : u32) -> Self
+const fn ra_runtime::tool::dispatch::CallHistory::no_progress_streak(& self) -> u32
+const fn ra_runtime::tool::dispatch::CallHistory::repeat_streak(& self) -> u32
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_caller(mut self, caller : ToolCaller) -> Self
+const fn ra_runtime::tool::dispatch::ToolObservation::failed(output : ToolCallOutput, code : & 'static str) -> Self
+const fn ra_runtime::tool::dispatch::ToolObservation::failure_code(& self) -> Option < & 'static str >
+const fn ra_runtime::tool::dispatch::ToolObservation::output(& self) -> & ToolCallOutput
+const fn ra_runtime::tool::dispatch::ToolObservation::succeeded(output : ToolCallOutput) -> Self
+const fn ra_runtime::tool::dispatch::ToolRefusal::code(& self) -> & 'static str
+const fn ra_runtime::tool::dispatch::ToolRefusal::new(output : ToolCallOutput, code : & 'static str) -> Self
+const fn ra_runtime::tool::dispatch::ToolRefusal::output(& self) -> & ToolCallOutput
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
@@ -53,17 +63,20 @@ fn ra_runtime::runner::result::RunResult::model_responses(& self) -> & [ModelRes
 fn ra_runtime::runner::result::RunResult::new_items(& self) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInputItem]
 fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
-fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, context : Arc < dyn ToolRuntimeContext >, cancel : CancelScope, repeat_streak : u32) -> Self
+fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, context : Arc < dyn ToolRuntimeContext >, cancel : CancelScope, history : CallHistory) -> Self
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
-fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker) -> Self
+fn ra_runtime::tool::dispatch::ToolObservation::into_output(self) -> ToolCallOutput
+fn ra_runtime::tool::dispatch::ToolRefusal::into_output(self) -> ToolCallOutput
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker, tool_failure : & 'a mut ToolFailureTracker) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
 fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]
+fn ra_runtime::turn::batch::TurnExecution::outcomes(& self) -> & [ToolOutcome]
 fn ra_runtime::turn::batch::TurnExecution::tool_results(& self) -> & [ToolUseResult]
-fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, tool_failure : & 'a ToolFailureTracker, context : Arc < dyn ToolRuntimeContext >, cancel : & 'a CancelScope) -> Self
 fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
@@ -100,7 +113,10 @@ struct ra_runtime::runner::RunRequest
 struct ra_runtime::runner::Runner
 struct ra_runtime::runner::result::RunResult
 struct ra_runtime::runner::stream::RunStream
+struct ra_runtime::tool::dispatch::CallHistory
 struct ra_runtime::tool::dispatch::ToolDispatchRequest
+struct ra_runtime::tool::dispatch::ToolObservation
+struct ra_runtime::tool::dispatch::ToolRefusal
 struct ra_runtime::turn::TurnSettlementRequest
 struct ra_runtime::turn::batch::TurnExecution
 struct ra_runtime::turn::batch::TurnExecutionRequest
@@ -115,4 +131,5 @@ variant ra_runtime::runner::stream::RunStreamEvent::Finished(RunOutcome)
 variant ra_runtime::runner::stream::RunStreamEvent::Item(RunItem)
 variant ra_runtime::runner::stream::RunStreamEvent::TurnStarted { turn: u32, agent: AgentId }
 variant ra_runtime::tool::dispatch::ToolDispatch::AwaitingApproval(ToolApproval)
-variant ra_runtime::tool::dispatch::ToolDispatch::Observed(ToolCallOutput)
+variant ra_runtime::tool::dispatch::ToolDispatch::Observed(ToolObservation)
+variant ra_runtime::tool::dispatch::ToolDispatch::Refused(ToolRefusal)

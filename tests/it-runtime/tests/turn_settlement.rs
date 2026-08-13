@@ -22,7 +22,7 @@ use ra_core::{
         RunItemKind, ToolCall,
     },
     model::ModelHandoffDefinition,
-    state::ToolUseTracker,
+    state::{ToolFailureTracker, ToolUseTracker},
     step::NextStep,
     tool::{
         Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolFailureHandling, ToolInvocation,
@@ -649,6 +649,7 @@ async fn test_turn_settlement_01() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -685,6 +686,7 @@ async fn test_turn_settlement_02() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -744,6 +746,7 @@ async fn test_turn_settlement_03() {
             Arc::new(Host),
             &cancel,
             &mut tracker,
+            &mut ToolFailureTracker::new(),
         ))
         .await
     });
@@ -806,6 +809,7 @@ async fn test_turn_settlement_04() {
                 Arc::new(Host),
                 &cancel,
                 &mut tracker,
+                &mut ToolFailureTracker::new(),
             )
             .with_max_function_tool_concurrency(1),
         )
@@ -871,6 +875,7 @@ async fn test_turn_settlement_05() {
             Arc::new(Host),
             &cancel,
             &mut tracker,
+            &mut ToolFailureTracker::new(),
         ))
         .await
     });
@@ -931,6 +936,7 @@ async fn settle_simultaneous_failures(classes: &[PropagatingFailure]) -> Error {
             Arc::new(Host),
             &cancel,
             &mut tracker,
+            &mut ToolFailureTracker::new(),
         ))
         .await
     });
@@ -1045,6 +1051,7 @@ async fn test_turn_settlement_08() {
                 Arc::new(Host),
                 &cancel,
                 &mut tracker,
+                &mut ToolFailureTracker::new(),
             ))
             .await
         });
@@ -1119,6 +1126,7 @@ async fn test_turn_settlement_09() {
                 Arc::new(Host),
                 &cancel,
                 &mut tracker,
+                &mut ToolFailureTracker::new(),
             ))
             .await
         });
@@ -1164,6 +1172,7 @@ async fn test_turn_settlement_10() {
             Arc::new(Host),
             &cancel,
             &mut tracker,
+            &mut ToolFailureTracker::new(),
         ))
         .await
     });
@@ -1196,6 +1205,7 @@ async fn test_turn_settlement_11() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1226,6 +1236,7 @@ async fn test_turn_settlement_12() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1277,6 +1288,7 @@ async fn test_turn_settlement_13() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1306,6 +1318,7 @@ async fn test_turn_settlement_14() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1351,6 +1364,7 @@ async fn test_turn_settlement_15() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap_err();
@@ -1382,6 +1396,7 @@ async fn test_turn_settlement_16() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1411,6 +1426,7 @@ async fn test_turn_settlement_17() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1432,6 +1448,7 @@ async fn test_turn_settlement_17() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap_err();
@@ -1467,6 +1484,7 @@ async fn test_turn_settlement_18() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap_err();
@@ -1491,6 +1509,7 @@ async fn test_turn_settlement_19() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap_err();
@@ -1542,6 +1561,7 @@ async fn test_turn_settlement_20() {
             Arc::new(Host),
             &cancel,
             &mut ToolUseTracker::new(),
+            &mut ToolFailureTracker::new(),
         ))
         .await;
 
@@ -1573,6 +1593,7 @@ async fn test_turn_settlement_21() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1610,6 +1631,7 @@ async fn test_turn_settlement_22() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap_err();
@@ -1637,6 +1659,7 @@ async fn test_turn_settlement_23() {
         Arc::new(Host),
         &cancel,
         &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .unwrap();
@@ -1667,6 +1690,7 @@ async fn test_turn_settlement_24() {
             Arc::new(Host),
             &cancel,
             &mut ToolUseTracker::new(),
+            &mut ToolFailureTracker::new(),
         )
         .with_original_input(original.clone())
         .with_pre_step_items(vec![message("old-1", "上一轮")]),
@@ -1716,6 +1740,7 @@ async fn test_turn_settlement_26() {
             Arc::new(Host),
             &cancel,
             &mut ToolUseTracker::new(),
+            &mut ToolFailureTracker::new(),
         ))
         .await
         .unwrap(),

@@ -7,10 +7,10 @@ use ra_core::{
     item::CallId,
     state::WorkStateHandle,
     tool::{
-        DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller,
-        ToolConcurrency, ToolExposure, ToolFailureHandling, ToolGuardrailId, ToolInvocation,
-        ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
-        ToolTimeoutBehavior,
+        DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy,
+        ToolAvailability, ToolCaller, ToolConcurrency, ToolExposure, ToolFailureHandling,
+        ToolGuardrailId, ToolInvocation, ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin,
+        ToolOutput, ToolSchema, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -254,6 +254,10 @@ fn test_tool_contract_08() {
     assert_eq!(restored.output_guardrails().len(), 1);
     assert_eq!(restored.max_repeat_streak(), NonZeroU32::new(5));
     assert_eq!(
+        restored.max_no_progress_streak(),
+        Some(DEFAULT_MAX_NO_PROGRESS_STREAK)
+    );
+    assert_eq!(
         restored.unknown().get("future_executor_policy"),
         Some(&json!({"version": 2}))
     );
@@ -274,7 +278,7 @@ fn test_tool_contract_09() {
     assert!(options.is_advertised());
     assert!(!options.is_discoverable());
 
-    // The loop breaker is off until a tool asks for it. A refused call is still recorded as an
+    // The repeat breaker is off until a tool asks for it. A refused call is still recorded as an
     // attempt, so a threshold latches: once reached, that tool stays refused for every identical
     // call in the run, and a tool whose arguments never vary has no way back.
     assert_eq!(options.max_repeat_streak(), None);
@@ -284,6 +288,27 @@ fn test_tool_contract_09() {
             .without_repeat_limit()
             .max_repeat_streak(),
         None
+    );
+
+    // The no-progress breaker is on, and the difference is what makes that safe: it counts
+    // failures that told the run nothing new, firing clears the count, and no tool is lost for the
+    // rest of the run. A tool whose repeated identical failure is not a stuck run — a readiness
+    // probe — can still say so.
+    assert_eq!(
+        options.max_no_progress_streak(),
+        Some(DEFAULT_MAX_NO_PROGRESS_STREAK)
+    );
+    assert_eq!(
+        ToolOptions::new()
+            .without_no_progress_limit()
+            .max_no_progress_streak(),
+        None
+    );
+    assert_eq!(
+        ToolOptions::new()
+            .with_max_no_progress_streak(NonZeroU32::new(9).unwrap())
+            .max_no_progress_streak(),
+        NonZeroU32::new(9)
     );
 }
 

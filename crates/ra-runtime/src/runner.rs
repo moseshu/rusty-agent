@@ -329,13 +329,15 @@ async fn run_loop(
         // `ModelResponse` either way.
         let response = turn_scope.run(model.get_response(model_request)).await??;
 
+        let (tool_use, tool_failure) = state.trackers_mut();
         let mut settlement = TurnSettlementRequest::new(
             &agent,
             &response,
             &surface,
             Arc::clone(&tool_context),
             &turn_scope,
-            state.tool_use_mut(),
+            tool_use,
+            tool_failure,
         )
         .with_original_input(original_input.clone())
         .with_pre_step_items(generated.clone());

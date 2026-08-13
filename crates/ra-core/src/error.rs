@@ -143,6 +143,13 @@ pub enum ToolErrorKind {
     /// or the environment failed. What the reader has to know is that the *same* call has already
     /// been made and that repeating it will keep being refused.
     RepeatedCall,
+    /// The call was refused before it ran, because this tool keeps failing without telling the run
+    /// anything it did not already know.
+    ///
+    /// Distinct from [`Self::RepeatedCall`]: that one is about the request being identical, this
+    /// one is about the answer being identical. Changing the arguments clears the first and does
+    /// nothing for the second — only a result the run has not seen before does.
+    NoProgress,
     /// The tool was cancelled (including a cancellation on the MCP side).
     Cancelled,
 }
@@ -521,6 +528,9 @@ impl Error {
                 }
                 // The identical call is the one thing that cannot work; anything else still can.
                 ToolErrorKind::RepeatedCall => Recoverability::RetryableWithChange,
+                // Repeating this tool is what stopped working. Another approach, or another tool,
+                // still may — which is precisely what the refusal is asking for.
+                ToolErrorKind::NoProgress => Recoverability::RetryableWithChange,
                 ToolErrorKind::NotFound => Recoverability::Fatal,
                 ToolErrorKind::Cancelled => Recoverability::Cancelled,
             },
@@ -600,6 +610,7 @@ impl Error {
                 ToolErrorKind::Timeout => "tool.timeout",
                 ToolErrorKind::ExecutionFailed => "tool.execution_failed",
                 ToolErrorKind::RepeatedCall => "tool.repeated_call",
+                ToolErrorKind::NoProgress => "tool.no_progress",
                 ToolErrorKind::Cancelled => "tool.cancelled",
             },
             Self::Sandbox { kind, .. } => match kind {
@@ -675,6 +686,9 @@ impl Error {
                 ToolErrorKind::ExecutionFailed => format!("工具 `{tool}` 执行失败。"),
                 ToolErrorKind::RepeatedCall => {
                     format!("工具 `{tool}` 被连续以相同参数调用，已拦截。")
+                }
+                ToolErrorKind::NoProgress => {
+                    format!("工具 `{tool}` 连续失败且没有新信息，已拦截。")
                 }
                 ToolErrorKind::Cancelled => format!("工具 `{tool}` 已取消。"),
             },

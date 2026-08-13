@@ -26,6 +26,18 @@ pub const DEFAULT_MAX_REPEAT_STREAK: NonZeroU32 = match NonZeroU32::new(3) {
     None => unreachable!(),
 };
 
+/// How many consecutive uninformative failures a tool is allowed before it is refused.
+///
+/// Unlike [`DEFAULT_MAX_REPEAT_STREAK`] this one is the default rather than a suggestion, and the
+/// difference between the two thresholds is what makes that safe. A repeat streak counts identical
+/// *requests*, which a run makes for good reasons; this counts failures that returned an answer the
+/// run had already been given, which it never does for a good reason. Any success on the tool
+/// clears it, so a false positive costs one refused call rather than the tool.
+pub const DEFAULT_MAX_NO_PROGRESS_STREAK: NonZeroU32 = match NonZeroU32::new(3) {
+    Some(value) => value,
+    None => unreachable!(),
+};
+
 /// Whether a tool is available in the current run.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -215,6 +227,8 @@ pub struct ToolOptions {
     failure_handling: ToolFailureHandling,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_repeat_streak: Option<NonZeroU32>,
+    #[serde(default = "default_max_no_progress_streak")]
+    max_no_progress_streak: Option<NonZeroU32>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -244,6 +258,8 @@ struct ToolOptionsWire {
     failure_handling: ToolFailureHandling,
     #[serde(default)]
     max_repeat_streak: Option<NonZeroU32>,
+    #[serde(default = "default_max_no_progress_streak")]
+    max_no_progress_streak: Option<NonZeroU32>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -281,6 +297,7 @@ impl<'de> Deserialize<'de> for ToolOptions {
             output_guardrails: deduplicate_guardrails(wire.output_guardrails),
             failure_handling: wire.failure_handling,
             max_repeat_streak: wire.max_repeat_streak,
+            max_no_progress_streak: wire.max_no_progress_streak,
             unknown: wire.unknown,
         })
     }
@@ -301,6 +318,7 @@ impl Default for ToolOptions {
             output_guardrails: Vec::new(),
             failure_handling: ToolFailureHandling::ModelVisible,
             max_repeat_streak: None,
+            max_no_progress_streak: Some(DEFAULT_MAX_NO_PROGRESS_STREAK),
             unknown: Unknown::new(),
         }
     }
@@ -404,6 +422,30 @@ impl ToolOptions {
         self
     }
 
+    /// Sets how many consecutive uninformative failures this tool is allowed.
+    ///
+    /// The threshold does not affect scheduling. Calls are dispatched exactly as
+    /// [`ToolConcurrency`] says, and admission reads the run's records as they stood when the
+    /// response arrived — so a response may contain several calls that all pass, with the limit
+    /// enforced on the next one. Anything that changed that would be withdrawing a tool's declared
+    /// concurrency through an unrelated setting, and would have to be asked for rather than
+    /// implied.
+    #[must_use]
+    pub const fn with_max_no_progress_streak(mut self, max: NonZeroU32) -> Self {
+        self.max_no_progress_streak = Some(max);
+        self
+    }
+
+    /// Exempts this tool from the no-progress breaker.
+    ///
+    /// For the tool whose repeated identical failure is not a stuck run: a readiness probe that
+    /// fails the same way until the thing it waits for exists is the shape to expect here.
+    #[must_use]
+    pub const fn without_no_progress_limit(mut self) -> Self {
+        self.max_no_progress_streak = None;
+        self
+    }
+
     /// Schema version.
     #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
@@ -504,11 +546,24 @@ impl ToolOptions {
         self.max_repeat_streak
     }
 
+    /// No-progress threshold for the failure breaker, or `None` when it is off.
+    #[must_use]
+    pub const fn max_no_progress_streak(&self) -> Option<NonZeroU32> {
+        self.max_no_progress_streak
+    }
+
     /// Unknown fields retained during deserialization.
     #[must_use]
     pub const fn unknown(&self) -> &Unknown {
         &self.unknown
     }
+}
+
+/// serde's `default` takes no arguments and returns the field's own type, and the field is an
+/// `Option` because a tool can turn the breaker off. The lint asks for a shape serde cannot call.
+#[allow(clippy::unnecessary_wraps)]
+const fn default_max_no_progress_streak() -> Option<NonZeroU32> {
+    Some(DEFAULT_MAX_NO_PROGRESS_STREAK)
 }
 
 fn push_unique(values: &mut Vec<ToolGuardrailId>, value: ToolGuardrailId) {

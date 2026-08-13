@@ -37,11 +37,139 @@ use crate::circuit;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolDispatch {
-    /// The call reached a model-visible result. A failure the model is meant to react to is also
-    /// this variant, carrying `is_error`; only failures that must stop the turn leave as [`Err`].
-    Observed(ToolCallOutput),
+    /// The tool ran and reached a model-visible result. A failure the model is meant to react to
+    /// is also this variant; only failures that must stop the turn leave as [`Err`].
+    Observed(ToolObservation),
+    /// The chain answered without running the tool.
+    ///
+    /// A separate state from a failed [`Self::Observed`], because "the tool ran and failed" and
+    /// "the tool never ran" are different facts and the records built from them differ. Deriving
+    /// this from `is_error` instead would put the two on the same footing: the no-progress counter
+    /// would count its own refusals as evidence about the tool.
+    Refused(ToolRefusal),
     /// A host has to decide before the tool may run.
     AwaitingApproval(ToolApproval),
+}
+
+/// What the model is told when the chain declines to run a call.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolRefusal {
+    output: ToolCallOutput,
+    code: &'static str,
+}
+
+impl ToolRefusal {
+    /// Records a refusal under the stable code the model was shown.
+    #[must_use]
+    pub const fn new(output: ToolCallOutput, code: &'static str) -> Self {
+        Self { output, code }
+    }
+
+    /// The result the model is shown.
+    #[must_use]
+    pub const fn output(&self) -> &ToolCallOutput {
+        &self.output
+    }
+
+    /// Stable code of the refusal.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// Takes the model-visible result out.
+    #[must_use]
+    pub fn into_output(self) -> ToolCallOutput {
+        self.output
+    }
+}
+
+/// A model-visible result, plus what the chain knows about it that the result does not show.
+///
+/// The failure code is carried beside the output rather than read back out of it, because the two
+/// can disagree by design. A tool using [`ToolFailureHandling::Custom`] answers a failure with its
+/// own sentence and no error flag — that is the whole point of the seam — and a record that
+/// classified outcomes by looking at the rendered result would be blind to exactly the tools that
+/// explain themselves best.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolObservation {
+    output: ToolCallOutput,
+    failure_code: Option<&'static str>,
+}
+
+impl ToolObservation {
+    /// Records a call that produced a usable result.
+    #[must_use]
+    pub const fn succeeded(output: ToolCallOutput) -> Self {
+        Self {
+            output,
+            failure_code: None,
+        }
+    }
+
+    /// Records a call that failed, under the stable code of the failure it produced.
+    #[must_use]
+    pub const fn failed(output: ToolCallOutput, code: &'static str) -> Self {
+        Self {
+            output,
+            failure_code: Some(code),
+        }
+    }
+
+    /// The result the model is shown.
+    #[must_use]
+    pub const fn output(&self) -> &ToolCallOutput {
+        &self.output
+    }
+
+    /// Stable code of the failure, or `None` when the call produced a usable result.
+    #[must_use]
+    pub const fn failure_code(&self) -> Option<&'static str> {
+        self.failure_code
+    }
+
+    /// Takes the model-visible result out.
+    #[must_use]
+    pub fn into_output(self) -> ToolCallOutput {
+        self.output
+    }
+}
+
+/// What the run's records already say about a call, projected by the batch.
+///
+/// The two counters are separate because they answer separate questions — see
+/// [`circuit`](crate::circuit). Passing them as one value keeps a call site from transposing two
+/// bare integers whose meanings are unrelated.
+#[must_use]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallHistory {
+    repeat_streak: u32,
+    no_progress_streak: u32,
+}
+
+impl CallHistory {
+    /// Creates the projection for one call.
+    pub const fn new(repeat_streak: u32, no_progress_streak: u32) -> Self {
+        Self {
+            repeat_streak,
+            no_progress_streak,
+        }
+    }
+
+    /// Consecutive calls of this identity that carried the same arguments, including this one.
+    #[must_use]
+    pub const fn repeat_streak(&self) -> u32 {
+        self.repeat_streak
+    }
+
+    /// Consecutive failures of this identity that showed the model nothing new.
+    #[must_use]
+    pub const fn no_progress_streak(&self) -> u32 {
+        self.no_progress_streak
+    }
 }
 
 /// Inputs for one invocation.
@@ -53,7 +181,7 @@ pub struct ToolDispatchRequest {
     arguments: Value,
     context: Arc<dyn ToolRuntimeContext>,
     cancel: CancelScope,
-    repeat_streak: u32,
+    history: CallHistory,
     caller: ToolCaller,
     work_state: Option<Arc<dyn WorkStateHandle>>,
 }
@@ -70,7 +198,7 @@ impl ToolDispatchRequest {
         arguments: Value,
         context: Arc<dyn ToolRuntimeContext>,
         cancel: CancelScope,
-        repeat_streak: u32,
+        history: CallHistory,
     ) -> Self {
         Self {
             tool,
@@ -78,7 +206,7 @@ impl ToolDispatchRequest {
             arguments,
             context,
             cancel,
-            repeat_streak,
+            history,
             caller: ToolCaller::Direct,
             work_state: None,
         }
@@ -117,7 +245,7 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch>
     // side, indistinguishable from one that is not there — so it reports as `not_found` rather
     // than inventing a second way to say "you may not call this".
     if !options.allows_caller(request.caller) {
-        return Ok(observed_failure(
+        return Ok(refused(
             &request.call_id,
             &name,
             &Error::tool(
@@ -128,12 +256,12 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch>
         ));
     }
 
-    // 2. Repeat admission, before approval so a host is not asked about a call that will not run.
-    // The loop breaker lives behind one insertion point rather than being bolted onto whichever
-    // call site notices the repetition first, and it refuses the way this stage chain refuses:
+    // 2. Loop-breaker admission, before approval so a host is not asked about a call that will not
+    // run. Both breakers live behind one insertion point rather than being bolted onto whichever
+    // call site notices the repetition first, and they refuse the way this stage chain refuses:
     // with an observation the model can react to.
-    if let Some(refusal) = circuit::admit_repeat(&options, request.repeat_streak, &name) {
-        return Ok(observed_failure(&request.call_id, &name, &refusal));
+    if let Some(reason) = circuit::admit(&options, request.history, &name) {
+        return Ok(refused(&request.call_id, &name, &reason));
     }
 
     // 3. Approval, before anything runs. Static policies are answered from the declaration and
@@ -228,6 +356,11 @@ async fn shape_failure(
         ToolFailureHandling::Propagate => Err(error),
         // The one path where a tool writes its own model-facing failure text. Returning `None`
         // means the tool declined to handle it, and an unhandled failure propagates.
+        //
+        // The result reads as a plain answer to the model, and the records still have to know a
+        // call failed here: `run_tests` explaining two different failures in its own words is the
+        // case the no-progress breaker exists to *not* fire on, and it can only tell those two
+        // apart if it is told they were failures at all.
         ToolFailureHandling::Custom => {
             let invocation = request.invocation();
             match request
@@ -235,7 +368,7 @@ async fn shape_failure(
                 .run(tool.handle_failure(&invocation, &error))
                 .await??
             {
-                Some(output) => observed_success(&request.call_id, &output),
+                Some(output) => observed(&request.call_id, &output, Some(error.code())),
                 None => Err(error),
             }
         }
@@ -282,13 +415,23 @@ const fn check_output_guardrails(_options: &ToolOptions) -> Result<()> {
 }
 
 fn observed_success(call_id: &CallId, output: &ToolOutput) -> Result<ToolDispatch> {
+    observed(call_id, output, None)
+}
+
+/// Renders a tool's own output as the model-visible result, classified for the records.
+fn observed(
+    call_id: &CallId,
+    output: &ToolOutput,
+    failure_code: Option<&'static str>,
+) -> Result<ToolDispatch> {
     let payload = serde_json::to_value(output).map_err(|error| {
         Error::caller("failed to render a tool result as provider-neutral JSON").with_source(error)
     })?;
-    Ok(ToolDispatch::Observed(ToolCallOutput::new(
-        call_id.clone(),
-        payload,
-    )))
+    let output = ToolCallOutput::new(call_id.clone(), payload);
+    Ok(ToolDispatch::Observed(match failure_code {
+        None => ToolObservation::succeeded(output),
+        Some(code) => ToolObservation::failed(output, code),
+    }))
 }
 
 /// Builds the model-visible form of a failure: a stable code and the tool it came from.
@@ -296,11 +439,27 @@ fn observed_success(call_id: &CallId, output: &ToolOutput) -> Result<ToolDispatc
 /// No prose. See the module documentation — framework error text is written for logs and for the
 /// user, not for the model, and a downstream reader must branch on the code rather than on wording.
 fn observed_failure(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
-    ToolDispatch::Observed(
-        ToolCallOutput::new(
-            call_id.clone(),
-            json!({ "error": { "code": error.code(), "tool": name } }),
-        )
-        .with_error(true),
+    ToolDispatch::Observed(ToolObservation::failed(
+        failure_output(call_id, name, error),
+        error.code(),
+    ))
+}
+
+/// Answers a call the chain declined to run, in the shape a failing tool would have used.
+///
+/// One error format reaches the model, not two. What differs is the record left behind: nothing
+/// ran, so there is nothing to say about how the tool behaves.
+fn refused(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
+    ToolDispatch::Refused(ToolRefusal::new(
+        failure_output(call_id, name, error),
+        error.code(),
+    ))
+}
+
+fn failure_output(call_id: &CallId, name: &str, error: &Error) -> ToolCallOutput {
+    ToolCallOutput::new(
+        call_id.clone(),
+        json!({ "error": { "code": error.code(), "tool": name } }),
     )
+    .with_error(true)
 }

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     compat::{SchemaVersion, Unknown},
-    state::ToolUseTracker,
+    state::{ToolFailureTracker, ToolUseTracker},
 };
 
 /// Current [`RunState`] schema version.
@@ -44,6 +44,8 @@ pub struct RunState {
     schema_version: SchemaVersion,
     #[serde(default)]
     tool_use: ToolUseTracker,
+    #[serde(default)]
+    tool_failure: ToolFailureTracker,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -61,6 +63,7 @@ impl RunState {
         Self {
             schema_version: RUN_STATE_SCHEMA_VERSION,
             tool_use: ToolUseTracker::new(),
+            tool_failure: ToolFailureTracker::new(),
             unknown: Unknown::new(),
         }
     }
@@ -87,10 +90,34 @@ impl RunState {
         &self.tool_use
     }
 
+    /// Replaces the carried failure history, leaving every other field alone.
+    #[must_use]
+    pub fn with_tool_failure(mut self, tool_failure: ToolFailureTracker) -> Self {
+        self.tool_failure = tool_failure;
+        self
+    }
+
     /// Mutable tool-use history for the loop's settlement path.
     #[doc(hidden)]
     pub fn tool_use_mut(&mut self) -> &mut ToolUseTracker {
         &mut self.tool_use
+    }
+
+    /// Failure history as of the most recently settled turn.
+    #[must_use]
+    pub const fn tool_failure(&self) -> &ToolFailureTracker {
+        &self.tool_failure
+    }
+
+    /// Both trackers at once, for the settlement path that records into each.
+    ///
+    /// One method rather than two: settlement holds the call trail and the failure history for the
+    /// same turn, and two separate `&mut` accessors would each borrow the whole state, so a caller
+    /// could not hold both. Splitting the borrow here keeps that from pushing `RunState` itself —
+    /// the checkpoint type — through a settlement signature.
+    #[doc(hidden)]
+    pub fn trackers_mut(&mut self) -> (&mut ToolUseTracker, &mut ToolFailureTracker) {
+        (&mut self.tool_use, &mut self.tool_failure)
     }
 
     /// Unknown fields retained during deserialization.

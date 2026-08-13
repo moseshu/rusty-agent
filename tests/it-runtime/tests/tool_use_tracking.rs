@@ -15,7 +15,7 @@ use ra_core::{
         RunItemKind, ToolCall,
     },
     model::ModelHandoffDefinition,
-    state::{ToolUse, ToolUseTracker},
+    state::{ToolFailureTracker, ToolUse, ToolUseTracker},
     tool::{
         Tool, ToolApprovalPolicy, ToolInvocation, ToolLookupKey, ToolOptions, ToolOrigin,
         ToolOutput, ToolSchema,
@@ -152,6 +152,7 @@ async fn settle(
         Arc::new(Host),
         &cancel,
         tracker,
+        &mut ToolFailureTracker::new(),
     ))
     .await
     .map(|_| ())
@@ -351,6 +352,7 @@ async fn test_tool_use_tracking_06() {
             Arc::new(Host),
             &cancel,
             &mut tracker,
+            &mut ToolFailureTracker::new(),
         ))
         .await
         .unwrap();
