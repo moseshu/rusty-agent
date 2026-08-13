@@ -212,6 +212,25 @@ pub enum BudgetKind {
     WallClock,
 }
 
+impl BudgetKind {
+    /// Stable machine-readable slug for traces and reports.
+    ///
+    /// It mirrors [`FinishReason::code`](crate::finish::FinishReason::code). The dimension is
+    /// named on its own here, without the `budget.` prefix [`Error::code`] gives it: that prefix
+    /// separates budget failures from other errors, while a `budget.kind` field has already said
+    /// which family it belongs to. **Which allowance ran out is only recoverable from this**,
+    /// since `FinishReason` folds tokens, cost and wall clock into one `budget_exhausted`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MaxTurns => "max_turns",
+            Self::Tokens => "tokens",
+            Self::Cost => "cost",
+            Self::WallClock => "wall_clock",
+        }
+    }
+}
+
 /// Where a guard fired. Matches the four tripwire classes the guardrail contract defines.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

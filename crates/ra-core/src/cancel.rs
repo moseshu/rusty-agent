@@ -283,16 +283,24 @@ impl Deadline {
 /// A child scope without its own reason walks up the chain, so "propagation preserves the root
 /// cause" requires writing nothing downward at cancellation time — **the root cause is a looked-up
 /// projection, not a copied duplicate**, the same approach as `Recoverability`.
+///
+/// The slot also carries the level it belongs to, so the lookup answers *where* the cancellation
+/// started and not only *why*. Without it the two are indistinguishable at any observer below the
+/// initiator — a tool that timed itself out and a tool killed by the run's deadline both surface
+/// as "this tool's scope is cancelled" — and attribution is exactly what the reason exists for.
 #[derive(Debug)]
 struct ReasonSlot {
     own: OnceLock<CancelReason>,
+    kind: ScopeKind,
     parent: Option<Arc<ReasonSlot>>,
 }
 
 impl ReasonSlot {
-    fn lookup(&self) -> Option<CancelReason> {
+    /// The root cause and the level that recorded it, borrowed: the checkpoint on every await
+    /// point runs through here, and it has no use for a copy of the level.
+    fn lookup(&self) -> Option<(&CancelReason, &ScopeKind)> {
         if let Some(reason) = self.own.get() {
-            return Some(reason.clone());
+            return Some((reason, &self.kind));
         }
         self.parent.as_ref()?.lookup()
     }
@@ -330,6 +338,7 @@ impl CancelScope {
             token: CancellationToken::new(),
             slot: Arc::new(ReasonSlot {
                 own: OnceLock::new(),
+                kind: ScopeKind::Run,
                 parent: None,
             }),
             deadline: None,
@@ -345,10 +354,11 @@ impl CancelScope {
     #[must_use]
     pub fn child(&self, kind: ScopeKind) -> Self {
         Self {
-            kind,
+            kind: kind.clone(),
             token: self.token.child_token(),
             slot: Arc::new(ReasonSlot {
                 own: OnceLock::new(),
+                kind,
                 parent: Some(Arc::clone(&self.slot)),
             }),
             deadline: self.deadline,
@@ -412,7 +422,34 @@ impl CancelScope {
         if !self.is_cancelled() {
             return None;
         }
-        Some(self.slot.lookup().unwrap_or(CancelReason::Unspecified))
+        Some(
+            self.slot
+                .lookup()
+                .map_or(CancelReason::Unspecified, |(reason, _)| reason.clone()),
+        )
+    }
+
+    /// The scope level that initiated the cancellation; `None` while not cancelled.
+    ///
+    /// **This is not `kind()`.** `kind()` says which level is *observing* the cancellation, which
+    /// for anything below the initiator is not where it came from: a tool scope cancelled by the
+    /// run's expired deadline reports `Tool` from `kind()` and `Run` from here. Metrics that
+    /// group cancellations by level need the second one, or every cancellation looks like it was
+    /// raised wherever it was first noticed.
+    ///
+    /// Both read the same slot chain, so the level can never name a scope that did not record the
+    /// reason [`Self::reason`] reports. A lookup that finds nothing degrades to this scope's own
+    /// level, matching how the reason degrades to [`CancelReason::Unspecified`].
+    #[must_use]
+    pub fn cancelled_scope(&self) -> Option<ScopeKind> {
+        if !self.is_cancelled() {
+            return None;
+        }
+        Some(
+            self.slot
+                .lookup()
+                .map_or_else(|| self.kind.clone(), |(_, kind)| kind.clone()),
+        )
     }
 
     /// Cancels this scope and every descendant. The parent is **unaffected**.

@@ -252,6 +252,39 @@ pub enum ContinuationInput {
     Normalized,
 }
 
+/// Sums the usage of a sequence of model calls.
+///
+/// One implementation, two readers: [`RunResult::usage`] answers a finished run, and the agent
+/// span has to answer a run that failed after paying for calls, where no [`RunResult`] exists. A
+/// second copy of this fold would drift the day [`Usage`] grows a dimension, and the two totals
+/// would disagree about the same calls.
+pub(crate) fn aggregate_usage(responses: &[ModelResponse]) -> Usage {
+    responses.iter().fold(Usage::default(), |total, response| {
+        // Saturating, like every other counter that adds provider-reported numbers: a provider
+        // that reports nonsense should skew a total, not panic a debug build.
+        let usage = response.usage();
+        Usage::new(
+            total.input_tokens().saturating_add(usage.input_tokens()),
+            total.output_tokens().saturating_add(usage.output_tokens()),
+        )
+        .with_cached_input_tokens(
+            total
+                .cached_input_tokens()
+                .saturating_add(usage.cached_input_tokens()),
+        )
+        .with_cache_write_tokens(
+            total
+                .cache_write_tokens()
+                .saturating_add(usage.cache_write_tokens()),
+        )
+        .with_reasoning_tokens(
+            total
+                .reasoning_tokens()
+                .saturating_add(usage.reasoning_tokens()),
+        )
+    })
+}
+
 /// Everything one finished run produced.
 ///
 /// `last_agent` is the **public** agent (R3-12): after a handoff the run is attributed to whoever
@@ -364,32 +397,7 @@ impl RunResult {
     /// calls it claims to summarise.
     #[must_use]
     pub fn usage(&self) -> Usage {
-        self.model_responses
-            .iter()
-            .fold(Usage::default(), |total, response| {
-                // Saturating, like every other counter that adds provider-reported numbers: a
-                // provider that reports nonsense should skew a total, not panic a debug build.
-                let usage = response.usage();
-                Usage::new(
-                    total.input_tokens().saturating_add(usage.input_tokens()),
-                    total.output_tokens().saturating_add(usage.output_tokens()),
-                )
-                .with_cached_input_tokens(
-                    total
-                        .cached_input_tokens()
-                        .saturating_add(usage.cached_input_tokens()),
-                )
-                .with_cache_write_tokens(
-                    total
-                        .cache_write_tokens()
-                        .saturating_add(usage.cache_write_tokens()),
-                )
-                .with_reasoning_tokens(
-                    total
-                        .reasoning_tokens()
-                        .saturating_add(usage.reasoning_tokens()),
-                )
-            })
+        aggregate_usage(&self.model_responses)
     }
 
     /// The message that delivered the run, if it produced one.

@@ -66,6 +66,18 @@ use crate::error::{Error, Recoverability};
 
 /// The field-name vocabulary. **Renaming one is a breaking change** — downstream reports and
 /// assertions look values up by name.
+///
+/// # A name means the same thing everywhere, a *scale* does not
+///
+/// The usage and duration fields appear on more than one [`super::SpanKind`], and what they count
+/// differs by kind: a `generation` reports one request, the `turn` above it reports that request
+/// plus its retries, and the `agent` above that reports the whole run. **So aggregation has to
+/// group by [`SPAN_KIND`] first** — summing [`USAGE_INPUT_TOKENS`] across every span in a trace
+/// counts the same tokens once per level and produces a number that is simply wrong.
+///
+/// The alternative, a separate `usage.total_*` set for the enclosing spans, was not taken: it
+/// doubles the vocabulary to encode something the span kind already says, and the first report to
+/// forget the distinction would get it wrong in the other direction instead.
 pub mod field {
     // -- present on every span ---------------------------------------------
 
@@ -107,7 +119,8 @@ pub mod field {
     pub const MODEL_PROVIDER: &str = "model.provider";
     /// Protocol path: `responses` / `chat` / `messages` / `compat`.
     pub const GEN_PROTOCOL: &str = "gen.protocol";
-    /// Input tokens for this request.
+    /// Input tokens: for this request on a `generation`, for everything below it on an enclosing
+    /// span. See the note on scale in the [module docs](self).
     pub const USAGE_INPUT_TOKENS: &str = "usage.input_tokens";
     /// The cached portion of those input tokens.
     ///
@@ -119,6 +132,30 @@ pub mod field {
     pub const USAGE_OUTPUT_TOKENS: &str = "usage.output_tokens";
     /// The reasoning tokens among them, when the provider reports them separately.
     pub const USAGE_REASONING_TOKENS: &str = "usage.reasoning_tokens";
+    /// Input tokens written into the provider prompt cache.
+    pub const USAGE_CACHE_WRITE_TOKENS: &str = "usage.cache_write_tokens";
+
+    // -- timing and terminal control flow ---------------------------------
+
+    /// Elapsed wall-clock time of the span in milliseconds.
+    ///
+    /// This is recorded only when the span reaches a terminal state. It deliberately stays a
+    /// number rather than a formatted duration so aggregation does not need to parse log text.
+    ///
+    /// Nested spans overlap by construction, so this **does not sum across levels** any more than
+    /// the usage fields do.
+    pub const DURATION_MS: &str = "duration.ms";
+    /// Time a function call spent waiting for runtime admission in milliseconds.
+    ///
+    /// It is separate from [`TOOL_EXECUTION_MS`] so an overloaded concurrency gate is not
+    /// misdiagnosed as a slow tool handler.
+    pub const TOOL_ADMISSION_WAIT_MS: &str = "tool.admission_wait_ms";
+    /// Time spent inside a tool handler in milliseconds.
+    pub const TOOL_EXECUTION_MS: &str = "tool.execution_ms";
+    /// Terminal finish reason for a completed run.
+    pub const FINISH_REASON: &str = "finish.reason";
+    /// Budget dimension that stopped a run, when a budget was exhausted.
+    pub const BUDGET_KIND: &str = "budget.kind";
 
     // -- function (tool call) ----------------------------------------------
 
@@ -166,6 +203,12 @@ pub mod field {
         USAGE_CACHED_INPUT_TOKENS,
         USAGE_OUTPUT_TOKENS,
         USAGE_REASONING_TOKENS,
+        USAGE_CACHE_WRITE_TOKENS,
+        DURATION_MS,
+        TOOL_ADMISSION_WAIT_MS,
+        TOOL_EXECUTION_MS,
+        FINISH_REASON,
+        BUDGET_KIND,
         TOOL_NAME,
         TOOL_CALL_ID,
         HANDOFF_FROM,

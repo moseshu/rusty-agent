@@ -29,7 +29,7 @@
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use ra_core::{
     budget::BudgetLimit,
@@ -44,12 +44,15 @@ use ra_core::{
     state::{RunState, WorkStateHandle},
     step::NextStep,
     tool::ToolRuntimeContext,
+    trace::SpanKind,
 };
 use tokio::sync::mpsc;
+use tracing::{Instrument, info_span};
 
 pub mod result;
 pub mod stream;
 
+use result::aggregate_usage;
 pub use result::{
     ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
     RunOutcome, RunResult,
@@ -61,7 +64,7 @@ use crate::{
     turn::{
         TurnSettlementRequest,
         batch::DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
-        prepare::{TurnPreparationRequest, prepare_turn},
+        prepare::{PreparedTurn, TurnActionSurface, TurnPreparationRequest, prepare_turn},
         settle_turn,
     },
 };
@@ -363,6 +366,49 @@ async fn run_loop(
     request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
 ) -> Result<RunResult> {
+    // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
+    // this span keeps the original name because it is the whole run's span — per-agent attribution
+    // is what a handoff span and the agent span its target opens are for, and neither exists while
+    // settlement still refuses handoffs.
+    let agent_name = request.agent.public().name().to_owned();
+    let agent_span = info_span!(
+        "agent",
+        span.kind = SpanKind::Agent.label(),
+        agent.name = %agent_name,
+        outcome = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        cancel.reason = tracing::field::Empty,
+        cancel.scope = tracing::field::Empty,
+        duration.ms = tracing::field::Empty,
+        finish.reason = tracing::field::Empty,
+        budget.kind = tracing::field::Empty,
+        usage.input_tokens = tracing::field::Empty,
+        usage.cached_input_tokens = tracing::field::Empty,
+        usage.cache_write_tokens = tracing::field::Empty,
+        usage.output_tokens = tracing::field::Empty,
+        usage.reasoning_tokens = tracing::field::Empty,
+    );
+    let started = Instant::now();
+    let result = run_loop_inner(request, events, &agent_span)
+        .instrument(agent_span.clone())
+        .await;
+    agent_span.record(
+        ra_core::trace::field::DURATION_MS,
+        duration_ms(started.elapsed()),
+    );
+    result
+}
+
+/// Runs the agent loop after the outer agent span has been installed.
+///
+/// The span is passed in as well as installed: the terminal facts are recorded here, where the run
+/// scope that explains a cancellation is still alive, rather than at the caller, which sees only
+/// an `Error` and would have to guess the level a cancellation came from.
+async fn run_loop_inner(
+    request: RunRequest,
+    events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
+    span: &tracing::Span,
+) -> Result<RunResult> {
     let RunRequest {
         mut agent,
         model_resolver,
@@ -374,7 +420,12 @@ async fn run_loop(
         work_state,
     } = request;
 
-    validate_config(&config)?;
+    if let Err(error) = validate_config(&config) {
+        // Ahead of the run scope, so there is no cancellation to attribute and no aggregate to
+        // report — but the span still has to say the run ended and why.
+        ra_core::trace::record_error(span, &error);
+        return Err(error);
+    }
 
     // The run gets its own scope, so either its configured deadline or an inherited caller
     // deadline stops this run without cancelling the caller's tree. An armed timer turns the
@@ -419,10 +470,29 @@ async fn run_loop(
                 reason: FinishReason::BudgetExhausted,
             }
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            record_progress_usage(span, &progress);
+            record_terminal_error(span, &error, &cancel);
+            return Err(error);
+        }
     };
 
-    let final_message = deliver_budget_closeout(&context, &agent, &mut progress, &state).await?;
+    // Which allowance ran out, recorded next to the finish reason rather than folded into it:
+    // `FinishReason` maps tokens, cost and wall clock all onto `budget_exhausted`, so without this
+    // a cost report cannot tell an expensive run from a slow one.
+    if let Some(kind) = progress.budget_stop {
+        span.record(ra_core::trace::field::BUDGET_KIND, kind.code());
+    }
+
+    let final_message = match deliver_budget_closeout(&context, &agent, &mut progress, &state).await
+    {
+        Ok(message) => message,
+        Err(error) => {
+            record_progress_usage(span, &progress);
+            record_terminal_error(span, &error, &closeout_cancel);
+            return Err(error);
+        }
+    };
 
     let mut result = RunResult::new(
         outcome.clone(),
@@ -436,8 +506,74 @@ async fn run_loop(
     if let Some(message) = final_message {
         result = result.with_final_message(message);
     }
+    record_run_outcome(span, &result);
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)
+}
+
+/// Records the run-level aggregate without creating a second accounting source.
+///
+/// These are the same field names a `generation` uses one level down, and the scale is the
+/// difference: this is the whole run, that is one request. Reports group by `span.kind` before
+/// summing — see the note in `ra_core::trace::field`.
+fn record_run_outcome(span: &tracing::Span, result: &RunResult) {
+    record_usage(span, &result.usage());
+    if let Some(reason) = result.outcome().finish_reason() {
+        span.record(ra_core::trace::field::FINISH_REASON, reason.code());
+    }
+    ra_core::trace::record_outcome(span, ra_core::trace::SpanOutcome::Ok);
+}
+
+/// Records usage already paid by model calls when no [`RunResult`] will be returned.
+///
+/// Through the same summation [`RunResult::usage`] uses, so a run that failed and a run that
+/// finished report the calls they made the same way.
+fn record_progress_usage(span: &tracing::Span, progress: &TurnLoopProgress) {
+    record_usage(span, &aggregate_usage(&progress.model_responses));
+}
+
+/// Records normalized usage on any span whose scale is defined by its kind.
+fn record_usage(span: &tracing::Span, usage: &ra_core::usage::Usage) {
+    span.record(
+        ra_core::trace::field::USAGE_INPUT_TOKENS,
+        usage.input_tokens(),
+    );
+    span.record(
+        ra_core::trace::field::USAGE_CACHED_INPUT_TOKENS,
+        usage.cached_input_tokens(),
+    );
+    span.record(
+        ra_core::trace::field::USAGE_CACHE_WRITE_TOKENS,
+        usage.cache_write_tokens(),
+    );
+    span.record(
+        ra_core::trace::field::USAGE_OUTPUT_TOKENS,
+        usage.output_tokens(),
+    );
+    span.record(
+        ra_core::trace::field::USAGE_REASONING_TOKENS,
+        usage.reasoning_tokens(),
+    );
+}
+
+/// Records a failed span, attributing a cancellation to the level that raised it.
+///
+/// The scope is asked rather than the error: `Error::Cancelled` carries a display string, while
+/// the root cause and the initiating level are the machine-readable pair the cancellation contract
+/// designates. Without the level, a run stopped by its own deadline and one stopped by the
+/// caller's interrupt are the same line in a report.
+fn record_terminal_error(span: &tracing::Span, error: &Error, scope: &CancelScope) {
+    match (
+        error.is_cancelled(),
+        scope.reason(),
+        scope.cancelled_scope(),
+    ) {
+        (true, Some(reason), Some(kind)) => {
+            span.record(ra_core::trace::field::ERROR_CODE, error.code());
+            ra_core::trace::record_cancel(span, &reason, &kind);
+        }
+        _ => ra_core::trace::record_error(span, error),
+    }
 }
 
 /// Runs turns until something says to stop.
@@ -473,94 +609,197 @@ async fn run_turns(
         // without the run's own scope inheriting it.
         let turn_scope = context.cancel.child(ScopeKind::Turn);
 
-        let input = next_input(
-            context.original_input,
-            &progress.generated,
-            budget_reminder(state.budget(), config.budget()),
-        );
-        let mut preparation = TurnPreparationRequest::new(
-            agent,
-            context.model_resolver.as_ref(),
-            context.tool_context.as_ref(),
-            &turn_scope,
-            state.tool_use(),
-            input,
-        )
-        .with_model_settings(config.model_settings.clone())
-        .with_tracing(config.tracing);
-        if let Some(model) = &config.model {
-            preparation = preparation.with_model(model.clone());
-        }
-        let prepared = prepare_turn(preparation).await?;
-
-        let model = Arc::clone(prepared.model());
-        let (surface, model_request) = prepared.into_call();
-
-        // R1-7's insertion point: the streaming model call and its delta forwarding replace this
-        // line without moving anything else, because settlement consumes a terminal
-        // `ModelResponse` either way.
-        let response = turn_scope.run(model.get_response(model_request)).await??;
-
-        // Both facts about a completed call are recorded here, before settlement, and the stop
-        // either may cause is *not* taken here. The response has already been paid for, so its
-        // items belong in history and its tool calls belong to the turn that requested them; the
-        // check at the top of the next iteration is what ends the run, one turn later and with the
-        // work intact.
+        // The level that answers "what did this turn cost". A turn is not one model call: it can
+        // hold retries, a model fallback, and a whole batch of tools, so the generation and
+        // function spans underneath have to roll up somewhere before the run total. Opened only
+        // once the turn is certain to run — the budget break above ends the loop without one.
         //
-        // Recording before settling is also what keeps the two facts agreeing when a deadline
-        // interrupts settlement below: the session projection may then be incomplete, but usage
-        // accounting, provider diagnostics, and an error handler's snapshot must not deny that the
-        // call ran. The copy is what that costs, next to the two history copies this turn already
-        // makes for settlement.
-        state.budget_mut().record_usage(response.usage());
-        progress.model_responses.push(response.clone());
-
-        let (tool_use, tool_failure) = state.trackers_mut();
-        let mut settlement = TurnSettlementRequest::new(
-            agent,
-            &response,
-            &surface,
-            Arc::clone(context.tool_context),
-            &turn_scope,
-            tool_use,
-            tool_failure,
-        )
-        .with_original_input(context.original_input.to_vec())
-        .with_pre_step_items(progress.generated.clone());
-        if let Some(work_state) = context.work_state {
-            settlement = settlement.with_work_state(Arc::clone(work_state));
+        // The stream event counts turns from 1 for a host to display; the trace field is defined
+        // from 0, and the conversion is here rather than at either definition.
+        let turn_span = info_span!(
+            "turn",
+            span.kind = SpanKind::Turn.label(),
+            turn.index = progress.turns - 1,
+            outcome = tracing::field::Empty,
+            error.code = tracing::field::Empty,
+            cancel.reason = tracing::field::Empty,
+            cancel.scope = tracing::field::Empty,
+            duration.ms = tracing::field::Empty,
+            usage.input_tokens = tracing::field::Empty,
+            usage.cached_input_tokens = tracing::field::Empty,
+            usage.cache_write_tokens = tracing::field::Empty,
+            usage.output_tokens = tracing::field::Empty,
+            usage.reasoning_tokens = tracing::field::Empty,
+        );
+        let turn_started = Instant::now();
+        let step = run_one_turn(context, agent, state, progress, &turn_scope, &turn_span)
+            .instrument(turn_span.clone())
+            .await;
+        turn_span.record(
+            ra_core::trace::field::DURATION_MS,
+            duration_ms(turn_started.elapsed()),
+        );
+        match &step {
+            Ok(_) => ra_core::trace::record_outcome(&turn_span, ra_core::trace::SpanOutcome::Ok),
+            Err(error) => record_terminal_error(&turn_span, error, &turn_scope),
         }
-        settlement =
-            settlement.with_max_function_tool_concurrency(config.max_function_tool_concurrency);
-        let settled = settle_turn(settlement).await?;
 
-        for item in settled.session_step_items() {
-            emit(context.events, RunStreamEvent::Item(item.clone()));
-        }
-        progress
-            .generated
-            .extend(settled.session_step_items().iter().cloned());
-
-        // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
-        // fifth state has to be answered here rather than fall through to "keep going".
-        match settled.next_step() {
-            NextStep::RunAgain => {}
-            NextStep::FinalOutput { reason } => break RunOutcome::Completed { reason: *reason },
-            NextStep::Interruption { items } => {
-                break RunOutcome::Interrupted {
-                    items: items.clone(),
-                };
-            }
-            // Control transfers to another agent, which speaks next. The new agent arrives as a
-            // public declaration, so it binds directly: whatever prepared *this* turn's execution
-            // instance has no say over who runs the next one. Unreachable until R17 — settlement
-            // refuses handoffs — but the state machine has to say what it does about it.
-            NextStep::Handoff { new_agent } => {
-                *agent = AgentBinding::direct(Arc::clone(new_agent));
-            }
+        // A turn that reached a conclusion ends the loop with it; anything else means another
+        // turn. The two states stay `Option` rather than becoming a second control-flow enum:
+        // `NextStep` is the one that names what a turn decided, and it is answered inside.
+        match step? {
+            None => {}
+            Some(outcome) => break outcome,
         }
     };
     Ok(outcome)
+}
+
+/// Runs one turn: prepare, call the model, settle, and say whether the run continues.
+///
+/// `None` means another turn; `Some` carries the outcome the run ends with.
+async fn run_one_turn(
+    context: &TurnLoopContext<'_>,
+    agent: &mut AgentBinding,
+    state: &mut RunState,
+    progress: &mut TurnLoopProgress,
+    turn_scope: &CancelScope,
+    turn_span: &tracing::Span,
+) -> Result<Option<RunOutcome>> {
+    let config = context.config;
+    let input = next_input(
+        context.original_input,
+        &progress.generated,
+        budget_reminder(state.budget(), config.budget()),
+    );
+    let mut preparation = TurnPreparationRequest::new(
+        agent,
+        context.model_resolver.as_ref(),
+        context.tool_context.as_ref(),
+        turn_scope,
+        state.tool_use(),
+        input,
+    )
+    .with_model_settings(config.model_settings.clone())
+    .with_tracing(config.tracing);
+    if let Some(model) = &config.model {
+        preparation = preparation.with_model(model.clone());
+    }
+    let prepared = prepare_turn(preparation).await?;
+
+    let (surface, response) = call_model(turn_scope, prepared).await?;
+
+    // Both facts about a completed call are recorded here, before settlement, and the stop
+    // either may cause is *not* taken here. The response has already been paid for, so its
+    // items belong in history and its tool calls belong to the turn that requested them; the
+    // check at the top of the next iteration is what ends the run, one turn later and with the
+    // work intact.
+    //
+    // Recording before settling is also what keeps the two facts agreeing when a deadline
+    // interrupts settlement below: the session projection may then be incomplete, but usage
+    // accounting, provider diagnostics, and an error handler's snapshot must not deny that the
+    // call ran. The copy is what that costs, next to the two history copies this turn already
+    // makes for settlement.
+    record_usage(turn_span, response.usage());
+    state.budget_mut().record_usage(response.usage());
+    progress.model_responses.push(response.clone());
+
+    let (tool_use, tool_failure) = state.trackers_mut();
+    let mut settlement = TurnSettlementRequest::new(
+        agent,
+        &response,
+        &surface,
+        Arc::clone(context.tool_context),
+        turn_scope,
+        tool_use,
+        tool_failure,
+    )
+    .with_original_input(context.original_input.to_vec())
+    .with_pre_step_items(progress.generated.clone());
+    if let Some(work_state) = context.work_state {
+        settlement = settlement.with_work_state(Arc::clone(work_state));
+    }
+    settlement =
+        settlement.with_max_function_tool_concurrency(config.max_function_tool_concurrency);
+    let settled = settle_turn(settlement).await?;
+
+    for item in settled.session_step_items() {
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+    }
+    progress
+        .generated
+        .extend(settled.session_step_items().iter().cloned());
+
+    // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
+    // fifth state has to be answered here rather than fall through to "keep going".
+    match settled.next_step() {
+        NextStep::RunAgain => Ok(None),
+        NextStep::FinalOutput { reason } => Ok(Some(RunOutcome::Completed { reason: *reason })),
+        NextStep::Interruption { items } => Ok(Some(RunOutcome::Interrupted {
+            items: items.clone(),
+        })),
+        // Control transfers to another agent, which speaks next. The new agent arrives as a
+        // public declaration, so it binds directly: whatever prepared *this* turn's execution
+        // instance has no say over who runs the next one. Unreachable until R17 — settlement
+        // refuses handoffs — but the state machine has to say what it does about it.
+        NextStep::Handoff { new_agent } => {
+            *agent = AgentBinding::direct(Arc::clone(new_agent));
+            Ok(None)
+        }
+    }
+}
+
+/// Executes one prepared model call and records its provider-neutral terminal facts.
+async fn call_model(
+    turn_scope: &CancelScope,
+    prepared: PreparedTurn,
+) -> Result<(TurnActionSurface, ModelResponse)> {
+    let model = Arc::clone(prepared.model());
+    let selector = prepared.selector().clone();
+    let (surface, model_request) = prepared.into_call();
+    let model_name = selector.model().unwrap_or("<provider_default>");
+    let generation_span = info_span!(
+        "generation",
+        span.kind = SpanKind::Generation.label(),
+        model.name = %model_name,
+        model.provider = %selector.provider(),
+        gen.protocol = %selector.protocol(),
+        outcome = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        cancel.reason = tracing::field::Empty,
+        cancel.scope = tracing::field::Empty,
+        duration.ms = tracing::field::Empty,
+        usage.input_tokens = tracing::field::Empty,
+        usage.cached_input_tokens = tracing::field::Empty,
+        usage.cache_write_tokens = tracing::field::Empty,
+        usage.output_tokens = tracing::field::Empty,
+        usage.reasoning_tokens = tracing::field::Empty,
+    );
+    let started = Instant::now();
+    let response = async { turn_scope.run(model.get_response(model_request)).await }
+        .instrument(generation_span.clone())
+        .await
+        .and_then(|response| response);
+    generation_span.record(
+        ra_core::trace::field::DURATION_MS,
+        duration_ms(started.elapsed()),
+    );
+    match response {
+        Ok(response) => {
+            record_generation_usage(&generation_span, response.usage());
+            ra_core::trace::record_outcome(&generation_span, ra_core::trace::SpanOutcome::Ok);
+            Ok((surface, response))
+        }
+        Err(error) => {
+            record_terminal_error(&generation_span, &error, turn_scope);
+            Err(error)
+        }
+    }
+}
+
+/// Records the normalized per-request usage preserved by the model response.
+fn record_generation_usage(span: &tracing::Span, usage: &ra_core::usage::Usage) {
+    record_usage(span, usage);
 }
 
 /// Asks the configured handler to turn an exhausted budget into something deliverable.
@@ -706,6 +945,11 @@ fn is_wall_clock_expiry(
         && scope
             .reason()
             .is_some_and(|reason| matches!(reason, CancelReason::Deadline))
+}
+
+/// Converts an elapsed duration to the stable trace unit without truncating a very long run.
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Builds the next call's input: what was asked, then everything produced since, then `reminder`.

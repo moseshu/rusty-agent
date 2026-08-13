@@ -17,7 +17,7 @@
 //! Concurrency ceilings and batching are deliberately absent: R3-4b owns the batch shape and R3-4c
 //! owns what happens when several of these run at once.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use ra_core::{
     cancel::CancelScope,
@@ -303,18 +303,32 @@ async fn invoke(
     cancel: &CancelScope,
     name: &str,
 ) -> Result<ToolOutput> {
+    let started = Instant::now();
     let call = tool.call(invocation);
-    match options.timeout() {
-        None => cancel.run(call).await?,
-        Some(limit) => match cancel.run(tokio::time::timeout(limit, call)).await? {
-            Ok(result) => result,
-            Err(_elapsed) => Err(Error::tool(
-                ToolErrorKind::Timeout,
-                name,
-                format!("the tool exceeded its {limit:?} limit"),
-            )),
-        },
-    }
+    let result = match options.timeout() {
+        None => cancel.run(call).await.and_then(|result| result),
+        Some(limit) => cancel
+            .run(tokio::time::timeout(limit, call))
+            .await
+            .and_then(|result| match result {
+                Ok(result) => result,
+                Err(_elapsed) => Err(Error::tool(
+                    ToolErrorKind::Timeout,
+                    name,
+                    format!("the tool exceeded its {limit:?} limit"),
+                )),
+            }),
+    };
+    tracing::Span::current().record(
+        ra_core::trace::field::TOOL_EXECUTION_MS,
+        duration_ms(started.elapsed()),
+    );
+    result
+}
+
+/// Converts elapsed time to the trace vocabulary's millisecond unit.
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Turns an invocation failure into either a model-visible observation or a stopped turn.

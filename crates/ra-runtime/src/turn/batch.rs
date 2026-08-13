@@ -35,7 +35,7 @@
 //! to happen where the stream is read, and [`execute_actions`] is handed a response that is
 //! already complete.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use ra_core::{
     agent::ToolUseResult,
@@ -45,13 +45,14 @@ use ra_core::{
     state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker, WorkStateHandle},
     step::{ProcessedResponse, ToolRunFunction},
     tool::{ToolConcurrency, ToolOrigin, ToolRuntimeContext},
+    trace::SpanKind,
 };
 use serde_json::{Value, json};
 use tokio::{
     sync::{RwLock, Semaphore},
     task::{Id, JoinError, JoinSet},
 };
-use tracing::{error, warn};
+use tracing::{Instrument, error, info_span, warn};
 
 use crate::tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool};
 
@@ -238,84 +239,7 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
         .interruptions
         .extend(processed.interruptions().cloned());
 
-    let gate = Arc::new(RwLock::new(()));
-    let slots = Arc::new(Semaphore::new(request.max_function_tool_concurrency));
-    let mut dispatches = JoinSet::new();
-    let mut task_orders = HashMap::new();
-    let mut tool_scopes = Vec::new();
-    for (order, action) in processed.functions().iter().enumerate() {
-        // Asked of the action, never rebuilt from its parts: settlement recorded this turn under
-        // `identity()` a moment ago, and a second derivation that drifted would look up something
-        // nothing ever recorded and hand the breaker a permanent zero.
-        let identity = action.identity();
-        // Admission reads the run's records as they stood when this response arrived; see
-        // `circuit::admit_progress` for what that means for several calls in one response.
-        let history = CallHistory::new(
-            request.tool_use.repeat_streak(request.agent_id, &identity),
-            request
-                .tool_failure
-                .no_progress_streak(request.agent_id, &identity),
-        );
-        let tool_scope = request.cancel.child(ScopeKind::Tool);
-        let mut dispatch_request = ToolDispatchRequest::new(
-            Arc::clone(action.tool()),
-            action.call_id().clone(),
-            action.call().arguments().clone(),
-            Arc::clone(&request.context),
-            tool_scope.clone(),
-            history,
-        );
-        if let Some(work_state) = &request.work_state {
-            dispatch_request = dispatch_request.with_work_state(Arc::clone(work_state));
-        }
-        let gate = Arc::clone(&gate);
-        let slots = Arc::clone(&slots);
-        let concurrency = action.tool().options().concurrency();
-        let call_id = action.call_id().clone();
-        let tool = action.tool().origin().clone();
-        let cancel = tool_scope;
-        tool_scopes.push(cancel.clone());
-        let handle = dispatches.spawn(async move {
-            let result = async {
-                cancel.ensure_not_cancelled()?;
-                // Take one total-dispatch permit before any per-tool gate.  The permit covers the
-                // entire common chain (approval, guardrails, and tool call), which is exactly the
-                // resource footprint a host needs to bound. Waiting is cancellation-aware: dropping
-                // a cancelled future returns its permit and cannot strand a queued batch.
-                let _slot = cancel
-                    .run(slots.acquire_owned())
-                    .await?
-                    .map_err(|_| Error::caller("the function-tool concurrency semaphore closed"))?;
-                // The guard must live across the complete common dispatch chain. Taking it around
-                // only `Tool::call` would let approval/guardrail code for a writer race a reader and
-                // make the declaration mean something different for different execution stages.
-                //
-                // Only `Parallel` shares. `Exclusive` and every variant this executor cannot read yet
-                // take the write permit: `ToolConcurrency` is `#[non_exhaustive]`, so some fallback is
-                // mandatory, and this one matches the field's own default — a declaration nobody here
-                // understands has not said the tool tolerates company. Refusing the call instead would
-                // fail the whole batch, since one propagating error cancels every other call in it, over
-                // a field that does nothing but pick a permit.
-                if matches!(concurrency, ToolConcurrency::Parallel) {
-                    let _permit = cancel.run(gate.read()).await?;
-                    cancel.ensure_not_cancelled()?;
-                    dispatch_tool(dispatch_request).await
-                } else {
-                    let _permit = cancel.run(gate.write()).await?;
-                    cancel.ensure_not_cancelled()?;
-                    dispatch_tool(dispatch_request).await
-                }
-            }
-            .await;
-            DispatchTaskResult {
-                order,
-                call_id,
-                tool,
-                result,
-            }
-        });
-        task_orders.insert(handle.id(), order);
-    }
+    let (mut dispatches, mut task_orders, tool_scopes) = spawn_function_dispatches(&request);
 
     let collected = collect_dispatches(
         &mut dispatches,
@@ -356,6 +280,216 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
     }
 
     Ok(execution)
+}
+
+/// Spawns the response's function calls and returns their supervisor state.
+fn spawn_function_dispatches(
+    request: &TurnExecutionRequest<'_>,
+) -> (
+    JoinSet<DispatchTaskResult>,
+    HashMap<Id, usize>,
+    Vec<CancelScope>,
+) {
+    let gate = Arc::new(RwLock::new(()));
+    let slots = Arc::new(Semaphore::new(request.max_function_tool_concurrency));
+    let mut dispatches = JoinSet::new();
+    let mut task_orders = HashMap::new();
+    let mut tool_scopes = Vec::new();
+    for (order, action) in request.processed.functions().iter().enumerate() {
+        // Asked of the action, never rebuilt from its parts: settlement recorded this turn under
+        // `identity()` a moment ago, and a second derivation that drifted would look up something
+        // nothing ever recorded and hand the breaker a permanent zero.
+        let identity = action.identity();
+        // Admission reads the run's records as they stood when this response arrived; see
+        // `circuit::admit_progress` for what that means for several calls in one response.
+        let history = CallHistory::new(
+            request.tool_use.repeat_streak(request.agent_id, &identity),
+            request
+                .tool_failure
+                .no_progress_streak(request.agent_id, &identity),
+        );
+        let tool_scope = request.cancel.child(ScopeKind::Tool);
+        let mut dispatch_request = ToolDispatchRequest::new(
+            Arc::clone(action.tool()),
+            action.call_id().clone(),
+            action.call().arguments().clone(),
+            Arc::clone(&request.context),
+            tool_scope.clone(),
+            history,
+        );
+        if let Some(work_state) = &request.work_state {
+            dispatch_request = dispatch_request.with_work_state(Arc::clone(work_state));
+        }
+        let gate = Arc::clone(&gate);
+        let slots = Arc::clone(&slots);
+        let concurrency = action.tool().options().concurrency();
+        let call_id = action.call_id().clone();
+        let tool = action.tool().origin().clone();
+        let cancel = tool_scope;
+        tool_scopes.push(cancel.clone());
+        // Built here rather than inside the spawned task, and this is the whole reason the
+        // helper exists: `tokio` does not carry the tracing context across a spawn, so a span
+        // created in the task body finds an empty span stack and becomes a root. Every tool call
+        // would then sit outside the run that made it, which is precisely the attribution this
+        // span is for. Created on the caller's side, it takes the enclosing agent span as parent.
+        let function_span = function_span(&tool, &call_id);
+        let task_id = spawn_dispatch_task(
+            &mut dispatches,
+            order,
+            call_id,
+            tool,
+            cancel,
+            gate,
+            slots,
+            concurrency,
+            dispatch_request,
+            function_span,
+        );
+        task_orders.insert(task_id, order);
+    }
+    (dispatches, task_orders, tool_scopes)
+}
+
+/// Creates one function span under whatever span the caller is running in.
+fn function_span(tool: &ToolOrigin, call_id: &CallId) -> tracing::Span {
+    info_span!(
+        "function",
+        span.kind = SpanKind::Function.label(),
+        tool.name = %tool.qualified_name(),
+        tool.call_id = %call_id,
+        outcome = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        cancel.reason = tracing::field::Empty,
+        cancel.scope = tracing::field::Empty,
+        duration.ms = tracing::field::Empty,
+        tool.admission_wait_ms = tracing::field::Empty,
+        tool.execution_ms = tracing::field::Empty,
+    )
+}
+
+/// Spawns one cancellation-aware dispatch chain and returns its supervisor identity.
+#[allow(clippy::too_many_arguments)]
+fn spawn_dispatch_task(
+    dispatches: &mut JoinSet<DispatchTaskResult>,
+    order: usize,
+    call_id: CallId,
+    tool: ToolOrigin,
+    cancel: CancelScope,
+    gate: Arc<RwLock<()>>,
+    slots: Arc<Semaphore>,
+    concurrency: ToolConcurrency,
+    dispatch_request: ToolDispatchRequest,
+    function_span: tracing::Span,
+) -> Id {
+    dispatches
+        .spawn(async move {
+            let started = Instant::now();
+            let result = dispatch_with_admission(
+                &cancel,
+                gate,
+                slots,
+                concurrency,
+                dispatch_request,
+                &function_span,
+            )
+            .await;
+            function_span.record(
+                ra_core::trace::field::DURATION_MS,
+                duration_ms(started.elapsed()),
+            );
+            record_function_outcome(&function_span, &result, &cancel);
+            DispatchTaskResult {
+                order,
+                call_id,
+                tool,
+                result,
+            }
+        })
+        .id()
+}
+
+/// Waits for the batch gates, then runs a single complete tool dispatch chain.
+async fn dispatch_with_admission(
+    cancel: &CancelScope,
+    gate: Arc<RwLock<()>>,
+    slots: Arc<Semaphore>,
+    concurrency: ToolConcurrency,
+    dispatch_request: ToolDispatchRequest,
+    span: &tracing::Span,
+) -> Result<ToolDispatch> {
+    cancel.ensure_not_cancelled()?;
+    let admission_started = Instant::now();
+    let _slot = cancel
+        .run(slots.acquire_owned())
+        .await?
+        .map_err(|_| Error::caller("the function-tool concurrency semaphore closed"))?;
+    if matches!(concurrency, ToolConcurrency::Parallel) {
+        let _permit = cancel.run(gate.read()).await?;
+        span.record(
+            ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
+            duration_ms(admission_started.elapsed()),
+        );
+        cancel.ensure_not_cancelled()?;
+        dispatch_tool(dispatch_request)
+            .instrument(span.clone())
+            .await
+    } else {
+        let _permit = cancel.run(gate.write()).await?;
+        span.record(
+            ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
+            duration_ms(admission_started.elapsed()),
+        );
+        cancel.ensure_not_cancelled()?;
+        dispatch_tool(dispatch_request)
+            .instrument(span.clone())
+            .await
+    }
+}
+
+/// Records the terminal result of one function-tool dispatch without leaking its payload.
+fn record_function_outcome(
+    span: &tracing::Span,
+    result: &Result<ToolDispatch>,
+    cancel: &CancelScope,
+) {
+    match result {
+        Ok(ToolDispatch::Observed(observation)) => match observation.failure_code() {
+            Some(code) => {
+                span.record(ra_core::trace::field::ERROR_CODE, code);
+                ra_core::trace::record_outcome(span, ra_core::trace::SpanOutcome::Error);
+            }
+            None => ra_core::trace::record_outcome(span, ra_core::trace::SpanOutcome::Ok),
+        },
+        Ok(ToolDispatch::Refused(refusal)) => {
+            span.record(ra_core::trace::field::ERROR_CODE, refusal.code());
+            ra_core::trace::record_outcome(span, ra_core::trace::SpanOutcome::Error);
+        }
+        // Suspended, not finished: the handler never ran, so `tool.execution_ms` is absent and the
+        // duration is the wait for a decision. Recorded as `ok` because nothing failed — a report
+        // of tool latency has to filter on the execution field being present, not assume it.
+        Ok(ToolDispatch::AwaitingApproval(_)) => {
+            ra_core::trace::record_outcome(span, ra_core::trace::SpanOutcome::Ok);
+        }
+        // The tool's own scope, so a tool that timed itself out is attributed to `tool` and one
+        // killed by the run's deadline to `run`, which is the distinction that says whether the
+        // ceiling that fired was the tool's or the run's.
+        Err(error) => match (
+            error.is_cancelled(),
+            cancel.reason(),
+            cancel.cancelled_scope(),
+        ) {
+            (true, Some(reason), Some(kind)) => {
+                span.record(ra_core::trace::field::ERROR_CODE, error.code());
+                ra_core::trace::record_cancel(span, &reason, &kind);
+            }
+            _ => ra_core::trace::record_error(span, error),
+        },
+    }
+}
+
+/// Converts elapsed time to the trace vocabulary's millisecond unit.
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Collect every task result before mutating the turn's records.

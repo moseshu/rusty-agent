@@ -60,6 +60,7 @@ const fn ra_core::config::SourceSelection::without(mut self, source : SettingSou
 const fn ra_core::config::Sourced < T >::new(source : SettingSource, value : T) -> Self
 const fn ra_core::config::Sourced < T >::source(& self) -> SettingSource
 const fn ra_core::config::Sourced < T >::value(& self) -> & T
+const fn ra_core::error::BudgetKind::code(self) -> & 'static str
 const fn ra_core::error::Error::code(& self) -> & 'static str
 const fn ra_core::error::Error::is_cancelled(& self) -> bool
 const fn ra_core::error::Error::is_retryable(& self) -> bool
@@ -488,9 +489,12 @@ const ra_core::tool::schema::FUNC_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::schema::TOOL_SCHEMA_VERSION: SchemaVersion
 const ra_core::trace::field::AGENT_NAME: & str
 const ra_core::trace::field::ALL: & [& str]
+const ra_core::trace::field::BUDGET_KIND: & str
 const ra_core::trace::field::CANCEL_REASON: & str
 const ra_core::trace::field::CANCEL_SCOPE: & str
+const ra_core::trace::field::DURATION_MS: & str
 const ra_core::trace::field::ERROR_CODE: & str
+const ra_core::trace::field::FINISH_REASON: & str
 const ra_core::trace::field::GEN_PROTOCOL: & str
 const ra_core::trace::field::GUARDRAIL_ID: & str
 const ra_core::trace::field::GUARDRAIL_STAGE: & str
@@ -503,10 +507,13 @@ const ra_core::trace::field::MODEL_PROVIDER: & str
 const ra_core::trace::field::OUTCOME: & str
 const ra_core::trace::field::SPAN_KIND: & str
 const ra_core::trace::field::SPAN_LABEL: & str
+const ra_core::trace::field::TOOL_ADMISSION_WAIT_MS: & str
 const ra_core::trace::field::TOOL_CALL_ID: & str
+const ra_core::trace::field::TOOL_EXECUTION_MS: & str
 const ra_core::trace::field::TOOL_NAME: & str
 const ra_core::trace::field::TURN_INDEX: & str
 const ra_core::trace::field::USAGE_CACHED_INPUT_TOKENS: & str
+const ra_core::trace::field::USAGE_CACHE_WRITE_TOKENS: & str
 const ra_core::trace::field::USAGE_INPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_OUTPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_REASONING_TOKENS: & str
@@ -602,6 +609,7 @@ fn ra_core::cancel::CancelReason::custom(label : impl Into < Cow < 'static , str
 fn ra_core::cancel::CancelReason::user_message(& self) -> String
 fn ra_core::cancel::CancelScope::cancel(& self, reason : CancelReason)
 fn ra_core::cancel::CancelScope::cancel_on_drop(self, reason : CancelReason) -> CancelOnDrop
+fn ra_core::cancel::CancelScope::cancelled_scope(& self) -> Option < ScopeKind >
 fn ra_core::cancel::CancelScope::child(& self, kind : ScopeKind) -> Self
 fn ra_core::cancel::CancelScope::ensure_not_cancelled(& self) -> Result < () , Error >
 fn ra_core::cancel::CancelScope::is_cancelled(& self) -> bool

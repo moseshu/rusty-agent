@@ -17,3 +17,5 @@ insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
