@@ -10,17 +10,18 @@
 
 use async_trait::async_trait;
 
-use crate::{error::Result, model::ModelToolDefinition};
+use crate::{context::RunContext, error::Result, model::ModelToolDefinition};
 
-pub mod invocation;
+pub mod context;
 pub mod namespace;
 pub mod options;
 pub mod origin;
 pub mod output;
 pub mod schema;
+pub mod services;
 mod strict;
 
-pub use invocation::{ToolCaller, ToolInvocation, ToolRuntimeContext};
+pub use context::{ToolCaller, ToolContext};
 pub use namespace::ToolNamespace;
 pub use options::{
     DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, TOOL_OPTIONS_SCHEMA_VERSION,
@@ -38,6 +39,7 @@ pub use output::{
 pub use schema::{
     DecodedToolInput, FUNC_SCHEMA_VERSION, FuncSchema, TOOL_SCHEMA_VERSION, ToolInput, ToolSchema,
 };
+pub use services::ToolServices;
 
 /// An executable tool exposed by an application or integration.
 ///
@@ -51,8 +53,11 @@ pub trait Tool: Send + Sync + 'static {
     /// Provider-neutral model-facing schema.
     fn schema(&self) -> &ToolSchema;
 
-    /// Executes one already-resolved invocation.
-    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput>;
+    /// Executes one already-resolved call.
+    ///
+    /// The context carries the call and the run it belongs to; see [`ToolContext`] for why those
+    /// are one value rather than an invocation beside a separately threaded host object.
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput>;
 
     /// Declarative execution and exposure policies.
     fn options(&self) -> ToolOptions {
@@ -60,7 +65,9 @@ pub trait Tool: Send + Sync + 'static {
     }
 
     /// Evaluates dynamic availability. Static policies are handled by the default implementation.
-    async fn is_enabled(&self, _context: &dyn ToolRuntimeContext) -> Result<bool> {
+    ///
+    /// Asked before the turn advertises anything, so there is no call yet — only the run.
+    async fn is_enabled(&self, _context: &RunContext) -> Result<bool> {
         match self.options().availability() {
             ToolAvailability::Enabled => Ok(true),
             ToolAvailability::Disabled => Ok(false),
@@ -71,8 +78,8 @@ pub trait Tool: Send + Sync + 'static {
         }
     }
 
-    /// Evaluates whether this invocation requires host approval.
-    async fn needs_approval(&self, _invocation: &ToolInvocation<'_>) -> Result<bool> {
+    /// Evaluates whether this call requires host approval.
+    async fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
         match self.options().approval() {
             ToolApprovalPolicy::Never => Ok(false),
             ToolApprovalPolicy::Always => Ok(true),
@@ -83,13 +90,13 @@ pub trait Tool: Send + Sync + 'static {
         }
     }
 
-    /// Optionally turns an invocation failure into a model-visible result.
+    /// Optionally turns a call failure into a model-visible result.
     ///
     /// The common executor calls this only when [`ToolFailureHandling::Custom`] is selected.
     /// Returning `None` means the failure remains unhandled and must be propagated.
     async fn handle_failure(
         &self,
-        _invocation: &ToolInvocation<'_>,
+        _context: &ToolContext<'_>,
         _error: &crate::error::Error,
     ) -> Result<Option<ToolOutput>> {
         Ok(None)

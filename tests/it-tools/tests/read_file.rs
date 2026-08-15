@@ -3,8 +3,11 @@
 use std::io::Write as _;
 
 use ra_core::{
-    item::CallId,
-    tool::{Tool, ToolConcurrency, ToolInvocation, ToolOutput, ToolOutputBlock, TruncationStage},
+    agent::AgentSpec,
+    context::RunContext,
+    item::{AgentId, CallId},
+    state::RunId,
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolOutputBlock, TruncationStage},
 };
 use ra_tools::read_file::{ReadFileLimits, ReadFileTool};
 use serde_json::{Value, json};
@@ -17,19 +20,36 @@ fn workspace(name: &str, contents: impl AsRef<[u8]>) -> TempDir {
     dir
 }
 
+/// The run a direct call is made inside. `read_file` reads neither the run nor host state, but a
+/// call always belongs to one, and the context is what says so.
+fn run() -> RunContext {
+    RunContext::new(
+        RunId::new("run-read-file"),
+        AgentSpec::builder()
+            .id(AgentId::new("reader"))
+            .name("Reader")
+            .build()
+            .expect("an agent"),
+    )
+}
+
 async fn read(tool: &ReadFileTool, arguments: &Value) -> ra_core::error::Result<ToolOutput> {
     let call_id = CallId::new("call-1");
-    tool.call(ToolInvocation::new(&call_id, arguments)).await
+    let run = run();
+    tool.call(ToolContext::new(&run, tool.origin(), &call_id, arguments))
+        .await
 }
 
 /// Runs the call and, when it fails, the tool's own failure shaping — the path R3-4's dispatcher
 /// takes for a tool declaring `ToolFailureHandling::Custom`.
 async fn observe(tool: &ReadFileTool, arguments: &Value) -> ToolOutput {
     let call_id = CallId::new("call-1");
-    match tool.call(ToolInvocation::new(&call_id, arguments)).await {
+    let run = run();
+    let context = || ToolContext::new(&run, tool.origin(), &call_id, arguments);
+    match tool.call(context()).await {
         Ok(output) => output,
         Err(error) => tool
-            .handle_failure(&ToolInvocation::new(&call_id, arguments), &error)
+            .handle_failure(&context(), &error)
             .await
             .expect("failure shaping must not fail")
             .expect("read_file shapes every failure it produces"),

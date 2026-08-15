@@ -12,14 +12,15 @@ use async_trait::async_trait;
 use ra_core::{
     agent::AgentSpec,
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     item::{
         AgentId, CallId, ItemId, Message, ModelResponse, OutputPhase, RunItem, RunItemKind,
         ToolCall,
     },
-    state::{ToolFailureTracker, ToolUse, ToolUseTracker},
+    state::{RunId, ToolFailureTracker, ToolUse, ToolUseTracker},
     tool::{
-        Tool, ToolConcurrency, ToolFailureHandling, ToolInvocation, ToolLookupKey, ToolOptions,
+        Tool, ToolConcurrency, ToolContext, ToolFailureHandling, ToolLookupKey, ToolOptions,
         ToolOrigin, ToolOutput, ToolSchema,
     },
 };
@@ -79,7 +80,7 @@ impl Tool for ScriptedTool {
         self.options.clone()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut script = self.script.lock().unwrap();
         let step = if script.is_empty() {
@@ -99,7 +100,7 @@ impl Tool for ScriptedTool {
 
     async fn handle_failure(
         &self,
-        _invocation: &ToolInvocation<'_>,
+        _context: &ToolContext<'_>,
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
         // The tool writes its own model-facing sentence, so two different failures reach the model
@@ -108,16 +109,21 @@ impl Tool for ScriptedTool {
     }
 }
 
-struct Host;
-
 fn binding() -> AgentBinding {
-    AgentBinding::direct(
-        AgentSpec::builder()
-            .id(AgentId::new("main"))
-            .name("main")
-            .build()
-            .unwrap(),
-    )
+    AgentBinding::direct(spec())
+}
+
+fn spec() -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("main"))
+        .name("main")
+        .build()
+        .unwrap()
+}
+
+/// The live context of the run these settlements belong to.
+fn run() -> Arc<RunContext> {
+    Arc::new(RunContext::new(RunId::new("run-no-progress"), spec()))
 }
 
 fn call(id: &str, call_id: &str, name: &str, arguments: Value) -> RunItem {
@@ -169,7 +175,7 @@ async fn settle_response(
         &binding(),
         &response,
         surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         tool_use,
         tool_failure,
@@ -526,7 +532,7 @@ async fn a_message_only_turn_leaves_every_streak_alone() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut tool_use,
         &mut failures,
@@ -564,7 +570,7 @@ impl Tool for GatedTool {
         self.options.clone()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         while !self.release.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;

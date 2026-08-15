@@ -19,6 +19,7 @@ use ra_core::{
     agent::{AgentId, AgentSpec, ToolUseBehavior, ToolUseBehaviorHandler, ToolUseResult},
     budget::{BudgetLimit, BudgetSnapshot},
     cancel::{CancelReason, CancelScope, Deadline},
+    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
@@ -29,10 +30,10 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel, ToolChoice,
     },
-    state::{RunState, ToolUse, WorkStateHandle},
+    state::{RunId, RunState, ToolUse, WorkStateHandle},
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolInvocation, ToolLookupKey, ToolNamespace,
-        ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
+        ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
     },
     usage::Usage,
 };
@@ -196,6 +197,9 @@ struct ScriptedTool {
     options: ToolOptions,
     calls: Arc<AtomicUsize>,
     work_states: Arc<Mutex<Vec<Option<String>>>>,
+    /// What each call was told about the run it belongs to: its ID, its public agent, and the
+    /// host's own state.
+    runs: Arc<Mutex<Vec<String>>>,
 }
 
 impl ScriptedTool {
@@ -215,6 +219,7 @@ impl ScriptedTool {
             options: ToolOptions::new(),
             calls: Arc::new(AtomicUsize::new(0)),
             work_states: Arc::new(Mutex::new(Vec::new())),
+            runs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -244,18 +249,34 @@ impl Tool for ScriptedTool {
         self.options.clone()
     }
 
-    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.work_states.lock().unwrap().push(
-            invocation
+            context
+                .services()
                 .work_state()
                 .and_then(|state| state.as_any().downcast_ref::<TaskState>())
                 .map(|state| state.plan.to_owned()),
         );
+        self.runs
+            .lock()
+            .unwrap()
+            .push(format!("call:{}", identity(context.run())));
         Ok(ToolOutput::text("done"))
     }
 
-    async fn needs_approval(&self, _invocation: &ToolInvocation<'_>) -> Result<bool> {
+    /// Only reached by a tool that declares dynamic availability, which is the point: preparation
+    /// asks this before the model call and dispatch calls `call` after it, so recording the same
+    /// string from both is what shows the two stages read one run.
+    async fn is_enabled(&self, context: &RunContext) -> Result<bool> {
+        self.runs
+            .lock()
+            .unwrap()
+            .push(format!("enabled:{}", identity(context)));
+        Ok(true)
+    }
+
+    async fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
         Ok(!matches!(
             self.options.approval(),
             ToolApprovalPolicy::Never
@@ -263,7 +284,21 @@ impl Tool for ScriptedTool {
     }
 }
 
-struct Host;
+/// The host's own state, reached through the run's one type-erased door.
+struct HostState {
+    workspace: &'static str,
+}
+
+/// Everything a stage can learn about the run it is part of, as one comparable string.
+fn identity(run: &RunContext) -> String {
+    format!(
+        "{}/{}/{}",
+        run.run_id(),
+        run.agent_id(),
+        run.app_context::<HostState>()
+            .map_or("<none>", |host| host.workspace)
+    )
+}
 
 const CLOSEOUT_TEXT: &str = "The budget was reached; save this progress and continue with a new \
                              allowance.";
@@ -359,13 +394,13 @@ impl Tool for SlowTool {
         self.inner.options()
     }
 
-    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        self.inner.call(invocation).await
+        self.inner.call(context).await
     }
 
-    async fn needs_approval(&self, invocation: &ToolInvocation<'_>) -> Result<bool> {
-        self.inner.needs_approval(invocation).await
+    async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        self.inner.needs_approval(context).await
     }
 }
 
@@ -521,7 +556,7 @@ fn request_with_tool_use_behavior(
             model: Arc::clone(model),
             selectors: Arc::new(Mutex::new(Vec::new())),
         }),
-        Arc::new(Host),
+        RunId::new("run-loop"),
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
     )
@@ -539,7 +574,7 @@ fn request_recording(
             model: Arc::clone(model),
             selectors,
         }),
-        Arc::new(Host),
+        RunId::new("run-loop"),
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
     )
@@ -549,7 +584,7 @@ fn pending_request(model: Arc<PendingModel>, cancel: &CancelScope) -> RunRequest
     RunRequest::new(
         agent(Vec::new()),
         Arc::new(SingleModelResolver { model }),
-        Arc::new(Host),
+        RunId::new("run-loop"),
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
     )
@@ -951,7 +986,7 @@ impl Tool for FailingTool {
         ToolOptions::new()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         Err(Error::tool(
             ToolErrorKind::ExecutionFailed,
             self.origin.qualified_name(),
@@ -2226,7 +2261,10 @@ async fn work_state_handle_is_propagated_all_the_way_to_tools() {
     let cancel = CancelScope::root();
     let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "第三步" });
 
-    Runner::run(request(vec![tool], &model, &cancel).with_work_state(task_state))
+    Runner::run(
+        request(vec![tool], &model, &cancel)
+            .with_services(ToolServices::new().with_work_state(task_state)),
+    )
         .await
         .unwrap();
 
@@ -2274,4 +2312,60 @@ async fn dropping_stream_does_not_cancel_callers_own_scope() {
         .await
         .unwrap();
     assert_eq!(result.turns(), 1);
+}
+
+#[tokio::test]
+async fn one_run_context_reaches_dynamic_availability_and_every_tool_call() {
+    // The acceptance the two context layers exist for: a run has one identity, and every stage that
+    // enters third-party code is told the same one. Preparation asks `is_enabled` before the model
+    // call; dispatch calls `call` after it; a second turn does both again. All four readings name
+    // the same run, the same public agent and the same host object.
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_availability(ToolAvailability::Dynamic)),
+    );
+    let seen = Arc::clone(&tool.runs);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![tool_call("c-2", "call-2", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "改完了")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    Runner::run(
+        request(vec![tool], &model, &cancel)
+            .with_app_context(Arc::new(HostState { workspace: "/ws" })),
+    )
+    .await
+    .unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    let expected = "run-loop/coder//ws";
+    assert_eq!(
+        seen,
+        [
+            format!("enabled:{expected}"),
+            format!("call:{expected}"),
+            format!("enabled:{expected}"),
+            format!("call:{expected}"),
+            format!("enabled:{expected}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_run_without_host_state_reads_none_rather_than_another_hosts_object() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let seen = Arc::clone(&tool.runs);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "改完了")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    Runner::run(request(vec![tool], &model, &cancel))
+        .await
+        .unwrap();
+
+    assert_eq!(seen.lock().unwrap().as_slice(), ["call:run-loop/coder/<none>"]);
 }

@@ -24,6 +24,7 @@ pub mod cancel;
 pub mod capability;
 pub mod compat;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod finish;
 pub mod guard;

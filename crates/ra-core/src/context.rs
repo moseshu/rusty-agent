@@ -1,0 +1,136 @@
+//! The live context of one run, and the single door to host application state.
+//!
+//! There are exactly two context layers in this framework, and each has exactly one shape: this
+//! run-level [`RunContext`], and the call-level
+//! [`ToolContext`](crate::tool::ToolContext) derived from it. A tool, a dynamic instruction, a
+//! guard and a hook all read the same object, so a run cannot end up with one notion of "who is
+//! running" for prompts and another for tools.
+//!
+//! # What it is not
+//!
+//! **Not model input.** Nothing here is projected into a [`ModelRequest`](crate::model::ModelRequest);
+//! a model request is built explicitly from items, and host objects, approvals and credentials
+//! never leak into it by being reachable from a context.
+//!
+//! **Not a checkpoint.** This value is deliberately not serializable. It holds a live host object
+//! and shared agent configuration, neither of which survives a process. Everything a resumed
+//! segment must still know belongs to [`RunState`](crate::state::RunState), which owns those facts;
+//! what appears here is a **read view** taken from that owner. That is why [`Self::budget`] hands
+//! out a borrowed snapshot rather than a counter: a second accumulator that a tool could advance
+//! would be a second answer to "what has this run spent", and the one that survives a checkpoint
+//! would not be it.
+//!
+//! # Application state has one door
+//!
+//! [`Self::app_context`] is it. The alternative — making the context generic over the host's type,
+//! as the reference implementation's `RunContextWrapper[TContext]` does — spreads that parameter to
+//! agents, tools and every registry, and two tools written against different host types can then no
+//! longer be registered together. Type erasure plus one checked read keeps the tool surface
+//! heterogeneous, and the framework's own ports stay named accessors on
+//! [`ToolServices`](crate::tool::ToolServices) rather than anonymous lookups.
+//!
+//! [`WorkStateHandle::as_any`](crate::state::WorkStateHandle::as_any) is **not** a second door: it
+//! reaches the cross-run task state, which is a different thing owned by a different party.
+
+use std::{any::Any, fmt, sync::Arc};
+
+use crate::{agent::AgentSpec, budget::BudgetSnapshot, item::AgentId, state::RunId};
+
+/// Everything running code may read about the run it is part of.
+///
+/// Cloning is not offered: the run owns one of these per stage and hands out borrows, so there is
+/// no copy that can drift from the state it was projected from.
+#[non_exhaustive]
+pub struct RunContext {
+    run_id: RunId,
+    agent: Arc<AgentSpec>,
+    app: Option<Arc<dyn Any + Send + Sync>>,
+    budget: BudgetSnapshot,
+}
+
+impl RunContext {
+    /// Creates the context of a run that is executing `agent` under `run_id`.
+    ///
+    /// `agent` is the **public** agent — the one the user configured and the one every record is
+    /// attributed to. A capability or sandbox step may produce a different instance that actually
+    /// executes, and that instance stays inside the framework: a hook reporting it, or a dynamic
+    /// instruction branching on it, would be describing something the user never wrote down.
+    #[must_use]
+    pub fn new(run_id: RunId, agent: Arc<AgentSpec>) -> Self {
+        Self {
+            run_id,
+            agent,
+            app: None,
+            budget: BudgetSnapshot::new(),
+        }
+    }
+
+    /// Attaches the host's own state object, readable through [`Self::app_context`].
+    #[must_use]
+    pub fn with_app_context(mut self, app_context: Arc<dyn Any + Send + Sync>) -> Self {
+        self.app = Some(app_context);
+        self
+    }
+
+    /// Sets the budget accounting this stage observes.
+    ///
+    /// The value is a copy taken from [`RunState`], not a handle into it. Read views are how a
+    /// context reports run facts; advancing them is the settlement point's job.
+    #[must_use]
+    pub fn with_budget(mut self, budget: BudgetSnapshot) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Identity of this run, stable across every segment it is resumed in.
+    #[must_use]
+    pub const fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// The public agent this run is attributed to.
+    #[must_use]
+    pub const fn agent(&self) -> &Arc<AgentSpec> {
+        &self.agent
+    }
+
+    /// Public identity of the agent that is speaking.
+    #[must_use]
+    pub fn agent_id(&self) -> &AgentId {
+        self.agent.id()
+    }
+
+    /// The host's own state object, when it is of type `T`.
+    ///
+    /// `None` covers both "the host attached nothing" and "the host attached something else",
+    /// which is what makes this a checked read rather than a cast: a tool written for one
+    /// application cannot silently reinterpret another's context.
+    #[must_use]
+    pub fn app_context<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.app.as_ref().and_then(|app| app.downcast_ref::<T>())
+    }
+
+    /// What the run has spent so far, as of the stage that built this context.
+    ///
+    /// Read-only by construction. The authoritative accounting is
+    /// [`RunState::budget`](crate::state::RunState::budget), and the limits it is measured against
+    /// are run configuration rather than a fact about the run.
+    #[must_use]
+    pub const fn budget(&self) -> &BudgetSnapshot {
+        &self.budget
+    }
+}
+
+impl fmt::Debug for RunContext {
+    /// Names what is attached without printing it. A host context is arbitrary application state,
+    /// and a run's own log is not the place for it to appear.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunContext")
+            .field("run_id", &self.run_id)
+            .field("agent_id", self.agent_id())
+            .field("has_app_context", &self.app.is_some())
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
+}

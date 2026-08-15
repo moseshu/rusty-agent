@@ -40,11 +40,12 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use ra_core::{
     agent::ToolUseResult,
     cancel::{CancelReason, CancelScope, DRAIN_GRACE, ScopeKind},
+    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
-    state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker, WorkStateHandle},
+    state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
     step::{ProcessedResponse, ToolRunFunction},
-    tool::{ToolConcurrency, ToolOrigin, ToolRuntimeContext},
+    tool::{ToolConcurrency, ToolOrigin, ToolServices},
     trace::SpanKind,
 };
 use serde_json::{Value, json};
@@ -166,9 +167,9 @@ pub struct TurnExecutionRequest<'a> {
     agent_id: &'a AgentId,
     tool_use: &'a ToolUseTracker,
     tool_failure: &'a ToolFailureTracker,
-    context: Arc<dyn ToolRuntimeContext>,
+    run: Arc<RunContext>,
     cancel: &'a CancelScope,
-    work_state: Option<Arc<dyn WorkStateHandle>>,
+    services: ToolServices,
     max_function_tool_concurrency: usize,
 }
 
@@ -179,7 +180,7 @@ impl<'a> TurnExecutionRequest<'a> {
         agent_id: &'a AgentId,
         tool_use: &'a ToolUseTracker,
         tool_failure: &'a ToolFailureTracker,
-        context: Arc<dyn ToolRuntimeContext>,
+        run: Arc<RunContext>,
         cancel: &'a CancelScope,
     ) -> Self {
         Self {
@@ -187,16 +188,16 @@ impl<'a> TurnExecutionRequest<'a> {
             agent_id,
             tool_use,
             tool_failure,
-            context,
+            run,
             cancel,
-            work_state: None,
+            services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
         }
     }
 
-    /// Sets the task state every tool in this batch is handed (R3-13).
-    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
-        self.work_state = Some(work_state);
+    /// Sets the framework ports every tool in this batch is handed.
+    pub fn with_services(mut self, services: ToolServices) -> Self {
+        self.services = services;
         self
     }
 
@@ -309,17 +310,15 @@ fn spawn_function_dispatches(
                 .no_progress_streak(request.agent_id, &identity),
         );
         let tool_scope = request.cancel.child(ScopeKind::Tool);
-        let mut dispatch_request = ToolDispatchRequest::new(
+        let dispatch_request = ToolDispatchRequest::new(
             Arc::clone(action.tool()),
             action.call_id().clone(),
             action.call().arguments().clone(),
-            Arc::clone(&request.context),
+            Arc::clone(&request.run),
             tool_scope.clone(),
             history,
-        );
-        if let Some(work_state) = &request.work_state {
-            dispatch_request = dispatch_request.with_work_state(Arc::clone(work_state));
-        }
+        )
+        .with_services(request.services.clone());
         let gate = Arc::clone(&gate);
         let slots = Arc::clone(&slots);
         let concurrency = action.tool().options().concurrency();

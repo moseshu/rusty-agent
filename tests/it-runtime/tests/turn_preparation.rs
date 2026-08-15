@@ -7,16 +7,17 @@ use futures::{StreamExt, stream};
 use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::{CancelReason, CancelScope, ScopeKind},
+    context::RunContext,
     error::{Error, Result},
     item::{CallId, Message, ModelInputItem, ModelResponse},
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelTracing, ProviderKey, ResolvedModel, ToolChoice,
     },
-    state::{ToolUse, ToolUseAttempt, ToolUseTracker},
+    state::{RunId, ToolUse, ToolUseAttempt, ToolUseTracker},
     tool::{
-        Tool, ToolAvailability, ToolExposure, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput,
-        ToolRuntimeContext, ToolSchema,
+        Tool, ToolAvailability, ToolContext, ToolExposure, ToolOptions, ToolOrigin, ToolOutput,
+        ToolSchema,
     },
 };
 use ra_runtime::{
@@ -144,7 +145,7 @@ impl Tool for RecordingTool {
         &self.schema
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         Ok(ToolOutput::text("unused"))
     }
 
@@ -152,14 +153,15 @@ impl Tool for RecordingTool {
         self.options.clone()
     }
 
-    async fn is_enabled(&self, context: &dyn ToolRuntimeContext) -> Result<bool> {
+    async fn is_enabled(&self, context: &RunContext) -> Result<bool> {
         self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(format!("is_enabled:{}", self.origin.name()));
+        // Dynamic availability is the first stage that enters third-party code, and it reaches
+        // host state the same way a running tool does: one checked read, through the run.
         let host = context
-            .as_any()
-            .downcast_ref::<HostContext>()
+            .app_context::<HostContext>()
             .ok_or_else(|| Error::caller("HostContext is required"))?;
         if !host.dynamic_tools_enabled {
             return Ok(false);
@@ -193,10 +195,13 @@ fn direct(agent: &Arc<AgentSpec>) -> AgentBinding {
     AgentBinding::direct(Arc::clone(agent))
 }
 
-fn host() -> HostContext {
-    HostContext {
-        dynamic_tools_enabled: true,
-    }
+/// The live run context preparation is handed, carrying the host's own state.
+fn host(agent: &Arc<AgentSpec>) -> RunContext {
+    RunContext::new(RunId::new("run-preparation"), Arc::clone(agent)).with_app_context(Arc::new(
+        HostContext {
+            dynamic_tools_enabled: true,
+        },
+    ))
 }
 
 #[tokio::test]
@@ -229,7 +234,7 @@ async fn test_turn_preparation_01() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
     let input = vec![ModelInputItem::Message(Message::user("hello"))];
 
@@ -328,7 +333,7 @@ async fn test_turn_preparation_02() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(event_log);
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
@@ -377,7 +382,7 @@ async fn test_turn_preparation_03() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(event_log);
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let error = prepare_turn(TurnPreparationRequest::new(
@@ -411,7 +416,7 @@ async fn test_turn_preparation_04() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let error = prepare_turn(TurnPreparationRequest::new(
@@ -440,7 +445,7 @@ async fn test_turn_preparation_05() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(event_log);
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     prepare_turn(TurnPreparationRequest::new(
@@ -466,7 +471,7 @@ async fn test_turn_preparation_06() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(event_log);
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     prepare_turn(TurnPreparationRequest::new(
@@ -493,7 +498,7 @@ async fn test_turn_preparation_07() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
     cancel.cancel(CancelReason::UserInterrupt);
 
@@ -522,7 +527,7 @@ async fn test_turn_preparation_08() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let run = CancelScope::root();
     let turn = run.child(ScopeKind::Turn);
     run.cancel(CancelReason::Shutdown);
@@ -560,7 +565,7 @@ async fn test_turn_preparation_09() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
@@ -596,7 +601,7 @@ async fn test_turn_preparation_10() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let pinned_to_live_tool = prepare_turn(
@@ -653,7 +658,7 @@ async fn test_turn_preparation_11() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(event_log);
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let default = prepare_turn(TurnPreparationRequest::new(
@@ -709,7 +714,7 @@ async fn test_turn_preparation_12() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(event_log);
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
     let input = vec![ModelInputItem::Message(Message::user("hello"))];
 
@@ -745,7 +750,7 @@ async fn test_turn_preparation_13() {
         .build()
         .unwrap();
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
-    let context = host();
+    let context = host(&agent);
     let cancel = CancelScope::root();
 
     let untouched = prepare_turn(TurnPreparationRequest::new(

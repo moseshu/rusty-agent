@@ -7,6 +7,7 @@ use futures::{StreamExt, stream};
 use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result},
     item::{
         CallId, HandoffCall, ItemId, McpApprovalRequest, Message, ModelResponse, OutputPhase,
@@ -16,11 +17,10 @@ use ra_core::{
         ApiProtocol, Model, ModelHandoffDefinition, ModelRequest, ModelResolver, ModelSelector,
         ModelSettings, ModelStream, ProviderKey, ResolvedModel,
     },
-    state::ToolUseTracker,
+    state::{RunId, ToolUseTracker},
     step::ToolUse,
     tool::{
-        Tool, ToolAvailability, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput,
-        ToolRuntimeContext, ToolSchema,
+        Tool, ToolAvailability, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
 };
 use ra_runtime::{
@@ -99,7 +99,7 @@ impl Tool for StubTool {
         &self.schema
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         Ok(ToolOutput::text("unused"))
     }
 
@@ -107,7 +107,7 @@ impl Tool for StubTool {
         self.options.clone()
     }
 
-    async fn is_enabled(&self, _context: &dyn ToolRuntimeContext) -> Result<bool> {
+    async fn is_enabled(&self, _context: &RunContext) -> Result<bool> {
         Ok(self.enabled)
     }
 }
@@ -153,8 +153,6 @@ fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
         )),
     )
 }
-
-struct Host;
 
 #[test]
 fn test_response_classification_01() {
@@ -231,7 +229,7 @@ async fn test_response_classification_03() {
         .build()
         .unwrap();
     let resolver = FixedResolver;
-    let context = Host;
+    let context = RunContext::new(RunId::new("run-classification"), Arc::clone(&agent));
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
@@ -274,7 +272,7 @@ async fn test_response_classification_04() {
         .build()
         .unwrap();
     let resolver = FixedResolver;
-    let context = Host;
+    let context = RunContext::new(RunId::new("run-classification"), Arc::clone(&agent));
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(

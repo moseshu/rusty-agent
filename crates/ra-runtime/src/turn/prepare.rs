@@ -16,6 +16,7 @@ use futures::future::try_join_all;
 use ra_core::{
     agent::AgentSpec,
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result},
     item::{AgentId, ModelInputItem},
     model::{
@@ -23,7 +24,7 @@ use ra_core::{
         ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing, ResolvedModelSettings,
     },
     state::ToolUseTracker,
-    tool::{Tool, ToolAvailability, ToolRuntimeContext},
+    tool::{Tool, ToolAvailability},
 };
 
 use crate::agent::AgentBinding;
@@ -37,7 +38,7 @@ use crate::agent::AgentBinding;
 pub struct TurnPreparationRequest<'a> {
     agent: &'a AgentBinding,
     model_resolver: &'a dyn ModelResolver,
-    tool_context: &'a dyn ToolRuntimeContext,
+    run: &'a RunContext,
     cancel: &'a CancelScope,
     tool_use: &'a ToolUseTracker,
     input: Vec<ModelInputItem>,
@@ -62,10 +63,14 @@ impl<'a> TurnPreparationRequest<'a> {
     /// `tool_choice` after the model has complied, and a caller allowed to omit it would have a
     /// run that forces the same call on every turn until the turn cap — silently, and only when a
     /// forced selection is configured.
+    ///
+    /// `run` is the same live context this turn's tools are later handed. Dynamic availability is
+    /// the first stage that enters third-party code, and it has to read the run from the same place
+    /// [`Tool::call`] will.
     pub fn new(
         agent: &'a AgentBinding,
         model_resolver: &'a dyn ModelResolver,
-        tool_context: &'a dyn ToolRuntimeContext,
+        run: &'a RunContext,
         cancel: &'a CancelScope,
         tool_use: &'a ToolUseTracker,
         input: Vec<ModelInputItem>,
@@ -73,7 +78,7 @@ impl<'a> TurnPreparationRequest<'a> {
         Self {
             agent,
             model_resolver,
-            tool_context,
+            run,
             cancel,
             tool_use,
             input,
@@ -294,7 +299,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let agent = request.agent.execution();
 
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
-    let tools = resolve_enabled_tools(agent, request.tool_context, request.cancel).await?;
+    let tools = resolve_enabled_tools(agent, request.run, request.cancel).await?;
     let tool_definitions: Vec<ModelToolDefinition> = tools
         .advertised
         .iter()
@@ -373,7 +378,7 @@ struct EnabledTools {
 
 async fn resolve_enabled_tools(
     agent: &AgentSpec,
-    context: &dyn ToolRuntimeContext,
+    context: &RunContext,
     cancel: &CancelScope,
 ) -> Result<EnabledTools> {
     let decisions = cancel

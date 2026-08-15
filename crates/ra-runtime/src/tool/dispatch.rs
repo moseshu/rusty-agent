@@ -21,12 +21,12 @@ use std::{sync::Arc, time::Instant};
 
 use ra_core::{
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     item::{CallId, ToolApproval, ToolCallOutput},
-    state::WorkStateHandle,
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolFailureHandling, ToolInvocation, ToolOptions,
-        ToolOutput, ToolRuntimeContext, ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolCaller, ToolContext, ToolFailureHandling, ToolOptions,
+        ToolOutput, ToolServices, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -179,11 +179,11 @@ pub struct ToolDispatchRequest {
     tool: Arc<dyn Tool>,
     call_id: CallId,
     arguments: Value,
-    context: Arc<dyn ToolRuntimeContext>,
+    run: Arc<RunContext>,
     cancel: CancelScope,
     history: CallHistory,
     caller: ToolCaller,
-    work_state: Option<Arc<dyn WorkStateHandle>>,
+    services: ToolServices,
 }
 
 impl ToolDispatchRequest {
@@ -192,11 +192,15 @@ impl ToolDispatchRequest {
     /// `cancel` is required rather than optional for the same reason it is in turn preparation:
     /// [`Tool::call`] is third-party `async` code, and the cancellation contract does not allow it
     /// to be awaited bare.
+    ///
+    /// `run` is the live context of the run this call belongs to. It is shared rather than rebuilt
+    /// per call, so every tool in one turn sees the same run identity, the same public agent, and
+    /// the same host state.
     pub fn new(
         tool: Arc<dyn Tool>,
         call_id: CallId,
         arguments: Value,
-        context: Arc<dyn ToolRuntimeContext>,
+        run: Arc<RunContext>,
         cancel: CancelScope,
         history: CallHistory,
     ) -> Self {
@@ -204,34 +208,37 @@ impl ToolDispatchRequest {
             tool,
             call_id,
             arguments,
-            context,
+            run,
             cancel,
             history,
             caller: ToolCaller::Direct,
-            work_state: None,
+            services: ToolServices::new(),
         }
     }
 
-    /// Sets the caller class this invocation is admitted under.
+    /// Sets the caller class this call is admitted under.
     pub const fn with_caller(mut self, caller: ToolCaller) -> Self {
         self.caller = caller;
         self
     }
 
-    /// Sets the task state the tool is handed (R3-13).
-    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
-        self.work_state = Some(work_state);
+    /// Sets the framework ports the tool is handed.
+    pub fn with_services(mut self, services: ToolServices) -> Self {
+        self.services = services;
         self
     }
 
-    fn invocation(&self) -> ToolInvocation<'_> {
-        let invocation = ToolInvocation::new(&self.call_id, &self.arguments)
-            .with_caller(self.caller)
-            .with_context(self.context.as_ref());
-        match &self.work_state {
-            Some(work_state) => invocation.with_work_state(work_state.as_ref()),
-            None => invocation,
-        }
+    /// Builds the context for this call. Every stage that enters third-party code takes it from
+    /// here, so a tool cannot be asked about a call under one context and then run under another.
+    fn context(&self) -> ToolContext<'_> {
+        ToolContext::new(
+            &self.run,
+            self.tool.origin(),
+            &self.call_id,
+            &self.arguments,
+        )
+        .with_caller(self.caller)
+        .with_services(&self.services)
     }
 }
 
@@ -282,7 +289,7 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch>
     // so its position relative to approval is decided here rather than per call site.
     check_input_guardrails(&options)?;
 
-    let outcome = invoke(tool, request.invocation(), &options, &request.cancel, &name).await;
+    let outcome = invoke(tool, request.context(), &options, &request.cancel, &name).await;
 
     let output = match outcome {
         Ok(output) => output,
@@ -298,13 +305,13 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch>
 /// Invokes the tool, applying its per-call time limit.
 async fn invoke(
     tool: &Arc<dyn Tool>,
-    invocation: ToolInvocation<'_>,
+    context: ToolContext<'_>,
     options: &ToolOptions,
     cancel: &CancelScope,
     name: &str,
 ) -> Result<ToolOutput> {
     let started = Instant::now();
-    let call = tool.call(invocation);
+    let call = tool.call(context);
     let result = match options.timeout() {
         None => cancel.run(call).await.and_then(|result| result),
         Some(limit) => cancel
@@ -376,10 +383,10 @@ async fn shape_failure(
         // case the no-progress breaker exists to *not* fire on, and it can only tell those two
         // apart if it is told they were failures at all.
         ToolFailureHandling::Custom => {
-            let invocation = request.invocation();
+            let context = request.context();
             match request
                 .cancel
-                .run(tool.handle_failure(&invocation, &error))
+                .run(tool.handle_failure(&context, &error))
                 .await??
             {
                 Some(output) => observed(&request.call_id, &output, Some(error.code())),
@@ -401,8 +408,8 @@ async fn needs_approval(
         ToolApprovalPolicy::Never => Ok(false),
         ToolApprovalPolicy::Always => Ok(true),
         ToolApprovalPolicy::Dynamic => {
-            let invocation = request.invocation();
-            request.cancel.run(tool.needs_approval(&invocation)).await?
+            let context = request.context();
+            request.cancel.run(tool.needs_approval(&context)).await?
         }
         policy => Err(Error::caller(format!(
             "tool `{}` uses an unsupported approval policy `{policy:?}`",

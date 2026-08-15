@@ -7,7 +7,7 @@ use ra_core::{
     agent::{AgentId, AgentInstructions, AgentSpec, ToolUseBehavior},
     error::Result,
     model::ModelSettings,
-    tool::{Tool, ToolInvocation, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema},
+    tool::{Tool, ToolContext, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema},
 };
 use serde_json::json;
 
@@ -54,7 +54,7 @@ impl Tool for EchoTool {
         &self.schema
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         Ok(ToolOutput::text("echo"))
     }
 }

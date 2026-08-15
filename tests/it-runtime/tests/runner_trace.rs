@@ -45,8 +45,9 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel,
     },
+    state::RunId,
     tool::{
-        Tool, ToolApprovalPolicy, ToolFailureHandling, ToolInvocation, ToolOptions, ToolOrigin,
+        Tool, ToolApprovalPolicy, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin,
         ToolOutput, ToolSchema,
     },
     usage::Usage,
@@ -345,7 +346,7 @@ impl Tool for ScriptedTool {
         self.options.clone()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if !self.handler_time.is_zero() {
             tokio::time::sleep(self.handler_time).await;
@@ -353,7 +354,7 @@ impl Tool for ScriptedTool {
         Ok(ToolOutput::text("done"))
     }
 
-    async fn needs_approval(&self, _invocation: &ToolInvocation<'_>) -> Result<bool> {
+    async fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
         Ok(!matches!(
             self.options.approval(),
             ToolApprovalPolicy::Never
@@ -391,7 +392,7 @@ impl Tool for PropagatingFailureTool {
         ToolOptions::new().with_failure_handling(ToolFailureHandling::Propagate)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         Err(Error::tool(
             ToolErrorKind::ExecutionFailed,
             self.origin.qualified_name(),
@@ -399,8 +400,6 @@ impl Tool for PropagatingFailureTool {
         ))
     }
 }
-
-struct Host;
 
 fn item(id: &str, kind: RunItemKind) -> RunItem {
     RunItem::new(ItemId::new(id), kind)
@@ -443,7 +442,7 @@ fn request(
         Arc::new(FixedResolver {
             model: Arc::clone(model),
         }),
-        Arc::new(Host),
+        RunId::new("run-trace"),
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
     )

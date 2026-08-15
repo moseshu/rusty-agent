@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use ra_core::{
     cancel::CancelScope,
+    context::RunContext,
     error::Result,
     item::{ModelInputItem, ModelResponse, RunItem},
-    state::{ToolFailureTracker, ToolUseTracker, WorkStateHandle},
+    state::{ToolFailureTracker, ToolUseTracker},
     step::SingleStepResult,
-    tool::ToolRuntimeContext,
+    tool::ToolServices,
 };
 
 use crate::agent::AgentBinding;
@@ -51,11 +52,11 @@ pub struct TurnSettlementRequest<'a> {
     agent: &'a AgentBinding,
     response: &'a ModelResponse,
     surface: &'a TurnActionSurface,
-    context: Arc<dyn ToolRuntimeContext>,
+    run: Arc<RunContext>,
     cancel: &'a CancelScope,
     tool_use: &'a mut ToolUseTracker,
     tool_failure: &'a mut ToolFailureTracker,
-    work_state: Option<Arc<dyn WorkStateHandle>>,
+    services: ToolServices,
     max_function_tool_concurrency: usize,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
@@ -72,11 +73,15 @@ impl<'a> TurnSettlementRequest<'a> {
     /// records, counts, and later hooks and spans. It reads
     /// [`public_id`](AgentBinding::public_id) and nothing else, so no caller is in a position to
     /// hand it a sandbox-prepared clone's identity by mistake (R3-12).
+    ///
+    /// `run` is the run's live context, which this turn's tools read. It carries the public agent
+    /// for the same reason `agent` is a binding: what a tool sees named is what the user configured,
+    /// never a prepared instance.
     pub fn new(
         agent: &'a AgentBinding,
         response: &'a ModelResponse,
         surface: &'a TurnActionSurface,
-        context: Arc<dyn ToolRuntimeContext>,
+        run: Arc<RunContext>,
         cancel: &'a CancelScope,
         tool_use: &'a mut ToolUseTracker,
         tool_failure: &'a mut ToolFailureTracker,
@@ -85,20 +90,20 @@ impl<'a> TurnSettlementRequest<'a> {
             agent,
             response,
             surface,
-            context,
+            run,
             cancel,
             tool_use,
             tool_failure,
-            work_state: None,
+            services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
         }
     }
 
-    /// Sets the task state this run participates in, for the tools this turn calls (R3-13).
-    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
-        self.work_state = Some(work_state);
+    /// Sets the framework ports the tools this turn calls are handed.
+    pub fn with_services(mut self, services: ToolServices) -> Self {
+        self.services = services;
         self
     }
 
@@ -143,19 +148,16 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
 
     // 2. Answer every bound action. Interruptions come back rather than blocking: a pending
     // approval is a state the run can be saved in, not an `await` somebody is stuck on.
-    let mut execution_request = TurnExecutionRequest::new(
+    let execution_request = TurnExecutionRequest::new(
         &processed,
         public_id,
         request.tool_use,
         request.tool_failure,
-        Arc::clone(&request.context),
+        Arc::clone(&request.run),
         request.cancel,
-    );
-    if let Some(work_state) = &request.work_state {
-        execution_request = execution_request.with_work_state(Arc::clone(work_state));
-    }
-    execution_request =
-        execution_request.with_max_function_tool_concurrency(request.max_function_tool_concurrency);
+    )
+    .with_services(request.services.clone())
+    .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
     let execution = execute_actions(execution_request).await?;
 
     // 2b. Record how it turned out, the mirror of 1b and for the mirror-image reason. Attempts have

@@ -2,15 +2,18 @@ use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ra_core::{
+    agent::AgentSpec,
+    budget::BudgetSnapshot,
     compat::SchemaVersion,
+    context::RunContext,
     error::{Error, Result},
-    item::CallId,
-    state::WorkStateHandle,
+    item::{AgentId, CallId},
+    state::{RunId, WorkStateHandle},
     tool::{
         DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy,
-        ToolAvailability, ToolCaller, ToolConcurrency, ToolExposure, ToolFailureHandling,
-        ToolGuardrailId, ToolInvocation, ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin,
-        ToolOutput, ToolSchema, ToolTimeoutBehavior,
+        ToolAvailability, ToolCaller, ToolConcurrency, ToolContext, ToolExposure,
+        ToolFailureHandling, ToolGuardrailId, ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin,
+        ToolOutput, ToolSchema, ToolServices, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -343,6 +346,23 @@ struct HostContext {
     prefix: &'static str,
 }
 
+/// Another host type, to check that reading application state is a checked read and not a cast.
+#[derive(Debug)]
+struct OtherHostContext;
+
+/// The run every tool call in this file happens inside.
+fn run_context() -> RunContext {
+    RunContext::new(RunId::new("run_tool_contract"), agent())
+}
+
+fn agent() -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("agent_tool_contract"))
+        .name("tool contract")
+        .build()
+        .unwrap()
+}
+
 struct EchoTool {
     origin: ToolOrigin,
     schema: ToolSchema,
@@ -379,18 +399,17 @@ impl Tool for EchoTool {
         &self.schema
     }
 
-    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
-        let context = invocation
-            .context()
-            .as_any()
-            .downcast_ref::<HostContext>()
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        let host = context
+            .run()
+            .app_context::<HostContext>()
             .ok_or_else(|| Error::caller("HostContext is required"))?;
-        let text = invocation
+        let text = context
             .arguments()
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::caller("text is required"))?;
-        Ok(ToolOutput::text(format!("{}{text}", context.prefix)))
+        Ok(ToolOutput::text(format!("{}{text}", host.prefix)))
     }
 
     fn options(&self) -> ToolOptions {
@@ -403,25 +422,31 @@ async fn test_tool_contract_12() {
     let tool: Arc<dyn Tool> = Arc::new(EchoTool::new());
     let call_id = CallId::new("call_1");
     let arguments = json!({"text": "hello"});
-    let context = HostContext { prefix: "host:" };
-    let invocation = ToolInvocation::new(&call_id, &arguments)
-        .with_caller(ToolCaller::Programmatic)
-        .with_context(&context);
+    let run = run_context().with_app_context(Arc::new(HostContext { prefix: "host:" }));
+    let context = ToolContext::new(&run, tool.origin(), &call_id, &arguments)
+        .with_caller(ToolCaller::Programmatic);
 
-    let debug = format!("{invocation:?}");
+    // Neither the model's arguments nor the host's own state belongs in a log line.
+    let debug = format!("{context:?}");
     assert!(!debug.contains("hello"));
+    assert!(!debug.contains("host:"));
+    assert!(debug.contains("has_app_context: true"));
 
     tool.validate().unwrap();
-    assert!(tool.is_enabled(&context).await.unwrap());
-    assert!(tool.needs_approval(&invocation).await.unwrap());
+    assert!(tool.is_enabled(&run).await.unwrap());
+    assert!(tool.needs_approval(&context).await.unwrap());
     assert!(tool.options().allows_caller(ToolCaller::Programmatic));
+
+    // The call knows which tool it resolved to, and knows it as the origin rather than as a name.
+    assert_eq!(context.origin().lookup_key(), tool.origin().lookup_key());
+    assert_eq!(context.call_id(), &call_id);
 
     let definition = tool.model_definition();
     assert_eq!(definition.name(), "echo");
     assert_eq!(definition.description(), Some("Echo text with the host prefix."));
     assert!(definition.strict());
 
-    let output = tool.call(invocation).await.unwrap();
+    let output = tool.call(context).await.unwrap();
     assert_eq!(output.as_text(), Some("host:hello"));
 }
 
@@ -436,23 +461,29 @@ async fn test_tool_contract_13() {
         }
     }
 
+    let origin = ToolOrigin::new("echo").unwrap();
     let call_id = CallId::new("call_work_state");
     let arguments = json!({"text": "hello"});
-    let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "第三步" });
+    let run = run_context();
+    let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "step three" });
+    let services = ToolServices::new().with_work_state(task_state);
 
-    // R3-13 留的位：工具读得到宿主挂上来的任务态，且拿得回自己的具体类型。
-    let invocation = ToolInvocation::new(&call_id, &arguments).with_work_state(task_state.as_ref());
-    let seen = invocation
+    // The task-state port: a tool reads what the host mounted and gets its own type back.
+    let context = ToolContext::new(&run, &origin, &call_id, &arguments).with_services(&services);
+    let seen = context
+        .services()
         .work_state()
-        .expect("挂了任务态就该读得到")
+        .expect("an attached task state has to be readable")
         .as_any()
         .downcast_ref::<TaskState>()
-        .expect("必须能取回宿主自己的类型");
-    assert_eq!(seen.plan, "第三步");
-    assert!(format!("{invocation:?}").contains("work_state"));
+        .expect("the host has to get its own type back")
+        .plan;
+    assert_eq!(seen, "step three");
+    assert!(format!("{context:?}").contains("work_state: true"));
 
-    // 不属于任何任务的 run 是常态，不是缺失。
-    assert!(ToolInvocation::new(&call_id, &arguments).work_state().is_none());
+    // A run that belongs to no task is the ordinary case, not a missing port.
+    let bare = ToolContext::new(&run, &origin, &call_id, &arguments);
+    assert!(bare.services().work_state().is_none());
 }
 
 #[tokio::test]
@@ -463,10 +494,56 @@ async fn test_tool_contract_14() {
         .with_approval(ToolApprovalPolicy::Dynamic);
     let call_id = CallId::new("call_dynamic");
     let arguments = json!({"text": "hello"});
-    let invocation = ToolInvocation::new(&call_id, &arguments);
+    let run = run_context();
+    let context = ToolContext::new(&run, tool.origin(), &call_id, &arguments);
 
-    assert!(tool.is_enabled(&HostContext { prefix: "" }).await.is_err());
-    assert!(tool.needs_approval(&invocation).await.is_err());
+    assert!(tool.is_enabled(&run).await.is_err());
+    assert!(tool.needs_approval(&context).await.is_err());
+}
+
+#[tokio::test]
+async fn test_tool_contract_18() {
+    // Application state has exactly one door, and going through it is a checked read: a tool
+    // written for one host cannot reinterpret another host's object, and a run that attached
+    // nothing answers the same way as one that attached something else.
+    let attached = run_context().with_app_context(Arc::new(HostContext { prefix: "host:" }));
+    assert_eq!(
+        attached.app_context::<HostContext>().map(|host| host.prefix),
+        Some("host:")
+    );
+    assert!(attached.app_context::<OtherHostContext>().is_none());
+    assert!(run_context().app_context::<HostContext>().is_none());
+
+    // Everything a tool can learn about the run comes from the same object, so the prompt path and
+    // the call path cannot disagree about who is running.
+    let origin = ToolOrigin::new("echo").unwrap();
+    let call_id = CallId::new("call_identity");
+    let arguments = json!({"text": "hello"});
+    let context = ToolContext::new(&attached, &origin, &call_id, &arguments);
+    assert_eq!(context.run().run_id(), attached.run_id());
+    assert_eq!(context.run().agent_id(), attached.agent_id());
+    assert_eq!(context.run().agent_id().as_str(), "agent_tool_contract");
+}
+
+#[test]
+fn test_tool_contract_19() {
+    // Run facts are read views taken from the state that owns them. The context reports spend; it
+    // has no way to advance it, so a run cannot end up with two answers to what it has spent.
+    let mut budget = BudgetSnapshot::new();
+    budget.record_turn();
+    let run = run_context().with_budget(budget.clone());
+
+    assert_eq!(run.budget(), &budget);
+    assert_eq!(run.budget().turns_used(), 1);
+
+    // A later projection of the same run reports the newer spend; the earlier one is a copy and
+    // stays where it was.
+    let mut advanced = budget.clone();
+    advanced.record_turn();
+    let later = run_context().with_budget(advanced);
+    assert_eq!(later.budget().turns_used(), 2);
+    assert_eq!(run.budget().turns_used(), 1);
+    assert_eq!(later.run_id(), run.run_id());
 }
 
 #[test]

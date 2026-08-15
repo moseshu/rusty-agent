@@ -7,8 +7,8 @@
 //!
 //! # Why a slot this early
 //!
-//! The cost is asymmetric. Reserving the slot today is one field on
-//! [`ToolInvocation`](crate::tool::ToolInvocation) and one on the run's request. Adding it later
+//! The cost is asymmetric. Reserving the slot today is one accessor on
+//! [`ToolServices`](crate::tool::ToolServices), the bag every call is handed. Adding it later
 //! instead means touching every construction point of the run context *and every caller of*
 //! [`Tool::call`](crate::tool::Tool::call) — including third-party tools, whose signatures the
 //! framework does not own. A milestone that cannot be added without a breaking change to other

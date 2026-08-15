@@ -15,7 +15,7 @@ pub mod tool_failure;
 pub mod tool_use;
 pub mod work;
 
-pub use run::{RUN_STATE_SCHEMA_VERSION, RunState};
+pub use run::{RUN_STATE_SCHEMA_VERSION, RunId, RunState};
 pub use tool_failure::{
     AgentToolFailures, EvidenceFingerprint, TOOL_FAILURE_RECENT_LIMIT, TOOL_FAILURE_SCHEMA_VERSION,
     ToolFailureEntry, ToolFailureRecord, ToolFailureTracker, ToolOutcome,

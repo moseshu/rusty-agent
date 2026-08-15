@@ -31,11 +31,55 @@ use crate::{
 /// Current [`RunState`] schema version.
 pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
+/// Stable identity of one run, across every segment it is resumed in.
+///
+/// It lives beside the recoverable state rather than beside the live
+/// [`RunContext`](crate::context::RunContext) on purpose. Persisted events, stored items and replay
+/// all attribute by this ID, so the run's identity has to be a value that survives a checkpoint;
+/// the live context only ever shows a read view of it.
+///
+/// # Where an ID comes from
+///
+/// From whoever starts the run, as an explicit construction argument. [`Self::generate`] mints one,
+/// but it has to be *called* — there is deliberately no `Default` and no minting inside another
+/// constructor, because an ID a value type produces on its own reappears in two places that must
+/// not have it: a `Default` that quietly acquires an identity, and a deserialization that hands a
+/// restored run a brand new one and detaches it from everything already written under the old.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(String);
+
+impl RunId {
+    /// Creates an ID from a host-generated string.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Mints a fresh random ID for a run that is starting now.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// String representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for RunId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// All mutable, framework-owned facts one run carries between its segments.
 ///
-/// This is not host application context. Host context is an arbitrary live object passed to tools
-/// through [`ToolRuntimeContext`](crate::tool::ToolRuntimeContext), while this value is safe to
-/// checkpoint and restore. New framework-owned state is added here with a serde default; callers
+/// This is not host application context. Host context is an arbitrary live object read through
+/// [`RunContext::app_context`](crate::context::RunContext::app_context), while this value is safe
+/// to checkpoint and restore. New framework-owned state is added here with a serde default; callers
 /// pass the complete value through the runner's request API so a resumed run cannot accidentally
 /// reset part of its accounting.
 #[non_exhaustive]

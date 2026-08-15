@@ -29,11 +29,12 @@
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
 
-use std::{sync::Arc, time::Instant};
+use std::{any::Any, sync::Arc, time::Instant};
 
 use ra_core::{
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
+    context::RunContext,
     error::{BudgetKind, Error, Result},
     finish::FinishReason,
     item::{
@@ -41,9 +42,9 @@ use ra_core::{
         RunItemKind,
     },
     model::{ModelResolver, ModelSettings, ModelTracing},
-    state::{RunState, WorkStateHandle},
+    state::{RunId, RunState},
     step::NextStep,
-    tool::ToolRuntimeContext,
+    tool::ToolServices,
     trace::SpanKind,
 };
 use tokio::sync::mpsc;
@@ -235,12 +236,13 @@ impl std::fmt::Debug for RunConfig {
 pub struct RunRequest {
     agent: AgentBinding,
     model_resolver: Arc<dyn ModelResolver>,
-    tool_context: Arc<dyn ToolRuntimeContext>,
+    run_id: RunId,
+    app_context: Option<Arc<dyn Any + Send + Sync>>,
     cancel: CancelScope,
     input: Vec<ModelInputItem>,
     config: RunConfig,
     state: RunState,
-    work_state: Option<Arc<dyn WorkStateHandle>>,
+    services: ToolServices,
 }
 
 impl RunRequest {
@@ -249,28 +251,54 @@ impl RunRequest {
     /// `cancel` is required for the same reason it is in turn preparation and tool dispatch: every
     /// stage of the loop awaits third-party code, and a run with no scope is a run nobody can
     /// interrupt.
+    ///
+    /// `run_id` is required and comes from the caller, never from a default. Persisted events,
+    /// stored items and replay all attribute by it, and an identity a constructor mints on its own
+    /// is one a resumed segment cannot be given back — [`RunId::generate`] makes minting a fresh one
+    /// something the caller *says*. A continuation passes the identity its first segment used.
     pub fn new(
         agent: AgentBinding,
         model_resolver: Arc<dyn ModelResolver>,
-        tool_context: Arc<dyn ToolRuntimeContext>,
+        run_id: RunId,
         cancel: CancelScope,
         input: Vec<ModelInputItem>,
     ) -> Self {
         Self {
             agent,
             model_resolver,
-            tool_context,
+            run_id,
+            app_context: None,
             cancel,
             input,
             config: RunConfig::new(),
             state: RunState::new(),
-            work_state: None,
+            services: ToolServices::new(),
         }
     }
 
     /// Sets the run-level configuration.
     pub fn with_config(mut self, config: RunConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Attaches the host's own state object.
+    ///
+    /// It reaches running code through
+    /// [`RunContext::app_context`](ra_core::context::RunContext::app_context) and nowhere else, so a
+    /// tool reads it by naming the type it expects rather than by casting whatever it was handed.
+    pub fn with_app_context(mut self, app_context: Arc<dyn Any + Send + Sync>) -> Self {
+        self.app_context = Some(app_context);
+        self
+    }
+
+    /// Installs the framework ports every tool in this run is handed.
+    ///
+    /// One bag rather than one setter per port: the ports travel from here through settlement,
+    /// batch execution and dispatch into [`Tool::call`](ra_core::tool::Tool::call), so a port added
+    /// as its own parameter would change four signatures and every third-party tool.
+    pub fn with_services(mut self, services: ToolServices) -> Self {
+        self.services = services;
         self
     }
 
@@ -284,16 +312,6 @@ impl RunRequest {
     /// [`RunState::with_tool_use`](ra_core::state::RunState::with_tool_use) and pass the result.
     pub fn with_state(mut self, state: RunState) -> Self {
         self.state = state;
-        self
-    }
-
-    /// Attaches the task state this run participates in (R3-13).
-    ///
-    /// Held as a handle rather than a value: the task spans runs and, at R17, nodes, so a run that
-    /// owned a copy would checkpoint a snapshot that goes stale as soon as anything else advances
-    /// it. Every tool this run dispatches is handed the same handle, and R7's guards will be.
-    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
-        self.work_state = Some(work_state);
         self
     }
 }
@@ -342,8 +360,9 @@ impl Runner {
 /// hand-off stop being visible together.
 struct TurnLoopContext<'a> {
     model_resolver: &'a Arc<dyn ModelResolver>,
-    tool_context: &'a Arc<dyn ToolRuntimeContext>,
-    work_state: Option<&'a Arc<dyn WorkStateHandle>>,
+    run_id: &'a RunId,
+    app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
+    services: &'a ToolServices,
     cancel: &'a CancelScope,
     closeout_cancel: &'a CancelScope,
     config: &'a RunConfig,
@@ -414,12 +433,13 @@ async fn run_loop_inner(
     let RunRequest {
         mut agent,
         model_resolver,
-        tool_context,
+        run_id,
+        app_context,
         cancel,
         input: original_input,
         config,
         mut state,
-        work_state,
+        services,
     } = request;
 
     if let Err(error) = validate_config(&config) {
@@ -445,8 +465,9 @@ async fn run_loop_inner(
 
     let context = TurnLoopContext {
         model_resolver: &model_resolver,
-        tool_context: &tool_context,
-        work_state: work_state.as_ref(),
+        run_id: &run_id,
+        app_context: app_context.as_ref(),
+        services: &services,
         cancel: &cancel,
         closeout_cancel: &closeout_cancel,
         config: &config,
@@ -678,10 +699,11 @@ async fn run_one_turn(
         &progress.generated,
         budget_reminder(state.budget(), config.budget()),
     );
+    let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
         agent,
         context.model_resolver.as_ref(),
-        context.tool_context.as_ref(),
+        &preparation_context,
         turn_scope,
         state.tool_use(),
         input,
@@ -710,23 +732,24 @@ async fn run_one_turn(
     state.budget_mut().record_usage(response.usage());
     progress.model_responses.push(response.clone());
 
+    // Built again rather than reused from preparation: the call above has been paid for, and the
+    // spend a tool reads has to include it. The two contexts are the same run and the same agent —
+    // what differs is only how much of the budget each stage can truthfully report.
+    let settlement_context = Arc::new(live_context(context, agent, state));
     let (tool_use, tool_failure) = state.trackers_mut();
-    let mut settlement = TurnSettlementRequest::new(
+    let settlement = TurnSettlementRequest::new(
         agent,
         &response,
         &surface,
-        Arc::clone(context.tool_context),
+        settlement_context,
         turn_scope,
         tool_use,
         tool_failure,
     )
     .with_original_input(context.original_input.to_vec())
-    .with_pre_step_items(progress.generated.clone());
-    if let Some(work_state) = context.work_state {
-        settlement = settlement.with_work_state(Arc::clone(work_state));
-    }
-    settlement =
-        settlement.with_max_function_tool_concurrency(config.max_function_tool_concurrency);
+    .with_pre_step_items(progress.generated.clone())
+    .with_services(context.services.clone())
+    .with_max_function_tool_concurrency(config.max_function_tool_concurrency);
     let settled = settle_turn(settlement).await?;
 
     for item in settled.session_step_items() {
@@ -764,6 +787,28 @@ async fn run_one_turn(
             *agent = AgentBinding::direct(Arc::clone(new_agent));
             Ok(None)
         }
+    }
+}
+
+/// Builds the live context the stage about to run hands to third-party code.
+///
+/// One function so every stage projects the same facts. Two of them matter enough to name:
+///
+/// - **The public agent, never the execution instance.** A dynamic availability check, a tool and
+///   later a guard all report and branch on the agent the user configured; a prepared clone that
+///   reached them would make a run describe something nobody wrote down.
+/// - **The budget as a copy taken from [`RunState`], not a handle into it.** The context is a read
+///   view; the state stays the one thing that accumulates and the one thing a checkpoint carries.
+fn live_context(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &RunState,
+) -> RunContext {
+    let run = RunContext::new(context.run_id.clone(), Arc::clone(agent.public()))
+        .with_budget(state.budget().clone());
+    match context.app_context {
+        Some(app_context) => run.with_app_context(Arc::clone(app_context)),
+        None => run,
     }
 }
 

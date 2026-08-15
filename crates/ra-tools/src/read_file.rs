@@ -51,8 +51,8 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
     tool::{
-        ObservationMetadata, Tool, ToolConcurrency, ToolFailureHandling, ToolInput as _,
-        ToolInvocation, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema,
+        ObservationMetadata, Tool, ToolConcurrency, ToolContext, ToolFailureHandling,
+        ToolInput as _, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema,
         Truncation, TruncationStage,
     },
 };
@@ -597,11 +597,11 @@ impl Tool for ReadFileTool {
         &self.schema
     }
 
-    async fn call(&self, invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         // `FuncSchema`'s schema-bound decoder takes the raw argument string a provider sent, while
-        // an invocation carries the parsed value. Until R2-6's registry owns that seam, the typed
+        // a call context carries the parsed value. Until R2-6's registry owns that seam, the typed
         // decode happens here; `deny_unknown_fields` keeps it as strict as the schema is.
-        let input: ReadFileInput = serde_json::from_value(invocation.arguments().clone())
+        let input: ReadFileInput = serde_json::from_value(context.arguments().clone())
             .map_err(|error| ReadFileFailure::BadArguments(error.to_string()).into_error())?;
         self.read(&input).await.map_err(ReadFileFailure::into_error)
     }
@@ -631,7 +631,7 @@ impl Tool for ReadFileTool {
 
     async fn handle_failure(
         &self,
-        _invocation: &ToolInvocation<'_>,
+        _context: &ToolContext<'_>,
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
         // Matched on the typed cause, never on the message. The sentence the model reads is

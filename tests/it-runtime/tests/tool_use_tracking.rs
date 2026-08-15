@@ -9,16 +9,17 @@ use async_trait::async_trait;
 use ra_core::{
     agent::AgentSpec,
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     item::{
         AgentId, CallId, ItemId, McpApprovalRequest, Message, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolCall,
     },
     model::ModelHandoffDefinition,
-    state::{ToolFailureTracker, ToolUse, ToolUseTracker},
+    state::{RunId, ToolFailureTracker, ToolUse, ToolUseTracker},
     tool::{
-        Tool, ToolApprovalPolicy, ToolInvocation, ToolLookupKey, ToolOptions, ToolOrigin,
-        ToolOutput, ToolSchema,
+        Tool, ToolApprovalPolicy, ToolContext, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput,
+        ToolSchema,
     },
 };
 use ra_runtime::{
@@ -81,7 +82,7 @@ impl Tool for ScriptedTool {
         self.options.clone()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.behavior {
             Behavior::Succeed => Ok(ToolOutput::text("ok")),
@@ -93,7 +94,7 @@ impl Tool for ScriptedTool {
         }
     }
 
-    async fn needs_approval(&self, _invocation: &ToolInvocation<'_>) -> Result<bool> {
+    async fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
         Ok(!matches!(
             self.options.approval(),
             ToolApprovalPolicy::Never
@@ -101,22 +102,27 @@ impl Tool for ScriptedTool {
     }
 }
 
-struct Host;
-
 fn agent() -> AgentId {
     AgentId::new("main")
+}
+
+fn spec(id: &str) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new(id))
+        .name(id)
+        .build()
+        .unwrap()
 }
 
 /// The binding a settlement runs under. `direct` because these tests are about what gets recorded,
 /// not about the public/execution split — that has its own file.
 fn binding(id: &str) -> AgentBinding {
-    AgentBinding::direct(
-        AgentSpec::builder()
-            .id(AgentId::new(id))
-            .name(id)
-            .build()
-            .unwrap(),
-    )
+    AgentBinding::direct(spec(id))
+}
+
+/// The live context of the run a settlement belongs to, naming the same agent as its binding.
+fn run(id: &str) -> Arc<RunContext> {
+    Arc::new(RunContext::new(RunId::new("run-tool-use"), spec(id)))
 }
 
 fn item(id: &str, kind: RunItemKind) -> RunItem {
@@ -149,7 +155,7 @@ async fn settle(
         &binding("main"),
         response,
         surface,
-        Arc::new(Host),
+        run("main"),
         &cancel,
         tracker,
         &mut ToolFailureTracker::new(),
@@ -349,7 +355,7 @@ async fn test_tool_use_tracking_06() {
             &binding(id),
             &response,
             &surface,
-            Arc::new(Host),
+            run(id),
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),

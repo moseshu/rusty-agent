@@ -7,6 +7,7 @@ use futures::{StreamExt, stream};
 use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result},
     item::{
         CallId, ItemId, ItemProvenance, Message, ModelResponse, OutputPhase, RunItem, RunItemKind,
@@ -16,8 +17,8 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel,
     },
-    state::{ToolFailureTracker, ToolUseTracker},
-    tool::{Tool, ToolInvocation, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
+    state::{RunId, ToolFailureTracker, ToolUseTracker},
+    tool::{Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::{
     agent::AgentBinding,
@@ -81,11 +82,14 @@ impl ModelResolver for RecordingResolver {
 struct StubTool {
     origin: ToolOrigin,
     schema: ToolSchema,
+    /// Public IDs of the agents this tool was told it was running for.
+    seen_agents: Arc<Mutex<Vec<String>>>,
 }
 
 impl StubTool {
     fn new(name: &str) -> Self {
         Self {
+            seen_agents: Arc::new(Mutex::new(Vec::new())),
             origin: ToolOrigin::new(name).unwrap(),
             schema: ToolSchema::new(
                 name,
@@ -115,15 +119,25 @@ impl Tool for StubTool {
         ToolOptions::new()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.seen_agents
+            .lock()
+            .unwrap()
+            .push(context.run().agent_id().as_str().to_owned());
         Ok(ToolOutput::text("ok"))
     }
 }
 
-struct Host;
-
 fn tool(name: &str) -> Arc<dyn Tool> {
     Arc::new(StubTool::new(name))
+}
+
+/// The live context of the run a binding is executing.
+///
+/// It names the **public** agent, for the reason the binding itself exists: a prepared instance is
+/// what runs, and what a tool, a hook or a dynamic instruction is told is who the user configured.
+fn run(binding: &AgentBinding) -> RunContext {
+    RunContext::new(RunId::new("run-binding"), Arc::clone(binding.public()))
 }
 
 /// The agent as the user wrote it down.
@@ -207,7 +221,7 @@ async fn test_agent_binding_03() {
     let prepared = prepare_turn(TurnPreparationRequest::new(
         &binding,
         &resolver,
-        &Host,
+        &run(&binding),
         &cancel,
         &ToolUseTracker::new(),
         Vec::new(),
@@ -239,7 +253,7 @@ async fn test_agent_binding_04() {
         &binding,
         &response,
         &surface,
-        Arc::new(Host),
+        Arc::new(run(&binding)),
         &cancel,
         &mut tracker,
         &mut ToolFailureTracker::new(),
@@ -285,7 +299,7 @@ async fn test_agent_binding_05() {
         &binding,
         &response,
         &surface,
-        Arc::new(Host),
+        Arc::new(run(&binding)),
         &cancel,
         &mut tracker,
         &mut ToolFailureTracker::new(),
@@ -319,7 +333,7 @@ async fn test_agent_binding_06() {
         &binding,
         &response,
         &surface,
-        Arc::new(Host),
+        Arc::new(run(&binding)),
         &cancel,
         &mut tracker,
         &mut ToolFailureTracker::new(),
@@ -338,4 +352,36 @@ async fn test_agent_binding_06() {
     // 一轮什么都没要，agent 依然在册：它确实跑了一轮。
     assert!(tracker.agent(&AgentId::new("coder")).is_some());
     assert!(!tracker.used_any_this_turn(&AgentId::new("coder")));
+}
+
+#[tokio::test]
+async fn test_agent_binding_07() {
+    // What a running tool is told about the run follows the same rule as records and counts: the
+    // public agent, even though a prepared instance is what advertised the surface and ran. A tool
+    // that saw `coder#sandbox-3f2a` here would report, log and branch on an identity the user never
+    // wrote down — and it would do it from inside the one object every host-facing stage reads.
+    let binding = AgentBinding::prepared(public_agent(), prepared_agent());
+    let stub = Arc::new(StubTool::new("read_file"));
+    let seen = Arc::clone(&stub.seen_agents);
+    let surface = TurnActionSurface::new(vec![stub], Vec::new()).unwrap();
+    let response = ModelResponse::new(vec![tool_call("c-1", "call-1", "read_file")]);
+    let cancel = CancelScope::root();
+
+    let context = run(&binding);
+    assert_eq!(context.agent_id().as_str(), "coder");
+    assert_eq!(context.run_id().as_str(), "run-binding");
+
+    settle_turn(TurnSettlementRequest::new(
+        &binding,
+        &response,
+        &surface,
+        Arc::new(context),
+        &cancel,
+        &mut ToolUseTracker::new(),
+        &mut ToolFailureTracker::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), ["coder"]);
 }

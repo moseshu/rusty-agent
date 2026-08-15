@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::{CancelReason, CancelScope},
+    context::RunContext,
     error::{Error, GuardrailStage, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
@@ -22,11 +23,11 @@ use ra_core::{
         RunItemKind, ToolCall,
     },
     model::ModelHandoffDefinition,
-    state::{ToolFailureTracker, ToolUseTracker},
+    state::{RunId, ToolFailureTracker, ToolUseTracker},
     step::NextStep,
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolFailureHandling, ToolInvocation,
-        ToolOptions, ToolOrigin, ToolOutput, ToolRuntimeContext, ToolSchema, ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
+        ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolTimeoutBehavior,
     },
 };
 use ra_runtime::{
@@ -92,7 +93,7 @@ impl Tool for ScriptedTool {
         self.options.clone()
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match &self.behavior {
             Behavior::Succeed(text) => Ok(ToolOutput::text(*text)),
@@ -108,7 +109,7 @@ impl Tool for ScriptedTool {
         }
     }
 
-    async fn needs_approval(&self, _invocation: &ToolInvocation<'_>) -> Result<bool> {
+    async fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
         match self.options.approval() {
             ToolApprovalPolicy::Never => Ok(false),
             _ => Ok(true),
@@ -117,7 +118,7 @@ impl Tool for ScriptedTool {
 
     async fn handle_failure(
         &self,
-        _invocation: &ToolInvocation<'_>,
+        _context: &ToolContext<'_>,
         _error: &Error,
     ) -> Result<Option<ToolOutput>> {
         self.failures_handled.fetch_add(1, Ordering::SeqCst);
@@ -227,7 +228,7 @@ impl Tool for BarrierFailureTool {
             .with_timeout_behavior(ToolTimeoutBehavior::Propagate)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         self.barrier.wait().await;
         Err(self.failure.error(self.origin.qualified_name()))
@@ -287,7 +288,7 @@ impl Tool for GateThenFailTool {
             .with_timeout_behavior(ToolTimeoutBehavior::Propagate)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         while !self.release.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
@@ -371,7 +372,7 @@ impl Tool for LateFailureTool {
             .with_timeout_behavior(ToolTimeoutBehavior::Propagate)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         ReadyWithoutWaking(Arc::clone(&self.ready)).await;
         Err(self.failure.error(self.origin.qualified_name()))
@@ -425,7 +426,7 @@ impl Tool for PanicOnTeardownTool {
         ToolOptions::new().with_concurrency(ToolConcurrency::Parallel)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         struct FailOnDrop;
 
         impl Drop for FailOnDrop {
@@ -488,7 +489,7 @@ impl Tool for DropReportingTool {
         ToolOptions::new().with_concurrency(ToolConcurrency::Parallel)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         struct ReportDrop(Arc<AtomicUsize>);
 
         impl Drop for ReportDrop {
@@ -548,7 +549,7 @@ impl Tool for GatedTool {
         ToolOptions::new().with_concurrency(self.concurrency)
     }
 
-    async fn call(&self, _invocation: ToolInvocation<'_>) -> Result<ToolOutput> {
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         while !self.release.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
@@ -558,18 +559,23 @@ impl Tool for GatedTool {
     }
 }
 
-struct Host;
-
 /// The binding every settlement here runs under. Nothing prepared an execution instance, so the
 /// two identities are the same object; the public/execution split has its own test file.
 fn binding() -> AgentBinding {
-    AgentBinding::direct(
-        AgentSpec::builder()
-            .id(AgentId::new("main"))
-            .name("Main")
-            .build()
-            .unwrap(),
-    )
+    AgentBinding::direct(agent())
+}
+
+fn agent() -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("main"))
+        .name("Main")
+        .build()
+        .unwrap()
+}
+
+/// The live context of the run these settlements belong to.
+fn run() -> Arc<RunContext> {
+    Arc::new(RunContext::new(RunId::new("run-settlement"), agent()))
 }
 
 fn item(id: &str, kind: RunItemKind) -> RunItem {
@@ -646,7 +652,7 @@ async fn test_turn_settlement_01() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -683,7 +689,7 @@ async fn test_turn_settlement_02() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -743,7 +749,7 @@ async fn test_turn_settlement_03() {
             &binding,
             &response,
             &surface,
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
@@ -806,7 +812,7 @@ async fn test_turn_settlement_04() {
                 &binding,
                 &response,
                 &surface,
-                Arc::new(Host),
+                run(),
                 &cancel,
                 &mut tracker,
                 &mut ToolFailureTracker::new(),
@@ -872,7 +878,7 @@ async fn test_turn_settlement_05() {
             &binding,
             &response,
             &surface,
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
@@ -933,7 +939,7 @@ async fn settle_simultaneous_failures(classes: &[PropagatingFailure]) -> Error {
             &binding,
             &response,
             &surface,
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
@@ -1048,7 +1054,7 @@ async fn test_turn_settlement_08() {
                 &binding,
                 &response,
                 &surface,
-                Arc::new(Host),
+                run(),
                 &cancel,
                 &mut tracker,
                 &mut ToolFailureTracker::new(),
@@ -1123,7 +1129,7 @@ async fn test_turn_settlement_09() {
                 &binding,
                 &response,
                 &surface,
-                Arc::new(Host),
+                run(),
                 &cancel,
                 &mut tracker,
                 &mut ToolFailureTracker::new(),
@@ -1169,7 +1175,7 @@ async fn test_turn_settlement_10() {
             &binding,
             &response,
             &surface,
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
@@ -1202,7 +1208,7 @@ async fn test_turn_settlement_11() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1233,7 +1239,7 @@ async fn test_turn_settlement_12() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1285,7 +1291,7 @@ async fn test_turn_settlement_13() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1315,7 +1321,7 @@ async fn test_turn_settlement_14() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1361,7 +1367,7 @@ async fn test_turn_settlement_15() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1393,7 +1399,7 @@ async fn test_turn_settlement_16() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1423,7 +1429,7 @@ async fn test_turn_settlement_17() {
         &binding(),
         &response,
         &surface(vec![visible]),
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1445,7 +1451,7 @@ async fn test_turn_settlement_17() {
         &binding(),
         &response,
         &surface(vec![propagating]),
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1481,7 +1487,7 @@ async fn test_turn_settlement_18() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1506,7 +1512,7 @@ async fn test_turn_settlement_19() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1558,7 +1564,7 @@ async fn test_turn_settlement_20() {
                 "write_file",
                 Behavior::Succeed("ok"),
             ))]),
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut ToolUseTracker::new(),
             &mut ToolFailureTracker::new(),
@@ -1590,7 +1596,7 @@ async fn test_turn_settlement_21() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1628,7 +1634,7 @@ async fn test_turn_settlement_22() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1656,7 +1662,7 @@ async fn test_turn_settlement_23() {
         &binding(),
         &response,
         &surface,
-        Arc::new(Host),
+        run(),
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
@@ -1687,7 +1693,7 @@ async fn test_turn_settlement_24() {
             &binding(),
             &response,
             &surface,
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut ToolUseTracker::new(),
             &mut ToolFailureTracker::new(),
@@ -1737,7 +1743,7 @@ async fn test_turn_settlement_26() {
             &binding(),
             &response,
             &surface,
-            Arc::new(Host),
+            run(),
             &cancel,
             &mut ToolUseTracker::new(),
             &mut ToolFailureTracker::new(),
@@ -1752,8 +1758,9 @@ async fn test_turn_settlement_26() {
     assert_eq!(joined, 1);
 }
 
-/// The lock is only here to prove `Host` stays `Send + Sync` as a runtime context.
+/// The lock is only here to prove a run context stays `Send + Sync`: it is shared by every tool a
+/// batch dispatches, and those run on separate tasks.
 #[allow(dead_code)]
-fn context_is_thread_safe(_context: &dyn ToolRuntimeContext) {
+fn context_is_thread_safe(_context: &RunContext) {
     let _guard: Mutex<()> = Mutex::new(());
 }
