@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::{
     context::RunContext,
     item::CallId,
-    tool::{ToolOrigin, ToolServices},
+    tool::{Tool, ToolOrigin, ToolServices},
 };
 
 /// How a tool invocation entered the runtime.
@@ -56,15 +56,18 @@ pub struct ToolContext<'a> {
 
 impl<'a> ToolContext<'a> {
     /// Creates the context of one direct call, with no ports installed.
-    pub const fn new(
+    ///
+    /// The origin is always derived from `tool`, so callers cannot invoke one implementation while
+    /// attributing the call to another tool's identity.
+    pub fn new(
         run: &'a RunContext,
-        origin: &'a ToolOrigin,
+        tool: &'a dyn Tool,
         call_id: &'a CallId,
         arguments: &'a Value,
     ) -> Self {
         Self {
             run,
-            origin,
+            origin: tool.origin(),
             call_id,
             arguments,
             caller: ToolCaller::Direct,

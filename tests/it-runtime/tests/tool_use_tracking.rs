@@ -122,7 +122,8 @@ fn binding(id: &str) -> AgentBinding {
 
 /// The live context of the run a settlement belongs to, naming the same agent as its binding.
 fn run(id: &str) -> Arc<RunContext> {
-    Arc::new(RunContext::new(RunId::new("run-tool-use"), spec(id)))
+    let spec = spec(id);
+    Arc::new(RunContext::new(RunId::new("run-tool-use"), spec.as_ref()))
 }
 
 fn item(id: &str, kind: RunItemKind) -> RunItem {

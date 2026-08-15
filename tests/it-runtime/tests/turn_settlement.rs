@@ -575,7 +575,11 @@ fn agent() -> Arc<AgentSpec> {
 
 /// The live context of the run these settlements belong to.
 fn run() -> Arc<RunContext> {
-    Arc::new(RunContext::new(RunId::new("run-settlement"), agent()))
+    let agent = agent();
+    Arc::new(RunContext::new(
+        RunId::new("run-settlement"),
+        agent.as_ref(),
+    ))
 }
 
 fn item(id: &str, kind: RunItemKind) -> RunItem {

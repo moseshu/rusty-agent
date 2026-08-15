@@ -229,7 +229,7 @@ async fn test_response_classification_03() {
         .build()
         .unwrap();
     let resolver = FixedResolver;
-    let context = RunContext::new(RunId::new("run-classification"), Arc::clone(&agent));
+    let context = RunContext::new(RunId::new("run-classification"), agent.as_ref());
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(
@@ -272,7 +272,7 @@ async fn test_response_classification_04() {
         .build()
         .unwrap();
     let resolver = FixedResolver;
-    let context = RunContext::new(RunId::new("run-classification"), Arc::clone(&agent));
+    let context = RunContext::new(RunId::new("run-classification"), agent.as_ref());
     let cancel = CancelScope::root();
 
     let prepared = prepare_turn(TurnPreparationRequest::new(

@@ -137,7 +137,7 @@ fn tool(name: &str) -> Arc<dyn Tool> {
 /// It names the **public** agent, for the reason the binding itself exists: a prepared instance is
 /// what runs, and what a tool, a hook or a dynamic instruction is told is who the user configured.
 fn run(binding: &AgentBinding) -> RunContext {
-    RunContext::new(RunId::new("run-binding"), Arc::clone(binding.public()))
+    RunContext::new(RunId::new("run-binding"), binding.public())
 }
 
 /// The agent as the user wrote it down.

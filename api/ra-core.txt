@@ -60,7 +60,9 @@ const fn ra_core::config::SourceSelection::without(mut self, source : SettingSou
 const fn ra_core::config::Sourced < T >::new(source : SettingSource, value : T) -> Self
 const fn ra_core::config::Sourced < T >::source(& self) -> SettingSource
 const fn ra_core::config::Sourced < T >::value(& self) -> & T
-const fn ra_core::context::RunContext::agent(& self) -> & Arc < AgentSpec >
+const fn ra_core::context::RunAgent::id(& self) -> & AgentId
+const fn ra_core::context::RunContext::agent(& self) -> & RunAgent
+const fn ra_core::context::RunContext::agent_id(& self) -> & AgentId
 const fn ra_core::context::RunContext::budget(& self) -> & BudgetSnapshot
 const fn ra_core::context::RunContext::run_id(& self) -> & RunId
 const fn ra_core::error::BudgetKind::code(self) -> & 'static str
@@ -374,7 +376,6 @@ const fn ra_core::step::single::SingleStepResult::processed_response(& self) -> 
 const fn ra_core::tool::context::ToolContext < 'a >::arguments(& self) -> & Value
 const fn ra_core::tool::context::ToolContext < 'a >::call_id(& self) -> & CallId
 const fn ra_core::tool::context::ToolContext < 'a >::caller(& self) -> ToolCaller
-const fn ra_core::tool::context::ToolContext < 'a >::new(run : & 'a RunContext, origin : & 'a ToolOrigin, call_id : & 'a CallId, arguments : & 'a Value) -> Self
 const fn ra_core::tool::context::ToolContext < 'a >::origin(& self) -> & ToolOrigin
 const fn ra_core::tool::context::ToolContext < 'a >::run(& self) -> & RunContext
 const fn ra_core::tool::context::ToolContext < 'a >::services(& self) -> & ToolServices
@@ -645,9 +646,9 @@ fn ra_core::config::Layered < T >::sources(& self) -> impl Iterator < Item = Set
 fn ra_core::config::Layered < T >::value(& self, selection : SourceSelection) -> Option < & T >
 fn ra_core::config::Sourced < T >::into_value(self) -> T
 fn ra_core::config::env_key(path : & str) -> String
-fn ra_core::context::RunContext::agent_id(& self) -> & AgentId
+fn ra_core::context::RunAgent::name(& self) -> & str
 fn ra_core::context::RunContext::app_context< T : Any + Send + Sync >(& self) -> Option < & T >
-fn ra_core::context::RunContext::new(run_id : RunId, agent : Arc < AgentSpec >) -> Self
+fn ra_core::context::RunContext::new(run_id : RunId, agent : & AgentSpec) -> Self
 fn ra_core::context::RunContext::with_app_context(mut self, app_context : Arc < dyn Any + Send + Sync >) -> Self
 fn ra_core::context::RunContext::with_budget(mut self, budget : BudgetSnapshot) -> Self
 fn ra_core::error::Error::budget(kind : BudgetKind, message : impl Into < String >) -> Self
@@ -935,6 +936,7 @@ fn ra_core::tool::Tool::options(& self) -> ToolOptions
 fn ra_core::tool::Tool::origin(& self) -> & ToolOrigin
 fn ra_core::tool::Tool::schema(& self) -> & ToolSchema
 fn ra_core::tool::Tool::validate(& self) -> Result < () >
+fn ra_core::tool::context::ToolContext < 'a >::new(run : & 'a RunContext, tool : & 'a dyn Tool, call_id : & 'a CallId, arguments : & 'a Value) -> Self
 fn ra_core::tool::namespace::ToolNamespace::as_str(& self) -> & str
 fn ra_core::tool::namespace::ToolNamespace::new(value : impl Into < String >) -> Result < Self >
 fn ra_core::tool::options::ToolGuardrailId::as_str(& self) -> & str
@@ -1070,6 +1072,7 @@ struct ra_core::config::LayerReport
 struct ra_core::config::Layered
 struct ra_core::config::SourceSelection
 struct ra_core::config::Sourced
+struct ra_core::context::RunAgent
 struct ra_core::context::RunContext
 struct ra_core::item::AgentId
 struct ra_core::item::CallId

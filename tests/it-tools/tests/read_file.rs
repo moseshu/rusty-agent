@@ -23,20 +23,18 @@ fn workspace(name: &str, contents: impl AsRef<[u8]>) -> TempDir {
 /// The run a direct call is made inside. `read_file` reads neither the run nor host state, but a
 /// call always belongs to one, and the context is what says so.
 fn run() -> RunContext {
-    RunContext::new(
-        RunId::new("run-read-file"),
-        AgentSpec::builder()
-            .id(AgentId::new("reader"))
-            .name("Reader")
-            .build()
-            .expect("an agent"),
-    )
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("reader"))
+        .name("Reader")
+        .build()
+        .expect("an agent");
+    RunContext::new(RunId::new("run-read-file"), agent.as_ref())
 }
 
 async fn read(tool: &ReadFileTool, arguments: &Value) -> ra_core::error::Result<ToolOutput> {
     let call_id = CallId::new("call-1");
     let run = run();
-    tool.call(ToolContext::new(&run, tool.origin(), &call_id, arguments))
+    tool.call(ToolContext::new(&run, tool, &call_id, arguments))
         .await
 }
 
@@ -45,7 +43,7 @@ async fn read(tool: &ReadFileTool, arguments: &Value) -> ra_core::error::Result<
 async fn observe(tool: &ReadFileTool, arguments: &Value) -> ToolOutput {
     let call_id = CallId::new("call-1");
     let run = run();
-    let context = || ToolContext::new(&run, tool.origin(), &call_id, arguments);
+    let context = || ToolContext::new(&run, tool, &call_id, arguments);
     match tool.call(context()).await {
         Ok(output) => output,
         Err(error) => tool

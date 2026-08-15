@@ -197,7 +197,7 @@ fn direct(agent: &Arc<AgentSpec>) -> AgentBinding {
 
 /// The live run context preparation is handed, carrying the host's own state.
 fn host(agent: &Arc<AgentSpec>) -> RunContext {
-    RunContext::new(RunId::new("run-preparation"), Arc::clone(agent)).with_app_context(Arc::new(
+    RunContext::new(RunId::new("run-preparation"), agent.as_ref()).with_app_context(Arc::new(
         HostContext {
             dynamic_tools_enabled: true,
         },

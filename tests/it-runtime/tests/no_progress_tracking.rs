@@ -123,7 +123,11 @@ fn spec() -> Arc<AgentSpec> {
 
 /// The live context of the run these settlements belong to.
 fn run() -> Arc<RunContext> {
-    Arc::new(RunContext::new(RunId::new("run-no-progress"), spec()))
+    let spec = spec();
+    Arc::new(RunContext::new(
+        RunId::new("run-no-progress"),
+        spec.as_ref(),
+    ))
 }
 
 fn call(id: &str, call_id: &str, name: &str, arguments: Value) -> RunItem {

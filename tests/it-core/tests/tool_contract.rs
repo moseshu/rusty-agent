@@ -352,7 +352,8 @@ struct OtherHostContext;
 
 /// The run every tool call in this file happens inside.
 fn run_context() -> RunContext {
-    RunContext::new(RunId::new("run_tool_contract"), agent())
+    let agent = agent();
+    RunContext::new(RunId::new("run_tool_contract"), agent.as_ref())
 }
 
 fn agent() -> Arc<AgentSpec> {
@@ -423,7 +424,7 @@ async fn test_tool_contract_12() {
     let call_id = CallId::new("call_1");
     let arguments = json!({"text": "hello"});
     let run = run_context().with_app_context(Arc::new(HostContext { prefix: "host:" }));
-    let context = ToolContext::new(&run, tool.origin(), &call_id, &arguments)
+    let context = ToolContext::new(&run, tool.as_ref(), &call_id, &arguments)
         .with_caller(ToolCaller::Programmatic);
 
     // Neither the model's arguments nor the host's own state belongs in a log line.
@@ -461,15 +462,15 @@ async fn test_tool_contract_13() {
         }
     }
 
-    let origin = ToolOrigin::new("echo").unwrap();
     let call_id = CallId::new("call_work_state");
     let arguments = json!({"text": "hello"});
     let run = run_context();
+    let tool = EchoTool::new();
     let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "step three" });
     let services = ToolServices::new().with_work_state(task_state);
 
     // The task-state port: a tool reads what the host mounted and gets its own type back.
-    let context = ToolContext::new(&run, &origin, &call_id, &arguments).with_services(&services);
+    let context = ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services);
     let seen = context
         .services()
         .work_state()
@@ -482,7 +483,7 @@ async fn test_tool_contract_13() {
     assert!(format!("{context:?}").contains("work_state: true"));
 
     // A run that belongs to no task is the ordinary case, not a missing port.
-    let bare = ToolContext::new(&run, &origin, &call_id, &arguments);
+    let bare = ToolContext::new(&run, &tool, &call_id, &arguments);
     assert!(bare.services().work_state().is_none());
 }
 
@@ -495,7 +496,7 @@ async fn test_tool_contract_14() {
     let call_id = CallId::new("call_dynamic");
     let arguments = json!({"text": "hello"});
     let run = run_context();
-    let context = ToolContext::new(&run, tool.origin(), &call_id, &arguments);
+    let context = ToolContext::new(&run, &tool, &call_id, &arguments);
 
     assert!(tool.is_enabled(&run).await.is_err());
     assert!(tool.needs_approval(&context).await.is_err());
@@ -516,13 +517,14 @@ async fn test_tool_contract_18() {
 
     // Everything a tool can learn about the run comes from the same object, so the prompt path and
     // the call path cannot disagree about who is running.
-    let origin = ToolOrigin::new("echo").unwrap();
     let call_id = CallId::new("call_identity");
     let arguments = json!({"text": "hello"});
-    let context = ToolContext::new(&attached, &origin, &call_id, &arguments);
+    let tool = EchoTool::new();
+    let context = ToolContext::new(&attached, &tool, &call_id, &arguments);
     assert_eq!(context.run().run_id(), attached.run_id());
     assert_eq!(context.run().agent_id(), attached.agent_id());
     assert_eq!(context.run().agent_id().as_str(), "agent_tool_contract");
+    assert_eq!(context.run().agent().name(), "tool contract");
 }
 
 #[test]

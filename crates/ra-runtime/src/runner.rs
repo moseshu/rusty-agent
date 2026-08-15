@@ -804,8 +804,8 @@ fn live_context(
     agent: &AgentBinding,
     state: &RunState,
 ) -> RunContext {
-    let run = RunContext::new(context.run_id.clone(), Arc::clone(agent.public()))
-        .with_budget(state.budget().clone());
+    let run =
+        RunContext::new(context.run_id.clone(), agent.public()).with_budget(state.budget().clone());
     match context.app_context {
         Some(app_context) => run.with_app_context(Arc::clone(app_context)),
         None => run,

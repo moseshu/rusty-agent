@@ -233,7 +233,7 @@ impl ToolDispatchRequest {
     fn context(&self) -> ToolContext<'_> {
         ToolContext::new(
             &self.run,
-            self.tool.origin(),
+            self.tool.as_ref(),
             &self.call_id,
             &self.arguments,
         )
