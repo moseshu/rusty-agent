@@ -52,11 +52,11 @@ use tracing::{Instrument, info_span};
 pub mod result;
 pub mod stream;
 
-use result::aggregate_usage;
 pub use result::{
     ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
-    RunOutcome, RunResult,
+    RunOutcome, RunResult, TurnRecord,
 };
+use result::{TurnRecordOwner, aggregate_usage};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
@@ -355,6 +355,8 @@ struct TurnLoopContext<'a> {
 struct TurnLoopProgress {
     generated: Vec<RunItem>,
     model_responses: Vec<ModelResponse>,
+    turn_record_owner: Arc<TurnRecordOwner>,
+    turn_records: Vec<TurnRecord>,
     turns: u32,
     budget_stop: Option<BudgetKind>,
 }
@@ -454,6 +456,8 @@ async fn run_loop_inner(
     let mut progress = TurnLoopProgress {
         generated: Vec::new(),
         model_responses: Vec::new(),
+        turn_record_owner: TurnRecordOwner::new(),
+        turn_records: Vec::new(),
         turns: 0,
         budget_stop: None,
     };
@@ -500,6 +504,8 @@ async fn run_loop_inner(
         original_input,
         progress.generated,
         progress.model_responses,
+        progress.turn_record_owner,
+        progress.turn_records,
         progress.turns,
         state,
     );
@@ -726,9 +732,21 @@ async fn run_one_turn(
     for item in settled.session_step_items() {
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
+    let first_item = progress.generated.len();
     progress
         .generated
         .extend(settled.session_step_items().iter().cloned());
+
+    // Recorded before the `match` below, which is where a handoff replaces the running agent: the
+    // record says who ran *this* turn, and taking the agent afterwards would attribute the turn to
+    // whoever it handed off to.
+    progress.turn_records.push(TurnRecord::new(
+        Arc::clone(&progress.turn_record_owner),
+        progress.turns,
+        agent.public_id().clone(),
+        settled.next_step().clone(),
+        first_item..progress.generated.len(),
+    ));
 
     // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
     // fifth state has to be answered here rather than fall through to "keep going".

@@ -98,4 +98,26 @@ impl NextStep {
         }
         Ok(Self::Interruption { items })
     }
+
+    /// Stable machine-readable name of the state, for records, traces and snapshots.
+    ///
+    /// It mirrors [`FinishReason::code`] and exists so that *what a turn decided* can be reported
+    /// outward without this enum going with it. This module is graded `Internal`: a host that
+    /// matched `NextStep` would freeze the settlement pipeline that produces it, and — since the
+    /// type is deliberately exhaustive — would turn every added state into a breaking change for
+    /// third-party code, which is the opposite of what that exhaustiveness is for. A code is the
+    /// half that can be depended on: it names the state and carries nothing to match against.
+    ///
+    /// The payload each state carries is reported next to the code by whoever reports it:
+    /// [`FinishReason`] for a settled run, the taking-over agent for a handoff, the pending items
+    /// for an interruption.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::RunAgain => "run_again",
+            Self::Handoff { .. } => "handoff",
+            Self::FinalOutput { .. } => "final_output",
+            Self::Interruption { .. } => "interruption",
+        }
+    }
 }

@@ -14,6 +14,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
+use insta::assert_json_snapshot;
 use ra_core::{
     agent::{AgentId, AgentSpec, ToolUseBehavior, ToolUseBehaviorHandler, ToolUseResult},
     budget::{BudgetLimit, BudgetSnapshot},
@@ -38,11 +39,11 @@ use ra_core::{
 use ra_runtime::{
     agent::AgentBinding,
     runner::{
-        ContinuationInput, RunConfig, RunErrorHandler, RunErrorHandlerInput,
-        RunErrorHandlerResult, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
+        ContinuationInput, RunConfig, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
+        RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner, TurnRecord,
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{sync::oneshot, time::timeout};
 
 /// Replays a fixed script of responses, one per turn, and records the input it was handed.
@@ -401,6 +402,60 @@ fn reminder_text(input: &[ModelInputItem]) -> String {
     }
 }
 
+/// The loop's own shape: what each settled turn decided, and the records it produced.
+///
+/// Read from the run rather than reconstructed from it. Deriving "the loop ran again" from there
+/// being a later turn would assert the arithmetic instead of the decision, and a handoff — which
+/// also continues the loop — would come out indistinguishable from a `RunAgain`.
+fn loop_skeleton(result: &RunResult) -> Value {
+    let turns = result
+        .turn_records()
+        .iter()
+        .map(|record| {
+            let items = result
+                .turn_items(record)
+                .iter()
+                .map(|item| {
+                    json!({
+                        "id": item.id().as_str(),
+                        "kind": item.kind().label(),
+                        "phase": message_phase(item),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "turn": record.turn(),
+                "agent": record.agent().as_str(),
+                "next_step": record.next_step_code(),
+                "finish_reason": record.finish_reason().map(FinishReason::code),
+                "items": items,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "turn_count": result.turns(),
+        "outcome": outcome_code(result.outcome()),
+        "turns": turns,
+    })
+}
+
+/// The run-level ending, as a stable code.
+fn outcome_code(outcome: &RunOutcome) -> String {
+    match outcome {
+        RunOutcome::Completed { reason } => format!("completed:{}", reason.code()),
+        RunOutcome::Interrupted { items } => format!("interrupted:{}", items.len()),
+        other => panic!("unhandled run outcome: {other:?}"),
+    }
+}
+
+/// The channel a record was stamped with, and `None` for records that are not messages.
+fn message_phase(item: &RunItem) -> Option<&'static str> {
+    match item.kind() {
+        RunItemKind::Message(message) => message.phase().map(OutputPhase::label),
+        _ => None,
+    }
+}
+
 /// The run's message channels in generation order (R3-10).
 fn phases(result: &RunResult) -> Vec<OutputPhase> {
     result
@@ -539,6 +594,135 @@ async fn loops_between_tool_calls_and_final_answer_until_model_requests_nothing(
     assert_eq!(result.usage().input_tokens(), 30);
     assert_eq!(result.usage().output_tokens(), 10);
     assert_eq!(result.model_responses().len(), 2);
+}
+
+#[tokio::test]
+async fn loop_skeleton_keeps_its_per_turn_decisions_and_record_sequence() {
+    // The regression floor for everything built on the loop. It is one snapshot rather than a
+    // handful of assertions because the thing being locked *is* the shape: what each turn decided,
+    // which records it produced, and in which order — a stage that changes any of those has to
+    // change this file first, and the diff is what the review looks at.
+    //
+    // The script's provider marks every message final, including the two that request a tool. What
+    // each turn settled on is what decides the channel; that the provider said otherwise never
+    // reaches the record.
+    let read = Arc::new(ScriptedTool::new("read_file"));
+    let write = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            message("msg-1", "我先看看文件"),
+            tool_call("c-1", "call-1", "read_file"),
+        ]),
+        ModelResponse::new(vec![
+            message("msg-2", "找到要改的地方了"),
+            tool_call("c-2", "call-2", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("msg-3", "改完了")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(request(vec![read, write], &model, &cancel))
+        .await
+        .unwrap();
+
+    // Keys are alphabetical: `assert_json_snapshot!` serializes through a sorted map.
+    assert_json_snapshot!(loop_skeleton(&result), @r###"
+    {
+      "outcome": "completed:final",
+      "turn_count": 3,
+      "turns": [
+        {
+          "agent": "coder",
+          "finish_reason": null,
+          "items": [
+            {
+              "id": "msg-1",
+              "kind": "message",
+              "phase": "commentary"
+            },
+            {
+              "id": "c-1",
+              "kind": "tool_call",
+              "phase": null
+            },
+            {
+              "id": "call-1.output",
+              "kind": "tool_call_output",
+              "phase": null
+            }
+          ],
+          "next_step": "run_again",
+          "turn": 1
+        },
+        {
+          "agent": "coder",
+          "finish_reason": null,
+          "items": [
+            {
+              "id": "msg-2",
+              "kind": "message",
+              "phase": "commentary"
+            },
+            {
+              "id": "c-2",
+              "kind": "tool_call",
+              "phase": null
+            },
+            {
+              "id": "call-2.output",
+              "kind": "tool_call_output",
+              "phase": null
+            }
+          ],
+          "next_step": "run_again",
+          "turn": 2
+        },
+        {
+          "agent": "coder",
+          "finish_reason": "final",
+          "items": [
+            {
+              "id": "msg-3",
+              "kind": "message",
+              "phase": "final"
+            }
+          ],
+          "next_step": "final_output",
+          "turn": 3
+        }
+      ]
+    }
+    "###);
+}
+
+#[tokio::test]
+async fn turn_items_rejects_a_record_from_another_run() {
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![message(
+        "first-message",
+        "first run",
+    )])]);
+    let first_cancel = CancelScope::root();
+    let first = Runner::run(request(Vec::new(), &first_model, &first_cancel))
+        .await
+        .unwrap();
+
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![message(
+        "second-message",
+        "second run",
+    )])]);
+    let second_cancel = CancelScope::root();
+    let second = Runner::run(request(Vec::new(), &second_model, &second_cancel))
+        .await
+        .unwrap();
+
+    let foreign_record = &first.turn_records()[0];
+    assert!(second.turn_items(foreign_record).is_empty());
+    assert_eq!(
+        second.turn_items(&second.turn_records()[0])[0]
+            .id()
+            .as_str(),
+        "second-message"
+    );
 }
 
 #[tokio::test]
@@ -1086,6 +1270,15 @@ async fn run_hitting_turn_limit_has_no_delivery_message() {
         [OutputPhase::Commentary, OutputPhase::Commentary]
     );
     assert!(result.final_message().is_none());
+
+    // No turn ended this run — the cap did, between two of them. Both records still say the turn
+    // asked for another, and the reason lives on the outcome instead.
+    let codes = result
+        .turn_records()
+        .iter()
+        .map(TurnRecord::next_step_code)
+        .collect::<Vec<_>>();
+    assert_eq!(codes, ["run_again", "run_again"]);
 }
 
 #[tokio::test]
@@ -1626,6 +1819,12 @@ async fn stopping_for_pending_approval_is_an_outcome_not_an_error() {
     assert_eq!(result.outcome().finish_reason(), None);
     assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
     assert_eq!(result.turns(), 1);
+    // The turn settled, and what it settled on is the pause itself — not a finish reason.
+    let [record] = result.turn_records() else {
+        panic!("一轮结算应当留下一条记录");
+    };
+    assert_eq!(record.next_step_code(), "interruption");
+    assert_eq!(record.finish_reason(), None);
     let RunItemKind::Message(message) = result.new_items()[0].kind() else {
         panic!("第一项必须是模型消息");
     };

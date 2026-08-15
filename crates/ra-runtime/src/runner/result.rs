@@ -14,6 +14,9 @@
 //! a display history replayed as model input duplicates records, and a model input stored as
 //! session history loses the ones a filter dropped. The third is a projection with an explicit
 //! policy rather than a stored field, so it cannot drift from the second.
+//!
+//! [`RunResult::turn_records`] is not a fourth one. It answers what each turn *decided* and borrows
+//! that turn's slice of the second rather than holding records of its own.
 
 use async_trait::async_trait;
 use ra_core::{
@@ -22,13 +25,14 @@ use ra_core::{
     error::{Error, Result},
     finish::FinishReason,
     item::{
-        InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase,
-        RunItem, RunItemKind,
+        AgentId, InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse,
+        OutputPhase, RunItem, RunItemKind,
     },
     state::{RunState, ToolUseTracker},
+    step::NextStep,
     usage::Usage,
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 /// Read-only facts supplied to a terminal error handler.
 ///
@@ -285,6 +289,103 @@ pub(crate) fn aggregate_usage(responses: &[ModelResponse]) -> Usage {
     })
 }
 
+/// What one settled turn decided.
+///
+/// The loop's control flow is one `match` on [`NextStep`], and until this existed that decision was
+/// observable only through its consequences: a run's turn count says another turn happened, not
+/// that the turn asked for one. Anything reconstructing the sequence from item counts is guessing,
+/// and it guesses wrong the moment a state is added — a handoff continues the loop exactly like a
+/// `RunAgain` does from the outside.
+///
+/// **Not a fourth history.** [`RunResult::turn_items`] borrows the run's own records rather than
+/// this holding a copy, for the reason the three sequences above are separate names: a second array
+/// of the same records is a second thing to keep in step.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct TurnRecord {
+    owner: Arc<TurnRecordOwner>,
+    turn: u32,
+    agent: AgentId,
+    next_step: NextStep,
+    items: Range<usize>,
+}
+
+impl TurnRecord {
+    pub(super) const fn new(
+        owner: Arc<TurnRecordOwner>,
+        turn: u32,
+        agent: AgentId,
+        next_step: NextStep,
+        items: Range<usize>,
+    ) -> Self {
+        Self {
+            owner,
+            turn,
+            agent,
+            next_step,
+            items,
+        }
+    }
+
+    /// Which turn this was, counting from 1 — the same number
+    /// [`RunStreamEvent::TurnStarted`](super::RunStreamEvent::TurnStarted) carries.
+    #[must_use]
+    pub const fn turn(&self) -> u32 {
+        self.turn
+    }
+
+    /// The **public** agent that ran the turn.
+    ///
+    /// Per turn rather than per run, because that is the granularity a handoff changes it at:
+    /// [`RunResult::last_agent`] answers who finished, this answers who spoke when.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    /// Stable code of the [`NextStep`] the turn settled on: `run_again`, `handoff`, `final_output`
+    /// or `interruption`.
+    ///
+    /// A code rather than the state itself, because [`NextStep`] is settlement's own control-flow
+    /// type — see [`NextStep::code`] for why it does not leave the framework.
+    #[must_use]
+    pub const fn next_step_code(&self) -> &'static str {
+        self.next_step.code()
+    }
+
+    /// Why the loop settled, when this turn is the one that ended it.
+    ///
+    /// `None` for every turn that did not: the run continued, or it stopped to ask the host
+    /// something, which is not a finish.
+    #[must_use]
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        match &self.next_step {
+            NextStep::FinalOutput { reason } => Some(*reason),
+            NextStep::RunAgain | NextStep::Handoff { .. } | NextStep::Interruption { .. } => None,
+        }
+    }
+
+    /// Where this turn's records sit in [`RunResult::new_items`].
+    pub(super) const fn range(&self) -> &Range<usize> {
+        &self.items
+    }
+}
+
+/// Identity shared by one result and the records it produced.
+///
+/// This is deliberately non-zero-sized: pointer identity must distinguish two independently
+/// completed runs, including when their record ranges happen to be identical.
+#[derive(Debug)]
+pub(super) struct TurnRecordOwner {
+    _marker: u8,
+}
+
+impl TurnRecordOwner {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self { _marker: 0 })
+    }
+}
+
 /// Everything one finished run produced.
 ///
 /// `last_agent` is the **public** agent (R3-12): after a handoff the run is attributed to whoever
@@ -297,18 +398,25 @@ pub struct RunResult {
     original_input: Vec<ModelInputItem>,
     new_items: Vec<RunItem>,
     model_responses: Vec<ModelResponse>,
+    turn_record_owner: Arc<TurnRecordOwner>,
+    turn_records: Vec<TurnRecord>,
     turns: u32,
     state: RunState,
     final_message: Option<Message>,
 }
 
 impl RunResult {
+    // One argument per field the loop fills, and the loop is the only caller. A parameter struct
+    // here would be the same list with a name in front of it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         outcome: RunOutcome,
         last_agent: Arc<AgentSpec>,
         original_input: Vec<ModelInputItem>,
         new_items: Vec<RunItem>,
         model_responses: Vec<ModelResponse>,
+        turn_record_owner: Arc<TurnRecordOwner>,
+        turn_records: Vec<TurnRecord>,
         turns: u32,
         state: RunState,
     ) -> Self {
@@ -319,6 +427,8 @@ impl RunResult {
             original_input,
             new_items,
             model_responses,
+            turn_record_owner,
+            turn_records,
             turns,
             state,
             final_message,
@@ -368,6 +478,37 @@ impl RunResult {
     #[must_use]
     pub const fn turns(&self) -> u32 {
         self.turns
+    }
+
+    /// One record per **settled** turn, in the order they ran.
+    ///
+    /// Shorter than [`Self::turns`] when the last turn never settled — an error or a cancellation
+    /// mid-turn leaves a turn that was started and paid for but decided nothing, and reporting a
+    /// decision it did not make is worse than reporting one fewer record.
+    ///
+    /// **The last record is not always the one that ended the run.** A turn cap or an exhausted
+    /// budget fires *between* turns, so every record can say `run_again` while the run stopped
+    /// anyway; [`Self::outcome`] is what always answers how it ended.
+    #[must_use]
+    pub fn turn_records(&self) -> &[TurnRecord] {
+        &self.turn_records
+    }
+
+    /// The records one settled turn produced.
+    ///
+    /// Empty for a record that belongs to a different run. Records share a private owner identity
+    /// with their result, then their range is looked up rather than indexed, so either kind of
+    /// mismatch answers nothing instead of panicking. Records produced outside any turn — a
+    /// closeout written to history after the loop ended — belong to no record here and are reached
+    /// through [`Self::new_items`].
+    #[must_use]
+    pub fn turn_items(&self, record: &TurnRecord) -> &[RunItem] {
+        if !Arc::ptr_eq(&self.turn_record_owner, &record.owner) {
+            return &[];
+        }
+        self.new_items
+            .get(record.range().clone())
+            .unwrap_or_default()
     }
 
     /// Tool-use history as of the last turn (R3-6b).

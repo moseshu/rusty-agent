@@ -351,6 +351,7 @@ const fn ra_core::state::tool_use::ToolUseRecord::schema_version(& self) -> Sche
 const fn ra_core::state::tool_use::ToolUseRecord::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_use::ToolUseTracker::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::tool_use::ToolUseTracker::unknown(& self) -> & Unknown
+const fn ra_core::step::NextStep::code(& self) -> & 'static str
 const fn ra_core::step::processed::ToolNotFound::call(& self) -> & ToolCall
 const fn ra_core::step::processed::ToolNotFound::call_id(& self) -> & CallId
 const fn ra_core::step::processed::ToolNotFound::item_id(& self) -> & ItemId

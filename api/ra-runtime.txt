@@ -33,6 +33,10 @@ const fn ra_runtime::runner::result::RunResult::outcome(& self) -> & RunOutcome
 const fn ra_runtime::runner::result::RunResult::state(& self) -> & RunState
 const fn ra_runtime::runner::result::RunResult::tool_use(& self) -> & ToolUseTracker
 const fn ra_runtime::runner::result::RunResult::turns(& self) -> u32
+const fn ra_runtime::runner::result::TurnRecord::agent(& self) -> & AgentId
+const fn ra_runtime::runner::result::TurnRecord::finish_reason(& self) -> Option < FinishReason >
+const fn ra_runtime::runner::result::TurnRecord::next_step_code(& self) -> & 'static str
+const fn ra_runtime::runner::result::TurnRecord::turn(& self) -> u32
 const fn ra_runtime::tool::dispatch::CallHistory::new(repeat_streak : u32, no_progress_streak : u32) -> Self
 const fn ra_runtime::tool::dispatch::CallHistory::no_progress_streak(& self) -> u32
 const fn ra_runtime::tool::dispatch::CallHistory::repeat_streak(& self) -> u32
@@ -80,6 +84,8 @@ fn ra_runtime::runner::result::RunResult::final_message(& self) -> Option < & Me
 fn ra_runtime::runner::result::RunResult::model_responses(& self) -> & [ModelResponse]
 fn ra_runtime::runner::result::RunResult::new_items(& self) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInputItem]
+fn ra_runtime::runner::result::RunResult::turn_items(& self, record : & TurnRecord) -> & [RunItem]
+fn ra_runtime::runner::result::RunResult::turn_records(& self) -> & [TurnRecord]
 fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, context : Arc < dyn ToolRuntimeContext >, cancel : CancelScope, history : CallHistory) -> Self
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
@@ -133,6 +139,7 @@ struct ra_runtime::runner::result::RunErrorData
 struct ra_runtime::runner::result::RunErrorHandlerInput
 struct ra_runtime::runner::result::RunErrorHandlerResult
 struct ra_runtime::runner::result::RunResult
+struct ra_runtime::runner::result::TurnRecord
 struct ra_runtime::runner::stream::RunStream
 struct ra_runtime::tool::dispatch::CallHistory
 struct ra_runtime::tool::dispatch::ToolDispatchRequest

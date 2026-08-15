@@ -179,3 +179,40 @@ fn test_next_step_06() {
         .is_interruption()
     );
 }
+
+#[test]
+fn test_next_step_07() {
+    // The code is the half of this type that leaves the framework — in a turn record, a trace
+    // field, a snapshot. The enum stays inside: it is a settlement intermediate, and it is
+    // exhaustive on purpose, so a host matching it would both freeze the pipeline that produces it
+    // and turn every added state into a breaking change.
+    let steps = [
+        NextStep::RunAgain,
+        NextStep::Handoff {
+            new_agent: agent("reviewer"),
+        },
+        NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        },
+        NextStep::interruption(vec![tool_approval("call-1")]).unwrap(),
+    ];
+
+    let codes = steps.iter().map(NextStep::code).collect::<Vec<_>>();
+    assert_eq!(
+        codes,
+        ["run_again", "handoff", "final_output", "interruption"]
+    );
+
+    // It names the state, not the payload. Two runs that settled for different reasons are both
+    // `final_output`, and `FinishReason` is what tells them apart.
+    assert_eq!(
+        NextStep::FinalOutput {
+            reason: FinishReason::MaxTurns
+        }
+        .code(),
+        NextStep::FinalOutput {
+            reason: FinishReason::Final
+        }
+        .code()
+    );
+}
