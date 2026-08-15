@@ -30,7 +30,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ProviderKey, ResolvedModel, ToolChoice,
     },
-    state::{RunId, RunState, ToolUse, WorkStateHandle},
+    state::{PendingControlRequest, RunId, RunState, ToolUse, WorkStateHandle},
     tool::{
         Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
         ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
@@ -1743,7 +1743,7 @@ async fn cancellation_outranks_an_exhausted_turn_budget() {
     let error = Runner::run(
         request(Vec::new(), &model, &cancel)
             .with_config(RunConfig::new().with_max_turns(1))
-            .with_state(RunState::new().with_budget(spent)),
+            .with_state(RunState::start(RunId::new("run-loop")).with_budget(spent)),
     )
     .await
     .unwrap_err();
@@ -1764,7 +1764,7 @@ async fn a_continuation_is_measured_against_what_an_earlier_segment_spent() {
     let result = Runner::run(
         request(Vec::new(), &model, &cancel)
             .with_config(RunConfig::new().with_max_tokens(12))
-            .with_state(RunState::new().with_budget(spent)),
+            .with_state(RunState::start(RunId::new("run-loop")).with_budget(spent)),
     )
     .await
     .unwrap();
@@ -2368,4 +2368,148 @@ async fn a_run_without_host_state_reads_none_rather_than_another_hosts_object() 
         .unwrap();
 
     assert_eq!(seen.lock().unwrap().as_slice(), ["call:run-loop/coder/<none>"]);
+}
+
+#[tokio::test]
+async fn resuming_with_state_carries_the_states_run_id_into_runner_and_context() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let seen = Arc::clone(&tool.runs);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let previous_state = RunState::start(RunId::new("authoritative-resumed-id"));
+
+    let result = Runner::run(
+        RunRequest::new(
+            agent(vec![tool]),
+            Arc::new(FixedResolver {
+                model: Arc::clone(&model),
+                selectors: Arc::new(Mutex::new(Vec::new())),
+            }),
+            RunId::new("placeholder-id"),
+            cancel,
+            vec![ModelInputItem::Message(Message::user("do something"))],
+        )
+        .with_state(previous_state),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["call:authoritative-resumed-id/coder/<none>"]
+    );
+    assert_eq!(result.state().run_id().as_str(), "authoritative-resumed-id");
+}
+
+struct InspectingControlTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    observed_requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl InspectingControlTool {
+    fn new(name: &str) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            observed_requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for InspectingControlTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        for req in context.run().pending_control_requests() {
+            self.observed_requests
+                .lock()
+                .unwrap()
+                .push(req.request_id().to_owned());
+        }
+        Ok(ToolOutput::text("inspected"))
+    }
+}
+
+#[tokio::test]
+async fn runner_projects_pending_control_requests_into_live_context_seen_by_tools() {
+    let tool = Arc::new(InspectingControlTool::new("inspect_reqs"));
+    let observed = Arc::clone(&tool.observed_requests);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "inspect_reqs")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+
+    let state = RunState::start(RunId::new("run-pending-reqs")).with_pending_control_requests(vec![
+        PendingControlRequest::new("approval-req-42"),
+        PendingControlRequest::new("approval-req-99"),
+    ]);
+
+    Runner::run(
+        request(vec![tool], &model, &cancel).with_state(state),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        ["approval-req-42", "approval-req-99"]
+    );
+}
+
+#[tokio::test]
+async fn runner_automatically_snapshots_event_seq_allocator_advancement_into_run_state() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "done")])]);
+    let cancel = CancelScope::root();
+
+    let request = request(Vec::new(), &model, &cancel);
+    let allocator = request.event_seq_allocator().clone();
+
+    assert_eq!(allocator.allocate().unwrap(), 0);
+    assert_eq!(allocator.allocate().unwrap(), 1);
+    assert_eq!(allocator.allocate().unwrap(), 2);
+
+    let result = Runner::run(request).await.unwrap();
+
+    assert_eq!(result.state().next_host_event_seq(), 3);
+}
+
+#[tokio::test]
+async fn runner_restores_event_seq_allocator_with_persisted_max_seq() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "done")])]);
+    let cancel = CancelScope::root();
+
+    let state = RunState::start(RunId::new("run-restore-test")).with_next_host_event_seq(10);
+    let request =
+        request(Vec::new(), &model, &cancel).with_state_and_persisted_max_seq(state, Some(25));
+
+    let allocator = request.event_seq_allocator().clone();
+    assert_eq!(allocator.current_next(), 26);
+    assert_eq!(allocator.allocate().unwrap(), 26);
+    assert_eq!(allocator.allocate().unwrap(), 27);
+
+    let result = Runner::run(request).await.unwrap();
+
+    assert_eq!(result.state().next_host_event_seq(), 28);
 }

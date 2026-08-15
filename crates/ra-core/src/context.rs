@@ -35,7 +35,12 @@
 
 use std::{any::Any, fmt, sync::Arc};
 
-use crate::{agent::AgentSpec, budget::BudgetSnapshot, item::AgentId, state::RunId};
+use crate::{
+    agent::AgentSpec,
+    budget::BudgetSnapshot,
+    item::AgentId,
+    state::{PendingControlRequest, RunId},
+};
 
 /// The credential-free identity of the public agent a run is attributed to.
 ///
@@ -92,6 +97,7 @@ pub struct RunContext {
     agent: RunAgent,
     app: Option<Arc<dyn Any + Send + Sync>>,
     budget: BudgetSnapshot,
+    pending_control_requests: Vec<PendingControlRequest>,
 }
 
 impl RunContext {
@@ -108,6 +114,7 @@ impl RunContext {
             agent: RunAgent::from_spec(agent),
             app: None,
             budget: BudgetSnapshot::new(),
+            pending_control_requests: Vec::new(),
         }
     }
 
@@ -126,6 +133,16 @@ impl RunContext {
     #[must_use]
     pub fn with_budget(mut self, budget: BudgetSnapshot) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Sets the pending control requests observed by this stage.
+    #[must_use]
+    pub fn with_pending_control_requests(
+        mut self,
+        pending_control_requests: Vec<PendingControlRequest>,
+    ) -> Self {
+        self.pending_control_requests = pending_control_requests;
         self
     }
 
@@ -166,6 +183,12 @@ impl RunContext {
     pub const fn budget(&self) -> &BudgetSnapshot {
         &self.budget
     }
+
+    /// Pending control or approval requests, as of the stage that built this context.
+    #[must_use]
+    pub fn pending_control_requests(&self) -> &[PendingControlRequest] {
+        &self.pending_control_requests
+    }
 }
 
 impl fmt::Debug for RunContext {
@@ -178,6 +201,10 @@ impl fmt::Debug for RunContext {
             .field("agent_id", self.agent_id())
             .field("has_app_context", &self.app.is_some())
             .field("budget", &self.budget)
+            .field(
+                "pending_control_requests",
+                &self.pending_control_requests.len(),
+            )
             .finish_non_exhaustive()
     }
 }

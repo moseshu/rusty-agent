@@ -42,7 +42,7 @@ use ra_core::{
         RunItemKind,
     },
     model::{ModelResolver, ModelSettings, ModelTracing},
-    state::{RunId, RunState},
+    state::{EventSeqAllocator, RunId, RunState},
     step::NextStep,
     tool::ToolServices,
     trace::SpanKind,
@@ -243,6 +243,7 @@ pub struct RunRequest {
     config: RunConfig,
     state: RunState,
     services: ToolServices,
+    event_seqs: EventSeqAllocator,
 }
 
 impl RunRequest {
@@ -263,6 +264,8 @@ impl RunRequest {
         cancel: CancelScope,
         input: Vec<ModelInputItem>,
     ) -> Self {
+        let state = RunState::start(run_id.clone());
+        let event_seqs = state.restore_event_seq_allocator(None);
         Self {
             agent,
             model_resolver,
@@ -271,8 +274,9 @@ impl RunRequest {
             cancel,
             input,
             config: RunConfig::new(),
-            state: RunState::new(),
+            state,
             services: ToolServices::new(),
+            event_seqs,
         }
     }
 
@@ -310,9 +314,43 @@ impl RunRequest {
     /// R3-8 and R6-6 add, since a caller who carried the fields they knew about would silently
     /// drop the rest. Set one field with
     /// [`RunState::with_tool_use`](ra_core::state::RunState::with_tool_use) and pass the result.
-    pub fn with_state(mut self, state: RunState) -> Self {
+    ///
+    /// **The state also carries the identity.** The continuation is attributed to the run it
+    /// continues, so the `run_id` given to [`Self::new`] is replaced by the state's — an identity
+    /// the caller passed separately could disagree with the one every already-persisted event was
+    /// written under, and the state is the side that survived the restart.
+    ///
+    /// Use [`Self::with_state_and_persisted_max_seq`] instead when a rollout log exists.
+    pub fn with_state(self, state: RunState) -> Self {
+        self.with_state_and_persisted_max_seq(state, None)
+    }
+
+    /// Continues from an earlier segment, reconciling the sequence bound against a persisted log.
+    ///
+    /// `persisted_run_max_seq` is the largest sequence number the rollout writer has actually
+    /// written for this run. A checkpoint can lag behind the log — numbers are allocated before the
+    /// write that persists them — so resuming from the checkpoint alone would re-issue numbers that
+    /// are already on disk. Passing `None` states that no log exists to reconcile against.
+    pub fn with_state_and_persisted_max_seq(
+        mut self,
+        state: RunState,
+        persisted_run_max_seq: Option<u64>,
+    ) -> Self {
+        self.run_id = state.run_id().clone();
+        self.event_seqs = state.restore_event_seq_allocator(persisted_run_max_seq);
         self.state = state;
         self
+    }
+
+    /// The run-scoped allocator host events draw their sequence numbers from.
+    ///
+    /// Read-only on purpose, and there is deliberately no setter. The allocator and the state are
+    /// two carriers of the same run identity; letting one be replaced independently would let a run
+    /// report one identity to its tools and checkpoint another, and would leave the bound this
+    /// allocator advances snapshotted into nothing.
+    #[must_use]
+    pub const fn event_seq_allocator(&self) -> &EventSeqAllocator {
+        &self.event_seqs
     }
 }
 
@@ -368,6 +406,7 @@ struct TurnLoopContext<'a> {
     config: &'a RunConfig,
     original_input: &'a [ModelInputItem],
     events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
+    event_seqs: &'a EventSeqAllocator,
 }
 
 /// What the loop produces, whichever way it ends.
@@ -440,6 +479,7 @@ async fn run_loop_inner(
         config,
         mut state,
         services,
+        event_seqs,
     } = request;
 
     if let Err(error) = validate_config(&config) {
@@ -473,6 +513,7 @@ async fn run_loop_inner(
         config: &config,
         original_input: &original_input,
         events: events.as_ref(),
+        event_seqs: &event_seqs,
     };
     let mut progress = TurnLoopProgress {
         generated: Vec::new(),
@@ -518,6 +559,11 @@ async fn run_loop_inner(
             return Err(error);
         }
     };
+
+    if let Some(reason) = outcome.finish_reason() {
+        state = state.with_finish_reason(reason);
+    }
+    state.snapshot_event_seq(&event_seqs);
 
     let mut result = RunResult::new(
         outcome.clone(),
@@ -678,6 +724,7 @@ async fn run_turns(
             None => {}
             Some(outcome) => break outcome,
         }
+        state.snapshot_event_seq(context.event_seqs);
     };
     Ok(outcome)
 }
@@ -804,8 +851,9 @@ fn live_context(
     agent: &AgentBinding,
     state: &RunState,
 ) -> RunContext {
-    let run =
-        RunContext::new(context.run_id.clone(), agent.public()).with_budget(state.budget().clone());
+    let run = RunContext::new(context.run_id.clone(), agent.public())
+        .with_budget(state.budget().clone())
+        .with_pending_control_requests(state.pending_control_requests().to_vec());
     match context.app_context {
         Some(app_context) => run.with_app_context(Arc::clone(app_context)),
         None => run,

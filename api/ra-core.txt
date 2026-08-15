@@ -313,11 +313,26 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::state::run::EventSeqAllocator::run_id(& self) -> & RunId
+const fn ra_core::state::run::GraphCursor::unknown(& self) -> & Unknown
+const fn ra_core::state::run::NestedRunRef::call_id(& self) -> & CallId
+const fn ra_core::state::run::NestedRunRef::unknown(& self) -> & Unknown
+const fn ra_core::state::run::PendingControlRequest::call_id(& self) -> Option < & CallId >
+const fn ra_core::state::run::PendingControlRequest::unknown(& self) -> & Unknown
 const fn ra_core::state::run::RunState::budget(& self) -> & BudgetSnapshot
+const fn ra_core::state::run::RunState::finish_reason(& self) -> Option < FinishReason >
+const fn ra_core::state::run::RunState::graph_cursor(& self) -> Option < & GraphCursor >
+const fn ra_core::state::run::RunState::next_host_event_seq(& self) -> u64
+const fn ra_core::state::run::RunState::run_id(& self) -> & RunId
 const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::run::RunState::tool_failure(& self) -> & ToolFailureTracker
 const fn ra_core::state::run::RunState::tool_use(& self) -> & ToolUseTracker
 const fn ra_core::state::run::RunState::unknown(& self) -> & Unknown
+const fn ra_core::state::run::RunState::usage_totals(& self) -> Option < & Usage >
+const fn ra_core::state::run::RunState::work_state_ref(& self) -> Option < & WorkStateRef >
+const fn ra_core::state::run::RunState::workspace_lease(& self) -> Option < & WorkspaceLeaseRef >
+const fn ra_core::state::run::WorkStateRef::unknown(& self) -> & Unknown
+const fn ra_core::state::run::WorkspaceLeaseRef::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_failure::AgentToolFailures::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::tool_failure::AgentToolFailures::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_failure::ToolFailureEntry::identity(& self) -> & ToolUse
@@ -649,8 +664,10 @@ fn ra_core::config::env_key(path : & str) -> String
 fn ra_core::context::RunAgent::name(& self) -> & str
 fn ra_core::context::RunContext::app_context< T : Any + Send + Sync >(& self) -> Option < & T >
 fn ra_core::context::RunContext::new(run_id : RunId, agent : & AgentSpec) -> Self
+fn ra_core::context::RunContext::pending_control_requests(& self) -> & [PendingControlRequest]
 fn ra_core::context::RunContext::with_app_context(mut self, app_context : Arc < dyn Any + Send + Sync >) -> Self
 fn ra_core::context::RunContext::with_budget(mut self, budget : BudgetSnapshot) -> Self
+fn ra_core::context::RunContext::with_pending_control_requests(mut self, pending_control_requests : Vec < PendingControlRequest >) -> Self
 fn ra_core::error::Error::budget(kind : BudgetKind, message : impl Into < String >) -> Self
 fn ra_core::error::Error::caller(message : impl Into < String >) -> Self
 fn ra_core::error::Error::cancelled(reason : impl Into < String >) -> Self
@@ -845,16 +862,49 @@ fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_t
 fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
+fn ra_core::state::run::EventSeqAllocator::allocate(& self) -> Result < u64 >
+fn ra_core::state::run::EventSeqAllocator::current_next(& self) -> u64
+fn ra_core::state::run::GraphCursor::edge_id(& self) -> Option < & str >
+fn ra_core::state::run::GraphCursor::new(node_id : impl Into < String >) -> Self
+fn ra_core::state::run::GraphCursor::node_id(& self) -> & str
+fn ra_core::state::run::GraphCursor::with_edge_id(mut self, edge_id : impl Into < String >) -> Self
+fn ra_core::state::run::NestedRunRef::new(scope_id : impl Into < String >, call_id : CallId) -> Self
+fn ra_core::state::run::NestedRunRef::scope_id(& self) -> & str
+fn ra_core::state::run::NestedRunRef::signature(& self) -> Option < & str >
+fn ra_core::state::run::NestedRunRef::with_signature(mut self, signature : impl Into < String >) -> Self
+fn ra_core::state::run::PendingControlRequest::description(& self) -> Option < & str >
+fn ra_core::state::run::PendingControlRequest::new(request_id : impl Into < String >) -> Self
+fn ra_core::state::run::PendingControlRequest::request_id(& self) -> & str
+fn ra_core::state::run::PendingControlRequest::with_call_id(mut self, call_id : CallId) -> Self
+fn ra_core::state::run::PendingControlRequest::with_description(mut self, description : impl Into < String >) -> Self
 fn ra_core::state::run::RunId::as_str(& self) -> & str
 fn ra_core::state::run::RunId::generate() -> Self
 fn ra_core::state::run::RunId::new(value : impl Into < String >) -> Self
 fn ra_core::state::run::RunState::budget_mut(& mut self) -> & mut BudgetSnapshot
-fn ra_core::state::run::RunState::new() -> Self
+fn ra_core::state::run::RunState::nested_runs(& self) -> & [NestedRunRef]
+fn ra_core::state::run::RunState::pending_control_requests(& self) -> & [PendingControlRequest]
+fn ra_core::state::run::RunState::restore_event_seq_allocator(& self, persisted_run_max_seq : Option < u64 >) -> EventSeqAllocator
+fn ra_core::state::run::RunState::snapshot_event_seq(& mut self, allocator : & EventSeqAllocator)
+fn ra_core::state::run::RunState::start(run_id : RunId) -> Self
 fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker
 fn ra_core::state::run::RunState::trackers_mut(& mut self) -> (& mut ToolUseTracker , & mut ToolFailureTracker)
 fn ra_core::state::run::RunState::with_budget(mut self, budget : BudgetSnapshot) -> Self
+fn ra_core::state::run::RunState::with_finish_reason(mut self, finish_reason : impl Into < Option < FinishReason > >) -> Self
+fn ra_core::state::run::RunState::with_graph_cursor(mut self, graph_cursor : impl Into < Option < GraphCursor > >) -> Self
+fn ra_core::state::run::RunState::with_nested_runs(mut self, nested_runs : Vec < NestedRunRef >) -> Self
+fn ra_core::state::run::RunState::with_next_host_event_seq(mut self, seq : u64) -> Self
+fn ra_core::state::run::RunState::with_pending_control_requests(mut self, pending_control_requests : Vec < PendingControlRequest >) -> Self
 fn ra_core::state::run::RunState::with_tool_failure(mut self, tool_failure : ToolFailureTracker) -> Self
 fn ra_core::state::run::RunState::with_tool_use(mut self, tool_use : ToolUseTracker) -> Self
+fn ra_core::state::run::RunState::with_usage_totals(mut self, usage_totals : impl Into < Option < Usage > >) -> Self
+fn ra_core::state::run::RunState::with_work_state_ref(mut self, work_state_ref : impl Into < Option < WorkStateRef > >) -> Self
+fn ra_core::state::run::RunState::with_workspace_lease(mut self, workspace_lease : impl Into < Option < WorkspaceLeaseRef > >) -> Self
+fn ra_core::state::run::WorkStateRef::new(task_id : impl Into < String >) -> Self
+fn ra_core::state::run::WorkStateRef::task_id(& self) -> & str
+fn ra_core::state::run::WorkspaceLeaseRef::lease_id(& self) -> & str
+fn ra_core::state::run::WorkspaceLeaseRef::new(lease_id : impl Into < String >) -> Self
+fn ra_core::state::run::WorkspaceLeaseRef::path(& self) -> Option < & str >
+fn ra_core::state::run::WorkspaceLeaseRef::with_path(mut self, path : impl Into < String >) -> Self
 fn ra_core::state::tool_failure::AgentToolFailures::entries(& self) -> & [ToolFailureEntry]
 fn ra_core::state::tool_failure::AgentToolFailures::entry(& self, identity : & ToolUse) -> Option < & ToolFailureEntry >
 fn ra_core::state::tool_failure::AgentToolFailures::run_failures(& self) -> u32
@@ -1127,8 +1177,14 @@ struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
+struct ra_core::state::run::EventSeqAllocator
+struct ra_core::state::run::GraphCursor
+struct ra_core::state::run::NestedRunRef
+struct ra_core::state::run::PendingControlRequest
 struct ra_core::state::run::RunId
 struct ra_core::state::run::RunState
+struct ra_core::state::run::WorkStateRef
+struct ra_core::state::run::WorkspaceLeaseRef
 struct ra_core::state::tool_failure::AgentToolFailures
 struct ra_core::state::tool_failure::EvidenceFingerprint
 struct ra_core::state::tool_failure::ToolFailureEntry
