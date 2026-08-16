@@ -480,7 +480,10 @@ async fn generation_span_records_normalized_usage() {
     let generations = spans.of_kind("generation");
     assert_eq!(generations.len(), 2, "{generations:?}");
     assert_eq!(generations[0].field("model.name"), Some("canonical-model"));
-    assert_eq!(generations[0].field("model.provider"), Some("test-provider"));
+    assert_eq!(
+        generations[0].field("model.provider"),
+        Some("test-provider")
+    );
     // A response that carried no usage reports zeroes rather than nothing. `Usage` has no "not
     // reported" state to preserve, so the span cannot invent one either.
     assert_eq!(generations[0].number("usage.input_tokens"), 0);
@@ -636,17 +639,14 @@ async fn a_failed_model_call_is_classified_as_an_error_with_its_code() {
 #[tokio::test(flavor = "current_thread")]
 async fn paid_usage_survives_a_later_tool_failure_on_turn_and_agent_spans() {
     let tool = Arc::new(PropagatingFailureTool::new("write_file"));
-    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
-        "call-item-1",
-        "call-1",
-        "write_file",
-    )])
-    .with_usage(
-        Usage::new(37, 11)
-            .with_cached_input_tokens(23)
-            .with_cache_write_tokens(7)
-            .with_reasoning_tokens(5),
-    )]);
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("call-item-1", "call-1", "write_file")]).with_usage(
+            Usage::new(37, 11)
+                .with_cached_input_tokens(23)
+                .with_cache_write_tokens(7)
+                .with_reasoning_tokens(5),
+        ),
+    ]);
     let cancel = CancelScope::root();
     let (spans, _text, guard) = capture();
 
@@ -661,8 +661,16 @@ async fn paid_usage_survives_a_later_tool_failure_on_turn_and_agent_spans() {
         let span = spans.only(kind);
         assert_eq!(span.field("outcome"), Some("error"), "{kind}: {span:?}");
         assert_eq!(span.number("usage.input_tokens"), 37, "{kind}: {span:?}");
-        assert_eq!(span.number("usage.cached_input_tokens"), 23, "{kind}: {span:?}");
-        assert_eq!(span.number("usage.cache_write_tokens"), 7, "{kind}: {span:?}");
+        assert_eq!(
+            span.number("usage.cached_input_tokens"),
+            23,
+            "{kind}: {span:?}"
+        );
+        assert_eq!(
+            span.number("usage.cache_write_tokens"),
+            7,
+            "{kind}: {span:?}"
+        );
         assert_eq!(span.number("usage.output_tokens"), 11, "{kind}: {span:?}");
         assert_eq!(span.number("usage.reasoning_tokens"), 5, "{kind}: {span:?}");
     }

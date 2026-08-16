@@ -19,9 +19,7 @@ use ra_core::{
     },
     state::{RunId, ToolUseTracker},
     step::ToolUse,
-    tool::{
-        Tool, ToolAvailability, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
-    },
+    tool::{Tool, ToolAvailability, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::{
     agent::AgentBinding,

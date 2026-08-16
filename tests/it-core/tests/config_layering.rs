@@ -16,12 +16,18 @@ use ra_core::config::{
 
 /// The effective value. `Layered::value` hands back `&T` directly, which reads better than
 /// peeling two layers of reference off `resolve`.
-fn effective_value(layered: &Layered<&'static str>, selection: SourceSelection) -> Option<&'static str> {
+fn effective_value(
+    layered: &Layered<&'static str>,
+    selection: SourceSelection,
+) -> Option<&'static str> {
     layered.value(selection).copied()
 }
 
 /// Which layer the effective value came from.
-fn effective_source(layered: &Layered<&'static str>, selection: SourceSelection) -> Option<SettingSource> {
+fn effective_source(
+    layered: &Layered<&'static str>,
+    selection: SourceSelection,
+) -> Option<SettingSource> {
     layered.resolve(selection).map(|s| s.source())
 }
 
@@ -78,7 +84,10 @@ fn test_config_layering_02() {
 fn test_config_layering_03() {
     let layered = all_six_layers();
 
-    assert_eq!(effective_value(&layered, SourceSelection::all()), Some("显式"));
+    assert_eq!(
+        effective_value(&layered, SourceSelection::all()),
+        Some("显式")
+    );
     assert_eq!(
         effective_source(&layered, SourceSelection::all()),
         Some(SettingSource::Explicit)
@@ -90,7 +99,10 @@ fn test_config_layering_04() {
     let mut layered = Layered::builtin("内置");
     layered.set(SettingSource::ProjectFile, "项目");
 
-    assert_eq!(effective_value(&layered, SourceSelection::all()), Some("项目"));
+    assert_eq!(
+        effective_value(&layered, SourceSelection::all()),
+        Some("项目")
+    );
     assert_eq!(
         effective_source(&layered, SourceSelection::all()),
         Some(SettingSource::ProjectFile)

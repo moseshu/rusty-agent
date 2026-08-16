@@ -19,7 +19,10 @@ use ra_model::openai::{
     responses::{OpenAiResponsesModel, OpenAiResponsesProvider},
 };
 use serde_json::{Map, Value, json};
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{header, method, path}};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
+};
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
     ModelSettings::new().resolve(
@@ -108,7 +111,10 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
     .await;
 
     let extra_body = Map::from_iter([
-        ("include".to_owned(), json!(["message.output_text.logprobs"])),
+        (
+            "include".to_owned(),
+            json!(["message.output_text.logprobs"]),
+        ),
         ("service_tier".to_owned(), json!("flex")),
         ("reasoning".to_owned(), json!({"summary": "auto"})),
     ]);
@@ -128,11 +134,8 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
             ],
         )),
         ModelInputItem::Message(
-            Message::new(
-                MessageRole::Assistant,
-                vec![ContentBlock::text("working")],
-            )
-            .with_phase(OutputPhase::Commentary),
+            Message::new(MessageRole::Assistant, vec![ContentBlock::text("working")])
+                .with_phase(OutputPhase::Commentary),
         ),
         ModelInputItem::Reasoning(
             Reasoning::new()
@@ -199,8 +202,8 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
         .await
         .expect("wiremock should retain requests");
     assert_eq!(requests.len(), 1);
-    let body: Value = serde_json::from_slice(&requests[0].body)
-        .expect("request should contain JSON");
+    let body: Value =
+        serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["instructions"], "stable instructions");
     assert_eq!(body["previous_response_id"], "resp_previous");
@@ -208,13 +211,19 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
     assert_eq!(body["service_tier"], "flex");
     assert_eq!(body["max_output_tokens"], 512);
     // `effort` merges into the provider-private reasoning object instead of replacing it.
-    assert_eq!(body["reasoning"], json!({"effort": "high", "summary": "auto"}));
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high", "summary": "auto"})
+    );
     assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
     assert_eq!(
         body["include"],
-        json!(["message.output_text.logprobs", "reasoning.encrypted_content"])
+        json!([
+            "message.output_text.logprobs",
+            "reasoning.encrypted_content"
+        ])
     );
     assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
     assert_eq!(
@@ -228,12 +237,35 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
         body["input"][4]["content"][0]["text"],
         "dynamic tail instructions"
     );
-    assert!(requests[0].url.query().is_some_and(|query| query == "region=test"));
+    assert!(
+        requests[0]
+            .url
+            .query()
+            .is_some_and(|query| query == "region=test")
+    );
     let headers = &requests[0].headers;
-    assert_eq!(headers.get("openai-organization").and_then(|v| v.to_str().ok()), Some("org-test"));
-    assert_eq!(headers.get("openai-project").and_then(|v| v.to_str().ok()), Some("project-test"));
-    assert_eq!(headers.get("x-client-default").and_then(|v| v.to_str().ok()), Some("present"));
-    assert_eq!(headers.get("x-request-header").and_then(|v| v.to_str().ok()), Some("present"));
+    assert_eq!(
+        headers
+            .get("openai-organization")
+            .and_then(|v| v.to_str().ok()),
+        Some("org-test")
+    );
+    assert_eq!(
+        headers.get("openai-project").and_then(|v| v.to_str().ok()),
+        Some("project-test")
+    );
+    assert_eq!(
+        headers
+            .get("x-client-default")
+            .and_then(|v| v.to_str().ok()),
+        Some("present")
+    );
+    assert_eq!(
+        headers
+            .get("x-request-header")
+            .and_then(|v| v.to_str().ok()),
+        Some("present")
+    );
 }
 
 #[tokio::test]
@@ -321,7 +353,10 @@ async fn handoff_history_replays_after_control_moved_to_the_target_agent() {
         .await
         .expect("handoff history should still lower");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     assert_eq!(body["input"][0]["type"], "function_call");
     assert_eq!(body["input"][0]["name"], "delegate_research");
@@ -355,7 +390,10 @@ async fn compacted_history_and_unanswered_calls_survive_the_provider_boundary() 
         .await
         .expect("compacted history should lower");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     let items = body["input"].as_array().expect("input should be an array");
     assert_eq!(items.len(), 1);
@@ -388,7 +426,10 @@ async fn hosted_tools_from_extra_body_survive_alongside_function_tools() {
         .await
         .expect("merged tool request should succeed");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     assert_eq!(body["tools"][0], json!({"type": "web_search"}));
     assert_eq!(body["tools"][1]["name"], "lookup");
@@ -475,10 +516,8 @@ async fn local_image_paths_are_materialized_only_at_the_provider_boundary() {
         ResponseTemplate::new(200).set_body_json(json!({"id": "resp_image", "output": []})),
     )
     .await;
-    let image_path = std::env::temp_dir().join(format!(
-        "rusty-agent-r1-4-{}.webp",
-        std::process::id()
-    ));
+    let image_path =
+        std::env::temp_dir().join(format!("rusty-agent-r1-4-{}.webp", std::process::id()));
     std::fs::write(&image_path, b"image-bytes").expect("fixture image should be writable");
 
     let result = model
@@ -493,7 +532,10 @@ async fn local_image_paths_are_materialized_only_at_the_provider_boundary() {
     std::fs::remove_file(&image_path).expect("fixture image should be removable");
     result.expect("local image request should succeed");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     let image_url = body["input"][0]["content"][0]["image_url"]
         .as_str()
@@ -521,7 +563,10 @@ async fn conversation_id_is_lowered_without_previous_response_id() {
         .await
         .expect("conversation request should succeed");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     assert_eq!(body["conversation"], "conv_123");
     assert!(body.get("previous_response_id").is_none());
@@ -531,9 +576,11 @@ async fn conversation_id_is_lowered_without_previous_response_id() {
 async fn provider_caches_models_and_redacts_credentials_from_debug() {
     let auth = OpenAiAuth::new("super-secret").with_base_url("https://example.test/v1/");
     assert!(!format!("{auth:?}").contains("super-secret"));
-    let provider = OpenAiResponsesProvider::new(auth, "default-model")
-        .expect("provider should build");
-    let first = provider.get_model(None).expect("default model should resolve");
+    let provider =
+        OpenAiResponsesProvider::new(auth, "default-model").expect("provider should build");
+    let first = provider
+        .get_model(None)
+        .expect("default model should resolve");
     let second = provider
         .get_model(Some("default-model"))
         .expect("named default should resolve");
@@ -601,7 +648,11 @@ async fn stream_entry_emits_completed_raw_response_then_normalized_items() {
         panic!("first event should be raw response.completed");
     };
     assert_eq!(raw.event_type(), "response.completed");
-    assert!(events[1..].iter().all(|event| matches!(event, Ok(ModelStreamEvent::RunItem(_)))));
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| matches!(event, Ok(ModelStreamEvent::RunItem(_))))
+    );
 }
 
 #[tokio::test]
@@ -620,11 +671,13 @@ async fn unsupported_responses_settings_fail_before_http() {
         .await
         .expect_err("unsupported settings should fail locally");
     assert_eq!(error.code(), "caller");
-    assert!(server
-        .received_requests()
-        .await
-        .expect("wiremock should answer")
-        .is_empty());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock should answer")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -661,7 +714,10 @@ async fn test_openai_responses_01() {
         .await
         .expect("structured tool output should lower");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     let parts = body["input"][0]["output"]
         .as_array()
@@ -704,7 +760,10 @@ async fn test_openai_responses_02() {
         .await
         .expect("host payloads should still lower");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     assert_eq!(body["input"][0]["output"], json!("{\"rows\":2}"));
 }
@@ -728,7 +787,10 @@ async fn test_openai_responses_03() {
         .await
         .expect("R2-1 tool output should replay");
 
-    let requests = server.received_requests().await.expect("request should exist");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request should exist");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
     assert_eq!(
         body["input"][0]["output"],

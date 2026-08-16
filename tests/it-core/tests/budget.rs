@@ -40,7 +40,10 @@ fn snapshot_uses_a_stable_priority_when_multiple_limits_are_exhausted() {
 
 #[test]
 fn zero_ceilings_are_rejected_before_a_run_starts() {
-    let error = BudgetLimit::new().with_max_tokens(0).validate().unwrap_err();
+    let error = BudgetLimit::new()
+        .with_max_tokens(0)
+        .validate()
+        .unwrap_err();
 
     assert!(error.to_string().contains("max_tokens"));
 }

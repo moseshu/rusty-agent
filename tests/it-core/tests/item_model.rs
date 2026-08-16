@@ -70,11 +70,10 @@ fn all_items() -> Vec<RunItem> {
             "item-mcp-list",
             RunItemKind::McpListTools(McpListTools::new(
                 "filesystem",
-                vec![McpTool::new(
-                    "read_text_file",
-                    json!({"type": "object"}),
-                )
-                .with_description("读取文本")],
+                vec![
+                    McpTool::new("read_text_file", json!({"type": "object"}))
+                        .with_description("读取文本"),
+                ],
             )),
         ),
         item(
@@ -138,18 +137,15 @@ fn test_item_model_02() {
 
 #[test]
 fn test_item_model_03() {
-    let item = item(
-        "item-1",
-        RunItemKind::Message(Message::user("检查项目")),
-    )
-    .with_provenance(
-        ItemProvenance::new(AgentId::new("agent-secret")).with_agent_name("内部执行器"),
-    )
-    .with_raw_provider_item(RawProviderItem::new(
-        "provider-secret",
-        json!({"provider_only": true}),
-    ))
-    .with_session_data("ui-secret", json!({"expanded": false}));
+    let item = item("item-1", RunItemKind::Message(Message::user("检查项目")))
+        .with_provenance(
+            ItemProvenance::new(AgentId::new("agent-secret")).with_agent_name("内部执行器"),
+        )
+        .with_raw_provider_item(RawProviderItem::new(
+            "provider-secret",
+            json!({"provider_only": true}),
+        ))
+        .with_session_data("ui-secret", json!({"expanded": false}));
 
     let stored = serde_json::to_string(&item).expect("权威项应可序列化");
     assert!(stored.contains("agent-secret"));
@@ -166,7 +162,10 @@ fn test_item_model_03() {
         "provider_only",
         "ui-secret",
     ] {
-        assert!(!sent.contains(forbidden), "模型输入泄漏了 {forbidden}: {sent}");
+        assert!(
+            !sent.contains(forbidden),
+            "模型输入泄漏了 {forbidden}: {sent}"
+        );
     }
     assert!(sent.contains("检查项目"));
 }
@@ -183,10 +182,7 @@ fn test_item_model_04() {
     );
     let output = item(
         "完全不同的-item-id",
-        RunItemKind::ToolCallOutput(ToolCallOutput::new(
-            CallId::new("same-call"),
-            json!("ok"),
-        )),
+        RunItemKind::ToolCallOutput(ToolCallOutput::new(CallId::new("same-call"), json!("ok"))),
     );
 
     assert_ne!(call.id(), output.id());
@@ -204,17 +200,20 @@ fn test_item_model_05() {
             {"type": "thinking", "thinking": "", "signature": "sig-a"},
             {"type": "redacted_thinking", "data": "opaque"}
         ]));
-    let item = item(
-        "reasoning",
-        RunItemKind::Reasoning(reasoning.clone()),
-    );
+    let item = item("reasoning", RunItemKind::Reasoning(reasoning.clone()));
 
     let Some(ModelInputItem::Reasoning(projected)) = item.to_model_input() else {
         panic!("reasoning 应投影为 reasoning");
     };
     assert_eq!(projected, reasoning);
     assert_eq!(projected.encrypted_content(), Some("sig-a\nsig-b"));
-    assert_eq!(projected.provider_data().and_then(Value::as_array).map(Vec::len), Some(2));
+    assert_eq!(
+        projected
+            .provider_data()
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
 }
 
 #[test]
@@ -306,14 +305,15 @@ fn test_item_model_09() {
 
 #[test]
 fn test_item_model_10() {
-    let item = item(
-        "item",
-        RunItemKind::Message(Message::system("system")),
-    )
-    .with_session_data("z", json!(1))
-    .with_session_data("a", json!(2));
+    let item = item("item", RunItemKind::Message(Message::system("system")))
+        .with_session_data("z", json!(1))
+        .with_session_data("a", json!(2));
 
-    let keys: Vec<&str> = item.session_data().iter().map(|(key, _)| key.as_str()).collect();
+    let keys: Vec<&str> = item
+        .session_data()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
     assert_eq!(keys, vec!["a", "z"]);
     assert!(item.unknown().is_empty());
 }

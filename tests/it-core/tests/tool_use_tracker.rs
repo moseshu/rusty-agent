@@ -287,13 +287,7 @@ fn test_tool_use_tracker_09() {
     let total = TOOL_USE_RECENT_LIMIT + 1;
     let turn = || {
         (0..total)
-            .map(|index| {
-                attempt(
-                    read.clone(),
-                    &format!("c-{index}"),
-                    json!({ "path": "a" }),
-                )
-            })
+            .map(|index| attempt(read.clone(), &format!("c-{index}"), json!({ "path": "a" })))
             .collect::<Vec<_>>()
     };
 

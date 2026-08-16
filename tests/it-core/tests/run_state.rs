@@ -10,9 +10,8 @@ use ra_core::{
     finish::FinishReason,
     item::{AgentId, CallId},
     state::{
-        GraphCursor, NestedRunRef, PendingControlRequest,
-        RUN_STATE_SCHEMA_VERSION, RunId, RunState, ToolUse, ToolUseAttempt, WorkStateRef,
-        WorkspaceLeaseRef,
+        GraphCursor, NestedRunRef, PendingControlRequest, RUN_STATE_SCHEMA_VERSION, RunId,
+        RunState, ToolUse, ToolUseAttempt, WorkStateRef, WorkspaceLeaseRef,
     },
     tool::ToolLookupKey,
     usage::Usage,
@@ -358,18 +357,15 @@ fn test_pending_control_requests_context_projection() {
         .with_call_id(CallId::new("call-1"))
         .with_description("approval required");
 
-    let state = RunState::start(run_id.clone())
-        .with_pending_control_requests(vec![request.clone()]);
+    let state =
+        RunState::start(run_id.clone()).with_pending_control_requests(vec![request.clone()]);
 
     let context = RunContext::new(run_id.clone(), &agent_spec)
         .with_pending_control_requests(state.pending_control_requests().to_vec());
 
     assert_eq!(context.pending_control_requests().len(), 1);
     assert_eq!(context.pending_control_requests()[0], request);
-    assert_eq!(
-        context.pending_control_requests()[0].request_id(),
-        "req-1"
-    );
+    assert_eq!(context.pending_control_requests()[0].request_id(), "req-1");
     assert_eq!(
         context.pending_control_requests()[0].call_id(),
         Some(&CallId::new("call-1"))

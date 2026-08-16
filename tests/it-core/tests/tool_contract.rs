@@ -12,18 +12,18 @@ use ra_core::{
     tool::{
         DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy,
         ToolAvailability, ToolCaller, ToolConcurrency, ToolContext, ToolExposure,
-        ToolFailureHandling, ToolGuardrailId, ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin,
-        ToolOutput, ToolSchema, ToolServices, ToolTimeoutBehavior,
+        ToolFailureHandling, ToolGuardrailId, ToolLookupKey, ToolNamespace, ToolOptions,
+        ToolOrigin, ToolOutput, ToolSchema, ToolServices, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
 
 #[test]
 fn test_tool_contract_01() {
-    let github = ToolOrigin::namespaced(ToolNamespace::new("mcp.github").unwrap(), "search")
-        .unwrap();
-    let internal = ToolOrigin::namespaced(ToolNamespace::new("mcp.internal").unwrap(), "search")
-        .unwrap();
+    let github =
+        ToolOrigin::namespaced(ToolNamespace::new("mcp.github").unwrap(), "search").unwrap();
+    let internal =
+        ToolOrigin::namespaced(ToolNamespace::new("mcp.internal").unwrap(), "search").unwrap();
 
     assert_eq!(github.qualified_name(), "mcp.github.search");
     assert_eq!(internal.qualified_name(), "mcp.internal.search");
@@ -46,8 +46,7 @@ fn test_tool_contract_01() {
 fn test_tool_contract_02() {
     let bare = ToolLookupKey::bare("search").unwrap();
     let namespaced =
-        ToolLookupKey::namespaced(ToolNamespace::new("plugin.catalog").unwrap(), "search")
-            .unwrap();
+        ToolLookupKey::namespaced(ToolNamespace::new("plugin.catalog").unwrap(), "search").unwrap();
     let deferred = ToolLookupKey::deferred_top_level("search").unwrap();
 
     assert_ne!(bare, deferred);
@@ -121,11 +120,10 @@ fn test_tool_contract_04() {
     assert!(restored.is_deferred_top_level());
     assert_eq!(restored.name(), "tool_search");
     assert!(restored.namespace().is_none());
-    assert!(ToolLookupKey::namespaced(
-        ToolNamespace::new("tool_search").unwrap(),
-        "tool_search"
-    )
-    .is_err());
+    assert!(
+        ToolLookupKey::namespaced(ToolNamespace::new("tool_search").unwrap(), "tool_search")
+            .is_err()
+    );
 }
 
 #[test]
@@ -181,7 +179,10 @@ fn test_tool_contract_06() {
     assert_eq!(restored.schema_version(), SchemaVersion::new(2));
 
     // A real identity difference is still distinguished.
-    assert_ne!(restored, ToolLookupKey::deferred_top_level("search").unwrap());
+    assert_ne!(
+        restored,
+        ToolLookupKey::deferred_top_level("search").unwrap()
+    );
     assert_ne!(restored, ToolLookupKey::bare("other").unwrap());
 
     // A whole-origin round trip stays routable too; that is the path R9 restore takes.
@@ -194,9 +195,7 @@ fn test_tool_contract_06() {
 #[test]
 fn test_tool_contract_07() {
     assert!(serde_json::from_value::<ToolNamespace>(json!(" namespace ")).is_err());
-    assert!(
-        serde_json::from_value::<ToolLookupKey>(json!({"kind": "bare", "name": ""})).is_err()
-    );
+    assert!(serde_json::from_value::<ToolLookupKey>(json!({"kind": "bare", "name": ""})).is_err());
     assert!(
         serde_json::from_value::<ToolLookupKey>(json!({
             "kind": "namespaced",
@@ -265,7 +264,10 @@ fn test_tool_contract_08() {
         Some(&json!({"version": 2}))
     );
     let normalized = serde_json::to_value(restored).unwrap();
-    assert_eq!(normalized["allowed_callers"], json!(["direct", "programmatic"]));
+    assert_eq!(
+        normalized["allowed_callers"],
+        json!(["direct", "programmatic"])
+    );
     assert_eq!(normalized["input_guardrails"], json!(["read_before_edit"]));
     assert_eq!(normalized["output_guardrails"], json!(["secret_scan"]));
 }
@@ -444,7 +446,10 @@ async fn test_tool_contract_12() {
 
     let definition = tool.model_definition();
     assert_eq!(definition.name(), "echo");
-    assert_eq!(definition.description(), Some("Echo text with the host prefix."));
+    assert_eq!(
+        definition.description(),
+        Some("Echo text with the host prefix.")
+    );
     assert!(definition.strict());
 
     let output = tool.call(context).await.unwrap();
@@ -509,7 +514,9 @@ async fn test_tool_contract_18() {
     // nothing answers the same way as one that attached something else.
     let attached = run_context().with_app_context(Arc::new(HostContext { prefix: "host:" }));
     assert_eq!(
-        attached.app_context::<HostContext>().map(|host| host.prefix),
+        attached
+            .app_context::<HostContext>()
+            .map(|host| host.prefix),
         Some("host:")
     );
     assert!(attached.app_context::<OtherHostContext>().is_none());

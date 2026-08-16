@@ -158,10 +158,10 @@ async fn settle_call(
         tool_use,
         tool_failure,
         ModelResponse::new(vec![call(
-        &format!("item-{call_id}"),
-        call_id,
-        "run_tests",
-        arguments,
+            &format!("item-{call_id}"),
+            call_id,
+            "run_tests",
+            arguments,
         )]),
     )
     .await
@@ -199,9 +199,10 @@ fn error_code(items: &[RunItem]) -> Option<String> {
 
 fn error_code_for_call(items: &[RunItem], call_id: &str) -> Option<String> {
     items.iter().find_map(|item| match item.kind() {
-        RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == call_id => {
-            output.output()["error"]["code"].as_str().map(ToOwned::to_owned)
-        }
+        RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == call_id => output
+            .output()["error"]["code"]
+            .as_str()
+            .map(ToOwned::to_owned),
         _ => None,
     })
 }
@@ -282,7 +283,11 @@ async fn a_response_is_admitted_as_a_whole_and_the_next_one_pays() {
     .await
     .unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 3, "every call in the response ran");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "every call in the response ran"
+    );
     for call_id in ["c-1", "c-2", "c-3"] {
         assert_eq!(
             error_code_for_call(&items, call_id).as_deref(),
@@ -290,7 +295,10 @@ async fn a_response_is_admitted_as_a_whole_and_the_next_one_pays() {
             "{call_id} was answered by the tool, not by the breaker"
         );
     }
-    assert_eq!(failures.no_progress_streak(&agent, &identity("run_tests")), 3);
+    assert_eq!(
+        failures.no_progress_streak(&agent, &identity("run_tests")),
+        3
+    );
 
     // The response after it is where the limit is enforced.
     let next = settle_call(&surface, &mut tool_use, &mut failures, "c-4", json!({}))

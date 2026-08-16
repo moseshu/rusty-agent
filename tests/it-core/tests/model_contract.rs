@@ -63,7 +63,10 @@ fn test_model_contract_01() {
     assert_eq!(request.tools()[0].name(), "search");
     assert_eq!(request.tools()[0].description(), Some("Search documents"));
     assert!(request.tools()[0].strict());
-    assert_eq!(request.handoffs()[0].target_agent().as_str(), "agent-review");
+    assert_eq!(
+        request.handoffs()[0].target_agent().as_str(),
+        "agent-review"
+    );
     assert_eq!(request.handoffs()[0].name(), "delegate_review");
     assert!(request.handoffs()[0].strict());
     assert_eq!(request.output_schema().expect("已设置").name(), "answer");
@@ -112,14 +115,19 @@ impl Model for FakeModel {
             .expect("测试 mutex 不应 poisoned")
             .push("response".to_owned());
         Ok(ModelResponse::new(
-            request.input().iter().cloned().map(|item| match item {
-                ModelInputItem::Message(message) => ra_core::item::RunItem::new(
-                    ItemId::new("item-1"),
-                    ra_core::item::RunItemKind::Message(message),
-                )
-                .with_provenance(ra_core::item::ItemProvenance::new(AgentId::new("agent"))),
-                _ => unreachable!("fixture 只有消息"),
-            }).collect(),
+            request
+                .input()
+                .iter()
+                .cloned()
+                .map(|item| match item {
+                    ModelInputItem::Message(message) => ra_core::item::RunItem::new(
+                        ItemId::new("item-1"),
+                        ra_core::item::RunItemKind::Message(message),
+                    )
+                    .with_provenance(ra_core::item::ItemProvenance::new(AgentId::new("agent"))),
+                    _ => unreachable!("fixture 只有消息"),
+                })
+                .collect(),
         ))
     }
 
@@ -138,10 +146,7 @@ impl Model for FakeModel {
         .boxed()
     }
 
-    fn get_retry_advice(
-        &self,
-        request: &ModelRetryAdviceRequest<'_>,
-    ) -> Option<RetryAdvice> {
+    fn get_retry_advice(&self, request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
         request.is_streaming().then(|| {
             RetryAdvice::new()
                 .with_suggested(true)

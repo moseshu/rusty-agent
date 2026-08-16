@@ -21,8 +21,9 @@ use ra_model::openai::{auth::OpenAiAuth, responses::OpenAiResponsesModel};
 use serde_json::json;
 
 fn required_env(name: &str) -> String {
-    std::env::var(name)
-        .unwrap_or_else(|_| panic!("live test requires env var {name}; see the command at the top of this file"))
+    std::env::var(name).unwrap_or_else(|_| {
+        panic!("live test requires env var {name}; see the command at the top of this file")
+    })
 }
 
 fn live_model() -> OpenAiResponsesModel {
@@ -98,8 +99,14 @@ async fn live_minimal_turn_round_trips() {
         .expect("the minimal round trip should succeed");
 
     report("minimal round trip", &response);
-    assert!(response.response_id().is_some(), "the server should return a response id");
-    assert!(response.usage().input_tokens() > 0, "usage should report input tokens");
+    assert!(
+        response.response_id().is_some(),
+        "the server should return a response id"
+    );
+    assert!(
+        response.usage().input_tokens() > 0,
+        "usage should report input tokens"
+    );
 }
 
 /// Two turns: replays the first turn's reasoning and tool call verbatim to exercise the

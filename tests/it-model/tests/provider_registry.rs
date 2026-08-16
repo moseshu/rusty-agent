@@ -93,11 +93,7 @@ fn test_provider_registry_01() {
     let explicit = Arc::new(FakeProvider::new(false));
     let registry = ProviderRegistry::builder(ProviderKey::new("native"))
         .unknown_prefix_policy(UnknownPrefixPolicy::ForwardTo(ProviderKey::new("compat")))
-        .register(registration(
-            "native",
-            ApiProtocol::OpenAiResponses,
-            native,
-        ))
+        .register(registration("native", ApiProtocol::OpenAiResponses, native))
         .register(registration(
             "compat",
             ApiProtocol::OpenAiChatCompletions,
@@ -155,7 +151,12 @@ fn test_provider_registry_02() {
         .build()
         .expect("registry should build");
 
-    for vendor in ["openai/gpt-x", "gemini/pro", "anthropic/sonnet", "grok/beta"] {
+    for vendor in [
+        "openai/gpt-x",
+        "gemini/pro",
+        "anthropic/sonnet",
+        "grok/beta",
+    ] {
         let selected = registry
             .select_model(Some(vendor))
             .expect("unregistered vendor should follow the configured policy");
@@ -292,12 +293,8 @@ async fn test_provider_registry_06() {
     let child = Arc::new(FakeProvider::new(false));
     let registry = ProviderRegistry::builder(ProviderKey::new("provider"))
         .register(
-            registration(
-                "provider",
-                ApiProtocol::OpenAiResponses,
-                Arc::clone(&child),
-            )
-            .with_alias("p"),
+            registration("provider", ApiProtocol::OpenAiResponses, Arc::clone(&child))
+                .with_alias("p"),
         )
         .build()
         .expect("registry should build");
@@ -341,12 +338,18 @@ async fn test_provider_registry_07() {
             .expect("provider should resolve before close");
     }
 
-    let close_error = registry.close().await.expect_err("one provider should fail");
+    let close_error = registry
+        .close()
+        .await
+        .expect_err("one provider should fail");
     assert_eq!(close_error.code(), "caller");
     assert_eq!(shared.close_count.load(Ordering::SeqCst), 1);
     assert_eq!(healthy.close_count.load(Ordering::SeqCst), 1);
 
-    registry.close().await.expect("repeated close is idempotent");
+    registry
+        .close()
+        .await
+        .expect("repeated close is idempotent");
     assert_eq!(shared.close_count.load(Ordering::SeqCst), 1);
     let after_close = registry
         .resolve_model(Some("a/four"))
@@ -379,12 +382,8 @@ fn test_provider_registry_09() {
     let one = Arc::new(FakeProvider::new(false));
     let two = Arc::new(FakeProvider::new(false));
     let collision = ProviderRegistry::builder(ProviderKey::new("one"))
-        .register(
-            registration("one", ApiProtocol::OpenAiResponses, one).with_alias("shared"),
-        )
-        .register(
-            registration("two", ApiProtocol::OpenAiResponses, two).with_alias("shared"),
-        )
+        .register(registration("one", ApiProtocol::OpenAiResponses, one).with_alias("shared"))
+        .register(registration("two", ApiProtocol::OpenAiResponses, two).with_alias("shared"))
         .build()
         .expect_err("prefix collision should fail");
     assert_eq!(collision.code(), "config");

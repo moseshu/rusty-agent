@@ -26,7 +26,11 @@ fn test_finish_reason_01() {
 
     let total = codes.len();
     codes.dedup();
-    assert_eq!(codes.len(), total, "存在重复的 code，图边路由与指标维度会串");
+    assert_eq!(
+        codes.len(),
+        total,
+        "存在重复的 code，图边路由与指标维度会串"
+    );
 
     for code in codes {
         assert!(!code.is_empty());

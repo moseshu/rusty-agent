@@ -144,9 +144,10 @@ async fn test_read_file_05() {
     // untouched behind it.
     let rendered = output.model_blocks();
     assert_eq!(rendered.len(), 2);
-    assert!(rendered[0].as_text().is_some_and(|note| note
-        .contains("[truncated by tool: 4 of 10 bytes kept]")
-        && note.contains("continue from offset 3")));
+    assert!(rendered[0].as_text().is_some_and(|note| {
+        note.contains("[truncated by tool: 4 of 10 bytes kept]")
+            && note.contains("continue from offset 3")
+    }));
     assert_eq!(rendered[1], output.blocks()[0]);
 }
 
@@ -359,11 +360,9 @@ async fn test_read_file_17() {
     .expect("a Latin-1 source file is still readable");
 
     assert_eq!(body(&output), "     1\tok\n");
-    assert!(output
-        .metadata()
-        .guidance()
-        .iter()
-        .any(|guidance| guidance == "The file is not valid UTF-8; undecodable bytes were replaced."));
+    assert!(output.metadata().guidance().iter().any(
+        |guidance| guidance == "The file is not valid UTF-8; undecodable bytes were replaced."
+    ));
 }
 
 #[tokio::test]
@@ -462,7 +461,10 @@ async fn test_read_file_23() {
             body(&output),
             format!("`{requested}` uses `..`, which this tool does not resolve.")
         );
-        assert_eq!(output.metadata().guidance(), ["Send the path without `..`."]);
+        assert_eq!(
+            output.metadata().guidance(),
+            ["Send the path without `..`."]
+        );
     }
 }
 

@@ -66,7 +66,11 @@ fn crate_identifiers_can_never_be_exempted() {
             .iter()
             .any(|violation| violation.message().contains("cannot be exempted"))
     );
-    assert_eq!(report.exemptions(), 0, "there is no quoted alias to consume");
+    assert_eq!(
+        report.exemptions(),
+        0,
+        "there is no quoted alias to consume"
+    );
 }
 
 #[test]
@@ -107,7 +111,11 @@ fn unused_marker_is_rejected_instead_of_inflating_the_count() {
     let report = scan_product_references(source, PRODUCTS);
 
     assert_eq!(report.exemptions(), 0);
-    assert!(messages(source).iter().any(|message| message.contains("unused")));
+    assert!(
+        messages(source)
+            .iter()
+            .any(|message| message.contains("unused"))
+    );
 }
 
 #[test]

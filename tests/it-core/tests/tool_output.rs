@@ -67,7 +67,10 @@ fn test_tool_output_04() {
             "missing field `text`",
         ),
         (json!({"schema_version": 1, "blocks": 7}), "invalid type"),
-        (json!({"schema_version": 1, "blocks": []}), "at least one block"),
+        (
+            json!({"schema_version": 1, "blocks": []}),
+            "at least one block",
+        ),
     ];
     for (payload, expected) in cases {
         let error = serde_json::from_value::<ToolOutput>(payload.clone()).unwrap_err();
@@ -89,7 +92,10 @@ fn test_tool_output_05() {
     );
     let stored = serde_json::to_value(&output).expect("tool output must serialize");
 
-    assert!(stored.get("schema_version").is_some(), "版本标记就是认领凭据");
+    assert!(
+        stored.get("schema_version").is_some(),
+        "版本标记就是认领凭据"
+    );
     let restored = ToolOutput::from_stored(&stored)
         .expect("自己写的记录不该读不了")
         .expect("自己写的记录必须被认成工具结果");
@@ -179,11 +185,17 @@ fn test_tool_output_09() {
 fn test_tool_output_10() {
     // R5-1 的裁剪发生在工具早就返回之后，它必须能追加而不是重建一份。
     let mut output = ToolOutput::text("部分内容").with_metadata(
-        ObservationMetadata::new().with_truncation(Truncation::new(TruncationStage::Tool, 900, 300)),
+        ObservationMetadata::new().with_truncation(Truncation::new(
+            TruncationStage::Tool,
+            900,
+            300,
+        )),
     );
-    output
-        .metadata_mut()
-        .push_truncation(Truncation::new(TruncationStage::ContextBudget, 300, 100));
+    output.metadata_mut().push_truncation(Truncation::new(
+        TruncationStage::ContextBudget,
+        300,
+        100,
+    ));
 
     assert_eq!(output.metadata().truncations().len(), 2);
 }
@@ -280,7 +292,8 @@ fn test_tool_output_15() {
         "future_top": true
     });
 
-    let output: ToolOutput = serde_json::from_value(stored).expect("newer output must stay readable");
+    let output: ToolOutput =
+        serde_json::from_value(stored).expect("newer output must stay readable");
     assert_eq!(output.schema_version(), SchemaVersion::new(7));
     assert_eq!(output.metadata().schema_version(), SchemaVersion::new(9));
 

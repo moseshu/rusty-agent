@@ -133,7 +133,10 @@ fn test_single_step_result_02() {
 #[test]
 fn test_single_step_result_03() {
     let error = settled()
-        .new_step_items(vec![message("msg-1", "完事了"), message("msg-2", "还有一句")])
+        .new_step_items(vec![
+            message("msg-1", "完事了"),
+            message("msg-2", "还有一句"),
+        ])
         .session_step_items(vec![message("msg-1", "完事了")])
         .build()
         .unwrap_err();
@@ -243,8 +246,11 @@ fn test_single_step_result_07() {
         .processed_response(pending_response())
         .session_step_items(session)
         .next_step(
-            NextStep::interruption(vec![mcp_approval("approval-1"), tool_approval("approval-2")])
-                .unwrap(),
+            NextStep::interruption(vec![
+                mcp_approval("approval-1"),
+                tool_approval("approval-2"),
+            ])
+            .unwrap(),
         )
         .build()
         .unwrap();
@@ -280,10 +286,7 @@ fn test_single_step_result_08() {
         .item(message("msg-1", "被改写过的内容"))
         .build()
         .unwrap();
-    let same_ids = settled()
-        .processed_response(rewritten)
-        .build()
-        .unwrap_err();
+    let same_ids = settled().processed_response(rewritten).build().unwrap_err();
     assert!(same_ids.to_string().contains("different content"));
 }
 
@@ -548,7 +551,10 @@ fn test_single_step_result_16() {
         .nested_history_owned_items(vec![ItemId::new("nested-1")])
         .build()
         .unwrap();
-    assert_eq!(result.nested_history_owned_items(), [ItemId::new("nested-1")]);
+    assert_eq!(
+        result.nested_history_owned_items(),
+        [ItemId::new("nested-1")]
+    );
 }
 
 #[test]

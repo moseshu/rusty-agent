@@ -61,10 +61,7 @@ fn test_tool_input_02() {
     let root = schema.input_schema();
 
     assert_eq!(root["additionalProperties"], false);
-    assert_eq!(
-        root["required"],
-        json!(["filters", "limit", "query"])
-    );
+    assert_eq!(root["required"], json!(["filters", "limit", "query"]));
     assert!(
         contains_null(&root["properties"]["limit"]),
         "{}",
@@ -93,7 +90,10 @@ fn test_tool_input_03() {
     let root = schema.input_schema();
 
     // No sibling keywords on this field, so the reference survives and must keep its definition.
-    assert_eq!(root["properties"]["filters"]["$ref"], "#/definitions/SearchFilters");
+    assert_eq!(
+        root["properties"]["filters"]["$ref"],
+        "#/definitions/SearchFilters"
+    );
     assert_eq!(
         root["definitions"]["SearchFilters"]["additionalProperties"],
         false
@@ -116,7 +116,9 @@ fn test_tool_input_03() {
     assert!(
         ReferencingInput::func_schema("referencing")
             .unwrap()
-            .decode_arguments(r#"{"filters":{"include_archived":null,"labels":[]},"tuple":["seven",7]}"#)
+            .decode_arguments(
+                r#"{"filters":{"include_archived":null,"labels":[]},"tuple":["seven",7]}"#
+            )
             .is_err(),
         "a positional tuple must be type-checked element by element"
     );
@@ -153,6 +155,7 @@ fn test_tool_input_04() {
 
 /// A self-referential type cannot be expressed as a strict schema; that has to be an error rather
 /// than a crashed process.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, JsonSchema, ToolInput)]
 struct RecursiveInput {
     /// The next node.
@@ -163,10 +166,7 @@ struct RecursiveInput {
 fn test_tool_input_05() {
     let error = RecursiveInput::tool_schema("recursive")
         .expect_err("self-referential input must not be expanded forever");
-    assert!(
-        error.to_string().contains("self-referential"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("self-referential"), "{error}");
 }
 
 #[test]
@@ -175,9 +175,11 @@ fn test_tool_input_06() {
 
     assert!(!schema.strict_json_schema());
     assert_eq!(schema.description(), Some("Explicit description wins."));
-    assert!(!schema.input_schema()["required"]
-        .as_array()
-        .is_some_and(|required| required.iter().any(|name| name == "optional")));
+    assert!(
+        !schema.input_schema()["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|name| name == "optional"))
+    );
 }
 
 #[test]
@@ -222,11 +224,16 @@ fn test_tool_input_08() {
         .with_return_type::<Vec<String>>();
 
     assert!(schema.inject_tool_context());
-    assert_eq!(schema.return_type_name(), Some("alloc::vec::Vec<alloc::string::String>"));
-    assert!(!schema.tool_schema().input_schema()["properties"]
-        .as_object()
-        .unwrap()
-        .contains_key("context"));
+    assert_eq!(
+        schema.return_type_name(),
+        Some("alloc::vec::Vec<alloc::string::String>")
+    );
+    assert!(
+        !schema.tool_schema().input_schema()["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("context")
+    );
     let debug = format!("{schema:?}");
     assert!(debug.contains("<schema-bound-decoder>"));
 }
@@ -257,7 +264,10 @@ fn test_tool_input_10() {
     assert!(serde_json::from_value::<core_contract::tool::ToolSchema>(wire).is_err());
 
     let mut old_wire = serde_json::to_value(schema).unwrap();
-    old_wire.as_object_mut().unwrap().remove("input_schema_hash");
+    old_wire
+        .as_object_mut()
+        .unwrap()
+        .remove("input_schema_hash");
     let restored: core_contract::tool::ToolSchema = serde_json::from_value(old_wire).unwrap();
     assert_eq!(restored.input_schema_hash().len(), 64);
 }
@@ -270,8 +280,7 @@ fn contains_null(schema: &Value) -> bool {
                     || kind
                         .as_array()
                         .is_some_and(|kinds| kinds.iter().any(|kind| kind == "null"))
-            })
-                || object.values().any(contains_null)
+            }) || object.values().any(contains_null)
         }
         Value::Array(values) => values.iter().any(contains_null),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,

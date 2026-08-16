@@ -714,7 +714,7 @@ async fn test_turn_settlement_02() {
 
     let output = output_for(settled.new_step_items(), "call-1");
     assert!(!output.is_error());
-    assert_eq!(stored_text(&output), Some("written".to_owned()));
+    assert_eq!(stored_text(output), Some("written".to_owned()));
 }
 
 #[tokio::test]
@@ -1415,7 +1415,7 @@ async fn test_turn_settlement_16() {
     let output = output_for(settled.new_step_items(), "call-1");
     // 这是唯一一条把散文送进模型上下文的路径，而且写它的是工具自己。
     assert_eq!(
-        stored_text(&output),
+        stored_text(output),
         Some("tool wrote its own explanation".to_owned())
     );
 }

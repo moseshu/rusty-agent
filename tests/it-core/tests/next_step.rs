@@ -128,7 +128,8 @@ fn test_next_step_03() {
 
 #[test]
 fn test_next_step_04() {
-    let step = NextStep::interruption(vec![tool_approval("call-1"), mcp_approval("req-1")]).unwrap();
+    let step =
+        NextStep::interruption(vec![tool_approval("call-1"), mcp_approval("req-1")]).unwrap();
     let NextStep::Interruption { items } = step else {
         panic!("应当是 interruption");
     };
@@ -164,8 +165,13 @@ fn test_next_step_06() {
         .is_interruption()
     );
     assert!(
-        RunItemKind::McpApprovalRequest(McpApprovalRequest::new("req-1", "docs", "search", json!({})))
-            .is_interruption()
+        RunItemKind::McpApprovalRequest(McpApprovalRequest::new(
+            "req-1",
+            "docs",
+            "search",
+            json!({})
+        ))
+        .is_interruption()
     );
 
     // 已经答完的那条不再是待决项，否则 resume 会把同一个审批再问一遍。

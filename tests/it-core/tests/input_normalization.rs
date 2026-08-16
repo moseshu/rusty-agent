@@ -94,7 +94,12 @@ fn default_prunes_unanswered_calls_and_their_dangling_reasoning() {
 
     assert_eq!(
         labels(normalized.entries()),
-        vec!["message", "tool_call", "tool_call_output", "tool_call_output"]
+        vec![
+            "message",
+            "tool_call",
+            "tool_call_output",
+            "tool_call_output"
+        ]
     );
     assert!(normalized.entries().iter().all(|entry| {
         entry
@@ -286,10 +291,7 @@ fn occurrence_coordinates_follow_the_latest_value_not_an_array_position() {
     );
     let output = run_item(
         "output-occurrence",
-        RunItemKind::ToolCallOutput(ToolCallOutput::new(
-            CallId::new("call-1"),
-            json!("done"),
-        )),
+        RunItemKind::ToolCallOutput(ToolCallOutput::new(CallId::new("call-1"), json!("done"))),
     );
     let latest = run_item(
         "call-latest-occurrence",
@@ -326,10 +328,7 @@ fn occurrence_coordinates_follow_the_latest_value_not_an_array_position() {
         ),
         run_item(
             "output-copy",
-            RunItemKind::ToolCallOutput(ToolCallOutput::new(
-                CallId::new("call-1"),
-                json!("done"),
-            )),
+            RunItemKind::ToolCallOutput(ToolCallOutput::new(CallId::new("call-1"), json!("done"))),
         ),
     ];
     let moved = InputItemNormalizer::new()

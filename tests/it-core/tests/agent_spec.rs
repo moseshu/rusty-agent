@@ -199,7 +199,11 @@ fn builder_rejects_tools_projecting_to_the_same_model_facing_name() {
         .tools([Arc::clone(&first), second])
         .build()
         .unwrap_err();
-    assert!(error.to_string().contains("advertises the tool name `echo`"));
+    assert!(
+        error
+            .to_string()
+            .contains("advertises the tool name `echo`")
+    );
 
     assert!(
         AgentSpec::builder()

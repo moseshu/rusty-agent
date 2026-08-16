@@ -40,13 +40,11 @@ fn test_model_settings_01() {
             object(json!({"route": "provider", "nested": {"provider": true}})),
         )
         .with_retry(
-            ModelRetrySettings::new()
-                .with_max_retries(3)
-                .with_backoff(
-                    RetryBackoffSettings::new()
-                        .with_initial_delay(Duration::from_millis(100))
-                        .with_jitter(true),
-                ),
+            ModelRetrySettings::new().with_max_retries(3).with_backoff(
+                RetryBackoffSettings::new()
+                    .with_initial_delay(Duration::from_millis(100))
+                    .with_jitter(true),
+            ),
         );
     let agent_defaults = ModelSettings::new()
         .with_temperature(0.0)
@@ -56,9 +54,8 @@ fn test_model_settings_01() {
         .with_metadata("source", "agent")
         .with_extra_header("x-agent", "yes")
         .with_retry(
-            ModelRetrySettings::new().with_backoff(
-                RetryBackoffSettings::new().with_max_delay(Duration::from_secs(5)),
-            ),
+            ModelRetrySettings::new()
+                .with_backoff(RetryBackoffSettings::new().with_max_delay(Duration::from_secs(5))),
         );
     let model_defaults = ModelSettings::new()
         .with_frequency_penalty(0.2)
@@ -66,10 +63,7 @@ fn test_model_settings_01() {
         .with_max_tokens(2_048)
         .with_timeout(Duration::from_secs(30))
         .with_effort(Effort::XHigh)
-        .with_extra_body(
-            key.clone(),
-            object(json!({"nested": {"model": true}})),
-        );
+        .with_extra_body(key.clone(), object(json!({"nested": {"model": true}})));
     let run_overrides = ModelSettings::new()
         .with_max_tokens(3_000)
         .with_timeout(Duration::from_secs(45))
@@ -79,21 +73,15 @@ fn test_model_settings_01() {
         .with_extra_header("x-layer", "run")
         .with_extra_query("api-version", "v2")
         .with_retry(
-            ModelRetrySettings::new()
-                .with_max_retries(0)
-                .with_backoff(
-                    RetryBackoffSettings::new()
-                        .with_multiplier(0.0)
-                        .with_jitter(false),
-                ),
+            ModelRetrySettings::new().with_max_retries(0).with_backoff(
+                RetryBackoffSettings::new()
+                    .with_multiplier(0.0)
+                    .with_jitter(false),
+            ),
         );
 
-    let resolved = provider_defaults.resolve(
-        &key,
-        &agent_defaults,
-        &model_defaults,
-        &run_overrides,
-    );
+    let resolved =
+        provider_defaults.resolve(&key, &agent_defaults, &model_defaults, &run_overrides);
 
     assert_eq!(resolved.provider(), &key);
     assert_eq!(resolved.max_tokens(), Some(2_048));
@@ -259,7 +247,11 @@ fn test_model_settings_05() {
     assert_eq!(capped.max_tokens(), Some(8_192), "超过模型上限必须被截住");
 
     let inherited = empty.resolve(&key, &agent_preference, &model_limit, &empty);
-    assert_eq!(inherited.max_tokens(), Some(1_000), "run 未设时沿用 agent 默认");
+    assert_eq!(
+        inherited.max_tokens(),
+        Some(1_000),
+        "run 未设时沿用 agent 默认"
+    );
 
     let uncapped = empty.resolve(&key, &agent_preference, &empty, &empty);
     assert_eq!(uncapped.max_tokens(), Some(1_000), "没有模型上限就不封顶");
@@ -341,12 +333,8 @@ fn test_model_settings_07() {
         run_overrides.clone(),
     ];
 
-    let resolved = provider_defaults.resolve(
-        &key,
-        &agent_defaults,
-        &model_defaults,
-        &run_overrides,
-    );
+    let resolved =
+        provider_defaults.resolve(&key, &agent_defaults, &model_defaults, &run_overrides);
 
     assert_eq!(
         resolved.extra_body(),
@@ -406,16 +394,11 @@ fn test_model_settings_09() {
         .with_metadata("safe", "visible")
         .with_extra_header("authorization", "header-secret")
         .with_extra_query("api-key", "query-secret")
-        .with_extra_body(
-            key.clone(),
-            object(json!({"private_token": "body-secret"})),
-        );
+        .with_extra_body(key.clone(), object(json!({"private_token": "body-secret"})));
     let empty = ModelSettings::new();
     let resolved = settings.resolve(&key, &empty, &empty, &empty);
 
-    let trace = resolved
-        .to_traceable_value()
-        .expect("trace 投影应可序列化");
+    let trace = resolved.to_traceable_value().expect("trace 投影应可序列化");
     let encoded = serde_json::to_string(&trace).expect("trace JSON 应可序列化");
     assert_eq!(trace["temperature"], 0.5);
     assert_eq!(trace["metadata"]["safe"], "visible");
@@ -435,23 +418,19 @@ fn test_model_settings_09() {
 fn test_model_settings_10() {
     let key = provider("openai");
     let provider_defaults = ModelSettings::new().with_retry(
-        ModelRetrySettings::new()
-            .with_max_retries(3)
-            .with_backoff(
-                RetryBackoffSettings::new()
-                    .with_initial_delay(Duration::from_millis(250))
-                    .with_max_delay(Duration::from_secs(4))
-                    .with_jitter(true),
-            ),
+        ModelRetrySettings::new().with_max_retries(3).with_backoff(
+            RetryBackoffSettings::new()
+                .with_initial_delay(Duration::from_millis(250))
+                .with_max_delay(Duration::from_secs(4))
+                .with_jitter(true),
+        ),
     );
     let run_overrides = ModelSettings::new().with_retry(
-        ModelRetrySettings::new()
-            .with_max_retries(0)
-            .with_backoff(
-                RetryBackoffSettings::new()
-                    .with_multiplier(0.0)
-                    .with_jitter(false),
-            ),
+        ModelRetrySettings::new().with_max_retries(0).with_backoff(
+            RetryBackoffSettings::new()
+                .with_multiplier(0.0)
+                .with_jitter(false),
+        ),
     );
     let empty = ModelSettings::new();
     let resolved = provider_defaults.resolve(&key, &empty, &empty, &run_overrides);
@@ -521,7 +500,10 @@ fn test_model_settings_13() {
         .insert("future_setting".into(), json!({"enabled": false}));
 
     let decoded: ModelSettings = serde_json::from_value(value).expect("旧代码应能读取");
-    assert_eq!(decoded.unknown().get("future_setting"), Some(&json!({"enabled": false})));
+    assert_eq!(
+        decoded.unknown().get("future_setting"),
+        Some(&json!({"enabled": false}))
+    );
     let rewritten = serde_json::to_value(decoded).expect("旧代码应能回写");
     assert_eq!(rewritten["future_setting"]["enabled"], false);
     let first = serde_json::to_string(&rewritten).expect("应可序列化");
