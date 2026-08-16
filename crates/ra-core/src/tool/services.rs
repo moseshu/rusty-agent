@@ -25,7 +25,7 @@
 use core::fmt;
 use std::sync::Arc;
 
-use crate::state::WorkStateHandle;
+use crate::{event::HostEventSink, state::WorkStateHandle};
 
 /// Framework-owned ports handed to a tool, each behind its own accessor.
 ///
@@ -37,17 +37,27 @@ use crate::state::WorkStateHandle;
 #[derive(Clone, Default)]
 pub struct ToolServices {
     work_state: Option<Arc<dyn WorkStateHandle>>,
+    event_sink: Option<Arc<dyn HostEventSink>>,
 }
 
 impl ToolServices {
     /// Creates a bag with no ports installed.
     pub const fn new() -> Self {
-        Self { work_state: None }
+        Self {
+            work_state: None,
+            event_sink: None,
+        }
     }
 
     /// Installs the task state the run participates in.
     pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
         self.work_state = Some(work_state);
+        self
+    }
+
+    /// Installs the host event sink for granular observability and UI streaming.
+    pub fn with_event_sink(mut self, event_sink: Arc<dyn HostEventSink>) -> Self {
+        self.event_sink = Some(event_sink);
         self
     }
 
@@ -60,6 +70,12 @@ impl ToolServices {
     pub fn work_state(&self) -> Option<&dyn WorkStateHandle> {
         self.work_state.as_deref()
     }
+
+    /// The host event sink for this run, when the host installed one.
+    #[must_use]
+    pub fn event_sink(&self) -> Option<&Arc<dyn HostEventSink>> {
+        self.event_sink.as_ref()
+    }
 }
 
 impl fmt::Debug for ToolServices {
@@ -68,6 +84,7 @@ impl fmt::Debug for ToolServices {
         formatter
             .debug_struct("ToolServices")
             .field("work_state", &self.work_state.is_some())
+            .field("event_sink", &self.event_sink.is_some())
             .finish_non_exhaustive()
     }
 }

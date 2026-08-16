@@ -16,3 +16,7 @@ pub mod output;
 pub mod pty;
 pub mod sandbox;
 pub mod session;
+
+/// Default schema version for process execution structures.
+pub const EXEC_SCHEMA_VERSION: ra_core::compat::SchemaVersion =
+    ra_core::compat::SchemaVersion::new(1);

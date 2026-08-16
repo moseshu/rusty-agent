@@ -73,6 +73,75 @@ const fn ra_core::error::Error::recoverability(& self) -> Recoverability
 const fn ra_core::error::Recoverability::is_failure(self) -> bool
 const fn ra_core::error::Recoverability::is_recoverable(self) -> bool
 const fn ra_core::error::Recoverability::is_retryable(self) -> bool
+const fn ra_core::event::HostEvent::agent_id(& self) -> & AgentId
+const fn ra_core::event::HostEvent::at(& self) -> EventTimestamp
+const fn ra_core::event::HostEvent::body(& self) -> & HostEventBody
+const fn ra_core::event::HostEvent::run_id(& self) -> & RunId
+const fn ra_core::event::HostEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::HostEvent::seq(& self) -> u64
+const fn ra_core::event::HostEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::HostEvent::with_timestamp(mut self, at : EventTimestamp) -> Self
+const fn ra_core::event::HostEventEmitter::agent_id(& self) -> & AgentId
+const fn ra_core::event::HostEventEmitter::allocator(& self) -> & EventSeqAllocator
+const fn ra_core::event::HostEventEmitter::sink(& self) -> & Arc < dyn HostEventSink >
+const fn ra_core::event::agent::AgentClosedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::agent::AgentClosedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::agent::AgentCompletedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::agent::AgentCompletedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::agent::AgentMessageSentEvent::from_agent(& self) -> & AgentId
+const fn ra_core::event::agent::AgentMessageSentEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::agent::AgentMessageSentEvent::to_agent(& self) -> & AgentId
+const fn ra_core::event::agent::AgentMessageSentEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::agent::AgentSpawnedEvent::child_agent_id(& self) -> & AgentId
+const fn ra_core::event::agent::AgentSpawnedEvent::child_run_id(& self) -> Option < & RunId >
+const fn ra_core::event::agent::AgentSpawnedEvent::operation_id(& self) -> Option < & AgentOperationId >
+const fn ra_core::event::agent::AgentSpawnedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::agent::AgentSpawnedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::agent::AgentStatusChangedEvent::new_status(& self) -> & AgentStatus
+const fn ra_core::event::agent::AgentStatusChangedEvent::previous_status(& self) -> & AgentStatus
+const fn ra_core::event::agent::AgentStatusChangedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::agent::AgentStatusChangedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::exec::ExecEvictedEvent::reason(& self) -> & ExecEvictionReason
+const fn ra_core::event::exec::ExecEvictedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::exec::ExecEvictedEvent::session_id(& self) -> & ExecSessionId
+const fn ra_core::event::exec::ExecEvictedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::exec::ExecExitedEvent::duration_ms(& self) -> u64
+const fn ra_core::event::exec::ExecExitedEvent::exit_code(& self) -> Option < i32 >
+const fn ra_core::event::exec::ExecExitedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::exec::ExecExitedEvent::session_id(& self) -> & ExecSessionId
+const fn ra_core::event::exec::ExecExitedEvent::stderr_bytes(& self) -> usize
+const fn ra_core::event::exec::ExecExitedEvent::stdout_bytes(& self) -> usize
+const fn ra_core::event::exec::ExecExitedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::exec::ExecExitedEvent::with_exit_code(mut self, exit_code : i32) -> Self
+const fn ra_core::event::exec::ExecOutputEvent::bytes(& self) -> usize
+const fn ra_core::event::exec::ExecOutputEvent::is_truncated(& self) -> bool
+const fn ra_core::event::exec::ExecOutputEvent::offset(& self) -> u64
+const fn ra_core::event::exec::ExecOutputEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::exec::ExecOutputEvent::session_id(& self) -> & ExecSessionId
+const fn ra_core::event::exec::ExecOutputEvent::stream(& self) -> ExecStreamKind
+const fn ra_core::event::exec::ExecOutputEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::exec::ExecOutputEvent::with_truncated(mut self, truncated : bool) -> Self
+const fn ra_core::event::exec::ExecStartedEvent::pid(& self) -> Option < u32 >
+const fn ra_core::event::exec::ExecStartedEvent::pty(& self) -> bool
+const fn ra_core::event::exec::ExecStartedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::exec::ExecStartedEvent::session_id(& self) -> & ExecSessionId
+const fn ra_core::event::exec::ExecStartedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::exec::ExecStartedEvent::with_pid(mut self, pid : u32) -> Self
+const fn ra_core::event::exec::ExecStartedEvent::with_pty(mut self, pty : bool) -> Self
+const fn ra_core::event::exec::ExecYieldedEvent::duration_ms(& self) -> u64
+const fn ra_core::event::exec::ExecYieldedEvent::reason(& self) -> & ExecYieldReason
+const fn ra_core::event::exec::ExecYieldedEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::exec::ExecYieldedEvent::session_id(& self) -> & ExecSessionId
+const fn ra_core::event::exec::ExecYieldedEvent::total_captured_bytes(& self) -> usize
+const fn ra_core::event::exec::ExecYieldedEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::exec::TerminalInteractionEvent::input_bytes(& self) -> usize
+const fn ra_core::event::exec::TerminalInteractionEvent::is_interrupt(& self) -> bool
+const fn ra_core::event::exec::TerminalInteractionEvent::schema_version(& self) -> SchemaVersion
+const fn ra_core::event::exec::TerminalInteractionEvent::session_id(& self) -> & ExecSessionId
+const fn ra_core::event::exec::TerminalInteractionEvent::unknown(& self) -> & Unknown
+const fn ra_core::event::sink::FnHostEventSink < F >::new(callback : F) -> Self
+const fn ra_core::event::timestamp::EventTimestamp::as_millis(self) -> u64
+const fn ra_core::event::timestamp::EventTimestamp::from_millis(millis : u64) -> Self
 const fn ra_core::finish::FinishReason::code(self) -> & 'static str
 const fn ra_core::finish::FinishReason::from_budget_kind(kind : BudgetKind) -> Self
 const fn ra_core::finish::FinishReason::is_complete(self) -> bool
@@ -476,6 +545,9 @@ const ra_core::config::CONFIG_FILE_NAME: & str
 const ra_core::config::ENV_PREFIX: & str
 const ra_core::config::LOCAL_CONFIG_FILE_NAME: & str
 const ra_core::config::SettingSource::ALL: & 'static [Self]
+const ra_core::event::HOST_EVENT_SCHEMA_VERSION: SchemaVersion
+const ra_core::event::agent::AGENT_EVENT_SCHEMA_VERSION: SchemaVersion
+const ra_core::event::exec::EXEC_EVENT_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::ITEM_PROVENANCE_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::RAW_PROVIDER_ITEM_SCHEMA_VERSION: SchemaVersion
 const ra_core::item::RUN_ITEM_SCHEMA_VERSION: SchemaVersion
@@ -554,6 +626,13 @@ enum ra_core::error::Recoverability
 enum ra_core::error::SandboxErrorKind
 enum ra_core::error::SessionErrorKind
 enum ra_core::error::ToolErrorKind
+enum ra_core::event::HostEventBody
+enum ra_core::event::agent::AgentEvent
+enum ra_core::event::agent::AgentStatus
+enum ra_core::event::exec::ExecEvent
+enum ra_core::event::exec::ExecEvictionReason
+enum ra_core::event::exec::ExecStreamKind
+enum ra_core::event::exec::ExecYieldReason
 enum ra_core::finish::FinishReason
 enum ra_core::item::ModelInputItem
 enum ra_core::item::RunItemKind
@@ -663,10 +742,13 @@ fn ra_core::config::Sourced < T >::into_value(self) -> T
 fn ra_core::config::env_key(path : & str) -> String
 fn ra_core::context::RunAgent::name(& self) -> & str
 fn ra_core::context::RunContext::app_context< T : Any + Send + Sync >(& self) -> Option < & T >
+fn ra_core::context::RunContext::event_emitter(& self, sink : Arc < dyn HostEventSink >) -> Option < HostEventEmitter >
+fn ra_core::context::RunContext::event_seq_allocator(& self) -> Option < & EventSeqAllocator >
 fn ra_core::context::RunContext::new(run_id : RunId, agent : & AgentSpec) -> Self
 fn ra_core::context::RunContext::pending_control_requests(& self) -> & [PendingControlRequest]
 fn ra_core::context::RunContext::with_app_context(mut self, app_context : Arc < dyn Any + Send + Sync >) -> Self
 fn ra_core::context::RunContext::with_budget(mut self, budget : BudgetSnapshot) -> Self
+fn ra_core::context::RunContext::with_event_seq_allocator(mut self, allocator : EventSeqAllocator) -> Self
 fn ra_core::context::RunContext::with_pending_control_requests(mut self, pending_control_requests : Vec < PendingControlRequest >) -> Self
 fn ra_core::error::Error::budget(kind : BudgetKind, message : impl Into < String >) -> Self
 fn ra_core::error::Error::caller(message : impl Into < String >) -> Self
@@ -680,6 +762,56 @@ fn ra_core::error::Error::session(kind : SessionErrorKind, message : impl Into <
 fn ra_core::error::Error::tool(kind : ToolErrorKind, tool : impl Into < String >, message : impl Into < String >) -> Self
 fn ra_core::error::Error::user_message(& self) -> String
 fn ra_core::error::Error::with_source(mut self, src : impl Into < BoxError >) -> Self
+fn ra_core::event::HostEvent::allocate(allocator : & EventSeqAllocator, agent_id : AgentId, body : HostEventBody) -> Result < Self >
+fn ra_core::event::HostEventEmitter::emit(& self, body : impl Into < HostEventBody >) -> Result < u64 >
+fn ra_core::event::HostEventEmitter::emit_agent(& self, event : AgentEvent) -> Result < u64 >
+fn ra_core::event::HostEventEmitter::emit_exec(& self, event : ExecEvent) -> Result < u64 >
+fn ra_core::event::HostEventEmitter::new(agent_id : AgentId, allocator : EventSeqAllocator, sink : Arc < dyn HostEventSink >) -> Self
+fn ra_core::event::HostEventEmitter::run_id(& self) -> & RunId
+fn ra_core::event::agent::AgentClosedEvent::new(reason : impl Into < String >) -> Self
+fn ra_core::event::agent::AgentClosedEvent::reason(& self) -> & str
+fn ra_core::event::agent::AgentCompletedEvent::new(outcome : impl Into < String >) -> Self
+fn ra_core::event::agent::AgentCompletedEvent::outcome(& self) -> & str
+fn ra_core::event::agent::AgentMessageSentEvent::message_id(& self) -> Option < & str >
+fn ra_core::event::agent::AgentMessageSentEvent::new(from_agent : AgentId, to_agent : AgentId, preview : impl Into < String >) -> Self
+fn ra_core::event::agent::AgentMessageSentEvent::preview(& self) -> & str
+fn ra_core::event::agent::AgentMessageSentEvent::with_message_id(mut self, id : impl Into < String >) -> Self
+fn ra_core::event::agent::AgentOperationId::as_str(& self) -> & str
+fn ra_core::event::agent::AgentOperationId::new(id : impl Into < String >) -> Self
+fn ra_core::event::agent::AgentSpawnedEvent::new(child_agent_id : AgentId) -> Self
+fn ra_core::event::agent::AgentSpawnedEvent::with_child_run_id(mut self, run_id : RunId) -> Self
+fn ra_core::event::agent::AgentSpawnedEvent::with_operation_id(mut self, op_id : impl Into < AgentOperationId >) -> Self
+fn ra_core::event::agent::AgentStatus::as_str(& self) -> & str
+fn ra_core::event::agent::AgentStatus::custom(name : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::event::agent::AgentStatusChangedEvent::new(previous_status : AgentStatus, new_status : AgentStatus) -> Self
+fn ra_core::event::exec::ExecEvictedEvent::new(session_id : impl Into < ExecSessionId >, reason : ExecEvictionReason) -> Self
+fn ra_core::event::exec::ExecEvictionReason::as_str(& self) -> & str
+fn ra_core::event::exec::ExecEvictionReason::custom(name : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::event::exec::ExecExitedEvent::new(session_id : impl Into < ExecSessionId >, duration_ms : u64, stdout_bytes : usize, stderr_bytes : usize) -> Self
+fn ra_core::event::exec::ExecOutputEvent::new(session_id : impl Into < ExecSessionId >, stream : ExecStreamKind, offset : u64, bytes : usize, text : impl Into < String >) -> Self
+fn ra_core::event::exec::ExecOutputEvent::text(& self) -> & str
+fn ra_core::event::exec::ExecSessionId::as_str(& self) -> & str
+fn ra_core::event::exec::ExecSessionId::generate() -> Self
+fn ra_core::event::exec::ExecSessionId::new(id : impl Into < String >) -> Self
+fn ra_core::event::exec::ExecStartedEvent::args(& self) -> & [String]
+fn ra_core::event::exec::ExecStartedEvent::command(& self) -> & str
+fn ra_core::event::exec::ExecStartedEvent::cwd(& self) -> Option < & str >
+fn ra_core::event::exec::ExecStartedEvent::new(session_id : impl Into < ExecSessionId >, command : impl Into < String >) -> Self
+fn ra_core::event::exec::ExecStartedEvent::with_args(mut self, args : impl IntoIterator < Item = impl Into < String > >) -> Self
+fn ra_core::event::exec::ExecStartedEvent::with_cwd(mut self, cwd : impl Into < String >) -> Self
+fn ra_core::event::exec::ExecYieldReason::as_str(& self) -> & str
+fn ra_core::event::exec::ExecYieldReason::custom(name : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::event::exec::ExecYieldedEvent::new(session_id : impl Into < ExecSessionId >, duration_ms : u64, total_captured_bytes : usize, reason : ExecYieldReason) -> Self
+fn ra_core::event::exec::TerminalInteractionEvent::new(session_id : impl Into < ExecSessionId >, input_bytes : usize, is_interrupt : bool) -> Self
+fn ra_core::event::sink::HostEventSink::emit(& self, event : HostEvent)
+fn ra_core::event::sink::InMemoryHostEventSink::clear(& self)
+fn ra_core::event::sink::InMemoryHostEventSink::events(& self) -> Vec < HostEvent >
+fn ra_core::event::sink::InMemoryHostEventSink::is_empty(& self) -> bool
+fn ra_core::event::sink::InMemoryHostEventSink::len(& self) -> usize
+fn ra_core::event::sink::InMemoryHostEventSink::new() -> Self
+fn ra_core::event::timestamp::EventTimestamp::from_system_time(time : SystemTime) -> Self
+fn ra_core::event::timestamp::EventTimestamp::now() -> Self
+fn ra_core::event::timestamp::EventTimestamp::to_system_time(self) -> SystemTime
 fn ra_core::item::AgentId::as_str(& self) -> & str
 fn ra_core::item::AgentId::new(value : impl Into < String >) -> Self
 fn ra_core::item::CallId::as_str(& self) -> & str
@@ -986,6 +1118,7 @@ fn ra_core::tool::Tool::options(& self) -> ToolOptions
 fn ra_core::tool::Tool::origin(& self) -> & ToolOrigin
 fn ra_core::tool::Tool::schema(& self) -> & ToolSchema
 fn ra_core::tool::Tool::validate(& self) -> Result < () >
+fn ra_core::tool::context::ToolContext < 'a >::event_emitter(& self) -> Option < HostEventEmitter >
 fn ra_core::tool::context::ToolContext < 'a >::new(run : & 'a RunContext, tool : & 'a dyn Tool, call_id : & 'a CallId, arguments : & 'a Value) -> Self
 fn ra_core::tool::namespace::ToolNamespace::as_str(& self) -> & str
 fn ra_core::tool::namespace::ToolNamespace::new(value : impl Into < String >) -> Result < Self >
@@ -1047,6 +1180,8 @@ fn ra_core::tool::schema::ToolSchema::new(name : impl Into < String >, input_sch
 fn ra_core::tool::schema::ToolSchema::to_model_definition(& self) -> ModelToolDefinition
 fn ra_core::tool::schema::ToolSchema::validate(& self) -> Result < () >
 fn ra_core::tool::schema::ToolSchema::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::tool::services::ToolServices::event_sink(& self) -> Option < & Arc < dyn HostEventSink > >
+fn ra_core::tool::services::ToolServices::with_event_sink(mut self, event_sink : Arc < dyn HostEventSink >) -> Self
 fn ra_core::tool::services::ToolServices::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_core::tool::services::ToolServices::work_state(& self) -> Option < & dyn WorkStateHandle >
 fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
@@ -1063,6 +1198,11 @@ mod ra_core::compat
 mod ra_core::config
 mod ra_core::context
 mod ra_core::error
+mod ra_core::event
+mod ra_core::event::agent
+mod ra_core::event::exec
+mod ra_core::event::sink
+mod ra_core::event::timestamp
 mod ra_core::finish
 mod ra_core::guard
 mod ra_core::hook
@@ -1124,6 +1264,25 @@ struct ra_core::config::SourceSelection
 struct ra_core::config::Sourced
 struct ra_core::context::RunAgent
 struct ra_core::context::RunContext
+struct ra_core::event::HostEvent
+struct ra_core::event::HostEventEmitter
+struct ra_core::event::agent::AgentClosedEvent
+struct ra_core::event::agent::AgentCompletedEvent
+struct ra_core::event::agent::AgentMessageSentEvent
+struct ra_core::event::agent::AgentOperationId
+struct ra_core::event::agent::AgentSpawnedEvent
+struct ra_core::event::agent::AgentStatusChangedEvent
+struct ra_core::event::exec::ExecEvictedEvent
+struct ra_core::event::exec::ExecExitedEvent
+struct ra_core::event::exec::ExecOutputEvent
+struct ra_core::event::exec::ExecSessionId
+struct ra_core::event::exec::ExecStartedEvent
+struct ra_core::event::exec::ExecYieldedEvent
+struct ra_core::event::exec::TerminalInteractionEvent
+struct ra_core::event::sink::FnHostEventSink
+struct ra_core::event::sink::InMemoryHostEventSink
+struct ra_core::event::sink::NoopHostEventSink
+struct ra_core::event::timestamp::EventTimestamp
 struct ra_core::item::AgentId
 struct ra_core::item::CallId
 struct ra_core::item::ItemId
@@ -1220,6 +1379,7 @@ struct ra_core::tool::schema::ToolSchema
 struct ra_core::tool::services::ToolServices
 struct ra_core::usage::Usage
 trait ra_core::agent::ToolUseBehaviorHandler
+trait ra_core::event::sink::HostEventSink
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
@@ -1311,6 +1471,41 @@ variant ra_core::error::ToolErrorKind::NoProgress
 variant ra_core::error::ToolErrorKind::NotFound
 variant ra_core::error::ToolErrorKind::RepeatedCall
 variant ra_core::error::ToolErrorKind::Timeout
+variant ra_core::event::HostEventBody::Agent(AgentEvent)
+variant ra_core::event::HostEventBody::Exec(ExecEvent)
+variant ra_core::event::HostEventBody::Unknown { family: String, data: serde_json :: Value }
+variant ra_core::event::agent::AgentEvent::Closed(AgentClosedEvent)
+variant ra_core::event::agent::AgentEvent::Completed(AgentCompletedEvent)
+variant ra_core::event::agent::AgentEvent::MessageSent(AgentMessageSentEvent)
+variant ra_core::event::agent::AgentEvent::Spawned(AgentSpawnedEvent)
+variant ra_core::event::agent::AgentEvent::StatusChanged(AgentStatusChangedEvent)
+variant ra_core::event::agent::AgentEvent::Unknown(serde_json :: Value)
+variant ra_core::event::agent::AgentStatus::Completed
+variant ra_core::event::agent::AgentStatus::Custom(Cow < 'static , str >)
+variant ra_core::event::agent::AgentStatus::Failed
+variant ra_core::event::agent::AgentStatus::Idle
+variant ra_core::event::agent::AgentStatus::Running
+variant ra_core::event::agent::AgentStatus::WaitingForInput
+variant ra_core::event::exec::ExecEvent::Evicted(ExecEvictedEvent)
+variant ra_core::event::exec::ExecEvent::Exited(ExecExitedEvent)
+variant ra_core::event::exec::ExecEvent::Output(ExecOutputEvent)
+variant ra_core::event::exec::ExecEvent::Started(ExecStartedEvent)
+variant ra_core::event::exec::ExecEvent::TerminalInteraction(TerminalInteractionEvent)
+variant ra_core::event::exec::ExecEvent::Unknown(serde_json :: Value)
+variant ra_core::event::exec::ExecEvent::Yielded(ExecYieldedEvent)
+variant ra_core::event::exec::ExecEvictionReason::CapacityExceeded
+variant ra_core::event::exec::ExecEvictionReason::Custom(Cow < 'static , str >)
+variant ra_core::event::exec::ExecEvictionReason::HostShutdown
+variant ra_core::event::exec::ExecEvictionReason::IdleTimeout
+variant ra_core::event::exec::ExecEvictionReason::TotalTimeout
+variant ra_core::event::exec::ExecStreamKind::Combined
+variant ra_core::event::exec::ExecStreamKind::Stderr
+variant ra_core::event::exec::ExecStreamKind::Stdout
+variant ra_core::event::exec::ExecYieldReason::BufferExceeded
+variant ra_core::event::exec::ExecYieldReason::Custom(Cow < 'static , str >)
+variant ra_core::event::exec::ExecYieldReason::ExplicitYield
+variant ra_core::event::exec::ExecYieldReason::InitialTimeout
+variant ra_core::event::exec::ExecYieldReason::WaitTimeout
 variant ra_core::finish::FinishReason::BudgetExhausted
 variant ra_core::finish::FinishReason::Cancelled
 variant ra_core::finish::FinishReason::ErrorHandled

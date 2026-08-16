@@ -38,8 +38,9 @@ use std::{any::Any, fmt, sync::Arc};
 use crate::{
     agent::AgentSpec,
     budget::BudgetSnapshot,
+    event::{HostEventEmitter, HostEventSink},
     item::AgentId,
-    state::{PendingControlRequest, RunId},
+    state::{EventSeqAllocator, PendingControlRequest, RunId},
 };
 
 /// The credential-free identity of the public agent a run is attributed to.
@@ -98,6 +99,7 @@ pub struct RunContext {
     app: Option<Arc<dyn Any + Send + Sync>>,
     budget: BudgetSnapshot,
     pending_control_requests: Vec<PendingControlRequest>,
+    event_seq_allocator: Option<EventSeqAllocator>,
 }
 
 impl RunContext {
@@ -115,6 +117,7 @@ impl RunContext {
             app: None,
             budget: BudgetSnapshot::new(),
             pending_control_requests: Vec::new(),
+            event_seq_allocator: None,
         }
     }
 
@@ -143,6 +146,13 @@ impl RunContext {
         pending_control_requests: Vec<PendingControlRequest>,
     ) -> Self {
         self.pending_control_requests = pending_control_requests;
+        self
+    }
+
+    /// Attaches the event sequence allocator for host event allocation.
+    #[must_use]
+    pub fn with_event_seq_allocator(mut self, allocator: EventSeqAllocator) -> Self {
+        self.event_seq_allocator = Some(allocator);
         self
     }
 
@@ -189,6 +199,23 @@ impl RunContext {
     pub fn pending_control_requests(&self) -> &[PendingControlRequest] {
         &self.pending_control_requests
     }
+
+    /// Sequence allocator for host events within this run, when attached.
+    #[must_use]
+    pub fn event_seq_allocator(&self) -> Option<&EventSeqAllocator> {
+        self.event_seq_allocator.as_ref()
+    }
+
+    /// Constructs a [`HostEventEmitter`] using this run's sequence allocator and agent identity.
+    #[must_use]
+    pub fn event_emitter(&self, sink: Arc<dyn HostEventSink>) -> Option<HostEventEmitter> {
+        let allocator = self.event_seq_allocator()?.clone();
+        Some(HostEventEmitter::new(
+            self.agent_id().clone(),
+            allocator,
+            sink,
+        ))
+    }
 }
 
 impl fmt::Debug for RunContext {
@@ -204,6 +231,10 @@ impl fmt::Debug for RunContext {
             .field(
                 "pending_control_requests",
                 &self.pending_control_requests.len(),
+            )
+            .field(
+                "has_event_seq_allocator",
+                &self.event_seq_allocator.is_some(),
             )
             .finish_non_exhaustive()
     }

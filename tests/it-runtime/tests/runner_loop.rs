@@ -1389,9 +1389,11 @@ async fn the_token_budget_reminder_rides_the_input_tail_and_leaves_the_prefix_al
 
     let instructions = model.instructions.lock().unwrap().clone();
     assert_eq!(instructions[0], instructions[1]);
-    assert!(!instructions[0]
-        .as_deref()
-        .is_some_and(|text| text.contains("Task token budget")));
+    assert!(
+        !instructions[0]
+            .as_deref()
+            .is_some_and(|text| text.contains("Task token budget"))
+    );
 
     let inputs = model.input_items.lock().unwrap().clone();
     assert_eq!(
@@ -1490,7 +1492,10 @@ async fn terminal_budget_handler_can_deliver_and_record_a_closeout_message() {
     .await
     .unwrap();
 
-    assert_eq!(result.final_message().unwrap().text_content(), CLOSEOUT_TEXT);
+    assert_eq!(
+        result.final_message().unwrap().text_content(),
+        CLOSEOUT_TEXT
+    );
     assert_eq!(phases(&result), [OutputPhase::Final]);
     assert_eq!(result.new_items().len(), 3);
 }
@@ -1520,7 +1525,10 @@ async fn a_closeout_can_be_delivered_without_entering_history() {
     .await
     .unwrap();
 
-    assert_eq!(result.final_message().unwrap().text_content(), CLOSEOUT_TEXT);
+    assert_eq!(
+        result.final_message().unwrap().text_content(),
+        CLOSEOUT_TEXT
+    );
     assert_eq!(result.new_items().len(), 2);
     assert!(phases(&result).is_empty());
 }
@@ -1554,7 +1562,10 @@ async fn a_non_persisted_closeout_is_emitted_as_a_stream_delivery() {
 
     assert_eq!(deliveries, [CLOSEOUT_TEXT]);
     let result = stream.finish().await.unwrap();
-    assert_eq!(result.final_message().unwrap().text_content(), CLOSEOUT_TEXT);
+    assert_eq!(
+        result.final_message().unwrap().text_content(),
+        CLOSEOUT_TEXT
+    );
     assert_eq!(result.new_items().len(), 2);
 }
 
@@ -1680,10 +1691,10 @@ async fn the_wall_clock_stops_a_running_tool_too() {
     ]);
     let cancel = CancelScope::root();
 
-    let run = Runner::run(
-        request(vec![tool], &model, &cancel)
-            .with_config(RunConfig::new().with_deadline(Deadline::after(Duration::from_millis(20)))),
-    );
+    let run =
+        Runner::run(request(vec![tool], &model, &cancel).with_config(
+            RunConfig::new().with_deadline(Deadline::after(Duration::from_millis(20))),
+        ));
     let result = timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
 
     assert!(matches!(
@@ -2265,8 +2276,8 @@ async fn work_state_handle_is_propagated_all_the_way_to_tools() {
         request(vec![tool], &model, &cancel)
             .with_services(ToolServices::new().with_work_state(task_state)),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     assert_eq!(seen.lock().unwrap().as_slice(), [Some("第三步".to_owned())]);
 }
@@ -2367,7 +2378,10 @@ async fn a_run_without_host_state_reads_none_rather_than_another_hosts_object() 
         .await
         .unwrap();
 
-    assert_eq!(seen.lock().unwrap().as_slice(), ["call:run-loop/coder/<none>"]);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["call:run-loop/coder/<none>"]
+    );
 }
 
 #[tokio::test]
@@ -2461,16 +2475,15 @@ async fn runner_projects_pending_control_requests_into_live_context_seen_by_tool
     ]);
     let cancel = CancelScope::root();
 
-    let state = RunState::start(RunId::new("run-pending-reqs")).with_pending_control_requests(vec![
-        PendingControlRequest::new("approval-req-42"),
-        PendingControlRequest::new("approval-req-99"),
-    ]);
+    let state =
+        RunState::start(RunId::new("run-pending-reqs")).with_pending_control_requests(vec![
+            PendingControlRequest::new("approval-req-42"),
+            PendingControlRequest::new("approval-req-99"),
+        ]);
 
-    Runner::run(
-        request(vec![tool], &model, &cancel).with_state(state),
-    )
-    .await
-    .unwrap();
+    Runner::run(request(vec![tool], &model, &cancel).with_state(state))
+        .await
+        .unwrap();
 
     assert_eq!(
         observed.lock().unwrap().as_slice(),
@@ -2512,4 +2525,174 @@ async fn runner_restores_event_seq_allocator_with_persisted_max_seq() {
     let result = Runner::run(request).await.unwrap();
 
     assert_eq!(result.state().next_host_event_seq(), 28);
+}
+
+#[tokio::test]
+async fn test_live_host_event_emission_across_multiple_tools() {
+    use ra_core::event::{
+        ExecEvent, InMemoryHostEventSink,
+        exec::{ExecOutputEvent, ExecSessionId, ExecStartedEvent, ExecStreamKind},
+    };
+
+    struct ToolA {
+        origin: ToolOrigin,
+        schema: ToolSchema,
+    }
+    impl ToolA {
+        fn new() -> Self {
+            Self {
+                origin: ToolOrigin::new("tool_a").unwrap(),
+                schema: ToolSchema::new(
+                    "tool_a",
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": false
+                    }),
+                )
+                .unwrap(),
+            }
+        }
+    }
+    #[async_trait]
+    impl Tool for ToolA {
+        fn origin(&self) -> &ToolOrigin {
+            &self.origin
+        }
+        fn schema(&self) -> &ToolSchema {
+            &self.schema
+        }
+        async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+            let emitter = context
+                .event_emitter()
+                .expect("tool context must have event emitter");
+            let s1 = emitter.emit_exec(ExecEvent::Started(ExecStartedEvent::new(
+                ExecSessionId::new("session-a"),
+                "command-a",
+            )))?;
+            let s2 = emitter.emit_exec(ExecEvent::Output(ExecOutputEvent::new(
+                ExecSessionId::new("session-a"),
+                ExecStreamKind::Stdout,
+                0,
+                10,
+                "output-a",
+            )))?;
+            Ok(ToolOutput::text(format!(
+                "tool_a executed with seq {s1},{s2}"
+            )))
+        }
+    }
+
+    struct ToolB {
+        origin: ToolOrigin,
+        schema: ToolSchema,
+    }
+    impl ToolB {
+        fn new() -> Self {
+            Self {
+                origin: ToolOrigin::new("tool_b").unwrap(),
+                schema: ToolSchema::new(
+                    "tool_b",
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": false
+                    }),
+                )
+                .unwrap(),
+            }
+        }
+    }
+    #[async_trait]
+    impl Tool for ToolB {
+        fn origin(&self) -> &ToolOrigin {
+            &self.origin
+        }
+        fn schema(&self) -> &ToolSchema {
+            &self.schema
+        }
+        async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+            let emitter = context
+                .event_emitter()
+                .expect("tool context must have event emitter");
+            let s1 = emitter.emit_exec(ExecEvent::Started(ExecStartedEvent::new(
+                ExecSessionId::new("session-b"),
+                "command-b",
+            )))?;
+            let s2 = emitter.emit_exec(ExecEvent::Output(ExecOutputEvent::new(
+                ExecSessionId::new("session-b"),
+                ExecStreamKind::Stdout,
+                0,
+                10,
+                "output-b",
+            )))?;
+            Ok(ToolOutput::text(format!(
+                "tool_b executed with seq {s1},{s2}"
+            )))
+        }
+    }
+
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("item-1", "call-1", "tool_a"),
+            tool_call("item-2", "call-2", "tool_b"),
+        ]),
+        ModelResponse::new(vec![message("msg-final", "all tools done")]),
+    ]);
+
+    let cancel = CancelScope::root();
+    let sink = Arc::new(InMemoryHostEventSink::new());
+    let services = ToolServices::new().with_event_sink(sink.clone());
+
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ToolA::new()), Arc::new(ToolB::new())];
+    let req = request(tools, &model, &cancel).with_services(services);
+
+    let result = Runner::run(req).await.expect("run must succeed");
+    let run_id = result.state().run_id().clone();
+
+    assert!(matches!(result.outcome(), RunOutcome::Completed { .. }));
+    let events = sink.events();
+    // Invariant 1: sequence numbers are unique within the run
+    let seq_set: std::collections::HashSet<u64> = events.iter().map(|e| e.seq()).collect();
+    assert_eq!(
+        seq_set.len(),
+        4,
+        "all emitted host events must have unique sequence numbers"
+    );
+
+    // Invariant 2: events for each tool execution session are strictly monotonic
+    for session_name in ["session-a", "session-b"] {
+        let session_seqs: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e.body() {
+                ra_core::event::HostEventBody::Exec(ExecEvent::Started(s))
+                    if s.session_id().as_str() == session_name =>
+                {
+                    Some(e.seq())
+                }
+                ra_core::event::HostEventBody::Exec(ExecEvent::Output(o))
+                    if o.session_id().as_str() == session_name =>
+                {
+                    Some(e.seq())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_seqs.len(), 2);
+        assert!(
+            session_seqs[0] < session_seqs[1],
+            "session events must be strictly monotonic"
+        );
+    }
+
+    // Invariant 3: all events share the identical run_id and authentic agent_id
+    for evt in &events {
+        assert_eq!(evt.run_id(), &run_id);
+        assert_eq!(evt.agent_id().as_str(), "coder");
+    }
+
+    // Invariant 4: run state next seq advanced to at least 4
+    assert!(result.state().next_host_event_seq() >= 4);
 }

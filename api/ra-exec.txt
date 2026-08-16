@@ -1,8 +1,83 @@
 # ra-exec 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+const fn ra_exec::command::ExecCursor::advance(self, bytes : u64) -> Self
+const fn ra_exec::command::ExecCursor::new(stream : ExecStreamKind, offset : u64) -> Self
+const fn ra_exec::command::ExecCursor::offset(self) -> u64
+const fn ra_exec::command::ExecCursor::stdout_start() -> Self
+const fn ra_exec::command::ExecCursor::stream(self) -> ExecStreamKind
+const fn ra_exec::command::ExecLimits::idle_timeout(& self) -> Option < Duration >
+const fn ra_exec::command::ExecLimits::initial_yield_timeout(& self) -> Duration
+const fn ra_exec::command::ExecLimits::max_capture_bytes(& self) -> usize
+const fn ra_exec::command::ExecLimits::max_sessions(& self) -> usize
+const fn ra_exec::command::ExecLimits::schema_version(& self) -> SchemaVersion
+const fn ra_exec::command::ExecLimits::total_timeout(& self) -> Option < Duration >
+const fn ra_exec::command::ExecLimits::unknown(& self) -> & Unknown
+const fn ra_exec::command::ExecLimits::with_idle_timeout(mut self, timeout : Option < Duration >) -> Self
+const fn ra_exec::command::ExecLimits::with_initial_yield_timeout(mut self, timeout : Duration) -> Self
+const fn ra_exec::command::ExecLimits::with_max_capture_bytes(mut self, bytes : usize) -> Self
+const fn ra_exec::command::ExecLimits::with_max_sessions(mut self, max_sessions : usize) -> Self
+const fn ra_exec::command::ExecLimits::with_total_timeout(mut self, timeout : Option < Duration >) -> Self
+const fn ra_exec::command::ExecRequest::env(& self) -> & HashMap < String , String >
+const fn ra_exec::command::ExecRequest::limits(& self) -> & ExecLimits
+const fn ra_exec::command::ExecRequest::pty(& self) -> bool
+const fn ra_exec::command::ExecRequest::schema_version(& self) -> SchemaVersion
+const fn ra_exec::command::ExecRequest::unknown(& self) -> & Unknown
+const fn ra_exec::command::ExecRequest::with_pty(mut self, pty : bool) -> Self
+const fn ra_exec::output::ExecOutputSummary::duration(& self) -> Duration
+const fn ra_exec::output::ExecOutputSummary::duration_ms(& self) -> u64
+const fn ra_exec::output::ExecOutputSummary::exit_code(& self) -> Option < i32 >
+const fn ra_exec::output::ExecOutputSummary::is_truncated(& self) -> bool
+const fn ra_exec::output::ExecOutputSummary::schema_version(& self) -> SchemaVersion
+const fn ra_exec::output::ExecOutputSummary::stderr_bytes(& self) -> usize
+const fn ra_exec::output::ExecOutputSummary::stdout_bytes(& self) -> usize
+const fn ra_exec::output::ExecOutputSummary::total_bytes(& self) -> usize
+const fn ra_exec::output::ExecOutputSummary::unknown(& self) -> & Unknown
+const fn ra_exec::output::ExecOutputSummary::with_duration(mut self, duration : Duration) -> Self
+const fn ra_exec::output::ExecOutputSummary::with_duration_ms(mut self, duration_ms : u64) -> Self
+const fn ra_exec::output::ExecOutputSummary::with_exit_code(mut self, exit_code : i32) -> Self
+const fn ra_exec::output::ExecOutputSummary::with_stderr_bytes(mut self, bytes : usize) -> Self
+const fn ra_exec::output::ExecOutputSummary::with_stdout_bytes(mut self, bytes : usize) -> Self
+const fn ra_exec::output::ExecOutputSummary::with_truncated(mut self, truncated : bool) -> Self
+const fn ra_exec::pty::StdinCommand::is_interrupt(& self) -> bool
+const fn ra_exec::pty::StdinCommand::schema_version(& self) -> SchemaVersion
+const fn ra_exec::pty::StdinCommand::session_id(& self) -> & ExecSessionId
+const fn ra_exec::pty::StdinCommand::unknown(& self) -> & Unknown
+const fn ra_exec::session::ExecSessionState::is_active(& self) -> bool
+const fn ra_exec::session::ExecSessionState::is_terminal(& self) -> bool
+const fn ra_exec::session::ExecSessionTransitionError::from(& self) -> & ExecSessionState
+const fn ra_exec::session::ExecSessionTransitionError::new(from : ExecSessionState, to : ExecSessionState) -> Self
+const fn ra_exec::session::ExecSessionTransitionError::to(& self) -> & ExecSessionState
+const ra_exec::EXEC_SCHEMA_VERSION: ra_core :: compat :: SchemaVersion
 enum ra_exec::fs::RootedOpenError
+enum ra_exec::pty::StdinValidationError
+enum ra_exec::pty::TerminalMode
+enum ra_exec::session::ExecSessionState
+fn ra_exec::command::ExecLimits::new() -> Self
+fn ra_exec::command::ExecRequest::args(& self) -> & [String]
+fn ra_exec::command::ExecRequest::command(& self) -> & str
+fn ra_exec::command::ExecRequest::cwd(& self) -> Option < & PathBuf >
+fn ra_exec::command::ExecRequest::new(command : impl Into < String >) -> Self
+fn ra_exec::command::ExecRequest::with_args(mut self, args : impl IntoIterator < Item = impl Into < String > >) -> Self
+fn ra_exec::command::ExecRequest::with_cwd(mut self, cwd : impl Into < PathBuf >) -> Self
+fn ra_exec::command::ExecRequest::with_env(mut self, key : impl Into < String >, val : impl Into < String >) -> Self
+fn ra_exec::command::ExecRequest::with_limits(mut self, limits : ExecLimits) -> Self
+fn ra_exec::fs::RootedFileSystem::create_dir_all(& self, path : & Path) -> Result < () , RootedOpenError >
+fn ra_exec::fs::RootedFileSystem::exists(& self, path : & Path) -> bool
 fn ra_exec::fs::RootedFileSystem::open(root : impl AsRef < Path >) -> io :: Result < Self >
 fn ra_exec::fs::RootedFileSystem::open_read(& self, path : & Path) -> Result < File , RootedOpenError >
+fn ra_exec::fs::RootedFileSystem::read_to_string(& self, path : & Path, max_bytes : usize) -> Result < (String , bool) , RootedOpenError >
+fn ra_exec::fs::RootedFileSystem::remove_file(& self, path : & Path) -> Result < () , RootedOpenError >
+fn ra_exec::fs::RootedFileSystem::write_file(& self, path : & Path, content : & [u8]) -> Result < () , RootedOpenError >
+fn ra_exec::output::ExecOutputSummary::new(stdout : impl Into < String >, stderr : impl Into < String >) -> Self
+fn ra_exec::output::ExecOutputSummary::stderr(& self) -> & str
+fn ra_exec::output::ExecOutputSummary::stdout(& self) -> & str
+fn ra_exec::pty::StdinCommand::chars(& self) -> Option < & str >
+fn ra_exec::pty::StdinCommand::interrupt(session_id : impl Into < ExecSessionId >) -> Self
+fn ra_exec::pty::StdinCommand::poll(session_id : impl Into < ExecSessionId >) -> Self
+fn ra_exec::pty::StdinCommand::validate(& self, mode : TerminalMode) -> Result < () , StdinValidationError >
+fn ra_exec::pty::StdinCommand::write(session_id : impl Into < ExecSessionId >, chars : impl Into < String >) -> Self
+fn ra_exec::session::ExecSessionState::can_transition_to(& self, next : & Self) -> bool
+fn ra_exec::session::ExecSessionState::transition_to(& mut self, next : Self) -> Result < () , ExecSessionTransitionError >
 mod ra_exec::command
 mod ra_exec::fs
 mod ra_exec::job
@@ -16,6 +91,22 @@ mod ra_exec::sandbox::network
 mod ra_exec::sandbox::seatbelt
 mod ra_exec::sandbox::unix_local
 mod ra_exec::session
+struct ra_exec::command::ExecCursor
+struct ra_exec::command::ExecLimits
+struct ra_exec::command::ExecRequest
 struct ra_exec::fs::RootedFileSystem
+struct ra_exec::output::ExecOutputSummary
+struct ra_exec::pty::StdinCommand
+struct ra_exec::session::ExecSessionTransitionError
 variant ra_exec::fs::RootedOpenError::Io(io :: Error)
 variant ra_exec::fs::RootedOpenError::OutsideRoot
+variant ra_exec::pty::StdinValidationError::NonTtyInputRejected
+variant ra_exec::pty::TerminalMode::Pipe
+variant ra_exec::pty::TerminalMode::Pty
+variant ra_exec::session::ExecSessionState::Cancelled
+variant ra_exec::session::ExecSessionState::Exited { exit_code: Option < i32 > }
+variant ra_exec::session::ExecSessionState::Expired { reason: ExecEvictionReason }
+variant ra_exec::session::ExecSessionState::Failed { error: String }
+variant ra_exec::session::ExecSessionState::Reserved
+variant ra_exec::session::ExecSessionState::Running
+variant ra_exec::session::ExecSessionState::Starting

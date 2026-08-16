@@ -9,6 +9,7 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+ra-core = { path = "../../crates/ra-core" }
 ra-patch = { path = "../../crates/ra-patch" }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"

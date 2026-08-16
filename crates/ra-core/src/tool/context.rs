@@ -1,12 +1,14 @@
 //! The call-level context: one resolved invocation, and the run it belongs to.
 
 use core::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     context::RunContext,
+    event::HostEventEmitter,
     item::CallId,
     tool::{Tool, ToolOrigin, ToolServices},
 };
@@ -120,6 +122,13 @@ impl<'a> ToolContext<'a> {
     /// Framework ports available to this call.
     pub const fn services(&self) -> &ToolServices {
         self.services
+    }
+
+    /// Constructs a [`HostEventEmitter`] if both an event allocator and sink are present.
+    #[must_use]
+    pub fn event_emitter(&self) -> Option<HostEventEmitter> {
+        let sink = self.services.event_sink()?;
+        self.run.event_emitter(Arc::clone(sink))
     }
 }
 

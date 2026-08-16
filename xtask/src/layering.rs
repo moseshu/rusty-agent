@@ -125,7 +125,13 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // hand-written JSON schemas that skip strict normalization and the typed decoder.
     ("ra-tools", &["ra-core", "ra-exec", "ra-mcp", "ra-macros"]),
     ("ra-flow", &["ra-core", "ra-runtime"]),
-    ("ra-patch", &[]),
+    // `ra-patch` parses and applies a text format and needs nothing from the framework to do it.
+    // What it does need is `ra-core::compat`: a `PatchPlan` and a `CommittedPatchDelta` are records
+    // that get persisted and read back by a build that may be older or newer, and a second
+    // `SchemaVersion` / `Unknown` pair declared here would make "does this record need migrating"
+    // answerable through `Compatibility` for a rollout line and not for a patch plan. The
+    // dependency buys the compat vocabulary and nothing else — no runtime, no tool contract.
+    ("ra-patch", &["ra-core"]),
     (
         "ra-coding",
         &[

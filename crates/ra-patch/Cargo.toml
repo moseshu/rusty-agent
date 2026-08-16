@@ -11,5 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+ra-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
