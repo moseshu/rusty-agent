@@ -68,6 +68,7 @@ fn ra_exec::fs::RootedFileSystem::open_read(& self, path : & Path) -> Result < F
 fn ra_exec::fs::RootedFileSystem::read_to_string(& self, path : & Path, max_bytes : usize) -> Result < (String , bool) , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::remove_file(& self, path : & Path) -> Result < () , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::write_file(& self, path : & Path, content : & [u8]) -> Result < () , RootedOpenError >
+fn ra_exec::fs::workspace_resource_id(identifier : impl Into < std :: borrow :: Cow < 'static , str > >) -> Result < ra_core :: tool :: ResourceId , ra_core :: error :: Error >
 fn ra_exec::output::ExecOutputSummary::new(stdout : impl Into < String >, stderr : impl Into < String >) -> Self
 fn ra_exec::output::ExecOutputSummary::stderr(& self) -> & str
 fn ra_exec::output::ExecOutputSummary::stdout(& self) -> & str
@@ -78,6 +79,7 @@ fn ra_exec::pty::StdinCommand::validate(& self, mode : TerminalMode) -> Result <
 fn ra_exec::pty::StdinCommand::write(session_id : impl Into < ExecSessionId >, chars : impl Into < String >) -> Self
 fn ra_exec::session::ExecSessionState::can_transition_to(& self, next : & Self) -> bool
 fn ra_exec::session::ExecSessionState::transition_to(& mut self, next : Self) -> Result < () , ExecSessionTransitionError >
+fn ra_exec::session::session_resource_id(session_id : & ExecSessionId) -> Result < ra_core :: tool :: ResourceId , ra_core :: error :: Error >
 mod ra_exec::command
 mod ra_exec::fs
 mod ra_exec::job

@@ -17,6 +17,7 @@ pub mod namespace;
 pub mod options;
 pub mod origin;
 pub mod output;
+pub mod resource;
 pub mod schema;
 pub mod services;
 mod strict;
@@ -36,6 +37,7 @@ pub use output::{
     OBSERVATION_METADATA_SCHEMA_VERSION, ObservationMetadata, TOOL_OUTPUT_SCHEMA_VERSION,
     TRUNCATION_SCHEMA_VERSION, ToolOutput, ToolOutputBlock, Truncation, TruncationStage,
 };
+pub use resource::{ResourceAccess, ResourceClaim, ResourceId, ResourceKind};
 pub use schema::{
     DecodedToolInput, FUNC_SCHEMA_VERSION, FuncSchema, TOOL_SCHEMA_VERSION, ToolInput, ToolSchema,
 };
@@ -102,10 +104,18 @@ pub trait Tool: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Evaluates resource claims for this invocation.
+    ///
+    /// Defaults to the static claims declared in [`ToolOptions::resource_claims`].
+    async fn resource_claims(&self, _context: &ToolContext<'_>) -> Result<Vec<ResourceClaim>> {
+        Ok(self.options().resource_claims().to_vec())
+    }
+
     /// Checks invariants shared by registries and runners.
     fn validate(&self) -> Result<()> {
         self.origin().validate()?;
         self.schema().validate()?;
+        self.options().validate()?;
         if self.origin().name() != self.schema().name() {
             return Err(crate::error::Error::caller(format!(
                 "tool origin name `{}` does not match schema name `{}`",

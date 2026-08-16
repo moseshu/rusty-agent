@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-use super::ToolCaller;
+use super::{ResourceClaim, ToolCaller};
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
@@ -96,11 +96,11 @@ pub enum ToolExposure {
 /// company gets none. The opposite default would make every tool written before this field
 /// existed silently eligible for concurrent execution.
 ///
-/// Measured, not assumed: Codex's `exec_command` and `shell_command` both declare parallel, and
-/// `apply_patch` declares nothing and therefore serializes — one writer against every reader is
-/// the whole rule. The batch executor reads this to pick a read or a write lock, which is
-/// why a tool cannot express "parallel with these, not with those": that would need a resource
-/// identity, and a resource identity is what a later variant here would carry.
+/// When set to [`Exclusive`](Self::Exclusive), the batch executor acquires a global exclusive
+/// lock ensuring the tool runs alone with no other tools from the same response overlapping it.
+///
+/// When set to [`Parallel`](Self::Parallel), the tool runs alongside other parallel-declared
+/// calls, constrained by the batch concurrency limit and any declared [`ResourceClaim`]s.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,6 +208,8 @@ pub struct ToolOptions {
     exposure: ToolExposure,
     #[serde(default)]
     concurrency: ToolConcurrency,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resource_claims: Vec<ResourceClaim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     allowed_callers: Option<Vec<ToolCaller>>,
     #[serde(
@@ -244,6 +246,8 @@ struct ToolOptionsWire {
     exposure: ToolExposure,
     #[serde(default)]
     concurrency: ToolConcurrency,
+    #[serde(default)]
+    resource_claims: Vec<ResourceClaim>,
     #[serde(default)]
     allowed_callers: Option<Vec<ToolCaller>>,
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
@@ -284,12 +288,13 @@ impl<'de> Deserialize<'de> for ToolOptions {
             callers.sort_unstable();
             callers.dedup();
         }
-        Ok(Self {
+        let options = Self {
             schema_version: wire.schema_version,
             availability: wire.availability,
             approval: wire.approval,
             exposure: wire.exposure,
             concurrency: wire.concurrency,
+            resource_claims: ResourceClaim::deduplicate(wire.resource_claims),
             allowed_callers,
             timeout: wire.timeout,
             timeout_behavior: wire.timeout_behavior,
@@ -299,7 +304,9 @@ impl<'de> Deserialize<'de> for ToolOptions {
             max_repeat_streak: wire.max_repeat_streak,
             max_no_progress_streak: wire.max_no_progress_streak,
             unknown: wire.unknown,
-        })
+        };
+        options.validate().map_err(D::Error::custom)?;
+        Ok(options)
     }
 }
 
@@ -311,6 +318,7 @@ impl Default for ToolOptions {
             approval: ToolApprovalPolicy::Never,
             exposure: ToolExposure::Advertised,
             concurrency: ToolConcurrency::Exclusive,
+            resource_claims: Vec::new(),
             allowed_callers: None,
             timeout: None,
             timeout_behavior: ToolTimeoutBehavior::ModelVisible,
@@ -356,6 +364,31 @@ impl ToolOptions {
     #[must_use]
     pub const fn with_concurrency(mut self, concurrency: ToolConcurrency) -> Self {
         self.concurrency = concurrency;
+        self
+    }
+
+    /// Declares fine-grained resource claims for concurrent execution.
+    ///
+    /// Fine-grained resource claims take effect when concurrency is set to
+    /// [`ToolConcurrency::Parallel`]. Tools declaring claims participate in global shared read
+    /// concurrency while acquiring read or write locks on their declared resources. Tools with
+    /// [`ToolConcurrency::Exclusive`] serialize globally and must not declare resource claims.
+    #[must_use]
+    pub fn with_resource_claims(mut self, claims: impl IntoIterator<Item = ResourceClaim>) -> Self {
+        self.resource_claims.extend(claims);
+        self.resource_claims = ResourceClaim::deduplicate(self.resource_claims);
+        self
+    }
+
+    /// Adds a resource claim, merging with any existing claim on the same resource so that
+    /// exclusive access takes precedence.
+    ///
+    /// Requires [`ToolConcurrency::Parallel`]. Tools with [`ToolConcurrency::Exclusive`]
+    /// must not declare resource claims.
+    #[must_use]
+    pub fn with_resource_claim(mut self, claim: ResourceClaim) -> Self {
+        self.resource_claims.push(claim);
+        self.resource_claims = ResourceClaim::deduplicate(self.resource_claims);
         self
     }
 
@@ -476,6 +509,12 @@ impl ToolOptions {
         self.concurrency
     }
 
+    /// Declared fine-grained resource claims for this tool.
+    #[must_use]
+    pub fn resource_claims(&self) -> &[ResourceClaim] {
+        &self.resource_claims
+    }
+
     /// Whether this tool belongs in the turn's advertised tool list.
     ///
     /// The consumer is turn preparation's advertised-surface stage. Named rather than left as a
@@ -556,6 +595,22 @@ impl ToolOptions {
     #[must_use]
     pub const fn unknown(&self) -> &Unknown {
         &self.unknown
+    }
+
+    /// Checks invariants on options declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if [`ToolConcurrency::Exclusive`] is combined with non-empty resource claims.
+    pub fn validate(&self) -> Result<()> {
+        if matches!(self.concurrency, ToolConcurrency::Exclusive)
+            && !self.resource_claims.is_empty()
+        {
+            return Err(Error::caller(
+                "a tool with Exclusive concurrency cannot declare resource claims; configure ToolConcurrency::Parallel to enable fine-grained resource claims",
+            ));
+        }
+        Ok(())
     }
 }
 

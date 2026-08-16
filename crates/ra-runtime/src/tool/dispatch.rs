@@ -25,8 +25,8 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{CallId, ToolApproval, ToolCallOutput},
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolContext, ToolFailureHandling, ToolOptions,
-        ToolOutput, ToolServices, ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
+        ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -228,9 +228,15 @@ impl ToolDispatchRequest {
         self
     }
 
+    /// The tool being dispatched.
+    #[must_use]
+    pub fn tool(&self) -> &Arc<dyn Tool> {
+        &self.tool
+    }
+
     /// Builds the context for this call. Every stage that enters third-party code takes it from
     /// here, so a tool cannot be asked about a call under one context and then run under another.
-    fn context(&self) -> ToolContext<'_> {
+    pub fn context(&self) -> ToolContext<'_> {
         ToolContext::new(
             &self.run,
             self.tool.as_ref(),
@@ -244,6 +250,15 @@ impl ToolDispatchRequest {
 
 /// Runs one call through the fixed chain.
 pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch> {
+    dispatch_tool_with_admission(request, None, Instant::now()).await
+}
+
+/// Runs one call through the fixed chain, optionally coordinating with a batch resource admission gate.
+pub(crate) async fn dispatch_tool_with_admission(
+    request: ToolDispatchRequest,
+    admission: Option<&crate::turn::batch::ResourceAdmissionGate>,
+    admission_started: Instant,
+) -> Result<ToolDispatch> {
     let tool = &request.tool;
     let options = tool.options();
     let name = tool.origin().qualified_name().to_owned();
@@ -289,14 +304,49 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch>
     // so its position relative to approval is decided here rather than per call site.
     check_input_guardrails(&options)?;
 
+    // 5. Dynamic resource claims evaluation.
+    // Exclusive tools run alone under a global write gate and skip fine-grained claims.
+    let claims = if matches!(options.concurrency(), ToolConcurrency::Parallel) {
+        let claims_result = request
+            .cancel
+            .run(tool.resource_claims(&request.context()))
+            .await;
+        match claims_result {
+            Ok(Ok(claims)) => claims,
+            Ok(Err(error)) => return shape_failure(tool, &request, &options, &name, error).await,
+            Err(error) => return Err(error),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 6. Concurrency & Resource Admission (if gate is provided).
+    let permits = if let Some(gate) = admission {
+        let permits = gate
+            .acquire_permits(&request.cancel, options.concurrency(), &claims)
+            .await?;
+        tracing::Span::current().record(
+            ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
+            duration_ms(admission_started.elapsed()),
+        );
+        request.cancel.ensure_not_cancelled()?;
+        Some(permits)
+    } else {
+        None
+    };
+
+    // 7. Invoke tool.
     let outcome = invoke(tool, request.context(), &options, &request.cancel, &name).await;
+
+    // Release fine-grained resource locks immediately upon invoke completion.
+    drop(permits);
 
     let output = match outcome {
         Ok(output) => output,
         Err(error) => return shape_failure(tool, &request, &options, &name, error).await,
     };
 
-    // 5. Output guardrail, on the result the tool actually produced.
+    // 8. Output guardrail, on the result the tool actually produced.
     check_output_guardrails(&options)?;
 
     observed_success(&request.call_id, &output)
@@ -334,12 +384,12 @@ async fn invoke(
 }
 
 /// Converts elapsed time to the trace vocabulary's millisecond unit.
-fn duration_ms(duration: std::time::Duration) -> u64 {
+pub(crate) fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Turns an invocation failure into either a model-visible observation or a stopped turn.
-async fn shape_failure(
+pub(crate) async fn shape_failure(
     tool: &Arc<dyn Tool>,
     request: &ToolDispatchRequest,
     options: &ToolOptions,
@@ -399,7 +449,7 @@ async fn shape_failure(
     }
 }
 
-async fn needs_approval(
+pub(crate) async fn needs_approval(
     tool: &Arc<dyn Tool>,
     options: &ToolOptions,
     request: &ToolDispatchRequest,
@@ -425,22 +475,22 @@ async fn needs_approval(
 
 /// R7-3's insertion point for tool input guardrails.
 #[allow(clippy::unnecessary_wraps)]
-const fn check_input_guardrails(_options: &ToolOptions) -> Result<()> {
+pub(crate) const fn check_input_guardrails(_options: &ToolOptions) -> Result<()> {
     Ok(())
 }
 
 /// R7-3's insertion point for tool output guardrails.
 #[allow(clippy::unnecessary_wraps)]
-const fn check_output_guardrails(_options: &ToolOptions) -> Result<()> {
+pub(crate) const fn check_output_guardrails(_options: &ToolOptions) -> Result<()> {
     Ok(())
 }
 
-fn observed_success(call_id: &CallId, output: &ToolOutput) -> Result<ToolDispatch> {
+pub(crate) fn observed_success(call_id: &CallId, output: &ToolOutput) -> Result<ToolDispatch> {
     observed(call_id, output, None)
 }
 
 /// Renders a tool's own output as the model-visible result, classified for the records.
-fn observed(
+pub(crate) fn observed(
     call_id: &CallId,
     output: &ToolOutput,
     failure_code: Option<&'static str>,
@@ -459,7 +509,7 @@ fn observed(
 ///
 /// No prose. See the module documentation — framework error text is written for logs and for the
 /// user, not for the model, and a downstream reader must branch on the code rather than on wording.
-fn observed_failure(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
+pub(crate) fn observed_failure(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
     ToolDispatch::Observed(ToolObservation::failed(
         failure_output(call_id, name, error),
         error.code(),
@@ -470,14 +520,14 @@ fn observed_failure(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch
 ///
 /// One error format reaches the model, not two. What differs is the record left behind: nothing
 /// ran, so there is nothing to say about how the tool behaves.
-fn refused(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
+pub(crate) fn refused(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
     ToolDispatch::Refused(ToolRefusal::new(
         failure_output(call_id, name, error),
         error.code(),
     ))
 }
 
-fn failure_output(call_id: &CallId, name: &str, error: &Error) -> ToolCallOutput {
+pub(crate) fn failure_output(call_id: &CallId, name: &str, error: &Error) -> ToolCallOutput {
     ToolCallOutput::new(
         call_id.clone(),
         json!({ "error": { "code": error.code(), "tool": name } }),

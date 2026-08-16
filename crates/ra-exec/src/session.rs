@@ -121,3 +121,10 @@ impl ExecSessionState {
         }
     }
 }
+
+/// Derives a resource identity for a process execution session.
+pub fn session_resource_id(
+    session_id: &ExecSessionId,
+) -> Result<ra_core::tool::ResourceId, ra_core::error::Error> {
+    ra_core::tool::ResourceId::process(session_id.to_string())
+}

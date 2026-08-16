@@ -90,7 +90,9 @@ fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInpu
 fn ra_runtime::runner::result::RunResult::turn_items(& self, record : & TurnRecord) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::turn_records(& self) -> & [TurnRecord]
 fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
+fn ra_runtime::tool::dispatch::ToolDispatchRequest::context(& self) -> ToolContext < '_ >
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, run : Arc < RunContext >, cancel : CancelScope, history : CallHistory) -> Self
+fn ra_runtime::tool::dispatch::ToolDispatchRequest::tool(& self) -> & Arc < dyn Tool >
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_services(mut self, services : ToolServices) -> Self
 fn ra_runtime::tool::dispatch::ToolObservation::into_output(self) -> ToolCallOutput
 fn ra_runtime::tool::dispatch::ToolRefusal::into_output(self) -> ToolCallOutput

@@ -35,7 +35,11 @@
 //! to happen where the stream is read, and [`execute_actions`] is handed a response that is
 //! already complete.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use ra_core::{
     agent::ToolUseResult,
@@ -45,17 +49,19 @@ use ra_core::{
     item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
     state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
     step::{ProcessedResponse, ToolRunFunction},
-    tool::{ToolConcurrency, ToolOrigin, ToolServices},
+    tool::{ResourceClaim, ResourceId, ToolConcurrency, ToolOrigin, ToolServices},
     trace::SpanKind,
 };
 use serde_json::{Value, json};
 use tokio::{
-    sync::{RwLock, Semaphore},
+    sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore},
     task::{Id, JoinError, JoinSet},
 };
 use tracing::{Instrument, error, info_span, warn};
 
-use crate::tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool};
+use crate::tool::dispatch::{
+    CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool_with_admission, duration_ms,
+};
 
 /// Default cap for all function-tool dispatch chains in one model response.
 ///
@@ -283,6 +289,99 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
     Ok(execution)
 }
 
+/// Coordinates concurrency permits across global and per-resource constraints.
+#[derive(Clone)]
+pub(crate) struct ResourceAdmissionGate {
+    global_gate: Arc<RwLock<()>>,
+    resource_locks: Arc<Mutex<HashMap<ResourceId, Arc<RwLock<()>>>>>,
+}
+
+impl ResourceAdmissionGate {
+    fn new() -> Self {
+        Self {
+            global_gate: Arc::new(RwLock::new(())),
+            resource_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn get_or_create_lock(&self, resource: &ResourceId) -> Arc<RwLock<()>> {
+        let mut locks = self
+            .resource_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks
+            .entry(resource.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+}
+
+/// An acquired read or write permit on an `RwLock`.
+pub(crate) enum ResourcePermit {
+    Read { _guard: OwnedRwLockReadGuard<()> },
+    Write { _guard: OwnedRwLockWriteGuard<()> },
+}
+
+/// Holds all acquired permits for a tool execution so they release on drop.
+///
+/// In Rust, struct fields drop in declaration order.
+pub(crate) struct AdmissionPermits {
+    _global: ResourcePermit,
+    _resources: Vec<ResourcePermit>,
+}
+
+impl ResourceAdmissionGate {
+    /// Acquires global write or global read + fine-grained resource locks.
+    pub(crate) async fn acquire_permits(
+        &self,
+        cancel: &CancelScope,
+        concurrency: ToolConcurrency,
+        claims: &[ResourceClaim],
+    ) -> Result<AdmissionPermits> {
+        if matches!(concurrency, ToolConcurrency::Exclusive) {
+            // Exclusive tools require a global write lock to run alone.
+            let global_guard = cancel.run(self.global_gate.clone().write_owned()).await?;
+            Ok(AdmissionPermits {
+                _global: ResourcePermit::Write {
+                    _guard: global_guard,
+                },
+                _resources: Vec::new(),
+            })
+        } else {
+            // Parallel tools acquire a global read lock and per-resource locks if claims exist.
+            let global_guard = cancel.run(self.global_gate.clone().read_owned()).await?;
+            if claims.is_empty() {
+                Ok(AdmissionPermits {
+                    _global: ResourcePermit::Read {
+                        _guard: global_guard,
+                    },
+                    _resources: Vec::new(),
+                })
+            } else {
+                // Sort claims deterministically by ResourceId to prevent AB-BA deadlocks.
+                let deduplicated = ResourceClaim::deduplicate(claims.iter().cloned());
+                let mut resource_permits = Vec::with_capacity(deduplicated.len());
+                for claim in deduplicated {
+                    let lock = self.get_or_create_lock(claim.resource());
+                    if claim.is_exclusive() {
+                        let guard = cancel.run(lock.write_owned()).await?;
+                        resource_permits.push(ResourcePermit::Write { _guard: guard });
+                    } else {
+                        let guard = cancel.run(lock.read_owned()).await?;
+                        resource_permits.push(ResourcePermit::Read { _guard: guard });
+                    }
+                }
+                Ok(AdmissionPermits {
+                    _global: ResourcePermit::Read {
+                        _guard: global_guard,
+                    },
+                    _resources: resource_permits,
+                })
+            }
+        }
+    }
+}
+
 /// Spawns the response's function calls and returns their supervisor state.
 fn spawn_function_dispatches(
     request: &TurnExecutionRequest<'_>,
@@ -291,7 +390,7 @@ fn spawn_function_dispatches(
     HashMap<Id, usize>,
     Vec<CancelScope>,
 ) {
-    let gate = Arc::new(RwLock::new(()));
+    let gate = ResourceAdmissionGate::new();
     let slots = Arc::new(Semaphore::new(request.max_function_tool_concurrency));
     let mut dispatches = JoinSet::new();
     let mut task_orders = HashMap::new();
@@ -319,9 +418,8 @@ fn spawn_function_dispatches(
             history,
         )
         .with_services(request.services.clone());
-        let gate = Arc::clone(&gate);
+        let gate = gate.clone();
         let slots = Arc::clone(&slots);
-        let concurrency = action.tool().options().concurrency();
         let call_id = action.call_id().clone();
         let tool = action.tool().origin().clone();
         let cancel = tool_scope;
@@ -340,7 +438,6 @@ fn spawn_function_dispatches(
             cancel,
             gate,
             slots,
-            concurrency,
             dispatch_request,
             function_span,
         );
@@ -374,75 +471,45 @@ fn spawn_dispatch_task(
     call_id: CallId,
     tool: ToolOrigin,
     cancel: CancelScope,
-    gate: Arc<RwLock<()>>,
+    gate: ResourceAdmissionGate,
     slots: Arc<Semaphore>,
-    concurrency: ToolConcurrency,
     dispatch_request: ToolDispatchRequest,
     function_span: tracing::Span,
 ) -> Id {
+    let task_span = function_span.clone();
     dispatches
-        .spawn(async move {
-            let started = Instant::now();
-            let result = dispatch_with_admission(
-                &cancel,
-                gate,
-                slots,
-                concurrency,
-                dispatch_request,
-                &function_span,
-            )
-            .await;
-            function_span.record(
-                ra_core::trace::field::DURATION_MS,
-                duration_ms(started.elapsed()),
-            );
-            record_function_outcome(&function_span, &result, &cancel);
-            DispatchTaskResult {
-                order,
-                call_id,
-                tool,
-                result,
-            }
-        })
-        .id()
-}
+        .spawn(
+            async move {
+                let started = Instant::now();
+                // 1. Acquire batch concurrency slot permit before entering third-party code.
+                // This bounds peak concurrent needs_approval(), resource_claims(), and call()
+                // invocations to `max_function_tool_concurrency`.
+                let slot_result = cancel.run(slots.acquire_owned()).await.and_then(|res| {
+                    res.map_err(|_| Error::caller("the function-tool concurrency semaphore closed"))
+                });
 
-/// Waits for the batch gates, then runs a single complete tool dispatch chain.
-async fn dispatch_with_admission(
-    cancel: &CancelScope,
-    gate: Arc<RwLock<()>>,
-    slots: Arc<Semaphore>,
-    concurrency: ToolConcurrency,
-    dispatch_request: ToolDispatchRequest,
-    span: &tracing::Span,
-) -> Result<ToolDispatch> {
-    cancel.ensure_not_cancelled()?;
-    let admission_started = Instant::now();
-    let _slot = cancel
-        .run(slots.acquire_owned())
-        .await?
-        .map_err(|_| Error::caller("the function-tool concurrency semaphore closed"))?;
-    if matches!(concurrency, ToolConcurrency::Parallel) {
-        let _permit = cancel.run(gate.read()).await?;
-        span.record(
-            ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
-            duration_ms(admission_started.elapsed()),
-        );
-        cancel.ensure_not_cancelled()?;
-        dispatch_tool(dispatch_request)
-            .instrument(span.clone())
-            .await
-    } else {
-        let _permit = cancel.run(gate.write()).await?;
-        span.record(
-            ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
-            duration_ms(admission_started.elapsed()),
-        );
-        cancel.ensure_not_cancelled()?;
-        dispatch_tool(dispatch_request)
-            .instrument(span.clone())
-            .await
-    }
+                let result = match slot_result {
+                    Ok(_slot_permit) => {
+                        dispatch_tool_with_admission(dispatch_request, Some(&gate), started).await
+                    }
+                    Err(error) => Err(error),
+                };
+
+                function_span.record(
+                    ra_core::trace::field::DURATION_MS,
+                    duration_ms(started.elapsed()),
+                );
+                record_function_outcome(&function_span, &result, &cancel);
+                DispatchTaskResult {
+                    order,
+                    call_id,
+                    tool,
+                    result,
+                }
+            }
+            .instrument(task_span),
+        )
+        .id()
 }
 
 /// Records the terminal result of one function-tool dispatch without leaking its payload.
@@ -484,11 +551,6 @@ fn record_function_outcome(
             _ => ra_core::trace::record_error(span, error),
         },
     }
-}
-
-/// Converts elapsed time to the trace vocabulary's millisecond unit.
-fn duration_ms(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Collect every task result before mutating the turn's records.

@@ -51,9 +51,9 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
     tool::{
-        ObservationMetadata, Tool, ToolConcurrency, ToolContext, ToolFailureHandling,
-        ToolInput as _, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema,
-        Truncation, TruncationStage,
+        ObservationMetadata, ResourceClaim, Tool, ToolConcurrency, ToolContext,
+        ToolFailureHandling, ToolInput as _, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock,
+        ToolSchema, Truncation, TruncationStage,
     },
 };
 use ra_exec::fs::{RootedFileSystem, RootedOpenError};
@@ -178,6 +178,7 @@ impl ReadFileLimits {
 pub struct ReadFileTool {
     origin: ToolOrigin,
     schema: ToolSchema,
+    options: ToolOptions,
     root: Option<PathBuf>,
     rooted_filesystem: Option<Arc<RootedFileSystem>>,
     limits: ReadFileLimits,
@@ -198,9 +199,13 @@ impl ReadFileTool {
     /// Creates a tool that reads anywhere the process can, resolving relative paths against the
     /// working directory.
     pub fn new() -> Result<Self> {
+        let options = ToolOptions::new()
+            .with_failure_handling(ToolFailureHandling::Custom)
+            .with_concurrency(ToolConcurrency::Parallel);
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ReadFileInput::tool_schema(TOOL_NAME)?,
+            options,
             root: None,
             rooted_filesystem: None,
             limits: ReadFileLimits::new(),
@@ -230,10 +235,27 @@ impl ReadFileTool {
             ))
             .with_source(error)
         })?;
+        let resource_id = ra_exec::fs::workspace_resource_id(
+            canonical.to_string_lossy().to_string(),
+        )
+        .map_err(|error| {
+            Error::config(format!(
+                "read_file workspace root `{}` produces invalid resource identity",
+                canonical.display()
+            ))
+            .with_source(error)
+        })?;
+        let options = ToolOptions::new()
+            .with_failure_handling(ToolFailureHandling::Custom)
+            .with_concurrency(ToolConcurrency::Parallel)
+            .with_resource_claim(ResourceClaim::shared(resource_id));
         Ok(Self {
+            origin: ToolOrigin::new(TOOL_NAME)?,
+            schema: ReadFileInput::tool_schema(TOOL_NAME)?,
+            options,
             root: Some(canonical),
             rooted_filesystem: Some(Arc::new(rooted_filesystem)),
-            ..Self::new()?
+            limits: ReadFileLimits::new(),
         })
     }
 
@@ -624,9 +646,7 @@ impl Tool for ReadFileTool {
         // request merely to verify a write is still the wrong policy. A breaker that can tell a
         // repeat carrying new evidence from one carrying none is what this tool needs before it
         // opts in.
-        ToolOptions::new()
-            .with_failure_handling(ToolFailureHandling::Custom)
-            .with_concurrency(ToolConcurrency::Parallel)
+        self.options.clone()
     }
 
     async fn handle_failure(

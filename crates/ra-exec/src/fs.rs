@@ -220,3 +220,10 @@ fn classify(error: io::Error) -> RootedOpenError {
         RootedOpenError::Io(error)
     }
 }
+
+/// Derives a resource identity for a workspace filesystem.
+pub fn workspace_resource_id(
+    identifier: impl Into<std::borrow::Cow<'static, str>>,
+) -> Result<ra_core::tool::ResourceId, ra_core::error::Error> {
+    ra_core::tool::ResourceId::workspace(identifier)
+}

@@ -10,6 +10,7 @@ async fn ra_core::tool::Tool::call(& self, context : ToolContext < '_ >) -> Resu
 async fn ra_core::tool::Tool::handle_failure(& self, _context : & ToolContext < '_ >, _error : & crate :: error :: Error) -> Result < Option < ToolOutput > >
 async fn ra_core::tool::Tool::is_enabled(& self, _context : & RunContext) -> Result < bool >
 async fn ra_core::tool::Tool::needs_approval(& self, _context : & ToolContext < '_ >) -> Result < bool >
+async fn ra_core::tool::Tool::resource_claims(& self, _context : & ToolContext < '_ >) -> Result < Vec < ResourceClaim > >
 const fn ra_core::agent::AgentSpec::id(& self) -> & AgentId
 const fn ra_core::agent::AgentSpec::instructions(& self) -> Option < & AgentInstructions >
 const fn ra_core::agent::AgentSpec::model_settings(& self) -> & ModelSettings
@@ -509,6 +510,17 @@ const fn ra_core::tool::output::Truncation::schema_version(& self) -> SchemaVers
 const fn ra_core::tool::output::Truncation::stage(& self) -> TruncationStage
 const fn ra_core::tool::output::Truncation::unknown(& self) -> & Unknown
 const fn ra_core::tool::output::TruncationStage::label(self) -> & 'static str
+const fn ra_core::tool::resource::ResourceAccess::conflicts_with(self, other : Self) -> bool
+const fn ra_core::tool::resource::ResourceAccess::is_exclusive(self) -> bool
+const fn ra_core::tool::resource::ResourceAccess::is_shared(self) -> bool
+const fn ra_core::tool::resource::ResourceClaim::access(& self) -> ResourceAccess
+const fn ra_core::tool::resource::ResourceClaim::exclusive(resource : ResourceId) -> Self
+const fn ra_core::tool::resource::ResourceClaim::is_exclusive(& self) -> bool
+const fn ra_core::tool::resource::ResourceClaim::is_shared(& self) -> bool
+const fn ra_core::tool::resource::ResourceClaim::new(resource : ResourceId, access : ResourceAccess) -> Self
+const fn ra_core::tool::resource::ResourceClaim::resource(& self) -> & ResourceId
+const fn ra_core::tool::resource::ResourceClaim::shared(resource : ResourceId) -> Self
+const fn ra_core::tool::resource::ResourceId::kind(& self) -> & ResourceKind
 const fn ra_core::tool::schema::DecodedToolInput::type_name(& self) -> & 'static str
 const fn ra_core::tool::schema::FuncSchema::inject_tool_context(& self) -> bool
 const fn ra_core::tool::schema::FuncSchema::input_type_name(& self) -> & 'static str
@@ -671,6 +683,8 @@ enum ra_core::tool::options::ToolTimeoutBehavior
 enum ra_core::tool::origin::ToolLookupKind
 enum ra_core::tool::output::ToolOutputBlock
 enum ra_core::tool::output::TruncationStage
+enum ra_core::tool::resource::ResourceAccess
+enum ra_core::tool::resource::ResourceKind
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::agent::AgentInstructions::as_static(& self) -> Option < & str >
@@ -1129,9 +1143,13 @@ fn ra_core::tool::options::ToolOptions::allows_caller(& self, caller : ToolCalle
 fn ra_core::tool::options::ToolOptions::input_guardrails(& self) -> & [ToolGuardrailId]
 fn ra_core::tool::options::ToolOptions::new() -> Self
 fn ra_core::tool::options::ToolOptions::output_guardrails(& self) -> & [ToolGuardrailId]
+fn ra_core::tool::options::ToolOptions::resource_claims(& self) -> & [ResourceClaim]
+fn ra_core::tool::options::ToolOptions::validate(& self) -> Result < () >
 fn ra_core::tool::options::ToolOptions::with_allowed_callers(mut self, callers : impl IntoIterator < Item = ToolCaller >) -> Self
 fn ra_core::tool::options::ToolOptions::with_input_guardrail(mut self, guardrail : ToolGuardrailId) -> Self
 fn ra_core::tool::options::ToolOptions::with_output_guardrail(mut self, guardrail : ToolGuardrailId) -> Self
+fn ra_core::tool::options::ToolOptions::with_resource_claim(mut self, claim : ResourceClaim) -> Self
+fn ra_core::tool::options::ToolOptions::with_resource_claims(mut self, claims : impl IntoIterator < Item = ResourceClaim >) -> Self
 fn ra_core::tool::origin::ToolLookupKey::bare(name : impl Into < String >) -> Result < Self >
 fn ra_core::tool::origin::ToolLookupKey::deferred_top_level(name : impl Into < String >) -> Result < Self >
 fn ra_core::tool::origin::ToolLookupKey::for_call(name : impl Into < String >, namespace : Option < ToolNamespace >) -> Result < Self >
@@ -1164,6 +1182,15 @@ fn ra_core::tool::output::ToolOutput::with_metadata(mut self, metadata : Observa
 fn ra_core::tool::output::ToolOutputBlock::as_text(& self) -> Option < & str >
 fn ra_core::tool::output::ToolOutputBlock::text(text : impl Into < String >) -> Self
 fn ra_core::tool::output::Truncation::new(stage : TruncationStage, original_bytes : u64, retained_bytes : u64) -> Self
+fn ra_core::tool::resource::ResourceClaim::conflicts_with(& self, other : & Self) -> bool
+fn ra_core::tool::resource::ResourceClaim::deduplicate(claims : impl IntoIterator < Item = Self >) -> Vec < Self >
+fn ra_core::tool::resource::ResourceId::custom(kind : impl Into < Cow < 'static , str > >, name : impl Into < Cow < 'static , str > >) -> Result < Self >
+fn ra_core::tool::resource::ResourceId::new(kind : ResourceKind, value : impl Into < Cow < 'static , str > >) -> Result < Self >
+fn ra_core::tool::resource::ResourceId::process(name : impl Into < Cow < 'static , str > >) -> Result < Self >
+fn ra_core::tool::resource::ResourceId::value(& self) -> & str
+fn ra_core::tool::resource::ResourceId::workspace(name : impl Into < Cow < 'static , str > >) -> Result < Self >
+fn ra_core::tool::resource::ResourceKind::as_str(& self) -> & str
+fn ra_core::tool::resource::ResourceKind::custom(name : impl Into < Cow < 'static , str > >) -> Self
 fn ra_core::tool::schema::DecodedToolInput::downcast< T : ToolInput >(self) -> Result < T >
 fn ra_core::tool::schema::DecodedToolInput::downcast_ref< T : ToolInput >(& self) -> Option < & T >
 fn ra_core::tool::schema::FuncSchema::decode_arguments(& self, arguments : & str) -> Result < DecodedToolInput >
@@ -1241,6 +1268,7 @@ mod ra_core::tool::namespace
 mod ra_core::tool::options
 mod ra_core::tool::origin
 mod ra_core::tool::output
+mod ra_core::tool::resource
 mod ra_core::tool::schema
 mod ra_core::tool::services
 mod ra_core::trace
@@ -1373,6 +1401,8 @@ struct ra_core::tool::origin::ToolOrigin
 struct ra_core::tool::output::ObservationMetadata
 struct ra_core::tool::output::ToolOutput
 struct ra_core::tool::output::Truncation
+struct ra_core::tool::resource::ResourceClaim
+struct ra_core::tool::resource::ResourceId
 struct ra_core::tool::schema::DecodedToolInput
 struct ra_core::tool::schema::FuncSchema
 struct ra_core::tool::schema::ToolSchema
@@ -1639,6 +1669,11 @@ variant ra_core::tool::output::ToolOutputBlock::Image(ImageBlock)
 variant ra_core::tool::output::ToolOutputBlock::Text { text: String }
 variant ra_core::tool::output::TruncationStage::ContextBudget
 variant ra_core::tool::output::TruncationStage::Tool
+variant ra_core::tool::resource::ResourceAccess::Exclusive
+variant ra_core::tool::resource::ResourceAccess::Shared
+variant ra_core::tool::resource::ResourceKind::Custom(Cow < 'static , str >)
+variant ra_core::tool::resource::ResourceKind::Process
+variant ra_core::tool::resource::ResourceKind::Workspace
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function
