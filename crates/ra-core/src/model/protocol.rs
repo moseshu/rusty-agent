@@ -13,8 +13,8 @@
 //! # This matrix answers protocol questions only
 //!
 //! "Does this wire format have a place to put X" belongs here. "Does this particular endpoint
-//! accept X" does not — that is a provider fact and belongs in a future `Quirks` type alongside
-//! the provider's `extra_body` bucket, so onboarding a vendor stays a one-file change.
+//! accept X" does not — that is a provider fact, and it belongs on the provider registration
+//! alongside the `extra_body` bucket, so onboarding a vendor stays a one-file change.
 //!
 //! The distinction is easy to get wrong in both directions:
 //!
@@ -27,11 +27,10 @@
 //!   entirely different shapes. Chat Completions therefore carries no reasoning at the protocol
 //!   level, and gateways that add it are described by `Quirks`.
 //!
-//! Both of those were pushed onto `Quirks` by this module, so that future type owes two questions
-//! its current field list does not cover: **does this endpoint accept `prompt_cache_key`**, and
-//! **does this gateway return `reasoning_content`**. Without them the two facts have nowhere to
-//! live, and the adapter falls back to guessing from the protocol — which is exactly what this
-//! matrix stopped doing.
+//! Both of those were pushed onto the provider quirks by this module. The first has since landed
+//! there and the adapter reads it before sending a cache key; the second still owes a switch —
+//! **does this gateway return `reasoning_content`** — and until it has one that fact has nowhere to
+//! live but a guess derived from the protocol, which is exactly what this matrix stopped doing.
 
 use std::fmt;
 

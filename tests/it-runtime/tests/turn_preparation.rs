@@ -285,6 +285,17 @@ async fn test_turn_preparation_01() {
         prepared.request().system_instructions(),
         Some("Use only the enabled tool snapshot.")
     );
+    assert_eq!(
+        prepared
+            .request()
+            .cache_plan()
+            .map(|plan| plan.prefix_hash().clone()),
+        Some(ra_core::prompt::ContentHash::compute(
+            "Use only the enabled tool snapshot."
+        )),
+        "the plan states what is stable; whether that span is worth caching is the adapter's call, \
+         since only it sees the merged tool table"
+    );
 
     let settings = prepared.request().model_settings();
     assert_eq!(settings.temperature(), Some(0.3));
@@ -803,10 +814,442 @@ async fn test_turn_preparation_13() {
     );
 }
 
+#[tokio::test]
+async fn test_dynamic_instructions_lowering_to_tail_items() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("dynamic-agent"))
+        .name("Dynamic Agent")
+        .dynamic_instructions_fn(|ctx| {
+            let run_id = ctx.run_id().as_str().to_string();
+            async move {
+                Ok(ra_core::prompt::ResolvedPrompt::new(
+                    format!("Turn-specific volatile data for run {run_id}"),
+                    ra_core::prompt::PromptSource::Agent,
+                ))
+            }
+        })
+        .build()
+        .unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        vec![ModelInputItem::Message(Message::user("Hello"))],
+    ))
+    .await
+    .unwrap();
+
+    // System instructions slot remains None: a generated prompt never reaches the cached prefix.
+    assert_eq!(prepared.request().system_instructions(), None);
+
+    // Input items have user message + dynamic tail item
+    assert_eq!(prepared.request().input().len(), 2);
+    let tail = &prepared.request().input()[1];
+    if let ModelInputItem::Message(msg) = tail {
+        assert_eq!(msg.role(), ra_core::item::MessageRole::User);
+        assert_eq!(
+            msg.content()[0].as_text(),
+            Some("Turn-specific volatile data for run run-preparation")
+        );
+    } else {
+        panic!("expected message input item for dynamic tail");
+    }
+
+    // The text is in the request; the record of what produced it travels alongside.
+    let provenance = prepared
+        .instruction_provenance()
+        .expect("a generated prompt must leave a provenance record");
+    assert_eq!(provenance.source(), &ra_core::prompt::PromptSource::Agent);
+    assert_eq!(
+        provenance.content_hash(),
+        &ra_core::prompt::ContentHash::compute(
+            "Turn-specific volatile data for run run-preparation"
+        ),
+        "the recorded hash must cover the text that was actually sent"
+    );
+}
+
+/// A generated prompt asking for the prefix is rejected, not silently relocated or dropped.
+///
+/// The prefix is the cached span. A generator reads the run, so anything it writes there changes
+/// every turn — this is the case that would quietly take prompt caching to a zero hit rate while
+/// every test still passed.
+#[tokio::test]
+async fn test_dynamic_instructions_cannot_reach_the_stable_prefix() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("prefix-grabbing-agent"))
+        .name("Prefix Grabbing Agent")
+        .dynamic_instructions_fn(|_| async move {
+            let prefix_section = ra_core::prompt::PromptSection::new(
+                ra_core::prompt::PromptSectionName::CORE_BEHAVIOR,
+                "Stable prefix constitution",
+                ra_core::prompt::PromptSource::Agent,
+                ra_core::prompt::SectionStability::Stable,
+                ra_core::prompt::SectionPosition::Prefix,
+                "Stable constitution text",
+            )?;
+
+            Ok(ra_core::prompt::ResolvedPrompt::new(
+                "Full text representation",
+                ra_core::prompt::PromptSource::Agent,
+            )
+            .with_sections(vec![prefix_section]))
+        })
+        .build()
+        .unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let err = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        vec![ModelInputItem::Message(Message::user("Hello"))],
+    ))
+    .await
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("prefix-grabbing-agent"),
+        "the error must name the agent whose generator misplaced the section: {message}"
+    );
+    assert!(
+        message.contains("core_behavior"),
+        "the error must name the offending section: {message}"
+    );
+}
+
+/// Every tail section a generator emits reaches the model, in order.
+#[tokio::test]
+async fn test_dynamic_instructions_lower_every_tail_section() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("structured-dynamic-agent"))
+        .name("Structured Dynamic Agent")
+        .dynamic_instructions_fn(|_| async move {
+            let first = ra_core::prompt::PromptSection::new(
+                ra_core::prompt::PromptSectionName::new("volatile_delta"),
+                "Volatile tail delta",
+                ra_core::prompt::PromptSource::Dynamic("delta".into()),
+                ra_core::prompt::SectionStability::Volatile,
+                ra_core::prompt::SectionPosition::TailMessage,
+                "Volatile delta update",
+            )?;
+
+            let second = ra_core::prompt::PromptSection::new(
+                ra_core::prompt::PromptSectionName::new("volatile_status"),
+                "Volatile tail status",
+                ra_core::prompt::PromptSource::Dynamic("status".into()),
+                ra_core::prompt::SectionStability::Volatile,
+                ra_core::prompt::SectionPosition::TailMessage,
+                "Volatile status update",
+            )?;
+
+            Ok(ra_core::prompt::ResolvedPrompt::new(
+                "Full text representation",
+                ra_core::prompt::PromptSource::Agent,
+            )
+            .with_sections(vec![first, second]))
+        })
+        .build()
+        .unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        vec![ModelInputItem::Message(Message::user("Hello"))],
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(prepared.request().system_instructions(), None);
+    assert_eq!(prepared.request().input().len(), 3);
+
+    let texts: Vec<Option<&str>> = prepared.request().input()[1..]
+        .iter()
+        .map(|item| match item {
+            ModelInputItem::Message(msg) => msg.content()[0].as_text(),
+            _ => panic!("expected message input items for dynamic tail"),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            Some("Volatile delta update"),
+            Some("Volatile status update")
+        ]
+    );
+    let provenance = prepared
+        .instruction_provenance()
+        .expect("structured dynamic prompt must retain provenance");
+    assert_eq!(
+        provenance.content_hash(),
+        &ra_core::prompt::ContentHash::compute("Volatile delta update\n\nVolatile status update")
+    );
+    assert_ne!(
+        provenance.content_hash(),
+        &ra_core::prompt::ContentHash::compute("Full text representation")
+    );
+}
+
+/// A failing generator keeps its own classification, and still names the agent.
+///
+/// Adding "which agent" used to mean rebuilding the error as a configuration error, which turned
+/// every transient generator failure into one needing a human. Retry and model fallback read
+/// `recoverability()` alone, so the rewrite silently disabled both.
+#[tokio::test]
+async fn test_dynamic_instructions_failure_keeps_its_classification() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("failing-dynamic-agent"))
+        .name("Failing Dynamic Agent")
+        .dynamic_instructions_fn(|_| async move {
+            Err(Error::provider(
+                ra_core::error::ProviderErrorKind::Timeout,
+                "custom generator network timeout",
+            ))
+        })
+        .build()
+        .unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let err = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap_err();
+
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("failing-dynamic-agent"),
+        "error message must name the failing agent public id: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("custom generator network timeout"),
+        "the generator's own message must survive: {err_msg}"
+    );
+    assert_eq!(
+        err.recoverability(),
+        ra_core::error::Recoverability::Retryable,
+        "a transient generator failure must stay retryable rather than become a config error"
+    );
+}
+
+/// Cancelling during generation reports as a cancellation, not as a configuration error.
+///
+/// The cancellation contract permits exactly one test for "was this cancelled": `is_cancelled()`.
+/// A stage that rebuilds the error into another variant makes that test answer `false`, and the
+/// run is then counted as a failure and considered for retry.
+#[tokio::test]
+async fn test_cancel_during_dynamic_instructions_stays_a_cancellation() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("slow-dynamic-agent"))
+        .name("Slow Dynamic Agent")
+        .dynamic_instructions_fn(|_| async move {
+            std::future::pending::<()>().await;
+            unreachable!("the scope cancels before the generator completes")
+        })
+        .build()
+        .unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let canceller = {
+        let scope = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            scope.cancel(CancelReason::UserInterrupt);
+        })
+    };
+
+    let err = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap_err();
+    canceller.await.unwrap();
+
+    assert!(
+        err.is_cancelled(),
+        "a cancelled generation must answer `true` to is_cancelled(), got `{}`",
+        err.code()
+    );
+    assert_eq!(
+        err.recoverability(),
+        ra_core::error::Recoverability::Cancelled
+    );
+    assert_eq!(cancel.reason(), Some(CancelReason::UserInterrupt));
+}
+
 fn write_file_attempt(call_id: &str) -> ToolUseAttempt {
     ToolUseAttempt::new(
         ToolUse::Tool(ToolOrigin::new("write_file").unwrap().lookup_key().clone()),
         CallId::new(call_id),
         &json!({ "path": "a.txt" }),
     )
+}
+
+/// A cacheable static prefix carries a plan whose hash and scope match what is being sent.
+///
+/// The scope matters as much as the hash: a key that changed per turn would partition the cache
+/// instead of sharing it, which reads as "caching is enabled" while never hitting.
+#[tokio::test]
+async fn test_cacheable_prefix_carries_a_run_scoped_cache_plan() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let instructions = "You are an autonomous engineering assistant. ".repeat(150);
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("cacheable-agent"))
+        .name("Cacheable Agent")
+        .instructions(instructions.clone())
+        .build()
+        .unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let binding = direct(&agent);
+    let tool_use = ToolUseTracker::new();
+    let prepare = || {
+        prepare_turn(TurnPreparationRequest::new(
+            &binding,
+            &resolver,
+            &context,
+            &cancel,
+            &tool_use,
+            Vec::new(),
+        ))
+    };
+
+    let prepared = prepare().await.unwrap();
+    let plan = prepared
+        .request()
+        .cache_plan()
+        .expect("a cacheable prefix on a caching protocol carries a plan");
+
+    assert_eq!(
+        plan.prefix_hash(),
+        &ra_core::prompt::ContentHash::compute(&instructions),
+        "the plan must name the instructions the request actually carries"
+    );
+    assert_eq!(
+        plan.cache_scope(),
+        Some("run-preparation"),
+        "the cache scope is the run, so every turn of one run shares a cache entry"
+    );
+
+    // The scope is stable across turns; that is the whole point of naming one.
+    let second = prepare().await.unwrap();
+    assert_eq!(
+        second.request().cache_plan().and_then(|p| p.cache_scope()),
+        Some("run-preparation")
+    );
+    assert_eq!(
+        second.request().cache_plan().map(|p| p.prefix_hash()),
+        prepared.request().cache_plan().map(|p| p.prefix_hash())
+    );
+}
+
+/// Short instructions still reach the model with a cache plan attached.
+///
+/// Preparation deliberately makes no judgement about whether caching is worthwhile: the cached
+/// prefix is the instructions plus the whole tool table, and hosted tools do not exist until the
+/// adapter merges them. An earlier version decided here, from the instructions alone, and so
+/// dropped the plan for exactly the request shape that benefits most — a small instruction block in
+/// front of a large tool table.
+#[tokio::test]
+async fn test_short_instructions_with_a_large_tool_table_still_carry_a_cache_plan() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+
+    let instructions = "Be helpful.";
+    let mut builder = AgentSpec::builder()
+        .id(AgentId::new("small-prompt-agent"))
+        .name("Small Prompt Agent")
+        .instructions(instructions);
+    for index in 0..12 {
+        builder = builder.tool(Arc::new(RecordingTool::new(
+            &format!("tool_{index}"),
+            ToolAvailability::Enabled,
+            Arc::clone(&event_log),
+            Ok(true),
+        )));
+    }
+    let agent = builder.build().unwrap();
+
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+    let binding = direct(&agent);
+    let tool_use = ToolUseTracker::new();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &binding,
+        &resolver,
+        &context,
+        &cancel,
+        &tool_use,
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert!(
+        ra_core::prompt::estimate_tokens(instructions)
+            < ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS,
+        "the fixture instructions must be below the floor for this test to mean anything"
+    );
+    let plan = prepared
+        .request()
+        .cache_plan()
+        .expect("preparation must not withhold a plan over the instructions' own length");
+    assert_eq!(
+        plan.prefix_hash(),
+        &ra_core::prompt::ContentHash::compute(instructions),
+        "the plan must name the instructions the request actually carries"
+    );
+    assert_eq!(plan.cache_scope(), Some("run-preparation"));
+    assert_eq!(prepared.request().tools().len(), 12);
 }

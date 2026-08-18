@@ -26,7 +26,13 @@ use crate::source;
 /// `match`es it itself, and adding a state **must** be a compile error. An outward-facing data
 /// enum and an inward-facing control-flow enum are constraints in opposite directions, not a
 /// contradiction.
-const EXHAUSTIVE_ALLOWED: &[&str] = &["NextStep"];
+///
+/// `ResolvedInstructions` is the same shape of decision. Its variants are the two positions an
+/// agent's instructions may occupy in a model request — the cached prefix, or volatile tail
+/// messages — and turn preparation `match`es it to decide which. A `_` arm would send a third
+/// placement to whichever slot the arm happened to pick, which is the silent misplacement the type
+/// was introduced to make impossible.
+const EXHAUSTIVE_ALLOWED: &[&str] = &["NextStep", "ResolvedInstructions"];
 
 /// Structs allowed to have public fields.
 ///

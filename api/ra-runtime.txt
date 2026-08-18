@@ -52,6 +52,7 @@ const fn ra_runtime::tool::dispatch::ToolRefusal::output(& self) -> & ToolCallOu
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
+const fn ra_runtime::turn::prepare::PreparedTurn::instruction_provenance(& self) -> Option < & PromptProvenance >
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector

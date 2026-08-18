@@ -869,6 +869,13 @@ async fn call_model(
     let model = Arc::clone(prepared.model());
     let selector = prepared.selector().clone();
     let (surface, model_request) = prepared.into_call();
+
+    // Checked here rather than left to each adapter. A cache plan names a prefix by hash, and an
+    // adapter that forgets to check would send one naming text the request no longer carries —
+    // silently, and only visible later as a cache that never hits. One check on the single
+    // dispatch path covers every protocol, including the ones whose adapters do not exist yet.
+    model_request.validate_cache_plan()?;
+
     let model_name = selector.model().unwrap_or("<provider_default>");
     let generation_span = info_span!(
         "generation",

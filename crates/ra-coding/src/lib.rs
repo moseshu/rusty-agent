@@ -10,14 +10,16 @@
 //! tool set, and discipline criteria all change with the business, and no crate may depend on it
 //! (enforced by the layering gate).
 
+pub mod agent;
 pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub(crate) mod final_answer;
 pub(crate) mod guards;
 pub mod host;
 pub mod profile;
-pub(crate) mod prompt;
+pub mod prompt;
 pub(crate) mod tools;
 
+pub use agent::build_agent;
 pub use host::CodingHost;
 pub use profile::CodingProfile;

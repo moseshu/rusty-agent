@@ -1,8 +1,8 @@
-//! The four gates whose subject does not exist yet.
+//! The three gates whose subject does not exist yet.
 //!
 //! They are not "to be implemented" placeholders — **there is nothing for the check to apply to**:
-//! with no tool schema there are no bytes to compare, and with no prompt sections there are no
-//! hashes to dump. An empty function that pretends to pass would be worse than none, so each
+//! with no tool schema there are no bytes to compare, and with no guard registry there is no table
+//! to reconcile. An empty function that pretends to pass would be worse than none, so each
 //! honestly returns [`Outcome::Skip`] with the task that blocks it, and every `cargo xtask all`
 //! lists them.
 //!
@@ -18,15 +18,6 @@ use crate::gate::Outcome;
 /// schemas total 19,786 B and did not differ by a byte across 82 requests).
 pub(crate) fn schema_stability() -> Outcome {
     Outcome::skip("R2-9", "尚无可渲染的工具 schema")
-}
-
-/// Dumping and reconciling prompt sections, hashes, tokens, and cache breakpoints.
-///
-/// Enabling condition: the `PromptSection` assembly of R4 is usable. It will then dump a
-/// per-provider section snapshot, so a changed stable prefix shows up in the diff — cache hit rate
-/// is the dominant cost driver.
-pub(crate) fn prompt_dump() -> Outcome {
-    Outcome::skip("R4", "尚无 prompt 装配可导出")
 }
 
 /// `Guard_Registry.md` agrees with the code, and hard-blocking guards number <= 8.

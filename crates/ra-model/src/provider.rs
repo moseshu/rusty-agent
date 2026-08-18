@@ -8,8 +8,9 @@
 //! The registration is the ownership boundary for all provider-specific facts. Its factory owns
 //! endpoint and credential configuration without exposing secrets through this registry, while
 //! the registration itself owns aliases, protocol selection, model aliases, provider defaults,
-//! and the static `extra_body` bucket. R1-6b must add `ProviderQuirks` to this same registration;
-//! a second vendor table would make onboarding one endpoint a two-file operation.
+//! the static `extra_body` bucket, and the endpoint capability switches in [`ProviderQuirks`].
+//! Keeping them together is deliberate: a second vendor table would make onboarding one endpoint
+//! a two-file operation, and would let the two descriptions of the same endpoint disagree.
 //!
 //! This follows the useful boundary of the `OpenAI` Agents SDK `MultiProvider`: a provider resolves
 //! model names and owns cached connections, while the runner depends only on `Model`.
@@ -29,6 +30,10 @@ use ra_core::{
     },
 };
 
+pub mod quirks;
+
+use quirks::ProviderQuirks;
+
 /// Lazily constructs one provider instance for a registration.
 ///
 /// Concrete factories own endpoint, credentials, default headers, and client construction. That
@@ -42,15 +47,19 @@ use ra_core::{
 /// setup that cheap is not worth a second locking phase.
 pub trait ProviderFactory: Send + Sync + 'static {
     /// Creates the provider instance cached by [`ProviderRegistry`].
-    fn create(&self) -> Result<Arc<dyn ModelProvider>>;
+    ///
+    /// `quirks` carries the endpoint capabilities declared on the registration. It is passed at
+    /// creation rather than read per request because it is static for the endpoint's lifetime,
+    /// and because the provider is what hands it to the adapters that need it.
+    fn create(&self, quirks: ProviderQuirks) -> Result<Arc<dyn ModelProvider>>;
 }
 
 impl<F> ProviderFactory for F
 where
-    F: Fn() -> Result<Arc<dyn ModelProvider>> + Send + Sync + 'static,
+    F: Fn(ProviderQuirks) -> Result<Arc<dyn ModelProvider>> + Send + Sync + 'static,
 {
-    fn create(&self) -> Result<Arc<dyn ModelProvider>> {
-        (self)()
+    fn create(&self, quirks: ProviderQuirks) -> Result<Arc<dyn ModelProvider>> {
+        (self)(quirks)
     }
 }
 
@@ -144,6 +153,7 @@ pub struct ProviderRegistration {
     factory: Arc<dyn ProviderFactory>,
     defaults: ModelSettings,
     models: Vec<ModelRegistration>,
+    quirks: ProviderQuirks,
 }
 
 impl ProviderRegistration {
@@ -157,6 +167,7 @@ impl ProviderRegistration {
             factory: Arc::new(factory),
             defaults: ModelSettings::new(),
             models: Vec::new(),
+            quirks: ProviderQuirks::new(),
         }
     }
 
@@ -185,6 +196,22 @@ impl ProviderRegistration {
     pub fn with_static_extra_body(mut self, body: JsonMap) -> Self {
         self.defaults = self.defaults.with_extra_body(self.key.clone(), body);
         self
+    }
+
+    /// Declares endpoint capabilities that cannot be derived from the protocol.
+    ///
+    /// Every switch defaults to off, so an endpoint gets first-party-only request fields only by
+    /// asking for them.
+    #[must_use]
+    pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
+        self.quirks = quirks;
+        self
+    }
+
+    /// Endpoint capabilities declared for this registration.
+    #[must_use]
+    pub const fn quirks(&self) -> ProviderQuirks {
+        self.quirks
     }
 
     /// Adds a canonical model and any local aliases.
@@ -519,7 +546,7 @@ impl ProviderRegistry {
             return Ok(Arc::clone(provider));
         }
 
-        let provider = registration.factory.create()?;
+        let provider = registration.factory.create(registration.quirks)?;
         cache
             .instances
             .insert(registration.key.clone(), Arc::clone(&provider));

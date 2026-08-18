@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ResolvedModelSettings;
-use crate::item::{AgentId, ModelInputItem};
+use crate::{
+    error::{Error, Result},
+    item::{AgentId, ModelInputItem},
+    prompt::{CachePlan, ContentHash},
+};
 
 /// Tracing visibility for one model call.
 #[non_exhaustive]
@@ -277,11 +281,17 @@ impl ModelOutputSchema {
 /// rather than here — the same treatment as `store` and `response_include`. Its absence is a
 /// decision, not an oversight.
 ///
-/// **A per-session prompt cache key.** A future milestone wants `prompt_cache_key` held constant
-/// for a whole session, equal to the thread id. That is a runtime value with a session lifetime,
-/// so `extra_body` is the wrong home for it — that bucket is static provider registration data.
-/// When that lands, the key belongs on this type as a new field; the type is `#[non_exhaustive]`
-/// precisely so adding one is not a breaking change.
+/// **Provider cache wire fields.** [`CachePlan`] states which bytes form the stable prefix and
+/// which span of calls should share a cache entry. It stops there. `cache_control` breakpoints and
+/// `prompt_cache_key` are wire vocabulary of one vendor each, and *whether a given endpoint honours
+/// them* is a provider fact — not a protocol one — so both the field names and the decision to send
+/// them belong to the adapter and to `ProviderQuirks`.
+///
+/// In particular `extra_body` is still the wrong home for a session cache key: that bucket is
+/// static provider registration data, shared by every run of that provider, while a cache scope is
+/// a runtime value with a session lifetime. A key placed there silently collapses every run onto
+/// one routing bucket. When the typed runtime override lands it belongs on this type as a new
+/// field; it is `#[non_exhaustive]` precisely so adding one is not a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
@@ -293,6 +303,7 @@ pub struct ModelRequest {
     handoffs: Vec<ModelHandoffDefinition>,
     tracing: ModelTracing,
     continuation: ConversationContinuation,
+    cache_plan: Option<CachePlan>,
 }
 
 impl ModelRequest {
@@ -308,6 +319,7 @@ impl ModelRequest {
             handoffs: Vec::new(),
             tracing: ModelTracing::Disabled,
             continuation: ConversationContinuation::None,
+            cache_plan: None,
         }
     }
 
@@ -315,6 +327,13 @@ impl ModelRequest {
     #[must_use]
     pub fn with_system_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.system_instructions = Some(instructions.into());
+        self
+    }
+
+    /// Attaches a provider-neutral cache plan for the stable system-instruction prefix.
+    #[must_use]
+    pub fn with_cache_plan(mut self, cache_plan: CachePlan) -> Self {
+        self.cache_plan = Some(cache_plan);
         self
     }
 
@@ -371,6 +390,35 @@ impl ModelRequest {
     #[must_use]
     pub fn system_instructions(&self) -> Option<&str> {
         self.system_instructions.as_deref()
+    }
+
+    /// Provider-neutral cache plan for the stable prefix, if caching is configured.
+    #[must_use]
+    pub const fn cache_plan(&self) -> Option<&CachePlan> {
+        self.cache_plan.as_ref()
+    }
+
+    /// Verifies that the attached cache plan identifies these exact stable instructions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a cache plan is attached without system instructions or if its prefix
+    /// hash differs from the instructions that will be sent to the provider.
+    pub fn validate_cache_plan(&self) -> Result<()> {
+        let Some(cache_plan) = &self.cache_plan else {
+            return Ok(());
+        };
+        let instructions = self.system_instructions.as_deref().ok_or_else(|| {
+            Error::caller("a prompt cache plan requires stable system instructions")
+        })?;
+        let actual_hash = ContentHash::compute(instructions);
+        if cache_plan.prefix_hash() != &actual_hash {
+            return Err(Error::caller(format!(
+                "prompt cache plan names prefix hash `{}`, but stable system instructions hash to `{actual_hash}`",
+                cache_plan.prefix_hash()
+            )));
+        }
+        Ok(())
     }
 
     /// Provider-neutral input items.

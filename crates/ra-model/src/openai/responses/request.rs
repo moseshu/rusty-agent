@@ -13,16 +13,23 @@ use ra_core::{
         ConversationContinuation, Effort, ModelHandoffDefinition, ModelRequest,
         ModelToolDefinition, ThinkingConfig, ToolChoice,
     },
+    prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
     tool::{ToolOutput, ToolOutputBlock},
 };
 use serde_json::{Map, Value, json};
 
 use crate::openai::error::behavior_error;
+use crate::provider::quirks::ProviderQuirks;
 
 const ENCRYPTED_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 
-pub(crate) async fn build_request_body(model: &str, request: &ModelRequest) -> Result<Value> {
+pub(crate) async fn build_request_body(
+    model: &str,
+    request: &ModelRequest,
+    quirks: ProviderQuirks,
+) -> Result<Value> {
     reject_unsupported_settings(request)?;
+    request.validate_cache_plan()?;
 
     let mut body = request
         .model_settings()
@@ -95,6 +102,7 @@ pub(crate) async fn build_request_body(model: &str, request: &ModelRequest) -> R
     }
 
     let tools = merge_tools(&mut body, request.tools(), request.handoffs())?;
+    insert_cache_scope(&mut body, request, quirks);
     if tools.populated {
         if let Some(tool_choice) = request.model_settings().tool_choice() {
             body.insert(
@@ -122,6 +130,54 @@ pub(crate) async fn build_request_body(model: &str, request: &ModelRequest) -> R
     }
 
     Ok(Value::Object(body))
+}
+
+/// Lowers a cache scope onto the wire, where the endpoint honours it and the span is worth caching.
+///
+/// **Called after the tool table is merged, and that ordering is load bearing.** The cached prefix
+/// is the instructions *plus the whole tool table*, and the table is only complete here: hosted
+/// tools — web search, file search, hosted MCP — have no protocol-neutral representation and arrive
+/// through `extra_body`, so no earlier layer can see them. Measuring before the merge would judge a
+/// short instruction block sitting in front of a large tool table as not worth caching, denying the
+/// discount to precisely the requests that most need it.
+///
+/// Neither an unsupported endpoint nor a short span is an error. Caching is a discount; refusing to
+/// issue the request rather than issuing it uncached would trade the call for the saving. Model
+/// fallback makes that concrete: it retries a prepared request against a different provider, so a
+/// plan built for an opted-in endpoint routinely arrives at one that is not.
+fn insert_cache_scope(
+    body: &mut Map<String, Value>,
+    request: &ModelRequest,
+    quirks: ProviderQuirks,
+) {
+    if !quirks.prompt_cache_key() {
+        return;
+    }
+    let Some(scope) = request.cache_plan().and_then(CachePlan::cache_scope) else {
+        return;
+    };
+    if stable_span_tokens(body, request) < MIN_CACHEABLE_PREFIX_TOKENS {
+        return;
+    }
+    body.insert(
+        "prompt_cache_key".to_owned(),
+        Value::String(scope.to_owned()),
+    );
+}
+
+/// Estimates the cached prefix: the stable instructions plus the merged tool table.
+///
+/// The table is measured from its serialized wire form rather than from the neutral definitions,
+/// which is the point — that form is what the provider caches, and it is the only form that
+/// includes hosted tools and handoffs. A table that cannot be serialized contributes nothing: an
+/// unmeasurable schema is a reason to under-count, never a reason to fail a request over a caching
+/// hint.
+fn stable_span_tokens(body: &Map<String, Value>, request: &ModelRequest) -> usize {
+    let instructions = request.system_instructions().map_or(0, estimate_tokens);
+    let tools = body.get("tools").map_or(0, |tools| {
+        serde_json::to_string(tools).map_or(0, |wire| estimate_tokens(&wire))
+    });
+    instructions + tools
 }
 
 /// Derives `store` from the requested continuation mode.
@@ -183,6 +239,22 @@ fn merge_effort(body: &mut Map<String, Value>, effort: Option<Effort>) -> Result
 }
 
 fn reject_unsupported_settings(request: &ModelRequest) -> Result<()> {
+    // The framework owns this field whenever it can send one, so a static value underneath it is
+    // rejected rather than silently overridden — in either direction. `extra_body` is provider
+    // *registration* data, shared by every run of that provider, while a cache scope has a session
+    // lifetime; a static key there quietly routes every run onto one bucket, which reads as
+    // configured caching while defeating the scoping it appears to configure.
+    if request
+        .model_settings()
+        .extra_body()
+        .contains_key("prompt_cache_key")
+    {
+        return Err(Error::caller(
+            "OpenAI extra_body must not set prompt_cache_key: it is static provider registration \
+             data shared by every run, while the cache scope on the request has a session \
+             lifetime; set the scope on the request instead",
+        ));
+    }
     if request.model_settings().frequency_penalty().is_some()
         || request.model_settings().presence_penalty().is_some()
     {

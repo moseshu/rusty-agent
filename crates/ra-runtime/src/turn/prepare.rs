@@ -14,7 +14,7 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use futures::future::try_join_all;
 use ra_core::{
-    agent::AgentSpec,
+    agent::{AgentSpec, ResolvedInstructions},
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result},
@@ -23,6 +23,7 @@ use ra_core::{
         Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
         ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing, ResolvedModelSettings,
     },
+    prompt::{CachePlan, PromptProvenance},
     state::ToolUseTracker,
     tool::{Tool, ToolAvailability},
 };
@@ -117,6 +118,7 @@ pub struct PreparedTurn {
     model: Arc<dyn Model>,
     request: ModelRequest,
     surface: TurnActionSurface,
+    instruction_provenance: Option<PromptProvenance>,
 }
 
 impl PreparedTurn {
@@ -153,6 +155,17 @@ impl PreparedTurn {
         &self.surface
     }
 
+    /// Identity of the generated prompt this turn used, or `None` for static instructions.
+    ///
+    /// The text itself is already inside the request; what this keeps is which generator produced
+    /// it, what it hashed to, and the version and provenance it declared. Without the record, the
+    /// only way to answer "what did the generator emit on turn 7" afterwards is to re-run the
+    /// generator against a run context that no longer exists.
+    #[must_use]
+    pub const fn instruction_provenance(&self) -> Option<&PromptProvenance> {
+        self.instruction_provenance.as_ref()
+    }
+
     /// Takes ownership of the surface and the request together.
     ///
     /// This is the exit settlement uses. The surface has to survive the model call — resolving the
@@ -185,6 +198,7 @@ impl fmt::Debug for PreparedTurn {
                 "has_system_instructions",
                 &self.request.system_instructions().is_some(),
             )
+            .field("instruction_provenance", &self.instruction_provenance)
             .field("surface", &self.surface)
             .finish_non_exhaustive()
     }
@@ -339,14 +353,26 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         model_settings = model_settings.reset_tool_choice();
     }
 
-    let instructions = resolve_instructions(agent, request.agent.public_id())?;
+    // 6. Resolve instructions. A generated prompt reads the run, so it runs inside the cancel
+    // scope like every other stage that enters third-party code.
+    let instructions = resolve_instructions(
+        agent,
+        request.agent.public_id(),
+        request.run,
+        request.cancel,
+    )
+    .await?;
 
-    // 6. Model-input filters are always last, so a filter sees the final tool surface and the
+    let mut input = request.input;
+    input.extend(instructions.tail_items);
+
+    // 7. Model-input filters are always last, so a filter sees the final tool surface and the
     // settings that go with it. R10-6b will replace this identity implementation with the
     // report-producing filter chain without changing the surrounding stage order.
-    let (input, instructions) = apply_model_input_filters(
-        request.input,
-        instructions,
+    let (input, instructions, instruction_provenance) = apply_model_input_filters(
+        input,
+        instructions.prefix,
+        instructions.provenance,
         surface.tools(),
         &model_settings,
     );
@@ -358,6 +384,30 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         .with_handoffs(surface.handoffs().to_vec())
         .with_tracing(request.tracing);
     if let Some(instructions) = instructions {
+        // The cache scope is the run for now. It wants to be the session id, so that a resumed or
+        // follow-up run reuses the same cache entry; until sessions exist, the run is the widest
+        // span this stage can name, and naming a narrower one would partition the cache rather
+        // than share it.
+        //
+        // **An agent with generated instructions gets no plan at all**, because it has no stable
+        // prefix and `CachePlan` is a plan for one. That is honest but leaves value on the table:
+        // a cache scope is useful even without stable instructions, since the tool table and the
+        // history ahead of the tail are still a prefix. Modelling a scope that does not name a
+        // prefix is a change to the type, and it belongs with the rest of the session-scoped
+        // caching work rather than here.
+        //
+        // The plan says only which bytes are stable and which calls should share an entry. Whether
+        // that becomes `cache_control` marks, a `prompt_cache_key`, or nothing is the adapter's
+        // decision, and depends on the endpoint rather than on the protocol.
+        //
+        // The plan is attached unconditionally, with no judgement about whether it is worth
+        // acting on. That judgement needs the whole cached prefix — instructions plus the final
+        // tool table, hosted tools included — and hosted tools have no protocol-neutral form: they
+        // exist only after the adapter merges them into the wire request. Deciding here would mean
+        // deciding on the instructions alone, which denies caching to precisely the requests that
+        // most need it.
+        let cache_plan = CachePlan::for_prefix(&instructions, Some(request.run.run_id().as_str()));
+        model_request = model_request.with_cache_plan(cache_plan);
         model_request = model_request.with_system_instructions(instructions);
     }
     if let Some(output_schema) = output_schema {
@@ -369,6 +419,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         model,
         request: model_request,
         surface,
+        instruction_provenance,
     })
 }
 
@@ -429,35 +480,89 @@ fn resolve_output_schema(_agent: &AgentSpec) -> Option<ModelOutputSchema> {
     None
 }
 
-/// Projects the agent's instruction source onto the stable system-instruction slot.
+/// What the instruction stage contributed to one turn.
+#[derive(Default)]
+struct TurnInstructions {
+    /// Text for the stable system-instruction slot. Only a static source can fill this.
+    prefix: Option<String>,
+    /// Volatile tail items, appended after the caller's input.
+    tail_items: Vec<ModelInputItem>,
+    /// Identity of a generated prompt, retained for the turn record.
+    provenance: Option<PromptProvenance>,
+}
+
+/// Resolves the agent's instructions into a stable prefix and volatile tail items.
 ///
-/// The failure branch is the point: when R4-11 adds a dynamic prompt source, a turn that cannot
-/// render it must say so rather than quietly send a request with no instructions at all.
+/// **A static source owns the prefix; a generated one may only reach the tail.** A generator reads
+/// the live run, so its text is a function of the turn — the date, the budget, the run id. Placing
+/// that in the prefix changes the cached span on every call, and the prefix is the span the whole
+/// cache plan is built to hold still. The placement comes from [`ResolvedInstructions`] rather than
+/// from a test this function performs, and lowering rejects a generator that asks for the prefix
+/// rather than dropping the section, so the generator learns its text went nowhere instead of
+/// quietly losing it.
 ///
-/// The source is read from the execution instance but the error names `public_id`. A configuration
+/// The source is read from the execution instance but errors name `public_id`. A configuration
 /// error has to point at the agent the user wrote down; naming a prepared clone would send them
 /// looking for something that is not in their configuration at all.
-fn resolve_instructions(agent: &AgentSpec, public_id: &AgentId) -> Result<Option<String>> {
-    match agent.instructions() {
-        None => Ok(None),
-        Some(instructions) => instructions
-            .as_static()
-            .map(str::to_owned)
-            .map(Some)
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "agent `{public_id}` uses an instruction source that turn preparation cannot \
-                     render yet"
+async fn resolve_instructions(
+    agent: &AgentSpec,
+    public_id: &AgentId,
+    context: &RunContext,
+    cancel: &CancelScope,
+) -> Result<TurnInstructions> {
+    let Some(instructions) = agent.instructions() else {
+        return Ok(TurnInstructions::default());
+    };
+
+    // Both failures below keep the original error's variant. Rewriting them into a configuration
+    // error would report a cancelled run as needing human intervention and would make
+    // `Error::is_cancelled` — the only cancellation test the contract allows — answer `false`.
+    let resolved = cancel
+        .run(instructions.resolve(context))
+        .await?
+        .map_err(|err| {
+            err.with_context(format!(
+                "resolving dynamic instructions for agent `{public_id}`"
+            ))
+        })?;
+
+    match resolved {
+        ResolvedInstructions::Prefix(text) => Ok(TurnInstructions {
+            prefix: Some(text),
+            ..TurnInstructions::default()
+        }),
+        ResolvedInstructions::Generated(prompt) => {
+            let (tail_items, provenance) = prompt.lower().map_err(|err| {
+                err.with_context(format!(
+                    "lowering dynamic instructions for agent `{public_id}`"
                 ))
-            }),
+            })?;
+            Ok(TurnInstructions {
+                prefix: None,
+                tail_items,
+                provenance: Some(provenance),
+            })
+        }
     }
 }
 
+/// Applies the model-input filter chain, currently an identity pass with no filters installed.
+///
+/// **The provenance record travels with the text it describes.** A filter can rewrite the input
+/// items and the instructions, and the record names the exact bytes a generated prompt contributed
+/// — so a chain that edits those bytes and leaves the record alone produces a turn whose only
+/// evidence of what was sent describes something else. Passing the record through this signature
+/// puts it in the implementer's hands rather than leaving the invariant to be rediscovered.
 fn apply_model_input_filters(
     input: Vec<ModelInputItem>,
     instructions: Option<String>,
+    provenance: Option<PromptProvenance>,
     _tools: &[Arc<dyn Tool>],
     _model_settings: &ResolvedModelSettings,
-) -> (Vec<ModelInputItem>, Option<String>) {
-    (input, instructions)
+) -> (
+    Vec<ModelInputItem>,
+    Option<String>,
+    Option<PromptProvenance>,
+) {
+    (input, instructions, provenance)
 }

@@ -480,6 +480,34 @@ impl Error {
         }
     }
 
+    /// Prefixes the message with caller context, keeping the variant and source intact.
+    ///
+    /// This exists so that adding "which agent" or "which stage" to an error in flight does not
+    /// have to go through `Error::config(format!("...: {err}"))`. That idiom silently reclassifies
+    /// everything it touches: a retryable provider timeout becomes a configuration problem needing
+    /// a human, and a cancellation stops answering `true` to [`Self::is_cancelled`] — the one test
+    /// the [cancellation contract](../../../Docs/Cancellation_Contract.md) permits. It also drops
+    /// the original error entirely, leaving nothing in the `source` chain.
+    ///
+    /// [`Self::Cancelled`] is returned untouched. Its reason is a fixed vocabulary that attribution
+    /// reads back; prefixing it with prose would turn the reason into free text.
+    #[must_use]
+    pub fn with_context(mut self, context: impl fmt::Display) -> Self {
+        match &mut self {
+            Self::Config { message, .. }
+            | Self::Caller { message, .. }
+            | Self::Provider { message, .. }
+            | Self::Tool { message, .. }
+            | Self::Sandbox { message, .. }
+            | Self::Session { message, .. }
+            | Self::Protocol { message, .. }
+            | Self::Budget { message, .. }
+            | Self::Guardrail { message, .. } => *message = format!("{context}: {message}"),
+            Self::Cancelled { .. } => {}
+        }
+        self
+    }
+
     /// Attaches an underlying error source. Calling this on a variant that carries no source
     /// (`Budget`, `Guardrail`, `Cancelled`) is a no-op.
     #[must_use]

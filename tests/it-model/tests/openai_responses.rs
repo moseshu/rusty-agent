@@ -12,12 +12,14 @@ use ra_core::{
         Effort, Model, ModelHandoffDefinition, ModelProvider, ModelRequest, ModelSettings,
         ModelStreamEvent, ModelToolDefinition, ProviderKey, ToolChoice,
     },
+    prompt::{CachePlan, ContentHash},
     tool::{ObservationMetadata, ToolOutput, ToolOutputBlock, Truncation, TruncationStage},
 };
 use ra_model::openai::{
     auth::OpenAiAuth,
     responses::{OpenAiResponsesModel, OpenAiResponsesProvider},
 };
+use ra_model::provider::quirks::ProviderQuirks;
 use serde_json::{Map, Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -82,6 +84,15 @@ fn success_payload() -> Value {
 }
 
 async fn mounted_model(server: &MockServer, template: ResponseTemplate) -> OpenAiResponsesModel {
+    mounted_model_with_quirks(server, template, ProviderQuirks::new()).await
+}
+
+/// A model whose endpoint has declared the capabilities under test.
+async fn mounted_model_with_quirks(
+    server: &MockServer,
+    template: ResponseTemplate,
+    quirks: ProviderQuirks,
+) -> OpenAiResponsesModel {
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .and(header("authorization", "Bearer test-secret"))
@@ -97,16 +108,18 @@ async fn mounted_model(server: &MockServer, template: ResponseTemplate) -> OpenA
             .with_default_header("x-client-default", "present"),
     )
     .expect("mock model should build")
+    .with_quirks(quirks)
 }
 
 #[tokio::test]
 async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
     let server = MockServer::start().await;
-    let model = mounted_model(
+    let model = mounted_model_with_quirks(
         &server,
         ResponseTemplate::new(200)
             .insert_header("x-request-id", "req_123")
             .set_body_json(success_payload()),
+        ProviderQuirks::new().with_prompt_cache_key(true),
     )
     .await;
 
@@ -151,6 +164,10 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
     ];
     let request = ModelRequest::new(input, resolved(settings))
         .with_system_instructions("stable instructions")
+        .with_cache_plan(
+            CachePlan::new(ContentHash::compute("stable instructions"))
+                .with_cache_scope("thread_123"),
+        )
         .with_previous_response_id("resp_previous")
         .with_tools(vec![
             ModelToolDefinition::new("lookup", json!({"type": "object"}))
@@ -206,6 +223,11 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
         serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["instructions"], "stable instructions");
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "this fixture's instructions and single tool are far below the caching floor, so the \
+         declared capability alone does not put a key on the wire"
+    );
     assert_eq!(body["previous_response_id"], "resp_previous");
     assert!(body.get("conversation").is_none());
     assert_eq!(body["service_tier"], "flex");
@@ -831,5 +853,230 @@ async fn test_openai_responses_04() {
             .await
             .expect("wiremock should answer")
             .is_empty()
+    );
+}
+
+/// An endpoint that has not declared the capability receives no `prompt_cache_key`.
+///
+/// Responses accepts the field, but whether *this* endpoint honours it follows from which vendor
+/// answers, not from the wire format: a compatible gateway behind a custom base URL speaks the same
+/// protocol and may reject it. The scope is still carried and validated — it simply is not sent.
+#[tokio::test]
+async fn a_cache_scope_is_not_lowered_to_an_endpoint_that_did_not_declare_support() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+    )
+    .await;
+
+    let request = ModelRequest::new(
+        vec![ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::text("hello")],
+        ))],
+        resolved(ModelSettings::new()),
+    )
+    .with_system_instructions("stable instructions")
+    .with_cache_plan(
+        CachePlan::new(ContentHash::compute("stable instructions")).with_cache_scope("thread_123"),
+    );
+
+    model
+        .get_response(request)
+        .await
+        .expect("an undeclarable cache scope must not fail the request");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
+    assert_eq!(body["instructions"], "stable instructions");
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "an endpoint that may reject the field must not be sent it"
+    );
+}
+
+/// A plan whose hash does not name the instructions being sent fails before the call is paid for.
+///
+/// The hash is the plan's only claim about what it applies to. A plan naming other bytes would have
+/// every later cache decision reasoning about a prefix this request never contained.
+#[tokio::test]
+async fn a_cache_plan_naming_other_bytes_fails_the_request() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+    )
+    .await;
+
+    let request = ModelRequest::new(
+        vec![ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::text("hello")],
+        ))],
+        resolved(ModelSettings::new()),
+    )
+    .with_system_instructions("stable instructions")
+    .with_cache_plan(CachePlan::new(ContentHash::compute(
+        "different instructions",
+    )));
+
+    let err = model
+        .get_response(request)
+        .await
+        .expect_err("a plan naming other bytes must not be sent");
+    assert!(
+        err.to_string().contains("cache plan"),
+        "the error must point at the plan: {err}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "the request must fail before it is paid for"
+    );
+}
+
+/// A static `extra_body` cache key is rejected rather than silently winning or losing.
+///
+/// `extra_body` is provider *registration* data, shared by every run of that provider, while a
+/// cache scope has a session lifetime. A key placed there routes every run onto one bucket — which
+/// reads as configured caching while defeating the very scoping it appears to configure. Failing
+/// names the conflict at the one moment someone can fix it.
+#[tokio::test]
+async fn a_static_extra_body_cache_key_is_rejected() {
+    let server = MockServer::start().await;
+    let model = mounted_model_with_quirks(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+        ProviderQuirks::new().with_prompt_cache_key(true),
+    )
+    .await;
+
+    let extra_body = Map::from_iter([("prompt_cache_key".to_owned(), json!("static_key"))]);
+    let settings = ModelSettings::new()
+        .with_extra_body(ProviderKey::new("openai"), extra_body.into_iter().collect());
+
+    let request = ModelRequest::new(
+        vec![ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::text("hello")],
+        ))],
+        resolved(settings),
+    )
+    .with_system_instructions("stable instructions")
+    .with_cache_plan(
+        CachePlan::new(ContentHash::compute("stable instructions")).with_cache_scope("run-7"),
+    );
+
+    let err = model
+        .get_response(request)
+        .await
+        .expect_err("a static cache key must not silently replace the run scope");
+    assert!(
+        err.to_string().contains("prompt_cache_key"),
+        "the error must name the offending field: {err}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "the conflict must be reported before the request is paid for"
+    );
+}
+
+/// Hosted tools from `extra_body` count toward the caching floor, exactly as neutral ones do.
+///
+/// This is the case no earlier layer can decide. Hosted tools — web search, file search, hosted MCP
+/// — have no protocol-neutral representation and arrive only through `extra_body`, so preparation
+/// cannot see them. A short instruction block in front of a large hosted-tool table is well past
+/// the floor, and measuring before the merge would silently deny it the discount.
+#[tokio::test]
+async fn hosted_tools_count_toward_the_caching_floor() {
+    let server = MockServer::start().await;
+    let model = mounted_model_with_quirks(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+        ProviderQuirks::new().with_prompt_cache_key(true),
+    )
+    .await;
+
+    // One large hosted tool, declared the only way hosted tools can be declared.
+    let hosted = json!([{
+        "type": "mcp",
+        "name": "hosted_search",
+        "description": "x".repeat(8_000),
+    }]);
+    let extra_body = Map::from_iter([("tools".to_owned(), hosted)]);
+    let settings = ModelSettings::new()
+        .with_extra_body(ProviderKey::new("openai"), extra_body.into_iter().collect());
+
+    let short_instructions = "Be helpful.";
+    let request = ModelRequest::new(
+        vec![ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::text("hello")],
+        ))],
+        resolved(settings),
+    )
+    .with_system_instructions(short_instructions)
+    .with_cache_plan(
+        CachePlan::new(ContentHash::compute(short_instructions)).with_cache_scope("run-7"),
+    );
+
+    model
+        .get_response(request)
+        .await
+        .expect("the request must be sent");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
+    assert_eq!(
+        body["prompt_cache_key"], "run-7",
+        "the hosted tool table puts the cached prefix past the floor, so the scope is sent"
+    );
+}
+
+/// A short prefix with nothing else in front of it is not worth a cache key.
+#[tokio::test]
+async fn a_short_span_with_no_tool_table_gets_no_cache_key() {
+    let server = MockServer::start().await;
+    let model = mounted_model_with_quirks(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+        ProviderQuirks::new().with_prompt_cache_key(true),
+    )
+    .await;
+
+    let short_instructions = "Be helpful.";
+    let request = ModelRequest::new(
+        vec![ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::text("hello")],
+        ))],
+        resolved(ModelSettings::new()),
+    )
+    .with_system_instructions(short_instructions)
+    .with_cache_plan(
+        CachePlan::new(ContentHash::compute(short_instructions)).with_cache_scope("run-7"),
+    );
+
+    model
+        .get_response(request)
+        .await
+        .expect("the request must be sent");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "no provider caches a span this short, so asking buys nothing"
     );
 }

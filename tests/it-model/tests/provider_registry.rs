@@ -81,7 +81,7 @@ fn registration(
     protocol: ApiProtocol,
     provider: Arc<FakeProvider>,
 ) -> ProviderRegistration {
-    ProviderRegistration::new(ProviderKey::new(key), protocol, move || {
+    ProviderRegistration::new(ProviderKey::new(key), protocol, move |_quirks| {
         Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)
     })
 }
@@ -260,7 +260,7 @@ fn test_provider_registry_05() {
     let registered = ProviderRegistration::new(
         ProviderKey::new("lazy"),
         ApiProtocol::OpenAiResponses,
-        move || {
+        move |_quirks| {
             factory_creates.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::clone(&factory_provider) as Arc<dyn ModelProvider>)
         },

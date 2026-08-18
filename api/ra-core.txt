@@ -1,16 +1,19 @@
 # ra-core 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_core::agent::AgentInstructions::resolve(& self, context : & RunContext) -> Result < ResolvedInstructions >
 async fn ra_core::agent::ToolUseBehaviorHandler::should_stop(& self, tool_results : & [ToolUseResult]) -> Result < bool >
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
 async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
+async fn ra_core::prompt::DynamicPromptHandler::resolve(& self, context : & RunContext) -> Result < ResolvedPrompt >
 async fn ra_core::tool::Tool::call(& self, context : ToolContext < '_ >) -> Result < ToolOutput >
 async fn ra_core::tool::Tool::handle_failure(& self, _context : & ToolContext < '_ >, _error : & crate :: error :: Error) -> Result < Option < ToolOutput > >
 async fn ra_core::tool::Tool::is_enabled(& self, _context : & RunContext) -> Result < bool >
 async fn ra_core::tool::Tool::needs_approval(& self, _context : & ToolContext < '_ >) -> Result < bool >
 async fn ra_core::tool::Tool::resource_claims(& self, _context : & ToolContext < '_ >) -> Result < Vec < ResourceClaim > >
+const fn ra_core::agent::AgentInstructions::is_dynamic(& self) -> bool
 const fn ra_core::agent::AgentSpec::id(& self) -> & AgentId
 const fn ra_core::agent::AgentSpec::instructions(& self) -> Option < & AgentInstructions >
 const fn ra_core::agent::AgentSpec::model_settings(& self) -> & ModelSettings
@@ -289,6 +292,7 @@ const fn ra_core::model::request::ModelHandoffDefinition::with_strict(mut self, 
 const fn ra_core::model::request::ModelOutputSchema::schema(& self) -> & Value
 const fn ra_core::model::request::ModelOutputSchema::strict(& self) -> bool
 const fn ra_core::model::request::ModelOutputSchema::with_strict(mut self, strict : bool) -> Self
+const fn ra_core::model::request::ModelRequest::cache_plan(& self) -> Option < & CachePlan >
 const fn ra_core::model::request::ModelRequest::continuation(& self) -> & ConversationContinuation
 const fn ra_core::model::request::ModelRequest::model_settings(& self) -> & ResolvedModelSettings
 const fn ra_core::model::request::ModelRequest::output_schema(& self) -> Option < & ModelOutputSchema >
@@ -383,6 +387,25 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::prompt::CachePlan::new(prefix_hash : ContentHash) -> Self
+const fn ra_core::prompt::CachePlan::prefix_hash(& self) -> & ContentHash
+const fn ra_core::prompt::PromptProvenance::content_hash(& self) -> & ContentHash
+const fn ra_core::prompt::PromptProvenance::source(& self) -> & PromptSource
+const fn ra_core::prompt::PromptRole::is_one_off(& self) -> bool
+const fn ra_core::prompt::PromptRole::is_read_only(& self) -> bool
+const fn ra_core::prompt::PromptSection::content_hash(& self) -> & ContentHash
+const fn ra_core::prompt::PromptSection::name(& self) -> & PromptSectionName
+const fn ra_core::prompt::PromptSection::position(& self) -> SectionPosition
+const fn ra_core::prompt::PromptSection::source(& self) -> & PromptSource
+const fn ra_core::prompt::PromptSection::stability(& self) -> SectionStability
+const fn ra_core::prompt::PromptSection::token_estimate(& self) -> usize
+const fn ra_core::prompt::PromptSectionName::from_static(name : & 'static str) -> Self
+const fn ra_core::prompt::ResolvedPrompt::content_hash(& self) -> & ContentHash
+const fn ra_core::prompt::ResolvedPrompt::source(& self) -> & PromptSource
+const fn ra_core::prompt::SectionPosition::is_prefix(& self) -> bool
+const fn ra_core::prompt::SectionPosition::is_tail_message(& self) -> bool
+const fn ra_core::prompt::SectionStability::is_stable(& self) -> bool
+const fn ra_core::prompt::SectionStability::is_volatile(& self) -> bool
 const fn ra_core::state::run::EventSeqAllocator::run_id(& self) -> & RunId
 const fn ra_core::state::run::GraphCursor::unknown(& self) -> & Unknown
 const fn ra_core::state::run::NestedRunRef::call_id(& self) -> & CallId
@@ -577,6 +600,16 @@ const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersio
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
+const ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS: usize
+const ra_core::prompt::PromptSectionName::CONTEXT_DURABILITY: Self
+const ra_core::prompt::PromptSectionName::CORE_BEHAVIOR: Self
+const ra_core::prompt::PromptSectionName::DYNAMIC_INSTRUCTIONS: Self
+const ra_core::prompt::PromptSectionName::EDITING_VERIFICATION: Self
+const ra_core::prompt::PromptSectionName::FINAL_ANSWER: Self
+const ra_core::prompt::PromptSectionName::PERSONALITY: Self
+const ra_core::prompt::PromptSectionName::ROLE: Self
+const ra_core::prompt::PromptSectionName::SAFETY: Self
+const ra_core::prompt::PromptSectionName::TOOL_USE: Self
 const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_failure::TOOL_FAILURE_RECENT_LIMIT: usize
 const ra_core::state::tool_failure::TOOL_FAILURE_SCHEMA_VERSION: SchemaVersion
@@ -623,6 +656,7 @@ const ra_core::trace::field::USAGE_INPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_OUTPUT_TOKENS: & str
 const ra_core::trace::field::USAGE_REASONING_TOKENS: & str
 const ra_core::usage::USAGE_SCHEMA_VERSION: SchemaVersion
+enum ra_core::agent::ResolvedInstructions
 enum ra_core::agent::ToolUseBehavior
 enum ra_core::cancel::CancelReason
 enum ra_core::cancel::ScopeKind
@@ -671,6 +705,10 @@ enum ra_core::model::settings::Effort
 enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
 enum ra_core::model::stream::ModelStreamEvent
+enum ra_core::prompt::PromptRole
+enum ra_core::prompt::PromptSource
+enum ra_core::prompt::SectionPosition
+enum ra_core::prompt::SectionStability
 enum ra_core::state::tool_use::ToolUse
 enum ra_core::step::NextStep
 enum ra_core::tool::context::ToolCaller
@@ -688,6 +726,8 @@ enum ra_core::tool::resource::ResourceKind
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::agent::AgentInstructions::as_static(& self) -> Option < & str >
+fn ra_core::agent::AgentInstructions::dynamic(handler : Arc < dyn DynamicPromptHandler >) -> Self
+fn ra_core::agent::AgentInstructions::dynamic_fn< F , Fut >(f : F) -> Self where F : Fn (& RunContext) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < ResolvedPrompt > > + Send + 'static ,
 fn ra_core::agent::AgentInstructions::static_text(text : impl Into < String >) -> Self
 fn ra_core::agent::AgentSpec::builder() -> AgentSpecBuilder
 fn ra_core::agent::AgentSpec::model(& self) -> Option < & str >
@@ -698,6 +738,8 @@ fn ra_core::agent::AgentSpecBuilder::build(self) -> Result < Arc < AgentSpec > >
 fn ra_core::agent::AgentSpecBuilder::clear_instructions(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_model(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_tools(mut self) -> Self
+fn ra_core::agent::AgentSpecBuilder::dynamic_instructions(mut self, handler : Arc < dyn DynamicPromptHandler >) -> Self
+fn ra_core::agent::AgentSpecBuilder::dynamic_instructions_fn< F , Fut >(mut self, f : F) -> Self where F : Fn (& RunContext) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < ResolvedPrompt > > + Send + 'static ,
 fn ra_core::agent::AgentSpecBuilder::id(mut self, id : AgentId) -> Self
 fn ra_core::agent::AgentSpecBuilder::instructions(mut self, instructions : impl Into < String >) -> Self
 fn ra_core::agent::AgentSpecBuilder::model(mut self, model : impl Into < String >) -> Self
@@ -707,6 +749,7 @@ fn ra_core::agent::AgentSpecBuilder::new() -> Self
 fn ra_core::agent::AgentSpecBuilder::tool(mut self, tool : Arc < dyn Tool >) -> Self
 fn ra_core::agent::AgentSpecBuilder::tool_use_behavior(mut self, tool_use_behavior : ToolUseBehavior) -> Self
 fn ra_core::agent::AgentSpecBuilder::tools(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
+fn ra_core::agent::AgentSpecBuilder::with_instructions(mut self, instructions : AgentInstructions) -> Self
 fn ra_core::agent::ToolUseBehavior::custom(handler : Arc < dyn ToolUseBehaviorHandler >) -> Self
 fn ra_core::agent::ToolUseBehavior::stop_at_tools(names : impl IntoIterator < Item = impl Into < String > >) -> Self
 fn ra_core::agent::ToolUseResult::new(tool : ToolOrigin, output : ToolCallOutput) -> Self
@@ -775,6 +818,7 @@ fn ra_core::error::Error::sandbox(kind : SandboxErrorKind, message : impl Into <
 fn ra_core::error::Error::session(kind : SessionErrorKind, message : impl Into < String >) -> Self
 fn ra_core::error::Error::tool(kind : ToolErrorKind, tool : impl Into < String >, message : impl Into < String >) -> Self
 fn ra_core::error::Error::user_message(& self) -> String
+fn ra_core::error::Error::with_context(mut self, context : impl fmt :: Display) -> Self
 fn ra_core::error::Error::with_source(mut self, src : impl Into < BoxError >) -> Self
 fn ra_core::event::HostEvent::allocate(allocator : & EventSeqAllocator, agent_id : AgentId, body : HostEventBody) -> Result < Self >
 fn ra_core::event::HostEventEmitter::emit(& self, body : impl Into < HostEventBody >) -> Result < u64 >
@@ -965,6 +1009,8 @@ fn ra_core::model::request::ModelRequest::input(& self) -> & [ModelInputItem]
 fn ra_core::model::request::ModelRequest::new(input : Vec < ModelInputItem >, model_settings : ResolvedModelSettings) -> Self
 fn ra_core::model::request::ModelRequest::system_instructions(& self) -> Option < & str >
 fn ra_core::model::request::ModelRequest::tools(& self) -> & [ModelToolDefinition]
+fn ra_core::model::request::ModelRequest::validate_cache_plan(& self) -> Result < () >
+fn ra_core::model::request::ModelRequest::with_cache_plan(mut self, cache_plan : CachePlan) -> Self
 fn ra_core::model::request::ModelRequest::with_continuation(mut self, continuation : ConversationContinuation) -> Self
 fn ra_core::model::request::ModelRequest::with_conversation_id(mut self, conversation_id : impl Into < String >) -> Self
 fn ra_core::model::request::ModelRequest::with_handoffs(mut self, handoffs : Vec < ModelHandoffDefinition >) -> Self
@@ -1008,6 +1054,34 @@ fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_t
 fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
+fn ra_core::prompt::CachePlan::cache_scope(& self) -> Option < & str >
+fn ra_core::prompt::CachePlan::for_prefix(prefix : & str, cache_scope : Option < & str >) -> Self
+fn ra_core::prompt::CachePlan::with_cache_scope(mut self, scope : impl Into < String >) -> Self
+fn ra_core::prompt::ContentHash::as_str(& self) -> & str
+fn ra_core::prompt::ContentHash::compute(data : impl AsRef < [u8] >) -> Self
+fn ra_core::prompt::ContentHash::from_hex(hex : impl Into < String >) -> Result < Self >
+fn ra_core::prompt::PromptProvenance::provenance(& self) -> Option < & str >
+fn ra_core::prompt::PromptProvenance::version(& self) -> Option < & str >
+fn ra_core::prompt::PromptRole::role_name(& self) -> & str
+fn ra_core::prompt::PromptSection::content(& self) -> & str
+fn ra_core::prompt::PromptSection::new(name : impl Into < PromptSectionName >, purpose : impl Into < String >, source : PromptSource, stability : SectionStability, position : SectionPosition, content : impl Into < String >) -> Result < Self >
+fn ra_core::prompt::PromptSection::purpose(& self) -> & str
+fn ra_core::prompt::PromptSection::with_token_estimate(mut self, estimate : usize) -> Self
+fn ra_core::prompt::PromptSectionName::as_str(& self) -> & str
+fn ra_core::prompt::PromptSectionName::new(name : impl Into < Cow < 'static , str > >) -> Self
+fn ra_core::prompt::ResolvedPrompt::lower(& self) -> Result < (Vec < ModelInputItem > , PromptProvenance) >
+fn ra_core::prompt::ResolvedPrompt::lower_to_tail_items(& self) -> Result < Vec < ModelInputItem > >
+fn ra_core::prompt::ResolvedPrompt::new(text : impl Into < String >, source : PromptSource) -> Self
+fn ra_core::prompt::ResolvedPrompt::provenance(& self) -> Option < & str >
+fn ra_core::prompt::ResolvedPrompt::provenance_record(& self) -> Result < PromptProvenance >
+fn ra_core::prompt::ResolvedPrompt::sections(& self) -> & [PromptSection]
+fn ra_core::prompt::ResolvedPrompt::text(& self) -> & str
+fn ra_core::prompt::ResolvedPrompt::version(& self) -> Option < & str >
+fn ra_core::prompt::ResolvedPrompt::volatile_tail_sections(& self) -> Result < Vec < PromptSection > >
+fn ra_core::prompt::ResolvedPrompt::with_provenance(mut self, provenance : impl Into < String >) -> Self
+fn ra_core::prompt::ResolvedPrompt::with_sections(mut self, sections : Vec < PromptSection >) -> Self
+fn ra_core::prompt::ResolvedPrompt::with_version(mut self, version : impl Into < String >) -> Self
+fn ra_core::prompt::estimate_tokens(text : & str) -> usize
 fn ra_core::state::run::EventSeqAllocator::allocate(& self) -> Result < u64 >
 fn ra_core::state::run::EventSeqAllocator::current_next(& self) -> u64
 fn ra_core::state::run::GraphCursor::edge_id(& self) -> Option < & str >
@@ -1364,6 +1438,12 @@ struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
+struct ra_core::prompt::CachePlan
+struct ra_core::prompt::ContentHash
+struct ra_core::prompt::PromptProvenance
+struct ra_core::prompt::PromptSection
+struct ra_core::prompt::PromptSectionName
+struct ra_core::prompt::ResolvedPrompt
 struct ra_core::state::run::EventSeqAllocator
 struct ra_core::state::run::GraphCursor
 struct ra_core::state::run::NestedRunRef
@@ -1413,6 +1493,7 @@ trait ra_core::event::sink::HostEventSink
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
+trait ra_core::prompt::DynamicPromptHandler
 trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
 trait ra_core::tool::schema::ToolInput
@@ -1421,6 +1502,8 @@ type ra_core::error::BoxError
 type ra_core::error::Result
 type ra_core::model::ModelStream
 type ra_core::model::settings::JsonMap
+variant ra_core::agent::ResolvedInstructions::Generated(ResolvedPrompt)
+variant ra_core::agent::ResolvedInstructions::Prefix(String)
 variant ra_core::agent::ToolUseBehavior::Custom(Arc < dyn ToolUseBehaviorHandler >)
 variant ra_core::agent::ToolUseBehavior::RunLlmAgain
 variant ra_core::agent::ToolUseBehavior::StopAtTools { names: BTreeSet < String > }
@@ -1635,6 +1718,21 @@ variant ra_core::model::settings::ToolChoice::Required
 variant ra_core::model::settings::ToolChoice::Tool(String)
 variant ra_core::model::stream::ModelStreamEvent::RawResponse(RawResponseEvent)
 variant ra_core::model::stream::ModelStreamEvent::RunItem(RunItemStreamEvent)
+variant ra_core::prompt::PromptRole::Coordinator
+variant ra_core::prompt::PromptRole::Custom(Cow < 'static , str >)
+variant ra_core::prompt::PromptRole::Main
+variant ra_core::prompt::PromptRole::OneOffAnswer
+variant ra_core::prompt::PromptRole::Planner
+variant ra_core::prompt::PromptRole::ReadOnlySpecialist
+variant ra_core::prompt::PromptSource::Agent
+variant ra_core::prompt::PromptSource::Builtin
+variant ra_core::prompt::PromptSource::Capability(String)
+variant ra_core::prompt::PromptSource::Custom(Cow < 'static , str >)
+variant ra_core::prompt::PromptSource::Dynamic(String)
+variant ra_core::prompt::SectionPosition::Prefix
+variant ra_core::prompt::SectionPosition::TailMessage
+variant ra_core::prompt::SectionStability::Stable
+variant ra_core::prompt::SectionStability::Volatile
 variant ra_core::state::tool_use::ToolUse::Handoff(AgentId)
 variant ra_core::state::tool_use::ToolUse::Mcp { server: String, tool_name: String }
 variant ra_core::state::tool_use::ToolUse::Tool(ToolLookupKey)

@@ -17,6 +17,7 @@ use ra_core::{
 };
 
 use super::auth::OpenAiAuth;
+use crate::provider::quirks::ProviderQuirks;
 
 pub(crate) mod cache;
 pub(crate) mod convert;
@@ -28,6 +29,7 @@ pub struct OpenAiResponsesProvider {
     auth: Arc<OpenAiAuth>,
     client: reqwest::Client,
     default_model: String,
+    quirks: ProviderQuirks,
     models: Mutex<BTreeMap<String, Arc<dyn Model>>>,
 }
 
@@ -46,8 +48,20 @@ impl OpenAiResponsesProvider {
             auth: Arc::new(auth),
             client,
             default_model,
+            quirks: ProviderQuirks::new(),
             models: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Declares the endpoint capabilities this provider may use.
+    ///
+    /// A registry passes the registration's declaration here. Constructed directly, the default is
+    /// every capability off, so a provider pointed at an unknown gateway sends nothing beyond what
+    /// the protocol itself defines.
+    #[must_use]
+    pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
+        self.quirks = quirks;
+        self
     }
 
     /// Default provider-facing model identifier.
@@ -89,6 +103,7 @@ impl ModelProvider for OpenAiResponsesProvider {
             model_name.to_owned(),
             Arc::clone(&self.auth),
             self.client.clone(),
+            self.quirks,
         ));
         models.insert(model_name.to_owned(), Arc::clone(&model));
         Ok(model)
@@ -101,6 +116,7 @@ pub struct OpenAiResponsesModel {
     model: String,
     auth: Arc<OpenAiAuth>,
     client: reqwest::Client,
+    quirks: ProviderQuirks,
 }
 
 impl OpenAiResponsesModel {
@@ -114,14 +130,32 @@ impl OpenAiResponsesModel {
         let client = reqwest::Client::builder()
             .build()
             .map_err(super::error::transport_error)?;
-        Ok(Self::from_parts(model, Arc::new(auth), client))
+        Ok(Self::from_parts(
+            model,
+            Arc::new(auth),
+            client,
+            ProviderQuirks::new(),
+        ))
     }
 
-    fn from_parts(model: String, auth: Arc<OpenAiAuth>, client: reqwest::Client) -> Self {
+    /// Declares the endpoint capabilities this model may use.
+    #[must_use]
+    pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
+        self.quirks = quirks;
+        self
+    }
+
+    fn from_parts(
+        model: String,
+        auth: Arc<OpenAiAuth>,
+        client: reqwest::Client,
+        quirks: ProviderQuirks,
+    ) -> Self {
         Self {
             model,
             auth,
             client,
+            quirks,
         }
     }
 
@@ -132,7 +166,7 @@ impl OpenAiResponsesModel {
     }
 
     async fn fetch(&self, request: ModelRequest) -> Result<convert::ConvertedResponse> {
-        let body = request::build_request_body(&self.model, &request).await?;
+        let body = request::build_request_body(&self.model, &request, self.quirks).await?;
         let mut http_request = self
             .client
             .post(format!("{}/responses", self.auth.base_url()))

@@ -11,17 +11,32 @@
 //! contracts exist. Private fields and the non-exhaustive public types let those additions remain
 //! source compatible; placeholder strings would freeze the wrong identities and callback shapes.
 
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
 
 use crate::{
+    context::RunContext,
     error::{Error, Result},
     item::{CallId, ToolCallOutput},
     model::ModelSettings,
+    prompt::{DynamicPromptHandler, ResolvedPrompt},
     tool::{Tool, ToolOrigin},
 };
 use async_trait::async_trait;
 
 pub use crate::item::AgentId;
+
+struct DynamicPromptFn<F>(F);
+
+#[async_trait]
+impl<F, Fut> DynamicPromptHandler for DynamicPromptFn<F>
+where
+    F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ResolvedPrompt>> + Send + 'static,
+{
+    async fn resolve(&self, context: &RunContext) -> Result<ResolvedPrompt> {
+        (self.0)(context).await
+    }
+}
 
 /// One function-tool result that a [`ToolUseBehavior`] may inspect.
 ///
@@ -125,12 +140,12 @@ pub enum ToolUseBehavior {
         /// Bare model-facing or qualified tool names that end the run.
         names: BTreeSet<String>,
     },
-    /// Let application policy inspect every result before deciding.
+    /// Delegate the stopping decision to custom asynchronous logic.
     Custom(Arc<dyn ToolUseBehaviorHandler>),
 }
 
 impl ToolUseBehavior {
-    /// Creates a name-matching stop policy.
+    /// Creates a stop policy that matches any of the designated tool names.
     #[must_use]
     pub fn stop_at_tools(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self::StopAtTools {
@@ -159,11 +174,31 @@ impl fmt::Debug for ToolUseBehavior {
     }
 }
 
+/// What an agent's instructions resolved to, tagged with the one placement each may occupy.
+///
+/// The tag is the whole point of the type. A [`ResolvedPrompt`] lowers to volatile tail messages,
+/// while static agent text belongs in the cached prefix; returning one type for both made the
+/// wrong placement a plain function call away — resolving a static agent and lowering the result
+/// put the entire system constitution into a user message, with nothing about the value saying it
+/// had ever been anything else. Every value of this enum names where it goes, so a caller that
+/// ignores the distinction no longer compiles.
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike most public types here. A third placement would
+/// not be an additive detail a consumer may ignore — it would be a new position in the model
+/// request, and a `_` arm silently sending it to whichever slot the arm happened to pick is the
+/// failure this type exists to prevent. Making that a breaking change is the honest encoding.
+#[derive(Clone, Debug)]
+pub enum ResolvedInstructions {
+    /// Static text, bound for the stable system-instruction prefix.
+    Prefix(String),
+    /// Generator output, bound for volatile tail messages.
+    Generated(ResolvedPrompt),
+}
+
 /// Instructions attached to an agent declaration.
 ///
-/// Only static instructions are supported today. The private representation deliberately leaves
-/// room for a future dynamic prompt source to be added without changing
-/// [`AgentSpec::instructions`] or exposing runtime context through the core type prematurely.
+/// Supports both static instruction text (for the stable prefix) and dynamic prompt generators
+/// that evaluate against runtime context.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct AgentInstructions {
@@ -173,6 +208,7 @@ pub struct AgentInstructions {
 #[derive(Clone)]
 enum InstructionSource {
     Static(String),
+    Dynamic(Arc<dyn DynamicPromptHandler>),
 }
 
 impl AgentInstructions {
@@ -184,11 +220,50 @@ impl AgentInstructions {
         }
     }
 
-    /// Returns the static text, or `None` for a future non-static source.
+    /// Creates dynamic instructions evaluated via a handler.
+    #[must_use]
+    pub fn dynamic(handler: Arc<dyn DynamicPromptHandler>) -> Self {
+        Self {
+            source: InstructionSource::Dynamic(handler),
+        }
+    }
+
+    /// Creates dynamic instructions from an asynchronous function.
+    pub fn dynamic_fn<F, Fut>(f: F) -> Self
+    where
+        F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResolvedPrompt>> + Send + 'static,
+    {
+        Self::dynamic(Arc::new(DynamicPromptFn(f)))
+    }
+
+    /// Returns the static text, or `None` for a dynamic source.
     #[must_use]
     pub fn as_static(&self) -> Option<&str> {
         match &self.source {
             InstructionSource::Static(text) => Some(text),
+            InstructionSource::Dynamic(_) => None,
+        }
+    }
+
+    /// Returns whether these instructions are generated dynamically.
+    #[must_use]
+    pub const fn is_dynamic(&self) -> bool {
+        matches!(&self.source, InstructionSource::Dynamic(_))
+    }
+
+    /// Resolves the instructions against the current run context, tagged with their placement.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever a dynamic generator returns, unchanged.
+    pub async fn resolve(&self, context: &RunContext) -> Result<ResolvedInstructions> {
+        match &self.source {
+            InstructionSource::Static(text) => Ok(ResolvedInstructions::Prefix(text.clone())),
+            InstructionSource::Dynamic(handler) => handler
+                .resolve(context)
+                .await
+                .map(ResolvedInstructions::Generated),
         }
     }
 
@@ -197,7 +272,7 @@ impl AgentInstructions {
             InstructionSource::Static(text) if text.is_empty() => {
                 Err(Error::config("agent instructions must not be empty"))
             }
-            InstructionSource::Static(_) => Ok(()),
+            InstructionSource::Static(_) | InstructionSource::Dynamic(_) => Ok(()),
         }
     }
 }
@@ -209,6 +284,10 @@ impl fmt::Debug for AgentInstructions {
                 .debug_struct("AgentInstructions")
                 .field("kind", &"static")
                 .field("bytes", &text.len())
+                .finish_non_exhaustive(),
+            InstructionSource::Dynamic(_) => formatter
+                .debug_struct("AgentInstructions")
+                .field("kind", &"dynamic")
                 .finish_non_exhaustive(),
         }
     }
@@ -356,6 +435,28 @@ impl AgentSpecBuilder {
     /// Sets static instructions.
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(AgentInstructions::static_text(instructions));
+        self
+    }
+
+    /// Sets dynamic instructions evaluated via a handler.
+    pub fn dynamic_instructions(mut self, handler: Arc<dyn DynamicPromptHandler>) -> Self {
+        self.instructions = Some(AgentInstructions::dynamic(handler));
+        self
+    }
+
+    /// Sets dynamic instructions from an asynchronous function.
+    pub fn dynamic_instructions_fn<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResolvedPrompt>> + Send + 'static,
+    {
+        self.instructions = Some(AgentInstructions::dynamic_fn(f));
+        self
+    }
+
+    /// Sets pre-constructed instructions.
+    pub fn with_instructions(mut self, instructions: AgentInstructions) -> Self {
+        self.instructions = Some(instructions);
         self
     }
 

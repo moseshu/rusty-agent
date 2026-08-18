@@ -2,12 +2,19 @@
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
 const fn ra_model::openai::auth::OpenAiAuth::default_headers(& self) -> & BTreeMap < String , String >
+const fn ra_model::openai::responses::OpenAiResponsesModel::with_quirks(mut self, quirks : ProviderQuirks) -> Self
+const fn ra_model::openai::responses::OpenAiResponsesProvider::with_quirks(mut self, quirks : ProviderQuirks) -> Self
 const fn ra_model::provider::ModelRegistration::defaults(& self) -> & ModelSettings
 const fn ra_model::provider::ProviderRegistration::defaults(& self) -> & ModelSettings
 const fn ra_model::provider::ProviderRegistration::key(& self) -> & ProviderKey
 const fn ra_model::provider::ProviderRegistration::protocol(& self) -> ApiProtocol
+const fn ra_model::provider::ProviderRegistration::quirks(& self) -> ProviderQuirks
+const fn ra_model::provider::ProviderRegistration::with_quirks(mut self, quirks : ProviderQuirks) -> Self
 const fn ra_model::provider::ProviderRegistry::default_provider(& self) -> & ProviderKey
 const fn ra_model::provider::ProviderRegistry::unknown_prefix_policy(& self) -> & UnknownPrefixPolicy
+const fn ra_model::provider::quirks::ProviderQuirks::new() -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::prompt_cache_key(self) -> bool
+const fn ra_model::provider::quirks::ProviderQuirks::with_prompt_cache_key(mut self, supported : bool) -> Self
 enum ra_model::provider::UnknownPrefixPolicy
 fn ra_model::openai::auth::OpenAiAuth::base_url(& self) -> & str
 fn ra_model::openai::auth::OpenAiAuth::new(api_key : impl Into < String >) -> Self
@@ -26,7 +33,7 @@ fn ra_model::provider::ModelRegistration::name(& self) -> & str
 fn ra_model::provider::ModelRegistration::new(name : impl Into < String >) -> Self
 fn ra_model::provider::ModelRegistration::with_alias(mut self, alias : impl Into < String >) -> Self
 fn ra_model::provider::ModelRegistration::with_defaults(mut self, defaults : ModelSettings) -> Self
-fn ra_model::provider::ProviderFactory::create(& self) -> Result < Arc < dyn ModelProvider > >
+fn ra_model::provider::ProviderFactory::create(& self, quirks : ProviderQuirks) -> Result < Arc < dyn ModelProvider > >
 fn ra_model::provider::ProviderRegistration::aliases(& self) -> & [String]
 fn ra_model::provider::ProviderRegistration::models(& self) -> & [ModelRegistration]
 fn ra_model::provider::ProviderRegistration::new(key : ProviderKey, protocol : ApiProtocol, factory : impl ProviderFactory) -> Self
@@ -56,6 +63,7 @@ mod ra_model::openai::chat
 mod ra_model::openai::responses
 mod ra_model::protocol
 mod ra_model::provider
+mod ra_model::provider::quirks
 mod ra_model::retry
 mod ra_model::usage
 struct ra_model::openai::auth::OpenAiAuth
@@ -65,6 +73,7 @@ struct ra_model::provider::ModelRegistration
 struct ra_model::provider::ProviderRegistration
 struct ra_model::provider::ProviderRegistry
 struct ra_model::provider::ProviderRegistryBuilder
+struct ra_model::provider::quirks::ProviderQuirks
 trait ra_model::provider::ProviderFactory
 variant ra_model::provider::UnknownPrefixPolicy::Error
 variant ra_model::provider::UnknownPrefixPolicy::ForwardTo(ProviderKey)
