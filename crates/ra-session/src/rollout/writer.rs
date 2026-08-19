@@ -960,10 +960,10 @@ impl RolloutRecord {
 /// - **It is one process's view.** It is replaced atomically, so a reader never sees a torn
 ///   document, but it may still be reading a snapshot the writer has already moved past.
 ///
-/// The authoritative usage ledger is the sequence of `model_usage` records in the rollout itself;
+/// The authoritative usage ledger is the sequence of `model_usage` records in the rollout itself.
 /// [`RolloutReader::scan_summary`](super::reader::RolloutReader::scan_summary) computes it, and
 /// while doing so holds every [`RolloutCheckpoint`] it passes to the records it claims to
-/// summarize.
+/// summarize — that full read, not this file, is what detects a tampered checkpoint.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutSidecar {
@@ -1235,6 +1235,19 @@ async fn checkpoint_seed(
     let sidecar: RolloutSidecar = serde_json::from_slice(&bytes).ok()?;
     let offset = sidecar.last_checkpoint_offset()?;
 
+    read_checkpoint_at(path, offset, session_id).await
+}
+
+/// Reads the checkpoint record starting at `offset`, or `None` if this session cannot use it.
+///
+/// Also the test recovery applies before adopting an offset as the index: writing back one that
+/// the fast path would refuse costs every later open a full scan and leaves the index unable to
+/// heal itself.
+async fn read_checkpoint_at(
+    path: &Path,
+    offset: u64,
+    session_id: &SessionId,
+) -> Option<CheckpointSeed> {
     let mut file = File::open(path).await.ok()?;
     let len = file.metadata().await.ok()?.len();
     if offset >= len {
@@ -1298,10 +1311,12 @@ impl RolloutWriter {
     ///
     /// **The fast path does not read the bytes before the checkpoint, so it cannot notice
     /// corruption there** — including a checkpoint whose own figures were edited in place, which
-    /// is believed here and caught by any full scan. Anything that skips reading cannot verify
-    /// what it skipped. [`RolloutReader::read_all`](super::reader::RolloutReader::read_all) and
-    /// [`RolloutReader::scan_summary`](super::reader::RolloutReader::scan_summary) remain the
-    /// authoritative checks.
+    /// is believed here. Anything that skips reading cannot verify what it skipped.
+    /// [`RolloutReader::scan_summary`](super::reader::RolloutReader::scan_summary) is the
+    /// authoritative check: it reads every record, parses every payload, and holds each
+    /// checkpoint to the records it summarizes.
+    /// [`RolloutReader::read_all`](super::reader::RolloutReader::read_all) is not — it validates
+    /// line-level envelopes only, leaving payloads unparsed and checkpoints unchecked.
     ///
     /// A crash can leave an unterminated fragment at the end of the file. Those bytes are dropped
     /// so that subsequent appends do not splice onto them — **only** the bytes the reader
@@ -1455,6 +1470,21 @@ impl RolloutWriter {
                 None => (Usage::default(), HashMap::new(), None, None),
             };
 
+        // A checkpoint newer than the one the index pointed at wins: the index can lag when a
+        // sidecar write fails, and keeping the stale offset would make every later resume re-read
+        // the same growing tail forever. It only wins if this session can use it, though —
+        // indexing a checkpoint the fast path will refuse pins recovery to a full scan for good.
+        let adopted_checkpoint_offset = match summary.last_checkpoint_offset() {
+            Some(scanned)
+                if read_checkpoint_at(path, scanned, session_id)
+                    .await
+                    .is_some() =>
+            {
+                Some(scanned)
+            }
+            _ => last_checkpoint_offset,
+        };
+
         usage_totals = usage_totals.accumulate(summary.usage_totals());
         for (run_id, seq) in summary.persisted_run_max_seq() {
             let entry = persisted_run_max_seq.entry(run_id.clone()).or_insert(0);
@@ -1472,10 +1502,7 @@ impl RolloutWriter {
             persisted_run_max_seq,
             usage_totals,
             file_len: end,
-            // A checkpoint newer than the one the index pointed at wins: the index can lag when a
-            // sidecar write fails, and keeping the stale offset would make every later resume
-            // re-read the same growing tail forever.
-            last_checkpoint_offset: summary.last_checkpoint_offset().or(last_checkpoint_offset),
+            last_checkpoint_offset: adopted_checkpoint_offset,
             // Carrying this over is what keeps the interval honest across restarts. Resetting it
             // to zero lets a process that stops just short of the interval start counting again,
             // so a session restarted often enough would never checkpoint at all.

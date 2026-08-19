@@ -150,6 +150,10 @@ impl RolloutReader {
     /// verbatim through [`RolloutRecord`], and [`RolloutRecord::payload`] reports the failure to
     /// whoever asks for a typed payload.
     ///
+    /// **This validates line-level envelopes only.** Payloads are left unparsed, so a record whose
+    /// contents are damaged still comes back here, and checkpoints are not held to the records
+    /// they summarize. [`RolloutReader::scan_summary`] is the check that does both.
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] if an I/O error occurs, or if a newline-terminated line is not valid
@@ -234,6 +238,7 @@ impl RolloutReader {
                                 &self.path,
                                 seq,
                                 &checkpoint,
+                                session_id.as_ref(),
                                 &usage_totals,
                                 &persisted_run_max_seq,
                             )?;
@@ -380,9 +385,28 @@ fn verify_checkpoint(
     path: &Path,
     timeline_seq: u64,
     checkpoint: &RolloutCheckpoint,
+    log_session_id: Option<&SessionId>,
     expected_usage: &Usage,
     expected_run_max_seq: &HashMap<RunId, u64>,
 ) -> Result<()> {
+    // Only checkable when the log states its own identity; a rollout without `session_meta` has
+    // nothing to contradict. Recovery covers that gap on its side by refusing to index a
+    // checkpoint it cannot use.
+    if let Some(log_session_id) = log_session_id
+        && checkpoint.session_id() != log_session_id
+    {
+        return Err(Error::session(
+            SessionErrorKind::Corrupted,
+            format!(
+                "rollout checkpoint at timeline_seq {timeline_seq} in {} names session {}, but \
+                 the log belongs to {}",
+                path.display(),
+                checkpoint.session_id().as_str(),
+                log_session_id.as_str()
+            ),
+        ));
+    }
+
     let found = checkpoint.usage_totals();
     let usage_matches = found.input_tokens() == expected_usage.input_tokens()
         && found.output_tokens() == expected_usage.output_tokens()

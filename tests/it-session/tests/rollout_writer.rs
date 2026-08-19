@@ -1740,6 +1740,193 @@ async fn test_rollout_writer_index_advances_past_a_stale_checkpoint_offset() {
     );
 }
 
+/// Tampering with only the checkpoint's identity, leaving its figures correct, used to leave the
+/// index permanently poisoned: the scan recorded the offset, recovery wrote it back, and the next
+/// open refused it again — a full scan forever, with nothing ever reported.
+///
+/// A log that states its own identity now contradicts the checkpoint outright. A log that does
+/// not is covered by recovery refusing to index a checkpoint it cannot use.
+#[tokio::test]
+async fn test_rollout_writer_does_not_index_an_unusable_checkpoint() {
+    let dir = temp_test_dir("checkpoint_identity_only_tamper");
+    let session_id = SessionId::new("sess-real");
+    let run_id = RunId::generate();
+    let file_path = dir.join("rollout-sess-real.jsonl");
+    let sidecar_path = dir.join("rollout-sess-real.jsonl.sidecar.json");
+
+    // No `session_meta` here on purpose: the log does not state its identity, so the checkpoint
+    // cannot be contradicted and only the indexing rule protects recovery.
+    let bad_offset;
+    let good_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        good_offset = writer.last_checkpoint_offset().unwrap();
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        bad_offset = writer.last_checkpoint_offset().unwrap();
+        writer.flush().await.unwrap();
+    }
+    assert_ne!(good_offset, bad_offset);
+
+    // Only the identity changes; the ledger stays truthful.
+    rewrite_line_at(&file_path, bad_offset, |record| {
+        assert_eq!(record["type"], json!("checkpoint"));
+        record["payload"]["session_id"] = json!("sess-other");
+    })
+    .await;
+
+    let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.usage_totals().input_tokens(),
+        40,
+        "the ledger must still be right"
+    );
+    assert_ne!(
+        writer.last_checkpoint_offset(),
+        Some(bad_offset),
+        "an offset the fast path will refuse must not be written back as the index"
+    );
+
+    // Recovery declining to index it is only half the requirement; the index also has to come
+    // back on its own. Writing on restores it at the next interval.
+    writer.set_checkpoint_interval(2);
+    for i in 0..2 {
+        writer
+            .append_item(RunItem::new(
+                ItemId::new(format!("heal-{i}")),
+                RunItemKind::Message(Message::user("heal")),
+            ))
+            .await
+            .unwrap();
+    }
+    let healed = writer
+        .last_checkpoint_offset()
+        .expect("a fresh checkpoint must restore the index");
+    assert_ne!(healed, bad_offset);
+    writer.flush().await.unwrap();
+    drop(writer);
+
+    let sidecar: RolloutSidecar =
+        serde_json::from_slice(&tokio::fs::read(&sidecar_path).await.unwrap()).unwrap();
+    assert_eq!(
+        sidecar.last_checkpoint_offset(),
+        Some(healed),
+        "the healed offset must reach the sidecar"
+    );
+
+    // And the next open uses it rather than scanning from the top again.
+    let reopened = RolloutWriter::open(&file_path, session_id).await.unwrap();
+    assert_eq!(reopened.last_checkpoint_offset(), Some(healed));
+    assert_eq!(reopened.usage_totals().input_tokens(), 40);
+}
+
+/// When the log does state its identity, a checkpoint naming another session is a contradiction
+/// inside the log and must be reported rather than silently skipped.
+#[tokio::test]
+async fn test_scan_catches_a_checkpoint_naming_another_session() {
+    let dir = temp_test_dir("checkpoint_identity_contradiction");
+    let session_id = SessionId::new("sess-real");
+    let run_id = RunId::generate();
+    let file_path = dir.join("rollout-sess-real.jsonl");
+
+    let checkpoint_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(3);
+        writer
+            .append_session_meta(RolloutSessionMeta::new(session_id.clone()))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        checkpoint_offset = writer.last_checkpoint_offset().unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    rewrite_line_at(&file_path, checkpoint_offset, |record| {
+        assert_eq!(record["type"], json!("checkpoint"));
+        record["payload"]["session_id"] = json!("sess-other");
+    })
+    .await;
+
+    let err = RolloutReader::open(&file_path)
+        .scan_summary()
+        .await
+        .expect_err("a checkpoint naming another session must be reported");
+    assert!(
+        matches!(
+            err,
+            Error::Session {
+                kind: SessionErrorKind::Corrupted,
+                ..
+            }
+        ) && err.to_string().contains("sess-other"),
+        "expected Corrupted naming the foreign session, got: {err}"
+    );
+}
+
+/// `read_all` checks envelopes; `scan_summary` checks meaning. The docs now say so, and this
+/// pins the difference.
+#[tokio::test]
+async fn test_read_all_validates_envelopes_while_scan_summary_validates_content() {
+    let dir = temp_test_dir("read_all_vs_scan_summary");
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    let checkpoint_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        checkpoint_offset = writer.last_checkpoint_offset().unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    rewrite_line_at(&file_path, checkpoint_offset, |record| {
+        record["payload"]["usage_totals"]["input_tokens"] = json!(777_777);
+    })
+    .await;
+
+    let reader = RolloutReader::open(&file_path);
+    assert!(
+        reader.read_all().await.is_ok(),
+        "read_all only validates envelopes, so it cannot be the authoritative check"
+    );
+    assert!(
+        reader.scan_summary().await.is_err(),
+        "scan_summary is the check that reads the contents"
+    );
+}
+
 #[tokio::test]
 async fn test_rollout_writer_path_traversal_rejection() {
     let dir = temp_test_dir("path_traversal");
