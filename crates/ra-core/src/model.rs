@@ -26,7 +26,7 @@ pub use protocol::{
 };
 pub use request::{
     ConversationContinuation, ModelHandoffDefinition, ModelOutputSchema, ModelRequest,
-    ModelToolDefinition, ModelTracing,
+    ModelToolDefinition, ModelTracing, ProviderConversationId,
 };
 pub use resolution::{ModelSelector, ResolvedModel};
 pub use retry::{

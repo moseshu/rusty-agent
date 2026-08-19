@@ -51,23 +51,7 @@ pub(crate) async fn build_request_body(
             Value::String(instructions.to_owned()),
         );
     }
-    match request.continuation() {
-        ConversationContinuation::None => {}
-        ConversationContinuation::PreviousResponseId(id) => {
-            body.insert("previous_response_id".to_owned(), Value::String(id.clone()));
-            body.remove("conversation");
-        }
-        ConversationContinuation::ConversationId(id) => {
-            body.insert("conversation".to_owned(), Value::String(id.clone()));
-            body.remove("previous_response_id");
-        }
-        _ => {
-            return Err(Error::caller(
-                "unsupported server continuation for OpenAI Responses",
-            ));
-        }
-    }
-    resolve_store(&mut body, request.continuation())?;
+    apply_continuation(&mut body, request.continuation())?;
 
     insert_optional_number(
         &mut body,
@@ -178,6 +162,33 @@ fn stable_span_tokens(body: &Map<String, Value>, request: &ModelRequest) -> usiz
         serde_json::to_string(tools).map_or(0, |wire| estimate_tokens(&wire))
     });
     instructions + tools
+}
+
+/// Applies server-side conversation continuation parameters to the request body.
+fn apply_continuation(
+    body: &mut Map<String, Value>,
+    continuation: &ConversationContinuation,
+) -> Result<()> {
+    match continuation {
+        ConversationContinuation::None => {}
+        ConversationContinuation::PreviousResponseId(id) => {
+            body.insert("previous_response_id".to_owned(), Value::String(id.clone()));
+            body.remove("conversation");
+        }
+        ConversationContinuation::ConversationId(id) => {
+            body.insert(
+                "conversation".to_owned(),
+                Value::String(id.as_str().to_owned()),
+            );
+            body.remove("previous_response_id");
+        }
+        _ => {
+            return Err(Error::caller(
+                "unsupported server continuation for OpenAI Responses",
+            ));
+        }
+    }
+    resolve_store(body, continuation)
 }
 
 /// Derives `store` from the requested continuation mode.

@@ -9,8 +9,14 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-ra-session = { path = "../../crates/ra-session" }
+async-trait = "0.1"
+ra-core = { path = "../../crates/ra-core" }
+# 关掉默认 feature（`sqlite`）不是为了编译速度：R9-2a 的验收要求「任一产品无需
+# SQLite/JSONL 也能实现与消费 Session port」，而依赖图里有没有 rusqlite 是这条唯一
+# 可验证的形式。将来加 SQLite store 的测试时，请另开测试目标而不是在这里打开 feature，
+# 否则这条验收就再也没有落点了。
+ra-session = { path = "../../crates/ra-session", default-features = false }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde_json = "1"

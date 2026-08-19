@@ -1,9 +1,12 @@
 # ra-session 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+fn ra_session::memory::InMemorySession::new(session_id : impl Into < SessionId >) -> Self
+fn ra_session::memory::InMemorySession::new_with_items(session_id : impl Into < SessionId >, items : Vec < RunItem >) -> Self
 mod ra_session::chain
 mod ra_session::checkpoint
 mod ra_session::file_history
 mod ra_session::lite
+mod ra_session::memory
 mod ra_session::mutate
 mod ra_session::resume
 mod ra_session::rollout
@@ -14,3 +17,4 @@ mod ra_session::store
 mod ra_session::store::local
 mod ra_session::store::mirror
 mod ra_session::store::summary
+struct ra_session::memory::InMemorySession

@@ -84,8 +84,12 @@ fn test_model_contract_02() {
         .with_previous_response_id("resp-old")
         .with_conversation_id("conv-new");
 
+    let expected_conv = ra_core::model::ProviderConversationId::new("conv-new");
     assert_eq!(request.continuation().previous_response_id(), None);
-    assert_eq!(request.continuation().conversation_id(), Some("conv-new"));
+    assert_eq!(
+        request.continuation().conversation_id(),
+        Some(&expected_conv)
+    );
     assert!(request.continuation().is_server_managed());
 
     let none = ConversationContinuation::None;

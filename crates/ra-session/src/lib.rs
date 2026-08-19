@@ -13,7 +13,11 @@ pub mod chain;
 pub mod checkpoint;
 pub mod file_history;
 pub mod lite;
+pub mod memory;
 pub mod mutate;
 pub mod resume;
 pub mod rollout;
 pub mod store;
+
+pub use memory::InMemorySession;
+pub use ra_core::session::{Session, SessionId};

@@ -8,6 +8,10 @@ async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
 async fn ra_core::prompt::DynamicPromptHandler::resolve(& self, context : & RunContext) -> Result < ResolvedPrompt >
+async fn ra_core::session::port::Session::add_items(& self, items : Vec < RunItem >) -> Result < () >
+async fn ra_core::session::port::Session::clear(& self) -> Result < () >
+async fn ra_core::session::port::Session::get_items(& self, limit : Option < usize >) -> Result < Vec < RunItem > >
+async fn ra_core::session::port::Session::pop_item(& self) -> Result < Option < RunItem > >
 async fn ra_core::tool::Tool::call(& self, context : ToolContext < '_ >) -> Result < ToolOutput >
 async fn ra_core::tool::Tool::handle_failure(& self, _context : & ToolContext < '_ >, _error : & crate :: error :: Error) -> Result < Option < ToolOutput > >
 async fn ra_core::tool::Tool::is_enabled(& self, _context : & RunContext) -> Result < bool >
@@ -996,7 +1000,7 @@ fn ra_core::model::Model::get_retry_advice(& self, _request : & ModelRetryAdvice
 fn ra_core::model::Model::stream_response(& self, request : ModelRequest) -> ModelStream < '_ >
 fn ra_core::model::ModelProvider::get_model(& self, model_name : Option < & str >) -> Result < Arc < dyn Model > >
 fn ra_core::model::ModelResolver::resolve_model(& self, model_name : Option < & str >) -> Result < ResolvedModel >
-fn ra_core::model::request::ConversationContinuation::conversation_id(& self) -> Option < & str >
+fn ra_core::model::request::ConversationContinuation::conversation_id(& self) -> Option < & ProviderConversationId >
 fn ra_core::model::request::ConversationContinuation::previous_response_id(& self) -> Option < & str >
 fn ra_core::model::request::ModelHandoffDefinition::description(& self) -> Option < & str >
 fn ra_core::model::request::ModelHandoffDefinition::name(& self) -> & str
@@ -1012,7 +1016,7 @@ fn ra_core::model::request::ModelRequest::tools(& self) -> & [ModelToolDefinitio
 fn ra_core::model::request::ModelRequest::validate_cache_plan(& self) -> Result < () >
 fn ra_core::model::request::ModelRequest::with_cache_plan(mut self, cache_plan : CachePlan) -> Self
 fn ra_core::model::request::ModelRequest::with_continuation(mut self, continuation : ConversationContinuation) -> Self
-fn ra_core::model::request::ModelRequest::with_conversation_id(mut self, conversation_id : impl Into < String >) -> Self
+fn ra_core::model::request::ModelRequest::with_conversation_id(mut self, conversation_id : impl Into < ProviderConversationId >) -> Self
 fn ra_core::model::request::ModelRequest::with_handoffs(mut self, handoffs : Vec < ModelHandoffDefinition >) -> Self
 fn ra_core::model::request::ModelRequest::with_output_schema(mut self, output_schema : ModelOutputSchema) -> Self
 fn ra_core::model::request::ModelRequest::with_previous_response_id(mut self, response_id : impl Into < String >) -> Self
@@ -1022,6 +1026,8 @@ fn ra_core::model::request::ModelToolDefinition::description(& self) -> Option <
 fn ra_core::model::request::ModelToolDefinition::name(& self) -> & str
 fn ra_core::model::request::ModelToolDefinition::new(name : impl Into < String >, input_schema : Value) -> Self
 fn ra_core::model::request::ModelToolDefinition::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::model::request::ProviderConversationId::as_str(& self) -> & str
+fn ra_core::model::request::ProviderConversationId::new(id : impl Into < String >) -> Self
 fn ra_core::model::resolution::ModelSelector::model(& self) -> Option < & str >
 fn ra_core::model::resolution::ModelSelector::new(provider : ProviderKey, model : Option < String >, protocol : ApiProtocol) -> Self
 fn ra_core::model::resolution::ResolvedModel::into_model(self) -> Arc < dyn Model >
@@ -1082,6 +1088,10 @@ fn ra_core::prompt::ResolvedPrompt::with_provenance(mut self, provenance : impl 
 fn ra_core::prompt::ResolvedPrompt::with_sections(mut self, sections : Vec < PromptSection >) -> Self
 fn ra_core::prompt::ResolvedPrompt::with_version(mut self, version : impl Into < String >) -> Self
 fn ra_core::prompt::estimate_tokens(text : & str) -> usize
+fn ra_core::session::id::SessionId::as_str(& self) -> & str
+fn ra_core::session::id::SessionId::generate() -> Self
+fn ra_core::session::id::SessionId::new(id : impl Into < String >) -> Self
+fn ra_core::session::port::Session::session_id(& self) -> & SessionId
 fn ra_core::state::run::EventSeqAllocator::allocate(& self) -> Result < u64 >
 fn ra_core::state::run::EventSeqAllocator::current_next(& self) -> u64
 fn ra_core::state::run::GraphCursor::edge_id(& self) -> Option < & str >
@@ -1327,6 +1337,8 @@ mod ra_core::model::stream
 mod ra_core::permission
 mod ra_core::prompt
 mod ra_core::session
+mod ra_core::session::id
+mod ra_core::session::port
 mod ra_core::state
 mod ra_core::state::run
 mod ra_core::state::tool_failure
@@ -1426,6 +1438,7 @@ struct ra_core::model::request::ModelHandoffDefinition
 struct ra_core::model::request::ModelOutputSchema
 struct ra_core::model::request::ModelRequest
 struct ra_core::model::request::ModelToolDefinition
+struct ra_core::model::request::ProviderConversationId
 struct ra_core::model::resolution::ModelSelector
 struct ra_core::model::resolution::ResolvedModel
 struct ra_core::model::retry::ModelRetryAdviceRequest
@@ -1444,6 +1457,7 @@ struct ra_core::prompt::PromptProvenance
 struct ra_core::prompt::PromptSection
 struct ra_core::prompt::PromptSectionName
 struct ra_core::prompt::ResolvedPrompt
+struct ra_core::session::id::SessionId
 struct ra_core::state::run::EventSeqAllocator
 struct ra_core::state::run::GraphCursor
 struct ra_core::state::run::NestedRunRef
@@ -1494,6 +1508,7 @@ trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
 trait ra_core::prompt::DynamicPromptHandler
+trait ra_core::session::port::Session
 trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
 trait ra_core::tool::schema::ToolInput
@@ -1694,7 +1709,7 @@ variant ra_core::model::protocol::ToolCallCarrier::ToolUseBlock
 variant ra_core::model::protocol::ToolResultCarrier::FunctionCallOutputItem
 variant ra_core::model::protocol::ToolResultCarrier::ToolResultBlock
 variant ra_core::model::protocol::ToolResultCarrier::ToolRoleMessage
-variant ra_core::model::request::ConversationContinuation::ConversationId(String)
+variant ra_core::model::request::ConversationContinuation::ConversationId(ProviderConversationId)
 variant ra_core::model::request::ConversationContinuation::None
 variant ra_core::model::request::ConversationContinuation::PreviousResponseId(String)
 variant ra_core::model::request::ModelTracing::Disabled

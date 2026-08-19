@@ -4,6 +4,8 @@
 //! output parsers, agent graphs, credentials, and provider SDK types do not belong here. Rich
 //! runtime types project into the lightweight model-facing definitions below before a call.
 
+use std::borrow::Borrow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,6 +15,59 @@ use crate::{
     item::{AgentId, ModelInputItem},
     prompt::{CachePlan, ContentHash},
 };
+
+/// An opaque identifier for a provider-managed server-side conversation.
+///
+/// This is distinct from local authoritative conversation session history identifiers
+/// ([`SessionId`](crate::session::SessionId)) and command execution session identifiers
+/// ([`ExecSessionId`](crate::event::exec::ExecSessionId)).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderConversationId(String);
+
+impl ProviderConversationId {
+    /// Creates a provider conversation identifier from a string.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Returns the string representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for ProviderConversationId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for ProviderConversationId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for ProviderConversationId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl AsRef<str> for ProviderConversationId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for ProviderConversationId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Tracing visibility for one model call.
 #[non_exhaustive]
@@ -55,7 +110,7 @@ pub enum ConversationContinuation {
     /// Continue from a provider response ID.
     PreviousResponseId(String),
     /// Append to a provider-managed conversation.
-    ConversationId(String),
+    ConversationId(ProviderConversationId),
 }
 
 impl ConversationContinuation {
@@ -70,7 +125,7 @@ impl ConversationContinuation {
 
     /// Conversation ID, when selected.
     #[must_use]
-    pub fn conversation_id(&self) -> Option<&str> {
+    pub fn conversation_id(&self) -> Option<&ProviderConversationId> {
         match self {
             Self::ConversationId(id) => Some(id),
             Self::None | Self::PreviousResponseId(_) => None,
@@ -381,7 +436,10 @@ impl ModelRequest {
 
     /// Uses a provider-managed conversation, replacing any previous response ID.
     #[must_use]
-    pub fn with_conversation_id(mut self, conversation_id: impl Into<String>) -> Self {
+    pub fn with_conversation_id(
+        mut self,
+        conversation_id: impl Into<ProviderConversationId>,
+    ) -> Self {
         self.continuation = ConversationContinuation::ConversationId(conversation_id.into());
         self
     }
