@@ -899,11 +899,17 @@ async fn test_rollout_writer_survives_unwritable_sidecar() {
         .await
         .expect("a durable append must not fail because its derived cache could not be written");
     assert_eq!(record.timeline_seq(), 1);
+
+    // The sidecar is refreshed on flush rather than on every append, so that is where the
+    // failure surfaces — and it must surface as a flag, not as a failed flush.
+    writer
+        .flush()
+        .await
+        .expect("flushing the log must not fail because its derived cache could not be written");
     assert!(
         writer.sidecar_is_stale(),
         "the failure has to be observable somewhere"
     );
-    writer.flush().await.unwrap();
     drop(writer);
 
     // The rollout file is the source of truth and is intact; recovery still works without a
@@ -1007,6 +1013,7 @@ async fn test_rollout_writer_ignores_a_damaged_sidecar_during_recovery() {
             ))
             .await
             .unwrap();
+        writer.flush().await.unwrap();
     }
 
     let genuine: RolloutSidecar =
@@ -1248,6 +1255,324 @@ async fn test_rollout_writer_poisons_itself_when_a_write_fails() {
             .to_string()
             .contains("poisoned")
     );
+}
+
+/// Resume must read the checkpoint plus the tail, not the whole log.
+///
+/// Proven by making the head unreadable: everything before the last checkpoint is overwritten
+/// with garbage of the same length, so a full scan would fail. Recovery succeeding *and* landing
+/// on the right numbers means it started from the checkpoint.
+#[tokio::test]
+async fn test_rollout_writer_resumes_from_checkpoint_without_reading_the_head() {
+    let dir = temp_test_dir("checkpoint_fast_resume");
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    let head_len;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(4);
+        writer
+            .append_session_meta(RolloutSessionMeta::new(session_id.clone()))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(100, 10)))
+                .await
+                .unwrap();
+        }
+        // The fourth append trips the interval and lays down a checkpoint behind it.
+        let offset = writer
+            .last_checkpoint_offset()
+            .expect("a checkpoint must have been written");
+        head_len = offset;
+
+        // Two more records land after the checkpoint; they are the tail resume must re-read.
+        writer
+            .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(50, 5)))
+            .await
+            .unwrap();
+        writer
+            .append_item(RunItem::new(
+                ItemId::new("tail"),
+                RunItemKind::Message(Message::user("tail")),
+            ))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    let intact = tokio::fs::read(&file_path).await.unwrap();
+    let total_usage_before = RolloutReader::open(&file_path)
+        .scan_summary()
+        .await
+        .unwrap()
+        .usage_totals()
+        .input_tokens();
+    assert_eq!(total_usage_before, 350);
+
+    // Destroy the head. Same length, so the file layout and every offset still line up.
+    let mut damaged = intact.clone();
+    let head = usize::try_from(head_len).unwrap();
+    for byte in &mut damaged[..head - 1] {
+        *byte = b'x';
+    }
+    damaged[head - 1] = b'\n';
+    tokio::fs::write(&file_path, &damaged).await.unwrap();
+    assert!(
+        RolloutReader::open(&file_path).read_all().await.is_err(),
+        "a full scan of the damaged file must fail, or this test proves nothing"
+    );
+
+    let writer = RolloutWriter::open(&file_path, session_id.clone())
+        .await
+        .expect("resume must be served from the checkpoint");
+    assert_eq!(
+        writer.usage_totals().input_tokens(),
+        350,
+        "checkpoint totals plus the tail must equal the full-scan total"
+    );
+    assert_eq!(writer.next_timeline_seq(), 7);
+}
+
+/// The checkpoint route and the full scan must agree, and losing the checkpoint must cost only
+/// time. Each way of losing it falls back to the same answer.
+#[tokio::test]
+async fn test_rollout_writer_checkpoint_recovery_matches_full_scan() {
+    let dir = temp_test_dir("checkpoint_matches_full_scan");
+    let session_id = SessionId::generate();
+    let run_a = RunId::generate();
+    let run_b = RunId::generate();
+    let agent_id = AgentId::new("agent");
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+    let sidecar_path = dir.join(format!(
+        "rollout-{}.jsonl.sidecar.json",
+        session_id.as_str()
+    ));
+
+    let allocator = RunState::start(run_a.clone()).restore_event_seq_allocator(None);
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(3);
+        writer
+            .append_session_meta(RolloutSessionMeta::new(session_id.clone()))
+            .await
+            .unwrap();
+        for i in 0..10 {
+            writer
+                .append_model_usage(
+                    RolloutModelUsage::new(run_b.clone(), Usage::new(10, 1)).with_turn_index(i),
+                )
+                .await
+                .unwrap();
+            let event = HostEvent::allocate(
+                &allocator,
+                agent_id.clone(),
+                HostEventBody::Exec(ExecEvent::Started(ExecStartedEvent::new(
+                    ExecSessionId::generate(),
+                    "echo",
+                ))),
+            )
+            .unwrap();
+            writer.append_event(event).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+
+    let full = RolloutReader::open(&file_path)
+        .scan_summary()
+        .await
+        .unwrap();
+    let expected_seq = full.last_timeline_seq().unwrap() + 1;
+
+    // Every way the index can be unusable must land on the same state as the full scan.
+    let sidecar_bytes = tokio::fs::read(&sidecar_path).await.unwrap();
+    let cases: Vec<(&str, Option<Vec<u8>>)> = vec![
+        ("index present", Some(sidecar_bytes.clone())),
+        ("index missing", None),
+        ("index truncated", Some(b"{\"schema_version\":1".to_vec())),
+        (
+            "index points past EOF",
+            Some(
+                serde_json::to_vec(
+                    &RolloutSidecar::new(session_id.clone(), 999, HashMap::new(), Usage::new(1, 1))
+                        .with_last_checkpoint_offset(u64::MAX / 2),
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            "index points at a non-checkpoint record",
+            Some(
+                serde_json::to_vec(
+                    &RolloutSidecar::new(session_id.clone(), 999, HashMap::new(), Usage::new(1, 1))
+                        .with_last_checkpoint_offset(0),
+                )
+                .unwrap(),
+            ),
+        ),
+    ];
+
+    for (label, bytes) in cases {
+        match bytes {
+            Some(b) => tokio::fs::write(&sidecar_path, b).await.unwrap(),
+            None => {
+                tokio::fs::remove_file(&sidecar_path).await.ok();
+            }
+        }
+
+        let writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{label}: recovery must succeed, got {e}"));
+        assert_eq!(
+            writer.next_timeline_seq(),
+            expected_seq,
+            "{label}: sequence must match the full scan"
+        );
+        assert_eq!(
+            writer.usage_totals(),
+            full.usage_totals(),
+            "{label}: usage ledger must match the full scan"
+        );
+        assert_eq!(
+            writer.persisted_run_max_seq(&run_a),
+            full.persisted_run_max_seq().get(&run_a).copied(),
+            "{label}: run max seq must match the full scan"
+        );
+    }
+}
+
+/// A checkpoint that names another session must not be believed.
+///
+/// The forged copy also inflates the usage ledger, so believing it and rebuilding from the log
+/// give different answers — otherwise the test would pass either way.
+#[tokio::test]
+async fn test_rollout_writer_rejects_checkpoint_from_another_session() {
+    let dir = temp_test_dir("checkpoint_foreign_session");
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    let checkpoint_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        checkpoint_offset = writer.last_checkpoint_offset().unwrap();
+        writer
+            .append_item(RunItem::new(
+                ItemId::new("after"),
+                RunItemKind::Message(Message::user("after")),
+            ))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    rewrite_line_at(&file_path, checkpoint_offset, |record| {
+        assert_eq!(record["type"], json!("checkpoint"));
+        record["payload"]["session_id"] = json!("sess-someone-else");
+        record["payload"]["usage_totals"]["input_tokens"] = json!(999_999);
+    })
+    .await;
+
+    // The index still points at it, but it no longer vouches for this session, so recovery falls
+    // back to the scan and reports what the log actually holds.
+    let writer = RolloutWriter::open(&file_path, session_id).await.unwrap();
+    assert_eq!(
+        writer.usage_totals().input_tokens(),
+        20,
+        "the foreign checkpoint's ledger was believed"
+    );
+    assert_eq!(writer.next_timeline_seq(), 4);
+}
+
+/// The tail scan cannot see the record before it, so a first tail record that fails to advance
+/// past the checkpoint is invisible to the within-tail monotonicity check. The join has to be
+/// checked separately or a backwards sequence slips through the fast path.
+#[tokio::test]
+async fn test_rollout_writer_rejects_non_monotonic_join_across_checkpoint() {
+    let dir = temp_test_dir("checkpoint_join_monotonicity");
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    let tail_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        // seq 0 and 1 are the usage records; the checkpoint took seq 2.
+        tail_offset = tokio::fs::metadata(&file_path).await.unwrap().len();
+        writer
+            .append_item(RunItem::new(
+                ItemId::new("tail"),
+                RunItemKind::Message(Message::user("tail")),
+            ))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    // Drag the single tail record back to a sequence the checkpoint already covers.
+    rewrite_line_at(&file_path, tail_offset, |record| {
+        assert_eq!(record["timeline_seq"], json!(3));
+        record["timeline_seq"] = json!(1);
+    })
+    .await;
+
+    let err = RolloutWriter::open(&file_path, session_id)
+        .await
+        .expect_err("a backwards sequence across the checkpoint must be caught");
+    assert!(
+        matches!(
+            err,
+            Error::Session {
+                kind: SessionErrorKind::Corrupted,
+                ..
+            }
+        ),
+        "expected Corrupted, got: {err}"
+    );
+}
+
+/// Rewrites the single JSONL record starting at `offset`, keeping the file's line structure.
+async fn rewrite_line_at(
+    path: &std::path::Path,
+    offset: u64,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    let text = tokio::fs::read_to_string(path).await.unwrap();
+    let idx = text[..usize::try_from(offset).unwrap()].lines().count();
+    let mut lines: Vec<String> = text.lines().map(ToOwned::to_owned).collect();
+
+    let mut record: serde_json::Value = serde_json::from_str(&lines[idx]).unwrap();
+    edit(&mut record);
+    lines[idx] = serde_json::to_string(&record).unwrap();
+
+    tokio::fs::write(path, format!("{}\n", lines.join("\n")))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

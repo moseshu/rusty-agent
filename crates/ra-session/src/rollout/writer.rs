@@ -19,7 +19,7 @@ use ra_core::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
 };
 
 use super::reader::RolloutReader;
@@ -576,6 +576,77 @@ impl RolloutModelUsage {
     }
 }
 
+/// Aggregates over every record preceding this one, written into the log itself.
+///
+/// This is what makes resume able to skip a full scan. The same summary kept beside the log
+/// cannot: nothing stored outside the rollout can establish that a derived value was computed
+/// from it, so a snapshot that took one plausible hit still looks valid. Inside the log the
+/// figures travel as an ordinary record, covered by the reader's parse contract and by the
+/// `timeline_seq` monotonicity check, and a damaged checkpoint line is therefore caught the same
+/// way any other damaged line is.
+///
+/// A checkpoint summarizes the records *before* it. Its own `timeline_seq` marks the boundary:
+/// recovery seeds itself from these values and folds in the records that follow.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutCheckpoint {
+    #[serde(default = "default_rollout_schema_version")]
+    schema_version: SchemaVersion,
+    session_id: SessionId,
+    usage_totals: Usage,
+    persisted_run_max_seq: HashMap<RunId, u64>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl RolloutCheckpoint {
+    /// Creates a checkpoint carrying the aggregates accumulated so far.
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        usage_totals: Usage,
+        persisted_run_max_seq: HashMap<RunId, u64>,
+    ) -> Self {
+        Self {
+            schema_version: ROLLOUT_SCHEMA_VERSION,
+            session_id,
+            usage_totals,
+            persisted_run_max_seq,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Session this checkpoint belongs to.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Token usage accumulated across every `model_usage` record before this point.
+    #[must_use]
+    pub const fn usage_totals(&self) -> &Usage {
+        &self.usage_totals
+    }
+
+    /// Maximum persisted host event sequence per run, as of this point.
+    #[must_use]
+    pub const fn persisted_run_max_seq(&self) -> &HashMap<RunId, u64> {
+        &self.persisted_run_max_seq
+    }
+
+    /// Schema version of the record.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
 /// Payload variants carried within a rollout line.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
@@ -592,6 +663,8 @@ pub enum RolloutPayload {
     ModelUsage(RolloutModelUsage),
     /// Child agent execution anchor on the root timeline.
     ChildAnchor(RolloutChildAnchor),
+    /// Aggregates over the preceding records, letting resume skip them.
+    Checkpoint(RolloutCheckpoint),
     /// Forward-compatible unknown payload.
     Unknown {
         /// Type name identifier.
@@ -634,6 +707,12 @@ impl From<RolloutModelUsage> for RolloutPayload {
 impl From<RolloutChildAnchor> for RolloutPayload {
     fn from(a: RolloutChildAnchor) -> Self {
         Self::ChildAnchor(a)
+    }
+}
+
+impl From<RolloutCheckpoint> for RolloutPayload {
+    fn from(c: RolloutCheckpoint) -> Self {
+        Self::Checkpoint(c)
     }
 }
 
@@ -711,6 +790,15 @@ impl RolloutRecord {
                     Error::session(
                         SessionErrorKind::Corrupted,
                         format!("failed to serialize child_anchor: {e}"),
+                    )
+                })?,
+            ),
+            RolloutPayload::Checkpoint(checkpoint) => (
+                "checkpoint".to_string(),
+                serde_json::to_value(checkpoint).map_err(|e| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        format!("failed to serialize checkpoint: {e}"),
                     )
                 })?,
             ),
@@ -818,6 +906,15 @@ impl RolloutRecord {
                     )
                     .with_source(e)
                 }),
+            "checkpoint" => serde_json::from_value::<RolloutCheckpoint>(self.payload.clone())
+                .map(RolloutPayload::Checkpoint)
+                .map_err(|e| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        format!("corrupted checkpoint payload: {e}"),
+                    )
+                    .with_source(e)
+                }),
             unknown_type => Ok(RolloutPayload::Unknown {
                 type_name: unknown_type.to_string(),
                 data: self.payload.clone(),
@@ -869,6 +966,8 @@ pub struct RolloutSidecar {
     next_timeline_seq: u64,
     persisted_run_max_seq: HashMap<RunId, u64>,
     usage_totals: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_checkpoint_offset: Option<u64>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -888,8 +987,26 @@ impl RolloutSidecar {
             next_timeline_seq,
             persisted_run_max_seq,
             usage_totals,
+            last_checkpoint_offset: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records where the newest checkpoint record starts in the rollout file.
+    #[must_use]
+    pub const fn with_last_checkpoint_offset(mut self, offset: u64) -> Self {
+        self.last_checkpoint_offset = Some(offset);
+        self
+    }
+
+    /// Byte offset of the newest checkpoint record, when one is known.
+    ///
+    /// This is the one field recovery reads, and it is treated as a hint rather than a fact: the
+    /// record found there is parsed and checked before anything is believed, so an offset that is
+    /// stale, wrong, or absent costs a full scan and nothing else.
+    #[must_use]
+    pub const fn last_checkpoint_offset(&self) -> Option<u64> {
+        self.last_checkpoint_offset
     }
 
     /// Associated session identifier.
@@ -958,9 +1075,19 @@ pub struct RolloutWriter {
     next_timeline_seq: u64,
     persisted_run_max_seq: HashMap<RunId, u64>,
     usage_totals: Usage,
+    file_len: u64,
+    checkpoint_interval: u64,
+    records_since_checkpoint: u64,
+    last_checkpoint_offset: Option<u64>,
     sidecar_stale: bool,
     poisoned: bool,
 }
+
+/// Records appended between checkpoints by default.
+///
+/// Sets how much of the tail a resume has to re-read; the cost of the checkpoints themselves is
+/// one extra record per interval.
+pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 256;
 
 /// Writer state rebuilt from an existing rollout file, by either route.
 #[derive(Debug, Default)]
@@ -968,6 +1095,8 @@ struct Recovered {
     next_timeline_seq: u64,
     persisted_run_max_seq: HashMap<RunId, u64>,
     usage_totals: Usage,
+    file_len: u64,
+    last_checkpoint_offset: Option<u64>,
 }
 
 /// Takes the writer's exclusive advisory lock on the rollout file.
@@ -1015,6 +1144,67 @@ fn lock_exclusive(_file: &File, path: &Path) -> Result<()> {
             path.display()
         ),
     ))
+}
+
+/// What a verified checkpoint contributes to recovery.
+struct CheckpointSeed {
+    offset: u64,
+    resume_offset: u64,
+    timeline_seq: u64,
+    usage_totals: Usage,
+    persisted_run_max_seq: HashMap<RunId, u64>,
+}
+
+/// Reads the checkpoint the sidecar points at, or `None` if it cannot be used.
+///
+/// The sidecar supplies only a byte offset. Everything believed afterwards comes from the record
+/// found there, which is an ordinary rollout line and is parsed and checked like one: it has to
+/// be a checkpoint, and it has to name this session. A wrong, stale, or missing offset therefore
+/// costs a full scan and never a wrong answer, which is what lets the index live outside the log
+/// when the summary itself could not.
+///
+/// `None` on every failure, deliberately: a miss is a normal outcome and the caller's response is
+/// the same in all cases — scan from the top.
+async fn checkpoint_seed(
+    path: &Path,
+    sidecar_path: &Path,
+    session_id: &SessionId,
+) -> Option<CheckpointSeed> {
+    let bytes = tokio::fs::read(sidecar_path).await.ok()?;
+    let sidecar: RolloutSidecar = serde_json::from_slice(&bytes).ok()?;
+    let offset = sidecar.last_checkpoint_offset()?;
+
+    let mut file = File::open(path).await.ok()?;
+    let len = file.metadata().await.ok()?.len();
+    if offset >= len {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).await.ok()?;
+
+    let mut line = Vec::new();
+    let read = BufReader::new(file)
+        .read_until(b'\n', &mut line)
+        .await
+        .ok()?;
+    if read == 0 || line.last() != Some(&b'\n') {
+        return None;
+    }
+
+    let record: RolloutRecord = serde_json::from_slice(&line).ok()?;
+    let RolloutPayload::Checkpoint(checkpoint) = record.payload().ok()? else {
+        return None;
+    };
+    if checkpoint.session_id() != session_id {
+        return None;
+    }
+
+    Some(CheckpointSeed {
+        offset,
+        resume_offset: offset + read as u64,
+        timeline_seq: record.timeline_seq(),
+        usage_totals: checkpoint.usage_totals().clone(),
+        persisted_run_max_seq: checkpoint.persisted_run_max_seq().clone(),
+    })
 }
 
 /// Reads the final byte of `file`, whose length is `end`, to see whether the last line is closed.
@@ -1106,7 +1296,7 @@ impl RolloutWriter {
             .len();
 
         if file_len > 0 {
-            recovered = Self::recover(&path, &session_id, &mut file).await?;
+            recovered = Self::recover(&path, &sidecar_path, &session_id, &mut file).await?;
         }
 
         let mut writer = Self {
@@ -1117,6 +1307,10 @@ impl RolloutWriter {
             next_timeline_seq: recovered.next_timeline_seq,
             persisted_run_max_seq: recovered.persisted_run_max_seq,
             usage_totals: recovered.usage_totals,
+            file_len: recovered.file_len,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            records_since_checkpoint: 0,
+            last_checkpoint_offset: recovered.last_checkpoint_offset,
             sidecar_stale: false,
             poisoned: false,
         };
@@ -1126,11 +1320,24 @@ impl RolloutWriter {
 
     /// Rebuilds writer state for a file that already has bytes in it.
     ///
-    /// Always derived from the log itself. The sidecar is deliberately not consulted — see
-    /// [`RolloutSidecar`] for why a summary stored beside the log cannot prove it describes it.
-    async fn recover(path: &Path, session_id: &SessionId, file: &mut File) -> Result<Recovered> {
-        let summary = RolloutReader::open(path).scan_summary().await?;
+    /// Tries the checkpoint fast path first and falls back to a full scan. Either way the result
+    /// is derived from the log: the checkpoint is a record inside the rollout, so believing it is
+    /// believing the log, which is exactly what a summary stored beside the log could not offer.
+    async fn recover(
+        path: &Path,
+        sidecar_path: &Path,
+        session_id: &SessionId,
+        file: &mut File,
+    ) -> Result<Recovered> {
+        let seed = checkpoint_seed(path, sidecar_path, session_id).await;
+        let scan_from = seed.as_ref().map_or(0, |s| s.resume_offset);
 
+        let summary = RolloutReader::open(path)
+            .scan_summary_from(scan_from)
+            .await?;
+
+        // Identity is established by the checkpoint when the fast path supplied one; the tail
+        // scan may not have reached a `session_meta` record.
         if let Some(found) = summary.session_id()
             && found != session_id
         {
@@ -1149,6 +1356,24 @@ impl RolloutWriter {
                     "rollout timeline_seq does not increase at {} (after {prev}, got {offending}); \
                      the file was written by more than one writer or edited externally",
                     path.display()
+                ),
+            ));
+        }
+
+        // The join between the checkpoint and the tail has to hold that rule too; the tail scan
+        // only sees records after the boundary, so it cannot notice a first record that fails to
+        // advance past the checkpoint.
+        if let Some(seed) = &seed
+            && let Some(first) = summary.first_timeline_seq()
+            && first <= seed.timeline_seq
+        {
+            return Err(Error::session(
+                SessionErrorKind::Corrupted,
+                format!(
+                    "rollout timeline_seq does not increase across the checkpoint at {} \
+                     (checkpoint {}, next {first})",
+                    path.display(),
+                    seed.timeline_seq
                 ),
             ));
         }
@@ -1178,7 +1403,7 @@ impl RolloutWriter {
         // A torn write can stop on a byte boundary that still parses, leaving a record the reader
         // accepted but no newline behind it. Close the line before anything is appended, or the
         // next record would be spliced onto its tail.
-        if end > 0 && !ends_with_newline(file, end).await? {
+        let end = if end > 0 && !ends_with_newline(file, end).await? {
             file.write_all(b"\n").await.map_err(|e| {
                 Error::session(
                     SessionErrorKind::Io,
@@ -1186,14 +1411,40 @@ impl RolloutWriter {
                 )
                 .with_source(e)
             })?;
+            end + 1
+        } else {
+            end
+        };
+
+        let (mut usage_totals, mut persisted_run_max_seq, checkpoint_seq, last_checkpoint_offset) =
+            match seed {
+                Some(seed) => (
+                    seed.usage_totals,
+                    seed.persisted_run_max_seq,
+                    Some(seed.timeline_seq),
+                    Some(seed.offset),
+                ),
+                None => (Usage::default(), HashMap::new(), None, None),
+            };
+
+        usage_totals = usage_totals.accumulate(summary.usage_totals());
+        for (run_id, seq) in summary.persisted_run_max_seq() {
+            let entry = persisted_run_max_seq.entry(run_id.clone()).or_insert(0);
+            *entry = (*entry).max(*seq);
         }
 
+        let last_seq = match (summary.last_timeline_seq(), checkpoint_seq) {
+            (Some(tail), Some(cp)) => Some(tail.max(cp)),
+            (Some(tail), None) => Some(tail),
+            (None, cp) => cp,
+        };
+
         Ok(Recovered {
-            next_timeline_seq: summary
-                .last_timeline_seq()
-                .map_or(0, |last| last.saturating_add(1)),
-            persisted_run_max_seq: summary.persisted_run_max_seq().clone(),
-            usage_totals: summary.usage_totals().clone(),
+            next_timeline_seq: last_seq.map_or(0, |last| last.saturating_add(1)),
+            persisted_run_max_seq,
+            usage_totals,
+            file_len: end,
+            last_checkpoint_offset,
         })
     }
 
@@ -1267,6 +1518,63 @@ impl RolloutWriter {
     /// Returns [`Error`] if sequence numbers are exhausted, if writing fails, or if an earlier
     /// write left the commit state unknown — see [`RolloutWriter::is_poisoned`].
     pub async fn append(&mut self, payload: impl Into<RolloutPayload>) -> Result<RolloutRecord> {
+        let record = self.append_inner(payload.into()).await?;
+
+        // The checkpoint goes in after the record it accounts for, so it summarizes a prefix that
+        // is already durable. A failure here is not the caller's to carry: the record they asked
+        // for is on disk, and a missing checkpoint only costs the next resume a longer scan.
+        if self.records_since_checkpoint >= self.checkpoint_interval
+            && let Err(e) = self.write_checkpoint().await
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "failed to append rollout checkpoint; resume will scan further back"
+            );
+        }
+
+        Ok(record)
+    }
+
+    /// Appends a checkpoint summarizing every record written so far.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if writing fails.
+    pub async fn write_checkpoint(&mut self) -> Result<RolloutRecord> {
+        let checkpoint = RolloutCheckpoint::new(
+            self.session_id.clone(),
+            self.usage_totals.clone(),
+            self.persisted_run_max_seq.clone(),
+        );
+
+        let offset = self.file_len;
+        let record = self
+            .append_inner(RolloutPayload::Checkpoint(checkpoint))
+            .await?;
+
+        self.last_checkpoint_offset = Some(offset);
+        self.records_since_checkpoint = 0;
+        self.refresh_sidecar().await;
+
+        Ok(record)
+    }
+
+    /// Sets how many records may be appended between checkpoints.
+    ///
+    /// Lower values shorten the tail a resume must re-read and cost one extra record more often.
+    /// Zero is treated as one: every append is followed by a checkpoint.
+    pub const fn set_checkpoint_interval(&mut self, records: u64) {
+        self.checkpoint_interval = if records == 0 { 1 } else { records };
+    }
+
+    /// Byte offset of the newest checkpoint written or recovered, if any.
+    #[must_use]
+    pub const fn last_checkpoint_offset(&self) -> Option<u64> {
+        self.last_checkpoint_offset
+    }
+
+    async fn append_inner(&mut self, payload: RolloutPayload) -> Result<RolloutRecord> {
         if self.poisoned {
             return Err(Error::session(
                 SessionErrorKind::Io,
@@ -1278,7 +1586,6 @@ impl RolloutWriter {
             ));
         }
 
-        let payload = payload.into();
         let timeline_seq = self.next_timeline_seq;
         let next_seq = timeline_seq
             .checked_add(1)
@@ -1346,6 +1653,8 @@ impl RolloutWriter {
 
         // Only update in-memory state after flush succeeds
         self.next_timeline_seq = next_seq;
+        self.file_len += line.len() as u64;
+        self.records_since_checkpoint += 1;
         if let Some((run_id, max_seq)) = candidate_run_seq {
             self.persisted_run_max_seq.insert(run_id, max_seq);
         }
@@ -1353,7 +1662,6 @@ impl RolloutWriter {
             self.usage_totals = new_usage;
         }
 
-        self.refresh_sidecar().await;
         Ok(record)
     }
 
@@ -1496,13 +1804,23 @@ impl RolloutWriter {
         }
     }
 
+    /// Replaces the sidecar atomically, so a reader never observes a half-written document.
+    ///
+    /// Written to a temporary file in the same directory and renamed over the target: `rename`
+    /// within a directory is atomic, whereas truncating the real file and writing into it leaves
+    /// a window where a concurrent reader sees an empty or partial JSON document. The temporary
+    /// name is derived from the target so a crash leaves an obvious artefact next to it rather
+    /// than a corrupt sidecar.
     async fn write_sidecar(&self) -> Result<()> {
-        let sidecar = RolloutSidecar::new(
+        let mut sidecar = RolloutSidecar::new(
             self.session_id.clone(),
             self.next_timeline_seq,
             self.persisted_run_max_seq.clone(),
             self.usage_totals.clone(),
         );
+        if let Some(offset) = self.last_checkpoint_offset {
+            sidecar = sidecar.with_last_checkpoint_offset(offset);
+        }
 
         let data = serde_json::to_vec_pretty(&sidecar).map_err(|e| {
             Error::session(
@@ -1511,14 +1829,28 @@ impl RolloutWriter {
             )
         })?;
 
-        tokio::fs::write(&self.sidecar_path, data)
+        let io_err = |what: &str, e: std::io::Error| {
+            Error::session(
+                SessionErrorKind::Io,
+                format!("failed to {what} rollout sidecar file: {e}"),
+            )
+            .with_source(e)
+        };
+
+        let mut tmp_name = self.sidecar_path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+
+        tokio::fs::write(&tmp_path, data)
             .await
-            .map_err(|e| {
-                Error::session(
-                    SessionErrorKind::Io,
-                    format!("failed to write rollout sidecar file: {e}"),
-                )
-                .with_source(e)
-            })
+            .map_err(|e| io_err("write", e))?;
+
+        match tokio::fs::rename(&tmp_path, &self.sidecar_path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                Err(io_err("replace", e))
+            }
+        }
     }
 }

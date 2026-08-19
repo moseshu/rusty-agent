@@ -15,7 +15,7 @@ use ra_core::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom},
 };
 
 use super::writer::{ChildAnchorKind, RolloutPayload, RolloutRecord};
@@ -25,6 +25,7 @@ use super::writer::{ChildAnchorKind, RolloutPayload, RolloutRecord};
 pub struct RolloutSummary {
     session_id: Option<SessionId>,
     record_count: usize,
+    first_timeline_seq: Option<u64>,
     last_timeline_seq: Option<u64>,
     persisted_run_max_seq: HashMap<RunId, u64>,
     usage_totals: Usage,
@@ -46,7 +47,16 @@ impl RolloutSummary {
         self.record_count
     }
 
-    /// Maximum timeline sequence number present in the log.
+    /// Sequence number of the first record in the scanned range.
+    ///
+    /// Distinct from [`RolloutSummary::last_timeline_seq`] when the scan started at an offset:
+    /// checking a tail against what precedes it needs the boundary record, not the maximum.
+    #[must_use]
+    pub const fn first_timeline_seq(&self) -> Option<u64> {
+        self.first_timeline_seq
+    }
+
+    /// Maximum timeline sequence number present in the scanned range.
     #[must_use]
     pub const fn last_timeline_seq(&self) -> Option<u64> {
         self.last_timeline_seq
@@ -64,7 +74,7 @@ impl RolloutSummary {
         &self.usage_totals
     }
 
-    /// Total length in bytes of all valid records read up to the corrupt or truncated boundary.
+    /// Absolute byte offset just past the last valid record read.
     #[must_use]
     pub const fn valid_bytes_len(&self) -> u64 {
         self.valid_bytes_len
@@ -125,7 +135,7 @@ impl RolloutReader {
     /// Returns [`Error`] if an I/O error occurs, or if a newline-terminated line is not valid
     /// UTF-8 or not a valid record envelope.
     pub async fn read_all(&self) -> Result<Vec<RolloutRecord>> {
-        let (records, _, _) = self.read_records_internal().await?;
+        let (records, _, _) = self.read_records_internal(0).await?;
         Ok(records)
     }
 
@@ -136,10 +146,27 @@ impl RolloutReader {
     ///
     /// Returns [`Error`] if reading fails.
     pub async fn scan_summary(&self) -> Result<RolloutSummary> {
+        self.scan_summary_from(0).await
+    }
+
+    /// Scans from byte offset `from` to the end of the file.
+    ///
+    /// `from` must sit on a record boundary; a caller that has one is expected to have got it by
+    /// reading a record there, not by guessing. Records before `from` are not read, so the
+    /// resulting summary describes only the tail: [`RolloutSummary::usage_totals`] and
+    /// [`RolloutSummary::persisted_run_max_seq`] must be folded onto whatever covers the head,
+    /// and corruption earlier in the file is not detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if reading fails, or if a newline-terminated line in the scanned range
+    /// is not valid UTF-8 or not a valid record envelope.
+    pub async fn scan_summary_from(&self, from: u64) -> Result<RolloutSummary> {
         let (records, valid_bytes_len, corrupted_trailing_bytes) =
-            self.read_records_internal().await?;
+            self.read_records_internal(from).await?;
 
         let mut session_id = None;
+        let mut first_timeline_seq: Option<u64> = None;
         let mut last_timeline_seq: Option<u64> = None;
         let mut persisted_run_max_seq = HashMap::new();
         let mut usage_totals = Usage::default();
@@ -147,6 +174,9 @@ impl RolloutReader {
 
         for record in &records {
             let seq = record.timeline_seq();
+            if first_timeline_seq.is_none() {
+                first_timeline_seq = Some(seq);
+            }
             if let Some(prev) = last_timeline_seq
                 && seq <= prev
                 && non_monotonic_timeline_seq.is_none()
@@ -179,6 +209,7 @@ impl RolloutReader {
         Ok(RolloutSummary {
             session_id,
             record_count: records.len(),
+            first_timeline_seq,
             last_timeline_seq,
             persisted_run_max_seq,
             usage_totals,
@@ -197,12 +228,15 @@ impl RolloutReader {
     /// written in full and this build cannot read it". The distinction decides whether
     /// [`RolloutWriter::open`](super::writer::RolloutWriter::open) is allowed to truncate those
     /// bytes away, so conflating the two would let a downgrade delete a complete record.
-    async fn read_records_internal(&self) -> Result<(Vec<RolloutRecord>, u64, Option<usize>)> {
+    async fn read_records_internal(
+        &self,
+        from: u64,
+    ) -> Result<(Vec<RolloutRecord>, u64, Option<usize>)> {
         if !self.path.exists() {
             return Ok((Vec::new(), 0, None));
         }
 
-        let file = File::open(&self.path).await.map_err(|e| {
+        let mut file = File::open(&self.path).await.map_err(|e| {
             Error::session(
                 SessionErrorKind::Io,
                 format!("failed to open rollout file for reading: {e}"),
@@ -210,11 +244,21 @@ impl RolloutReader {
             .with_source(e)
         })?;
 
+        if from > 0 {
+            file.seek(SeekFrom::Start(from)).await.map_err(|e| {
+                Error::session(
+                    SessionErrorKind::Io,
+                    format!("failed to seek into rollout file: {e}"),
+                )
+                .with_source(e)
+            })?;
+        }
+
         let mut reader = BufReader::new(file);
         let mut byte_buffer = Vec::new();
         let mut line_number: usize = 0;
         let mut records = Vec::new();
-        let mut valid_bytes_len: u64 = 0;
+        let mut valid_bytes_len: u64 = from;
         let mut corrupted_trailing_bytes = None;
 
         loop {
