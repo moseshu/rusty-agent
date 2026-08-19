@@ -22,7 +22,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
 };
 
-use super::reader::RolloutReader;
+use super::reader::{RolloutReader, RolloutSummary};
 
 /// Current schema version for rollout envelopes and records.
 pub const ROLLOUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
@@ -929,16 +929,20 @@ impl RolloutRecord {
     }
 }
 
-/// A summary written alongside the rollout file for outside readers.
+/// A summary written alongside the rollout file, plus the index recovery uses to find the newest
+/// checkpoint.
 ///
-/// **Not authoritative, and never consulted during recovery.** Every field here is derived from
-/// the rollout, and nothing stored beside the log can prove a derived value was computed from it:
-/// a checksum over the log answers "did these bytes change", not "did these totals come from
-/// these bytes". A snapshot that took a single plausible hit — `next_timeline_seq` off by one,
-/// say — would still match any such check, and resuming from it appends a duplicate sequence
-/// number that makes the log unopenable.
+/// **Only [`RolloutSidecar::last_checkpoint_offset`] is read back, and only as a hint.** The
+/// record found at that offset must parse, be a checkpoint, and name this session before anything
+/// is believed, so an offset that is stale, wrong, out of range, or missing costs a full scan and
+/// never a wrong answer. Nothing else in this file influences recovery.
 ///
-/// So [`RolloutWriter::open`] always rebuilds its state by scanning the log.
+/// The summary fields cannot: nothing stored beside the log can establish that a derived value
+/// was computed from it. A snapshot that took one plausible hit — `next_timeline_seq` off by one —
+/// still looks entirely valid, and resuming from it appends a duplicate sequence number that
+/// leaves the log unopenable. An offset is safe to keep out here precisely because it is checked
+/// against the thing it points into; a total is not, because there is nothing to check it against
+/// short of the scan it was meant to avoid.
 ///
 /// # Do not use this as a ledger
 ///
@@ -948,15 +952,18 @@ impl RolloutRecord {
 ///
 /// - **It can be arbitrarily wrong.** Nothing ties these numbers to the log (see above), so a
 ///   damaged snapshot is indistinguishable from a good one.
-/// - **It lags.** A write failure leaves the previous contents in place and only sets
-///   [`RolloutWriter::sidecar_is_stale`] on the writer, which no outside reader can observe.
-/// - **It can be torn.** The file is replaced by a plain non-atomic overwrite, so a concurrent
-///   reader can observe a truncated or partially written JSON document.
+/// - **It lags.** It is rewritten when the writer is opened, at each checkpoint, and on
+///   [`RolloutWriter::flush`] or [`RolloutWriter::sync_all`] — not on every append. A writer
+///   dropped without flushing leaves it at the last checkpoint. A failed write leaves the
+///   previous contents and only sets [`RolloutWriter::sidecar_is_stale`], which no outside reader
+///   can observe.
+/// - **It is one process's view.** It is replaced atomically, so a reader never sees a torn
+///   document, but it may still be reading a snapshot the writer has already moved past.
 ///
 /// The authoritative usage ledger is the sequence of `model_usage` records in the rollout itself;
-/// [`RolloutReader::scan_summary`](super::reader::RolloutReader::scan_summary) computes it. Making
-/// resume skip that scan needs the summary to live *inside* the rollout as a checkpoint record,
-/// where the reader's corruption contract covers it; that is deliberately not part of this slice.
+/// [`RolloutReader::scan_summary`](super::reader::RolloutReader::scan_summary) computes it, and
+/// while doing so holds every [`RolloutCheckpoint`] it passes to the records it claims to
+/// summarize.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutSidecar {
@@ -1064,8 +1071,9 @@ fn sidecar_path_for(path: &Path) -> PathBuf {
 /// 4. `persisted_run_max_seq` is maintained per [`RunId`], recovered by scanning the log.
 ///
 /// Exactly one writer may hold a rollout file, enforced by an advisory lock in
-/// [`RolloutWriter::open`]. The [`RolloutSidecar`] written alongside is an output, never an input:
-/// recovery reads the log.
+/// [`RolloutWriter::open`]. The [`RolloutSidecar`] written alongside contributes exactly one thing
+/// to recovery — the byte offset of the newest checkpoint, which is verified against the log
+/// before use. Its summary fields are output only.
 #[derive(Debug)]
 pub struct RolloutWriter {
     session_id: SessionId,
@@ -1097,6 +1105,7 @@ struct Recovered {
     usage_totals: Usage,
     file_len: u64,
     last_checkpoint_offset: Option<u64>,
+    records_since_checkpoint: u64,
 }
 
 /// Takes the writer's exclusive advisory lock on the rollout file.
@@ -1144,6 +1153,58 @@ fn lock_exclusive(_file: &File, path: &Path) -> Result<()> {
             path.display()
         ),
     ))
+}
+
+/// Rejects a scanned range that cannot belong to this session or cannot be ordered.
+fn validate_scan(
+    path: &Path,
+    session_id: &SessionId,
+    summary: &RolloutSummary,
+    seed: Option<&CheckpointSeed>,
+) -> Result<()> {
+    // Identity is established by the checkpoint when the fast path supplied one; a tail scan may
+    // never reach a `session_meta` record.
+    if let Some(found) = summary.session_id()
+        && found != session_id
+    {
+        return Err(Error::caller(format!(
+            "rollout file at {} belongs to session {}, not {}",
+            path.display(),
+            found.as_str(),
+            session_id.as_str()
+        )));
+    }
+
+    if let Some((prev, offending)) = summary.non_monotonic_timeline_seq() {
+        return Err(Error::session(
+            SessionErrorKind::Corrupted,
+            format!(
+                "rollout timeline_seq does not increase at {} (after {prev}, got {offending}); \
+                 the file was written by more than one writer or edited externally",
+                path.display()
+            ),
+        ));
+    }
+
+    // The join between the checkpoint and the tail has to hold that rule too; the tail scan only
+    // sees records after the boundary, so it cannot notice a first record that fails to advance
+    // past the checkpoint.
+    if let Some(seed) = seed
+        && let Some(first) = summary.first_timeline_seq()
+        && first <= seed.timeline_seq
+    {
+        return Err(Error::session(
+            SessionErrorKind::Corrupted,
+            format!(
+                "rollout timeline_seq does not increase across the checkpoint at {} \
+                 (checkpoint {}, next {first})",
+                path.display(),
+                seed.timeline_seq
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 /// What a verified checkpoint contributes to recovery.
@@ -1230,10 +1291,17 @@ async fn ends_with_newline(file: &mut File, end: u64) -> Result<bool> {
 impl RolloutWriter {
     /// Creates or opens a rollout file at the specified path for the given session.
     ///
-    /// If the file already exists, it scans existing valid records to recover `next_timeline_seq`,
-    /// `persisted_run_max_seq`, and accumulated `usage_totals`. That scan is unconditional: the
-    /// sidecar is never trusted to stand in for it, because no check applied to a file beside the
-    /// log can establish that the summary in it was computed from the log. See [`RolloutSidecar`].
+    /// If the file already exists, `next_timeline_seq`, `persisted_run_max_seq` and
+    /// `usage_totals` are recovered from it. When the sidecar points at a usable
+    /// [`RolloutCheckpoint`], that record supplies the totals for everything before it and only
+    /// the tail is scanned; otherwise the whole file is.
+    ///
+    /// **The fast path does not read the bytes before the checkpoint, so it cannot notice
+    /// corruption there** — including a checkpoint whose own figures were edited in place, which
+    /// is believed here and caught by any full scan. Anything that skips reading cannot verify
+    /// what it skipped. [`RolloutReader::read_all`](super::reader::RolloutReader::read_all) and
+    /// [`RolloutReader::scan_summary`](super::reader::RolloutReader::scan_summary) remain the
+    /// authoritative checks.
     ///
     /// A crash can leave an unterminated fragment at the end of the file. Those bytes are dropped
     /// so that subsequent appends do not splice onto them — **only** the bytes the reader
@@ -1309,7 +1377,7 @@ impl RolloutWriter {
             usage_totals: recovered.usage_totals,
             file_len: recovered.file_len,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-            records_since_checkpoint: 0,
+            records_since_checkpoint: recovered.records_since_checkpoint,
             last_checkpoint_offset: recovered.last_checkpoint_offset,
             sidecar_stale: false,
             poisoned: false,
@@ -1336,47 +1404,7 @@ impl RolloutWriter {
             .scan_summary_from(scan_from)
             .await?;
 
-        // Identity is established by the checkpoint when the fast path supplied one; the tail
-        // scan may not have reached a `session_meta` record.
-        if let Some(found) = summary.session_id()
-            && found != session_id
-        {
-            return Err(Error::caller(format!(
-                "rollout file at {} belongs to session {}, not {}",
-                path.display(),
-                found.as_str(),
-                session_id.as_str()
-            )));
-        }
-
-        if let Some((prev, offending)) = summary.non_monotonic_timeline_seq() {
-            return Err(Error::session(
-                SessionErrorKind::Corrupted,
-                format!(
-                    "rollout timeline_seq does not increase at {} (after {prev}, got {offending}); \
-                     the file was written by more than one writer or edited externally",
-                    path.display()
-                ),
-            ));
-        }
-
-        // The join between the checkpoint and the tail has to hold that rule too; the tail scan
-        // only sees records after the boundary, so it cannot notice a first record that fails to
-        // advance past the checkpoint.
-        if let Some(seed) = &seed
-            && let Some(first) = summary.first_timeline_seq()
-            && first <= seed.timeline_seq
-        {
-            return Err(Error::session(
-                SessionErrorKind::Corrupted,
-                format!(
-                    "rollout timeline_seq does not increase across the checkpoint at {} \
-                     (checkpoint {}, next {first})",
-                    path.display(),
-                    seed.timeline_seq
-                ),
-            ));
-        }
+        validate_scan(path, session_id, &summary, seed.as_ref())?;
 
         if summary.corrupted_trailing_bytes().is_some() {
             file.set_len(summary.valid_bytes_len()).await.map_err(|e| {
@@ -1444,7 +1472,14 @@ impl RolloutWriter {
             persisted_run_max_seq,
             usage_totals,
             file_len: end,
-            last_checkpoint_offset,
+            // A checkpoint newer than the one the index pointed at wins: the index can lag when a
+            // sidecar write fails, and keeping the stale offset would make every later resume
+            // re-read the same growing tail forever.
+            last_checkpoint_offset: summary.last_checkpoint_offset().or(last_checkpoint_offset),
+            // Carrying this over is what keeps the interval honest across restarts. Resetting it
+            // to zero lets a process that stops just short of the interval start counting again,
+            // so a session restarted often enough would never checkpoint at all.
+            records_since_checkpoint: summary.records_since_last_checkpoint() as u64,
         })
     }
 

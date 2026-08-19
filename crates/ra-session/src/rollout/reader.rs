@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom},
 };
 
-use super::writer::{ChildAnchorKind, RolloutPayload, RolloutRecord};
+use super::writer::{ChildAnchorKind, RolloutCheckpoint, RolloutPayload, RolloutRecord};
 
 /// Reconstructed summary of a rollout file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,8 @@ pub struct RolloutSummary {
     valid_bytes_len: u64,
     corrupted_trailing_bytes: Option<usize>,
     non_monotonic_timeline_seq: Option<(u64, u64)>,
+    last_checkpoint_offset: Option<u64>,
+    records_since_last_checkpoint: usize,
 }
 
 impl RolloutSummary {
@@ -86,6 +88,24 @@ impl RolloutSummary {
         self.corrupted_trailing_bytes
     }
 
+    /// Byte offset of the last checkpoint record in the scanned range.
+    ///
+    /// Recovery uses this to keep its index pointing at the newest checkpoint even when it
+    /// started from an older one.
+    #[must_use]
+    pub const fn last_checkpoint_offset(&self) -> Option<u64> {
+        self.last_checkpoint_offset
+    }
+
+    /// Records that follow the last checkpoint in the scanned range.
+    ///
+    /// A writer resuming here has this many records behind it since the last checkpoint, so
+    /// carrying it over is what keeps the checkpoint interval honest across restarts.
+    #[must_use]
+    pub const fn records_since_last_checkpoint(&self) -> usize {
+        self.records_since_last_checkpoint
+    }
+
     /// The first `(previous, offending)` pair where `timeline_seq` failed to increase, if any.
     ///
     /// The writer assigns `timeline_seq` at append time and only advances it once the record is
@@ -136,7 +156,7 @@ impl RolloutReader {
     /// UTF-8 or not a valid record envelope.
     pub async fn read_all(&self) -> Result<Vec<RolloutRecord>> {
         let (records, _, _) = self.read_records_internal(0).await?;
-        Ok(records)
+        Ok(records.into_iter().map(|(_, record)| record).collect())
     }
 
     /// Scans the rollout file and produces a summary including sequence bounds, usage totals,
@@ -171,8 +191,14 @@ impl RolloutReader {
         let mut persisted_run_max_seq = HashMap::new();
         let mut usage_totals = Usage::default();
         let mut non_monotonic_timeline_seq = None;
+        let mut last_checkpoint_offset = None;
+        let mut records_since_last_checkpoint = 0usize;
 
-        for record in &records {
+        // Only a scan that started at the top has the prefix a checkpoint claims to summarize,
+        // and so only it can hold the checkpoint to that claim.
+        let verifies_checkpoints = from == 0;
+
+        for (offset, record) in &records {
             let seq = record.timeline_seq();
             if first_timeline_seq.is_none() {
                 first_timeline_seq = Some(seq);
@@ -184,6 +210,7 @@ impl RolloutReader {
                 non_monotonic_timeline_seq = Some((prev, seq));
             }
             last_timeline_seq = Some(last_timeline_seq.map_or(seq, |prev| prev.max(seq)));
+            records_since_last_checkpoint += 1;
 
             if let Ok(payload) = record.payload() {
                 match payload {
@@ -201,6 +228,19 @@ impl RolloutReader {
                     RolloutPayload::ModelUsage(mu) => {
                         usage_totals = usage_totals.accumulate(mu.usage());
                     }
+                    RolloutPayload::Checkpoint(checkpoint) => {
+                        if verifies_checkpoints {
+                            verify_checkpoint(
+                                &self.path,
+                                seq,
+                                &checkpoint,
+                                &usage_totals,
+                                &persisted_run_max_seq,
+                            )?;
+                        }
+                        last_checkpoint_offset = Some(*offset);
+                        records_since_last_checkpoint = 0;
+                    }
                     _ => {}
                 }
             }
@@ -216,6 +256,8 @@ impl RolloutReader {
             valid_bytes_len,
             corrupted_trailing_bytes,
             non_monotonic_timeline_seq,
+            last_checkpoint_offset,
+            records_since_last_checkpoint,
         })
     }
 
@@ -231,7 +273,7 @@ impl RolloutReader {
     async fn read_records_internal(
         &self,
         from: u64,
-    ) -> Result<(Vec<RolloutRecord>, u64, Option<usize>)> {
+    ) -> Result<(Vec<(u64, RolloutRecord)>, u64, Option<usize>)> {
         if !self.path.exists() {
             return Ok((Vec::new(), 0, None));
         }
@@ -306,7 +348,7 @@ impl RolloutReader {
                 // keeping the line preserves it verbatim. Rejecting it here would fail the whole
                 // file, and marking it corrupt would hand the writer permission to erase it.
                 Ok(record) => {
-                    records.push(record);
+                    records.push((valid_bytes_len, record));
                     valid_bytes_len += bytes_read as u64;
                 }
                 Err(err) => {
@@ -324,6 +366,55 @@ impl RolloutReader {
 
         Ok((records, valid_bytes_len, corrupted_trailing_bytes))
     }
+}
+
+/// Holds a checkpoint to the prefix it claims to summarize.
+///
+/// A checkpoint is a derived value living among primary facts, which makes it the one record in
+/// the log that can be checked against the others. Doing so costs nothing here because the scan
+/// has already read that prefix — and it is the only place the check is possible, since knowing
+/// whether the figures follow from the records means having read the records. Resume's fast path
+/// deliberately does not read them, so a checkpoint whose numbers were edited in place is
+/// believed there and caught here.
+fn verify_checkpoint(
+    path: &Path,
+    timeline_seq: u64,
+    checkpoint: &RolloutCheckpoint,
+    expected_usage: &Usage,
+    expected_run_max_seq: &HashMap<RunId, u64>,
+) -> Result<()> {
+    let found = checkpoint.usage_totals();
+    let usage_matches = found.input_tokens() == expected_usage.input_tokens()
+        && found.output_tokens() == expected_usage.output_tokens()
+        && found.cached_input_tokens() == expected_usage.cached_input_tokens()
+        && found.cache_write_tokens() == expected_usage.cache_write_tokens()
+        && found.reasoning_tokens() == expected_usage.reasoning_tokens();
+
+    if !usage_matches {
+        return Err(Error::session(
+            SessionErrorKind::Corrupted,
+            format!(
+                "rollout checkpoint at timeline_seq {timeline_seq} in {} disagrees with the \
+                 records it summarizes: it claims {} input tokens, they add up to {}",
+                path.display(),
+                found.input_tokens(),
+                expected_usage.input_tokens()
+            ),
+        ));
+    }
+
+    if checkpoint.persisted_run_max_seq() != expected_run_max_seq {
+        return Err(Error::session(
+            SessionErrorKind::Corrupted,
+            format!(
+                "rollout checkpoint at timeline_seq {timeline_seq} in {} disagrees with the \
+                 records it summarizes: per-run event sequences do not match",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 /// An individual replay item in a unified multi-agent session replay stream.

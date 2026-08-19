@@ -1489,15 +1489,22 @@ async fn test_rollout_writer_rejects_checkpoint_from_another_session() {
     })
     .await;
 
-    // The index still points at it, but it no longer vouches for this session, so recovery falls
-    // back to the scan and reports what the log actually holds.
-    let writer = RolloutWriter::open(&file_path, session_id).await.unwrap();
-    assert_eq!(
-        writer.usage_totals().input_tokens(),
-        20,
-        "the foreign checkpoint's ledger was believed"
+    // The index still points at it, but it no longer vouches for this session, so the fast path
+    // declines it and the scan runs — which then finds the inflated ledger contradicting the
+    // records and says so. Believing the checkpoint instead would have returned 999_999 happily.
+    let err = RolloutWriter::open(&file_path, session_id)
+        .await
+        .expect_err("a foreign checkpoint must not be adopted");
+    assert!(
+        matches!(
+            err,
+            Error::Session {
+                kind: SessionErrorKind::Corrupted,
+                ..
+            }
+        ) && err.to_string().contains("999999"),
+        "expected the scan to reject the forged ledger, got: {err}"
     );
-    assert_eq!(writer.next_timeline_seq(), 4);
 }
 
 /// The tail scan cannot see the record before it, so a first tail record that fails to advance
@@ -1573,6 +1580,164 @@ async fn rewrite_line_at(
     tokio::fs::write(path, format!("{}\n", lines.join("\n")))
         .await
         .unwrap();
+}
+
+/// A checkpoint whose figures were edited in place, keeping the JSON, the session and the
+/// sequence intact, is believed by the fast path — it never reads the records that would
+/// contradict it. Any full scan must catch it, which is the only place the contradiction is
+/// visible.
+#[tokio::test]
+async fn test_scan_catches_a_checkpoint_that_disagrees_with_its_records() {
+    let dir = temp_test_dir("checkpoint_value_tampering");
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    let checkpoint_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .await
+                .unwrap();
+        }
+        checkpoint_offset = writer.last_checkpoint_offset().unwrap();
+        writer
+            .append_item(RunItem::new(
+                ItemId::new("tail"),
+                RunItemKind::Message(Message::user("tail")),
+            ))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    rewrite_line_at(&file_path, checkpoint_offset, |record| {
+        assert_eq!(record["type"], json!("checkpoint"));
+        record["payload"]["usage_totals"]["input_tokens"] = json!(999_999);
+    })
+    .await;
+
+    let err = RolloutReader::open(&file_path)
+        .scan_summary()
+        .await
+        .expect_err("a checkpoint contradicting its own records must be reported");
+    assert!(
+        matches!(
+            err,
+            Error::Session {
+                kind: SessionErrorKind::Corrupted,
+                ..
+            }
+        ),
+        "expected Corrupted, got: {err}"
+    );
+    assert!(err.to_string().contains("999999"), "got: {err}");
+}
+
+/// The checkpoint interval has to survive restarts. Counting from zero on every open lets a
+/// process that stops just short of the interval start over, so a session restarted often enough
+/// would never checkpoint and the tail would grow without bound.
+#[tokio::test]
+async fn test_rollout_writer_checkpoint_interval_survives_restarts() {
+    let dir = temp_test_dir("checkpoint_interval_restarts");
+    let session_id = SessionId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    // Four rounds of four records, always stopping one short of the interval of five.
+    for round in 0..4 {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(5);
+        for i in 0..4 {
+            writer
+                .append_item(RunItem::new(
+                    ItemId::new(format!("r{round}-{i}")),
+                    RunItemKind::Message(Message::user("x")),
+                ))
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+    }
+
+    let records = RolloutReader::open(&file_path).read_all().await.unwrap();
+    let checkpoints = records
+        .iter()
+        .filter(|r| r.type_name() == "checkpoint")
+        .count();
+    assert!(
+        checkpoints >= 3,
+        "16 records at an interval of 5 must produce at least 3 checkpoints, got {checkpoints}"
+    );
+}
+
+/// A sidecar left pointing at an older checkpoint must not pin recovery there forever: the tail
+/// scan passes newer checkpoints and the newest one has to become the index.
+#[tokio::test]
+async fn test_rollout_writer_index_advances_past_a_stale_checkpoint_offset() {
+    let dir = temp_test_dir("checkpoint_index_advances");
+    let session_id = SessionId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+    let sidecar_path = dir.join(format!(
+        "rollout-{}.jsonl.sidecar.json",
+        session_id.as_str()
+    ));
+
+    let (first_offset, newest_offset) = {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_item(RunItem::new(
+                    ItemId::new("a"),
+                    RunItemKind::Message(Message::user("a")),
+                ))
+                .await
+                .unwrap();
+        }
+        let first = writer.last_checkpoint_offset().unwrap();
+        for _ in 0..6 {
+            writer
+                .append_item(RunItem::new(
+                    ItemId::new("b"),
+                    RunItemKind::Message(Message::user("b")),
+                ))
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+        (first, writer.last_checkpoint_offset().unwrap())
+    };
+    assert_ne!(first_offset, newest_offset);
+
+    // Stand in for a sidecar update that failed after the first checkpoint.
+    let current: RolloutSidecar =
+        serde_json::from_slice(&tokio::fs::read(&sidecar_path).await.unwrap()).unwrap();
+    let stale = RolloutSidecar::new(
+        session_id.clone(),
+        current.next_timeline_seq(),
+        current.persisted_run_max_seq().clone(),
+        current.usage_totals().clone(),
+    )
+    .with_last_checkpoint_offset(first_offset);
+    tokio::fs::write(&sidecar_path, serde_json::to_vec(&stale).unwrap())
+        .await
+        .unwrap();
+
+    let writer = RolloutWriter::open(&file_path, session_id).await.unwrap();
+    assert_eq!(
+        writer.last_checkpoint_offset(),
+        Some(newest_offset),
+        "recovery stayed pinned to the stale offset and will re-read the tail forever"
+    );
 }
 
 #[tokio::test]
