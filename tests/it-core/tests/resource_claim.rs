@@ -28,18 +28,9 @@ fn test_resource_kind_semantics() {
     assert_eq!(proc.to_string(), "process");
     assert_eq!(custom.to_string(), "database");
 
-    assert_eq!(
-        serde_json::to_value(&ws).unwrap(),
-        json!("workspace")
-    );
-    assert_eq!(
-        serde_json::to_value(&proc).unwrap(),
-        json!("process")
-    );
-    assert_eq!(
-        serde_json::to_value(&custom).unwrap(),
-        json!("database")
-    );
+    assert_eq!(serde_json::to_value(&ws).unwrap(), json!("workspace"));
+    assert_eq!(serde_json::to_value(&proc).unwrap(), json!("process"));
+    assert_eq!(serde_json::to_value(&custom).unwrap(), json!("database"));
 
     let round_ws: ResourceKind = serde_json::from_str("\"workspace\"").unwrap();
     let round_proc: ResourceKind = serde_json::from_str("\"process\"").unwrap();
@@ -47,7 +38,10 @@ fn test_resource_kind_semantics() {
 
     assert_eq!(round_ws, ResourceKind::Workspace);
     assert_eq!(round_proc, ResourceKind::Process);
-    assert_eq!(round_custom, ResourceKind::Custom(Cow::Borrowed("database")));
+    assert_eq!(
+        round_custom,
+        ResourceKind::Custom(Cow::Borrowed("database"))
+    );
 
     assert_eq!(ResourceKind::from("workspace"), ResourceKind::Workspace);
     assert_eq!(ResourceKind::from("process"), ResourceKind::Process);
@@ -349,7 +343,9 @@ async fn test_tool_resource_claims_evaluation() {
     let dyn_claims = dynamic_tool.resource_claims(&tool_ctx).await.unwrap();
     assert_eq!(
         dyn_claims,
-        vec![ResourceClaim::exclusive(ResourceId::workspace("dynamic_ws").unwrap())]
+        vec![ResourceClaim::exclusive(
+            ResourceId::workspace("dynamic_ws").unwrap()
+        )]
     );
 }
 

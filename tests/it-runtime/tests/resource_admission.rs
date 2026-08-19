@@ -541,9 +541,7 @@ async fn test_legacy_tools_compatibility_with_claims() {
 
     release.store(true, Ordering::SeqCst);
 
-    task.await
-        .expect("settlement joins")
-        .expect("both settle");
+    task.await.expect("settlement joins").expect("both settle");
 
     assert_eq!(entered.load(Ordering::SeqCst), 2);
     assert_eq!(completed.load(Ordering::SeqCst), 2);
@@ -567,8 +565,18 @@ async fn test_dynamic_resource_claims_execution() {
         let binding = binding();
         let surface = surface(vec![dyn_tool]);
         let response = ModelResponse::new(vec![
-            tool_call("item-1", "call-1", "dyn_workspace_tool", json!({ "workspace": "ws-1" })),
-            tool_call("item-2", "call-2", "dyn_workspace_tool", json!({ "workspace": "ws-2" })),
+            tool_call(
+                "item-1",
+                "call-1",
+                "dyn_workspace_tool",
+                json!({ "workspace": "ws-1" }),
+            ),
+            tool_call(
+                "item-2",
+                "call-2",
+                "dyn_workspace_tool",
+                json!({ "workspace": "ws-2" }),
+            ),
         ]);
         let cancel = CancelScope::root();
         let mut tracker = ToolUseTracker::new();
@@ -647,9 +655,7 @@ async fn test_mixed_shared_and_exclusive_on_same_resource() {
 
     release.store(true, Ordering::SeqCst);
 
-    task.await
-        .expect("settlement joins")
-        .expect("both settle");
+    task.await.expect("settlement joins").expect("both settle");
 
     assert_eq!(entered.load(Ordering::SeqCst), 2);
     assert_eq!(completed.load(Ordering::SeqCst), 2);
@@ -708,9 +714,7 @@ async fn test_exclusive_tool_serializes_against_parallel_claim_tools() {
 
     release.store(true, Ordering::SeqCst);
 
-    task.await
-        .expect("settlement joins")
-        .expect("both settle");
+    task.await.expect("settlement joins").expect("both settle");
 
     assert_eq!(entered.load(Ordering::SeqCst), 2);
     assert_eq!(completed.load(Ordering::SeqCst), 2);
@@ -733,9 +737,19 @@ async fn test_dynamic_claim_failure_does_not_abort_turn() {
     let surface = surface(vec![dyn_tool]);
     let response = ModelResponse::new(vec![
         // Invalid workspace argument with trailing space causes ResourceId validation failure
-        tool_call("item-1", "call-1", "dyn_tool", json!({ "workspace": "invalid " })),
+        tool_call(
+            "item-1",
+            "call-1",
+            "dyn_tool",
+            json!({ "workspace": "invalid " }),
+        ),
         // Valid workspace argument
-        tool_call("item-2", "call-2", "dyn_tool", json!({ "workspace": "valid_repo" })),
+        tool_call(
+            "item-2",
+            "call-2",
+            "dyn_tool",
+            json!({ "workspace": "valid_repo" }),
+        ),
     ]);
     let cancel = CancelScope::root();
     let mut tracker = ToolUseTracker::new();

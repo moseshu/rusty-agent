@@ -19,7 +19,8 @@ fn test_session_id_generation_and_display() {
     let restored: ExecSessionId = serde_json::from_str(&json_str).expect("must deserialize");
     assert_eq!(id1, restored);
 
-    let res_id = ra_exec::session::session_resource_id(&id1).expect("must derive session ResourceId");
+    let res_id =
+        ra_exec::session::session_resource_id(&id1).expect("must derive session ResourceId");
     assert_eq!(res_id.to_string(), "process:exec-custom-1");
 }
 

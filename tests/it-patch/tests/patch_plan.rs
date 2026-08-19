@@ -217,7 +217,12 @@ fn test_patch_records_use_the_core_compat_vocabulary() {
         newer.schema_version().compatibility(PATCH_SCHEMA_VERSION),
         Compatibility::Newer
     );
-    assert!(!newer.schema_version().compatibility(PATCH_SCHEMA_VERSION).needs_migration());
+    assert!(
+        !newer
+            .schema_version()
+            .compatibility(PATCH_SCHEMA_VERSION)
+            .needs_migration()
+    );
 
     // And an older one reports that it does need one.
     let older = SchemaVersion::new(0);

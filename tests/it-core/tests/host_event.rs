@@ -21,9 +21,9 @@ use ra_core::{
             AgentSpawnedEvent, AgentStatus, AgentStatusChangedEvent,
         },
         exec::{
-            EXEC_EVENT_SCHEMA_VERSION, ExecEvictedEvent, ExecEvictionReason, ExecExitedEvent, ExecOutputEvent, ExecSessionId,
-            ExecStartedEvent, ExecStreamKind, ExecYieldReason, ExecYieldedEvent,
-            TerminalInteractionEvent,
+            EXEC_EVENT_SCHEMA_VERSION, ExecEvictedEvent, ExecEvictionReason, ExecExitedEvent,
+            ExecOutputEvent, ExecSessionId, ExecStartedEvent, ExecStreamKind, ExecYieldReason,
+            ExecYieldedEvent, TerminalInteractionEvent,
         },
     },
     item::AgentId,
