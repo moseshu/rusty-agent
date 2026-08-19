@@ -61,6 +61,9 @@ futures = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
 cap-std = "4.0.2"
+# 只用 `flock`。选 rustix 而不是 libc 直调，是因为 workspace 里 `unsafe_code = "forbid"`，
+# 而它已经作为传递依赖在锁文件里了，不新增第三方代码面。
+rustix = { version = "1", features = ["fs"] }
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }

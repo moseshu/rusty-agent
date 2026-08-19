@@ -129,6 +129,37 @@ impl Usage {
         self.reasoning_tokens
     }
 
+    /// Adds `delta` onto these totals, saturating on overflow.
+    ///
+    /// The known counters are summed. Unknown fields are **retained, not added**: they are opaque
+    /// JSON values here, so there is nothing to sum them with, and `delta` wins on a key both
+    /// sides carry — the later observation is the more specific one. Retaining them still matters,
+    /// because a running total that dropped the counters this build does not recognize would
+    /// describe less than the responses it was built from. Do not read a retained unknown counter
+    /// as a total across `accumulate` calls; only the last one survives.
+    ///
+    /// Accumulation lives here rather than in whichever crate happens to keep the ledger so the
+    /// unknown-field merge stays a `Usage` concern. Exposing a public setter for `unknown` instead
+    /// would let any caller mint fields that never came from a payload, which is precisely what
+    /// [`Unknown`]'s crate-internal merge is there to prevent.
+    #[must_use]
+    pub fn accumulate(&self, delta: &Self) -> Self {
+        let mut merged = self.clone();
+
+        merged.input_tokens = self.input_tokens.saturating_add(delta.input_tokens);
+        merged.output_tokens = self.output_tokens.saturating_add(delta.output_tokens);
+        merged.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(delta.cached_input_tokens);
+        merged.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(delta.cache_write_tokens);
+        merged.reasoning_tokens = self.reasoning_tokens.saturating_add(delta.reasoning_tokens);
+        merged.unknown.extend_from(&delta.unknown);
+
+        merged
+    }
+
     /// Unknown fields retained during deserialization.
     #[must_use]
     pub const fn unknown(&self) -> &Unknown {

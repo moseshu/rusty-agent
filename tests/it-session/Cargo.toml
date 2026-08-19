@@ -18,5 +18,5 @@ ra-core = { path = "../../crates/ra-core" }
 ra-session = { path = "../../crates/ra-session", default-features = false }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 serde_json = "1"

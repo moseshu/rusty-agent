@@ -28,7 +28,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::{
-    agent::AgentEvent,
+    agent::{AgentEvent, AgentOperationId},
     exec::ExecEvent,
     sink::{FnHostEventSink, HostEventSink, InMemoryHostEventSink, NoopHostEventSink},
     timestamp::EventTimestamp,

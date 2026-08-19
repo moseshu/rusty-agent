@@ -1257,6 +1257,7 @@ dependencies = [
  "async-trait",
  "ra-core",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
