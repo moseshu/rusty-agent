@@ -107,9 +107,12 @@ async fn test_exec_command_simple_execution() {
     let dir = workspace();
     let tool = rooted(&dir);
 
-    let output = execute(&tool, &arguments(json!({ "cmd": "echo 'hello execution'" })))
-        .await
-        .expect("execution succeeds");
+    let output = execute(
+        &tool,
+        &arguments(json!({ "cmd": "echo 'hello execution'" })),
+    )
+    .await
+    .expect("execution succeeds");
 
     assert_eq!(
         output.as_text().expect("text output").trim(),
@@ -146,7 +149,11 @@ async fn test_exec_command_rejects_escaping_workdir() {
     let dir = workspace();
     let tool = rooted(&dir);
 
-    let output = observe(&tool, &arguments(json!({ "cmd": "ls", "workdir": "../outside" }))).await;
+    let output = observe(
+        &tool,
+        &arguments(json!({ "cmd": "ls", "workdir": "../outside" })),
+    )
+    .await;
 
     let text = output.as_text().expect("text output");
     assert!(text.contains("uses `..`"), "unexpected sentence: {text}");
@@ -169,7 +176,10 @@ async fn test_exec_command_rejects_workdir_outside_the_root() {
     .await;
 
     let text = output.as_text().expect("text output");
-    assert!(text.contains("outside the workspace"), "unexpected sentence: {text}");
+    assert!(
+        text.contains("outside the workspace"),
+        "unexpected sentence: {text}"
+    );
     assert!(!output.metadata().guidance().is_empty());
 }
 
@@ -178,10 +188,17 @@ async fn test_exec_command_reports_a_missing_workdir_once() {
     let dir = workspace();
     let tool = rooted(&dir);
 
-    let output = observe(&tool, &arguments(json!({ "cmd": "ls", "workdir": "absent" }))).await;
+    let output = observe(
+        &tool,
+        &arguments(json!({ "cmd": "ls", "workdir": "absent" })),
+    )
+    .await;
 
     let text = output.as_text().expect("text output");
-    assert!(text.contains("No such directory"), "unexpected sentence: {text}");
+    assert!(
+        text.contains("No such directory"),
+        "unexpected sentence: {text}"
+    );
     assert_eq!(text.matches("No such directory").count(), 1);
 }
 
@@ -194,7 +211,10 @@ async fn test_exec_command_refuses_a_terminal_it_cannot_allocate() {
     let output = observe(&tool, &arguments(json!({ "cmd": "ls", "tty": true }))).await;
 
     let text = output.as_text().expect("text output");
-    assert!(text.contains("cannot allocate a terminal"), "unexpected sentence: {text}");
+    assert!(
+        text.contains("cannot allocate a terminal"),
+        "unexpected sentence: {text}"
+    );
     assert!(!output.metadata().guidance().is_empty());
 }
 
@@ -208,7 +228,10 @@ async fn test_exec_command_rejects_unknown_arguments() {
     let output = observe(&tool, &args).await;
 
     let text = output.as_text().expect("text output");
-    assert!(text.contains("Invalid arguments"), "unexpected sentence: {text}");
+    assert!(
+        text.contains("Invalid arguments"),
+        "unexpected sentence: {text}"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +247,10 @@ async fn test_exec_command_background_yield() {
     .expect("execution starts and yields");
 
     let text = output.as_text().expect("text output");
-    assert!(text.contains("still running"), "unexpected sentence: {text}");
+    assert!(
+        text.contains("still running"),
+        "unexpected sentence: {text}"
+    );
     assert!(!output.metadata().guidance().is_empty());
 
     for session_id in tool.process_manager().active_sessions().await {
@@ -248,7 +274,12 @@ async fn test_exec_command_enforces_its_timeout() {
     )
     .await
     .expect("execution starts and yields");
-    assert!(output.as_text().expect("text output").contains("still running"));
+    assert!(
+        output
+            .as_text()
+            .expect("text output")
+            .contains("still running")
+    );
 
     let manager = tool.process_manager();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -293,9 +324,12 @@ async fn test_exec_command_truncation_limits() {
     let limits = ExecCommandLimits::new().with_max_output_bytes(50);
     let tool = rooted(&dir).with_limits(limits);
 
-    let output = execute(&tool, &arguments(json!({ "cmd": "printf '%0.s0' $(seq 1 200)" })))
-        .await
-        .expect("execution completes");
+    let output = execute(
+        &tool,
+        &arguments(json!({ "cmd": "printf '%0.s0' $(seq 1 200)" })),
+    )
+    .await
+    .expect("execution completes");
 
     let text = output.as_text().expect("text output");
     assert!(text.contains("[omitted"), "unexpected body: {text}");

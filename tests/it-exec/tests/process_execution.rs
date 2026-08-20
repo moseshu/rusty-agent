@@ -26,8 +26,15 @@ fn quick_yield() -> ExecLimits {
     ExecLimits::new().with_initial_yield_timeout(Duration::from_millis(100))
 }
 
-async fn yielded(manager: &ProcessManager, request: ExecRequest) -> ra_exec::session::ExecSessionId {
-    match manager.execute(request, None).await.expect("command starts") {
+async fn yielded(
+    manager: &ProcessManager,
+    request: ExecRequest,
+) -> ra_exec::session::ExecSessionId {
+    match manager
+        .execute(request, None)
+        .await
+        .expect("command starts")
+    {
         ExecExecutionResult::Yielded { session_id, .. } => session_id,
         ExecExecutionResult::Completed(summary) => {
             panic!("expected the command to yield, it finished: {summary:?}")
@@ -91,7 +98,10 @@ fn test_head_tail_buffer_read_from_reports_the_gap_and_ends() {
     let (text, next) = buffer.read_from(10).expect("output past the first read");
     // The cursor lands inside bytes the buffer dropped: the gap is announced, and the cursor jumps
     // over it instead of advancing by the length of a string that stands in for missing output.
-    assert!(text.contains("[omitted 10 bytes]"), "unexpected text: {text}");
+    assert!(
+        text.contains("[omitted 10 bytes]"),
+        "unexpected text: {text}"
+    );
     assert!(text.contains("KLMNOPQRST"));
     assert_eq!(next, 30);
     assert!(buffer.read_from(next).is_none());
@@ -173,7 +183,10 @@ async fn test_process_manager_execute_with_stderr() {
 async fn test_process_manager_passes_arguments_to_the_shell() {
     let manager = ProcessManager::default();
     let request = ExecRequest::new("echo \"$1-$2\"").with_args(["sh", "left", "right"]);
-    let result = manager.execute(request, None).await.expect("execution succeeds");
+    let result = manager
+        .execute(request, None)
+        .await
+        .expect("execution succeeds");
 
     assert_eq!(result.summary().stdout().trim(), "left-right");
 }
@@ -182,7 +195,10 @@ async fn test_process_manager_passes_arguments_to_the_shell() {
 async fn test_process_manager_honours_a_requested_shell() {
     let manager = ProcessManager::default();
     let request = ExecRequest::new("echo $0").with_shell(Some("/bin/sh"));
-    let result = manager.execute(request, None).await.expect("execution succeeds");
+    let result = manager
+        .execute(request, None)
+        .await
+        .expect("execution succeeds");
 
     assert_eq!(result.summary().stdout().trim(), "/bin/sh");
 }
@@ -280,7 +296,10 @@ async fn test_process_manager_keeps_output_after_an_invalid_byte() {
         .expect("execution succeeds");
 
     let streamed = streamed_text(&sink);
-    assert!(streamed.starts_with('A'), "text before the bad byte was lost");
+    assert!(
+        streamed.starts_with('A'),
+        "text before the bad byte was lost"
+    );
     assert!(streamed.ends_with('B'), "text after the bad byte was lost");
     assert_eq!(streamed, result.summary().stdout());
 }
@@ -431,7 +450,11 @@ async fn test_process_manager_refuses_a_combined_cursor() {
 #[tokio::test]
 async fn test_process_manager_eviction() {
     let manager = ProcessManager::default();
-    let session_id = yielded(&manager, ExecRequest::new("sleep 30").with_limits(quick_yield())).await;
+    let session_id = yielded(
+        &manager,
+        ExecRequest::new("sleep 30").with_limits(quick_yield()),
+    )
+    .await;
 
     tokio::time::timeout(
         RESPONSIVE,
@@ -457,7 +480,10 @@ async fn test_process_manager_eviction() {
 async fn test_process_manager_retires_finished_sessions() {
     let manager = ProcessManager::default();
     let request = ExecRequest::new("echo retired").with_limits(quick_yield());
-    let result = manager.execute(request, None).await.expect("execution succeeds");
+    let result = manager
+        .execute(request, None)
+        .await
+        .expect("execution succeeds");
     assert!(matches!(result, ExecExecutionResult::Completed(_)));
 
     assert!(manager.active_sessions().await.is_empty());
@@ -471,8 +497,16 @@ async fn test_process_manager_evicts_the_oldest_running_session_at_capacity() {
         .with_initial_yield_timeout(Duration::from_millis(100));
     let manager = ProcessManager::new(limits.clone());
 
-    let first = yielded(&manager, ExecRequest::new("sleep 30").with_limits(limits.clone())).await;
-    let second = yielded(&manager, ExecRequest::new("sleep 30").with_limits(limits.clone())).await;
+    let first = yielded(
+        &manager,
+        ExecRequest::new("sleep 30").with_limits(limits.clone()),
+    )
+    .await;
+    let second = yielded(
+        &manager,
+        ExecRequest::new("sleep 30").with_limits(limits.clone()),
+    )
+    .await;
     let third = yielded(&manager, ExecRequest::new("sleep 30").with_limits(limits)).await;
 
     let active = manager.active_sessions().await;
@@ -554,8 +588,9 @@ async fn wait_until_gone(pid: &str) {
 #[tokio::test]
 async fn test_process_manager_terminates_the_whole_process_group() {
     let manager = ProcessManager::default();
-    let request = ExecRequest::new(r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $!; wait"#)
-        .with_limits(quick_yield());
+    let request =
+        ExecRequest::new(r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $!; wait"#)
+            .with_limits(quick_yield());
     let session_id = yielded(&manager, request).await;
 
     // The background pid is printed before the shell blocks, so it has arrived by the yield.
@@ -566,7 +601,10 @@ async fn test_process_manager_terminates_the_whole_process_group() {
         .stdout()
         .trim()
         .to_owned();
-    assert!(!background.is_empty(), "the command did not report its child");
+    assert!(
+        !background.is_empty(),
+        "the command did not report its child"
+    );
     assert!(is_alive(&background), "the child never started");
 
     tokio::time::timeout(RESPONSIVE, manager.cancel(&session_id))
@@ -582,7 +620,11 @@ async fn test_process_manager_terminates_the_whole_process_group() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_process_manager_stdin_write_does_not_block_cancellation() {
     let manager = Arc::new(ProcessManager::default());
-    let session_id = yielded(&manager, ExecRequest::new("sleep 30").with_limits(quick_yield())).await;
+    let session_id = yielded(
+        &manager,
+        ExecRequest::new("sleep 30").with_limits(quick_yield()),
+    )
+    .await;
 
     // Far more than any pipe buffer, sent to a command that will never read a byte of it.
     let payload = "x".repeat(1024 * 1024);

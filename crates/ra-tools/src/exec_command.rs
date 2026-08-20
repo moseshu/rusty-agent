@@ -189,16 +189,16 @@ impl ExecCommandTool {
             ))
             .with_source(error)
         })?;
-        let resource_id =
-            ra_exec::fs::workspace_resource_id(canonical.to_string_lossy().to_string()).map_err(
-                |error| {
-                    Error::config(format!(
-                        "exec_command workspace root `{}` produces invalid resource identity",
-                        canonical.display()
-                    ))
-                    .with_source(error)
-                },
-            )?;
+        let resource_id = ra_exec::fs::workspace_resource_id(
+            canonical.to_string_lossy().to_string(),
+        )
+        .map_err(|error| {
+            Error::config(format!(
+                "exec_command workspace root `{}` produces invalid resource identity",
+                canonical.display()
+            ))
+            .with_source(error)
+        })?;
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ExecCommandInput::tool_schema(TOOL_NAME)?,
@@ -342,7 +342,9 @@ impl Tool for ExecCommandTool {
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         let input: ExecCommandInput = serde_json::from_value(context.arguments().clone())
             .map_err(|error| ExecCommandFailure::BadArguments(error.to_string()).into_error())?;
-        let request = self.request(input).map_err(ExecCommandFailure::into_error)?;
+        let request = self
+            .request(input)
+            .map_err(ExecCommandFailure::into_error)?;
 
         let emitter = context.event_emitter();
         let outcome = self
@@ -525,13 +527,17 @@ impl ExecCommandFailure {
             Self::OutsideRoot(_) => "Run the command inside the workspace root.",
             Self::AmbiguousParent(_) => "Send `workdir` without `..`.",
             Self::MissingDirectory(_) => "Check the directory exists, or run from the root.",
-            Self::PtyUnavailable => "Run the command without `tty`, in a form that needs no terminal.",
+            Self::PtyUnavailable => {
+                "Run the command without `tty`, in a form that needs no terminal."
+            }
             Self::Spawn(_) => "Check the command and the shell, then try again.",
             // Not "stop one": by the time this failure exists every one of them has already been
             // told to stop and outlived the deadline for doing so, so a stop request against any
             // of them is a call that returns having done nothing. Waiting is the only move the
             // model has, and the stuck processes are something the user needs to hear about.
-            Self::Busy(_) => "Wait for them to be reclaimed and try again; tell the user if it persists.",
+            Self::Busy(_) => {
+                "Wait for them to be reclaimed and try again; tell the user if it persists."
+            }
             Self::Session(_) => "Start the command again rather than addressing that session.",
         }
     }
@@ -568,7 +574,10 @@ impl fmt::Display for ExecCommandFailure {
             }
             Self::MissingDirectory(path) => write!(f, "No such directory: `{path}`."),
             Self::PtyUnavailable => {
-                write!(f, "This build runs commands on pipes and cannot allocate a terminal.")
+                write!(
+                    f,
+                    "This build runs commands on pipes and cannot allocate a terminal."
+                )
             }
             Self::Spawn(reason) => write!(f, "The command did not start: {reason}."),
             Self::Busy(reason) => write!(f, "No room to run another command: {reason}."),

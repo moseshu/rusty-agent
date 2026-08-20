@@ -26,18 +26,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use ra_core::event::exec::ExecSessionId;
 use ra_core::{
     cancel::DRAIN_GRACE,
     event::{
         HostEventEmitter,
         exec::{
-            ExecEvictedEvent, ExecEvictionReason, ExecEvent, ExecExitedEvent, ExecOutputEvent,
+            ExecEvent, ExecEvictedEvent, ExecEvictionReason, ExecExitedEvent, ExecOutputEvent,
             ExecStartedEvent, ExecStreamKind, ExecYieldReason, ExecYieldedEvent,
             TerminalInteractionEvent,
         },
     },
 };
-pub use ra_core::event::exec::ExecSessionId;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -600,10 +600,7 @@ impl ProcessManager {
             sess.pid = pid;
             *sess.child_stdin.lock().await = child_stdin;
             sess.terminate = Some(terminate_tx);
-            (
-                Arc::clone(&sess.exit_notify),
-                Arc::clone(&sess.child_stdin),
-            )
+            (Arc::clone(&sess.exit_notify), Arc::clone(&sess.child_stdin))
         };
 
         // Armed before the supervisor can possibly report an exit. `Notify` wakes the waiters
@@ -757,7 +754,10 @@ impl ProcessManager {
     }
 
     /// Fetches an output summary snapshot of a session.
-    pub async fn get_output_summary(&self, session_id: &ExecSessionId) -> Option<ExecOutputSummary> {
+    pub async fn get_output_summary(
+        &self,
+        session_id: &ExecSessionId,
+    ) -> Option<ExecOutputSummary> {
         let session = self.registry.get(session_id).await?;
         let summary = session.lock().await.summary();
         Some(summary)
@@ -778,13 +778,13 @@ impl ProcessManager {
         session_id: &ExecSessionId,
         cursor: ExecCursor,
     ) -> Result<Option<(String, ExecCursor)>, ExecError> {
-        let session = self
-            .registry
-            .get(session_id)
-            .await
-            .ok_or_else(|| ExecError::UnknownSession {
-                session_id: session_id.clone(),
-            })?;
+        let session =
+            self.registry
+                .get(session_id)
+                .await
+                .ok_or_else(|| ExecError::UnknownSession {
+                    session_id: session_id.clone(),
+                })?;
 
         let mut sess = session.lock().await;
         let buffer = match cursor.stream() {
@@ -829,13 +829,13 @@ impl ProcessManager {
         is_interrupt: bool,
         emitter: Option<&HostEventEmitter>,
     ) -> Result<(), ExecError> {
-        let session = self
-            .registry
-            .get(session_id)
-            .await
-            .ok_or_else(|| ExecError::UnknownSession {
-                session_id: session_id.clone(),
-            })?;
+        let session =
+            self.registry
+                .get(session_id)
+                .await
+                .ok_or_else(|| ExecError::UnknownSession {
+                    session_id: session_id.clone(),
+                })?;
 
         let stdin_slot = {
             let mut sess = session.lock().await;
@@ -854,11 +854,9 @@ impl ProcessManager {
 
         if is_interrupt {
             if let Some(em) = emitter {
-                let _ = em.emit(ExecEvent::TerminalInteraction(TerminalInteractionEvent::new(
-                    session_id.clone(),
-                    0,
-                    true,
-                )));
+                let _ = em.emit(ExecEvent::TerminalInteraction(
+                    TerminalInteractionEvent::new(session_id.clone(), 0, true),
+                ));
             }
             return Ok(());
         }
@@ -894,11 +892,9 @@ impl ProcessManager {
         // rather than when someone started trying to send it.
         session.lock().await.last_active_at = Instant::now();
         if let Some(em) = emitter {
-            let _ = em.emit(ExecEvent::TerminalInteraction(TerminalInteractionEvent::new(
-                session_id.clone(),
-                input.len(),
-                false,
-            )));
+            let _ = em.emit(ExecEvent::TerminalInteraction(
+                TerminalInteractionEvent::new(session_id.clone(), input.len(), false),
+            ));
         }
         Ok(())
     }
@@ -918,7 +914,8 @@ impl ProcessManager {
     /// the emitter the session was started with — not here. One session has one death, and the
     /// supervisor is the only thing positioned to say what it was.
     pub async fn evict(&self, session_id: &ExecSessionId, reason: ExecEvictionReason) {
-        self.stop(session_id, TerminalOutcome::Evicted(reason)).await;
+        self.stop(session_id, TerminalOutcome::Evicted(reason))
+            .await;
     }
 
     /// Records a session's death and asks its supervisor to deliver it.
@@ -1126,7 +1123,10 @@ async fn supervise(
         );
     }
 
-    let exit_code = status.as_ref().ok().and_then(std::process::ExitStatus::code);
+    let exit_code = status
+        .as_ref()
+        .ok()
+        .and_then(std::process::ExitStatus::code);
     let (recorded_state, duration_ms, stdout_bytes, stderr_bytes, notify) = {
         let mut sess = context.session.lock().await;
         sess.exit_code = exit_code;
