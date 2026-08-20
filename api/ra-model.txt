@@ -2,6 +2,22 @@
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
 const fn ra_model::openai::auth::OpenAiAuth::default_headers(& self) -> & BTreeMap < String , String >
+const fn ra_model::openai::chat::ChatLoweringOptions::new() -> Self
+const fn ra_model::openai::chat::ChatLoweringOptions::strict_feature_validation(self) -> bool
+const fn ra_model::openai::chat::ChatLoweringOptions::with_strict_feature_validation(mut self, strict : bool) -> Self
+const fn ra_model::openai::chat::OpenAiChatModel::with_buffered_tool_calls(mut self, buffered : bool) -> Self
+const fn ra_model::openai::chat::OpenAiChatModel::with_lowering_options(mut self, options : ChatLoweringOptions) -> Self
+const fn ra_model::openai::chat::OpenAiChatModel::with_quirks(mut self, quirks : ProviderQuirks) -> Self
+const fn ra_model::openai::chat::OpenAiChatProvider::with_buffered_tool_calls(mut self, buffered : bool) -> Self
+const fn ra_model::openai::chat::OpenAiChatProvider::with_lowering_options(mut self, options : ChatLoweringOptions) -> Self
+const fn ra_model::openai::chat::OpenAiChatProvider::with_quirks(mut self, quirks : ProviderQuirks) -> Self
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::base_url(self) -> & 'a str
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::model(self) -> & 'a str
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::new(model : & 'a str, base_url : & 'a str) -> Self
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::origin_model(self) -> Option < & 'a str >
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::provider_data(self) -> Option < & 'a Value >
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::with_origin_model(mut self, origin_model : Option < & 'a str >) -> Self
+const fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::with_provider_data(mut self, provider_data : Option < & 'a Value >) -> Self
 const fn ra_model::openai::responses::OpenAiResponsesModel::with_quirks(mut self, quirks : ProviderQuirks) -> Self
 const fn ra_model::openai::responses::OpenAiResponsesProvider::with_quirks(mut self, quirks : ProviderQuirks) -> Self
 const fn ra_model::provider::ModelRegistration::defaults(& self) -> & ModelSettings
@@ -12,9 +28,21 @@ const fn ra_model::provider::ProviderRegistration::quirks(& self) -> ProviderQui
 const fn ra_model::provider::ProviderRegistration::with_quirks(mut self, quirks : ProviderQuirks) -> Self
 const fn ra_model::provider::ProviderRegistry::default_provider(& self) -> & ProviderKey
 const fn ra_model::provider::ProviderRegistry::unknown_prefix_policy(& self) -> & UnknownPrefixPolicy
+const fn ra_model::provider::quirks::ProviderQuirks::multimodal_tool_output(self) -> bool
 const fn ra_model::provider::quirks::ProviderQuirks::new() -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::parallel_tool_calls(self) -> bool
 const fn ra_model::provider::quirks::ProviderQuirks::prompt_cache_key(self) -> bool
+const fn ra_model::provider::quirks::ProviderQuirks::reasoning_content(self) -> bool
+const fn ra_model::provider::quirks::ProviderQuirks::store(self) -> bool
+const fn ra_model::provider::quirks::ProviderQuirks::stream_usage(self) -> bool
+const fn ra_model::provider::quirks::ProviderQuirks::thinking_blocks(self) -> bool
+const fn ra_model::provider::quirks::ProviderQuirks::with_multimodal_tool_output(mut self, supported : bool) -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::with_parallel_tool_calls(mut self, supported : bool) -> Self
 const fn ra_model::provider::quirks::ProviderQuirks::with_prompt_cache_key(mut self, supported : bool) -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::with_reasoning_content(mut self, supported : bool) -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::with_store(mut self, supported : bool) -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::with_stream_usage(mut self, supported : bool) -> Self
+const fn ra_model::provider::quirks::ProviderQuirks::with_thinking_blocks(mut self, supported : bool) -> Self
 enum ra_model::provider::UnknownPrefixPolicy
 fn ra_model::openai::auth::OpenAiAuth::base_url(& self) -> & str
 fn ra_model::openai::auth::OpenAiAuth::new(api_key : impl Into < String >) -> Self
@@ -24,6 +52,17 @@ fn ra_model::openai::auth::OpenAiAuth::with_base_url(mut self, base_url : impl I
 fn ra_model::openai::auth::OpenAiAuth::with_default_header(mut self, name : impl Into < String >, value : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::with_organization(mut self, organization : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::with_project(mut self, project : impl Into < String >) -> Self
+fn ra_model::openai::chat::OpenAiChatModel::model(& self) -> & str
+fn ra_model::openai::chat::OpenAiChatModel::new(model : impl Into < String >, auth : OpenAiAuth) -> Result < Self >
+fn ra_model::openai::chat::OpenAiChatModel::with_reasoning_replay(mut self, replay : ReasoningReplayPolicy) -> Self
+fn ra_model::openai::chat::OpenAiChatProvider::default_model(& self) -> & str
+fn ra_model::openai::chat::OpenAiChatProvider::new(auth : OpenAiAuth, default_model : impl Into < String >) -> Result < Self >
+fn ra_model::openai::chat::OpenAiChatProvider::with_reasoning_replay(mut self, replay : ReasoningReplayPolicy) -> Self
+fn ra_model::openai::chat::reasoning::ReasoningReplayContext < 'a >::has_foreign_provider_data(self) -> bool
+fn ra_model::openai::chat::reasoning::ReasoningReplayPolicy::allows(& self, context : & ReasoningReplayContext < '_ >) -> bool
+fn ra_model::openai::chat::reasoning::ReasoningReplayPolicy::never() -> Self
+fn ra_model::openai::chat::reasoning::ReasoningReplayPolicy::new(policy : impl Fn (& ReasoningReplayContext < '_ >) -> bool + Send + Sync + 'static) -> Self
+fn ra_model::openai::chat::reasoning::default_should_replay_reasoning(context : & ReasoningReplayContext < '_ >) -> bool
 fn ra_model::openai::responses::OpenAiResponsesModel::model(& self) -> & str
 fn ra_model::openai::responses::OpenAiResponsesModel::new(model : impl Into < String >, auth : OpenAiAuth) -> Result < Self >
 fn ra_model::openai::responses::OpenAiResponsesProvider::default_model(& self) -> & str
@@ -60,6 +99,7 @@ mod ra_model::fallback
 mod ra_model::openai
 mod ra_model::openai::auth
 mod ra_model::openai::chat
+mod ra_model::openai::chat::reasoning
 mod ra_model::openai::responses
 mod ra_model::protocol
 mod ra_model::provider
@@ -67,6 +107,11 @@ mod ra_model::provider::quirks
 mod ra_model::retry
 mod ra_model::usage
 struct ra_model::openai::auth::OpenAiAuth
+struct ra_model::openai::chat::ChatLoweringOptions
+struct ra_model::openai::chat::OpenAiChatModel
+struct ra_model::openai::chat::OpenAiChatProvider
+struct ra_model::openai::chat::reasoning::ReasoningReplayContext
+struct ra_model::openai::chat::reasoning::ReasoningReplayPolicy
 struct ra_model::openai::responses::OpenAiResponsesModel
 struct ra_model::openai::responses::OpenAiResponsesProvider
 struct ra_model::provider::ModelRegistration

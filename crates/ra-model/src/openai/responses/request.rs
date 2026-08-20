@@ -2,12 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ra_core::{
     error::{Error, Result},
     item::{
-        ContentBlock, FileBlock, FileSource, ImageBlock, ImageSource, InputItemNormalizer, Message,
-        MessageRole, ModelInputItem, OutputPhase,
+        ContentBlock, FileBlock, FileSource, ImageBlock, InputItemNormalizer, Message, MessageRole,
+        ModelInputItem, OutputPhase,
     },
     model::{
         ConversationContinuation, Effort, ModelHandoffDefinition, ModelRequest,
@@ -18,6 +17,7 @@ use ra_core::{
 };
 use serde_json::{Map, Value, json};
 
+use crate::openai::content::{ResolvedImage, resolve_image, stringify_tool_output};
 use crate::openai::error::behavior_error;
 use crate::provider::quirks::ProviderQuirks;
 
@@ -513,36 +513,10 @@ async fn lower_content(block: &ContentBlock, role: MessageRole) -> Result<Value>
 /// becomes a wire field — a second copy is what makes a base64 image work in a user message and
 /// fail in a tool result.
 async fn lower_image(image: &ImageBlock) -> Result<Value> {
-    let mut part = match image.source() {
-        ImageSource::Base64(source) => json!({
-            "type": "input_image",
-            "image_url": format!("data:{};base64,{}", source.media_type(), source.data())
-        }),
-        ImageSource::LocalPath(source) => {
-            let bytes = tokio::fs::read(source.path()).await.map_err(|error| {
-                Error::caller(format!(
-                    "could not read local image `{}`",
-                    source.path().display()
-                ))
-                .with_source(error)
-            })?;
-            json!({
-                "type": "input_image",
-                "image_url": format!(
-                    "data:{};base64,{}",
-                    infer_media_type(source.path()),
-                    STANDARD.encode(bytes)
-                )
-            })
-        }
-        ImageSource::Url(source) => json!({"type": "input_image", "image_url": source.url()}),
-        ImageSource::ProviderFile(source) => {
-            json!({"type": "input_image", "file_id": source.file_id()})
-        }
-        _ => {
-            return Err(Error::caller(
-                "unsupported image source for OpenAI Responses",
-            ));
+    let mut part = match resolve_image(image.source()).await? {
+        ResolvedImage::Url(url) => json!({"type": "input_image", "image_url": url}),
+        ResolvedImage::ProviderFile(file_id) => {
+            json!({"type": "input_image", "file_id": file_id})
         }
     };
     if let Some(detail) = image.detail() {
@@ -585,7 +559,7 @@ fn lower_file(file: &FileBlock) -> Result<Value> {
 /// exists to end.
 async fn lower_tool_output(payload: &Value) -> Result<Value> {
     let Some(output) = ToolOutput::from_stored(payload)? else {
-        return output_string(payload).map(Value::String);
+        return stringify_tool_output(payload).map(Value::String);
     };
     let mut parts = Vec::new();
     for block in output.model_blocks() {
@@ -601,31 +575,6 @@ async fn lower_tool_output(payload: &Value) -> Result<Value> {
         });
     }
     Ok(Value::Array(parts))
-}
-
-fn infer_media_type(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        _ => "image/png",
-    }
-}
-
-fn output_string(output: &Value) -> Result<String> {
-    output.as_str().map_or_else(
-        || {
-            serde_json::to_string(output).map_err(|error| {
-                behavior_error("tool output could not be serialized").with_source(error)
-            })
-        },
-        |text| Ok(text.to_owned()),
-    )
 }
 
 /// Appends the protocol-neutral tools and handoffs to any hosted tools from `extra_body`.
