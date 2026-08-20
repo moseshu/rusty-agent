@@ -25,7 +25,7 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use ra_core::{
     error::{Error, Result},
-    tool::{Tool, ToolAvailability, ToolLookupKey},
+    tool::{Tool, ToolLookupKey},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
@@ -372,16 +372,23 @@ impl fmt::Debug for ToolSurface {
     }
 }
 
-/// Whether this tool occupies a slot in the turn's tool table.
+/// Whether this tool occupies a slot in the turn's tool table **today**.
 ///
 /// Two independent declarations can withhold a tool from the model, and both have to be read here.
 /// Exposure answers "does the model see it"; availability answers "is it live at all". A tool that
 /// is registered for host dispatch, or switched off entirely, is still a tool the registry routes
 /// — it just is not one the surface budget is paying for.
 ///
+/// The availability half comes from
+/// [`ToolOptions::can_reach_model_surface`](ra_core::tool::ToolOptions::can_reach_model_surface)
+/// rather than being spelled out again, so the budget and the name-uniqueness rule cannot come to
+/// disagree about what "switched off" means. What this adds is the narrower half: a
+/// [`Deferred`](ra_core::tool::ToolExposure::Deferred) tool can reach a surface later, and so
+/// claims its name today, but it is not in this turn's tool list and costs this turn nothing.
+///
 /// Dynamic availability counts as advertised, because it may be. The budget describes the surface
 /// the profile declared, not the one a particular turn happened to send.
 pub(super) fn is_advertised(tool: &dyn Tool) -> bool {
     let options = tool.options();
-    options.is_advertised() && !matches!(options.availability(), ToolAvailability::Disabled)
+    options.is_advertised() && options.can_reach_model_surface()
 }

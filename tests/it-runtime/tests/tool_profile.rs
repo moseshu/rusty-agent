@@ -200,6 +200,91 @@ fn test_two_servers_may_export_the_same_name_but_one_surface_may_not() {
 }
 
 #[test]
+fn test_a_host_only_tool_may_share_a_name_with_an_advertised_one() {
+    // A name is only ever ambiguous inside one tool list, and a hidden tool never appears in one.
+    // Rejecting this would refuse an ordinary installation — a host-only `search` beside an
+    // integration's `search` — over a conflict no provider would ever see.
+    let hidden = ToolOptions::new().with_exposure(ToolExposure::Hidden);
+    let registry = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(
+            StubTool::namespaced("host", "search")
+                .with_options(hidden)
+                .shared(),
+        )
+        .build()
+        .expect("a valid registry");
+
+    let profile = ToolProfile::builder(profile_id("full"))
+        .all_registered()
+        .budget(ToolSurfaceBudget::new(1, 1).expect("a valid budget"))
+        .build()
+        .expect("a valid profile");
+    let surface = registry
+        .assemble(&profile)
+        .expect("only one `search` is offered");
+
+    assert_eq!(surface.len(), 2);
+    assert_eq!(surface.advertised_names().collect::<Vec<_>>(), ["search"]);
+}
+
+#[test]
+fn test_a_deferred_tool_still_claims_its_name() {
+    // Deferred is a promise that discovery can promote the tool into a later turn's advertised
+    // set. It costs nothing today and so is not in `advertised_count`, but it stakes a claim on
+    // its name today — otherwise the collision would appear on the turn it is promoted, which is
+    // the one moment nothing is checking.
+    let deferred = ToolOptions::new().with_exposure(ToolExposure::Deferred);
+    let registry = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(
+            StubTool::namespaced("mcp.jira", "search")
+                .with_options(deferred)
+                .shared(),
+        )
+        .build()
+        .expect("a valid registry");
+
+    let profile = ToolProfile::builder(profile_id("full"))
+        .all_registered()
+        .budget(ToolSurfaceBudget::new(0, 24).expect("a valid budget"))
+        .build()
+        .expect("a valid profile");
+    let error = registry
+        .assemble(&profile)
+        .expect_err("a promotable name must not collide");
+
+    assert!(error.to_string().contains("search"), "{error}");
+}
+
+#[test]
+fn test_a_switched_off_tool_claims_nothing() {
+    // `Disabled` is static, so the tool cannot become advertised without a configuration change.
+    // It holds no name and pays no budget.
+    let disabled = ToolOptions::new().with_availability(ToolAvailability::Disabled);
+    let registry = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(
+            StubTool::namespaced("mcp.jira", "search")
+                .with_options(disabled)
+                .shared(),
+        )
+        .build()
+        .expect("a valid registry");
+
+    let profile = ToolProfile::builder(profile_id("full"))
+        .all_registered()
+        .budget(ToolSurfaceBudget::new(1, 1).expect("a valid budget"))
+        .build()
+        .expect("a valid profile");
+    let surface = registry
+        .assemble(&profile)
+        .expect("only one `search` is live");
+
+    assert_eq!(surface.advertised_count(), 1);
+}
+
+#[test]
 fn test_one_lookup_key_may_be_registered_once() {
     let error = ToolRegistry::builder()
         .register(StubTool::bare("read_file").shared())

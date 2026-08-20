@@ -89,10 +89,11 @@ impl ToolRegistry {
     /// - the advertised entries fall outside the profile's declared count;
     /// - they cost more than the profile's declared bytes.
     ///
-    /// The name check applies to every selected tool rather than only the advertised ones. The
-    /// surface's destination is an [`AgentSpec`](ra_core::agent::AgentSpec), which applies exactly
-    /// that rule; being laxer here would move the same failure to a later call whose message
-    /// cannot name the profile or the two lookup keys that collided.
+    /// The name check covers the entries that can reach a model surface, not every selected tool:
+    /// a name is only ambiguous inside one tool list, and a host-only tool never appears in one.
+    /// It is the same rule [`AgentSpec`](ra_core::agent::AgentSpec) applies to the tools it is
+    /// handed, restated here only because this is the point that can name the profile and both
+    /// colliding lookup keys.
     pub fn assemble(&self, profile: &ToolProfile) -> Result<ToolSurface> {
         let id = profile.id();
         let tools: Vec<Arc<dyn Tool>> = match profile.selection() {
@@ -116,14 +117,16 @@ impl ToolRegistry {
         let mut advertised_count = 0;
         let mut advertised_bytes = 0;
         for tool in &tools {
-            let key = tool.origin().lookup_key();
-            let name = tool.schema().name();
-            if let Some(previous) = names.insert(name, key) {
-                return Err(Error::config(format!(
-                    "tool profile `{id}` advertises the name `{name}` from two lookup keys \
-                     `{previous:?}` and `{key:?}`; distinct routing identities still have to \
-                     project to distinct model-facing names"
-                )));
+            if tool.options().can_reach_model_surface() {
+                let key = tool.origin().lookup_key();
+                let name = tool.schema().name();
+                if let Some(previous) = names.insert(name, key) {
+                    return Err(Error::config(format!(
+                        "tool profile `{id}` advertises the name `{name}` from two lookup keys \
+                         `{previous:?}` and `{key:?}`; distinct routing identities still have to \
+                         project to distinct model-facing names"
+                    )));
+                }
             }
             if is_advertised(tool.as_ref()) {
                 advertised_count += 1;

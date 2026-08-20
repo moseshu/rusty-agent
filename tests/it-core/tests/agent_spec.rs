@@ -7,13 +7,17 @@ use ra_core::{
     agent::{AgentId, AgentInstructions, AgentSpec, ToolUseBehavior},
     error::Result,
     model::ModelSettings,
-    tool::{Tool, ToolContext, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema},
+    tool::{
+        Tool, ToolContext, ToolExposure, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput,
+        ToolSchema,
+    },
 };
 use serde_json::json;
 
 struct EchoTool {
     origin: ToolOrigin,
     schema: ToolSchema,
+    options: ToolOptions,
 }
 
 impl EchoTool {
@@ -40,7 +44,13 @@ impl EchoTool {
                 }),
             )
             .unwrap(),
+            options: ToolOptions::new(),
         }
+    }
+
+    fn with_options(mut self, options: ToolOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
@@ -56,6 +66,10 @@ impl Tool for EchoTool {
 
     async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
         Ok(ToolOutput::text("echo"))
+    }
+
+    fn options(&self) -> ToolOptions {
+        self.options.clone()
     }
 }
 
@@ -213,6 +227,33 @@ fn builder_rejects_tools_projecting_to_the_same_model_facing_name() {
             .build()
             .is_ok()
     );
+}
+
+#[test]
+fn builder_lets_a_hidden_tool_share_a_model_facing_name() {
+    // The name rule covers the tools that can reach a model surface, not every declared tool. A
+    // hidden tool is never in a tool list, so its name is ambiguous with nothing — and refusing
+    // this pair would make an ordinary installation, a host-only tool beside an integration's
+    // tool of the same name, impossible to declare.
+    let advertised: Arc<dyn Tool> = Arc::new(EchoTool::namespaced("server_a"));
+    let hidden: Arc<dyn Tool> = Arc::new(
+        EchoTool::namespaced("host")
+            .with_options(ToolOptions::new().with_exposure(ToolExposure::Hidden)),
+    );
+    assert_eq!(
+        advertised.model_definition().name(),
+        hidden.model_definition().name()
+    );
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("worker"))
+        .name("Worker")
+        .tools([advertised, hidden])
+        .build()
+        .expect("only one of the two is ever offered to a model");
+
+    // Both stay declared and dispatchable; the lookup keys are what keep them apart.
+    assert_eq!(agent.tools().len(), 2);
 }
 
 #[test]

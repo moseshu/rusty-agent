@@ -535,6 +535,38 @@ impl ToolOptions {
         matches!(self.exposure, ToolExposure::Deferred)
     }
 
+    /// Whether this tool's model-facing name can ever appear in a turn's tool list.
+    ///
+    /// This is the question a **name-uniqueness** check has to ask, and it is wider than
+    /// [`is_advertised`](Self::is_advertised) on one side and narrower on the other. Wider:
+    /// [`Deferred`](ToolExposure::Deferred) is a promise that discovery can promote the tool into
+    /// a later turn's advertised set, so it stakes a claim on its name today even though it costs
+    /// nothing today. Narrower: it reads availability too, because a tool switched off cannot
+    /// reach any surface at all.
+    ///
+    /// [`Hidden`](ToolExposure::Hidden) tools answer `false`, which is the point of having this
+    /// separate from `is_advertised`. A host-only tool and an integration's tool are allowed to
+    /// share a model-facing name — only one of them is ever offered to a model — and a uniqueness
+    /// rule that ignored exposure would make that ordinary installation unbuildable.
+    ///
+    /// [`Dynamic`](ToolAvailability::Dynamic) answers `true`: a per-run callback may turn it on,
+    /// and a request's legality must not depend on how that callback happens to answer.
+    ///
+    /// Both `match`es are written out rather than negated so that a future variant is a compile
+    /// error here instead of silently defaulting to "claims nothing".
+    #[must_use]
+    pub const fn can_reach_model_surface(&self) -> bool {
+        let live = match self.availability {
+            ToolAvailability::Enabled | ToolAvailability::Dynamic => true,
+            ToolAvailability::Disabled => false,
+        };
+        let reachable = match self.exposure {
+            ToolExposure::Advertised | ToolExposure::Deferred => true,
+            ToolExposure::Hidden => false,
+        };
+        live && reachable
+    }
+
     /// Explicit caller allowlist, or `None` for unrestricted.
     #[must_use]
     pub fn allowed_callers(&self) -> Option<&[ToolCaller]> {

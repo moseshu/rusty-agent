@@ -531,6 +531,13 @@ impl AgentSpecBuilder {
         // A namespace separates two lookup keys without separating the names they project to, so
         // two servers that both expose `search` would build fine here and then fail on every model
         // call instead.
+        //
+        // **The two checks cover different sets, and that is the point.** Every declared tool
+        // needs a distinct lookup key, because dispatch has to find it whoever called. Only the
+        // tools that can reach a model surface need a distinct name, because a name is only ever
+        // ambiguous inside one tool list — a host-only tool named `search` beside an
+        // integration's `search` is an ordinary installation, and rejecting it here would refuse a
+        // configuration no provider would ever see.
         let mut tool_keys = BTreeSet::new();
         let mut advertised_names = BTreeSet::new();
         for tool in &self.tools {
@@ -540,6 +547,9 @@ impl AgentSpecBuilder {
                 return Err(Error::config(format!(
                     "agent `{id}` declares tool lookup key `{key:?}` more than once"
                 )));
+            }
+            if !tool.options().can_reach_model_surface() {
+                continue;
             }
             let advertised = tool.model_definition().name().to_owned();
             if !advertised_names.insert(advertised.clone()) {

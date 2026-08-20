@@ -495,6 +495,7 @@ const fn ra_core::tool::context::ToolContext < 'a >::with_caller(mut self, calle
 const fn ra_core::tool::context::ToolContext < 'a >::with_services(mut self, services : & 'a ToolServices) -> Self
 const fn ra_core::tool::options::ToolOptions::approval(& self) -> ToolApprovalPolicy
 const fn ra_core::tool::options::ToolOptions::availability(& self) -> ToolAvailability
+const fn ra_core::tool::options::ToolOptions::can_reach_model_surface(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::concurrency(& self) -> ToolConcurrency
 const fn ra_core::tool::options::ToolOptions::exposure(& self) -> ToolExposure
 const fn ra_core::tool::options::ToolOptions::failure_handling(& self) -> ToolFailureHandling
