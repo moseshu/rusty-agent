@@ -169,6 +169,23 @@ impl ToolSchema {
         })
     }
 
+    /// What one advertised entry costs in the turn's tool table, in bytes.
+    ///
+    /// The three model-visible parts are counted — the input schema, the name, and the
+    /// description — and each provider's envelope around them is not. That envelope differs per
+    /// wire format, so including it would make the same tool measure differently depending on
+    /// which endpoint the run happens to use, and a surface budget has to be comparable across
+    /// providers to be worth stating.
+    ///
+    /// This is the single definition of the measure. A per-tool ceiling and a whole-surface
+    /// budget that each computed their own would drift, and the surface would then pass while
+    /// its entries failed.
+    pub fn advertised_bytes(&self) -> Result<usize> {
+        Ok(self.canonical_json()?.len()
+            + self.name.len()
+            + self.description.as_deref().map_or(0, str::len))
+    }
+
     /// Schema version.
     #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {

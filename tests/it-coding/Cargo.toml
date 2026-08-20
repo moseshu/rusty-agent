@@ -16,4 +16,7 @@ rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde_json = "1"
 tempfile = "3"
+async-trait = "0.1"
 ra-prompt = { path = "../../crates/ra-prompt" }
+ra-runtime = { path = "../../crates/ra-runtime" }
+ra-tools = { path = "../../crates/ra-tools" }

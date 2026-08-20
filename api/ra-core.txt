@@ -1282,6 +1282,7 @@ fn ra_core::tool::schema::FuncSchema::for_input< T : ToolInput >(name : impl Int
 fn ra_core::tool::schema::FuncSchema::with_return_type< T : 'static >(mut self) -> Self
 fn ra_core::tool::schema::ToolInput::func_schema(name : impl Into < String >) -> Result < FuncSchema > where Self : Sized ,
 fn ra_core::tool::schema::ToolInput::tool_schema(name : impl Into < String >) -> Result < ToolSchema > where Self : Sized ,
+fn ra_core::tool::schema::ToolSchema::advertised_bytes(& self) -> Result < usize >
 fn ra_core::tool::schema::ToolSchema::canonical_json(& self) -> Result < String >
 fn ra_core::tool::schema::ToolSchema::description(& self) -> Option < & str >
 fn ra_core::tool::schema::ToolSchema::input_schema_hash(& self) -> & str

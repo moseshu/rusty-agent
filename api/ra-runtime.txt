@@ -49,6 +49,16 @@ const fn ra_runtime::tool::dispatch::ToolObservation::succeeded(output : ToolCal
 const fn ra_runtime::tool::dispatch::ToolRefusal::code(& self) -> & 'static str
 const fn ra_runtime::tool::dispatch::ToolRefusal::new(output : ToolCallOutput, code : & 'static str) -> Self
 const fn ra_runtime::tool::dispatch::ToolRefusal::output(& self) -> & ToolCallOutput
+const fn ra_runtime::tool::profile::ToolProfile::budget(& self) -> & ToolSurfaceBudget
+const fn ra_runtime::tool::profile::ToolProfile::id(& self) -> & ToolProfileId
+const fn ra_runtime::tool::profile::ToolProfile::selection(& self) -> & ToolSelection
+const fn ra_runtime::tool::profile::ToolSurface::advertised_bytes(& self) -> usize
+const fn ra_runtime::tool::profile::ToolSurface::advertised_count(& self) -> usize
+const fn ra_runtime::tool::profile::ToolSurface::profile(& self) -> & ToolProfileId
+const fn ra_runtime::tool::profile::ToolSurfaceBudget::max_advertised(& self) -> usize
+const fn ra_runtime::tool::profile::ToolSurfaceBudget::max_advertised_bytes(& self) -> Option < usize >
+const fn ra_runtime::tool::profile::ToolSurfaceBudget::min_advertised(& self) -> usize
+const fn ra_runtime::tool::profile::ToolSurfaceBudget::with_max_advertised_bytes(mut self, bytes : usize) -> Self
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
@@ -62,6 +72,7 @@ enum ra_runtime::runner::result::ContinuationInput
 enum ra_runtime::runner::result::RunOutcome
 enum ra_runtime::runner::stream::RunStreamEvent
 enum ra_runtime::tool::dispatch::ToolDispatch
+enum ra_runtime::tool::profile::ToolSelection
 fn ra_runtime::agent::AgentBinding::direct(agent : Arc < AgentSpec >) -> Self
 fn ra_runtime::agent::AgentBinding::is_prepared(& self) -> bool
 fn ra_runtime::agent::AgentBinding::prepared(public : Arc < AgentSpec >, execution : Arc < AgentSpec >) -> Self
@@ -97,6 +108,31 @@ fn ra_runtime::tool::dispatch::ToolDispatchRequest::tool(& self) -> & Arc < dyn 
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_services(mut self, services : ToolServices) -> Self
 fn ra_runtime::tool::dispatch::ToolObservation::into_output(self) -> ToolCallOutput
 fn ra_runtime::tool::dispatch::ToolRefusal::into_output(self) -> ToolCallOutput
+fn ra_runtime::tool::profile::ToolProfile::builder(id : ToolProfileId) -> ToolProfileBuilder
+fn ra_runtime::tool::profile::ToolProfileBuilder::all_registered(mut self) -> Self
+fn ra_runtime::tool::profile::ToolProfileBuilder::budget(mut self, budget : ToolSurfaceBudget) -> Self
+fn ra_runtime::tool::profile::ToolProfileBuilder::build(self) -> Result < ToolProfile >
+fn ra_runtime::tool::profile::ToolProfileBuilder::include(mut self, key : ToolLookupKey) -> Self
+fn ra_runtime::tool::profile::ToolProfileBuilder::include_all(mut self, keys : impl IntoIterator < Item = ToolLookupKey >) -> Self
+fn ra_runtime::tool::profile::ToolProfileId::as_str(& self) -> & str
+fn ra_runtime::tool::profile::ToolProfileId::new(value : impl Into < String >) -> Result < Self >
+fn ra_runtime::tool::profile::ToolSurface::advertised_names(& self) -> impl Iterator < Item = & str >
+fn ra_runtime::tool::profile::ToolSurface::into_tools(self) -> Vec < Arc < dyn Tool > >
+fn ra_runtime::tool::profile::ToolSurface::is_empty(& self) -> bool
+fn ra_runtime::tool::profile::ToolSurface::len(& self) -> usize
+fn ra_runtime::tool::profile::ToolSurface::tools(& self) -> & [Arc < dyn Tool >]
+fn ra_runtime::tool::profile::ToolSurfaceBudget::new(min_advertised : usize, max_advertised : usize) -> Result < Self >
+fn ra_runtime::tool::registry::ToolRegistry::assemble(& self, profile : & ToolProfile) -> Result < ToolSurface >
+fn ra_runtime::tool::registry::ToolRegistry::builder() -> ToolRegistryBuilder
+fn ra_runtime::tool::registry::ToolRegistry::contains(& self, key : & ToolLookupKey) -> bool
+fn ra_runtime::tool::registry::ToolRegistry::get(& self, key : & ToolLookupKey) -> Option < & Arc < dyn Tool > >
+fn ra_runtime::tool::registry::ToolRegistry::is_empty(& self) -> bool
+fn ra_runtime::tool::registry::ToolRegistry::keys(& self) -> impl Iterator < Item = & ToolLookupKey >
+fn ra_runtime::tool::registry::ToolRegistry::len(& self) -> usize
+fn ra_runtime::tool::registry::ToolRegistry::tools(& self) -> impl Iterator < Item = & Arc < dyn Tool > >
+fn ra_runtime::tool::registry::ToolRegistryBuilder::build(self) -> Result < ToolRegistry >
+fn ra_runtime::tool::registry::ToolRegistryBuilder::register(mut self, tool : Arc < dyn Tool >) -> Self
+fn ra_runtime::tool::registry::ToolRegistryBuilder::register_all(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, run : Arc < RunContext >, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker, tool_failure : & 'a mut ToolFailureTracker) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
@@ -151,6 +187,13 @@ struct ra_runtime::tool::dispatch::CallHistory
 struct ra_runtime::tool::dispatch::ToolDispatchRequest
 struct ra_runtime::tool::dispatch::ToolObservation
 struct ra_runtime::tool::dispatch::ToolRefusal
+struct ra_runtime::tool::profile::ToolProfile
+struct ra_runtime::tool::profile::ToolProfileBuilder
+struct ra_runtime::tool::profile::ToolProfileId
+struct ra_runtime::tool::profile::ToolSurface
+struct ra_runtime::tool::profile::ToolSurfaceBudget
+struct ra_runtime::tool::registry::ToolRegistry
+struct ra_runtime::tool::registry::ToolRegistryBuilder
 struct ra_runtime::turn::TurnSettlementRequest
 struct ra_runtime::turn::batch::TurnExecution
 struct ra_runtime::turn::batch::TurnExecutionRequest
@@ -169,3 +212,5 @@ variant ra_runtime::runner::stream::RunStreamEvent::TurnStarted { turn: u32, age
 variant ra_runtime::tool::dispatch::ToolDispatch::AwaitingApproval(ToolApproval)
 variant ra_runtime::tool::dispatch::ToolDispatch::Observed(ToolObservation)
 variant ra_runtime::tool::dispatch::ToolDispatch::Refused(ToolRefusal)
+variant ra_runtime::tool::profile::ToolSelection::AllRegistered
+variant ra_runtime::tool::profile::ToolSelection::Explicit(BTreeSet < ToolLookupKey >)

@@ -608,11 +608,13 @@ async fn test_read_file_31() {
     // work are the cheap ones: Codex spends 1,635 B on `exec_command` and 554 B on `view_image`,
     // and keeps its budget for the orchestration tools. This is the ceiling for one advertised
     // entry, not a snapshot — a description that doubles should have to say so here.
+    // The measure is the schema's own, shared with the whole-surface budget a profile enforces.
+    // Two definitions of "what an entry costs" would let the surface pass while its entries fail.
     let tool = ReadFileTool::new().expect("read_file builds");
-    let schema = tool.schema();
-    let size = schema.canonical_json().expect("a renderable schema").len()
-        + schema.name().len()
-        + schema.description().map_or(0, str::len);
+    let size = tool
+        .schema()
+        .advertised_bytes()
+        .expect("a renderable schema");
 
     assert!(size < 900, "read_file advertises {size} bytes");
 }
