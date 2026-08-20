@@ -1300,6 +1300,7 @@ fn ra_core::trace::SpanKind::label(& self) -> & str
 fn ra_core::trace::record_cancel(span : & Span, reason : & CancelReason, scope : & ScopeKind)
 fn ra_core::trace::record_error(span : & Span, err : & Error)
 fn ra_core::trace::record_outcome(span : & Span, outcome : SpanOutcome)
+fn ra_core::usage::Usage::accumulate(& self, delta : & Self) -> Self
 fn ra_core::usage::Usage::new(input_tokens : u64, output_tokens : u64) -> Self
 mod ra_core::agent
 mod ra_core::budget

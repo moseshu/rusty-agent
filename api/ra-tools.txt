@@ -1,5 +1,12 @@
 # ra-tools 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+const fn ra_tools::exec_command::ExecCommandLimits::default_yield_time_ms(& self) -> u64
+const fn ra_tools::exec_command::ExecCommandLimits::max_output_bytes(& self) -> usize
+const fn ra_tools::exec_command::ExecCommandLimits::new() -> Self
+const fn ra_tools::exec_command::ExecCommandLimits::with_default_yield_time_ms(mut self, ms : u64) -> Self
+const fn ra_tools::exec_command::ExecCommandLimits::with_max_output_bytes(mut self, bytes : usize) -> Self
+const fn ra_tools::exec_command::ExecCommandTool::limits(& self) -> & ExecCommandLimits
+const fn ra_tools::exec_command::ExecCommandTool::with_limits(mut self, limits : ExecCommandLimits) -> Self
 const fn ra_tools::read_file::ReadFileLimits::default_line_limit(& self) -> u32
 const fn ra_tools::read_file::ReadFileLimits::max_binary_bytes(& self) -> usize
 const fn ra_tools::read_file::ReadFileLimits::max_line_bytes(& self) -> usize
@@ -11,6 +18,11 @@ const fn ra_tools::read_file::ReadFileLimits::with_max_line_bytes(mut self, byte
 const fn ra_tools::read_file::ReadFileLimits::with_max_output_bytes(mut self, bytes : usize) -> Self
 const fn ra_tools::read_file::ReadFileTool::limits(& self) -> & ReadFileLimits
 const fn ra_tools::read_file::ReadFileTool::with_limits(mut self, limits : ReadFileLimits) -> Self
+fn ra_tools::exec_command::ExecCommandTool::new() -> Result < Self >
+fn ra_tools::exec_command::ExecCommandTool::process_manager(& self) -> & Arc < ProcessManager >
+fn ra_tools::exec_command::ExecCommandTool::root(& self) -> Option < & Path >
+fn ra_tools::exec_command::ExecCommandTool::rooted(root : impl AsRef < Path >) -> Result < Self >
+fn ra_tools::exec_command::ExecCommandTool::with_manager(mut self, manager : Arc < ProcessManager >) -> Self
 fn ra_tools::read_file::ReadFileTool::new() -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::root(& self) -> Option < & Path >
 fn ra_tools::read_file::ReadFileTool::rooted(root : impl AsRef < Path >) -> Result < Self >
@@ -27,5 +39,7 @@ mod ra_tools::update_plan
 mod ra_tools::view_image
 mod ra_tools::web
 mod ra_tools::write_stdin
+struct ra_tools::exec_command::ExecCommandLimits
+struct ra_tools::exec_command::ExecCommandTool
 struct ra_tools::read_file::ReadFileLimits
 struct ra_tools::read_file::ReadFileTool

@@ -1,7 +1,129 @@
 # ra-session 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_session::rollout::reader::RolloutReader::read_all(& self) -> Result < Vec < RolloutRecord > >
+async fn ra_session::rollout::reader::RolloutReader::scan_summary(& self) -> Result < RolloutSummary >
+async fn ra_session::rollout::reader::RolloutReader::scan_summary_from(& self, from : u64) -> Result < RolloutSummary >
+async fn ra_session::rollout::writer::RolloutWriter::append(& mut self, payload : impl Into < RolloutPayload >) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::append_child_anchor(& mut self, anchor : RolloutChildAnchor) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::append_event(& mut self, event : HostEvent) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::append_item(& mut self, item : RunItem) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::append_model_usage(& mut self, usage : RolloutModelUsage) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::append_session_meta(& mut self, meta : RolloutSessionMeta) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::append_turn_context(& mut self, ctx : RolloutTurnContext) -> Result < RolloutRecord >
+async fn ra_session::rollout::writer::RolloutWriter::create_for_session(base_dir : impl AsRef < Path >, session_id : SessionId) -> Result < Self >
+async fn ra_session::rollout::writer::RolloutWriter::flush(& mut self) -> Result < () >
+async fn ra_session::rollout::writer::RolloutWriter::open(path : impl Into < PathBuf >, session_id : SessionId) -> Result < Self >
+async fn ra_session::rollout::writer::RolloutWriter::sync_all(& mut self) -> Result < () >
+async fn ra_session::rollout::writer::RolloutWriter::write_checkpoint(& mut self) -> Result < RolloutRecord >
+const fn ra_session::rollout::reader::RolloutSummary::corrupted_trailing_bytes(& self) -> Option < usize >
+const fn ra_session::rollout::reader::RolloutSummary::first_timeline_seq(& self) -> Option < u64 >
+const fn ra_session::rollout::reader::RolloutSummary::last_checkpoint_offset(& self) -> Option < u64 >
+const fn ra_session::rollout::reader::RolloutSummary::last_timeline_seq(& self) -> Option < u64 >
+const fn ra_session::rollout::reader::RolloutSummary::non_monotonic_timeline_seq(& self) -> Option < (u64 , u64) >
+const fn ra_session::rollout::reader::RolloutSummary::persisted_run_max_seq(& self) -> & HashMap < RunId , u64 >
+const fn ra_session::rollout::reader::RolloutSummary::record_count(& self) -> usize
+const fn ra_session::rollout::reader::RolloutSummary::records_since_last_checkpoint(& self) -> usize
+const fn ra_session::rollout::reader::RolloutSummary::session_id(& self) -> Option < & SessionId >
+const fn ra_session::rollout::reader::RolloutSummary::usage_totals(& self) -> & Usage
+const fn ra_session::rollout::reader::RolloutSummary::valid_bytes_len(& self) -> u64
+const fn ra_session::rollout::writer::RolloutCheckpoint::persisted_run_max_seq(& self) -> & HashMap < RunId , u64 >
+const fn ra_session::rollout::writer::RolloutCheckpoint::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutCheckpoint::session_id(& self) -> & SessionId
+const fn ra_session::rollout::writer::RolloutCheckpoint::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutCheckpoint::usage_totals(& self) -> & Usage
+const fn ra_session::rollout::writer::RolloutChildAnchor::call_id(& self) -> Option < & CallId >
+const fn ra_session::rollout::writer::RolloutChildAnchor::child_agent_id(& self) -> & AgentId
+const fn ra_session::rollout::writer::RolloutChildAnchor::child_run_id(& self) -> Option < & RunId >
+const fn ra_session::rollout::writer::RolloutChildAnchor::kind(& self) -> & ChildAnchorKind
+const fn ra_session::rollout::writer::RolloutChildAnchor::operation_id(& self) -> & AgentOperationId
+const fn ra_session::rollout::writer::RolloutChildAnchor::root_run_id(& self) -> & RunId
+const fn ra_session::rollout::writer::RolloutChildAnchor::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutChildAnchor::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutModelUsage::run_id(& self) -> & RunId
+const fn ra_session::rollout::writer::RolloutModelUsage::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutModelUsage::turn_index(& self) -> Option < u32 >
+const fn ra_session::rollout::writer::RolloutModelUsage::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutModelUsage::usage(& self) -> & Usage
+const fn ra_session::rollout::writer::RolloutModelUsage::with_turn_index(mut self, turn_index : u32) -> Self
+const fn ra_session::rollout::writer::RolloutRecord::at(& self) -> EventTimestamp
+const fn ra_session::rollout::writer::RolloutRecord::payload_value(& self) -> & serde_json :: Value
+const fn ra_session::rollout::writer::RolloutRecord::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutRecord::timeline_seq(& self) -> u64
+const fn ra_session::rollout::writer::RolloutRecord::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutSessionMeta::created_at(& self) -> Option < EventTimestamp >
+const fn ra_session::rollout::writer::RolloutSessionMeta::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutSessionMeta::session_id(& self) -> & SessionId
+const fn ra_session::rollout::writer::RolloutSessionMeta::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutSessionMeta::with_created_at(mut self, created_at : EventTimestamp) -> Self
+const fn ra_session::rollout::writer::RolloutSidecar::last_checkpoint_offset(& self) -> Option < u64 >
+const fn ra_session::rollout::writer::RolloutSidecar::next_timeline_seq(& self) -> u64
+const fn ra_session::rollout::writer::RolloutSidecar::persisted_run_max_seq(& self) -> & HashMap < RunId , u64 >
+const fn ra_session::rollout::writer::RolloutSidecar::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutSidecar::session_id(& self) -> & SessionId
+const fn ra_session::rollout::writer::RolloutSidecar::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutSidecar::usage_totals(& self) -> & Usage
+const fn ra_session::rollout::writer::RolloutSidecar::with_last_checkpoint_offset(mut self, offset : u64) -> Self
+const fn ra_session::rollout::writer::RolloutTurnContext::run_id(& self) -> & RunId
+const fn ra_session::rollout::writer::RolloutTurnContext::schema_version(& self) -> SchemaVersion
+const fn ra_session::rollout::writer::RolloutTurnContext::turn_index(& self) -> u32
+const fn ra_session::rollout::writer::RolloutTurnContext::unknown(& self) -> & Unknown
+const fn ra_session::rollout::writer::RolloutWriter::is_poisoned(& self) -> bool
+const fn ra_session::rollout::writer::RolloutWriter::last_checkpoint_offset(& self) -> Option < u64 >
+const fn ra_session::rollout::writer::RolloutWriter::next_timeline_seq(& self) -> u64
+const fn ra_session::rollout::writer::RolloutWriter::persisted_run_max_seq_map(& self) -> & HashMap < RunId , u64 >
+const fn ra_session::rollout::writer::RolloutWriter::session_id(& self) -> & SessionId
+const fn ra_session::rollout::writer::RolloutWriter::set_checkpoint_interval(& mut self, records : u64)
+const fn ra_session::rollout::writer::RolloutWriter::sidecar_is_stale(& self) -> bool
+const fn ra_session::rollout::writer::RolloutWriter::usage_totals(& self) -> & Usage
+const ra_session::rollout::writer::DEFAULT_CHECKPOINT_INTERVAL: u64
+const ra_session::rollout::writer::ROLLOUT_SCHEMA_VERSION: SchemaVersion
+enum ra_session::rollout::reader::UnifiedReplayItem
+enum ra_session::rollout::writer::ChildAnchorKind
+enum ra_session::rollout::writer::RolloutPayload
 fn ra_session::memory::InMemorySession::new(session_id : impl Into < SessionId >) -> Self
 fn ra_session::memory::InMemorySession::new_with_items(session_id : impl Into < SessionId >, items : Vec < RunItem >) -> Self
+fn ra_session::rollout::reader::RolloutReader::open(path : impl Into < PathBuf >) -> Self
+fn ra_session::rollout::reader::RolloutReader::path(& self) -> & Path
+fn ra_session::rollout::reader::graft_child_transcripts< S : BuildHasher >(root_records : & [RolloutRecord], child_transcripts : & HashMap < AgentOperationId , Vec < RolloutRecord > , S >) -> Vec < UnifiedReplayItem >
+fn ra_session::rollout::writer::ChildAnchorKind::as_str(& self) -> & str
+fn ra_session::rollout::writer::ChildAnchorKind::custom(name : impl Into < Cow < 'static , str > >) -> Self
+fn ra_session::rollout::writer::RolloutCheckpoint::new(session_id : SessionId, usage_totals : Usage, persisted_run_max_seq : HashMap < RunId , u64 >) -> Self
+fn ra_session::rollout::writer::RolloutChildAnchor::new(root_run_id : RunId, operation_id : AgentOperationId, child_agent_id : AgentId, kind : ChildAnchorKind, transcript_ref : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutChildAnchor::summary(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutChildAnchor::transcript_ref(& self) -> & str
+fn ra_session::rollout::writer::RolloutChildAnchor::with_call_id(mut self, call_id : CallId) -> Self
+fn ra_session::rollout::writer::RolloutChildAnchor::with_child_run_id(mut self, run_id : RunId) -> Self
+fn ra_session::rollout::writer::RolloutChildAnchor::with_summary(mut self, summary : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutModelUsage::model(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutModelUsage::new(run_id : RunId, usage : Usage) -> Self
+fn ra_session::rollout::writer::RolloutModelUsage::with_model(mut self, model : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutRecord::new(timeline_seq : u64, at : EventTimestamp, payload : RolloutPayload) -> Result < Self >
+fn ra_session::rollout::writer::RolloutRecord::payload(& self) -> Result < RolloutPayload >
+fn ra_session::rollout::writer::RolloutRecord::type_name(& self) -> & str
+fn ra_session::rollout::writer::RolloutSessionMeta::cli_version(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutSessionMeta::cwd(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutSessionMeta::model_provider(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutSessionMeta::new(session_id : SessionId) -> Self
+fn ra_session::rollout::writer::RolloutSessionMeta::originator(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutSessionMeta::with_cli_version(mut self, version : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutSessionMeta::with_cwd(mut self, cwd : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutSessionMeta::with_model_provider(mut self, provider : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutSessionMeta::with_originator(mut self, originator : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutSidecar::new(session_id : SessionId, next_timeline_seq : u64, persisted_run_max_seq : HashMap < RunId , u64 >, usage_totals : Usage) -> Self
+fn ra_session::rollout::writer::RolloutTurnContext::approval_policy(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutTurnContext::cwd(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutTurnContext::effort(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutTurnContext::model(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutTurnContext::new(run_id : RunId, turn_index : u32) -> Self
+fn ra_session::rollout::writer::RolloutTurnContext::sandbox_policy(& self) -> Option < & str >
+fn ra_session::rollout::writer::RolloutTurnContext::with_approval_policy(mut self, policy : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutTurnContext::with_cwd(mut self, cwd : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutTurnContext::with_effort(mut self, effort : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutTurnContext::with_model(mut self, model : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutTurnContext::with_sandbox_policy(mut self, policy : impl Into < String >) -> Self
+fn ra_session::rollout::writer::RolloutWriter::path(& self) -> & Path
+fn ra_session::rollout::writer::RolloutWriter::persisted_run_max_seq(& self, run_id : & RunId) -> Option < u64 >
+fn ra_session::rollout::writer::RolloutWriter::sidecar_path(& self) -> & Path
 mod ra_session::chain
 mod ra_session::checkpoint
 mod ra_session::file_history
@@ -18,3 +140,28 @@ mod ra_session::store::local
 mod ra_session::store::mirror
 mod ra_session::store::summary
 struct ra_session::memory::InMemorySession
+struct ra_session::rollout::reader::RolloutReader
+struct ra_session::rollout::reader::RolloutSummary
+struct ra_session::rollout::writer::RolloutCheckpoint
+struct ra_session::rollout::writer::RolloutChildAnchor
+struct ra_session::rollout::writer::RolloutModelUsage
+struct ra_session::rollout::writer::RolloutRecord
+struct ra_session::rollout::writer::RolloutSessionMeta
+struct ra_session::rollout::writer::RolloutSidecar
+struct ra_session::rollout::writer::RolloutTurnContext
+struct ra_session::rollout::writer::RolloutWriter
+variant ra_session::rollout::reader::UnifiedReplayItem::Child { operation_id: AgentOperationId, record: RolloutRecord }
+variant ra_session::rollout::reader::UnifiedReplayItem::Root(RolloutRecord)
+variant ra_session::rollout::writer::ChildAnchorKind::ApprovalBubbled
+variant ra_session::rollout::writer::ChildAnchorKind::Completed
+variant ra_session::rollout::writer::ChildAnchorKind::Custom(Cow < 'static , str >)
+variant ra_session::rollout::writer::ChildAnchorKind::Failed
+variant ra_session::rollout::writer::ChildAnchorKind::Spawned
+variant ra_session::rollout::writer::RolloutPayload::Checkpoint(RolloutCheckpoint)
+variant ra_session::rollout::writer::RolloutPayload::ChildAnchor(RolloutChildAnchor)
+variant ra_session::rollout::writer::RolloutPayload::Event(HostEvent)
+variant ra_session::rollout::writer::RolloutPayload::Item(RunItem)
+variant ra_session::rollout::writer::RolloutPayload::ModelUsage(RolloutModelUsage)
+variant ra_session::rollout::writer::RolloutPayload::SessionMeta(RolloutSessionMeta)
+variant ra_session::rollout::writer::RolloutPayload::TurnContext(RolloutTurnContext)
+variant ra_session::rollout::writer::RolloutPayload::Unknown { type_name: String, data: serde_json :: Value }

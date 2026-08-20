@@ -1,6 +1,10 @@
 //! Command execution requests, limits, and streaming cursors.
 
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use ra_core::{
     compat::{SchemaVersion, Unknown},
@@ -29,6 +33,15 @@ const fn default_idle_timeout_ms() -> Option<u64> {
 
 const fn default_max_sessions() -> usize {
     64
+}
+
+/// The stricter of two optional limits, where `None` means no limit at all.
+const fn tighter(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left < right { left } else { right }),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
 }
 
 #[inline]
@@ -86,6 +99,28 @@ impl ExecLimits {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns these limits with every field taken down to whichever value `ceiling` allows.
+    ///
+    /// **Only tightening, never loosening.** These are two different parties: a host configures a
+    /// bound on what any command may consume, and a caller asks for what one command needs. If a
+    /// request could raise the bound it was measured against, the bound would mean nothing — any
+    /// caller wanting more would simply ask for more. This is the same rule the cancellation
+    /// contract applies to deadlines, and for the same reason.
+    ///
+    /// `None` on a timeout means "no limit", so it loses to any limit the other side names.
+    #[must_use]
+    pub fn tightened_by(&self, ceiling: &Self) -> Self {
+        let mut tightened = self.clone();
+        tightened.initial_yield_timeout_ms = self
+            .initial_yield_timeout_ms
+            .min(ceiling.initial_yield_timeout_ms);
+        tightened.max_capture_bytes = self.max_capture_bytes.min(ceiling.max_capture_bytes);
+        tightened.idle_timeout_ms = tighter(self.idle_timeout_ms, ceiling.idle_timeout_ms);
+        tightened.total_timeout_ms = tighter(self.total_timeout_ms, ceiling.total_timeout_ms);
+        tightened.max_sessions = self.max_sessions.min(ceiling.max_sessions);
+        tightened
     }
 
     /// Sets the initial yield timeout before backgrounding.
@@ -191,6 +226,10 @@ pub struct ExecRequest {
     cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shell: Option<PathBuf>,
+    #[serde(default)]
+    login: bool,
     #[serde(default)]
     pty: bool,
     #[serde(default)]
@@ -209,10 +248,39 @@ impl ExecRequest {
             args: Vec::new(),
             cwd: None,
             env: HashMap::new(),
+            shell: None,
+            login: false,
             pty: false,
             limits: ExecLimits::default(),
             unknown: Unknown::new(),
         }
+    }
+
+    /// Sets the shell program that interprets [`Self::command`].
+    ///
+    /// `None` leaves the choice to the executor's default.
+    ///
+    /// **A bare name is looked up on `PATH`; an absolute path is used as given.** That is the
+    /// ordinary way a program is named, and it is what makes `bash` work as a request without the
+    /// caller having to know where this machine keeps it. It is not weakened by `PATH`: the command
+    /// string this shell is about to interpret is arbitrary already, so a `PATH` that could
+    /// substitute the shell could equally substitute anything the command runs.
+    ///
+    /// The place that stops being true is a host that vets the command but not the shell. Whatever
+    /// admission policy eventually reads a request has to read this field too, and if it wants to
+    /// require an absolute path it says so there — the check belongs with the policy that needs it,
+    /// not here, where it would only refuse `bash` on behalf of hosts that never asked.
+    #[must_use]
+    pub fn with_shell(mut self, shell: Option<impl Into<PathBuf>>) -> Self {
+        self.shell = shell.map(Into::into);
+        self
+    }
+
+    /// Runs the shell as a login shell.
+    #[must_use]
+    pub const fn with_login(mut self, login: bool) -> Self {
+        self.login = login;
+        self
     }
 
     /// Appends arguments to the command request.
@@ -272,6 +340,18 @@ impl ExecRequest {
     #[must_use]
     pub const fn env(&self) -> &HashMap<String, String> {
         &self.env
+    }
+
+    /// Shell program that interprets the command, when the caller named one.
+    #[must_use]
+    pub fn shell(&self) -> Option<&Path> {
+        self.shell.as_deref()
+    }
+
+    /// Whether the shell runs as a login shell.
+    #[must_use]
+    pub const fn login(&self) -> bool {
+        self.login
     }
 
     /// Whether PTY is enabled.

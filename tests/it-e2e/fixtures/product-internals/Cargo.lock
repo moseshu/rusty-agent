@@ -542,6 +542,7 @@ dependencies = [
  "cap-std",
  "portable-pty",
  "ra-core",
+ "rustix",
  "serde",
  "thiserror 2.0.19",
  "tokio",
