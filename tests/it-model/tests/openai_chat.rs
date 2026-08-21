@@ -1028,9 +1028,23 @@ async fn collect_stream(
     model: &OpenAiChatModel,
     request: ModelRequest,
 ) -> (Vec<(String, Value, u64)>, Vec<RunItemKind>) {
+    let (raw, items, _) = collect_stream_with_terminal(model, request).await;
+    (raw, items)
+}
+
+/// The same collection, keeping the terminal response the stream settled into.
+async fn collect_stream_with_terminal(
+    model: &OpenAiChatModel,
+    request: ModelRequest,
+) -> (
+    Vec<(String, Value, u64)>,
+    Vec<RunItemKind>,
+    Option<ra_core::item::ModelResponse>,
+) {
     let events = model.stream_response(request).collect::<Vec<_>>().await;
     let mut raw = Vec::new();
     let mut items = Vec::new();
+    let mut terminal = None;
     for event in events {
         match event.expect("stream should not fail") {
             ModelStreamEvent::RawResponse(event) => raw.push((
@@ -1041,10 +1055,16 @@ async fn collect_stream(
                     .expect("every event carries a sequence number"),
             )),
             ModelStreamEvent::RunItem(event) => items.push(event.item().kind().clone()),
+            ModelStreamEvent::Completed(response) => {
+                assert!(
+                    terminal.replace(*response).is_none(),
+                    "a stream settles exactly once"
+                );
+            }
             _ => panic!("unexpected model stream event"),
         }
     }
-    (raw, items)
+    (raw, items, terminal)
 }
 
 /// Mounts a chat model answering with the supplied SSE frames, terminated by `[DONE]`.
@@ -1433,6 +1453,143 @@ async fn a_streamed_call_reports_usage_when_the_endpoint_declares_it() {
     assert_eq!(
         completed["response"]["usage"]["input_tokens_details"]["cached_tokens"], 4,
         "without this detail a run's cache hit rate cannot be computed"
+    );
+}
+
+/// A stream ends by stating the same terminal facts the non-streaming entry point returns.
+///
+/// Deltas alone are not a response: usage rides a frame of its own, the request identifier is a
+/// response header, and neither can be recovered from the narration. A consumer that had to fold
+/// them itself would be re-deriving a vocabulary this adapter does not promise to keep stable.
+#[tokio::test]
+async fn a_stream_settles_into_a_terminal_response_carrying_what_the_deltas_cannot() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-request-id", "req_streamed")
+                .set_body_raw(
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        delta(json!({"content": "hi"}), Some("stop")),
+                        json!({
+                            "id": "chatcmpl_stream",
+                            "choices": [],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                        })
+                    ),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let model = OpenAiChatModel::new(
+        MODEL,
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+    )
+    .expect("mock model should build")
+    .with_quirks(ProviderQuirks::new().with_stream_usage(true));
+
+    let (raw, items, terminal) = collect_stream_with_terminal(
+        &model,
+        request(vec![ModelInputItem::Message(Message::user("go"))]),
+    )
+    .await;
+
+    let terminal = terminal.expect("a settled stream states its terminal facts");
+    assert_eq!(terminal.usage().input_tokens(), 10);
+    assert_eq!(terminal.usage().output_tokens(), 2);
+    assert_eq!(terminal.request_id(), Some("req_streamed"));
+    // A `chatcmpl-` identifier cannot be continued from, so the field stays empty here exactly as
+    // it does on the non-streaming path rather than advertising a conversation that does not exist.
+    assert_eq!(terminal.response_id(), None);
+    assert_eq!(
+        terminal
+            .output()
+            .iter()
+            .map(|item| item.kind().clone())
+            .collect::<Vec<_>>(),
+        items,
+        "the terminal response lists what the normalized channel already published"
+    );
+    assert_eq!(
+        raw.last().map(|(event_type, _, _)| event_type.as_str()),
+        Some("response.completed"),
+        "the raw narration still ends where it did; the terminal facts follow it"
+    );
+}
+
+/// The terminal response lists items in output order, not in the order they happened to close.
+///
+/// A message that opened between two tool calls is closed after both of them, so publication order
+/// and output order genuinely differ here. A consumer replaying this turn reads the output order.
+#[tokio::test]
+async fn the_terminal_response_orders_items_by_output_slot_not_by_completion() {
+    let server = MockServer::start().await;
+    let model = streaming_model(
+        &server,
+        &[
+            delta(
+                json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "{}"}}]}),
+                None,
+            ),
+            delta(json!({"content": "working on it"}), None),
+            delta(
+                json!({"tool_calls": [{"index": 1, "id": "call_b", "function": {"name": "lookup", "arguments": "{}"}}]}),
+                Some("tool_calls"),
+            ),
+        ],
+    )
+    .await;
+
+    let (raw, items, terminal) = collect_stream_with_terminal(
+        &model,
+        request(vec![ModelInputItem::Message(Message::user("go"))]),
+    )
+    .await;
+    let terminal = terminal.expect("a settled stream states its terminal facts");
+
+    let slots = raw
+        .iter()
+        .filter(|(event_type, _, _)| event_type == "response.output_item.done")
+        .map(|(_, payload, _)| {
+            (
+                payload["item"]["type"].as_str().unwrap_or("").to_owned(),
+                payload["output_index"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        slots,
+        vec![
+            ("function_call".to_owned(), 0),
+            ("function_call".to_owned(), 2),
+            ("message".to_owned(), 1)
+        ]
+    );
+
+    let labels = |kinds: &[RunItemKind]| {
+        kinds
+            .iter()
+            .map(|kind| kind.label().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        labels(&items),
+        vec!["tool_call", "tool_call", "message"],
+        "publication order follows when each item closed"
+    );
+    assert_eq!(
+        labels(
+            &terminal
+                .output()
+                .iter()
+                .map(|item| item.kind().clone())
+                .collect::<Vec<_>>()
+        ),
+        vec!["tool_call", "message", "tool_call"],
+        "the terminal response follows the output slots the consumer was told about"
     );
 }
 

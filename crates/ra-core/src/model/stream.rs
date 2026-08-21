@@ -19,8 +19,10 @@
 //! them apart also means adding a run event later does not change the return type of every
 //! provider adapter.
 //!
-//! Delta aggregation and terminal backfill on top of this envelope are a future consumer of
-//! `ra-runtime`'s own.
+//! Terminal backfill is on this channel rather than above it: the adapter is the only participant
+//! that can assemble it, because usage, the transport identifiers and the output ordering are facts
+//! about the whole wire call and not about any frame. Aggregating deltas into a rendered view stays
+//! a consumer's job.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,7 +30,7 @@ use serde_json::Value;
 use super::ProviderKey;
 use crate::{
     compat::{SchemaVersion, Unknown},
-    item::RunItem,
+    item::{ModelResponse, RunItem},
 };
 
 /// Current model-stream-event schema version.
@@ -44,6 +46,23 @@ pub enum ModelStreamEvent {
     /// A normalized item became available. Lifting belongs to the adapter, so this is still the
     /// model channel.
     RunItem(RunItemStreamEvent),
+    /// The terminal facts of this call, assembled once the stream said it was finished.
+    ///
+    /// **A successful stream ends with exactly one of these, and it is the last event.** Deltas
+    /// alone are not a response: usage arrives on a frame of its own or not at all, the transport
+    /// identifiers are not in the body, and the ordering of output items is a property of the whole
+    /// call rather than of any one frame. A consumer that folded the deltas itself would be
+    /// re-deriving all of that from a vocabulary this crate does not even promise to keep stable,
+    /// once per protocol.
+    ///
+    /// Its absence is therefore meaningful: a stream that stops without one did not produce a turn,
+    /// whatever it emitted along the way.
+    ///
+    /// Boxed because it is the largest variant by far and the deltas are what actually flow. It is
+    /// carried directly rather than wrapped in an event struct like its neighbours, because
+    /// [`ModelResponse`] already versions itself and already retains unknown fields — a wrapper
+    /// would add a second copy of both.
+    Completed(Box<ModelResponse>),
 }
 
 /// Raw provider event isolated behind the provider registration key.

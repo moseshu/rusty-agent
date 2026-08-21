@@ -656,7 +656,9 @@ async fn stream_entry_emits_completed_raw_response_then_normalized_items() {
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,
-        ResponseTemplate::new(200).set_body_json(success_payload()),
+        ResponseTemplate::new(200)
+            .insert_header("x-request-id", "req_stream")
+            .set_body_json(success_payload()),
     )
     .await;
     let events = model
@@ -664,17 +666,29 @@ async fn stream_entry_emits_completed_raw_response_then_normalized_items() {
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
     let ModelStreamEvent::RawResponse(raw) = events[0].as_ref().expect("raw event should succeed")
     else {
         panic!("first event should be raw response.completed");
     };
     assert_eq!(raw.event_type(), "response.completed");
     assert!(
-        events[1..]
+        events[1..events.len() - 1]
             .iter()
             .all(|event| matches!(event, Ok(ModelStreamEvent::RunItem(_))))
     );
+    // The terminal facts come last, after everything they summarize, and they are the same value
+    // the non-streaming entry point returns.
+    let ModelStreamEvent::Completed(response) = events
+        .last()
+        .expect("the stream should not be empty")
+        .as_ref()
+        .expect("the terminal event should succeed")
+    else {
+        panic!("the last event should be the terminal response");
+    };
+    assert_eq!(response.output().len(), 4);
+    assert_eq!(response.request_id(), Some("req_stream"));
 }
 
 #[tokio::test]

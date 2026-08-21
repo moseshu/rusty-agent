@@ -36,8 +36,8 @@ use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     item::{
-        CallId, ContentBlock, ItemId, Message, MessageRole, RawProviderItem, Reasoning, RunItem,
-        RunItemKind,
+        CallId, ContentBlock, ItemId, Message, MessageRole, ModelResponse, RawProviderItem,
+        Reasoning, RunItem, RunItemKind,
     },
     model::{
         ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
@@ -60,16 +60,19 @@ pub(crate) fn events(
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
     buffer_tool_calls: bool,
+    request_id: Option<String>,
 ) -> ModelStream<'static> {
     let driver = StreamDriver {
         frames: frames.boxed(),
         codec,
         provider,
         handoffs,
+        request_id,
         state: StreamingState::default(),
         layout: OutputLayout::default(),
         sequence: 0,
         pending: VecDeque::new(),
+        settled: Vec::new(),
         buffered: buffer_tool_calls.then(ToolCallBuffer::default),
         finished: false,
     };
@@ -301,10 +304,19 @@ struct StreamDriver {
     codec: ChatCodec,
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
+    /// Transport diagnostics from the response headers, which the body never carries.
+    request_id: Option<String>,
     state: StreamingState,
     layout: OutputLayout,
     sequence: u64,
     pending: VecDeque<Result<ModelStreamEvent>>,
+    /// Normalized items already published, kept with the output slot each was announced under.
+    ///
+    /// The terminal response has to list them in output order, which is not the order they are
+    /// published in: a message that sits between two tool calls is closed after both of them. The
+    /// slot is recorded at publication rather than recomputed at the end, so the two views cannot
+    /// disagree about where an item went.
+    settled: Vec<(usize, RunItem)>,
     buffered: Option<ToolCallBuffer>,
     finished: bool,
 }
@@ -421,6 +433,7 @@ impl StreamDriver {
         let name = kind.label();
         let item = RunItem::new(id, kind)
             .with_raw_provider_item(RawProviderItem::new(self.provider.as_str(), raw));
+        self.settled.push((output_index, item.clone()));
         self.pending
             .push_back(Ok(ModelStreamEvent::RunItem(RunItemStreamEvent::new(
                 name, item,
@@ -949,7 +962,29 @@ impl StreamDriver {
                 }
             }),
         );
+        self.emit_completed(usage);
         Ok(())
+    }
+
+    /// Publishes the terminal facts of the call, after everything they summarize.
+    ///
+    /// This is the same value the non-streaming entry point returns, assembled from what the stream
+    /// delivered rather than from one document — which is the whole reason it is built here: usage
+    /// rides a frame of its own, the request identifier is a response header, and the output order
+    /// is a property of the call. A caller cannot recover any of the three from the deltas.
+    fn emit_completed(&mut self, usage: ra_core::usage::Usage) {
+        let mut settled = std::mem::take(&mut self.settled);
+        settled.sort_by_key(|(output_index, _)| *output_index);
+        let mut response = ModelResponse::new(settled.into_iter().map(|(_, item)| item).collect())
+            .with_usage(usage);
+        if let Some(request_id) = self.request_id.clone() {
+            response = response.with_request_id(request_id);
+        }
+        // `response_id` stays empty for the same reason the non-streaming path leaves it empty: a
+        // `chatcmpl-` identifier cannot be continued from, and filling the field would advertise a
+        // server-side conversation this protocol does not have.
+        self.pending
+            .push_back(Ok(ModelStreamEvent::Completed(Box::new(response))));
     }
 
     /// Releases tool calls still held back when the stream ended without announcing why.

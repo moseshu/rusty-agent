@@ -289,8 +289,11 @@ fn test_model_contract_06() {
 fn test_model_contract_07() {
     // An adapter knows one wire call and nothing about agents or handoffs. Letting it announce
     // "the public agent changed" would make the type permit a permanently invalid state; the run
-    // channel is wrapped by the runner inside ra-runtime (R1-7 / R13) rather than by widening this
-    // enum.
+    // channel is wrapped by the runner inside ra-runtime rather than by widening this enum.
+    //
+    // The terminal response is on this channel and not above it: usage, the transport identifiers
+    // and the output ordering are facts about the whole wire call, so only the adapter can state
+    // them.
     let labels: Vec<String> = [
         ModelStreamEvent::RawResponse(RawResponseEvent::new(
             ProviderKey::new("test"),
@@ -304,6 +307,7 @@ fn test_model_contract_07() {
                 ra_core::item::RunItemKind::Message(Message::user("hi")),
             ),
         )),
+        ModelStreamEvent::Completed(Box::new(ra_core::item::ModelResponse::new(vec![]))),
     ]
     .iter()
     .map(|event| {
@@ -314,5 +318,5 @@ fn test_model_contract_07() {
     })
     .collect();
 
-    assert_eq!(labels, vec!["raw_response", "run_item"]);
+    assert_eq!(labels, vec!["raw_response", "run_item", "completed"]);
 }

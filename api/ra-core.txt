@@ -1734,6 +1734,7 @@ variant ra_core::model::settings::ToolChoice::Mcp(McpToolChoice)
 variant ra_core::model::settings::ToolChoice::None
 variant ra_core::model::settings::ToolChoice::Required
 variant ra_core::model::settings::ToolChoice::Tool(String)
+variant ra_core::model::stream::ModelStreamEvent::Completed(Box < ModelResponse >)
 variant ra_core::model::stream::ModelStreamEvent::RawResponse(RawResponseEvent)
 variant ra_core::model::stream::ModelStreamEvent::RunItem(RunItemStreamEvent)
 variant ra_core::prompt::PromptRole::Coordinator

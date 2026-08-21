@@ -289,6 +289,9 @@ impl Model for OpenAiResponsesModel {
                             name, item,
                         )))
                     }));
+                    events.push(Ok(ModelStreamEvent::Completed(Box::new(
+                        converted.response,
+                    ))));
                     events
                 }
                 Err(error) => vec![Err(error)],

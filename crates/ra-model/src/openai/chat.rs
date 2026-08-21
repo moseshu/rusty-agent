@@ -441,6 +441,9 @@ impl Model for OpenAiChatModel {
             let handoffs = request.handoffs().to_vec();
             match model.send(&request, true).await {
                 Ok(response) if response.status().is_success() => {
+                    // Read before the body is consumed: the terminal response carries it, and the
+                    // frames it is assembled from never mention it.
+                    let request_id = request_id(&response);
                     match ensure_event_stream(&response) {
                         Ok(()) => stream::events(
                             model.codec.clone(),
@@ -448,6 +451,7 @@ impl Model for OpenAiChatModel {
                             provider,
                             handoffs,
                             model.buffer_tool_calls,
+                            request_id,
                         ),
                         Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
                     }
