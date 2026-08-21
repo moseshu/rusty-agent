@@ -17,12 +17,24 @@
 //! read; sequence numbers must be monotonic across every emitted event; a thinking block's text
 //! and its signature arrive in different deltas; and some deltas carry only provider-private
 //! fields yet still must not be dropped.
+//!
+//! # The synthesized event vocabulary is not frozen
+//!
+//! Names like `response.output_text.delta`, and the field layout inside those payloads, travel
+//! inside a provider-isolated raw event with no stability promise. They are **not** a public
+//! contract yet. The streaming milestone owns defining the run-level event channel and the
+//! partial-message switch, and it should feel free to rename or restructure what this module
+//! emits: the tests here assert the reassembly rules, not the spelling.
+//!
+//! Read the usage totals assembled at the end the same way. This module fills them in because a
+//! stream that reports nothing cannot be reconciled against anything, but per-request usage
+//! accounting is a later milestone's contract and may reshape what is recorded here.
 
 use std::collections::VecDeque;
 
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
-    error::Result,
+    error::{Error, ProviderErrorKind, Result},
     item::{
         CallId, ContentBlock, ItemId, Message, MessageRole, RawProviderItem, Reasoning, RunItem,
         RunItemKind,
@@ -36,7 +48,7 @@ use ra_core::{
 use serde_json::{Value, json};
 
 use super::{ChatCodec, FAKE_ITEM_ID, convert};
-use crate::openai::error::behavior_error;
+use crate::openai::{error::behavior_error, sse::SseFrame};
 
 /// What a provider reports when it withholds a turn without saying anything else.
 const CONTENT_FILTER_REFUSAL: &str = "Response withheld by the provider's content filter.";
@@ -44,7 +56,7 @@ const CONTENT_FILTER_REFUSAL: &str = "Response withheld by the provider's conten
 /// Turns a stream of chat-completion chunks into model stream events.
 pub(crate) fn events(
     codec: ChatCodec,
-    frames: impl Stream<Item = Result<Value>> + Send + 'static,
+    frames: impl Stream<Item = Result<SseFrame>> + Send + 'static,
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
     buffer_tool_calls: bool,
@@ -112,6 +124,9 @@ struct StreamingState {
     thinking_blocks: Vec<Value>,
     saw_content_filter: bool,
     warned_choices: bool,
+    /// Whether the sender said the stream was complete, either way it is allowed to say so.
+    saw_done: bool,
+    saw_finish_reason: bool,
     usage: Option<Value>,
 }
 
@@ -263,7 +278,7 @@ struct ToolCallBuffer {
 // ---------------------------------------------------------------------------------------------
 
 struct StreamDriver {
-    frames: BoxStream<'static, Result<Value>>,
+    frames: BoxStream<'static, Result<SseFrame>>,
     codec: ChatCodec,
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
@@ -285,24 +300,55 @@ impl StreamDriver {
                 return None;
             }
             match self.frames.next().await {
-                Some(Ok(chunk)) => {
+                Some(Ok(SseFrame::Data(chunk))) => {
                     if let Err(error) = self.process_chunk(&chunk) {
                         self.finished = true;
                         return Some(Err(error));
                     }
                 }
+                Some(Ok(SseFrame::Done)) => self.state.saw_done = true,
                 Some(Err(error)) => {
                     self.finished = true;
                     return Some(Err(error));
                 }
                 None => {
                     self.finished = true;
+                    // Settle only against evidence that the sender finished. Reaching the end of
+                    // the body is not that evidence, and treating it as such is what turns a cut
+                    // connection into a confident, empty answer.
+                    if let Some(error) = self.truncation_error() {
+                        return Some(Err(error));
+                    }
                     if let Err(error) = self.finalize() {
                         return Some(Err(error));
                     }
                 }
             }
         }
+    }
+
+    /// Reports a stream that stopped without the sender ever saying it was finished.
+    ///
+    /// A Chat stream ends in one of two ways that mean "complete": the `[DONE]` terminator, or a
+    /// terminal `finish_reason` on the choice. Either is accepted, because gateways omit one or
+    /// the other; neither is not. Without one of them the bytes simply ran out, which happens when
+    /// a proxy drops the connection after a chunk it already forwarded — and settling that into a
+    /// `response.completed` hands the caller a partial turn wearing a success.
+    ///
+    /// The two messages are deliberately different. Whether anything was already emitted decides
+    /// whether the request can be replayed at all, and that is the one fact a retry policy above
+    /// cannot recover once this error is built.
+    fn truncation_error(&self) -> Option<Error> {
+        if self.state.saw_done || self.state.saw_finish_reason {
+            return None;
+        }
+        let message = if self.state.started {
+            "OpenAI stream ended after partial output, without `[DONE]` or a finish reason; the \
+             turn is incomplete and its emitted events cannot be replayed transparently"
+        } else {
+            "OpenAI stream closed without sending an event, `[DONE]`, or a finish reason"
+        };
+        Some(Error::provider(ProviderErrorKind::Network, message))
     }
 
     /// Every emitted event shares one counter, so a consumer can order events it received on
@@ -370,13 +416,13 @@ impl StreamDriver {
                 "OpenAI Chat Completions streamed several choices; only the first is processed",
             )?;
         }
-        let Some(choice) = choices
-            .iter()
-            .find(|choice| choice.get("index").and_then(Value::as_u64).unwrap_or(0) == 0)
-        else {
+        let Some(choice) = convert::primary_choice(choices) else {
             return Ok(());
         };
         let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+        if finish_reason.is_some() {
+            self.state.saw_finish_reason = true;
+        }
         if finish_reason == Some("content_filter") {
             self.state.saw_content_filter = true;
         }

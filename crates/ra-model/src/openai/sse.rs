@@ -6,6 +6,10 @@
 //!
 //! The reader is deliberately dumb about content. It hands back one JSON value per frame and knows
 //! nothing about chunk shapes; deciding what a frame means is the protocol adapter's job.
+//!
+//! It does report one structural fact: whether the terminator arrived. That cannot be inferred
+//! from the frames themselves, and without it a decoder cannot tell a finished stream from a
+//! connection that was cut after the last chunk it happened to deliver.
 
 use std::collections::VecDeque;
 
@@ -18,6 +22,14 @@ use super::error::{behavior_error, transport_error};
 /// The terminator both `OpenAI` protocols send before closing the connection.
 const DONE_MARKER: &str = "[DONE]";
 
+/// One decoded server-sent event.
+pub(crate) enum SseFrame {
+    /// A `data:` payload that parsed as JSON.
+    Data(Value),
+    /// The `[DONE]` terminator: the sender says this stream is complete.
+    Done,
+}
+
 /// Decoder state carried across network reads.
 struct SseReader {
     bytes: BoxStream<'static, Result<Vec<u8>>>,
@@ -26,18 +38,18 @@ struct SseReader {
     /// `data:` field values collected for the frame currently being assembled.
     data: Vec<String>,
     /// Frames already decoded from the last read, waiting to be yielded.
-    ready: VecDeque<Result<Value>>,
+    ready: VecDeque<Result<SseFrame>>,
     /// Set once the stream is finished, so trailing bytes after `[DONE]` are ignored.
     done: bool,
 }
 
-/// Splits an HTTP response body into one JSON value per SSE frame.
+/// Splits an HTTP response body into one frame per server-sent event.
 ///
-/// A frame ends at a blank line, and a stream may also simply end: an endpoint that closes without
-/// sending `[DONE]` is not an error here, because the protocol decoder above has its own view of
-/// whether the events it received add up to a complete response. Treating a missing terminator as
-/// a transport failure would turn a complete answer into a failed call.
-pub(crate) fn frames(response: reqwest::Response) -> impl Stream<Item = Result<Value>> {
+/// A frame ends at a blank line, and a body may also simply stop. Ending is not reported as an
+/// error here — whether the events received add up to a complete response is a protocol question,
+/// not a byte-level one — but [`SseFrame::Done`] is surfaced so the decoder above can tell the two
+/// endings apart instead of assuming the good one.
+pub(crate) fn frames(response: reqwest::Response) -> impl Stream<Item = Result<SseFrame>> {
     let reader = SseReader {
         bytes: response
             .bytes_stream()
@@ -115,11 +127,15 @@ impl SseReader {
         let payload = std::mem::take(&mut self.data).join("\n");
         if payload.trim() == DONE_MARKER {
             self.done = true;
+            self.ready.push_back(Ok(SseFrame::Done));
             return;
         }
-        self.ready
-            .push_back(serde_json::from_str(&payload).map_err(|error| {
-                behavior_error("OpenAI stream sent a frame that is not JSON").with_source(error)
-            }));
+        self.ready.push_back(
+            serde_json::from_str(&payload)
+                .map(SseFrame::Data)
+                .map_err(|error| {
+                    behavior_error("OpenAI stream sent a frame that is not JSON").with_source(error)
+                }),
+        );
     }
 }

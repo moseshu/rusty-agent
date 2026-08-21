@@ -589,9 +589,12 @@ pub(crate) fn convert_completion(
              run items",
         )?;
     }
-    let choice = choices
-        .first()
-        .ok_or_else(|| behavior_error("OpenAI chat completion returned no choices"))?;
+    if choices.is_empty() {
+        return Err(behavior_error("OpenAI chat completion returned no choices"));
+    }
+    let choice = primary_choice(choices).ok_or_else(|| {
+        behavior_error("OpenAI chat completion returned choices but none at index 0")
+    })?;
     let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
     reject_unfinished_choice(finish_reason)?;
     let message = choice
@@ -613,6 +616,19 @@ pub(crate) fn convert_completion(
     // `response_id` stays empty on purpose. A `chatcmpl-` identifier cannot be continued from, and
     // filling the field would advertise a server-side conversation this protocol does not have.
     Ok(response)
+}
+
+/// Selects the choice this adapter answers for.
+///
+/// By `index`, never by array position. The protocol numbers choices explicitly and nowhere
+/// promises the array is ordered, so reading position instead would answer with a different
+/// choice than the streaming path picks for the same response — and the two paths are supposed to
+/// be interchangeable. A choice carrying no `index` is read as index 0, which is what a provider
+/// sending one unnumbered choice means.
+pub(crate) fn primary_choice(choices: &[Value]) -> Option<&Value> {
+    choices
+        .iter()
+        .find(|choice| choice.get("index").and_then(Value::as_u64).unwrap_or(0) == 0)
 }
 
 /// Rejects a terminal state that is not a finished answer.

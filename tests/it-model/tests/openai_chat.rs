@@ -350,7 +350,10 @@ async fn dangling_reasoning_content_does_not_contaminate_a_later_turn() {
     ]);
     let body = sent_body(&server, &model, request).await;
 
-    assert_eq!(body["messages"][0]["reasoning_content"], "first turn thinking");
+    assert_eq!(
+        body["messages"][0]["reasoning_content"],
+        "first turn thinking"
+    );
     let later = &body["messages"][2];
     assert_eq!(later["content"], "still done");
     assert!(
@@ -417,14 +420,8 @@ async fn reasoning_message_and_tool_calls_merge_into_one_assistant_message() {
             json!({"account_id": 42}),
         )),
         ModelInputItem::ToolCall(ToolCall::new(CallId::new("call_b"), "lookup", Value::Null)),
-        ModelInputItem::ToolCallOutput(ToolCallOutput::new(
-            CallId::new("call_a"),
-            json!("found"),
-        )),
-        ModelInputItem::ToolCallOutput(ToolCallOutput::new(
-            CallId::new("call_b"),
-            json!("found"),
-        )),
+        ModelInputItem::ToolCallOutput(ToolCallOutput::new(CallId::new("call_a"), json!("found"))),
+        ModelInputItem::ToolCallOutput(ToolCallOutput::new(CallId::new("call_b"), json!("found"))),
     ]);
     let body = sent_body(&server, &model, request).await;
 
@@ -815,6 +812,46 @@ async fn reasoning_content_needs_a_declaration_before_it_is_believed() {
     ));
 }
 
+/// `choices` numbers its entries, and both paths have to read that number rather than the order.
+#[tokio::test]
+async fn the_answered_choice_is_selected_by_index_not_by_array_position() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_unordered",
+            "choices": [
+                {
+                    "index": 1,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "the other candidate"}
+                },
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "the answer"}
+                }
+            ]
+        })),
+    )
+    .await
+    .with_lowering_options(ChatLoweringOptions::new().with_strict_feature_validation(false));
+
+    let response = model
+        .get_response(request(vec![ModelInputItem::Message(Message::user("hi"))]))
+        .await
+        .expect("completion should lift");
+    let RunItemKind::Message(message) = response.output()[0].kind() else {
+        panic!("expected a message");
+    };
+    assert_eq!(
+        message.text_content(),
+        "the answer",
+        "the streaming path selects by index, and answering a different choice here would make \
+         the two entry points disagree about the same response"
+    );
+}
+
 #[tokio::test]
 async fn a_truncated_completion_is_classified_rather_than_served_as_an_answer() {
     let server = MockServer::start().await;
@@ -895,18 +932,25 @@ async fn collect_stream(
     (raw, items)
 }
 
-/// Mounts a chat model answering with the supplied SSE frames.
+/// Mounts a chat model answering with the supplied SSE frames, terminated by `[DONE]`.
 async fn streaming_model(server: &MockServer, frames: &[Value]) -> OpenAiChatModel {
     let body = frames
         .iter()
         .map(|frame| format!("data: {frame}\n\n"))
         .collect::<String>()
         + "data: [DONE]\n\n";
+    mounted_stream(
+        server,
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+    )
+    .await
+}
+
+/// Mounts a chat model answering a streaming request with whatever the caller supplies.
+async fn mounted_stream(server: &MockServer, template: ResponseTemplate) -> OpenAiChatModel {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
-        )
+        .respond_with(template)
         .mount(server)
         .await;
     OpenAiChatModel::new(
@@ -914,6 +958,17 @@ async fn streaming_model(server: &MockServer, frames: &[Value]) -> OpenAiChatMod
         OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
     )
     .expect("mock model should build")
+}
+
+/// Consumes the stream, returning the terminal error when it failed.
+async fn stream_error(model: &OpenAiChatModel) -> ra_core::error::Error {
+    model
+        .stream_response(request(vec![ModelInputItem::Message(Message::user("go"))]))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the stream should report the failure")
 }
 
 fn delta(delta: Value, finish_reason: Option<&str>) -> Value {
@@ -1094,13 +1149,19 @@ async fn sequence_numbers_increase_monotonically_across_every_event() {
     )
     .await;
 
-    let sequences = raw.iter().map(|(_, _, sequence)| *sequence).collect::<Vec<_>>();
+    let sequences = raw
+        .iter()
+        .map(|(_, _, sequence)| *sequence)
+        .collect::<Vec<_>>();
     assert_eq!(
         sequences,
         (0..sequences.len() as u64).collect::<Vec<_>>(),
         "a gap or a repeat here reorders a consumer's view of the turn"
     );
-    assert_eq!(raw.last().map(|(event_type, _, _)| event_type.as_str()), Some("response.completed"));
+    assert_eq!(
+        raw.last().map(|(event_type, _, _)| event_type.as_str()),
+        Some("response.completed")
+    );
 }
 
 /// A thinking block's text and its signature arrive in different deltas.
@@ -1110,8 +1171,14 @@ async fn thinking_text_and_signature_accumulate_into_one_block() {
     let model = streaming_model(
         &server,
         &[
-            delta(json!({"thinking_blocks": [{"type": "thinking", "thinking": "weigh"}]}), None),
-            delta(json!({"thinking_blocks": [{"type": "thinking", "thinking": "ing it"}]}), None),
+            delta(
+                json!({"thinking_blocks": [{"type": "thinking", "thinking": "weigh"}]}),
+                None,
+            ),
+            delta(
+                json!({"thinking_blocks": [{"type": "thinking", "thinking": "ing it"}]}),
+                None,
+            ),
             delta(
                 json!({"thinking_blocks": [{"type": "thinking", "signature": "sig-one"}]}),
                 None,
@@ -1247,9 +1314,96 @@ async fn a_streamed_call_reports_usage_when_the_endpoint_declares_it() {
         .expect("the stream must end with a completed response");
     assert_eq!(completed["response"]["usage"]["input_tokens"], 10);
     assert_eq!(
-        completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
-        4,
+        completed["response"]["usage"]["input_tokens_details"]["cached_tokens"], 4,
         "without this detail a run's cache hit rate cannot be computed"
+    );
+}
+
+/// Running out of bytes is not the sender saying it finished.
+#[tokio::test]
+async fn a_stream_cut_short_fails_instead_of_reporting_a_complete_turn() {
+    let server = MockServer::start().await;
+    // Text deltas, then the connection simply ends: no `[DONE]`, no finish reason.
+    let body = format!(
+        "data: {}\n\n",
+        delta(json!({"content": "half an ans"}), None)
+    );
+    let model = mounted_stream(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+    )
+    .await;
+
+    let error = stream_error(&model).await;
+    assert_eq!(error.recoverability(), Recoverability::Retryable);
+    assert!(
+        error.to_string().contains("partial output"),
+        "the message has to say output was already emitted, because that decides whether the \
+         request may be replayed at all: {error}"
+    );
+}
+
+/// A gateway that ignores `stream=true` must not read as a turn in which the model said nothing.
+#[tokio::test]
+async fn a_streaming_request_answered_with_json_is_refused() {
+    let server = MockServer::start().await;
+    let model = mounted_stream(
+        &server,
+        ResponseTemplate::new(200).set_body_json(empty_completion()),
+    )
+    .await;
+
+    let error = stream_error(&model).await;
+    assert!(
+        error.to_string().contains("does not honour `stream=true`"),
+        "unexpected message: {error}"
+    );
+    assert!(
+        !error.to_string().contains("ok"),
+        "the completion body is the model's output and must not be quoted into an error: {error}"
+    );
+}
+
+/// Gateways omit one terminator or the other, so either alone has to be enough.
+#[tokio::test]
+async fn a_finish_reason_alone_settles_a_stream_that_never_sends_done() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "data: {}\n\n",
+        delta(json!({"content": "hi"}), Some("stop"))
+    );
+    let model = mounted_stream(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+    )
+    .await;
+
+    let (raw, items) = collect_stream(
+        &model,
+        request(vec![ModelInputItem::Message(Message::user("go"))]),
+    )
+    .await;
+    assert_eq!(
+        raw.last().map(|(event_type, _, _)| event_type.as_str()),
+        Some("response.completed")
+    );
+    assert_eq!(items.len(), 1);
+}
+
+/// An empty body is the same failure as a cut one, and says so differently.
+#[tokio::test]
+async fn a_stream_that_sends_nothing_at_all_fails() {
+    let server = MockServer::start().await;
+    let model = mounted_stream(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(String::new(), "text/event-stream"),
+    )
+    .await;
+
+    let error = stream_error(&model).await;
+    assert!(
+        error.to_string().contains("without sending an event"),
+        "unexpected message: {error}"
     );
 }
 
