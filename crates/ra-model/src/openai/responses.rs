@@ -10,13 +10,10 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream as futures_stream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
-    model::{
-        Model, ModelProvider, ModelRequest, ModelStream, ModelStreamEvent, RawResponseEvent,
-        RunItemStreamEvent,
-    },
+    model::{Model, ModelProvider, ModelRequest, ModelStream},
 };
 
-use super::auth::OpenAiAuth;
+use super::{auth::OpenAiAuth, sse::Terminator};
 use crate::provider::quirks::ProviderQuirks;
 
 pub(crate) mod cache;
@@ -165,8 +162,10 @@ impl OpenAiResponsesModel {
         &self.model
     }
 
-    async fn fetch(&self, request: ModelRequest) -> Result<convert::ConvertedResponse> {
-        let body = request::build_request_body(&self.model, &request, self.quirks).await?;
+    /// Issues one request and returns the raw HTTP response.
+    async fn send(&self, request: &ModelRequest, streaming: bool) -> Result<reqwest::Response> {
+        let body =
+            request::build_request_body(&self.model, request, self.quirks, streaming).await?;
         let mut http_request = self
             .client
             .post(format!("{}/responses", self.auth.base_url()))
@@ -214,16 +213,16 @@ impl OpenAiResponsesModel {
             http_request = http_request.timeout(timeout);
         }
 
-        let response = http_request
+        http_request
             .json(&body)
             .send()
             .await
-            .map_err(super::error::transport_error)?;
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+            .map_err(super::error::transport_error)
+    }
+
+    async fn fetch(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
+        let response = self.send(&request, false).await?;
+        let request_id = request_id(&response);
         let status = response.status();
         let payload = match response.json::<serde_json::Value>().await {
             Ok(payload) => payload,
@@ -245,7 +244,7 @@ impl OpenAiResponsesModel {
             ));
         }
         convert::convert_response(
-            payload,
+            &payload,
             request_id,
             request.handoffs(),
             request.model_settings().provider(),
@@ -266,38 +265,43 @@ impl fmt::Debug for OpenAiResponsesModel {
 #[async_trait]
 impl Model for OpenAiResponsesModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
-        self.fetch(request)
-            .await
-            .map(|converted| converted.response)
+        self.fetch(request).await
     }
 
     fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
         let model = self.clone();
         futures_stream::once(async move {
-            match model.fetch(request).await {
-                Ok(converted) => {
-                    let provider = converted.provider;
-                    let mut events =
-                        vec![Ok(ModelStreamEvent::RawResponse(RawResponseEvent::new(
+            let provider = request.model_settings().provider().clone();
+            let handoffs = request.handoffs().to_vec();
+            match model.send(&request, true).await {
+                Ok(response) if response.status().is_success() => {
+                    // Read before the body is consumed: the terminal response carries it, and no
+                    // frame in the stream mentions it.
+                    let request_id = request_id(&response);
+                    match super::sse::ensure_event_stream(&response, "Responses") {
+                        Ok(()) => stream::events(
+                            super::sse::frames(response, Terminator::default()),
                             provider,
-                            "response.completed",
-                            converted.raw_response,
-                        )))];
-                    events.extend(converted.response.output().iter().cloned().map(|item| {
-                        let name = item.kind().label();
-                        Ok(ModelStreamEvent::RunItem(RunItemStreamEvent::new(
-                            name, item,
-                        )))
-                    }));
-                    events.push(Ok(ModelStreamEvent::Completed(Box::new(
-                        converted.response,
-                    ))));
-                    events
+                            handoffs,
+                            request_id,
+                        ),
+                        Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
+                    }
                 }
-                Err(error) => vec![Err(error)],
+                Ok(response) => futures_stream::once(super::sse::failed_stream(response)).boxed(),
+                Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
             }
         })
-        .flat_map(futures_stream::iter)
+        .flatten()
         .boxed()
     }
+}
+
+/// Reads the transport diagnostic identifier, when the endpoint sets one.
+fn request_id(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }

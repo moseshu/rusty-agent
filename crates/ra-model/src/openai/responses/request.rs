@@ -27,6 +27,7 @@ pub(crate) async fn build_request_body(
     model: &str,
     request: &ModelRequest,
     quirks: ProviderQuirks,
+    streaming: bool,
 ) -> Result<Value> {
     reject_unsupported_settings(request)?;
     request.validate_cache_plan()?;
@@ -111,6 +112,15 @@ pub(crate) async fn build_request_body(
             "tool_choice".to_owned(),
             lower_tool_choice(Some(tool_choice), &tools.function_names)?,
         );
+    }
+
+    // Owned by the entry point rather than by configuration: a caller that asked for the streamed
+    // entry point and got one whole document back would have no events to render, and a static
+    // `stream` in `extra_body` would make the other entry point wait for a body it cannot decode.
+    if streaming {
+        body.insert("stream".to_owned(), Value::Bool(true));
+    } else {
+        body.remove("stream");
     }
 
     Ok(Value::Object(body))

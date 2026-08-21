@@ -13,18 +13,12 @@ use serde_json::Value;
 
 use crate::openai::error::behavior_error;
 
-pub(crate) struct ConvertedResponse {
-    pub(crate) response: ModelResponse,
-    pub(crate) raw_response: Value,
-    pub(crate) provider: ProviderKey,
-}
-
 pub(crate) fn convert_response(
-    payload: Value,
+    payload: &Value,
     request_id: Option<String>,
     handoffs: &[ModelHandoffDefinition],
     provider: &ProviderKey,
-) -> Result<ConvertedResponse> {
+) -> Result<ModelResponse> {
     if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
         let message = error
             .get("message")
@@ -32,9 +26,9 @@ pub(crate) fn convert_response(
             .unwrap_or("OpenAI response contained an error");
         return Err(behavior_error(message));
     }
-    reject_unfinished_response(&payload)?;
+    reject_unfinished_response(payload)?;
 
-    let response_id = required_str(&payload, "id", "response")?;
+    let response_id = required_str(payload, "id", "response")?;
     let output = payload
         .get("output")
         .and_then(Value::as_array)
@@ -57,11 +51,7 @@ pub(crate) fn convert_response(
     if let Some(request_id) = request_id {
         response = response.with_request_id(request_id);
     }
-    Ok(ConvertedResponse {
-        response,
-        raw_response: payload,
-        provider: provider.clone(),
-    })
+    Ok(response)
 }
 
 /// Rejects any terminal state that is not a finished response.
@@ -95,14 +85,17 @@ fn reject_unfinished_response(payload: &Value) -> Result<()> {
             ))),
         },
         "cancelled" => Err(behavior_error("OpenAI response was cancelled")),
-        // `background: true` returns before the output exists; R1-7 owns polling and streaming.
+        // `queued` and `in_progress` reach here from a `background: true` request, which answers
+        // before the output exists. Polling one to completion is a mode of its own and nothing
+        // requests it yet; until something does, a response with no output is not an answer.
         other => Err(behavior_error(format!(
             "OpenAI response is not finished (status `{other}`)"
         ))),
     }
 }
 
-fn convert_output_item(
+/// Lifts one output item, whether it arrived inside a finished response or on its own frame.
+pub(crate) fn convert_output_item(
     item: &Value,
     response_id: &str,
     index: usize,

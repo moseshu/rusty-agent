@@ -444,7 +444,7 @@ impl Model for OpenAiChatModel {
                     // Read before the body is consumed: the terminal response carries it, and the
                     // frames it is assembled from never mention it.
                     let request_id = request_id(&response);
-                    match ensure_event_stream(&response) {
+                    match super::sse::ensure_event_stream(&response, "Chat Completions") {
                         Ok(()) => stream::events(
                             model.codec.clone(),
                             super::sse::frames(response, model.codec.terminator.clone()),
@@ -456,63 +456,11 @@ impl Model for OpenAiChatModel {
                         Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
                     }
                 }
-                Ok(response) => futures_stream::once(failed_stream(response)).boxed(),
+                Ok(response) => futures_stream::once(super::sse::failed_stream(response)).boxed(),
                 Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
             }
         })
         .flatten()
         .boxed()
     }
-}
-
-/// Rejects a successful response that is not an event stream.
-///
-/// An endpoint that ignores `stream=true` answers with one whole `chat.completion` document. Its
-/// body contains no `data:` lines, so the frame reader finds nothing, and without this check the
-/// call would settle as a turn in which the model said nothing at all — the most expensive kind of
-/// wrong answer, because it looks like a cheap one.
-///
-/// A missing header is allowed through. Some proxies omit it, and the terminal-evidence check in
-/// the decoder already catches a body that turns out to carry no stream. The body itself is
-/// deliberately not quoted into the error: when the endpoint did answer with a completion, that
-/// body is the model's output, and error text reaches logs that the transcript's redaction rules
-/// never applied to.
-fn ensure_event_stream(response: &reqwest::Response) -> Result<()> {
-    let Some(content_type) = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Ok(());
-    };
-    if content_type
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("text/event-stream")
-    {
-        return Ok(());
-    }
-    Err(Error::provider(
-        ProviderErrorKind::Behavior,
-        format!(
-            "OpenAI Chat Completions was asked to stream but answered with `{content_type}`; this \
-             endpoint does not honour `stream=true`, so use the non-streaming entry point against \
-             it"
-        ),
-    ))
-}
-
-/// Turns a non-2xx streaming response into the single error event it amounts to.
-async fn failed_stream(response: reqwest::Response) -> Result<ra_core::model::ModelStreamEvent> {
-    let request_id = request_id(&response);
-    let status = response.status();
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .unwrap_or(serde_json::Value::Null);
-    Err(super::error::response_error(
-        status,
-        &payload,
-        request_id.as_deref(),
-    ))
 }

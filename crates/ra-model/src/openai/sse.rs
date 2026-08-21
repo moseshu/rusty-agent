@@ -14,10 +14,13 @@
 use std::collections::VecDeque;
 
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
-use ra_core::error::Result;
+use ra_core::{
+    error::{Error, ProviderErrorKind, Result},
+    model::ModelStreamEvent,
+};
 use serde_json::Value;
 
-use super::error::{behavior_error, transport_error};
+use super::error::{behavior_error, response_error, transport_error};
 
 /// The terminator both `OpenAI` protocols send before closing the connection.
 const DONE_MARKER: &str = "[DONE]";
@@ -72,6 +75,55 @@ impl Terminator {
     pub(crate) const fn end_of_body_is_terminal(&self) -> bool {
         self.end_of_body
     }
+}
+
+/// Rejects a successful response that is not an event stream.
+///
+/// An endpoint that ignores `stream=true` answers with one whole document. Its body contains no
+/// `data:` lines, so the frame reader finds nothing, and without this check the call would settle
+/// as a turn in which the model said nothing at all — the most expensive kind of wrong answer,
+/// because it looks like a cheap one.
+///
+/// A missing header is allowed through. Some proxies omit it, and each decoder's terminal-evidence
+/// check already catches a body that turns out to carry no stream. The body itself is deliberately
+/// not quoted into the error: when the endpoint did answer with a completion, that body is the
+/// model's output, and error text reaches logs that the transcript's redaction rules never applied
+/// to.
+pub(crate) fn ensure_event_stream(response: &reqwest::Response, protocol: &str) -> Result<()> {
+    let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    if content_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("text/event-stream")
+    {
+        return Ok(());
+    }
+    Err(Error::provider(
+        ProviderErrorKind::Behavior,
+        format!(
+            "OpenAI {protocol} was asked to stream but answered with `{content_type}`; this \
+             endpoint does not honour `stream=true`, so use the non-streaming entry point against \
+             it"
+        ),
+    ))
+}
+
+/// Turns a non-2xx streaming response into the single error event it amounts to.
+pub(crate) async fn failed_stream(response: reqwest::Response) -> Result<ModelStreamEvent> {
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let status = response.status();
+    let payload = response.json::<Value>().await.unwrap_or(Value::Null);
+    Err(response_error(status, &payload, request_id.as_deref()))
 }
 
 /// Decoder state carried across network reads.

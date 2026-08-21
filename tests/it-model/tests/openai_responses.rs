@@ -20,6 +20,7 @@ use ra_model::openai::{
     responses::{OpenAiResponsesModel, OpenAiResponsesProvider},
 };
 use ra_model::provider::quirks::ProviderQuirks;
+use rstest::rstest;
 use serde_json::{Map, Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -651,14 +652,218 @@ async fn invalid_function_arguments_are_model_behavior_errors() {
     assert_eq!(error.recoverability(), Recoverability::RetryableWithChange);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------------------------
+
+/// Renders frames as an event stream body.
+fn sse_body(frames: &[Value]) -> String {
+    frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect()
+}
+
+/// The frames a finished turn arrives as, ending with the response object itself.
+fn stream_frames() -> Vec<Value> {
+    let payload = success_payload();
+    let output = payload["output"]
+        .as_array()
+        .expect("fixture output")
+        .clone();
+    let mut frames = vec![json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": "resp_123", "status": "in_progress"}
+    })];
+    for (index, item) in output.iter().enumerate() {
+        frames.push(json!({
+            "type": "response.output_item.added",
+            "sequence_number": index * 2 + 1,
+            "output_index": index,
+            "item": {"id": item["id"], "type": item["type"]}
+        }));
+        frames.push(json!({
+            "type": "response.output_item.done",
+            "sequence_number": index * 2 + 2,
+            "output_index": index,
+            "item": item
+        }));
+    }
+    frames.push(json!({
+        "type": "response.completed",
+        "sequence_number": output.len() * 2 + 1,
+        "response": payload
+    }));
+    frames
+}
+
+async fn streamed_events(
+    server: &MockServer,
+    frames: &[Value],
+) -> Vec<ra_core::error::Result<ModelStreamEvent>> {
+    let model = mounted_model(
+        server,
+        ResponseTemplate::new(200)
+            .insert_header("x-request-id", "req_stream")
+            .set_body_raw(sse_body(frames), "text/event-stream"),
+    )
+    .await;
+    model
+        .stream_response(
+            ModelRequest::new(vec![], resolved(ModelSettings::new())).with_handoffs(vec![
+                ModelHandoffDefinition::new(
+                    AgentId::new("research-agent"),
+                    "delegate_research",
+                    json!({"type": "object"}),
+                ),
+            ]),
+        )
+        .collect::<Vec<_>>()
+        .await
+}
+
+/// The provider's own events are forwarded in full, and the items are lifted as they finish.
+///
+/// Nothing is synthesized on this protocol: the frames already carry types, output indexes and
+/// sequence numbers, so a consumer reading the raw channel is reading `OpenAI`'s event schema
+/// rather than a shape this crate invented.
 #[tokio::test]
-async fn stream_entry_emits_completed_raw_response_then_normalized_items() {
+async fn the_stream_forwards_every_provider_event_and_lifts_items_as_they_finish() {
+    let server = MockServer::start().await;
+    let events = streamed_events(&server, &stream_frames()).await;
+
+    let mut raw = Vec::new();
+    let mut items = Vec::new();
+    let mut terminal = None;
+    for event in events {
+        match event.expect("no frame in this fixture fails") {
+            ModelStreamEvent::RawResponse(event) => raw.push(event.event_type().to_owned()),
+            ModelStreamEvent::RunItem(event) => items.push(event.item().id().as_str().to_owned()),
+            ModelStreamEvent::Completed(response) => terminal = Some(*response),
+            _ => panic!("unexpected model stream event"),
+        }
+    }
+
+    assert_eq!(raw.first().map(String::as_str), Some("response.created"));
+    assert_eq!(raw.last().map(String::as_str), Some("response.completed"));
+    assert_eq!(
+        raw.iter()
+            .filter(|event| *event == "response.output_item.done")
+            .count(),
+        4,
+        "a frame that is lifted is still forwarded, so a protocol-aware consumer sees it too"
+    );
+    // The identifiers come from the items themselves, so the same turn read either way names its
+    // items identically.
+    assert_eq!(items, ["rs_123", "msg_123", "fc_123", "fc_handoff"]);
+
+    let terminal = terminal.expect("a completed stream states its terminal facts");
+    assert_eq!(terminal.response_id(), Some("resp_123"));
+    assert_eq!(terminal.request_id(), Some("req_stream"));
+    assert_eq!(terminal.usage().cached_input_tokens(), 60);
+    assert_eq!(
+        terminal
+            .output()
+            .iter()
+            .map(|item| item.id().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        items,
+        "the terminal response and the streamed items describe one turn"
+    );
+}
+
+/// The streamed entry point asks for a stream; the other one must not.
+#[tokio::test]
+async fn only_the_streaming_entry_point_asks_the_endpoint_to_stream() {
+    let server = MockServer::start().await;
+    let _ = streamed_events(&server, &stream_frames()).await;
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should retain requests");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
+    assert_eq!(body["stream"], true);
+
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,
-        ResponseTemplate::new(200)
-            .insert_header("x-request-id", "req_stream")
-            .set_body_json(success_payload()),
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+    )
+    .await;
+    model
+        .get_response(ModelRequest::new(vec![], resolved(ModelSettings::new())))
+        .await
+        .expect("the non-streaming path still works");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should retain requests");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request should be JSON");
+    assert!(
+        body.get("stream").is_none(),
+        "a body waiting for one document must not ask for a stream: {body}"
+    );
+}
+
+/// Running out of bytes is not the provider saying it finished.
+#[tokio::test]
+async fn a_stream_without_the_terminal_frame_is_refused() {
+    let server = MockServer::start().await;
+    let mut frames = stream_frames();
+    frames.pop();
+    let events = streamed_events(&server, &frames).await;
+
+    let error = events
+        .into_iter()
+        .find_map(Result::err)
+        .expect("an unsettled stream must report the failure");
+    assert!(
+        error.to_string().contains("without `response.completed`"),
+        "unexpected message: {error}"
+    );
+}
+
+/// A failure frame states an outcome that nothing later in the stream repeats.
+#[rstest]
+#[case::truncated("max_output_tokens", "provider.context_overflow")]
+#[case::filtered("content_filter", "provider.refusal")]
+#[tokio::test]
+async fn a_failure_frame_is_classified_rather_than_read_as_a_dropped_connection(
+    #[case] reason: &str,
+    #[case] expected: &str,
+) {
+    let server = MockServer::start().await;
+    let events = streamed_events(
+        &server,
+        &[
+            json!({"type": "response.created", "response": {"id": "resp_123"}}),
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_123",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": reason}
+                }
+            }),
+        ],
+    )
+    .await;
+
+    let error = events
+        .into_iter()
+        .find_map(Result::err)
+        .expect("a failure frame must fail the stream");
+    assert_eq!(error.code(), expected);
+}
+
+/// An endpoint that ignores `stream=true` answers with one document and no events at all.
+#[tokio::test]
+async fn an_endpoint_that_ignores_the_stream_flag_is_reported_as_such() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
     )
     .await;
     let events = model
@@ -666,29 +871,15 @@ async fn stream_entry_emits_completed_raw_response_then_normalized_items() {
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(events.len(), 6);
-    let ModelStreamEvent::RawResponse(raw) = events[0].as_ref().expect("raw event should succeed")
-    else {
-        panic!("first event should be raw response.completed");
-    };
-    assert_eq!(raw.event_type(), "response.completed");
+    assert_eq!(events.len(), 1);
+    let error = events
+        .into_iter()
+        .find_map(Result::err)
+        .expect("a non-stream answer must fail rather than settle as an empty turn");
     assert!(
-        events[1..events.len() - 1]
-            .iter()
-            .all(|event| matches!(event, Ok(ModelStreamEvent::RunItem(_))))
+        error.to_string().contains("does not honour `stream=true`"),
+        "unexpected message: {error}"
     );
-    // The terminal facts come last, after everything they summarize, and they are the same value
-    // the non-streaming entry point returns.
-    let ModelStreamEvent::Completed(response) = events
-        .last()
-        .expect("the stream should not be empty")
-        .as_ref()
-        .expect("the terminal event should succeed")
-    else {
-        panic!("the last event should be the terminal response");
-    };
-    assert_eq!(response.output().len(), 4);
-    assert_eq!(response.request_id(), Some("req_stream"));
 }
 
 #[tokio::test]
