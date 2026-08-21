@@ -326,6 +326,23 @@ fn thinking_block(block: &ThinkingBlock) -> Value {
 // The assistant-merge state machine
 // ---------------------------------------------------------------------------------------------
 
+/// Reasoning text waiting for the assistant message that owns it.
+///
+/// Both spellings are carried, because a gateway that returned one of them expects that one back:
+/// collapsing them would replay `reasoning_content` to an endpoint that only ever speaks
+/// `reasoning`, and drop the body of one that speaks both.
+#[derive(Default)]
+struct PendingReasoning {
+    summary: Option<String>,
+    body: Option<String>,
+}
+
+impl PendingReasoning {
+    fn is_empty(&self) -> bool {
+        self.summary.is_none() && self.body.is_none()
+    }
+}
+
 /// Thinking blocks waiting for the assistant message that owns them.
 struct PendingThinking {
     blocks: Vec<Value>,
@@ -341,6 +358,7 @@ struct AssistantDraft {
     refusal: Option<String>,
     thinking_blocks: Option<Vec<Value>>,
     reasoning_content: Option<String>,
+    reasoning: Option<String>,
 }
 
 impl AssistantDraft {
@@ -364,6 +382,9 @@ impl AssistantDraft {
         if let Some(reasoning) = self.reasoning_content {
             message.insert("reasoning_content".to_owned(), Value::String(reasoning));
         }
+        if let Some(reasoning) = self.reasoning {
+            message.insert("reasoning".to_owned(), Value::String(reasoning));
+        }
         Value::Object(message)
     }
 }
@@ -373,7 +394,7 @@ struct MessageAccumulator {
     messages: Vec<Value>,
     current: Option<AssistantDraft>,
     pending_thinking: Option<PendingThinking>,
-    pending_reasoning: Option<String>,
+    pending_reasoning: Option<PendingReasoning>,
 }
 
 impl MessageAccumulator {
@@ -444,7 +465,12 @@ impl MessageAccumulator {
             }
         }
         if let Some(reasoning) = self.pending_reasoning.take() {
-            draft.reasoning_content = Some(reasoning);
+            if reasoning.summary.is_some() {
+                draft.reasoning_content = reasoning.summary;
+            }
+            if reasoning.body.is_some() {
+                draft.reasoning = reasoning.body;
+            }
         }
     }
 
@@ -500,12 +526,38 @@ impl MessageAccumulator {
             self.pending_thinking = replayable_thinking_blocks(reasoning);
         }
         if codec.quirks.reasoning_content() && codec.replay.allows(&context) {
-            let summary = reasoning.summary().join("\n");
-            if !summary.is_empty() {
-                self.pending_reasoning = Some(summary);
-            }
+            self.pending_reasoning = replayable_reasoning(reasoning);
         }
     }
+}
+
+/// Recovers the reasoning text to resend, in the wire field it originally arrived in.
+///
+/// The recorded provider payload wins, because only it says which spelling the endpoint used. The
+/// fallback to the normalized summary covers records written before that was tracked, and by other
+/// adapters.
+///
+/// There is deliberately **no** fallback for the body. `content` is also where thinking-block text
+/// and Responses-style reasoning text land, so inventing a `reasoning` field out of it would send
+/// a gateway text it never produced, under a name it may not accept.
+fn replayable_reasoning(reasoning: &Reasoning) -> Option<PendingReasoning> {
+    let recorded = reasoning.provider_data().and_then(Value::as_object);
+    let recorded_field = |name: &str| {
+        recorded
+            .and_then(|data| data.get(name))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let summary = recorded_field("reasoning_content").or_else(|| {
+        let joined = reasoning.summary().join("\n");
+        (!joined.is_empty()).then_some(joined)
+    });
+    let pending = PendingReasoning {
+        summary,
+        body: recorded_field("reasoning"),
+    };
+    (!pending.is_empty()).then_some(pending)
 }
 
 /// Recovers the thinking-block sequence to resend, preferring the provider's own copy.
@@ -785,7 +837,7 @@ pub(crate) fn lift_reasoning(
         return None;
     }
 
-    let mut provider_data = reasoning_provider_data(&codec.model, completion_id);
+    let mut provider_data = reasoning_provider_data(&codec.model, completion_id, summary, body);
     let mut reasoning = Reasoning::new();
     if let Some(text) = summary {
         reasoning = reasoning.with_summary(vec![text.to_owned()]);
@@ -814,13 +866,31 @@ pub(crate) fn lift_reasoning(
 
 /// Records which model produced a reasoning item, so a later turn can refuse to replay it
 /// somewhere else.
-pub(crate) fn reasoning_provider_data(model: &str, completion_id: &str) -> Map<String, Value> {
+pub(crate) fn reasoning_provider_data(
+    model: &str,
+    completion_id: &str,
+    summary: Option<&str>,
+    body: Option<&str>,
+) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert("model".to_owned(), Value::String(model.to_owned()));
     data.insert(
         "response_id".to_owned(),
         Value::String(completion_id.to_owned()),
     );
+    // Which spelling arrived is itself replay material. The normalized `summary` and `content`
+    // views cannot say whether text came back as `reasoning_content` or as `reasoning`, and a
+    // gateway wants the same field it sent — so the wire names are recorded here, where this type
+    // documents the replay source of truth to live.
+    if let Some(summary) = summary {
+        data.insert(
+            "reasoning_content".to_owned(),
+            Value::String(summary.to_owned()),
+        );
+    }
+    if let Some(body) = body {
+        data.insert("reasoning".to_owned(), Value::String(body.to_owned()));
+    }
     data
 }
 

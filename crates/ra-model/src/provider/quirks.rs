@@ -127,12 +127,18 @@ impl ProviderQuirks {
         self.multimodal_tool_output
     }
 
-    /// Declares that this endpoint speaks `reasoning_content` on Chat Completions messages.
+    /// Declares that this endpoint speaks a reasoning field on Chat Completions messages.
     ///
     /// This is the switch the protocol capability matrix delegates here rather than answering
-    /// itself. `reasoning_content` is not a Chat Completions field: first-party `OpenAI` never
-    /// returns it, while Qwen, `DeepSeek` and Kimi gateways do. Deriving the answer from the
-    /// protocol would be a guess about who is on the other end of the socket.
+    /// itself. Neither spelling is a Chat Completions field: first-party `OpenAI` returns neither,
+    /// while Qwen, `DeepSeek` and Kimi return `reasoning_content` and other gateways return
+    /// `reasoning`. Deriving the answer from the protocol would be a guess about who is on the
+    /// other end of the socket.
+    ///
+    /// One switch covers both spellings because the question is the same one — does this endpoint
+    /// talk about reasoning at all. Which spelling it used is not a configuration choice but an
+    /// observation, so it is recorded on the item as it arrives and replayed in the same field
+    /// rather than being declared here.
     #[must_use]
     pub const fn with_reasoning_content(mut self, supported: bool) -> Self {
         self.reasoning_content = supported;

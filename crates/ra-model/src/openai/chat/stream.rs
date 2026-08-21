@@ -45,7 +45,7 @@ use ra_core::{
     },
     usage::Usage,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{ChatCodec, FAKE_ITEM_ID, convert};
 use crate::openai::{error::behavior_error, sse::SseFrame};
@@ -94,10 +94,27 @@ struct FunctionCall {
 /// Reasoning text accumulated across deltas.
 #[derive(Default)]
 struct ReasoningDraft {
-    /// Segments from `reasoning_content`, which reads as a summary.
+    /// Text from `reasoning_content`, which reads as a summary.
     summary: Vec<String>,
-    /// Segments from `reasoning`, which reads as the reasoning body.
-    content: Vec<String>,
+    /// Text from `reasoning`, which reads as the reasoning body.
+    ///
+    /// Held apart from the thinking text below rather than appended to one list. Which wire field
+    /// produced a segment decides what a later turn may resend it as, and a single list cannot
+    /// answer that once the two are concatenated.
+    body: Option<String>,
+    /// Text folded out of the thinking-block sequence when the stream settles.
+    thinking_text: Option<String>,
+}
+
+impl ReasoningDraft {
+    /// The normalized reasoning text, body first, as consumers and later turns read it.
+    fn content(&self) -> Vec<String> {
+        self.body
+            .iter()
+            .chain(self.thinking_text.iter())
+            .cloned()
+            .collect()
+    }
 }
 
 // Each flag records an independent thing the stream has seen, and folding them into enums would
@@ -637,12 +654,7 @@ impl StreamDriver {
             }),
         );
         if let Some(reasoning) = self.state.reasoning.as_mut() {
-            if reasoning.content.is_empty() {
-                reasoning.content.push(String::new());
-            }
-            if let Some(segment) = reasoning.content.first_mut() {
-                segment.push_str(&text);
-            }
+            reasoning.body.get_or_insert_default().push_str(&text);
         }
     }
 
@@ -1006,7 +1018,7 @@ impl StreamDriver {
             .filter_map(|block| block.get("thinking").and_then(Value::as_str))
             .collect::<String>();
         if !text.is_empty() {
-            reasoning.content.push(text);
+            reasoning.thinking_text = Some(text);
         }
     }
 
@@ -1025,8 +1037,7 @@ impl StreamDriver {
             .state
             .reasoning
             .as_ref()
-            .and_then(|reasoning| reasoning.content.first())
-            .cloned()
+            .and_then(|reasoning| reasoning.content().first().cloned())
         {
             self.emit(
                 "response.reasoning_text.done",
@@ -1178,13 +1189,12 @@ impl StreamDriver {
                 .map(|text| json!({"type": "summary_text", "text": text}))
                 .collect::<Vec<_>>(),
             "content": reasoning
-                .content
+                .content()
                 .iter()
                 .map(|text| json!({"type": "reasoning_text", "text": text}))
                 .collect::<Vec<_>>()
         });
-        let mut provider_data =
-            convert::reasoning_provider_data(&self.codec.model, self.state.completion_id());
+        let mut provider_data = self.reasoning_provider_data(reasoning);
         if !self.state.thinking_blocks.is_empty() {
             provider_data.insert(
                 "thinking_blocks".to_owned(),
@@ -1201,22 +1211,35 @@ impl StreamDriver {
     /// Builds the normalized reasoning item, keeping the provider sequence as replay truth.
     fn neutral_reasoning(&self) -> Option<Reasoning> {
         let draft = self.state.reasoning.as_ref()?;
-        let mut provider_data =
-            convert::reasoning_provider_data(&self.codec.model, self.state.completion_id());
+        let mut reasoning = Reasoning::new()
+            .with_summary(draft.summary.clone())
+            .with_content(draft.content())
+            .with_provider_data(Value::Object(self.reasoning_provider_data(draft)));
+        if let Some(signature) = self.last_thinking_signature() {
+            reasoning = reasoning.with_encrypted_content(signature);
+        }
+        Some(reasoning)
+    }
+
+    /// Records everything a later turn needs to reproduce this reasoning on the wire.
+    ///
+    /// Built in one place for both the event payload and the normalized item, so the record a
+    /// consumer sees and the record a replay reads can never describe different reasoning.
+    fn reasoning_provider_data(&self, draft: &ReasoningDraft) -> Map<String, Value> {
+        let summary = draft.summary.join("\n");
+        let mut provider_data = convert::reasoning_provider_data(
+            &self.codec.model,
+            self.state.completion_id(),
+            (!summary.is_empty()).then_some(summary.as_str()),
+            draft.body.as_deref(),
+        );
         if !self.state.thinking_blocks.is_empty() {
             provider_data.insert(
                 "thinking_blocks".to_owned(),
                 Value::Array(self.state.thinking_blocks.clone()),
             );
         }
-        let mut reasoning = Reasoning::new()
-            .with_summary(draft.summary.clone())
-            .with_content(draft.content.clone())
-            .with_provider_data(Value::Object(provider_data));
-        if let Some(signature) = self.last_thinking_signature() {
-            reasoning = reasoning.with_encrypted_content(signature);
-        }
-        Some(reasoning)
+        provider_data
     }
 
     /// The signature that closes the accumulated thinking sequence, when one arrived.

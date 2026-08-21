@@ -26,6 +26,7 @@ use ra_model::openai::{
     chat::{ChatLoweringOptions, OpenAiChatModel, reasoning::ReasoningReplayPolicy},
 };
 use ra_model::provider::quirks::ProviderQuirks;
+use rstest::rstest;
 use serde_json::{Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -647,6 +648,81 @@ async fn a_compaction_summary_lowers_to_an_ordinary_user_turn() {
     assert_eq!(
         body["messages"][0],
         json!({"role": "user", "content": "earlier: the user asked about accounts"})
+    );
+}
+
+/// Lifting a reasoning field and then dropping it on the next turn is a silent loss.
+///
+/// Asserted against the outbound body rather than the lifted item, because that is where the loss
+/// shows: an item can hold text that no later request ever carries.
+#[rstest]
+#[case::body_only(json!({"reasoning": "the body spelling"}), None, Some("the body spelling"))]
+#[case::summary_only(
+    json!({"reasoning_content": "the summary spelling"}),
+    Some("the summary spelling"),
+    None
+)]
+#[case::both(
+    json!({"reasoning_content": "the summary spelling", "reasoning": "the body spelling"}),
+    Some("the summary spelling"),
+    Some("the body spelling")
+)]
+#[tokio::test]
+async fn every_lifted_reasoning_field_survives_into_the_next_request(
+    #[case] returned: Value,
+    #[case] expected_summary: Option<&str>,
+    #[case] expected_body: Option<&str>,
+) {
+    let quirks = ProviderQuirks::new().with_reasoning_content(true);
+    let mut message = json!({"role": "assistant", "content": "answer"});
+    for (key, value) in returned.as_object().expect("a reasoning-bearing message") {
+        message[key] = value.clone();
+    }
+
+    let first = MockServer::start().await;
+    let model = mounted_model_with(
+        &first,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_reasoning",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": message}]
+        })),
+        quirks,
+    )
+    .await;
+    let response = model
+        .get_response(request(vec![ModelInputItem::Message(Message::user("hi"))]))
+        .await
+        .expect("completion should lift");
+
+    // Feed the recorded turn straight back, exactly as a runner would.
+    let second = MockServer::start().await;
+    let next = mounted_model_with(
+        &second,
+        ResponseTemplate::new(200).set_body_json(empty_completion()),
+        quirks,
+    )
+    .await;
+    let mut history = response.to_input_items();
+    history.push(ModelInputItem::Message(Message::user("and now?")));
+    let body = sent_body(&second, &next, request(history)).await;
+
+    let assistant = body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["role"] == "assistant")
+        })
+        .expect("the recorded assistant turn should be replayed");
+    assert_eq!(
+        assistant.get("reasoning_content").and_then(Value::as_str),
+        expected_summary,
+        "replayed the wrong summary field: {assistant}"
+    );
+    assert_eq!(
+        assistant.get("reasoning").and_then(Value::as_str),
+        expected_body,
+        "a gateway wants back the field it sent, and this one was dropped: {assistant}"
     );
 }
 
