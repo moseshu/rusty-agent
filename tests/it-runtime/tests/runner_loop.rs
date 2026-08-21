@@ -20,7 +20,7 @@ use ra_core::{
     budget::{BudgetLimit, BudgetSnapshot},
     cancel::{CancelReason, CancelScope, Deadline},
     context::RunContext,
-    error::{Error, Result, ToolErrorKind},
+    error::{Error, ProviderErrorKind, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
@@ -161,15 +161,42 @@ fn raw_event(event_type: &str) -> ModelStreamEvent {
 }
 
 fn streaming_request(model: &Arc<StreamingModel>, cancel: &CancelScope) -> RunRequest {
+    model_request(Arc::clone(model) as Arc<dyn Model>, cancel)
+}
+
+fn model_request(model: Arc<dyn Model>, cancel: &CancelScope) -> RunRequest {
     RunRequest::new(
         agent(Vec::new()),
-        Arc::new(SingleModelResolver {
-            model: Arc::clone(model) as Arc<dyn Model>,
-        }),
+        Arc::new(SingleModelResolver { model }),
         RunId::new("run-loop"),
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
     )
+}
+
+/// Settles a turn and then fails, which is the ordering the error-reporting rule is about.
+struct SettledThenFailingModel;
+
+#[async_trait]
+impl Model for SettledThenFailingModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller(
+            "this fixture only answers on the streaming entry point",
+        ))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        stream::iter(vec![
+            Ok(ModelStreamEvent::Completed(Box::new(ModelResponse::new(
+                vec![message("msg-1", "答案")],
+            )))),
+            Err(Error::provider(
+                ProviderErrorKind::Network,
+                "connection reset while draining the stream",
+            )),
+        ])
+        .boxed()
+    }
 }
 
 /// A model call that only ends by being cancelled. Its drop notification makes cancellation of an
@@ -2220,6 +2247,27 @@ async fn a_stream_with_an_event_after_its_terminal_response_fails_the_turn() {
         error
             .to_string()
             .contains("event after its terminal response"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A failure arriving after the terminal response is reported as itself, not as the ordering rule
+/// it also broke: the contract violation is the consequence, and the frame carried the cause.
+#[tokio::test]
+async fn a_failure_after_the_terminal_response_still_reports_what_failed() {
+    let cancel = CancelScope::root();
+
+    let stream = Runner::run_streamed(
+        model_request(Arc::new(SettledThenFailingModel), &cancel)
+            .with_config(RunConfig::new().with_partial_messages(true)),
+    );
+    let error = stream
+        .finish()
+        .await
+        .expect_err("a stream that failed has not produced a usable turn");
+
+    assert!(
+        error.to_string().contains("connection reset"),
         "unexpected error: {error}"
     );
 }

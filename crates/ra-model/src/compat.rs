@@ -236,10 +236,21 @@ impl CompatEndpoint {
     /// base URL naming the request path twice.
     fn validate(&self) -> Result<()> {
         self.auth.validate()?;
-        if matches!(&self.done_marker, DoneMarker::Literal(marker) if marker.trim().is_empty()) {
-            return Err(Error::config(
-                "compat stream done marker must not be empty or whitespace",
-            ));
+        // A frame payload is compared to this marker after trimming, which makes both of these
+        // configurations unusable in opposite ways.
+        if let DoneMarker::Literal(marker) = &self.done_marker {
+            if marker.trim().is_empty() {
+                return Err(Error::config(
+                    "compat stream done marker must not be empty or whitespace",
+                ));
+            }
+            if marker != marker.trim() {
+                return Err(Error::config(format!(
+                    "compat stream done marker `{marker}` is padded with whitespace, so it can \
+                     never match a trimmed frame payload; the stream would end by failing to parse \
+                     that frame as JSON instead of by recognizing it"
+                )));
+            }
         }
         if self.base_url().ends_with(REQUEST_PATH) {
             return Err(Error::config(format!(

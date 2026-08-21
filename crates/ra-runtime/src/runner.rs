@@ -982,13 +982,17 @@ async fn stream_model_call(
     let mut stream = model.stream_response(request);
     let mut settled: Option<ModelResponse> = None;
     while let Some(event) = stream.next().await {
+        // Resolved before the ordering check on purpose. A stream that fails after settling has
+        // broken the contract *and* hit something; reporting only the broken contract would name
+        // the consequence and lose the cause, which is the one thing this frame carried.
+        let event = event?;
         if settled.is_some() {
             return Err(Error::provider(
                 ProviderErrorKind::Behavior,
                 "the model stream emitted an event after its terminal response",
             ));
         }
-        match event? {
+        match event {
             ModelStreamEvent::RawResponse(raw) => emit(events, RunStreamEvent::RawResponse(raw)),
             ModelStreamEvent::Completed(response) => settled = Some(*response),
             // Every other model event is the adapter's own view of items this run publishes itself.

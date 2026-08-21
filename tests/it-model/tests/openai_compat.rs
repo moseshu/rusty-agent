@@ -186,6 +186,31 @@ async fn a_blank_custom_done_marker_is_refused() {
     );
 }
 
+/// A padded marker is refused too: it fails in the opposite direction, by never matching.
+///
+/// The failure is loud either way — the frame that should have terminated the stream is then read
+/// as a chunk and fails to parse — but it is reported as the endpoint sending malformed JSON, which
+/// sends whoever is debugging it to the wrong side of the connection.
+#[tokio::test]
+async fn a_padded_custom_done_marker_is_refused() {
+    let server = MockServer::start().await;
+    let error = endpoint(&server)
+        .with_done_marker(DoneMarker::Literal(" [END] ".to_owned()))
+        .build_provider()
+        .expect_err("a marker that can never match is a misconfiguration, not a policy");
+
+    assert!(
+        error.to_string().contains("padded with whitespace"),
+        "unexpected error: {error}"
+    );
+
+    // The same marker without the padding is the configuration that was meant, and it is accepted.
+    endpoint(&server)
+        .with_done_marker(DoneMarker::Literal("[END]".to_owned()))
+        .build_provider()
+        .expect("a trimmed marker is usable");
+}
+
 /// Request transport headers replace endpoint defaults instead of being appended as duplicates.
 #[tokio::test]
 async fn request_headers_override_endpoint_default_headers() {

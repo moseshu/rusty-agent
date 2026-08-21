@@ -23,6 +23,11 @@ pub enum DoneMarker {
     ///
     /// `[DONE]` stays recognized alongside it: an endpoint that sends both terminates either way,
     /// and no valid chunk could have been meant by that payload.
+    ///
+    /// The payload is compared after trimming, so the marker must be non-empty and carry no
+    /// surrounding whitespace. Both are refused when the endpoint is built rather than at the
+    /// stream that would misbehave: a blank marker would end the stream on any empty `data:` frame,
+    /// and a padded one could never match at all.
     Literal(String),
     /// No terminator: this endpoint's stream ends when the body does.
     ///
