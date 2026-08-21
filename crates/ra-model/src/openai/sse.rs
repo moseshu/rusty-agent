@@ -26,13 +26,59 @@ const DONE_MARKER: &str = "[DONE]";
 pub(crate) enum SseFrame {
     /// A `data:` payload that parsed as JSON.
     Data(Value),
-    /// The `[DONE]` terminator: the sender says this stream is complete.
+    /// The terminator: the sender says this stream is complete.
     Done,
+}
+
+/// How one endpoint signals that a stream is complete.
+///
+/// The default is what the protocol specifies, and a compatible endpoint that deviates says so on
+/// its own configuration — the decoder never guesses from what it happens to receive.
+///
+/// `[DONE]` stays recognized whatever is configured. A declared marker is an addition rather than
+/// a replacement: an endpoint that sends the standard terminator as well loses nothing by it, and
+/// a payload of `[DONE]` is not valid JSON, so nothing else could have been meant by it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Terminator {
+    /// A non-standard terminator payload this endpoint sends.
+    marker: Option<String>,
+    /// Whether the body ending is itself the sender saying it finished.
+    end_of_body: bool,
+}
+
+impl Terminator {
+    /// Recognizes a non-standard terminator payload in addition to `[DONE]`.
+    pub(crate) fn with_marker(marker: impl Into<String>) -> Self {
+        Self {
+            marker: Some(marker.into()),
+            end_of_body: false,
+        }
+    }
+
+    /// Declares that this endpoint sends no terminator at all.
+    pub(crate) const fn end_of_body() -> Self {
+        Self {
+            marker: None,
+            end_of_body: true,
+        }
+    }
+
+    /// Whether a frame payload is this endpoint's way of saying the stream finished.
+    fn is_terminal(&self, payload: &str) -> bool {
+        payload == DONE_MARKER || self.marker.as_deref() == Some(payload)
+    }
+
+    /// Whether the body running out counts as evidence that the sender finished.
+    pub(crate) const fn end_of_body_is_terminal(&self) -> bool {
+        self.end_of_body
+    }
 }
 
 /// Decoder state carried across network reads.
 struct SseReader {
     bytes: BoxStream<'static, Result<Vec<u8>>>,
+    /// How this endpoint spells the end of a stream.
+    terminator: Terminator,
     /// Bytes received but not yet terminated by a newline.
     partial: Vec<u8>,
     /// `data:` field values collected for the frame currently being assembled.
@@ -49,12 +95,16 @@ struct SseReader {
 /// error here — whether the events received add up to a complete response is a protocol question,
 /// not a byte-level one — but [`SseFrame::Done`] is surfaced so the decoder above can tell the two
 /// endings apart instead of assuming the good one.
-pub(crate) fn frames(response: reqwest::Response) -> impl Stream<Item = Result<SseFrame>> {
+pub(crate) fn frames(
+    response: reqwest::Response,
+    terminator: Terminator,
+) -> impl Stream<Item = Result<SseFrame>> {
     let reader = SseReader {
         bytes: response
             .bytes_stream()
             .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(transport_error))
             .boxed(),
+        terminator,
         partial: Vec::new(),
         data: Vec::new(),
         ready: VecDeque::new(),
@@ -125,7 +175,7 @@ impl SseReader {
             return;
         }
         let payload = std::mem::take(&mut self.data).join("\n");
-        if payload.trim() == DONE_MARKER {
+        if self.terminator.is_terminal(payload.trim()) {
             self.done = true;
             self.ready.push_back(Ok(SseFrame::Done));
             return;

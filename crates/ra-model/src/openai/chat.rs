@@ -23,7 +23,7 @@ use ra_core::{
 };
 
 use self::reasoning::ReasoningReplayPolicy;
-use super::auth::OpenAiAuth;
+use super::{auth::OpenAiAuth, sse::Terminator};
 use crate::provider::quirks::ProviderQuirks;
 
 pub(crate) mod convert;
@@ -98,6 +98,7 @@ pub(crate) struct ChatCodec {
     pub(crate) quirks: ProviderQuirks,
     pub(crate) options: ChatLoweringOptions,
     pub(crate) replay: ReasoningReplayPolicy,
+    pub(crate) terminator: Terminator,
 }
 
 impl ChatCodec {
@@ -123,6 +124,7 @@ pub struct OpenAiChatProvider {
     quirks: ProviderQuirks,
     options: ChatLoweringOptions,
     replay: ReasoningReplayPolicy,
+    terminator: Terminator,
     buffer_tool_calls: bool,
     models: Mutex<BTreeMap<String, Arc<dyn Model>>>,
 }
@@ -145,6 +147,7 @@ impl OpenAiChatProvider {
             quirks: ProviderQuirks::new(),
             options: ChatLoweringOptions::new(),
             replay: ReasoningReplayPolicy::default(),
+            terminator: Terminator::default(),
             buffer_tool_calls: false,
             models: Mutex::new(BTreeMap::new()),
         })
@@ -154,6 +157,18 @@ impl OpenAiChatProvider {
     #[must_use]
     pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
         self.quirks = quirks;
+        self
+    }
+
+    /// Declares how this endpoint terminates a stream.
+    ///
+    /// Deliberately not public: the protocol has one terminator, and only a compatible endpoint
+    /// can be in a position to deviate from it. The knob therefore belongs to the compat layer's
+    /// endpoint configuration rather than to this adapter, where a first-party caller would have
+    /// to decide about a question that has only one answer for them.
+    #[must_use]
+    pub(crate) fn with_terminator(mut self, terminator: Terminator) -> Self {
+        self.terminator = terminator;
         self
     }
 
@@ -220,6 +235,7 @@ impl ModelProvider for OpenAiChatProvider {
                 quirks: self.quirks,
                 options: self.options,
                 replay: self.replay.clone(),
+                terminator: self.terminator.clone(),
             },
             auth: Arc::clone(&self.auth),
             client: self.client.clone(),
@@ -257,6 +273,7 @@ impl OpenAiChatModel {
                 quirks: ProviderQuirks::new(),
                 options: ChatLoweringOptions::new(),
                 replay: ReasoningReplayPolicy::default(),
+                terminator: Terminator::default(),
             },
             auth: Arc::new(auth),
             client,
@@ -308,13 +325,15 @@ impl OpenAiChatModel {
         let mut http_request = self
             .client
             .post(format!("{}/chat/completions", self.auth.base_url()))
-            .bearer_auth(self.auth.api_key())
             .header("content-type", "application/json")
             .header(
                 "user-agent",
                 concat!("rusty-agent/", env!("CARGO_PKG_VERSION")),
             );
 
+        if let Some(api_key) = self.auth.api_key() {
+            http_request = http_request.bearer_auth(api_key);
+        }
         if let Some(organization) = self.auth.organization() {
             http_request = http_request.header("openai-organization", organization);
         }
@@ -425,7 +444,7 @@ impl Model for OpenAiChatModel {
                     match ensure_event_stream(&response) {
                         Ok(()) => stream::events(
                             model.codec.clone(),
-                            super::sse::frames(response),
+                            super::sse::frames(response, model.codec.terminator.clone()),
                             provider,
                             handoffs,
                             model.buffer_tool_calls,

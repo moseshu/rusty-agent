@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, fmt};
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiAuth {
-    api_key: String,
+    api_key: Option<String>,
     base_url: String,
     organization: Option<String>,
     project: Option<String>,
@@ -22,12 +22,33 @@ impl OpenAiAuth {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key: Some(api_key.into()),
             base_url: "https://api.openai.com/v1".to_owned(),
             organization: None,
             project: None,
             default_headers: BTreeMap::new(),
         }
+    }
+
+    /// Creates configuration for an endpoint that authenticates nothing.
+    ///
+    /// Model servers run on the developer's own machine — Ollama, vLLM, llama.cpp, LM Studio —
+    /// speak this protocol without any credential. The alternative is to invent a placeholder
+    /// secret to get past validation, which puts a value that means nothing into configuration
+    /// files and logs, and hides the one case where a missing key really is a mistake.
+    ///
+    /// The base URL is required here rather than defaulted: an unauthenticated request to the
+    /// first-party endpoint has no meaning.
+    #[must_use]
+    pub fn keyless(base_url: impl Into<String>) -> Self {
+        Self {
+            api_key: None,
+            base_url: String::new(),
+            organization: None,
+            project: None,
+            default_headers: BTreeMap::new(),
+        }
+        .with_base_url(base_url)
     }
 
     /// Replaces the API base URL. A trailing slash is ignored.
@@ -37,6 +58,13 @@ impl OpenAiAuth {
         base_url
             .trim_end_matches('/')
             .clone_into(&mut self.base_url);
+        self
+    }
+
+    /// Sets the bearer credential, replacing whatever was configured before.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
         self
     }
 
@@ -89,12 +117,21 @@ impl OpenAiAuth {
         &self.default_headers
     }
 
-    pub(crate) fn api_key(&self) -> &str {
-        &self.api_key
+    /// The bearer credential, when this endpoint takes one.
+    pub(crate) fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
     }
 
     pub(crate) fn validate(&self) -> ra_core::error::Result<()> {
-        if self.api_key.trim().is_empty() {
+        // A blank string is still rejected. `keyless` is how an endpoint declares it wants no
+        // credential; an empty one reaching here means a key was configured from something that
+        // turned out to be unset, and sending the request unauthenticated would report it as a
+        // rejection from the endpoint instead of as the local misconfiguration it is.
+        if self
+            .api_key
+            .as_ref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
             return Err(ra_core::error::Error::config(
                 "OpenAI API key must not be empty",
             ));
@@ -112,7 +149,8 @@ impl fmt::Debug for OpenAiAuth {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenAiAuth")
-            .field("api_key", &"[REDACTED]")
+            // Whether a credential exists is configuration worth seeing; its value never is.
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("base_url", &self.base_url)
             .field("organization", &self.organization)
             .field("project", &self.project)

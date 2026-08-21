@@ -170,13 +170,15 @@ impl OpenAiResponsesModel {
         let mut http_request = self
             .client
             .post(format!("{}/responses", self.auth.base_url()))
-            .bearer_auth(self.auth.api_key())
             .header("content-type", "application/json")
             .header(
                 "user-agent",
                 concat!("rusty-agent/", env!("CARGO_PKG_VERSION")),
             );
 
+        if let Some(api_key) = self.auth.api_key() {
+            http_request = http_request.bearer_auth(api_key);
+        }
         if let Some(organization) = self.auth.organization() {
             http_request = http_request.header("openai-organization", organization);
         }

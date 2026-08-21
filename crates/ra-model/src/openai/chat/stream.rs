@@ -362,11 +362,21 @@ impl StreamDriver {
     /// a proxy drops the connection after a chunk it already forwarded — and settling that into a
     /// `response.completed` hands the caller a partial turn wearing a success.
     ///
+    /// An endpoint declared to send no terminator at all gets a third way, and it costs exactly
+    /// what this check was defending: for that endpoint a cut connection and a finished turn are
+    /// the same bytes, and this settles both. It still refuses a stream that never delivered a
+    /// chunk, because that is the failure worth keeping closed — an empty answer delivered
+    /// confidently reads as a model with nothing to say rather than as a connection that never
+    /// carried one.
+    ///
     /// The two messages are deliberately different. Whether anything was already emitted decides
     /// whether the request can be replayed at all, and that is the one fact a retry policy above
     /// cannot recover once this error is built.
     fn truncation_error(&self) -> Option<Error> {
         if self.state.saw_done || self.state.finish_reason.is_some() {
+            return None;
+        }
+        if self.codec.terminator.end_of_body_is_terminal() && self.state.started {
             return None;
         }
         let message = if self.state.started {

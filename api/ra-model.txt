@@ -1,6 +1,11 @@
 # ra-model 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
+const fn ra_model::compat::CompatEndpoint::done_marker(& self) -> & DoneMarker
+const fn ra_model::compat::CompatEndpoint::extra_body(& self) -> & JsonMap
+const fn ra_model::compat::CompatEndpoint::quirks(& self) -> ProviderQuirks
+const fn ra_model::compat::CompatEndpoint::with_lowering_options(mut self, options : ChatLoweringOptions) -> Self
+const fn ra_model::compat::CompatEndpoint::with_quirks(mut self, quirks : ProviderQuirks) -> Self
 const fn ra_model::openai::auth::OpenAiAuth::default_headers(& self) -> & BTreeMap < String , String >
 const fn ra_model::openai::chat::ChatLoweringOptions::new() -> Self
 const fn ra_model::openai::chat::ChatLoweringOptions::strict_feature_validation(self) -> bool
@@ -43,11 +48,24 @@ const fn ra_model::provider::quirks::ProviderQuirks::with_reasoning_content(mut 
 const fn ra_model::provider::quirks::ProviderQuirks::with_store(mut self, supported : bool) -> Self
 const fn ra_model::provider::quirks::ProviderQuirks::with_stream_usage(mut self, supported : bool) -> Self
 const fn ra_model::provider::quirks::ProviderQuirks::with_thinking_blocks(mut self, supported : bool) -> Self
+enum ra_model::compat::quirks::DoneMarker
 enum ra_model::provider::UnknownPrefixPolicy
+fn ra_model::compat::CompatEndpoint::base_url(& self) -> & str
+fn ra_model::compat::CompatEndpoint::build_provider(& self) -> Result < OpenAiChatProvider >
+fn ra_model::compat::CompatEndpoint::default_model(& self) -> & str
+fn ra_model::compat::CompatEndpoint::into_registration(self, key : ProviderKey) -> Result < ProviderRegistration >
+fn ra_model::compat::CompatEndpoint::new(base_url : impl Into < String >, default_model : impl Into < String >) -> Self
+fn ra_model::compat::CompatEndpoint::with_api_key(mut self, api_key : impl Into < String >) -> Self
+fn ra_model::compat::CompatEndpoint::with_default_header(mut self, name : impl Into < String >, value : impl Into < String >) -> Self
+fn ra_model::compat::CompatEndpoint::with_done_marker(mut self, done_marker : DoneMarker) -> Self
+fn ra_model::compat::CompatEndpoint::with_extra_body(mut self, extra_body : JsonMap) -> Self
+fn ra_model::compat::CompatEndpoint::with_reasoning_replay(mut self, replay : ReasoningReplayPolicy) -> Self
 fn ra_model::openai::auth::OpenAiAuth::base_url(& self) -> & str
+fn ra_model::openai::auth::OpenAiAuth::keyless(base_url : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::new(api_key : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::organization(& self) -> Option < & str >
 fn ra_model::openai::auth::OpenAiAuth::project(& self) -> Option < & str >
+fn ra_model::openai::auth::OpenAiAuth::with_api_key(mut self, api_key : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::with_base_url(mut self, base_url : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::with_default_header(mut self, name : impl Into < String >, value : impl Into < String >) -> Self
 fn ra_model::openai::auth::OpenAiAuth::with_organization(mut self, organization : impl Into < String >) -> Self
@@ -106,6 +124,7 @@ mod ra_model::provider
 mod ra_model::provider::quirks
 mod ra_model::retry
 mod ra_model::usage
+struct ra_model::compat::CompatEndpoint
 struct ra_model::openai::auth::OpenAiAuth
 struct ra_model::openai::chat::ChatLoweringOptions
 struct ra_model::openai::chat::OpenAiChatModel
@@ -120,5 +139,8 @@ struct ra_model::provider::ProviderRegistry
 struct ra_model::provider::ProviderRegistryBuilder
 struct ra_model::provider::quirks::ProviderQuirks
 trait ra_model::provider::ProviderFactory
+variant ra_model::compat::quirks::DoneMarker::Absent
+variant ra_model::compat::quirks::DoneMarker::Literal(String)
+variant ra_model::compat::quirks::DoneMarker::Standard
 variant ra_model::provider::UnknownPrefixPolicy::Error
 variant ra_model::provider::UnknownPrefixPolicy::ForwardTo(ProviderKey)
