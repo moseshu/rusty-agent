@@ -2191,6 +2191,39 @@ async fn a_stream_that_ends_without_terminal_facts_fails_the_turn() {
     );
 }
 
+/// A terminal response closes the model channel: accepting a later one would make the run settle
+/// to a response the provider had already superseded or contradicted.
+#[tokio::test]
+async fn a_stream_with_an_event_after_its_terminal_response_fails_the_turn() {
+    let model = StreamingModel::new(vec![vec![
+        ModelStreamEvent::Completed(Box::new(ModelResponse::new(vec![message(
+            "msg-first",
+            "first answer",
+        )]))),
+        ModelStreamEvent::Completed(Box::new(ModelResponse::new(vec![message(
+            "msg-second",
+            "second answer",
+        )]))),
+    ]]);
+    let cancel = CancelScope::root();
+
+    let stream = Runner::run_streamed(
+        streaming_request(&model, &cancel)
+            .with_config(RunConfig::new().with_partial_messages(true)),
+    );
+    let error = stream
+        .finish()
+        .await
+        .expect_err("a terminal response must be the last model-stream event");
+
+    assert!(
+        error
+            .to_string()
+            .contains("event after its terminal response"),
+        "unexpected error: {error}"
+    );
+}
+
 #[tokio::test]
 async fn terminal_result_does_not_require_reading_all_events_first() {
     let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "完事了")])]);

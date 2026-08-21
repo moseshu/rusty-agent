@@ -208,6 +208,10 @@ impl StreamDriver {
             &self.provider,
         )?;
         self.settled = true;
+        // `response.completed` is terminal for this protocol. Stop reading at it so the terminal
+        // model event is also the final event a consumer observes; the trailing `[DONE]` marker is
+        // transport punctuation and carries no facts the completed response lacks.
+        self.finished = true;
         Ok(ModelStreamEvent::Completed(Box::new(response)))
     }
 }

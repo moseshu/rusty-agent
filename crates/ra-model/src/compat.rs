@@ -236,6 +236,11 @@ impl CompatEndpoint {
     /// base URL naming the request path twice.
     fn validate(&self) -> Result<()> {
         self.auth.validate()?;
+        if matches!(&self.done_marker, DoneMarker::Literal(marker) if marker.trim().is_empty()) {
+            return Err(Error::config(
+                "compat stream done marker must not be empty or whitespace",
+            ));
+        }
         if self.base_url().ends_with(REQUEST_PATH) {
             return Err(Error::config(format!(
                 "compat base URL `{}` already ends in `{REQUEST_PATH}`, which the adapter appends \

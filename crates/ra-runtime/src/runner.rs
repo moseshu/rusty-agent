@@ -982,6 +982,12 @@ async fn stream_model_call(
     let mut stream = model.stream_response(request);
     let mut settled: Option<ModelResponse> = None;
     while let Some(event) = stream.next().await {
+        if settled.is_some() {
+            return Err(Error::provider(
+                ProviderErrorKind::Behavior,
+                "the model stream emitted an event after its terminal response",
+            ));
+        }
         match event? {
             ModelStreamEvent::RawResponse(raw) => emit(events, RunStreamEvent::RawResponse(raw)),
             ModelStreamEvent::Completed(response) => settled = Some(*response),

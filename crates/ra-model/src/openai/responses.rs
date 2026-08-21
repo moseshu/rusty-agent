@@ -178,22 +178,11 @@ impl OpenAiResponsesModel {
         if let Some(api_key) = self.auth.api_key() {
             http_request = http_request.bearer_auth(api_key);
         }
-        if let Some(organization) = self.auth.organization() {
-            http_request = http_request.header("openai-organization", organization);
-        }
-        if let Some(project) = self.auth.project() {
-            http_request = http_request.header("openai-project", project);
-        }
-        for (name, value) in self.auth.default_headers() {
-            if !name.eq_ignore_ascii_case("authorization") {
-                http_request = http_request.header(name, value);
-            }
-        }
-        for (name, value) in request.model_settings().extra_headers() {
-            if !name.eq_ignore_ascii_case("authorization") {
-                http_request = http_request.header(name, value);
-            }
-        }
+        http_request = super::apply_transport_headers(
+            http_request,
+            &self.auth,
+            request.model_settings().extra_headers(),
+        )?;
 
         let query = request
             .model_settings()

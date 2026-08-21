@@ -773,6 +773,33 @@ async fn the_stream_forwards_every_provider_event_and_lifts_items_as_they_finish
     );
 }
 
+/// The completed frame closes the model channel even if a broken endpoint sends more SSE data.
+#[tokio::test]
+async fn a_completed_response_is_the_last_model_stream_event() {
+    let server = MockServer::start().await;
+    let mut frames = stream_frames();
+    frames.push(json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 99,
+        "output_index": 1,
+        "delta": "must not be forwarded"
+    }));
+    let events = streamed_events(&server, &frames).await;
+
+    assert!(matches!(
+        events.last(),
+        Some(Ok(ModelStreamEvent::Completed(_)))
+    ));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            Ok(ModelStreamEvent::RawResponse(event))
+                if event.event_type() == "response.output_text.delta"
+        )),
+        "data after response.completed must not escape the terminal model stream"
+    );
+}
+
 /// The streamed entry point asks for a stream; the other one must not.
 #[tokio::test]
 async fn only_the_streaming_entry_point_asks_the_endpoint_to_stream() {

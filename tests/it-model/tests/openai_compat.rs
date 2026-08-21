@@ -171,6 +171,59 @@ async fn a_declared_credential_authenticates_and_a_blank_one_is_refused() {
     );
 }
 
+/// A custom terminator must be a real payload rather than the empty `data:` field of an SSE frame.
+#[tokio::test]
+async fn a_blank_custom_done_marker_is_refused() {
+    let server = MockServer::start().await;
+    let error = endpoint(&server)
+        .with_done_marker(DoneMarker::Literal(" \t ".to_owned()))
+        .build_provider()
+        .expect_err("an empty marker would treat an empty data frame as the end of the stream");
+
+    assert!(
+        error.to_string().contains("done marker must not be empty"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Request transport headers replace endpoint defaults instead of being appended as duplicates.
+#[tokio::test]
+async fn request_headers_override_endpoint_default_headers() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(completion()),
+    )
+    .await;
+    let endpoint = endpoint(&server).with_default_header("x-router-route", "endpoint");
+    let model = model_of(&endpoint);
+    let settings = ModelSettings::new()
+        .with_extra_header("x-router-route", "request")
+        .resolve(
+            &ProviderKey::new(PROVIDER),
+            &ModelSettings::new(),
+            &ModelSettings::new(),
+            &ModelSettings::new(),
+        );
+
+    model
+        .get_response(ModelRequest::new(user_turn(), settings))
+        .await
+        .expect("mock completion should convert");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should retain requests");
+    let values = requests[0]
+        .headers
+        .get_all("x-router-route")
+        .iter()
+        .map(|value| value.to_str().expect("header should be text"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, ["request"]);
+}
+
 /// Declaring a capability is the only thing that puts its field on the wire.
 #[tokio::test]
 async fn declared_capabilities_reach_the_wire_through_the_endpoint() {
