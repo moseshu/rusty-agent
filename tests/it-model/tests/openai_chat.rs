@@ -852,6 +852,45 @@ async fn the_answered_choice_is_selected_by_index_not_by_array_position() {
     );
 }
 
+/// Both reasoning spellings are read on both entry points, or the two disagree about a response.
+#[tokio::test]
+async fn both_reasoning_spellings_lift_on_the_non_streaming_path_too() {
+    let server = MockServer::start().await;
+    let model = mounted_model_with(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_reasoning",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "the summary spelling",
+                    "reasoning": "the body spelling"
+                }
+            }]
+        })),
+        ProviderQuirks::new().with_reasoning_content(true),
+    )
+    .await;
+
+    let response = model
+        .get_response(request(vec![ModelInputItem::Message(Message::user("hi"))]))
+        .await
+        .expect("completion should lift");
+    let RunItemKind::Reasoning(reasoning) = response.output()[0].kind() else {
+        panic!("expected a reasoning item");
+    };
+    assert_eq!(reasoning.summary(), ["the summary spelling"]);
+    assert_eq!(
+        reasoning.content(),
+        ["the body spelling"],
+        "the streaming path reads this field, so dropping it here makes the same response lift \
+         differently depending on how it was requested"
+    );
+}
+
 #[tokio::test]
 async fn a_truncated_completion_is_classified_rather_than_served_as_an_answer() {
     let server = MockServer::start().await;
@@ -1041,7 +1080,8 @@ async fn output_indexes_are_derived_for_reasoning_message_and_tool_calls() {
             delta(json!({"content": "and here is the answer"}), Some("stop")),
         ],
     )
-    .await;
+    .await
+    .with_quirks(ProviderQuirks::new().with_reasoning_content(true));
 
     let (raw, _) = collect_stream(
         &model,
@@ -1141,7 +1181,8 @@ async fn sequence_numbers_increase_monotonically_across_every_event() {
             delta(json!({"content": " second"}), Some("stop")),
         ],
     )
-    .await;
+    .await
+    .with_quirks(ProviderQuirks::new().with_reasoning_content(true));
 
     let (raw, _) = collect_stream(
         &model,
@@ -1362,6 +1403,127 @@ async fn a_streaming_request_answered_with_json_is_refused() {
         !error.to_string().contains("ok"),
         "the completion body is the model's output and must not be quoted into an error: {error}"
     );
+}
+
+/// A turn cut off at the token limit is not an answer, whichever entry point delivered it.
+#[tokio::test]
+async fn a_streamed_turn_stopped_at_the_token_limit_is_classified_like_a_completed_one() {
+    let server = MockServer::start().await;
+    let model = streaming_model(
+        &server,
+        &[delta(json!({"content": "half a sen"}), Some("length"))],
+    )
+    .await;
+
+    let error = stream_error(&model).await;
+    assert_eq!(
+        error.recoverability(),
+        Recoverability::RetryableWithChange,
+        "the non-streaming path classifies this exact state, and the two must agree: {error}"
+    );
+    assert!(
+        error.to_string().contains("output token limit"),
+        "unexpected message: {error}"
+    );
+}
+
+/// A gateway-private reasoning field needs the same declaration on both entry points.
+#[tokio::test]
+async fn streamed_reasoning_content_needs_a_declaration_before_it_is_believed() {
+    let server = MockServer::start().await;
+    let model = streaming_model(
+        &server,
+        &[
+            delta(json!({"reasoning_content": "gateway-specific field"}), None),
+            delta(json!({"reasoning": "another gateway spelling"}), None),
+            delta(json!({"content": "answer"}), Some("stop")),
+        ],
+    )
+    .await;
+
+    let (_, items) = collect_stream(
+        &model,
+        request(vec![ModelInputItem::Message(Message::user("go"))]),
+    )
+    .await;
+    assert_eq!(
+        items.len(),
+        1,
+        "an undeclared endpoint's private fields were believed: {items:?}"
+    );
+    assert!(matches!(items[0], RunItemKind::Message(_)));
+}
+
+/// Buffering must not delete a call it does not buffer.
+#[tokio::test]
+async fn a_custom_tool_call_survives_the_release_of_buffered_function_calls() {
+    let server = MockServer::start().await;
+    let model = streaming_model(
+        &server,
+        &[
+            delta(
+                json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "{}"}}]}),
+                None,
+            ),
+            // The terminal frame carries a custom call beside the buffered function call.
+            delta(
+                json!({"tool_calls": [
+                    {"index": 1, "id": "call_c", "type": "custom", "custom": {"name": "run", "input": "ls"}}
+                ]}),
+                Some("tool_calls"),
+            ),
+        ],
+    )
+    .await
+    .with_buffered_tool_calls(true);
+
+    // Strict validation is the default, so the shape this adapter cannot execute is reported
+    // rather than quietly dropped on the way past.
+    let error = stream_error(&model).await;
+    assert!(
+        error.to_string().contains("custom"),
+        "the custom call was overwritten by the released buffer instead of being reported: {error}"
+    );
+}
+
+/// Reporting it is the strict behaviour; dropping it is the lenient one, and both must see it.
+#[tokio::test]
+async fn a_lenient_endpoint_keeps_the_function_call_beside_a_dropped_custom_call() {
+    let server = MockServer::start().await;
+    let model = streaming_model(
+        &server,
+        &[
+            delta(
+                json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "{\"a\":1}"}}]}),
+                None,
+            ),
+            delta(
+                json!({"tool_calls": [
+                    {"index": 1, "id": "call_c", "type": "custom", "custom": {"name": "run", "input": "ls"}}
+                ]}),
+                Some("tool_calls"),
+            ),
+        ],
+    )
+    .await
+    .with_buffered_tool_calls(true)
+    .with_lowering_options(ChatLoweringOptions::new().with_strict_feature_validation(false));
+
+    let (_, items) = collect_stream(
+        &model,
+        request(vec![ModelInputItem::Message(Message::user("go"))]),
+    )
+    .await;
+    let calls = items
+        .iter()
+        .filter_map(|kind| match kind {
+            RunItemKind::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "the buffered call must still be released");
+    assert_eq!(calls[0].call_id().as_str(), "call_a");
+    assert_eq!(calls[0].arguments(), &json!({"a": 1}));
 }
 
 /// Gateways omit one terminator or the other, so either alone has to be enough.

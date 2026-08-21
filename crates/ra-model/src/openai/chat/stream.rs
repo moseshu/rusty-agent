@@ -126,7 +126,9 @@ struct StreamingState {
     warned_choices: bool,
     /// Whether the sender said the stream was complete, either way it is allowed to say so.
     saw_done: bool,
-    saw_finish_reason: bool,
+    /// The terminal reason itself, not merely that one arrived: `length` means the turn was cut
+    /// off, and settling that as an answer is the failure the non-streaming path already refuses.
+    finish_reason: Option<String>,
     usage: Option<Value>,
 }
 
@@ -319,6 +321,14 @@ impl StreamDriver {
                     if let Some(error) = self.truncation_error() {
                         return Some(Err(error));
                     }
+                    // The same terminal states the non-streaming path refuses. A turn stopped at
+                    // the token limit carries a well-formed half sentence either way, and which
+                    // entry point the caller used cannot decide whether it counts as an answer.
+                    if let Err(error) =
+                        convert::reject_unfinished_choice(self.state.finish_reason.as_deref())
+                    {
+                        return Some(Err(error));
+                    }
                     if let Err(error) = self.finalize() {
                         return Some(Err(error));
                     }
@@ -339,7 +349,7 @@ impl StreamDriver {
     /// whether the request can be replayed at all, and that is the one fact a retry policy above
     /// cannot recover once this error is built.
     fn truncation_error(&self) -> Option<Error> {
-        if self.state.saw_done || self.state.saw_finish_reason {
+        if self.state.saw_done || self.state.finish_reason.is_some() {
             return None;
         }
         let message = if self.state.started {
@@ -420,8 +430,8 @@ impl StreamDriver {
             return Ok(());
         };
         let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
-        if finish_reason.is_some() {
-            self.state.saw_finish_reason = true;
+        if let Some(reason) = finish_reason {
+            self.state.finish_reason = Some(reason.to_owned());
         }
         if finish_reason == Some("content_filter") {
             self.state.saw_content_filter = true;
@@ -429,8 +439,10 @@ impl StreamDriver {
         let Some(delta) = choice.get("delta").filter(|value| value.is_object()) else {
             return Ok(());
         };
-        let delta = self.intercept_tool_calls(delta, finish_reason)?;
-        self.process_delta(&delta)
+        for delta in self.intercept_tool_calls(delta, finish_reason)? {
+            self.process_delta(&delta)?;
+        }
+        Ok(())
     }
 
     /// Holds tool-call fragments back until the call is complete, when buffering is enabled.
@@ -440,13 +452,20 @@ impl StreamDriver {
     /// JSON, so buffering trades incremental rendering for a call that is always well formed.
     /// Deltas that carry other output pass through untouched — dropping them would lose text the
     /// model already produced.
+    ///
+    /// Completed calls come back as a **second delta** rather than written over the first. The
+    /// delta that releases them may itself be carrying a call this adapter does not buffer — a
+    /// custom tool call, which is a valid response shape — and overwriting the array would delete
+    /// it before anything could reject it, turning a refusal into silence. The reference
+    /// implementation keeps the two apart the same way, by emitting the completed calls as a chunk
+    /// of their own.
     fn intercept_tool_calls(
         &mut self,
         delta: &Value,
         finish_reason: Option<&str>,
-    ) -> Result<Value> {
+    ) -> Result<Vec<Value>> {
         if self.buffered.is_none() {
-            return Ok(delta.clone());
+            return Ok(vec![delta.clone()]);
         }
         let mut remaining = Vec::new();
         for fragment in delta
@@ -467,33 +486,41 @@ impl StreamDriver {
             }
         }
 
-        let mut delta = delta.clone();
-        if let Some(object) = delta.as_object_mut() {
+        let mut passthrough = delta.clone();
+        if let Some(object) = passthrough.as_object_mut() {
             if remaining.is_empty() {
                 object.remove("tool_calls");
             } else {
                 object.insert("tool_calls".to_owned(), Value::Array(remaining));
             }
         }
-        if finished_tool_calls(finish_reason) {
-            self.release_buffered_calls(&mut delta)?;
+        let carries_output = has_passthrough_output(&passthrough);
+        let mut deltas = vec![passthrough];
+        if finished_tool_calls(finish_reason)
+            && let Some(released) = self.release_buffered_calls(carries_output)?
+        {
+            deltas.push(released);
         }
-        Ok(delta)
+        Ok(deltas)
     }
 
-    /// Replaces the held fragments with one complete `tool_calls` array.
-    fn release_buffered_calls(&mut self, delta: &mut Value) -> Result<()> {
+    /// Turns the held fragments into one delta carrying the completed calls.
+    ///
+    /// `carries_output` says whether the delta that triggered the release already had output of
+    /// its own. That is what separates "the model asked for tools and they were buffered" from
+    /// "the endpoint claimed a tool-call ending and sent no tool call at all".
+    fn release_buffered_calls(&mut self, carries_output: bool) -> Result<Option<Value>> {
         let Some(buffer) = self.buffered.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         if buffer.calls.is_empty() {
-            if !buffer.saw_passthrough && !has_passthrough_output(delta) {
+            if !buffer.saw_passthrough && !carries_output {
                 return Err(behavior_error(
                     "OpenAI stream finished with finish_reason `tool_calls` but sent no tool call \
                      fragments",
                 ));
             }
-            return Ok(());
+            return Ok(None);
         }
         let mut released = Vec::with_capacity(buffer.calls.len());
         for (index, call) in std::mem::take(&mut buffer.calls) {
@@ -514,10 +541,7 @@ impl StreamDriver {
                 "function": {"name": call.name, "arguments": call.arguments}
             }));
         }
-        if let Some(object) = delta.as_object_mut() {
-            object.insert("tool_calls".to_owned(), Value::Array(released));
-        }
-        Ok(())
+        Ok(Some(json!({"tool_calls": released})))
     }
 
     fn process_delta(&mut self, delta: &Value) -> Result<()> {
@@ -546,6 +570,12 @@ impl StreamDriver {
     }
 
     fn process_reasoning_content(&mut self, delta: &Value) {
+        // Neither of the reasoning fields is part of Chat Completions; both are gateway additions,
+        // so both wait on the same declaration the non-streaming path checks. Without this the
+        // same response yields a reasoning item down one entry point and not the other.
+        if !self.codec.quirks.reasoning_content() {
+            return;
+        }
         let Some(text) = non_empty(delta.get("reasoning_content")) else {
             return;
         };
@@ -589,6 +619,9 @@ impl StreamDriver {
     }
 
     fn process_reasoning_text(&mut self, delta: &Value) {
+        if !self.codec.quirks.reasoning_content() {
+            return;
+        }
         let Some(text) = non_empty(delta.get("reasoning")) else {
             return;
         };
@@ -910,9 +943,12 @@ impl StreamDriver {
         if !held {
             return Ok(());
         }
-        let mut delta = json!({});
-        self.release_buffered_calls(&mut delta)?;
-        self.process_delta(&delta)
+        // The held calls are known to be non-empty here, so the "claimed tool calls and sent none"
+        // check cannot fire and the flag it reads is irrelevant.
+        if let Some(delta) = self.release_buffered_calls(true)? {
+            self.process_delta(&delta)?;
+        }
+        Ok(())
     }
 
     /// Records a turn the provider withheld without saying anything else.

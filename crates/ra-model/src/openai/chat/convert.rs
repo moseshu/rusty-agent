@@ -637,7 +637,11 @@ pub(crate) fn primary_choice(choices: &[Value]) -> Option<&Value> {
 /// half a sentence as if the model had finished. The reference implementation returns it; this
 /// adapter classifies it, matching the sibling Responses adapter, which refuses the identical
 /// `incomplete / max_output_tokens` state for the identical reason.
-fn reject_unfinished_choice(finish_reason: Option<&str>) -> Result<()> {
+///
+/// Shared with the streaming path, which reaches the same terminal reasons by a different route.
+/// A turn stopped at the token limit is not an answer, and which entry point the caller happened
+/// to use has no bearing on that.
+pub(crate) fn reject_unfinished_choice(finish_reason: Option<&str>) -> Result<()> {
     if finish_reason == Some("length") {
         return Err(Error::provider(
             ProviderErrorKind::ContextOverflow,
@@ -763,40 +767,47 @@ pub(crate) fn lift_reasoning(
     message: &Value,
     completion_id: &str,
 ) -> Option<Reasoning> {
-    let reasoning_content = codec
-        .quirks
-        .reasoning_content()
+    let declared = codec.quirks.reasoning_content();
+    // Both spellings are gateway additions rather than protocol fields, so both wait on the same
+    // declaration — and the streaming path reads both, which is the only reason this one does too.
+    // A response that yields a reasoning item down one entry point has to yield it down the other.
+    let summary = declared
         .then(|| non_empty(message.get("reasoning_content")))
+        .flatten();
+    let body = declared
+        .then(|| non_empty(message.get("reasoning")))
         .flatten();
     let thinking_blocks = message
         .get("thinking_blocks")
         .and_then(Value::as_array)
         .filter(|blocks| !blocks.is_empty());
-    if reasoning_content.is_none() && thinking_blocks.is_none() {
+    if summary.is_none() && body.is_none() && thinking_blocks.is_none() {
         return None;
     }
 
     let mut provider_data = reasoning_provider_data(&codec.model, completion_id);
     let mut reasoning = Reasoning::new();
-    if let Some(text) = reasoning_content {
+    if let Some(text) = summary {
         reasoning = reasoning.with_summary(vec![text.to_owned()]);
     }
+    let mut content = body.map(str::to_owned).into_iter().collect::<Vec<_>>();
     if let Some(blocks) = thinking_blocks {
         provider_data.insert("thinking_blocks".to_owned(), Value::Array(blocks.clone()));
-        let content = blocks
-            .iter()
-            .filter_map(|block| non_empty(block.get("thinking")).map(str::to_owned))
-            .collect::<Vec<_>>();
+        content.extend(
+            blocks
+                .iter()
+                .filter_map(|block| non_empty(block.get("thinking")).map(str::to_owned)),
+        );
         let signatures = blocks
             .iter()
             .filter_map(|block| non_empty(block.get("signature")))
             .collect::<Vec<_>>();
-        if !content.is_empty() {
-            reasoning = reasoning.with_content(content);
-        }
         if !signatures.is_empty() {
             reasoning = reasoning.with_encrypted_content(signatures.join("\n"));
         }
+    }
+    if !content.is_empty() {
+        reasoning = reasoning.with_content(content);
     }
     Some(reasoning.with_provider_data(Value::Object(provider_data)))
 }
