@@ -31,17 +31,18 @@
 
 use std::{any::Any, sync::Arc, time::Instant};
 
+use futures::StreamExt;
 use ra_core::{
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
     context::RunContext,
-    error::{BudgetKind, Error, Result},
+    error::{BudgetKind, Error, ProviderErrorKind, Result},
     finish::FinishReason,
     item::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind,
     },
-    model::{ModelResolver, ModelSettings, ModelTracing},
+    model::{Model, ModelRequest, ModelResolver, ModelSettings, ModelStreamEvent, ModelTracing},
     state::{EventSeqAllocator, RunId, RunState},
     step::NextStep,
     tool::ToolServices,
@@ -93,6 +94,7 @@ pub struct RunConfig {
     model_settings: ModelSettings,
     tracing: ModelTracing,
     error_handler: Option<Arc<dyn RunErrorHandler>>,
+    partial_messages: bool,
 }
 
 impl Default for RunConfig {
@@ -111,6 +113,7 @@ impl RunConfig {
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
             error_handler: None,
+            partial_messages: false,
         }
     }
 
@@ -182,6 +185,29 @@ impl RunConfig {
         self
     }
 
+    /// Streams each model call and forwards its provider events, so a host can render a turn as it
+    /// is produced.
+    ///
+    /// Off by default, and the default is not timidity. Streaming a call costs a decoder that has
+    /// to reassemble a turn from fragments and decide when the sender really finished, and a run
+    /// whose output nobody is watching gains nothing for it. The switch is also what the
+    /// non-streaming path is measured against: both settle the same turn from the same terminal
+    /// response, so a bug that only appears when tokens are rendered has one place to be.
+    ///
+    /// **It takes effect only on [`Runner::run_streamed`].** [`Runner::run`] has no subscriber to
+    /// forward to, so it keeps making one non-streaming call rather than assembling deltas and
+    /// discarding them.
+    pub const fn with_partial_messages(mut self, partial_messages: bool) -> Self {
+        self.partial_messages = partial_messages;
+        self
+    }
+
+    /// Whether model calls are streamed and their provider events forwarded.
+    #[must_use]
+    pub const fn partial_messages(&self) -> bool {
+        self.partial_messages
+    }
+
     /// Budget dimensions governing this run.
     #[must_use]
     pub const fn budget(&self) -> &BudgetLimit {
@@ -221,6 +247,7 @@ impl std::fmt::Debug for RunConfig {
             .field("model_settings", &self.model_settings)
             .field("tracing", &self.tracing)
             .field("has_error_handler", &self.error_handler.is_some())
+            .field("partial_messages", &self.partial_messages)
             .finish()
     }
 }
@@ -762,7 +789,7 @@ async fn run_one_turn(
     }
     let prepared = prepare_turn(preparation).await?;
 
-    let (surface, response) = call_model(turn_scope, prepared).await?;
+    let (surface, response) = call_model(turn_scope, prepared, context).await?;
 
     // Both facts about a completed call are recorded here, before settlement, and the stop
     // either may cause is *not* taken here. The response has already been paid for, so its
@@ -862,9 +889,15 @@ fn live_context(
 }
 
 /// Executes one prepared model call and records its provider-neutral terminal facts.
+///
+/// Whether the call is streamed changes what a subscriber sees while it runs, and nothing else:
+/// both paths end at one [`ModelResponse`] and hand it to the same settlement. That is deliberate —
+/// a second settlement path for streamed turns is how the streamed and non-streamed views of the
+/// same run start to disagree about what happened.
 async fn call_model(
     turn_scope: &CancelScope,
     prepared: PreparedTurn,
+    context: &TurnLoopContext<'_>,
 ) -> Result<(TurnActionSurface, ModelResponse)> {
     let model = Arc::clone(prepared.model());
     let selector = prepared.selector().clone();
@@ -895,10 +928,19 @@ async fn call_model(
         usage.reasoning_tokens = tracing::field::Empty,
     );
     let started = Instant::now();
-    let response = async { turn_scope.run(model.get_response(model_request)).await }
-        .instrument(generation_span.clone())
-        .await
-        .and_then(|response| response);
+    let streamed = context.config.partial_messages && context.events.is_some();
+    let response = async {
+        if streamed {
+            turn_scope
+                .run(stream_model_call(&model, model_request, context.events))
+                .await
+        } else {
+            turn_scope.run(model.get_response(model_request)).await
+        }
+    }
+    .instrument(generation_span.clone())
+    .await
+    .and_then(|response| response);
     generation_span.record(
         ra_core::trace::field::DURATION_MS,
         duration_ms(started.elapsed()),
@@ -914,6 +956,46 @@ async fn call_model(
             Err(error)
         }
     }
+}
+
+/// Drives one streamed model call, forwarding its provider events and returning what it settled to.
+///
+/// # Two kinds of event arrive and only one is forwarded
+///
+/// Provider events are narration and go straight through. The adapter's normalized items are
+/// dropped here: this turn's records reach a subscriber from settlement, attributed and with their
+/// output phase decided, and forwarding the adapter's copy as well would publish each of them
+/// twice — the first time as something the run has not yet judged.
+///
+/// # A stream that never settles is a failed call
+///
+/// The terminal response is the only place usage, the transport identifier and the output ordering
+/// exist, so a stream that ends without one has not produced a turn no matter how much narration it
+/// delivered. Rebuilding the turn from the deltas instead would mean re-deriving all three from a
+/// provider-shaped vocabulary that carries no stability promise, once per protocol — and reporting
+/// a turn the provider never said it finished.
+async fn stream_model_call(
+    model: &Arc<dyn Model>,
+    request: ModelRequest,
+    events: Option<&mpsc::UnboundedSender<RunStreamEvent>>,
+) -> Result<ModelResponse> {
+    let mut stream = model.stream_response(request);
+    let mut settled: Option<ModelResponse> = None;
+    while let Some(event) = stream.next().await {
+        match event? {
+            ModelStreamEvent::RawResponse(raw) => emit(events, RunStreamEvent::RawResponse(raw)),
+            ModelStreamEvent::Completed(response) => settled = Some(*response),
+            // Every other model event is the adapter's own view of items this run publishes itself.
+            _ => {}
+        }
+    }
+    settled.ok_or_else(|| {
+        Error::provider(
+            ProviderErrorKind::Behavior,
+            "the model stream ended without a terminal response, so the turn has no usage, no \
+             request identifier and no settled output order",
+        )
+    })
 }
 
 /// Records the normalized per-request usage preserved by the model response.

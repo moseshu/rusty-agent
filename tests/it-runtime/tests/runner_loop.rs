@@ -28,7 +28,7 @@ use ra_core::{
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ProviderKey, ResolvedModel, ToolChoice,
+        ModelStreamEvent, ProviderKey, RawResponseEvent, ResolvedModel, ToolChoice,
     },
     state::{PendingControlRequest, RunId, RunState, ToolUse, WorkStateHandle},
     tool::{
@@ -99,6 +99,77 @@ impl Model for ScriptedModel {
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
         stream::empty().boxed()
     }
+}
+
+/// Answers on the streaming entry point, and records whether the non-streaming one was used.
+///
+/// The two counters are the point of the fixture: which entry point the loop opened is the thing
+/// the partial-message switch decides, and it is not observable from the run's result.
+struct StreamingModel {
+    events: Mutex<Vec<Vec<ModelStreamEvent>>>,
+    streamed_calls: Arc<AtomicUsize>,
+    blocking_calls: Arc<AtomicUsize>,
+    fallback: Mutex<Vec<ModelResponse>>,
+}
+
+impl StreamingModel {
+    fn new(events: Vec<Vec<ModelStreamEvent>>) -> Arc<Self> {
+        Arc::new(Self {
+            events: Mutex::new(events),
+            streamed_calls: Arc::new(AtomicUsize::new(0)),
+            blocking_calls: Arc::new(AtomicUsize::new(0)),
+            fallback: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Supplies what the non-streaming entry point answers, when the loop chooses it.
+    fn with_fallback(self: Arc<Self>, responses: Vec<ModelResponse>) -> Arc<Self> {
+        *self.fallback.lock().unwrap() = responses;
+        self
+    }
+}
+
+#[async_trait]
+impl Model for StreamingModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.blocking_calls.fetch_add(1, Ordering::SeqCst);
+        let mut fallback = self.fallback.lock().unwrap();
+        if fallback.is_empty() {
+            return Err(Error::caller("streaming model has no non-streaming answer"));
+        }
+        Ok(fallback.remove(0))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        self.streamed_calls.fetch_add(1, Ordering::SeqCst);
+        let mut script = self.events.lock().unwrap();
+        let events = if script.is_empty() {
+            Vec::new()
+        } else {
+            script.remove(0)
+        };
+        stream::iter(events.into_iter().map(Ok)).boxed()
+    }
+}
+
+fn raw_event(event_type: &str) -> ModelStreamEvent {
+    ModelStreamEvent::RawResponse(RawResponseEvent::new(
+        ProviderKey::new("test-provider"),
+        event_type,
+        json!({"delta": "…"}),
+    ))
+}
+
+fn streaming_request(model: &Arc<StreamingModel>, cancel: &CancelScope) -> RunRequest {
+    RunRequest::new(
+        agent(Vec::new()),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
+    )
 }
 
 /// A model call that only ends by being cancelled. Its drop notification makes cancellation of an
@@ -1995,6 +2066,129 @@ async fn stream_events_include_settlement_normalized_message_channels() {
         [Some(OutputPhase::Commentary), Some(OutputPhase::Final)]
     );
     assert_eq!(stream.finish().await.unwrap().turns(), 2);
+}
+
+/// With partial messages on, provider narration reaches the subscriber and the turn still settles
+/// from the terminal response rather than from the deltas.
+#[tokio::test]
+async fn partial_messages_forward_provider_events_and_settle_from_the_terminal_response() {
+    let model = StreamingModel::new(vec![vec![
+        raw_event("response.created"),
+        raw_event("response.output_text.delta"),
+        // The adapter's own view of the item. The run publishes its settled copy instead, so this
+        // must not reach the subscriber as a second record.
+        ModelStreamEvent::RunItem(ra_core::model::RunItemStreamEvent::new(
+            "message_output_created",
+            message("msg-1", "改完了"),
+        )),
+        raw_event("response.completed"),
+        ModelStreamEvent::Completed(Box::new(
+            ModelResponse::new(vec![message("msg-1", "改完了")]).with_usage(Usage::new(11, 3)),
+        )),
+    ]]);
+    let streamed_calls = Arc::clone(&model.streamed_calls);
+    let blocking_calls = Arc::clone(&model.blocking_calls);
+    let cancel = CancelScope::root();
+
+    let mut stream = Runner::run_streamed(
+        streaming_request(&model, &cancel)
+            .with_config(RunConfig::new().with_partial_messages(true)),
+    );
+    let mut raw = Vec::new();
+    let mut items = Vec::new();
+    while let Some(event) = stream.next_event().await {
+        match event {
+            RunStreamEvent::RawResponse(event) => raw.push(event.event_type().to_owned()),
+            RunStreamEvent::Item(item) => items.push(item.id().as_str().to_owned()),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        raw,
+        [
+            "response.created",
+            "response.output_text.delta",
+            "response.completed"
+        ]
+    );
+    assert_eq!(
+        items,
+        ["msg-1"],
+        "the settled record is published once; the adapter's copy of it is not a second record"
+    );
+    assert_eq!(streamed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(blocking_calls.load(Ordering::SeqCst), 0);
+
+    let result = stream.finish().await.unwrap();
+    assert_eq!(result.turns(), 1);
+    // Usage exists only on the terminal response; a run that folded the deltas would report none.
+    assert_eq!(result.usage().input_tokens(), 11);
+    assert_eq!(result.usage().output_tokens(), 3);
+}
+
+/// A run nobody asked narration from does not open a streamed call at all.
+#[tokio::test]
+async fn a_run_without_partial_messages_keeps_making_one_non_streaming_call() {
+    let model = StreamingModel::new(Vec::new())
+        .with_fallback(vec![ModelResponse::new(vec![message("msg-1", "完事了")])]);
+    let streamed_calls = Arc::clone(&model.streamed_calls);
+    let blocking_calls = Arc::clone(&model.blocking_calls);
+    let cancel = CancelScope::root();
+
+    let stream = Runner::run_streamed(streaming_request(&model, &cancel));
+    let result = stream.finish().await.unwrap();
+
+    assert_eq!(result.turns(), 1);
+    assert_eq!(
+        streamed_calls.load(Ordering::SeqCst),
+        0,
+        "assembling deltas nobody is watching costs a decoder and buys nothing"
+    );
+    assert_eq!(blocking_calls.load(Ordering::SeqCst), 1);
+}
+
+/// The switch needs a subscriber to mean anything, so the blocking entry point ignores it.
+#[tokio::test]
+async fn partial_messages_do_nothing_on_the_entry_point_that_has_no_subscriber() {
+    let model = StreamingModel::new(Vec::new())
+        .with_fallback(vec![ModelResponse::new(vec![message("msg-1", "完事了")])]);
+    let streamed_calls = Arc::clone(&model.streamed_calls);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(
+        streaming_request(&model, &cancel)
+            .with_config(RunConfig::new().with_partial_messages(true)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.turns(), 1);
+    assert_eq!(streamed_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Narration is not a turn: a stream that never states its terminal facts fails the call.
+#[tokio::test]
+async fn a_stream_that_ends_without_terminal_facts_fails_the_turn() {
+    let model = StreamingModel::new(vec![vec![
+        raw_event("response.created"),
+        raw_event("response.output_text.delta"),
+    ]]);
+    let cancel = CancelScope::root();
+
+    let stream = Runner::run_streamed(
+        streaming_request(&model, &cancel)
+            .with_config(RunConfig::new().with_partial_messages(true)),
+    );
+    let error = stream
+        .finish()
+        .await
+        .expect_err("a stream that never settled has not produced a turn");
+
+    assert!(
+        error.to_string().contains("without a terminal response"),
+        "unexpected message: {error}"
+    );
 }
 
 #[tokio::test]

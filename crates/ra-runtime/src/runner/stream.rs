@@ -8,14 +8,18 @@
 //! never heard of agents or turns — so the two are separate enums and this one wraps rather than
 //! extends the other.
 //!
-//! Forwarding provider deltas into this channel is R1-7's, and its insertion point is the model
-//! call in [`super::run_loop`]. Until then a subscriber sees a turn's records the moment that turn
-//! settles, which is already incremental across a multi-turn run.
+//! Provider deltas are forwarded onto it, unchanged, when the run asks for partial messages. What
+//! is *not* forwarded is the model channel's normalized items: this channel already delivers each
+//! record when the turn settles, attributed and with its output phase decided, and a settlement
+//! decides things the adapter cannot know. Publishing the adapter's copy as well would show every
+//! message twice, the first time without the phase — which is the confusion the settlement stamp
+//! exists to prevent.
 
 use ra_core::{
     cancel::{CancelOnDrop, CancelReason, DRAIN_GRACE},
     error::Result,
     item::{AgentId, Message, RunItem},
+    model::RawResponseEvent,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -37,6 +41,16 @@ pub enum RunStreamEvent {
         /// The public agent speaking.
         agent: AgentId,
     },
+    /// A provider event from the model call this turn is making, forwarded unchanged.
+    ///
+    /// Only when the run asked for partial messages; a run that did not never opens a streamed
+    /// model call at all, because the deltas would be assembled and then dropped.
+    ///
+    /// **This is narration, not record.** The payload is provider-shaped, isolated behind the
+    /// provider key, and carries no stability promise — the same event may be spelled differently
+    /// by the next protocol, or by the next version of this adapter. Render it; do not persist it,
+    /// and do not reconstruct the turn from it. [`Self::Item`] is the record.
+    RawResponse(RawResponseEvent),
     /// One record the turn produced, already attributed.
     ///
     /// A closeout that *was* recorded arrives here rather than as [`Self::FinalMessage`], because
