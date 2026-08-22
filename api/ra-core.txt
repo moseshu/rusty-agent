@@ -340,6 +340,23 @@ const fn ra_core::model::retry::RetryBackoffSettings::with_initial_delay(mut sel
 const fn ra_core::model::retry::RetryBackoffSettings::with_jitter(mut self, jitter : bool) -> Self
 const fn ra_core::model::retry::RetryBackoffSettings::with_max_delay(mut self, delay : Duration) -> Self
 const fn ra_core::model::retry::RetryBackoffSettings::with_multiplier(mut self, multiplier : f64) -> Self
+const fn ra_core::model::retry::backoff::JitterSample::get(self) -> f64
+const fn ra_core::model::retry::backoff::RetryBackoff::initial_delay(& self) -> Duration
+const fn ra_core::model::retry::backoff::RetryBackoff::jitter(& self) -> bool
+const fn ra_core::model::retry::backoff::RetryBackoff::max_delay(& self) -> Duration
+const fn ra_core::model::retry::backoff::RetryBackoff::multiplier(& self) -> f64
+const fn ra_core::model::retry::backoff::RetryBackoff::new() -> Self
+const fn ra_core::model::retry::normalized::NormalizedProviderError::is_network_error(& self) -> bool
+const fn ra_core::model::retry::normalized::NormalizedProviderError::is_timeout(& self) -> bool
+const fn ra_core::model::retry::normalized::NormalizedProviderError::kind(& self) -> ProviderErrorKind
+const fn ra_core::model::retry::normalized::NormalizedProviderError::replay_safety(& self) -> ReplaySafety
+const fn ra_core::model::retry::normalized::NormalizedProviderError::retry_after(& self) -> Option < Duration >
+const fn ra_core::model::retry::normalized::NormalizedProviderError::should_retry(& self) -> Option < bool >
+const fn ra_core::model::retry::normalized::NormalizedProviderError::status_code(& self) -> Option < u16 >
+const fn ra_core::model::retry::normalized::NormalizedProviderError::with_replay_safety(mut self, replay_safety : ReplaySafety) -> Self
+const fn ra_core::model::retry::normalized::NormalizedProviderError::with_retry_after(mut self, retry_after : Duration) -> Self
+const fn ra_core::model::retry::normalized::NormalizedProviderError::with_should_retry(mut self, should_retry : bool) -> Self
+const fn ra_core::model::retry::normalized::NormalizedProviderError::with_status_code(mut self, status_code : u16) -> Self
 const fn ra_core::model::settings::Effort::label(self) -> & 'static str
 const fn ra_core::model::settings::McpToolChoice::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::settings::McpToolChoice::unknown(& self) -> & Unknown
@@ -613,6 +630,12 @@ const ra_core::item::tool::TOOL_ITEM_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::protocol::ApiProtocol::ALL: & 'static [Self]
 const ra_core::model::retry::MODEL_RETRY_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::retry::RETRY_BACKOFF_SETTINGS_SCHEMA_VERSION: SchemaVersion
+const ra_core::model::retry::backoff::DEFAULT_INITIAL_DELAY: Duration
+const ra_core::model::retry::backoff::DEFAULT_MAX_DELAY: Duration
+const ra_core::model::retry::backoff::DEFAULT_MULTIPLIER: f64
+const ra_core::model::retry::backoff::JITTER_RANGE: f64
+const ra_core::model::retry::backoff::JitterSample::ZERO: Self
+const ra_core::model::retry::backoff::MAX_HONORED_RETRY_AFTER: Duration
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
@@ -1051,6 +1074,21 @@ fn ra_core::model::retry::ModelRetrySettings::with_backoff(mut self, backoff : R
 fn ra_core::model::retry::RetryAdvice::reason(& self) -> Option < & str >
 fn ra_core::model::retry::RetryAdvice::with_reason(mut self, reason : impl Into < String >) -> Self
 fn ra_core::model::retry::RetryBackoffSettings::new() -> Self
+fn ra_core::model::retry::backoff::JitterSample::new(sample : f64) -> Self
+fn ra_core::model::retry::backoff::RetryBackoff::base_delay(& self, attempt : u32) -> Duration
+fn ra_core::model::retry::backoff::RetryBackoff::delay(& self, attempt : u32, retry_after : Option < Duration >, sample : JitterSample) -> Duration
+fn ra_core::model::retry::backoff::RetryBackoff::from_settings(settings : Option < & RetryBackoffSettings >) -> Self
+fn ra_core::model::retry::normalized::NormalizedProviderError::error_code(& self) -> Option < & str >
+fn ra_core::model::retry::normalized::NormalizedProviderError::from_error(error : & Error) -> Option < & Self >
+fn ra_core::model::retry::normalized::NormalizedProviderError::into_error(self) -> Error
+fn ra_core::model::retry::normalized::NormalizedProviderError::message(& self) -> & str
+fn ra_core::model::retry::normalized::NormalizedProviderError::new(kind : ProviderErrorKind, message : impl Into < String >) -> Self
+fn ra_core::model::retry::normalized::NormalizedProviderError::request_id(& self) -> Option < & str >
+fn ra_core::model::retry::normalized::NormalizedProviderError::with_error_code(mut self, error_code : impl Into < String >) -> Self
+fn ra_core::model::retry::normalized::NormalizedProviderError::with_request_id(mut self, request_id : impl Into < String >) -> Self
+fn ra_core::model::retry::normalized::NormalizedProviderError::with_source(mut self, source : impl Into < BoxError >) -> Self
+fn ra_core::model::retry::normalized::replay_safety_of(error : & Error) -> ReplaySafety
+fn ra_core::model::retry::normalized::stamp_replay_safety(error : Error, replay_safety : ReplaySafety) -> Error
 fn ra_core::model::settings::McpToolChoice::name(& self) -> & str
 fn ra_core::model::settings::McpToolChoice::new(server : impl Into < String >, name : impl Into < String >) -> Self
 fn ra_core::model::settings::McpToolChoice::server(& self) -> & str
@@ -1353,6 +1391,8 @@ mod ra_core::model::protocol
 mod ra_core::model::request
 mod ra_core::model::resolution
 mod ra_core::model::retry
+mod ra_core::model::retry::backoff
+mod ra_core::model::retry::normalized
 mod ra_core::model::settings
 mod ra_core::model::stream
 mod ra_core::permission
@@ -1466,6 +1506,9 @@ struct ra_core::model::retry::ModelRetryAdviceRequest
 struct ra_core::model::retry::ModelRetrySettings
 struct ra_core::model::retry::RetryAdvice
 struct ra_core::model::retry::RetryBackoffSettings
+struct ra_core::model::retry::backoff::JitterSample
+struct ra_core::model::retry::backoff::RetryBackoff
+struct ra_core::model::retry::normalized::NormalizedProviderError
 struct ra_core::model::settings::McpToolChoice
 struct ra_core::model::settings::ModelSettings
 struct ra_core::model::settings::ProviderKey
@@ -1595,6 +1638,7 @@ variant ra_core::error::ProtocolErrorKind::Transport
 variant ra_core::error::ProviderErrorKind::Auth
 variant ra_core::error::ProviderErrorKind::BadRequest
 variant ra_core::error::ProviderErrorKind::Behavior
+variant ra_core::error::ProviderErrorKind::Conflict
 variant ra_core::error::ProviderErrorKind::ContextOverflow
 variant ra_core::error::ProviderErrorKind::Network
 variant ra_core::error::ProviderErrorKind::RateLimit

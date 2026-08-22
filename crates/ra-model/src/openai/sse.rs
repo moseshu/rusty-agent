@@ -16,11 +16,11 @@ use std::collections::VecDeque;
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
-    model::ModelStreamEvent,
+    model::{ModelStreamEvent, ReplaySafety, stamp_replay_safety},
 };
 use serde_json::Value;
 
-use super::error::{behavior_error, response_error, transport_error};
+use super::error::{ResponseFacts, behavior_error, response_failure, transport_error};
 
 /// The terminator both `OpenAI` protocols send before closing the connection.
 const DONE_MARKER: &str = "[DONE]";
@@ -115,15 +115,31 @@ pub(crate) fn ensure_event_stream(response: &reqwest::Response, protocol: &str) 
 }
 
 /// Turns a non-2xx streaming response into the single error event it amounts to.
-pub(crate) async fn failed_stream(response: reqwest::Response) -> Result<ModelStreamEvent> {
-    let request_id = response
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let status = response.status();
+///
+/// No frame ever existed, so nothing downstream has been handed a fragment of this turn. Whether
+/// that makes a replay safe is still not this function's call — a request continuing server-managed
+/// state can have advanced it before the refusal — so the caller supplies the verdict.
+pub(crate) async fn failed_stream(
+    response: reqwest::Response,
+    unstarted: ReplaySafety,
+) -> Result<ModelStreamEvent> {
+    let facts = ResponseFacts::read(&response);
     let payload = response.json::<Value>().await.unwrap_or(Value::Null);
-    Err(response_error(status, &payload, request_id.as_deref()))
+    Err(response_failure(&facts, &payload)
+        .with_replay_safety(unstarted)
+        .into_error())
+}
+
+/// Turns a failure that happened before the stream existed into the stream it stands in for.
+///
+/// Same reasoning as above, applied to the failures that never reached a response at all: the
+/// request was refused, mis-answered, or never sent.
+pub(crate) fn error_stream(
+    error: Error,
+    unstarted: ReplaySafety,
+) -> BoxStream<'static, Result<ModelStreamEvent>> {
+    let error = stamp_replay_safety(error, unstarted);
+    stream::once(async move { Err(error) }).boxed()
 }
 
 /// Decoder state carried across network reads.

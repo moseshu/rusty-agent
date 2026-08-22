@@ -29,6 +29,7 @@ fn all_errors() -> Vec<Error> {
         ProviderErrorKind::ServerError,
         ProviderErrorKind::Auth,
         ProviderErrorKind::BadRequest,
+        ProviderErrorKind::Conflict,
         ProviderErrorKind::Refusal,
         ProviderErrorKind::Behavior,
         ProviderErrorKind::ContextOverflow,
@@ -216,6 +217,8 @@ fn test_error_taxonomy_09() {
         ProviderErrorKind::RateLimit,
         ProviderErrorKind::Timeout,
         ProviderErrorKind::ServerError,
+        // A concurrent update caused a well-formed request to conflict; a later attempt usually succeeds.
+        ProviderErrorKind::Conflict,
     ] {
         let err = Error::provider(kind, "transient");
         assert!(err.is_retryable(), "`{}` 应可原样重试", err.code());

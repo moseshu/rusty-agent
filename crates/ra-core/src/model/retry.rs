@@ -1,8 +1,17 @@
-//! Retry configuration shared by model-setting resolution and the later retry runtime.
+//! Retry configuration, provider evidence, and the delay arithmetic they feed.
 //!
-//! This module defines the serializable configuration surface, plus the minimal provider-advice
-//! contract required by [`super::Model`]. A later milestone will add normalized provider errors
-//! and runtime policy decisions without changing the model trait.
+//! Three layers, kept apart on purpose:
+//!
+//! | Layer | Type | Who owns it |
+//! | --- | --- | --- |
+//! | Configuration | [`ModelRetrySettings`], [`RetryBackoffSettings`] | the caller, through settings resolution |
+//! | Provider facts | [`NormalizedProviderError`], [`RetryAdvice`] | the adapter that saw the wire failure |
+//! | Arithmetic | [`RetryBackoff`] | this module, so one schedule has one answer |
+//!
+//! What is **not** here is the decision. Whether a particular failure is retried — the veto, the
+//! attempt count, the budget, and the trace record of what was chosen — belongs to the policy that
+//! runs the loop. An adapter reports what happened and what it would suggest; it never decides how
+//! many times the application is willing to pay.
 
 use std::time::Duration;
 
@@ -14,6 +23,15 @@ use crate::{
     compat::{SchemaVersion, Unknown},
     error::Error,
 };
+
+pub mod backoff;
+pub mod normalized;
+
+pub use backoff::{
+    DEFAULT_INITIAL_DELAY, DEFAULT_MAX_DELAY, DEFAULT_MULTIPLIER, JITTER_RANGE, JitterSample,
+    MAX_HONORED_RETRY_AFTER, RetryBackoff,
+};
+pub use normalized::{NormalizedProviderError, replay_safety_of, stamp_replay_safety};
 
 /// Current model-retry-settings schema version.
 pub const MODEL_RETRY_SETTINGS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);

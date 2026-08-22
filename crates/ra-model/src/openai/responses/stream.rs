@@ -27,7 +27,7 @@ use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     model::{
         ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
-        RunItemStreamEvent,
+        ReplaySafety, RunItemStreamEvent, stamp_replay_safety,
     },
 };
 use serde_json::Value;
@@ -48,6 +48,7 @@ pub(crate) fn events(
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
     request_id: Option<String>,
+    unstarted: ReplaySafety,
 ) -> ModelStream<'static> {
     let driver = StreamDriver {
         frames: frames.boxed(),
@@ -56,6 +57,8 @@ pub(crate) fn events(
         request_id,
         response_id: None,
         pending: VecDeque::new(),
+        emitted: false,
+        unstarted,
         settled: false,
         finished: false,
     };
@@ -78,13 +81,41 @@ struct StreamDriver {
     /// One frame can mean two events: the provider's own narration always, plus the normalized
     /// form of the two frames that carry one.
     pending: VecDeque<Result<ModelStreamEvent>>,
+    /// Whether any event has already reached the consumer.
+    emitted: bool,
+    /// The verdict a failure gets while nothing has been emitted, which depends on the request.
+    unstarted: ReplaySafety,
     /// Whether the terminal frame arrived, which is the only evidence this stream finished.
     settled: bool,
     finished: bool,
 }
 
 impl StreamDriver {
+    /// Yields the next event, recording what a later failure would have to be replayed over.
+    ///
+    /// This is the only layer that can answer the replay question. The frame reader below has no
+    /// idea what its bytes were turned into, and the policy above receives the error long after the
+    /// stream that produced it is gone.
     async fn next_event(&mut self) -> Option<Result<ModelStreamEvent>> {
+        match self.decode_next().await? {
+            Ok(event) => {
+                self.emitted = true;
+                Some(Ok(event))
+            }
+            // Any event already delivered makes a transparent replay a duplicate for whoever read
+            // it, whether that event carried output or only narration.
+            Err(error) => Some(Err(stamp_replay_safety(
+                error,
+                if self.emitted {
+                    ReplaySafety::Unsafe
+                } else {
+                    self.unstarted
+                },
+            ))),
+        }
+    }
+
+    async fn decode_next(&mut self) -> Option<Result<ModelStreamEvent>> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);

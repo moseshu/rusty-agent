@@ -28,3 +28,4 @@ async-trait = { workspace = true }
 base64 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+httpdate = { workspace = true }

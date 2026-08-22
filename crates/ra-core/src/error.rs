@@ -116,6 +116,12 @@ pub enum ProviderErrorKind {
     Auth,
     /// Malformed request (HTTP 400). Usually a local construction bug, so retrying is useless.
     BadRequest,
+    /// The endpoint reported a state conflict (HTTP 409).
+    ///
+    /// Held apart from [`Self::BadRequest`] because the request is well-formed: something else
+    /// changed the same state concurrently. That usually settles on its own, which is why the
+    /// reference client retries it and this one classifies it as transient.
+    Conflict,
     /// The model refused. Triggers model fallback.
     Refusal,
     /// Model output violates the protocol: invalid JSON tool arguments, structured output that
@@ -557,7 +563,10 @@ impl Error {
                 ProviderErrorKind::Network
                 | ProviderErrorKind::RateLimit
                 | ProviderErrorKind::Timeout
-                | ProviderErrorKind::ServerError => Recoverability::Retryable,
+                | ProviderErrorKind::ServerError
+                // The competing change has usually landed by the next attempt, so the same
+                // request is worth sending again unchanged.
+                | ProviderErrorKind::Conflict => Recoverability::Retryable,
                 // Refusal -> change model; protocol violation -> change prompt; context
                 // overflow -> compact first.
                 ProviderErrorKind::Refusal
@@ -647,6 +656,7 @@ impl Error {
                 ProviderErrorKind::ServerError => "provider.server_error",
                 ProviderErrorKind::Auth => "provider.auth",
                 ProviderErrorKind::BadRequest => "provider.bad_request",
+                ProviderErrorKind::Conflict => "provider.conflict",
                 ProviderErrorKind::Refusal => "provider.refusal",
                 ProviderErrorKind::Behavior => "provider.behavior",
                 ProviderErrorKind::ContextOverflow => "provider.context_overflow",
@@ -717,6 +727,7 @@ impl Error {
                 ProviderErrorKind::BadRequest => {
                     "请求被模型服务拒绝。这通常是程序缺陷，请反馈。".to_owned()
                 }
+                ProviderErrorKind::Conflict => "模型服务状态冲突，稍后会自动重试。".to_owned(),
                 ProviderErrorKind::Refusal => "模型拒绝回答，正在尝试其它模型。".to_owned(),
                 ProviderErrorKind::Behavior => "模型输出格式不正确，正在重试。".to_owned(),
                 ProviderErrorKind::ContextOverflow => {

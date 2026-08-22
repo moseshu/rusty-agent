@@ -48,6 +48,14 @@ const fn ra_model::provider::quirks::ProviderQuirks::with_reasoning_content(mut 
 const fn ra_model::provider::quirks::ProviderQuirks::with_store(mut self, supported : bool) -> Self
 const fn ra_model::provider::quirks::ProviderQuirks::with_stream_usage(mut self, supported : bool) -> Self
 const fn ra_model::provider::quirks::ProviderQuirks::with_thinking_blocks(mut self, supported : bool) -> Self
+const fn ra_model::retry::RetryHints::retry_after(self) -> Option < Duration >
+const fn ra_model::retry::RetryHints::should_retry(self) -> Option < bool >
+const fn ra_model::retry::unstarted_replay_safety(continuation : & ConversationContinuation) -> ReplaySafety
+const ra_model::retry::REASON_ENDPOINT_VERDICT: & str
+const ra_model::retry::REASON_ERROR_CLASS: & str
+const ra_model::retry::RETRY_AFTER_HEADER: & str
+const ra_model::retry::RETRY_AFTER_MS_HEADER: & str
+const ra_model::retry::SHOULD_RETRY_HEADER: & str
 enum ra_model::compat::quirks::DoneMarker
 enum ra_model::provider::UnknownPrefixPolicy
 fn ra_model::compat::CompatEndpoint::base_url(& self) -> & str
@@ -109,6 +117,8 @@ fn ra_model::provider::ProviderRegistryBuilder::build(self) -> Result < Provider
 fn ra_model::provider::ProviderRegistryBuilder::new(default_provider : ProviderKey) -> Self
 fn ra_model::provider::ProviderRegistryBuilder::register(mut self, registration : ProviderRegistration) -> Self
 fn ra_model::provider::ProviderRegistryBuilder::unknown_prefix_policy(mut self, policy : UnknownPrefixPolicy) -> Self
+fn ra_model::retry::RetryHints::from_headers< 'a >(lookup : impl Fn (& str) -> Option < & 'a str >) -> Self
+fn ra_model::retry::retry_advice(request : & ModelRetryAdviceRequest < '_ >) -> Option < RetryAdvice >
 mod ra_model::anthropic
 mod ra_model::anthropic::betas
 mod ra_model::compat
@@ -138,6 +148,7 @@ struct ra_model::provider::ProviderRegistration
 struct ra_model::provider::ProviderRegistry
 struct ra_model::provider::ProviderRegistryBuilder
 struct ra_model::provider::quirks::ProviderQuirks
+struct ra_model::retry::RetryHints
 trait ra_model::provider::ProviderFactory
 variant ra_model::compat::quirks::DoneMarker::Absent
 variant ra_model::compat::quirks::DoneMarker::Literal(String)

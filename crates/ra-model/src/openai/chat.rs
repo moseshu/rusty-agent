@@ -19,12 +19,15 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream as futures_stream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
-    model::{Model, ModelProvider, ModelRequest, ModelStream},
+    model::{
+        Model, ModelProvider, ModelRequest, ModelRetryAdviceRequest, ModelStream, RetryAdvice,
+        stamp_replay_safety,
+    },
 };
 
 use self::reasoning::ReasoningReplayPolicy;
-use super::{auth::OpenAiAuth, sse::Terminator};
-use crate::provider::quirks::ProviderQuirks;
+use super::{auth::OpenAiAuth, error::ResponseFacts, sse::Terminator};
+use crate::{provider::quirks::ProviderQuirks, retry::unstarted_replay_safety};
 
 pub(crate) mod convert;
 pub mod reasoning;
@@ -367,44 +370,30 @@ impl OpenAiChatModel {
 
     async fn fetch(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
         let response = self.send(&request, false).await?;
-        let request_id = request_id(&response);
-        let status = response.status();
+        let facts = ResponseFacts::read(&response);
+        let status = facts.status();
         let payload = match response.json::<serde_json::Value>().await {
             Ok(payload) => payload,
             Err(error) if !status.is_success() => {
-                return Err(super::error::response_error(
-                    status,
-                    &serde_json::Value::Null,
-                    request_id.as_deref(),
-                )
-                .with_source(error));
+                return Err(
+                    super::error::response_failure(&facts, &serde_json::Value::Null)
+                        .with_source(error)
+                        .into_error(),
+                );
             }
             Err(error) => return Err(super::error::decode_error(error)),
         };
         if !status.is_success() {
-            return Err(super::error::response_error(
-                status,
-                &payload,
-                request_id.as_deref(),
-            ));
+            return Err(super::error::response_failure(&facts, &payload).into_error());
         }
         convert::convert_completion(
             &self.codec,
             &payload,
-            request_id,
+            facts.into_request_id(),
             request.handoffs(),
             request.model_settings().provider(),
         )
     }
-}
-
-/// Reads the transport diagnostic identifier, when the endpoint sets one.
-fn request_id(response: &reqwest::Response) -> Option<String> {
-    response
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
 }
 
 impl fmt::Debug for OpenAiChatModel {
@@ -420,7 +409,13 @@ impl fmt::Debug for OpenAiChatModel {
 #[async_trait]
 impl Model for OpenAiChatModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
-        self.fetch(request).await
+        // A non-streaming call publishes nothing until it returns, so no consumer saw a partial
+        // turn. What the endpoint may have recorded on its own side is the other half of the
+        // question, and the continuation is what answers it.
+        let unstarted = unstarted_replay_safety(request.continuation());
+        self.fetch(request)
+            .await
+            .map_err(|error| stamp_replay_safety(error, unstarted))
     }
 
     fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
@@ -428,11 +423,12 @@ impl Model for OpenAiChatModel {
         futures_stream::once(async move {
             let provider = request.model_settings().provider().clone();
             let handoffs = request.handoffs().to_vec();
+            let unstarted = unstarted_replay_safety(request.continuation());
             match model.send(&request, true).await {
                 Ok(response) if response.status().is_success() => {
                     // Read before the body is consumed: the terminal response carries it, and the
                     // frames it is assembled from never mention it.
-                    let request_id = request_id(&response);
+                    let request_id = ResponseFacts::read(&response).into_request_id();
                     match super::sse::ensure_event_stream(&response, "Chat Completions") {
                         Ok(()) => stream::events(
                             model.codec.clone(),
@@ -441,15 +437,22 @@ impl Model for OpenAiChatModel {
                             handoffs,
                             model.buffer_tool_calls,
                             request_id,
+                            unstarted,
                         ),
-                        Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
+                        Err(error) => super::sse::error_stream(error, unstarted),
                     }
                 }
-                Ok(response) => futures_stream::once(super::sse::failed_stream(response)).boxed(),
-                Err(error) => futures_stream::once(async move { Err(error) }).boxed(),
+                Ok(response) => {
+                    futures_stream::once(super::sse::failed_stream(response, unstarted)).boxed()
+                }
+                Err(error) => super::sse::error_stream(error, unstarted),
             }
         })
         .flatten()
         .boxed()
+    }
+
+    fn get_retry_advice(&self, request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
+        crate::retry::retry_advice(request)
     }
 }

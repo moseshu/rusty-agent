@@ -41,7 +41,7 @@ use ra_core::{
     },
     model::{
         ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
-        RunItemStreamEvent,
+        ReplaySafety, RunItemStreamEvent, stamp_replay_safety,
     },
     usage::Usage,
 };
@@ -61,6 +61,7 @@ pub(crate) fn events(
     handoffs: Vec<ModelHandoffDefinition>,
     buffer_tool_calls: bool,
     request_id: Option<String>,
+    unstarted: ReplaySafety,
 ) -> ModelStream<'static> {
     let driver = StreamDriver {
         frames: frames.boxed(),
@@ -72,6 +73,8 @@ pub(crate) fn events(
         layout: OutputLayout::default(),
         sequence: 0,
         pending: VecDeque::new(),
+        emitted: false,
+        unstarted,
         settled: Vec::new(),
         buffered: buffer_tool_calls.then(ToolCallBuffer::default),
         finished: false,
@@ -310,6 +313,10 @@ struct StreamDriver {
     layout: OutputLayout,
     sequence: u64,
     pending: VecDeque<Result<ModelStreamEvent>>,
+    /// Whether any event has already reached the consumer.
+    emitted: bool,
+    /// The verdict a failure gets while nothing has been emitted, which depends on the request.
+    unstarted: ReplaySafety,
     /// Normalized items already published, kept with the output slot each was announced under.
     ///
     /// The terminal response has to list them in output order, which is not the order they are
@@ -322,7 +329,31 @@ struct StreamDriver {
 }
 
 impl StreamDriver {
+    /// Yields the next event, recording what a later failure would have to be replayed over.
+    ///
+    /// This is the only layer that can answer the replay question. The frame reader below has no
+    /// idea what its bytes were turned into, and the policy above receives the error long after the
+    /// stream that produced it is gone.
     async fn next_event(&mut self) -> Option<Result<ModelStreamEvent>> {
+        match self.decode_next().await? {
+            Ok(event) => {
+                self.emitted = true;
+                Some(Ok(event))
+            }
+            // Any event already delivered makes a transparent replay a duplicate for whoever read
+            // it, whether that event carried output or only narration.
+            Err(error) => Some(Err(stamp_replay_safety(
+                error,
+                if self.emitted {
+                    ReplaySafety::Unsafe
+                } else {
+                    self.unstarted
+                },
+            ))),
+        }
+    }
+
+    async fn decode_next(&mut self) -> Option<Result<ModelStreamEvent>> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);
@@ -381,9 +412,10 @@ impl StreamDriver {
     /// confidently reads as a model with nothing to say rather than as a connection that never
     /// carried one.
     ///
-    /// The two messages are deliberately different. Whether anything was already emitted decides
-    /// whether the request can be replayed at all, and that is the one fact a retry policy above
-    /// cannot recover once this error is built.
+    /// The two messages are deliberately different, and so is what the error carries: whether
+    /// anything was already emitted decides whether the request may be replayed at all, and the
+    /// verdict is stamped onto every error leaving this driver rather than left for a reader to
+    /// infer from the wording.
     fn truncation_error(&self) -> Option<Error> {
         if self.state.saw_done || self.state.finish_reason.is_some() {
             return None;
