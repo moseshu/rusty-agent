@@ -14,7 +14,7 @@ use ra_core::{
         RunState, ToolUse, ToolUseAttempt, WorkStateRef, WorkspaceLeaseRef,
     },
     tool::ToolLookupKey,
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use serde_json::json;
 
@@ -39,7 +39,8 @@ fn test_run_state_01() {
     assert!(state.workspace_lease().is_none());
     assert!(state.work_state_ref().is_none());
     assert!(state.graph_cursor().is_none());
-    assert!(state.usage_totals().is_none());
+    assert_eq!(state.usage_totals().requests(), 0);
+    assert_eq!(state.tokens_used(), 0);
     assert!(state.pending_control_requests().is_empty());
     assert!(state.unknown().is_empty());
 }
@@ -50,11 +51,11 @@ fn test_run_state_02() {
     let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
     let mut budget = BudgetSnapshot::new();
     budget.record_turn();
-    budget.record_usage(&Usage::new(3, 4));
 
     let mut state = RunState::start(RunId::new("run-accounting"))
         .with_budget(budget)
         .with_next_host_event_seq(5);
+    state.record_usage(&Usage::from_request(RequestUsage::new(3, 4)));
     record_call(&mut state, &agent, &identity, "call-1");
 
     let serialized = serde_json::to_string(&state).expect("run state must serialize");
@@ -64,7 +65,8 @@ fn test_run_state_02() {
     assert_eq!(restored.next_host_event_seq(), 5);
     assert_eq!(restored.tool_use().repeat_streak(&agent, &identity), 1);
     assert_eq!(restored.budget().turns_used(), 1);
-    assert_eq!(restored.budget().tokens_used(), 7);
+    assert_eq!(restored.tokens_used(), 7);
+    assert_eq!(restored.usage_totals().request_usage_entries().len(), 1);
 }
 
 #[test]
@@ -154,7 +156,7 @@ fn test_run_state_extension_slots_roundtrip() {
     let lease = WorkspaceLeaseRef::new("lease-42").with_path("/tmp/workspace");
     let task_ref = WorkStateRef::new("task-root-100");
     let cursor = GraphCursor::new("node-plan").with_edge_id("edge-step-1");
-    let usage = Usage::new(100, 50);
+    let usage = Usage::from_request(RequestUsage::new(100, 50));
     let control_req = PendingControlRequest::new("approval-1")
         .with_call_id(CallId::new("call-exec"))
         .with_description("approve dangerous action");
@@ -179,7 +181,7 @@ fn test_run_state_extension_slots_roundtrip() {
     assert_eq!(restored.workspace_lease(), Some(&lease));
     assert_eq!(restored.work_state_ref(), Some(&task_ref));
     assert_eq!(restored.graph_cursor(), Some(&cursor));
-    assert_eq!(restored.usage_totals(), Some(&usage));
+    assert_eq!(restored.usage_totals(), &usage);
     assert_eq!(restored.pending_control_requests(), &[control_req]);
 }
 
@@ -374,4 +376,62 @@ fn test_pending_control_requests_context_projection() {
         context.pending_control_requests()[0].description(),
         Some("approval required")
     );
+}
+
+/// The ledger grows only through the settlement entry point, and it keeps itemizing across a
+/// checkpoint: a resumed run adds to what earlier segments spent instead of starting over.
+#[test]
+fn test_usage_ledger_accumulates_and_survives_a_checkpoint() {
+    let mut state = RunState::start(RunId::new("run-ledger"));
+    state.record_usage(&Usage::from_request(
+        RequestUsage::new(1_000, 100).with_cached_input_tokens(0),
+    ));
+    state.record_usage(&Usage::from_request(
+        RequestUsage::new(1_200, 80).with_cached_input_tokens(1_000),
+    ));
+
+    assert_eq!(state.usage_totals().requests(), 2);
+    assert_eq!(state.tokens_used(), 2_380);
+
+    let serialized = serde_json::to_string(&state).expect("state must serialize");
+    let mut restored: RunState = serde_json::from_str(&serialized).expect("state must deserialize");
+    assert_eq!(restored.usage_totals(), state.usage_totals());
+
+    restored.record_usage(&Usage::from_request(
+        RequestUsage::new(1_300, 90).with_cached_input_tokens(1_200),
+    ));
+
+    assert_eq!(restored.usage_totals().requests(), 3);
+    assert_eq!(restored.tokens_used(), 3_770);
+    let cached: Vec<u64> = restored
+        .usage_totals()
+        .request_usage_entries()
+        .iter()
+        .map(RequestUsage::cached_input_tokens)
+        .collect();
+    assert_eq!(cached, vec![0, 1_000, 1_200]);
+}
+
+/// A stage reads what the run has spent through its context, which is a copy: writing through it
+/// is not possible, and the state stays the only thing that accumulates.
+#[test]
+fn test_usage_ledger_projects_into_a_read_only_context() {
+    let run_id = RunId::new("run-ledger-ctx");
+    let agent_spec = AgentSpec::builder()
+        .id(AgentId::new("tester"))
+        .name("Tester")
+        .build()
+        .expect("agent spec must build");
+    let mut state = RunState::start(run_id.clone());
+    state.record_usage(&Usage::from_request(
+        RequestUsage::new(500, 50).with_reasoning_tokens(20),
+    ));
+
+    let context = RunContext::new(run_id, &agent_spec)
+        .with_usage_totals(state.usage_totals().clone())
+        .with_budget(state.budget().clone());
+
+    assert_eq!(context.usage_totals(), state.usage_totals());
+    assert_eq!(context.usage_totals().requests(), 1);
+    assert_eq!(context.usage_totals().reasoning_tokens(), 20);
 }

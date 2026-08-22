@@ -191,6 +191,15 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
     assert_eq!(response.usage().input_tokens(), 100);
     assert_eq!(response.usage().cached_input_tokens(), 60);
     assert_eq!(response.usage().reasoning_tokens(), 15);
+    // One call, one entry: the ledger a run accumulates is built from these, so a response that
+    // reported its cost without saying it was one request would go missing from every per-request
+    // breakdown downstream.
+    assert_eq!(response.usage().requests(), 1);
+    let entry = &response.usage().request_usage_entries()[0];
+    assert_eq!(entry.input_tokens(), 100);
+    assert_eq!(entry.output_tokens(), 40);
+    assert_eq!(entry.cached_input_tokens(), 60);
+    assert_eq!(entry.reasoning_tokens(), 15);
     assert_eq!(response.output().len(), 4);
     let RunItemKind::Reasoning(reasoning) = response.output()[0].kind() else {
         panic!("first output should be reasoning");
@@ -595,6 +604,32 @@ async fn conversation_id_is_lowered_without_previous_response_id() {
     assert!(body.get("previous_response_id").is_none());
 }
 
+/// An endpoint that sends no usage block still charged for the call. Recording zero tokens against
+/// one request is the honest reading; recording no request at all would make a run that talked to
+/// such an endpoint look like a run that never called a model.
+#[tokio::test]
+async fn a_response_without_a_usage_block_still_counts_as_one_request() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_no_usage",
+            "status": "completed",
+            "output": []
+        })),
+    )
+    .await;
+
+    let response = model
+        .get_response(ModelRequest::new(vec![], resolved(ModelSettings::new())))
+        .await
+        .expect("a response without usage should still lift");
+
+    assert_eq!(response.usage().requests(), 1);
+    assert_eq!(response.usage().total_tokens(), 0);
+    assert_eq!(response.usage().request_usage_entries().len(), 1);
+}
+
 #[tokio::test]
 async fn provider_caches_models_and_redacts_credentials_from_debug() {
     let auth = OpenAiAuth::new("super-secret").with_base_url("https://example.test/v1/");
@@ -762,6 +797,13 @@ async fn the_stream_forwards_every_provider_event_and_lifts_items_as_they_finish
     assert_eq!(terminal.response_id(), Some("resp_123"));
     assert_eq!(terminal.request_id(), Some("req_stream"));
     assert_eq!(terminal.usage().cached_input_tokens(), 60);
+    // A streamed call is one request, recorded exactly as the non-streaming path records it, so
+    // the ledger cannot tell which entry point produced a turn.
+    assert_eq!(terminal.usage().requests(), 1);
+    assert_eq!(
+        terminal.usage().request_usage_entries()[0].cached_input_tokens(),
+        60
+    );
     assert_eq!(
         terminal
             .output()

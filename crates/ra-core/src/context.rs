@@ -41,6 +41,7 @@ use crate::{
     event::{HostEventEmitter, HostEventSink},
     item::AgentId,
     state::{EventSeqAllocator, PendingControlRequest, RunId},
+    usage::Usage,
 };
 
 /// The credential-free identity of the public agent a run is attributed to.
@@ -98,6 +99,7 @@ pub struct RunContext {
     agent: RunAgent,
     app: Option<Arc<dyn Any + Send + Sync>>,
     budget: BudgetSnapshot,
+    usage_totals: Usage,
     pending_control_requests: Vec<PendingControlRequest>,
     event_seq_allocator: Option<EventSeqAllocator>,
 }
@@ -116,6 +118,7 @@ impl RunContext {
             agent: RunAgent::from_spec(agent),
             app: None,
             budget: BudgetSnapshot::new(),
+            usage_totals: Usage::default(),
             pending_control_requests: Vec::new(),
             event_seq_allocator: None,
         }
@@ -136,6 +139,16 @@ impl RunContext {
     #[must_use]
     pub fn with_budget(mut self, budget: BudgetSnapshot) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Sets the usage ledger this stage observes.
+    ///
+    /// A copy taken from [`RunState`](crate::state::RunState) for the same reason the budget is one:
+    /// the context reports what the run has spent, and only the settlement point adds to it.
+    #[must_use]
+    pub fn with_usage_totals(mut self, usage_totals: Usage) -> Self {
+        self.usage_totals = usage_totals;
         self
     }
 
@@ -184,7 +197,7 @@ impl RunContext {
         self.app.as_ref().and_then(|app| app.downcast_ref::<T>())
     }
 
-    /// What the run has spent so far, as of the stage that built this context.
+    /// Turns the run has taken so far, as of the stage that built this context.
     ///
     /// Read-only by construction. The authoritative accounting is
     /// [`RunState::budget`](crate::state::RunState::budget), and the limits it is measured against
@@ -192,6 +205,16 @@ impl RunContext {
     #[must_use]
     pub const fn budget(&self) -> &BudgetSnapshot {
         &self.budget
+    }
+
+    /// Tokens the run has spent so far, per request and in total.
+    ///
+    /// The same ledger [`RunState::usage_totals`](crate::state::RunState::usage_totals) owns, as of
+    /// the stage that built this context — including the call that has just been paid for, so a
+    /// tool reads spend that already includes the turn it is running under.
+    #[must_use]
+    pub const fn usage_totals(&self) -> &Usage {
+        &self.usage_totals
     }
 
     /// Pending control or approval requests, as of the stage that built this context.

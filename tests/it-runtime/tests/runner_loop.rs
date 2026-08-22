@@ -35,7 +35,7 @@ use ra_core::{
         Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
         ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
     },
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use ra_runtime::{
     agent::AgentBinding,
@@ -414,6 +414,15 @@ impl RunErrorHandler for BudgetCloseoutHandler {
     ) -> Result<Option<RunErrorHandlerResult>> {
         assert!(input.error().code().starts_with("budget."));
         assert!(input.data().turns() > 0);
+        // A closeout speaks about spend, so the ledger that stopped the run reaches it, and on a
+        // run that was never resumed it agrees with the calls this segment made.
+        let from_responses: u64 = input
+            .data()
+            .model_responses()
+            .iter()
+            .map(|response| response.usage().total_tokens())
+            .sum();
+        assert_eq!(input.data().usage().total_tokens(), from_responses);
         // The public declaration, which is whose place the closeout speaks in.
         assert_eq!(input.data().last_agent().name(), "Coder");
         assert_eq!(input.data().last_agent().id().as_str(), "coder");
@@ -694,8 +703,9 @@ async fn loops_between_tool_calls_and_final_answer_until_model_requests_nothing(
     let tool_calls = Arc::clone(&tool.calls);
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
-            .with_usage(Usage::new(10, 4)),
-        ModelResponse::new(vec![message("msg-1", "改完了")]).with_usage(Usage::new(20, 6)),
+            .with_usage(Usage::from_request(RequestUsage::new(10, 4))),
+        ModelResponse::new(vec![message("msg-1", "改完了")])
+            .with_usage(Usage::from_request(RequestUsage::new(20, 6))),
     ]);
     let cancel = CancelScope::root();
 
@@ -727,6 +737,48 @@ async fn loops_between_tool_calls_and_final_answer_until_model_requests_nothing(
     assert_eq!(result.usage().input_tokens(), 30);
     assert_eq!(result.usage().output_tokens(), 10);
     assert_eq!(result.model_responses().len(), 2);
+
+    // Each call keeps its own line in the ledger. The summed 30 cannot say whether the run made
+    // one large request or two, which is the difference a cost report and a cache diagnosis both
+    // turn on, and the run's own ledger agrees with the projection call for call.
+    assert_eq!(result.usage().requests(), 2);
+    let per_request: Vec<(u64, u64)> = result
+        .usage()
+        .request_usage_entries()
+        .iter()
+        .map(|entry| (entry.input_tokens(), entry.output_tokens()))
+        .collect();
+    assert_eq!(per_request, vec![(10, 4), (20, 6)]);
+    assert_eq!(result.state().usage_totals(), &result.usage());
+    assert_eq!(result.state().tokens_used(), 40);
+}
+
+/// A resumed run keeps counting from what earlier segments spent, and the two totals that describe
+/// it stay distinguishable: the ledger covers the whole run, the result covers this segment.
+#[tokio::test]
+async fn a_resumed_runs_ledger_covers_every_segment_while_its_result_covers_this_one() {
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![message("msg-1", "改完了")])
+            .with_usage(Usage::from_request(RequestUsage::new(20, 6))),
+    ]);
+    let cancel = CancelScope::root();
+    let mut carried = RunState::start(RunId::new("run-loop"));
+    carried.record_usage(&Usage::from_request(
+        RequestUsage::new(1_000, 100).with_cached_input_tokens(900),
+    ));
+
+    let result = Runner::run(request(Vec::new(), &model, &cancel).with_state(carried))
+        .await
+        .unwrap();
+
+    assert_eq!(result.usage().requests(), 1);
+    assert_eq!(result.usage().input_tokens(), 20);
+
+    let ledger = result.state().usage_totals();
+    assert_eq!(ledger.requests(), 2);
+    assert_eq!(ledger.input_tokens(), 1_020);
+    assert_eq!(ledger.cached_input_tokens(), 900);
+    assert_eq!(result.state().tokens_used(), 1_126);
 }
 
 #[tokio::test]
@@ -1472,7 +1524,7 @@ async fn the_token_budget_reminder_rides_the_input_tail_and_leaves_the_prefix_al
     let tool = Arc::new(ScriptedTool::new("write_file"));
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
-            .with_usage(Usage::new(7, 5)),
+            .with_usage(Usage::from_request(RequestUsage::new(7, 5))),
         ModelResponse::new(vec![message("msg-1", "done")]),
     ]);
     let cancel = CancelScope::root();
@@ -1514,7 +1566,7 @@ async fn an_exhausting_response_still_gets_its_turn_settled() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
-            .with_usage(Usage::new(7, 5)),
+            .with_usage(Usage::from_request(RequestUsage::new(7, 5))),
     ]);
     let cancel = CancelScope::root();
     let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
@@ -1532,7 +1584,7 @@ async fn an_exhausting_response_still_gets_its_turn_settled() {
             reason: FinishReason::BudgetExhausted
         }
     ));
-    assert_eq!(result.state().budget().tokens_used(), 12);
+    assert_eq!(result.state().tokens_used(), 12);
     assert_eq!(result.model_responses().len(), 1);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert_eq!(result.new_items().len(), 2);
@@ -1544,7 +1596,7 @@ async fn an_exhausting_response_still_gets_its_turn_settled() {
 async fn a_final_answer_survives_the_response_that_exhausts_the_budget() {
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![message("msg-1", "here is the answer")])
-            .with_usage(Usage::new(6, 6)),
+            .with_usage(Usage::from_request(RequestUsage::new(6, 6))),
     ]);
     let cancel = CancelScope::root();
 
@@ -1564,7 +1616,7 @@ async fn a_final_answer_survives_the_response_that_exhausts_the_budget() {
         result.final_message().unwrap().text_content(),
         "here is the answer"
     );
-    assert_eq!(result.state().budget().tokens_used(), 12);
+    assert_eq!(result.state().tokens_used(), 12);
 }
 
 #[tokio::test]
@@ -1784,7 +1836,7 @@ async fn the_wall_clock_stops_a_running_tool_too() {
     });
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")])
-            .with_usage(Usage::new(3, 4)),
+            .with_usage(Usage::from_request(RequestUsage::new(3, 4))),
         ModelResponse::new(vec![message("msg-1", "done")]),
     ]);
     let cancel = CancelScope::root();
@@ -1868,12 +1920,13 @@ async fn a_continuation_is_measured_against_what_an_earlier_segment_spent() {
     let cancel = CancelScope::root();
     let mut spent = BudgetSnapshot::new();
     spent.record_turn();
-    spent.record_usage(&Usage::new(6, 6));
+    let mut carried = RunState::start(RunId::new("run-loop")).with_budget(spent);
+    carried.record_usage(&Usage::from_request(RequestUsage::new(6, 6)));
 
     let result = Runner::run(
         request(Vec::new(), &model, &cancel)
             .with_config(RunConfig::new().with_max_tokens(12))
-            .with_state(RunState::start(RunId::new("run-loop")).with_budget(spent)),
+            .with_state(carried),
     )
     .await
     .unwrap();
@@ -2110,7 +2163,8 @@ async fn partial_messages_forward_provider_events_and_settle_from_the_terminal_r
         )),
         raw_event("response.completed"),
         ModelStreamEvent::Completed(Box::new(
-            ModelResponse::new(vec![message("msg-1", "改完了")]).with_usage(Usage::new(11, 3)),
+            ModelResponse::new(vec![message("msg-1", "改完了")])
+                .with_usage(Usage::from_request(RequestUsage::new(11, 3))),
         )),
     ]]);
     let streamed_calls = Arc::clone(&model.streamed_calls);

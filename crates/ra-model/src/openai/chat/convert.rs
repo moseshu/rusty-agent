@@ -24,7 +24,7 @@ use ra_core::{
     },
     model::{ModelHandoffDefinition, ModelRequest, ProviderKey},
     tool::{ToolOutput, ToolOutputBlock},
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use serde_json::{Map, Value, json};
 
@@ -940,10 +940,14 @@ pub(crate) fn convert_usage(value: Option<&Value>) -> Usage {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
-    Usage::new(field("prompt_tokens"), field("completion_tokens"))
-        .with_cached_input_tokens(detail("/prompt_tokens_details/cached_tokens"))
-        .with_cache_write_tokens(detail("/prompt_tokens_details/cache_write_tokens"))
-        .with_reasoning_tokens(detail("/completion_tokens_details/reasoning_tokens"))
+    // One call, one entry, whether or not the endpoint sent a usage block; see the Responses side
+    // for why an unreported cost is still a request that happened.
+    Usage::from_request(
+        RequestUsage::new(field("prompt_tokens"), field("completion_tokens"))
+            .with_cached_input_tokens(detail("/prompt_tokens_details/cached_tokens"))
+            .with_cache_write_tokens(detail("/prompt_tokens_details/cache_write_tokens"))
+            .with_reasoning_tokens(detail("/completion_tokens_details/reasoning_tokens")),
+    )
 }
 
 /// Reads a string field, treating an empty one as absent.

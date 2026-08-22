@@ -7,7 +7,7 @@ use ra_core::{
         ModelInputItem, ModelResponse, OutputPhase, RawProviderItem, Reasoning, RunItem,
         RunItemKind, ToolApproval, ToolCall, ToolCallOutput,
     },
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use serde_json::{Value, json};
 
@@ -222,11 +222,11 @@ fn test_item_model_06() {
         "message",
         RunItemKind::Message(Message::assistant("结果", OutputPhase::Final)),
     )])
-    .with_usage(
-        Usage::new(120, 30)
+    .with_usage(Usage::from_request(
+        RequestUsage::new(120, 30)
             .with_cached_input_tokens(80)
             .with_reasoning_tokens(10),
-    )
+    ))
     .with_response_id("response-1")
     .with_request_id("request-1");
 

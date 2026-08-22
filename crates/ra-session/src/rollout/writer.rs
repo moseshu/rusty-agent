@@ -496,6 +496,12 @@ impl RolloutTurnContext {
 }
 
 /// Unprunable model usage record written upon each model completion settlement.
+///
+/// This is the reconciliation baseline for every total derived from it. Items are compacted and
+/// pruned, and a run's checkpointed totals therefore cannot be checked against the responses still
+/// present in its state; they can be checked against these records, which are never removed. The
+/// per-request entries inside [`Self::usage`] are the finest granularity that survives, which is
+/// what makes a cache hit rate computable for one call rather than only for a whole session.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutModelUsage {
@@ -601,6 +607,11 @@ pub struct RolloutCheckpoint {
 
 impl RolloutCheckpoint {
     /// Creates a checkpoint carrying the aggregates accumulated so far.
+    ///
+    /// Per-request entries are dropped from `usage_totals`, so a checkpoint's size does not grow
+    /// with the number of requests it summarizes: they are written repeatedly, each restating the
+    /// totals so far, and carrying every entry into every one of them would make the log grow with
+    /// the square of the session. The detail stays in the `model_usage` records this summarizes.
     #[must_use]
     pub fn new(
         session_id: SessionId,
@@ -610,7 +621,7 @@ impl RolloutCheckpoint {
         Self {
             schema_version: ROLLOUT_SCHEMA_VERSION,
             session_id,
-            usage_totals,
+            usage_totals: usage_totals.without_entries(),
             persisted_run_max_seq,
             unknown: Unknown::new(),
         }
@@ -623,6 +634,8 @@ impl RolloutCheckpoint {
     }
 
     /// Token usage accumulated across every `model_usage` record before this point.
+    ///
+    /// Totals only; see [`Self::new`] for why the per-request entries are not repeated here.
     #[must_use]
     pub const fn usage_totals(&self) -> &Usage {
         &self.usage_totals
@@ -981,6 +994,9 @@ pub struct RolloutSidecar {
 
 impl RolloutSidecar {
     /// Constructs a sidecar snapshot.
+    ///
+    /// `usage_totals` keeps its totals and drops its per-request entries: this file is rewritten on
+    /// every append, and the detail it would carry is already in the log it points at.
     #[must_use]
     pub fn new(
         session_id: SessionId,
@@ -993,7 +1009,7 @@ impl RolloutSidecar {
             session_id,
             next_timeline_seq,
             persisted_run_max_seq,
-            usage_totals,
+            usage_totals: usage_totals.without_entries(),
             last_checkpoint_offset: None,
             unknown: Unknown::new(),
         }
@@ -1667,7 +1683,10 @@ impl RolloutWriter {
                 candidate_run_seq = Some((event.run_id().clone(), current_max.max(event.seq())));
             }
             RolloutPayload::ModelUsage(mu) => {
-                candidate_usage = Some(self.usage_totals.accumulate(mu.usage()));
+                // Totals only. The writer's running figure exists to seed checkpoints and the
+                // sidecar, neither of which repeats per-request detail, and holding every entry
+                // for the life of a long session would grow this writer without bound.
+                candidate_usage = Some(self.usage_totals.accumulate(&mu.usage().without_entries()));
             }
             _ => {}
         }

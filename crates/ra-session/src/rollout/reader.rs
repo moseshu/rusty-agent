@@ -71,6 +71,10 @@ impl RolloutSummary {
     }
 
     /// Accumulated unpruned token usage totals across all model usage records in the file.
+    ///
+    /// Request count and token counters, without the per-request entries: a summary of a long
+    /// session would otherwise carry one entry per call ever made. Read the `model_usage` records
+    /// for the breakdown — they are the ledger this only summarizes.
     #[must_use]
     pub const fn usage_totals(&self) -> &Usage {
         &self.usage_totals
@@ -230,7 +234,10 @@ impl RolloutReader {
                         *entry = (*entry).max(event.seq());
                     }
                     RolloutPayload::ModelUsage(mu) => {
-                        usage_totals = usage_totals.accumulate(mu.usage());
+                        // Totals only, to compare against checkpoints that carry totals only. The
+                        // per-request entries stay in the records themselves, where a caller that
+                        // wants them reads them without every summary paying to carry them.
+                        usage_totals = usage_totals.accumulate(&mu.usage().without_entries());
                     }
                     RolloutPayload::Checkpoint(checkpoint) => {
                         if verifies_checkpoints {
@@ -407,8 +414,12 @@ fn verify_checkpoint(
         ));
     }
 
+    // Compared counter by counter rather than by value equality: both sides carry totals only, and
+    // a plain `==` would additionally require the retained per-request entries to match, which a
+    // totals-only projection never has.
     let found = checkpoint.usage_totals();
-    let usage_matches = found.input_tokens() == expected_usage.input_tokens()
+    let usage_matches = found.requests() == expected_usage.requests()
+        && found.input_tokens() == expected_usage.input_tokens()
         && found.output_tokens() == expected_usage.output_tokens()
         && found.cached_input_tokens() == expected_usage.cached_input_tokens()
         && found.cache_write_tokens() == expected_usage.cache_write_tokens()
@@ -419,9 +430,12 @@ fn verify_checkpoint(
             SessionErrorKind::Corrupted,
             format!(
                 "rollout checkpoint at timeline_seq {timeline_seq} in {} disagrees with the \
-                 records it summarizes: it claims {} input tokens, they add up to {}",
+                 records it summarizes: it claims {} requests totalling {} input tokens, they add \
+                 up to {} requests and {} input tokens",
                 path.display(),
+                found.requests(),
                 found.input_tokens(),
+                expected_usage.requests(),
                 expected_usage.input_tokens()
             ),
         ));

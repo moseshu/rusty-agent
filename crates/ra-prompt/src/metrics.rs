@@ -1,6 +1,6 @@
 //! Cache hit rate calculations and evaluation metrics.
 
-use ra_core::usage::Usage;
+use ra_core::usage::{RequestUsage, Usage};
 
 /// Calculates the cache hit rate ratio from cached and total input tokens.
 ///
@@ -23,10 +23,20 @@ pub fn calculate_cache_hit_rate(cached_tokens: u64, total_input_tokens: u64) -> 
     (cached / total).clamp(0.0, 1.0)
 }
 
-/// Evaluates cache hit rate directly from a [`Usage`] record.
+/// Evaluates cache hit rate directly from a [`Usage`] ledger.
 #[must_use]
 pub fn calculate_cache_hit_rate_from_usage(usage: &Usage) -> f64 {
     calculate_cache_hit_rate(usage.cached_input_tokens(), usage.input_tokens())
+}
+
+/// Evaluates cache hit rate for one request.
+///
+/// A ledger-wide rate answers whether a run was cheap; this one answers *which call* broke the
+/// prefix. Averaged across a run, one cold first call and a stable prefix afterwards look much like
+/// a prefix that is being invalidated every turn — and those are opposite problems.
+#[must_use]
+pub fn calculate_cache_hit_rate_from_request(request: &RequestUsage) -> f64 {
+    calculate_cache_hit_rate(request.cached_input_tokens(), request.input_tokens())
 }
 
 /// Evaluates whether the cache hit rate meets or exceeds the target threshold (default 70%).

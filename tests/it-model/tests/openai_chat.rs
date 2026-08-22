@@ -827,6 +827,14 @@ async fn a_completion_lifts_into_reasoning_message_and_paired_calls() {
     assert_eq!(response.usage().input_tokens(), 100);
     assert_eq!(response.usage().cached_input_tokens(), 60);
     assert_eq!(response.usage().reasoning_tokens(), 15);
+    // Both protocols report one call as one request with one entry, so a mixed-protocol run's
+    // ledger is comparable across the calls that made it up.
+    assert_eq!(response.usage().requests(), 1);
+    let entry = &response.usage().request_usage_entries()[0];
+    assert_eq!(entry.input_tokens(), 100);
+    assert_eq!(entry.output_tokens(), 40);
+    assert_eq!(entry.cached_input_tokens(), 60);
+    assert_eq!(entry.reasoning_tokens(), 15);
 
     assert_eq!(response.output().len(), 4);
     let RunItemKind::Reasoning(reasoning) = response.output()[0].kind() else {
@@ -1500,6 +1508,10 @@ async fn a_stream_settles_into_a_terminal_response_carrying_what_the_deltas_cann
     let terminal = terminal.expect("a settled stream states its terminal facts");
     assert_eq!(terminal.usage().input_tokens(), 10);
     assert_eq!(terminal.usage().output_tokens(), 2);
+    // Usage arrives on a frame of its own and is still recorded as the one request that produced
+    // the whole stream, which is what keeps a streamed turn comparable with a non-streamed one.
+    assert_eq!(terminal.usage().requests(), 1);
+    assert_eq!(terminal.usage().request_usage_entries().len(), 1);
     assert_eq!(terminal.request_id(), Some("req_streamed"));
     // A `chatcmpl-` identifier cannot be continued from, so the field stays empty here exactly as
     // it does on the non-streaming path rather than advertising a conversation that does not exist.

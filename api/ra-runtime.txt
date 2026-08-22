@@ -25,6 +25,7 @@ const fn ra_runtime::runner::RunConfig::with_tracing(mut self, tracing : ModelTr
 const fn ra_runtime::runner::RunRequest::event_seq_allocator(& self) -> & EventSeqAllocator
 const fn ra_runtime::runner::result::RunErrorData < 'a >::last_agent(& self) -> & 'a Arc < AgentSpec >
 const fn ra_runtime::runner::result::RunErrorData < 'a >::turns(& self) -> u32
+const fn ra_runtime::runner::result::RunErrorData < 'a >::usage(& self) -> & Usage
 const fn ra_runtime::runner::result::RunErrorHandlerInput < 'a >::data(& self) -> & RunErrorData < 'a >
 const fn ra_runtime::runner::result::RunErrorHandlerInput < 'a >::error(& self) -> & 'a Error
 const fn ra_runtime::runner::result::RunErrorHandlerResult::message(& self) -> & Message

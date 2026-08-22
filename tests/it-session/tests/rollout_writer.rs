@@ -12,7 +12,7 @@ use ra_core::{
     item::{AgentId, Compaction, ItemId, Message, OutputPhase, RunItem, RunItemKind},
     session::SessionId,
     state::{RunId, RunState},
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use ra_session::{
     ChildAnchorKind, RolloutChildAnchor, RolloutModelUsage, RolloutPayload, RolloutReader,
@@ -101,9 +101,11 @@ async fn test_rollout_writer_lifecycle_and_timeline_seq_monotonicity() {
     assert_eq!(writer.next_timeline_seq(), 4);
 
     // 5. Append model usage (seq 4)
-    let usage = Usage::new(500, 100)
-        .with_cached_input_tokens(50)
-        .with_reasoning_tokens(20);
+    let usage = Usage::from_request(
+        RequestUsage::new(500, 100)
+            .with_cached_input_tokens(50)
+            .with_reasoning_tokens(20),
+    );
     let model_usage = RolloutModelUsage::new(run_id.clone(), usage).with_turn_index(1);
     let r4 = writer
         .append_model_usage(model_usage)
@@ -159,10 +161,12 @@ async fn test_rollout_writer_unprunable_usage_totals_across_compaction() {
         .expect("writer creation should succeed");
 
     // Record usage for Turn 1
-    let usage1 = Usage::new(1000, 200)
-        .with_cached_input_tokens(200)
-        .with_cache_write_tokens(100)
-        .with_reasoning_tokens(50);
+    let usage1 = Usage::from_request(
+        RequestUsage::new(1000, 200)
+            .with_cached_input_tokens(200)
+            .with_cache_write_tokens(100)
+            .with_reasoning_tokens(50),
+    );
     writer
         .append_model_usage(
             RolloutModelUsage::new(run_id.clone(), usage1.clone()).with_turn_index(1),
@@ -171,10 +175,12 @@ async fn test_rollout_writer_unprunable_usage_totals_across_compaction() {
         .expect("append usage1 should succeed");
 
     // Record usage for Turn 2
-    let usage2 = Usage::new(1500, 300)
-        .with_cached_input_tokens(800)
-        .with_cache_write_tokens(0)
-        .with_reasoning_tokens(80);
+    let usage2 = Usage::from_request(
+        RequestUsage::new(1500, 300)
+            .with_cached_input_tokens(800)
+            .with_cache_write_tokens(0)
+            .with_reasoning_tokens(80),
+    );
     writer
         .append_model_usage(
             RolloutModelUsage::new(run_id.clone(), usage2.clone()).with_turn_index(2),
@@ -182,9 +188,13 @@ async fn test_rollout_writer_unprunable_usage_totals_across_compaction() {
         .await
         .expect("append usage2 should succeed");
 
-    // Expected total usage
-    let expected_totals = usage1.accumulate(&usage2);
+    // Expected total usage. The running figure carries totals only: it is restated in every
+    // checkpoint and in the sidecar, and repeating one entry per call in each of them would grow
+    // the log with the square of the session. The entries stay in the records themselves.
+    let expected_totals = usage1.accumulate(&usage2).without_entries();
     assert_eq!(writer.usage_totals(), &expected_totals);
+    assert_eq!(writer.usage_totals().requests(), 2);
+    assert!(writer.usage_totals().request_usage_entries().is_empty());
     assert_eq!(writer.usage_totals().input_tokens(), 2500);
     assert_eq!(writer.usage_totals().output_tokens(), 500);
     assert_eq!(writer.usage_totals().cached_input_tokens(), 1000);
@@ -205,10 +215,12 @@ async fn test_rollout_writer_unprunable_usage_totals_across_compaction() {
         .expect("append compaction item should succeed");
 
     // Add another turn post-compaction
-    let usage3 = Usage::new(800, 150)
-        .with_cached_input_tokens(600)
-        .with_cache_write_tokens(50)
-        .with_reasoning_tokens(20);
+    let usage3 = Usage::from_request(
+        RequestUsage::new(800, 150)
+            .with_cached_input_tokens(600)
+            .with_cache_write_tokens(50)
+            .with_reasoning_tokens(20),
+    );
     writer
         .append_model_usage(
             RolloutModelUsage::new(run_id.clone(), usage3.clone()).with_turn_index(3),
@@ -216,7 +228,7 @@ async fn test_rollout_writer_unprunable_usage_totals_across_compaction() {
         .await
         .expect("append usage3 should succeed");
 
-    let final_expected = expected_totals.accumulate(&usage3);
+    let final_expected = expected_totals.accumulate(&usage3.without_entries());
     assert_eq!(writer.usage_totals(), &final_expected);
 
     // Scan the log from reader to verify full unpruned accounting matches writer totals
@@ -226,6 +238,28 @@ async fn test_rollout_writer_unprunable_usage_totals_across_compaction() {
         .await
         .expect("scan_summary should succeed");
     assert_eq!(summary.usage_totals(), &final_expected);
+    assert_eq!(summary.usage_totals().requests(), 3);
+
+    // Compaction removed conversation items, and the per-request detail is still there: the
+    // records are the ledger a total can be rebuilt from and checked against, which is the only
+    // reason a checkpointed total is worth anything.
+    let records = reader.read_all().await.expect("records should be readable");
+    let per_request: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|record| match record.payload() {
+            Ok(RolloutPayload::ModelUsage(usage)) => Some(usage),
+            _ => None,
+        })
+        .flat_map(|usage| {
+            usage
+                .usage()
+                .request_usage_entries()
+                .iter()
+                .map(|entry| (entry.input_tokens(), entry.cached_input_tokens()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(per_request, vec![(1000, 200), (1500, 800), (800, 600)]);
 }
 
 #[tokio::test]
@@ -715,7 +749,7 @@ async fn test_rollout_writer_sidecar_file_persistence() {
         .await
         .unwrap();
 
-    let usage = Usage::new(500, 100);
+    let usage = Usage::from_request(RequestUsage::new(500, 100));
     writer
         .append_model_usage(RolloutModelUsage::new(run_id.clone(), usage).with_turn_index(1))
         .await
@@ -1003,7 +1037,10 @@ async fn test_rollout_writer_ignores_a_damaged_sidecar_during_recovery() {
             .await
             .unwrap();
         writer
-            .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(700, 300)))
+            .append_model_usage(RolloutModelUsage::new(
+                run_id.clone(),
+                Usage::from_request(RequestUsage::new(700, 300)),
+            ))
             .await
             .unwrap();
         writer
@@ -1027,7 +1064,7 @@ async fn test_rollout_writer_ignores_a_damaged_sidecar_during_recovery() {
         session_id.clone(),
         1,
         HashMap::new(),
-        Usage::new(999_000, 0),
+        Usage::from_request(RequestUsage::new(999_000, 0)),
     );
     tokio::fs::write(&sidecar_path, serde_json::to_vec(&damaged).unwrap())
         .await
@@ -1281,7 +1318,10 @@ async fn test_rollout_writer_resumes_from_checkpoint_without_reading_the_head() 
             .unwrap();
         for _ in 0..3 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(100, 10)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(100, 10)),
+                ))
                 .await
                 .unwrap();
         }
@@ -1293,7 +1333,10 @@ async fn test_rollout_writer_resumes_from_checkpoint_without_reading_the_head() 
 
         // Two more records land after the checkpoint; they are the tail resume must re-read.
         writer
-            .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(50, 5)))
+            .append_model_usage(RolloutModelUsage::new(
+                run_id.clone(),
+                Usage::from_request(RequestUsage::new(50, 5)),
+            ))
             .await
             .unwrap();
         writer
@@ -1367,7 +1410,11 @@ async fn test_rollout_writer_checkpoint_recovery_matches_full_scan() {
         for i in 0..10 {
             writer
                 .append_model_usage(
-                    RolloutModelUsage::new(run_b.clone(), Usage::new(10, 1)).with_turn_index(i),
+                    RolloutModelUsage::new(
+                        run_b.clone(),
+                        Usage::from_request(RequestUsage::new(10, 1)),
+                    )
+                    .with_turn_index(i),
                 )
                 .await
                 .unwrap();
@@ -1401,8 +1448,13 @@ async fn test_rollout_writer_checkpoint_recovery_matches_full_scan() {
             "index points past EOF",
             Some(
                 serde_json::to_vec(
-                    &RolloutSidecar::new(session_id.clone(), 999, HashMap::new(), Usage::new(1, 1))
-                        .with_last_checkpoint_offset(u64::MAX / 2),
+                    &RolloutSidecar::new(
+                        session_id.clone(),
+                        999,
+                        HashMap::new(),
+                        Usage::from_request(RequestUsage::new(1, 1)),
+                    )
+                    .with_last_checkpoint_offset(u64::MAX / 2),
                 )
                 .unwrap(),
             ),
@@ -1411,8 +1463,13 @@ async fn test_rollout_writer_checkpoint_recovery_matches_full_scan() {
             "index points at a non-checkpoint record",
             Some(
                 serde_json::to_vec(
-                    &RolloutSidecar::new(session_id.clone(), 999, HashMap::new(), Usage::new(1, 1))
-                        .with_last_checkpoint_offset(0),
+                    &RolloutSidecar::new(
+                        session_id.clone(),
+                        999,
+                        HashMap::new(),
+                        Usage::from_request(RequestUsage::new(1, 1)),
+                    )
+                    .with_last_checkpoint_offset(0),
                 )
                 .unwrap(),
             ),
@@ -1467,7 +1524,10 @@ async fn test_rollout_writer_rejects_checkpoint_from_another_session() {
         writer.set_checkpoint_interval(2);
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }
@@ -1525,7 +1585,10 @@ async fn test_rollout_writer_rejects_non_monotonic_join_across_checkpoint() {
         writer.set_checkpoint_interval(2);
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }
@@ -1601,7 +1664,10 @@ async fn test_scan_catches_a_checkpoint_that_disagrees_with_its_records() {
         writer.set_checkpoint_interval(2);
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }
@@ -1637,6 +1703,58 @@ async fn test_scan_catches_a_checkpoint_that_disagrees_with_its_records() {
         "expected Corrupted, got: {err}"
     );
     assert!(err.to_string().contains("999999"), "got: {err}");
+}
+
+/// The request count is checked alongside the token counters. Without it, a checkpoint claiming the
+/// same tokens over a different number of calls passes reconciliation, and every per-request
+/// average derived from it is quietly wrong.
+#[tokio::test]
+async fn test_scan_catches_a_checkpoint_that_miscounts_its_requests() {
+    let dir = temp_test_dir("checkpoint_request_count_tampering");
+    let session_id = SessionId::generate();
+    let run_id = RunId::generate();
+    let file_path = dir.join(format!("rollout-{}.jsonl", session_id.as_str()));
+
+    let checkpoint_offset;
+    {
+        let mut writer = RolloutWriter::open(&file_path, session_id.clone())
+            .await
+            .unwrap();
+        writer.set_checkpoint_interval(2);
+        for _ in 0..2 {
+            writer
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
+                .await
+                .unwrap();
+        }
+        checkpoint_offset = writer.last_checkpoint_offset().unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    rewrite_line_at(&file_path, checkpoint_offset, |record| {
+        assert_eq!(record["type"], json!("checkpoint"));
+        assert_eq!(record["payload"]["usage_totals"]["requests"], json!(2));
+        record["payload"]["usage_totals"]["requests"] = json!(1);
+    })
+    .await;
+
+    let err = RolloutReader::open(&file_path)
+        .scan_summary()
+        .await
+        .expect_err("a checkpoint miscounting its requests must be reported");
+    assert!(
+        matches!(
+            err,
+            Error::Session {
+                kind: SessionErrorKind::Corrupted,
+                ..
+            }
+        ),
+        "expected Corrupted, got: {err}"
+    );
 }
 
 /// The checkpoint interval has to survive restarts. Counting from zero on every open lets a
@@ -1765,14 +1883,20 @@ async fn test_rollout_writer_does_not_index_an_unusable_checkpoint() {
         writer.set_checkpoint_interval(2);
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }
         good_offset = writer.last_checkpoint_offset().unwrap();
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }
@@ -1856,7 +1980,10 @@ async fn test_scan_catches_a_checkpoint_naming_another_session() {
             .unwrap();
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }
@@ -1903,7 +2030,10 @@ async fn test_read_all_validates_envelopes_while_scan_summary_validates_content(
         writer.set_checkpoint_interval(2);
         for _ in 0..2 {
             writer
-                .append_model_usage(RolloutModelUsage::new(run_id.clone(), Usage::new(10, 1)))
+                .append_model_usage(RolloutModelUsage::new(
+                    run_id.clone(),
+                    Usage::from_request(RequestUsage::new(10, 1)),
+                ))
                 .await
                 .unwrap();
         }

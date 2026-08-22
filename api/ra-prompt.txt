@@ -34,6 +34,7 @@ fn ra_prompt::dump::PromptDumpSection::stability(& self) -> & str
 fn ra_prompt::dynamic::resolved_to_tail_input_items(resolved : & ResolvedPrompt) -> Result < Vec < ModelInputItem > >
 fn ra_prompt::dynamic::resolved_to_volatile_sections(resolved : & ResolvedPrompt) -> Result < Vec < PromptSection > >
 fn ra_prompt::metrics::calculate_cache_hit_rate(cached_tokens : u64, total_input_tokens : u64) -> f64
+fn ra_prompt::metrics::calculate_cache_hit_rate_from_request(request : & RequestUsage) -> f64
 fn ra_prompt::metrics::calculate_cache_hit_rate_from_usage(usage : & Usage) -> f64
 fn ra_prompt::metrics::meets_cache_hit_target(usage : & Usage, target_threshold : f64) -> bool
 fn ra_prompt::reminder::ReminderAttachment::render_text(& self) -> String

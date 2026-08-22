@@ -1,9 +1,6 @@
 //! Runtime helpers for budget enforcement and model-facing budget guidance.
 
-use ra_core::{
-    budget::{BudgetLimit, BudgetSnapshot},
-    item::Message,
-};
+use ra_core::{budget::BudgetLimit, item::Message, state::RunState};
 
 /// Returns the token-budget reminder appended to one model call's input.
 ///
@@ -15,8 +12,8 @@ use ra_core::{
 /// Only the task-token budget becomes prompt text. Turn, cost, and deadline ceilings are host
 /// control-plane limits; exposing them would invite the model to reason about implementation
 /// details instead of pacing the work it was asked to complete.
-pub(crate) fn budget_reminder(snapshot: &BudgetSnapshot, limit: &BudgetLimit) -> Option<Message> {
-    let remaining = snapshot.remaining_tokens(limit)?;
+pub(crate) fn budget_reminder(state: &RunState, limit: &BudgetLimit) -> Option<Message> {
+    let remaining = state.remaining_tokens(limit)?;
     Some(Message::system(format!(
         "Task token budget: {remaining} tokens remain. Pace the remaining work accordingly."
     )))

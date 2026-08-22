@@ -50,7 +50,7 @@ use ra_core::{
         Tool, ToolApprovalPolicy, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin,
         ToolOutput, ToolSchema,
     },
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use ra_runtime::{
     agent::AgentBinding,
@@ -452,12 +452,12 @@ fn request(
 fn tool_then_answer() -> Arc<ScriptedModel> {
     ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("call-item-1", "call-1", "write_file")]),
-        ModelResponse::new(vec![message("msg-1", "final answer")]).with_usage(
-            Usage::new(100, 20)
+        ModelResponse::new(vec![message("msg-1", "final answer")]).with_usage(Usage::from_request(
+            RequestUsage::new(100, 20)
                 .with_cached_input_tokens(80)
                 .with_cache_write_tokens(10)
                 .with_reasoning_tokens(12),
-        ),
+        )),
     ])
 }
 
@@ -485,8 +485,12 @@ async fn generation_span_records_normalized_usage() {
         Some("test-provider")
     );
     // A response that carried no usage reports zeroes rather than nothing. `Usage` has no "not
-    // reported" state to preserve, so the span cannot invent one either.
+    // reported" state to preserve, so the span cannot invent one either — including the request
+    // count, which comes from the adapter that made the calls rather than from the loop that
+    // watched them.
     assert_eq!(generations[0].number("usage.input_tokens"), 0);
+    assert_eq!(generations[0].number("usage.requests"), 0);
+    assert_eq!(generations[1].number("usage.requests"), 1);
     assert_eq!(generations[1].number("usage.input_tokens"), 100);
     assert_eq!(generations[1].number("usage.cached_input_tokens"), 80);
     assert_eq!(generations[1].number("usage.cache_write_tokens"), 10);
@@ -494,8 +498,11 @@ async fn generation_span_records_normalized_usage() {
     assert_eq!(generations[1].number("usage.reasoning_tokens"), 12);
     assert_eq!(generations[1].field("outcome"), Some("ok"));
 
-    // The run total is the sum of the calls, on the span one level up.
+    // The run total is the sum of the calls, on the span one level up. The scale differs by span
+    // kind, which is exactly why the request count is recorded next to the tokens: without it a
+    // report cannot tell one expensive call from several cheap ones.
     let agent = spans.only("agent");
+    assert_eq!(agent.number("usage.requests"), 1);
     assert_eq!(agent.number("usage.input_tokens"), 100);
     assert_eq!(agent.number("usage.output_tokens"), 20);
     assert_eq!(agent.field("finish.reason"), Some("final"));
@@ -641,10 +648,12 @@ async fn paid_usage_survives_a_later_tool_failure_on_turn_and_agent_spans() {
     let tool = Arc::new(PropagatingFailureTool::new("write_file"));
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("call-item-1", "call-1", "write_file")]).with_usage(
-            Usage::new(37, 11)
-                .with_cached_input_tokens(23)
-                .with_cache_write_tokens(7)
-                .with_reasoning_tokens(5),
+            Usage::from_request(
+                RequestUsage::new(37, 11)
+                    .with_cached_input_tokens(23)
+                    .with_cache_write_tokens(7)
+                    .with_reasoning_tokens(5),
+            ),
         ),
     ]);
     let cancel = CancelScope::root();

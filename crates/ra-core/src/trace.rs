@@ -119,6 +119,13 @@ pub mod field {
     pub const MODEL_PROVIDER: &str = "model.provider";
     /// Protocol path: `responses` / `chat` / `messages` / `compat`.
     pub const GEN_PROTOCOL: &str = "gen.protocol";
+    /// Provider requests the usage figures on this span cover.
+    ///
+    /// Usually 1 on a `generation` and the number of calls below it on an enclosing span. It is
+    /// what makes an average per request computable at all, and it is the field that says a
+    /// `generation` cost more than one request — a fallback that escalated after a refusal, for
+    /// instance, where the token counts alone look like a single expensive call.
+    pub const USAGE_REQUESTS: &str = "usage.requests";
     /// Input tokens: for this request on a `generation`, for everything below it on an enclosing
     /// span. See the note on scale in the [module docs](self).
     pub const USAGE_INPUT_TOKENS: &str = "usage.input_tokens";
@@ -199,6 +206,7 @@ pub mod field {
         MODEL_NAME,
         MODEL_PROVIDER,
         GEN_PROTOCOL,
+        USAGE_REQUESTS,
         USAGE_INPUT_TOKENS,
         USAGE_CACHED_INPUT_TOKENS,
         USAGE_OUTPUT_TOKENS,

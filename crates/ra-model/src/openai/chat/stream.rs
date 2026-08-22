@@ -26,9 +26,9 @@
 //! partial-message switch, and it should feel free to rename or restructure what this module
 //! emits: the tests here assert the reassembly rules, not the spelling.
 //!
-//! Read the usage totals assembled at the end the same way. This module fills them in because a
-//! stream that reports nothing cannot be reconciled against anything, but per-request usage
-//! accounting is a later milestone's contract and may reshape what is recorded here.
+//! The usage totals assembled at the end are **not** in that category. They travel on the terminal
+//! response as one recorded request, exactly as the non-streaming path reports it, so a streamed
+//! turn and a non-streamed one produce the same ledger entry for the same call.
 
 use std::collections::VecDeque;
 

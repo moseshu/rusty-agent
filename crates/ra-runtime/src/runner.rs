@@ -469,6 +469,7 @@ async fn run_loop(
         duration.ms = tracing::field::Empty,
         finish.reason = tracing::field::Empty,
         budget.kind = tracing::field::Empty,
+        usage.requests = tracing::field::Empty,
         usage.input_tokens = tracing::field::Empty,
         usage.cached_input_tokens = tracing::field::Empty,
         usage.cache_write_tokens = tracing::field::Empty,
@@ -634,6 +635,7 @@ fn record_progress_usage(span: &tracing::Span, progress: &TurnLoopProgress) {
 
 /// Records normalized usage on any span whose scale is defined by its kind.
 fn record_usage(span: &tracing::Span, usage: &ra_core::usage::Usage) {
+    span.record(ra_core::trace::field::USAGE_REQUESTS, usage.requests());
     span.record(
         ra_core::trace::field::USAGE_INPUT_TOKENS,
         usage.input_tokens(),
@@ -689,7 +691,7 @@ async fn run_turns(
         // exhausted its turns — the reason a host reacts to is different for each.
         context.cancel.ensure_not_cancelled()?;
 
-        if let Some(kind) = state.budget().exhausted_kind(config.budget()) {
+        if let Some(kind) = state.exhausted_budget_kind(config.budget()) {
             progress.budget_stop = Some(kind);
             break RunOutcome::Completed {
                 reason: FinishReason::from_budget_kind(kind),
@@ -725,6 +727,7 @@ async fn run_turns(
             cancel.reason = tracing::field::Empty,
             cancel.scope = tracing::field::Empty,
             duration.ms = tracing::field::Empty,
+            usage.requests = tracing::field::Empty,
             usage.input_tokens = tracing::field::Empty,
             usage.cached_input_tokens = tracing::field::Empty,
             usage.cache_write_tokens = tracing::field::Empty,
@@ -771,7 +774,7 @@ async fn run_one_turn(
     let input = next_input(
         context.original_input,
         &progress.generated,
-        budget_reminder(state.budget(), config.budget()),
+        budget_reminder(state, config.budget()),
     );
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
@@ -803,7 +806,7 @@ async fn run_one_turn(
     // call ran. The copy is what that costs, next to the two history copies this turn already
     // makes for settlement.
     record_usage(turn_span, response.usage());
-    state.budget_mut().record_usage(response.usage());
+    state.record_usage(response.usage());
     progress.model_responses.push(response.clone());
 
     // Built again rather than reused from preparation: the call above has been paid for, and the
@@ -871,8 +874,9 @@ async fn run_one_turn(
 /// - **The public agent, never the execution instance.** A dynamic availability check, a tool and
 ///   later a guard all report and branch on the agent the user configured; a prepared clone that
 ///   reached them would make a run describe something nobody wrote down.
-/// - **The budget as a copy taken from [`RunState`], not a handle into it.** The context is a read
-///   view; the state stays the one thing that accumulates and the one thing a checkpoint carries.
+/// - **The spend counters as copies taken from [`RunState`], not handles into it.** The context is
+///   a read view; the state stays the one thing that accumulates and the one thing a checkpoint
+///   carries.
 fn live_context(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
@@ -880,6 +884,7 @@ fn live_context(
 ) -> RunContext {
     let run = RunContext::new(context.run_id.clone(), agent.public())
         .with_budget(state.budget().clone())
+        .with_usage_totals(state.usage_totals().clone())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(context.event_seqs.clone());
     match context.app_context {
@@ -921,6 +926,7 @@ async fn call_model(
         cancel.reason = tracing::field::Empty,
         cancel.scope = tracing::field::Empty,
         duration.ms = tracing::field::Empty,
+        usage.requests = tracing::field::Empty,
         usage.input_tokens = tracing::field::Empty,
         usage.cached_input_tokens = tracing::field::Empty,
         usage.cache_write_tokens = tracing::field::Empty,
@@ -1033,6 +1039,7 @@ async fn deliver_budget_closeout(
         &progress.model_responses,
         progress.turns,
         state.budget().clone(),
+        state.usage_totals().clone(),
     );
     // A deadline cancels the run scope, so this uses its sibling: budget exhaustion still gets a
     // chance to produce a closeout, while an interrupt on the caller's scope cancels both paths.

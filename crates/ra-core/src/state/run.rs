@@ -1,7 +1,7 @@
 //! The run's own resumable state (the skeleton a future migration grows into the full checkpoint).
 //!
 //! A run has facts that are neither agent configuration nor session history: tool-use accounting,
-//! budget counters, event sequences, and state owned by the loop itself. Keeping those values as
+//! turn and token spend, event sequences, and state owned by the loop itself. Keeping those values as
 //! independent fields on the runner would make a new fact a signature change across every entry
 //! point and would let a continuation accidentally carry one fact but not another. `RunState` is
 //! the single carrier that crosses a run-segment boundary.
@@ -26,9 +26,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    budget::BudgetSnapshot,
+    budget::{BudgetLimit, BudgetSnapshot},
+    cancel::Deadline,
     compat::{SchemaVersion, Unknown},
-    error::{Error, Result},
+    error::{BudgetKind, Error, Result},
     finish::FinishReason,
     item::CallId,
     state::{ToolFailureTracker, ToolUseTracker},
@@ -429,8 +430,8 @@ pub struct RunState {
     work_state_ref: Option<WorkStateRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     graph_cursor: Option<GraphCursor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage_totals: Option<Usage>,
+    #[serde(default)]
+    usage_totals: Usage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_control_requests: Vec<PendingControlRequest>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
@@ -453,7 +454,7 @@ impl RunState {
             workspace_lease: None,
             work_state_ref: None,
             graph_cursor: None,
-            usage_totals: None,
+            usage_totals: Usage::default(),
             pending_control_requests: Vec::new(),
             unknown: Unknown::new(),
         }
@@ -656,17 +657,72 @@ impl RunState {
         self
     }
 
-    /// Accumulated usage totals, projected from settled turn responses.
+    /// The run's usage ledger: every model call it has paid for, across every segment.
+    ///
+    /// An empty ledger reports zero requests, which is the same statement `None` used to make with
+    /// one more state to handle. It is cumulative, so a resumed run's ledger covers the earlier
+    /// segments too — unlike the total a single run result reports, which describes only the
+    /// segment that produced it.
     #[must_use]
-    pub const fn usage_totals(&self) -> Option<&Usage> {
-        self.usage_totals.as_ref()
+    pub const fn usage_totals(&self) -> &Usage {
+        &self.usage_totals
     }
 
-    /// Replaces the accumulated usage totals.
+    /// Adds one settled model call's usage to the ledger.
+    ///
+    /// The single place a run's spend grows. The budget's token ceiling is measured against this
+    /// ledger rather than against a counter of its own, so there is nothing here that a second
+    /// caller could advance halfway.
+    pub fn record_usage(&mut self, usage: &Usage) {
+        self.usage_totals = self.usage_totals.accumulate(usage);
+    }
+
+    /// Replaces the ledger wholesale, for restoring one rather than extending it.
+    ///
+    /// Use [`Self::record_usage`] to record a call. This setter exists for the caller that
+    /// reconstructs state from a persisted record, and it replaces rather than adds precisely so
+    /// that reconstructing twice cannot double the spend.
     #[must_use]
-    pub fn with_usage_totals(mut self, usage_totals: impl Into<Option<Usage>>) -> Self {
-        self.usage_totals = usage_totals.into();
+    pub fn with_usage_totals(mut self, usage_totals: Usage) -> Self {
+        self.usage_totals = usage_totals;
         self
+    }
+
+    /// Total model tokens this run has spent, across every segment.
+    #[must_use]
+    pub const fn tokens_used(&self) -> u64 {
+        self.usage_totals.total_tokens()
+    }
+
+    /// Remaining token allowance, if tokens are limited.
+    #[must_use]
+    pub fn remaining_tokens(&self, limit: &BudgetLimit) -> Option<u64> {
+        limit
+            .max_tokens()
+            .map(|maximum| maximum.saturating_sub(self.tokens_used()))
+    }
+
+    /// The first exhausted budget dimension in a deterministic priority order.
+    ///
+    /// It lives here because answering it needs both carriers of spend: the turn counter on
+    /// [`BudgetSnapshot`] and the usage ledger this state owns. A version that read only one of
+    /// them would have to take the other as an argument, and the argument a caller passes by
+    /// mistake — one turn's usage instead of the run's — is a run that never stops.
+    #[must_use]
+    pub fn exhausted_budget_kind(&self, limit: &BudgetLimit) -> Option<BudgetKind> {
+        if self.budget.turns_exhausted(limit) {
+            return Some(BudgetKind::MaxTurns);
+        }
+        if limit
+            .max_tokens()
+            .is_some_and(|maximum| self.tokens_used() >= maximum)
+        {
+            return Some(BudgetKind::Tokens);
+        }
+        if limit.deadline().is_some_and(Deadline::is_expired) {
+            return Some(BudgetKind::WallClock);
+        }
+        None
     }
 
     /// Pending control or approval requests.

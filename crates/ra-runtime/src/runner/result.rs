@@ -46,6 +46,7 @@ pub struct RunErrorData<'a> {
     model_responses: &'a [ModelResponse],
     turns: u32,
     budget: BudgetSnapshot,
+    usage: Usage,
 }
 
 impl<'a> RunErrorData<'a> {
@@ -56,6 +57,7 @@ impl<'a> RunErrorData<'a> {
         model_responses: &'a [ModelResponse],
         turns: u32,
         budget: BudgetSnapshot,
+        usage: Usage,
     ) -> Self {
         Self {
             last_agent,
@@ -64,6 +66,7 @@ impl<'a> RunErrorData<'a> {
             model_responses,
             turns,
             budget,
+            usage,
         }
     }
 
@@ -102,10 +105,20 @@ impl<'a> RunErrorData<'a> {
         self.turns
     }
 
-    /// Budget counters as of the terminal condition.
+    /// Turn counters as of the terminal condition.
     #[must_use]
     pub fn budget(&self) -> BudgetSnapshot {
         self.budget.clone()
+    }
+
+    /// The run's usage ledger as of the terminal condition, per request and in total.
+    ///
+    /// Cumulative across segments, which is what a handler writing "the budget ran out" needs: the
+    /// responses above cover this segment only, and a closeout that quoted them on a resumed run
+    /// would name a smaller number than the ceiling that just stopped it.
+    #[must_use]
+    pub const fn usage(&self) -> &Usage {
+        &self.usage
     }
 }
 
@@ -256,36 +269,18 @@ pub enum ContinuationInput {
     Normalized,
 }
 
-/// Sums the usage of a sequence of model calls.
+/// Folds the usage of a sequence of model calls into one ledger.
 ///
 /// One implementation, two readers: [`RunResult::usage`] answers a finished run, and the agent
 /// span has to answer a run that failed after paying for calls, where no [`RunResult`] exists. A
 /// second copy of this fold would drift the day [`Usage`] grows a dimension, and the two totals
 /// would disagree about the same calls.
+///
+/// Every call's per-request entries come along, so the fold answers "what did this run cost" and
+/// "which call cost it" from the same value.
 pub(crate) fn aggregate_usage(responses: &[ModelResponse]) -> Usage {
     responses.iter().fold(Usage::default(), |total, response| {
-        // Saturating, like every other counter that adds provider-reported numbers: a provider
-        // that reports nonsense should skew a total, not panic a debug build.
-        let usage = response.usage();
-        Usage::new(
-            total.input_tokens().saturating_add(usage.input_tokens()),
-            total.output_tokens().saturating_add(usage.output_tokens()),
-        )
-        .with_cached_input_tokens(
-            total
-                .cached_input_tokens()
-                .saturating_add(usage.cached_input_tokens()),
-        )
-        .with_cache_write_tokens(
-            total
-                .cache_write_tokens()
-                .saturating_add(usage.cache_write_tokens()),
-        )
-        .with_reasoning_tokens(
-            total
-                .reasoning_tokens()
-                .saturating_add(usage.reasoning_tokens()),
-        )
+        total.accumulate(response.usage())
     })
 }
 
@@ -531,11 +526,19 @@ impl RunResult {
         &self.state
     }
 
-    /// Token usage across every call this run made.
+    /// Token usage across every call **this segment** made, per request and in total.
     ///
     /// Summed from [`Self::model_responses`] rather than accumulated into a field: a stored total
     /// is a second source of truth that a dropped or retried response can put out of step with the
     /// calls it claims to summarise.
+    ///
+    /// # This is not the same number as the run's ledger
+    ///
+    /// [`RunState::usage_totals`](ra_core::state::RunState::usage_totals), reachable through
+    /// [`Self::state`], is cumulative across every segment of the run and is what the token budget
+    /// is measured against. This is what the segment that just finished spent. On a run that was
+    /// never resumed the two agree; on a resumed one they are *supposed* to differ, and reading
+    /// this one as the run's total would under-report every continuation.
     #[must_use]
     pub fn usage(&self) -> Usage {
         aggregate_usage(&self.model_responses)

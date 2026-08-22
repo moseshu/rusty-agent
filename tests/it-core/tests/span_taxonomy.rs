@@ -204,6 +204,7 @@ fn test_span_taxonomy_09() {
         field::ERROR_CODE,
         field::CANCEL_REASON,
         field::CANCEL_SCOPE,
+        field::USAGE_REQUESTS,
         field::USAGE_INPUT_TOKENS,
         field::USAGE_CACHED_INPUT_TOKENS,
         field::USAGE_OUTPUT_TOKENS,

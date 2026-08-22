@@ -9,6 +9,16 @@
 //! limit, which is configuration and is never persisted. The snapshot therefore holds spent
 //! counters and nothing else: it serializes completely, and two snapshots that compare equal really
 //! do describe the same spend.
+//!
+//! # The token dimension is not counted here
+//!
+//! Turns are the one thing this snapshot counts, because a turn is the loop's own event and nothing
+//! else records it. Tokens are reported by the provider and already accumulate in the run's usage
+//! ledger, so a `tokens_used` field here would be a second counter incremented from the same
+//! settlement point — and two counters that must agree eventually stop agreeing, in the one place
+//! where the disagreement means a run either overspends or stops early. The token ceiling is
+//! therefore evaluated where both facts are held together, by
+//! [`RunState`](crate::state::RunState), against the ledger it owns.
 
 use std::time::Duration;
 
@@ -17,8 +27,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cancel::Deadline,
     compat::{SchemaVersion, Unknown},
-    error::BudgetKind,
-    usage::Usage,
 };
 
 /// Current [`BudgetSnapshot`] schema version.
@@ -33,8 +41,9 @@ pub const BUDGET_SNAPSHOT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 /// Money is deliberately not a dimension here. No provider reports a charge alongside its usage,
 /// so a framework-side amount could only come from a built-in price table — one that is per
 /// provider, per model, per token class, changes without notice, and would be wrong silently. The
-/// authoritative per-request token counts are preserved on every `ModelResponse`, which is what a
-/// host needs to apply its own contracted rates. Tokens are the unit both sides can agree on.
+/// authoritative per-request token counts are preserved on every `ModelResponse` and in the run's
+/// usage ledger, which is what a host needs to apply its own contracted rates. Tokens are the unit
+/// both sides can agree on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BudgetLimit {
     max_turns: Option<u32>,
@@ -115,21 +124,22 @@ impl BudgetLimit {
     }
 }
 
-/// Recoverable usage accounting for a run.
+/// Recoverable turn accounting for a run.
 ///
 /// Every counter is spend, so the whole value survives a checkpoint. What was spent is the only
 /// thing a continuation has to carry: the ceilings it will be measured against arrive with the new
 /// [`BudgetLimit`], which is how a caller resumes the same work with a larger allowance. Nothing
 /// process-local lives here — the wall clock is on the limit precisely because a monotonic instant
 /// cannot be restored — so a clean record round-trips to an equal value.
+///
+/// Token spend is not among these counters; see the [module docs](self) for why it is read from the
+/// run's usage ledger instead of being counted a second time here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetSnapshot {
     #[serde(default = "budget_snapshot_schema_version")]
     schema_version: SchemaVersion,
     #[serde(default)]
     turns_used: u32,
-    #[serde(default)]
-    tokens_used: u64,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -147,7 +157,6 @@ impl BudgetSnapshot {
         Self {
             schema_version: BUDGET_SNAPSHOT_SCHEMA_VERSION,
             turns_used: 0,
-            tokens_used: 0,
             unknown: Unknown::new(),
         }
     }
@@ -163,21 +172,10 @@ impl BudgetSnapshot {
         self.turns_used = self.turns_used.saturating_add(1);
     }
 
-    /// Records immutable usage reported by a completed model call.
-    pub fn record_usage(&mut self, usage: &Usage) {
-        self.tokens_used = self.tokens_used.saturating_add(usage.total_tokens());
-    }
-
     /// Number of model turns that have started.
     #[must_use]
     pub const fn turns_used(&self) -> u32 {
         self.turns_used
-    }
-
-    /// Total model tokens reported so far.
-    #[must_use]
-    pub const fn tokens_used(&self) -> u64 {
-        self.tokens_used
     }
 
     /// Fields written by a newer version and retained across a downgrade read/write cycle.
@@ -194,33 +192,16 @@ impl BudgetSnapshot {
             .map(|maximum| maximum.saturating_sub(self.turns_used))
     }
 
-    /// Remaining token allowance, if tokens are limited.
+    /// Whether the turn allowance is used up.
+    ///
+    /// One dimension rather than a verdict on the whole budget: answering that means holding the
+    /// usage ledger too, which is why [`RunState`](crate::state::RunState) is the one that answers
+    /// it.
     #[must_use]
-    pub fn remaining_tokens(&self, limit: &BudgetLimit) -> Option<u64> {
+    pub fn turns_exhausted(&self, limit: &BudgetLimit) -> bool {
         limit
-            .max_tokens
-            .map(|maximum| maximum.saturating_sub(self.tokens_used))
-    }
-
-    /// The first exhausted dimension in a deterministic priority order.
-    #[must_use]
-    pub fn exhausted_kind(&self, limit: &BudgetLimit) -> Option<BudgetKind> {
-        if limit
             .max_turns
             .is_some_and(|maximum| self.turns_used >= maximum)
-        {
-            return Some(BudgetKind::MaxTurns);
-        }
-        if limit
-            .max_tokens
-            .is_some_and(|maximum| self.tokens_used >= maximum)
-        {
-            return Some(BudgetKind::Tokens);
-        }
-        if limit.deadline.is_some_and(Deadline::is_expired) {
-            return Some(BudgetKind::WallClock);
-        }
-        None
     }
 }
 

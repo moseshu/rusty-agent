@@ -7,7 +7,7 @@ use ra_core::{
         OutputPhase, RawProviderItem, Reasoning, RunItem, RunItemKind, ToolCall,
     },
     model::{ModelHandoffDefinition, ProviderKey},
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 use serde_json::Value;
 
@@ -58,7 +58,7 @@ pub(crate) fn convert_response(
 ///
 /// A truncated response carries a well-formed `output` array, so lifting it silently would hand
 /// the runner a half-written message as if it were a final answer. `ModelResponse` has no field
-/// for a partial result yet (R1-8), which leaves the classified error as the honest signal.
+/// for a partial result, which leaves the classified error as the honest signal.
 fn reject_unfinished_response(payload: &Value) -> Result<()> {
     let Some(status) = payload.get("status").and_then(Value::as_str) else {
         return Ok(());
@@ -240,10 +240,15 @@ fn convert_usage(value: Option<&Value>) -> Usage {
         .and_then(|usage| usage.pointer("/output_tokens_details/reasoning_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    Usage::new(input, output)
-        .with_cached_input_tokens(cached)
-        .with_cache_write_tokens(cache_write)
-        .with_reasoning_tokens(reasoning)
+    // One call, one entry — including when the endpoint reported no usage block at all. A request
+    // that was answered was paid for, and a ledger that recorded nothing for it would under-report
+    // how many calls a run made rather than admit it does not know what they cost.
+    Usage::from_request(
+        RequestUsage::new(input, output)
+            .with_cached_input_tokens(cached)
+            .with_cache_write_tokens(cache_write)
+            .with_reasoning_tokens(reasoning),
+    )
 }
 
 fn required_str<'a>(value: &'a Value, key: &str, owner: &str) -> Result<&'a str> {

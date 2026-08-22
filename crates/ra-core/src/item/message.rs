@@ -204,9 +204,13 @@ impl ModelResponse {
     }
 
     /// Sets usage for this call.
+    ///
+    /// A [`RequestUsage`](crate::usage::RequestUsage) converts, which is what an adapter reporting
+    /// one provider request passes: the conversion records it as one request rather than as bare
+    /// totals with nothing behind them.
     #[must_use]
-    pub fn with_usage(mut self, usage: Usage) -> Self {
-        self.usage = usage;
+    pub fn with_usage(mut self, usage: impl Into<Usage>) -> Self {
+        self.usage = usage.into();
         self
     }
 
@@ -236,7 +240,12 @@ impl ModelResponse {
         &self.output
     }
 
-    /// Usage totals.
+    /// What this call cost, per request and in total.
+    ///
+    /// A ledger rather than one request's counters, because one response is not always one request:
+    /// an adapter that escalates to a second model after a refusal, or that splits a call
+    /// internally, pays more than once for the response it returns. Each of those requests keeps
+    /// its own entry, which is the only form in which a host can price them separately.
     #[must_use]
     pub const fn usage(&self) -> &Usage {
         &self.usage
