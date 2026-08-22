@@ -118,11 +118,11 @@ fn a_checkpoint_round_trip_preserves_the_whole_snapshot() {
     );
 }
 
-/// A budget snapshot written by a build that still counted tokens itself keeps that number as an
-/// unknown field, and it does **not** become spend: the ledger is the only thing measured, so an
-/// old checkpoint cannot smuggle a second total back in.
+/// Token spend recorded by a build that counted it on the snapshot is **still spend**. It moves
+/// into the ledger when the snapshot is attached, so a continuation is measured against what the
+/// earlier segment actually used rather than starting its allowance over.
 #[test]
-fn a_snapshot_written_when_the_budget_counted_tokens_does_not_reintroduce_that_counter() {
+fn a_snapshot_written_when_the_budget_counted_tokens_carries_that_spend_into_the_ledger() {
     let legacy = serde_json::json!({
         "schema_version": 1,
         "turns_used": 2,
@@ -130,12 +130,36 @@ fn a_snapshot_written_when_the_budget_counted_tokens_does_not_reintroduce_that_c
     });
 
     let restored: BudgetSnapshot = serde_json::from_value(legacy).unwrap();
+    // A host may checkpoint the snapshot on its own before attaching it to a `RunState`. Its spend
+    // must survive that round trip; otherwise the later migration has nothing left to move.
+    let standalone = serde_json::to_value(&restored).unwrap();
+    assert_eq!(standalone["tokens_used"], serde_json::json!(4_000));
+    let restored: BudgetSnapshot = serde_json::from_value(standalone).unwrap();
+
     let state = RunState::start(RunId::new("run-legacy")).with_budget(restored);
 
     assert_eq!(state.budget().turns_used(), 2);
-    assert_eq!(state.tokens_used(), 0);
+    assert_eq!(state.tokens_used(), 4_000);
+    assert_eq!(state.usage_totals().carried_total_tokens(), 4_000);
+
+    // The ceiling sees it, which is the point: without the migration this run would be handed a
+    // second full allowance.
+    let limit = BudgetLimit::new().with_max_turns(9).with_max_tokens(4_000);
     assert_eq!(
-        state.budget().unknown().get("tokens_used"),
-        Some(&serde_json::json!(4_000))
+        state.exhausted_budget_kind(&limit),
+        Some(BudgetKind::Tokens)
     );
+
+    // Carried spend has no known split, so it stays out of the counters a cache hit rate divides
+    // by rather than being attributed to input tokens nobody measured.
+    assert_eq!(state.usage_totals().input_tokens(), 0);
+    assert_eq!(state.usage_totals().output_tokens(), 0);
+    assert_eq!(state.usage_totals().requests(), 0);
+
+    // Taking the spend into the ledger consumes the legacy carrier, so a current snapshot no
+    // longer emits the obsolete field.
+    assert!(serde_json::to_value(state.budget())
+        .unwrap()
+        .get("tokens_used")
+        .is_none());
 }

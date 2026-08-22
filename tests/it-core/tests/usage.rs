@@ -1,6 +1,10 @@
 //! Per-request usage detail and the ledger it accumulates into.
 
-use ra_core::usage::{REQUEST_USAGE_SCHEMA_VERSION, RequestUsage, USAGE_SCHEMA_VERSION, Usage};
+use ra_core::{
+    budget::BudgetSnapshot,
+    state::{RunId, RunState},
+    usage::{REQUEST_USAGE_SCHEMA_VERSION, RequestUsage, USAGE_SCHEMA_VERSION, Usage},
+};
 use serde_json::json;
 
 fn request(input: u64, output: u64, cached: u64, cache_write: u64, reasoning: u64) -> RequestUsage {
@@ -205,4 +209,66 @@ fn a_request_that_reported_nothing_is_still_counted() {
     assert_eq!(ledger.requests(), 1);
     assert_eq!(ledger.total_tokens(), 0);
     assert_eq!(ledger.request_usage_entries().len(), 1);
+}
+
+/// Provider counters this build does not recognize have to survive the projection that drops the
+/// entries. Kept only on the entry, a future `audio_tokens` would vanish from every checkpointed
+/// total — which is the failure retaining unknown fields exists to prevent.
+#[test]
+fn an_entrys_unknown_counters_survive_a_totals_only_projection() {
+    let mut wire = serde_json::to_value(RequestUsage::new(10, 2)).unwrap();
+    wire["audio_tokens"] = json!(7);
+    let entry: RequestUsage = serde_json::from_value(wire).unwrap();
+
+    let ledger = Usage::from_request(entry);
+    assert_eq!(ledger.unknown().get("audio_tokens"), Some(&json!(7)));
+    assert_eq!(
+        ledger.request_usage_entries()[0]
+            .unknown()
+            .get("audio_tokens"),
+        Some(&json!(7)),
+        "the entry keeps its own copy; lifting is in addition to, not instead of"
+    );
+
+    let totals = ledger.without_entries();
+    assert_eq!(totals.unknown().get("audio_tokens"), Some(&json!(7)));
+    assert_eq!(
+        serde_json::to_value(&totals).unwrap()["audio_tokens"],
+        json!(7)
+    );
+}
+
+/// Spend inherited from a record that never said how it split counts against the ceiling and
+/// nowhere else. Attributing it to input tokens would put a number nobody measured into the
+/// denominator of every cache hit rate taken from this ledger.
+#[test]
+fn carried_spend_counts_toward_the_total_and_not_toward_the_counters() {
+    let legacy_budget: BudgetSnapshot = serde_json::from_value(json!({
+        "schema_version": 1,
+        "tokens_used": 4_000
+    }))
+    .unwrap();
+    let mut state = RunState::start(RunId::new("run-carried-spend")).with_budget(legacy_budget);
+    let carried = state.usage_totals();
+
+    assert_eq!(carried.total_tokens(), 4_000);
+    assert_eq!(carried.carried_total_tokens(), 4_000);
+    assert_eq!(carried.input_tokens(), 0);
+    assert_eq!(carried.output_tokens(), 0);
+    assert_eq!(carried.requests(), 0);
+    assert!(carried.request_usage_entries().is_empty());
+
+    state.record_usage(&Usage::from_request(request(1_000, 200, 900, 0, 0)));
+    let continued = state.usage_totals();
+    assert_eq!(continued.total_tokens(), 5_200);
+    assert_eq!(continued.input_tokens(), 1_000);
+    assert_eq!(continued.requests(), 1);
+    assert_eq!(continued.carried_total_tokens(), 4_000);
+
+    // And it survives both the projection and a round trip, since a checkpoint that dropped it
+    // would give the run its spent allowance back.
+    let totals = continued.without_entries();
+    assert_eq!(totals.total_tokens(), 5_200);
+    let restored: Usage = serde_json::from_value(serde_json::to_value(&totals).unwrap()).unwrap();
+    assert_eq!(restored, totals);
 }

@@ -140,6 +140,20 @@ pub struct BudgetSnapshot {
     schema_version: SchemaVersion,
     #[serde(default)]
     turns_used: u32,
+    /// Token spend read from a checkpoint written while this type still counted tokens.
+    ///
+    /// It is claimed by a named field rather than left to [`Unknown`] so that
+    /// [`RunState`](crate::state::RunState) can move it into the usage ledger on the way in: left
+    /// as an opaque retained key it would round-trip forever while the run that resumed from it
+    /// measured its token ceiling from zero, and a continuation would quietly get a second full
+    /// allowance. Never written back — after one read/write cycle the record states its spend in
+    /// the ledger instead, and this stays zero.
+    #[serde(
+        default,
+        rename = "tokens_used",
+        skip_serializing_if = "legacy_tokens_used_is_zero"
+    )]
+    legacy_tokens_used: u64,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -157,8 +171,19 @@ impl BudgetSnapshot {
         Self {
             schema_version: BUDGET_SNAPSHOT_SCHEMA_VERSION,
             turns_used: 0,
+            legacy_tokens_used: 0,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Takes the token spend a pre-ledger checkpoint recorded here, leaving zero behind.
+    ///
+    /// Taking rather than reading: the value has exactly one destination, and one that could be
+    /// read twice could also be added twice.
+    pub(crate) const fn take_legacy_tokens_used(&mut self) -> u64 {
+        let carried = self.legacy_tokens_used;
+        self.legacy_tokens_used = 0;
+        carried
     }
 
     /// Schema version of this checkpoint record.
@@ -207,4 +232,8 @@ impl BudgetSnapshot {
 
 const fn budget_snapshot_schema_version() -> SchemaVersion {
     BUDGET_SNAPSHOT_SCHEMA_VERSION
+}
+
+const fn legacy_tokens_used_is_zero(value: &u64) -> bool {
+    *value == 0
 }

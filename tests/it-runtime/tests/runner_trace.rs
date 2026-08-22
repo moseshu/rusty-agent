@@ -484,12 +484,13 @@ async fn generation_span_records_normalized_usage() {
         generations[0].field("model.provider"),
         Some("test-provider")
     );
-    // A response that carried no usage reports zeroes rather than nothing. `Usage` has no "not
-    // reported" state to preserve, so the span cannot invent one either — including the request
-    // count, which comes from the adapter that made the calls rather than from the loop that
-    // watched them.
+    // A response that carried no usage reports zero tokens rather than nothing — `Usage` has no
+    // "not reported" state to preserve, so the span cannot invent one. It still reports the one
+    // request that produced it: a call whose cost the adapter never stated is a call that was
+    // nonetheless made, and a request count that skipped it would under-report every run driven by
+    // a model implementation that does not fill usage in.
     assert_eq!(generations[0].number("usage.input_tokens"), 0);
-    assert_eq!(generations[0].number("usage.requests"), 0);
+    assert_eq!(generations[0].number("usage.requests"), 1);
     assert_eq!(generations[1].number("usage.requests"), 1);
     assert_eq!(generations[1].number("usage.input_tokens"), 100);
     assert_eq!(generations[1].number("usage.cached_input_tokens"), 80);
@@ -502,7 +503,7 @@ async fn generation_span_records_normalized_usage() {
     // kind, which is exactly why the request count is recorded next to the tokens: without it a
     // report cannot tell one expensive call from several cheap ones.
     let agent = spans.only("agent");
-    assert_eq!(agent.number("usage.requests"), 1);
+    assert_eq!(agent.number("usage.requests"), 2);
     assert_eq!(agent.number("usage.input_tokens"), 100);
     assert_eq!(agent.number("usage.output_tokens"), 20);
     assert_eq!(agent.field("finish.reason"), Some("final"));

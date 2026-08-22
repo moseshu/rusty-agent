@@ -29,7 +29,8 @@ fn test_cache_hit_rate_from_usage_record() {
 fn test_cache_hit_rate_is_answerable_for_a_single_request() {
     let cold_start = RequestUsage::new(1000, 50);
     let warm = RequestUsage::new(1200, 40).with_cached_input_tokens(1000);
-    let run = Usage::from_request(cold_start.clone()).accumulate(&Usage::from_request(warm.clone()));
+    let run =
+        Usage::from_request(cold_start.clone()).accumulate(&Usage::from_request(warm.clone()));
 
     assert_eq!(calculate_cache_hit_rate_from_request(&cold_start), 0.0);
     assert!(calculate_cache_hit_rate_from_request(&warm) > 0.83);

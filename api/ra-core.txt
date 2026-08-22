@@ -581,6 +581,7 @@ const fn ra_core::usage::RequestUsage::with_cached_input_tokens(mut self, tokens
 const fn ra_core::usage::RequestUsage::with_reasoning_tokens(mut self, tokens : u64) -> Self
 const fn ra_core::usage::Usage::cache_write_tokens(& self) -> u64
 const fn ra_core::usage::Usage::cached_input_tokens(& self) -> u64
+const fn ra_core::usage::Usage::carried_total_tokens(& self) -> u64
 const fn ra_core::usage::Usage::input_tokens(& self) -> u64
 const fn ra_core::usage::Usage::output_tokens(& self) -> u64
 const fn ra_core::usage::Usage::reasoning_tokens(& self) -> u64

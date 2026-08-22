@@ -6,9 +6,23 @@
 //!
 //! `tests/` **is committed**, so its absence does not mean "not on this machine" but a broken
 //! checkout — that is a FAIL, not a skip.
+//!
+//! # Which runner
+//!
+//! `cargo test` by default; `cargo nextest run` when `RA_TEST_RUNNER=nextest` asks for it. Both run
+//! every case here — the one thing nextest does not run is doctests, and the hosts under `tests/`
+//! hold no product code to document, their `src/lib.rs` files being empty by design.
+//!
+//! **Opting in rather than detecting** is deliberate. On the machine this was developed on, a full
+//! `cargo nextest run` over this workspace repeatedly stopped in its list phase: the binaries it had
+//! spawned to enumerate tests sat sleeping at zero percent CPU indefinitely, while the same command
+//! against a single host finished instantly. The cause is not established — it reproduces at scale
+//! and not below it — so the default stays on the runner that demonstrably completes. A gate that
+//! hangs is worse than a gate that is merely slower, and a runner nobody can explain should not be
+//! the one a fresh checkout gets silently.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::gate::Outcome;
 use crate::source;
@@ -16,7 +30,65 @@ use crate::source;
 /// The host for cross-crate contracts; it corresponds to no single crate under test.
 const CROSS_CRATE_HOST: &str = "it-e2e";
 
-/// Runs the gate. `args` passes through to `cargo test` (for example `-p it-core`).
+/// Which runner executed the suite.
+///
+/// The gate reports it. A gate that quietly switches runners is one whose green cannot be compared
+/// with yesterday's — and the two differ in what they *skip*, not only in how fast they are.
+enum Runner {
+    /// `cargo nextest run`: one process per test, parallel across binaries.
+    Nextest,
+    /// `cargo test`: the built-in harness, which runs the binaries one after another.
+    Cargo,
+}
+
+impl Runner {
+    /// Reads the requested runner, falling back to the built-in harness.
+    ///
+    /// An unavailable nextest is **not** silently downgraded: someone who asked for it and got the
+    /// slow path anyway would conclude the tool does nothing, so the absence is reported and the
+    /// suite still runs.
+    fn select(cargo: &str) -> (Self, Option<String>) {
+        let requested = std::env::var("RA_TEST_RUNNER").unwrap_or_default();
+        if !requested.eq_ignore_ascii_case("nextest") {
+            return (Self::Cargo, None);
+        }
+        let available = Command::new(cargo)
+            .args(["nextest", "--version"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if available {
+            (Self::Nextest, None)
+        } else {
+            (
+                Self::Cargo,
+                Some(
+                    "RA_TEST_RUNNER=nextest 但没装 cargo-nextest，已退回 cargo test\
+                     （装：cargo install cargo-nextest --locked）"
+                        .to_owned(),
+                ),
+            )
+        }
+    }
+
+    /// The subcommand this runner is invoked with.
+    fn command(&self) -> &'static [&'static str] {
+        match self {
+            Self::Nextest => &["nextest", "run"],
+            Self::Cargo => &["test"],
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Nextest => "nextest",
+            Self::Cargo => "cargo test",
+        }
+    }
+}
+
+/// Runs the gate. `args` passes through to the runner (for example `-p it-core`).
 pub(crate) fn run(args: &[String]) -> Outcome {
     let manifest = source::workspace_root().join("tests").join("Cargo.toml");
     if !manifest.is_file() {
@@ -32,8 +104,12 @@ pub(crate) fn run(args: &[String]) -> Outcome {
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let status = Command::new(cargo)
-        .arg("test")
+    let (runner, note) = Runner::select(&cargo);
+    if let Some(note) = &note {
+        eprintln!("{note}");
+    }
+    let status = Command::new(&cargo)
+        .args(runner.command())
         .arg("--manifest-path")
         .arg(&manifest)
         .args(args)
@@ -41,9 +117,11 @@ pub(crate) fn run(args: &[String]) -> Outcome {
         .status();
 
     match status {
-        Ok(status) if status.success() => Outcome::pass("测试 workspace 全绿"),
-        Ok(status) => Outcome::Fail(vec![format!("cargo test 退出码 {status}")]),
-        Err(err) => Outcome::Fail(vec![format!("无法启动 cargo test：{err}")]),
+        Ok(status) if status.success() => {
+            Outcome::pass(format!("测试 workspace 全绿（{}）", runner.label()))
+        }
+        Ok(status) => Outcome::Fail(vec![format!("{} 退出码 {status}", runner.label())]),
+        Err(err) => Outcome::Fail(vec![format!("无法启动 {}：{err}", runner.label())]),
     }
 }
 

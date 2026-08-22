@@ -3,8 +3,8 @@
 # 分离的原因：insta / wiremock / rstest 这类测试专用依赖不该出现在主 workspace 的
 # 依赖图里。主仓库 `cargo build --workspace` 与 `cargo tree` 因此只看得到产品依赖。
 #
-# 运行：cargo test --manifest-path tests/Cargo.toml
-# 或：  cargo xtask test
+# 运行：cargo xtask test（或 cargo test --manifest-path tests/Cargo.toml）
+# 跑得慢的三条对策见 README.md「为什么慢」。
 [workspace]
 resolver = "3"
 # 个人实验，不是正式测试宿主；它有自己的 Cargo.toml，不 exclude 会被 cargo 认成
@@ -27,3 +27,12 @@ members = [
     "it-coding",
     "it-e2e",
 ]
+
+# 每个测试文件是一个独立二进制，这里有五十多个，所以**链接时间是这个 workspace 的
+# 主要成本**，而调试信息是链接器要搬运的最大一块。关掉它：断言失败照样打印
+# `文件:行`（那来自 panic location，与调试信息无关），代价只是 backtrace 里没有行号
+# ——真要用调试器时临时 `--config profile.dev.debug=2` 即可。
+#
+# 只在测试 workspace 关。主 workspace 编的是要交付的库，那边保持默认。
+[profile.dev]
+debug = 0

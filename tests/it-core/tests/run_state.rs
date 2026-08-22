@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use ra_core::{
     agent::AgentSpec,
-    budget::BudgetSnapshot,
+    budget::{BudgetLimit, BudgetSnapshot},
     compat::SchemaVersion,
     context::RunContext,
     finish::FinishReason,
@@ -434,4 +434,46 @@ fn test_usage_ledger_projects_into_a_read_only_context() {
     assert_eq!(context.usage_totals(), state.usage_totals());
     assert_eq!(context.usage_totals().requests(), 1);
     assert_eq!(context.usage_totals().reasoning_tokens(), 20);
+}
+
+/// A checkpoint written while the budget still counted tokens itself must not hand the run that
+/// resumes from it a fresh allowance. The spend moves into the ledger on the way in, and it is not
+/// re-counted when that state is written out and read back.
+#[test]
+fn test_run_state_migrates_pre_ledger_token_spend_into_the_usage_ledger() {
+    let legacy = r#"{
+        "schema_version": 1,
+        "run_id": "run-legacy",
+        "next_host_event_seq": 4,
+        "budget": { "schema_version": 1, "turns_used": 3, "tokens_used": 12000 }
+    }"#;
+
+    let restored: RunState = serde_json::from_str(legacy).expect("legacy state must deserialize");
+
+    assert_eq!(restored.budget().turns_used(), 3);
+    assert_eq!(restored.tokens_used(), 12_000);
+    assert_eq!(restored.usage_totals().carried_total_tokens(), 12_000);
+    assert_eq!(restored.usage_totals().requests(), 0);
+    assert_eq!(
+        restored.remaining_tokens(&BudgetLimit::new().with_max_tokens(20_000)),
+        Some(8_000)
+    );
+
+    // Written back, the spend is stated by the ledger and the old field is gone — so a second pass
+    // through this migration cannot add it again.
+    let rewritten = serde_json::to_value(&restored).expect("state must serialize");
+    assert!(rewritten["budget"].get("tokens_used").is_none());
+    assert_eq!(rewritten["usage_totals"]["carried_total_tokens"], 12_000);
+
+    let round_tripped: RunState =
+        serde_json::from_value(rewritten).expect("state must deserialize again");
+    assert_eq!(round_tripped.tokens_used(), 12_000);
+    assert_eq!(round_tripped, restored);
+
+    // Calls made after the resume add to the carried spend rather than replacing it.
+    let mut continued = round_tripped;
+    continued.record_usage(&Usage::from_request(RequestUsage::new(500, 100)));
+    assert_eq!(continued.tokens_used(), 12_600);
+    assert_eq!(continued.usage_totals().requests(), 1);
+    assert_eq!(continued.usage_totals().input_tokens(), 500);
 }

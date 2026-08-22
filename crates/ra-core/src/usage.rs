@@ -198,6 +198,8 @@ pub struct Usage {
     cache_write_tokens: u64,
     #[serde(default)]
     reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    carried_total_tokens: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     request_usage_entries: Vec<RequestUsage>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
@@ -208,10 +210,21 @@ const fn usage_schema_version() -> SchemaVersion {
     USAGE_SCHEMA_VERSION
 }
 
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl Usage {
     /// Creates a ledger holding exactly one request.
+    ///
+    /// Counters this build does not recognize are **lifted onto the ledger as well as kept on the
+    /// entry**. A totals-only projection drops the entries, and a provider counter that lived only
+    /// there would disappear with them — which is the opposite of what retaining unknown fields is
+    /// for. Lifting keeps the newest observation reachable at the level that survives.
     #[must_use]
     pub fn from_request(request: RequestUsage) -> Self {
+        let mut unknown = Unknown::new();
+        unknown.extend_from(&request.unknown);
         Self {
             schema_version: USAGE_SCHEMA_VERSION,
             requests: 1,
@@ -220,8 +233,23 @@ impl Usage {
             cached_input_tokens: request.cached_input_tokens,
             cache_write_tokens: request.cache_write_tokens,
             reasoning_tokens: request.reasoning_tokens,
+            carried_total_tokens: 0,
             request_usage_entries: vec![request],
-            unknown: Unknown::new(),
+            unknown,
+        }
+    }
+
+    /// Creates a ledger describing spend inherited from a record that did not itemize it.
+    ///
+    /// The only caller is the migration that reads a checkpoint written when the budget counted
+    /// tokens itself: that record states a total and nothing about how it split, so the total
+    /// arrives here rather than being attributed to input or output tokens it was never known to
+    /// be. See [`Self::carried_total_tokens`].
+    #[must_use]
+    pub(crate) fn from_carried_total(total_tokens: u64) -> Self {
+        Self {
+            carried_total_tokens: total_tokens,
+            ..Self::default()
         }
     }
 
@@ -262,10 +290,12 @@ impl Usage {
         self.output_tokens
     }
 
-    /// Sum of input and output tokens.
+    /// Sum of input and output tokens, plus any spend carried in without a split.
     #[must_use]
     pub const fn total_tokens(&self) -> u64 {
-        self.input_tokens.saturating_add(self.output_tokens)
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.carried_total_tokens)
     }
 
     /// Input tokens served from cache.
@@ -284,6 +314,17 @@ impl Usage {
     #[must_use]
     pub const fn reasoning_tokens(&self) -> u64 {
         self.reasoning_tokens
+    }
+
+    /// Spend inherited from a record that stated a total without saying how it split.
+    ///
+    /// It counts in [`Self::total_tokens`], which is what a budget meters, and deliberately not in
+    /// [`Self::input_tokens`] or [`Self::output_tokens`]: attributing it to either would put a
+    /// number nobody measured into the denominator of every cache-hit rate computed from this
+    /// ledger. A run that never resumed from a pre-ledger checkpoint has zero here.
+    #[must_use]
+    pub const fn carried_total_tokens(&self) -> u64 {
+        self.carried_total_tokens
     }
 
     /// Adds `delta` onto this ledger, saturating on overflow.
@@ -314,6 +355,9 @@ impl Usage {
             .cache_write_tokens
             .saturating_add(delta.cache_write_tokens);
         merged.reasoning_tokens = self.reasoning_tokens.saturating_add(delta.reasoning_tokens);
+        merged.carried_total_tokens = self
+            .carried_total_tokens
+            .saturating_add(delta.carried_total_tokens);
         merged
             .request_usage_entries
             .extend(delta.request_usage_entries.iter().cloned());
@@ -352,6 +396,7 @@ impl Default for Usage {
             cached_input_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            carried_total_tokens: 0,
             request_usage_entries: Vec::new(),
             unknown: Unknown::new(),
         }

@@ -40,10 +40,56 @@ tests/
 ## 运行
 
 ```bash
-cargo test --manifest-path tests/Cargo.toml            # 全部
-cargo test --manifest-path tests/Cargo.toml -p it-core # 单个
-cargo xtask test                                        # 等价封装
+cargo xtask test                                        # 全部（推荐入口）
+cargo xtask test -p it-core                             # 单个宿主
 ```
+
+默认用 `cargo test`。门禁输出会写明用的是哪个 runner，免得两次绿没有可比性。
+
+直接用 cargo 也一样：
+
+```bash
+cargo test --manifest-path tests/Cargo.toml -p it-core
+```
+
+### 为什么慢，以及能做什么
+
+这里是**五十多个独立测试二进制**，断言本身几乎不花时间（日志里满屏
+`finished in 0.00s`），成本全在编译链接和一个个起进程上。
+
+1. **`[profile.dev] debug = 0`**（已配在 `tests/Cargo.toml`）。调试信息是链接器要搬
+   运的最大一块，关掉直接砍链接时间，顺带让 `tests/target` 不再动辄几十 GB。断言失败
+   照样打印 `文件:行`（那来自 panic location），只是 backtrace 没有行号；要用调试器时
+   临时 `--config profile.dev.debug=2`。
+
+2. **每个新链接出来的二进制，首次执行要多花十几秒**。这是 macOS 对未签名 / 未公证可执行
+   文件在首次运行时的在线校验，实测形态很清楚（数字来自一台开发机）：
+
+   | 场景 | 耗时 |
+   | --- | --- |
+   | 刚链接出来、首次执行 | ~18s，全程 0% CPU |
+   | 同一个二进制再跑 | 0.008s |
+   | 同样的内容换个路径 | ~1s（按内容缓存，不按路径） |
+
+   一次 `ra-core` 改动会重链五十多个二进制，于是 **≈16 分钟纯等待**，与测试本身无关；只改
+   一个测试文件则只重链那一个。**系统设置 → 隐私与安全性 → 开发者工具**里给终端开豁免，
+   实测**不能**消掉这一项（它管的是"允许运行不满足策略的软件"，不是那次在线查询）。真正
+   有效的方向是让这台机器到 Apple 校验端点的网络通畅——代理 / VPN / 防火墙拦住时就是这种
+   固定十几秒的超时形态。
+
+3. **[cargo-nextest](https://nexte.st) 是 opt-in 的**（`cargo install cargo-nextest --locked`，
+   配置在 `tests/.config/nextest.toml`）：
+
+   ```bash
+   RA_TEST_RUNNER=nextest cargo xtask test
+   ```
+
+   它跨二进制并行，正好治这里"进程启停占大头"的病。**默认不启用**：在这台机器上整仓跑它
+   会停在 list 阶段——枚举用的子进程 0% CPU 无限期挂着，而只跑单个宿主时秒回。原因未查明，
+   只在规模上来时复现。挂住的门禁比慢的门禁更糟，所以默认留给 `cargo test`。
+
+4. **迭代时只跑受影响的宿主**，全量留给提交前那一次。注意 `-p it-core` 与全量构建的
+   feature 合并结果不同，来回切会触发重编——同一轮里固定一种选择最省。
 
 ## 测私有项怎么办
 

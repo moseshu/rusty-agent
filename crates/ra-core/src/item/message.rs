@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::{ContentBlock, ModelInputItem, OutputPhase, RunItem};
 use crate::{
     compat::{SchemaVersion, Unknown},
-    usage::Usage,
+    usage::{RequestUsage, Usage},
 };
 
 /// Current message schema version.
@@ -179,7 +179,7 @@ pub struct ModelResponse {
     schema_version: SchemaVersion,
     #[serde(default)]
     output: Vec<RunItem>,
-    #[serde(default)]
+    #[serde(default = "one_request_of_unknown_cost")]
     usage: Usage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response_id: Option<String>,
@@ -189,14 +189,34 @@ pub struct ModelResponse {
     unknown: Unknown,
 }
 
+/// One request whose cost was not reported.
+///
+/// Both the constructor default and the deserialization default, so a response restored from a
+/// record written before usage was carried says the same thing as one built without it: a call
+/// happened, and what it cost is unknown.
+fn one_request_of_unknown_cost() -> Usage {
+    Usage::from_request(RequestUsage::default())
+}
+
 impl ModelResponse {
-    /// Creates a model response.
+    /// Creates a model response, counted as one request whose cost is not yet known.
+    ///
+    /// The count starts at one rather than zero because a response exists only where a request was
+    /// made, and an adapter that never calls [`Self::with_usage`] — every implementation written
+    /// against this type before it carried a ledger — would otherwise complete calls that no total
+    /// ever counted. Starting at zero puts the burden of stating the obvious on every
+    /// implementer and fails silently when one forgets, which is the worse of the two defaults.
+    ///
+    /// [`Self::with_usage`] replaces it, so an adapter that knows the cost reports it, and one that
+    /// spent more than one request on this response says so. A response synthesized without a
+    /// provider call behind it — a replay, or a stub — states that with
+    /// `with_usage(Usage::default())`.
     #[must_use]
     pub fn new(output: Vec<RunItem>) -> Self {
         Self {
             schema_version: MODEL_RESPONSE_SCHEMA_VERSION,
             output,
-            usage: Usage::default(),
+            usage: one_request_of_unknown_cost(),
             response_id: None,
             request_id: None,
             unknown: Unknown::new(),

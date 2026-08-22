@@ -407,8 +407,16 @@ impl PendingControlRequest {
 /// fields, while optional framework-owned extensions are populated with serde defaults; callers
 /// pass the complete value through the runner's request API so a resumed run cannot accidentally
 /// reset part of its accounting.
+///
+/// # Reading one written by an older build
+///
+/// Deserialization goes through [`RunStateRecord`], which exists so that spend recorded under an
+/// earlier layout still counts. That is the whole of the migration, and it is on the way in rather
+/// than at a call site, because a resumed run that has to remember to migrate is a resumed run that
+/// silently gets its allowance back the day someone forgets.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RunStateRecord")]
 pub struct RunState {
     #[serde(default = "run_state_schema_version")]
     schema_version: SchemaVersion,
@@ -436,6 +444,92 @@ pub struct RunState {
     pending_control_requests: Vec<PendingControlRequest>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+}
+
+/// What a checkpoint literally contains, before this build's invariants are applied to it.
+///
+/// **It mirrors [`RunState`] field for field** and exists only to give deserialization a place to
+/// run afterwards. A field added to one and not the other is caught by the round-trip test that
+/// populates every slot: the missing field comes back defaulted and the comparison fails.
+///
+/// The one thing it does is move token spend that an older layout kept on the budget snapshot into
+/// the usage ledger, which is where every ceiling is now measured. Without it a continuation from
+/// such a checkpoint starts its token accounting at zero — spend already paid for, invisible, and a
+/// budget that stops the run at twice what it was given.
+#[derive(Deserialize)]
+struct RunStateRecord {
+    #[serde(default = "run_state_schema_version")]
+    schema_version: SchemaVersion,
+    run_id: RunId,
+    next_host_event_seq: u64,
+    #[serde(default)]
+    tool_use: ToolUseTracker,
+    #[serde(default)]
+    tool_failure: ToolFailureTracker,
+    #[serde(default)]
+    budget: BudgetSnapshot,
+    #[serde(default)]
+    finish_reason: Option<FinishReason>,
+    #[serde(default)]
+    nested_runs: Vec<NestedRunRef>,
+    #[serde(default)]
+    workspace_lease: Option<WorkspaceLeaseRef>,
+    #[serde(default)]
+    work_state_ref: Option<WorkStateRef>,
+    #[serde(default)]
+    graph_cursor: Option<GraphCursor>,
+    #[serde(default)]
+    usage_totals: Usage,
+    #[serde(default)]
+    pending_control_requests: Vec<PendingControlRequest>,
+    #[serde(flatten, default)]
+    unknown: Unknown,
+}
+
+impl From<RunStateRecord> for RunState {
+    fn from(record: RunStateRecord) -> Self {
+        let RunStateRecord {
+            schema_version,
+            run_id,
+            next_host_event_seq,
+            tool_use,
+            tool_failure,
+            mut budget,
+            finish_reason,
+            nested_runs,
+            workspace_lease,
+            work_state_ref,
+            graph_cursor,
+            mut usage_totals,
+            pending_control_requests,
+            unknown,
+        } = record;
+
+        // Carried in as a total with no split, because that is all the older record said. It counts
+        // against the token ceiling and stays out of the input and output counters that cache
+        // metrics divide by.
+        let carried = budget.take_legacy_tokens_used();
+        if carried > 0 {
+            usage_totals = usage_totals.accumulate(&Usage::from_carried_total(carried));
+        }
+
+        Self {
+            schema_version,
+            run_id,
+            next_host_event_seq,
+            tool_use,
+            tool_failure,
+            budget,
+            finish_reason,
+            nested_runs,
+            workspace_lease,
+            work_state_ref,
+            graph_cursor,
+            usage_totals,
+            pending_control_requests,
+            unknown,
+        }
+    }
 }
 
 impl RunState {
@@ -576,9 +670,21 @@ impl RunState {
         &self.budget
     }
 
-    /// Replaces budget accounting while preserving all other run state.
+    /// Replaces turn accounting while preserving all other run state.
+    ///
+    /// A snapshot restored on its own from a pre-ledger checkpoint carries token spend that belongs
+    /// in the ledger, so it is moved here too. Otherwise the migration would depend on which of the
+    /// two doors the value came through — deserializing the whole state, or deserializing a
+    /// snapshot and attaching it — and only one of them would charge the run for what it spent.
     #[must_use]
     pub fn with_budget(mut self, budget: BudgetSnapshot) -> Self {
+        let mut budget = budget;
+        let carried = budget.take_legacy_tokens_used();
+        if carried > 0 {
+            self.usage_totals = self
+                .usage_totals
+                .accumulate(&Usage::from_carried_total(carried));
+        }
         self.budget = budget;
         self
     }
