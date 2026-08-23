@@ -7,6 +7,7 @@ async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :
 async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
+async fn ra_core::model::retry::policy::ModelRetryPolicy::evaluate(& self, context : & RetryPolicyContext < '_ >) -> RetryDecision
 async fn ra_core::prompt::DynamicPromptHandler::resolve(& self, context : & RunContext) -> Result < ResolvedPrompt >
 async fn ra_core::session::port::Session::add_items(& self, items : Vec < RunItem >) -> Result < () >
 async fn ra_core::session::port::Session::clear(& self) -> Result < () >
@@ -357,6 +358,19 @@ const fn ra_core::model::retry::normalized::NormalizedProviderError::with_replay
 const fn ra_core::model::retry::normalized::NormalizedProviderError::with_retry_after(mut self, retry_after : Duration) -> Self
 const fn ra_core::model::retry::normalized::NormalizedProviderError::with_should_retry(mut self, should_retry : bool) -> Self
 const fn ra_core::model::retry::normalized::NormalizedProviderError::with_status_code(mut self, status_code : u16) -> Self
+const fn ra_core::model::retry::policy::RetryDecision::delay(& self) -> Option < Duration >
+const fn ra_core::model::retry::policy::RetryDecision::no_retry() -> Self
+const fn ra_core::model::retry::policy::RetryDecision::replay_approved(& self) -> bool
+const fn ra_core::model::retry::policy::RetryDecision::retry() -> Self
+const fn ra_core::model::retry::policy::RetryDecision::should_retry(& self) -> bool
+const fn ra_core::model::retry::policy::RetryDecision::with_delay(mut self, delay : Duration) -> Self
+const fn ra_core::model::retry::policy::RetryDecision::with_replay_approval(mut self) -> Self
+const fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::attempt(& self) -> u32
+const fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::error(& self) -> & Error
+const fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::is_streaming(& self) -> bool
+const fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::max_retries(& self) -> u32
+const fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::new(error : & 'a Error, attempt : u32, max_retries : u32, streaming : bool, provider_advice : Option < & 'a RetryAdvice >) -> Self
+const fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::provider_advice(& self) -> Option < & RetryAdvice >
 const fn ra_core::model::settings::Effort::label(self) -> & 'static str
 const fn ra_core::model::settings::McpToolChoice::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::settings::McpToolChoice::unknown(& self) -> & Unknown
@@ -682,6 +696,10 @@ const ra_core::trace::field::MCP_SERVER: & str
 const ra_core::trace::field::MODEL_NAME: & str
 const ra_core::trace::field::MODEL_PROVIDER: & str
 const ra_core::trace::field::OUTCOME: & str
+const ra_core::trace::field::RETRY_ATTEMPT: & str
+const ra_core::trace::field::RETRY_DELAY_MS: & str
+const ra_core::trace::field::RETRY_MAX: & str
+const ra_core::trace::field::RETRY_REASON: & str
 const ra_core::trace::field::SPAN_KIND: & str
 const ra_core::trace::field::SPAN_LABEL: & str
 const ra_core::trace::field::TOOL_ADMISSION_WAIT_MS: & str
@@ -1070,7 +1088,9 @@ fn ra_core::model::resolution::ResolvedModel::into_model(self) -> Arc < dyn Mode
 fn ra_core::model::resolution::ResolvedModel::new(selector : ModelSelector, model : Arc < dyn Model >, provider_defaults : ModelSettings, model_defaults : ModelSettings) -> Self
 fn ra_core::model::resolution::ResolvedModel::resolve_settings(& self, agent_defaults : & ModelSettings, run_overrides : & ModelSettings) -> ResolvedModelSettings
 fn ra_core::model::retry::ModelRetrySettings::new() -> Self
+fn ra_core::model::retry::ModelRetrySettings::policy(& self) -> Option < & dyn ModelRetryPolicy >
 fn ra_core::model::retry::ModelRetrySettings::with_backoff(mut self, backoff : RetryBackoffSettings) -> Self
+fn ra_core::model::retry::ModelRetrySettings::with_policy(mut self, policy : Arc < dyn ModelRetryPolicy >) -> Self
 fn ra_core::model::retry::RetryAdvice::reason(& self) -> Option < & str >
 fn ra_core::model::retry::RetryAdvice::with_reason(mut self, reason : impl Into < String >) -> Self
 fn ra_core::model::retry::RetryBackoffSettings::new() -> Self
@@ -1089,6 +1109,9 @@ fn ra_core::model::retry::normalized::NormalizedProviderError::with_request_id(m
 fn ra_core::model::retry::normalized::NormalizedProviderError::with_source(mut self, source : impl Into < BoxError >) -> Self
 fn ra_core::model::retry::normalized::replay_safety_of(error : & Error) -> ReplaySafety
 fn ra_core::model::retry::normalized::stamp_replay_safety(error : Error, replay_safety : ReplaySafety) -> Error
+fn ra_core::model::retry::policy::RetryDecision::reason(& self) -> Option < & str >
+fn ra_core::model::retry::policy::RetryDecision::with_reason(mut self, reason : impl Into < String >) -> Self
+fn ra_core::model::retry::policy::RetryPolicyContext < 'a >::normalized(& self) -> Option < & NormalizedProviderError >
 fn ra_core::model::settings::McpToolChoice::name(& self) -> & str
 fn ra_core::model::settings::McpToolChoice::new(server : impl Into < String >, name : impl Into < String >) -> Self
 fn ra_core::model::settings::McpToolChoice::server(& self) -> & str
@@ -1393,6 +1416,7 @@ mod ra_core::model::resolution
 mod ra_core::model::retry
 mod ra_core::model::retry::backoff
 mod ra_core::model::retry::normalized
+mod ra_core::model::retry::policy
 mod ra_core::model::settings
 mod ra_core::model::stream
 mod ra_core::permission
@@ -1509,6 +1533,12 @@ struct ra_core::model::retry::RetryBackoffSettings
 struct ra_core::model::retry::backoff::JitterSample
 struct ra_core::model::retry::backoff::RetryBackoff
 struct ra_core::model::retry::normalized::NormalizedProviderError
+struct ra_core::model::retry::policy::NetworkErrorRetryPolicy
+struct ra_core::model::retry::policy::NeverRetryPolicy
+struct ra_core::model::retry::policy::ProviderSuggestedRetryPolicy
+struct ra_core::model::retry::policy::RetryAfterPolicy
+struct ra_core::model::retry::policy::RetryDecision
+struct ra_core::model::retry::policy::RetryPolicyContext
 struct ra_core::model::settings::McpToolChoice
 struct ra_core::model::settings::ModelSettings
 struct ra_core::model::settings::ProviderKey
@@ -1572,6 +1602,7 @@ trait ra_core::event::sink::HostEventSink
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
+trait ra_core::model::retry::policy::ModelRetryPolicy
 trait ra_core::prompt::DynamicPromptHandler
 trait ra_core::session::port::Session
 trait ra_core::state::work::WorkStateHandle

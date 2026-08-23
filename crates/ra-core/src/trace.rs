@@ -119,6 +119,14 @@ pub mod field {
     pub const MODEL_PROVIDER: &str = "model.provider";
     /// Protocol path: `responses` / `chat` / `messages` / `compat`.
     pub const GEN_PROTOCOL: &str = "gen.protocol";
+    /// Zero-based physical request attempt within one logical model call.
+    pub const RETRY_ATTEMPT: &str = "retry.attempt";
+    /// Retry attempts allowed after the initial request for this logical call.
+    pub const RETRY_MAX: &str = "retry.max";
+    /// Delay before the selected retry, in milliseconds.
+    pub const RETRY_DELAY_MS: &str = "retry.delay_ms";
+    /// Stable policy or provider reason for the selected retry.
+    pub const RETRY_REASON: &str = "retry.reason";
     /// Provider requests the usage figures on this span cover.
     ///
     /// Usually 1 on a `generation` and the number of calls below it on an enclosing span. It is
@@ -206,6 +214,10 @@ pub mod field {
         MODEL_NAME,
         MODEL_PROVIDER,
         GEN_PROTOCOL,
+        RETRY_ATTEMPT,
+        RETRY_MAX,
+        RETRY_DELAY_MS,
+        RETRY_REASON,
         USAGE_REQUESTS,
         USAGE_INPUT_TOKENS,
         USAGE_CACHED_INPUT_TOKENS,

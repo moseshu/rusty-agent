@@ -95,6 +95,7 @@ portable-pty = "0.9"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting"] }
 httpdate = "1"
+rand = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
 
 # --- 宏 ---

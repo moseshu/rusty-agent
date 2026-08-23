@@ -1,19 +1,19 @@
 //! Retry configuration, provider evidence, and the delay arithmetic they feed.
 //!
-//! Three layers, kept apart on purpose:
+//! Four layers, kept apart on purpose:
 //!
 //! | Layer | Type | Who owns it |
 //! | --- | --- | --- |
 //! | Configuration | [`ModelRetrySettings`], [`RetryBackoffSettings`] | the caller, through settings resolution |
 //! | Provider facts | [`NormalizedProviderError`], [`RetryAdvice`] | the adapter that saw the wire failure |
 //! | Arithmetic | [`RetryBackoff`] | this module, so one schedule has one answer |
+//! | Decision | [`ModelRetryPolicy`], [`RetryDecision`] | the host, subject to runtime safety limits |
 //!
-//! What is **not** here is the decision. Whether a particular failure is retried — the veto, the
-//! attempt count, the budget, and the trace record of what was chosen — belongs to the policy that
-//! runs the loop. An adapter reports what happened and what it would suggest; it never decides how
-//! many times the application is willing to pay.
+//! The policy is defined here but executed by the runtime. An adapter reports what happened and
+//! what it would suggest; it never decides how many times the application is willing to pay, and
+//! a policy cannot bypass the runtime's attempt cap, cancellation, or replay boundary.
 
-use std::time::Duration;
+use std::{fmt, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,12 +26,17 @@ use crate::{
 
 pub mod backoff;
 pub mod normalized;
+pub mod policy;
 
 pub use backoff::{
     DEFAULT_INITIAL_DELAY, DEFAULT_MAX_DELAY, DEFAULT_MULTIPLIER, JITTER_RANGE, JitterSample,
     MAX_HONORED_RETRY_AFTER, RetryBackoff,
 };
 pub use normalized::{NormalizedProviderError, replay_safety_of, stamp_replay_safety};
+pub use policy::{
+    ModelRetryPolicy, NetworkErrorRetryPolicy, NeverRetryPolicy, ProviderSuggestedRetryPolicy,
+    RetryAfterPolicy, RetryDecision, RetryPolicyContext,
+};
 
 /// Current model-retry-settings schema version.
 pub const MODEL_RETRY_SETTINGS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
@@ -187,7 +192,7 @@ impl<'a> ModelRetryAdviceRequest<'a> {
 
 /// Runner-managed model retry settings.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelRetrySettings {
     schema_version: SchemaVersion,
@@ -195,6 +200,8 @@ pub struct ModelRetrySettings {
     max_retries: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backoff: Option<RetryBackoffSettings>,
+    #[serde(skip, default)]
+    policy: Option<Arc<dyn ModelRetryPolicy>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -207,11 +214,16 @@ impl ModelRetrySettings {
             schema_version: MODEL_RETRY_SETTINGS_SCHEMA_VERSION,
             max_retries: None,
             backoff: None,
+            policy: None,
             unknown: Unknown::new(),
         }
     }
 
     /// Sets retries allowed after the initial request.
+    ///
+    /// A budget alone does not enable retries; install a [`ModelRetryPolicy`] with
+    /// [`Self::with_policy`] as well. This keeps persisted settings declarative, because policies
+    /// are executable host code that must be explicitly reattached after process recovery.
     #[must_use]
     pub const fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = Some(max_retries);
@@ -222,6 +234,17 @@ impl ModelRetrySettings {
     #[must_use]
     pub fn with_backoff(mut self, backoff: RetryBackoffSettings) -> Self {
         self.backoff = Some(backoff);
+        self
+    }
+
+    /// Sets the runtime-only policy that decides which failures deserve another attempt.
+    ///
+    /// Policies are deliberately omitted from serialization: configuration can persist the retry
+    /// budget and backoff, while executable host code must be reattached when a process resumes.
+    /// Without a reattached policy, even a nonzero [`Self::max_retries`] leaves retries disabled.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<dyn ModelRetryPolicy>) -> Self {
+        self.policy = Some(policy);
         self
     }
 
@@ -243,6 +266,12 @@ impl ModelRetrySettings {
         self.backoff.as_ref()
     }
 
+    /// Runtime-only retry policy, if the caller installed one.
+    #[must_use]
+    pub fn policy(&self) -> Option<&dyn ModelRetryPolicy> {
+        self.policy.as_deref()
+    }
+
     /// Unknown fields retained during deserialization.
     #[must_use]
     pub const fn unknown(&self) -> &Unknown {
@@ -257,11 +286,39 @@ impl ModelRetrySettings {
             override_if_some(&mut target.max_retries, layer.max_retries);
             target.backoff =
                 RetryBackoffSettings::merge([target.backoff.as_ref(), layer.backoff.as_ref()]);
+            if layer.policy.is_some() {
+                target.policy.clone_from(&layer.policy);
+            }
             // A layer written by a newer version carries its additions here. Dropping them would
             // make the merged value quietly less informative than the layer it came from.
             target.unknown.extend_from(&layer.unknown);
         }
         resolved
+    }
+}
+
+impl PartialEq for ModelRetrySettings {
+    fn eq(&self, other: &Self) -> bool {
+        // A policy is executable host code, not persisted configuration. Function and trait-object
+        // identity is neither stable across clones nor meaningful in settings snapshots, so the
+        // serializable settings remain the equality contract.
+        self.schema_version == other.schema_version
+            && self.max_retries == other.max_retries
+            && self.backoff == other.backoff
+            && self.unknown == other.unknown
+    }
+}
+
+impl fmt::Debug for ModelRetrySettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelRetrySettings")
+            .field("schema_version", &self.schema_version)
+            .field("max_retries", &self.max_retries)
+            .field("backoff", &self.backoff)
+            .field("has_policy", &self.policy.is_some())
+            .field("unknown", &self.unknown)
+            .finish()
     }
 }
 

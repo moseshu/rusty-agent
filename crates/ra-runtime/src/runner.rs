@@ -42,14 +42,19 @@ use ra_core::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind,
     },
-    model::{Model, ModelRequest, ModelResolver, ModelSettings, ModelStreamEvent, ModelTracing},
+    model::{
+        Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
+        ModelStreamEvent, ModelTracing, ReplaySafety, RetryAdvice, RetryBackoff, RetryDecision,
+        RetryPolicyContext, replay_safety_of, stamp_replay_safety,
+    },
     state::{EventSeqAllocator, RunId, RunState},
     step::NextStep,
     tool::ToolServices,
     trace::SpanKind,
+    usage::{RequestUsage, Usage},
 };
 use tokio::sync::mpsc;
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info_span, warn};
 
 pub mod result;
 pub mod stream;
@@ -893,6 +898,34 @@ fn live_context(
     }
 }
 
+struct ModelCallAttempt<'a> {
+    turn_scope: &'a CancelScope,
+    model: &'a Arc<dyn Model>,
+    selector: &'a ra_core::model::ModelSelector,
+    events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
+    streamed: bool,
+    attempt: u32,
+    max_retries: u32,
+    retry_trace: Option<RetryTrace>,
+}
+
+/// Facts selected after a failed attempt and recorded on the next physical request's span.
+struct RetryTrace {
+    delay: std::time::Duration,
+    reason: Option<String>,
+}
+
+struct RetryEvaluation<'a> {
+    turn_scope: &'a CancelScope,
+    model: &'a Arc<dyn Model>,
+    request: &'a ModelRequest,
+    error: &'a Error,
+    retry_settings: Option<&'a ra_core::model::ModelRetrySettings>,
+    attempt: u32,
+    max_retries: u32,
+    streamed: bool,
+}
+
 /// Executes one prepared model call and records its provider-neutral terminal facts.
 ///
 /// Whether the call is streamed changes what a subscriber sees while it runs, and nothing else:
@@ -914,13 +947,91 @@ async fn call_model(
     // dispatch path covers every protocol, including the ones whose adapters do not exist yet.
     model_request.validate_cache_plan()?;
 
-    let model_name = selector.model().unwrap_or("<provider_default>");
+    let streamed = context.config.partial_messages && context.events.is_some();
+    let retry_settings = model_request.model_settings().retry().cloned();
+    let max_retries = retry_settings
+        .as_ref()
+        .and_then(ra_core::model::ModelRetrySettings::max_retries)
+        .unwrap_or(0);
+    let mut attempt = 0;
+    let mut failed_attempts = 0;
+    let mut retry_trace = None;
+
+    loop {
+        let response = call_model_attempt(
+            ModelCallAttempt {
+                turn_scope,
+                model: &model,
+                selector: &selector,
+                events: context.events,
+                streamed,
+                attempt,
+                max_retries,
+                retry_trace: retry_trace.take(),
+            },
+            model_request.clone(),
+        )
+        .await;
+        match response {
+            Ok(mut response) => {
+                if failed_attempts > 0 {
+                    let usage = prepend_failed_attempts(response.usage(), failed_attempts);
+                    response = response.with_usage(usage);
+                }
+                return Ok((surface, response));
+            }
+            Err(error) => {
+                let Some((decision, delay)) = evaluate_retry(RetryEvaluation {
+                    turn_scope,
+                    model: &model,
+                    request: &model_request,
+                    error: &error,
+                    retry_settings: retry_settings.as_ref(),
+                    attempt,
+                    max_retries,
+                    streamed,
+                })
+                .await?
+                else {
+                    return Err(error);
+                };
+
+                warn!(
+                    error.code = error.code(),
+                    retry.attempt = attempt + 1,
+                    retry.max = max_retries,
+                    retry.delay_ms = duration_ms(delay),
+                    retry.reason = decision.reason().unwrap_or(""),
+                    "retrying failed model request"
+                );
+                turn_scope.run(tokio::time::sleep(delay)).await?;
+                attempt = attempt.saturating_add(1);
+                failed_attempts = failed_attempts.saturating_add(1);
+                retry_trace = Some(RetryTrace {
+                    delay,
+                    reason: decision.reason().map(str::to_owned),
+                });
+            }
+        }
+    }
+}
+
+/// Executes one physical model request and gives it its own generation span.
+async fn call_model_attempt(
+    attempt: ModelCallAttempt<'_>,
+    model_request: ModelRequest,
+) -> Result<ModelResponse> {
+    let model_name = attempt.selector.model().unwrap_or("<provider_default>");
     let generation_span = info_span!(
         "generation",
         span.kind = SpanKind::Generation.label(),
         model.name = %model_name,
-        model.provider = %selector.provider(),
-        gen.protocol = %selector.protocol(),
+        model.provider = %attempt.selector.provider(),
+        gen.protocol = %attempt.selector.protocol(),
+        retry.attempt = attempt.attempt,
+        retry.max = attempt.max_retries,
+        retry.delay_ms = tracing::field::Empty,
+        retry.reason = tracing::field::Empty,
         outcome = tracing::field::Empty,
         error.code = tracing::field::Empty,
         cancel.reason = tracing::field::Empty,
@@ -933,15 +1044,31 @@ async fn call_model(
         usage.output_tokens = tracing::field::Empty,
         usage.reasoning_tokens = tracing::field::Empty,
     );
+    if let Some(retry_trace) = &attempt.retry_trace {
+        generation_span.record(
+            ra_core::trace::field::RETRY_DELAY_MS,
+            duration_ms(retry_trace.delay),
+        );
+        if let Some(reason) = &retry_trace.reason {
+            generation_span.record(ra_core::trace::field::RETRY_REASON, reason.as_str());
+        }
+    }
     let started = Instant::now();
-    let streamed = context.config.partial_messages && context.events.is_some();
     let response = async {
-        if streamed {
-            turn_scope
-                .run(stream_model_call(&model, model_request, context.events))
+        if attempt.streamed {
+            attempt
+                .turn_scope
+                .run(stream_model_call(
+                    attempt.model,
+                    model_request,
+                    attempt.events,
+                ))
                 .await
         } else {
-            turn_scope.run(model.get_response(model_request)).await
+            attempt
+                .turn_scope
+                .run(attempt.model.get_response(model_request))
+                .await
         }
     }
     .instrument(generation_span.clone())
@@ -955,13 +1082,97 @@ async fn call_model(
         Ok(response) => {
             record_generation_usage(&generation_span, response.usage());
             ra_core::trace::record_outcome(&generation_span, ra_core::trace::SpanOutcome::Ok);
-            Ok((surface, response))
+            Ok(response)
         }
         Err(error) => {
-            record_terminal_error(&generation_span, &error, turn_scope);
+            record_terminal_error(&generation_span, &error, attempt.turn_scope);
             Err(error)
         }
     }
+}
+
+/// Applies the runner-owned retry limits and replay boundary to a policy decision.
+async fn evaluate_retry(
+    input: RetryEvaluation<'_>,
+) -> Result<Option<(RetryDecision, std::time::Duration)>> {
+    if input.attempt >= input.max_retries
+        || input.error.is_cancelled()
+        || !input.error.is_retryable()
+    {
+        return Ok(None);
+    }
+    let Some(settings) = input.retry_settings else {
+        return Ok(None);
+    };
+    let Some(policy) = settings.policy() else {
+        return Ok(None);
+    };
+    let advice = input.model.get_retry_advice(&ModelRetryAdviceRequest::new(
+        input.error,
+        input.attempt,
+        input.streamed,
+        input.request.continuation(),
+    ));
+
+    // `Unsafe` means the adapter knows replay would duplicate accepted output or state. It is a
+    // hard boundary, not a provider preference a policy may overrule.
+    if matches!(
+        advice
+            .as_ref()
+            .map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety),
+        ReplaySafety::Unsafe
+    ) {
+        return Ok(None);
+    }
+    let decision = input
+        .turn_scope
+        .run(policy.evaluate(&RetryPolicyContext::new(
+            input.error,
+            input.attempt,
+            input.max_retries,
+            input.streamed,
+            advice.as_ref(),
+        )))
+        .await?;
+    if !decision.should_retry() {
+        return Ok(None);
+    }
+
+    let safety = advice
+        .as_ref()
+        .map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
+    let stateless_non_streaming =
+        !input.streamed && !input.request.continuation().is_server_managed();
+    if !matches!(safety, ReplaySafety::Safe)
+        && !stateless_non_streaming
+        && !decision.replay_approved()
+    {
+        return Ok(None);
+    }
+
+    let delay = decision.delay().unwrap_or_else(|| {
+        RetryBackoff::from_settings(settings.backoff()).delay(
+            input.attempt,
+            advice
+                .as_ref()
+                .and_then(RetryAdvice::retry_after)
+                .or_else(|| {
+                    ra_core::model::NormalizedProviderError::from_error(input.error)
+                        .and_then(ra_core::model::NormalizedProviderError::retry_after)
+                }),
+            ra_core::model::JitterSample::new(rand::random()),
+        )
+    });
+    Ok(Some((decision, delay)))
+}
+
+/// Adds one zero-cost ledger entry for each request that failed before reporting usage.
+fn prepend_failed_attempts(usage: &Usage, failed_attempts: u32) -> Usage {
+    let mut augmented = Usage::default();
+    for _ in 0..failed_attempts {
+        augmented = augmented.accumulate(&Usage::from_request(RequestUsage::default()));
+    }
+    augmented.accumulate(usage)
 }
 
 /// Drives one streamed model call, forwarding its provider events and returning what it settled to.
@@ -987,11 +1198,21 @@ async fn stream_model_call(
 ) -> Result<ModelResponse> {
     let mut stream = model.stream_response(request);
     let mut settled: Option<ModelResponse> = None;
+    let mut published = false;
     while let Some(event) = stream.next().await {
         // Resolved before the ordering check on purpose. A stream that fails after settling has
         // broken the contract *and* hit something; reporting only the broken contract would name
         // the consequence and lose the cause, which is the one thing this frame carried.
-        let event = event?;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                return Err(if published {
+                    stamp_replay_safety(error, ReplaySafety::Unsafe)
+                } else {
+                    error
+                });
+            }
+        };
         if settled.is_some() {
             return Err(Error::provider(
                 ProviderErrorKind::Behavior,
@@ -999,18 +1220,29 @@ async fn stream_model_call(
             ));
         }
         match event {
-            ModelStreamEvent::RawResponse(raw) => emit(events, RunStreamEvent::RawResponse(raw)),
+            ModelStreamEvent::RawResponse(raw) => {
+                // Once this leaves the model boundary it is visible to the run subscriber. A
+                // replay would duplicate even a harmless-looking `response.created` frame, so
+                // every published raw event closes the retry window for this call.
+                published = events.is_some();
+                emit(events, RunStreamEvent::RawResponse(raw));
+            }
             ModelStreamEvent::Completed(response) => settled = Some(*response),
             // Every other model event is the adapter's own view of items this run publishes itself.
             _ => {}
         }
     }
     settled.ok_or_else(|| {
-        Error::provider(
+        let error = Error::provider(
             ProviderErrorKind::Behavior,
             "the model stream ended without a terminal response, so the turn has no usage, no \
              request identifier and no settled output order",
-        )
+        );
+        if published {
+            stamp_replay_safety(error, ReplaySafety::Unsafe)
+        } else {
+            error
+        }
     })
 }
 

@@ -35,15 +35,16 @@ use futures::{StreamExt, stream};
 use ra_core::{
     agent::{AgentId, AgentSpec, ToolUseBehavior},
     cancel::{CancelReason, CancelScope},
-    error::{Error, Result, ToolErrorKind},
+    error::{Error, ProviderErrorKind, Result, ToolErrorKind},
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
         ToolCall,
     },
     model::{
-        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ProviderKey, ResolvedModel,
+        ApiProtocol, Model, ModelRequest, ModelResolver, ModelRetryPolicy, ModelRetrySettings,
+        ModelSelector, ModelSettings, ModelStream, NormalizedProviderError, ProviderKey,
+        ResolvedModel, RetryBackoffSettings, RetryDecision, RetryPolicyContext,
     },
     state::RunId,
     tool::{
@@ -257,6 +258,23 @@ impl ScriptedModel {
         Arc::new(Self {
             script: Mutex::new(vec![Err(error)]),
         })
+    }
+
+    fn from_results(script: Vec<Result<ModelResponse>>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(script),
+        })
+    }
+}
+
+struct TraceRetryPolicy;
+
+#[async_trait]
+impl ModelRetryPolicy for TraceRetryPolicy {
+    async fn evaluate(&self, _context: &RetryPolicyContext<'_>) -> RetryDecision {
+        RetryDecision::retry()
+            .with_delay(Duration::ZERO)
+            .with_reason("transient_network")
     }
 }
 
@@ -507,6 +525,45 @@ async fn generation_span_records_normalized_usage() {
     assert_eq!(agent.number("usage.input_tokens"), 100);
     assert_eq!(agent.number("usage.output_tokens"), 20);
     assert_eq!(agent.field("finish.reason"), Some("final"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retry_span_records_the_delay_and_reason_on_the_following_attempt() {
+    let model = ScriptedModel::from_results(vec![
+        Err(
+            NormalizedProviderError::new(ProviderErrorKind::Network, "connection reset")
+                .into_error(),
+        ),
+        Ok(ModelResponse::new(vec![message("retry-answer", "done")])),
+    ]);
+    let cancel = CancelScope::root();
+    let retry = ModelRetrySettings::new()
+        .with_max_retries(1)
+        .with_backoff(
+            RetryBackoffSettings::new()
+                .with_initial_delay(Duration::ZERO)
+                .with_jitter(false),
+        )
+        .with_policy(Arc::new(TraceRetryPolicy));
+    let (spans, _text, guard) = capture();
+
+    Runner::run(
+        request(Vec::new(), &model, &cancel)
+            .with_config(RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry))),
+    )
+    .await
+    .expect("the second physical request should succeed");
+    drop(guard);
+
+    let generations = spans.of_kind("generation");
+    assert_eq!(generations.len(), 2, "{generations:?}");
+    assert_eq!(generations[0].field("retry.attempt"), Some("0"));
+    assert_eq!(generations[1].field("retry.attempt"), Some("1"));
+    assert_eq!(generations[1].number("retry.delay_ms"), 0);
+    assert_eq!(
+        generations[1].field("retry.reason"),
+        Some("transient_network")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

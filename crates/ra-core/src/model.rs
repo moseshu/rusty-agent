@@ -30,9 +30,10 @@ pub use request::{
 };
 pub use resolution::{ModelSelector, ResolvedModel};
 pub use retry::{
-    JitterSample, ModelRetryAdviceRequest, ModelRetrySettings, NormalizedProviderError,
-    ReplaySafety, RetryAdvice, RetryBackoff, RetryBackoffSettings, replay_safety_of,
-    stamp_replay_safety,
+    JitterSample, ModelRetryAdviceRequest, ModelRetryPolicy, ModelRetrySettings,
+    NetworkErrorRetryPolicy, NeverRetryPolicy, NormalizedProviderError,
+    ProviderSuggestedRetryPolicy, ReplaySafety, RetryAdvice, RetryAfterPolicy, RetryBackoff,
+    RetryBackoffSettings, RetryDecision, RetryPolicyContext, replay_safety_of, stamp_replay_safety,
 };
 pub use settings::{
     Effort, JsonMap, McpToolChoice, ModelSettings, ProviderKey, ResolvedModelSettings,
