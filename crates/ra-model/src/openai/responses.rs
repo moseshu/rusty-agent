@@ -235,6 +235,7 @@ impl OpenAiResponsesModel {
             facts.into_request_id(),
             request.handoffs(),
             request.model_settings().provider(),
+            &self.model,
         )
     }
 }
@@ -277,6 +278,7 @@ impl Model for OpenAiResponsesModel {
                         Ok(()) => stream::events(
                             super::sse::frames(response, Terminator::default()),
                             provider,
+                            model.model.clone(),
                             handoffs,
                             request_id,
                             unstarted,

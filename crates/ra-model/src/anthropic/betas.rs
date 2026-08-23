@@ -1,1 +1,1 @@
-//! Beta switches: interleaved-thinking / mid-conversation-system / effort.
+//! Beta switches for interleaved thinking, mid-conversation system messages, and effort.

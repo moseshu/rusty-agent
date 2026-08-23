@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 ra-core = { path = "../../crates/ra-core" }
-ra-model = { path = "../../crates/ra-model", features = ["compat"] }
+ra-model = { path = "../../crates/ra-model", features = ["compat", "anthropic"] }
 async-trait = "0.1"
 futures = "0.3"
 insta = { version = "1", features = ["json", "redactions"] }

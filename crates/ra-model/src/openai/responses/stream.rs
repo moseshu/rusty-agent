@@ -46,6 +46,7 @@ const CREATED: &str = "response.created";
 pub(crate) fn events(
     frames: impl Stream<Item = Result<SseFrame>> + Send + 'static,
     provider: ProviderKey,
+    model: String,
     handoffs: Vec<ModelHandoffDefinition>,
     request_id: Option<String>,
     unstarted: ReplaySafety,
@@ -53,6 +54,7 @@ pub(crate) fn events(
     let driver = StreamDriver {
         frames: frames.boxed(),
         provider,
+        model,
         handoffs,
         request_id,
         response_id: None,
@@ -71,6 +73,8 @@ pub(crate) fn events(
 struct StreamDriver {
     frames: BoxStream<'static, Result<SseFrame>>,
     provider: ProviderKey,
+    /// The model that produced reasoning replay material in this stream.
+    model: String,
     handoffs: Vec<ModelHandoffDefinition>,
     /// Transport diagnostics from the response headers, which no frame carries.
     request_id: Option<String>,
@@ -217,6 +221,7 @@ impl StreamDriver {
             usize::try_from(index).unwrap_or(usize::MAX),
             &self.handoffs,
             &self.provider,
+            &self.model,
         )?;
         let name = run_item.kind().label();
         Ok(ModelStreamEvent::RunItem(RunItemStreamEvent::new(
@@ -237,6 +242,7 @@ impl StreamDriver {
             self.request_id.clone(),
             &self.handoffs,
             &self.provider,
+            &self.model,
         )?;
         self.settled = true;
         // `response.completed` is terminal for this protocol. Stop reading at it so the terminal

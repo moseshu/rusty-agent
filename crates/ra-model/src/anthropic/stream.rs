@@ -1,1 +1,1 @@
-//! Anthropic SSE -> `StreamEvent`。
+//! Anthropic SSE to `ModelStreamEvent` conversion.

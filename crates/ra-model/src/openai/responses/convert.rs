@@ -18,6 +18,7 @@ pub(crate) fn convert_response(
     request_id: Option<String>,
     handoffs: &[ModelHandoffDefinition],
     provider: &ProviderKey,
+    model: &str,
 ) -> Result<ModelResponse> {
     if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
         let message = error
@@ -41,6 +42,7 @@ pub(crate) fn convert_response(
             index,
             handoffs,
             provider,
+            model,
         )?);
     }
 
@@ -101,6 +103,7 @@ pub(crate) fn convert_output_item(
     index: usize,
     handoffs: &[ModelHandoffDefinition],
     provider: &ProviderKey,
+    model: &str,
 ) -> Result<RunItem> {
     let item_type = required_str(item, "type", "response output item")?;
     let item_id = item.get("id").and_then(Value::as_str).map_or_else(
@@ -109,7 +112,7 @@ pub(crate) fn convert_output_item(
     );
     let kind = match item_type {
         "message" => RunItemKind::Message(convert_message(item)?),
-        "reasoning" => RunItemKind::Reasoning(convert_reasoning(item)),
+        "reasoning" => RunItemKind::Reasoning(convert_reasoning(item, model)),
         "function_call" => convert_function_call(item, handoffs)?,
         // Hosted-tool items (web search, file search, hosted MCP, image generation) have no
         // protocol-neutral payload yet. They can only appear when `extra_body.tools` requested
@@ -170,13 +173,23 @@ fn convert_message(item: &Value) -> Result<Message> {
     Ok(message)
 }
 
-fn convert_reasoning(item: &Value) -> Reasoning {
+/// Preserves the source model with the provider replay data.
+///
+/// A Chat-compatible endpoint can only replay `reasoning_content` to the model that generated
+/// it. Responses items do not carry that field themselves, so retaining it here lets a later
+/// Chat lowering keep the summary when the model is unchanged while still refusing a cross-model
+/// replay.
+fn convert_reasoning(item: &Value, model: &str) -> Reasoning {
     let summary = text_segments(item.get("summary"));
     let content = text_segments(item.get("content"));
+    let mut provider_data = item.clone();
+    if let Some(data) = provider_data.as_object_mut() {
+        data.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     let mut reasoning = Reasoning::new()
         .with_summary(summary)
         .with_content(content)
-        .with_provider_data(item.clone());
+        .with_provider_data(provider_data);
     if let Some(id) = item.get("id").and_then(Value::as_str) {
         reasoning = reasoning.with_id(id);
     }

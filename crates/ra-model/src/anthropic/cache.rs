@@ -1,1 +1,1 @@
-//! `cache_control` breakpoint plan. The tools array carries no breakpoint; the prefix after system covers it.
+//! `cache_control` breakpoint planning. The tools array carries no breakpoint; the system prefix covers it.
