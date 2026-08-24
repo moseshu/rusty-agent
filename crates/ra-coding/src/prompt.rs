@@ -6,11 +6,11 @@
 //! string its declaration happened to carry, and none of the sectioning, ordering, prefix hashing,
 //! or dump governance would apply to what the model actually receives.
 //!
-//! The per-topic modules alongside this one hold the product's own prompt text. Two are written —
-//! [`personality`] and [`role`] — and the rest are still empty registration slots: writing that
-//! text is a separate piece of work, and filling them with placeholders would freeze wording nobody
-//! has decided on. Each one lands by adding a section to [`assemble_stable_prefix`], which is why
-//! the assembly is a list rather than a hardcoded concatenation.
+//! The per-topic modules alongside this one hold the product's own prompt text. Three are written:
+//! `identity`, [`personality`], and [`role`]. The rest are still empty registration slots: writing
+//! that text is a separate piece of work, and filling them with placeholders would freeze wording
+//! nobody has decided on. Each one lands by adding a section to [`assemble_stable_prefix`], which
+//! is why the assembly is a list rather than a hardcoded concatenation.
 
 pub(crate) mod autonomy;
 pub(crate) mod channels;
@@ -27,6 +27,7 @@ use ra_core::error::Result;
 use ra_core::prompt::PromptRole;
 use ra_prompt::assembler::{PromptAssembler, StablePrefix};
 
+use self::identity::IdentityPromptBuilder;
 use self::personality::PersonalityPromptBuilder;
 use self::role::RolePromptBuilder;
 
@@ -44,6 +45,7 @@ use self::role::RolePromptBuilder;
 pub fn assemble_stable_prefix(role: &PromptRole) -> Result<StablePrefix> {
     PromptAssembler::new()
         .with_sections([
+            IdentityPromptBuilder::build_identity_section()?,
             PersonalityPromptBuilder::build_personality_section()?,
             RolePromptBuilder::build_role_section(role)?,
         ])?

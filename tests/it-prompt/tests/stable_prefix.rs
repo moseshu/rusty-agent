@@ -18,6 +18,13 @@ fn fixture_section(name: PromptSectionName, text: &str) -> ra_core::prompt::Prom
 }
 
 fn build_standard_assembler() -> PromptAssembler {
+    let identity = PromptSectionBuilder::new(PromptSectionName::IDENTITY)
+        .purpose("Agent identity")
+        .source(PromptSource::Builtin)
+        .content("Identity: collaborate in the shared workspace.")
+        .build()
+        .expect("valid identity section");
+
     let core = PromptSectionBuilder::new(PromptSectionName::CORE_BEHAVIOR)
         .purpose("Core behavior")
         .source(PromptSource::Builtin)
@@ -68,6 +75,8 @@ fn build_standard_assembler() -> PromptAssembler {
         .expect("add safety")
         .add_section(durability)
         .expect("add durability")
+        .add_section(identity)
+        .expect("add identity")
         .add_section(core)
         .expect("add core")
         .add_section(personality)
@@ -96,6 +105,7 @@ fn test_stable_prefix_assembly_order_determinism() {
     assert_eq!(
         section_names,
         vec![
+            "identity",
             "core_behavior",
             "tool_use",
             "safety",

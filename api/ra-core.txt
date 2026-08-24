@@ -664,6 +664,7 @@ const ra_core::prompt::PromptSectionName::CORE_BEHAVIOR: Self
 const ra_core::prompt::PromptSectionName::DYNAMIC_INSTRUCTIONS: Self
 const ra_core::prompt::PromptSectionName::EDITING_VERIFICATION: Self
 const ra_core::prompt::PromptSectionName::FINAL_ANSWER: Self
+const ra_core::prompt::PromptSectionName::IDENTITY: Self
 const ra_core::prompt::PromptSectionName::PERSONALITY: Self
 const ra_core::prompt::PromptSectionName::ROLE: Self
 const ra_core::prompt::PromptSectionName::SAFETY: Self

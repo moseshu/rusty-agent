@@ -70,24 +70,26 @@ impl fmt::Debug for StablePrefix {
 
 /// Canonical section order priority.
 fn section_order_rank(name: &PromptSectionName) -> (u8, &str) {
-    if *name == PromptSectionName::CORE_BEHAVIOR {
+    if *name == PromptSectionName::IDENTITY {
         (0, name.as_str())
-    } else if *name == PromptSectionName::TOOL_USE {
+    } else if *name == PromptSectionName::CORE_BEHAVIOR {
         (1, name.as_str())
-    } else if *name == PromptSectionName::SAFETY {
+    } else if *name == PromptSectionName::TOOL_USE {
         (2, name.as_str())
-    } else if *name == PromptSectionName::EDITING_VERIFICATION {
+    } else if *name == PromptSectionName::SAFETY {
         (3, name.as_str())
-    } else if *name == PromptSectionName::FINAL_ANSWER {
+    } else if *name == PromptSectionName::EDITING_VERIFICATION {
         (4, name.as_str())
-    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
+    } else if *name == PromptSectionName::FINAL_ANSWER {
         (5, name.as_str())
-    } else if *name == PromptSectionName::PERSONALITY {
+    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
         (6, name.as_str())
-    } else if *name == PromptSectionName::ROLE {
+    } else if *name == PromptSectionName::PERSONALITY {
         (7, name.as_str())
-    } else {
+    } else if *name == PromptSectionName::ROLE {
         (8, name.as_str())
+    } else {
+        (9, name.as_str())
     }
 }
 

@@ -88,6 +88,22 @@ fn test_the_built_agent_carries_the_assembled_prefix() {
     );
 }
 
+/// Identity is the first stable section so every following instruction inherits its collaboration
+/// and role-neutral completion context.
+#[test]
+fn test_the_product_prefix_begins_with_the_identity_contract() {
+    let prefix = assemble_stable_prefix(&PromptRole::Main).expect("prefix");
+    let identity = prefix
+        .sections()
+        .first()
+        .expect("the product prefix includes an identity section");
+
+    assert_eq!(identity.name().as_str(), "identity");
+    assert!(identity.content().contains("same workspace"));
+    assert!(identity.content().contains("assigned role"));
+    assert!(identity.content().contains("authority and capabilities"));
+}
+
 /// The product's assembled prefix is currently too short for any provider to cache.
 ///
 /// This pins a fact that is otherwise invisible. The floor is 1024 estimated tokens — every

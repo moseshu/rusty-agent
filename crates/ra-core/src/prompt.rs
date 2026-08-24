@@ -140,6 +140,8 @@ impl fmt::Display for SectionPosition {
 pub struct PromptSectionName(Cow<'static, str>);
 
 impl PromptSectionName {
+    /// Agent identity and collaboration contract section.
+    pub const IDENTITY: Self = Self::from_static("identity");
     /// Core agent behavior section.
     pub const CORE_BEHAVIOR: Self = Self::from_static("core_behavior");
     /// Tool usage guidance section.
