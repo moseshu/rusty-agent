@@ -87,6 +87,7 @@ fn ra_exec::fs::RootedFileSystem::open(root : impl AsRef < Path >) -> io :: Resu
 fn ra_exec::fs::RootedFileSystem::open_read(& self, path : & Path) -> Result < File , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::read_to_string(& self, path : & Path, max_bytes : usize) -> Result < (String , bool) , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::remove_file(& self, path : & Path) -> Result < () , RootedOpenError >
+fn ra_exec::fs::RootedFileSystem::rename(& self, from : & Path, to : & Path) -> Result < () , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::write_file(& self, path : & Path, content : & [u8]) -> Result < () , RootedOpenError >
 fn ra_exec::fs::workspace_resource_id(identifier : impl Into < std :: borrow :: Cow < 'static , str > >) -> Result < ra_core :: tool :: ResourceId , ra_core :: error :: Error >
 fn ra_exec::output::ExecOutputSummary::new(stdout : impl Into < String >, stderr : impl Into < String >) -> Self
