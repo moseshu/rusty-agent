@@ -291,7 +291,7 @@ pub(crate) async fn dispatch_tool_with_admission(
     if needs_approval(tool, &options, &request).await? {
         let mut approval = ToolApproval::new(
             request.call_id.clone(),
-            tool.origin().name(),
+            tool.model_definition().name(),
             request.arguments.clone(),
         );
         if let Some(namespace) = tool.origin().namespace() {

@@ -213,6 +213,7 @@ impl fmt::Debug for PreparedTurn {
 #[non_exhaustive]
 pub struct TurnActionSurface {
     tools: Vec<Arc<dyn Tool>>,
+    tool_names: Vec<String>,
     handoffs: Vec<ModelHandoffDefinition>,
 }
 
@@ -223,10 +224,14 @@ impl TurnActionSurface {
     /// it makes the model's call ambiguous, and any resolution order picked here would be an
     /// arbitrary one that silently favours one meaning over the other.
     pub fn new(tools: Vec<Arc<dyn Tool>>, handoffs: Vec<ModelHandoffDefinition>) -> Result<Self> {
-        let mut names = BTreeSet::new();
-        let advertised = tools
+        let tool_names: Vec<String> = tools
             .iter()
-            .map(|tool| tool.origin().name())
+            .map(|tool| tool.model_definition().name().to_owned())
+            .collect();
+        let mut names = BTreeSet::new();
+        let advertised = tool_names
+            .iter()
+            .map(String::as_str)
             .chain(handoffs.iter().map(ModelHandoffDefinition::name));
         for name in advertised {
             if !names.insert(name) {
@@ -236,7 +241,11 @@ impl TurnActionSurface {
                 )));
             }
         }
-        Ok(Self { tools, handoffs })
+        Ok(Self {
+            tools,
+            tool_names,
+            handoffs,
+        })
     }
 
     /// Executable tools this turn advertised.
@@ -254,7 +263,10 @@ impl TurnActionSurface {
     /// Resolves a model-facing name to its executable tool.
     #[must_use]
     pub fn find_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools.iter().find(|tool| tool.origin().name() == name)
+        self.tools
+            .iter()
+            .zip(&self.tool_names)
+            .find_map(|(tool, advertised)| (advertised == name).then_some(tool))
     }
 
     /// Resolves a model-facing name to its handoff definition.
@@ -278,9 +290,9 @@ impl TurnActionSurface {
     /// that fails at the provider, while one dropped for a name it can resolve silently disables a
     /// forced call.
     pub fn advertised_names(&self) -> impl Iterator<Item = &str> {
-        self.tools
+        self.tool_names
             .iter()
-            .map(|tool| tool.origin().name())
+            .map(String::as_str)
             .chain(self.handoffs.iter().map(ModelHandoffDefinition::name))
     }
 }

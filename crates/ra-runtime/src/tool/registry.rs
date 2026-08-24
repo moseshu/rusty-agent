@@ -92,8 +92,11 @@ impl ToolRegistry {
     /// The name check covers the entries that can reach a model surface, not every selected tool:
     /// a name is only ambiguous inside one tool list, and a host-only tool never appears in one.
     /// It is the same rule [`AgentSpec`](ra_core::agent::AgentSpec) applies to the tools it is
-    /// handed, restated here only because this is the point that can name the profile and both
-    /// colliding lookup keys.
+    /// handed — read off the same
+    /// [`model_definition`](ra_core::tool::Tool::model_definition), so a tool that advertises
+    /// itself under a name it does not route under is judged here exactly as it is there —
+    /// restated only because this is the point that can name the profile and both colliding
+    /// lookup keys.
     pub fn assemble(&self, profile: &ToolProfile) -> Result<ToolSurface> {
         let id = profile.id();
         let tools: Vec<Arc<dyn Tool>> = match profile.selection() {
@@ -113,27 +116,33 @@ impl ToolRegistry {
             ToolSelection::AllRegistered => self.entries.values().map(Arc::clone).collect(),
         };
 
-        let mut names: BTreeMap<&str, &ToolLookupKey> = BTreeMap::new();
-        let mut advertised_count = 0;
+        let mut names: BTreeMap<String, &ToolLookupKey> = BTreeMap::new();
+        let mut advertised = Vec::new();
         let mut advertised_bytes = 0;
         for tool in &tools {
-            if tool.options().can_reach_model_surface() {
-                let key = tool.origin().lookup_key();
-                let name = tool.schema().name();
-                if let Some(previous) = names.insert(name, key) {
-                    return Err(Error::config(format!(
-                        "tool profile `{id}` advertises the name `{name}` from two lookup keys \
-                         `{previous:?}` and `{key:?}`; distinct routing identities still have to \
-                         project to distinct model-facing names"
-                    )));
-                }
+            // Everything the budget pays for can also reach a model surface, so one projection
+            // answers every question asked here — which name is claimed, which name is sent, and
+            // what it costs — and none of the three can end up read off something else.
+            if !tool.options().can_reach_model_surface() {
+                continue;
+            }
+            let definition = tool.model_definition();
+            let key = tool.origin().lookup_key();
+            if let Some(previous) = names.insert(definition.name().to_owned(), key) {
+                return Err(Error::config(format!(
+                    "tool profile `{id}` advertises the name `{}` from two lookup keys \
+                     `{previous:?}` and `{key:?}`; distinct routing identities still have to \
+                     project to distinct model-facing names",
+                    definition.name()
+                )));
             }
             if is_advertised(tool.as_ref()) {
-                advertised_count += 1;
-                advertised_bytes += tool.schema().advertised_bytes()?;
+                advertised.push(definition.name().to_owned());
+                advertised_bytes += definition.advertised_bytes()?;
             }
         }
 
+        let advertised_count = advertised.len();
         let budget = profile.budget();
         if advertised_count < budget.min_advertised() {
             return Err(Error::config(format!(
@@ -161,7 +170,7 @@ impl ToolRegistry {
         Ok(ToolSurface::new(
             id.clone(),
             tools,
-            advertised_count,
+            advertised,
             advertised_bytes,
         ))
     }

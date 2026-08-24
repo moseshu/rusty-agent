@@ -15,7 +15,7 @@ use ra_core::{
     },
     model::{
         ApiProtocol, Model, ModelHandoffDefinition, ModelRequest, ModelResolver, ModelSelector,
-        ModelSettings, ModelStream, ProviderKey, ResolvedModel,
+        ModelSettings, ModelStream, ModelToolDefinition, ProviderKey, ResolvedModel,
     },
     state::{RunId, ToolUseTracker},
     step::ToolUse,
@@ -65,6 +65,7 @@ struct StubTool {
     schema: ToolSchema,
     options: ToolOptions,
     enabled: bool,
+    advertised_as: Option<String>,
 }
 
 impl StubTool {
@@ -83,7 +84,13 @@ impl StubTool {
             .unwrap(),
             options: ToolOptions::new().with_availability(availability),
             enabled,
+            advertised_as: None,
         }
+    }
+
+    fn advertised_as(mut self, name: &str) -> Self {
+        self.advertised_as = Some(name.to_owned());
+        self
     }
 }
 
@@ -107,6 +114,15 @@ impl Tool for StubTool {
 
     async fn is_enabled(&self, _context: &RunContext) -> Result<bool> {
         Ok(self.enabled)
+    }
+
+    fn model_definition(&self) -> ModelToolDefinition {
+        match &self.advertised_as {
+            Some(name) => {
+                ModelToolDefinition::new(name.clone(), self.schema.input_schema().clone())
+            }
+            None => self.schema.to_model_definition(),
+        }
     }
 }
 
@@ -379,4 +395,33 @@ fn test_response_classification_08() {
     assert!(!processed.has_tools_or_approvals_to_run());
     assert!(!processed.has_interruptions());
     assert!(processed.tools_used().is_empty());
+}
+
+#[test]
+fn test_response_classification_09() {
+    let surface = TurnActionSurface::new(
+        vec![
+            Arc::new(StubTool::new("search", ToolAvailability::Enabled, true)),
+            Arc::new(
+                StubTool::new("search", ToolAvailability::Enabled, true)
+                    .advertised_as("jira_search"),
+            ),
+        ],
+        Vec::new(),
+    )
+    .expect("distinct model-facing names are an unambiguous surface");
+
+    assert_eq!(
+        surface.advertised_names().collect::<Vec<_>>(),
+        ["search", "jira_search"]
+    );
+    assert!(surface.find_tool("jira_search").is_some());
+    assert!(surface.find_tool("missing").is_none());
+
+    let response = ModelResponse::new(vec![tool_call("call-item-1", "call-1", "jira_search")]);
+    let processed = process_model_response(&response, &surface)
+        .expect("the advertised projection resolves to its executable tool");
+
+    assert_eq!(processed.functions().len(), 1);
+    assert_eq!(processed.functions()[0].tool().origin().name(), "search");
 }

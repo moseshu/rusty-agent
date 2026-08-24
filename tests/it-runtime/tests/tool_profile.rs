@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use ra_core::{
     agent::{AgentId, AgentSpec},
     error::Result,
+    model::ModelToolDefinition,
     tool::{
         Tool, ToolAvailability, ToolContext, ToolExposure, ToolLookupKey, ToolNamespace,
         ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
@@ -21,6 +22,7 @@ struct StubTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     options: ToolOptions,
+    advertised_as: Option<String>,
 }
 
 impl StubTool {
@@ -51,6 +53,7 @@ impl StubTool {
             origin,
             schema,
             options: ToolOptions::new(),
+            advertised_as: None,
         }
     }
 
@@ -61,6 +64,12 @@ impl StubTool {
 
     fn with_options(mut self, options: ToolOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Advertises the tool under a different name than it routes under.
+    fn advertised_as(mut self, name: &str) -> Self {
+        self.advertised_as = Some(name.to_owned());
         self
     }
 
@@ -85,6 +94,15 @@ impl Tool for StubTool {
 
     fn options(&self) -> ToolOptions {
         self.options.clone()
+    }
+
+    fn model_definition(&self) -> ModelToolDefinition {
+        match &self.advertised_as {
+            Some(name) => {
+                ModelToolDefinition::new(name.clone(), self.schema.input_schema().clone())
+            }
+            None => self.schema.to_model_definition(),
+        }
     }
 }
 
@@ -536,6 +554,84 @@ fn test_a_budget_floor_cannot_exceed_its_ceiling() {
     let error = ToolSurfaceBudget::new(16, 14).expect_err("an inverted budget must fail");
 
     assert!(error.to_string().contains("cannot exceed"), "{error}");
+}
+
+#[test]
+fn test_a_configured_budget_is_checked_like_a_constructed_one() {
+    // A budget that arrives from configuration goes through the same constructor. Otherwise an
+    // inverted one exists, and every assembly then fails with an error pointing at the tool
+    // surface rather than at the two numbers that are the actual mistake.
+    let error = serde_json::from_str::<ToolSurfaceBudget>(
+        r#"{"min_advertised": 16, "max_advertised": 14, "max_advertised_bytes": null}"#,
+    )
+    .expect_err("an inverted budget must fail to deserialize");
+    assert!(error.to_string().contains("cannot exceed"), "{error}");
+
+    let budget: ToolSurfaceBudget = serde_json::from_str(
+        r#"{"min_advertised": 14, "max_advertised": 16, "max_advertised_bytes": 20480}"#,
+    )
+    .expect("a valid budget");
+    assert_eq!(
+        budget,
+        ToolSurfaceBudget::new(14, 16)
+            .expect("a valid budget")
+            .with_max_advertised_bytes(20 * 1024)
+    );
+}
+
+#[test]
+fn test_the_name_check_reads_the_projection_a_provider_is_sent() {
+    let profile = ToolProfile::builder(profile_id("full"))
+        .all_registered()
+        .budget(ToolSurfaceBudget::new(0, 24).expect("a valid budget"))
+        .build()
+        .expect("a valid profile");
+
+    // A tool may advertise itself under a name it does not route under, and the projection is
+    // what a provider is handed. Two distinct schema names that collide there are a collision.
+    let colliding = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp.github", "issues").shared())
+        .register(
+            StubTool::namespaced("mcp.jira", "tickets")
+                .advertised_as("issues")
+                .shared(),
+        )
+        .build()
+        .expect("distinct routing identities are registrable");
+    let error = colliding
+        .assemble(&profile)
+        .expect_err("two entries advertised as `issues` must fail");
+    assert!(error.to_string().contains("issues"), "{error}");
+
+    // And the mirror image, which reading the schema name would have refused: two tools whose
+    // schemas share a name are a legal surface once one of them is advertised under another.
+    let renamed = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(
+            StubTool::namespaced("mcp.jira", "search")
+                .advertised_as("jira_search")
+                .shared(),
+        )
+        .build()
+        .expect("a valid registry");
+    let surface = renamed
+        .assemble(&profile)
+        .expect("the two names differ at the boundary");
+
+    // The surface reports, and was billed for, the names it actually advertises.
+    assert_eq!(
+        surface.advertised_names().collect::<Vec<_>>(),
+        ["search", "jira_search"]
+    );
+    let expected: usize = renamed
+        .tools()
+        .map(|tool| {
+            tool.model_definition()
+                .advertised_bytes()
+                .expect("a renderable schema")
+        })
+        .sum();
+    assert_eq!(surface.advertised_bytes(), expected);
 }
 
 #[test]

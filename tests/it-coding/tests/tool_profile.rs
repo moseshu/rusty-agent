@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ra_coding::CodingProfile;
+use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
     error::Result,
     tool::{Tool, ToolContext, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
@@ -11,6 +11,7 @@ use ra_core::{
 use ra_runtime::tool::{profile::ToolSelection, registry::ToolRegistry};
 use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
 use serde_json::json;
+use tempfile::TempDir;
 
 /// A stand-in for a tool this product has declared but not yet written.
 ///
@@ -74,6 +75,23 @@ fn selected_names(profile: CodingProfile) -> Vec<String> {
         .iter()
         .map(|key| key.name().to_owned())
         .collect()
+}
+
+/// Every core tool that has a real implementation today, under the identity it registers with.
+///
+/// This list is the one place a newly written core tool has to be added, and the tests below read
+/// today's state off it rather than restating it — a test that hard-codes which tools exist stops
+/// checking the newest one on the day it lands.
+///
+/// The workspace only has to exist so the patch tool can bind its root capability; nothing here
+/// writes to it.
+fn implemented_core_tools(workspace: &TempDir) -> Vec<Arc<dyn Tool>> {
+    let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
+    vec![
+        Arc::new(ReadFileTool::new().expect("read_file builds")),
+        Arc::new(ExecCommandTool::new().expect("exec_command builds")),
+        host.apply_patch_tool().expect("apply_patch builds"),
+    ]
 }
 
 /// A registry holding exactly the tools a tier declares, standing in for the real ones.
@@ -205,15 +223,24 @@ fn test_a_tier_assembles_into_a_surface_within_its_budget() {
 
 #[test]
 fn test_a_tier_refuses_to_assemble_while_a_declared_tool_is_missing() {
-    // Today's real state: two of the six core entries exist. The tier fails loudly rather than
-    // shipping a four-entry surface whose prompt describes six.
+    // Some of the six core entries are still unwritten. The tier fails loudly rather than shipping
+    // a smaller surface than its prompt describes, and it names one of the entries that is gone.
+    let workspace = TempDir::new().expect("a workspace");
     let registry = ToolRegistry::builder()
-        .register(Arc::new(ReadFileTool::new().expect("read_file builds")))
-        .register(Arc::new(
-            ExecCommandTool::new().expect("exec_command builds"),
-        ))
+        .register_all(implemented_core_tools(&workspace))
         .build()
         .expect("a valid registry");
+
+    let missing: Vec<String> = selected_keys(CodingProfile::Core)
+        .into_iter()
+        .filter(|key| !registry.contains(key))
+        .map(|key| key.name().to_owned())
+        .collect();
+    assert!(
+        !missing.is_empty(),
+        "every core tool now exists; this test has outlived its subject and should be replaced \
+         by one that assembles the tier"
+    );
 
     let error = registry
         .assemble(
@@ -225,28 +252,35 @@ fn test_a_tier_refuses_to_assemble_while_a_declared_tool_is_missing() {
 
     let message = error.to_string();
     assert!(message.contains("core"), "{message}");
-    assert!(message.contains("apply_patch"), "{message}");
+    assert!(
+        missing.iter().any(|name| message.contains(name)),
+        "the failure names none of {missing:?}: {message}"
+    );
 }
 
 #[test]
 fn test_the_declared_names_match_the_tools_that_exist() {
     // The declared list is only a specification if it is the same identity the implementations
-    // register under. These two are written, so they can be checked against it now.
+    // register under. Checking it in this direction — every implementation lands on a declared
+    // key — is what keeps a newly written tool inside the test instead of beside it.
+    let workspace = TempDir::new().expect("a workspace");
     let registry = ToolRegistry::builder()
-        .register(Arc::new(ReadFileTool::new().expect("read_file builds")))
-        .register(Arc::new(
-            ExecCommandTool::new().expect("exec_command builds"),
-        ))
+        .register_all(implemented_core_tools(&workspace))
         .build()
         .expect("a valid registry");
+    let declared = selected_keys(CodingProfile::Core);
 
-    for key in selected_keys(CodingProfile::Core) {
-        if matches!(key.name(), "read_file" | "exec_command") {
-            assert!(
-                registry.contains(&key),
-                "core declares `{}`, which no implementation registers under that key",
-                key.name()
-            );
-        }
+    for key in registry.keys() {
+        assert!(
+            declared.contains(key),
+            "`{}` is implemented, but core declares no such lookup key",
+            key.name()
+        );
     }
+    assert_eq!(
+        registry.len(),
+        3,
+        "a core tool was written without being added to `implemented_core_tools`, or one was \
+         removed"
+    );
 }

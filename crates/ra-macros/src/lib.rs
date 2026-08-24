@@ -1,7 +1,7 @@
 //! # `ra-macros`
 //!
-//! Procedural macros: `#[derive(ToolInput)]`. (The `#[tool]` attribute macro is R2-4, not yet
-//! implemented.)
+//! Procedural macros: `#[derive(ToolInput)]`. (An attribute-macro form, `#[tool]`, is planned;
+//! its module is still a stub.)
 //!
 //! **Boundary**: it generates only the boilerplate and schema that the `ra-core` contracts need,
 //! at compile time. It contains no runtime registration, IO, or provider logic.

@@ -202,6 +202,29 @@ impl ModelToolDefinition {
     pub const fn strict(&self) -> bool {
         self.strict
     }
+
+    /// What one advertised entry costs in a turn's tool table, in bytes.
+    ///
+    /// The three model-visible parts are counted — the input schema, the name, and the
+    /// description — and each provider's envelope around them is not. That envelope differs per
+    /// wire format, so including it would make the same tool measure differently depending on
+    /// which endpoint the run happens to use, and a surface budget has to be comparable across
+    /// providers to be worth stating.
+    ///
+    /// This is the single definition of the measure, and it sits on the projection rather than on
+    /// [`ToolSchema`](crate::tool::ToolSchema) because the projection is what a provider is sent:
+    /// a tool that advertises itself under a different name than it routes under is billed for
+    /// the name it advertises.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the input schema cannot be rendered.
+    pub fn advertised_bytes(&self) -> Result<usize> {
+        let input_schema = serde_json::to_string(&self.input_schema).map_err(|error| {
+            Error::config("failed to render advertised tool schema").with_source(error)
+        })?;
+        Ok(input_schema.len() + self.name.len() + self.description.as_deref().map_or(0, str::len))
+    }
 }
 
 /// Model-facing projection of an agent handoff.

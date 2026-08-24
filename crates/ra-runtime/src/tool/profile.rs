@@ -86,6 +86,7 @@ impl<'de> Deserialize<'de> for ToolProfileId {
 /// is no longer there. The floor is how a profile says which of its entries were the point.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "DeclaredBudget")]
 pub struct ToolSurfaceBudget {
     min_advertised: usize,
     max_advertised: usize,
@@ -138,6 +139,33 @@ impl ToolSurfaceBudget {
     #[must_use]
     pub const fn max_advertised_bytes(&self) -> Option<usize> {
         self.max_advertised_bytes
+    }
+}
+
+/// The wire shape of a budget, before anything has checked it.
+///
+/// A budget that arrives from configuration goes through [`ToolSurfaceBudget::new`] like every
+/// other one. Deriving `Deserialize` straight onto the fields would let an inverted budget exist,
+/// and it would then fail every assembly with an error pointing at the tool surface rather than at
+/// the two numbers that are the actual mistake.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredBudget {
+    min_advertised: usize,
+    max_advertised: usize,
+    #[serde(default)]
+    max_advertised_bytes: Option<usize>,
+}
+
+impl TryFrom<DeclaredBudget> for ToolSurfaceBudget {
+    type Error = Error;
+
+    fn try_from(declared: DeclaredBudget) -> Result<Self> {
+        let budget = Self::new(declared.min_advertised, declared.max_advertised)?;
+        Ok(match declared.max_advertised_bytes {
+            Some(bytes) => budget.with_max_advertised_bytes(bytes),
+            None => budget,
+        })
     }
 }
 
@@ -283,7 +311,7 @@ impl ToolProfileBuilder {
 pub struct ToolSurface {
     profile: ToolProfileId,
     tools: Vec<Arc<dyn Tool>>,
-    advertised_count: usize,
+    advertised: Vec<String>,
     advertised_bytes: usize,
 }
 
@@ -291,13 +319,13 @@ impl ToolSurface {
     pub(super) fn new(
         profile: ToolProfileId,
         tools: Vec<Arc<dyn Tool>>,
-        advertised_count: usize,
+        advertised: Vec<String>,
         advertised_bytes: usize,
     ) -> Self {
         Self {
             profile,
             tools,
-            advertised_count,
+            advertised,
             advertised_bytes,
         }
     }
@@ -320,22 +348,22 @@ impl ToolSurface {
         self.tools
     }
 
-    /// Model-facing names of the entries that count against the budget.
+    /// Model-facing names of the entries that count against the budget, in lookup-key order.
     ///
     /// This is the list a prompt's tool section has to agree with: a profile that stops
     /// advertising a tool while the prompt still tells the model to use it produces turns spent
     /// asking for something that is not there.
+    ///
+    /// Assembly recorded these rather than the surface deriving them again, so they are the same
+    /// names the budget was charged for and the same ones the uniqueness check ruled on.
     pub fn advertised_names(&self) -> impl Iterator<Item = &str> {
-        self.tools
-            .iter()
-            .filter(|tool| is_advertised(tool.as_ref()))
-            .map(|tool| tool.schema().name())
+        self.advertised.iter().map(String::as_str)
     }
 
     /// How many entries the model is shown.
     #[must_use]
     pub const fn advertised_count(&self) -> usize {
-        self.advertised_count
+        self.advertised.len()
     }
 
     /// What those entries cost per turn, by [`ToolSchema::advertised_bytes`].
@@ -365,9 +393,9 @@ impl fmt::Debug for ToolSurface {
             .debug_struct("ToolSurface")
             .field("profile", &self.profile)
             .field("tools", &self.len())
-            .field("advertised_count", &self.advertised_count)
+            .field("advertised_count", &self.advertised_count())
             .field("advertised_bytes", &self.advertised_bytes)
-            .field("advertised", &self.advertised_names().collect::<Vec<_>>())
+            .field("advertised", &self.advertised)
             .finish_non_exhaustive()
     }
 }

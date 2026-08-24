@@ -1085,6 +1085,7 @@ fn ra_core::model::request::ModelRequest::with_output_schema(mut self, output_sc
 fn ra_core::model::request::ModelRequest::with_previous_response_id(mut self, response_id : impl Into < String >) -> Self
 fn ra_core::model::request::ModelRequest::with_system_instructions(mut self, instructions : impl Into < String >) -> Self
 fn ra_core::model::request::ModelRequest::with_tools(mut self, tools : Vec < ModelToolDefinition >) -> Self
+fn ra_core::model::request::ModelToolDefinition::advertised_bytes(& self) -> Result < usize >
 fn ra_core::model::request::ModelToolDefinition::description(& self) -> Option < & str >
 fn ra_core::model::request::ModelToolDefinition::name(& self) -> & str
 fn ra_core::model::request::ModelToolDefinition::new(name : impl Into < String >, input_schema : Value) -> Self
