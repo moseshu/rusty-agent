@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 ra-core = { workspace = true }
+ra-macros = { workspace = true }
 ra-runtime = { workspace = true }
 ra-prompt = { workspace = true }
 ra-context = { workspace = true }

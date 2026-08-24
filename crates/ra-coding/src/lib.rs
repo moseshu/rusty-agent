@@ -20,6 +20,6 @@ pub mod profile;
 pub mod prompt;
 pub(crate) mod tools;
 
-pub use agent::build_agent;
+pub use agent::{build_agent, build_agent_with_host};
 pub use host::CodingHost;
 pub use profile::CodingProfile;

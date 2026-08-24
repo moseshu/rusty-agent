@@ -14,8 +14,10 @@ pub(crate) mod fuzz;
 pub mod parse;
 pub mod render;
 
-pub use apply::CommittedPatchDelta;
-pub use parse::{PatchAction, PatchConflict, PatchHunk, PatchMatchLevel, PatchPlan};
+pub use apply::{AppliedFileUpdate, CommittedPatchDelta, apply_hunks};
+pub use parse::{
+    PatchAction, PatchConflict, PatchHunk, PatchMatchLevel, PatchParseError, PatchPlan, parse_patch,
+};
 
 /// Default schema version for patch structures.
 ///

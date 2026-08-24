@@ -12,7 +12,7 @@ use ra_core::agent::{AgentId, AgentSpec};
 use ra_core::error::Result;
 use ra_core::prompt::PromptRole;
 
-use crate::prompt::assemble_stable_prefix;
+use crate::{host::CodingHost, prompt::assemble_stable_prefix};
 
 /// Builds the coding agent's declaration with an assembled stable prefix.
 ///
@@ -29,5 +29,25 @@ pub fn build_agent(
         .id(id)
         .name(name)
         .instructions(prefix.system_instructions())
+        .build()
+}
+
+/// Builds the coding agent with the product's currently implemented editing tool installed.
+///
+/// This deliberately installs only `apply_patch`: the complete profile remains unavailable until
+/// the other declared core tools exist, and pretending the incomplete set were a profile would
+/// make the prompt advertise capabilities the runtime cannot dispatch.
+pub fn build_agent_with_host(
+    id: AgentId,
+    name: impl Into<String>,
+    role: &PromptRole,
+    host: &CodingHost,
+) -> Result<Arc<AgentSpec>> {
+    let prefix = assemble_stable_prefix(role)?;
+    AgentSpec::builder()
+        .id(id)
+        .name(name)
+        .instructions(prefix.system_instructions())
+        .tools(vec![host.apply_patch_tool()?])
         .build()
 }

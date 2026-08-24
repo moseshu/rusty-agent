@@ -1124,6 +1124,7 @@ dependencies = [
  "ra-context",
  "ra-core",
  "ra-exec",
+ "ra-macros",
  "ra-mcp",
  "ra-patch",
  "ra-prompt",

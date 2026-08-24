@@ -176,6 +176,18 @@ impl RootedFileSystem {
         self.root.remove_file(&relative).map_err(classify)
     }
 
+    /// Renames a file below the root without reopening either path by ambient name.
+    pub fn rename(&self, from: &Path, to: &Path) -> Result<(), RootedOpenError> {
+        let from = relative_path(from)?;
+        let to = relative_path(to)?;
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.create_dir_all(parent)?;
+        }
+        self.root.rename(&from, &self.root, &to).map_err(classify)
+    }
+
     /// Checks if a path exists below the root.
     #[must_use]
     pub fn exists(&self, path: &Path) -> bool {

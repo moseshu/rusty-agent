@@ -6,8 +6,10 @@ use ra_core::{
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
     state::EventSeqAllocator,
-    tool::ToolServices,
+    tool::{Tool, ToolServices},
 };
+
+use crate::tools::apply_patch::ApplyPatchTool;
 use ra_exec::fs::RootedFileSystem;
 
 /// The host runtime context and capabilities for the coding agent.
@@ -71,6 +73,13 @@ impl CodingHost {
     /// Constructs [`ToolServices`] equipped with this host's event sink.
     pub fn build_tool_services(&self) -> ToolServices {
         ToolServices::new().with_event_sink(Arc::clone(&self.event_sink))
+    }
+
+    /// Creates the coding product's workspace-confined patch tool.
+    pub fn apply_patch_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
+        Ok(Arc::new(ApplyPatchTool::new(Arc::clone(
+            &self.workspace_fs,
+        ))?))
     }
 
     /// Creates an authenticated [`HostEventEmitter`] bound to this host's sink and the given allocator.
