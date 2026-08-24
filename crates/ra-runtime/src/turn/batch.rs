@@ -42,7 +42,7 @@ use std::{
 };
 
 use ra_core::{
-    agent::ToolUseResult,
+    agent::{FunctionToolResult, ToolUseResult},
     cancel::{CancelReason, CancelScope, DRAIN_GRACE, ScopeKind},
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
@@ -76,6 +76,7 @@ pub(crate) const DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY: usize = 8;
 pub struct TurnExecution {
     new_items: Vec<RunItem>,
     interruptions: Vec<RunItem>,
+    function_results: Vec<FunctionToolResult>,
     tool_results: Vec<ToolUseResult>,
     outcomes: Vec<ToolOutcome>,
 }
@@ -140,6 +141,26 @@ impl TurnExecution {
     #[must_use]
     pub fn has_interruptions(&self) -> bool {
         !self.interruptions.is_empty()
+    }
+
+    /// Complete results for every function call that reached a terminal dispatch decision, in
+    /// model order.
+    ///
+    /// This retains failures and pending approvals alongside successful calls. It is the batch
+    /// settlement surface for consumers that need the normalized item or an interruption, while
+    /// [`Self::tool_results`] deliberately remains the narrower stop-policy input.
+    ///
+    /// A call to an unadvertised name is not included: it has no validated [`ToolOrigin`], so
+    /// fabricating one would make its recorded identity look executable. Its error output remains
+    /// in [`Self::new_items`], paired to the model's call as required.
+    ///
+    /// The runner does not yet carry these values through [`ra_core::step::SingleStepResult`]. It
+    /// preserves the corresponding items and interruptions through its established result paths;
+    /// promotion of the complete per-call values waits for nested-agent execution, which is their
+    /// first runner-level consumer.
+    #[must_use]
+    pub fn function_results(&self) -> &[FunctionToolResult] {
+        &self.function_results
     }
 
     /// Function-tool results, in the response's model order.
@@ -844,14 +865,28 @@ fn settle_dispatches(
                     });
                 }
                 let output = observation.into_output();
-                if !output.is_error() {
+                let item = output_item(&completed.call_id, output.clone());
+                if output.is_error() {
+                    execution
+                        .function_results
+                        .push(FunctionToolResult::completed(
+                            completed.tool,
+                            output,
+                            item.clone(),
+                        )?);
+                } else {
+                    execution
+                        .function_results
+                        .push(FunctionToolResult::completed(
+                            completed.tool.clone(),
+                            output.clone(),
+                            item.clone(),
+                        )?);
                     execution
                         .tool_results
-                        .push(ToolUseResult::new(completed.tool, output.clone()));
+                        .push(ToolUseResult::new(completed.tool, output));
                 }
-                execution
-                    .new_items
-                    .push(output_item(&completed.call_id, output));
+                execution.new_items.push(item);
             }
             ToolDispatch::Refused(refusal) => {
                 if let Some(action) = processed.functions().get(completed.order) {
@@ -861,18 +896,31 @@ fn settle_dispatches(
                         refusal.output().output(),
                     ));
                 }
+                let output = refusal.into_output();
+                let item = output_item(&completed.call_id, output.clone());
+                execution
+                    .function_results
+                    .push(FunctionToolResult::completed(
+                        completed.tool,
+                        output,
+                        item.clone(),
+                    )?);
                 // Never a `ToolUseResult`: a stop policy cannot inspect what it stops on, and a run
                 // reporting `FinishReason::ToolStop` over a call that never ran would be reporting
                 // that the agent reached its own conclusion.
-                execution
-                    .new_items
-                    .push(output_item(&completed.call_id, refusal.into_output()));
+                execution.new_items.push(item);
             }
             ToolDispatch::AwaitingApproval(approval) => {
                 let item = RunItem::new(
                     approval_item_id(&completed.call_id),
                     RunItemKind::ToolApproval(approval),
                 );
+                execution
+                    .function_results
+                    .push(FunctionToolResult::awaiting_approval(
+                        completed.tool,
+                        item.clone(),
+                    )?);
                 execution.interruptions.push(item.clone());
                 execution.new_items.push(item);
             }

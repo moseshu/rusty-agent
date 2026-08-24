@@ -16,9 +16,10 @@ use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
 use crate::{
     context::RunContext,
     error::{Error, Result},
-    item::{CallId, ToolCallOutput},
+    item::{CallId, RunItem, ToolCallOutput},
     model::ModelSettings,
     prompt::{DynamicPromptHandler, ResolvedPrompt},
+    state::NestedRunRef,
     tool::{Tool, ToolOrigin},
 };
 use async_trait::async_trait;
@@ -82,6 +83,121 @@ impl ToolUseResult {
     #[must_use]
     pub const fn output(&self) -> &ToolCallOutput {
         &self.output
+    }
+}
+
+/// The complete result of one function-tool dispatch.
+///
+/// Unlike [`ToolUseResult`], this preserves every terminal path the dispatcher produced. A
+/// model-visible failure has an error output, and an approval interruption has no output yet. The
+/// narrower value remains the input to [`ToolUseBehavior`] because a stop policy must not turn a
+/// failed or unapproved call into a successful terminal run.
+///
+/// `nested_run` is a persistent identity, not a live child runtime result. `ra-core` cannot own
+/// that runtime object without reversing the crate dependency; the nested-agent implementation
+/// will populate and resolve the reference through the parent run's bounded registry.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct FunctionToolResult {
+    tool: ToolOrigin,
+    output: Option<ToolCallOutput>,
+    run_item: Option<RunItem>,
+    interruptions: Vec<RunItem>,
+    nested_run: Option<NestedRunRef>,
+}
+
+impl FunctionToolResult {
+    /// Creates the result of a completed function-tool dispatch.
+    ///
+    /// `run_item` must be a normalized output record for the same call. A mismatched call ID would
+    /// create a history that no provider can replay, so it is rejected at construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when `run_item` is not a tool output record for `output`'s call ID.
+    pub fn completed(tool: ToolOrigin, output: ToolCallOutput, run_item: RunItem) -> Result<Self> {
+        if !matches!(
+            run_item.kind(),
+            crate::item::RunItemKind::ToolCallOutput(item) if item.call_id() == output.call_id()
+        ) {
+            return Err(Error::caller(
+                "a completed function-tool result requires a tool output run item for the same call",
+            ));
+        }
+        Ok(Self {
+            tool,
+            output: Some(output),
+            run_item: Some(run_item),
+            interruptions: Vec::new(),
+            nested_run: None,
+        })
+    }
+
+    /// Creates the result of a local approval interruption.
+    ///
+    /// The same item is the pending interruption and the normalized run item. Nested-agent
+    /// interruptions use the same shape once their execution boundary exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when `approval` is not a tool approval record.
+    pub fn awaiting_approval(tool: ToolOrigin, approval: RunItem) -> Result<Self> {
+        if !matches!(approval.kind(), crate::item::RunItemKind::ToolApproval(_)) {
+            return Err(Error::caller(
+                "a function-tool approval result requires a tool approval run item",
+            ));
+        }
+        Ok(Self {
+            tool,
+            output: None,
+            run_item: Some(approval.clone()),
+            interruptions: vec![approval],
+            nested_run: None,
+        })
+    }
+
+    /// Stable identity of the tool that was dispatched.
+    #[must_use]
+    pub const fn tool(&self) -> &ToolOrigin {
+        &self.tool
+    }
+
+    /// Model-visible output, absent while execution is waiting for approval.
+    #[must_use]
+    pub const fn output(&self) -> Option<&ToolCallOutput> {
+        self.output.as_ref()
+    }
+
+    /// ID of the call this result answers when either its output or its normalized item has one.
+    #[must_use]
+    pub const fn call_id(&self) -> Option<&CallId> {
+        match self.output.as_ref() {
+            Some(output) => Some(output.call_id()),
+            None => match self.run_item.as_ref() {
+                Some(item) => item.call_id(),
+                None => None,
+            },
+        }
+    }
+
+    /// Normalized run item emitted for this call, if it is ready to enter history.
+    #[must_use]
+    pub const fn run_item(&self) -> Option<&RunItem> {
+        self.run_item.as_ref()
+    }
+
+    /// Pending interruptions raised by this tool invocation, including local approvals.
+    #[must_use]
+    pub fn interruptions(&self) -> &[RunItem] {
+        &self.interruptions
+    }
+
+    /// Persistent child-run identity for an agent-as-tool invocation.
+    ///
+    /// It remains empty until nested-agent execution is available.
+    #[must_use]
+    pub const fn nested_run(&self) -> Option<&NestedRunRef> {
+        self.nested_run.as_ref()
     }
 }
 

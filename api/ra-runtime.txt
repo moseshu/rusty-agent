@@ -140,6 +140,7 @@ fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_services(mut self, services : ToolServices) -> Self
+fn ra_runtime::turn::batch::TurnExecution::function_results(& self) -> & [FunctionToolResult]
 fn ra_runtime::turn::batch::TurnExecution::has_interruptions(& self) -> bool
 fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]

@@ -32,7 +32,13 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
-    turn::{TurnSettlementRequest, prepare::TurnActionSurface, settle_turn},
+    turn::{
+        TurnSettlementRequest,
+        batch::{TurnExecutionRequest, execute_actions},
+        prepare::TurnActionSurface,
+        process::process_model_response,
+        settle_turn,
+    },
 };
 use serde_json::{Value, json};
 
@@ -139,6 +145,73 @@ struct GatedTool {
     release: Arc<AtomicBool>,
     completed: Arc<AtomicUsize>,
     output: &'static str,
+}
+
+/// A pair of tools that always complete opposite to their model order.
+///
+/// The second call waits until the first has entered, wakes it, and returns without another await.
+/// It therefore finishes before the first call can be polled again.
+struct OutOfOrderTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    first: bool,
+    first_entered: Arc<AtomicBool>,
+    release_first: Arc<tokio::sync::Notify>,
+}
+
+impl OutOfOrderTool {
+    fn new(
+        name: &str,
+        first: bool,
+        first_entered: Arc<AtomicBool>,
+        release_first: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            first,
+            first_entered,
+            release_first,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for OutOfOrderTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_concurrency(ToolConcurrency::Parallel)
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        if self.first {
+            self.first_entered.store(true, Ordering::SeqCst);
+            self.release_first.notified().await;
+            Ok(ToolOutput::text("first"))
+        } else {
+            while !self.first_entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            self.release_first.notify_one();
+            Ok(ToolOutput::text("second"))
+        }
+    }
 }
 
 /// Failure classes that must propagate out of a batch and therefore participate in the batch's
@@ -715,6 +788,122 @@ async fn test_turn_settlement_02() {
     let output = output_for(settled.new_step_items(), "call-1");
     assert!(!output.is_error());
     assert_eq!(stored_text(output), Some("written".to_owned()));
+}
+
+#[tokio::test]
+async fn function_results_preserve_output_items_failures_and_approval_interruptions() {
+    let successful: Arc<dyn Tool> = Arc::new(ScriptedTool::new(
+        "successful",
+        Behavior::Succeed("done"),
+    ));
+    let failed: Arc<dyn Tool> = Arc::new(ScriptedTool::new("failed", Behavior::Fail));
+    let approval: Arc<dyn Tool> = Arc::new(
+        ScriptedTool::new("approval", Behavior::Succeed("never runs")).with_options(
+            ToolOptions::new().with_approval(ToolApprovalPolicy::Always),
+        ),
+    );
+    let surface = surface(vec![successful, failed, approval]);
+    let response = ModelResponse::new(vec![
+        tool_call("call-item-1", "call-1", "successful"),
+        tool_call("call-item-2", "call-2", "failed"),
+        tool_call("call-item-3", "call-3", "approval"),
+    ]);
+    let processed = process_model_response(&response, &surface).unwrap();
+    let agent_id = AgentId::new("main");
+    let cancel = CancelScope::root();
+
+    let execution = execute_actions(TurnExecutionRequest::new(
+        &processed,
+        &agent_id,
+        &ToolUseTracker::new(),
+        &ToolFailureTracker::new(),
+        run(),
+        &cancel,
+    ))
+    .await
+    .unwrap();
+
+    let results = execution.function_results();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].tool().qualified_name(), "successful");
+    assert_eq!(results[0].output().unwrap().call_id().as_str(), "call-1");
+    assert!(!results[0].output().unwrap().is_error());
+    assert!(matches!(
+        results[0].run_item().unwrap().kind(),
+        RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-1"
+    ));
+    assert!(results[0].interruptions().is_empty());
+    assert!(results[0].nested_run().is_none());
+
+    assert_eq!(results[1].tool().qualified_name(), "failed");
+    assert_eq!(results[1].output().unwrap().call_id().as_str(), "call-2");
+    assert!(results[1].output().unwrap().is_error());
+    assert!(matches!(
+        results[1].run_item().unwrap().kind(),
+        RunItemKind::ToolCallOutput(output) if output.is_error()
+    ));
+
+    assert_eq!(results[2].tool().qualified_name(), "approval");
+    assert!(results[2].output().is_none());
+    assert_eq!(results[2].call_id().unwrap().as_str(), "call-3");
+    assert!(matches!(
+        results[2].run_item().unwrap().kind(),
+        RunItemKind::ToolApproval(_)
+    ));
+    assert_eq!(results[2].interruptions().len(), 1);
+    assert!(matches!(
+        results[2].interruptions()[0].kind(),
+        RunItemKind::ToolApproval(_)
+    ));
+
+    // Stop policies retain their narrower contract: a failure or waiting approval cannot become a
+    // completed ToolStop outcome just because it has a full execution result.
+    assert_eq!(execution.tool_results().len(), 1);
+    assert_eq!(execution.tool_results()[0].call_id().as_str(), "call-1");
+}
+
+#[tokio::test]
+async fn function_results_remain_in_model_order_when_calls_finish_out_of_order() {
+    let first_entered = Arc::new(AtomicBool::new(false));
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let first: Arc<dyn Tool> = Arc::new(OutOfOrderTool::new(
+        "first",
+        true,
+        Arc::clone(&first_entered),
+        Arc::clone(&release_first),
+    ));
+    let second: Arc<dyn Tool> = Arc::new(OutOfOrderTool::new(
+        "second",
+        false,
+        Arc::clone(&first_entered),
+        Arc::clone(&release_first),
+    ));
+    let surface = surface(vec![first, second]);
+    let response = ModelResponse::new(vec![
+        tool_call("call-item-1", "call-1", "first"),
+        tool_call("call-item-2", "call-2", "second"),
+    ]);
+    let processed = process_model_response(&response, &surface).unwrap();
+    let agent_id = AgentId::new("main");
+    let cancel = CancelScope::root();
+
+    let execution = execute_actions(TurnExecutionRequest::new(
+        &processed,
+        &agent_id,
+        &ToolUseTracker::new(),
+        &ToolFailureTracker::new(),
+        run(),
+        &cancel,
+    ))
+    .await
+    .unwrap();
+
+    let names = execution
+        .function_results()
+        .iter()
+        .map(|result| result.tool().qualified_name())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["first", "second"]);
 }
 
 #[tokio::test]

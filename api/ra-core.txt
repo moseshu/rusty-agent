@@ -23,6 +23,11 @@ const fn ra_core::agent::AgentSpec::id(& self) -> & AgentId
 const fn ra_core::agent::AgentSpec::instructions(& self) -> Option < & AgentInstructions >
 const fn ra_core::agent::AgentSpec::model_settings(& self) -> & ModelSettings
 const fn ra_core::agent::AgentSpec::tool_use_behavior(& self) -> & ToolUseBehavior
+const fn ra_core::agent::FunctionToolResult::call_id(& self) -> Option < & CallId >
+const fn ra_core::agent::FunctionToolResult::nested_run(& self) -> Option < & NestedRunRef >
+const fn ra_core::agent::FunctionToolResult::output(& self) -> Option < & ToolCallOutput >
+const fn ra_core::agent::FunctionToolResult::run_item(& self) -> Option < & RunItem >
+const fn ra_core::agent::FunctionToolResult::tool(& self) -> & ToolOrigin
 const fn ra_core::agent::ToolUseResult::call_id(& self) -> & CallId
 const fn ra_core::agent::ToolUseResult::output(& self) -> & ToolCallOutput
 const fn ra_core::agent::ToolUseResult::tool(& self) -> & ToolOrigin
@@ -809,6 +814,9 @@ fn ra_core::agent::AgentSpecBuilder::tool(mut self, tool : Arc < dyn Tool >) -> 
 fn ra_core::agent::AgentSpecBuilder::tool_use_behavior(mut self, tool_use_behavior : ToolUseBehavior) -> Self
 fn ra_core::agent::AgentSpecBuilder::tools(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
 fn ra_core::agent::AgentSpecBuilder::with_instructions(mut self, instructions : AgentInstructions) -> Self
+fn ra_core::agent::FunctionToolResult::awaiting_approval(tool : ToolOrigin, approval : RunItem) -> Result < Self >
+fn ra_core::agent::FunctionToolResult::completed(tool : ToolOrigin, output : ToolCallOutput, run_item : RunItem) -> Result < Self >
+fn ra_core::agent::FunctionToolResult::interruptions(& self) -> & [RunItem]
 fn ra_core::agent::ToolUseBehavior::custom(handler : Arc < dyn ToolUseBehaviorHandler >) -> Self
 fn ra_core::agent::ToolUseBehavior::stop_at_tools(names : impl IntoIterator < Item = impl Into < String > >) -> Self
 fn ra_core::agent::ToolUseResult::new(tool : ToolOrigin, output : ToolCallOutput) -> Self
@@ -1448,6 +1456,7 @@ mod ra_core::usage
 struct ra_core::agent::AgentInstructions
 struct ra_core::agent::AgentSpec
 struct ra_core::agent::AgentSpecBuilder
+struct ra_core::agent::FunctionToolResult
 struct ra_core::agent::ToolUseResult
 struct ra_core::budget::BudgetLimit
 struct ra_core::budget::BudgetSnapshot
