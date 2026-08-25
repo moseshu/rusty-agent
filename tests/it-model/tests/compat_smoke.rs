@@ -15,11 +15,7 @@ use ra_core::{
 use ra_model::{
     anthropic::smoke::preview_request_payload,
     compat::CompatEndpoint,
-    openai::{
-        auth::OpenAiAuth,
-        chat::OpenAiChatModel,
-        responses::OpenAiResponsesModel,
-    },
+    openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel},
     provider::quirks::ProviderQuirks,
 };
 use serde_json::{Value, json};
@@ -522,12 +518,18 @@ fn anthropic_preview_groups_tool_turns_and_projects_structured_output() {
     assert_eq!(payload["messages"][0]["content"][1]["id"], "call_a");
     assert_eq!(payload["messages"][0]["content"][2]["id"], "call_b");
     assert_eq!(payload["messages"][1]["role"], "user");
-    assert_eq!(payload["messages"][1]["content"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        payload["messages"][1]["content"].as_array().map(Vec::len),
+        Some(2)
+    );
     assert_eq!(
         payload["messages"][1]["content"][0]["content"][0]["text"],
         "visible result"
     );
-    assert_eq!(payload["messages"][1]["content"][1]["content"], "plain result");
+    assert_eq!(
+        payload["messages"][1]["content"][1]["content"],
+        "plain result"
+    );
     assert_eq!(
         payload["tool_choice"],
         json!({"type": "auto", "disable_parallel_tool_use": true})
@@ -583,12 +585,13 @@ async fn responses_and_chat_preserve_reasoning_and_tool_pairs_across_protocol_bo
         .await;
     let responses_model = OpenAiResponsesModel::new(
         MODEL,
-        OpenAiAuth::new("test-secret")
-            .with_base_url(format!("{}/v1/", responses_source.uri())),
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", responses_source.uri())),
     )
     .expect("Responses source model should build");
     let responses_history = responses_model
-        .get_response(history_request(vec![ModelInputItem::Message(Message::user("start"))]))
+        .get_response(history_request(vec![ModelInputItem::Message(
+            Message::user("start"),
+        )]))
         .await
         .expect("Responses source response should convert")
         .to_input_items();
@@ -616,9 +619,15 @@ async fn responses_and_chat_preserve_reasoning_and_tool_pairs_across_protocol_bo
         .expect("Chat should lower Responses history");
     let chat_body = received_body(&chat_target).await;
     assert_eq!(chat_body["messages"][0]["reasoning_content"], "need lookup");
-    assert_eq!(chat_body["messages"][0]["tool_calls"][0]["id"], "call_from_responses");
+    assert_eq!(
+        chat_body["messages"][0]["tool_calls"][0]["id"],
+        "call_from_responses"
+    );
     assert_eq!(chat_body["messages"][1]["role"], "tool");
-    assert_eq!(chat_body["messages"][1]["tool_call_id"], "call_from_responses");
+    assert_eq!(
+        chat_body["messages"][1]["tool_call_id"],
+        "call_from_responses"
+    );
 
     let chat_source = MockServer::start().await;
     Mock::given(method("POST"))
@@ -653,7 +662,9 @@ async fn responses_and_chat_preserve_reasoning_and_tool_pairs_across_protocol_bo
     .expect("Chat source model should build")
     .with_quirks(ProviderQuirks::new().with_reasoning_content(true));
     let chat_history = chat_source_model
-        .get_response(history_request(vec![ModelInputItem::Message(Message::user("start"))]))
+        .get_response(history_request(vec![ModelInputItem::Message(
+            Message::user("start"),
+        )]))
         .await
         .expect("Chat source response should convert")
         .to_input_items();
@@ -666,8 +677,7 @@ async fn responses_and_chat_preserve_reasoning_and_tool_pairs_across_protocol_bo
         .await;
     let responses_target_model = OpenAiResponsesModel::new(
         MODEL,
-        OpenAiAuth::new("test-secret")
-            .with_base_url(format!("{}/v1/", responses_target.uri())),
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", responses_target.uri())),
     )
     .expect("Responses target model should build");
     let mut chat_to_responses = chat_history;

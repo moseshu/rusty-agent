@@ -792,15 +792,12 @@ async fn test_turn_settlement_02() {
 
 #[tokio::test]
 async fn function_results_preserve_output_items_failures_and_approval_interruptions() {
-    let successful: Arc<dyn Tool> = Arc::new(ScriptedTool::new(
-        "successful",
-        Behavior::Succeed("done"),
-    ));
+    let successful: Arc<dyn Tool> =
+        Arc::new(ScriptedTool::new("successful", Behavior::Succeed("done")));
     let failed: Arc<dyn Tool> = Arc::new(ScriptedTool::new("failed", Behavior::Fail));
     let approval: Arc<dyn Tool> = Arc::new(
-        ScriptedTool::new("approval", Behavior::Succeed("never runs")).with_options(
-            ToolOptions::new().with_approval(ToolApprovalPolicy::Always),
-        ),
+        ScriptedTool::new("approval", Behavior::Succeed("never runs"))
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
     );
     let surface = surface(vec![successful, failed, approval]);
     let response = ModelResponse::new(vec![

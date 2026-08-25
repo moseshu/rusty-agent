@@ -158,8 +158,10 @@ fn a_snapshot_written_when_the_budget_counted_tokens_carries_that_spend_into_the
 
     // Taking the spend into the ledger consumes the legacy carrier, so a current snapshot no
     // longer emits the obsolete field.
-    assert!(serde_json::to_value(state.budget())
-        .unwrap()
-        .get("tokens_used")
-        .is_none());
+    assert!(
+        serde_json::to_value(state.budget())
+            .unwrap()
+            .get("tokens_used")
+            .is_none()
+    );
 }
