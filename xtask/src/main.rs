@@ -23,6 +23,7 @@ mod public_api;
 mod schema_stability;
 mod source;
 mod tests_workspace;
+mod token_budget;
 
 use clap::{Parser, Subcommand};
 
@@ -54,7 +55,8 @@ enum Task {
     },
     /// Checks `Guard_Registry.md` against the code, and that hard-blocking guards number <= 8.
     GuardRegistry,
-    /// Checks tool schemas are <= 20KB and each prompt section is within its token ceiling.
+    /// Checks what the coding product's advertised tool table costs a turn. Per-prompt-section
+    /// ceilings are not part of it; they wait on R4-7.
     TokenBudget,
     /// Checks there is no test code under `crates/` (tests all live in the tests/ workspace).
     NoInlineTests,
@@ -92,7 +94,7 @@ fn all_gates() -> Vec<(&'static str, Outcome)> {
         ("schema-stability", schema_stability::run(false)),
         ("prompt-dump", prompt_dump::run(false)),
         ("guard-registry", pending::guard_registry()),
-        ("token-budget", pending::token_budget()),
+        ("token-budget", token_budget::run()),
         ("feature-matrix", feature_matrix::run()),
         ("test", tests_workspace::run(&[])),
     ]
@@ -107,7 +109,7 @@ fn main() -> std::process::ExitCode {
         Task::SchemaStability { bless } => vec![("schema-stability", schema_stability::run(bless))],
         Task::PromptDump { bless } => vec![("prompt-dump", prompt_dump::run(bless))],
         Task::GuardRegistry => vec![("guard-registry", pending::guard_registry())],
-        Task::TokenBudget => vec![("token-budget", pending::token_budget())],
+        Task::TokenBudget => vec![("token-budget", token_budget::run())],
         Task::FeatureMatrix => vec![("feature-matrix", feature_matrix::run())],
         Task::Test { args } => vec![("test", tests_workspace::run(&args))],
     };

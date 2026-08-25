@@ -1,14 +1,12 @@
-//! The two gates whose subject does not exist yet.
+//! The gate whose subject does not exist yet.
 //!
-//! They are not "to be implemented" placeholders — **there is nothing for the check to apply to**:
-//! with no token-accounted prompt sections there is no combined budget to check, and with no guard
-//! registry there is no table to reconcile. An empty function that pretends to pass would be worse
-//! than none, so each
-//! honestly returns [`Outcome::Skip`] with the task that blocks it, and every `cargo xtask all`
-//! lists them.
+//! It is not a "to be implemented" placeholder — **there is nothing for the check to apply to**:
+//! with no guard registry there is no table to reconcile. A function that pretended to pass would
+//! be worse than none, so it honestly returns [`Outcome::Skip`] carrying the task that blocks it,
+//! and every `cargo xtask all` lists it.
 //!
-//! Each one states its **enabling condition**: when that task lands, the implementation moves into
-//! its own module and one entry disappears from here.
+//! It states that **enabling condition** below: when the task lands, the implementation moves into
+//! its own module and this one goes away.
 
 use crate::gate::Outcome;
 
@@ -19,12 +17,4 @@ use crate::gate::Outcome;
 /// is a safety net, not a tool for shaping behavior.
 pub(crate) fn guard_registry() -> Outcome {
     Outcome::skip("R7-0", "尚无 guard 登记表")
-}
-
-/// Tool schemas <= 20 KB, and each prompt section within its token ceiling.
-///
-/// Enabling condition: R4 exposes prompt-section token ceilings. The measure
-/// is what a **single request advertises**, not the total number of reachable tools.
-pub(crate) fn token_budget() -> Outcome {
-    Outcome::skip("R4", "尚无 prompt 可计量")
 }

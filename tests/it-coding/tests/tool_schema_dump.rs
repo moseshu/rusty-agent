@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use ra_coding::CodingHost;
+use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
     item::{AgentId, Message, ModelInputItem},
     model::{
@@ -25,6 +25,27 @@ use wiremock::{
 
 const RENDER_COUNT: usize = 100;
 const SNAPSHOT: &str = "tool-schemas.txt";
+
+/// The line the wire measurement comes out on, and that `cargo xtask token-budget` reads back.
+///
+/// The gate quotes this number rather than only reporting that a test passed, and it goes red when
+/// the line stops appearing — which is what keeps the case below from being renamed away unnoticed:
+/// `cargo test` run against a name filter that matches nothing exits 0 all the same.
+const MEASUREMENT_MARKER: &str = "tool-wire-budget:";
+
+/// The product ceiling, read from the profile that declares it rather than restated here.
+///
+/// The wire table is the neutral surface plus each provider's envelope, so it is measured against
+/// the same ceiling and simply has less room. Reading it back means a change to the declared
+/// budget reaches this contract too, instead of leaving a second number to drift.
+fn coding_tool_table_ceiling() -> usize {
+    CodingProfile::default()
+        .to_tool_profile()
+        .expect("a valid profile")
+        .budget()
+        .max_advertised_bytes()
+        .expect("the surface declares a byte ceiling")
+}
 
 fn snapshot_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -156,6 +177,52 @@ async fn render_snapshot() -> String {
         format!("### {protocol}\n{json}\n")
     })
     .collect()
+}
+
+/// Checks the bytes that each provider actually receives, including its own tool envelope.
+///
+/// The profile's provider-neutral budget deliberately excludes envelopes because they differ by
+/// endpoint. This complementary check keeps that abstraction honest: a provider serializer cannot
+/// grow the current product's wire table past the product ceiling unnoticed. The complete default
+/// profile is intentionally not constructible until every declared tool exists; as each real tool
+/// joins this factory, it is measured here on every supported provider path.
+#[tokio::test]
+async fn test_current_provider_tool_tables_fit_the_coding_byte_budget() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let responses = responses_tools(model_request(&workspace)).await;
+    let chat = chat_tools(model_request(&workspace)).await;
+    let anthropic = preview_request_payload("schema-test", &model_request(&workspace))
+        .expect("Anthropic preview lowers")["tools"]
+        .clone();
+
+    let ceiling = coding_tool_table_ceiling();
+    let measured = [
+        ("openai_responses", responses),
+        ("openai_chat", chat),
+        ("anthropic_messages", anthropic),
+    ]
+    .map(|(provider, tools)| {
+        let bytes = serde_json::to_vec(&tools)
+            .expect("tool payload is serializable")
+            .len();
+        (provider, bytes)
+    });
+
+    // Report the widest one before asserting, so the number is on the record whether or not the
+    // assertion holds: the fattest envelope is the one the ceiling will meet first.
+    let (widest, bytes) = measured
+        .iter()
+        .copied()
+        .max_by_key(|(_, bytes)| *bytes)
+        .expect("three provider paths");
+    println!("{MEASUREMENT_MARKER} {widest} {bytes}/{ceiling}");
+
+    for (provider, bytes) in measured {
+        assert!(
+            bytes <= ceiling,
+            "{provider} tool table is {bytes} bytes, above the coding profile ceiling of {ceiling}"
+        );
+    }
 }
 
 #[tokio::test]
