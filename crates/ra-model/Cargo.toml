@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = ["openai"]
 openai = ["dep:reqwest", "dep:base64"]
-anthropic = ["dep:reqwest"]
+anthropic = ["dep:reqwest", "dep:base64"]
 # 兼容端点复用 OpenAI Chat codec；这是加法依赖，不与其他 provider 互斥。
 compat = ["openai"]
 

@@ -305,12 +305,9 @@ fn insert_tool_choice(
     parallel: Option<bool>,
 ) -> Result<()> {
     let choice = match choice {
+        // Nothing to forbid without a tool table, and Anthropic does not accept a `tool_choice`
+        // beside an absent `tools`.
         Some(ToolChoice::None) if tool_names.is_empty() => return Ok(()),
-        Some(ToolChoice::None) => {
-            return Err(Error::caller(
-                "Anthropic compatibility preview cannot represent ToolChoice::None while tools are advertised",
-            ));
-        }
         Some(choice) => choice,
         None if parallel == Some(false) => &ToolChoice::Auto,
         None => return Ok(()),
@@ -318,7 +315,7 @@ fn insert_tool_choice(
     let mut value = match choice {
         ToolChoice::Auto => json!({"type": "auto"}),
         ToolChoice::Required => json!({"type": "any"}),
-        ToolChoice::None => unreachable!("ToolChoice::None is handled before lowering"),
+        ToolChoice::None => json!({"type": "none"}),
         ToolChoice::Tool(name) => {
             validate_tool_name(name)?;
             if !tool_names.contains(name) {

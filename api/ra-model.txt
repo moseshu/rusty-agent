@@ -1,6 +1,7 @@
 # ra-model 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_model::provider::ProviderRegistry::close(& self) -> Result < () >
+const fn ra_model::anthropic::auth::AnthropicAuth::default_headers(& self) -> & BTreeMap < String , String >
 const fn ra_model::compat::CompatEndpoint::done_marker(& self) -> & DoneMarker
 const fn ra_model::compat::CompatEndpoint::extra_body(& self) -> & JsonMap
 const fn ra_model::compat::CompatEndpoint::quirks(& self) -> ProviderQuirks
@@ -58,6 +59,20 @@ const ra_model::retry::RETRY_AFTER_MS_HEADER: & str
 const ra_model::retry::SHOULD_RETRY_HEADER: & str
 enum ra_model::compat::quirks::DoneMarker
 enum ra_model::provider::UnknownPrefixPolicy
+fn ra_model::anthropic::AnthropicMessagesModel::model(& self) -> & str
+fn ra_model::anthropic::AnthropicMessagesModel::new(model : impl Into < String >, auth : AnthropicAuth) -> Result < Self >
+fn ra_model::anthropic::AnthropicMessagesProvider::default_model(& self) -> & str
+fn ra_model::anthropic::AnthropicMessagesProvider::new(auth : AnthropicAuth, default_model : impl Into < String >) -> Result < Self >
+fn ra_model::anthropic::auth::AnthropicAuth::base_url(& self) -> & str
+fn ra_model::anthropic::auth::AnthropicAuth::betas(& self) -> & [String]
+fn ra_model::anthropic::auth::AnthropicAuth::keyless(base_url : impl Into < String >) -> Self
+fn ra_model::anthropic::auth::AnthropicAuth::new(api_key : impl Into < String >) -> Self
+fn ra_model::anthropic::auth::AnthropicAuth::version(& self) -> & str
+fn ra_model::anthropic::auth::AnthropicAuth::with_api_key(mut self, api_key : impl Into < String >) -> Self
+fn ra_model::anthropic::auth::AnthropicAuth::with_base_url(mut self, base_url : impl Into < String >) -> Self
+fn ra_model::anthropic::auth::AnthropicAuth::with_beta(mut self, beta : impl Into < String >) -> Self
+fn ra_model::anthropic::auth::AnthropicAuth::with_default_header(mut self, name : impl Into < String >, value : impl Into < String >) -> Self
+fn ra_model::anthropic::auth::AnthropicAuth::with_version(mut self, version : impl Into < String >) -> Self
 fn ra_model::anthropic::smoke::preview_request_payload(model : & str, request : & ModelRequest) -> Result < Value >
 fn ra_model::compat::CompatEndpoint::base_url(& self) -> & str
 fn ra_model::compat::CompatEndpoint::build_provider(& self) -> Result < OpenAiChatProvider >
@@ -121,6 +136,7 @@ fn ra_model::provider::ProviderRegistryBuilder::unknown_prefix_policy(mut self, 
 fn ra_model::retry::RetryHints::from_headers< 'a >(lookup : impl Fn (& str) -> Option < & 'a str >) -> Self
 fn ra_model::retry::retry_advice(request : & ModelRetryAdviceRequest < '_ >) -> Option < RetryAdvice >
 mod ra_model::anthropic
+mod ra_model::anthropic::auth
 mod ra_model::anthropic::betas
 mod ra_model::anthropic::smoke
 mod ra_model::compat
@@ -136,6 +152,9 @@ mod ra_model::provider
 mod ra_model::provider::quirks
 mod ra_model::retry
 mod ra_model::usage
+struct ra_model::anthropic::AnthropicMessagesModel
+struct ra_model::anthropic::AnthropicMessagesProvider
+struct ra_model::anthropic::auth::AnthropicAuth
 struct ra_model::compat::CompatEndpoint
 struct ra_model::openai::auth::OpenAiAuth
 struct ra_model::openai::chat::ChatLoweringOptions
