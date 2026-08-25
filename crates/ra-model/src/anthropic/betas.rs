@@ -1,1 +1,1 @@
-//! Beta switches for interleaved thinking, mid-conversation system messages, and effort.
+//! Beta identifiers are transport configuration on [`crate::anthropic::AnthropicAuth`].

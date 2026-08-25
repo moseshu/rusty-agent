@@ -602,8 +602,9 @@ fn anthropic_preview_groups_tool_turns_and_projects_structured_output() {
     assert!(payload.get("disable_parallel_tool_use").is_none());
 }
 
+/// Anthropic can forbid tool calls outright, so the tool table stays advertised while it does.
 #[test]
-fn anthropic_preview_refuses_an_unrepresentable_no_tools_choice() {
+fn anthropic_preview_forbids_tool_calls_without_withdrawing_the_tools() {
     let request = ModelRequest::new(
         vec![ModelInputItem::Message(Message::user("hello"))],
         resolved(
@@ -617,9 +618,10 @@ fn anthropic_preview_refuses_an_unrepresentable_no_tools_choice() {
         json!({"type": "object"}),
     )]);
 
-    let error = preview_request_payload(MODEL, &request)
-        .expect_err("the preview must not silently discard ToolChoice::None");
-    assert!(error.to_string().contains("ToolChoice::None"));
+    let payload = preview_request_payload(MODEL, &request)
+        .expect("Anthropic states a no-tools turn as a tool choice");
+    assert_eq!(payload["tool_choice"], json!({"type": "none"}));
+    assert_eq!(payload["tools"][0]["name"], "lookup");
 }
 
 /// Smallest budget Anthropic accepts, and the smallest output ceiling that leaves room for it.
