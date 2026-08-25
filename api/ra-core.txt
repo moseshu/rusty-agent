@@ -537,6 +537,7 @@ const fn ra_core::tool::options::ToolOptions::concurrency(& self) -> ToolConcurr
 const fn ra_core::tool::options::ToolOptions::exposure(& self) -> ToolExposure
 const fn ra_core::tool::options::ToolOptions::failure_handling(& self) -> ToolFailureHandling
 const fn ra_core::tool::options::ToolOptions::is_advertised(& self) -> bool
+const fn ra_core::tool::options::ToolOptions::is_advertised_to_model(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::is_discoverable(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::max_no_progress_streak(& self) -> Option < NonZeroU32 >
 const fn ra_core::tool::options::ToolOptions::max_repeat_streak(& self) -> Option < NonZeroU32 >

@@ -567,6 +567,24 @@ impl ToolOptions {
         live && reachable
     }
 
+    /// Whether this tool occupies a slot in a tool table the model is sent.
+    ///
+    /// Both declarations have to be read, and this is where the two halves are joined: exposure
+    /// answers "does the model see it", availability answers "is it live at all". Named here
+    /// rather than spelled out at each call site because the surface token budget and the
+    /// product's advertised tool inventory both ask it, and a prompt that listed a different set
+    /// than the request carries would promise the model a name the runtime cannot dispatch.
+    ///
+    /// Narrower than [`can_reach_model_surface`](Self::can_reach_model_surface), which the
+    /// name-uniqueness rule asks instead: [`Deferred`](ToolExposure::Deferred) stakes a claim on
+    /// its name today but is not in this table. [`Dynamic`](ToolAvailability::Dynamic) answers
+    /// `true`, because it may be on — so this describes the surface as declared, which one turn's
+    /// per-run callback can still narrow.
+    #[must_use]
+    pub const fn is_advertised_to_model(&self) -> bool {
+        self.is_advertised() && self.can_reach_model_surface()
+    }
+
     /// Explicit caller allowlist, or `None` for unrestricted.
     #[must_use]
     pub fn allowed_callers(&self) -> Option<&[ToolCaller]> {
