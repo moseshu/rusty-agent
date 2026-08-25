@@ -10,8 +10,8 @@
 //! `identity`, [`personality`], [`role`], and the generated `tool_surface`. The rest are still
 //! empty registration slots: writing that text is a separate piece of work, and filling them with
 //! placeholders would freeze wording nobody has decided on. Each one lands by adding a section to
-//! [`assemble_stable_prefix`], which is why the assembly is a list rather than a hardcoded
-//! concatenation.
+//! [`assemble_stable_prefix_for_tools`], which is why the assembly is a list rather than a
+//! hardcoded concatenation.
 
 pub(crate) mod autonomy;
 pub(crate) mod channels;
@@ -64,7 +64,9 @@ pub fn assemble_stable_prefix(role: &PromptRole) -> Result<StablePrefix> {
 ///
 /// # Errors
 ///
-/// Propagates section construction and assembly failures.
+/// Propagates section construction and assembly failures, and rejects two tools that advertise the
+/// same model-facing name — the prompt would name one entry for a dispatch the agent will refuse
+/// to build.
 pub fn assemble_stable_prefix_for_tools(
     role: &PromptRole,
     tools: &[Arc<dyn Tool>],

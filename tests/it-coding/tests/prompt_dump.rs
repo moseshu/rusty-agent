@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ra_coding::{
     CodingHost,
@@ -23,6 +23,14 @@ use ra_prompt::dump::PromptDump;
 use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
 
 const TOOL_SURFACE_RENDER_COUNT: usize = 100;
+
+/// Serializes the two snapshot writers against each other.
+///
+/// The two files are blessed by separate tests that the harness runs in parallel, and both read
+/// the tool-surface baseline before writing. Unsynchronized, one test's write can truncate the
+/// file the other is reading, turning a legitimate bless into a panic about a missing revision
+/// marker — or, worse, into a bogus one about an unraised revision.
+static BLESS_SNAPSHOTS: Mutex<()> = Mutex::new(());
 
 fn snapshot_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -93,6 +101,7 @@ fn test_stable_prefix_matches_the_committed_snapshot() {
 
     let path = snapshot_path();
     if std::env::var_os("BLESS_PROMPT_DUMP").is_some() {
+        let _writing = lock_snapshots();
         refuse_bless_without_revision_bump(&rendered_tool_surface());
         std::fs::write(&path, &rendered).expect("snapshot must be writable");
         return;
@@ -201,6 +210,7 @@ fn test_tool_surface_matches_the_committed_snapshot_and_requires_a_revision_bump
     let path = tool_surface_snapshot_path();
 
     if std::env::var_os("BLESS_PROMPT_DUMP").is_some() {
+        let _writing = lock_snapshots();
         refuse_bless_without_revision_bump(&rendered);
         std::fs::write(&path, rendered).expect("tool-surface snapshot must be writable");
         return;
@@ -228,11 +238,12 @@ fn rendered_tool_surface() -> String {
 
 /// Refuses a bless that would move the tool surface without raising its revision.
 ///
-/// **Both snapshots have to be guarded, not just the tool-surface one.** The two files are written
-/// by separate tests that the harness runs in parallel, and the prompt dump embeds the surface
-/// fingerprint. A guard on one write alone would still leave the other file rewritten with a
-/// fingerprint no reviewer approved, and the next run would then fail on a snapshot other than the
-/// one that actually changed.
+/// **Both bless paths call this, not just the tool-surface one.** Adding or removing an advertised
+/// tool moves both files, and guarding one write alone would leave the tree half-blessed — the
+/// names list rewritten, the fingerprint not — with the next run failing on the file that was left
+/// behind rather than on the change that caused it. A description- or schema-only edit moves only
+/// the tool-surface snapshot, because the prompt section carries names and never the digest, so
+/// guarding the prompt dump costs nothing in that case.
 fn refuse_bless_without_revision_bump(rendered: &str) {
     let Ok(baseline) = std::fs::read_to_string(tool_surface_snapshot_path()) else {
         return;
@@ -245,6 +256,16 @@ fn refuse_bless_without_revision_bump(rendered: &str) {
         "the advertised tool surface changed without a schema revision bump; raise \
          TOOL_SCHEMA_REVISION before blessing"
     );
+}
+
+/// Takes the write lock, ignoring poisoning.
+///
+/// A poisoned lock means the other writer already failed its own guard and said why. Panicking
+/// here on the poison instead would replace that explanation with a lock error.
+fn lock_snapshots() -> std::sync::MutexGuard<'static, ()> {
+    BLESS_SNAPSHOTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 fn revision(surface: &str) -> u32 {
@@ -303,19 +324,22 @@ fn test_the_product_prefix_begins_with_the_identity_contract() {
 /// The product's assembled prefix is currently too short for any provider to cache.
 ///
 /// This pins a fact that is otherwise invisible. The floor is 1024 estimated tokens — every
-/// provider ignores a shorter prefix — and today's prefix carries only the tone and role sections,
-/// landing in the low hundreds. So the real product gets no cache plan, and no `prompt_cache_key`
-/// is sent even to an endpoint that declared support for one.
+/// provider ignores a shorter prefix — and today's prefix carries the identity, tone, role and
+/// advertised-tool sections, landing in the low hundreds. So the real product gets no cache plan,
+/// and no `prompt_cache_key` is sent even to an endpoint that declared support for one.
 ///
-/// **This is missing content, not a broken threshold.** The remaining sections are unwritten and
-/// the tool table, which shares the same cached prefix and is usually the larger half, is not
-/// attached to this agent yet. The assertion is deliberately written to fail once either lands: at
-/// that point caching starts applying to the product, and that is a change worth noticing rather
-/// than discovering on a bill.
+/// Measured on the host-backed prefix, which is the longer of the two the product assembles and
+/// the one an agent with tools installed actually carries. A prefix that only cleared the floor
+/// once tools were attached would otherwise reach the floor without this test noticing.
+///
+/// **This is missing content, not a broken threshold.** Most sections are still unwritten, and the
+/// provider's tool table — a different part of the request, which the same cache span covers — is
+/// one tool wide. The assertion is deliberately written to fail once that changes: at that point
+/// caching starts applying to the product, and that is a change worth noticing rather than
+/// discovering on a bill.
 #[test]
 fn test_the_product_prefix_is_still_below_the_caching_floor() {
-    let prefix = assemble_stable_prefix(&PromptRole::Main).expect("prefix");
-    let tokens = prefix.token_estimate();
+    let tokens = host_backed_prefix().token_estimate();
 
     assert!(
         tokens < MIN_CACHEABLE_PREFIX_TOKENS,

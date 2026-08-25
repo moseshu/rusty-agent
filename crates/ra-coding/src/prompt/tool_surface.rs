@@ -50,9 +50,11 @@ impl ToolSurfacePromptBuilder {
             return Ok(None);
         }
 
+        // "Available tools", not "tool schemas": the schemas are in the request's tool table, and
+        // naming them here would tell the model to look for something this text does not carry.
         let content = format!(
-            "Available tool schemas:\n{}\n\nUse only these tools. Their provider-supplied \
-             schemas define the accepted arguments.",
+            "Available tools:\n{}\n\nUse only these tools. Their provider-supplied schemas \
+             define the accepted arguments.",
             render_names(&entries)
         );
 
@@ -95,7 +97,11 @@ impl ToolSurfacePromptBuilder {
 fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, ContentHash>> {
     let mut entries = BTreeMap::new();
     for tool in tools {
-        if !tool.options().can_reach_model_surface() || !tool.options().is_advertised() {
+        // The same rule the surface budget applies, read from the one place that owns it, so the
+        // prompt cannot come to name a set the request does not carry. A `Dynamic` tool is listed
+        // even though a per-run callback may withhold it from a given turn: the prefix has to hold
+        // still across runs, so it describes the surface as declared.
+        if !tool.options().is_advertised_to_model() {
             continue;
         }
 
