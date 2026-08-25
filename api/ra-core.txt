@@ -668,6 +668,7 @@ const ra_core::prompt::PromptSectionName::IDENTITY: Self
 const ra_core::prompt::PromptSectionName::PERSONALITY: Self
 const ra_core::prompt::PromptSectionName::ROLE: Self
 const ra_core::prompt::PromptSectionName::SAFETY: Self
+const ra_core::prompt::PromptSectionName::TOOL_SURFACE: Self
 const ra_core::prompt::PromptSectionName::TOOL_USE: Self
 const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_failure::TOOL_FAILURE_RECENT_LIMIT: usize

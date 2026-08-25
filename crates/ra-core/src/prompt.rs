@@ -146,6 +146,8 @@ impl PromptSectionName {
     pub const CORE_BEHAVIOR: Self = Self::from_static("core_behavior");
     /// Tool usage guidance section.
     pub const TOOL_USE: Self = Self::from_static("tool_use");
+    /// Stable inventory of the tool schemas advertised with the prompt.
+    pub const TOOL_SURFACE: Self = Self::from_static("tool_surface");
     /// Safety boundaries and operational safety section.
     pub const SAFETY: Self = Self::from_static("safety");
     /// Editing and post-change verification guidance section.
