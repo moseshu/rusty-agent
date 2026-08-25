@@ -449,9 +449,10 @@ impl fmt::Debug for TurnActionSurface {
 
 /// Prepares one turn in the only permitted stage order.
 pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<PreparedTurn> {
-    // Every stage below reads the **execution** instance. Preparation decides what the model is
-    // offered, and offering what the public agent declares would hand the model tools whichever
-    // capability or sandbox step produced this instance may have removed.
+    // Execution-owned stages read the **execution** instance. Preparation decides which tools,
+    // model, and settings the model receives, and taking those from the public agent would offer
+    // capabilities the prepared instance may no longer run. The output schema is the deliberate
+    // exception below: it is a public delivery promise, not an execution capability.
     let agent = request.agent.execution();
 
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
@@ -467,8 +468,10 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     )?;
     let tool_definitions = surface.tool_definitions();
 
-    // 3. Resolve structured output after handoffs. R1-16 owns the output parser contract.
-    let output_schema = resolve_output_schema(agent);
+    // 3. Project the public structured-output promise after handoffs. A prepared execution
+    // instance may alter its tools or model, but it must not silently downgrade the output
+    // contract callers configured and future closeout validation will enforce.
+    let output_schema = resolve_output_schema(request.agent.public());
 
     // 4. Resolve the provider and model only after the advertised action surface is stable.
     request.cancel.ensure_not_cancelled()?;
@@ -617,8 +620,8 @@ fn resolve_handoffs(_agent: &AgentSpec) -> Vec<ModelHandoffDefinition> {
     Vec::new()
 }
 
-fn resolve_output_schema(_agent: &AgentSpec) -> Option<ModelOutputSchema> {
-    None
+fn resolve_output_schema(public_agent: &AgentSpec) -> Option<ModelOutputSchema> {
+    public_agent.output_schema().to_model_output_schema()
 }
 
 /// What the instruction stage contributed to one turn.

@@ -14,6 +14,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelTracing, ProviderKey, ResolvedModel, ToolChoice,
     },
+    output::OutputSchema,
     state::{RunId, ToolUse, ToolUseAttempt, ToolUseTracker},
     tool::{
         Tool, ToolAvailability, ToolContext, ToolExposure, ToolOptions, ToolOrigin, ToolOutput,
@@ -22,9 +23,9 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
-    turn::prepare::{TurnPreparationRequest, prepare_turn},
+    turn::prepare::{PreparedTurn, TurnPreparationRequest, prepare_turn},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 type Events = Arc<Mutex<Vec<String>>>;
 
@@ -812,6 +813,144 @@ async fn test_turn_preparation_13() {
         still_forced.request().model_settings().tool_choice(),
         Some(&ToolChoice::Required)
     );
+}
+
+fn review_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"],
+        "additionalProperties": false
+    })
+}
+
+fn reviewer(output_schema: OutputSchema) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("reviewer"))
+        .name("Reviewer")
+        .output_schema(output_schema)
+        .build()
+        .unwrap()
+}
+
+async fn prepare_for(agent: &Arc<AgentSpec>) -> PreparedTurn {
+    let resolver = RecordingResolver::new(Arc::new(Mutex::new(Vec::new())));
+    let context = host(agent);
+    let cancel = CancelScope::root();
+
+    prepare_turn(TurnPreparationRequest::new(
+        &direct(agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_turn_preparation_projects_agent_output_schema_to_model_request() {
+    let agent = reviewer(OutputSchema::json_schema("review", review_schema()));
+
+    let prepared = prepare_for(&agent).await;
+
+    let output_schema = prepared
+        .request()
+        .output_schema()
+        .expect("the agent schema must reach the request");
+    assert_eq!(output_schema.name(), "review");
+    assert_eq!(output_schema.schema(), &review_schema());
+    // The declared default, on the wire: strictness is what makes the schema a contract rather
+    // than a suggestion, and asserting it here is what keeps the default from being lost between
+    // the declaration and the request.
+    assert!(output_schema.strict());
+}
+
+#[tokio::test]
+async fn test_turn_preparation_preserves_a_relaxed_strict_declaration() {
+    let agent = reviewer(OutputSchema::json_schema("review", review_schema()).with_strict(false));
+
+    let prepared = prepare_for(&agent).await;
+
+    let output_schema = prepared
+        .request()
+        .output_schema()
+        .expect("the agent schema must reach the request");
+    assert!(!output_schema.strict());
+}
+
+#[tokio::test]
+async fn test_turn_preparation_omits_the_output_schema_of_a_plain_text_agent() {
+    // Plain text is the default, so this stayed true while the stage was a stub returning `None`.
+    // It has to keep being true now that the stage reads a real declaration: an ordinary agent
+    // must not start sending a structured-output request.
+    let agent = reviewer(OutputSchema::plain_text());
+
+    let prepared = prepare_for(&agent).await;
+
+    assert!(prepared.request().output_schema().is_none());
+}
+
+#[tokio::test]
+async fn test_turn_preparation_keeps_the_public_output_contract_for_a_prepared_agent() {
+    let public = reviewer(OutputSchema::json_schema("review", review_schema()));
+    let execution = public.to_builder().clear_output_schema().build().unwrap();
+    let binding = AgentBinding::prepared(Arc::clone(&public), execution);
+    let resolver = RecordingResolver::new(Arc::new(Mutex::new(Vec::new())));
+    let context = host(&public);
+    let cancel = CancelScope::root();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &binding,
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+
+    let output_schema = prepared
+        .request()
+        .output_schema()
+        .expect("the public agent's schema must remain the request contract");
+    assert_eq!(output_schema.name(), "review");
+    assert_eq!(output_schema.schema(), &review_schema());
+    assert!(output_schema.strict());
+}
+
+#[tokio::test]
+async fn test_turn_preparation_ignores_an_output_schema_only_the_execution_instance_declares() {
+    // The other half of the same rule, and the more dangerous direction: a preparation step the
+    // caller never configured must not be able to *impose* structured output either. The host
+    // asked for text, so it parses text; a schema arriving from the execution instance would make
+    // the model answer in JSON that nothing downstream expects.
+    let public = reviewer(OutputSchema::plain_text());
+    let execution = public
+        .to_builder()
+        .output_schema(OutputSchema::json_schema("review", review_schema()))
+        .build()
+        .unwrap();
+    let binding = AgentBinding::prepared(Arc::clone(&public), execution);
+    let resolver = RecordingResolver::new(Arc::new(Mutex::new(Vec::new())));
+    let context = host(&public);
+    let cancel = CancelScope::root();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &binding,
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert!(prepared.request().output_schema().is_none());
 }
 
 #[tokio::test]

@@ -32,11 +32,16 @@ pub mod guard;
 pub mod hook;
 pub mod item;
 pub mod model;
+pub mod output;
 pub mod permission;
 pub mod prompt;
 pub mod session;
 pub mod state;
 pub mod step;
+// Crate-internal JSON-schema machinery. It sits beside the modules that use it rather than inside
+// one of them: tool inputs and agent output declarations answer to the same provider strict-mode
+// rules, and a shared rule that lives under one caller reads like it belongs to that caller.
+mod strict;
 pub mod tool;
 pub mod trace;
 pub mod usage;

@@ -14,7 +14,7 @@ use crate::{
     error::{Error, Result},
     item::{AgentId, ModelInputItem},
     prompt::{CachePlan, ContentHash},
-    tool::canonicalize_json,
+    strict::canonicalize_json,
 };
 
 /// An opaque identifier for a provider-managed server-side conversation.
@@ -316,8 +316,15 @@ pub struct ModelOutputSchema {
 
 impl ModelOutputSchema {
     /// Creates a structured-output definition.
+    ///
+    /// The schema is canonicalized like a tool's, for the same reason: key order in a
+    /// `serde_json::Value` depends on which feature set the dependency graph selected, and a
+    /// request body that varies with that is neither reproducible in a snapshot nor stable across
+    /// the calls a provider is being asked to cache.
     #[must_use]
     pub fn new(name: impl Into<String>, schema: Value) -> Self {
+        let mut schema = schema;
+        canonicalize_json(&mut schema);
         Self {
             name: name.into(),
             schema,

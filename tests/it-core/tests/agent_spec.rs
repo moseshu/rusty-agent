@@ -5,14 +5,15 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     agent::{AgentId, AgentInstructions, AgentSpec, ToolUseBehavior},
-    error::Result,
+    error::{Error, Result},
     model::ModelSettings,
+    output::OutputSchema,
     tool::{
         Tool, ToolContext, ToolExposure, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput,
         ToolSchema,
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 struct EchoTool {
     origin: ToolOrigin,
@@ -282,6 +283,110 @@ fn derived_builder_can_clear_inherited_optional_fields() {
     assert!(agent.instructions().is_some());
     assert_eq!(agent.model(), Some("openai/gpt-5"));
     assert_eq!(agent.tools().len(), 1);
+}
+
+fn review_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"],
+        "additionalProperties": false
+    })
+}
+
+fn reviewer(output_schema: OutputSchema) -> Result<Arc<AgentSpec>> {
+    AgentSpec::builder()
+        .id(AgentId::new("reviewer"))
+        .name("Reviewer")
+        .output_schema(output_schema)
+        .build()
+}
+
+#[test]
+fn output_schema_is_immutable_and_derived_builders_can_restore_plain_text() {
+    let output_schema = OutputSchema::json_schema("review", review_schema());
+    let agent = reviewer(output_schema.clone()).unwrap();
+
+    assert_eq!(agent.output_schema(), &output_schema);
+    assert_eq!(agent.output_schema().name(), Some("review"));
+    assert_eq!(agent.output_schema().strict(), Some(true));
+    assert_eq!(
+        agent
+            .output_schema()
+            .json_schema_value()
+            .expect("a structured declaration has a schema"),
+        &review_schema()
+    );
+
+    // Deriving keeps the promise unless the derivation says otherwise. A prepared execution
+    // instance inherits it for the same reason it inherits tools: it stands in for this agent.
+    let derived = agent.to_builder().model("openai/gpt-5").build().unwrap();
+    assert_eq!(derived.output_schema(), &output_schema);
+
+    let plain_text = agent.to_builder().clear_output_schema().build().unwrap();
+    assert!(plain_text.output_schema().is_plain_text());
+    assert!(!agent.output_schema().is_plain_text());
+
+    let default_agent = AgentSpec::builder()
+        .id(AgentId::new("plain-text"))
+        .name("Plain Text")
+        .build()
+        .unwrap();
+    assert!(default_agent.output_schema().is_plain_text());
+}
+
+#[test]
+fn build_rejects_an_output_declaration_no_provider_would_accept() {
+    // Each of these reaches the wire unchanged and is refused there, on every model call of every
+    // run. Nothing between the declaration and the request inspects it, so this build is the only
+    // place the mistake can still be attributed to the code that made it.
+    let unnamed = reviewer(OutputSchema::json_schema("", review_schema())).unwrap_err();
+    assert!(matches!(unnamed, Error::Config { .. }), "{unnamed:?}");
+
+    let not_a_schema = reviewer(OutputSchema::json_schema("review", json!("approved"))).unwrap_err();
+    assert!(
+        matches!(not_a_schema, Error::Config { .. }),
+        "{not_a_schema:?}"
+    );
+
+    // A strict declaration is a claim about the schema, and the claim is what is checked: the same
+    // open-ended schema is a perfectly ordinary non-strict declaration.
+    let open_ended = json!({
+        "type": "object",
+        "properties": {"approved": {"type": "boolean"}}
+    });
+    let unenforceable =
+        reviewer(OutputSchema::json_schema("review", open_ended.clone())).unwrap_err();
+    assert!(
+        matches!(unenforceable, Error::Config { .. }),
+        "{unenforceable:?}"
+    );
+    reviewer(OutputSchema::json_schema("review", open_ended).with_strict(false))
+        .expect("a non-strict declaration makes no claim the provider will check");
+
+    // Nesting is where a hand-written schema usually goes wrong: the root looks right and the
+    // violation sits one level down, where only a recursive check finds it.
+    let nested = json!({
+        "type": "object",
+        "properties": {
+            "review": {
+                "type": "object",
+                "properties": {"approved": {"type": "boolean"}},
+                "required": ["approved"]
+            }
+        },
+        "required": ["review"],
+        "additionalProperties": false
+    });
+    let nested_error = reviewer(OutputSchema::json_schema("review", nested)).unwrap_err();
+    assert!(
+        matches!(nested_error, Error::Config { .. }),
+        "{nested_error:?}"
+    );
+    assert!(
+        nested_error.to_string().contains("$.review"),
+        "the error must point at the offending node: {nested_error}"
+    );
 }
 
 #[test]

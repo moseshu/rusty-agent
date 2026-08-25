@@ -22,6 +22,7 @@ const fn ra_core::agent::AgentInstructions::is_dynamic(& self) -> bool
 const fn ra_core::agent::AgentSpec::id(& self) -> & AgentId
 const fn ra_core::agent::AgentSpec::instructions(& self) -> Option < & AgentInstructions >
 const fn ra_core::agent::AgentSpec::model_settings(& self) -> & ModelSettings
+const fn ra_core::agent::AgentSpec::output_schema(& self) -> & OutputSchema
 const fn ra_core::agent::AgentSpec::tool_use_behavior(& self) -> & ToolUseBehavior
 const fn ra_core::agent::FunctionToolResult::call_id(& self) -> Option < & CallId >
 const fn ra_core::agent::FunctionToolResult::nested_run(& self) -> Option < & NestedRunRef >
@@ -427,6 +428,10 @@ const fn ra_core::model::stream::RawResponseEvent::schema_version(& self) -> Sch
 const fn ra_core::model::stream::RawResponseEvent::unknown(& self) -> & Unknown
 const fn ra_core::model::stream::RunItemStreamEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::model::stream::RunItemStreamEvent::unknown(& self) -> & Unknown
+const fn ra_core::output::OutputSchema::is_plain_text(& self) -> bool
+const fn ra_core::output::OutputSchema::json_schema_value(& self) -> Option < & Value >
+const fn ra_core::output::OutputSchema::plain_text() -> Self
+const fn ra_core::output::OutputSchema::strict(& self) -> Option < bool >
 const fn ra_core::prompt::CachePlan::new(prefix_hash : ContentHash) -> Self
 const fn ra_core::prompt::CachePlan::prefix_hash(& self) -> & ContentHash
 const fn ra_core::prompt::PromptProvenance::content_hash(& self) -> & ContentHash
@@ -806,6 +811,7 @@ fn ra_core::agent::AgentSpec::tools(& self) -> & [Arc < dyn Tool >]
 fn ra_core::agent::AgentSpecBuilder::build(self) -> Result < Arc < AgentSpec > >
 fn ra_core::agent::AgentSpecBuilder::clear_instructions(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_model(mut self) -> Self
+fn ra_core::agent::AgentSpecBuilder::clear_output_schema(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_tools(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::dynamic_instructions(mut self, handler : Arc < dyn DynamicPromptHandler >) -> Self
 fn ra_core::agent::AgentSpecBuilder::dynamic_instructions_fn< F , Fut >(mut self, f : F) -> Self where F : Fn (& RunContext) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < ResolvedPrompt > > + Send + 'static ,
@@ -815,6 +821,7 @@ fn ra_core::agent::AgentSpecBuilder::model(mut self, model : impl Into < String 
 fn ra_core::agent::AgentSpecBuilder::model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_core::agent::AgentSpecBuilder::name(mut self, name : impl Into < String >) -> Self
 fn ra_core::agent::AgentSpecBuilder::new() -> Self
+fn ra_core::agent::AgentSpecBuilder::output_schema(mut self, output_schema : OutputSchema) -> Self
 fn ra_core::agent::AgentSpecBuilder::tool(mut self, tool : Arc < dyn Tool >) -> Self
 fn ra_core::agent::AgentSpecBuilder::tool_use_behavior(mut self, tool_use_behavior : ToolUseBehavior) -> Self
 fn ra_core::agent::AgentSpecBuilder::tools(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
@@ -1148,6 +1155,11 @@ fn ra_core::model::stream::RawResponseEvent::new(provider : ProviderKey, event_t
 fn ra_core::model::stream::RunItemStreamEvent::item(& self) -> & RunItem
 fn ra_core::model::stream::RunItemStreamEvent::name(& self) -> & str
 fn ra_core::model::stream::RunItemStreamEvent::new(name : impl Into < String >, item : RunItem) -> Self
+fn ra_core::output::OutputSchema::json_schema(name : impl Into < String >, schema : Value) -> Self
+fn ra_core::output::OutputSchema::name(& self) -> Option < & str >
+fn ra_core::output::OutputSchema::to_model_output_schema(& self) -> Option < ModelOutputSchema >
+fn ra_core::output::OutputSchema::validate(& self) -> Result < () >
+fn ra_core::output::OutputSchema::with_strict(mut self, strict : bool) -> Self
 fn ra_core::prompt::CachePlan::cache_scope(& self) -> Option < & str >
 fn ra_core::prompt::CachePlan::for_prefix(prefix : & str, cache_scope : Option < & str >) -> Self
 fn ra_core::prompt::CachePlan::with_cache_scope(mut self, scope : impl Into < String >) -> Self
@@ -1441,6 +1453,7 @@ mod ra_core::model::retry::normalized
 mod ra_core::model::retry::policy
 mod ra_core::model::settings
 mod ra_core::model::stream
+mod ra_core::output
 mod ra_core::permission
 mod ra_core::prompt
 mod ra_core::session
@@ -1568,6 +1581,7 @@ struct ra_core::model::settings::ProviderKey
 struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
+struct ra_core::output::OutputSchema
 struct ra_core::prompt::CachePlan
 struct ra_core::prompt::ContentHash
 struct ra_core::prompt::PromptProvenance

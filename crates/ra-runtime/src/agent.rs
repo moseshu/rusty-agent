@@ -90,9 +90,13 @@ impl AgentBinding {
 
     /// The instance that actually runs: its tools, its model, its settings.
     ///
-    /// Turn preparation reads this and nothing else. Resolving the advertised surface from the
-    /// public agent instead would offer tools the prepared instance cannot run, and the mismatch
-    /// would only surface when the model called one of them.
+    /// Turn preparation reads this for everything that describes execution. Resolving the
+    /// advertised surface from the public agent instead would offer tools the prepared instance
+    /// cannot run, and the mismatch would only surface when the model called one of them.
+    ///
+    /// The declared output form is the one documented exception, and it is exactly the inverse
+    /// argument: a delivery promise is not an execution capability, so it is read from
+    /// [`Self::public`] — see [`AgentSpec::output_schema`].
     #[must_use]
     pub const fn execution(&self) -> &Arc<AgentSpec> {
         &self.execution

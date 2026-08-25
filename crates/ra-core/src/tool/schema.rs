@@ -7,16 +7,16 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned, de::Erro
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{
-    canonicalize_json,
-    origin::validate_tool_name,
-    strict::{ensure_strict_json_schema, verify_strict_json_schema},
-};
+use super::origin::validate_tool_name;
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result, ToolErrorKind},
     model::ModelToolDefinition,
+    strict::{canonicalize_json, ensure_strict_json_schema, verify_strict_json_schema},
 };
+
+/// Names this declaration in the shared strict-mode diagnostics.
+const TOOL_INPUT_SCHEMA_LABEL: &str = "tool input schema";
 
 /// Current tool-schema version.
 pub const TOOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
@@ -57,7 +57,7 @@ pub trait ToolInput: ToolInputRequirements {
             root.remove("description");
         }
         let mut schema = if Self::STRICT_JSON_SCHEMA {
-            ensure_strict_json_schema(&mut input_schema)?;
+            ensure_strict_json_schema(&mut input_schema, TOOL_INPUT_SCHEMA_LABEL)?;
             ToolSchema::new(name, input_schema)?
         } else {
             ToolSchema::loose(name, input_schema)?
@@ -103,7 +103,7 @@ impl ToolSchema {
     /// hand-written and MCP-sourced schemas must already be strict, or use [`Self::loose`].
     pub fn new(name: impl Into<String>, input_schema: Value) -> Result<Self> {
         let schema = Self::build(name, input_schema, true)?;
-        verify_strict_json_schema(&schema.input_schema)?;
+        verify_strict_json_schema(&schema.input_schema, TOOL_INPUT_SCHEMA_LABEL)?;
         Ok(schema)
     }
 
@@ -147,7 +147,7 @@ impl ToolSchema {
             )));
         }
         if self.strict_json_schema {
-            verify_strict_json_schema(&self.input_schema)?;
+            verify_strict_json_schema(&self.input_schema, TOOL_INPUT_SCHEMA_LABEL)?;
         }
         Ok(())
     }
@@ -260,7 +260,8 @@ impl<'de> Deserialize<'de> for ToolSchema {
             )));
         }
         if wire.strict_json_schema {
-            verify_strict_json_schema(&input_schema).map_err(D::Error::custom)?;
+            verify_strict_json_schema(&input_schema, TOOL_INPUT_SCHEMA_LABEL)
+                .map_err(D::Error::custom)?;
         }
         Ok(Self {
             schema_version: wire.schema_version,
