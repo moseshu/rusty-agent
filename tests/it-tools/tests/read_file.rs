@@ -69,6 +69,12 @@ async fn test_read_file_01() {
     tool.validate().expect("identity and schema must agree");
     assert_eq!(tool.origin().qualified_name(), "read_file");
     assert!(tool.schema().strict_json_schema());
+    assert_eq!(
+        tool.model_definition().description(),
+        Some(
+            "Reads one file: text comes back with line numbers, images and PDFs come back as content. The\nline numbers are display only and are not part of the file."
+        )
+    );
 
     let schema = tool.schema().input_schema();
     assert_eq!(schema["additionalProperties"], json!(false));

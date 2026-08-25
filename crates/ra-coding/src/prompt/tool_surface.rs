@@ -32,7 +32,7 @@ use ra_core::{
 /// Raise this value whenever any model-facing name, description, strictness flag, or input schema
 /// changes. The tool-surface snapshot rejects a changed fingerprint with an unchanged revision,
 /// so a reviewer can distinguish a deliberately invalidated tool table from an accidental edit.
-pub(crate) const TOOL_SCHEMA_REVISION: u32 = 1;
+pub(crate) const TOOL_SCHEMA_REVISION: u32 = 2;
 
 /// Builds the prompt section and the reviewable digest for one advertised tool surface.
 pub(crate) struct ToolSurfacePromptBuilder;

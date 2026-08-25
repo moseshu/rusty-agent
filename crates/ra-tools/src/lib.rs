@@ -24,9 +24,10 @@
 //! [`ra_mcp`] — and this crate only binds it to a [`Tool`](ra_core::tool::Tool) implementation
 //! with a schema, an identity, and a model-facing result contract.
 //!
-//! **Stability**: `Evolving`. Which tools ship and what their schemas look like is exactly what
-//! R2-8 through R2-11 are still deciding, and a tool schema is a wire format the moment a model
-//! sees it. The `Tool` trait it implements is `ra-core`'s and is `Stable`.
+//! **Stability**: `Evolving`. The advertised tool set is still only partly implemented, and each
+//! implemented tool's model-facing description is reviewed as a wire contract. A tool schema is a
+//! wire format the moment a model sees it. The `Tool` trait it implements is `ra-core`'s and is
+//! `Stable`.
 
 pub mod agent_ns;
 pub mod ask_user;
