@@ -1,4 +1,14 @@
-//! Strict JSON-schema normalization shared by derived tool inputs.
+//! Strict JSON-schema normalization shared by derived tool inputs and agent output declarations.
+//!
+//! Both answer to the same provider rules, so both go through this module. Which of the two
+//! entry points applies is not a preference: a schema this framework *generates* from a Rust type
+//! is normalized ([`ensure_strict_json_schema`]), because the caller never wrote it and cannot fix
+//! it; a schema a caller *hands over* is only verified ([`verify_strict_json_schema`]), because
+//! rewriting it would silently change a contract its author chose.
+//!
+//! The `label` every entry point takes names the declaration in error messages. It is a parameter
+//! rather than a constant because the same violation reads very differently depending on which
+//! declaration the caller has to go and fix.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,12 +24,13 @@ const DEFINITION_KEYS: [&str; 2] = ["$defs", "definitions"];
 /// The node budget alone does not stop a self-referential type: each expansion consumes only a
 /// handful of nodes but a whole stack frame, so the stack overflows long before the budget does.
 /// The active-reference set turns that abort into an ordinary error.
-struct NormalizeState {
+struct NormalizeState<'a> {
     remaining: usize,
     active_refs: BTreeSet<String>,
+    label: &'a str,
 }
 
-pub(super) fn ensure_strict_json_schema(schema: &mut Value) -> Result<()> {
+pub(crate) fn ensure_strict_json_schema(schema: &mut Value, label: &str) -> Result<()> {
     if schema.as_object().is_some_and(Map::is_empty) {
         *schema = serde_json::json!({
             "additionalProperties": false,
@@ -34,27 +45,28 @@ pub(super) fn ensure_strict_json_schema(schema: &mut Value) -> Result<()> {
     let mut state = NormalizeState {
         remaining: MAX_SCHEMA_NODES,
         active_refs: BTreeSet::new(),
+        label,
     };
     normalize_node(schema, &root, &mut state)?;
     prune_unreferenced_definitions(schema);
 
     let object = schema
         .as_object()
-        .ok_or_else(|| Error::config("the root tool input schema must be a JSON object"))?;
+        .ok_or_else(|| Error::config(format!("the root {label} must be a JSON object")))?;
     if object.contains_key("anyOf") {
-        return Err(Error::config(
-            "the root of a strict tool input schema must not use anyOf",
-        ));
+        return Err(Error::config(format!(
+            "the root of a strict {label} must not use anyOf"
+        )));
     }
     match object.get("type") {
         Some(Value::String(kind)) if kind == "object" => Ok(()),
-        _ => Err(Error::config(
-            "the root of a strict tool input schema must be a non-nullable object",
-        )),
+        _ => Err(Error::config(format!(
+            "the root of a strict {label} must be a non-nullable object"
+        ))),
     }
 }
 
-fn normalize_node(node: &mut Value, root: &Value, state: &mut NormalizeState) -> Result<()> {
+fn normalize_node(node: &mut Value, root: &Value, state: &mut NormalizeState<'_>) -> Result<()> {
     state.remaining = state.remaining.checked_sub(1).ok_or_else(|| {
         Error::config("JSON schema is too large to convert safely to strict mode")
     })?;
@@ -166,7 +178,7 @@ fn normalize_definitions(
     object: &mut Map<String, Value>,
     key: &str,
     root: &Value,
-    state: &mut NormalizeState,
+    state: &mut NormalizeState<'_>,
 ) -> Result<()> {
     if let Some(definitions) = object.get_mut(key).and_then(Value::as_object_mut) {
         for definition in definitions.values_mut() {
@@ -180,7 +192,7 @@ fn normalize_variants(
     object: &mut Map<String, Value>,
     key: &str,
     root: &Value,
-    state: &mut NormalizeState,
+    state: &mut NormalizeState<'_>,
 ) -> Result<()> {
     if let Some(variants) = object.get_mut(key).and_then(Value::as_array_mut) {
         for variant in variants {
@@ -193,7 +205,7 @@ fn normalize_variants(
 fn normalize_all_of(
     object: &mut Map<String, Value>,
     root: &Value,
-    state: &mut NormalizeState,
+    state: &mut NormalizeState<'_>,
 ) -> Result<()> {
     let Some(all_of) = object.remove("allOf") else {
         return Ok(());
@@ -228,7 +240,7 @@ fn normalize_all_of(
 fn expand_ref_with_siblings(
     node: &mut Value,
     root: &Value,
-    state: &mut NormalizeState,
+    state: &mut NormalizeState<'_>,
 ) -> Result<()> {
     let Some(object) = node.as_object() else {
         return Ok(());
@@ -241,8 +253,9 @@ fn expand_ref_with_siblings(
     }
     let reference = reference.to_owned();
     if !state.active_refs.insert(reference.clone()) {
+        let label = state.label;
         return Err(Error::config(format!(
-            "tool input schema is self-referential through `{reference}`; \
+            "{label} is self-referential through `{reference}`; \
              a recursive type cannot be expressed as a strict JSON schema"
         )));
     }
@@ -328,24 +341,24 @@ fn collect_refs(value: &Value) -> BTreeSet<String> {
 /// Hand-written and MCP-sourced schemas never pass through [`ensure_strict_json_schema`], so a
 /// schema that merely *claims* to be strict would otherwise reach the provider and be rejected
 /// there. Unlike normalization this accepts any `required` order and does not inline references.
-pub(super) fn verify_strict_json_schema(schema: &Value) -> Result<()> {
+pub(crate) fn verify_strict_json_schema(schema: &Value, label: &str) -> Result<()> {
     let object = schema
         .as_object()
-        .ok_or_else(|| Error::config("the root tool input schema must be a JSON object"))?;
+        .ok_or_else(|| Error::config(format!("the root {label} must be a JSON object")))?;
     if object.contains_key("anyOf") {
-        return Err(Error::config(
-            "the root of a strict tool input schema must not use anyOf",
-        ));
+        return Err(Error::config(format!(
+            "the root of a strict {label} must not use anyOf"
+        )));
     }
     if !matches!(object.get("type"), Some(Value::String(kind)) if kind == "object") {
-        return Err(Error::config(
-            "the root of a strict tool input schema must be a non-nullable object",
-        ));
+        return Err(Error::config(format!(
+            "the root of a strict {label} must be a non-nullable object"
+        )));
     }
-    verify_node(schema, "$")
+    verify_node(schema, "$", label)
 }
 
-fn verify_node(node: &Value, path: &str) -> Result<()> {
+fn verify_node(node: &Value, path: &str, label: &str) -> Result<()> {
     let Some(object) = node.as_object() else {
         return Ok(());
     };
@@ -362,12 +375,12 @@ fn verify_node(node: &Value, path: &str) -> Result<()> {
     if is_object {
         if object.get("additionalProperties") != Some(&Value::Bool(false)) {
             return Err(Error::config(format!(
-                "strict tool input schema requires `additionalProperties: false` at `{path}`"
+                "strict {label} requires `additionalProperties: false` at `{path}`"
             )));
         }
         let properties = properties.ok_or_else(|| {
             Error::config(format!(
-                "strict tool input schema requires an object `properties` map at `{path}`"
+                "strict {label} requires an object `properties` map at `{path}`"
             ))
         })?;
         let required_values = object
@@ -375,19 +388,19 @@ fn verify_node(node: &Value, path: &str) -> Result<()> {
             .and_then(Value::as_array)
             .ok_or_else(|| {
                 Error::config(format!(
-                    "strict tool input schema requires a `required` string array at `{path}`"
+                    "strict {label} requires a `required` string array at `{path}`"
                 ))
             })?;
         let mut required = BTreeSet::new();
         for name in required_values {
             let name = name.as_str().ok_or_else(|| {
                 Error::config(format!(
-                    "strict tool input schema requires only strings in `required` at `{path}`"
+                    "strict {label} requires only strings in `required` at `{path}`"
                 ))
             })?;
             if !required.insert(name) {
                 return Err(Error::config(format!(
-                    "strict tool input schema has duplicate `required` entry `{name}` at `{path}`"
+                    "strict {label} has duplicate `required` entry `{name}` at `{path}`"
                 )));
             }
         }
@@ -397,18 +410,17 @@ fn verify_node(node: &Value, path: &str) -> Result<()> {
             .collect::<BTreeSet<_>>();
         if let Some(missing) = declared.difference(&required).next() {
             return Err(Error::config(format!(
-                "strict tool input schema requires every property in `required`; \
+                "strict {label} requires every property in `required`; \
                  `{path}.{missing}` is missing"
             )));
         }
         if let Some(unexpected) = required.difference(&declared).next() {
             return Err(Error::config(format!(
-                "strict tool input schema has undeclared `required` entry \
-                 `{path}.{unexpected}`"
+                "strict {label} has undeclared `required` entry `{path}.{unexpected}`"
             )));
         }
         for (name, property) in properties {
-            verify_node(property, &format!("{path}.{name}"))?;
+            verify_node(property, &format!("{path}.{name}"), label)?;
         }
     }
 
@@ -416,24 +428,24 @@ fn verify_node(node: &Value, path: &str) -> Result<()> {
         match object.get(key) {
             Some(Value::Array(entries)) => {
                 for (index, entry) in entries.iter().enumerate() {
-                    verify_node(entry, &format!("{path}[{index}]"))?;
+                    verify_node(entry, &format!("{path}[{index}]"), label)?;
                 }
             }
-            Some(node) => verify_node(node, &format!("{path}[]"))?,
+            Some(node) => verify_node(node, &format!("{path}[]"), label)?,
             None => {}
         }
     }
     for key in ["anyOf", "allOf", "oneOf"] {
         if let Some(variants) = object.get(key).and_then(Value::as_array) {
             for variant in variants {
-                verify_node(variant, path)?;
+                verify_node(variant, path, label)?;
             }
         }
     }
     for key in DEFINITION_KEYS {
         if let Some(definitions) = object.get(key).and_then(Value::as_object) {
             for (name, definition) in definitions {
-                verify_node(definition, &format!("#/{key}/{name}"))?;
+                verify_node(definition, &format!("#/{key}/{name}"), label)?;
             }
         }
     }

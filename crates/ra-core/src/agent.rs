@@ -6,10 +6,12 @@
 //! the value as an [`Arc`](std::sync::Arc), while intentional variants go through
 //! [`AgentSpec::to_builder`].
 //!
-//! Several agent concerns have dedicated later milestones. Dynamic prompts, output schemas, hooks,
-//! guardrails, capabilities, and handoffs must be added here only after their own protocol-neutral
-//! contracts exist. Private fields and the non-exhaustive public types let those additions remain
-//! source compatible; placeholder strings would freeze the wrong identities and callback shapes.
+//! Several agent concerns have dedicated later milestones. Dynamic prompts and output schemas have
+//! their protocol-neutral declarations here; output parsing and validation remain with the
+//! structured-output contract. Hooks, guardrails, capabilities, and handoffs must be added only
+//! after their own contracts exist. Private fields and the non-exhaustive public types let those
+//! additions remain source compatible; placeholder strings would freeze the wrong identities and
+//! callback shapes.
 
 use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
 
@@ -18,6 +20,7 @@ use crate::{
     error::{Error, Result},
     item::{CallId, RunItem, ToolCallOutput},
     model::ModelSettings,
+    output::OutputSchema,
     prompt::{DynamicPromptHandler, ResolvedPrompt},
     state::NestedRunRef,
     tool::{Tool, ToolOrigin},
@@ -422,6 +425,7 @@ pub struct AgentSpec {
     instructions: Option<AgentInstructions>,
     model: Option<String>,
     model_settings: ModelSettings,
+    output_schema: OutputSchema,
     tools: Vec<Arc<dyn Tool>>,
     tool_use_behavior: ToolUseBehavior,
 }
@@ -443,6 +447,7 @@ impl AgentSpec {
             instructions: self.instructions.clone(),
             model: self.model.clone(),
             model_settings: self.model_settings.clone(),
+            output_schema: self.output_schema.clone(),
             tools: self.tools.clone(),
             tool_use_behavior: self.tool_use_behavior.clone(),
         }
@@ -478,6 +483,26 @@ impl AgentSpec {
         &self.model_settings
     }
 
+    /// Output form this agent promises to produce.
+    ///
+    /// Plain text is the default. JSON-schema declarations are projected into every prepared
+    /// model request; parsing and final-message validation are part of the remaining
+    /// structured-output work.
+    ///
+    /// **The promise belongs to the agent the user configured, not to whatever instance ends up
+    /// executing.** This is the one declaration turn preparation takes from the public side of an
+    /// `AgentBinding` rather than the execution instance: tools, model, and settings describe what
+    /// can actually run, while the output form is what the caller was promised and what closeout
+    /// validation answers for. A capability or sandbox step may substitute an execution instance
+    /// and [`AgentSpecBuilder::clear_output_schema`] lets it drop this field, but doing so changes
+    /// nothing about the request — otherwise a preparation step the caller never configured could
+    /// quietly downgrade a structured contract into free text, and every reader parsing the final
+    /// message would break on a turn that looks ordinary.
+    #[must_use]
+    pub const fn output_schema(&self) -> &OutputSchema {
+        &self.output_schema
+    }
+
     /// Tools declared directly by this agent.
     #[must_use]
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
@@ -504,6 +529,7 @@ impl fmt::Debug for AgentSpec {
             .field("name", &self.name)
             .field("instructions", &self.instructions)
             .field("model", &self.model)
+            .field("output_schema", &self.output_schema)
             .field("tools", &tools)
             .field("tool_use_behavior", &self.tool_use_behavior)
             .finish_non_exhaustive()
@@ -518,6 +544,7 @@ pub struct AgentSpecBuilder {
     instructions: Option<AgentInstructions>,
     model: Option<String>,
     model_settings: ModelSettings,
+    output_schema: OutputSchema,
     tools: Vec<Arc<dyn Tool>>,
     tool_use_behavior: ToolUseBehavior,
 }
@@ -531,6 +558,7 @@ impl AgentSpecBuilder {
             instructions: None,
             model: None,
             model_settings: ModelSettings::new(),
+            output_schema: OutputSchema::default(),
             tools: Vec::new(),
             tool_use_behavior: ToolUseBehavior::default(),
         }
@@ -600,6 +628,18 @@ impl AgentSpecBuilder {
         self
     }
 
+    /// Sets the output form this agent promises to produce.
+    pub fn output_schema(mut self, output_schema: OutputSchema) -> Self {
+        self.output_schema = output_schema;
+        self
+    }
+
+    /// Restores ordinary plain-text output after deriving from another agent.
+    pub fn clear_output_schema(mut self) -> Self {
+        self.output_schema = OutputSchema::plain_text();
+        self
+    }
+
     /// Sets the policy applied after this agent's function tools produce observations.
     pub fn tool_use_behavior(mut self, tool_use_behavior: ToolUseBehavior) -> Self {
         self.tool_use_behavior = tool_use_behavior;
@@ -641,6 +681,7 @@ impl AgentSpecBuilder {
         if let Some(model) = &self.model {
             validate_required_text("agent model selector", model)?;
         }
+        self.output_schema.validate()?;
 
         // Two identities have to be unique, and neither implies the other. The lookup key is how
         // dispatch finds the executable object; the model-facing name is what the turn advertises.
@@ -682,6 +723,7 @@ impl AgentSpecBuilder {
             instructions: self.instructions,
             model: self.model,
             model_settings: self.model_settings,
+            output_schema: self.output_schema,
             tools: self.tools,
             tool_use_behavior: self.tool_use_behavior,
         }))
