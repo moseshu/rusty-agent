@@ -1,6 +1,8 @@
 # ra-core 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_core::agent::AgentInstructions::resolve(& self, context : & RunContext) -> Result < ResolvedInstructions >
+async fn ra_core::agent::HandoffAvailabilityHandler::is_enabled(& self, context : & RunContext) -> Result < bool >
+async fn ra_core::agent::HandoffSpec::is_enabled(& self, context : & RunContext) -> Result < bool >
 async fn ra_core::agent::ToolUseBehaviorHandler::should_stop(& self, tool_results : & [ToolUseResult]) -> Result < bool >
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
@@ -29,6 +31,9 @@ const fn ra_core::agent::FunctionToolResult::nested_run(& self) -> Option < & Ne
 const fn ra_core::agent::FunctionToolResult::output(& self) -> Option < & ToolCallOutput >
 const fn ra_core::agent::FunctionToolResult::run_item(& self) -> Option < & RunItem >
 const fn ra_core::agent::FunctionToolResult::tool(& self) -> & ToolOrigin
+const fn ra_core::agent::HandoffSpec::history_projection(& self) -> & HistoryProjection
+const fn ra_core::agent::HandoffSpec::schema(& self) -> & ToolSchema
+const fn ra_core::agent::HandoffSpec::target_agent(& self) -> & AgentId
 const fn ra_core::agent::ToolUseResult::call_id(& self) -> & CallId
 const fn ra_core::agent::ToolUseResult::output(& self) -> & ToolCallOutput
 const fn ra_core::agent::ToolUseResult::tool(& self) -> & ToolOrigin
@@ -728,6 +733,7 @@ const ra_core::trace::field::USAGE_REASONING_TOKENS: & str
 const ra_core::trace::field::USAGE_REQUESTS: & str
 const ra_core::usage::REQUEST_USAGE_SCHEMA_VERSION: SchemaVersion
 const ra_core::usage::USAGE_SCHEMA_VERSION: SchemaVersion
+enum ra_core::agent::HistoryProjection
 enum ra_core::agent::ResolvedInstructions
 enum ra_core::agent::ToolUseBehavior
 enum ra_core::cancel::CancelReason
@@ -804,17 +810,21 @@ fn ra_core::agent::AgentInstructions::dynamic(handler : Arc < dyn DynamicPromptH
 fn ra_core::agent::AgentInstructions::dynamic_fn< F , Fut >(f : F) -> Self where F : Fn (& RunContext) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < ResolvedPrompt > > + Send + 'static ,
 fn ra_core::agent::AgentInstructions::static_text(text : impl Into < String >) -> Self
 fn ra_core::agent::AgentSpec::builder() -> AgentSpecBuilder
+fn ra_core::agent::AgentSpec::handoffs(& self) -> & [HandoffSpec]
 fn ra_core::agent::AgentSpec::model(& self) -> Option < & str >
 fn ra_core::agent::AgentSpec::name(& self) -> & str
 fn ra_core::agent::AgentSpec::to_builder(& self) -> AgentSpecBuilder
 fn ra_core::agent::AgentSpec::tools(& self) -> & [Arc < dyn Tool >]
 fn ra_core::agent::AgentSpecBuilder::build(self) -> Result < Arc < AgentSpec > >
+fn ra_core::agent::AgentSpecBuilder::clear_handoffs(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_instructions(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_model(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_output_schema(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::clear_tools(mut self) -> Self
 fn ra_core::agent::AgentSpecBuilder::dynamic_instructions(mut self, handler : Arc < dyn DynamicPromptHandler >) -> Self
 fn ra_core::agent::AgentSpecBuilder::dynamic_instructions_fn< F , Fut >(mut self, f : F) -> Self where F : Fn (& RunContext) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < ResolvedPrompt > > + Send + 'static ,
+fn ra_core::agent::AgentSpecBuilder::handoff(mut self, handoff : HandoffSpec) -> Self
+fn ra_core::agent::AgentSpecBuilder::handoffs(mut self, handoffs : impl IntoIterator < Item = HandoffSpec >) -> Self
 fn ra_core::agent::AgentSpecBuilder::id(mut self, id : AgentId) -> Self
 fn ra_core::agent::AgentSpecBuilder::instructions(mut self, instructions : impl Into < String >) -> Self
 fn ra_core::agent::AgentSpecBuilder::model(mut self, model : impl Into < String >) -> Self
@@ -829,6 +839,13 @@ fn ra_core::agent::AgentSpecBuilder::with_instructions(mut self, instructions : 
 fn ra_core::agent::FunctionToolResult::awaiting_approval(tool : ToolOrigin, approval : RunItem) -> Result < Self >
 fn ra_core::agent::FunctionToolResult::completed(tool : ToolOrigin, output : ToolCallOutput, run_item : RunItem) -> Result < Self >
 fn ra_core::agent::FunctionToolResult::interruptions(& self) -> & [RunItem]
+fn ra_core::agent::HandoffSpec::model_definition(& self) -> ModelHandoffDefinition
+fn ra_core::agent::HandoffSpec::new(target_agent : AgentId, schema : ToolSchema) -> Self
+fn ra_core::agent::HandoffSpec::validate(& self) -> Result < () >
+fn ra_core::agent::HandoffSpec::with_availability(mut self, availability : Arc < dyn HandoffAvailabilityHandler >) -> Self
+fn ra_core::agent::HandoffSpec::with_availability_fn< F , Fut >(mut self, f : F) -> Self where F : Fn (& RunContext) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < bool > > + Send + 'static ,
+fn ra_core::agent::HandoffSpec::with_history_projection(mut self, history_projection : HistoryProjection) -> Self
+fn ra_core::agent::HistoryProjection::validate(& self) -> Result < () >
 fn ra_core::agent::ToolUseBehavior::custom(handler : Arc < dyn ToolUseBehaviorHandler >) -> Self
 fn ra_core::agent::ToolUseBehavior::stop_at_tools(names : impl IntoIterator < Item = impl Into < String > >) -> Self
 fn ra_core::agent::ToolUseResult::new(tool : ToolOrigin, output : ToolCallOutput) -> Self
@@ -1076,6 +1093,7 @@ fn ra_core::model::ModelProvider::get_model(& self, model_name : Option < & str 
 fn ra_core::model::ModelResolver::resolve_model(& self, model_name : Option < & str >) -> Result < ResolvedModel >
 fn ra_core::model::request::ConversationContinuation::conversation_id(& self) -> Option < & ProviderConversationId >
 fn ra_core::model::request::ConversationContinuation::previous_response_id(& self) -> Option < & str >
+fn ra_core::model::request::ModelHandoffDefinition::advertised_bytes(& self) -> Result < usize >
 fn ra_core::model::request::ModelHandoffDefinition::description(& self) -> Option < & str >
 fn ra_core::model::request::ModelHandoffDefinition::name(& self) -> & str
 fn ra_core::model::request::ModelHandoffDefinition::new(target_agent : AgentId, name : impl Into < String >, input_schema : Value) -> Self
@@ -1484,6 +1502,7 @@ struct ra_core::agent::AgentInstructions
 struct ra_core::agent::AgentSpec
 struct ra_core::agent::AgentSpecBuilder
 struct ra_core::agent::FunctionToolResult
+struct ra_core::agent::HandoffSpec
 struct ra_core::agent::ToolUseResult
 struct ra_core::budget::BudgetLimit
 struct ra_core::budget::BudgetSnapshot
@@ -1634,6 +1653,7 @@ struct ra_core::tool::schema::ToolSchema
 struct ra_core::tool::services::ToolServices
 struct ra_core::usage::RequestUsage
 struct ra_core::usage::Usage
+trait ra_core::agent::HandoffAvailabilityHandler
 trait ra_core::agent::ToolUseBehaviorHandler
 trait ra_core::event::sink::HostEventSink
 trait ra_core::model::Model
@@ -1646,10 +1666,15 @@ trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
 trait ra_core::tool::schema::ToolInput
 trait ra_core::tool::schema::ToolInputRequirements
+type ra_core::agent::AgentDefinition
 type ra_core::error::BoxError
 type ra_core::error::Result
 type ra_core::model::ModelStream
 type ra_core::model::settings::JsonMap
+variant ra_core::agent::HistoryProjection::Full
+variant ra_core::agent::HistoryProjection::LastItems(usize)
+variant ra_core::agent::HistoryProjection::None
+variant ra_core::agent::HistoryProjection::Summary
 variant ra_core::agent::ResolvedInstructions::Generated(ResolvedPrompt)
 variant ra_core::agent::ResolvedInstructions::Prefix(String)
 variant ra_core::agent::ToolUseBehavior::Custom(Arc < dyn ToolUseBehaviorHandler >)

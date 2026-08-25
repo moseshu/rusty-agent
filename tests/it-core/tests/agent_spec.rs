@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::{AgentId, AgentInstructions, AgentSpec, ToolUseBehavior},
+    agent::{AgentId, AgentInstructions, AgentSpec, HandoffSpec, ToolUseBehavior},
     error::{Error, Result},
     model::ModelSettings,
     output::OutputSchema,
@@ -228,6 +228,33 @@ fn builder_rejects_tools_projecting_to_the_same_model_facing_name() {
             .build()
             .is_ok()
     );
+}
+
+#[test]
+fn builder_rejects_a_tool_and_handoff_with_the_same_model_facing_name() {
+    let error = AgentSpec::builder()
+        .id(AgentId::new("planner"))
+        .name("Planner")
+        .tool(Arc::new(EchoTool::new()))
+        .handoff(HandoffSpec::new(
+            AgentId::new("reviewer"),
+            ToolSchema::new(
+                "echo",
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+        ))
+        .build()
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("tools and handoffs share one provider namespace"));
 }
 
 #[test]

@@ -223,10 +223,7 @@ impl ModelToolDefinition {
     ///
     /// Returns a configuration error if the input schema cannot be rendered.
     pub fn advertised_bytes(&self) -> Result<usize> {
-        let input_schema = serde_json::to_string(&self.input_schema).map_err(|error| {
-            Error::config("failed to render advertised tool schema").with_source(error)
-        })?;
-        Ok(input_schema.len() + self.name.len() + self.description.as_deref().map_or(0, str::len))
+        advertised_definition_bytes(&self.name, self.description.as_deref(), &self.input_schema)
     }
 }
 
@@ -299,6 +296,30 @@ impl ModelHandoffDefinition {
     pub const fn strict(&self) -> bool {
         self.strict
     }
+
+    /// What one advertised entry costs in a turn's model-action table.
+    ///
+    /// The measure matches [`ModelToolDefinition::advertised_bytes`]: tools and handoffs occupy
+    /// the same provider namespace and use the same name, description, and input-schema fields.
+    /// Provider envelopes are excluded because they vary by wire protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the input schema cannot be rendered.
+    pub fn advertised_bytes(&self) -> Result<usize> {
+        advertised_definition_bytes(&self.name, self.description.as_deref(), &self.input_schema)
+    }
+}
+
+fn advertised_definition_bytes(
+    name: &str,
+    description: Option<&str>,
+    input_schema: &Value,
+) -> Result<usize> {
+    let input_schema = serde_json::to_string(input_schema).map_err(|error| {
+        Error::config("failed to render advertised action schema").with_source(error)
+    })?;
+    Ok(input_schema.len() + name.len() + description.map_or(0, str::len))
 }
 
 /// Model-facing structured-output schema.

@@ -59,6 +59,8 @@ use tracing::{Instrument, info_span, warn};
 pub mod result;
 pub mod stream;
 
+pub use crate::turn::prepare::ActionSurfaceBudget;
+
 pub use result::{
     ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
     RunOutcome, RunResult, TurnRecord,
@@ -104,6 +106,7 @@ pub struct RunConfig {
     error_handler: Option<Arc<dyn RunErrorHandler>>,
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
+    action_surface_budget: ActionSurfaceBudget,
 }
 
 impl Default for RunConfig {
@@ -124,6 +127,7 @@ impl RunConfig {
             error_handler: None,
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
+            action_surface_budget: ActionSurfaceBudget::default(),
         }
     }
 
@@ -222,10 +226,29 @@ impl RunConfig {
         self
     }
 
+    /// Sets the per-turn budget for the complete model-facing action table.
+    ///
+    /// This budget is applied after dynamic availability and includes function tools and
+    /// handoffs. It is distinct from a tool profile's selection budget because a profile does not
+    /// own handoff declarations.
+    pub const fn with_action_surface_budget(
+        mut self,
+        action_surface_budget: ActionSurfaceBudget,
+    ) -> Self {
+        self.action_surface_budget = action_surface_budget;
+        self
+    }
+
     /// Policy applied to the final tool-and-handoff table for each turn.
     #[must_use]
     pub const fn tool_name_collision_policy(&self) -> ToolNameCollisionPolicy {
         self.tool_name_collision_policy
+    }
+
+    /// Per-turn budget for the final tool-and-handoff action table.
+    #[must_use]
+    pub const fn action_surface_budget(&self) -> ActionSurfaceBudget {
+        self.action_surface_budget
     }
 
     /// Whether model calls are streamed and their provider events forwarded.
@@ -278,6 +301,7 @@ impl std::fmt::Debug for RunConfig {
                 "tool_name_collision_policy",
                 &self.tool_name_collision_policy,
             )
+            .field("action_surface_budget", &self.action_surface_budget)
             .finish()
     }
 }
@@ -817,7 +841,8 @@ async fn run_one_turn(
     )
     .with_model_settings(config.model_settings.clone())
     .with_tracing(config.tracing)
-    .with_tool_name_collision_policy(config.tool_name_collision_policy());
+    .with_tool_name_collision_policy(config.tool_name_collision_policy())
+    .with_action_surface_budget(config.action_surface_budget());
     if let Some(model) = &config.model {
         preparation = preparation.with_model(model.clone());
     }

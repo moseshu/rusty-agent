@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
-    agent::{AgentId, AgentSpec},
+    agent::{AgentId, AgentSpec, HandoffSpec},
     cancel::{CancelReason, CancelScope, ScopeKind},
     context::RunContext,
     error::{Error, Result},
@@ -23,6 +23,7 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
+    runner::ActionSurfaceBudget,
     turn::prepare::{PreparedTurn, TurnPreparationRequest, prepare_turn},
 };
 use serde_json::{Value, json};
@@ -318,6 +319,207 @@ async fn test_turn_preparation_01() {
         settings.metadata().get("run").map(String::as_str),
         Some("yes")
     );
+}
+
+#[tokio::test]
+async fn dynamic_handoffs_are_resolved_into_the_same_turn_surface_as_tools() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let enabled_events = Arc::clone(&event_log);
+    let disabled_events = Arc::clone(&event_log);
+    let handoff_schema = |name| {
+        ToolSchema::new(
+            name,
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap()
+    };
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("planner"))
+        .name("Planner")
+        .handoffs([
+            HandoffSpec::new(AgentId::new("reviewer"), handoff_schema("delegate_review"))
+                .with_availability_fn(move |_| {
+                    let events = Arc::clone(&enabled_events);
+                    async move {
+                        events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push("handoff:reviewer".to_owned());
+                        Ok(true)
+                    }
+                }),
+            HandoffSpec::new(AgentId::new("writer"), handoff_schema("delegate_write"))
+                .with_availability_fn(move |_| {
+                    let events = Arc::clone(&disabled_events);
+                    async move {
+                        events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push("handoff:writer".to_owned());
+                        Ok(false)
+                    }
+                }),
+        ])
+        .build()
+        .unwrap();
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        prepared
+            .request()
+            .handoffs()
+            .iter()
+            .map(|handoff| handoff.name())
+            .collect::<Vec<_>>(),
+        ["delegate_review"]
+    );
+    assert_eq!(
+        prepared
+            .action_surface()
+            .advertised_names()
+            .collect::<Vec<_>>(),
+        ["delegate_review"]
+    );
+    let mut observed = events(&event_log);
+    observed.sort();
+    assert_eq!(
+        observed,
+        ["handoff:reviewer", "handoff:writer", "resolve_model"]
+    );
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_dynamic_handoff_before_model_resolution() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("planner"))
+        .name("Planner")
+        .handoff(
+            HandoffSpec::new(
+                AgentId::new("reviewer"),
+                ToolSchema::new(
+                    "delegate_review",
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": false
+                    }),
+                )
+                .unwrap(),
+            )
+            .with_availability_fn(|_| async move {
+                std::future::pending::<()>().await;
+                unreachable!("the scope cancels before handoff availability completes")
+            }),
+        )
+        .build()
+        .unwrap();
+    let resolver = RecordingResolver::new(event_log);
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+    let canceller = {
+        let scope = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            scope.cancel(CancelReason::UserInterrupt);
+        })
+    };
+
+    let error = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        Vec::new(),
+    ))
+    .await
+    .unwrap_err();
+    canceller.await.unwrap();
+
+    assert!(error.is_cancelled());
+    assert!(resolver.resolved_names().is_empty());
+}
+
+#[tokio::test]
+async fn action_surface_budget_counts_handoffs_and_their_schema_bytes() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("planner"))
+        .name("Planner")
+        .handoff(HandoffSpec::new(
+            AgentId::new("reviewer"),
+            ToolSchema::new(
+                "delegate_review",
+                json!({
+                    "type": "object",
+                    "properties": { "reason": { "type": "string" } },
+                    "required": ["reason"],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let resolver = RecordingResolver::new(event_log);
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+    let binding = direct(&agent);
+
+    let count_error = prepare_turn(
+        TurnPreparationRequest::new(
+            &binding,
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_action_surface_budget(ActionSurfaceBudget::new(0)),
+    )
+    .await
+    .unwrap_err();
+    assert!(count_error
+        .to_string()
+        .contains("advertises 1 model actions"));
+
+    let byte_error = prepare_turn(
+        TurnPreparationRequest::new(
+            &binding,
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_action_surface_budget(ActionSurfaceBudget::new(1).with_max_advertised_bytes(0)),
+    )
+    .await
+    .unwrap_err();
+    assert!(byte_error
+        .to_string()
+        .contains("bytes of model actions"));
+    assert!(resolver.resolved_names().is_empty());
 }
 
 #[tokio::test]

@@ -46,6 +46,81 @@ pub enum ToolNameCollisionPolicy {
     Error,
 }
 
+/// Per-turn ceiling for the complete model-facing action table.
+///
+/// Unlike [`ToolSurfaceBudget`](crate::tool::profile::ToolSurfaceBudget), this is applied after
+/// dynamic availability and includes both function tools and handoffs. Tool profiles remain a
+/// tool-selection concern; this value is the only budget that can account for everything a
+/// provider receives in one flat action namespace.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActionSurfaceBudget {
+    max_advertised: usize,
+    max_advertised_bytes: Option<usize>,
+}
+
+impl Default for ActionSurfaceBudget {
+    fn default() -> Self {
+        Self::unbounded()
+    }
+}
+
+impl ActionSurfaceBudget {
+    /// Creates a ceiling on the number of model-facing actions in one turn.
+    #[must_use]
+    pub const fn new(max_advertised: usize) -> Self {
+        Self {
+            max_advertised,
+            max_advertised_bytes: None,
+        }
+    }
+
+    /// Creates a budget with no count or byte ceiling.
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    /// Adds a ceiling on model-facing action-schema bytes.
+    #[must_use]
+    pub const fn with_max_advertised_bytes(mut self, max_advertised_bytes: usize) -> Self {
+        self.max_advertised_bytes = Some(max_advertised_bytes);
+        self
+    }
+
+    /// Maximum number of actions the model may receive.
+    #[must_use]
+    pub const fn max_advertised(&self) -> usize {
+        self.max_advertised
+    }
+
+    /// Maximum model-facing action-schema bytes, when configured.
+    #[must_use]
+    pub const fn max_advertised_bytes(&self) -> Option<usize> {
+        self.max_advertised_bytes
+    }
+
+    fn validate(self, surface: &TurnActionSurface) -> Result<()> {
+        let count = surface.advertised_count();
+        if count > self.max_advertised {
+            return Err(Error::config(format!(
+                "the turn advertises {count} model actions, above its configured ceiling of {}",
+                self.max_advertised
+            )));
+        }
+        if let Some(max_bytes) = self.max_advertised_bytes {
+            let bytes = surface.advertised_bytes()?;
+            if bytes > max_bytes {
+                return Err(Error::config(format!(
+                    "the turn advertises {bytes} bytes of model actions, above its configured \
+                     ceiling of {max_bytes}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Inputs needed to prepare one model call.
 ///
 /// The selected model and settings can be overridden for one run without mutating the agent.
@@ -63,6 +138,7 @@ pub struct TurnPreparationRequest<'a> {
     model_settings: ModelSettings,
     tracing: ModelTracing,
     collision_policy: ToolNameCollisionPolicy,
+    action_surface_budget: ActionSurfaceBudget,
 }
 
 impl<'a> TurnPreparationRequest<'a> {
@@ -104,6 +180,7 @@ impl<'a> TurnPreparationRequest<'a> {
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
             collision_policy: ToolNameCollisionPolicy::Warn,
+            action_surface_budget: ActionSurfaceBudget::default(),
         }
     }
 
@@ -131,6 +208,15 @@ impl<'a> TurnPreparationRequest<'a> {
         collision_policy: ToolNameCollisionPolicy,
     ) -> Self {
         self.collision_policy = collision_policy;
+        self
+    }
+
+    /// Sets the ceiling applied to the final tool-and-handoff table.
+    pub const fn with_action_surface_budget(
+        mut self,
+        action_surface_budget: ActionSurfaceBudget,
+    ) -> Self {
+        self.action_surface_budget = action_surface_budget;
         self
     }
 }
@@ -371,6 +457,33 @@ impl TurnActionSurface {
         &self.handoffs
     }
 
+    /// Number of entries this turn sends in its flat model-facing action namespace.
+    #[must_use]
+    pub fn advertised_count(&self) -> usize {
+        self.tools.len() + self.handoffs.len()
+    }
+
+    /// Bytes contributed by every model-facing action this turn sends.
+    ///
+    /// This deliberately includes handoffs. A provider receives both kinds through its tool table,
+    /// so charging only executable tools would accept a request whose actual action schema exceeds
+    /// the configured budget.
+    pub fn advertised_bytes(&self) -> Result<usize> {
+        self.tool_definitions()
+            .iter()
+            .map(ModelToolDefinition::advertised_bytes)
+            .chain(
+                self.handoffs
+                    .iter()
+                    .map(ModelHandoffDefinition::advertised_bytes),
+            )
+            .try_fold(0_usize, |total, bytes| {
+                total.checked_add(bytes?).ok_or_else(|| {
+                    Error::config("the advertised model-action table is too large to measure")
+                })
+            })
+    }
+
     /// Resolves a model-facing name to its executable tool.
     #[must_use]
     pub fn find_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -460,12 +573,13 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
 
     // 2. Resolve enabled handoffs after tools. Sealing the two into one surface here — not lazily
     // at settlement — is what applies the collision policy before the model call is paid for.
-    let handoffs = resolve_handoffs(agent);
+    let handoffs = resolve_handoffs(agent, request.run, request.cancel).await?;
     let surface = TurnActionSurface::new_with_collision_policy(
         tools.advertised,
         handoffs,
         request.collision_policy,
     )?;
+    request.action_surface_budget.validate(&surface)?;
     let tool_definitions = surface.tool_definitions();
 
     // 3. Project the public structured-output promise after handoffs. A prepared execution
@@ -616,8 +730,24 @@ async fn resolve_enabled_tools(
     Ok(EnabledTools { advertised })
 }
 
-fn resolve_handoffs(_agent: &AgentSpec) -> Vec<ModelHandoffDefinition> {
-    Vec::new()
+async fn resolve_handoffs(
+    agent: &AgentSpec,
+    context: &RunContext,
+    cancel: &CancelScope,
+) -> Result<Vec<ModelHandoffDefinition>> {
+    let decisions = cancel
+        .run(try_join_all(agent.handoffs().iter().map(
+            |handoff| async move { handoff.is_enabled(context).await },
+        )))
+        .await??;
+
+    Ok(agent
+        .handoffs()
+        .iter()
+        .zip(decisions)
+        .filter(|(_, enabled)| *enabled)
+        .map(|(handoff, _)| handoff.model_definition())
+        .collect())
 }
 
 fn resolve_output_schema(public_agent: &AgentSpec) -> Option<ModelOutputSchema> {
