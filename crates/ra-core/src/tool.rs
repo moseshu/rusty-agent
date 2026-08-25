@@ -23,6 +23,8 @@ pub mod schema;
 pub mod services;
 mod strict;
 
+pub(crate) use strict::canonicalize_json;
+
 pub use context::{ToolCaller, ToolContext};
 pub use namespace::ToolNamespace;
 pub use options::{

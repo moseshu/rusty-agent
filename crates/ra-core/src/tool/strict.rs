@@ -456,7 +456,12 @@ fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<&'a Value> 
     Ok(current)
 }
 
-pub(super) fn canonicalize_json(value: &mut Value) {
+/// Sorts every object key recursively without changing array order.
+///
+/// The model request types use this at their construction boundary too. A `Tool` may override
+/// its model-facing projection, so normalizing only `ToolSchema` would leave that otherwise-valid
+/// route dependent on the `serde_json` map implementation selected by the dependency graph.
+pub(crate) fn canonicalize_json(value: &mut Value) {
     match value {
         Value::Object(object) => {
             let mut sorted = BTreeMap::new();

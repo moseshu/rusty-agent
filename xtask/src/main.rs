@@ -20,6 +20,7 @@ mod layering;
 mod pending;
 mod prompt_dump;
 mod public_api;
+mod schema_stability;
 mod source;
 mod tests_workspace;
 
@@ -38,8 +39,12 @@ struct Cli {
 enum Task {
     /// Runs all nine gates and summarizes.
     All,
-    /// Asserts a tool schema renders byte-identically 100 times in a row.
-    SchemaStability,
+    /// Reconciles actual provider tool payloads against their snapshot and asserts 100 renders.
+    SchemaStability {
+        /// Rewrites the snapshot after an intentional provider-wire schema change.
+        #[arg(long)]
+        bless: bool,
+    },
     /// Reconciles the assembled stable prefix against its committed snapshot.
     PromptDump {
         /// Rewrites the snapshot instead of reconciling. Run it after an intentional prompt change
@@ -84,7 +89,7 @@ fn all_gates() -> Vec<(&'static str, Outcome)> {
         ("layering", layering::run()),
         ("no-inline-tests", inline_tests::run()),
         ("public-api", public_api::run(false)),
-        ("schema-stability", pending::schema_stability()),
+        ("schema-stability", schema_stability::run(false)),
         ("prompt-dump", prompt_dump::run(false)),
         ("guard-registry", pending::guard_registry()),
         ("token-budget", pending::token_budget()),
@@ -99,7 +104,7 @@ fn main() -> std::process::ExitCode {
         Task::Layering => vec![("layering", layering::run())],
         Task::NoInlineTests => vec![("no-inline-tests", inline_tests::run())],
         Task::PublicApi { bless } => vec![("public-api", public_api::run(bless))],
-        Task::SchemaStability => vec![("schema-stability", pending::schema_stability())],
+        Task::SchemaStability { bless } => vec![("schema-stability", schema_stability::run(bless))],
         Task::PromptDump { bless } => vec![("prompt-dump", prompt_dump::run(bless))],
         Task::GuardRegistry => vec![("guard-registry", pending::guard_registry())],
         Task::TokenBudget => vec![("token-budget", pending::token_budget())],

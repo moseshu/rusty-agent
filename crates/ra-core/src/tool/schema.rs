@@ -8,8 +8,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
+    canonicalize_json,
     origin::validate_tool_name,
-    strict::{canonicalize_json, ensure_strict_json_schema, verify_strict_json_schema},
+    strict::{ensure_strict_json_schema, verify_strict_json_schema},
 };
 use crate::{
     compat::{SchemaVersion, Unknown},

@@ -132,6 +132,8 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // answerable through `Compatibility` for a rollout line and not for a patch plan. The
     // dependency buys the compat vocabulary and nothing else — no runtime, no tool contract.
     ("ra-patch", &["ra-core"]),
+    // Same reason as `ra-tools`: the product's `apply_patch` input uses the strict `ToolInput`
+    // derive rather than maintaining a hand-written schema.
     (
         "ra-coding",
         &[
@@ -143,6 +145,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-mcp",
             "ra-patch",
             "ra-tools",
+            "ra-macros",
         ],
     ),
     (
