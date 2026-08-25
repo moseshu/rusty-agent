@@ -106,6 +106,12 @@ async fn test_exec_command_schema_and_identity() {
     tool.validate().expect("identity and schema must agree");
     assert_eq!(tool.origin().qualified_name(), "exec_command");
     assert!(tool.schema().strict_json_schema());
+    assert_eq!(
+        tool.model_definition().description(),
+        Some(
+            "Runs a command in a shell. Returns its output, or a `session_id` when the command is still\nrunning after the yield timeout."
+        )
+    );
 
     let schema = tool.schema().input_schema();
     assert_eq!(schema["additionalProperties"], json!(false));

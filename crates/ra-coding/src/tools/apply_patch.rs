@@ -20,7 +20,8 @@ const TOOL_NAME: &str = "apply_patch";
 
 #[derive(Debug, Deserialize, JsonSchema, ToolInput)]
 #[serde(deny_unknown_fields)]
-/// Applies a V4A patch. Supply the patch verbatim, from `*** Begin Patch` through `*** End Patch`.
+/// Applies a V4A patch to workspace files. A later failure can leave earlier actions applied.
+/// Supply the patch verbatim, from `*** Begin Patch` through `*** End Patch`.
 struct ApplyPatchInput {
     /// Freeform V4A patch text. Do not encode file contents separately.
     patch: String,

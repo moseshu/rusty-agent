@@ -102,3 +102,17 @@ fn host_backed_agent_advertises_the_editing_entry() {
     assert_eq!(agent.tools().len(), 1);
     assert_eq!(agent.tools()[0].origin().name(), "apply_patch");
 }
+
+#[test]
+fn description_discloses_that_a_failed_patch_can_be_partially_applied() {
+    let workspace = TempDir::new().expect("workspace");
+    let host = CodingHost::open(workspace.path()).expect("host");
+    let tool = host.apply_patch_tool().expect("tool");
+
+    assert_eq!(
+        tool.model_definition().description(),
+        Some(
+            "Applies a V4A patch to workspace files. A later failure can leave earlier actions applied.\nSupply the patch verbatim, from `*** Begin Patch` through `*** End Patch`."
+        )
+    );
+}
