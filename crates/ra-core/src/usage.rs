@@ -210,6 +210,11 @@ const fn usage_schema_version() -> SchemaVersion {
     USAGE_SCHEMA_VERSION
 }
 
+/// The reference is Serde's, not a choice: `skip_serializing_if` always calls with `&T`.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if signature"
+)]
 const fn is_zero(value: &u64) -> bool {
     *value == 0
 }

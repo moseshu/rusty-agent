@@ -51,6 +51,10 @@ pub(crate) struct Terminator {
 
 impl Terminator {
     /// Recognizes a non-standard terminator payload in addition to `[DONE]`.
+    ///
+    /// Gated with its only caller: a first-party endpoint has one terminator, so this deviation
+    /// exists for `compat` alone and is dead code in a build that does not compile it.
+    #[cfg(feature = "compat")]
     pub(crate) fn with_marker(marker: impl Into<String>) -> Self {
         Self {
             marker: Some(marker.into()),
@@ -59,6 +63,9 @@ impl Terminator {
     }
 
     /// Declares that this endpoint sends no terminator at all.
+    ///
+    /// Gated with its only caller, for the same reason as [`Self::with_marker`].
+    #[cfg(feature = "compat")]
     pub(crate) const fn end_of_body() -> Self {
         Self {
             marker: None,

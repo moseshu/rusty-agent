@@ -612,6 +612,14 @@ impl RolloutCheckpoint {
     /// with the number of requests it summarizes: they are written repeatedly, each restating the
     /// totals so far, and carrying every entry into every one of them would make the log grow with
     /// the square of the session. The detail stays in the `model_usage` records this summarizes.
+    /// By value because this is a handover: the caller's ledger becomes the record's. The body
+    /// still projects through the borrowing `Usage::without_entries`, which cannot consume — other
+    /// callers reach it from a `&Usage` they keep — so the clone stays until that has a consuming
+    /// counterpart.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "ownership handover at the persistence boundary"
+    )]
     #[must_use]
     pub fn new(
         session_id: SessionId,
@@ -997,6 +1005,11 @@ impl RolloutSidecar {
     ///
     /// `usage_totals` keeps its totals and drops its per-request entries: this file is rewritten on
     /// every append, and the detail it would carry is already in the log it points at.
+    /// `usage_totals` is by value for the same reason as [`RolloutCheckpoint::new`].
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "ownership handover at the persistence boundary"
+    )]
     #[must_use]
     pub fn new(
         session_id: SessionId,

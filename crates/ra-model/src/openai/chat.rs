@@ -169,6 +169,7 @@ impl OpenAiChatProvider {
     /// can be in a position to deviate from it. The knob therefore belongs to the compat layer's
     /// endpoint configuration rather than to this adapter, where a first-party caller would have
     /// to decide about a question that has only one answer for them.
+    #[cfg(feature = "compat")]
     #[must_use]
     pub(crate) fn with_terminator(mut self, terminator: Terminator) -> Self {
         self.terminator = terminator;

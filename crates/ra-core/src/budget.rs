@@ -234,6 +234,11 @@ const fn budget_snapshot_schema_version() -> SchemaVersion {
     BUDGET_SNAPSHOT_SCHEMA_VERSION
 }
 
+/// The reference is Serde's, not a choice: `skip_serializing_if` always calls with `&T`.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if signature"
+)]
 const fn legacy_tokens_used_is_zero(value: &u64) -> bool {
     *value == 0
 }
