@@ -10,7 +10,7 @@ use ra_core::{
     },
     model::{
         ConversationContinuation, Effort, ModelHandoffDefinition, ModelRequest,
-        ModelToolDefinition, ThinkingConfig, ToolChoice,
+        ModelToolDefinition, ToolChoice,
     },
     prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
     tool::{ToolOutput, ToolOutputBlock},
@@ -238,6 +238,7 @@ fn resolve_store(
 /// `reasoning.summary`, `reasoning.context` and `reasoning.mode` have no protocol-neutral
 /// counterpart and can only arrive through `extra_body`; a whole-object overwrite would drop them
 /// as a side effect of setting an unrelated field.
+///
 fn merge_effort(body: &mut Map<String, Value>, effort: Option<Effort>) -> Result<()> {
     let Some(effort) = effort else {
         return Ok(());
@@ -283,11 +284,12 @@ fn reject_unsupported_settings(request: &ModelRequest) -> Result<()> {
             "OpenAI Responses does not accept frequency_penalty or presence_penalty",
         ));
     }
-    if let Some(thinking) = request.model_settings().thinking()
-        && !matches!(thinking, ThinkingConfig::Disabled)
-    {
+    // Every shape is refused, `Disabled` included. This protocol has no thinking switch at all, so
+    // accepting an explicit "off" and then sending nothing leaves a reasoning model thinking at its
+    // default effort with no trace of the setting anywhere in the request.
+    if request.model_settings().thinking().is_some() {
         return Err(Error::caller(
-            "OpenAI Responses uses effort rather than ThinkingConfig",
+            "OpenAI Responses expresses reasoning through effort and cannot carry a ThinkingConfig",
         ));
     }
     Ok(())
