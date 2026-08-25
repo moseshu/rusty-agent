@@ -78,6 +78,54 @@ async fn test_read_file_01() {
 }
 
 #[tokio::test]
+async fn test_read_file_01a() {
+    let dir = workspace("hello.txt", "alpha\n");
+    let tool = rooted(&dir);
+    let arguments = json!({ "path": "hello.txt", "offset": null, "limit": null });
+    let decoded = tool
+        .decode_input(&arguments)
+        .expect("arguments decode against the advertised schema")
+        .expect("read_file has a schema-bound input type");
+    let run = run();
+    let output = tool
+        .call(
+            ToolContext::new(&run, &tool, &CallId::new("call-decoded"), &arguments)
+                .with_decoded_input(decoded),
+        )
+        .await
+        .expect("the common invocation entry's decoded input executes");
+
+    assert_eq!(body(&output), "     1\talpha\n");
+}
+
+#[tokio::test]
+async fn test_read_file_01b() {
+    let tool = ReadFileTool::new().expect("read_file builds");
+    let arguments = json!({ "path": 3, "offset": null, "limit": null });
+    let error = tool
+        .decode_input(&arguments)
+        .expect_err("invalid arguments must fail before the tool body runs");
+    let run = run();
+    let output = tool
+        .handle_failure(
+            &ToolContext::new(&run, &tool, &CallId::new("call-invalid"), &arguments),
+            &error,
+        )
+        .await
+        .expect("failure shaping must not fail")
+        .expect("schema decode failures keep read_file's model-visible guidance");
+
+    assert_eq!(
+        body(&output),
+        "Invalid arguments: argument `$.path` has type integer, expected string."
+    );
+    assert_eq!(
+        output.metadata().guidance(),
+        ["Send `path`, and `offset` and `limit` only for text."]
+    );
+}
+
+#[tokio::test]
 async fn test_read_file_02() {
     // R3-4b's batch shape reads this declaration to pick a read or a write lock. Three reads of
     // three files are one wall-clock read, and a read cannot observe another call's writes.

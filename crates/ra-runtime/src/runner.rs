@@ -71,7 +71,10 @@ use crate::{
     turn::{
         TurnSettlementRequest,
         batch::DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
-        prepare::{PreparedTurn, TurnActionSurface, TurnPreparationRequest, prepare_turn},
+        prepare::{
+            PreparedTurn, ToolNameCollisionPolicy, TurnActionSurface, TurnPreparationRequest,
+            prepare_turn,
+        },
         settle_turn,
     },
 };
@@ -100,6 +103,7 @@ pub struct RunConfig {
     tracing: ModelTracing,
     error_handler: Option<Arc<dyn RunErrorHandler>>,
     partial_messages: bool,
+    tool_name_collision_policy: ToolNameCollisionPolicy,
 }
 
 impl Default for RunConfig {
@@ -119,6 +123,7 @@ impl RunConfig {
             tracing: ModelTracing::Disabled,
             error_handler: None,
             partial_messages: false,
+            tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
         }
     }
 
@@ -207,6 +212,22 @@ impl RunConfig {
         self
     }
 
+    /// Selects whether an ambiguous model-facing action name is retained with a warning or
+    /// rejected before the model call.
+    pub const fn with_tool_name_collision_policy(
+        mut self,
+        tool_name_collision_policy: ToolNameCollisionPolicy,
+    ) -> Self {
+        self.tool_name_collision_policy = tool_name_collision_policy;
+        self
+    }
+
+    /// Policy applied to the final tool-and-handoff table for each turn.
+    #[must_use]
+    pub const fn tool_name_collision_policy(&self) -> ToolNameCollisionPolicy {
+        self.tool_name_collision_policy
+    }
+
     /// Whether model calls are streamed and their provider events forwarded.
     #[must_use]
     pub const fn partial_messages(&self) -> bool {
@@ -253,6 +274,10 @@ impl std::fmt::Debug for RunConfig {
             .field("tracing", &self.tracing)
             .field("has_error_handler", &self.error_handler.is_some())
             .field("partial_messages", &self.partial_messages)
+            .field(
+                "tool_name_collision_policy",
+                &self.tool_name_collision_policy,
+            )
             .finish()
     }
 }
@@ -791,7 +816,8 @@ async fn run_one_turn(
         input,
     )
     .with_model_settings(config.model_settings.clone())
-    .with_tracing(config.tracing);
+    .with_tracing(config.tracing)
+    .with_tool_name_collision_policy(config.tool_name_collision_policy());
     if let Some(model) = &config.model {
         preparation = preparation.with_model(model.clone());
     }

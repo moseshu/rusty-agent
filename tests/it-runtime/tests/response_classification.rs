@@ -24,7 +24,9 @@ use ra_core::{
 use ra_runtime::{
     agent::AgentBinding,
     turn::{
-        prepare::{TurnActionSurface, TurnPreparationRequest, prepare_turn},
+        prepare::{
+            ToolNameCollisionPolicy, TurnActionSurface, TurnPreparationRequest, prepare_turn,
+        },
         process::process_model_response,
     },
 };
@@ -424,4 +426,51 @@ fn test_response_classification_09() {
 
     assert_eq!(processed.functions().len(), 1);
     assert_eq!(processed.functions()[0].tool().origin().name(), "search");
+}
+
+#[test]
+fn test_response_classification_10() {
+    let surface = TurnActionSurface::new_with_collision_policy(
+        vec![tool("transfer_to_reviewer")],
+        vec![handoff("transfer_to_reviewer", "reviewer")],
+        ToolNameCollisionPolicy::Warn,
+    )
+    .expect("the warning policy keeps one deterministic dispatch winner");
+
+    assert!(surface.find_tool("transfer_to_reviewer").is_none());
+    assert_eq!(surface.handoffs().len(), 1);
+    assert_eq!(
+        surface.advertised_names().collect::<Vec<_>>(),
+        ["transfer_to_reviewer"]
+    );
+    assert!(surface.tool_definitions().is_empty());
+
+    let response = ModelResponse::new(vec![tool_call(
+        "call-item-1",
+        "call-1",
+        "transfer_to_reviewer",
+    )]);
+    let processed = process_model_response(&response, &surface)
+        .expect("the retained handoff is the only resolution for the advertised name");
+    assert_eq!(processed.handoffs()[0].target_agent().as_str(), "reviewer");
+}
+
+#[test]
+fn test_response_classification_11() {
+    let surface = TurnActionSurface::new_with_collision_policy(
+        vec![tool("search"), tool("search")],
+        Vec::new(),
+        ToolNameCollisionPolicy::Warn,
+    )
+    .expect("the warning policy keeps one deterministic dispatch winner");
+
+    assert_eq!(surface.tools().len(), 1);
+    assert_eq!(
+        surface
+            .tool_definitions()
+            .iter()
+            .map(ModelToolDefinition::name)
+            .collect::<Vec<_>>(),
+        ["search"]
+    );
 }

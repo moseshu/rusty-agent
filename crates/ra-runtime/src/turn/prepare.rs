@@ -10,7 +10,7 @@
 //! Every stage that can block runs inside the caller's [`CancelScope`]: dynamic availability calls
 //! third-party `async` code, which the cancellation contract does not allow to be awaited bare.
 
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use futures::future::try_join_all;
 use ra_core::{
@@ -30,6 +30,22 @@ use ra_core::{
 
 use crate::agent::AgentBinding;
 
+/// What to do when two actions claim one model-facing tool name.
+///
+/// This is a turn-preparation policy rather than a registry policy: registry lookup keys remain
+/// unambiguous, while tools and handoffs share one flat provider namespace. [`Warn`](Self::Warn)
+/// retains a deterministic winner and records the discarded entry; [`Error`](Self::Error) refuses
+/// the turn before a provider call.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolNameCollisionPolicy {
+    /// Keep the current dispatch winner and emit an actionable warning.
+    #[default]
+    Warn,
+    /// Reject the ambiguous model-facing table before calling the provider.
+    Error,
+}
+
 /// Inputs needed to prepare one model call.
 ///
 /// The selected model and settings can be overridden for one run without mutating the agent.
@@ -46,6 +62,7 @@ pub struct TurnPreparationRequest<'a> {
     model_override: Option<String>,
     model_settings: ModelSettings,
     tracing: ModelTracing,
+    collision_policy: ToolNameCollisionPolicy,
 }
 
 impl<'a> TurnPreparationRequest<'a> {
@@ -86,6 +103,7 @@ impl<'a> TurnPreparationRequest<'a> {
             model_override: None,
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
+            collision_policy: ToolNameCollisionPolicy::Warn,
         }
     }
 
@@ -104,6 +122,15 @@ impl<'a> TurnPreparationRequest<'a> {
     /// Sets provider-side tracing visibility for this call.
     pub const fn with_tracing(mut self, tracing: ModelTracing) -> Self {
         self.tracing = tracing;
+        self
+    }
+
+    /// Sets how collisions in the final model-facing action table are handled.
+    pub const fn with_tool_name_collision_policy(
+        mut self,
+        collision_policy: ToolNameCollisionPolicy,
+    ) -> Self {
+        self.collision_policy = collision_policy;
         self
     }
 }
@@ -208,8 +235,9 @@ impl fmt::Debug for PreparedTurn {
 ///
 /// The model answers with names, and settlement has to map each name back to the exact object the
 /// turn offered. Keeping tools and handoffs together in one snapshot is what makes that mapping
-/// total: a name resolves to a tool, to a handoff, or to nothing — never to two things at once,
-/// because construction rejects a surface where the two overlap.
+/// total: a name resolves to a tool, to a handoff, or to nothing — never to two things at once.
+/// [`ToolNameCollisionPolicy::Error`] rejects an overlap; [`ToolNameCollisionPolicy::Warn`]
+/// removes every non-winning action before this snapshot is built.
 #[non_exhaustive]
 pub struct TurnActionSurface {
     tools: Vec<Arc<dyn Tool>>,
@@ -220,30 +248,100 @@ pub struct TurnActionSurface {
 impl TurnActionSurface {
     /// Builds a snapshot, rejecting a surface that advertises one name twice.
     ///
-    /// Handoffs share the tool namespace on the wire, so a duplicate is not a theoretical concern:
-    /// it makes the model's call ambiguous, and any resolution order picked here would be an
-    /// arbitrary one that silently favours one meaning over the other.
+    /// Use [`Self::new_with_collision_policy`] to retain a deterministic winner instead.
     pub fn new(tools: Vec<Arc<dyn Tool>>, handoffs: Vec<ModelHandoffDefinition>) -> Result<Self> {
+        Self::new_with_collision_policy(tools, handoffs, ToolNameCollisionPolicy::Error)
+    }
+
+    /// Builds a snapshot under an explicit model-facing name-collision policy.
+    pub fn new_with_collision_policy(
+        mut tools: Vec<Arc<dyn Tool>>,
+        mut handoffs: Vec<ModelHandoffDefinition>,
+        policy: ToolNameCollisionPolicy,
+    ) -> Result<Self> {
         let tool_names: Vec<String> = tools
             .iter()
             .map(|tool| tool.model_definition().name().to_owned())
             .collect();
-        let mut names = BTreeSet::new();
-        let advertised = tool_names
-            .iter()
-            .map(String::as_str)
-            .chain(handoffs.iter().map(ModelHandoffDefinition::name));
-        for name in advertised {
-            if !names.insert(name) {
-                return Err(Error::config(format!(
-                    "the turn advertises the name `{name}` more than once; a model call on it \
-                     would be ambiguous"
-                )));
+
+        let mut owners: BTreeMap<&str, Vec<ActionOwner>> = BTreeMap::new();
+        for (index, name) in tool_names.iter().enumerate() {
+            owners
+                .entry(name)
+                .or_default()
+                .push(ActionOwner::Tool(index));
+        }
+        for (index, handoff) in handoffs.iter().enumerate() {
+            owners
+                .entry(handoff.name())
+                .or_default()
+                .push(ActionOwner::Handoff(index));
+        }
+
+        let mut retained_tools = vec![true; tools.len()];
+        let mut retained_handoffs = vec![true; handoffs.len()];
+        for (name, entries) in owners {
+            if entries.len() < 2 {
+                continue;
+            }
+            match policy {
+                ToolNameCollisionPolicy::Error => {
+                    return Err(Error::config(format!(
+                        "the turn advertises the name `{name}` more than once; a model call on it \
+                         would be ambiguous"
+                    )));
+                }
+                ToolNameCollisionPolicy::Warn => {}
+            }
+
+            // Handoffs own their wire name when present, matching response classification. Within
+            // one kind, the last declaration wins. The filtered snapshot carries that exact
+            // decision through both provider submission and response settlement.
+            let Some(winner) = entries
+                .iter()
+                .rev()
+                .find(|entry| matches!(entry, ActionOwner::Handoff(_)))
+                .or_else(|| entries.last())
+                .copied()
+            else {
+                continue;
+            };
+            tracing::warn!(
+                tool_name = name,
+                winner = winner.kind(),
+                discarded = entries.len() - 1,
+                "model-facing tool name collision; only the dispatch winner is advertised"
+            );
+            for entry in entries {
+                if entry == winner {
+                    continue;
+                }
+                match entry {
+                    ActionOwner::Tool(index) => retained_tools[index] = false,
+                    ActionOwner::Handoff(index) => retained_handoffs[index] = false,
+                }
             }
         }
+
+        let mut retained_tool_names = Vec::with_capacity(tools.len());
+        tools = tools
+            .into_iter()
+            .zip(tool_names)
+            .zip(retained_tools)
+            .filter_map(|((tool, name), retained)| retained.then_some((tool, name)))
+            .map(|(tool, name)| {
+                retained_tool_names.push(name);
+                tool
+            })
+            .collect();
+        handoffs = handoffs
+            .into_iter()
+            .zip(retained_handoffs)
+            .filter_map(|(handoff, retained)| retained.then_some(handoff))
+            .collect();
         Ok(Self {
             tools,
-            tool_names,
+            tool_names: retained_tool_names,
             handoffs,
         })
     }
@@ -252,6 +350,19 @@ impl TurnActionSurface {
     #[must_use]
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
+    }
+
+    /// Model-tool projections for exactly the executable tools in this snapshot.
+    ///
+    /// The provider request must be built from this rather than from the pre-policy inventory, or
+    /// a warning-resolved collision could be filtered for settlement but still be sent to the
+    /// provider as an ambiguous table.
+    #[must_use]
+    pub fn tool_definitions(&self) -> Vec<ModelToolDefinition> {
+        self.tools
+            .iter()
+            .map(|tool| tool.model_definition())
+            .collect()
     }
 
     /// Handoffs this turn advertised.
@@ -266,13 +377,17 @@ impl TurnActionSurface {
         self.tools
             .iter()
             .zip(&self.tool_names)
+            .rev()
             .find_map(|(tool, advertised)| (advertised == name).then_some(tool))
     }
 
     /// Resolves a model-facing name to its handoff definition.
     #[must_use]
     pub fn find_handoff(&self, name: &str) -> Option<&ModelHandoffDefinition> {
-        self.handoffs.iter().find(|handoff| handoff.name() == name)
+        self.handoffs
+            .iter()
+            .rev()
+            .find(|handoff| handoff.name() == name)
     }
 
     /// Whether this turn offered a transfer to the given agent.
@@ -294,6 +409,21 @@ impl TurnActionSurface {
             .iter()
             .map(String::as_str)
             .chain(self.handoffs.iter().map(ModelHandoffDefinition::name))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionOwner {
+    Tool(usize),
+    Handoff(usize),
+}
+
+impl ActionOwner {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Tool(_) => "tool",
+            Self::Handoff(_) => "handoff",
+        }
     }
 }
 
@@ -326,17 +456,16 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
 
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
     let tools = resolve_enabled_tools(agent, request.run, request.cancel).await?;
-    let tool_definitions: Vec<ModelToolDefinition> = tools
-        .advertised
-        .iter()
-        .map(|tool| tool.model_definition())
-        .collect();
 
-    // 2. Resolve enabled handoffs after tools. R17 owns the concrete handoff contract. Sealing the
-    // two into one surface here — not lazily at settlement — is what makes an ambiguous surface
-    // fail before the model call is paid for instead of after it.
+    // 2. Resolve enabled handoffs after tools. Sealing the two into one surface here — not lazily
+    // at settlement — is what applies the collision policy before the model call is paid for.
     let handoffs = resolve_handoffs(agent);
-    let surface = TurnActionSurface::new(tools.advertised, handoffs)?;
+    let surface = TurnActionSurface::new_with_collision_policy(
+        tools.advertised,
+        handoffs,
+        request.collision_policy,
+    )?;
+    let tool_definitions = surface.tool_definitions();
 
     // 3. Resolve structured output after handoffs. R1-16 owns the output parser contract.
     let output_schema = resolve_output_schema(agent);

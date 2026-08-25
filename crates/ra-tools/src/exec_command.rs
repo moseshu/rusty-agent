@@ -34,9 +34,9 @@ use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     tool::{
-        ObservationMetadata, ResourceClaim, Tool, ToolConcurrency, ToolContext,
-        ToolFailureHandling, ToolInput as _, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
-        Truncation, TruncationStage,
+        DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
+        ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
+        ToolOrigin, ToolOutput, ToolSchema, Truncation, TruncationStage,
     },
 };
 use ra_exec::{
@@ -135,7 +135,7 @@ impl ExecCommandLimits {
 /// The `exec_command` tool.
 pub struct ExecCommandTool {
     origin: ToolOrigin,
-    schema: ToolSchema,
+    func_schema: FuncSchema,
     options: ToolOptions,
     process_manager: Arc<ProcessManager>,
     limits: ExecCommandLimits,
@@ -159,7 +159,7 @@ impl ExecCommandTool {
     pub fn new() -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
-            schema: ExecCommandInput::tool_schema(TOOL_NAME)?,
+            func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
             options: base_options(),
             process_manager: Arc::new(ProcessManager::default()),
             limits: ExecCommandLimits::new(),
@@ -201,7 +201,7 @@ impl ExecCommandTool {
         })?;
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
-            schema: ExecCommandInput::tool_schema(TOOL_NAME)?,
+            func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
             options: base_options().with_resource_claim(ResourceClaim::exclusive(resource_id)),
             process_manager: Arc::new(ProcessManager::default()),
             limits: ExecCommandLimits::new(),
@@ -336,12 +336,35 @@ impl Tool for ExecCommandTool {
     }
 
     fn schema(&self) -> &ToolSchema {
-        &self.schema
+        self.func_schema.tool_schema()
     }
 
-    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
-        let input: ExecCommandInput = serde_json::from_value(context.arguments().clone())
-            .map_err(|error| ExecCommandFailure::BadArguments(error.to_string()).into_error())?;
+    fn func_schema(&self) -> Option<&FuncSchema> {
+        Some(&self.func_schema)
+    }
+
+    fn decode_input(&self, arguments: &serde_json::Value) -> Result<Option<DecodedToolInput>> {
+        self.func_schema
+            .decode_value_diagnostic(arguments.clone())
+            .map(Some)
+            .map_err(|error| ExecCommandFailure::BadArguments(error).into_error())
+    }
+
+    async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
+        let input = context
+            .take_decoded_input::<ExecCommandInput>()?
+            .map_or_else(
+                || {
+                    serde_json::from_value(context.arguments().clone()).map_err(|error| {
+                        ExecCommandFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
+                            input_type: self.func_schema.input_type_name(),
+                            message: error.to_string(),
+                        })
+                        .into_error()
+                    })
+                },
+                Ok,
+            )?;
         let request = self
             .request(input)
             .map_err(ExecCommandFailure::into_error)?;
@@ -480,7 +503,7 @@ type ExecResult<T> = std::result::Result<T, ExecCommandFailure>;
 #[derive(Debug)]
 enum ExecCommandFailure {
     /// The argument object does not match the schema.
-    BadArguments(String),
+    BadArguments(ToolArgumentDecodeError),
     /// The working directory is outside the workspace root.
     OutsideRoot(String),
     /// The working directory is spelled with `..`, which this tool refuses to resolve.

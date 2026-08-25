@@ -8,9 +8,10 @@ use serde_json::Value;
 
 use crate::{
     context::RunContext,
+    error::{Error, Result},
     event::HostEventEmitter,
     item::CallId,
-    tool::{Tool, ToolOrigin, ToolServices},
+    tool::{DecodedToolInput, Tool, ToolInput, ToolOrigin, ToolServices},
 };
 
 /// How a tool invocation entered the runtime.
@@ -54,6 +55,7 @@ pub struct ToolContext<'a> {
     arguments: &'a Value,
     caller: ToolCaller,
     services: &'a ToolServices,
+    decoded_input: Option<DecodedToolInput>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -74,6 +76,7 @@ impl<'a> ToolContext<'a> {
             arguments,
             caller: ToolCaller::Direct,
             services: &NO_SERVICES,
+            decoded_input: None,
         }
     }
 
@@ -86,6 +89,16 @@ impl<'a> ToolContext<'a> {
     /// Installs the framework ports this call may reach.
     pub const fn with_services(mut self, services: &'a ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Adds the schema-bound input decoded by the common invocation entry.
+    ///
+    /// Tools that expose a [`FuncSchema`](super::FuncSchema) receive this value during runtime
+    /// dispatch. Direct callers may still construct a context without it while testing a tool in
+    /// isolation.
+    pub fn with_decoded_input(mut self, decoded_input: DecodedToolInput) -> Self {
+        self.decoded_input = Some(decoded_input);
         self
     }
 
@@ -111,6 +124,33 @@ impl<'a> ToolContext<'a> {
     #[must_use]
     pub const fn arguments(&self) -> &Value {
         self.arguments
+    }
+
+    /// Borrows the schema-bound input when this context carries one of type `T`.
+    ///
+    /// A type mismatch is a framework wiring error, distinct from a context that simply carries
+    /// no decoded input for an untyped tool.
+    pub fn decoded_input<T: ToolInput>(&self) -> Result<Option<&T>> {
+        let Some(decoded) = self.decoded_input.as_ref() else {
+            return Ok(None);
+        };
+        decoded.downcast_ref::<T>().map(Some).ok_or_else(|| {
+            Error::caller(format!(
+                "tool context holds decoded input `{}`, not `{}`",
+                decoded.type_name(),
+                core::any::type_name::<T>()
+            ))
+        })
+    }
+
+    /// Takes the schema-bound input when this context carries one of type `T`.
+    ///
+    /// This avoids cloning a typed argument object merely because tool invocation owns its input.
+    pub fn take_decoded_input<T: ToolInput>(&mut self) -> Result<Option<T>> {
+        self.decoded_input
+            .take()
+            .map(DecodedToolInput::downcast::<T>)
+            .transpose()
     }
 
     /// Caller class used by [`ToolOptions`](super::ToolOptions) admission checks.
@@ -139,6 +179,7 @@ impl fmt::Debug for ToolContext<'_> {
             .field("tool", &self.origin.qualified_name())
             .field("call_id", self.call_id)
             .field("arguments", &"<redacted>")
+            .field("has_decoded_input", &self.decoded_input.is_some())
             .field("caller", &self.caller)
             .field("services", self.services)
             .finish()

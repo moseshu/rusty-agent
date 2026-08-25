@@ -51,9 +51,9 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
     tool::{
-        ObservationMetadata, ResourceClaim, Tool, ToolConcurrency, ToolContext,
-        ToolFailureHandling, ToolInput as _, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock,
-        ToolSchema, Truncation, TruncationStage,
+        DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
+        ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
+        ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema, Truncation, TruncationStage,
     },
 };
 use ra_exec::fs::{RootedFileSystem, RootedOpenError};
@@ -177,7 +177,7 @@ impl ReadFileLimits {
 /// The `read_file` tool.
 pub struct ReadFileTool {
     origin: ToolOrigin,
-    schema: ToolSchema,
+    func_schema: FuncSchema,
     options: ToolOptions,
     root: Option<PathBuf>,
     rooted_filesystem: Option<Arc<RootedFileSystem>>,
@@ -204,7 +204,7 @@ impl ReadFileTool {
             .with_concurrency(ToolConcurrency::Parallel);
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
-            schema: ReadFileInput::tool_schema(TOOL_NAME)?,
+            func_schema: FuncSchema::for_input::<ReadFileInput>(TOOL_NAME)?,
             options,
             root: None,
             rooted_filesystem: None,
@@ -251,7 +251,7 @@ impl ReadFileTool {
             .with_resource_claim(ResourceClaim::shared(resource_id));
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
-            schema: ReadFileInput::tool_schema(TOOL_NAME)?,
+            func_schema: FuncSchema::for_input::<ReadFileInput>(TOOL_NAME)?,
             options,
             root: Some(canonical),
             rooted_filesystem: Some(Arc::new(rooted_filesystem)),
@@ -616,15 +616,36 @@ impl Tool for ReadFileTool {
     }
 
     fn schema(&self) -> &ToolSchema {
-        &self.schema
+        self.func_schema.tool_schema()
     }
 
-    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
-        // `FuncSchema`'s schema-bound decoder takes the raw argument string a provider sent, while
-        // a call context carries the parsed value. Until R2-6's registry owns that seam, the typed
-        // decode happens here; `deny_unknown_fields` keeps it as strict as the schema is.
-        let input: ReadFileInput = serde_json::from_value(context.arguments().clone())
-            .map_err(|error| ReadFileFailure::BadArguments(error.to_string()).into_error())?;
+    fn func_schema(&self) -> Option<&FuncSchema> {
+        Some(&self.func_schema)
+    }
+
+    fn decode_input(&self, arguments: &serde_json::Value) -> Result<Option<DecodedToolInput>> {
+        self.func_schema
+            .decode_value_diagnostic(arguments.clone())
+            .map(Some)
+            .map_err(|error| ReadFileFailure::BadArguments(error).into_error())
+    }
+
+    async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
+        // Runtime dispatch puts the schema-bound value here. The fallback keeps direct, isolated
+        // tool tests possible; provider calls never take it because the common entry validates
+        // and decodes before invoking this method.
+        let input = context.take_decoded_input::<ReadFileInput>()?.map_or_else(
+            || {
+                serde_json::from_value(context.arguments().clone()).map_err(|error| {
+                    ReadFileFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
+                        input_type: self.func_schema.input_type_name(),
+                        message: error.to_string(),
+                    })
+                    .into_error()
+                })
+            },
+            Ok,
+        )?;
         self.read(&input).await.map_err(ReadFileFailure::into_error)
     }
 
@@ -691,7 +712,7 @@ impl ResolvedPath {
 #[derive(Debug)]
 enum ReadFileFailure {
     /// The argument object does not match the schema.
-    BadArguments(String),
+    BadArguments(ToolArgumentDecodeError),
     /// Nothing at that path.
     NotFound(String),
     /// A directory, a device, or a socket.

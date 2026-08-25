@@ -788,6 +788,8 @@ enum ra_core::tool::output::ToolOutputBlock
 enum ra_core::tool::output::TruncationStage
 enum ra_core::tool::resource::ResourceAccess
 enum ra_core::tool::resource::ResourceKind
+enum ra_core::tool::schema::ArgumentShapeViolation
+enum ra_core::tool::schema::ToolArgumentDecodeError
 enum ra_core::trace::SpanKind
 enum ra_core::trace::SpanOutcome
 fn ra_core::agent::AgentInstructions::as_static(& self) -> Option < & str >
@@ -1298,13 +1300,18 @@ fn ra_core::step::single::SingleStepResultBuilder::original_input(mut self, inpu
 fn ra_core::step::single::SingleStepResultBuilder::pre_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_core::step::single::SingleStepResultBuilder::processed_response(mut self, processed : ProcessedResponse) -> Self
 fn ra_core::step::single::SingleStepResultBuilder::session_step_items(mut self, items : Vec < RunItem >) -> Self
+fn ra_core::tool::Tool::decode_input(& self, arguments : & Value) -> Result < Option < DecodedToolInput > >
+fn ra_core::tool::Tool::func_schema(& self) -> Option < & FuncSchema >
 fn ra_core::tool::Tool::model_definition(& self) -> ModelToolDefinition
 fn ra_core::tool::Tool::options(& self) -> ToolOptions
 fn ra_core::tool::Tool::origin(& self) -> & ToolOrigin
 fn ra_core::tool::Tool::schema(& self) -> & ToolSchema
 fn ra_core::tool::Tool::validate(& self) -> Result < () >
+fn ra_core::tool::context::ToolContext < 'a >::decoded_input< T : ToolInput >(& self) -> Result < Option < & T > >
 fn ra_core::tool::context::ToolContext < 'a >::event_emitter(& self) -> Option < HostEventEmitter >
 fn ra_core::tool::context::ToolContext < 'a >::new(run : & 'a RunContext, tool : & 'a dyn Tool, call_id : & 'a CallId, arguments : & 'a Value) -> Self
+fn ra_core::tool::context::ToolContext < 'a >::take_decoded_input< T : ToolInput >(& mut self) -> Result < Option < T > >
+fn ra_core::tool::context::ToolContext < 'a >::with_decoded_input(mut self, decoded_input : DecodedToolInput) -> Self
 fn ra_core::tool::namespace::ToolNamespace::as_str(& self) -> & str
 fn ra_core::tool::namespace::ToolNamespace::new(value : impl Into < String >) -> Result < Self >
 fn ra_core::tool::options::ToolGuardrailId::as_str(& self) -> & str
@@ -1365,6 +1372,9 @@ fn ra_core::tool::resource::ResourceKind::custom(name : impl Into < Cow < 'stati
 fn ra_core::tool::schema::DecodedToolInput::downcast< T : ToolInput >(self) -> Result < T >
 fn ra_core::tool::schema::DecodedToolInput::downcast_ref< T : ToolInput >(& self) -> Option < & T >
 fn ra_core::tool::schema::FuncSchema::decode_arguments(& self, arguments : & str) -> Result < DecodedToolInput >
+fn ra_core::tool::schema::FuncSchema::decode_arguments_diagnostic(& self, arguments : & str) -> std :: result :: Result < DecodedToolInput , ToolArgumentDecodeError >
+fn ra_core::tool::schema::FuncSchema::decode_value(& self, value : Value) -> Result < DecodedToolInput >
+fn ra_core::tool::schema::FuncSchema::decode_value_diagnostic(& self, value : Value) -> std :: result :: Result < DecodedToolInput , ToolArgumentDecodeError >
 fn ra_core::tool::schema::FuncSchema::for_input< T : ToolInput >(name : impl Into < String >) -> Result < Self >
 fn ra_core::tool::schema::FuncSchema::with_return_type< T : 'static >(mut self) -> Self
 fn ra_core::tool::schema::ToolInput::func_schema(name : impl Into < String >) -> Result < FuncSchema > where Self : Sized ,
@@ -1896,6 +1906,15 @@ variant ra_core::tool::resource::ResourceAccess::Shared
 variant ra_core::tool::resource::ResourceKind::Custom(Cow < 'static , str >)
 variant ra_core::tool::resource::ResourceKind::Process
 variant ra_core::tool::resource::ResourceKind::Workspace
+variant ra_core::tool::schema::ArgumentShapeViolation::ExpectedObject { path: String }
+variant ra_core::tool::schema::ArgumentShapeViolation::InvalidSchema { path: String, message: String }
+variant ra_core::tool::schema::ArgumentShapeViolation::MissingRequired { path: String }
+variant ra_core::tool::schema::ArgumentShapeViolation::NoMatchingVariant { path: String }
+variant ra_core::tool::schema::ArgumentShapeViolation::UnexpectedType { path: String, actual: String, expected: String }
+variant ra_core::tool::schema::ArgumentShapeViolation::UnknownArgument { path: String }
+variant ra_core::tool::schema::ToolArgumentDecodeError::Deserialize { input_type: & 'static str, message: String }
+variant ra_core::tool::schema::ToolArgumentDecodeError::InvalidJson { message: String }
+variant ra_core::tool::schema::ToolArgumentDecodeError::Shape(ArgumentShapeViolation)
 variant ra_core::trace::SpanKind::Agent
 variant ra_core::trace::SpanKind::Custom(Cow < 'static , str >)
 variant ra_core::trace::SpanKind::Function

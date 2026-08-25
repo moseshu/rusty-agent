@@ -21,9 +21,8 @@ use super::prepare::TurnActionSurface;
 
 /// Classifies one model response against the surface the turn advertised.
 ///
-/// Name resolution order is handoff, then tool, then unresolved. The order is not a tie-break:
-/// [`TurnActionSurface::new`] already rejected a surface where one name means two things, so at
-/// most one branch can match.
+/// Name resolution order is handoff, then tool, then unresolved. Preparation retains at most one
+/// action for each name under its collision policy, so at most one branch can match.
 pub fn process_model_response(
     response: &ModelResponse,
     surface: &TurnActionSurface,

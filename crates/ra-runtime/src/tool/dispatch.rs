@@ -1,8 +1,9 @@
 //! One tool invocation, in the only permitted stage order (R3-4).
 //!
-//! The chain is repeat admission -> approval -> input guardrail -> invoke -> output guardrail, and
-//! every stage that can refuse does so by **returning a value**, never by throwing prose a caller
-//! has to read. That is what keeps the turn's control flow out of error strings.
+//! The chain is typed argument decoding -> repeat admission -> approval -> input guardrail ->
+//! invoke -> output guardrail. Every stage that can refuse does so by **returning a value**, never
+//! by throwing prose a caller has to read. That is what keeps the turn's control flow out of error
+//! strings.
 //!
 //! # Framework error text must never reach the model
 //!
@@ -246,6 +247,17 @@ impl ToolDispatchRequest {
         .with_caller(self.caller)
         .with_services(&self.services)
     }
+
+    fn context_with_decoded(
+        &self,
+        decoded: Option<ra_core::tool::DecodedToolInput>,
+    ) -> ToolContext<'_> {
+        let context = self.context();
+        match decoded {
+            Some(decoded) => context.with_decoded_input(decoded),
+            None => context,
+        }
+    }
 }
 
 /// Runs one call through the fixed chain.
@@ -277,6 +289,15 @@ pub(crate) async fn dispatch_tool_with_admission(
             ),
         ));
     }
+
+    // Typed function tools are decoded exactly once at the common invocation boundary. A tool
+    // implementation receives the checked value from its context instead of each implementation
+    // independently reinterpreting provider JSON. Untyped and remote tools retain the parsed
+    // JSON-only contract.
+    let decoded_input = match tool.decode_input(&request.arguments) {
+        Ok(decoded) => decoded,
+        Err(error) => return shape_failure(tool, &request, &options, &name, error).await,
+    };
 
     // 2. Loop-breaker admission, before approval so a host is not asked about a call that will not
     // run. Both breakers live behind one insertion point rather than being bolted onto whichever
@@ -336,7 +357,14 @@ pub(crate) async fn dispatch_tool_with_admission(
     };
 
     // 7. Invoke tool.
-    let outcome = invoke(tool, request.context(), &options, &request.cancel, &name).await;
+    let outcome = invoke(
+        tool,
+        request.context_with_decoded(decoded_input),
+        &options,
+        &request.cancel,
+        &name,
+    )
+    .await;
 
     // Release fine-grained resource locks immediately upon invoke completion.
     drop(permits);
@@ -426,7 +454,10 @@ pub(crate) async fn shape_failure(
         ToolFailureHandling::ModelVisible => Ok(observed_failure(&request.call_id, name, &error)),
         ToolFailureHandling::Propagate => Err(error),
         // The one path where a tool writes its own model-facing failure text. Returning `None`
-        // means the tool declined to handle it, and an unhandled failure propagates.
+        // normally means the tool declined to handle it, and an unhandled failure propagates.
+        // `ToolErrorKind::InvalidInput` is the exception: it is always model-visible so a malformed
+        // call can be corrected. This also covers an InvalidInput emitted from a tool body, not
+        // only the common decoding boundary.
         //
         // The result reads as a plain answer to the model, and the records still have to know a
         // call failed here: `run_tests` explaining two different failures in its own words is the
@@ -440,6 +471,9 @@ pub(crate) async fn shape_failure(
                 .await??
             {
                 Some(output) => observed(&request.call_id, &output, Some(error.code())),
+                None if is_invalid_input(&error) => {
+                    Ok(observed_failure(&request.call_id, name, &error))
+                }
                 None => Err(error),
             }
         }
@@ -447,6 +481,17 @@ pub(crate) async fn shape_failure(
             "tool `{name}` uses an unsupported failure handling policy `{handling:?}`"
         ))),
     }
+}
+
+/// Whether this refusal is an argument object the model can correct on its next turn.
+fn is_invalid_input(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Tool {
+            kind: ToolErrorKind::InvalidInput,
+            ..
+        }
+    )
 }
 
 pub(crate) async fn needs_approval(

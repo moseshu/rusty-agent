@@ -69,6 +69,37 @@ fn rooted(dir: &TempDir) -> ExecCommandTool {
 }
 
 #[tokio::test]
+async fn test_exec_command_schema_decode_failure_is_model_visible() {
+    let tool = ExecCommandTool::new().expect("exec_command builds");
+    let arguments = json!({
+        "cmd": 3,
+        "workdir": null,
+        "shell": null,
+        "tty": null,
+        "login": null,
+        "yield_time_ms": null,
+        "timeout_ms": null
+    });
+    let error = tool
+        .decode_input(&arguments)
+        .expect_err("invalid arguments must fail before the tool body runs");
+    let run = run();
+    let output = tool
+        .handle_failure(
+            &ToolContext::new(&run, &tool, &CallId::new("call-invalid"), &arguments),
+            &error,
+        )
+        .await
+        .expect("failure shaping must not fail")
+        .expect("schema decode failures keep exec_command's model-visible guidance");
+
+    assert_eq!(
+        output.as_text().expect("a single text block"),
+        "Invalid arguments: argument `$.cmd` has type integer, expected string."
+    );
+}
+
+#[tokio::test]
 async fn test_exec_command_schema_and_identity() {
     let tool = ExecCommandTool::new().expect("exec_command builds");
 

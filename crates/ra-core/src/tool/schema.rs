@@ -313,7 +313,124 @@ impl fmt::Debug for DecodedToolInput {
     }
 }
 
-type ArgumentDecoder = fn(&str, Value) -> Result<DecodedToolInput>;
+type ArgumentDecoder = fn(Value) -> std::result::Result<DecodedToolInput, ToolArgumentDecodeError>;
+
+/// A model-safe diagnostic produced while decoding a tool argument object.
+///
+/// This deliberately does not use the framework [`Error`]. Framework errors are for hosts and
+/// logs and may be localized; tools with custom failure handling can use this value to produce
+/// their own model-facing explanation without copying framework prose into a tool result.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolArgumentDecodeError {
+    /// The provider payload could not be parsed as JSON.
+    InvalidJson {
+        /// Parser diagnostic.
+        message: String,
+    },
+    /// The parsed JSON value does not satisfy the declared input schema.
+    Shape(ArgumentShapeViolation),
+    /// The schema accepted the value but the Rust input type rejected it.
+    Deserialize {
+        /// Rust type bound to this decoder.
+        input_type: &'static str,
+        /// Serde's direct diagnostic.
+        message: String,
+    },
+}
+
+impl fmt::Display for ToolArgumentDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJson { message } => {
+                write!(formatter, "arguments are not valid JSON: {message}")
+            }
+            Self::Shape(violation) => violation.fmt(formatter),
+            Self::Deserialize {
+                input_type,
+                message,
+            } => write!(
+                formatter,
+                "arguments do not match `{input_type}`: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ToolArgumentDecodeError {}
+
+/// One schema-level violation in a model argument object.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgumentShapeViolation {
+    /// The schema is internally malformed at this location.
+    InvalidSchema {
+        /// JSON-path-like schema location.
+        path: String,
+        /// Concrete problem in the schema.
+        message: String,
+    },
+    /// No member of an `anyOf` accepted the argument.
+    NoMatchingVariant {
+        /// JSON-path-like argument location.
+        path: String,
+    },
+    /// The argument has a different JSON type than the schema expects.
+    UnexpectedType {
+        /// JSON-path-like argument location.
+        path: String,
+        /// JSON type supplied by the model.
+        actual: String,
+        /// JSON type or types accepted by the schema.
+        expected: String,
+    },
+    /// A schema with object properties received a non-object value.
+    ExpectedObject {
+        /// JSON-path-like argument location.
+        path: String,
+    },
+    /// A required argument is absent.
+    MissingRequired {
+        /// JSON-path-like argument location.
+        path: String,
+    },
+    /// The model supplied a property forbidden by the schema.
+    UnknownArgument {
+        /// JSON-path-like argument location.
+        path: String,
+    },
+}
+
+impl fmt::Display for ArgumentShapeViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSchema { path, message } => {
+                write!(formatter, "schema node at `{path}` is invalid: {message}")
+            }
+            Self::NoMatchingVariant { path } => {
+                write!(
+                    formatter,
+                    "argument `{path}` does not match any allowed schema variant"
+                )
+            }
+            Self::UnexpectedType {
+                path,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "argument `{path}` has type {actual}, expected {expected}"
+            ),
+            Self::ExpectedObject { path } => {
+                write!(formatter, "argument `{path}` must be an object")
+            }
+            Self::MissingRequired { path } => {
+                write!(formatter, "required argument `{path}` is missing")
+            }
+            Self::UnknownArgument { path } => write!(formatter, "unknown argument `{path}`"),
+        }
+    }
+}
 
 /// Function schema with its argument decoder and runtime signature metadata.
 #[non_exhaustive]
@@ -356,19 +473,58 @@ impl FuncSchema {
 
     /// Decodes one model argument JSON string using the type that generated the schema.
     pub fn decode_arguments(&self, arguments: &str) -> Result<DecodedToolInput> {
-        let value = serde_json::from_str::<Value>(arguments).map_err(|error| {
-            Error::tool(
-                ToolErrorKind::InvalidInput,
-                self.tool_schema.name(),
-                format!("arguments are not valid JSON: {error}"),
-            )
+        self.decode_arguments_diagnostic(arguments)
+            .map_err(|error| self.decode_error(error))
+    }
+
+    /// Decodes one already-parsed model argument value using the type that generated the schema.
+    ///
+    /// Providers normalize arguments before dispatch, so the common invocation entry must not
+    /// serialize a value merely to parse it again. The string form remains for adapters that have
+    /// not parsed their wire payload yet; both paths share the same schema validation and typed
+    /// decoder.
+    pub fn decode_value(&self, value: Value) -> Result<DecodedToolInput> {
+        self.decode_value_diagnostic(value)
+            .map_err(|error| self.decode_error(error))
+    }
+
+    /// Decodes one model argument JSON string and retains a model-safe diagnostic on failure.
+    ///
+    /// Tools with custom failure handling should use this method rather than rendering a framework
+    /// [`Error`]. Its diagnostics are direct parser or schema facts, not host-facing framework
+    /// prose.
+    pub fn decode_arguments_diagnostic(
+        &self,
+        arguments: &str,
+    ) -> std::result::Result<DecodedToolInput, ToolArgumentDecodeError> {
+        let value = serde_json::from_str(arguments).map_err(|error| {
+            ToolArgumentDecodeError::InvalidJson {
+                message: error.to_string(),
+            }
         })?;
-        validate_argument_shape(
+        self.decode_value_diagnostic(value)
+    }
+
+    /// Decodes one parsed model argument object and retains a model-safe diagnostic on failure.
+    ///
+    /// This is the custom failure-handling counterpart to [`Self::decode_value`]. It preserves
+    /// structured schema violations and direct serde diagnostics without exposing framework error
+    /// formatting to the model.
+    pub fn decode_value_diagnostic(
+        &self,
+        value: Value,
+    ) -> std::result::Result<DecodedToolInput, ToolArgumentDecodeError> {
+        validate_argument_shape(&value, self.tool_schema.input_schema())?;
+        (self.decoder)(value)
+    }
+
+    fn decode_error(&self, error: ToolArgumentDecodeError) -> Error {
+        Error::tool(
+            ToolErrorKind::InvalidInput,
             self.tool_schema.name(),
-            &value,
-            self.tool_schema.input_schema(),
-        )?;
-        (self.decoder)(self.tool_schema.name(), value)
+            error.to_string(),
+        )
+        .with_source(error)
     }
 
     /// Boundary schema version.
@@ -415,16 +571,14 @@ impl fmt::Debug for FuncSchema {
     }
 }
 
-fn decode_arguments<T: ToolInput>(tool_name: &str, arguments: Value) -> Result<DecodedToolInput> {
+fn decode_arguments<T: ToolInput>(
+    arguments: Value,
+) -> std::result::Result<DecodedToolInput, ToolArgumentDecodeError> {
     let value = serde_json::from_value::<T>(arguments).map_err(|error| {
-        Error::tool(
-            ToolErrorKind::InvalidInput,
-            tool_name,
-            format!(
-                "arguments do not match `{}`: {error}",
-                core::any::type_name::<T>()
-            ),
-        )
+        ToolArgumentDecodeError::Deserialize {
+            input_type: core::any::type_name::<T>(),
+            message: error.to_string(),
+        }
     })?;
     Ok(DecodedToolInput {
         type_name: core::any::type_name::<T>(),
@@ -432,9 +586,11 @@ fn decode_arguments<T: ToolInput>(tool_name: &str, arguments: Value) -> Result<D
     })
 }
 
-fn validate_argument_shape(tool_name: &str, value: &Value, schema: &Value) -> Result<()> {
-    validate_schema_node(value, schema, schema, "$")
-        .map_err(|message| Error::tool(ToolErrorKind::InvalidInput, tool_name, message))
+fn validate_argument_shape(
+    value: &Value,
+    schema: &Value,
+) -> std::result::Result<(), ToolArgumentDecodeError> {
+    validate_schema_node(value, schema, schema, "$").map_err(ToolArgumentDecodeError::Shape)
 }
 
 fn validate_schema_node(
@@ -442,14 +598,21 @@ fn validate_schema_node(
     schema: &Value,
     root: &Value,
     path: &str,
-) -> core::result::Result<(), String> {
+) -> core::result::Result<(), ArgumentShapeViolation> {
     let object = schema
         .as_object()
-        .ok_or_else(|| format!("schema node at `{path}` is not an object"))?;
+        .ok_or_else(|| ArgumentShapeViolation::InvalidSchema {
+            path: path.to_owned(),
+            message: "it is not an object".to_owned(),
+        })?;
 
     if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-        let resolved = resolve_schema_ref(root, reference)
-            .ok_or_else(|| format!("schema reference `{reference}` cannot be resolved"))?;
+        let resolved = resolve_schema_ref(root, reference).ok_or_else(|| {
+            ArgumentShapeViolation::InvalidSchema {
+                path: path.to_owned(),
+                message: format!("reference `{reference}` cannot be resolved"),
+            }
+        })?;
         validate_schema_node(value, resolved, root, path)?;
     }
 
@@ -460,9 +623,9 @@ fn validate_schema_node(
             .iter()
             .any(|variant| validate_schema_node(value, variant, root, path).is_ok())
     {
-        return Err(format!(
-            "argument `{path}` does not match any allowed schema variant"
-        ));
+        return Err(ArgumentShapeViolation::NoMatchingVariant {
+            path: path.to_owned(),
+        });
     }
 
     if let Some(variants) = object.get("allOf").and_then(Value::as_array) {
@@ -474,28 +637,34 @@ fn validate_schema_node(
     if let Some(kind) = object.get("type")
         && !matches_schema_type(value, kind)
     {
-        return Err(format!(
-            "argument `{path}` has type {}, expected {}",
-            value_type(value),
-            schema_type_label(kind)
-        ));
+        return Err(ArgumentShapeViolation::UnexpectedType {
+            path: path.to_owned(),
+            actual: value_type(value).to_owned(),
+            expected: schema_type_label(kind),
+        });
     }
 
     if let Some(properties) = object.get("properties").and_then(Value::as_object) {
         let input = value
             .as_object()
-            .ok_or_else(|| format!("argument `{path}` must be an object"))?;
+            .ok_or_else(|| ArgumentShapeViolation::ExpectedObject {
+                path: path.to_owned(),
+            })?;
         if let Some(required) = object.get("required").and_then(Value::as_array) {
             for name in required.iter().filter_map(Value::as_str) {
                 if !input.contains_key(name) {
-                    return Err(format!("required argument `{path}.{name}` is missing"));
+                    return Err(ArgumentShapeViolation::MissingRequired {
+                        path: format!("{path}.{name}"),
+                    });
                 }
             }
         }
         if object.get("additionalProperties") == Some(&Value::Bool(false)) {
             for name in input.keys() {
                 if !properties.contains_key(name) {
-                    return Err(format!("unknown argument `{path}.{name}`"));
+                    return Err(ArgumentShapeViolation::UnknownArgument {
+                        path: format!("{path}.{name}"),
+                    });
                 }
             }
         }

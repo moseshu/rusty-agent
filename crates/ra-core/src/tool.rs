@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 
 use crate::{context::RunContext, error::Result, model::ModelToolDefinition};
+use serde_json::Value;
 
 pub mod context;
 pub mod namespace;
@@ -39,7 +40,8 @@ pub use output::{
 };
 pub use resource::{ResourceAccess, ResourceClaim, ResourceId, ResourceKind};
 pub use schema::{
-    DecodedToolInput, FUNC_SCHEMA_VERSION, FuncSchema, TOOL_SCHEMA_VERSION, ToolInput, ToolSchema,
+    ArgumentShapeViolation, DecodedToolInput, FUNC_SCHEMA_VERSION, FuncSchema, TOOL_SCHEMA_VERSION,
+    ToolArgumentDecodeError, ToolInput, ToolSchema,
 };
 pub use services::ToolServices;
 
@@ -54,6 +56,30 @@ pub trait Tool: Send + Sync + 'static {
 
     /// Provider-neutral model-facing schema.
     fn schema(&self) -> &ToolSchema;
+
+    /// Optional typed function schema from which the default [`Tool::decode_input`] is derived.
+    ///
+    /// A tool that returns one has its parsed model arguments schema-validated and decoded before
+    /// [`Tool::call`] runs. The resulting value is available through
+    /// [`ToolContext::decoded_input`]. Implementations that override [`Tool::decode_input`] must
+    /// decode against this same schema; the runtime calls `decode_input`, not this method,
+    /// directly. Tools without a Rust input type, such as a remote MCP proxy, keep receiving the
+    /// parsed JSON value unchanged.
+    fn func_schema(&self) -> Option<&FuncSchema> {
+        None
+    }
+
+    /// Decodes one normalized argument object at the common invocation boundary.
+    ///
+    /// Typed tools may override this to preserve a domain-specific error source for their custom
+    /// failure formatter. Such implementations must not block: decoding runs synchronously before
+    /// the cancellation scope can poll or interrupt it. Returning `None` declares that the tool
+    /// accepts parsed JSON directly.
+    fn decode_input(&self, arguments: &Value) -> Result<Option<DecodedToolInput>> {
+        self.func_schema()
+            .map(|schema| schema.decode_value(arguments.clone()))
+            .transpose()
+    }
 
     /// Executes one already-resolved call.
     ///
