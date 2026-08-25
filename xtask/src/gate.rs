@@ -2,9 +2,9 @@
 //!
 //! Three states rather than two: **SKIP is not PASS**.
 //!
-//! Several of the nine gates have nothing to check yet (tool schemas wait on R2, prompt sections
-//! wait on R4). Such an entry could either print a "not implemented" placeholder or pretend to
-//! pass; the first reads as done, and the second is worse because it manufactures confidence.
+//! One of the nine gates still has nothing to check (the guard registry waits on R7-0). Such an
+//! entry could either print a "not implemented" placeholder or pretend to pass; the first reads as
+//! done, and the second is worse because it manufactures confidence.
 //! So [`Outcome::Skip`] is its own tier, carries **which task is blocking it**, and is counted
 //! separately in the summary: CI never turns red for it, but every run shows how many are still
 //! owed.

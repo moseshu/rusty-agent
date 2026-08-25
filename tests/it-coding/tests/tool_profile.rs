@@ -13,6 +13,15 @@ use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
 use serde_json::json;
 use tempfile::TempDir;
 
+/// The line the schema budget prints its measurement on, and that `cargo xtask token-budget`
+/// reads back.
+///
+/// The gate quotes this number instead of only reporting that a test passed — the latter is what
+/// the `test` gate already does. It also means a gate that stops finding this line goes red: a
+/// binary from which the measurement was renamed away passes perfectly well, and a budget nobody
+/// measures is not a budget.
+const MEASUREMENT_MARKER: &str = "tool-schema-budget:";
+
 /// A stand-in for a tool this product has declared but not yet written.
 ///
 /// The profile's job is to hold the surface to a shape; proving it does so must not wait for
@@ -219,6 +228,45 @@ fn test_a_tier_assembles_into_a_surface_within_its_budget() {
             surface.advertised_bytes()
         );
     }
+}
+
+#[test]
+fn test_the_implemented_working_tools_stay_within_their_share_of_the_surface() {
+    let workspace = TempDir::new().expect("a workspace");
+    let tools = implemented_core_tools(&workspace);
+    let bytes: usize = tools
+        .iter()
+        .map(|tool| {
+            tool.model_definition()
+                .advertised_bytes()
+                .expect("a renderable tool definition")
+        })
+        .sum();
+
+    // The budget is derived rather than restated. The ceiling is what one turn may advertise and
+    // the default tier says how many entries share it, so an entry's fair share is that quotient,
+    // and what is implemented today may hold that many shares. A fixed total would instead have to
+    // be raised by whoever writes the next tool — which teaches raising it without looking, the
+    // same reason the tiers are bands rather than exact counts. As a share it grows when a tool
+    // lands, and only a schema that is fat for its slot turns this red.
+    let default = CodingProfile::default();
+    let ceiling = default
+        .to_tool_profile()
+        .expect("a valid profile")
+        .budget()
+        .max_advertised_bytes()
+        .expect("the surface declares a byte ceiling");
+    let share = ceiling / selected_keys(default).len();
+    let budget = share * tools.len();
+
+    println!("{MEASUREMENT_MARKER} {bytes}/{budget}");
+    assert!(
+        bytes <= budget,
+        "{} implemented working tools advertise {bytes} bytes, above the {budget} they may hold \
+         ({share} each of the surface's {ceiling}). Shrink a description or a schema; raising the \
+         ceiling moves the cost onto every turn.",
+        tools.len()
+    );
 }
 
 #[test]
