@@ -20,3 +20,5 @@ async-trait = "0.1"
 ra-prompt = { path = "../../crates/ra-prompt" }
 ra-runtime = { path = "../../crates/ra-runtime" }
 ra-tools = { path = "../../crates/ra-tools" }
+ra-model = { path = "../../crates/ra-model", features = ["anthropic"] }
+wiremock = "0.6"

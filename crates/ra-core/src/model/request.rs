@@ -14,6 +14,7 @@ use crate::{
     error::{Error, Result},
     item::{AgentId, ModelInputItem},
     prompt::{CachePlan, ContentHash},
+    tool::canonicalize_json,
 };
 
 /// An opaque identifier for a provider-managed server-side conversation.
@@ -157,6 +158,8 @@ impl ModelToolDefinition {
     /// Creates a model-facing tool definition.
     #[must_use]
     pub fn new(name: impl Into<String>, input_schema: Value) -> Self {
+        let mut input_schema = input_schema;
+        canonicalize_json(&mut input_schema);
         Self {
             name: name.into(),
             description: None,
@@ -242,6 +245,8 @@ impl ModelHandoffDefinition {
     /// Creates a model-facing handoff definition.
     #[must_use]
     pub fn new(target_agent: AgentId, name: impl Into<String>, input_schema: Value) -> Self {
+        let mut input_schema = input_schema;
+        canonicalize_json(&mut input_schema);
         Self {
             target_agent,
             name: name.into(),

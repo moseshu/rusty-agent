@@ -78,6 +78,74 @@ fn test_model_contract_01() {
     );
 }
 
+fn unordered_tool_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search terms"},
+            "limit": {"minimum": 1, "type": "integer"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn unordered_handoff_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string", "description": "Research topic"},
+            "depth": {"minimum": 1, "type": "integer"}
+        },
+        "additionalProperties": false
+    })
+}
+
+#[test]
+fn test_model_contract_01a() {
+    let first = ModelToolDefinition::new("search", unordered_tool_schema());
+    let first_handoff = ModelHandoffDefinition::new(
+        AgentId::new("researcher"),
+        "delegate_research",
+        unordered_handoff_schema(),
+    );
+
+    for _ in 0..100 {
+        let again = ModelToolDefinition::new("search", unordered_tool_schema());
+        let again_handoff = ModelHandoffDefinition::new(
+            AgentId::new("researcher"),
+            "delegate_research",
+            unordered_handoff_schema(),
+        );
+        // Compared as bytes, not as `Value`: a `Value` comparison is key-order insensitive under
+        // either map backend, so it cannot see the drift canonicalization exists to prevent.
+        assert_eq!(
+            serde_json::to_vec(again.input_schema()).unwrap(),
+            serde_json::to_vec(first.input_schema()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(again_handoff.input_schema()).unwrap(),
+            serde_json::to_vec(first_handoff.input_schema()).unwrap()
+        );
+    }
+
+    assert_eq!(
+        first.input_schema()["properties"]
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .collect::<Vec<_>>(),
+        ["limit", "query"]
+    );
+    assert_eq!(
+        first_handoff.input_schema()["properties"]
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .collect::<Vec<_>>(),
+        ["depth", "topic"]
+    );
+}
+
 #[test]
 fn test_model_contract_02() {
     let request = request()

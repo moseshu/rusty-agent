@@ -240,18 +240,30 @@ fn test_tool_input_08() {
 
 #[test]
 fn test_tool_input_09() {
-    let first = GenericInput::<String>::tool_schema("generic")
-        .unwrap()
-        .canonical_json()
-        .unwrap();
-    let first_hash = GenericInput::<String>::tool_schema("generic")
-        .unwrap()
-        .input_schema_hash()
-        .to_owned();
+    let first_schema = GenericInput::<String>::tool_schema("generic").unwrap();
+    let first_definition = first_schema.to_model_definition();
+    let first = serde_json::to_vec(&(
+        first_definition.name(),
+        first_definition.description(),
+        first_definition.input_schema(),
+        first_definition.strict(),
+    ))
+    .unwrap();
+    let first_hash = first_schema.input_schema_hash().to_owned();
 
     for _ in 0..100 {
         let schema = GenericInput::<String>::tool_schema("generic").unwrap();
-        assert_eq!(schema.canonical_json().unwrap(), first);
+        let definition = schema.to_model_definition();
+        assert_eq!(
+            serde_json::to_vec(&(
+                definition.name(),
+                definition.description(),
+                definition.input_schema(),
+                definition.strict(),
+            ))
+            .unwrap(),
+            first
+        );
         assert_eq!(schema.input_schema_hash(), first_hash);
     }
 }
