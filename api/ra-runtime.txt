@@ -11,11 +11,13 @@ async fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedRes
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::runner::RunConfig::action_surface_budget(& self) -> ActionSurfaceBudget
 const fn ra_runtime::runner::RunConfig::budget(& self) -> & BudgetLimit
 const fn ra_runtime::runner::RunConfig::max_function_tool_concurrency(& self) -> usize
 const fn ra_runtime::runner::RunConfig::max_turns(& self) -> u32
 const fn ra_runtime::runner::RunConfig::partial_messages(& self) -> bool
 const fn ra_runtime::runner::RunConfig::tool_name_collision_policy(& self) -> ToolNameCollisionPolicy
+const fn ra_runtime::runner::RunConfig::with_action_surface_budget(mut self, action_surface_budget : ActionSurfaceBudget) -> Self
 const fn ra_runtime::runner::RunConfig::with_budget(mut self, budget : BudgetLimit) -> Self
 const fn ra_runtime::runner::RunConfig::with_deadline(mut self, deadline : Deadline) -> Self
 const fn ra_runtime::runner::RunConfig::with_max_function_tool_concurrency(mut self, max : usize) -> Self
@@ -66,11 +68,17 @@ const fn ra_runtime::tool::profile::ToolSurfaceBudget::min_advertised(& self) ->
 const fn ra_runtime::tool::profile::ToolSurfaceBudget::with_max_advertised_bytes(mut self, bytes : usize) -> Self
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
+const fn ra_runtime::turn::prepare::ActionSurfaceBudget::max_advertised(& self) -> usize
+const fn ra_runtime::turn::prepare::ActionSurfaceBudget::max_advertised_bytes(& self) -> Option < usize >
+const fn ra_runtime::turn::prepare::ActionSurfaceBudget::new(max_advertised : usize) -> Self
+const fn ra_runtime::turn::prepare::ActionSurfaceBudget::unbounded() -> Self
+const fn ra_runtime::turn::prepare::ActionSurfaceBudget::with_max_advertised_bytes(mut self, max_advertised_bytes : usize) -> Self
 const fn ra_runtime::turn::prepare::PreparedTurn::action_surface(& self) -> & TurnActionSurface
 const fn ra_runtime::turn::prepare::PreparedTurn::instruction_provenance(& self) -> Option < & PromptProvenance >
 const fn ra_runtime::turn::prepare::PreparedTurn::model(& self) -> & Arc < dyn Model >
 const fn ra_runtime::turn::prepare::PreparedTurn::request(& self) -> & ModelRequest
 const fn ra_runtime::turn::prepare::PreparedTurn::selector(& self) -> & ModelSelector
+const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_action_surface_budget(mut self, action_surface_budget : ActionSurfaceBudget) -> Self
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tool_name_collision_policy(mut self, collision_policy : ToolNameCollisionPolicy) -> Self
 const fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_tracing(mut self, tracing : ModelTracing) -> Self
 const ra_runtime::runner::DEFAULT_MAX_TURNS: u32
@@ -84,6 +92,15 @@ fn ra_runtime::agent::AgentBinding::direct(agent : Arc < AgentSpec >) -> Self
 fn ra_runtime::agent::AgentBinding::is_prepared(& self) -> bool
 fn ra_runtime::agent::AgentBinding::prepared(public : Arc < AgentSpec >, execution : Arc < AgentSpec >) -> Self
 fn ra_runtime::agent::AgentBinding::public_id(& self) -> & AgentId
+fn ra_runtime::agent::AgentRegistry::builder() -> AgentRegistryBuilder
+fn ra_runtime::agent::AgentRegistry::contains(& self, id : & AgentId) -> bool
+fn ra_runtime::agent::AgentRegistry::definitions(& self) -> impl Iterator < Item = & Arc < AgentDefinition > >
+fn ra_runtime::agent::AgentRegistry::get(& self, id : & AgentId) -> Option < & Arc < AgentDefinition > >
+fn ra_runtime::agent::AgentRegistry::is_empty(& self) -> bool
+fn ra_runtime::agent::AgentRegistry::len(& self) -> usize
+fn ra_runtime::agent::AgentRegistryBuilder::build(self) -> Result < AgentRegistry >
+fn ra_runtime::agent::AgentRegistryBuilder::register(mut self, definition : Arc < AgentDefinition >) -> Self
+fn ra_runtime::agent::AgentRegistryBuilder::register_all(mut self, definitions : impl IntoIterator < Item = Arc < AgentDefinition > >) -> Self
 fn ra_runtime::runner::RunConfig::new() -> Self
 fn ra_runtime::runner::RunConfig::with_error_handler(mut self, error_handler : Arc < dyn RunErrorHandler >) -> Self
 fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < String >) -> Self
@@ -155,6 +172,8 @@ fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_services(mut self,
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
 fn ra_runtime::turn::prepare::PreparedTurn::tools(& self) -> & [Arc < dyn Tool >]
+fn ra_runtime::turn::prepare::TurnActionSurface::advertised_bytes(& self) -> Result < usize >
+fn ra_runtime::turn::prepare::TurnActionSurface::advertised_count(& self) -> usize
 fn ra_runtime::turn::prepare::TurnActionSurface::advertised_names(& self) -> impl Iterator < Item = & str >
 fn ra_runtime::turn::prepare::TurnActionSurface::advertises_handoff_to(& self, target : & AgentId) -> bool
 fn ra_runtime::turn::prepare::TurnActionSurface::find_handoff(& self, name : & str) -> Option < & ModelHandoffDefinition >
@@ -184,6 +203,8 @@ mod ra_runtime::turn::prepare
 mod ra_runtime::turn::process
 mod ra_runtime::turn::resolve
 struct ra_runtime::agent::AgentBinding
+struct ra_runtime::agent::AgentRegistry
+struct ra_runtime::agent::AgentRegistryBuilder
 struct ra_runtime::runner::RunConfig
 struct ra_runtime::runner::RunRequest
 struct ra_runtime::runner::Runner
@@ -207,6 +228,7 @@ struct ra_runtime::tool::registry::ToolRegistryBuilder
 struct ra_runtime::turn::TurnSettlementRequest
 struct ra_runtime::turn::batch::TurnExecution
 struct ra_runtime::turn::batch::TurnExecutionRequest
+struct ra_runtime::turn::prepare::ActionSurfaceBudget
 struct ra_runtime::turn::prepare::PreparedTurn
 struct ra_runtime::turn::prepare::TurnActionSurface
 struct ra_runtime::turn::prepare::TurnPreparationRequest

@@ -255,10 +255,10 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
     // depend on whether the model happened to name a tool that resolved.
     request.cancel.ensure_not_cancelled()?;
 
-    // A transfer of control cannot be executed without the agent registry that resolves an
-    // `AgentId` to a declaration, which R17 owns. The branch is unreachable today — preparation
-    // advertises no handoffs, so classification can produce none — and it fails loudly rather than
-    // letting the turn continue as if the model had asked for nothing.
+    // Preparation can advertise and classify a handoff, but a transfer of control still needs the
+    // graph runtime to resolve its target to a runnable agent and replace the active binding. Until
+    // that execution contract exists, fail loudly rather than letting the turn continue as if the
+    // model had asked for nothing.
     execute_handoffs(processed)?;
 
     // Decisions the model's own response raised (hosted approvals) are asked about first: they are
@@ -948,7 +948,7 @@ fn outcome(
     )
 }
 
-/// R17's insertion point for executing a transfer of control.
+/// Insertion point for executing a transfer of control once the graph runtime owns it.
 fn execute_handoffs(processed: &ProcessedResponse) -> Result<()> {
     match processed.handoffs().first() {
         None => Ok(()),

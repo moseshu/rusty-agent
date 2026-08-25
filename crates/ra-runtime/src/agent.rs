@@ -32,9 +32,13 @@
 //! `as_tool` — the sub-agent shape, where a whole run becomes one tool call — is R12-2's and lands
 //! in this module beside the binding, since a nested run needs both identities too.
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
-use ra_core::{agent::AgentSpec, item::AgentId};
+use ra_core::{
+    agent::{AgentDefinition, AgentSpec},
+    error::{Error, Result},
+    item::AgentId,
+};
 
 /// The public agent a turn is attributed to, bound to the instance that executes it.
 ///
@@ -122,5 +126,114 @@ impl fmt::Debug for AgentBinding {
             .field("execution_id", self.execution.id())
             .field("prepared", &self.is_prepared())
             .finish_non_exhaustive()
+    }
+}
+
+/// Immutable set of agent declarations addressable by stable identity.
+///
+/// Applications may populate the builder from configuration, plugins, or direct API calls; this
+/// registry deliberately does not assign meaning to the source. Building it validates that every
+/// handoff target is present in this declaration set and makes that set available for later target
+/// resolution. Direct runs do not consult this registry yet; live child-run state, admission, and
+/// lifecycle stay outside this immutable configuration registry.
+#[non_exhaustive]
+#[derive(Clone, Default)]
+pub struct AgentRegistry {
+    entries: BTreeMap<AgentId, Arc<AgentDefinition>>,
+}
+
+impl AgentRegistry {
+    /// Starts an empty registry builder.
+    pub fn builder() -> AgentRegistryBuilder {
+        AgentRegistryBuilder {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Finds a declaration by stable agent identity.
+    #[must_use]
+    pub fn get(&self, id: &AgentId) -> Option<&Arc<AgentDefinition>> {
+        self.entries.get(id)
+    }
+
+    /// Whether a declaration with this identity is registered.
+    #[must_use]
+    pub fn contains(&self, id: &AgentId) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    /// Number of registered declarations.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no declarations are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Every declaration in stable identity order.
+    pub fn definitions(&self) -> impl Iterator<Item = &Arc<AgentDefinition>> {
+        self.entries.values()
+    }
+}
+
+impl fmt::Debug for AgentRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentRegistry")
+            .field("agent_ids", &self.entries.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builder for an immutable [`AgentRegistry`].
+#[must_use]
+pub struct AgentRegistryBuilder {
+    entries: Vec<Arc<AgentDefinition>>,
+}
+
+impl AgentRegistryBuilder {
+    /// Registers one agent declaration.
+    pub fn register(mut self, definition: Arc<AgentDefinition>) -> Self {
+        self.entries.push(definition);
+        self
+    }
+
+    /// Registers several agent declarations.
+    pub fn register_all(
+        mut self,
+        definitions: impl IntoIterator<Item = Arc<AgentDefinition>>,
+    ) -> Self {
+        self.entries.extend(definitions);
+        self
+    }
+
+    /// Validates the declaration set and freezes it.
+    pub fn build(self) -> Result<AgentRegistry> {
+        let mut entries = BTreeMap::new();
+        for definition in self.entries {
+            let id = definition.id().clone();
+            if entries.insert(id.clone(), definition).is_some() {
+                return Err(Error::config(format!(
+                    "agent id `{id}` is registered more than once"
+                )));
+            }
+        }
+
+        for (source, definition) in &entries {
+            for handoff in definition.handoffs() {
+                if !entries.contains_key(handoff.target_agent()) {
+                    return Err(Error::config(format!(
+                        "agent `{source}` hands off to unregistered agent `{}`",
+                        handoff.target_agent()
+                    )));
+                }
+            }
+        }
+
+        Ok(AgentRegistry { entries })
     }
 }

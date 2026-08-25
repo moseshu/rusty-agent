@@ -20,6 +20,11 @@
 //! turns the next addition into a decision someone has to make on purpose, which is the only
 //! moment at which the trade is visible. [`ToolProfileBuilder::build`] therefore refuses a profile
 //! that has not declared one; "no ceiling" is expressible, but only by writing it down.
+//!
+//! A profile budgets tool selection, not the final provider request. Handoffs belong to an agent
+//! declaration and are resolved only after dynamic availability, so the combined tool-and-handoff
+//! ceiling is [`ActionSurfaceBudget`](crate::runner::ActionSurfaceBudget), applied during turn
+//! preparation.
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
@@ -366,7 +371,11 @@ impl ToolSurface {
         self.advertised.len()
     }
 
-    /// What those entries cost per turn, by [`ToolSchema::advertised_bytes`].
+    /// What the advertised tool entries cost, by [`ToolSchema::advertised_bytes`].
+    ///
+    /// This excludes handoffs because a [`ToolSurface`] is a tool-selection result. Use the final
+    /// turn's [`ActionSurfaceBudget`](crate::runner::ActionSurfaceBudget) to bound the complete
+    /// provider action table.
     ///
     /// [`ToolSchema::advertised_bytes`]: ra_core::tool::ToolSchema::advertised_bytes
     #[must_use]
