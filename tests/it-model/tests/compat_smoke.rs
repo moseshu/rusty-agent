@@ -8,14 +8,18 @@ use ra_core::{
     item::{AgentId, CallId, Message, ModelInputItem, OutputPhase, ToolCall, ToolCallOutput},
     model::{
         Effort, Model, ModelHandoffDefinition, ModelProvider, ModelRequest, ModelSettings,
-        ModelToolDefinition, ProviderKey, ToolChoice,
+        ModelToolDefinition, ProviderKey, ThinkingConfig, ToolChoice,
     },
     tool::ToolOutput,
 };
 use ra_model::{
     anthropic::smoke::preview_request_payload,
     compat::CompatEndpoint,
-    openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel},
+    openai::{
+        auth::OpenAiAuth,
+        chat::OpenAiChatModel,
+        responses::OpenAiResponsesModel,
+    },
     provider::quirks::ProviderQuirks,
 };
 use serde_json::{Value, json};
@@ -166,6 +170,67 @@ async fn capture_compat(request: ModelRequest) -> Value {
         .await
         .expect("compat smoke response should convert");
     received_body(&server).await
+}
+
+/// Lowers through the real Responses adapter and returns the refusal it must produce.
+///
+/// The endpoint is mounted so a regression that lowers the setting instead of refusing it shows up
+/// as a request on the wire rather than as a passing test.
+async fn responses_refusal(request: ModelRequest) -> String {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_success()))
+        .mount(&server)
+        .await;
+    let model = OpenAiResponsesModel::new(
+        MODEL,
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+    )
+    .expect("responses smoke model should build");
+    let error = model
+        .get_response(request)
+        .await
+        .expect_err("the Responses adapter must refuse the setting");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock should retain requests")
+            .len(),
+        0,
+        "a refused setting must not reach the endpoint"
+    );
+    error.to_string()
+}
+
+/// The Chat Completions counterpart of [`responses_refusal`], under the default strict policy.
+async fn chat_refusal(request: ModelRequest) -> String {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_success()))
+        .mount(&server)
+        .await;
+    let model = OpenAiChatModel::new(
+        MODEL,
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+    )
+    .expect("chat smoke model should build");
+    let error = model
+        .get_response(request)
+        .await
+        .expect_err("the Chat Completions adapter must refuse the setting");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock should retain requests")
+            .len(),
+        0,
+        "a refused setting must not reach the endpoint"
+    );
+    error.to_string()
 }
 
 fn history_request(input: Vec<ModelInputItem>) -> ModelRequest {
@@ -555,6 +620,207 @@ fn anthropic_preview_refuses_an_unrepresentable_no_tools_choice() {
     let error = preview_request_payload(MODEL, &request)
         .expect_err("the preview must not silently discard ToolChoice::None");
     assert!(error.to_string().contains("ToolChoice::None"));
+}
+
+/// Smallest budget Anthropic accepts, and the smallest output ceiling that leaves room for it.
+const THINKING_BUDGET: u64 = 2048;
+const THINKING_MAX_TOKENS: u64 = 4096;
+
+fn thinking_settings(thinking: ThinkingConfig) -> ModelSettings {
+    ModelSettings::new()
+        .with_max_tokens(THINKING_MAX_TOKENS)
+        .with_thinking(thinking)
+}
+
+fn every_thinking_configuration() -> [ThinkingConfig; 3] {
+    [
+        ThinkingConfig::Adaptive,
+        ThinkingConfig::Enabled {
+            budget_tokens: THINKING_BUDGET,
+        },
+        ThinkingConfig::Disabled,
+    ]
+}
+
+fn hello(settings: ModelSettings) -> ModelRequest {
+    ModelRequest::new(
+        vec![ModelInputItem::Message(Message::user("hello"))],
+        resolved(settings),
+    )
+}
+
+#[test]
+fn anthropic_preview_lowers_every_thinking_configuration() {
+    let payload = |thinking| {
+        preview_request_payload(MODEL, &hello(thinking_settings(thinking)))
+            .expect("Anthropic thinking configuration should lower")
+    };
+
+    assert_eq!(
+        payload(ThinkingConfig::Adaptive)["thinking"],
+        json!({"type": "adaptive"})
+    );
+    assert_eq!(
+        payload(ThinkingConfig::Enabled {
+            budget_tokens: THINKING_BUDGET
+        })["thinking"],
+        json!({"type": "enabled", "budget_tokens": THINKING_BUDGET})
+    );
+    assert_eq!(
+        payload(ThinkingConfig::Disabled)["thinking"],
+        json!({"type": "disabled"})
+    );
+}
+
+#[test]
+fn anthropic_preview_lowers_every_effort_level() {
+    for (effort, label) in [
+        (Effort::Low, "low"),
+        (Effort::Medium, "medium"),
+        (Effort::High, "high"),
+        (Effort::XHigh, "xhigh"),
+        (Effort::Max, "max"),
+    ] {
+        let request = hello(
+            ModelSettings::new()
+                .with_max_tokens(256)
+                .with_effort(effort),
+        );
+
+        let payload = preview_request_payload(MODEL, &request)
+            .expect("Anthropic effort configuration should lower");
+        assert_eq!(payload["output_config"], json!({"effort": label}));
+    }
+}
+
+/// Thinking travels with the rest of a request rather than only on its own.
+#[test]
+fn anthropic_preview_keeps_thinking_beside_tools_and_effort() {
+    let request = hello(
+        thinking_settings(ThinkingConfig::Adaptive)
+            .with_effort(Effort::High)
+            .with_tool_choice(ToolChoice::Tool("lookup".to_owned())),
+    )
+    .with_tools(vec![ModelToolDefinition::new(
+        "lookup",
+        json!({"type": "object"}),
+    )]);
+
+    let payload = preview_request_payload(MODEL, &request)
+        .expect("thinking should lower alongside tools and effort");
+    assert_eq!(payload["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(payload["output_config"], json!({"effort": "high"}));
+    assert_eq!(
+        payload["tool_choice"],
+        json!({"type": "tool", "name": "lookup"})
+    );
+    assert_eq!(payload["tools"][0]["name"], "lookup");
+    assert_eq!(payload["max_tokens"], json!(THINKING_MAX_TOKENS));
+}
+
+#[test]
+fn anthropic_preview_rejects_a_thinking_budget_that_exhausts_max_tokens() {
+    for max_tokens in [THINKING_BUDGET - 1, THINKING_BUDGET] {
+        let request = hello(
+            thinking_settings(ThinkingConfig::Enabled {
+                budget_tokens: THINKING_BUDGET,
+            })
+            .with_max_tokens(max_tokens),
+        );
+
+        let error = preview_request_payload(MODEL, &request)
+            .expect_err("Anthropic must reject max_tokens at or below the thinking budget");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("max_tokens ({max_tokens})"))
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("thinking.budget_tokens ({THINKING_BUDGET})"))
+        );
+    }
+}
+
+/// The floor is Anthropic's own: a budget under it is a 400 however much room `max_tokens` leaves.
+#[test]
+fn anthropic_preview_rejects_a_thinking_budget_below_the_floor() {
+    let request = hello(thinking_settings(ThinkingConfig::Enabled {
+        budget_tokens: 1023,
+    }));
+
+    let error = preview_request_payload(MODEL, &request)
+        .expect_err("Anthropic must reject a thinking budget below its minimum");
+    assert!(error.to_string().contains("at least 1024"));
+
+    let accepted = hello(thinking_settings(ThinkingConfig::Enabled {
+        budget_tokens: 1024,
+    }));
+    assert_eq!(
+        preview_request_payload(MODEL, &accepted).expect("the floor itself should lower")["thinking"],
+        json!({"type": "enabled", "budget_tokens": 1024})
+    );
+}
+
+/// Turning thinking off is only representable below the top two effort levels.
+#[test]
+fn anthropic_preview_rejects_disabled_thinking_at_the_highest_efforts() {
+    for effort in [Effort::XHigh, Effort::Max] {
+        let request = hello(thinking_settings(ThinkingConfig::Disabled).with_effort(effort));
+
+        let error = preview_request_payload(MODEL, &request)
+            .expect_err("Anthropic must reject disabled thinking at the top effort levels");
+        assert!(error.to_string().contains("thinking.type=disabled"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("output_config.effort={effort}"))
+        );
+    }
+
+    let request = hello(thinking_settings(ThinkingConfig::Disabled).with_effort(Effort::High));
+    assert_eq!(
+        preview_request_payload(MODEL, &request).expect("high effort still accepts disabled")["thinking"],
+        json!({"type": "disabled"})
+    );
+}
+
+/// Neither `OpenAI` protocol has a thinking switch, so no shape may be accepted and then dropped.
+#[tokio::test]
+async fn openai_protocols_refuse_every_thinking_configuration() {
+    for thinking in every_thinking_configuration() {
+        let error = responses_refusal(hello(thinking_settings(thinking))).await;
+        assert!(error.contains("cannot carry a ThinkingConfig"), "{error}");
+
+        let error = chat_refusal(hello(thinking_settings(thinking))).await;
+        assert!(error.contains("cannot carry a ThinkingConfig"), "{error}");
+    }
+}
+
+/// Provider adapters preserve every neutral effort level; model-specific support belongs to a
+/// future capability axis rather than a protocol-wide deny-list.
+#[tokio::test]
+async fn openai_protocols_lower_every_effort_level() {
+    for (effort, label) in [
+        (Effort::Low, "low"),
+        (Effort::Medium, "medium"),
+        (Effort::High, "high"),
+        (Effort::XHigh, "xhigh"),
+        (Effort::Max, "max"),
+    ] {
+        let settings = || {
+            ModelSettings::new()
+                .with_max_tokens(256)
+                .with_effort(effort)
+        };
+
+        let body = capture_responses(hello(settings())).await;
+        assert_eq!(body["reasoning"]["effort"], label);
+
+        let body = capture_chat(hello(settings())).await;
+        assert_eq!(body["reasoning_effort"], label);
+    }
 }
 
 #[tokio::test]

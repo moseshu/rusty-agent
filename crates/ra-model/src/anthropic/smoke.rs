@@ -9,12 +9,15 @@ use std::collections::BTreeSet;
 use ra_core::{
     error::{Error, Result},
     item::{ContentBlock, MessageRole, ModelInputItem},
-    model::{ModelRequest, ToolChoice},
+    model::{Effort, ModelRequest, ThinkingConfig, ToolChoice},
     tool::{ToolOutput, ToolOutputBlock},
 };
 use serde_json::{Map, Value, json};
 
 const ANTHROPIC_ASSISTANT_ROLE: &str = "assistant"; // layering-allow: assistant = Anthropic wire message role
+
+/// Smallest explicit thinking budget Anthropic accepts on the models that still take one.
+const MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
 
 /// Lowers the matrix-supported subset of a request into an Anthropic Messages payload.
 ///
@@ -63,7 +66,14 @@ pub fn preview_request_payload(model: &str, request: &ModelRequest) -> Result<Va
         &tool_names,
         request.model_settings().parallel_tool_calls(),
     )?;
-    if let Some(effort) = request.model_settings().effort() {
+    let effort = request.model_settings().effort();
+    insert_thinking(
+        &mut body,
+        request.model_settings().thinking(),
+        effort,
+        max_tokens,
+    )?;
+    if let Some(effort) = effort {
         body.insert(
             "output_config".to_owned(),
             json!({"effort": effort.label()}),
@@ -76,6 +86,65 @@ pub fn preview_request_payload(model: &str, request: &ModelRequest) -> Result<Va
         body.insert("top_p".to_owned(), json!(top_p));
     }
     Ok(Value::Object(body))
+}
+
+/// Lowers the provider-neutral thinking setting and validates the couplings Anthropic enforces.
+///
+/// Three constraints live here rather than in `ra-core`, because all three are couplings between
+/// Anthropic request fields that have no counterpart elsewhere. `OpenAI`'s effort setting has no
+/// comparable relationship to `max_tokens`, and no floor of its own, so the same neutral settings
+/// stay valid there.
+///
+/// - An explicit budget must leave room under the output ceiling: `max_tokens > budget_tokens`.
+/// - An explicit budget has a floor of [`MIN_THINKING_BUDGET_TOKENS`].
+/// - Thinking may only be turned off below the top two effort levels; the pair is refused there.
+///
+/// One limit is worth stating because this preview cannot enforce it: the explicit-budget shape is
+/// only accepted by older Anthropic models, and current ones take `adaptive` alone and answer a
+/// budget with a 400. Choosing between them needs a model-capability axis the framework does not
+/// have yet, so the preview lowers the shape it is handed and leaves the choice to the caller.
+fn insert_thinking(
+    body: &mut Map<String, Value>,
+    thinking: Option<ThinkingConfig>,
+    effort: Option<Effort>,
+    max_tokens: u64,
+) -> Result<()> {
+    let Some(thinking) = thinking else {
+        return Ok(());
+    };
+
+    let value = match thinking {
+        ThinkingConfig::Adaptive => json!({"type": "adaptive"}),
+        ThinkingConfig::Enabled { budget_tokens } => {
+            if budget_tokens < MIN_THINKING_BUDGET_TOKENS {
+                return Err(Error::caller(format!(
+                    "Anthropic thinking.budget_tokens ({budget_tokens}) must be at least {MIN_THINKING_BUDGET_TOKENS}"
+                )));
+            }
+            if max_tokens <= budget_tokens {
+                return Err(Error::caller(format!(
+                    "Anthropic max_tokens ({max_tokens}) must be greater than thinking.budget_tokens ({budget_tokens})"
+                )));
+            }
+            json!({"type": "enabled", "budget_tokens": budget_tokens})
+        }
+        ThinkingConfig::Disabled => {
+            if let Some(effort @ (Effort::XHigh | Effort::Max)) = effort {
+                return Err(Error::caller(format!(
+                    "Anthropic rejects thinking.type=disabled at output_config.effort={effort}; \
+                     lower the effort or keep thinking on"
+                )));
+            }
+            json!({"type": "disabled"})
+        }
+        _ => {
+            return Err(Error::caller(
+                "Anthropic compatibility preview does not support this ThinkingConfig variant",
+            ));
+        }
+    };
+    body.insert("thinking".to_owned(), value);
+    Ok(())
 }
 
 fn lower_messages(request: &ModelRequest) -> Result<Vec<Value>> {

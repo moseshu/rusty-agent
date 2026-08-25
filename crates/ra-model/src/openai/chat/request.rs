@@ -6,7 +6,7 @@ use ra_core::{
     error::{Error, Result},
     model::{
         ConversationContinuation, ModelHandoffDefinition, ModelRequest, ModelToolDefinition,
-        ThinkingConfig, ToolChoice,
+        ToolChoice,
     },
     prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
 };
@@ -118,12 +118,14 @@ fn reject_unsupported_settings(codec: &ChatCodec, request: &ModelRequest) -> Res
              lifetime; set the scope on the request instead",
         ));
     }
-    if let Some(thinking) = request.model_settings().thinking()
-        && !matches!(thinking, ThinkingConfig::Disabled)
-    {
-        return Err(Error::caller(
-            "OpenAI Chat Completions uses reasoning_effort rather than ThinkingConfig",
-        ));
+    // Every shape is refused, `Disabled` included. This protocol has no thinking switch at all, so
+    // accepting an explicit "off" and then sending nothing leaves a reasoning model thinking at its
+    // default effort with no trace of the setting anywhere in the request.
+    if request.model_settings().thinking().is_some() {
+        codec.degrade(
+            "OpenAI Chat Completions expresses reasoning through reasoning_effort and cannot carry \
+             a ThinkingConfig",
+        )?;
     }
     // Chat Completions has no server-side conversation at all: the caller replays the whole
     // history or the model sees nothing. Continuing anyway would send a first turn that silently
