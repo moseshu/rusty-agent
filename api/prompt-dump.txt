@@ -78,3 +78,20 @@ Cache Scope:          <run>
 Prompt Clears Floor:  no (~294 vs 1024; the request's tool table also counts)
 ==================================================================
 
+### host_backed_role: main
+======================= PROMPT DUMP REPORT =======================
+Stable Prefix Hash:   f6ded09a5d84bebea297becd6a397d366d6a3e3f82e276b084b60361743b6163
+Total Prefix Tokens:  ~319
+------------------------------------------------------------------
+Section Name           Stability Position     Tokens   Bytes      Hash Prefix
+------------------------------------------------------------------
+identity               stable    prefix       120      479        85045d06035d...
+tool_surface           stable    prefix       32       125        deded4e8c849...
+personality            stable    prefix       131      522        b943b1105c14...
+role                   stable    prefix       36       141        83b120785cc2...
+------------------------------------------------------------------
+Cache Prefix Hash:    f6ded09a5d84bebea297becd6a397d366d6a3e3f82e276b084b60361743b6163
+Cache Scope:          <run>
+Prompt Clears Floor:  no (~319 vs 1024; the request's tool table also counts)
+==================================================================
+

@@ -12,7 +12,10 @@ use ra_core::agent::{AgentId, AgentSpec};
 use ra_core::error::Result;
 use ra_core::prompt::PromptRole;
 
-use crate::{host::CodingHost, prompt::assemble_stable_prefix};
+use crate::{
+    host::CodingHost,
+    prompt::{assemble_stable_prefix, assemble_stable_prefix_for_tools},
+};
 
 /// Builds the coding agent's declaration with an assembled stable prefix.
 ///
@@ -43,11 +46,12 @@ pub fn build_agent_with_host(
     role: &PromptRole,
     host: &CodingHost,
 ) -> Result<Arc<AgentSpec>> {
-    let prefix = assemble_stable_prefix(role)?;
+    let tools = vec![host.apply_patch_tool()?];
+    let prefix = assemble_stable_prefix_for_tools(role, &tools)?;
     AgentSpec::builder()
         .id(id)
         .name(name)
         .instructions(prefix.system_instructions())
-        .tools(vec![host.apply_patch_tool()?])
+        .tools(tools)
         .build()
 }

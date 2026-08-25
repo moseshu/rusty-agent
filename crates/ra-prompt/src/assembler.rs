@@ -76,20 +76,22 @@ fn section_order_rank(name: &PromptSectionName) -> (u8, &str) {
         (1, name.as_str())
     } else if *name == PromptSectionName::TOOL_USE {
         (2, name.as_str())
-    } else if *name == PromptSectionName::SAFETY {
+    } else if *name == PromptSectionName::TOOL_SURFACE {
         (3, name.as_str())
-    } else if *name == PromptSectionName::EDITING_VERIFICATION {
+    } else if *name == PromptSectionName::SAFETY {
         (4, name.as_str())
-    } else if *name == PromptSectionName::FINAL_ANSWER {
+    } else if *name == PromptSectionName::EDITING_VERIFICATION {
         (5, name.as_str())
-    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
+    } else if *name == PromptSectionName::FINAL_ANSWER {
         (6, name.as_str())
-    } else if *name == PromptSectionName::PERSONALITY {
+    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
         (7, name.as_str())
-    } else if *name == PromptSectionName::ROLE {
+    } else if *name == PromptSectionName::PERSONALITY {
         (8, name.as_str())
-    } else {
+    } else if *name == PromptSectionName::ROLE {
         (9, name.as_str())
+    } else {
+        (10, name.as_str())
     }
 }
 

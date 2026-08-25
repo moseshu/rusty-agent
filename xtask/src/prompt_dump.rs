@@ -15,16 +15,18 @@ use std::process::Command;
 use crate::gate::Outcome;
 use crate::source;
 
-/// Path of the committed snapshot, relative to the workspace root.
-const SNAPSHOT: &str = "api/prompt-dump.txt";
+/// Paths of the committed snapshots, relative to the workspace root.
+const SNAPSHOTS: [&str; 2] = ["api/prompt-dump.txt", "api/tool-surface.txt"];
 
 /// Runs the gate. When `bless` is true it rewrites the snapshot instead of reconciling.
 pub(crate) fn run(bless: bool) -> Outcome {
     let root = source::workspace_root();
-    let snapshot = PathBuf::from(&root).join(SNAPSHOT);
-    if !bless && !snapshot.exists() {
+    let missing = SNAPSHOTS
+        .iter()
+        .find(|snapshot| !PathBuf::from(&root).join(snapshot).is_file());
+    if !bless && let Some(snapshot) = missing {
         return Outcome::Fail(vec![format!(
-            "缺 prompt 快照 {SNAPSHOT}——跑 `cargo xtask prompt-dump --bless` 生成"
+            "缺 prompt 快照 {snapshot}——跑 `cargo xtask prompt-dump --bless` 生成"
         )]);
     }
 
@@ -44,13 +46,17 @@ pub(crate) fn run(bless: bool) -> Outcome {
     }
 
     match command.status() {
-        Ok(status) if status.success() && bless => Outcome::pass(format!("已重写 {SNAPSHOT}")),
-        Ok(status) if status.success() => {
-            Outcome::pass(format!("装配出的稳定前缀与 {SNAPSHOT} 一致"))
+        Ok(status) if status.success() && bless => {
+            Outcome::pass(format!("已重写 {} 和 {}", SNAPSHOTS[0], SNAPSHOTS[1]))
         }
+        Ok(status) if status.success() => Outcome::pass(format!(
+            "稳定前缀与 {}、工具面与 {} 一致",
+            SNAPSHOTS[0], SNAPSHOTS[1]
+        )),
         Ok(_) => Outcome::Fail(vec![format!(
-            "装配出的稳定前缀与 {SNAPSHOT} 不一致：每一份已缓存的前缀都会因此失效。\
-             确认改动是有意的之后，跑 `cargo xtask prompt-dump --bless` 让 diff 进 review"
+            "稳定前缀或工具面快照不一致：每一份已缓存的前缀都会因此失效。\
+             工具 schema 变更还必须提升 TOOL_SCHEMA_REVISION；确认改动后，运行 \
+             `cargo xtask prompt-dump --bless` 让 diff 进 review"
         )]),
         Err(err) => Outcome::Fail(vec![format!("无法启动 cargo test：{err}")]),
     }
