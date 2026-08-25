@@ -548,8 +548,9 @@ async fn retry_span_records_the_delay_and_reason_on_the_following_attempt() {
     let (spans, _text, guard) = capture();
 
     Runner::run(
-        request(Vec::new(), &model, &cancel)
-            .with_config(RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry))),
+        request(Vec::new(), &model, &cancel).with_config(
+            RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry)),
+        ),
     )
     .await
     .expect("the second physical request should succeed");
