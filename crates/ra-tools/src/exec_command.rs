@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     tool::{
-        DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
+        DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool, ToolApprovalPolicy,
         ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
         ToolOrigin, ToolOutput, ToolSchema, Truncation, TruncationStage,
     },
@@ -419,6 +419,7 @@ impl Tool for ExecCommandTool {
 
 fn base_options() -> ToolOptions {
     ToolOptions::new()
+        .with_approval(ToolApprovalPolicy::Always)
         .with_failure_handling(ToolFailureHandling::Custom)
         .with_concurrency(ToolConcurrency::Exclusive)
 }

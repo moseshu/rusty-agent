@@ -47,6 +47,7 @@ use ra_core::{
         ModelStreamEvent, ModelTracing, ReplaySafety, RetryAdvice, RetryBackoff, RetryDecision,
         RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
+    permission::{PermissionMode, PermissionRule},
     state::{EventSeqAllocator, RunId, RunState},
     step::NextStep,
     tool::ToolServices,
@@ -70,6 +71,7 @@ pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
     agent::AgentBinding,
+    permission::PermissionEngine,
     turn::{
         TurnSettlementRequest,
         batch::DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
@@ -107,6 +109,7 @@ pub struct RunConfig {
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
+    permission: PermissionEngine,
 }
 
 impl Default for RunConfig {
@@ -128,6 +131,7 @@ impl RunConfig {
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
+            permission: PermissionEngine::default(),
         }
     }
 
@@ -239,6 +243,21 @@ impl RunConfig {
         self
     }
 
+    /// Selects the base permission mode used for every tool call in this run.
+    pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
+        self.permission = self.permission.with_mode(mode);
+        self
+    }
+
+    /// Replaces the ordered permission-rule exceptions for this run.
+    pub fn with_permission_rules(
+        mut self,
+        rules: impl IntoIterator<Item = PermissionRule>,
+    ) -> Self {
+        self.permission = PermissionEngine::new(self.permission.mode()).with_rules(rules);
+        self
+    }
+
     /// Policy applied to the final tool-and-handoff table for each turn.
     #[must_use]
     pub const fn tool_name_collision_policy(&self) -> ToolNameCollisionPolicy {
@@ -249,6 +268,12 @@ impl RunConfig {
     #[must_use]
     pub const fn action_surface_budget(&self) -> ActionSurfaceBudget {
         self.action_surface_budget
+    }
+
+    /// Permission evaluator shared by every turn of this run.
+    #[must_use]
+    pub const fn permission(&self) -> &PermissionEngine {
+        &self.permission
     }
 
     /// Whether model calls are streamed and their provider events forwarded.
@@ -302,6 +327,7 @@ impl std::fmt::Debug for RunConfig {
                 &self.tool_name_collision_policy,
             )
             .field("action_surface_budget", &self.action_surface_budget)
+            .field("permission", &self.permission)
             .finish()
     }
 }
@@ -878,6 +904,7 @@ async fn run_one_turn(
         turn_scope,
         tool_use,
         tool_failure,
+        config.permission().clone(),
     )
     .with_original_input(context.original_input.to_vec())
     .with_pre_step_items(progress.generated.clone())

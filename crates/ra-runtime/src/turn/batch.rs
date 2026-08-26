@@ -59,6 +59,7 @@ use tokio::{
 };
 use tracing::{Instrument, error, info_span, warn};
 
+use crate::permission::PermissionEngine;
 use crate::tool::dispatch::{
     CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool_with_admission, duration_ms,
 };
@@ -198,6 +199,7 @@ pub struct TurnExecutionRequest<'a> {
     cancel: &'a CancelScope,
     services: ToolServices,
     max_function_tool_concurrency: usize,
+    permission: PermissionEngine,
 }
 
 impl<'a> TurnExecutionRequest<'a> {
@@ -209,6 +211,7 @@ impl<'a> TurnExecutionRequest<'a> {
         tool_failure: &'a ToolFailureTracker,
         run: Arc<RunContext>,
         cancel: &'a CancelScope,
+        permission: PermissionEngine,
     ) -> Self {
         Self {
             processed,
@@ -219,6 +222,7 @@ impl<'a> TurnExecutionRequest<'a> {
             cancel,
             services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
+            permission,
         }
     }
 
@@ -437,6 +441,7 @@ fn spawn_function_dispatches(
             Arc::clone(&request.run),
             tool_scope.clone(),
             history,
+            request.permission.clone(),
         )
         .with_services(request.services.clone());
         let gate = gate.clone();

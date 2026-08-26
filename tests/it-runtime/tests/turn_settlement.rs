@@ -733,6 +733,7 @@ async fn test_turn_settlement_01() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -770,6 +771,7 @@ async fn test_turn_settlement_02() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -816,6 +818,7 @@ async fn function_results_preserve_output_items_failures_and_approval_interrupti
         &ToolFailureTracker::new(),
         run(),
         &cancel,
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -891,6 +894,7 @@ async fn function_results_remain_in_model_order_when_calls_finish_out_of_order()
         &ToolFailureTracker::new(),
         run(),
         &cancel,
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -943,6 +947,7 @@ async fn test_turn_settlement_03() {
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await
     });
@@ -1006,6 +1011,7 @@ async fn test_turn_settlement_04() {
                 &cancel,
                 &mut tracker,
                 &mut ToolFailureTracker::new(),
+                Default::default(),
             )
             .with_max_function_tool_concurrency(1),
         )
@@ -1072,6 +1078,7 @@ async fn test_turn_settlement_05() {
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await
     });
@@ -1133,6 +1140,7 @@ async fn settle_simultaneous_failures(classes: &[PropagatingFailure]) -> Error {
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await
     });
@@ -1248,6 +1256,7 @@ async fn test_turn_settlement_08() {
                 &cancel,
                 &mut tracker,
                 &mut ToolFailureTracker::new(),
+                Default::default(),
             ))
             .await
         });
@@ -1323,6 +1332,7 @@ async fn test_turn_settlement_09() {
                 &cancel,
                 &mut tracker,
                 &mut ToolFailureTracker::new(),
+                Default::default(),
             ))
             .await
         });
@@ -1369,6 +1379,7 @@ async fn test_turn_settlement_10() {
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await
     });
@@ -1402,6 +1413,7 @@ async fn test_turn_settlement_11() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1433,6 +1445,7 @@ async fn test_turn_settlement_12() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1485,6 +1498,7 @@ async fn test_turn_settlement_13() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1515,6 +1529,7 @@ async fn test_turn_settlement_14() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1561,6 +1576,7 @@ async fn test_turn_settlement_15() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap_err();
@@ -1593,6 +1609,7 @@ async fn test_turn_settlement_16() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1623,6 +1640,7 @@ async fn test_turn_settlement_17() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1645,6 +1663,7 @@ async fn test_turn_settlement_17() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap_err();
@@ -1681,6 +1700,7 @@ async fn test_turn_settlement_18() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap_err();
@@ -1706,6 +1726,7 @@ async fn test_turn_settlement_19() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap_err();
@@ -1758,6 +1779,7 @@ async fn test_turn_settlement_20() {
             &cancel,
             &mut ToolUseTracker::new(),
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await;
 
@@ -1790,6 +1812,7 @@ async fn test_turn_settlement_21() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1828,6 +1851,7 @@ async fn test_turn_settlement_22() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap_err();
@@ -1856,6 +1880,7 @@ async fn test_turn_settlement_23() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -1887,6 +1912,7 @@ async fn test_turn_settlement_24() {
             &cancel,
             &mut ToolUseTracker::new(),
             &mut ToolFailureTracker::new(),
+            Default::default(),
         )
         .with_original_input(original.clone())
         .with_pre_step_items(vec![message("old-1", "上一轮")]),
@@ -1937,6 +1963,7 @@ async fn test_turn_settlement_26() {
             &cancel,
             &mut ToolUseTracker::new(),
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await
         .unwrap(),

@@ -1,9 +1,9 @@
 //! One tool invocation, in the only permitted stage order (R3-4).
 //!
-//! The chain is typed argument decoding -> repeat admission -> approval -> input guardrail ->
-//! invoke -> output guardrail. Every stage that can refuse does so by **returning a value**, never
-//! by throwing prose a caller has to read. That is what keeps the turn's control flow out of error
-//! strings.
+//! The chain is typed argument decoding -> repeat admission -> permission -> approval -> input
+//! guardrail -> invoke -> output guardrail. Every stage that can refuse does so by **returning a
+//! value**, never by throwing prose a caller has to read. That is what keeps the turn's control
+//! flow out of error strings.
 //!
 //! # Framework error text must never reach the model
 //!
@@ -25,6 +25,7 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
     item::{CallId, ToolApproval, ToolCallOutput},
+    permission::PermissionDecision,
     tool::{
         Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
         ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior,
@@ -33,6 +34,7 @@ use ra_core::{
 use serde_json::{Value, json};
 
 use crate::circuit;
+use crate::permission::PermissionEngine;
 
 /// What the chain decided about one call.
 #[non_exhaustive]
@@ -185,6 +187,7 @@ pub struct ToolDispatchRequest {
     history: CallHistory,
     caller: ToolCaller,
     services: ToolServices,
+    permission: PermissionEngine,
 }
 
 impl ToolDispatchRequest {
@@ -204,6 +207,7 @@ impl ToolDispatchRequest {
         run: Arc<RunContext>,
         cancel: CancelScope,
         history: CallHistory,
+        permission: PermissionEngine,
     ) -> Self {
         Self {
             tool,
@@ -214,6 +218,7 @@ impl ToolDispatchRequest {
             history,
             caller: ToolCaller::Direct,
             services: ToolServices::new(),
+            permission,
         }
     }
 
@@ -307,18 +312,39 @@ pub(crate) async fn dispatch_tool_with_admission(
         return Ok(refused(&request.call_id, &name, &reason));
     }
 
-    // 3. Approval, before anything runs. Static policies are answered from the declaration and
-    // never enter third-party code, exactly as dynamic availability is handled in preparation.
-    if needs_approval(tool, &options, &request).await? {
-        let mut approval = ToolApproval::new(
-            request.call_id.clone(),
-            tool.model_definition().name(),
-            request.arguments.clone(),
-        );
-        if let Some(namespace) = tool.origin().namespace() {
-            approval = approval.with_namespace(namespace.as_str());
+    // 3. Permission policy and approval, before anything runs. A fixed rule or mode decision is
+    // resolved without entering third-party code. Only the remaining default path asks a dynamic
+    // tool whether it needs approval.
+    let permission = resolve_permission(tool, &options, &request).await?;
+    match permission {
+        PermissionDecision::Allow => {}
+        PermissionDecision::Deny => {
+            return Ok(refused(
+                &request.call_id,
+                &name,
+                &Error::tool(
+                    ToolErrorKind::PermissionDenied,
+                    &name,
+                    "the permission policy denied this tool call",
+                ),
+            ));
         }
-        return Ok(ToolDispatch::AwaitingApproval(approval));
+        PermissionDecision::Ask => {
+            let mut approval = ToolApproval::new(
+                request.call_id.clone(),
+                tool.model_definition().name(),
+                request.arguments.clone(),
+            );
+            if let Some(namespace) = tool.origin().namespace() {
+                approval = approval.with_namespace(namespace.as_str());
+            }
+            return Ok(ToolDispatch::AwaitingApproval(approval));
+        }
+        _ => {
+            return Err(Error::caller(format!(
+                "tool `{name}` has an unsupported permission decision `{permission:?}`"
+            )));
+        }
     }
 
     // 4. Input guardrail. R7-3 owns the contract; the stage exists so it lands in one place, and
@@ -378,6 +404,36 @@ pub(crate) async fn dispatch_tool_with_admission(
     check_output_guardrails(&options)?;
 
     observed_success(&request.call_id, &output)
+}
+
+/// Applies fixed rule and mode decisions before consulting a tool's dynamic approval callback.
+async fn resolve_permission(
+    tool: &Arc<dyn Tool>,
+    options: &ToolOptions,
+    request: &ToolDispatchRequest,
+) -> Result<PermissionDecision> {
+    let model_definition = tool.model_definition();
+    let tool_name = model_definition.name();
+    let namespace = tool
+        .origin()
+        .namespace()
+        .map(ra_core::tool::ToolNamespace::as_str);
+    if let Some(decision) =
+        request
+            .permission
+            .fixed_decision(options.permission_scope(), tool_name, namespace)
+    {
+        return Ok(decision);
+    }
+
+    let fallback = if needs_approval(tool, options, request).await? {
+        PermissionDecision::Ask
+    } else {
+        PermissionDecision::Allow
+    };
+    Ok(request
+        .permission
+        .evaluate(options.permission_scope(), tool_name, namespace, fallback))
 }
 
 /// Invokes the tool, applying its per-call time limit.

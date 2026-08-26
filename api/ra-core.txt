@@ -437,7 +437,10 @@ const fn ra_core::output::OutputSchema::is_plain_text(& self) -> bool
 const fn ra_core::output::OutputSchema::json_schema_value(& self) -> Option < & Value >
 const fn ra_core::output::OutputSchema::plain_text() -> Self
 const fn ra_core::output::OutputSchema::strict(& self) -> Option < bool >
+const fn ra_core::permission::PermissionDecision::label(self) -> & 'static str
 const fn ra_core::permission::PermissionMode::label(self) -> & 'static str
+const fn ra_core::permission::PermissionRule::decision(& self) -> PermissionDecision
+const fn ra_core::permission::PermissionRule::new(decision : PermissionDecision) -> Self
 const fn ra_core::prompt::CachePlan::new(prefix_hash : ContentHash) -> Self
 const fn ra_core::prompt::CachePlan::prefix_hash(& self) -> & ContentHash
 const fn ra_core::prompt::PromptProvenance::content_hash(& self) -> & ContentHash
@@ -552,6 +555,7 @@ const fn ra_core::tool::options::ToolOptions::is_advertised_to_model(& self) -> 
 const fn ra_core::tool::options::ToolOptions::is_discoverable(& self) -> bool
 const fn ra_core::tool::options::ToolOptions::max_no_progress_streak(& self) -> Option < NonZeroU32 >
 const fn ra_core::tool::options::ToolOptions::max_repeat_streak(& self) -> Option < NonZeroU32 >
+const fn ra_core::tool::options::ToolOptions::permission_scope(& self) -> PermissionScope
 const fn ra_core::tool::options::ToolOptions::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::options::ToolOptions::timeout(& self) -> Option < Duration >
 const fn ra_core::tool::options::ToolOptions::timeout_behavior(& self) -> ToolTimeoutBehavior
@@ -563,6 +567,7 @@ const fn ra_core::tool::options::ToolOptions::with_exposure(mut self, exposure :
 const fn ra_core::tool::options::ToolOptions::with_failure_handling(mut self, handling : ToolFailureHandling) -> Self
 const fn ra_core::tool::options::ToolOptions::with_max_no_progress_streak(mut self, max : NonZeroU32) -> Self
 const fn ra_core::tool::options::ToolOptions::with_max_repeat_streak(mut self, max : NonZeroU32) -> Self
+const fn ra_core::tool::options::ToolOptions::with_permission_scope(mut self, permission_scope : PermissionScope) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout(mut self, timeout : Duration) -> Self
 const fn ra_core::tool::options::ToolOptions::with_timeout_behavior(mut self, behavior : ToolTimeoutBehavior) -> Self
 const fn ra_core::tool::options::ToolOptions::without_no_progress_limit(mut self) -> Self
@@ -785,7 +790,9 @@ enum ra_core::model::settings::Effort
 enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
 enum ra_core::model::stream::ModelStreamEvent
+enum ra_core::permission::PermissionDecision
 enum ra_core::permission::PermissionMode
+enum ra_core::permission::PermissionScope
 enum ra_core::prompt::PromptRole
 enum ra_core::prompt::PromptSource
 enum ra_core::prompt::SectionPosition
@@ -1181,6 +1188,11 @@ fn ra_core::output::OutputSchema::name(& self) -> Option < & str >
 fn ra_core::output::OutputSchema::to_model_output_schema(& self) -> Option < ModelOutputSchema >
 fn ra_core::output::OutputSchema::validate(& self) -> Result < () >
 fn ra_core::output::OutputSchema::with_strict(mut self, strict : bool) -> Self
+fn ra_core::permission::PermissionRule::matches(& self, tool_name : & str, namespace : Option < & str >) -> bool
+fn ra_core::permission::PermissionRule::namespace(& self) -> Option < & str >
+fn ra_core::permission::PermissionRule::tool_name(& self) -> Option < & str >
+fn ra_core::permission::PermissionRule::with_namespace(mut self, namespace : impl Into < String >) -> Self
+fn ra_core::permission::PermissionRule::with_tool_name(mut self, tool_name : impl Into < String >) -> Self
 fn ra_core::prompt::CachePlan::cache_scope(& self) -> Option < & str >
 fn ra_core::prompt::CachePlan::for_prefix(prefix : & str, cache_scope : Option < & str >) -> Self
 fn ra_core::prompt::CachePlan::with_cache_scope(mut self, scope : impl Into < String >) -> Self
@@ -1604,6 +1616,7 @@ struct ra_core::model::settings::ResolvedModelSettings
 struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
 struct ra_core::output::OutputSchema
+struct ra_core::permission::PermissionRule
 struct ra_core::prompt::CachePlan
 struct ra_core::prompt::ContentHash
 struct ra_core::prompt::PromptProvenance
@@ -1759,6 +1772,7 @@ variant ra_core::error::ToolErrorKind::ExecutionFailed
 variant ra_core::error::ToolErrorKind::InvalidInput
 variant ra_core::error::ToolErrorKind::NoProgress
 variant ra_core::error::ToolErrorKind::NotFound
+variant ra_core::error::ToolErrorKind::PermissionDenied
 variant ra_core::error::ToolErrorKind::RepeatedCall
 variant ra_core::error::ToolErrorKind::Timeout
 variant ra_core::event::HostEventBody::Agent(AgentEvent)
@@ -1896,11 +1910,17 @@ variant ra_core::model::settings::ToolChoice::Tool(String)
 variant ra_core::model::stream::ModelStreamEvent::Completed(Box < ModelResponse >)
 variant ra_core::model::stream::ModelStreamEvent::RawResponse(RawResponseEvent)
 variant ra_core::model::stream::ModelStreamEvent::RunItem(RunItemStreamEvent)
+variant ra_core::permission::PermissionDecision::Allow
+variant ra_core::permission::PermissionDecision::Ask
+variant ra_core::permission::PermissionDecision::Deny
 variant ra_core::permission::PermissionMode::AcceptEdits
 variant ra_core::permission::PermissionMode::BypassPermissions
 variant ra_core::permission::PermissionMode::Default
 variant ra_core::permission::PermissionMode::DontAsk
 variant ra_core::permission::PermissionMode::Plan
+variant ra_core::permission::PermissionScope::Edit
+variant ra_core::permission::PermissionScope::Execute
+variant ra_core::permission::PermissionScope::Read
 variant ra_core::prompt::PromptRole::Coordinator
 variant ra_core::prompt::PromptRole::Custom(Cow < 'static , str >)
 variant ra_core::prompt::PromptRole::Main

@@ -24,7 +24,7 @@ pub(crate) mod capability;
 pub(crate) mod circuit;
 pub mod guard;
 pub(crate) mod hook;
-pub(crate) mod permission;
+pub mod permission;
 pub mod runner;
 pub mod tool;
 #[doc(hidden)]

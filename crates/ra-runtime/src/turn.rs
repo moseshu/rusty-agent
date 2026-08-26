@@ -33,6 +33,7 @@ pub mod process;
 #[doc(hidden)]
 pub mod resolve;
 
+use crate::permission::PermissionEngine;
 use batch::{DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, TurnExecutionRequest, execute_actions};
 use prepare::TurnActionSurface;
 use process::process_model_response;
@@ -58,6 +59,7 @@ pub struct TurnSettlementRequest<'a> {
     tool_failure: &'a mut ToolFailureTracker,
     services: ToolServices,
     max_function_tool_concurrency: usize,
+    permission: PermissionEngine,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
 }
@@ -77,6 +79,7 @@ impl<'a> TurnSettlementRequest<'a> {
     /// `run` is the run's live context, which this turn's tools read. It carries the public agent
     /// for the same reason `agent` is a binding: what a tool sees named is what the user configured,
     /// never a prepared instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: &'a AgentBinding,
         response: &'a ModelResponse,
@@ -85,6 +88,7 @@ impl<'a> TurnSettlementRequest<'a> {
         cancel: &'a CancelScope,
         tool_use: &'a mut ToolUseTracker,
         tool_failure: &'a mut ToolFailureTracker,
+        permission: PermissionEngine,
     ) -> Self {
         Self {
             agent,
@@ -96,6 +100,7 @@ impl<'a> TurnSettlementRequest<'a> {
             tool_failure,
             services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
+            permission,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
         }
@@ -155,6 +160,7 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
         request.tool_failure,
         Arc::clone(&request.run),
         request.cancel,
+        request.permission.clone(),
     )
     .with_services(request.services.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency);

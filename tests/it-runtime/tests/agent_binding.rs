@@ -257,6 +257,7 @@ async fn test_agent_binding_04() {
         &cancel,
         &mut tracker,
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -303,6 +304,7 @@ async fn test_agent_binding_05() {
         &cancel,
         &mut tracker,
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -337,6 +339,7 @@ async fn test_agent_binding_06() {
         &cancel,
         &mut tracker,
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();
@@ -379,6 +382,7 @@ async fn test_agent_binding_07() {
         &cancel,
         &mut ToolUseTracker::new(),
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .unwrap();

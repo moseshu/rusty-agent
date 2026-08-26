@@ -30,6 +30,8 @@ async fn typed_decode_failure_is_an_observation_not_a_stopped_run() {
         run,
         CancelScope::root(),
         CallHistory::default(),
+
+        Default::default(),
     );
 
     let result = dispatch_tool(request)
