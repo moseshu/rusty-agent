@@ -10,6 +10,7 @@ async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
 async fn ra_core::model::retry::policy::ModelRetryPolicy::evaluate(& self, context : & RetryPolicyContext < '_ >) -> RetryDecision
+async fn ra_core::permission::ToolApprovalHandler::decide(& self, approval : & ToolApproval, context : & RunContext) -> Result < ToolApprovalDecision >
 async fn ra_core::prompt::DynamicPromptHandler::resolve(& self, context : & RunContext) -> Result < ResolvedPrompt >
 async fn ra_core::session::port::Session::add_items(& self, items : Vec < RunItem >) -> Result < () >
 async fn ra_core::session::port::Session::clear(& self) -> Result < () >
@@ -441,6 +442,18 @@ const fn ra_core::permission::PermissionDecision::label(self) -> & 'static str
 const fn ra_core::permission::PermissionMode::label(self) -> & 'static str
 const fn ra_core::permission::PermissionRule::decision(& self) -> PermissionDecision
 const fn ra_core::permission::PermissionRule::new(decision : PermissionDecision) -> Self
+const fn ra_core::permission::PermissionUpdate::destination(& self) -> PermissionUpdateDestination
+const fn ra_core::permission::PermissionUpdate::set_mode(destination : PermissionUpdateDestination, mode : PermissionMode) -> Self
+const fn ra_core::permission::PermissionUpdateDestination::label(self) -> & 'static str
+const fn ra_core::permission::ToolApprovalAllow::new() -> Self
+const fn ra_core::permission::ToolApprovalAllow::updated_input(& self) -> Option < & Value >
+const fn ra_core::permission::ToolApprovalDecision::allow() -> Self
+const fn ra_core::permission::ToolApprovalDecision::interrupts_run(& self) -> bool
+const fn ra_core::permission::ToolApprovalDecision::is_allowed(& self) -> bool
+const fn ra_core::permission::ToolApprovalDecision::label(& self) -> & 'static str
+const fn ra_core::permission::ToolApprovalDecision::updated_input(& self) -> Option < & Value >
+const fn ra_core::permission::ToolApprovalDeny::interrupts_run(& self) -> bool
+const fn ra_core::permission::ToolApprovalDeny::with_interrupt(mut self, interrupt : bool) -> Self
 const fn ra_core::prompt::CachePlan::new(prefix_hash : ContentHash) -> Self
 const fn ra_core::prompt::CachePlan::prefix_hash(& self) -> & ContentHash
 const fn ra_core::prompt::PromptProvenance::content_hash(& self) -> & ContentHash
@@ -793,6 +806,9 @@ enum ra_core::model::stream::ModelStreamEvent
 enum ra_core::permission::PermissionDecision
 enum ra_core::permission::PermissionMode
 enum ra_core::permission::PermissionScope
+enum ra_core::permission::PermissionUpdate
+enum ra_core::permission::PermissionUpdateDestination
+enum ra_core::permission::ToolApprovalDecision
 enum ra_core::prompt::PromptRole
 enum ra_core::prompt::PromptSource
 enum ra_core::prompt::SectionPosition
@@ -1193,6 +1209,18 @@ fn ra_core::permission::PermissionRule::namespace(& self) -> Option < & str >
 fn ra_core::permission::PermissionRule::tool_name(& self) -> Option < & str >
 fn ra_core::permission::PermissionRule::with_namespace(mut self, namespace : impl Into < String >) -> Self
 fn ra_core::permission::PermissionRule::with_tool_name(mut self, tool_name : impl Into < String >) -> Self
+fn ra_core::permission::PermissionUpdate::add_rules(destination : PermissionUpdateDestination, rules : impl IntoIterator < Item = PermissionRule >) -> Self
+fn ra_core::permission::PermissionUpdate::remove_rules(destination : PermissionUpdateDestination, rules : impl IntoIterator < Item = PermissionRule >) -> Self
+fn ra_core::permission::PermissionUpdate::replace_rules(destination : PermissionUpdateDestination, rules : impl IntoIterator < Item = PermissionRule >) -> Self
+fn ra_core::permission::ToolApprovalAllow::updated_permissions(& self) -> & [PermissionUpdate]
+fn ra_core::permission::ToolApprovalAllow::with_updated_input(mut self, updated_input : Value) -> Self
+fn ra_core::permission::ToolApprovalAllow::with_updated_permissions(mut self, updated_permissions : impl IntoIterator < Item = PermissionUpdate >) -> Self
+fn ra_core::permission::ToolApprovalDecision::allow_with_input(updated_input : Value) -> Self
+fn ra_core::permission::ToolApprovalDecision::denial_message(& self) -> Option < & str >
+fn ra_core::permission::ToolApprovalDecision::deny(message : impl Into < String >) -> Self
+fn ra_core::permission::ToolApprovalDecision::updated_permissions(& self) -> & [PermissionUpdate]
+fn ra_core::permission::ToolApprovalDeny::message(& self) -> & str
+fn ra_core::permission::ToolApprovalDeny::new(message : impl Into < String >) -> Self
 fn ra_core::prompt::CachePlan::cache_scope(& self) -> Option < & str >
 fn ra_core::prompt::CachePlan::for_prefix(prefix : & str, cache_scope : Option < & str >) -> Self
 fn ra_core::prompt::CachePlan::with_cache_scope(mut self, scope : impl Into < String >) -> Self
@@ -1617,6 +1645,8 @@ struct ra_core::model::stream::RawResponseEvent
 struct ra_core::model::stream::RunItemStreamEvent
 struct ra_core::output::OutputSchema
 struct ra_core::permission::PermissionRule
+struct ra_core::permission::ToolApprovalAllow
+struct ra_core::permission::ToolApprovalDeny
 struct ra_core::prompt::CachePlan
 struct ra_core::prompt::ContentHash
 struct ra_core::prompt::PromptProvenance
@@ -1676,6 +1706,7 @@ trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
 trait ra_core::model::retry::policy::ModelRetryPolicy
+trait ra_core::permission::ToolApprovalHandler
 trait ra_core::prompt::DynamicPromptHandler
 trait ra_core::session::port::Session
 trait ra_core::state::work::WorkStateHandle
@@ -1921,6 +1952,16 @@ variant ra_core::permission::PermissionMode::Plan
 variant ra_core::permission::PermissionScope::Edit
 variant ra_core::permission::PermissionScope::Execute
 variant ra_core::permission::PermissionScope::Read
+variant ra_core::permission::PermissionUpdate::AddRules { destination: PermissionUpdateDestination, rules: Vec < PermissionRule > }
+variant ra_core::permission::PermissionUpdate::RemoveRules { destination: PermissionUpdateDestination, rules: Vec < PermissionRule > }
+variant ra_core::permission::PermissionUpdate::ReplaceRules { destination: PermissionUpdateDestination, rules: Vec < PermissionRule > }
+variant ra_core::permission::PermissionUpdate::SetMode { destination: PermissionUpdateDestination, mode: PermissionMode }
+variant ra_core::permission::PermissionUpdateDestination::LocalSettings
+variant ra_core::permission::PermissionUpdateDestination::ProjectSettings
+variant ra_core::permission::PermissionUpdateDestination::Session
+variant ra_core::permission::PermissionUpdateDestination::UserSettings
+variant ra_core::permission::ToolApprovalDecision::Allow(ToolApprovalAllow)
+variant ra_core::permission::ToolApprovalDecision::Deny(ToolApprovalDeny)
 variant ra_core::prompt::PromptRole::Coordinator
 variant ra_core::prompt::PromptRole::Custom(Cow < 'static , str >)
 variant ra_core::prompt::PromptRole::Main
