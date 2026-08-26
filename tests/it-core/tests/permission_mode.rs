@@ -1,6 +1,18 @@
 //! Permission-mode contracts.
 
-use ra_core::permission::{PermissionDecision, PermissionMode, PermissionRule, PermissionScope};
+use async_trait::async_trait;
+use ra_core::{
+    agent::AgentSpec,
+    context::RunContext,
+    error::Result,
+    item::{CallId, ToolApproval},
+    permission::{
+        PermissionDecision, PermissionMode, PermissionRule, PermissionScope, PermissionUpdate,
+        PermissionUpdateDestination, ToolApprovalAllow, ToolApprovalDecision, ToolApprovalDeny,
+        ToolApprovalHandler,
+    },
+    state::RunId,
+};
 use serde_json::{Value, json};
 
 fn all_modes() -> &'static [PermissionMode] {
@@ -108,4 +120,236 @@ fn test_permission_scope_05() {
             scope
         );
     }
+}
+
+#[test]
+fn test_tool_approval_decision_06() {
+    let update = PermissionUpdate::add_rules(
+        PermissionUpdateDestination::Session,
+        [PermissionRule::new(PermissionDecision::Allow)
+            .with_tool_name("read_file")
+            .with_namespace("workspace")],
+    );
+    let decision = ToolApprovalDecision::from(
+        ToolApprovalAllow::new()
+            .with_updated_input(json!({"path": "README.md"}))
+            .with_updated_permissions([update.clone()]),
+    );
+
+    assert!(decision.is_allowed());
+    assert_eq!(decision.label(), "allow");
+    assert_eq!(decision.to_string(), "allow");
+    assert_eq!(decision.updated_input(), Some(&json!({"path": "README.md"})));
+    assert_eq!(decision.updated_permissions(), [update]);
+    assert_eq!(decision.denial_message(), None);
+    assert!(!decision.interrupts_run());
+    assert_eq!(
+        serde_json::to_value(&decision).unwrap(),
+        json!({
+            "behavior": "allow",
+            "updated_input": {"path": "README.md"},
+            "updated_permissions": [{
+                "type": "addRules",
+                "destination": "session",
+                "rules": [{
+                    "decision": "allow",
+                    "tool_name": "read_file",
+                    "namespace": "workspace"
+                }]
+            }]
+        })
+    );
+    let restored: ToolApprovalDecision =
+        serde_json::from_value(serde_json::to_value(&decision).unwrap()).unwrap();
+    assert_eq!(restored, decision);
+
+    let denied = ToolApprovalDecision::from(
+        ToolApprovalDeny::new("The operation is outside the workspace").with_interrupt(true),
+    );
+    assert!(!denied.is_allowed());
+    assert_eq!(denied.label(), "deny");
+    assert_eq!(
+        denied.denial_message(),
+        Some("The operation is outside the workspace")
+    );
+    assert!(denied.interrupts_run());
+    assert!(denied.updated_permissions().is_empty());
+    assert_eq!(denied.updated_input(), None);
+    assert_eq!(
+        serde_json::to_value(&denied).unwrap(),
+        json!({
+            "behavior": "deny",
+            "message": "The operation is outside the workspace",
+            "interrupt": true
+        })
+    );
+    let restored: ToolApprovalDecision =
+        serde_json::from_value(serde_json::to_value(&denied).unwrap()).unwrap();
+    assert_eq!(restored, denied);
+}
+
+/// A refusal carries no policy update, and the type system is what says so: the approval builders
+/// live on `ToolApprovalAllow` and cannot be reached through `deny`. This pins the two properties
+/// that a future merge of the branches would break silently.
+#[test]
+fn test_tool_approval_decision_09() {
+    assert_eq!(
+        serde_json::to_value(ToolApprovalDecision::allow()).unwrap(),
+        json!({"behavior": "allow"}),
+        "an approval that changes nothing must not invent wire fields"
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolApprovalDecision>(json!({"behavior": "allow"})).unwrap(),
+        ToolApprovalDecision::allow()
+    );
+    assert_eq!(
+        serde_json::to_value(ToolApprovalDecision::deny("no")).unwrap(),
+        json!({"behavior": "deny", "message": "no"}),
+        "the default is to continue the run, so `interrupt` stays off the wire"
+    );
+
+    // A JSON null is a real replacement input, distinct from an omitted field that preserves the
+    // original invocation. The distinction prevents an approval from silently running unreviewed
+    // arguments after a host requested a replacement.
+    let null_input = ToolApprovalDecision::allow_with_input(Value::Null);
+    assert_eq!(null_input.updated_input(), Some(&Value::Null));
+    assert_ne!(null_input, ToolApprovalDecision::allow());
+    let text = serde_json::to_string(&null_input).unwrap();
+    assert_eq!(text, r#"{"behavior":"allow","updated_input":null}"#);
+    assert_eq!(
+        serde_json::from_str::<ToolApprovalDecision>(&text).unwrap(),
+        null_input,
+        "every representable decision must survive a round trip"
+    );
+
+    for unknown in [
+        json!({"behavior": "allow", "unexpected": true}),
+        json!({"behavior": "deny", "message": "no", "unexpected": true}),
+        // A refusal cannot carry policy updates; the approval's field must not leak into it.
+        json!({"behavior": "deny", "message": "no", "updated_permissions": []}),
+    ] {
+        assert!(
+            serde_json::from_value::<ToolApprovalDecision>(unknown.clone()).is_err(),
+            "unknown approval field must be rejected, not dropped: {unknown}"
+        );
+    }
+    assert!(serde_json::from_value::<ToolApprovalDecision>(json!({"behavior": "ask"})).is_err());
+}
+
+#[test]
+fn test_permission_update_07() {
+    let updates = [
+        (
+            PermissionUpdate::add_rules(
+                PermissionUpdateDestination::Session,
+                [PermissionRule::new(PermissionDecision::Ask)],
+            ),
+            PermissionUpdateDestination::Session,
+        ),
+        (
+            PermissionUpdate::replace_rules(PermissionUpdateDestination::LocalSettings, []),
+            PermissionUpdateDestination::LocalSettings,
+        ),
+        (
+            PermissionUpdate::remove_rules(
+                PermissionUpdateDestination::ProjectSettings,
+                [PermissionRule::new(PermissionDecision::Deny)],
+            ),
+            PermissionUpdateDestination::ProjectSettings,
+        ),
+        (
+            PermissionUpdate::set_mode(
+                PermissionUpdateDestination::UserSettings,
+                PermissionMode::DontAsk,
+            ),
+            PermissionUpdateDestination::UserSettings,
+        ),
+    ];
+
+    for (update, destination) in updates {
+        assert_eq!(update.destination(), destination);
+        let restored: PermissionUpdate =
+            serde_json::from_value(serde_json::to_value(&update).unwrap()).unwrap();
+        assert_eq!(restored, update);
+    }
+
+    assert_eq!(
+        PermissionUpdateDestination::ProjectSettings.to_string(),
+        "projectSettings"
+    );
+    assert!(
+        serde_json::from_value::<PermissionUpdate>(json!({
+            "type": "addRules",
+            "rules": []
+        }))
+        .is_err(),
+        "an update without a destination must not be given one"
+    );
+    assert!(
+        serde_json::from_value::<PermissionUpdate>(json!({
+            "type": "addRules",
+            "destination": "session",
+            "rules": [],
+            "behavior": "allow"
+        }))
+        .is_err(),
+        "a qualifier a newer version added must fail loudly, not widen the update"
+    );
+}
+
+/// Reports what it read back through its return value rather than asserting in place: an
+/// assertion inside the callback passes just as quietly when the callback is never run.
+struct EchoingApprovalHandler;
+
+#[async_trait]
+impl ToolApprovalHandler for EchoingApprovalHandler {
+    async fn decide(
+        &self,
+        approval: &ToolApproval,
+        context: &RunContext,
+    ) -> Result<ToolApprovalDecision> {
+        Ok(ToolApprovalDecision::allow_with_input(json!({
+            "run_id": context.run_id().as_str(),
+            "agent_id": context.agent_id().as_str(),
+            "call_id": approval.call_id().as_str(),
+            "tool_name": approval.tool_name(),
+            "arguments": approval.arguments(),
+            "namespace": approval.namespace(),
+        })))
+    }
+}
+
+#[tokio::test]
+async fn test_tool_approval_handler_08() {
+    let agent = AgentSpec::builder()
+        .id(ra_core::item::AgentId::new("agent-approval-handler"))
+        .name("Approval handler")
+        .build()
+        .unwrap();
+    let context = RunContext::new(RunId::new("run-approval-handler"), &agent);
+    let approval = ToolApproval::new(
+        CallId::new("call-approval-handler"),
+        "exec_command",
+        json!({"command": "git status"}),
+    )
+    .with_namespace("workspace");
+
+    let decision = EchoingApprovalHandler
+        .decide(&approval, &context)
+        .await
+        .unwrap();
+
+    assert!(decision.is_allowed());
+    assert_eq!(
+        decision.updated_input(),
+        Some(&json!({
+            "run_id": "run-approval-handler",
+            "agent_id": "agent-approval-handler",
+            "call_id": "call-approval-handler",
+            "tool_name": "exec_command",
+            "arguments": {"command": "git status"},
+            "namespace": "workspace",
+        })),
+        "the handler must see the live run context and the pending record it is answering"
+    );
 }
