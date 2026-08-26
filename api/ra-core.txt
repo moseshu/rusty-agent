@@ -437,6 +437,7 @@ const fn ra_core::output::OutputSchema::is_plain_text(& self) -> bool
 const fn ra_core::output::OutputSchema::json_schema_value(& self) -> Option < & Value >
 const fn ra_core::output::OutputSchema::plain_text() -> Self
 const fn ra_core::output::OutputSchema::strict(& self) -> Option < bool >
+const fn ra_core::permission::PermissionMode::label(self) -> & 'static str
 const fn ra_core::prompt::CachePlan::new(prefix_hash : ContentHash) -> Self
 const fn ra_core::prompt::CachePlan::prefix_hash(& self) -> & ContentHash
 const fn ra_core::prompt::PromptProvenance::content_hash(& self) -> & ContentHash
@@ -669,6 +670,7 @@ const ra_core::model::retry::backoff::MAX_HONORED_RETRY_AFTER: Duration
 const ra_core::model::settings::MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::settings::MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion
 const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
+const ra_core::permission::PermissionMode::ALL: & 'static [Self]
 const ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS: usize
 const ra_core::prompt::PromptSectionName::CONTEXT_DURABILITY: Self
 const ra_core::prompt::PromptSectionName::CORE_BEHAVIOR: Self
@@ -783,6 +785,7 @@ enum ra_core::model::settings::Effort
 enum ra_core::model::settings::ThinkingConfig
 enum ra_core::model::settings::ToolChoice
 enum ra_core::model::stream::ModelStreamEvent
+enum ra_core::permission::PermissionMode
 enum ra_core::prompt::PromptRole
 enum ra_core::prompt::PromptSource
 enum ra_core::prompt::SectionPosition
@@ -1893,6 +1896,11 @@ variant ra_core::model::settings::ToolChoice::Tool(String)
 variant ra_core::model::stream::ModelStreamEvent::Completed(Box < ModelResponse >)
 variant ra_core::model::stream::ModelStreamEvent::RawResponse(RawResponseEvent)
 variant ra_core::model::stream::ModelStreamEvent::RunItem(RunItemStreamEvent)
+variant ra_core::permission::PermissionMode::AcceptEdits
+variant ra_core::permission::PermissionMode::BypassPermissions
+variant ra_core::permission::PermissionMode::Default
+variant ra_core::permission::PermissionMode::DontAsk
+variant ra_core::permission::PermissionMode::Plan
 variant ra_core::prompt::PromptRole::Coordinator
 variant ra_core::prompt::PromptRole::Custom(Cow < 'static , str >)
 variant ra_core::prompt::PromptRole::Main
