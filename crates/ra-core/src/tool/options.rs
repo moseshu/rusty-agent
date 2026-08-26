@@ -9,6 +9,7 @@ use super::{ResourceClaim, ToolCaller};
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
+    permission::PermissionScope,
 };
 
 /// Current tool-options schema version.
@@ -205,6 +206,8 @@ pub struct ToolOptions {
     #[serde(default)]
     approval: ToolApprovalPolicy,
     #[serde(default)]
+    permission_scope: PermissionScope,
+    #[serde(default)]
     exposure: ToolExposure,
     #[serde(default)]
     concurrency: ToolConcurrency,
@@ -242,6 +245,8 @@ struct ToolOptionsWire {
     availability: ToolAvailability,
     #[serde(default)]
     approval: ToolApprovalPolicy,
+    #[serde(default)]
+    permission_scope: PermissionScope,
     #[serde(default)]
     exposure: ToolExposure,
     #[serde(default)]
@@ -292,6 +297,7 @@ impl<'de> Deserialize<'de> for ToolOptions {
             schema_version: wire.schema_version,
             availability: wire.availability,
             approval: wire.approval,
+            permission_scope: wire.permission_scope,
             exposure: wire.exposure,
             concurrency: wire.concurrency,
             resource_claims: ResourceClaim::deduplicate(wire.resource_claims),
@@ -316,6 +322,7 @@ impl Default for ToolOptions {
             schema_version: TOOL_OPTIONS_SCHEMA_VERSION,
             availability: ToolAvailability::Enabled,
             approval: ToolApprovalPolicy::Never,
+            permission_scope: PermissionScope::Execute,
             exposure: ToolExposure::Advertised,
             concurrency: ToolConcurrency::Exclusive,
             resource_claims: Vec::new(),
@@ -350,6 +357,17 @@ impl ToolOptions {
     #[must_use]
     pub const fn with_approval(mut self, approval: ToolApprovalPolicy) -> Self {
         self.approval = approval;
+        self
+    }
+
+    /// Declares the action class the permission engine evaluates.
+    ///
+    /// The default is [`PermissionScope::Execute`], the conservative class. Tools that are safe
+    /// to use in plan mode must opt into [`PermissionScope::Read`] explicitly; a newly added tool
+    /// must not become plan-safe merely because its author omitted a declaration.
+    #[must_use]
+    pub const fn with_permission_scope(mut self, permission_scope: PermissionScope) -> Self {
+        self.permission_scope = permission_scope;
         self
     }
 
@@ -495,6 +513,12 @@ impl ToolOptions {
     #[must_use]
     pub const fn approval(&self) -> ToolApprovalPolicy {
         self.approval
+    }
+
+    /// Action class the permission engine evaluates for this tool.
+    #[must_use]
+    pub const fn permission_scope(&self) -> PermissionScope {
+        self.permission_scope
     }
 
     /// Model-surface exposure.

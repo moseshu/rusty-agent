@@ -156,6 +156,11 @@ pub enum ToolErrorKind {
     /// one is about the answer being identical. Changing the arguments clears the first and does
     /// nothing for the second — only a result the run has not seen before does.
     NoProgress,
+    /// The call was refused before it ran by the run's permission policy.
+    ///
+    /// This is distinct from a sandbox denial: the permission evaluator made the decision before
+    /// the tool reached an enforcement boundary, so no side effect was attempted.
+    PermissionDenied,
     /// The tool was cancelled (including a cancellation on the MCP side).
     Cancelled,
 }
@@ -587,6 +592,7 @@ impl Error {
                 // Repeating this tool is what stopped working. Another approach, or another tool,
                 // still may — which is precisely what the refusal is asking for.
                 ToolErrorKind::NoProgress => Recoverability::RetryableWithChange,
+                ToolErrorKind::PermissionDenied => Recoverability::NeedsIntervention,
                 ToolErrorKind::NotFound => Recoverability::Fatal,
                 ToolErrorKind::Cancelled => Recoverability::Cancelled,
             },
@@ -668,6 +674,7 @@ impl Error {
                 ToolErrorKind::ExecutionFailed => "tool.execution_failed",
                 ToolErrorKind::RepeatedCall => "tool.repeated_call",
                 ToolErrorKind::NoProgress => "tool.no_progress",
+                ToolErrorKind::PermissionDenied => "tool.permission_denied",
                 ToolErrorKind::Cancelled => "tool.cancelled",
             },
             Self::Sandbox { kind, .. } => match kind {
@@ -747,6 +754,9 @@ impl Error {
                 }
                 ToolErrorKind::NoProgress => {
                     format!("工具 `{tool}` 连续失败且没有新信息，已拦截。")
+                }
+                ToolErrorKind::PermissionDenied => {
+                    format!("工具 `{tool}` 被当前权限策略拒绝。")
                 }
                 ToolErrorKind::Cancelled => format!("工具 `{tool}` 已取消。"),
             },

@@ -5,7 +5,7 @@ use ra_core::{
     context::RunContext,
     item::{AgentId, CallId},
     state::RunId,
-    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput},
+    tool::{Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolOutput},
 };
 use ra_tools::exec_command::{ExecCommandLimits, ExecCommandTool};
 use serde_json::{Value, json};
@@ -136,6 +136,7 @@ async fn test_exec_command_options() {
     let tool = ExecCommandTool::new().expect("exec_command builds");
 
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Exclusive);
+    assert_eq!(tool.options().approval(), ToolApprovalPolicy::Always);
     assert!(tool.options().is_advertised());
 }
 

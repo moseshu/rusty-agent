@@ -5,9 +5,10 @@ use std::{fmt, io::Read as _, path::Path, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     error::Result,
+    permission::PermissionScope,
     tool::{
-        Tool, ToolConcurrency, ToolContext, ToolInput as _, ToolOptions, ToolOrigin, ToolOutput,
-        ToolSchema,
+        Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolInput as _, ToolOptions,
+        ToolOrigin, ToolOutput, ToolSchema,
     },
 };
 use ra_exec::fs::RootedFileSystem;
@@ -50,7 +51,10 @@ impl ApplyPatchTool {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ApplyPatchInput::tool_schema(TOOL_NAME)?,
-            options: ToolOptions::new().with_concurrency(ToolConcurrency::Exclusive),
+            options: ToolOptions::new()
+                .with_approval(ToolApprovalPolicy::Always)
+                .with_permission_scope(PermissionScope::Edit)
+                .with_concurrency(ToolConcurrency::Exclusive),
             filesystem,
         })
     }

@@ -50,6 +50,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
+    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
         ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
@@ -201,6 +202,7 @@ impl ReadFileTool {
     pub fn new() -> Result<Self> {
         let options = ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
+            .with_permission_scope(PermissionScope::Read)
             .with_concurrency(ToolConcurrency::Parallel);
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
@@ -247,6 +249,7 @@ impl ReadFileTool {
         })?;
         let options = ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
+            .with_permission_scope(PermissionScope::Read)
             .with_concurrency(ToolConcurrency::Parallel)
             .with_resource_claim(ResourceClaim::shared(resource_id));
         Ok(Self {

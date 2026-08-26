@@ -4,7 +4,7 @@ use ra_core::{
     context::RunContext,
     item::{AgentId, CallId},
     state::RunId,
-    tool::ToolContext,
+    tool::{ToolApprovalPolicy, ToolContext},
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -101,6 +101,10 @@ fn host_backed_agent_advertises_the_editing_entry() {
     .expect("agent");
     assert_eq!(agent.tools().len(), 1);
     assert_eq!(agent.tools()[0].origin().name(), "apply_patch");
+    assert_eq!(
+        agent.tools()[0].options().approval(),
+        ToolApprovalPolicy::Always
+    );
 }
 
 #[test]

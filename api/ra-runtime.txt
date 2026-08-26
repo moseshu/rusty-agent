@@ -11,11 +11,13 @@ async fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedRes
 async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::permission::PermissionEngine::mode(& self) -> PermissionMode
 const fn ra_runtime::runner::RunConfig::action_surface_budget(& self) -> ActionSurfaceBudget
 const fn ra_runtime::runner::RunConfig::budget(& self) -> & BudgetLimit
 const fn ra_runtime::runner::RunConfig::max_function_tool_concurrency(& self) -> usize
 const fn ra_runtime::runner::RunConfig::max_turns(& self) -> u32
 const fn ra_runtime::runner::RunConfig::partial_messages(& self) -> bool
+const fn ra_runtime::runner::RunConfig::permission(& self) -> & PermissionEngine
 const fn ra_runtime::runner::RunConfig::tool_name_collision_policy(& self) -> ToolNameCollisionPolicy
 const fn ra_runtime::runner::RunConfig::with_action_surface_budget(mut self, action_surface_budget : ActionSurfaceBudget) -> Self
 const fn ra_runtime::runner::RunConfig::with_budget(mut self, budget : BudgetLimit) -> Self
@@ -101,10 +103,18 @@ fn ra_runtime::agent::AgentRegistry::len(& self) -> usize
 fn ra_runtime::agent::AgentRegistryBuilder::build(self) -> Result < AgentRegistry >
 fn ra_runtime::agent::AgentRegistryBuilder::register(mut self, definition : Arc < AgentDefinition >) -> Self
 fn ra_runtime::agent::AgentRegistryBuilder::register_all(mut self, definitions : impl IntoIterator < Item = Arc < AgentDefinition > >) -> Self
+fn ra_runtime::permission::PermissionEngine::evaluate(& self, scope : PermissionScope, tool_name : & str, namespace : Option < & str >, fallback : PermissionDecision) -> PermissionDecision
+fn ra_runtime::permission::PermissionEngine::fixed_decision(& self, scope : PermissionScope, tool_name : & str, namespace : Option < & str >) -> Option < PermissionDecision >
+fn ra_runtime::permission::PermissionEngine::new(mode : PermissionMode) -> Self
+fn ra_runtime::permission::PermissionEngine::rules(& self) -> & [PermissionRule]
+fn ra_runtime::permission::PermissionEngine::with_mode(mut self, mode : PermissionMode) -> Self
+fn ra_runtime::permission::PermissionEngine::with_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
 fn ra_runtime::runner::RunConfig::new() -> Self
 fn ra_runtime::runner::RunConfig::with_error_handler(mut self, error_handler : Arc < dyn RunErrorHandler >) -> Self
 fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < String >) -> Self
 fn ra_runtime::runner::RunConfig::with_model_settings(mut self, model_settings : ModelSettings) -> Self
+fn ra_runtime::runner::RunConfig::with_permission_mode(mut self, mode : PermissionMode) -> Self
+fn ra_runtime::runner::RunConfig::with_permission_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
 fn ra_runtime::runner::RunRequest::new(agent : AgentBinding, model_resolver : Arc < dyn ModelResolver >, run_id : RunId, cancel : CancelScope, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::runner::RunRequest::with_app_context(mut self, app_context : Arc < dyn Any + Send + Sync >) -> Self
 fn ra_runtime::runner::RunRequest::with_config(mut self, config : RunConfig) -> Self
@@ -127,7 +137,7 @@ fn ra_runtime::runner::result::RunResult::turn_items(& self, record : & TurnReco
 fn ra_runtime::runner::result::RunResult::turn_records(& self) -> & [TurnRecord]
 fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::context(& self) -> ToolContext < '_ >
-fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, run : Arc < RunContext >, cancel : CancelScope, history : CallHistory) -> Self
+fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, run : Arc < RunContext >, cancel : CancelScope, history : CallHistory, permission : PermissionEngine) -> Self
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::tool(& self) -> & Arc < dyn Tool >
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_services(mut self, services : ToolServices) -> Self
 fn ra_runtime::tool::dispatch::ToolObservation::into_output(self) -> ToolCallOutput
@@ -157,7 +167,7 @@ fn ra_runtime::tool::registry::ToolRegistry::tools(& self) -> impl Iterator < It
 fn ra_runtime::tool::registry::ToolRegistryBuilder::build(self) -> Result < ToolRegistry >
 fn ra_runtime::tool::registry::ToolRegistryBuilder::register(mut self, tool : Arc < dyn Tool >) -> Self
 fn ra_runtime::tool::registry::ToolRegistryBuilder::register_all(mut self, tools : impl IntoIterator < Item = Arc < dyn Tool > >) -> Self
-fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, run : Arc < RunContext >, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker, tool_failure : & 'a mut ToolFailureTracker) -> Self
+fn ra_runtime::turn::TurnSettlementRequest < 'a >::new(agent : & 'a AgentBinding, response : & 'a ModelResponse, surface : & 'a TurnActionSurface, run : Arc < RunContext >, cancel : & 'a CancelScope, tool_use : & 'a mut ToolUseTracker, tool_failure : & 'a mut ToolFailureTracker, permission : PermissionEngine) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_original_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_pre_step_items(mut self, items : Vec < RunItem >) -> Self
 fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_services(mut self, services : ToolServices) -> Self
@@ -167,7 +177,7 @@ fn ra_runtime::turn::batch::TurnExecution::interruptions(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::new_items(& self) -> & [RunItem]
 fn ra_runtime::turn::batch::TurnExecution::outcomes(& self) -> & [ToolOutcome]
 fn ra_runtime::turn::batch::TurnExecution::tool_results(& self) -> & [ToolUseResult]
-fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, tool_failure : & 'a ToolFailureTracker, run : Arc < RunContext >, cancel : & 'a CancelScope) -> Self
+fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::new(processed : & 'a ProcessedResponse, agent_id : & 'a AgentId, tool_use : & 'a ToolUseTracker, tool_failure : & 'a ToolFailureTracker, run : Arc < RunContext >, cancel : & 'a CancelScope, permission : PermissionEngine) -> Self
 fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_services(mut self, services : ToolServices) -> Self
 fn ra_runtime::turn::prepare::PreparedTurn::into_call(self) -> (TurnActionSurface , ModelRequest)
 fn ra_runtime::turn::prepare::PreparedTurn::into_request(self) -> ModelRequest
@@ -190,6 +200,7 @@ fn ra_runtime::turn::process::process_model_response(response : & ModelResponse,
 fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution, public : & AgentSpec, next_step : & NextStep) -> Vec < RunItem >
 mod ra_runtime::agent
 mod ra_runtime::guard
+mod ra_runtime::permission
 mod ra_runtime::runner
 mod ra_runtime::runner::result
 mod ra_runtime::runner::stream
@@ -205,6 +216,7 @@ mod ra_runtime::turn::resolve
 struct ra_runtime::agent::AgentBinding
 struct ra_runtime::agent::AgentRegistry
 struct ra_runtime::agent::AgentRegistryBuilder
+struct ra_runtime::permission::PermissionEngine
 struct ra_runtime::runner::RunConfig
 struct ra_runtime::runner::RunRequest
 struct ra_runtime::runner::Runner

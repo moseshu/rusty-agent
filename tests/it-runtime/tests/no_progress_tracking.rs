@@ -183,6 +183,7 @@ async fn settle_response(
         &cancel,
         tool_use,
         tool_failure,
+        Default::default(),
     ))
     .await?;
     Ok(settled.new_step_items().to_vec())
@@ -548,6 +549,7 @@ async fn a_message_only_turn_leaves_every_streak_alone() {
         &cancel,
         &mut tool_use,
         &mut failures,
+        Default::default(),
     ))
     .await
     .unwrap();

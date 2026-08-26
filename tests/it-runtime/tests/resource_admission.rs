@@ -279,6 +279,7 @@ async fn test_identical_exclusive_claims_serialize() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -342,6 +343,7 @@ async fn test_identical_shared_claims_run_in_parallel() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -401,6 +403,7 @@ async fn test_disjoint_exclusive_claims_run_in_parallel() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -467,6 +470,7 @@ async fn test_deadlock_prevention_on_inverted_resource_order() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -530,6 +534,7 @@ async fn test_legacy_tools_compatibility_with_claims() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -589,6 +594,7 @@ async fn test_dynamic_resource_claims_execution() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -644,6 +650,7 @@ async fn test_mixed_shared_and_exclusive_on_same_resource() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -703,6 +710,7 @@ async fn test_exclusive_tool_serializes_against_parallel_claim_tools() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         ))
         .await
     });
@@ -763,6 +771,7 @@ async fn test_dynamic_claim_failure_does_not_abort_turn() {
         &cancel,
         &mut tracker,
         &mut failure_tracker,
+        Default::default(),
     ))
     .await
     .expect("turn completes successfully without aborting");
@@ -826,6 +835,7 @@ async fn test_cancellation_releases_resource_claims() {
         &cancel,
         &mut tracker,
         &mut failure_tracker,
+        Default::default(),
     ))
     .await
     .expect("turn completes");
@@ -888,6 +898,7 @@ async fn test_approval_does_not_hold_resource_locks() {
         &cancel,
         &mut tracker,
         &mut failure_tracker,
+        Default::default(),
     ))
     .await
     .expect("turn completes with interruption");
@@ -1012,6 +1023,7 @@ async fn test_concurrency_slot_limits_needs_approval_and_claims() {
             &cancel,
             &mut tracker,
             &mut failure_tracker,
+            Default::default(),
         )
         .with_max_function_tool_concurrency(2),
     )
@@ -1155,6 +1167,7 @@ async fn test_cancellation_of_exclusive_holder_unblocks_waiting_claims() {
         &cancel,
         &mut tracker,
         &mut failure_tracker,
+        Default::default(),
     ))
     .await;
 

@@ -160,6 +160,7 @@ async fn settle(
         &cancel,
         tracker,
         &mut ToolFailureTracker::new(),
+        Default::default(),
     ))
     .await
     .map(|_| ())
@@ -360,6 +361,7 @@ async fn test_tool_use_tracking_06() {
             &cancel,
             &mut tracker,
             &mut ToolFailureTracker::new(),
+            Default::default(),
         ))
         .await
         .unwrap();
