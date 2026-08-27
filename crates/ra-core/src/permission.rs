@@ -31,7 +31,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::{context::RunContext, error::Result, item::ToolApproval};
+use crate::{
+    compat::Unknown,
+    context::RunContext,
+    error::Result,
+    item::{AgentId, CallId, ToolApproval},
+};
 
 /// The host-selected policy for permission evaluation.
 ///
@@ -647,6 +652,188 @@ impl From<ToolApprovalDeny> for ToolApprovalDecision {
     }
 }
 
+/// Presentation and correlation data for one pending tool approval.
+///
+/// This is a data contract between the approval producer and a host UI. The UI may render the
+/// title, display name, and description as supplied, but none of these strings authorizes an
+/// action: the host returns a [`ToolApprovalDecision`] and the runtime applies that typed result.
+/// Keeping the renderable data with the approval request prevents every host from inventing a
+/// different prompt from a tool name and JSON arguments.
+///
+/// `tool_use_id` is always copied from the [`ToolApproval::call_id`] that owns this context, so a
+/// host can correlate a UI response without inventing a second identifier. `agent_id` is present
+/// only when a child agent requested approval, and is a different fact from
+/// [`RunContext::agent_id`]: that one always names the public agent currently speaking, and a
+/// handoff replaces it mid-run. The remaining optional text fields are absent when the approval
+/// producer has no applicable value; a UI must not manufacture a replacement that changes the
+/// meaning of a supplied field.
+///
+/// When a later runtime stage persists this alongside a [`ToolApproval`] record, that record's
+/// schema version covers the enclosing pending-approval state. Unknown fields are retained and
+/// written back rather than rejected: a newer renderer hint must survive a resume through an
+/// older runtime even when that runtime cannot use the hint itself.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPermissionContext {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<PermissionUpdate>,
+    /// Deliberately without `#[serde(default)]`, unlike every field around it: a context whose
+    /// correlation ID is absent must fail to load rather than deserialize into an empty `CallId`
+    /// that matches no pending call.
+    tool_use_id: CallId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl ToolPermissionContext {
+    /// Creates context correlated to one pending approval.
+    ///
+    /// This is the only constructor so the UI correlation ID has one source of truth. Callers
+    /// that later load a context from storage can use [`Self::matches_approval`] before acting on
+    /// it to check that the record was paired with the same pending call.
+    #[must_use]
+    pub fn for_approval(approval: &ToolApproval) -> Self {
+        Self {
+            suggestions: Vec::new(),
+            tool_use_id: approval.call_id().clone(),
+            agent_id: None,
+            blocked_path: None,
+            decision_reason: None,
+            title: None,
+            display_name: None,
+            description: None,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Attaches host-suggested, typed permission updates for the user to accept or ignore.
+    #[must_use]
+    pub fn with_suggestions(
+        mut self,
+        suggestions: impl IntoIterator<Item = PermissionUpdate>,
+    ) -> Self {
+        self.suggestions = suggestions.into_iter().collect();
+        self
+    }
+
+    /// Identifies the exact tool call awaiting approval.
+    ///
+    /// There is deliberately no setter: this value is derived by [`Self::for_approval`] from the
+    /// pending record's canonical call ID.
+    #[must_use]
+    pub const fn tool_use_id(&self) -> &CallId {
+        &self.tool_use_id
+    }
+
+    /// Whether this context belongs to the given pending approval.
+    #[must_use]
+    pub fn matches_approval(&self, approval: &ToolApproval) -> bool {
+        self.tool_use_id == *approval.call_id()
+    }
+
+    /// Identifies the child agent that requested approval.
+    #[must_use]
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = Some(agent_id);
+        self
+    }
+
+    /// Records the path that was blocked, when the approval concerns a filesystem boundary.
+    #[must_use]
+    pub fn with_blocked_path(mut self, blocked_path: impl Into<String>) -> Self {
+        self.blocked_path = Some(blocked_path.into());
+        self
+    }
+
+    /// Records why the approval producer requested a decision.
+    #[must_use]
+    pub fn with_decision_reason(mut self, decision_reason: impl Into<String>) -> Self {
+        self.decision_reason = Some(decision_reason.into());
+        self
+    }
+
+    /// Sets the complete primary prompt text supplied to the UI.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Sets the compact action name supplied to the UI.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    /// Sets the human-readable subtitle supplied to the UI.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Typed policy updates suggested for this approval.
+    #[must_use]
+    pub fn suggestions(&self) -> &[PermissionUpdate] {
+        &self.suggestions
+    }
+
+    /// ID of the child agent that requested approval, when applicable.
+    #[must_use]
+    pub const fn agent_id(&self) -> Option<&AgentId> {
+        self.agent_id.as_ref()
+    }
+
+    /// Blocked filesystem path, when applicable.
+    #[must_use]
+    pub fn blocked_path(&self) -> Option<&str> {
+        self.blocked_path.as_deref()
+    }
+
+    /// Reason the approval producer requested a decision, when supplied.
+    #[must_use]
+    pub fn decision_reason(&self) -> Option<&str> {
+        self.decision_reason.as_deref()
+    }
+
+    /// Primary permission prompt text, when supplied.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Compact action name for permission UI controls, when supplied.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// Human-readable permission UI subtitle, when supplied.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Unknown fields retained while reading a newer approval context.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
 impl fmt::Display for ToolApprovalDecision {
     /// Renders [`Self::label`] — the behavior, not the refusal message, which is model-visible
     /// text rather than a stable identifier.
@@ -657,11 +844,13 @@ impl fmt::Display for ToolApprovalDecision {
 
 /// Resolves one pending tool approval from the live run context.
 ///
-/// The handler receives the exact [`ToolApproval`] record that caused the interruption and the
-/// same [`RunContext`] dynamic prompts and tools receive. It returns a typed core value, so the
-/// host or UI may render and collect a choice without reinterpreting display text as permission
-/// semantics. The paused-run logic and persistence remain responsibilities of their respective
-/// runtime and state layers.
+/// The handler receives the exact [`ToolApproval`] record that caused the interruption, its
+/// directly renderable [`ToolPermissionContext`], and the same [`RunContext`] dynamic prompts and
+/// tools receive.
+///
+/// A handler returns a typed core value, so the host or UI collects a choice without interpreting
+/// display text as permission semantics. The paused-run logic and persistence remain
+/// responsibilities of their respective runtime and state layers.
 #[async_trait]
 pub trait ToolApprovalHandler: Send + Sync + 'static {
     /// Produces the host's decision for this pending approval.
@@ -677,6 +866,7 @@ pub trait ToolApprovalHandler: Send + Sync + 'static {
     async fn decide(
         &self,
         approval: &ToolApproval,
+        permission: &ToolPermissionContext,
         context: &RunContext,
     ) -> Result<ToolApprovalDecision>;
 }
