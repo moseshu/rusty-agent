@@ -427,6 +427,18 @@ impl RunRequest {
     /// the caller passed separately could disagree with the one every already-persisted event was
     /// written under, and the state is the side that survived the restart.
     ///
+    /// **Input selects the continuation base.** Supplying input preserves the caller-managed
+    /// continuation behavior: that input is the base for this segment's model calls. Passing an
+    /// empty input asks the runner to project the checkpoint's recorded history automatically.
+    /// To add a new user turn, start from the projection [`RunResult::continuation_input`] builds
+    /// and append that turn before constructing this request.
+    ///
+    /// **Choosing the first is a one-way door.** Input a caller supplies is a base, not a record,
+    /// so the checkpoint never learns the new turn it carried; from then on the state says so and
+    /// refuses to project, because a projection that silently dropped that turn is the failure
+    /// this refusal exists to prevent. A run continued that way stays caller-managed, and the host
+    /// keeps owning the transcript it built.
+    ///
     /// Use [`Self::with_state_and_persisted_max_seq`] instead when a rollout log exists.
     pub fn with_state(self, state: RunState) -> Self {
         self.with_state_and_persisted_max_seq(state, None)
@@ -504,6 +516,11 @@ impl Runner {
 /// the alternative to *that* is one function long enough that the budget checks and the settlement
 /// hand-off stop being visible together.
 struct TurnLoopContext<'a> {
+    /// The model-input base for this segment.
+    ///
+    /// A caller-supplied continuation keeps control of this projection. Empty input instead uses
+    /// the checkpoint's recorded history, which lets a host resume without rebuilding it.
+    input_base: &'a [ModelInputItem],
     model_resolver: &'a Arc<dyn ModelResolver>,
     run_id: &'a RunId,
     app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
@@ -511,19 +528,43 @@ struct TurnLoopContext<'a> {
     cancel: &'a CancelScope,
     closeout_cancel: &'a CancelScope,
     config: &'a RunConfig,
-    original_input: &'a [ModelInputItem],
     events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
     event_seqs: &'a EventSeqAllocator,
 }
 
 /// What the loop produces, whichever way it ends.
+///
+/// **It does not hold the records themselves.** The run's history lives in [`RunState`], which is
+/// what a checkpoint carries and what the next model request is built from; a second copy here
+/// would be a second thing to keep in step, and the two would first disagree on the resume path
+/// where only one of them spans earlier segments. What this holds instead is where *this* segment
+/// starts in that history, because a [`RunResult`] reports the segment it ran while the checkpoint
+/// reports the whole run.
 struct TurnLoopProgress {
-    generated: Vec<RunItem>,
-    model_responses: Vec<ModelResponse>,
+    first_item: usize,
+    first_response: usize,
     turn_record_owner: Arc<TurnRecordOwner>,
     turn_records: Vec<TurnRecord>,
     turns: u32,
     budget_stop: Option<BudgetKind>,
+}
+
+impl TurnLoopProgress {
+    /// Records this segment generated, as a window into the run's own history.
+    fn segment_items<'a>(&self, state: &'a RunState) -> &'a [RunItem] {
+        state
+            .generated_items()
+            .get(self.first_item..)
+            .unwrap_or_default()
+    }
+
+    /// Model calls this segment made, as a window into the run's own history.
+    fn segment_responses<'a>(&self, state: &'a RunState) -> &'a [ModelResponse] {
+        state
+            .model_responses()
+            .get(self.first_response..)
+            .unwrap_or_default()
+    }
 }
 
 /// The loop both entry points share.
@@ -583,7 +624,7 @@ async fn run_loop_inner(
         run_id,
         app_context,
         cancel,
-        input: original_input,
+        input: requested_input,
         config,
         mut state,
         services,
@@ -597,6 +638,14 @@ async fn run_loop_inner(
         return Err(error);
     }
 
+    // An explicit input remains the caller's continuation base. An empty resumed request chooses
+    // the checkpoint projection, so hosts that persist only state do not have to rebuild it.
+    let resuming = state.current_agent().is_some();
+    if let Err(error) = state.begin_segment(agent.public_id().clone(), requested_input.clone()) {
+        ra_core::trace::record_error(span, &error);
+        return Err(error);
+    }
+    let input_base = segment_input_base(&state, resuming, requested_input);
     // The run gets its own scope, so either its configured deadline or an inherited caller
     // deadline stops this run without cancelling the caller's tree. An armed timer turns the
     // effective deadline — pure data in `ra-core` — into a real cancellation. Every descendant
@@ -612,6 +661,7 @@ async fn run_loop_inner(
     let _deadline = arm_deadline(&cancel);
 
     let context = TurnLoopContext {
+        input_base: &input_base,
         model_resolver: &model_resolver,
         run_id: &run_id,
         app_context: app_context.as_ref(),
@@ -619,13 +669,12 @@ async fn run_loop_inner(
         cancel: &cancel,
         closeout_cancel: &closeout_cancel,
         config: &config,
-        original_input: &original_input,
         events: events.as_ref(),
         event_seqs: &event_seqs,
     };
     let mut progress = TurnLoopProgress {
-        generated: Vec::new(),
-        model_responses: Vec::new(),
+        first_item: state.generated_items().len(),
+        first_response: state.model_responses().len(),
         turn_record_owner: TurnRecordOwner::new(),
         turn_records: Vec::new(),
         turns: 0,
@@ -645,7 +694,7 @@ async fn run_loop_inner(
             }
         }
         Err(error) => {
-            record_progress_usage(span, &progress);
+            record_progress_usage(span, progress.segment_responses(&state));
             record_terminal_error(span, &error, &cancel);
             return Err(error);
         }
@@ -658,27 +707,30 @@ async fn run_loop_inner(
         span.record(ra_core::trace::field::BUDGET_KIND, kind.code());
     }
 
-    let final_message = match deliver_budget_closeout(&context, &agent, &mut progress, &state).await
-    {
-        Ok(message) => message,
-        Err(error) => {
-            record_progress_usage(span, &progress);
-            record_terminal_error(span, &error, &closeout_cancel);
-            return Err(error);
-        }
-    };
+    let final_message =
+        match deliver_budget_closeout(&context, &agent, &mut progress, &mut state).await {
+            Ok(message) => message,
+            Err(error) => {
+                record_progress_usage(span, progress.segment_responses(&state));
+                record_terminal_error(span, &error, &closeout_cancel);
+                return Err(error);
+            }
+        };
 
     if let Some(reason) = outcome.finish_reason() {
         state = state.with_finish_reason(reason);
     }
     state.snapshot_event_seq(&event_seqs);
 
+    // Cut out of the run's history rather than accumulated alongside it: a result reports the
+    // segment it ran, and the checkpoint it carries reports every segment.
+    let (new_items, model_responses) = segment_records(&progress, &state);
     let mut result = RunResult::new(
         outcome.clone(),
         Arc::clone(agent.public()),
-        original_input,
-        progress.generated,
-        progress.model_responses,
+        input_base,
+        new_items,
+        model_responses,
         progress.turn_record_owner,
         progress.turn_records,
         progress.turns,
@@ -690,6 +742,37 @@ async fn run_loop_inner(
     record_run_outcome(span, &result);
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)
+}
+
+/// Selects the input base for one segment after its state accepted the agent identity.
+fn segment_input_base(
+    state: &RunState,
+    resuming: bool,
+    requested_input: Vec<ModelInputItem>,
+) -> Vec<ModelInputItem> {
+    if !resuming || !requested_input.is_empty() {
+        return requested_input;
+    }
+
+    let mut input = state.original_input().to_vec();
+    input.extend(
+        state
+            .generated_items()
+            .iter()
+            .filter_map(RunItem::to_model_input),
+    );
+    input
+}
+
+/// Copies the checkpoint records created by one segment for its result.
+fn segment_records(
+    progress: &TurnLoopProgress,
+    state: &RunState,
+) -> (Vec<RunItem>, Vec<ModelResponse>) {
+    (
+        progress.segment_items(state).to_vec(),
+        progress.segment_responses(state).to_vec(),
+    )
 }
 
 /// Records the run-level aggregate without creating a second accounting source.
@@ -709,8 +792,8 @@ fn record_run_outcome(span: &tracing::Span, result: &RunResult) {
 ///
 /// Through the same summation [`RunResult::usage`] uses, so a run that failed and a run that
 /// finished report the calls they made the same way.
-fn record_progress_usage(span: &tracing::Span, progress: &TurnLoopProgress) {
-    record_usage(span, &aggregate_usage(&progress.model_responses));
+fn record_progress_usage(span: &tracing::Span, responses: &[ModelResponse]) {
+    record_usage(span, &aggregate_usage(responses));
 }
 
 /// Records normalized usage on any span whose scale is defined by its kind.
@@ -852,8 +935,8 @@ async fn run_one_turn(
 ) -> Result<Option<RunOutcome>> {
     let config = context.config;
     let input = next_input(
-        context.original_input,
-        &progress.generated,
+        context.input_base,
+        progress.segment_items(state),
         budget_reminder(state, config.budget()),
     );
     let preparation_context = live_context(context, agent, state);
@@ -885,11 +968,16 @@ async fn run_one_turn(
     // Recording before settling is also what keeps the two facts agreeing when a deadline
     // interrupts settlement below: the session projection may then be incomplete, but usage
     // accounting, provider diagnostics, and an error handler's snapshot must not deny that the
-    // call ran. The copy is what that costs, next to the two history copies this turn already
-    // makes for settlement.
+    // call ran. The copy is what that costs, next to the history copy this turn already makes for
+    // settlement.
     record_usage(turn_span, response.usage());
     state.record_usage(response.usage());
-    progress.model_responses.push(response.clone());
+    state.record_model_response(response.clone());
+
+    // Settlement sees the same input base the model did and only this segment's preceding items.
+    // The base may itself be a full caller-supplied or checkpoint-projected transcript.
+    let segment_original_input = context.input_base.to_vec();
+    let pre_step_items = progress.segment_items(state).to_vec();
 
     // Built again rather than reused from preparation: the call above has been paid for, and the
     // spend a tool reads has to include it. The two contexts are the same run and the same agent —
@@ -906,8 +994,8 @@ async fn run_one_turn(
         tool_failure,
         config.permission().clone(),
     )
-    .with_original_input(context.original_input.to_vec())
-    .with_pre_step_items(progress.generated.clone())
+    .with_original_input(segment_original_input)
+    .with_pre_step_items(pre_step_items)
     .with_services(context.services.clone())
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency);
     let settled = settle_turn(settlement).await?;
@@ -915,10 +1003,10 @@ async fn run_one_turn(
     for item in settled.session_step_items() {
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
-    let first_item = progress.generated.len();
-    progress
-        .generated
-        .extend(settled.session_step_items().iter().cloned());
+    // The range is relative to the segment, because that is what `RunResult::turn_items` indexes.
+    let first_item = progress.segment_items(state).len();
+    state.record_generated_items(settled.session_step_items().iter().cloned());
+    let last_item = progress.segment_items(state).len();
 
     // Recorded before the `match` below, which is where a handoff replaces the running agent: the
     // record says who ran *this* turn, and taking the agent afterwards would attribute the turn to
@@ -928,7 +1016,7 @@ async fn run_one_turn(
         progress.turns,
         agent.public_id().clone(),
         settled.next_step().clone(),
-        first_item..progress.generated.len(),
+        first_item..last_item,
     ));
 
     // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
@@ -939,15 +1027,22 @@ async fn run_one_turn(
         // The items are the session's own records: settlement re-points a pending decision at what
         // it stores before handing the decision over, so this outcome and the stream carry one copy
         // of each question rather than two that disagree about who produced it.
-        NextStep::Interruption { items } => Ok(Some(RunOutcome::Interrupted {
-            items: items.clone(),
-        })),
+        NextStep::Interruption { items } => {
+            // The checkpoint keeps their IDs, which resolve against the records recorded just
+            // above. Settlement guarantees they are among them, so a failure here is this loop
+            // breaking its own contract rather than anything the host did.
+            state.set_pending_interruptions(items)?;
+            Ok(Some(RunOutcome::Interrupted {
+                items: items.clone(),
+            }))
+        }
         // Control transfers to another agent, which speaks next. The new agent arrives as a
         // public declaration, so it binds directly: whatever prepared *this* turn's execution
         // instance has no say over who runs the next one. Unreachable until R17 — settlement
         // refuses handoffs — but the state machine has to say what it does about it.
         NextStep::Handoff { new_agent } => {
             *agent = AgentBinding::direct(Arc::clone(new_agent));
+            state.set_current_agent(agent.public_id().clone());
             Ok(None)
         }
     }
@@ -1337,7 +1432,7 @@ async fn deliver_budget_closeout(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     progress: &mut TurnLoopProgress,
-    state: &RunState,
+    state: &mut RunState,
 ) -> Result<Option<Message>> {
     let (Some(kind), Some(handler)) = (progress.budget_stop, context.config.error_handler.as_ref())
     else {
@@ -1345,11 +1440,13 @@ async fn deliver_budget_closeout(
     };
 
     let error = Error::budget(kind, "the configured run budget was exhausted");
+    // The same base and segment window the model used. The base can already contain the complete
+    // checkpoint projection, while an explicit caller continuation remains caller-controlled.
     let data = RunErrorData::new(
         agent.public(),
-        context.original_input,
-        &progress.generated,
-        &progress.model_responses,
+        context.input_base,
+        progress.segment_items(state),
+        progress.segment_responses(state),
         progress.turns,
         state.budget().clone(),
         state.usage_totals().clone(),
@@ -1372,11 +1469,11 @@ async fn deliver_budget_closeout(
     let message = closeout.message().clone();
     if closeout.write_to_history() {
         let item = RunItem::new(
-            next_error_item_id(&progress.generated, progress.turns),
+            next_error_item_id(state.generated_items(), progress.turns),
             RunItemKind::Message(message.clone()),
         );
         emit(context.events, RunStreamEvent::Item(item.clone()));
-        progress.generated.push(item);
+        state.record_generated_items([item]);
     } else {
         emit(
             context.events,

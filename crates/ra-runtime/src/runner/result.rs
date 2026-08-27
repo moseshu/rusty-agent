@@ -4,11 +4,11 @@
 //!
 //! A run produces three different sequences and they are deliberately not one array:
 //!
-//! | Sequence | Question it answers |
-//! | --- | --- |
-//! | [`RunResult::original_input`] | what was asked |
-//! | [`RunResult::new_items`] | what the run produced, in order |
-//! | [`RunResult::continuation_input`] | what the *next* call should send |
+//! | Sequence | Question it answers | Scope |
+//! | --- | --- | --- |
+//! | [`RunResult::original_input`] | this segment's continuation base | the segment |
+//! | [`RunResult::new_items`] | what this segment produced, in order | the segment |
+//! | [`RunResult::continuation_input`] | what the *next* call should send | the run |
 //!
 //! Collapsing them is the failure the reference implementation's `to_input_list()` exists to avoid:
 //! a display history replayed as model input duplicates records, and a model input stored as
@@ -81,19 +81,21 @@ impl<'a> RunErrorData<'a> {
         self.last_agent
     }
 
-    /// Input supplied when the run segment began.
+    /// The continuation base this segment began from.
+    ///
+    /// This is either caller-supplied input or an automatic projection from the checkpoint.
     #[must_use]
     pub fn original_input(&self) -> &'a [ModelInputItem] {
         self.original_input
     }
 
-    /// Records produced before the terminal condition.
+    /// Records this segment produced before the terminal condition.
     #[must_use]
     pub fn new_items(&self) -> &'a [RunItem] {
         self.new_items
     }
 
-    /// Completed model calls made before the terminal condition.
+    /// Completed model calls this segment made before the terminal condition.
     #[must_use]
     pub fn model_responses(&self) -> &'a [ModelResponse] {
         self.model_responses
@@ -451,25 +453,37 @@ impl RunResult {
         &self.last_agent
     }
 
-    /// The input the run started from.
+    /// The continuation base this segment started from.
+    ///
+    /// This is the caller-provided input when one was supplied. For an empty checkpoint resume,
+    /// it is the checkpoint's projected history.
     #[must_use]
     pub fn original_input(&self) -> &[ModelInputItem] {
         &self.original_input
     }
 
-    /// Everything the run generated, in the order it happened.
+    /// Everything **this segment** generated, in the order it happened.
+    ///
+    /// A resumed run's earlier records are not here: they are in
+    /// [`RunState::generated_items`](ra_core::state::RunState::generated_items), reachable through
+    /// [`Self::state`]. The split is deliberate — [`Self::turn_records`] index into this one, and
+    /// a host that streamed the earlier segments has already shown their records once.
     #[must_use]
     pub fn new_items(&self) -> &[RunItem] {
         &self.new_items
     }
 
-    /// One entry per model call, kept for usage accounting, provider continuation IDs, and replay.
+    /// One entry per model call **this segment** made, kept for usage accounting, provider
+    /// continuation IDs, and replay.
+    ///
+    /// Scoped like [`Self::new_items`], and for the same reason; the run's own list is
+    /// [`RunState::model_responses`](ra_core::state::RunState::model_responses).
     #[must_use]
     pub fn model_responses(&self) -> &[ModelResponse] {
         &self.model_responses
     }
 
-    /// How many turns ran.
+    /// How many turns ran in this segment.
     #[must_use]
     pub const fn turns(&self) -> u32 {
         self.turns
@@ -566,6 +580,10 @@ impl RunResult {
     /// A projection, not a stored list. Storing it would let the "what to send next" copy drift
     /// from the "what happened" one, and the drift shows up as a duplicated or missing turn a
     /// session later.
+    ///
+    /// It extends this result's continuation base with the records this segment produced. For an
+    /// automatic checkpoint resume that base already contains the prior recorded history; for an
+    /// explicit resume it remains the caller-provided input.
     #[must_use]
     pub fn continuation_input(&self, policy: ContinuationInput) -> Vec<ModelInputItem> {
         let mut items = self.original_input.clone();

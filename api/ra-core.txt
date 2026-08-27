@@ -483,11 +483,13 @@ const fn ra_core::state::run::NestedRunRef::unknown(& self) -> & Unknown
 const fn ra_core::state::run::PendingControlRequest::call_id(& self) -> Option < & CallId >
 const fn ra_core::state::run::PendingControlRequest::unknown(& self) -> & Unknown
 const fn ra_core::state::run::RunState::budget(& self) -> & BudgetSnapshot
+const fn ra_core::state::run::RunState::current_agent(& self) -> Option < & AgentId >
 const fn ra_core::state::run::RunState::finish_reason(& self) -> Option < FinishReason >
 const fn ra_core::state::run::RunState::graph_cursor(& self) -> Option < & GraphCursor >
 const fn ra_core::state::run::RunState::next_host_event_seq(& self) -> u64
 const fn ra_core::state::run::RunState::run_id(& self) -> & RunId
 const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::run::RunState::starting_agent(& self) -> Option < & AgentId >
 const fn ra_core::state::run::RunState::tokens_used(& self) -> u64
 const fn ra_core::state::run::RunState::tool_failure(& self) -> & ToolFailureTracker
 const fn ra_core::state::run::RunState::tool_use(& self) -> & ToolUseTracker
@@ -705,6 +707,7 @@ const ra_core::prompt::PromptSectionName::SAFETY: Self
 const ra_core::prompt::PromptSectionName::TOOL_SURFACE: Self
 const ra_core::prompt::PromptSectionName::TOOL_USE: Self
 const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
+const ra_core::state::run::RUN_STATE_SCHEMA_VERSION_SUMMARIES: & [(SchemaVersion , & str)]
 const ra_core::state::tool_failure::TOOL_FAILURE_RECENT_LIMIT: usize
 const ra_core::state::tool_failure::TOOL_FAILURE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_use::TOOL_USE_RECENT_LIMIT: usize
@@ -1289,13 +1292,24 @@ fn ra_core::state::run::PendingControlRequest::with_description(mut self, descri
 fn ra_core::state::run::RunId::as_str(& self) -> & str
 fn ra_core::state::run::RunId::generate() -> Self
 fn ra_core::state::run::RunId::new(value : impl Into < String >) -> Self
+fn ra_core::state::run::RunState::begin_segment(& mut self, agent : AgentId, input : Vec < ModelInputItem >) -> Result < () >
 fn ra_core::state::run::RunState::budget_mut(& mut self) -> & mut BudgetSnapshot
 fn ra_core::state::run::RunState::exhausted_budget_kind(& self, limit : & BudgetLimit) -> Option < BudgetKind >
+fn ra_core::state::run::RunState::generated_items(& self) -> & [RunItem]
+fn ra_core::state::run::RunState::last_model_response(& self) -> Option < & ModelResponse >
+fn ra_core::state::run::RunState::model_responses(& self) -> & [ModelResponse]
 fn ra_core::state::run::RunState::nested_runs(& self) -> & [NestedRunRef]
+fn ra_core::state::run::RunState::original_input(& self) -> & [ModelInputItem]
 fn ra_core::state::run::RunState::pending_control_requests(& self) -> & [PendingControlRequest]
+fn ra_core::state::run::RunState::pending_interruption_items(& self) -> impl Iterator < Item = & RunItem >
+fn ra_core::state::run::RunState::pending_interruptions(& self) -> & [ItemId]
+fn ra_core::state::run::RunState::record_generated_items(& mut self, items : impl IntoIterator < Item = RunItem >)
+fn ra_core::state::run::RunState::record_model_response(& mut self, response : ModelResponse)
 fn ra_core::state::run::RunState::record_usage(& mut self, usage : & Usage)
 fn ra_core::state::run::RunState::remaining_tokens(& self, limit : & BudgetLimit) -> Option < u64 >
 fn ra_core::state::run::RunState::restore_event_seq_allocator(& self, persisted_run_max_seq : Option < u64 >) -> EventSeqAllocator
+fn ra_core::state::run::RunState::set_current_agent(& mut self, agent : AgentId)
+fn ra_core::state::run::RunState::set_pending_interruptions(& mut self, items : & [RunItem]) -> Result < () >
 fn ra_core::state::run::RunState::snapshot_event_seq(& mut self, allocator : & EventSeqAllocator)
 fn ra_core::state::run::RunState::start(run_id : RunId) -> Self
 fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker

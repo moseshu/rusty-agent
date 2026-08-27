@@ -6,10 +6,9 @@
 //! point and would let a continuation accidentally carry one fact but not another. `RunState` is
 //! the single carrier that crosses a run-segment boundary.
 //!
-//! It deliberately belongs to `ra-core`: a future migration grows this same value into the full
-//! serializable run state (generated items, model responses, pending approvals, guardrail
-//! results), and a persisted wire type cannot live in `ra-runtime` without reversing the
-//! dependency direction.
+//! It deliberately belongs to `ra-core`: it already carries the run's own history — generated
+//! items, model responses, pending approvals — and guardrail results join them when they land, and
+//! a persisted wire type cannot live in `ra-runtime` without reversing the dependency direction.
 //!
 //! # Not to be confused with `WorkState`
 //!
@@ -31,13 +30,27 @@ use crate::{
     compat::{SchemaVersion, Unknown},
     error::{BudgetKind, Error, Result},
     finish::FinishReason,
-    item::CallId,
+    item::{AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem},
     state::{ToolFailureTracker, ToolUseTracker},
     usage::Usage,
 };
 
 /// Current [`RunState`] schema version.
 pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// Human-readable summaries of every run-state wire version this build understands.
+///
+/// The list stays beside the version number. A checkpoint is a long-lived wire contract, so a
+/// version bump without a short statement of what changed leaves a future reader unable to tell
+/// whether an older runtime may safely resume it.
+pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[(
+    RUN_STATE_SCHEMA_VERSION,
+    "Initial resumable run identity, accounting, history, and interruption records.",
+)];
+
+const fn default_input_history_is_complete() -> bool {
+    true
+}
 
 /// Stable identity of one run, across every segment it is resumed in.
 ///
@@ -415,8 +428,8 @@ impl PendingControlRequest {
 /// than at a call site, because a resumed run that has to remember to migrate is a resumed run that
 /// silently gets its allowance back the day someone forgets.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "RunStateRecord")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RunStateRecord")]
 pub struct RunState {
     #[serde(default = "run_state_schema_version")]
     schema_version: SchemaVersion,
@@ -442,9 +455,28 @@ pub struct RunState {
     usage_totals: Usage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_control_requests: Vec<PendingControlRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    starting_agent: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_agent: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    original_input: Vec<ModelInputItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    generated_items: Vec<RunItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_responses: Vec<ModelResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_interruptions: Vec<ItemId>,
+    #[serde(default = "default_input_history_is_complete")]
+    input_history_is_complete: bool,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
+
+// `RunState` was publicly `Eq` before it gained the serializable response projection. The values
+// accepted by this state are JSON-shaped and therefore have reflexive equality; keeping the
+// implementation preserves the public trait contract without exposing a second state type.
+impl Eq for RunState {}
 
 /// What a checkpoint literally contains, before this build's invariants are applied to it.
 ///
@@ -452,10 +484,15 @@ pub struct RunState {
 /// run afterwards. A field added to one and not the other is caught by the round-trip test that
 /// populates every slot: the missing field comes back defaulted and the comparison fails.
 ///
-/// The one thing it does is move token spend that an older layout kept on the budget snapshot into
-/// the usage ledger, which is where every ceiling is now measured. Without it a continuation from
-/// such a checkpoint starts its token accounting at zero — spend already paid for, invisible, and a
-/// budget that stops the run at twice what it was given.
+/// It does two things. It **migrates**: token spend an older layout kept on the budget snapshot
+/// moves into the usage ledger, which is where every ceiling is now measured. Without that, a
+/// continuation from such a checkpoint starts its token accounting at zero — spend already paid
+/// for, invisible, and a budget that stops the run at twice what it was given.
+///
+/// And it **refuses**. A checkpoint is the one input to this framework that arrives from outside
+/// the process that wrote it: a disk, an older build, an editor. Every invariant the run relies on
+/// afterwards is therefore checked here rather than assumed, because the alternative is not a
+/// crash — it is a run that resumes as something quietly different from what was paused.
 #[derive(Deserialize)]
 struct RunStateRecord {
     #[serde(default = "run_state_schema_version")]
@@ -482,12 +519,28 @@ struct RunStateRecord {
     usage_totals: Usage,
     #[serde(default)]
     pending_control_requests: Vec<PendingControlRequest>,
+    #[serde(default)]
+    starting_agent: Option<AgentId>,
+    #[serde(default)]
+    current_agent: Option<AgentId>,
+    #[serde(default)]
+    original_input: Vec<ModelInputItem>,
+    #[serde(default)]
+    generated_items: Vec<RunItem>,
+    #[serde(default)]
+    model_responses: Vec<ModelResponse>,
+    #[serde(default)]
+    pending_interruptions: Vec<ItemId>,
+    #[serde(default = "default_input_history_is_complete")]
+    input_history_is_complete: bool,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
 
-impl From<RunStateRecord> for RunState {
-    fn from(record: RunStateRecord) -> Self {
+impl TryFrom<RunStateRecord> for RunState {
+    type Error = Error;
+
+    fn try_from(record: RunStateRecord) -> std::result::Result<Self, Self::Error> {
         let RunStateRecord {
             schema_version,
             run_id,
@@ -502,6 +555,13 @@ impl From<RunStateRecord> for RunState {
             graph_cursor,
             mut usage_totals,
             pending_control_requests,
+            starting_agent,
+            current_agent,
+            original_input,
+            generated_items,
+            model_responses,
+            pending_interruptions,
+            input_history_is_complete,
             unknown,
         } = record;
 
@@ -513,7 +573,30 @@ impl From<RunStateRecord> for RunState {
             usage_totals = usage_totals.accumulate(&Usage::from_carried_total(carried));
         }
 
-        Self {
+        if current_agent.is_some() && starting_agent.is_none() {
+            return Err(Error::caller(
+                "run state has a current agent but no starting agent",
+            ));
+        }
+        // The dangerous direction is this one, not the one above. A checkpoint that has history but
+        // names nobody looks exactly like a run that never started, so [`RunState::begin_segment`]
+        // would take it for a first segment and overwrite `original_input` with whatever the
+        // resumed request happened to carry — while keeping the records generated against the input
+        // it just replaced. The transcript that comes out of that is spliced, and nothing after it
+        // can tell.
+        if current_agent.is_none()
+            && !(original_input.is_empty()
+                && generated_items.is_empty()
+                && model_responses.is_empty())
+        {
+            return Err(Error::caller(
+                "run state carries history but names no current agent, so nothing can say which \
+                 declaration is entitled to resume it",
+            ));
+        }
+        validate_pending_interruptions(&pending_interruptions, &generated_items)?;
+
+        Ok(Self {
             schema_version,
             run_id,
             next_host_event_seq,
@@ -527,8 +610,15 @@ impl From<RunStateRecord> for RunState {
             graph_cursor,
             usage_totals,
             pending_control_requests,
+            starting_agent,
+            current_agent,
+            original_input,
+            generated_items,
+            model_responses,
+            pending_interruptions,
+            input_history_is_complete,
             unknown,
-        }
+        })
     }
 }
 
@@ -550,6 +640,13 @@ impl RunState {
             graph_cursor: None,
             usage_totals: Usage::default(),
             pending_control_requests: Vec::new(),
+            starting_agent: None,
+            current_agent: None,
+            original_input: Vec::new(),
+            generated_items: Vec::new(),
+            model_responses: Vec::new(),
+            pending_interruptions: Vec::new(),
+            input_history_is_complete: true,
             unknown: Unknown::new(),
         }
     }
@@ -847,11 +944,164 @@ impl RunState {
         self
     }
 
+    /// Public declaration that started the run, once its first segment has begun.
+    #[must_use]
+    pub const fn starting_agent(&self) -> Option<&AgentId> {
+        self.starting_agent.as_ref()
+    }
+
+    /// Public declaration that must execute the next segment.
+    #[must_use]
+    pub const fn current_agent(&self) -> Option<&AgentId> {
+        self.current_agent.as_ref()
+    }
+
+    /// Original model input from the first segment of this run.
+    #[must_use]
+    pub fn original_input(&self) -> &[ModelInputItem] {
+        &self.original_input
+    }
+
+    /// Authoritative records generated across every completed segment of this run.
+    ///
+    /// These are the run's in-memory resume projection. The session log may persist the same
+    /// records as the durable source of history; retaining this projection makes a checkpoint
+    /// self-sufficient between a pause and the session store's next materialization.
+    #[must_use]
+    pub fn generated_items(&self) -> &[RunItem] {
+        &self.generated_items
+    }
+
+    /// Completed model responses across every segment of this run.
+    #[must_use]
+    pub fn model_responses(&self) -> &[ModelResponse] {
+        &self.model_responses
+    }
+
+    /// Last completed model response, if the run has made one.
+    #[must_use]
+    pub fn last_model_response(&self) -> Option<&ModelResponse> {
+        self.model_responses.last()
+    }
+
+    /// IDs of the records the host still has to answer before this run may continue.
+    ///
+    /// IDs rather than second copies of the records: every one of them is already in
+    /// [`Self::generated_items`], and a checkpoint holding both would carry two versions of the
+    /// same question to keep in step. The day something annotates the authoritative record — a
+    /// session key, provenance — a resume that compared the two copies would refuse to continue
+    /// over a difference that changes nothing about the question being asked.
+    #[must_use]
+    pub fn pending_interruptions(&self) -> &[ItemId] {
+        &self.pending_interruptions
+    }
+
+    /// The authoritative records [`Self::pending_interruptions`] names.
+    pub fn pending_interruption_items(&self) -> impl Iterator<Item = &RunItem> {
+        self.pending_interruptions.iter().filter_map(|id| {
+            self.generated_items
+                .iter()
+                .find(|generated| generated.id() == id)
+        })
+    }
+
+    /// Starts or resumes a segment under a stable public agent identity.
+    ///
+    /// A restored checkpoint must bind back to the same declaration. Replacing it with an agent
+    /// that merely has a similar display name could select different instructions, tools, or
+    /// handoffs after a restart, so the mismatch is rejected before any provider call is made.
+    ///
+    /// The state records the opening input only once. A caller may still supply a model-input
+    /// projection when it resumes, but that makes its input history incomplete: later segments
+    /// must also provide input instead of asking the runner to project this checkpoint.
+    #[doc(hidden)]
+    pub fn begin_segment(&mut self, agent: AgentId, input: Vec<ModelInputItem>) -> Result<()> {
+        if !self.pending_interruptions.is_empty() {
+            return Err(Error::caller(
+                "run state has unanswered interruptions; resolve them before resuming",
+            ));
+        }
+        match &self.current_agent {
+            Some(current) if current != &agent => Err(Error::caller(format!(
+                "run state expects current agent `{current}`, not `{agent}`"
+            ))),
+            Some(_) if input.is_empty() && !self.input_history_is_complete => Err(Error::caller(
+                "run state cannot project input after a caller-managed continuation; resume with \
+                 explicit input",
+            )),
+            Some(_) => {
+                if !input.is_empty() {
+                    self.input_history_is_complete = false;
+                }
+                Ok(())
+            }
+            None => {
+                self.starting_agent = Some(agent.clone());
+                self.current_agent = Some(agent);
+                self.original_input = input;
+                Ok(())
+            }
+        }
+    }
+
+    /// Changes the public agent after a validated handoff.
+    #[doc(hidden)]
+    pub fn set_current_agent(&mut self, agent: AgentId) {
+        debug_assert!(self.starting_agent.is_some());
+        self.current_agent = Some(agent);
+    }
+
+    /// Appends settled records to the checkpoint's resume projection.
+    #[doc(hidden)]
+    pub fn record_generated_items(&mut self, items: impl IntoIterator<Item = RunItem>) {
+        self.generated_items.extend(items);
+    }
+
+    /// Appends a completed model response to the checkpoint's resume projection.
+    #[doc(hidden)]
+    pub fn record_model_response(&mut self, response: ModelResponse) {
+        self.model_responses.push(response);
+    }
+
+    /// Names the records the host must answer, after checking the run generated every one of them.
+    ///
+    /// Takes the records and keeps their IDs: the caller has them in hand, and resolving each one
+    /// against [`Self::generated_items`] here is what makes the stored names refer to something.
+    #[doc(hidden)]
+    pub fn set_pending_interruptions(&mut self, items: &[RunItem]) -> Result<()> {
+        let ids: Vec<ItemId> = items.iter().map(|item| item.id().clone()).collect();
+        validate_pending_interruptions(&ids, &self.generated_items)?;
+        self.pending_interruptions = ids;
+        Ok(())
+    }
+
     /// Unknown fields retained during deserialization.
     #[must_use]
     pub const fn unknown(&self) -> &Unknown {
         &self.unknown
     }
+}
+
+/// Checks that every named interruption resolves to an interruption record the run generated.
+///
+/// The same check runs on the way in from a checkpoint and on the way in from settlement. They
+/// produce the same value, and a rule enforced on only one of them is a rule a restart walks
+/// around: an ID naming nothing leaves the run permanently unresumable, and one naming an ordinary
+/// message leaves it waiting for an answer to a question nobody was asked.
+fn validate_pending_interruptions(ids: &[ItemId], generated: &[RunItem]) -> Result<()> {
+    for id in ids {
+        let Some(item) = generated.iter().find(|generated| generated.id() == id) else {
+            return Err(Error::caller(format!(
+                "pending interruption `{id}` is absent from generated items"
+            )));
+        };
+        if !item.kind().is_interruption() {
+            return Err(Error::caller(format!(
+                "pending interruption `{id}` names a record that is not an interruption"
+            )));
+        }
+    }
+    Ok(())
 }
 
 const fn run_state_schema_version() -> SchemaVersion {
