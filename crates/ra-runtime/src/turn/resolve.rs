@@ -8,12 +8,14 @@
 //! final answer outranks another turn, because that is the round trip the promotion exists to save;
 //! and anything still owed an answer outranks concluding.
 
+use std::collections::BTreeMap;
+
 use ra_core::{
     agent::{AgentSpec, ToolUseBehavior},
     cancel::CancelScope,
     error::{Error, Result},
     finish::FinishReason,
-    item::{ItemProvenance, RunItem},
+    item::{ItemId, ItemProvenance, RunItem},
     step::{NextStep, ProcessedResponse, resolve_output_phases},
 };
 
@@ -138,6 +140,54 @@ pub fn step_items(
     // too. Restating it here would make the producer and the gate two statements of one rule, and
     // the day they disagreed the gate would be checking its own copy.
     resolve_output_phases(items, next_step)
+}
+
+/// Re-points a settled interruption at the records the turn actually stores.
+///
+/// [`resolve_next_step`] has to run before [`step_items`] — the output-phase rule reads the
+/// decision, so the decision cannot read the records — which leaves the pending items it carries as
+/// pre-settlement copies of records written below. Left that way, one settled turn holds two
+/// unequal copies of every pending decision: the stored one names its producer and the one offered
+/// to the host does not. Reconciling at the single point that produces the decision is what keeps
+/// each consumer from having to look the stored copy up for itself, and keeps the ones that only
+/// pass it along — a turn record, a checkpoint, a resume — from carrying the copy that lost.
+///
+/// **Ask order is preserved, not record order.** The two agree today, but what the host was
+/// promised is the order it was asked in — hosted approvals as the model produced them, then the
+/// calls that turned out to need one — and re-deriving that from record positions would silently
+/// renumber the questions the day the two orders diverge.
+///
+/// The missing-record arm is unreachable by construction: every interruption is either one of
+/// `processed`'s own items or an approval the batch also pushed onto `execution.new_items`, and
+/// [`step_items`] is the union of those two. It answers rather than unwraps because that
+/// containment is an invariant of another module, and a silent `expect` here would report the
+/// breakage as a panic in the runner rather than as a settlement that named the item it lost.
+pub(super) fn rebind_interruption(next_step: NextStep, items: &[RunItem]) -> Result<NextStep> {
+    match next_step {
+        NextStep::Interruption { items: pending } => {
+            let stored: BTreeMap<&ItemId, &RunItem> =
+                items.iter().map(|item| (item.id(), item)).collect();
+            let pending = pending
+                .iter()
+                .map(|item| {
+                    stored.get(item.id()).copied().cloned().ok_or_else(|| {
+                        Error::caller(format!(
+                            "pending decision `{}` is missing from the records this turn stores; \
+                             the host would be asked about something the session never kept",
+                            item.id()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            NextStep::interruption(pending)
+        }
+        // No `_` arm, for the reason `NextStep` is exhaustive: a fifth state has to say whether it
+        // carries a copy of this turn's records, and this is one of the sites that must stop
+        // compiling until it does.
+        step @ (NextStep::RunAgain | NextStep::FinalOutput { .. } | NextStep::Handoff { .. }) => {
+            Ok(step)
+        }
+    }
 }
 
 /// Files one record under the public agent, leaving an existing attribution alone.

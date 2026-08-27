@@ -936,6 +936,9 @@ async fn run_one_turn(
     match settled.next_step() {
         NextStep::RunAgain => Ok(None),
         NextStep::FinalOutput { reason } => Ok(Some(RunOutcome::Completed { reason: *reason })),
+        // The items are the session's own records: settlement re-points a pending decision at what
+        // it stores before handing the decision over, so this outcome and the stream carry one copy
+        // of each question rather than two that disagree about who produced it.
         NextStep::Interruption { items } => Ok(Some(RunOutcome::Interrupted {
             items: items.clone(),
         })),

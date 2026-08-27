@@ -37,7 +37,7 @@ use crate::permission::PermissionEngine;
 use batch::{DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, TurnExecutionRequest, execute_actions};
 use prepare::TurnActionSurface;
 use process::process_model_response;
-use resolve::{resolve_next_step, step_items};
+use resolve::{rebind_interruption, resolve_next_step, step_items};
 
 /// Inputs for settling one turn.
 ///
@@ -197,6 +197,13 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     // and what R12 attributes, and a copy the runner corrected afterwards would leave the
     // authoritative one saying something else.
     let items = step_items(&processed, &execution, request.agent.public(), &next_step);
+
+    // The decision above was made before these records existed, so a pending decision it carries is
+    // still the pre-settlement copy of one of them. Re-pointing it now is what makes this one
+    // settled turn internally consistent: every consumer of `next_step` sees the same record the
+    // session stores, instead of each having to know to go look it up.
+    let next_step = rebind_interruption(next_step, &items)?;
+
     SingleStepResult::builder()
         .original_input(request.original_input)
         .model_response(request.response.clone())

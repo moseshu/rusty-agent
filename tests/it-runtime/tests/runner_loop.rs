@@ -2116,6 +2116,64 @@ async fn streaming_path_emits_each_turns_records_immediately_and_returns_termina
 }
 
 #[tokio::test]
+async fn streaming_path_returns_pending_approval_without_waiting_for_a_host_reply() {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let tool_calls = Arc::clone(&tool.calls);
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![
+        message_with_phase("msg-1", "I need approval before writing", OutputPhase::Final),
+        tool_call("call-1", "tool-call-1", "write_file"),
+    ])]);
+    let cancel = CancelScope::root();
+
+    let mut stream = Runner::run_streamed(request(vec![tool], &model, &cancel));
+    let mut turns = Vec::new();
+    let mut items = Vec::new();
+    let mut finished = None;
+    while let Some(event) = stream.next_event().await {
+        match event {
+            RunStreamEvent::TurnStarted { turn, .. } => turns.push(turn),
+            RunStreamEvent::Item(item) => items.push(item),
+            RunStreamEvent::Finished(outcome) => finished = Some(outcome),
+            other => panic!("unexpected event while waiting for approval: {other:?}"),
+        }
+    }
+
+    assert_eq!(turns, [1]);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.id().as_str())
+            .collect::<Vec<_>>(),
+        ["msg-1", "call-1", "tool-call-1.approval"]
+    );
+    let Some(RunOutcome::Interrupted { items: pending }) = finished else {
+        panic!("the stream must finish with the pending approval outcome");
+    };
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id().as_str(), "tool-call-1.approval");
+    assert!(matches!(pending[0].kind(), RunItemKind::ToolApproval(_)));
+    // The question the host is handed is the settled record, not the copy execution raised: it
+    // names its producer. Asserted directly rather than only through the equality below, which
+    // would still hold if attribution stopped happening and both copies lost it together.
+    assert_eq!(
+        pending[0]
+            .provenance()
+            .map(|provenance| provenance.agent_id().as_str()),
+        Some("coder")
+    );
+    assert!(items.contains(&pending[0]));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+
+    let result = stream.finish().await.unwrap();
+    assert!(matches!(result.outcome(), RunOutcome::Interrupted { .. }));
+    assert_eq!(result.turns(), 1);
+}
+
+#[tokio::test]
 async fn stream_events_include_settlement_normalized_message_channels() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
     let model = ScriptedModel::new(vec![
