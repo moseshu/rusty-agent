@@ -8,10 +8,14 @@ use ra_core::{
     compat::SchemaVersion,
     context::RunContext,
     finish::FinishReason,
-    item::{AgentId, CallId},
+    item::{
+        AgentId, CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem,
+        RunItemKind, ToolApproval,
+    },
     state::{
-        GraphCursor, NestedRunRef, PendingControlRequest, RUN_STATE_SCHEMA_VERSION, RunId,
-        RunState, ToolUse, ToolUseAttempt, WorkStateRef, WorkspaceLeaseRef,
+        GraphCursor, NestedRunRef, PendingControlRequest, RUN_STATE_SCHEMA_VERSION,
+        RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, ToolUse, ToolUseAttempt, WorkStateRef,
+        WorkspaceLeaseRef,
     },
     tool::ToolLookupKey,
     usage::{RequestUsage, Usage},
@@ -42,6 +46,12 @@ fn test_run_state_01() {
     assert_eq!(state.usage_totals().requests(), 0);
     assert_eq!(state.tokens_used(), 0);
     assert!(state.pending_control_requests().is_empty());
+    assert!(state.starting_agent().is_none());
+    assert!(state.current_agent().is_none());
+    assert!(state.original_input().is_empty());
+    assert!(state.generated_items().is_empty());
+    assert!(state.model_responses().is_empty());
+    assert!(state.pending_interruptions().is_empty());
     assert!(state.unknown().is_empty());
 }
 
@@ -113,6 +123,9 @@ fn test_run_state_04() {
 
 #[test]
 fn test_run_state_identity_equality() {
+    fn requires_eq<T: Eq>() {}
+
+    requires_eq::<RunState>();
     let state1 = RunState::start(RunId::new("run-fixed"));
     let state2 = RunState::start(RunId::new("run-fixed"));
     let state3 = RunState::start(RunId::new("run-different"));
@@ -183,6 +196,246 @@ fn test_run_state_extension_slots_roundtrip() {
     assert_eq!(restored.graph_cursor(), Some(&cursor));
     assert_eq!(restored.usage_totals(), &usage);
     assert_eq!(restored.pending_control_requests(), &[control_req]);
+}
+
+fn approval_item(id: &str, call: &str) -> RunItem {
+    RunItem::new(
+        ItemId::new(id),
+        RunItemKind::ToolApproval(ToolApproval::new(
+            CallId::new(call),
+            "exec_command",
+            json!({"cmd": "git status"}),
+        )),
+    )
+}
+
+fn commentary_item(id: &str, text: &str) -> RunItem {
+    RunItem::new(
+        ItemId::new(id),
+        RunItemKind::Message(Message::assistant(text, OutputPhase::Commentary)),
+    )
+}
+
+/// Every wire version this build can read has to be described next to the number, or a future
+/// reader has no way to tell whether an older runtime may resume a checkpoint that carries it.
+#[test]
+fn test_run_state_schema_version_summaries_describe_every_readable_version() {
+    assert!(
+        RUN_STATE_SCHEMA_VERSION_SUMMARIES
+            .iter()
+            .any(|(version, _)| *version == RUN_STATE_SCHEMA_VERSION),
+        "the current schema version must carry a summary of what it changed"
+    );
+    for pair in RUN_STATE_SCHEMA_VERSION_SUMMARIES.windows(2) {
+        assert!(
+            pair[0].0 < pair[1].0,
+            "summaries must be listed once each, in ascending version order"
+        );
+    }
+    for (version, summary) in RUN_STATE_SCHEMA_VERSION_SUMMARIES {
+        assert!(
+            !summary.trim().is_empty(),
+            "schema version {version} must say what it changed"
+        );
+        assert!(*version <= RUN_STATE_SCHEMA_VERSION);
+    }
+}
+
+#[test]
+fn test_run_state_history_checkpoint_roundtrip() {
+    let agent = AgentId::new("coder");
+    let original_input = vec![ModelInputItem::Message(Message::user(
+        "inspect the workspace",
+    ))];
+    let approval = approval_item("approval-1", "call-1");
+    let response = ModelResponse::new(vec![commentary_item("message-1", "I will inspect it")]);
+
+    let mut state = RunState::start(RunId::new("run-history"));
+    state
+        .begin_segment(agent.clone(), original_input.clone())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![approval.clone()]);
+    state.record_model_response(response.clone());
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("stored approval must be a generated interruption");
+
+    let serialized = serde_json::to_string(&state).expect("history checkpoint must serialize");
+    let restored: RunState = serde_json::from_str(&serialized).expect("history must deserialize");
+
+    assert_eq!(restored.starting_agent(), Some(&agent));
+    assert_eq!(restored.current_agent(), Some(&agent));
+    assert_eq!(restored.original_input(), original_input);
+    assert_eq!(restored.generated_items(), [approval.clone()]);
+    assert_eq!(restored.model_responses(), [response.clone()]);
+    assert_eq!(restored.last_model_response(), Some(&response));
+    assert_eq!(
+        restored.pending_interruptions(),
+        [ItemId::new("approval-1")]
+    );
+    assert_eq!(
+        restored.pending_interruption_items().collect::<Vec<_>>(),
+        [&approval],
+        "a named interruption resolves to the authoritative record, not to a second copy"
+    );
+}
+
+/// The checkpoint names its pending interruptions instead of copying them, so the wire form must
+/// hold one copy of each question rather than two that can drift apart.
+#[test]
+fn test_run_state_stores_pending_interruptions_by_id_only() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = RunState::start(RunId::new("run-interruption-shape"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![approval.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("stored approval must be a generated interruption");
+
+    let stored = serde_json::to_value(&state).expect("state must serialize");
+    assert_eq!(stored["pending_interruptions"], json!(["approval-1"]));
+}
+
+#[test]
+fn test_run_state_rejects_pending_interruptions_that_name_nothing_answerable() {
+    let approval = approval_item("approval-1", "call-1");
+    let commentary = commentary_item("message-1", "still working");
+    let mut state = RunState::start(RunId::new("run-invalid-interruption"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![approval.clone(), commentary.clone()]);
+
+    let absent = approval_item("approval-missing", "call-9");
+    let error = state
+        .set_pending_interruptions(&[absent])
+        .expect_err("an interruption the run never generated is unanswerable");
+    assert!(error.to_string().contains("absent from generated items"));
+
+    let error = state
+        .set_pending_interruptions(&[commentary])
+        .expect_err("an ordinary message is not a question the host can answer");
+    assert!(error.to_string().contains("is not an interruption"));
+
+    // The same two rules on the way in from a checkpoint. Enforcing them only on the setter would
+    // let a hand-edited or older-build record walk around both.
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("stored approval must be valid before the wire form is edited");
+    let stored = serde_json::to_value(&state).expect("state must serialize");
+
+    let mut names_nothing = stored.clone();
+    names_nothing["pending_interruptions"] = json!(["approval-missing"]);
+    assert!(
+        serde_json::from_value::<RunState>(names_nothing).is_err(),
+        "a checkpoint must not resume waiting on a record it does not hold"
+    );
+
+    let mut names_a_message = stored;
+    names_a_message["pending_interruptions"] = json!(["message-1"]);
+    assert!(
+        serde_json::from_value::<RunState>(names_a_message).is_err(),
+        "a checkpoint must not resume a plain message as a pending approval"
+    );
+}
+
+/// History with no agent naming it is the shape that resumes as a *first* segment: the caller's
+/// input would replace `original_input` while the records generated against the old input stayed,
+/// and the spliced transcript that comes out is untraceable afterwards.
+#[test]
+fn test_run_state_rejects_history_that_names_no_current_agent() {
+    let mut state = RunState::start(RunId::new("run-orphan-history"));
+    state
+        .begin_segment(
+            AgentId::new("coder"),
+            vec![ModelInputItem::Message(Message::user("start"))],
+        )
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![commentary_item("message-1", "working")]);
+    state.record_model_response(ModelResponse::new(Vec::new()));
+
+    let stored = serde_json::to_value(&state).expect("state must serialize");
+    for dropped in ["current_agent", "starting_agent"] {
+        let mut orphaned = stored.clone();
+        orphaned
+            .as_object_mut()
+            .expect("a run state serializes as an object")
+            .remove(dropped);
+        assert!(
+            serde_json::from_value::<RunState>(orphaned).is_err(),
+            "a checkpoint with history must not resume without `{dropped}`"
+        );
+    }
+}
+
+/// A resumed segment may keep a caller-managed continuation base without replacing the opening
+/// input stored in its checkpoint.
+#[test]
+fn test_run_state_allows_a_resumed_segment_that_carries_its_own_input() {
+    let agent = AgentId::new("coder");
+    let original_input = vec![ModelInputItem::Message(Message::user("start"))];
+    let mut state = RunState::start(RunId::new("run-resume-input"));
+    state
+        .begin_segment(agent.clone(), original_input.clone())
+        .expect("first segment must initialize the history");
+
+    let caller_managed_input = vec![ModelInputItem::Message(Message::user("now do X"))];
+    state
+        .begin_segment(agent.clone(), caller_managed_input)
+        .expect("a resumed segment may carry its caller-managed continuation base");
+    assert_eq!(
+        state.original_input(),
+        original_input,
+        "a resumed segment must leave the run's opening input alone"
+    );
+
+    let error = state
+        .begin_segment(agent.clone(), Vec::new())
+        .expect_err("a caller-managed continuation makes automatic projection unsafe");
+    assert!(error.to_string().contains("cannot project input"));
+
+    let serialized = serde_json::to_value(&state).expect("state must serialize");
+    assert_eq!(serialized["input_history_is_complete"], false);
+    let mut restored: RunState =
+        serde_json::from_value(serialized).expect("state must retain its resume mode");
+    let error = restored
+        .begin_segment(agent.clone(), Vec::new())
+        .expect_err("a restored caller-managed continuation cannot project input either");
+    assert!(error.to_string().contains("cannot project input"));
+
+    let error = state
+        .begin_segment(AgentId::new("planner"), Vec::new())
+        .expect_err("a restored checkpoint must bind back to the agent that owns it");
+    assert!(error.to_string().contains("expects current agent `coder`"));
+}
+
+/// Unanswered questions block the next segment, and clearing them is what unblocks it.
+#[test]
+fn test_run_state_blocks_a_segment_while_interruptions_are_unanswered() {
+    let agent = AgentId::new("coder");
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = RunState::start(RunId::new("run-blocked"));
+    state
+        .begin_segment(agent.clone(), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![approval.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("stored approval must be a generated interruption");
+
+    let error = state
+        .begin_segment(agent.clone(), Vec::new())
+        .expect_err("a run waiting on an approval must not issue another model call");
+    assert!(error.to_string().contains("unanswered interruptions"));
+
+    state
+        .set_pending_interruptions(&[])
+        .expect("answering every question clears the block");
+    state
+        .begin_segment(agent, Vec::new())
+        .expect("an answered run resumes");
 }
 
 #[test]

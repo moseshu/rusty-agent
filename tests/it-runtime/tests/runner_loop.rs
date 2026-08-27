@@ -651,6 +651,28 @@ fn request(
     request_recording(tools, model, cancel, Arc::new(Mutex::new(Vec::new())))
 }
 
+/// A request that continues a checkpoint whose first segment already ran.
+///
+/// It carries no input of its own, selecting automatic projection from the checkpoint's history.
+fn resume_request(
+    tools: Vec<Arc<dyn Tool>>,
+    model: &Arc<ScriptedModel>,
+    cancel: &CancelScope,
+    state: RunState,
+) -> RunRequest {
+    RunRequest::new(
+        agent(tools),
+        Arc::new(FixedResolver {
+            model: Arc::clone(model),
+            selectors: Arc::new(Mutex::new(Vec::new())),
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        Vec::new(),
+    )
+    .with_state(state)
+}
+
 fn request_with_tool_use_behavior(
     tools: Vec<Arc<dyn Tool>>,
     tool_use_behavior: ToolUseBehavior,
@@ -2013,6 +2035,18 @@ async fn stopping_for_pending_approval_is_an_outcome_not_an_error() {
     };
     assert_eq!(items.len(), 1);
     assert!(items[0].kind().is_interruption());
+    assert_eq!(
+        result.state().pending_interruptions(),
+        [items[0].id().clone()]
+    );
+    assert_eq!(
+        result
+            .state()
+            .pending_interruption_items()
+            .collect::<Vec<_>>(),
+        [&items[0]],
+        "a checkpointed interruption must resolve to its authoritative generated record"
+    );
     assert_eq!(result.outcome().finish_reason(), None);
     assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
     assert_eq!(result.turns(), 1);
@@ -2027,6 +2061,18 @@ async fn stopping_for_pending_approval_is_an_outcome_not_an_error() {
     };
     assert_eq!(message.phase(), Some(OutputPhase::Commentary));
     assert!(result.final_message().is_none());
+
+    let resume_model = ScriptedModel::new(Vec::new());
+    let error = Runner::run(resume_request(
+        Vec::new(),
+        &resume_model,
+        &cancel,
+        result.state().clone(),
+    ))
+    .await
+    .expect_err("an unanswered checkpoint must not issue another model call");
+    assert!(error.to_string().contains("unanswered interruptions"));
+    assert_eq!(resume_model.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -2123,7 +2169,11 @@ async fn streaming_path_returns_pending_approval_without_waiting_for_a_host_repl
     );
     let tool_calls = Arc::clone(&tool.calls);
     let model = ScriptedModel::new(vec![ModelResponse::new(vec![
-        message_with_phase("msg-1", "I need approval before writing", OutputPhase::Final),
+        message_with_phase(
+            "msg-1",
+            "I need approval before writing",
+            OutputPhase::Final,
+        ),
         tool_call("call-1", "tool-call-1", "write_file"),
     ])]);
     let cancel = CancelScope::root();
@@ -2620,20 +2670,23 @@ async fn run_state_is_returned_with_result_so_next_segment_can_continue_counting
             .repeat_streak(&AgentId::new("coder"), &identity),
         1
     );
+    assert_eq!(first.state().starting_agent(), Some(&AgentId::new("coder")));
+    assert_eq!(first.state().current_agent(), Some(&AgentId::new("coder")));
+    assert_eq!(first.state().original_input(), first.original_input());
+    assert_eq!(first.state().generated_items(), first.new_items());
+    assert_eq!(first.state().model_responses(), first.model_responses());
 
     // Carry the complete run state into the second segment. Replacing it with an empty state would
     // reset consecutive segments, turning pause-and-resume into a way to bypass the R3-6 circuit
     // breaker. This resume entry point takes the complete `RunState`, so later runtime facts cannot
     // be omitted either.
     let second_model = ScriptedModel::new(script(2));
-    let second = Runner::run(
-        request(
-            vec![Arc::new(ScriptedTool::new("write_file"))],
-            &second_model,
-            &cancel,
-        )
-        .with_state(first.state().clone()),
-    )
+    let second = Runner::run(resume_request(
+        vec![Arc::new(ScriptedTool::new("write_file"))],
+        &second_model,
+        &cancel,
+        first.state().clone(),
+    ))
     .await
     .unwrap();
 
@@ -2643,6 +2696,111 @@ async fn run_state_is_returned_with_result_so_next_segment_can_continue_counting
             .repeat_streak(&AgentId::new("coder"), &identity),
         2
     );
+    assert_eq!(
+        second_model.input_items.lock().unwrap()[0],
+        first.continuation_input(ContinuationInput::PreserveAll),
+        "a restored checkpoint must supply the earlier authoritative history"
+    );
+    assert_eq!(
+        second.state().generated_items().len(),
+        first.new_items().len() + second.new_items().len()
+    );
+    assert_eq!(
+        second.state().model_responses().len(),
+        first.model_responses().len() + second.model_responses().len()
+    );
+
+    // The third segment is what catches a continuation projected from the segment instead of from
+    // the run: `second.new_items()` holds only what the second segment produced, so pairing it
+    // with the run's opening input would send the model a conversation missing its first segment.
+    let third_model = ScriptedModel::new(script(3));
+    let third = Runner::run(resume_request(
+        vec![Arc::new(ScriptedTool::new("write_file"))],
+        &third_model,
+        &cancel,
+        second.state().clone(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        third_model.input_items.lock().unwrap()[0],
+        second.continuation_input(ContinuationInput::PreserveAll),
+        "a continuation must project the whole run's history, not the last segment's"
+    );
+    assert_eq!(
+        third.state().generated_items().len(),
+        first.new_items().len() + second.new_items().len() + third.new_items().len()
+    );
+    assert_eq!(
+        third.original_input(),
+        second.continuation_input(ContinuationInput::PreserveAll),
+        "an automatic resume records the checkpoint projection as its continuation base"
+    );
+}
+
+/// A resumed request retains an explicit continuation base rather than silently replacing it with
+/// the checkpoint projection.
+#[tokio::test]
+async fn resuming_a_checkpoint_uses_the_caller_supplied_continuation_base() {
+    let first_model =
+        ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "改完了")])]);
+    let cancel = CancelScope::root();
+    let first = Runner::run(request(Vec::new(), &first_model, &cancel))
+        .await
+        .unwrap();
+
+    let second_model =
+        ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "又改完了")])]);
+    let mut continuation = first.continuation_input(ContinuationInput::PreserveAll);
+    continuation.push(ModelInputItem::Message(Message::user("继续检查边界条件")));
+    let result = Runner::run(
+        RunRequest::new(
+            agent(Vec::new()),
+            Arc::new(FixedResolver {
+                model: Arc::clone(&second_model),
+                selectors: Arc::new(Mutex::new(Vec::new())),
+            }),
+            RunId::new("run-loop"),
+            cancel.clone(),
+            continuation.clone(),
+        )
+        .with_state(first.state().clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        second_model.calls.load(Ordering::SeqCst),
+        1,
+        "the supplied continuation reaches the provider"
+    );
+    assert_eq!(second_model.input_items.lock().unwrap()[0], continuation);
+    assert_eq!(result.original_input(), continuation);
+    let mut expected_next = continuation;
+    expected_next.extend(
+        result
+            .new_items()
+            .iter()
+            .filter_map(RunItem::to_model_input),
+    );
+    assert_eq!(
+        result.continuation_input(ContinuationInput::PreserveAll),
+        expected_next,
+        "the next continuation appends only records from this segment"
+    );
+
+    let third_model = ScriptedModel::new(Vec::new());
+    let error = Runner::run(resume_request(
+        Vec::new(),
+        &third_model,
+        &cancel,
+        result.state().clone(),
+    ))
+    .await
+    .expect_err("automatic projection cannot omit a caller-managed input");
+    assert!(error.to_string().contains("cannot project input"));
+    assert_eq!(third_model.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
