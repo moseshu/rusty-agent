@@ -123,7 +123,14 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // `ra-macros` is the schema derive (R2-2). Every crate that *declares* a tool needs it, and it
     // is a kernel crate with no dependencies of its own, so this widens nothing: the alternative is
     // hand-written JSON schemas that skip strict normalization and the typed decoder.
-    ("ra-tools", &["ra-core", "ra-exec", "ra-mcp", "ra-macros"]),
+    //
+    // `ra-patch` is the same shape as `ra-exec` and `ra-mcp` here: a service crate holding the work
+    // that one tool entry point binds to. It arrived when `apply_patch` moved in, which is also
+    // when the reusable-piece test stopped having an exception.
+    (
+        "ra-tools",
+        &["ra-core", "ra-exec", "ra-mcp", "ra-macros", "ra-patch"],
+    ),
     ("ra-flow", &["ra-core", "ra-runtime"]),
     // `ra-patch` parses and applies a text format and needs nothing from the framework to do it.
     // What it does need is `ra-core::compat`: a `PatchPlan` and a `CommittedPatchDelta` are records
@@ -132,8 +139,9 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // answerable through `Compatibility` for a rollout line and not for a patch plan. The
     // dependency buys the compat vocabulary and nothing else — no runtime, no tool contract.
     ("ra-patch", &["ra-core"]),
-    // Same reason as `ra-tools`: the product's `apply_patch` input uses the strict `ToolInput`
-    // derive rather than maintaining a hand-written schema.
+    // `ra-macros` is gone from this list: it was here only for the `apply_patch` input schema, and
+    // that tool now lives in `ra-tools`. `ra-patch` stays — the dangerous-action detector reads a
+    // `PatchPlan` to produce approval facts, without applying anything.
     (
         "ra-coding",
         &[
@@ -145,7 +153,6 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-mcp",
             "ra-patch",
             "ra-tools",
-            "ra-macros",
         ],
     ),
     (

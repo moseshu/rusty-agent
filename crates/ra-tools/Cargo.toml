@@ -14,6 +14,9 @@ workspace = true
 ra-core = { workspace = true }
 ra-exec = { workspace = true }
 ra-mcp = { workspace = true }
+# V4A parsing and hunk application. `apply_patch` binds it to a `Tool`; the format itself is not
+# this crate's business, exactly as process execution is `ra-exec`'s.
+ra-patch = { workspace = true }
 # 工具 schema 的唯一正规来源是 R2-2 的 derive；手写 JSON schema 会绕开 strict 规范化、
 # 类型化 decoder 与字节稳定（R2-9）三件事，每绕一次都要在这里重写一遍。
 ra-macros = { workspace = true }

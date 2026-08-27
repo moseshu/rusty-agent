@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 ra-core = { workspace = true }
-ra-macros = { workspace = true }
 ra-runtime = { workspace = true }
 ra-prompt = { workspace = true }
 ra-context = { workspace = true }
@@ -27,3 +26,5 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 schemars = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
