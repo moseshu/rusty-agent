@@ -18,6 +18,7 @@ const fn ra_tools::read_file::ReadFileLimits::with_max_line_bytes(mut self, byte
 const fn ra_tools::read_file::ReadFileLimits::with_max_output_bytes(mut self, bytes : usize) -> Self
 const fn ra_tools::read_file::ReadFileTool::limits(& self) -> & ReadFileLimits
 const fn ra_tools::read_file::ReadFileTool::with_limits(mut self, limits : ReadFileLimits) -> Self
+fn ra_tools::apply_patch::ApplyPatchTool::new(filesystem : Arc < RootedFileSystem >) -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::new() -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::process_manager(& self) -> & Arc < ProcessManager >
 fn ra_tools::exec_command::ExecCommandTool::root(& self) -> Option < & Path >
@@ -27,6 +28,7 @@ fn ra_tools::read_file::ReadFileTool::new() -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::root(& self) -> Option < & Path >
 fn ra_tools::read_file::ReadFileTool::rooted(root : impl AsRef < Path >) -> Result < Self >
 mod ra_tools::agent_ns
+mod ra_tools::apply_patch
 mod ra_tools::ask_user
 mod ra_tools::exec_command
 mod ra_tools::glob
@@ -39,6 +41,7 @@ mod ra_tools::update_plan
 mod ra_tools::view_image
 mod ra_tools::web
 mod ra_tools::write_stdin
+struct ra_tools::apply_patch::ApplyPatchTool
 struct ra_tools::exec_command::ExecCommandLimits
 struct ra_tools::exec_command::ExecCommandTool
 struct ra_tools::read_file::ReadFileLimits

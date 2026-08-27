@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 ra-core = { path = "../../crates/ra-core" }
 ra-tools = { path = "../../crates/ra-tools" }
+ra-exec = { path = "../../crates/ra-exec" }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

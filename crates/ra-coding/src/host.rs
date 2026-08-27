@@ -9,8 +9,8 @@ use ra_core::{
     tool::{Tool, ToolServices},
 };
 
-use crate::tools::apply_patch::ApplyPatchTool;
 use ra_exec::fs::RootedFileSystem;
+use ra_tools::apply_patch::ApplyPatchTool;
 
 /// The host runtime context and capabilities for the coding agent.
 ///

@@ -1,4 +1,14 @@
-//! The coding product's sole file-editing tool.
+//! The V4A patch-application tool.
+//!
+//! Editing a file through a diff is not a coding concern: a research agent revising a report and an
+//! assistant maintaining a checklist want the same operation, and neither would write a line of
+//! this differently. What *is* product content is the discipline around it — whether the patch tool
+//! is the only writer, what the prompt says about reading before editing, and which approval a
+//! product attaches — and none of that lives here.
+//!
+//! The tool binds a confined filesystem capability to [`ra_patch`]'s parser and applier; it owns
+//! neither. Actions are committed one at a time and a later failure keeps the earlier ones, so the
+//! result reports what was actually written rather than claiming an atomicity this does not have.
 
 use std::{fmt, io::Read as _, path::Path, sync::Arc};
 
@@ -29,7 +39,7 @@ struct ApplyPatchInput {
 }
 
 /// An `apply_patch` tool confined to one workspace capability.
-pub(crate) struct ApplyPatchTool {
+pub struct ApplyPatchTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     options: ToolOptions,
@@ -47,7 +57,10 @@ impl fmt::Debug for ApplyPatchTool {
 
 impl ApplyPatchTool {
     /// Creates a patch tool backed by an already-confined workspace filesystem.
-    pub(crate) fn new(filesystem: Arc<RootedFileSystem>) -> Result<Self> {
+    ///
+    /// The capability is the caller's to scope: this tool writes wherever the filesystem it is
+    /// handed lets it write, and does not resolve or check a root of its own.
+    pub fn new(filesystem: Arc<RootedFileSystem>) -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ApplyPatchInput::tool_schema(TOOL_NAME)?,
