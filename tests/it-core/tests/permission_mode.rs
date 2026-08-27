@@ -5,11 +5,11 @@ use ra_core::{
     agent::AgentSpec,
     context::RunContext,
     error::Result,
-    item::{CallId, ToolApproval},
+    item::{AgentId, CallId, ToolApproval},
     permission::{
         PermissionDecision, PermissionMode, PermissionRule, PermissionScope, PermissionUpdate,
         PermissionUpdateDestination, ToolApprovalAllow, ToolApprovalDecision, ToolApprovalDeny,
-        ToolApprovalHandler,
+        ToolApprovalHandler, ToolPermissionContext,
     },
     state::RunId,
 };
@@ -306,6 +306,7 @@ impl ToolApprovalHandler for EchoingApprovalHandler {
     async fn decide(
         &self,
         approval: &ToolApproval,
+        permission: &ToolPermissionContext,
         context: &RunContext,
     ) -> Result<ToolApprovalDecision> {
         Ok(ToolApprovalDecision::allow_with_input(json!({
@@ -315,6 +316,16 @@ impl ToolApprovalHandler for EchoingApprovalHandler {
             "tool_name": approval.tool_name(),
             "arguments": approval.arguments(),
             "namespace": approval.namespace(),
+            "permission_context": {
+                "suggestions": permission.suggestions(),
+                "tool_use_id": permission.tool_use_id().as_str(),
+                "agent_id": permission.agent_id().map(AgentId::as_str),
+                "blocked_path": permission.blocked_path(),
+                "decision_reason": permission.decision_reason(),
+                "title": permission.title(),
+                "display_name": permission.display_name(),
+                "description": permission.description(),
+            },
         })))
     }
 }
@@ -333,9 +344,16 @@ async fn test_tool_approval_handler_08() {
         json!({"command": "git status"}),
     )
     .with_namespace("workspace");
+    let permission = ToolPermissionContext::for_approval(&approval)
+        .with_agent_id(AgentId::new("child-agent"))
+        .with_blocked_path("/outside/workspace")
+        .with_decision_reason("outside_workspace")
+        .with_title("Approval needed to run a command")
+        .with_display_name("Run command")
+        .with_description("git status will inspect the working tree.");
 
     let decision = EchoingApprovalHandler
-        .decide(&approval, &context)
+        .decide(&approval, &permission, &context)
         .await
         .unwrap();
 
@@ -349,7 +367,143 @@ async fn test_tool_approval_handler_08() {
             "tool_name": "exec_command",
             "arguments": {"command": "git status"},
             "namespace": "workspace",
+            "permission_context": {
+                "suggestions": [],
+                "tool_use_id": "call-approval-handler",
+                "agent_id": "child-agent",
+                "blocked_path": "/outside/workspace",
+                "decision_reason": "outside_workspace",
+                "title": "Approval needed to run a command",
+                "display_name": "Run command",
+                "description": "git status will inspect the working tree.",
+            },
         })),
-        "the handler must see the live run context and the pending record it is answering"
+        "the handler must see the live run context, pending record, and renderable approval context"
     );
+}
+
+#[test]
+fn test_tool_permission_context_10() {
+    let suggestion = PermissionUpdate::add_rules(
+        PermissionUpdateDestination::LocalSettings,
+        [PermissionRule::new(PermissionDecision::Allow)
+            .with_tool_name("exec_command")
+            .with_namespace("workspace")],
+    );
+    let approval = ToolApproval::new(
+        CallId::new("call-permission-context"),
+        "exec_command",
+        json!({"command": "git status"}),
+    );
+    let permission = ToolPermissionContext::for_approval(&approval)
+        .with_suggestions([suggestion.clone()])
+        .with_agent_id(AgentId::new("child-agent"))
+        .with_blocked_path("/workspace/../outside")
+        .with_decision_reason("outside_workspace")
+        .with_title("Approval needed to access a path outside the workspace")
+        .with_display_name("Run command")
+        .with_description("The command can inspect a path outside the workspace.");
+
+    assert_eq!(permission.suggestions(), [suggestion]);
+    assert_eq!(permission.tool_use_id().as_str(), "call-permission-context");
+    assert_eq!(
+        permission.agent_id().map(AgentId::as_str),
+        Some("child-agent")
+    );
+    assert_eq!(permission.blocked_path(), Some("/workspace/../outside"));
+    assert_eq!(permission.decision_reason(), Some("outside_workspace"));
+    assert_eq!(
+        permission.title(),
+        Some("Approval needed to access a path outside the workspace")
+    );
+    assert_eq!(permission.display_name(), Some("Run command"));
+    assert_eq!(
+        permission.description(),
+        Some("The command can inspect a path outside the workspace.")
+    );
+
+    let value = serde_json::to_value(&permission).expect("permission context must serialize");
+    assert_eq!(
+        value,
+        json!({
+            "suggestions": [{
+                "type": "addRules",
+                "destination": "localSettings",
+                "rules": [{
+                    "decision": "allow",
+                    "tool_name": "exec_command",
+                    "namespace": "workspace"
+                }]
+            }],
+            "tool_use_id": "call-permission-context",
+            "agent_id": "child-agent",
+            "blocked_path": "/workspace/../outside",
+            "decision_reason": "outside_workspace",
+            "title": "Approval needed to access a path outside the workspace",
+            "display_name": "Run command",
+            "description": "The command can inspect a path outside the workspace."
+        })
+    );
+    let restored: ToolPermissionContext =
+        serde_json::from_value(value).expect("permission context must deserialize");
+    assert_eq!(restored, permission);
+
+    assert!(permission.matches_approval(&approval));
+    let different_approval = ToolApproval::new(
+        CallId::new("call-other"),
+        "exec_command",
+        json!({"command": "git status"}),
+    );
+    assert!(!permission.matches_approval(&different_approval));
+
+    let newer_context = serde_json::from_value::<ToolPermissionContext>(json!({
+        "tool_use_id": "call-permission-context",
+        "title": "Approval needed",
+        "renderer_hint": {"emphasis": "danger"}
+    }))
+    .expect("a newer context field must be retained");
+    assert_eq!(
+        newer_context.unknown().get("renderer_hint"),
+        Some(&json!({"emphasis": "danger"}))
+    );
+    assert_eq!(
+        serde_json::to_value(&newer_context).unwrap()["renderer_hint"],
+        json!({"emphasis": "danger"}),
+        "an older runtime must write newer UI data back unchanged"
+    );
+}
+
+/// The correlation ID has one source of truth: `for_approval` copies it from the pending record
+/// and there is no setter. This pins the other half — the wire form cannot supply an absent one
+/// either. Every other field on this type carries `#[serde(default)]`, so adding one here for
+/// symmetry would look right and silently turn a missing ID into a `CallId` matching no call.
+#[test]
+fn test_tool_permission_context_11() {
+    assert!(
+        serde_json::from_value::<ToolPermissionContext>(json!({"title": "Approval needed"}))
+            .is_err(),
+        "a context without a correlation ID must fail to load, not default to an empty one"
+    );
+    assert!(
+        serde_json::from_value::<ToolPermissionContext>(json!({"tool_use_id": null})).is_err(),
+        "an explicit null must not stand in for the pending call's ID"
+    );
+    assert!(
+        serde_json::from_str::<ToolPermissionContext>(
+            r#"{"tool_use_id":"call-a","tool_use_id":"call-b"}"#
+        )
+        .is_err(),
+        "a second correlation ID must not quietly override the first"
+    );
+
+    // The mirror image: the ID alone is enough, so the seven optional fields really are optional
+    // on the way in and a persisted context stays pairable with its record.
+    let approval = ToolApproval::new(CallId::new("call-a"), "exec_command", json!({}));
+    let restored =
+        serde_json::from_value::<ToolPermissionContext>(json!({"tool_use_id": "call-a"}))
+            .expect("a context carrying only its correlation ID must load");
+    assert!(restored.matches_approval(&approval));
+    assert_eq!(restored.suggestions(), []);
+    assert_eq!(restored.agent_id(), None);
+    assert_eq!(restored.title(), None);
 }

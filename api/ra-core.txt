@@ -10,7 +10,7 @@ async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
 async fn ra_core::model::retry::policy::ModelRetryPolicy::evaluate(& self, context : & RetryPolicyContext < '_ >) -> RetryDecision
-async fn ra_core::permission::ToolApprovalHandler::decide(& self, approval : & ToolApproval, context : & RunContext) -> Result < ToolApprovalDecision >
+async fn ra_core::permission::ToolApprovalHandler::decide(& self, approval : & ToolApproval, permission : & ToolPermissionContext, context : & RunContext) -> Result < ToolApprovalDecision >
 async fn ra_core::prompt::DynamicPromptHandler::resolve(& self, context : & RunContext) -> Result < ResolvedPrompt >
 async fn ra_core::session::port::Session::add_items(& self, items : Vec < RunItem >) -> Result < () >
 async fn ra_core::session::port::Session::clear(& self) -> Result < () >
@@ -454,6 +454,9 @@ const fn ra_core::permission::ToolApprovalDecision::label(& self) -> & 'static s
 const fn ra_core::permission::ToolApprovalDecision::updated_input(& self) -> Option < & Value >
 const fn ra_core::permission::ToolApprovalDeny::interrupts_run(& self) -> bool
 const fn ra_core::permission::ToolApprovalDeny::with_interrupt(mut self, interrupt : bool) -> Self
+const fn ra_core::permission::ToolPermissionContext::agent_id(& self) -> Option < & AgentId >
+const fn ra_core::permission::ToolPermissionContext::tool_use_id(& self) -> & CallId
+const fn ra_core::permission::ToolPermissionContext::unknown(& self) -> & Unknown
 const fn ra_core::prompt::CachePlan::new(prefix_hash : ContentHash) -> Self
 const fn ra_core::prompt::CachePlan::prefix_hash(& self) -> & ContentHash
 const fn ra_core::prompt::PromptProvenance::content_hash(& self) -> & ContentHash
@@ -1221,6 +1224,21 @@ fn ra_core::permission::ToolApprovalDecision::deny(message : impl Into < String 
 fn ra_core::permission::ToolApprovalDecision::updated_permissions(& self) -> & [PermissionUpdate]
 fn ra_core::permission::ToolApprovalDeny::message(& self) -> & str
 fn ra_core::permission::ToolApprovalDeny::new(message : impl Into < String >) -> Self
+fn ra_core::permission::ToolPermissionContext::blocked_path(& self) -> Option < & str >
+fn ra_core::permission::ToolPermissionContext::decision_reason(& self) -> Option < & str >
+fn ra_core::permission::ToolPermissionContext::description(& self) -> Option < & str >
+fn ra_core::permission::ToolPermissionContext::display_name(& self) -> Option < & str >
+fn ra_core::permission::ToolPermissionContext::for_approval(approval : & ToolApproval) -> Self
+fn ra_core::permission::ToolPermissionContext::matches_approval(& self, approval : & ToolApproval) -> bool
+fn ra_core::permission::ToolPermissionContext::suggestions(& self) -> & [PermissionUpdate]
+fn ra_core::permission::ToolPermissionContext::title(& self) -> Option < & str >
+fn ra_core::permission::ToolPermissionContext::with_agent_id(mut self, agent_id : AgentId) -> Self
+fn ra_core::permission::ToolPermissionContext::with_blocked_path(mut self, blocked_path : impl Into < String >) -> Self
+fn ra_core::permission::ToolPermissionContext::with_decision_reason(mut self, decision_reason : impl Into < String >) -> Self
+fn ra_core::permission::ToolPermissionContext::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::permission::ToolPermissionContext::with_display_name(mut self, display_name : impl Into < String >) -> Self
+fn ra_core::permission::ToolPermissionContext::with_suggestions(mut self, suggestions : impl IntoIterator < Item = PermissionUpdate >) -> Self
+fn ra_core::permission::ToolPermissionContext::with_title(mut self, title : impl Into < String >) -> Self
 fn ra_core::prompt::CachePlan::cache_scope(& self) -> Option < & str >
 fn ra_core::prompt::CachePlan::for_prefix(prefix : & str, cache_scope : Option < & str >) -> Self
 fn ra_core::prompt::CachePlan::with_cache_scope(mut self, scope : impl Into < String >) -> Self
@@ -1647,6 +1665,7 @@ struct ra_core::output::OutputSchema
 struct ra_core::permission::PermissionRule
 struct ra_core::permission::ToolApprovalAllow
 struct ra_core::permission::ToolApprovalDeny
+struct ra_core::permission::ToolPermissionContext
 struct ra_core::prompt::CachePlan
 struct ra_core::prompt::ContentHash
 struct ra_core::prompt::PromptProvenance
