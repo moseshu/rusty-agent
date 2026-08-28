@@ -43,8 +43,8 @@ use ra_core::{
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelRetryPolicy, ModelRetrySettings,
-        ModelSelector, ModelSettings, ModelStream, NormalizedProviderError, ProviderKey,
-        ResolvedModel, RetryBackoffSettings, RetryDecision, RetryPolicyContext,
+        ModelSelector, ModelSettings, ModelStream, ModelStreamEvent, NormalizedProviderError,
+        ProviderKey, ResolvedModel, RetryBackoffSettings, RetryDecision, RetryPolicyContext,
     },
     state::RunId,
     tool::{
@@ -291,7 +291,15 @@ impl Model for ScriptedModel {
     }
 
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-        stream::empty().boxed()
+        let mut script = self.script.lock().unwrap();
+        let event = if script.is_empty() {
+            Err(Error::caller("scripted model ran out of responses"))
+        } else {
+            script
+                .remove(0)
+                .map(|response| ModelStreamEvent::Completed(Box::new(response)))
+        };
+        stream::iter(vec![event]).boxed()
     }
 }
 

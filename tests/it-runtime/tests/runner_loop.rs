@@ -27,8 +27,10 @@ use ra_core::{
         RunItemKind, ToolCall,
     },
     model::{
-        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ModelStreamEvent, ProviderKey, RawResponseEvent, ResolvedModel, ToolChoice,
+        ApiProtocol, Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest,
+        ModelRetrySettings, ModelSelector, ModelSettings, ModelStream, ModelStreamEvent,
+        NetworkErrorRetryPolicy, NormalizedProviderError, ProviderKey, RawResponseEvent,
+        ReplaySafety, ResolvedModel, RetryAdvice, RetryBackoffSettings, ToolChoice,
     },
     permission::{PermissionDecision, PermissionRule},
     state::{PendingControlRequest, RunId, RunState, ToolOutcome, ToolUse, WorkStateHandle},
@@ -46,7 +48,10 @@ use ra_runtime::{
     },
 };
 use serde_json::{Value, json};
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{
+    sync::{Notify, oneshot},
+    time::timeout,
+};
 
 /// Replays a fixed script of responses, one per turn, and records the input it was handed.
 struct ScriptedModel {
@@ -69,11 +74,8 @@ impl ScriptedModel {
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
-}
 
-#[async_trait]
-impl Model for ScriptedModel {
-    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+    fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inputs.lock().unwrap().push(request.input().len());
         self.input_items
@@ -90,15 +92,24 @@ impl Model for ScriptedModel {
             .push(request.model_settings().tool_choice().cloned());
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
-            // The loop asked for a turn the script did not plan for. Answering with a final
-            // message would hide the mismatch behind a passing test.
             return Err(Error::caller("scripted model ran out of responses"));
         }
         Ok(script.remove(0))
     }
+}
 
-    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-        stream::empty().boxed()
+#[async_trait]
+impl Model for ScriptedModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.next_response(request)
+    }
+
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        stream::iter(vec![
+            self.next_response(request)
+                .map(|response| ModelStreamEvent::Completed(Box::new(response))),
+        ])
+        .boxed()
     }
 }
 
@@ -110,7 +121,57 @@ struct StreamingModel {
     events: Mutex<Vec<Vec<ModelStreamEvent>>>,
     streamed_calls: Arc<AtomicUsize>,
     blocking_calls: Arc<AtomicUsize>,
-    fallback: Mutex<Vec<ModelResponse>>,
+}
+
+/// Holds the terminal response until the tool started from its completed stream item runs.
+struct DispatchingStreamingModel {
+    response: ModelResponse,
+    tool_started: Arc<Notify>,
+}
+
+impl DispatchingStreamingModel {
+    fn new(response: ModelResponse, tool_started: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            response,
+            tool_started,
+        })
+    }
+}
+
+#[async_trait]
+impl Model for DispatchingStreamingModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller(
+            "this fixture only answers on the streaming entry point",
+        ))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        let item = self.response.output()[0].clone();
+        let response = self.response.clone();
+        let tool_started = Arc::clone(&self.tool_started);
+        stream::unfold(0_u8, move |stage| {
+            let item = item.clone();
+            let response = response.clone();
+            let tool_started = Arc::clone(&tool_started);
+            async move {
+                match stage {
+                    0 => Some((
+                        Ok(ModelStreamEvent::RunItem(
+                            ra_core::model::RunItemStreamEvent::new("tool_call", item),
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tool_started.notified().await;
+                        Some((Ok(ModelStreamEvent::Completed(Box::new(response))), 2))
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .boxed()
+    }
 }
 
 impl StreamingModel {
@@ -119,14 +180,7 @@ impl StreamingModel {
             events: Mutex::new(events),
             streamed_calls: Arc::new(AtomicUsize::new(0)),
             blocking_calls: Arc::new(AtomicUsize::new(0)),
-            fallback: Mutex::new(Vec::new()),
         })
-    }
-
-    /// Supplies what the non-streaming entry point answers, when the loop chooses it.
-    fn with_fallback(self: Arc<Self>, responses: Vec<ModelResponse>) -> Arc<Self> {
-        *self.fallback.lock().unwrap() = responses;
-        self
     }
 }
 
@@ -134,11 +188,9 @@ impl StreamingModel {
 impl Model for StreamingModel {
     async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
         self.blocking_calls.fetch_add(1, Ordering::SeqCst);
-        let mut fallback = self.fallback.lock().unwrap();
-        if fallback.is_empty() {
-            return Err(Error::caller("streaming model has no non-streaming answer"));
-        }
-        Ok(fallback.remove(0))
+        Err(Error::caller(
+            "this fixture must use the streaming model entry point",
+        ))
     }
 
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
@@ -243,7 +295,16 @@ impl Model for PendingModel {
     }
 
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-        stream::empty().boxed()
+        let dropped = Arc::clone(&self.dropped);
+        let started = self.started.lock().unwrap().take();
+        stream::once(async move {
+            let _notify = NotifyWhenDropped(dropped);
+            if let Some(sender) = started {
+                let _ = sender.send(());
+            }
+            futures::future::pending::<Result<ModelStreamEvent>>().await
+        })
+        .boxed()
     }
 }
 
@@ -380,6 +441,95 @@ impl Tool for ScriptedTool {
             self.options.approval(),
             ToolApprovalPolicy::Never
         ))
+    }
+}
+
+/// A regular tool that makes its start observable to the streaming-model fixture.
+struct NotifyingTool {
+    inner: ScriptedTool,
+    started: Arc<Notify>,
+}
+
+impl NotifyingTool {
+    fn new(name: &str, started: Arc<Notify>) -> Self {
+        Self {
+            inner: ScriptedTool::new(name),
+            started,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NotifyingTool {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+
+    fn options(&self) -> ToolOptions {
+        self.inner.options()
+    }
+
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.started.notify_one();
+        self.inner.call(context).await
+    }
+}
+
+/// Holds a streamed dispatch open and reports whether its call future was reaped.
+struct PendingDropTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    started: Arc<Notify>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl PendingDropTool {
+    fn new(name: &str, started: Arc<Notify>, dropped: Arc<AtomicUsize>) -> Self {
+        Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::new(
+                name,
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+            started,
+            dropped,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for PendingDropTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        struct ReportDrop(Arc<AtomicUsize>);
+
+        impl Drop for ReportDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        self.started.notify_one();
+        let _report = ReportDrop(Arc::clone(&self.dropped));
+        std::future::pending::<()>().await;
+        unreachable!("a pending test tool can only leave through cancellation")
     }
 }
 
@@ -612,14 +762,28 @@ fn phases(result: &RunResult) -> Vec<OutputPhase> {
 }
 
 fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
+    tool_call_with_arguments(id, call_id, name, json!({ "path": "a.txt" }))
+}
+
+fn tool_call_with_arguments(id: &str, call_id: &str, name: &str, arguments: Value) -> RunItem {
     item(
         id,
-        RunItemKind::ToolCall(ToolCall::new(
-            CallId::new(call_id),
-            name,
-            json!({ "path": "a.txt" }),
-        )),
+        RunItemKind::ToolCall(ToolCall::new(CallId::new(call_id), name, arguments)),
     )
+}
+
+/// One turn narrated as a completed tool call, then settled by `terminal`.
+///
+/// The two are separate arguments because the interesting cases are the ones where a provider's
+/// terminal response disagrees with what its own stream already announced.
+fn narrated_tool_call_turn(narrated: RunItem, terminal: ModelResponse) -> Vec<ModelStreamEvent> {
+    vec![
+        ModelStreamEvent::RunItem(ra_core::model::RunItemStreamEvent::new(
+            "tool_call",
+            narrated,
+        )),
+        ModelStreamEvent::Completed(Box::new(terminal)),
+    ]
 }
 
 fn agent(tools: Vec<Arc<dyn Tool>>) -> AgentBinding {
@@ -2281,7 +2445,9 @@ async fn a_rejected_call_clears_the_streak_it_never_contributed_to() {
         }
     }
     assert_eq!(
-        state.tool_failure().no_progress_streak(&agent_id, &identity),
+        state
+            .tool_failure()
+            .no_progress_streak(&agent_id, &identity),
         2
     );
 
@@ -2631,32 +2797,95 @@ async fn partial_messages_forward_provider_events_and_settle_from_the_terminal_r
     assert_eq!(result.usage().output_tokens(), 3);
 }
 
-/// A run nobody asked narration from does not open a streamed call at all.
 #[tokio::test]
-async fn a_run_without_partial_messages_keeps_making_one_non_streaming_call() {
-    let model = StreamingModel::new(Vec::new())
-        .with_fallback(vec![ModelResponse::new(vec![message("msg-1", "完事了")])]);
+async fn completed_stream_tool_call_starts_before_the_terminal_response() {
+    let tool_started = Arc::new(Notify::new());
+    let tool = Arc::new(NotifyingTool::new("write_file", Arc::clone(&tool_started)));
+    let response = ModelResponse::new(vec![tool_call("call-1", "tool-call-1", "write_file")]);
+    let model = DispatchingStreamingModel::new(response, tool_started);
+    let cancel = CancelScope::root();
+
+    let result = timeout(
+        Duration::from_millis(250),
+        Runner::run_streamed(
+            RunRequest::new(
+                agent_with_tool_use_behavior(vec![tool], ToolUseBehavior::StopOnFirstTool),
+                Arc::new(SingleModelResolver {
+                    model: Arc::clone(&model) as Arc<dyn Model>,
+                }),
+                RunId::new("run-loop"),
+                cancel.clone(),
+                vec![ModelInputItem::Message(Message::user("stream a tool call"))],
+            )
+            .with_config(RunConfig::new().with_partial_messages(true)),
+        )
+        .finish(),
+    )
+    .await
+    .expect("the tool must start while the model stream is still open")
+    .expect("the streamed turn must settle");
+
+    assert_eq!(result.turns(), 1);
+    assert_eq!(result.new_items().len(), 2);
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::ToolStop),
+        "the terminal response still owns settlement and tool-stop policy"
+    );
+}
+
+/// A run without narration still streams so it can dispatch completed tool calls early — and the
+/// switch still decides what a subscriber sees, which is the only thing it was ever about.
+#[tokio::test]
+async fn a_run_without_partial_messages_streams_without_forwarding_narration() {
+    let model = StreamingModel::new(vec![vec![
+        raw_event("response.created"),
+        raw_event("response.completed"),
+        ModelStreamEvent::Completed(Box::new(ModelResponse::new(vec![message(
+            "msg-1",
+            "完事了",
+        )]))),
+    ]]);
     let streamed_calls = Arc::clone(&model.streamed_calls);
     let blocking_calls = Arc::clone(&model.blocking_calls);
     let cancel = CancelScope::root();
 
-    let stream = Runner::run_streamed(streaming_request(&model, &cancel));
+    let mut stream = Runner::run_streamed(streaming_request(&model, &cancel));
+    let mut raw = 0_usize;
+    let mut items = Vec::new();
+    while let Some(event) = stream.next_event().await {
+        match event {
+            RunStreamEvent::RawResponse(_) => raw += 1,
+            RunStreamEvent::Item(item) => items.push(item.id().as_str().to_owned()),
+            _ => {}
+        }
+    }
     let result = stream.finish().await.unwrap();
 
     assert_eq!(result.turns(), 1);
     assert_eq!(
         streamed_calls.load(Ordering::SeqCst),
-        0,
-        "assembling deltas nobody is watching costs a decoder and buys nothing"
+        1,
+        "streaming is the execution shape even when raw narration is not forwarded"
     );
-    assert_eq!(blocking_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(blocking_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        raw, 0,
+        "a host that did not ask for narration must not be sent the provider's frames"
+    );
+    assert_eq!(
+        items,
+        ["msg-1"],
+        "settled records are the run's own and are published regardless of the switch"
+    );
 }
 
-/// The switch needs a subscriber to mean anything, so the blocking entry point ignores it.
+/// The blocking entry point does not expose narration but still uses the streaming execution path.
 #[tokio::test]
-async fn partial_messages_do_nothing_on_the_entry_point_that_has_no_subscriber() {
-    let model = StreamingModel::new(Vec::new())
-        .with_fallback(vec![ModelResponse::new(vec![message("msg-1", "完事了")])]);
+async fn partial_messages_do_not_change_the_blocking_entry_points_execution_shape() {
+    let model = StreamingModel::new(vec![vec![ModelStreamEvent::Completed(Box::new(
+        ModelResponse::new(vec![message("msg-1", "完事了")]),
+    ))]]);
     let streamed_calls = Arc::clone(&model.streamed_calls);
     let cancel = CancelScope::root();
 
@@ -2668,7 +2897,7 @@ async fn partial_messages_do_nothing_on_the_entry_point_that_has_no_subscriber()
     .unwrap();
 
     assert_eq!(result.turns(), 1);
-    assert_eq!(streamed_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(streamed_calls.load(Ordering::SeqCst), 1);
 }
 
 /// Narration is not a turn: a stream that never states its terminal facts fails the call.
@@ -2745,6 +2974,330 @@ async fn a_failure_after_the_terminal_response_still_reports_what_failed() {
 
     assert!(
         error.to_string().contains("connection reset"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Runs one tool call whose tool refuses any repeat, and reports whether the tool executed.
+///
+/// `narrated` is the only difference between the two runs: whether the adapter announced the call
+/// as a completed stream item, which is what decides whether it can be started early.
+async fn repeat_limited_call(narrated: bool) -> (usize, bool) {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_max_repeat_streak(NonZeroU32::new(1).unwrap())),
+    );
+    let tool_calls = Arc::clone(&tool.calls);
+    let call = tool_call("c-1", "call-1", "write_file");
+    let terminal = ModelResponse::new(vec![call.clone()]);
+    let first_turn = if narrated {
+        narrated_tool_call_turn(call, terminal)
+    } else {
+        vec![ModelStreamEvent::Completed(Box::new(terminal))]
+    };
+    let model = StreamingModel::new(vec![
+        first_turn,
+        vec![ModelStreamEvent::Completed(Box::new(ModelResponse::new(
+            vec![message("msg-1", "换个思路")],
+        )))],
+    ]);
+    let cancel = CancelScope::root();
+
+    let result = Runner::run(RunRequest::new(
+        agent(vec![tool as Arc<dyn Tool>]),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("改文件"))],
+    ))
+    .await
+    .unwrap();
+
+    let refused = result.new_items().iter().any(|item| match item.kind() {
+        RunItemKind::ToolCallOutput(output) => {
+            output.is_error() && output.output()["error"]["code"] == json!("tool.repeated_call")
+        }
+        _ => false,
+    });
+    (tool_calls.load(Ordering::SeqCst), refused)
+}
+
+/// The repeat breaker counts the call being admitted, which means it cannot be evaluated before
+/// the response that contains it exists. A tool that configures the limit therefore waits for
+/// settlement instead of starting early — otherwise the threshold would quietly depend on how
+/// talkative the provider's adapter happens to be.
+#[tokio::test]
+async fn a_repeat_limit_is_enforced_whether_or_not_the_adapter_narrates_the_call() {
+    assert_eq!(
+        repeat_limited_call(true).await,
+        (0, true),
+        "a narrated call must not escape the breaker by starting before settlement"
+    );
+    assert_eq!(
+        repeat_limited_call(false).await,
+        (0, true),
+        "the settled path is the behaviour the narrated one has to match"
+    );
+}
+
+/// A call the stream announced and the terminal response then described differently cannot be
+/// settled: one of the two is not what the provider ran, and the runtime cannot tell which.
+///
+/// How far the tool itself got is deliberately not asserted. The turn fails on the mismatch
+/// whether the early task reached the tool or was cancelled while still queued, and pinning that
+/// down would be asserting the scheduler rather than the rule.
+#[tokio::test]
+async fn a_terminal_response_that_changes_a_streamed_call_fails_the_turn() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = StreamingModel::new(vec![narrated_tool_call_turn(
+        tool_call_with_arguments("c-1", "call-1", "write_file", json!({ "path": "a.txt" })),
+        ModelResponse::new(vec![tool_call_with_arguments(
+            "c-1",
+            "call-1",
+            "write_file",
+            json!({ "path": "b.txt" }),
+        )]),
+    )]);
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(RunRequest::new(
+        agent(vec![tool as Arc<dyn Tool>]),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("改文件"))],
+    ))
+    .await
+    .expect_err("a response that contradicts its own stream cannot settle a turn");
+
+    assert!(
+        error.to_string().contains("changed streamed function call"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The terminal response is the record the session stores, so a call missing from it has no
+/// record to answer under, however far its tool got.
+#[tokio::test]
+async fn a_terminal_response_that_omits_a_streamed_call_fails_the_turn() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = StreamingModel::new(vec![narrated_tool_call_turn(
+        tool_call("c-1", "call-1", "write_file"),
+        ModelResponse::new(vec![message("msg-1", "算了")]),
+    )]);
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(RunRequest::new(
+        agent(vec![tool as Arc<dyn Tool>]),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("改文件"))],
+    ))
+    .await
+    .expect_err("a started call the response never bound cannot be settled");
+
+    assert!(
+        error.to_string().contains("omitted a function call"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A malformed terminal response still has to reap a tool that began from one of its stream
+/// items. Returning directly from classification would only abort the JoinSet on drop, skipping
+/// the turn's explicit cancellation-and-drain protocol.
+#[tokio::test]
+async fn a_terminal_classification_error_drains_streamed_tool_work() {
+    let started = Arc::new(Notify::new());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let tool = Arc::new(PendingDropTool::new(
+        "write_file",
+        Arc::clone(&started),
+        Arc::clone(&dropped),
+    ));
+    let first = tool_call("c-1", "call-1", "write_file");
+    let terminal = ModelResponse::new(vec![
+        first.clone(),
+        tool_call("c-2", "call-1", "write_file"),
+    ]);
+    let model = DispatchingStreamingModel::new(terminal, started);
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(RunRequest::new(
+        agent(vec![tool as Arc<dyn Tool>]),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("改文件"))],
+    ))
+    .await
+    .expect_err("duplicate terminal call ids must fail classification");
+
+    assert!(
+        error
+            .to_string()
+            .contains("claimed by more than one action"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "settlement must wait for the early tool task to acknowledge cancellation"
+    );
+}
+
+/// Narrates one completed tool call, then fails — while reporting the failure as replay-safe.
+///
+/// An adapter answering `Safe` here is not lying: it knows the *request* was never accepted. What
+/// it cannot know is that a tool already started on the strength of the item it emitted.
+struct DispatchThenFailModel {
+    tool_started: Arc<Notify>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Model for DispatchThenFailModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller(
+            "this fixture only answers on the streaming entry point",
+        ))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = tool_call("c-1", "call-1", "write_file");
+        let tool_started = Arc::clone(&self.tool_started);
+        stream::unfold(0_u8, move |stage| {
+            let call = call.clone();
+            let tool_started = Arc::clone(&tool_started);
+            async move {
+                match stage {
+                    0 => Some((
+                        Ok(ModelStreamEvent::RunItem(
+                            ra_core::model::RunItemStreamEvent::new("tool_call", call),
+                        )),
+                        1,
+                    )),
+                    // Only fail once the side effect has actually happened, so the test is about
+                    // the rule rather than about which task the scheduler polled first.
+                    1 => {
+                        tool_started.notified().await;
+                        Some((
+                            Err(NormalizedProviderError::new(
+                                ProviderErrorKind::Network,
+                                "connection reset",
+                            )
+                            .into_error()),
+                            2,
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .boxed()
+    }
+
+    fn get_retry_advice(&self, _request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
+        Some(RetryAdvice::new().with_replay_safety(ReplaySafety::Safe))
+    }
+}
+
+/// Replay safety is the adapter's answer about the provider, never about this runtime. Once a
+/// tool has run, no advice can make sending the same request again safe — the second turn would
+/// produce the same call and the same side effect.
+#[tokio::test]
+async fn a_tool_started_from_the_stream_vetoes_a_retry_the_adapter_calls_safe() {
+    let tool_started = Arc::new(Notify::new());
+    let tool = Arc::new(NotifyingTool::new("write_file", Arc::clone(&tool_started)));
+    let tool_calls = Arc::clone(&tool.inner.calls);
+    let model = Arc::new(DispatchThenFailModel {
+        tool_started,
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let model_calls = Arc::clone(&model.calls);
+    let cancel = CancelScope::root();
+
+    let retry = ModelRetrySettings::new()
+        .with_max_retries(3)
+        .with_backoff(
+            RetryBackoffSettings::new()
+                .with_initial_delay(Duration::ZERO)
+                .with_jitter(false),
+        )
+        .with_policy(Arc::new(NetworkErrorRetryPolicy));
+
+    let error = timeout(
+        Duration::from_secs(2),
+        Runner::run(
+            RunRequest::new(
+                agent(vec![tool as Arc<dyn Tool>]),
+                Arc::new(SingleModelResolver {
+                    model: Arc::clone(&model) as Arc<dyn Model>,
+                }),
+                RunId::new("run-loop"),
+                cancel.clone(),
+                vec![ModelInputItem::Message(Message::user("改文件"))],
+            )
+            .with_config(
+                RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry)),
+            ),
+        ),
+    )
+    .await
+    .expect("the run must not retry its way into a loop")
+    .expect_err("a call whose tool already ran cannot be replayed");
+
+    assert_eq!(error.code(), "provider.network");
+    assert_eq!(
+        model_calls.load(Ordering::SeqCst),
+        1,
+        "the retry budget was three; consumption is what stopped it, not exhaustion"
+    );
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Two stream items for one `call_id` would start the same call twice, and only the first could
+/// ever be matched to a record.
+#[tokio::test]
+async fn a_function_call_narrated_twice_in_one_stream_fails_the_turn() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let call = tool_call("c-1", "call-1", "write_file");
+    let model = StreamingModel::new(vec![vec![
+        ModelStreamEvent::RunItem(ra_core::model::RunItemStreamEvent::new(
+            "tool_call",
+            call.clone(),
+        )),
+        ModelStreamEvent::RunItem(ra_core::model::RunItemStreamEvent::new(
+            "tool_call",
+            call.clone(),
+        )),
+        ModelStreamEvent::Completed(Box::new(ModelResponse::new(vec![call]))),
+    ]]);
+    let cancel = CancelScope::root();
+
+    let error = Runner::run(RunRequest::new(
+        agent(vec![tool as Arc<dyn Tool>]),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("改文件"))],
+    ))
+    .await
+    .expect_err("one call_id names one call");
+
+    assert!(
+        error.to_string().contains("more than once"),
         "unexpected error: {error}"
     );
 }

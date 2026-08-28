@@ -75,7 +75,7 @@ use crate::{
     tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     turn::{
         TurnSettlementRequest,
-        batch::DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
+        batch::{DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, StreamedFunctionDispatches, StreamedStart},
         prepare::{
             PreparedTurn, ToolNameCollisionPolicy, TurnActionSurface, TurnPreparationRequest,
             prepare_turn,
@@ -204,18 +204,20 @@ impl RunConfig {
         self
     }
 
-    /// Streams each model call and forwards its provider events, so a host can render a turn as it
+    /// Forwards provider events while each model call streams, so a host can render a turn as it
     /// is produced.
     ///
-    /// Off by default, and the default is not timidity. Streaming a call costs a decoder that has
-    /// to reassemble a turn from fragments and decide when the sender really finished, and a run
-    /// whose output nobody is watching gains nothing for it. The switch is also what the
-    /// non-streaming path is measured against: both settle the same turn from the same terminal
-    /// response, so a bug that only appears when tokens are rendered has one place to be.
+    /// Function calls are always read from the model stream: a completed call starts immediately,
+    /// while the provider is still generating later items. This switch controls only whether raw
+    /// provider narration is exposed to a [`RunStream`]; it has no effect on tool dispatch or on
+    /// the terminal response that settles the turn.
+    ///
+    /// Off by default, and not out of timidity. Narration that reaches a subscriber cannot be
+    /// unsent, so forwarding it closes this call's retry window — a run that renders nothing gives
+    /// up replayable failures for output nobody reads.
     ///
     /// **It takes effect only on [`Runner::run_streamed`].** [`Runner::run`] has no subscriber to
-    /// forward to, so it keeps making one non-streaming call rather than assembling deltas and
-    /// discarding them.
+    /// forward to.
     pub const fn with_partial_messages(mut self, partial_messages: bool) -> Self {
         self.partial_messages = partial_messages;
         self
@@ -277,7 +279,7 @@ impl RunConfig {
         &self.permission
     }
 
-    /// Whether model calls are streamed and their provider events forwarded.
+    /// Whether provider events are forwarded to the run subscriber.
     #[must_use]
     pub const fn partial_messages(&self) -> bool {
         self.partial_messages
@@ -484,8 +486,12 @@ impl Runner {
     /// An interruption comes back as [`RunOutcome::Interrupted`], not as an error: the host is
     /// being asked a question, and a run that reported that as a failure would have no way to be
     /// answered and resumed.
+    ///
+    /// Boxed because the loop's future carries a whole turn — preparation, the model call, and the
+    /// dispatcher its stream starts tools through — and a caller that composes runs should not
+    /// have to hold all of it inline on the stack.
     pub async fn run(request: RunRequest) -> Result<RunResult> {
-        run_loop(request, None).await
+        Box::pin(run_loop(request, None)).await
     }
 
     /// Runs the agent, announcing each turn's records as they are produced.
@@ -506,7 +512,7 @@ impl Runner {
         let scope = request.cancel.child(ScopeKind::Run);
         request.cancel = scope.clone();
         let guard = scope.cancel_on_drop(CancelReason::UserInterrupt);
-        let task = tokio::spawn(async move { run_loop(request, Some(sender)).await });
+        let task = tokio::spawn(async move { Box::pin(run_loop(request, Some(sender))).await });
         RunStream::new(receiver, task, guard)
     }
 }
@@ -1159,7 +1165,18 @@ async fn run_one_turn(
     }
     let prepared = prepare_turn(preparation).await?;
 
-    let (surface, response) = call_model(turn_scope, prepared, context).await?;
+    let streaming_dispatch = StreamedDispatchInput {
+        agent_id: agent.public_id().clone(),
+        tool_use: state.tool_use().clone(),
+        tool_failure: state.tool_failure().clone(),
+        run: Arc::new(live_context(context, agent, state)),
+        cancel: turn_scope.clone(),
+        services: context.services.clone(),
+        max_function_tool_concurrency: config.max_function_tool_concurrency,
+        permission: context.permission.clone(),
+    };
+    let (surface, response, streamed_dispatches) =
+        call_model(turn_scope, prepared, context, streaming_dispatch).await?;
 
     // Both facts about a completed call are recorded here, before settlement, and the stop
     // either may cause is *not* taken here. The response has already been paid for, so its
@@ -1184,6 +1201,9 @@ async fn run_one_turn(
     // Built again rather than reused from preparation: the call above has been paid for, and the
     // spend a tool reads has to include it. The two contexts are the same run and the same agent —
     // what differs is only how much of the budget each stage can truthfully report.
+    //
+    // A tool the stream already started holds the earlier one instead, for the reason given on
+    // [`StreamedDispatchInput`]: its response had not been paid for when it was handed over.
     let settlement_context = Arc::new(live_context(context, agent, state));
     let (tool_use, tool_failure) = state.trackers_mut();
     let settlement = TurnSettlementRequest::new(
@@ -1199,7 +1219,8 @@ async fn run_one_turn(
     .with_original_input(segment_original_input)
     .with_pre_step_items(pre_step_items)
     .with_services(context.services.clone())
-    .with_max_function_tool_concurrency(config.max_function_tool_concurrency);
+    .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
+    .with_streamed_dispatches(streamed_dispatches);
     let settled = settle_turn(settlement).await?;
 
     for item in settled.session_step_items() {
@@ -1281,10 +1302,70 @@ struct ModelCallAttempt<'a> {
     model: &'a Arc<dyn Model>,
     selector: &'a ra_core::model::ModelSelector,
     events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
-    streamed: bool,
     attempt: u32,
     max_retries: u32,
     retry_trace: Option<RetryTrace>,
+    streaming_dispatch: StreamedDispatchInput,
+}
+
+/// What one attempt let out of the runtime before it failed.
+///
+/// This is the runner's own record, not the adapter's opinion, and it is the reason a failed call
+/// may or may not be replayable. Both fields mean the same thing at different costs: something
+/// happened that a second attempt would repeat.
+#[derive(Debug, Clone, Copy, Default)]
+struct CallConsumption {
+    /// Provider narration reached a [`RunStream`] subscriber, which cannot be unsent.
+    published: bool,
+    /// A tool started from a completed stream item and may have had side effects.
+    dispatched: bool,
+}
+
+impl CallConsumption {
+    /// Whether anything happened that replaying this call would duplicate.
+    const fn any(self) -> bool {
+        self.published || self.dispatched
+    }
+}
+
+/// Everything needed to start a tool from a completed item in a model stream.
+///
+/// # Early tools see the run as it was before the call
+///
+/// The response's usage does not exist while the stream is still open, so the context here is the
+/// one from immediately before the model call, and settlement builds a second one that includes
+/// the call's spend. In a turn where the adapter narrated items, both are therefore live at once:
+/// tools started early read the pre-call spend, tools the terminal response spawns read the
+/// post-call spend. Sharing one context instead would mean choosing which group to lie to, and the
+/// pre-call figure is the only one an early tool could ever have been given.
+///
+/// Settlement remains the only place that records the response and its attempts, so nothing about
+/// the turn's own records depends on which context a tool held.
+#[derive(Clone)]
+struct StreamedDispatchInput {
+    agent_id: ra_core::item::AgentId,
+    tool_use: ra_core::state::ToolUseTracker,
+    tool_failure: ra_core::state::ToolFailureTracker,
+    run: Arc<RunContext>,
+    cancel: CancelScope,
+    services: ToolServices,
+    max_function_tool_concurrency: usize,
+    permission: PermissionEngine,
+}
+
+impl StreamedDispatchInput {
+    fn start(&self) -> StreamedFunctionDispatches {
+        StreamedFunctionDispatches::new(
+            self.agent_id.clone(),
+            self.tool_use.clone(),
+            self.tool_failure.clone(),
+            Arc::clone(&self.run),
+            self.cancel.clone(),
+            self.services.clone(),
+            self.max_function_tool_concurrency,
+            self.permission.clone(),
+        )
+    }
 }
 
 /// Facts selected after a failed attempt and recorded on the next physical request's span.
@@ -1301,20 +1382,21 @@ struct RetryEvaluation<'a> {
     retry_settings: Option<&'a ra_core::model::ModelRetrySettings>,
     attempt: u32,
     max_retries: u32,
-    streamed: bool,
+    consumed: CallConsumption,
 }
 
 /// Executes one prepared model call and records its provider-neutral terminal facts.
 ///
-/// Whether the call is streamed changes what a subscriber sees while it runs, and nothing else:
-/// both paths end at one [`ModelResponse`] and hand it to the same settlement. That is deliberate —
-/// a second settlement path for streamed turns is how the streamed and non-streamed views of the
-/// same run start to disagree about what happened.
+/// Every call streams, because a completed function call in the stream is what lets a tool overlap
+/// the rest of generation. What a subscriber sees is a separate switch; both settle one
+/// [`ModelResponse`] through the same settlement. That is deliberate — a second settlement path
+/// for streamed turns is how two views of the same run start to disagree about what happened.
 async fn call_model(
     turn_scope: &CancelScope,
     prepared: PreparedTurn,
     context: &TurnLoopContext<'_>,
-) -> Result<(TurnActionSurface, ModelResponse)> {
+    streaming_dispatch: StreamedDispatchInput,
+) -> Result<(TurnActionSurface, ModelResponse, StreamedFunctionDispatches)> {
     let model = Arc::clone(prepared.model());
     let selector = prepared.selector().clone();
     let (surface, model_request) = prepared.into_call();
@@ -1325,7 +1407,15 @@ async fn call_model(
     // dispatch path covers every protocol, including the ones whose adapters do not exist yet.
     model_request.validate_cache_plan()?;
 
-    let streamed = context.config.partial_messages && context.events.is_some();
+    // Tools start from completed stream items even when no host subscribes to raw narration, so
+    // every call streams. `partial_messages` decides one separate thing: whether that narration
+    // leaves the runtime. A run that forwards nothing has consumed nothing, which is what keeps
+    // its failures replayable.
+    let narration = context
+        .config
+        .partial_messages
+        .then_some(context.events)
+        .flatten();
     let retry_settings = model_request.model_settings().retry().cloned();
     let max_retries = retry_settings
         .as_ref()
@@ -1336,27 +1426,30 @@ async fn call_model(
     let mut retry_trace = None;
 
     loop {
+        let mut consumed = CallConsumption::default();
         let response = call_model_attempt(
             ModelCallAttempt {
                 turn_scope,
                 model: &model,
                 selector: &selector,
-                events: context.events,
-                streamed,
+                events: narration,
                 attempt,
                 max_retries,
                 retry_trace: retry_trace.take(),
+                streaming_dispatch: streaming_dispatch.clone(),
             },
             model_request.clone(),
+            &surface,
+            &mut consumed,
         )
         .await;
         match response {
-            Ok(mut response) => {
+            Ok((mut response, streamed_dispatches)) => {
                 if failed_attempts > 0 {
                     let usage = prepend_failed_attempts(response.usage(), failed_attempts);
                     response = response.with_usage(usage);
                 }
-                return Ok((surface, response));
+                return Ok((surface, response, streamed_dispatches));
             }
             Err(error) => {
                 let Some((decision, delay)) = evaluate_retry(RetryEvaluation {
@@ -1367,7 +1460,7 @@ async fn call_model(
                     retry_settings: retry_settings.as_ref(),
                     attempt,
                     max_retries,
-                    streamed,
+                    consumed,
                 })
                 .await?
                 else {
@@ -1398,7 +1491,9 @@ async fn call_model(
 async fn call_model_attempt(
     attempt: ModelCallAttempt<'_>,
     model_request: ModelRequest,
-) -> Result<ModelResponse> {
+    surface: &TurnActionSurface,
+    consumed: &mut CallConsumption,
+) -> Result<(ModelResponse, StreamedFunctionDispatches)> {
     let model_name = attempt.selector.model().unwrap_or("<provider_default>");
     let generation_span = info_span!(
         "generation",
@@ -1432,35 +1527,26 @@ async fn call_model_attempt(
         }
     }
     let started = Instant::now();
-    let response = async {
-        if attempt.streamed {
-            attempt
-                .turn_scope
-                .run(stream_model_call(
-                    attempt.model,
-                    model_request,
-                    attempt.events,
-                ))
-                .await
-        } else {
-            attempt
-                .turn_scope
-                .run(attempt.model.get_response(model_request))
-                .await
-        }
-    }
+    let response = stream_model_call(
+        attempt.model,
+        model_request,
+        attempt.events,
+        surface,
+        attempt.turn_scope,
+        attempt.streaming_dispatch.start(),
+        consumed,
+    )
     .instrument(generation_span.clone())
-    .await
-    .and_then(|response| response);
+    .await;
     generation_span.record(
         ra_core::trace::field::DURATION_MS,
         duration_ms(started.elapsed()),
     );
     match response {
-        Ok(response) => {
+        Ok((response, streamed_dispatches)) => {
             record_generation_usage(&generation_span, response.usage());
             ra_core::trace::record_outcome(&generation_span, ra_core::trace::SpanOutcome::Ok);
-            Ok(response)
+            Ok((response, streamed_dispatches))
         }
         Err(error) => {
             record_terminal_error(&generation_span, &error, attempt.turn_scope);
@@ -1473,6 +1559,10 @@ async fn call_model_attempt(
 async fn evaluate_retry(
     input: RetryEvaluation<'_>,
 ) -> Result<Option<(RetryDecision, std::time::Duration)>> {
+    // Every model call streams, so this is a constant rather than a mode. It stays in the two
+    // provider-facing values because they describe the transport a policy is reasoning about.
+    const STREAMED: bool = true;
+
     if input.attempt >= input.max_retries
         || input.error.is_cancelled()
         || !input.error.is_retryable()
@@ -1485,10 +1575,20 @@ async fn evaluate_retry(
     let Some(policy) = settings.policy() else {
         return Ok(None);
     };
+
+    // Asked before the adapter is, because this is not the adapter's question. The runtime is the
+    // only party that knows a raw frame reached a subscriber or that a tool already ran on the
+    // strength of this call, and no provider advice can make repeating either of those safe. An
+    // adapter reporting `Safe` for a mid-stream drop is answering truthfully about the *request*
+    // while knowing nothing about the file a tool has already written.
+    if input.consumed.any() {
+        return Ok(None);
+    }
+
     let advice = input.model.get_retry_advice(&ModelRetryAdviceRequest::new(
         input.error,
         input.attempt,
-        input.streamed,
+        STREAMED,
         input.request.continuation(),
     ));
 
@@ -1508,7 +1608,7 @@ async fn evaluate_retry(
             input.error,
             input.attempt,
             input.max_retries,
-            input.streamed,
+            STREAMED,
             advice.as_ref(),
         )))
         .await?;
@@ -1516,14 +1616,15 @@ async fn evaluate_retry(
         return Ok(None);
     }
 
+    // Nothing left this runtime — the check above established that — so the remaining question is
+    // whether the *provider* is holding state this request would be replayed against. A stateless
+    // continuation is holding none, which makes the replay free regardless of what the adapter was
+    // able to determine about the failure itself.
     let safety = advice
         .as_ref()
         .map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
-    let stateless_non_streaming =
-        !input.streamed && !input.request.continuation().is_server_managed();
-    if !matches!(safety, ReplaySafety::Safe)
-        && !stateless_non_streaming
-        && !decision.replay_approved()
+    let nothing_to_duplicate = !input.request.continuation().is_server_managed();
+    if !matches!(safety, ReplaySafety::Safe) && !nothing_to_duplicate && !decision.replay_approved()
     {
         return Ok(None);
     }
@@ -1573,24 +1674,78 @@ async fn stream_model_call(
     model: &Arc<dyn Model>,
     request: ModelRequest,
     events: Option<&mpsc::UnboundedSender<RunStreamEvent>>,
+    surface: &TurnActionSurface,
+    cancel: &CancelScope,
+    mut dispatches: StreamedFunctionDispatches,
+    consumed: &mut CallConsumption,
+) -> Result<(ModelResponse, StreamedFunctionDispatches)> {
+    // `CancelScope::run` cannot wrap this call: the dispatcher below owns spawned tasks that have
+    // to be drained rather than dropped when the scope fires. Its entry checkpoint is taken here
+    // instead, and it earns its place twice — an already-cancelled scope opens no provider
+    // request, and a deadline that expired without a timer to fire it becomes a real cancellation.
+    cancel.ensure_not_cancelled()?;
+
+    let settled = read_model_stream(
+        model,
+        request,
+        events,
+        surface,
+        cancel,
+        &mut dispatches,
+        consumed,
+    )
+    .await;
+    match settled {
+        Ok(response) => Ok((response, dispatches)),
+        Err(error) => {
+            dispatches.cancel_and_drain().await;
+            // Stamped from what this runtime did, not from what the provider thinks. `Unsafe`
+            // travels with the error so a host reads the same boundary the retry gate applied.
+            //
+            // The other branch deliberately does *not* stamp `Safe`. Nothing observable left the
+            // runtime, but whether the provider accepted and charged the request is its own
+            // question that only an adapter can answer — and answering it here with `Safe` is
+            // precisely the failure `ReplaySafety::Unknown` exists to keep available.
+            Err(if consumed.any() {
+                stamp_replay_safety(error, ReplaySafety::Unsafe)
+            } else {
+                error
+            })
+        }
+    }
+}
+
+/// Reads the stream to its terminal response, publishing and dispatching as events arrive.
+///
+/// Split from [`stream_model_call`] so that every failure exit reaches the one place that drains
+/// early tool work, rather than repeating the teardown at each `return`.
+async fn read_model_stream(
+    model: &Arc<dyn Model>,
+    request: ModelRequest,
+    events: Option<&mpsc::UnboundedSender<RunStreamEvent>>,
+    surface: &TurnActionSurface,
+    cancel: &CancelScope,
+    dispatches: &mut StreamedFunctionDispatches,
+    consumed: &mut CallConsumption,
 ) -> Result<ModelResponse> {
     let mut stream = model.stream_response(request);
     let mut settled: Option<ModelResponse> = None;
-    let mut published = false;
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = tokio::select! {
+            () = cancel.cancelled() => {
+                // The fallback mirrors `CancelScope::run`: a scope that signalled is cancelled
+                // whether or not a root cause was recorded, and continuing to read would be the
+                // one outcome that is certainly wrong.
+                return Err(cancel.reason().unwrap_or(CancelReason::Unspecified).into());
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else { break };
+
         // Resolved before the ordering check on purpose. A stream that fails after settling has
         // broken the contract *and* hit something; reporting only the broken contract would name
         // the consequence and lose the cause, which is the one thing this frame carried.
-        let event = match event {
-            Ok(event) => event,
-            Err(error) => {
-                return Err(if published {
-                    stamp_replay_safety(error, ReplaySafety::Unsafe)
-                } else {
-                    error
-                });
-            }
-        };
+        let event = event?;
         if settled.is_some() {
             return Err(Error::provider(
                 ProviderErrorKind::Behavior,
@@ -1601,27 +1756,58 @@ async fn stream_model_call(
             ModelStreamEvent::RawResponse(raw) => {
                 // Once this leaves the model boundary it is visible to the run subscriber. A
                 // replay would duplicate even a harmless-looking `response.created` frame, so
-                // every published raw event closes the retry window for this call.
-                published = events.is_some();
+                // every published raw event closes the retry window for this call. With narration
+                // switched off there is no subscriber, and nothing is published.
+                if events.is_some() {
+                    consumed.published = true;
+                }
                 emit(events, RunStreamEvent::RawResponse(raw));
             }
             ModelStreamEvent::Completed(response) => settled = Some(*response),
+            ModelStreamEvent::RunItem(item) => {
+                start_streamed_call(item.item(), surface, dispatches, consumed)?;
+            }
             // Every other model event is the adapter's own view of items this run publishes itself.
             _ => {}
         }
     }
     settled.ok_or_else(|| {
-        let error = Error::provider(
+        Error::provider(
             ProviderErrorKind::Behavior,
             "the model stream ended without a terminal response, so the turn has no usage, no \
              request identifier and no settled output order",
-        );
-        if published {
-            stamp_replay_safety(error, ReplaySafety::Unsafe)
-        } else {
-            error
-        }
+        )
     })
+}
+
+/// Starts a tool from one completed stream item, when the item is a function call this turn
+/// advertised and the call is one that may overlap the rest of generation.
+fn start_streamed_call(
+    item: &RunItem,
+    surface: &TurnActionSurface,
+    dispatches: &mut StreamedFunctionDispatches,
+    consumed: &mut CallConsumption,
+) -> Result<()> {
+    if !matches!(item.kind(), RunItemKind::ToolCall(_)) {
+        return Ok(());
+    }
+
+    // Classified by the function settlement uses, against the same surface, so an early start can
+    // never bind a name differently from the record that will answer it.
+    let processed = crate::turn::process::process_model_response(
+        &ModelResponse::new(vec![item.clone()]),
+        surface,
+    )?;
+
+    // A handoff, a name this turn did not advertise, or a hosted call: settlement answers all of
+    // them, and none of them is work that overlapping would speed up.
+    let Some(action) = processed.functions().first() else {
+        return Ok(());
+    };
+    if dispatches.start(action)? == StreamedStart::Started {
+        consumed.dispatched = true;
+    }
+    Ok(())
 }
 
 /// Records the normalized per-request usage preserved by the model response.

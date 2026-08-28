@@ -71,6 +71,14 @@ use crate::tool::dispatch::{
 /// budget can set a different value through [`RunConfig`](crate::runner::RunConfig).
 pub(crate) const DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY: usize = 8;
 
+/// Position a dispatch carries until the terminal response names one for it.
+///
+/// Only a call started from a stream item ever holds this: the response that decides model order
+/// has not arrived when it is spawned. `spawn_function_dispatches` replaces it while matching the
+/// terminal response, so a task still carrying it at collection is one the response never bound —
+/// which is the batch-invalidating condition, not an ordering to record.
+const UNBOUND_ORDER: usize = usize::MAX;
+
 /// What executing one turn's actions produced.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
@@ -200,6 +208,7 @@ pub struct TurnExecutionRequest<'a> {
     services: ToolServices,
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
+    streamed_dispatches: Option<StreamedFunctionDispatches>,
 }
 
 impl<'a> TurnExecutionRequest<'a> {
@@ -223,6 +232,7 @@ impl<'a> TurnExecutionRequest<'a> {
             services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             permission,
+            streamed_dispatches: None,
         }
     }
 
@@ -237,14 +247,33 @@ impl<'a> TurnExecutionRequest<'a> {
         self.max_function_tool_concurrency = max;
         self
     }
+
+    /// Supplies function calls that started when their completed stream items arrived.
+    ///
+    /// The terminal response remains authoritative: these tasks are matched against its bound
+    /// actions before their results are allowed to settle the turn.
+    pub(crate) fn with_streamed_dispatches(
+        mut self,
+        streamed_dispatches: StreamedFunctionDispatches,
+    ) -> Self {
+        self.streamed_dispatches = Some(streamed_dispatches);
+        self
+    }
 }
 
 /// Answers every action the response bound.
-pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnExecution> {
+pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<TurnExecution> {
+    // Take ownership before any validation can return. A streamed call has spawned supervised
+    // work already, and dropping its `JoinSet` on an early error would detach that work from the
+    // turn that owns it.
+    let mut streamed_dispatches = request.streamed_dispatches.take();
     let processed = request.processed;
     let mut execution = TurnExecution::default();
 
     if request.max_function_tool_concurrency == 0 {
+        if let Some(dispatches) = streamed_dispatches.take() {
+            dispatches.cancel_and_drain().await;
+        }
         return Err(Error::config(
             "`max_function_tool_concurrency` must be at least 1; zero would permanently queue \
              every tool call",
@@ -257,13 +286,23 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
     // `is_complete()` would say the agent reached its own conclusion, so R15 sees no closeout owed
     // and R17-3 takes the success edge. Whether a cancelled turn reports as cancelled must not
     // depend on whether the model happened to name a tool that resolved.
-    request.cancel.ensure_not_cancelled()?;
+    if let Err(error) = request.cancel.ensure_not_cancelled() {
+        if let Some(dispatches) = streamed_dispatches.take() {
+            dispatches.cancel_and_drain().await;
+        }
+        return Err(error);
+    }
 
     // Preparation can advertise and classify a handoff, but a transfer of control still needs the
     // graph runtime to resolve its target to a runnable agent and replace the active binding. Until
     // that execution contract exists, fail loudly rather than letting the turn continue as if the
     // model had asked for nothing.
-    execute_handoffs(processed)?;
+    if let Err(error) = execute_handoffs(processed) {
+        if let Some(dispatches) = streamed_dispatches.take() {
+            dispatches.cancel_and_drain().await;
+        }
+        return Err(error);
+    }
 
     // Decisions the model's own response raised (hosted approvals) are asked about first: they are
     // already stored records, and the host sees them in the order the model produced them.
@@ -271,7 +310,22 @@ pub async fn execute_actions(request: TurnExecutionRequest<'_>) -> Result<TurnEx
         .interruptions
         .extend(processed.interruptions().cloned());
 
-    let (mut dispatches, mut task_orders, tool_scopes) = spawn_function_dispatches(&request);
+    let (mut dispatches, mut task_orders, tool_scopes, preflight_failure) =
+        spawn_function_dispatches(&request, streamed_dispatches);
+
+    // A response that contradicts the stream it arrived on invalidates the whole batch, so this
+    // failure is returned directly rather than entered into the arbitration table. Ranking it
+    // there would let an ordinary tool error that completed in the same scheduling turn outrank
+    // it and report the consequence instead of the cause. Late failures the drain collects are
+    // still logged by `record_task_result`.
+    if let Some(error) = preflight_failure {
+        cancel_tool_scopes(&tool_scopes);
+        let mut collected = CollectedDispatches::default();
+        drain_dispatches(&mut dispatches, &mut task_orders, &mut collected).await;
+        // Parent cancellation still outranks it, for the reason given at the checkpoint below.
+        request.cancel.ensure_not_cancelled()?;
+        return Err(error);
+    }
 
     let collected = collect_dispatches(
         &mut dispatches,
@@ -338,6 +392,156 @@ impl ResourceAdmissionGate {
             .entry(resource.clone())
             .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
+    }
+}
+
+/// Function-tool work that started from a completed item in a model stream.
+///
+/// A provider's item event is early enough to overlap tool execution with the rest of response
+/// generation, but it is not the response record the session stores. Callers must therefore pass
+/// this value back to [`execute_actions`], which verifies every started call against the terminal
+/// response before it can contribute an observation.
+pub(crate) struct StreamedFunctionDispatches {
+    dispatches: JoinSet<DispatchTaskResult>,
+    task_orders: HashMap<Id, usize>,
+    tool_scopes: Vec<CancelScope>,
+    started: HashMap<CallId, StreamedFunctionCall>,
+    gate: ResourceAdmissionGate,
+    slots: Arc<Semaphore>,
+    agent_id: AgentId,
+    tool_use: ToolUseTracker,
+    tool_failure: ToolFailureTracker,
+    run: Arc<RunContext>,
+    cancel: CancelScope,
+    services: ToolServices,
+    permission: PermissionEngine,
+}
+
+struct StreamedFunctionCall {
+    tool: ToolOrigin,
+    arguments: Value,
+    task_id: Id,
+}
+
+/// What one completed stream item became.
+///
+/// `Deferred` is not a failure and not a no-op: the call is left for settlement to spawn on the
+/// ordinary path, which is where the caller must stop treating the stream as replay-unsafe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamedStart {
+    /// The tool is running; the model call can no longer be replayed.
+    Started,
+    /// Nothing was started, and the terminal response will answer this call.
+    Deferred,
+}
+
+impl StreamedFunctionDispatches {
+    /// Creates the per-turn dispatcher used only while a model stream is being read.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        agent_id: AgentId,
+        tool_use: ToolUseTracker,
+        tool_failure: ToolFailureTracker,
+        run: Arc<RunContext>,
+        cancel: CancelScope,
+        services: ToolServices,
+        max_function_tool_concurrency: usize,
+        permission: PermissionEngine,
+    ) -> Self {
+        Self {
+            dispatches: JoinSet::new(),
+            task_orders: HashMap::new(),
+            tool_scopes: Vec::new(),
+            started: HashMap::new(),
+            gate: ResourceAdmissionGate::new(),
+            slots: Arc::new(Semaphore::new(max_function_tool_concurrency)),
+            agent_id,
+            tool_use,
+            tool_failure,
+            run,
+            cancel,
+            services,
+            permission,
+        }
+    }
+
+    /// Starts one tool call as soon as the adapter has completed that output item.
+    ///
+    /// # A repeat limit is not overlappable, so it defers instead
+    ///
+    /// [`admit_repeat`](crate::circuit) is specified against a streak that already counts the call
+    /// being admitted *and every identical call beside it in the same response* — settlement files
+    /// the whole turn before executing any of it, which is what lets the breaker refuse all `N`
+    /// identical calls at once rather than by scheduling order. Here the response does not exist
+    /// yet: neither this call nor its siblings are in the tracker, and no reconstruction from the
+    /// items seen so far can know how many more are coming.
+    ///
+    /// So a tool that configures [`ToolOptions::max_repeat_streak`](ra_core::tool::ToolOptions)
+    /// gives up the overlap rather than the guarantee, and is answered by settlement on the
+    /// ordinary path. The threshold is opt-in per tool, so this costs latency exactly where a
+    /// caller asked for the breaker.
+    ///
+    /// The no-progress streak needs no such treatment: outcomes are filed at the end of the
+    /// *previous* turn, so both paths read the same number.
+    pub(crate) fn start(&mut self, action: &ToolRunFunction) -> Result<StreamedStart> {
+        let call_id = action.call_id().clone();
+        if self.started.contains_key(&call_id) {
+            return Err(Error::provider(
+                ra_core::error::ProviderErrorKind::Behavior,
+                format!("the model stream emitted function call `{call_id}` more than once"),
+            ));
+        }
+        if action.tool().options().max_repeat_streak().is_some() {
+            return Ok(StreamedStart::Deferred);
+        }
+        let identity = action.identity();
+        let history = CallHistory::new(
+            self.tool_use.repeat_streak(&self.agent_id, &identity),
+            self.tool_failure
+                .no_progress_streak(&self.agent_id, &identity),
+        );
+        let tool_scope = self.cancel.child(ScopeKind::Tool);
+        let dispatch_request = ToolDispatchRequest::new(
+            Arc::clone(action.tool()),
+            call_id.clone(),
+            action.call().arguments().clone(),
+            Arc::clone(&self.run),
+            tool_scope.clone(),
+            history,
+            self.permission.clone(),
+        )
+        .with_services(self.services.clone());
+        let tool = action.tool().origin().clone();
+        let function_span = function_span(&tool, &call_id);
+        let task_id = spawn_dispatch_task(
+            &mut self.dispatches,
+            UNBOUND_ORDER,
+            call_id.clone(),
+            tool.clone(),
+            tool_scope.clone(),
+            self.gate.clone(),
+            Arc::clone(&self.slots),
+            dispatch_request,
+            function_span,
+        );
+        self.task_orders.insert(task_id, UNBOUND_ORDER);
+        self.tool_scopes.push(tool_scope);
+        self.started.insert(
+            call_id,
+            StreamedFunctionCall {
+                tool,
+                arguments: action.call().arguments().clone(),
+                task_id,
+            },
+        );
+        Ok(StreamedStart::Started)
+    }
+
+    /// Cancels and reaps early work when the stream cannot yield a terminal response.
+    pub(crate) async fn cancel_and_drain(mut self) {
+        cancel_tool_scopes(&self.tool_scopes);
+        let mut collected = CollectedDispatches::default();
+        drain_dispatches(&mut self.dispatches, &mut self.task_orders, &mut collected).await;
     }
 }
 
@@ -410,17 +614,51 @@ impl ResourceAdmissionGate {
 /// Spawns the response's function calls and returns their supervisor state.
 fn spawn_function_dispatches(
     request: &TurnExecutionRequest<'_>,
+    mut streamed: Option<StreamedFunctionDispatches>,
 ) -> (
     JoinSet<DispatchTaskResult>,
     HashMap<Id, usize>,
     Vec<CancelScope>,
+    Option<Error>,
 ) {
-    let gate = ResourceAdmissionGate::new();
-    let slots = Arc::new(Semaphore::new(request.max_function_tool_concurrency));
-    let mut dispatches = JoinSet::new();
-    let mut task_orders = HashMap::new();
-    let mut tool_scopes = Vec::new();
+    let gate = streamed
+        .as_ref()
+        .map_or_else(ResourceAdmissionGate::new, |streamed| streamed.gate.clone());
+    let slots = streamed.as_ref().map_or_else(
+        || Arc::new(Semaphore::new(request.max_function_tool_concurrency)),
+        |streamed| Arc::clone(&streamed.slots),
+    );
+    let mut dispatches = streamed.as_mut().map_or_else(JoinSet::new, |streamed| {
+        std::mem::take(&mut streamed.dispatches)
+    });
+    let mut task_orders = streamed.as_mut().map_or_else(HashMap::new, |streamed| {
+        std::mem::take(&mut streamed.task_orders)
+    });
+    let mut tool_scopes = streamed.as_mut().map_or_else(Vec::new, |streamed| {
+        std::mem::take(&mut streamed.tool_scopes)
+    });
+    let mut preflight_failure = None;
     for (order, action) in request.processed.functions().iter().enumerate() {
+        if let Some(streamed) = streamed.as_mut()
+            && let Some(started) = streamed.started.remove(action.call_id())
+        {
+            if started.tool != *action.tool().origin()
+                || started.arguments != *action.call().arguments()
+            {
+                preflight_failure = Some(Error::provider(
+                    ra_core::error::ProviderErrorKind::Behavior,
+                    format!(
+                        "the terminal response changed streamed function call `{}` before it \
+                         settled",
+                        action.call_id()
+                    ),
+                ));
+                break;
+            }
+            let previous = task_orders.insert(started.task_id, order);
+            debug_assert_eq!(previous, Some(UNBOUND_ORDER));
+            continue;
+        }
         // Asked of the action, never rebuilt from its parts: settlement recorded this turn under
         // `identity()` a moment ago, and a second derivation that drifted would look up something
         // nothing ever recorded and hand the breaker a permanent zero.
@@ -469,7 +707,17 @@ fn spawn_function_dispatches(
         );
         task_orders.insert(task_id, order);
     }
-    (dispatches, task_orders, tool_scopes)
+    if preflight_failure.is_none()
+        && let Some(streamed) = streamed
+        && !streamed.started.is_empty()
+    {
+        preflight_failure = Some(Error::provider(
+            ra_core::error::ProviderErrorKind::Behavior,
+            "the terminal response omitted a function call that had already completed in the \
+             model stream",
+        ));
+    }
+    (dispatches, task_orders, tool_scopes, preflight_failure)
 }
 
 /// Creates one function span under whatever span the caller is running in.
@@ -689,9 +937,18 @@ fn record_task_result(
     source: &'static str,
 ) {
     match joined {
-        Ok((id, task)) => {
+        Ok((id, mut task)) => {
             let recorded_order = task_orders.remove(&id);
-            debug_assert_eq!(recorded_order, Some(task.order));
+            if task.order == UNBOUND_ORDER {
+                // Spawned from a stream item, so the position it will answer under was decided
+                // after the task existed. `None` leaves it unbound, which only a batch that is
+                // already failing its preflight check can produce.
+                if let Some(order) = recorded_order {
+                    task.order = order;
+                }
+            } else {
+                debug_assert_eq!(recorded_order, Some(task.order));
+            }
             match task.result {
                 Ok(dispatch) => collected.completed.push(CompletedDispatch {
                     order: task.order,

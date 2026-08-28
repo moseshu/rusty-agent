@@ -34,7 +34,10 @@ pub mod process;
 pub mod resolve;
 
 use crate::permission::PermissionEngine;
-use batch::{DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, TurnExecutionRequest, execute_actions};
+use batch::{
+    DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, StreamedFunctionDispatches, TurnExecutionRequest,
+    execute_actions,
+};
 use prepare::TurnActionSurface;
 use process::process_model_response;
 use resolve::{rebind_interruption, resolve_next_step, step_items};
@@ -60,6 +63,7 @@ pub struct TurnSettlementRequest<'a> {
     services: ToolServices,
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
+    streamed_dispatches: Option<StreamedFunctionDispatches>,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
 }
@@ -101,6 +105,7 @@ impl<'a> TurnSettlementRequest<'a> {
             services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             permission,
+            streamed_dispatches: None,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
         }
@@ -118,6 +123,15 @@ impl<'a> TurnSettlementRequest<'a> {
         self
     }
 
+    /// Supplies function calls that began from completed model-stream items.
+    pub(crate) fn with_streamed_dispatches(
+        mut self,
+        streamed_dispatches: StreamedFunctionDispatches,
+    ) -> Self {
+        self.streamed_dispatches = Some(streamed_dispatches);
+        self
+    }
+
     /// Sets the input the run started from.
     pub fn with_original_input(mut self, input: Vec<ModelInputItem>) -> Self {
         self.original_input = input;
@@ -132,10 +146,21 @@ impl<'a> TurnSettlementRequest<'a> {
 }
 
 /// Settles one turn in the only permitted stage order.
-pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleStepResult> {
+pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<SingleStepResult> {
     // 1. Classify. Nothing runs until every call the model made is bound to the thing that will
     // answer it, so no later stage has to re-read a provider payload to find out what it is.
-    let processed = process_model_response(request.response, request.surface)?;
+    let processed = match process_model_response(request.response, request.surface) {
+        Ok(processed) => processed,
+        Err(error) => {
+            // A completed stream item can already have spawned tool work. Classification normally
+            // precedes execution, but this path owns an exception to that ordering, so it must
+            // give the same cancellation and drain guarantee as every later failure path.
+            if let Some(dispatches) = request.streamed_dispatches.take() {
+                dispatches.cancel_and_drain().await;
+            }
+            return Err(error);
+        }
+    };
 
     // 1b. Record what the model asked for, before anything acts on it. This is not a fifth stage:
     // it produces no decision and nothing branches on it here. Its position is the point — R3-6's
@@ -164,6 +189,12 @@ pub async fn settle_turn(request: TurnSettlementRequest<'_>) -> Result<SingleSte
     )
     .with_services(request.services.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
+    let execution_request = match request.streamed_dispatches {
+        Some(streamed_dispatches) => {
+            execution_request.with_streamed_dispatches(streamed_dispatches)
+        }
+        None => execution_request,
+    };
     let execution = execute_actions(execution_request).await?;
 
     // 2b. Record how it turned out, the mirror of 1b and for the mirror-image reason. Attempts have
