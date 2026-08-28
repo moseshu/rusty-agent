@@ -17,7 +17,8 @@ use ra_core::{
         RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, ToolUse, ToolUseAttempt, WorkStateRef,
         WorkspaceLeaseRef,
     },
-    tool::ToolLookupKey,
+    permission::PermissionDecision,
+    tool::{ToolLookupKey, ToolNamespace, ToolOrigin},
     usage::{RequestUsage, Usage},
 };
 use serde_json::json;
@@ -201,11 +202,10 @@ fn test_run_state_extension_slots_roundtrip() {
 fn approval_item(id: &str, call: &str) -> RunItem {
     RunItem::new(
         ItemId::new(id),
-        RunItemKind::ToolApproval(ToolApproval::new(
-            CallId::new(call),
-            "exec_command",
-            json!({"cmd": "git status"}),
-        )),
+        RunItemKind::ToolApproval(
+            ToolApproval::new(CallId::new(call), "exec_command", json!({"cmd": "git status"}))
+                .with_tool_origin(&ToolOrigin::new("exec_command").unwrap()),
+        ),
     )
 }
 
@@ -296,6 +296,172 @@ fn test_run_state_stores_pending_interruptions_by_id_only() {
 
     let stored = serde_json::to_value(&state).expect("state must serialize");
     assert_eq!(stored["pending_interruptions"], json!(["approval-1"]));
+}
+
+#[test]
+fn test_run_state_retains_approval_answers_and_exact_always_rules() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = RunState::start(RunId::new("run-approval-answer"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items([approval.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("approval must be pending");
+    state
+        .approve(&approval, true)
+        .expect("answer must be retained");
+
+    assert_eq!(state.pending_interruption_resolutions().len(), 1);
+    assert_eq!(state.permission_rules().len(), 1);
+    let rule = &state.permission_rules()[0];
+    assert_eq!(rule.decision(), PermissionDecision::Allow);
+    assert_eq!(rule.tool_name(), Some("exec_command"));
+    // Pinned to the executable the host was shown. A name-only rule would extend one click to
+    // every namespace that happens to advertise `exec_command`.
+    assert_eq!(
+        rule.lookup_key(),
+        Some(ToolOrigin::new("exec_command").unwrap().lookup_key())
+    );
+    let elsewhere = ToolOrigin::namespaced(ToolNamespace::new("mcp_shell").unwrap(), "exec_command")
+        .expect("a same-named tool in another namespace must be constructible");
+    assert!(
+        !rule.matches_origin(&elsewhere),
+        "an approval answer must not cover a tool the host never saw"
+    );
+
+    let restored: RunState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(
+        restored.pending_interruption_resolutions(),
+        state.pending_interruption_resolutions()
+    );
+    assert_eq!(restored.permission_rules(), state.permission_rules());
+}
+
+/// A host that corrects itself before resuming must not leave the withdrawn grant behind.
+#[test]
+fn test_run_state_re_answer_retracts_the_superseded_always_rule() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = RunState::start(RunId::new("run-approval-re-answer"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items([approval.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("approval must be pending");
+
+    state
+        .approve(&approval, true)
+        .expect("the first answer must be retained");
+    assert_eq!(state.permission_rules().len(), 1);
+
+    // "Always allow", then corrected to a plain rejection: the resolution flips and the rule the
+    // first answer minted has to go with it, or every later call stays auto-approved.
+    state
+        .reject(&approval, false)
+        .expect("the corrected answer must replace the first one");
+    assert_eq!(state.pending_interruption_resolutions().len(), 1);
+    assert!(
+        state.permission_rules().is_empty(),
+        "a withdrawn `always` grant must not survive its own answer"
+    );
+
+    // Re-answering the other way round replaces rather than accumulates.
+    state
+        .reject(&approval, true)
+        .expect("an always-deny answer must be retained");
+    state
+        .approve(&approval, true)
+        .expect("an always-allow answer must replace it");
+    assert_eq!(state.permission_rules().len(), 1);
+    assert_eq!(
+        state.permission_rules()[0].decision(),
+        PermissionDecision::Allow
+    );
+}
+
+/// The refusal side of the same contract: an answer is retained, and `always` denies exactly.
+#[test]
+fn test_run_state_retains_rejection_answers_and_exact_always_deny_rules() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = RunState::start(RunId::new("run-approval-reject"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items([approval.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&approval))
+        .expect("approval must be pending");
+    state
+        .reject(&approval, true)
+        .expect("rejection must be retained");
+
+    assert_eq!(state.pending_interruption_resolutions().len(), 1);
+    assert_eq!(state.permission_rules().len(), 1);
+    let rule = &state.permission_rules()[0];
+    assert_eq!(rule.decision(), PermissionDecision::Deny);
+    assert_eq!(
+        rule.lookup_key(),
+        Some(ToolOrigin::new("exec_command").unwrap().lookup_key())
+    );
+
+    // A rejected interruption still blocks the resume until the runtime has recorded its refusal.
+    assert!(
+        state
+            .clone()
+            .begin_segment(AgentId::new("coder"), Vec::new())
+            .is_ok(),
+        "an answered interruption must no longer block a resumed segment"
+    );
+
+    let restored: RunState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(
+        restored.pending_interruption_resolutions(),
+        state.pending_interruption_resolutions()
+    );
+    assert_eq!(restored.permission_rules(), state.permission_rules());
+}
+
+/// An approval that predates stored routing identities cannot be executed on resume, so the
+/// failure belongs at the click rather than at the point of no return.
+#[test]
+fn test_run_state_refuses_to_approve_an_approval_without_a_routing_identity() {
+    let legacy = RunItem::new(
+        ItemId::new("approval-legacy"),
+        RunItemKind::ToolApproval(ToolApproval::new(
+            CallId::new("call-1"),
+            "exec_command",
+            json!({"cmd": "git status"}),
+        )),
+    );
+    let mut state = RunState::start(RunId::new("run-approval-legacy"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items([legacy.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&legacy))
+        .expect("approval must be pending");
+
+    let error = state
+        .approve(&legacy, false)
+        .expect_err("an unroutable approval must be refused before it is retained");
+    assert!(error.to_string().contains("routing identity"), "{error}");
+    assert!(state.pending_interruption_resolutions().is_empty());
+
+    // Rejecting one is still safe: it needs no tool to execute, and its `always` rule falls back
+    // to the name form, which denies more rather than less.
+    state
+        .reject(&legacy, true)
+        .expect("an unroutable approval may still be refused");
+    assert_eq!(state.permission_rules().len(), 1);
+    assert_eq!(state.permission_rules()[0].lookup_key(), None);
+    assert_eq!(
+        state.permission_rules()[0].decision(),
+        PermissionDecision::Deny
+    );
 }
 
 #[test]

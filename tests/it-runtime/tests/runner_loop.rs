@@ -30,7 +30,8 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelStreamEvent, ProviderKey, RawResponseEvent, ResolvedModel, ToolChoice,
     },
-    state::{PendingControlRequest, RunId, RunState, ToolUse, WorkStateHandle},
+    permission::{PermissionDecision, PermissionRule},
+    state::{PendingControlRequest, RunId, RunState, ToolOutcome, ToolUse, WorkStateHandle},
     tool::{
         Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
         ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
@@ -2073,6 +2074,320 @@ async fn stopping_for_pending_approval_is_an_outcome_not_an_error() {
     .expect_err("an unanswered checkpoint must not issue another model call");
     assert!(error.to_string().contains("unanswered interruptions"));
     assert_eq!(resume_model.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn approved_checkpointed_tool_call_runs_once_then_continues() {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, &cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state
+        .approve(&items[0], true)
+        .expect("host approval must be retained");
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "done")])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("approved checkpoint must resume");
+
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(resumed.state().pending_interruptions().is_empty());
+    assert!(
+        resumed
+            .state()
+            .pending_interruption_resolutions()
+            .is_empty()
+    );
+    assert_eq!(resumed.state().permission_rules().len(), 1);
+    let output_item = resumed
+        .new_items()
+        .iter()
+        .find(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(_)))
+        .expect("the approved call must be answered in history");
+    // Attributed like every other stored record. A session read back later has to be able to say
+    // who produced this one, and it does not travel through settlement's `attribute` step.
+    assert!(
+        output_item.provenance().is_some(),
+        "a settled approval output must name its producing agent"
+    );
+
+    // The outcome reaches the failure tracker, so the loop breakers see the resumed call at all.
+    // An entry exists for an identity only once an outcome has been filed under it.
+    let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
+    assert!(
+        resumed
+            .state()
+            .tool_failure()
+            .agent(&AgentId::new("coder"))
+            .and_then(|failures| failures.entry(&identity))
+            .is_some(),
+        "a resumed call's outcome must be filed under its identity"
+    );
+
+    // The settled output has to reach the model, or the resumed turn asks about a call whose
+    // result the transcript never carried.
+    let inputs = second_model.input_items.lock().unwrap();
+    assert!(
+        inputs[0]
+            .iter()
+            .any(|item| matches!(item, ModelInputItem::ToolCallOutput(_))),
+        "the resumed call's output must be part of the next request"
+    );
+}
+
+/// The mirror of the approval path: the tool must not run, and the model must be told why.
+#[tokio::test]
+async fn rejected_checkpointed_tool_call_is_refused_without_running_the_tool() {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, &cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state
+        .reject(&items[0], true)
+        .expect("host rejection must be retained");
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "ok")])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(
+        tool.calls.load(Ordering::SeqCst),
+        0,
+        "a rejected call must never reach the tool"
+    );
+    assert!(resumed.state().pending_interruptions().is_empty());
+    assert!(
+        resumed
+            .state()
+            .pending_interruption_resolutions()
+            .is_empty()
+    );
+
+    // The refusal is a model-visible error result, not a silent gap in the transcript: without the
+    // error flag the model reads its own rejected call as having succeeded.
+    let refusal_item = resumed
+        .new_items()
+        .iter()
+        .find(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(_)))
+        .expect("a rejection must still answer the call");
+    assert!(
+        refusal_item.provenance().is_some(),
+        "a refusal record must name its producing agent like every other stored record"
+    );
+    let RunItemKind::ToolCallOutput(refusal) = refusal_item.kind() else {
+        unreachable!()
+    };
+    assert!(refusal.is_error());
+    assert_eq!(refusal.call_id().as_str(), "call-1");
+
+    // A rejection is filed as a refusal, exactly like a call the permission stage declines: both
+    // answered without running the tool. Recording nothing would leave an earlier failure streak
+    // standing behind a call that never ran.
+    let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
+    assert!(
+        resumed
+            .state()
+            .tool_failure()
+            .agent(&AgentId::new("coder"))
+            .and_then(|failures| failures.entry(&identity))
+            .is_some(),
+        "a host rejection must be filed under the identity it answered"
+    );
+
+    // `always` leaves a deny rule behind, so a later call of the same tool is refused without
+    // asking the host a second time.
+    assert_eq!(resumed.state().permission_rules().len(), 1);
+    assert_eq!(
+        resumed.state().permission_rules()[0].decision(),
+        PermissionDecision::Deny
+    );
+}
+
+/// A refusal must clear the streak rather than let it stand behind a call that never ran.
+#[tokio::test]
+async fn a_rejected_call_clears_the_streak_it_never_contributed_to() {
+    let identity = ToolUse::Tool(ToolLookupKey::bare("write_file").unwrap());
+    let agent_id = AgentId::new("coder");
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, &cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+
+    // Two earlier failures of the same identity, as an earlier turn would have left them.
+    let mut state = interrupted.state().clone();
+    {
+        let (_, failure) = state.trackers_mut();
+        for call in ["call-old-1", "call-old-2"] {
+            failure.record_turn(
+                &agent_id,
+                [ToolOutcome::failed(
+                    identity.clone(),
+                    CallId::new(call),
+                    &json!({ "path": "a.txt" }),
+                    &json!({"error": "boom"}),
+                    "tool.failed",
+                )],
+            );
+        }
+    }
+    assert_eq!(
+        state.tool_failure().no_progress_streak(&agent_id, &identity),
+        2
+    );
+
+    state
+        .reject(&items[0], false)
+        .expect("host rejection must be retained");
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "ok")])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        resumed
+            .state()
+            .tool_failure()
+            .no_progress_streak(&agent_id, &identity),
+        0,
+        "a call the host refused is not evidence that the tool is still failing"
+    );
+}
+
+/// A host answer settles the question an `Ask` rule poses; it does not overrule a `Deny`.
+#[tokio::test]
+async fn a_checkpointed_answer_satisfies_an_ask_rule_but_not_a_deny_rule() {
+    async fn resume_under(
+        rule: PermissionRule,
+        tool: &Arc<ScriptedTool>,
+        cancel: &CancelScope,
+    ) -> Result<RunResult> {
+        let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+            "c-1",
+            "call-1",
+            "write_file",
+        )])]);
+        let interrupted = Runner::run(request(vec![tool.clone()], &first_model, cancel))
+            .await
+            .expect("first segment must ask for approval");
+        let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+            panic!("expected an approval interruption");
+        };
+        let mut state = interrupted.state().clone();
+        state
+            .approve(&items[0], false)
+            .expect("host approval must be retained");
+        let second_model =
+            ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "done")])]);
+        Runner::run(
+            resume_request(vec![tool.clone()], &second_model, cancel, state)
+                .with_config(RunConfig::new().with_permission_rules([rule])),
+        )
+        .await
+    }
+
+    let cancel = CancelScope::root();
+
+    // An `Ask` rule is a question, and the host has now answered it. Treating the rule as
+    // unsatisfied would ask again on a resume that exists precisely because it was answered,
+    // leaving the run permanently unresumable.
+    let asked = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let resumed = resume_under(
+        PermissionRule::new(PermissionDecision::Ask).with_tool_name("write_file"),
+        &asked,
+        &cancel,
+    )
+    .await
+    .expect("an answered ask rule must not block the resume");
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(asked.calls.load(Ordering::SeqCst), 1);
+
+    // A `Deny` rule is policy that was never up for a click. Resolving the interruption is not a
+    // licence to overrule it, so the call is refused rather than executed.
+    let denied = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let resumed = resume_under(
+        PermissionRule::new(PermissionDecision::Deny).with_tool_name("write_file"),
+        &denied,
+        &cancel,
+    )
+    .await
+    .expect("a denied checkpoint still resumes, refusing the call");
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(
+        denied.calls.load(Ordering::SeqCst),
+        0,
+        "a deny rule must survive a host approval"
+    );
+    let refusal = resumed
+        .new_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) => Some(output),
+            _ => None,
+        })
+        .expect("a refused call must still be answered");
+    assert!(refusal.is_error());
 }
 
 #[tokio::test]

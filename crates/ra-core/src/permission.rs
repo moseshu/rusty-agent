@@ -36,6 +36,7 @@ use crate::{
     context::RunContext,
     error::Result,
     item::{AgentId, CallId, ToolApproval},
+    tool::{ToolLookupKey, ToolNamespace, ToolOrigin},
 };
 
 /// The host-selected policy for permission evaluation.
@@ -175,6 +176,14 @@ pub enum PermissionScope {
 /// When several rules match, the runtime uses the last one. This makes an appended rule an
 /// intentional override of a broad earlier rule, while retaining deterministic, serializable
 /// policy order.
+///
+/// # Written policy and answered questions are matched differently
+///
+/// The wildcard reading above is right for policy a person writes down: `write_file` in a config
+/// file means the capability, wherever it is served from. It is wrong for a rule minted from one
+/// approval click, where the host saw a specific action and said "always" about *that* one —
+/// [`Self::with_lookup_key`] pins such a rule to the exact executable, so a same-named tool in a
+/// namespace the host never saw is not covered by an answer it never gave.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +193,8 @@ pub struct PermissionRule {
     tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lookup_key: Option<ToolLookupKey>,
 }
 
 impl PermissionRule {
@@ -194,6 +205,7 @@ impl PermissionRule {
             decision,
             tool_name: None,
             namespace: None,
+            lookup_key: None,
         }
     }
 
@@ -211,6 +223,17 @@ impl PermissionRule {
     #[must_use]
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Pins this rule to one exact executable.
+    ///
+    /// A pinned rule stops being a statement about a name and becomes a statement about a
+    /// specific tool: it matches that lookup key and nothing else, whatever
+    /// [`Self::with_tool_name`] and [`Self::with_namespace`] also say.
+    #[must_use]
+    pub fn with_lookup_key(mut self, lookup_key: ToolLookupKey) -> Self {
+        self.lookup_key = Some(lookup_key);
         self
     }
 
@@ -232,12 +255,39 @@ impl PermissionRule {
         self.namespace.as_deref()
     }
 
+    /// Exact executable the rule is pinned to, if any.
+    #[must_use]
+    pub const fn lookup_key(&self) -> Option<&ToolLookupKey> {
+        self.lookup_key.as_ref()
+    }
+
+    /// Whether this rule matches the tool being dispatched.
+    ///
+    /// The origin is asked as a whole rather than taken apart by the caller, because a pinned rule
+    /// and an unpinned one read different parts of it. [`Tool::validate`](crate::tool::Tool::validate)
+    /// holds the origin name and the schema name equal, so the name matched here is the one the
+    /// model called.
+    #[must_use]
+    pub fn matches_origin(&self, origin: &ToolOrigin) -> bool {
+        match &self.lookup_key {
+            Some(pinned) => pinned == origin.lookup_key(),
+            None => self.matches(origin.name(), origin.namespace().map(ToolNamespace::as_str)),
+        }
+    }
+
     /// Whether this rule matches a model-facing tool identity.
+    ///
+    /// A rule pinned by [`Self::with_lookup_key`] never matches here: a bare name and namespace
+    /// cannot show that the caller holds the exact tool the rule was written about, and answering
+    /// "yes" on that evidence is how a pinned rule would silently widen back into a name rule.
+    /// Dispatch uses [`Self::matches_origin`].
     #[must_use]
     pub fn matches(&self, tool_name: &str, namespace: Option<&str>) -> bool {
-        self.tool_name
-            .as_deref()
-            .is_none_or(|name| name == tool_name)
+        self.lookup_key.is_none()
+            && self
+                .tool_name
+                .as_deref()
+                .is_none_or(|name| name == tool_name)
             && self
                 .namespace
                 .as_deref()

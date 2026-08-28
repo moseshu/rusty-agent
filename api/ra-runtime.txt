@@ -50,6 +50,7 @@ const fn ra_runtime::runner::result::TurnRecord::turn(& self) -> u32
 const fn ra_runtime::tool::dispatch::CallHistory::new(repeat_streak : u32, no_progress_streak : u32) -> Self
 const fn ra_runtime::tool::dispatch::CallHistory::no_progress_streak(& self) -> u32
 const fn ra_runtime::tool::dispatch::CallHistory::repeat_streak(& self) -> u32
+const fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_approval_granted(mut self) -> Self
 const fn ra_runtime::tool::dispatch::ToolDispatchRequest::with_caller(mut self, caller : ToolCaller) -> Self
 const fn ra_runtime::tool::dispatch::ToolObservation::failed(output : ToolCallOutput, code : & 'static str) -> Self
 const fn ra_runtime::tool::dispatch::ToolObservation::failure_code(& self) -> Option < & 'static str >
@@ -103,8 +104,8 @@ fn ra_runtime::agent::AgentRegistry::len(& self) -> usize
 fn ra_runtime::agent::AgentRegistryBuilder::build(self) -> Result < AgentRegistry >
 fn ra_runtime::agent::AgentRegistryBuilder::register(mut self, definition : Arc < AgentDefinition >) -> Self
 fn ra_runtime::agent::AgentRegistryBuilder::register_all(mut self, definitions : impl IntoIterator < Item = Arc < AgentDefinition > >) -> Self
-fn ra_runtime::permission::PermissionEngine::evaluate(& self, scope : PermissionScope, tool_name : & str, namespace : Option < & str >, fallback : PermissionDecision) -> PermissionDecision
-fn ra_runtime::permission::PermissionEngine::fixed_decision(& self, scope : PermissionScope, tool_name : & str, namespace : Option < & str >) -> Option < PermissionDecision >
+fn ra_runtime::permission::PermissionEngine::evaluate(& self, scope : PermissionScope, origin : & ToolOrigin, fallback : PermissionDecision) -> PermissionDecision
+fn ra_runtime::permission::PermissionEngine::fixed_decision(& self, scope : PermissionScope, origin : & ToolOrigin) -> Option < PermissionDecision >
 fn ra_runtime::permission::PermissionEngine::new(mode : PermissionMode) -> Self
 fn ra_runtime::permission::PermissionEngine::rules(& self) -> & [PermissionRule]
 fn ra_runtime::permission::PermissionEngine::with_mode(mut self, mode : PermissionMode) -> Self

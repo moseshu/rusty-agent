@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::CallId;
-use crate::compat::{SchemaVersion, Unknown};
+use crate::{
+    compat::{SchemaVersion, Unknown},
+    tool::{ToolLookupKey, ToolOrigin},
+};
 
 /// Current tool-item schema version.
 pub const TOOL_ITEM_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
@@ -140,6 +143,10 @@ pub struct ToolApproval {
     arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
+    // Boxed because only this one variant of `RunItemKind` carries it. Inline, an approval-only
+    // routing key widens every message and reasoning record the session stores by the same amount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lookup_key: Option<Box<ToolLookupKey>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -154,6 +161,7 @@ impl ToolApproval {
             tool_name: tool_name.into(),
             arguments,
             namespace: None,
+            lookup_key: None,
             unknown: Unknown::new(),
         }
     }
@@ -162,6 +170,21 @@ impl ToolApproval {
     #[must_use]
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Records the exact executable identity selected for this approval.
+    ///
+    /// The model-facing name is not a routing key: two namespaces may advertise the same name,
+    /// and a resumed run must not select whichever implementation happens to be present later.
+    ///
+    /// Only the lookup key is stored. The qualified name is a pure function of it — see
+    /// [`ToolOrigin::from_lookup_key`], which derives it, and [`ToolOrigin::validate`], which
+    /// enforces the derivation — so a second copy on this record could only ever be redundant or
+    /// wrong, and checking one against the other proves nothing a reader would not already know.
+    #[must_use]
+    pub fn with_tool_origin(mut self, origin: &ToolOrigin) -> Self {
+        self.lookup_key = Some(Box::new(origin.lookup_key().clone()));
         self
     }
 
@@ -193,6 +216,12 @@ impl ToolApproval {
     #[must_use]
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    /// Exact routing key needed to rebuild the pending action after a restart.
+    #[must_use]
+    pub fn lookup_key(&self) -> Option<&ToolLookupKey> {
+        self.lookup_key.as_deref()
     }
 
     /// Unknown fields retained during deserialization.

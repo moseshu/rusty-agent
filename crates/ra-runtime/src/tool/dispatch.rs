@@ -188,6 +188,7 @@ pub struct ToolDispatchRequest {
     caller: ToolCaller,
     services: ToolServices,
     permission: PermissionEngine,
+    approval_granted: bool,
 }
 
 impl ToolDispatchRequest {
@@ -219,6 +220,7 @@ impl ToolDispatchRequest {
             caller: ToolCaller::Direct,
             services: ToolServices::new(),
             permission,
+            approval_granted: false,
         }
     }
 
@@ -231,6 +233,13 @@ impl ToolDispatchRequest {
     /// Sets the framework ports the tool is handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Marks a call as already approved by the host after an interruption.
+    #[doc(hidden)]
+    pub const fn with_approval_granted(mut self) -> Self {
+        self.approval_granted = true;
         self
     }
 
@@ -338,6 +347,7 @@ pub(crate) async fn dispatch_tool_with_admission(
             if let Some(namespace) = tool.origin().namespace() {
                 approval = approval.with_namespace(namespace.as_str());
             }
+            approval = approval.with_tool_origin(tool.origin());
             return Ok(ToolDispatch::AwaitingApproval(approval));
         }
         _ => {
@@ -407,23 +417,32 @@ pub(crate) async fn dispatch_tool_with_admission(
 }
 
 /// Applies fixed rule and mode decisions before consulting a tool's dynamic approval callback.
+///
+/// # What a host answer already covers
+///
+/// A call resumed after an approval carries the host's answer, and that answer settles exactly one
+/// of the three decisions: `Ask` is a question the host has now been asked and has answered, so it
+/// collapses to `Allow`. `Deny` does not — a deny rule, plan mode, and `DontAsk` are policy that
+/// was never up for a click, and resolving the interruption is not a licence to overrule them.
+/// The order matters as much as the substance: consulting the fixed decision *before* honouring
+/// the answer is what keeps the denials reachable at all.
 async fn resolve_permission(
     tool: &Arc<dyn Tool>,
     options: &ToolOptions,
     request: &ToolDispatchRequest,
 ) -> Result<PermissionDecision> {
-    let model_definition = tool.model_definition();
-    let tool_name = model_definition.name();
-    let namespace = tool
-        .origin()
-        .namespace()
-        .map(ra_core::tool::ToolNamespace::as_str);
-    if let Some(decision) =
-        request
-            .permission
-            .fixed_decision(options.permission_scope(), tool_name, namespace)
+    let origin = tool.origin();
+    if let Some(decision) = request
+        .permission
+        .fixed_decision(options.permission_scope(), origin)
     {
+        if request.approval_granted && matches!(decision, PermissionDecision::Ask) {
+            return Ok(PermissionDecision::Allow);
+        }
         return Ok(decision);
+    }
+    if request.approval_granted {
+        return Ok(PermissionDecision::Allow);
     }
 
     let fallback = if needs_approval(tool, options, request).await? {
@@ -433,7 +452,7 @@ async fn resolve_permission(
     };
     Ok(request
         .permission
-        .evaluate(options.permission_scope(), tool_name, namespace, fallback))
+        .evaluate(options.permission_scope(), origin, fallback))
 }
 
 /// Invokes the tool, applying its per-call time limit.

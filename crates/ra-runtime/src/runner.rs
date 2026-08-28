@@ -40,7 +40,7 @@ use ra_core::{
     finish::FinishReason,
     item::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
-        RunItemKind,
+        RunItemKind, ToolApproval, ToolCallOutput,
     },
     model::{
         Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
@@ -48,7 +48,7 @@ use ra_core::{
         RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
     permission::{PermissionMode, PermissionRule},
-    state::{EventSeqAllocator, RunId, RunState},
+    state::{EventSeqAllocator, InterruptionResolution, RunId, RunState, ToolOutcome, ToolUse},
     step::NextStep,
     tool::ToolServices,
     trace::SpanKind,
@@ -72,6 +72,7 @@ pub use stream::{RunStream, RunStreamEvent};
 use crate::{
     agent::AgentBinding,
     permission::PermissionEngine,
+    tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     turn::{
         TurnSettlementRequest,
         batch::DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
@@ -528,6 +529,7 @@ struct TurnLoopContext<'a> {
     cancel: &'a CancelScope,
     closeout_cancel: &'a CancelScope,
     config: &'a RunConfig,
+    permission: &'a PermissionEngine,
     events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
     event_seqs: &'a EventSeqAllocator,
 }
@@ -613,6 +615,7 @@ async fn run_loop(
 /// The span is passed in as well as installed: the terminal facts are recorded here, where the run
 /// scope that explains a cancellation is still alive, rather than at the caller, which sees only
 /// an `Error` and would have to guess the level a cancellation came from.
+#[allow(clippy::too_many_lines)]
 async fn run_loop_inner(
     request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
@@ -660,6 +663,22 @@ async fn run_loop_inner(
     };
     let _deadline = arm_deadline(&cancel);
 
+    let mut progress = TurnLoopProgress {
+        first_item: state.generated_items().len(),
+        first_response: state.model_responses().len(),
+        turn_record_owner: TurnRecordOwner::new(),
+        turn_records: Vec::new(),
+        turns: 0,
+        budget_stop: None,
+    };
+    let permission = config.permission().clone().with_rules(
+        config
+            .permission()
+            .rules()
+            .iter()
+            .cloned()
+            .chain(state.permission_rules().iter().cloned()),
+    );
     let context = TurnLoopContext {
         input_base: &input_base,
         model_resolver: &model_resolver,
@@ -669,23 +688,26 @@ async fn run_loop_inner(
         cancel: &cancel,
         closeout_cancel: &closeout_cancel,
         config: &config,
+        permission: &permission,
         events: events.as_ref(),
         event_seqs: &event_seqs,
     };
-    let mut progress = TurnLoopProgress {
-        first_item: state.generated_items().len(),
-        first_response: state.model_responses().len(),
-        turn_record_owner: TurnRecordOwner::new(),
-        turn_records: Vec::new(),
-        turns: 0,
-        budget_stop: None,
+    let interrupted_turn = resolve_interrupted_turn(&context, &agent, &mut state).await;
+
+    // Settling checkpointed answers and running turns are one stage as far as stopping is
+    // concerned: both execute tools under the run scope, so both can be the thing a deadline
+    // interrupts. Joining them into a single `Result` before the match below is what keeps the
+    // translation underneath a single statement of the rule rather than two copies to keep in step.
+    let stepped = match interrupted_turn {
+        Ok(()) => run_turns(&context, &mut agent, &mut state, &mut progress).await,
+        Err(error) => Err(error),
     };
 
     // The one place an expired wall clock is read back as a budget stop. Everything under the run
     // scope reports expiry the same way any other cancellation is reported, which is what lets the
     // loop stay free of deadline special cases; translating it here — rather than at each of the
     // four `?` inside — is why exactly one kind of stop can be a soft one.
-    let outcome = match run_turns(&context, &mut agent, &mut state, &mut progress).await {
+    let outcome = match stepped {
         Ok(outcome) => outcome,
         Err(error) if is_wall_clock_expiry(&error, &cancel, budget_deadline) => {
             progress.budget_stop = Some(BudgetKind::WallClock);
@@ -742,6 +764,186 @@ async fn run_loop_inner(
     record_run_outcome(span, &result);
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)
+}
+
+/// Settles host answers that were checkpointed with an interrupted run before another model call.
+///
+/// The approval record remains in history as the control-plane question; this stage appends the
+/// paired tool output (or rejection) and only then clears its pending ID. That ordering makes a
+/// checkpoint taken between the click and the tool invocation resumable instead of losing work.
+async fn resolve_interrupted_turn(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+) -> Result<()> {
+    let answers = state.pending_interruption_resolutions().to_vec();
+    // Filed once for the whole stage rather than once per answer, because these are the tail of a
+    // single interrupted turn. `ToolFailureTracker::record_turn` fingerprints the ordered turn it
+    // is given to recognise a re-settle, so splitting one turn into several one-outcome calls
+    // would leave that guard describing a turn nothing will ever settle again.
+    let mut outcomes = Vec::new();
+    for answer in answers {
+        let item = state
+            .generated_items()
+            .iter()
+            .find(|item| item.id() == answer.item_id())
+            .ok_or_else(|| {
+                Error::caller(format!(
+                    "answered interruption `{}` is absent from generated items",
+                    answer.item_id()
+                ))
+            })?;
+        let RunItemKind::ToolApproval(approval) = item.kind() else {
+            return Err(Error::caller(format!(
+                "answered interruption `{}` is not a local tool approval",
+                answer.item_id()
+            )));
+        };
+        let provenance = item.provenance().cloned();
+        let approval = approval.clone();
+        let (output, outcome) = match answer.resolution() {
+            InterruptionResolution::Reject { .. } => {
+                let output = ToolCallOutput::new(
+                    approval.call_id().clone(),
+                    serde_json::json!({"code": "approval_rejected", "tool": approval.tool_name()}),
+                )
+                .with_error(true);
+                // Filed as a refusal, the same as a call the permission stage declines below: both
+                // are "the runtime answered without running the tool", which is what
+                // `ToolOutcome::refused` names. Recording nothing instead would leave an earlier
+                // failure streak standing behind a call that never ran, so the next genuine
+                // attempt would be judged on evidence this one did not produce. An approval
+                // written before routing identities were stored has nothing to file it under.
+                let outcome = approval.lookup_key().map(|key| {
+                    ToolOutcome::refused(
+                        ToolUse::Tool(key.clone()),
+                        approval.call_id().clone(),
+                        approval.arguments(),
+                        output.output(),
+                    )
+                });
+                (output, outcome)
+            }
+            InterruptionResolution::Approve { .. } => {
+                let (output, outcome) =
+                    execute_approved_call(context, agent, state, &approval, answer.item_id())
+                        .await?;
+                (output, Some(outcome))
+            }
+            _ => return Err(Error::caller("unsupported interruption resolution")),
+        };
+        outcomes.extend(outcome);
+        let mut output_item = RunItem::new(
+            ItemId::new(format!("{}.output", approval.call_id())),
+            RunItemKind::ToolCallOutput(output),
+        );
+        if let Some(provenance) = provenance {
+            output_item = output_item.with_provenance(provenance);
+        }
+        emit(context.events, RunStreamEvent::Item(output_item.clone()));
+        state.record_generated_items([output_item]);
+        state.settle_interruption_resolution(answer.item_id())?;
+    }
+    if !outcomes.is_empty() {
+        let (_, failure) = state.trackers_mut();
+        failure.record_turn(agent.public_id(), outcomes);
+    }
+    Ok(())
+}
+
+/// Runs one call the host approved before the checkpoint was taken.
+///
+/// The identity handed to the breaker is rebuilt from the approval's lookup key rather than asked
+/// of a bound action, which is safe only because the tool below is *selected* by that same key:
+/// the two cannot drift the way [`ProcessedResponse`](ra_core::step::ProcessedResponse) warns
+/// about, because one is the search term for the other.
+async fn execute_approved_call(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &RunState,
+    approval: &ToolApproval,
+    item_id: &ItemId,
+) -> Result<(ToolCallOutput, ToolOutcome)> {
+    let key = approval.lookup_key().ok_or_else(|| {
+        Error::caller(format!(
+            "approval `{item_id}` cannot resume because it has no serialized tool lookup key"
+        ))
+    })?;
+    let tool = agent
+        .public()
+        .tools()
+        .iter()
+        .find(|tool| tool.origin().lookup_key() == key)
+        .ok_or_else(|| {
+            Error::caller(format!(
+                "approval `{item_id}` names lookup key `{key:?}`, which the resumed agent no \
+                 longer provides"
+            ))
+        })?;
+
+    let mut run = RunContext::new(context.run_id.clone(), agent.public())
+        .with_budget(state.budget().clone())
+        .with_usage_totals(state.usage_totals().clone())
+        .with_pending_control_requests(state.pending_control_requests().to_vec())
+        .with_event_seq_allocator(context.event_seqs.clone());
+    if let Some(app_context) = context.app_context {
+        run = run.with_app_context(Arc::clone(app_context));
+    }
+
+    // The streak already counts this call: settlement recorded the attempt before it interrupted,
+    // so the breaker sees the same history here that it would have seen had the host answered
+    // without a restart in between.
+    let identity = ToolUse::Tool(key.clone());
+    let history = CallHistory::new(
+        state.tool_use().repeat_streak(agent.public_id(), &identity),
+        state
+            .tool_failure()
+            .no_progress_streak(agent.public_id(), &identity),
+    );
+    let dispatch = dispatch_tool(
+        ToolDispatchRequest::new(
+            Arc::clone(tool),
+            approval.call_id().clone(),
+            approval.arguments().clone(),
+            Arc::new(run),
+            context.cancel.child(ScopeKind::Tool),
+            history,
+            context.permission.clone(),
+        )
+        .with_services(context.services.clone())
+        .with_approval_granted(),
+    )
+    .await?;
+
+    let call_id = approval.call_id().clone();
+    match dispatch {
+        ToolDispatch::Observed(observation) => {
+            let failure_code = observation.failure_code();
+            let output = observation.output().clone();
+            let outcome = match failure_code {
+                Some(code) => ToolOutcome::failed(
+                    identity,
+                    call_id,
+                    approval.arguments(),
+                    output.output(),
+                    code,
+                ),
+                None => {
+                    ToolOutcome::succeeded(identity, call_id, approval.arguments(), output.output())
+                }
+            };
+            Ok((output, outcome))
+        }
+        ToolDispatch::Refused(refusal) => {
+            let output = refusal.into_output();
+            let outcome =
+                ToolOutcome::refused(identity, call_id, approval.arguments(), output.output());
+            Ok((output, outcome))
+        }
+        ToolDispatch::AwaitingApproval(_) => Err(Error::caller(
+            "an approved tool call requested approval again",
+        )),
+    }
 }
 
 /// Selects the input base for one segment after its state accepted the agent identity.
@@ -992,7 +1194,7 @@ async fn run_one_turn(
         turn_scope,
         tool_use,
         tool_failure,
-        config.permission().clone(),
+        context.permission.clone(),
     )
     .with_original_input(segment_original_input)
     .with_pre_step_items(pre_step_items)
