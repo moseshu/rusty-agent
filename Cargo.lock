@@ -899,7 +899,6 @@ name = "minimal_agent"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "futures",
  "ra-core",
  "ra-runtime",
  "serde_json",

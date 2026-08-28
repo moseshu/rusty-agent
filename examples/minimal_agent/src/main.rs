@@ -29,8 +29,8 @@ use ra_core::{
         ToolCall,
     },
     model::{
-        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ModelStreamEvent, ProviderKey, ResolvedModel,
+        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
+        ResolvedModel,
     },
     state::RunId,
     tool::{Tool, ToolContext, ToolOrigin, ToolOutput, ToolSchema},
@@ -98,11 +98,10 @@ impl Tool for CountLines {
 /// Turn one asks for the tool; turn two answers. That is the shortest path that actually exercises
 /// the loop — a single-response model would never reach tool dispatch or a second turn.
 ///
-/// **`stream_response` is the one the runtime calls**, on every run, whether or not the host asked
-/// for partial messages: the loop starts function calls from completed stream items, and
-/// `partial_messages` decides only whether that narration leaves the runtime. `get_response` is
-/// still required by the trait, so it is implemented here in terms of the same script, but nothing
-/// in `ra-runtime` reaches it today.
+/// Only `get_response` is written here. The loop drives every call through `stream_response`, but
+/// its default answers with this method's result as a one-event stream — which is why a model with
+/// nothing to stream does not have to know that. An adapter speaking a protocol that *can* stream
+/// overrides it, and earns the overlap of starting tools before generation finishes.
 struct ScriptedModel {
     calls: AtomicUsize,
 }
@@ -137,16 +136,6 @@ impl ScriptedModel {
 impl Model for ScriptedModel {
     async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
         Ok(self.next_response())
-    }
-
-    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-        // A successful stream ends with exactly one `Completed`, and it is the last event. A real
-        // adapter emits `RawResponse` and `RunItem` deltas before it; a stream that stops without
-        // a `Completed` did not produce a turn, whatever it emitted along the way.
-        let response = self.next_response();
-        Box::pin(futures::stream::once(async move {
-            Ok(ModelStreamEvent::Completed(Box::new(response)))
-        }))
     }
 }
 
