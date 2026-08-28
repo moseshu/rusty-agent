@@ -1,6 +1,6 @@
 //! Deterministic assembly of stable prefix prompt sections.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use ra_core::error::{Error, Result};
@@ -110,12 +110,17 @@ impl PromptAssembler {
         }
     }
 
-    /// Adds or replaces a prompt section.
+    /// Adds a prompt section, replacing any section already registered under that name.
     ///
     /// Only stable prefix sections belong here. A tail section is rejected at insertion rather
     /// than filtered out at assembly: accepting it and returning `Ok` would tell the caller their
     /// text is in the prefix right up until they notice it is not in the output. Tail content
     /// travels through the reminder channel instead.
+    ///
+    /// Replacement is the point of the single-section form — swapping one role's guidance for
+    /// another's is an override that reads as one at the call site. Registering a whole list is a
+    /// different act, and [`Self::with_sections`] refuses a name that is already registered for the
+    /// reason above: the losing section would be gone from the prefix with nothing said about it.
     ///
     /// # Errors
     ///
@@ -139,12 +144,31 @@ impl PromptAssembler {
         Ok(self)
     }
 
-    /// Adds multiple prompt sections.
+    /// Adds multiple prompt sections, rejecting any name that is already registered.
+    ///
+    /// A batch is a registration list. A name appearing twice in one, or landing on a section an
+    /// earlier call installed, means two builders claim the same slot; [`Self::add_section`]'s
+    /// replacement would resolve that by dropping one of them, leaving a section that was built,
+    /// validated and never sent — visible only as a line missing from the next prompt dump.
+    /// Deliberate replacement is still available by calling `add_section` separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a section name is already registered, or for the per-section failures
+    /// described on [`Self::add_section`].
     pub fn with_sections(
         mut self,
         sections: impl IntoIterator<Item = PromptSection>,
     ) -> Result<Self> {
+        let mut claimed: HashSet<PromptSectionName> = self.sections.keys().cloned().collect();
         for section in sections {
+            if !claimed.insert(section.name().clone()) {
+                return Err(Error::config(format!(
+                    "prompt section `{}` is already registered; use `add_section` for an explicit \
+                     replacement",
+                    section.name()
+                )));
+            }
             self = self.add_section(section)?;
         }
         Ok(self)

@@ -239,6 +239,60 @@ fn test_assembler_rejects_sections_it_would_not_assemble() {
     );
 }
 
+/// Two sections claiming one name in a single batch is an error, not a silent replacement.
+///
+/// A registration list is written by whoever assembles a product's prefix, and two builders
+/// reaching for the same slot there is a mistake in that list. Letting the later one win would
+/// leave a section that was built and validated and never sent, showing up only as a row missing
+/// from the next prompt dump.
+#[test]
+fn test_assembler_rejects_two_sections_claiming_one_name_in_a_batch() {
+    let first = fixture_section(PromptSectionName::CORE_BEHAVIOR, "First claim on the slot.");
+    let second = fixture_section(PromptSectionName::CORE_BEHAVIOR, "Second claim on the slot.");
+
+    let Err(err) = PromptAssembler::new().with_sections(vec![first, second]) else {
+        panic!("the assembler must refuse a batch that names one section twice");
+    };
+    assert!(
+        err.to_string().contains("core_behavior"),
+        "the error must name the contested section: {err}"
+    );
+}
+
+/// Replacing a section through a separate call stays available; only the batch form refuses.
+///
+/// Swapping one role's guidance for another's is an override, and it reads as one at the call site.
+#[test]
+fn test_a_separate_add_section_call_still_replaces_by_name() {
+    let assembler = build_standard_assembler();
+    let ro_role = fixture_section(PromptSectionName::ROLE, "Fixture read-only role guidance.");
+
+    let swapped = assembler
+        .clone()
+        .add_section(ro_role)
+        .expect("an explicit override must still be accepted");
+
+    assert_ne!(
+        swapped.assemble().expect("swapped assembles").prefix_hash(),
+        assembler
+            .assemble()
+            .expect("original assembles")
+            .prefix_hash(),
+    );
+}
+
+/// A batch cannot replace a section installed by an earlier registration either.
+#[test]
+fn test_a_batch_cannot_replace_an_already_registered_section() {
+    let replacement = fixture_section(PromptSectionName::ROLE, "Replacement role guidance.");
+
+    let Err(err) = build_standard_assembler().with_sections(vec![replacement]) else {
+        panic!("a batch must not replace a section registered before that batch");
+    };
+    assert!(err.to_string().contains("role"));
+    assert!(err.to_string().contains("add_section"));
+}
+
 /// The assembled total is the sum of the section rows, so a dump reconciles with its own breakdown.
 #[test]
 fn test_prefix_token_total_equals_the_sum_of_its_sections() {

@@ -321,12 +321,77 @@ fn test_the_product_prefix_begins_with_the_identity_contract() {
     assert!(identity.content().contains("authority and capabilities"));
 }
 
+/// Engineering judgment follows identity so implementation decisions inherit the collaboration
+/// and completion contract without being entangled with the advertised tool surface.
+///
+/// The tool-surface half is asserted on the host-backed prefix, because that is the only one where
+/// a `tool_surface` section exists at all: checked on the bare prefix, "engineering judgment comes
+/// first" would hold no matter which way the two were ranked.
+#[test]
+fn test_the_product_prefix_places_engineering_judgment_after_identity() {
+    let prefix = assemble_stable_prefix(&PromptRole::Main).expect("prefix");
+    let engineering = prefix
+        .sections()
+        .get(1)
+        .expect("the product prefix includes an engineering-judgment section");
+
+    assert_eq!(
+        prefix
+            .sections()
+            .first()
+            .expect("the product prefix includes an identity section")
+            .name()
+            .as_str(),
+        "identity"
+    );
+    assert_eq!(engineering.name().as_str(), "core_behavior");
+    assert!(
+        engineering
+            .content()
+            .contains("existing public APIs, helpers, and mechanisms")
+    );
+
+    assert_eq!(
+        section_names(&host_backed_prefix()),
+        [
+            "identity",
+            "core_behavior",
+            "tool_surface",
+            "personality",
+            "role"
+        ],
+        "engineering judgment must still precede the advertised tool surface"
+    );
+}
+
+/// Every shipped role shares the engineering-judgment portion of the stable prefix. Role-specific
+/// scope belongs exclusively to the role section, preserving the common cached-prefix skeleton.
+#[test]
+fn test_the_one_off_prefix_includes_engineering_judgment() {
+    let prefix = assemble_stable_prefix(&PromptRole::OneOffAnswer).expect("prefix");
+
+    assert_eq!(
+        section_names(&prefix),
+        ["identity", "core_behavior", "personality", "role"],
+        "role-specific scope must not remove a stable-prefix section"
+    );
+}
+
+fn section_names(prefix: &ra_prompt::assembler::StablePrefix) -> Vec<&str> {
+    prefix
+        .sections()
+        .iter()
+        .map(|section| section.name().as_str())
+        .collect()
+}
+
 /// The product's assembled prefix is currently too short for any provider to cache.
 ///
 /// This pins a fact that is otherwise invisible. The floor is 1024 estimated tokens — every
-/// provider ignores a shorter prefix — and today's prefix carries the identity, tone, role and
-/// advertised-tool sections, landing in the low hundreds. So the real product gets no cache plan,
-/// and no `prompt_cache_key` is sent even to an endpoint that declared support for one.
+/// provider ignores a shorter prefix — and today's prefix carries the identity, engineering,
+/// tone, role and advertised-tool sections, landing in the low hundreds. So the real product gets
+/// no cache plan, and no `prompt_cache_key` is sent even to an endpoint that declared support for
+/// one.
 ///
 /// Measured on the host-backed prefix, which is the longer of the two the product assembles and
 /// the one an agent with tools installed actually carries. A prefix that only cleared the floor
