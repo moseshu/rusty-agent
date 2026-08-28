@@ -30,26 +30,84 @@ use crate::{
     compat::{SchemaVersion, Unknown},
     error::{BudgetKind, Error, Result},
     finish::FinishReason,
-    item::{AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem},
+    item::{
+        AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind, ToolApproval,
+    },
+    permission::{PermissionDecision, PermissionRule},
     state::{ToolFailureTracker, ToolUseTracker},
     usage::Usage,
 };
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
 /// The list stays beside the version number. A checkpoint is a long-lived wire contract, so a
 /// version bump without a short statement of what changed leaves a future reader unable to tell
 /// whether an older runtime may safely resume it.
-pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[(
-    RUN_STATE_SCHEMA_VERSION,
-    "Initial resumable run identity, accounting, history, and interruption records.",
-)];
+pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
+    (
+        SchemaVersion::new(1),
+        "Initial resumable run identity, accounting, history, and interruption records.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted host approval answers, exact routing identities, and session permission rules.",
+    ),
+];
 
 const fn default_input_history_is_complete() -> bool {
     true
+}
+
+/// A host answer retained until the runtime has turned the interrupted action into history.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptionResolution {
+    /// Execute the action the host approved.
+    Approve {
+        /// Whether to retain an exact allow rule for later calls.
+        always: bool,
+    },
+    /// Do not execute the action and return a refusal to the model.
+    Reject {
+        /// Whether to retain an exact deny rule for later calls.
+        always: bool,
+    },
+}
+
+impl InterruptionResolution {
+    /// Whether this answer should be retained as an exact permission rule.
+    #[must_use]
+    pub const fn always(self) -> bool {
+        match self {
+            Self::Approve { always } | Self::Reject { always } => always,
+        }
+    }
+}
+
+/// One pending interruption together with the host answer it received.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingInterruptionResolution {
+    item_id: ItemId,
+    resolution: InterruptionResolution,
+}
+
+impl PendingInterruptionResolution {
+    /// ID of the authoritative interruption record being answered.
+    #[must_use]
+    pub const fn item_id(&self) -> &ItemId {
+        &self.item_id
+    }
+
+    /// Host answer awaiting runtime settlement.
+    #[must_use]
+    pub const fn resolution(&self) -> InterruptionResolution {
+        self.resolution
+    }
 }
 
 /// Stable identity of one run, across every segment it is resumed in.
@@ -467,6 +525,10 @@ pub struct RunState {
     model_responses: Vec<ModelResponse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_interruptions: Vec<ItemId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_interruption_resolutions: Vec<PendingInterruptionResolution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
     input_history_is_complete: bool,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
@@ -531,6 +593,10 @@ struct RunStateRecord {
     model_responses: Vec<ModelResponse>,
     #[serde(default)]
     pending_interruptions: Vec<ItemId>,
+    #[serde(default)]
+    pending_interruption_resolutions: Vec<PendingInterruptionResolution>,
+    #[serde(default)]
+    permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
     input_history_is_complete: bool,
     #[serde(flatten, default)]
@@ -561,9 +627,17 @@ impl TryFrom<RunStateRecord> for RunState {
             generated_items,
             model_responses,
             pending_interruptions,
+            pending_interruption_resolutions,
+            permission_rules,
             input_history_is_complete,
             unknown,
         } = record;
+
+        let schema_version = if schema_version <= RUN_STATE_SCHEMA_VERSION {
+            RUN_STATE_SCHEMA_VERSION
+        } else {
+            schema_version
+        };
 
         // Carried in as a total with no split, because that is all the older record said. It counts
         // against the token ceiling and stays out of the input and output counters that cache
@@ -595,6 +669,10 @@ impl TryFrom<RunStateRecord> for RunState {
             ));
         }
         validate_pending_interruptions(&pending_interruptions, &generated_items)?;
+        validate_interruption_resolutions(
+            &pending_interruption_resolutions,
+            &pending_interruptions,
+        )?;
 
         Ok(Self {
             schema_version,
@@ -616,6 +694,8 @@ impl TryFrom<RunStateRecord> for RunState {
             generated_items,
             model_responses,
             pending_interruptions,
+            pending_interruption_resolutions,
+            permission_rules,
             input_history_is_complete,
             unknown,
         })
@@ -646,6 +726,8 @@ impl RunState {
             generated_items: Vec::new(),
             model_responses: Vec::new(),
             pending_interruptions: Vec::new(),
+            pending_interruption_resolutions: Vec::new(),
+            permission_rules: Vec::new(),
             input_history_is_complete: true,
             unknown: Unknown::new(),
         }
@@ -1005,6 +1087,114 @@ impl RunState {
         })
     }
 
+    /// Answers a pending tool approval and retains that answer for resume.
+    pub fn approve(&mut self, item: &RunItem, always: bool) -> Result<()> {
+        let approval = self.authoritative_tool_approval(item)?;
+        if approval.lookup_key().is_none() {
+            return Err(Error::caller(format!(
+                "approval `{}` cannot resume because it lacks a serialized tool routing identity",
+                item.id()
+            )));
+        }
+        self.answer_interruption(item, InterruptionResolution::Approve { always })
+    }
+
+    /// Rejects a pending tool approval and retains that answer for resume.
+    pub fn reject(&mut self, item: &RunItem, always: bool) -> Result<()> {
+        self.answer_interruption(item, InterruptionResolution::Reject { always })
+    }
+
+    /// Answers the awaiting records without removing them before their result is recorded.
+    ///
+    /// Removing an approval at click time would lose the call on a crash between the click and its
+    /// execution. The runtime removes it only when it has appended either the output or refusal.
+    fn answer_interruption(
+        &mut self,
+        item: &RunItem,
+        resolution: InterruptionResolution,
+    ) -> Result<()> {
+        let authoritative = self.authoritative_tool_approval(item)?.clone();
+        if let Some(existing) = self
+            .pending_interruption_resolutions
+            .iter_mut()
+            .find(|entry| entry.item_id == *item.id())
+        {
+            existing.resolution = resolution;
+        } else {
+            self.pending_interruption_resolutions
+                .push(PendingInterruptionResolution {
+                    item_id: item.id().clone(),
+                    resolution,
+                });
+        }
+        // A re-answer supersedes the one before it, and the rule that answer minted has to go with
+        // it. Appending alone would leave "always allow", later corrected to a plain rejection,
+        // still allowing every subsequent call — a grant the host withdrew and has no way to reach.
+        let rule = session_rule(&authoritative, resolution);
+        self.permission_rules
+            .retain(|existing| !targets_same_action(existing, &rule));
+        if resolution.always() {
+            self.permission_rules.push(rule);
+        }
+        Ok(())
+    }
+
+    fn authoritative_tool_approval(&self, item: &RunItem) -> Result<&ToolApproval> {
+        if !self.pending_interruptions.iter().any(|id| id == item.id()) {
+            return Err(Error::caller(format!(
+                "interruption `{}` is not pending",
+                item.id()
+            )));
+        }
+        let Some(authoritative) = self
+            .generated_items
+            .iter()
+            .find(|stored| stored.id() == item.id())
+        else {
+            return Err(Error::caller(format!(
+                "pending interruption `{}` is absent from generated items",
+                item.id()
+            )));
+        };
+        let RunItemKind::ToolApproval(approval) = authoritative.kind() else {
+            return Err(Error::caller(format!(
+                "interruption `{}` is not a local tool approval",
+                item.id()
+            )));
+        };
+        Ok(approval)
+    }
+
+    /// Answers that have not yet been settled into model-visible history.
+    #[must_use]
+    pub fn pending_interruption_resolutions(&self) -> &[PendingInterruptionResolution] {
+        &self.pending_interruption_resolutions
+    }
+
+    /// Session-scoped rules created by an `always` approval or rejection.
+    #[must_use]
+    pub fn permission_rules(&self) -> &[PermissionRule] {
+        &self.permission_rules
+    }
+
+    /// Marks an answered interruption as represented in history.
+    #[doc(hidden)]
+    pub fn settle_interruption_resolution(&mut self, item_id: &ItemId) -> Result<()> {
+        if !self
+            .pending_interruption_resolutions
+            .iter()
+            .any(|entry| entry.item_id == *item_id)
+        {
+            return Err(Error::caller(format!(
+                "interruption `{item_id}` has no host answer"
+            )));
+        }
+        self.pending_interruption_resolutions
+            .retain(|entry| entry.item_id != *item_id);
+        self.pending_interruptions.retain(|id| id != item_id);
+        Ok(())
+    }
+
     /// Starts or resumes a segment under a stable public agent identity.
     ///
     /// A restored checkpoint must bind back to the same declaration. Replacing it with an agent
@@ -1016,7 +1206,12 @@ impl RunState {
     /// must also provide input instead of asking the runner to project this checkpoint.
     #[doc(hidden)]
     pub fn begin_segment(&mut self, agent: AgentId, input: Vec<ModelInputItem>) -> Result<()> {
-        if !self.pending_interruptions.is_empty() {
+        if self.pending_interruptions.iter().any(|id| {
+            !self
+                .pending_interruption_resolutions
+                .iter()
+                .any(|entry| entry.item_id == *id)
+        }) {
             return Err(Error::caller(
                 "run state has unanswered interruptions; resolve them before resuming",
             ));
@@ -1072,6 +1267,7 @@ impl RunState {
         let ids: Vec<ItemId> = items.iter().map(|item| item.id().clone()).collect();
         validate_pending_interruptions(&ids, &self.generated_items)?;
         self.pending_interruptions = ids;
+        self.pending_interruption_resolutions.clear();
         Ok(())
     }
 
@@ -1080,6 +1276,60 @@ impl RunState {
     pub const fn unknown(&self) -> &Unknown {
         &self.unknown
     }
+}
+
+/// The session rule one `always` answer records.
+///
+/// Pinned to the exact executable the host was shown, not to its model-facing name: a click on
+/// "always allow `write_file`" is an answer about the tool in front of the user, and a name rule
+/// would extend it to every namespace that happens to advertise the same name. The unpinned
+/// fallback is reachable only for a rejection of a record written before routing identities were
+/// stored — [`RunState::approve`] refuses that case outright — and it errs toward denying more.
+fn session_rule(approval: &ToolApproval, resolution: InterruptionResolution) -> PermissionRule {
+    let decision = match resolution {
+        InterruptionResolution::Approve { .. } => PermissionDecision::Allow,
+        InterruptionResolution::Reject { .. } => PermissionDecision::Deny,
+    };
+    let mut rule = PermissionRule::new(decision).with_tool_name(approval.tool_name());
+    if let Some(namespace) = approval.namespace() {
+        rule = rule.with_namespace(namespace);
+    }
+    if let Some(lookup_key) = approval.lookup_key() {
+        rule = rule.with_lookup_key(lookup_key.clone());
+    }
+    rule
+}
+
+/// Whether two session rules speak about the same action, whatever they decide about it.
+///
+/// The decision is deliberately excluded: replacing an answer has to retract the previous rule
+/// precisely when the two disagree.
+fn targets_same_action(rule: &PermissionRule, other: &PermissionRule) -> bool {
+    rule.tool_name() == other.tool_name()
+        && rule.namespace() == other.namespace()
+        && rule.lookup_key() == other.lookup_key()
+}
+
+fn validate_interruption_resolutions(
+    resolutions: &[PendingInterruptionResolution],
+    pending: &[ItemId],
+) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for resolution in resolutions {
+        if !seen.insert(resolution.item_id()) {
+            return Err(Error::caller(format!(
+                "interruption `{}` has more than one host answer",
+                resolution.item_id()
+            )));
+        }
+        if !pending.iter().any(|id| id == resolution.item_id()) {
+            return Err(Error::caller(format!(
+                "interruption resolution `{}` names no pending interruption",
+                resolution.item_id()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Checks that every named interruption resolves to an interruption record the run generated.

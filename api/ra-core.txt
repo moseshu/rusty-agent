@@ -441,6 +441,7 @@ const fn ra_core::output::OutputSchema::strict(& self) -> Option < bool >
 const fn ra_core::permission::PermissionDecision::label(self) -> & 'static str
 const fn ra_core::permission::PermissionMode::label(self) -> & 'static str
 const fn ra_core::permission::PermissionRule::decision(& self) -> PermissionDecision
+const fn ra_core::permission::PermissionRule::lookup_key(& self) -> Option < & ToolLookupKey >
 const fn ra_core::permission::PermissionRule::new(decision : PermissionDecision) -> Self
 const fn ra_core::permission::PermissionUpdate::destination(& self) -> PermissionUpdateDestination
 const fn ra_core::permission::PermissionUpdate::set_mode(destination : PermissionUpdateDestination, mode : PermissionMode) -> Self
@@ -478,10 +479,13 @@ const fn ra_core::prompt::SectionStability::is_stable(& self) -> bool
 const fn ra_core::prompt::SectionStability::is_volatile(& self) -> bool
 const fn ra_core::state::run::EventSeqAllocator::run_id(& self) -> & RunId
 const fn ra_core::state::run::GraphCursor::unknown(& self) -> & Unknown
+const fn ra_core::state::run::InterruptionResolution::always(self) -> bool
 const fn ra_core::state::run::NestedRunRef::call_id(& self) -> & CallId
 const fn ra_core::state::run::NestedRunRef::unknown(& self) -> & Unknown
 const fn ra_core::state::run::PendingControlRequest::call_id(& self) -> Option < & CallId >
 const fn ra_core::state::run::PendingControlRequest::unknown(& self) -> & Unknown
+const fn ra_core::state::run::PendingInterruptionResolution::item_id(& self) -> & ItemId
+const fn ra_core::state::run::PendingInterruptionResolution::resolution(& self) -> InterruptionResolution
 const fn ra_core::state::run::RunState::budget(& self) -> & BudgetSnapshot
 const fn ra_core::state::run::RunState::current_agent(& self) -> Option < & AgentId >
 const fn ra_core::state::run::RunState::finish_reason(& self) -> Option < FinishReason >
@@ -819,6 +823,7 @@ enum ra_core::prompt::PromptRole
 enum ra_core::prompt::PromptSource
 enum ra_core::prompt::SectionPosition
 enum ra_core::prompt::SectionStability
+enum ra_core::state::run::InterruptionResolution
 enum ra_core::state::tool_use::ToolUse
 enum ra_core::step::NextStep
 enum ra_core::tool::context::ToolCaller
@@ -1112,10 +1117,12 @@ fn ra_core::item::reasoning::Reasoning::with_encrypted_content(mut self, encrypt
 fn ra_core::item::reasoning::Reasoning::with_id(mut self, id : impl Into < String >) -> Self
 fn ra_core::item::reasoning::Reasoning::with_provider_data(mut self, data : Value) -> Self
 fn ra_core::item::reasoning::Reasoning::with_summary(mut self, summary : Vec < String >) -> Self
+fn ra_core::item::tool::ToolApproval::lookup_key(& self) -> Option < & ToolLookupKey >
 fn ra_core::item::tool::ToolApproval::namespace(& self) -> Option < & str >
 fn ra_core::item::tool::ToolApproval::new(call_id : CallId, tool_name : impl Into < String >, arguments : Value) -> Self
 fn ra_core::item::tool::ToolApproval::tool_name(& self) -> & str
 fn ra_core::item::tool::ToolApproval::with_namespace(mut self, namespace : impl Into < String >) -> Self
+fn ra_core::item::tool::ToolApproval::with_tool_origin(mut self, origin : & ToolOrigin) -> Self
 fn ra_core::item::tool::ToolCall::name(& self) -> & str
 fn ra_core::item::tool::ToolCall::new(call_id : CallId, name : impl Into < String >, arguments : Value) -> Self
 fn ra_core::item::tool::ToolCallOutput::new(call_id : CallId, output : Value) -> Self
@@ -1211,8 +1218,10 @@ fn ra_core::output::OutputSchema::to_model_output_schema(& self) -> Option < Mod
 fn ra_core::output::OutputSchema::validate(& self) -> Result < () >
 fn ra_core::output::OutputSchema::with_strict(mut self, strict : bool) -> Self
 fn ra_core::permission::PermissionRule::matches(& self, tool_name : & str, namespace : Option < & str >) -> bool
+fn ra_core::permission::PermissionRule::matches_origin(& self, origin : & ToolOrigin) -> bool
 fn ra_core::permission::PermissionRule::namespace(& self) -> Option < & str >
 fn ra_core::permission::PermissionRule::tool_name(& self) -> Option < & str >
+fn ra_core::permission::PermissionRule::with_lookup_key(mut self, lookup_key : ToolLookupKey) -> Self
 fn ra_core::permission::PermissionRule::with_namespace(mut self, namespace : impl Into < String >) -> Self
 fn ra_core::permission::PermissionRule::with_tool_name(mut self, tool_name : impl Into < String >) -> Self
 fn ra_core::permission::PermissionUpdate::add_rules(destination : PermissionUpdateDestination, rules : impl IntoIterator < Item = PermissionRule >) -> Self
@@ -1292,6 +1301,7 @@ fn ra_core::state::run::PendingControlRequest::with_description(mut self, descri
 fn ra_core::state::run::RunId::as_str(& self) -> & str
 fn ra_core::state::run::RunId::generate() -> Self
 fn ra_core::state::run::RunId::new(value : impl Into < String >) -> Self
+fn ra_core::state::run::RunState::approve(& mut self, item : & RunItem, always : bool) -> Result < () >
 fn ra_core::state::run::RunState::begin_segment(& mut self, agent : AgentId, input : Vec < ModelInputItem >) -> Result < () >
 fn ra_core::state::run::RunState::budget_mut(& mut self) -> & mut BudgetSnapshot
 fn ra_core::state::run::RunState::exhausted_budget_kind(& self, limit : & BudgetLimit) -> Option < BudgetKind >
@@ -1302,14 +1312,18 @@ fn ra_core::state::run::RunState::nested_runs(& self) -> & [NestedRunRef]
 fn ra_core::state::run::RunState::original_input(& self) -> & [ModelInputItem]
 fn ra_core::state::run::RunState::pending_control_requests(& self) -> & [PendingControlRequest]
 fn ra_core::state::run::RunState::pending_interruption_items(& self) -> impl Iterator < Item = & RunItem >
+fn ra_core::state::run::RunState::pending_interruption_resolutions(& self) -> & [PendingInterruptionResolution]
 fn ra_core::state::run::RunState::pending_interruptions(& self) -> & [ItemId]
+fn ra_core::state::run::RunState::permission_rules(& self) -> & [PermissionRule]
 fn ra_core::state::run::RunState::record_generated_items(& mut self, items : impl IntoIterator < Item = RunItem >)
 fn ra_core::state::run::RunState::record_model_response(& mut self, response : ModelResponse)
 fn ra_core::state::run::RunState::record_usage(& mut self, usage : & Usage)
+fn ra_core::state::run::RunState::reject(& mut self, item : & RunItem, always : bool) -> Result < () >
 fn ra_core::state::run::RunState::remaining_tokens(& self, limit : & BudgetLimit) -> Option < u64 >
 fn ra_core::state::run::RunState::restore_event_seq_allocator(& self, persisted_run_max_seq : Option < u64 >) -> EventSeqAllocator
 fn ra_core::state::run::RunState::set_current_agent(& mut self, agent : AgentId)
 fn ra_core::state::run::RunState::set_pending_interruptions(& mut self, items : & [RunItem]) -> Result < () >
+fn ra_core::state::run::RunState::settle_interruption_resolution(& mut self, item_id : & ItemId) -> Result < () >
 fn ra_core::state::run::RunState::snapshot_event_seq(& mut self, allocator : & EventSeqAllocator)
 fn ra_core::state::run::RunState::start(run_id : RunId) -> Self
 fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker
@@ -1691,6 +1705,7 @@ struct ra_core::state::run::EventSeqAllocator
 struct ra_core::state::run::GraphCursor
 struct ra_core::state::run::NestedRunRef
 struct ra_core::state::run::PendingControlRequest
+struct ra_core::state::run::PendingInterruptionResolution
 struct ra_core::state::run::RunId
 struct ra_core::state::run::RunState
 struct ra_core::state::run::WorkStateRef
@@ -2010,6 +2025,8 @@ variant ra_core::prompt::SectionPosition::Prefix
 variant ra_core::prompt::SectionPosition::TailMessage
 variant ra_core::prompt::SectionStability::Stable
 variant ra_core::prompt::SectionStability::Volatile
+variant ra_core::state::run::InterruptionResolution::Approve { always: bool }
+variant ra_core::state::run::InterruptionResolution::Reject { always: bool }
 variant ra_core::state::tool_use::ToolUse::Handoff(AgentId)
 variant ra_core::state::tool_use::ToolUse::Mcp { server: String, tool_name: String }
 variant ra_core::state::tool_use::ToolUse::Tool(ToolLookupKey)

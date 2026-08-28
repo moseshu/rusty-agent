@@ -16,8 +16,9 @@ pub mod tool_use;
 pub mod work;
 
 pub use run::{
-    EventSeqAllocator, GraphCursor, NestedRunRef, PendingControlRequest, RUN_STATE_SCHEMA_VERSION,
-    RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, WorkStateRef, WorkspaceLeaseRef,
+    EventSeqAllocator, GraphCursor, InterruptionResolution, NestedRunRef, PendingControlRequest,
+    PendingInterruptionResolution, RUN_STATE_SCHEMA_VERSION, RUN_STATE_SCHEMA_VERSION_SUMMARIES,
+    RunId, RunState, WorkStateRef, WorkspaceLeaseRef,
 };
 pub use tool_failure::{
     AgentToolFailures, EvidenceFingerprint, TOOL_FAILURE_RECENT_LIMIT, TOOL_FAILURE_SCHEMA_VERSION,

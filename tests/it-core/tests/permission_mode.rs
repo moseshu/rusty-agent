@@ -12,6 +12,7 @@ use ra_core::{
         ToolApprovalHandler, ToolPermissionContext,
     },
     state::RunId,
+    tool::{ToolNamespace, ToolOrigin},
 };
 use serde_json::{Value, json};
 
@@ -103,6 +104,42 @@ fn test_permission_rule_04() {
         }))
         .is_err()
     );
+}
+
+/// A rule minted from one approval click is an answer about one executable, not about a name.
+#[test]
+fn test_pinned_permission_rule_matches_only_its_own_executable() {
+    let bare = ToolOrigin::new("write_file").expect("bare origin must build");
+    let namespaced = ToolOrigin::namespaced(
+        ToolNamespace::new("mcp_fs").expect("namespace must build"),
+        "write_file",
+    )
+    .expect("namespaced origin must build");
+
+    let name_rule = PermissionRule::new(PermissionDecision::Allow).with_tool_name("write_file");
+    let pinned = PermissionRule::new(PermissionDecision::Allow)
+        .with_tool_name("write_file")
+        .with_lookup_key(bare.lookup_key().clone());
+
+    // The unpinned rule keeps the documented wildcard reading a host writes policy with.
+    assert!(name_rule.matches_origin(&bare));
+    assert!(name_rule.matches_origin(&namespaced));
+
+    // The pinned one covers only the tool the host was actually shown.
+    assert!(pinned.matches_origin(&bare));
+    assert!(!pinned.matches_origin(&namespaced));
+    assert_eq!(pinned.lookup_key(), Some(bare.lookup_key()));
+
+    // A bare name and namespace are not evidence that the caller holds the pinned executable, so
+    // the name-only matcher refuses rather than widening the rule back out.
+    assert!(!pinned.matches("write_file", None));
+
+    let value = serde_json::to_value(&pinned).expect("pinned rule must serialize");
+    assert_eq!(value["lookup_key"]["name"], "write_file");
+    let restored: PermissionRule =
+        serde_json::from_value(value).expect("pinned rule must deserialize");
+    assert_eq!(restored, pinned);
+    assert!(!restored.matches_origin(&namespaced));
 }
 
 #[test]

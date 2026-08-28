@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use ra_core::permission::{PermissionDecision, PermissionMode, PermissionRule, PermissionScope};
+use ra_core::{
+    permission::{PermissionDecision, PermissionMode, PermissionRule, PermissionScope},
+    tool::ToolOrigin,
+};
 
 /// Immutable rule evaluator applied to every tool call in a run.
 ///
@@ -65,11 +68,10 @@ impl PermissionEngine {
     pub fn evaluate(
         &self,
         scope: PermissionScope,
-        tool_name: &str,
-        namespace: Option<&str>,
+        origin: &ToolOrigin,
         fallback: PermissionDecision,
     ) -> PermissionDecision {
-        self.fixed_decision(scope, tool_name, namespace)
+        self.fixed_decision(scope, origin)
             .unwrap_or_else(|| self.normalize(fallback))
     }
 
@@ -81,14 +83,13 @@ impl PermissionEngine {
     pub fn fixed_decision(
         &self,
         scope: PermissionScope,
-        tool_name: &str,
-        namespace: Option<&str>,
+        origin: &ToolOrigin,
     ) -> Option<PermissionDecision> {
         if matches!(self.mode, PermissionMode::Plan) && !matches!(scope, PermissionScope::Read) {
             return Some(PermissionDecision::Deny);
         }
 
-        if let Some(decision) = self.matching_rule(tool_name, namespace) {
+        if let Some(decision) = self.matching_rule(origin) {
             return Some(self.normalize(decision));
         }
 
@@ -102,15 +103,11 @@ impl PermissionEngine {
         }
     }
 
-    fn matching_rule(
-        &self,
-        tool_name: &str,
-        namespace: Option<&str>,
-    ) -> Option<PermissionDecision> {
+    fn matching_rule(&self, origin: &ToolOrigin) -> Option<PermissionDecision> {
         self.rules
             .iter()
             .rev()
-            .find(|rule| rule.matches(tool_name, namespace))
+            .find(|rule| rule.matches_origin(origin))
             .map(PermissionRule::decision)
     }
 
