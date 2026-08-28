@@ -46,15 +46,44 @@ pub type ModelStream<'a> = BoxStream<'a, Result<ModelStreamEvent>>;
 
 /// A resolved model capable of non-streaming and streaming calls.
 ///
-/// Required methods are intentionally limited to the two call modes. Retry advice and resource
-/// cleanup have defaults so future adapters only override behavior they own.
+/// One required method, [`Self::get_response`]. Everything else has a default so future adapters
+/// only override behavior they own.
+///
+/// # The loop always streams, and that is not the same as "the host asked for streaming"
+///
+/// `ra-runtime` calls [`Self::stream_response`] for **every** model call. A function call the
+/// adapter completes mid-stream starts its tool immediately, overlapping execution with the rest of
+/// generation, and that is worth doing whether or not anyone is watching the narration;
+/// `partial_messages` decides one separate thing, namely whether the raw provider events leave the
+/// runtime.
+///
+/// So [`Self::get_response`] is the one an adapter must write and [`Self::stream_response`] is the
+/// one the loop calls. That reads backwards until you look at the default: a model that implements
+/// only the required method still gets driven through the streaming entry point, because the
+/// default is written in terms of it. Making the streaming method required instead would put the
+/// harder of the two on every mock, test double, and example in exchange for nothing — a real
+/// adapter overrides it either way.
 #[async_trait]
 pub trait Model: Send + Sync + 'static {
     /// Executes one complete model call.
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse>;
 
     /// Starts one streaming model call.
-    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_>;
+    ///
+    /// The default answers with [`Self::get_response`]'s result as a single
+    /// [`ModelStreamEvent::Completed`], which is a correct stream and the shape the loop expects.
+    /// What it forfeits is overlap: with no items arriving before the terminal response, no tool
+    /// can start early and the turn executes its whole batch at settlement. That is a performance
+    /// property, not a behavioral one, so **an adapter whose protocol can stream should override
+    /// this** — the default exists for the models that have nothing to stream, not as an invitation
+    /// to skip the work.
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        Box::pin(futures::stream::once(async move {
+            self.get_response(request)
+                .await
+                .map(|response| ModelStreamEvent::Completed(Box::new(response)))
+        }))
+    }
 
     /// Returns provider-specific evidence for the runtime retry policy.
     fn get_retry_advice(&self, _request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {

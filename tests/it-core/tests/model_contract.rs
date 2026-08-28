@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
-    item::{AgentId, ItemId, Message, ModelInputItem, ModelResponse},
+    item::{
+        AgentId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
+    },
     model::{
         ConversationContinuation, Model, ModelHandoffDefinition, ModelOutputSchema, ModelProvider,
         ModelRequest, ModelRetryAdviceRequest, ModelSettings, ModelStream, ModelStreamEvent,
@@ -208,13 +210,16 @@ impl Model for FakeModel {
             .lock()
             .expect("测试 mutex 不应 poisoned")
             .push("stream".to_owned());
-        stream::once(async {
+        stream::iter([
             Ok(ModelStreamEvent::RawResponse(RawResponseEvent::new(
                 ProviderKey::new("test"),
                 "response.delta",
                 json!({"delta": "hello"}),
-            )))
-        })
+            ))),
+            Ok(ModelStreamEvent::Completed(Box::new(ModelResponse::new(
+                Vec::new(),
+            )))),
+        ])
         .boxed()
     }
 
@@ -261,19 +266,19 @@ async fn test_model_contract_04() {
         .expect("非流式调用应成功");
     assert_eq!(response.output().len(), 1);
 
-    let event = resolved
+    let events: Vec<ModelStreamEvent> = resolved
         .stream_response(request())
-        .next()
-        .await
-        .expect("应有流事件")
-        .expect("流事件应成功");
-    match event {
-        ModelStreamEvent::RawResponse(raw) => {
-            assert_eq!(raw.provider().as_str(), "test");
-            assert_eq!(raw.event_type(), "response.delta");
-        }
-        _ => panic!("fixture 应产生 raw response"),
-    }
+        .map(|event| event.expect("流事件应成功"))
+        .collect()
+        .await;
+    let [ModelStreamEvent::RawResponse(raw), ModelStreamEvent::Completed(response)] =
+        events.as_slice()
+    else {
+        panic!("fixture 应产生 raw response 后接 completed，got {events:?}");
+    };
+    assert_eq!(raw.provider().as_str(), "test");
+    assert_eq!(raw.event_type(), "response.delta");
+    assert!(response.output().is_empty());
 
     let error = Error::provider(ProviderErrorKind::Network, "disconnected");
     let continuation = ConversationContinuation::None;
@@ -301,14 +306,13 @@ async fn test_model_contract_04() {
 fn test_model_contract_05() {
     struct MinimalModel;
 
+    // One required method. Spelling out `stream_response` here as an empty stream is what this
+    // used to do, and it produced a model the loop could not drive at all: a stream that ends
+    // without a `Completed` did not produce a turn.
     #[async_trait]
     impl Model for MinimalModel {
         async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
             Ok(ModelResponse::new(Vec::new()))
-        }
-
-        fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-            stream::empty().boxed()
         }
     }
 
@@ -323,6 +327,35 @@ fn test_model_contract_05() {
         retry_request.continuation().previous_response_id(),
         Some("resp-1")
     );
+}
+
+/// The loop only ever calls `stream_response`, so a model that implements neither streaming nor
+/// anything else has to still be drivable — otherwise the one required method is the one nobody
+/// calls, and every mock has to learn stream plumbing to be run at all.
+#[tokio::test]
+async fn test_model_contract_default_stream_yields_one_completed() {
+    struct MinimalModel;
+
+    #[async_trait]
+    impl Model for MinimalModel {
+        async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse::new(vec![RunItem::new(
+                ItemId::new("msg-1"),
+                RunItemKind::Message(Message::assistant("done", OutputPhase::Final)),
+            )]))
+        }
+    }
+
+    let events: Vec<ModelStreamEvent> = MinimalModel
+        .stream_response(request())
+        .map(|event| event.expect("the default stream must not fail"))
+        .collect()
+        .await;
+
+    let [ModelStreamEvent::Completed(response)] = events.as_slice() else {
+        panic!("the default stream must be exactly one Completed, got {events:?}");
+    };
+    assert_eq!(response.output().len(), 1);
 }
 
 #[test]

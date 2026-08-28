@@ -292,9 +292,9 @@ impl PreparedTurn {
 
     /// Takes ownership of the request alone, for a caller that does not settle the turn.
     ///
-    /// [`Model::get_response`] takes the request by value, and it is the one part of a preparation
-    /// that is expensive to copy — it holds the turn's whole input history. Use [`Self::into_call`]
-    /// instead whenever the response will be classified.
+    /// [`Model::stream_response`] takes the request by value, and it is the one part of a
+    /// preparation that is expensive to copy — it holds the turn's whole input history. Use
+    /// [`Self::into_call`] instead whenever the response will be classified.
     #[must_use]
     pub fn into_request(self) -> ModelRequest {
         self.request
