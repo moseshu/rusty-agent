@@ -67,7 +67,14 @@ impl Model for RetryingModel {
     }
 
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-        stream::empty().boxed()
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let event = self
+            .responses
+            .lock()
+            .unwrap()
+            .remove(0)
+            .map(|response| ModelStreamEvent::Completed(Box::new(response)));
+        stream::iter(vec![event]).boxed()
     }
 
     fn get_retry_advice(
@@ -229,6 +236,44 @@ async fn a_published_stream_event_closes_the_retry_window() {
     assert_eq!(raw_events, 1);
     assert_eq!(error.code(), "provider.network");
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The mirror of the test above, and the reason the switch is worth having: the same failing
+/// stream stays replayable when its narration was never forwarded, because nothing a second
+/// attempt could duplicate ever left the runtime.
+#[tokio::test]
+async fn a_stream_nobody_subscribed_to_keeps_its_retry_window_open() {
+    let model = Arc::new(StreamThenFailModel {
+        calls: AtomicUsize::new(0),
+    });
+    let cancel = CancelScope::root();
+    let mut stream = Runner::run_streamed(request(
+        Arc::clone(&model) as Arc<dyn Model>,
+        &cancel,
+        false,
+        1,
+    ));
+    let mut raw_events = 0;
+    while let Some(event) = stream.next_event().await {
+        if matches!(event, RunStreamEvent::RawResponse(_)) {
+            raw_events += 1;
+        }
+    }
+    let error = stream
+        .finish()
+        .await
+        .expect_err("both attempts fail, so the run does too");
+
+    assert_eq!(
+        raw_events, 0,
+        "narration is off, so the frame the adapter emitted must not reach the subscriber"
+    );
+    assert_eq!(error.code(), "provider.network");
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        2,
+        "an unpublished stream failure is still replayable"
+    );
 }
 
 #[tokio::test]

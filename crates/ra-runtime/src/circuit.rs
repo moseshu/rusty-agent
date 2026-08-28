@@ -48,6 +48,11 @@ pub(crate) fn admit(options: &ToolOptions, history: CallHistory, tool_name: &str
 /// The consequence to keep in mind is that a refused call is recorded too, so the streak keeps
 /// growing while the tool is being refused. Nothing lowers it except a call with different
 /// arguments. That is why this threshold is opt-in per tool rather than a framework default.
+///
+/// The premise in the first sentence is load-bearing, and one path has to protect it: a tool call
+/// can otherwise start from a model-stream item before its response exists.
+/// [`StreamedFunctionDispatches::start`](crate::turn::batch) keeps a tool that sets this limit off
+/// that path for exactly this reason.
 fn admit_repeat(options: &ToolOptions, repeat_streak: u32, tool_name: &str) -> Option<Error> {
     let limit = options.max_repeat_streak()?;
     (repeat_streak >= limit.get()).then(|| {
