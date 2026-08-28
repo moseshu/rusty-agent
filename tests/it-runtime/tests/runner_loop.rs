@@ -1601,6 +1601,8 @@ async fn only_last_message_is_delivery_when_commentary_and_delivery_coexist_in_t
         [OutputPhase::Commentary, OutputPhase::Final]
     );
     assert_eq!(result.final_message().unwrap().text_content(), "结论是这样");
+    // The convenience projection reads that one field, so commentary in the same turn stays out.
+    assert_eq!(result.final_text(), "结论是这样");
 }
 
 #[tokio::test]
@@ -1642,6 +1644,9 @@ async fn run_hitting_turn_limit_has_no_delivery_message() {
         [OutputPhase::Commentary, OutputPhase::Commentary]
     );
     assert!(result.final_message().is_none());
+    // Empty rather than the last thing the model happened to say: nothing was delivered, and
+    // promoting a progress update to the run's conclusion is what this projection must not do.
+    assert!(result.final_text().is_empty());
 
     // No turn ended this run — the cap did, between two of them. Both records still say the turn
     // asked for another, and the reason lives on the outcome instead.

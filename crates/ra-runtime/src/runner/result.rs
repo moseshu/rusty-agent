@@ -575,6 +575,28 @@ impl RunResult {
         self.final_message.as_ref()
     }
 
+    /// The text of [`Self::final_message`], empty when the run delivered none.
+    ///
+    /// **It reads that one field and nothing else.** The temptation this method exists to remove is
+    /// the other implementation — walking [`Self::new_items`] for the record settlement stamped
+    /// [`OutputPhase::Final`] on. That walk is already done once, in [`Self::new`], and a second
+    /// copy would be a second definition of "which record was the delivery" for the two of them to
+    /// disagree about: a closeout from a [`RunErrorHandler`] replaces the field without touching
+    /// the items, so the two answers differ on exactly the runs a host most wants to render.
+    ///
+    /// Empty is meaningful in the same way [`Self::final_message`]'s `None` is: a run that stopped
+    /// for an approval or ran out of turns delivered nothing. A host that wants to show *something*
+    /// regardless reads [`Self::new_items`].
+    ///
+    /// Choosing among several candidate answers, shortening one, or rendering it for a particular
+    /// audience is presentation policy and belongs to R15, not here.
+    #[must_use]
+    pub fn final_text(&self) -> String {
+        self.final_message()
+            .map(Message::text_content)
+            .unwrap_or_default()
+    }
+
     /// Builds the input for a call that continues from this run.
     ///
     /// A projection, not a stored list. Storing it would let the "what to send next" copy drift
