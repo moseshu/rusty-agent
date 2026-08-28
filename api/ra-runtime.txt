@@ -5,10 +5,10 @@ async fn ra_runtime::runner::result::RunErrorHandler::handle(& self, input : Run
 async fn ra_runtime::runner::stream::RunStream::finish(self) -> Result < RunResult >
 async fn ra_runtime::runner::stream::RunStream::next_event(& mut self) -> Option < RunStreamEvent >
 async fn ra_runtime::tool::dispatch::dispatch_tool(request : ToolDispatchRequest) -> Result < ToolDispatch >
-async fn ra_runtime::turn::batch::execute_actions(request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
+async fn ra_runtime::turn::batch::execute_actions(mut request : TurnExecutionRequest < '_ >) -> Result < TurnExecution >
 async fn ra_runtime::turn::prepare::prepare_turn(request : TurnPreparationRequest < '_ >) -> Result < PreparedTurn >
 async fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedResponse, execution : & TurnExecution, tool_use_behavior : & ToolUseBehavior, cancel : & CancelScope) -> Result < NextStep >
-async fn ra_runtime::turn::settle_turn(request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
+async fn ra_runtime::turn::settle_turn(mut request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::permission::PermissionEngine::mode(& self) -> PermissionMode
@@ -131,6 +131,7 @@ fn ra_runtime::runner::result::RunErrorHandlerResult::new(message : Message) -> 
 fn ra_runtime::runner::result::RunOutcome::interruptions(& self) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::continuation_input(& self, policy : ContinuationInput) -> Vec < ModelInputItem >
 fn ra_runtime::runner::result::RunResult::final_message(& self) -> Option < & Message >
+fn ra_runtime::runner::result::RunResult::final_text(& self) -> String
 fn ra_runtime::runner::result::RunResult::model_responses(& self) -> & [ModelResponse]
 fn ra_runtime::runner::result::RunResult::new_items(& self) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInputItem]

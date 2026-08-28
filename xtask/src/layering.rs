@@ -82,6 +82,10 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-assistant", Layer::Product),
     ("ra-cli", Layer::Binary),
     ("xtask", Layer::Binary),
+    // A binary by shape, but the layer rule is not what constrains it — a `Binary` may depend on a
+    // product, and this one must not. Its two-entry row in [`ALLOWED_INTERNAL_DEPS`] is the actual
+    // gate.
+    ("minimal_agent", Layer::Binary),
 ];
 
 /// The direct internal dependencies each crate's responsibility table allows.
@@ -164,6 +168,12 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
         &["ra-coding", "ra-assistant", "ra-protocol", "ra-eval"],
     ),
     ("xtask", &[]),
+    // `examples/minimal_agent` claims that a third party can build a working agent out of the
+    // kernel alone. This row is what makes the claim mechanical rather than aspirational: the day
+    // someone reaches for `ra-tools` or `ra-coding` to finish the example, this gate fails and names
+    // the capability that has to move into a `ra-core` contract instead. Widening it is not a fix —
+    // it is the admission that the extension surface has a hole. See MVP acceptance item 6b.
+    ("minimal_agent", &["ra-core", "ra-runtime"]),
 ];
 
 fn layer_of(name: &str) -> Option<Layer> {
