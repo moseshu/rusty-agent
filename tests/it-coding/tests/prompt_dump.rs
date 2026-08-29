@@ -59,12 +59,12 @@ fn host_backed_prefix() -> ra_prompt::assembler::StablePrefix {
         .expect("host-backed product prefix must assemble")
 }
 
-fn tool_surface_content(prefix: &ra_prompt::assembler::StablePrefix) -> String {
+fn section_content(prefix: &ra_prompt::assembler::StablePrefix, name: &str) -> String {
     prefix
         .sections()
         .iter()
-        .find(|section| section.name().as_str() == "tool_surface")
-        .expect("host-backed prompt must record its advertised tool surface")
+        .find(|section| section.name().as_str() == name)
+        .unwrap_or_else(|| panic!("the assembled prefix must carry a `{name}` section"))
         .content()
         .to_owned()
 }
@@ -169,10 +169,14 @@ fn test_tool_surface_is_sorted_and_byte_stable() {
     let second = assemble_stable_prefix_for_tools(&PromptRole::Main, &other_order)
         .expect("second assembles");
 
-    assert_eq!(tool_surface_content(&first), tool_surface_content(&second));
+    assert_eq!(
+        section_content(&first, "tool_surface"),
+        section_content(&second, "tool_surface")
+    );
     assert_eq!(first.prefix_hash(), second.prefix_hash());
     assert!(
-        tool_surface_content(&first).contains("`apply_patch`\n- `exec_command`\n- `read_file`")
+        section_content(&first, "tool_surface")
+            .contains("`apply_patch`\n- `exec_command`\n- `read_file`")
     );
     // The digest is the other artifact built from the same list, so it has to be order-insensitive
     // for the same reason — a snapshot that moved with registration order would fail the gate on
@@ -191,8 +195,8 @@ fn test_tool_surface_is_sorted_and_byte_stable() {
         let rendered = assemble_stable_prefix_for_tools(&PromptRole::Main, tools)
             .expect("repeated prompt assembles");
         assert_eq!(
-            tool_surface_content(&rendered),
-            tool_surface_content(&first),
+            section_content(&rendered, "tool_surface"),
+            section_content(&first, "tool_surface"),
             "tool surface changed at render {iteration}"
         );
         assert_eq!(
@@ -351,15 +355,13 @@ fn test_the_product_prefix_places_engineering_judgment_after_identity() {
             .contains("existing public APIs, helpers, and mechanisms")
     );
 
-    assert_eq!(
-        section_names(&host_backed_prefix()),
-        [
-            "identity",
-            "core_behavior",
-            "tool_surface",
-            "personality",
-            "role"
-        ],
+    // The pair, not the whole list: the full order is asserted once, where the section that most
+    // recently joined it is the subject.
+    let host_backed = host_backed_prefix();
+    let names = section_names(&host_backed);
+    assert!(
+        names.iter().position(|name| *name == "core_behavior")
+            < names.iter().position(|name| *name == "tool_surface"),
         "engineering judgment must still precede the advertised tool surface"
     );
 }
@@ -372,8 +374,111 @@ fn test_the_one_off_prefix_includes_engineering_judgment() {
 
     assert_eq!(
         section_names(&prefix),
-        ["identity", "core_behavior", "personality", "role"],
+        [
+            "identity",
+            "core_behavior",
+            "editing_verification",
+            "personality",
+            "role"
+        ],
         "role-specific scope must not remove a stable-prefix section"
+    );
+}
+
+/// The editing section sits after the advertised tool surface and names the dedicated entry the
+/// host-backed agent installs — displacing the shell write path, without claiming to be the only
+/// mechanism that may ever write a file.
+#[test]
+fn test_the_product_prefix_includes_editing_and_git_safety_rules() {
+    let main_prefix = host_backed_prefix();
+    let editing = section_content(&main_prefix, "editing_verification");
+
+    assert!(editing.contains("`apply_patch` for direct workspace edits"));
+    assert!(editing.contains("dedicated tool"));
+    assert!(
+        editing.contains("Do not create or edit files with `cat`, heredocs, or other shell write"),
+        "naming the entry only constrains anything if the shell path it displaces is named too"
+    );
+    assert!(
+        editing.contains("bulk mechanical rewrites do not need `apply_patch`"),
+        "apply_patch is the dedicated editing tool, not the only mechanism allowed to write a file"
+    );
+    assert!(editing.contains("pre-existing changes"));
+
+    // The commands this product's own dangerous-action report flags, so the prefix warns about the
+    // set the runtime actually stops on rather than an overlapping one.
+    assert!(editing.contains("`git reset --hard`"));
+    assert!(editing.contains("`git clean`"));
+    assert!(editing.contains("`git checkout --`"));
+
+    assert_eq!(
+        section_names(&main_prefix),
+        [
+            "identity",
+            "core_behavior",
+            "tool_surface",
+            "editing_verification",
+            "personality",
+            "role"
+        ]
+    );
+}
+
+/// Tool-specific guidance must come from the same advertised surface as the provider request.
+/// A role that could edit in another product configuration still cannot call a tool the current
+/// agent omitted.
+#[test]
+fn test_the_editing_entry_requires_an_advertised_apply_patch_tool() {
+    let bare_main = assemble_stable_prefix(&PromptRole::Main).expect("bare main prefix");
+    assert!(
+        !section_content(&bare_main, "editing_verification").contains("`apply_patch`"),
+        "a prefix assembled without tools must not promise apply_patch"
+    );
+
+    let host_backed_main = host_backed_prefix();
+    assert!(
+        section_content(&host_backed_main, "editing_verification").contains("`apply_patch`"),
+        "the host-backed agent advertises apply_patch, so its editing guidance must name it"
+    );
+}
+
+/// A role whose own guidance denies it editing tools is never told to use one.
+///
+/// The two halves of this section have different scopes. Worktree preservation and destructive-Git
+/// avoidance hold for anything that reaches a shell, so every role keeps them; the sentence naming
+/// `apply_patch` would contradict the read-only role text, and it is ranked *ahead* of that text,
+/// so an agent would read the instruction before the denial.
+#[test]
+fn test_read_only_roles_keep_git_safety_without_the_editing_entry() {
+    let mut safety_only: Option<String> = None;
+    for role in [
+        PromptRole::ReadOnlySpecialist,
+        PromptRole::Planner,
+        PromptRole::OneOffAnswer,
+    ] {
+        let prefix = assemble_stable_prefix(&role).expect("prefix");
+        let editing = section_content(&prefix, "editing_verification");
+
+        assert!(
+            !prefix.system_instructions().contains("apply_patch"),
+            "{role} states it has no editing tools; its prefix must not name one"
+        );
+        assert!(
+            editing.contains("pre-existing changes") && editing.contains("`git reset --hard`"),
+            "{role} must retain the worktree and Git-safety guidance"
+        );
+        // Byte-identical across these roles, or the shared half is not shared and each one is
+        // paying for its own cached span.
+        let previous = safety_only.get_or_insert_with(|| editing.clone());
+        assert_eq!(*previous, editing, "{role} rewrote the shared safety half");
+    }
+
+    let coordinator =
+        assemble_stable_prefix_for_tools(&PromptRole::Coordinator, &host_backed_tools())
+            .expect("prefix");
+    assert!(
+        section_content(&coordinator, "editing_verification").contains("`apply_patch`"),
+        "a role that is not read-only keeps the editing entry"
     );
 }
 
