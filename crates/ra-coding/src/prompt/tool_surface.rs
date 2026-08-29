@@ -38,6 +38,17 @@ pub(crate) const TOOL_SCHEMA_REVISION: u32 = 2;
 pub(crate) struct ToolSurfacePromptBuilder;
 
 impl ToolSurfacePromptBuilder {
+    /// Returns whether an advertised tool has the given model-facing name.
+    ///
+    /// This is deliberately the same exposure predicate used by the stable inventory. Prompt
+    /// sections that give tool-specific advice must not infer availability from an agent role:
+    /// the agent construction path is the only place that knows which tools the provider receives.
+    pub(crate) fn contains_advertised_tool(tools: &[Arc<dyn Tool>], name: &str) -> bool {
+        tools.iter().any(|tool| {
+            tool.options().is_advertised_to_model() && tool.model_definition().name() == name
+        })
+    }
+
     /// Builds the model-visible inventory: the advertised names, sorted, and nothing else.
     ///
     /// Registration order is host startup detail, and letting it reach this text would invalidate
