@@ -53,6 +53,13 @@ fn build_standard_assembler() -> PromptAssembler {
         .build()
         .expect("valid editing section");
 
+    let autonomy = PromptSectionBuilder::new(PromptSectionName::AUTONOMY)
+        .purpose("Autonomous progress")
+        .source(PromptSource::Builtin)
+        .content("Autonomy: respond to evidence and pursue the requested deliverable.")
+        .build()
+        .expect("valid autonomy section");
+
     let final_ans = PromptSectionBuilder::new(PromptSectionName::FINAL_ANSWER)
         .purpose("Final answer delivery")
         .source(PromptSource::Builtin)
@@ -89,6 +96,8 @@ fn build_standard_assembler() -> PromptAssembler {
         .expect("add role")
         .add_section(editing)
         .expect("add editing")
+        .add_section(autonomy)
+        .expect("add autonomy")
 }
 
 #[test]
@@ -110,6 +119,7 @@ fn test_stable_prefix_assembly_order_determinism() {
             "tool_use",
             "safety",
             "editing_verification",
+            "autonomy",
             "final_answer",
             "context_durability",
             "personality",

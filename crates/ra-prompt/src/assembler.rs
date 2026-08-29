@@ -82,16 +82,18 @@ fn section_order_rank(name: &PromptSectionName) -> (u8, &str) {
         (4, name.as_str())
     } else if *name == PromptSectionName::EDITING_VERIFICATION {
         (5, name.as_str())
-    } else if *name == PromptSectionName::FINAL_ANSWER {
+    } else if *name == PromptSectionName::AUTONOMY {
         (6, name.as_str())
-    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
+    } else if *name == PromptSectionName::FINAL_ANSWER {
         (7, name.as_str())
-    } else if *name == PromptSectionName::PERSONALITY {
+    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
         (8, name.as_str())
-    } else if *name == PromptSectionName::ROLE {
+    } else if *name == PromptSectionName::PERSONALITY {
         (9, name.as_str())
-    } else {
+    } else if *name == PromptSectionName::ROLE {
         (10, name.as_str())
+    } else {
+        (11, name.as_str())
     }
 }
 

@@ -18,7 +18,7 @@ use ra_coding::{
     prompt::{assemble_stable_prefix, assemble_stable_prefix_for_tools, tool_surface_snapshot},
 };
 use ra_core::prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, PromptRole};
-use ra_core::tool::Tool;
+use ra_core::tool::{DEFAULT_MAX_NO_PROGRESS_STREAK, Tool};
 use ra_prompt::dump::PromptDump;
 use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
 
@@ -378,6 +378,7 @@ fn test_the_one_off_prefix_includes_engineering_judgment() {
             "identity",
             "core_behavior",
             "editing_verification",
+            "autonomy",
             "personality",
             "role"
         ],
@@ -411,17 +412,81 @@ fn test_the_product_prefix_includes_editing_and_git_safety_rules() {
     assert!(editing.contains("`git clean`"));
     assert!(editing.contains("`git checkout --`"));
 
+    // The pair, not the whole list: the full order is asserted where autonomy, the section that
+    // most recently joined it, is the subject.
+    let names = section_names(&main_prefix);
+    let position = |wanted: &str| names.iter().position(|name| *name == wanted);
+    assert!(
+        position("tool_surface") < position("editing_verification"),
+        "the editing entry must still follow the surface that advertises it"
+    );
+}
+
+/// The autonomy section follows editing safety and directs a run to use failure results as
+/// evidence instead of cycling through the same uninformative tool failure.
+///
+/// It says nothing about the role's authority or the deliverable: `identity` owns that contract,
+/// and a second cached copy of it is the thing this section is written to avoid.
+#[test]
+fn test_the_product_prefix_includes_autonomous_progress_and_stop_loss() {
+    let prefix = host_backed_prefix();
+    let autonomy = section_content(&prefix, "autonomy");
+
+    assert!(autonomy.contains("Do not stop at analysis or a proposal"));
+    assert!(autonomy.contains("let it change the next attempt"));
+    assert!(autonomy.contains("three consecutive failures that returned nothing new"));
+    assert!(
+        autonomy.contains("the tool is not lost and the task is not done"),
+        "the breaker clears its streak when it fires, so a refusal must not read as a lost tool"
+    );
+    assert!(autonomy.contains("information or authority would unblock it"));
+
+    // The prefix spells the runtime's default out in words. Pinning it here is what forces a
+    // change to the threshold back through this text, rather than leaving a cached prompt
+    // asserting a limit nobody enforces.
     assert_eq!(
-        section_names(&main_prefix),
+        DEFAULT_MAX_NO_PROGRESS_STREAK.get(),
+        3,
+        "the autonomy section reads `three consecutive failures`; update the prompt text with it"
+    );
+
+    assert_eq!(
+        section_names(&prefix),
         [
             "identity",
             "core_behavior",
             "tool_surface",
             "editing_verification",
+            "autonomy",
             "personality",
             "role"
         ]
     );
+}
+
+/// This rule is capability-aware rather than main-agent-only. Every product role needs the same
+/// completion and no-progress boundary, with the role section determining which actions it may
+/// actually take.
+#[test]
+fn test_every_role_shares_the_autonomy_section() {
+    let mut expected: Option<String> = None;
+    for role in [
+        PromptRole::Main,
+        PromptRole::ReadOnlySpecialist,
+        PromptRole::Planner,
+        PromptRole::OneOffAnswer,
+        PromptRole::Coordinator,
+    ] {
+        let autonomy = section_content(
+            &assemble_stable_prefix(&role).expect("product prefix assembles"),
+            "autonomy",
+        );
+        let previous = expected.get_or_insert_with(|| autonomy.clone());
+        assert_eq!(
+            *previous, autonomy,
+            "{role} must keep the shared autonomy contract"
+        );
+    }
 }
 
 /// Tool-specific guidance must come from the same advertised surface as the provider request.
@@ -494,9 +559,9 @@ fn section_names(prefix: &ra_prompt::assembler::StablePrefix) -> Vec<&str> {
 ///
 /// This pins a fact that is otherwise invisible. The floor is 1024 estimated tokens — every
 /// provider ignores a shorter prefix — and today's prefix carries the identity, engineering,
-/// tone, role and advertised-tool sections, landing in the low hundreds. So the real product gets
-/// no cache plan, and no `prompt_cache_key` is sent even to an endpoint that declared support for
-/// one.
+/// editing, autonomy, tone, role and advertised-tool sections, landing short of it. So the real
+/// product gets no cache plan, and no `prompt_cache_key` is sent even to an endpoint that declared
+/// support for one.
 ///
 /// Measured on the host-backed prefix, which is the longer of the two the product assembles and
 /// the one an agent with tools installed actually carries. A prefix that only cleared the floor
