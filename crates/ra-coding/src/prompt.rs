@@ -6,8 +6,8 @@
 //! string its declaration happened to carry, and none of the sectioning, ordering, prefix hashing,
 //! or dump governance would apply to what the model actually receives.
 //!
-//! The per-topic modules alongside this one hold the product's own prompt text. Six are written:
-//! `identity`, `engineering`, `editing`, [`personality`], [`role`], and the generated
+//! The per-topic modules alongside this one hold the product's own prompt text. Seven are written:
+//! `identity`, `engineering`, `editing`, `autonomy`, [`personality`], [`role`], and the generated
 //! `tool_surface`. The rest are still empty registration slots: writing that text is a separate
 //! piece of work, and filling them with placeholders would freeze wording nobody has decided on.
 //! Each one lands by adding a section to [`assemble_stable_prefix_for_tools`], which is why the
@@ -37,6 +37,7 @@ use ra_core::prompt::PromptRole;
 use ra_core::tool::Tool;
 use ra_prompt::assembler::{PromptAssembler, StablePrefix};
 
+use self::autonomy::AutonomyPromptBuilder;
 use self::editing::EditingPromptBuilder;
 use self::engineering::EngineeringPromptBuilder;
 use self::identity::IdentityPromptBuilder;
@@ -87,6 +88,7 @@ pub fn assemble_stable_prefix_for_tools(
         IdentityPromptBuilder::build_identity_section()?,
         EngineeringPromptBuilder::build_engineering_section()?,
         EditingPromptBuilder::build_editing_section(role, apply_patch_is_advertised)?,
+        AutonomyPromptBuilder::build_autonomy_section()?,
         PersonalityPromptBuilder::build_personality_section()?,
         RolePromptBuilder::build_role_section(role)?,
     ];

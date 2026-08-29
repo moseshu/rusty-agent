@@ -152,6 +152,8 @@ impl PromptSectionName {
     pub const SAFETY: Self = Self::from_static("safety");
     /// Editing and post-change verification guidance section.
     pub const EDITING_VERIFICATION: Self = Self::from_static("editing_verification");
+    /// Autonomous progress and stop-loss guidance section.
+    pub const AUTONOMY: Self = Self::from_static("autonomy");
     /// Final answer and deliverable format section.
     pub const FINAL_ANSWER: Self = Self::from_static("final_answer");
     /// Context durability and memory guidance section.
