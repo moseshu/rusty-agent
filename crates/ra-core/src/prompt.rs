@@ -154,6 +154,8 @@ impl PromptSectionName {
     pub const EDITING_VERIFICATION: Self = Self::from_static("editing_verification");
     /// Autonomous progress and stop-loss guidance section.
     pub const AUTONOMY: Self = Self::from_static("autonomy");
+    /// Commentary and final response-channel guidance section.
+    pub const CHANNELS: Self = Self::from_static("channels");
     /// Final answer and deliverable format section.
     pub const FINAL_ANSWER: Self = Self::from_static("final_answer");
     /// Context durability and memory guidance section.

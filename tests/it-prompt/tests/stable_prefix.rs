@@ -60,6 +60,13 @@ fn build_standard_assembler() -> PromptAssembler {
         .build()
         .expect("valid autonomy section");
 
+    let channels = PromptSectionBuilder::new(PromptSectionName::CHANNELS)
+        .purpose("Response channels")
+        .source(PromptSource::Builtin)
+        .content("Channels: keep progress in commentary and deliver once at the end.")
+        .build()
+        .expect("valid channels section");
+
     let final_ans = PromptSectionBuilder::new(PromptSectionName::FINAL_ANSWER)
         .purpose("Final answer delivery")
         .source(PromptSource::Builtin)
@@ -98,6 +105,8 @@ fn build_standard_assembler() -> PromptAssembler {
         .expect("add editing")
         .add_section(autonomy)
         .expect("add autonomy")
+        .add_section(channels)
+        .expect("add channels")
 }
 
 #[test]
@@ -120,6 +129,7 @@ fn test_stable_prefix_assembly_order_determinism() {
             "safety",
             "editing_verification",
             "autonomy",
+            "channels",
             "final_answer",
             "context_durability",
             "personality",
