@@ -27,12 +27,15 @@ fn host_backed_agent_advertises_the_editing_entry() {
     )
     .expect("agent");
 
-    assert_eq!(agent.tools().len(), 1);
-    assert_eq!(agent.tools()[0].origin().name(), "apply_patch");
-    assert_eq!(
-        agent.tools()[0].options().approval(),
-        ToolApprovalPolicy::Always
-    );
+    // Found by name rather than by position: this case is about the editing entry, and an index
+    // would make it fail the next time the host installs another tool beside it.
+    let editing = agent
+        .tools()
+        .iter()
+        .find(|tool| tool.origin().name() == "apply_patch")
+        .expect("the host-backed agent advertises the editing entry");
+
+    assert_eq!(editing.options().approval(), ToolApprovalPolicy::Always);
 }
 
 /// The capability the host hands the tool is the workspace it was opened on, not the process root.

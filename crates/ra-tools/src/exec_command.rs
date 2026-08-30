@@ -393,8 +393,9 @@ impl Tool for ExecCommandTool {
     }
 
     fn options(&self) -> ToolOptions {
-        // `Exclusive` is the conservative default a command deserves: it can write anything, so
-        // nothing else may run beside it until resource-level admission can say otherwise.
+        // The rooted form declares the workspace claim that serializes conflicting commands. An
+        // ambient host has no such claim, so commands remain independently schedulable instead of
+        // turning every command into a global run lock.
         //
         // `Custom` failure handling is what buys the model a sentence instead of a bare error code,
         // and every failure this tool produces carries one — a gap would turn a mistyped argument
@@ -421,7 +422,7 @@ fn base_options() -> ToolOptions {
     ToolOptions::new()
         .with_approval(ToolApprovalPolicy::Always)
         .with_failure_handling(ToolFailureHandling::Custom)
-        .with_concurrency(ToolConcurrency::Exclusive)
+        .with_concurrency(ToolConcurrency::Parallel)
 }
 
 /// Renders a command that finished within the yield window.

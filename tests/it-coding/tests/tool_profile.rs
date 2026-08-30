@@ -10,7 +10,7 @@ use ra_core::{
     tool::{Tool, ToolContext, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::tool::{profile::ToolSelection, registry::ToolRegistry};
-use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
+use ra_tools::read_file::ReadFileTool;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -99,7 +99,8 @@ fn implemented_core_tools(workspace: &TempDir) -> Vec<Arc<dyn Tool>> {
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
     vec![
         Arc::new(ReadFileTool::new().expect("read_file builds")),
-        Arc::new(ExecCommandTool::new().expect("exec_command builds")),
+        host.exec_command_tool().expect("exec_command builds"),
+        host.write_stdin_tool().expect("write_stdin builds"),
         host.apply_patch_tool().expect("apply_patch builds"),
     ]
 }
@@ -461,7 +462,7 @@ fn test_the_declared_names_match_the_tools_that_exist() {
     }
     assert_eq!(
         registry.len(),
-        3,
+        4,
         "a core tool was written without being added to `implemented_core_tools`, or one was \
          removed"
     );

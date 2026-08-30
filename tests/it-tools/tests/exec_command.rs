@@ -135,9 +135,35 @@ async fn test_exec_command_schema_and_identity() {
 async fn test_exec_command_options() {
     let tool = ExecCommandTool::new().expect("exec_command builds");
 
-    assert_eq!(tool.options().concurrency(), ToolConcurrency::Exclusive);
+    assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
     assert_eq!(tool.options().approval(), ToolApprovalPolicy::Always);
     assert!(tool.options().is_advertised());
+}
+
+/// What keeps two commands out of each other's way is the workspace claim, not the schedule.
+///
+/// Commands are schedulable in parallel so that a batch of them is one batch. The serialization
+/// that lost is not gone: the rooted form claims its workspace exclusively, so two commands rooted
+/// in the same tree still take turns. An assertion on the concurrency mode alone would keep passing
+/// with that claim deleted, and every command in a batch would then run over the same worktree.
+#[tokio::test]
+async fn test_a_rooted_command_claims_its_workspace_exclusively() {
+    let dir = workspace();
+    let tool = rooted(&dir);
+    let claims = tool.options().resource_claims().to_vec();
+
+    assert_eq!(claims.len(), 1, "{claims:?}");
+    assert!(claims[0].is_exclusive(), "{claims:?}");
+    assert!(
+        claims[0].resource().to_string().contains(
+            &dir.path()
+                .canonicalize()
+                .expect("a real path")
+                .display()
+                .to_string()
+        ),
+        "the claim must name this workspace: {claims:?}"
+    );
 }
 
 #[tokio::test]

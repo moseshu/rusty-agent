@@ -7,6 +7,7 @@ async fn ra_exec::session::ProcessManager::execute(& self, request : ExecRequest
 async fn ra_exec::session::ProcessManager::get_output_summary(& self, session_id : & ExecSessionId) -> Option < ExecOutputSummary >
 async fn ra_exec::session::ProcessManager::get_session_state(& self, session_id : & ExecSessionId) -> Option < ExecSessionState >
 async fn ra_exec::session::ProcessManager::read_output(& self, session_id : & ExecSessionId, cursor : ExecCursor) -> Result < Option < (String , ExecCursor) > , ExecError >
+async fn ra_exec::session::ProcessManager::wait_for_output(& self, session_id : & ExecSessionId, stdout_cursor : u64, stderr_cursor : u64, timeout : Duration) -> Result < () , ExecError >
 async fn ra_exec::session::ProcessManager::write_stdin(& self, session_id : & ExecSessionId, chars : Option < & str >, is_interrupt : bool, emitter : Option < & HostEventEmitter >) -> Result < () , ExecError >
 const fn ra_exec::command::ExecCursor::advance(self, bytes : u64) -> Self
 const fn ra_exec::command::ExecCursor::new(stream : ExecStreamKind, offset : u64) -> Self

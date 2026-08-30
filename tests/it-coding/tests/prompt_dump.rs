@@ -65,7 +65,11 @@ fn tool_surface_snapshot_path() -> PathBuf {
 fn host_backed_tools() -> Vec<Arc<dyn Tool>> {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
-    vec![host.apply_patch_tool().expect("apply_patch builds")]
+    vec![
+        host.apply_patch_tool().expect("apply_patch builds"),
+        host.exec_command_tool().expect("exec_command builds"),
+        host.write_stdin_tool().expect("write_stdin builds"),
+    ]
 }
 
 fn host_backed_prefix() -> ra_prompt::assembler::StablePrefix {
@@ -283,8 +287,10 @@ fn test_host_backed_agent_carries_the_tool_surface_prefix() {
             .and_then(ra_core::agent::AgentInstructions::as_static),
         Some(prefix.system_instructions())
     );
-    assert_eq!(agent.tools().len(), 1);
+    assert_eq!(agent.tools().len(), 3);
     assert!(prefix.system_instructions().contains("`apply_patch`"));
+    assert!(prefix.system_instructions().contains("`exec_command`"));
+    assert!(prefix.system_instructions().contains("`write_stdin`"));
 }
 
 /// Opening a workspace does not override a role's tool boundary.
