@@ -1,0 +1,16 @@
+[package]
+name = "it-cli"
+description = "ra-cli 的集成测试。不随主 workspace 发布。"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-cli = { path = "../../crates/ra-cli" }
+ra-coding = { path = "../../crates/ra-coding" }
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = "1"
+tempfile = "3"

@@ -18,9 +18,14 @@
 //! has to be unique — `engineering` builds `core_behavior`. Two modules reaching for the same
 //! section name is caught at assembly rather than silently resolved, which is what makes claiming a
 //! shared slot safe.
+//!
+//! [`dump`] is the odd module out: it writes no prompt text. It composes the report that `ra prompt
+//! dump` prints and the snapshot gate commits, which is a product decision about what a dump covers
+//! rather than a section of one.
 
 pub(crate) mod autonomy;
 pub(crate) mod channels;
+pub mod dump;
 pub(crate) mod editing;
 pub(crate) mod engineering;
 pub(crate) mod formatting;

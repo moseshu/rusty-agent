@@ -10,6 +10,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+# The command line is a library with a thin binary in front of it. `main.rs` is unreachable from
+# the test workspace, and a subcommand nobody can exercise is how a flag rots.
+[lib]
+name = "ra_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ra"
 path = "src/main.rs"
