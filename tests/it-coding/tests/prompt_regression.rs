@@ -40,10 +40,11 @@ static SHIPPED_ROLES: [PromptRole; 5] = [
 
 /// The ceiling on the assembled stable prefix, as the sum of the sections' own allowances.
 ///
-/// Twice [`MIN_CACHEABLE_PREFIX_TOKENS`]. The floor and the ceiling are different kinds of fact —
-/// below the floor no provider caches the span at all, above the ceiling it is cached and simply
-/// costs more on every turn than this product has decided a system prompt is worth.
-const PREFIX_TOKEN_CEILING: usize = 2 * MIN_CACHEABLE_PREFIX_TOKENS;
+/// The declared sum of the product's section allowances. The floor and the ceiling are different
+/// kinds of fact — below the floor no provider caches the span at all, above the ceiling it is
+/// cached and simply costs more on every turn than this product has decided a system prompt is
+/// worth.
+const PREFIX_TOKEN_CEILING: usize = 2_432;
 
 /// Names whose appearance in shipped prompt text would be a marker of borrowed material.
 ///

@@ -27,6 +27,8 @@ use ra_core::{
     tool::Tool,
 };
 
+use crate::profile::MAX_ADVERTISED_NAME_CHARS;
+
 /// Product-owned revision of the advertised coding-tool schemas.
 ///
 /// Raise this value whenever any model-facing name, description, strictness flag, or input schema
@@ -37,10 +39,11 @@ pub(crate) const TOOL_SCHEMA_REVISION: u32 = 2;
 /// Cached-prefix allowance for this section, in estimated tokens.
 ///
 /// The only allowance here that a text edit cannot spend on its own: this section is generated from
-/// the advertised tool list, so it grows when tools are added. That is the point of giving it a
-/// limit — a tool surface wide enough to crowd the instructions out of the cached prefix should
-/// have to be argued for, and this is where the argument surfaces.
-const TOKEN_BUDGET: usize = 256;
+/// the advertised tool list, so it grows when tools are added. Its source contract permits 1,536
+/// name characters; with the heading, punctuation, and 24 entries at the ceiling that fits inside
+/// 434 estimated tokens. The remaining room up to 512 accommodates wording changes without
+/// teaching the prompt a second, implicit name-length policy.
+const TOKEN_BUDGET: usize = 512;
 
 /// Builds the prompt section and the reviewable digest for one advertised tool surface.
 pub(crate) struct ToolSurfacePromptBuilder;
@@ -71,9 +74,13 @@ impl ToolSurfacePromptBuilder {
 
         // "Available tools", not "tool schemas": the schemas are in the request's tool table, and
         // naming them here would tell the model to look for something this text does not carry.
+        //
+        // The restriction to these entries is stated once, in the `tool_use` section assembled
+        // immediately above this one. Repeating it here would put one rule in two spans of the same
+        // cached prefix, where editing either leaves the model holding both versions of it.
         let content = format!(
-            "Available tools:\n{}\n\nUse only these tools. Their provider-supplied schemas \
-             define the accepted arguments.",
+            "Available tools:\n{}\n\nTheir provider-supplied schemas define the accepted \
+             arguments.",
             render_names(&entries)
         );
 
@@ -132,6 +139,13 @@ fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, Conten
                 "tool prompt surface advertises model-facing name `{name}` more than once"
             )));
         }
+    }
+    let name_chars: usize = entries.keys().map(|name| name.chars().count()).sum();
+    if name_chars > MAX_ADVERTISED_NAME_CHARS {
+        return Err(Error::config(format!(
+            "coding prompt inventory advertises {name_chars} characters in model-facing tool \
+             names, above its declared ceiling of {MAX_ADVERTISED_NAME_CHARS}"
+        )));
     }
     Ok(entries)
 }

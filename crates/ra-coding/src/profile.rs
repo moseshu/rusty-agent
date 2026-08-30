@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 /// aspiration. It applies to every tier: a smaller surface made of larger entries costs the same.
 const MAX_ADVERTISED_BYTES: usize = 20 * 1024;
 
+/// The longest aggregate model-facing name list a coding prompt inventories.
+///
+/// A tool schema is sent in the provider's tool table, while the cached prefix repeats only its
+/// name. The two costs therefore need independent bounds. Twenty-four names of up to 64
+/// characters cover common provider limits and qualified MCP-style names without allowing an
+/// unconstrained host registration to grow the reusable instruction span indefinitely.
+pub(crate) const MAX_ADVERTISED_NAME_CHARS: usize = 24 * 64;
+
 /// The entries that do the work, plus the two that produce structured observations.
 ///
 /// Six rather than four because `grep` and `glob` are not conveniences over `exec_command`: they
@@ -97,16 +105,22 @@ impl CodingProfile {
             // looking. The bands are wide enough to breathe and narrow enough that a surface which
             // dropped several entries lands outside one.
             Self::Core => builder.include_all(lookup_keys(&CORE)?).budget(
-                ToolSurfaceBudget::new(6, 8)?.with_max_advertised_bytes(MAX_ADVERTISED_BYTES),
+                ToolSurfaceBudget::new(6, 8)?
+                    .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
+                    .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS),
             ),
             Self::CodexLike => builder
                 .include_all(lookup_keys(&CORE)?)
                 .include_all(lookup_keys(&CODEX_LIKE_EXTRA)?)
                 .budget(
-                    ToolSurfaceBudget::new(14, 16)?.with_max_advertised_bytes(MAX_ADVERTISED_BYTES),
+                    ToolSurfaceBudget::new(14, 16)?
+                        .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
+                        .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS),
                 ),
             Self::Full => builder.all_registered().budget(
-                ToolSurfaceBudget::new(14, 24)?.with_max_advertised_bytes(MAX_ADVERTISED_BYTES),
+                ToolSurfaceBudget::new(14, 24)?
+                    .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
+                    .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS),
             ),
         };
         builder.build()

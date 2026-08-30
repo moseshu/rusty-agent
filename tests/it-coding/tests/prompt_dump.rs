@@ -193,11 +193,12 @@ fn test_a_dump_compared_against_itself_reports_no_change() {
     );
 }
 
-/// Inserting one section must not report every section below it as having moved.
+/// An insertion must not report every section below it as having moved.
 ///
-/// Adding the tool surface shifts the index of everything after it, and a report that called all of
-/// them moved would bury the insertion that caused the change under seven consequences of it. The
-/// comparison ranks sections among the ones both dumps share, so only the real causes are named.
+/// Advertising a tool inserts the selection rules and the inventory they point at, which shifts the
+/// index of everything after them, and a report that called all of those moved would bury the two
+/// insertions under seven consequences of them. The comparison ranks sections among the ones both
+/// dumps share, so only the real causes are named.
 #[test]
 fn test_an_insertion_is_not_reported_as_moving_every_section_below_it() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -210,8 +211,8 @@ fn test_an_insertion_is_not_reported_as_moving_every_section_below_it() {
     let named: Vec<&str> = diff.changes().iter().map(SectionChange::name).collect();
     assert_eq!(
         named,
-        ["tool_surface", "editing_verification"],
-        "only the added surface and the editing text that names it actually changed"
+        ["tool_use", "tool_surface", "editing_verification"],
+        "only the added pair and the editing text that names an entry actually changed"
     );
     assert!(
         !diff
@@ -309,13 +310,20 @@ fn test_host_backed_read_only_and_one_off_agents_carry_no_tools() {
             agent.tools().is_empty(),
             "`{role}` must not receive an editing tool"
         );
+        let instructions = agent
+            .instructions()
+            .and_then(ra_core::agent::AgentInstructions::as_static)
+            .expect("agent has a stable prefix")
+            .to_owned();
         assert!(
-            !agent
-                .instructions()
-                .and_then(ra_core::agent::AgentInstructions::as_static)
-                .expect("agent has a stable prefix")
-                .contains("`apply_patch`"),
+            !instructions.contains("`apply_patch`"),
             "tool-free agents must not name an unavailable editing entry"
+        );
+        // The same rule one level up: with no entries to choose among, the prefix carries neither
+        // the inventory nor the rules for reading it.
+        assert!(
+            !instructions.contains("Available tools:") && !instructions.contains("Tool Use:"),
+            "tool-free agents must not carry tool-selection guidance"
         );
     }
 }
@@ -540,6 +548,69 @@ fn test_the_product_prefix_places_engineering_judgment_after_identity() {
     );
 }
 
+/// Tool selection is a shared behavior contract, while the adjacent surface supplies the changing
+/// list of names. This keeps a schema addition from becoming an instruction to use a capability
+/// that the current request never advertises.
+#[test]
+fn test_the_product_prefix_includes_the_tool_selection_contract() {
+    let host_backed = host_backed_prefix();
+    let tool_use = section_content(&host_backed, "tool_use");
+
+    assert!(tool_use.contains("Use only the entries listed under Available tools"));
+    assert!(tool_use.contains("do not infer or invoke an unlisted capability"));
+    assert!(tool_use.contains("advertised specialist"));
+    assert!(tool_use.contains("long-tail command-line work"));
+    // Naming no tool is the property, not the absence of one particular name: a backtick in this
+    // section is a tool name, and every prefix that carries the section carries it whatever the
+    // host advertised.
+    assert!(
+        !tool_use.contains('`'),
+        "the selection contract must name no tool, but reads: {tool_use}"
+    );
+
+    // The heading the rules point at is the one the inventory actually renders, and the rule that
+    // restricts the model to it is stated in one of the two sections rather than both.
+    let inventory = section_content(&host_backed, "tool_surface");
+    assert!(inventory.starts_with("Available tools:"));
+    assert!(
+        !inventory.contains("Use only"),
+        "one restriction, one span of the cached prefix: {inventory}"
+    );
+
+    let names = section_names(&host_backed);
+    assert!(
+        position_of(&names, "core_behavior") < position_of(&names, "tool_use")
+            && position_of(&names, "tool_use") < position_of(&names, "tool_surface"),
+        "tool selection must follow engineering judgment and precede the advertised inventory"
+    );
+}
+
+/// An agent whose request carries no tools carries no rules for choosing among them.
+///
+/// The pair is one decision in two sections. Assembled alone, the selection rules would tell such
+/// an agent to choose from a list its prompt does not contain — and they rank ahead of the role
+/// section, so that would be the instruction a one-off or read-only agent reads *first*, with the
+/// denial arriving several hundred tokens later. `editing` refuses to name `apply_patch` on the
+/// same grounds.
+#[test]
+fn test_a_tool_free_prefix_carries_neither_the_inventory_nor_its_selection_rules() {
+    for role in [
+        PromptRole::Main,
+        PromptRole::ReadOnlySpecialist,
+        PromptRole::Planner,
+        PromptRole::OneOffAnswer,
+        PromptRole::Coordinator,
+    ] {
+        let prefix = assemble_stable_prefix(&role).expect("bare prefix");
+        let names = section_names(&prefix);
+        assert!(
+            !names.contains(&"tool_use") && !names.contains(&"tool_surface"),
+            "`{role}` advertises no tool, so neither half of the pair belongs in its prefix: \
+             {names:?}"
+        );
+    }
+}
+
 /// Every shipped role shares the engineering-judgment portion of the stable prefix. Role-specific
 /// scope belongs exclusively to the role section, preserving the common cached-prefix skeleton.
 #[test]
@@ -714,6 +785,7 @@ fn test_the_product_prefix_includes_dual_channel_response_rules() {
         [
             "identity",
             "core_behavior",
+            "tool_use",
             "tool_surface",
             "editing_verification",
             "autonomy",
