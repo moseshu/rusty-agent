@@ -1465,8 +1465,7 @@ fn emit_started(
         return;
     };
     let mut started = ExecStartedEvent::new(session_id.clone(), request.command().to_owned())
-        .with_args(request.args().to_vec())
-        .with_pty(request.pty());
+        .with_args(request.args().to_vec());
     if let Some(cwd) = request.cwd() {
         started = started.with_cwd(cwd.to_string_lossy().to_string());
     }

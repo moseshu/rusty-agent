@@ -119,7 +119,7 @@ fn test_dual_channel_strict_isolation() {
 
     emitter
         .emit_exec(ExecEvent::Started(
-            ExecStartedEvent::new(ExecSessionId::new("sess-1"), "cargo test").with_pty(true),
+            ExecStartedEvent::new(ExecSessionId::new("sess-1"), "cargo test").with_pid(4_242),
         ))
         .expect("must emit");
 

@@ -191,7 +191,7 @@ pub enum ScopeKind {
     Turn,
     /// One tool call.
     Tool,
-    /// One child process or PTY session.
+    /// One child process.
     Process,
     /// Extension point: a custom level such as a graph node (extension-safety rule 5).
     Custom(Cow<'static, str>),

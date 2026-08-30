@@ -1,4 +1,4 @@
-//! Integration tests for ExecRequest, ExecLimits, StdinCommand, and RootedFileSystem.
+//! Integration tests for ExecRequest, ExecLimits, and RootedFileSystem.
 
 use std::{fs as std_fs, path::Path, time::Duration};
 
@@ -8,8 +8,6 @@ use ra_exec::{
     command::{ExecCursor, ExecLimits, ExecRequest},
     fs::{RootedFileSystem, RootedOpenError},
     output::ExecOutputSummary,
-    pty::{StdinCommand, StdinValidationError, TerminalMode},
-    session::ExecSessionId,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -19,15 +17,13 @@ fn test_exec_request_and_limits_construction() {
     let req = ExecRequest::new("npm test")
         .with_args(["--", "--watch=false"])
         .with_cwd("/src")
-        .with_env("NODE_ENV", "test")
-        .with_pty(true);
+        .with_env("NODE_ENV", "test");
 
     assert_eq!(req.schema_version(), EXEC_SCHEMA_VERSION);
     assert_eq!(req.command(), "npm test");
     assert_eq!(req.args(), &["--", "--watch=false"]);
     assert_eq!(req.cwd(), Some(&Path::new("/src").to_path_buf()));
     assert_eq!(req.env().get("NODE_ENV"), Some(&"test".to_owned()));
-    assert!(req.pty());
     assert!(req.unknown().is_empty());
 
     let default_limits = req.limits();
@@ -85,37 +81,6 @@ fn test_exec_cursor_saturates_instead_of_moving_backwards() {
             .offset(),
         u64::MAX
     );
-}
-
-#[test]
-fn test_stdin_command_validation_modes() {
-    let session_id = ExecSessionId::new("exec-pty-test");
-
-    // Pty mode accepts character input, poll, and interrupt
-    let write_cmd = StdinCommand::write(session_id.clone(), "ls -la\n");
-    assert_eq!(write_cmd.schema_version(), EXEC_SCHEMA_VERSION);
-    assert_eq!(write_cmd.validate(TerminalMode::Pty), Ok(()));
-    assert_eq!(write_cmd.chars(), Some("ls -la\n"));
-    assert!(!write_cmd.is_interrupt());
-    assert!(write_cmd.unknown().is_empty());
-
-    let poll_cmd = StdinCommand::poll(session_id.clone());
-    assert_eq!(poll_cmd.validate(TerminalMode::Pty), Ok(()));
-    assert_eq!(poll_cmd.chars(), None);
-
-    let interrupt_cmd = StdinCommand::interrupt(session_id.clone());
-    assert_eq!(interrupt_cmd.validate(TerminalMode::Pty), Ok(()));
-    assert!(interrupt_cmd.is_interrupt());
-
-    // Pipe mode rejects non-empty character input
-    assert_eq!(
-        write_cmd.validate(TerminalMode::Pipe),
-        Err(StdinValidationError::NonTtyInputRejected)
-    );
-
-    // Pipe mode accepts poll and interrupt
-    assert_eq!(poll_cmd.validate(TerminalMode::Pipe), Ok(()));
-    assert_eq!(interrupt_cmd.validate(TerminalMode::Pipe), Ok(()));
 }
 
 #[test]
@@ -226,27 +191,6 @@ fn test_exec_contracts_forward_compatibility() {
     let summary_reserialized =
         serde_json::to_value(&summary).expect("must reserialize ExecOutputSummary");
     assert_eq!(summary_reserialized["peak_rss_bytes"], 52428800);
-
-    // 3. StdinCommand with future priority
-    let future_stdin_payload = json!({
-        "schema_version": 2,
-        "session_id": "exec-10",
-        "chars": "y\n",
-        "is_interrupt": false,
-        "flush_mode": "immediate"
-    });
-
-    let stdin_cmd: StdinCommand =
-        serde_json::from_value(future_stdin_payload).expect("must deserialize future StdinCommand");
-    assert_eq!(stdin_cmd.schema_version(), SchemaVersion::new(2));
-    assert_eq!(
-        stdin_cmd.unknown().get("flush_mode"),
-        Some(&json!("immediate"))
-    );
-
-    let stdin_reserialized =
-        serde_json::to_value(&stdin_cmd).expect("must reserialize StdinCommand");
-    assert_eq!(stdin_reserialized["flush_mode"], "immediate");
 }
 
 #[test]

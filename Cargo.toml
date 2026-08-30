@@ -91,7 +91,6 @@ reqwest = { version = "0.12", features = [
 
 # --- 存储与进程 ---
 rusqlite = { version = "0.32", features = ["bundled"] }
-portable-pty = "0.9"
 
 # --- 杂项 ---
 uuid = { version = "1", features = ["v4", "v7", "serde"] }

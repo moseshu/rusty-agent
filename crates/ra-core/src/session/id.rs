@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// An opaque identifier for a local authoritative conversation session.
 ///
 /// This is the identity of the authoritative local conversation history. It is distinct from
-/// execution and PTY session identifiers ([`ExecSessionId`](crate::event::exec::ExecSessionId))
+/// command execution session identifiers ([`ExecSessionId`](crate::event::exec::ExecSessionId))
 /// and provider-managed remote conversation identifiers ([`ProviderConversationId`](crate::model::ProviderConversationId)).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

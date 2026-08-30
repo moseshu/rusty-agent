@@ -175,8 +175,7 @@ fn test_all_exec_events_serde_roundtrip_equality() {
             ExecStartedEvent::new(sid.clone(), "cargo test")
                 .with_args(["--", "test_name"])
                 .with_cwd("/src")
-                .with_pid(42)
-                .with_pty(true),
+                .with_pid(42),
         ),
         ExecEvent::Output(
             ExecOutputEvent::new(sid.clone(), ExecStreamKind::Stdout, 0, 10, "output text")
@@ -387,8 +386,8 @@ fn test_forward_compat_payload_extra_fields() {
         assert_eq!(started.schema_version(), EXEC_EVENT_SCHEMA_VERSION);
         assert!(started.unknown().get("schema_version").is_none());
 
-        // Must contain exactly the 2 unknown fields, and NOT "kind"
-        assert_eq!(started.unknown().len(), 2);
+        // Must contain exactly the 3 unknown fields, and NOT "kind"
+        assert_eq!(started.unknown().len(), 3);
         assert!(started.unknown().get("kind").is_none());
         assert_eq!(
             started.unknown().get("container_id"),
@@ -398,6 +397,11 @@ fn test_forward_compat_payload_extra_fields() {
             started.unknown().get("cgroup_memory_limit"),
             Some(&json!(1073741824))
         );
+        // `pty` is a field this build removed, and the fixture is what a log written before that
+        // removal looks like. It lands in the unknown bag and is written back out below, which is
+        // what keeps a reader that never knew the field from deleting it from someone else's
+        // record.
+        assert_eq!(started.unknown().get("pty"), Some(&json!(false)));
     } else {
         panic!("expected ExecStarted event");
     }
@@ -408,6 +412,7 @@ fn test_forward_compat_payload_extra_fields() {
         reserialized["body"]["data"]["cgroup_memory_limit"],
         1073741824
     );
+    assert_eq!(reserialized["body"]["data"]["pty"], false);
 }
 
 #[test]
