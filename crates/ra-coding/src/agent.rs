@@ -37,9 +37,10 @@ pub fn build_agent(
 
 /// Builds the coding agent with the host-backed tools its role permits.
 ///
-/// For a role that may edit, this deliberately installs only `apply_patch`: the complete profile
-/// remains unavailable until the other declared core tools exist, and pretending the incomplete set
-/// were a profile would make the prompt advertise capabilities the runtime cannot dispatch.
+/// The complete profile remains unavailable until every declared core tool exists, and pretending
+/// the incomplete set were a profile would make the prompt advertise capabilities the runtime
+/// cannot dispatch. The execution pair is nevertheless installed together: a background session
+/// is only useful when the same agent can write to it afterwards.
 pub fn build_agent_with_host(
     id: AgentId,
     name: impl Into<String>,
@@ -75,5 +76,9 @@ pub(crate) fn host_backed_tools(
     if role.is_read_only() || role.is_one_off() {
         return Ok(Vec::new());
     }
-    Ok(vec![host.apply_patch_tool()?])
+    Ok(vec![
+        host.apply_patch_tool()?,
+        host.exec_command_tool()?,
+        host.write_stdin_tool()?,
+    ])
 }

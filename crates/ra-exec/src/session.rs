@@ -808,6 +808,69 @@ impl ProcessManager {
         Ok(Some((text, next)))
     }
 
+    /// Waits until either output stream advances beyond the supplied cursors, the session exits,
+    /// or `timeout` elapses.
+    ///
+    /// This is the companion to [`Self::read_output`] for an interactive client. The cursors make
+    /// the wait about output produced after one particular interaction rather than about a session
+    /// that may have been printing for minutes. A timeout is a successful wait with no news; use
+    /// [`Self::read_output`] afterward to obtain whichever stream data arrived.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::UnknownSession`] if the manager no longer retains the identifier.
+    pub async fn wait_for_output(
+        &self,
+        session_id: &ExecSessionId,
+        stdout_cursor: u64,
+        stderr_cursor: u64,
+        timeout: Duration,
+    ) -> Result<(), ExecError> {
+        let session =
+            self.registry
+                .get(session_id)
+                .await
+                .ok_or_else(|| ExecError::UnknownSession {
+                    session_id: session_id.clone(),
+                })?;
+
+        // `Notify::notify_waiters` does not retain a permit. Arm both waiters before inspecting
+        // the buffers, then inspect them under the session lock: output landing on either side of
+        // that inspection is therefore either visible in the snapshot or wakes this call.
+        let (output_notify, exit_notify) = {
+            let sess = session.lock().await;
+            (
+                Arc::clone(&sess.output_notify),
+                Arc::clone(&sess.exit_notify),
+            )
+        };
+        let output_ready = output_notify.notified();
+        let exit_ready = exit_notify.notified();
+        tokio::pin!(output_ready);
+        tokio::pin!(exit_ready);
+        output_ready.as_mut().enable();
+        exit_ready.as_mut().enable();
+
+        {
+            let sess = session.lock().await;
+            if sess.stdout_buffer.total_bytes()
+                > usize::try_from(stdout_cursor).unwrap_or(usize::MAX)
+                || sess.stderr_buffer.total_bytes()
+                    > usize::try_from(stderr_cursor).unwrap_or(usize::MAX)
+                || sess.state.is_terminal()
+            {
+                return Ok(());
+            }
+        }
+
+        tokio::select! {
+            () = &mut output_ready => {}
+            () = &mut exit_ready => {}
+            () = tokio::time::sleep(timeout) => {}
+        }
+        Ok(())
+    }
+
     /// Delivers interactive standard input or an interrupt to a running session.
     ///
     /// An interrupt is `SIGINT` to the process group, not a kill: a program that installs a handler

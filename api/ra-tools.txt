@@ -27,6 +27,8 @@ fn ra_tools::exec_command::ExecCommandTool::with_manager(mut self, manager : Arc
 fn ra_tools::read_file::ReadFileTool::new() -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::root(& self) -> Option < & Path >
 fn ra_tools::read_file::ReadFileTool::rooted(root : impl AsRef < Path >) -> Result < Self >
+fn ra_tools::write_stdin::WriteStdinTool::new(process_manager : Arc < ProcessManager >) -> Result < Self >
+fn ra_tools::write_stdin::WriteStdinTool::process_manager(& self) -> & Arc < ProcessManager >
 mod ra_tools::agent_ns
 mod ra_tools::apply_patch
 mod ra_tools::ask_user
@@ -46,3 +48,4 @@ struct ra_tools::exec_command::ExecCommandLimits
 struct ra_tools::exec_command::ExecCommandTool
 struct ra_tools::read_file::ReadFileLimits
 struct ra_tools::read_file::ReadFileTool
+struct ra_tools::write_stdin::WriteStdinTool
