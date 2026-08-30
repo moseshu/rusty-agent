@@ -424,6 +424,61 @@ async fn test_process_manager_stdin_and_cursor_read() {
         .expect("cancel is prompt");
 }
 
+/// The interactive delivery mark only ever advances, and never past what the session produced.
+///
+/// Both halves are load bearing. The mark is what one caller — the model's `write_stdin`
+/// conversation — reads to learn which bytes it has not seen; a mark that could move backward would
+/// repeat output already delivered, and one that could name a future offset would skip output that
+/// had not arrived yet. Neither is reachable through the tool today, which is exactly why the
+/// guarantee is asserted here rather than left to the one caller that happens to behave.
+#[tokio::test]
+async fn test_the_interactive_delivery_mark_advances_and_stays_within_produced_output() {
+    let manager = ProcessManager::default();
+    let session_id = yielded(&manager, ExecRequest::new("cat").with_limits(quick_yield())).await;
+
+    manager
+        .write_stdin(&session_id, Some("marked line\n"), false, None)
+        .await
+        .expect("write succeeds");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let produced = manager
+        .get_output_summary(&session_id)
+        .await
+        .expect("the session is retained")
+        .stdout_bytes() as u64;
+    assert!(produced > 0, "the echoed line has arrived");
+
+    // Beyond what exists: clamped to what the session actually produced.
+    manager
+        .mark_interactive_output_delivered(&session_id, produced + 4_096, 0)
+        .await
+        .expect("marking succeeds");
+    assert_eq!(
+        manager
+            .interactive_output_cursors(&session_id)
+            .await
+            .expect("cursors are readable"),
+        (produced, 0)
+    );
+
+    // Backward: refused in favour of the position already reached.
+    manager
+        .mark_interactive_output_delivered(&session_id, 0, 0)
+        .await
+        .expect("marking succeeds");
+    assert_eq!(
+        manager
+            .interactive_output_cursors(&session_id)
+            .await
+            .expect("cursors are readable"),
+        (produced, 0)
+    );
+
+    tokio::time::timeout(RESPONSIVE, manager.cancel(&session_id))
+        .await
+        .expect("cancel is prompt");
+}
+
 /// A combined cursor cannot be resumed from, so it is refused rather than answered wrongly.
 #[tokio::test]
 async fn test_process_manager_refuses_a_combined_cursor() {

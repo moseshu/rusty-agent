@@ -325,6 +325,14 @@ struct ExecSession {
     /// Sends termination requests to the supervisor that owns the child process.
     terminate: Option<mpsc::UnboundedSender<TerminationSignal>>,
     exit_code: Option<i32>,
+    /// The output positions the interactive tool has already returned to its caller.
+    ///
+    /// This is deliberately separate from [`ExecCursor`]: a general reader owns its own cursor,
+    /// while the model has one shared `write_stdin` conversation with a session. Keeping the
+    /// latter here means a command can finish between two model calls without its unread tail
+    /// being mistaken for output that was already delivered.
+    interactive_stdout_cursor: u64,
+    interactive_stderr_cursor: u64,
     output_notify: Arc<Notify>,
     exit_notify: Arc<Notify>,
 }
@@ -342,6 +350,8 @@ impl ExecSession {
             child_stdin: Arc::new(Mutex::new(None)),
             terminate: None,
             exit_code: None,
+            interactive_stdout_cursor: 0,
+            interactive_stderr_cursor: 0,
             output_notify: Arc::new(Notify::new()),
             exit_notify: Arc::new(Notify::new()),
         }
@@ -761,6 +771,66 @@ impl ProcessManager {
         let session = self.registry.get(session_id).await?;
         let summary = session.lock().await.summary();
         Some(summary)
+    }
+
+    /// Returns the output positions not yet delivered through the interactive-tool path.
+    ///
+    /// A regular [`Self::read_output`] caller does not affect these positions: it supplies and
+    /// owns its own [`ExecCursor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::UnknownSession`] if the manager no longer retains the identifier.
+    pub async fn interactive_output_cursors(
+        &self,
+        session_id: &ExecSessionId,
+    ) -> Result<(u64, u64), ExecError> {
+        let session =
+            self.registry
+                .get(session_id)
+                .await
+                .ok_or_else(|| ExecError::UnknownSession {
+                    session_id: session_id.clone(),
+                })?;
+        let sess = session.lock().await;
+        Ok((
+            sess.interactive_stdout_cursor,
+            sess.interactive_stderr_cursor,
+        ))
+    }
+
+    /// Records output through these positions as delivered by the interactive tool.
+    ///
+    /// Positions advance only and are clamped to output the session has actually produced. That
+    /// makes a delayed or repeated completion unable to move the cursor backward or skip output
+    /// by naming a future offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::UnknownSession`] if the manager no longer retains the identifier.
+    pub async fn mark_interactive_output_delivered(
+        &self,
+        session_id: &ExecSessionId,
+        stdout_cursor: u64,
+        stderr_cursor: u64,
+    ) -> Result<(), ExecError> {
+        let session =
+            self.registry
+                .get(session_id)
+                .await
+                .ok_or_else(|| ExecError::UnknownSession {
+                    session_id: session_id.clone(),
+                })?;
+        let mut sess = session.lock().await;
+        let stdout_limit = u64::try_from(sess.stdout_buffer.total_bytes()).unwrap_or(u64::MAX);
+        let stderr_limit = u64::try_from(sess.stderr_buffer.total_bytes()).unwrap_or(u64::MAX);
+        sess.interactive_stdout_cursor = sess
+            .interactive_stdout_cursor
+            .max(stdout_cursor.min(stdout_limit));
+        sess.interactive_stderr_cursor = sess
+            .interactive_stderr_cursor
+            .max(stderr_cursor.min(stderr_limit));
+        Ok(())
     }
 
     /// Reads output produced at or after the cursor's position.

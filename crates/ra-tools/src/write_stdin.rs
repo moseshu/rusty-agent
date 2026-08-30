@@ -115,13 +115,11 @@ impl Tool for WriteStdinTool {
                 Ok,
             )?;
         let session_id = ExecSessionId::new(input.session_id);
-        let before = self
+        let (stdout_cursor, stderr_cursor) = self
             .process_manager
-            .get_output_summary(&session_id)
+            .interactive_output_cursors(&session_id)
             .await
-            .ok_or_else(|| WriteStdinFailure::UnknownSession(session_id.clone()).into_error())?;
-        let stdout_cursor = before.stdout_bytes() as u64;
-        let stderr_cursor = before.stderr_bytes() as u64;
+            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
         let emitter = context.event_emitter();
         if let Err(error) = self
             .process_manager
@@ -149,7 +147,7 @@ impl Tool for WriteStdinTool {
             .await
             .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
 
-        let stdout = self
+        let (stdout, next_stdout_cursor) = self
             .process_manager
             .read_output(
                 &session_id,
@@ -157,8 +155,10 @@ impl Tool for WriteStdinTool {
             )
             .await
             .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?
-            .map(|(text, _)| text);
-        let stderr = self
+            .map_or((None, stdout_cursor), |(text, cursor)| {
+                (Some(text), cursor.offset())
+            });
+        let (stderr, next_stderr_cursor) = self
             .process_manager
             .read_output(
                 &session_id,
@@ -166,7 +166,13 @@ impl Tool for WriteStdinTool {
             )
             .await
             .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?
-            .map(|(text, _)| text);
+            .map_or((None, stderr_cursor), |(text, cursor)| {
+                (Some(text), cursor.offset())
+            });
+        self.process_manager
+            .mark_interactive_output_delivered(&session_id, next_stdout_cursor, next_stderr_cursor)
+            .await
+            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
         let state = self
             .process_manager
             .get_session_state(&session_id)
