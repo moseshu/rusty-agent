@@ -184,6 +184,18 @@ impl PromptAssembler {
     /// Assembles all registered prefix sections into a [`StablePrefix`].
     ///
     /// Sections are ordered deterministically by canonical priority and joined with double newlines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a section spends more than the allowance it declared through
+    /// [`PromptSection::with_token_budget`].
+    ///
+    /// **This is the only place the declared allowance is checked, and deliberately so.** It is the
+    /// last point where the numbers are final — an exact tokenizer count may arrive after
+    /// construction through `with_token_estimate` — and the only one that sees every section
+    /// together, which is what makes the sum of the allowances a ceiling on the whole cached span
+    /// rather than a set of unrelated limits. Checking at construction instead would pass a section
+    /// whose estimate was replaced a line later, and would report nothing about the prefix.
     pub fn assemble(&self) -> Result<StablePrefix> {
         let mut prefix_sections: Vec<PromptSection> = self
             .sections
@@ -197,6 +209,26 @@ impl PromptAssembler {
             let rank_b = section_order_rank(b.name());
             rank_a.cmp(&rank_b)
         });
+
+        // Reported before the prefix is built, so an over-budget section is refused rather than
+        // assembled and then complained about: a caller that ignored the error would otherwise hold
+        // a perfectly usable prefix that every turn overpays for.
+        for section in &prefix_sections {
+            let Some(budget) = section.token_budget() else {
+                continue;
+            };
+            let spent = section.token_estimate();
+            if spent > budget {
+                return Err(Error::config(format!(
+                    "prompt section `{}` estimates {spent} tokens against its declared budget of \
+                     {budget}, over by {}; the stable prefix is paid for on every turn of every \
+                     run, so either tighten the text or raise the section's declared budget where \
+                     the increase can be reviewed",
+                    section.name(),
+                    spent - budget,
+                )));
+            }
+        }
 
         let system_instructions = prefix_sections
             .iter()

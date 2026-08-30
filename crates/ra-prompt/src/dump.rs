@@ -8,6 +8,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::assembler::StablePrefix;
 
+/// Horizontal rule of the text report, as wide as the widest row its table can print.
+const RULE: &str =
+    "------------------------------------------------------------------------------------------\n";
+
+/// Opening banner, on [`RULE`]'s width.
+const BANNER_TOP: &str =
+    "=================================== PROMPT DUMP REPORT ===================================\n";
+
+/// Closing banner, on [`RULE`]'s width.
+const BANNER_BOTTOM: &str =
+    "==========================================================================================\n";
+
 /// Inspection summary of a single prompt section.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptDumpSection {
@@ -18,6 +30,10 @@ pub struct PromptDumpSection {
     position: String,
     content_hash: String,
     token_estimate: usize,
+    // Defaulted for the same reason the section's own wire field is: a dump recorded before
+    // budgets existed carries no allowance, and `--baseline` has to keep reading it.
+    #[serde(default)]
+    token_budget: Option<usize>,
     bytes: usize,
 }
 
@@ -43,8 +59,16 @@ impl PromptDumpSection {
             position: position.into(),
             content_hash: content_hash.into(),
             token_estimate,
+            token_budget: None,
             bytes,
         }
+    }
+
+    /// Records the cached-prefix allowance the section declared.
+    #[must_use]
+    pub const fn with_token_budget(mut self, budget: usize) -> Self {
+        self.token_budget = Some(budget);
+        self
     }
 
     /// Section name.
@@ -89,6 +113,12 @@ impl PromptDumpSection {
         self.token_estimate
     }
 
+    /// Declared cached-prefix allowance, if the section states one.
+    #[must_use]
+    pub const fn token_budget(&self) -> Option<usize> {
+        self.token_budget
+    }
+
     /// Size in bytes.
     #[must_use]
     pub const fn bytes(&self) -> usize {
@@ -127,6 +157,7 @@ impl PromptDump {
                 position: s.position().to_string(),
                 content_hash: s.content_hash().to_string(),
                 token_estimate: s.token_estimate(),
+                token_budget: s.token_budget(),
                 bytes: s.content().len(),
             })
             .collect();
@@ -187,7 +218,7 @@ impl PromptDump {
         // Writing into a `String` cannot fail, so the `fmt::Result` values below are discarded
         // rather than propagated.
         let mut out = String::new();
-        out.push_str("======================= PROMPT DUMP REPORT =======================\n");
+        out.push_str(BANNER_TOP);
         if let Some(p) = &self.provider {
             let _ = writeln!(out, "Provider: {p}");
         }
@@ -196,26 +227,35 @@ impl PromptDump {
         }
         let _ = writeln!(out, "Stable Prefix Hash:   {}", self.prefix_hash);
         let _ = writeln!(out, "Total Prefix Tokens:  ~{}", self.total_prefix_tokens);
-        out.push_str("------------------------------------------------------------------\n");
+        out.push_str(RULE);
+        // `Source` is here because a section's provenance is the one thing a reader cannot recover
+        // from the text: it is what says this wording is the product's own rather than material
+        // carried in from somewhere else. `Budget` is here because a row's token count only means
+        // something next to the allowance it was written against.
         let _ = writeln!(
             out,
-            "{:<22} {:<9} {:<12} {:<8} {:<10} Hash Prefix",
-            "Section Name", "Stability", "Position", "Tokens", "Bytes"
+            "{:<22} {:<10} {:<9} {:<9} {:<7} {:<7} {:<8} Hash Prefix",
+            "Section Name", "Source", "Stability", "Position", "Tokens", "Budget", "Bytes"
         );
-        out.push_str("------------------------------------------------------------------\n");
+        out.push_str(RULE);
         for sec in &self.sections {
             let hash_short = if sec.content_hash.len() >= 12 {
                 &sec.content_hash[..12]
             } else {
                 &sec.content_hash
             };
+            // A section that declares no allowance prints as one, rather than borrowing the look of
+            // a section that declared a large one.
+            let budget = sec
+                .token_budget
+                .map_or_else(|| "-".to_owned(), |budget| budget.to_string());
             let _ = writeln!(
                 out,
-                "{:<22} {:<9} {:<12} {:<8} {:<10} {hash_short}...",
-                sec.name, sec.stability, sec.position, sec.token_estimate, sec.bytes
+                "{:<22} {:<10} {:<9} {:<9} {:<7} {budget:<7} {:<8} {hash_short}...",
+                sec.name, sec.source, sec.stability, sec.position, sec.token_estimate, sec.bytes
             );
         }
-        out.push_str("------------------------------------------------------------------\n");
+        out.push_str(RULE);
         // The plan states intent, not wire form: which bytes are stable and which calls should
         // share an entry. Breakpoints and cache-key fields are the adapter's lowering, and a dump
         // that printed them would be reporting a decision this layer does not make.
@@ -243,7 +283,7 @@ impl PromptDump {
              tool table also counts)",
             self.total_prefix_tokens
         );
-        out.push_str("==================================================================\n");
+        out.push_str(BANNER_BOTTOM);
         out
     }
 

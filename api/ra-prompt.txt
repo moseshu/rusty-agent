@@ -5,7 +5,9 @@ const fn ra_prompt::assembler::StablePrefix::prefix_hash(& self) -> & ContentHas
 const fn ra_prompt::assembler::StablePrefix::token_estimate(& self) -> usize
 const fn ra_prompt::dump::PromptDump::total_prefix_tokens(& self) -> usize
 const fn ra_prompt::dump::PromptDumpSection::bytes(& self) -> usize
+const fn ra_prompt::dump::PromptDumpSection::token_budget(& self) -> Option < usize >
 const fn ra_prompt::dump::PromptDumpSection::token_estimate(& self) -> usize
+const fn ra_prompt::dump::PromptDumpSection::with_token_budget(mut self, budget : usize) -> Self
 const fn ra_prompt::stability::PrefixStabilityTracker::invalidation_count(& self) -> usize
 const fn ra_prompt::stability::PrefixStabilityTracker::last_prefix_hash(& self) -> Option < & ContentHash >
 enum ra_prompt::reminder::ReminderAttachment
@@ -61,6 +63,7 @@ fn ra_prompt::section::PromptSectionBuilder::source(mut self, source : PromptSou
 fn ra_prompt::section::PromptSectionBuilder::stability(mut self, stability : SectionStability) -> Self
 fn ra_prompt::section::PromptSectionBuilder::stable(mut self) -> Self
 fn ra_prompt::section::PromptSectionBuilder::tail_message(mut self) -> Self
+fn ra_prompt::section::PromptSectionBuilder::token_budget(mut self, budget : usize) -> Self
 fn ra_prompt::section::PromptSectionBuilder::token_estimate(mut self, estimate : usize) -> Self
 fn ra_prompt::section::PromptSectionBuilder::volatile(mut self) -> Self
 fn ra_prompt::section::compute_content_hash(text : & str) -> ContentHash

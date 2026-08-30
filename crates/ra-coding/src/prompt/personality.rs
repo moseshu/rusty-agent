@@ -9,6 +9,11 @@ use ra_core::prompt::{
     PromptSection, PromptSectionName, PromptSource, SectionPosition, SectionStability,
 };
 
+/// Cached-prefix allowance for this section, in estimated tokens.
+///
+/// A stance, not a rule list: see the prefix budget note in [the module above](super).
+const TOKEN_BUDGET: usize = 192;
+
 /// Builder for constructing the standard personality and tone prompt section.
 pub struct PersonalityPromptBuilder;
 
@@ -32,5 +37,6 @@ impl PersonalityPromptBuilder {
             SectionPosition::Prefix,
             content,
         )
+        .map(|section| section.with_token_budget(TOKEN_BUDGET))
     }
 }

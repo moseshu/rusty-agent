@@ -260,6 +260,7 @@ pub struct PromptSection {
     position: SectionPosition,
     content_hash: ContentHash,
     token_estimate: usize,
+    token_budget: Option<usize>,
     content: String,
 }
 
@@ -273,6 +274,11 @@ struct PromptSectionWire {
     position: SectionPosition,
     content_hash: ContentHash,
     token_estimate: usize,
+    // Defaulted, unlike every other field here: a section recorded before budgets existed declared
+    // no allowance, and that is exactly what `None` says. Refusing it would reject old dumps over a
+    // fact they could not have carried.
+    #[serde(default)]
+    token_budget: Option<usize>,
     content: String,
 }
 
@@ -301,7 +307,11 @@ impl TryFrom<PromptSectionWire> for PromptSection {
 
         // The estimate is restored verbatim: an external tokenizer's exact count is data, and
         // recomputing it would discard the reason `with_token_estimate` exists.
-        Ok(section.with_token_estimate(wire.token_estimate))
+        let section = section.with_token_estimate(wire.token_estimate);
+        Ok(match wire.token_budget {
+            Some(budget) => section.with_token_budget(budget),
+            None => section,
+        })
     }
 }
 
@@ -341,6 +351,7 @@ impl PromptSection {
             position,
             content_hash,
             token_estimate,
+            token_budget: None,
             content,
         })
     }
@@ -349,6 +360,22 @@ impl PromptSection {
     #[must_use]
     pub fn with_token_estimate(mut self, estimate: usize) -> Self {
         self.token_estimate = estimate;
+        self
+    }
+
+    /// Declares the largest share of the cached prefix this section may spend.
+    ///
+    /// A prefix section is paid for on every turn of every run, so a topic that doubles in length
+    /// is a recurring cost rather than a one-off edit. The allowance is declared next to the text
+    /// it governs, travels with the section into the dump, and is enforced where sections become
+    /// the cached artifact — see `PromptAssembler::assemble`.
+    ///
+    /// Declaring one is optional. A section without an allowance is not exempt by intent; it is a
+    /// section whose author has not stated a limit, and the dump shows the difference rather than
+    /// inventing a number nobody chose.
+    #[must_use]
+    pub fn with_token_budget(mut self, budget: usize) -> Self {
+        self.token_budget = Some(budget);
         self
     }
 
@@ -394,6 +421,12 @@ impl PromptSection {
         self.token_estimate
     }
 
+    /// Declared cached-prefix allowance, if the section states one.
+    #[must_use]
+    pub const fn token_budget(&self) -> Option<usize> {
+        self.token_budget
+    }
+
     /// Section text content.
     #[must_use]
     pub fn content(&self) -> &str {
@@ -412,6 +445,7 @@ impl fmt::Debug for PromptSection {
             .field("position", &self.position)
             .field("content_hash", &self.content_hash)
             .field("token_estimate", &self.token_estimate)
+            .field("token_budget", &self.token_budget)
             .field("bytes", &self.content.len())
             .finish_non_exhaustive()
     }
