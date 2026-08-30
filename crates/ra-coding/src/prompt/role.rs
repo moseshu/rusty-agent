@@ -13,6 +13,11 @@ use ra_core::prompt::{
     PromptRole, PromptSection, PromptSectionName, PromptSource, SectionPosition, SectionStability,
 };
 
+/// Cached-prefix allowance for this section, in estimated tokens.
+///
+/// A stance, not a rule list: see the prefix budget note in [the module above](super).
+const TOKEN_BUDGET: usize = 192;
+
 /// Builder for generating role-specific prompt sections.
 pub struct RolePromptBuilder;
 
@@ -84,5 +89,6 @@ impl RolePromptBuilder {
             SectionPosition::Prefix,
             content,
         )
+        .map(|section| section.with_token_budget(TOKEN_BUDGET))
     }
 }

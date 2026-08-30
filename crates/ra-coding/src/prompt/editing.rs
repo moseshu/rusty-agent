@@ -18,6 +18,11 @@ use ra_core::prompt::{
     PromptRole, PromptSection, PromptSectionName, PromptSource, SectionPosition, SectionStability,
 };
 
+/// Cached-prefix allowance for this section, in estimated tokens.
+///
+/// An enumerated rule list: see the prefix budget note in [the module above](super).
+const TOKEN_BUDGET: usize = 256;
+
 /// Builder for the coding agent's editing and worktree-safety prompt section.
 pub(crate) struct EditingPromptBuilder;
 
@@ -68,6 +73,7 @@ impl EditingPromptBuilder {
             SectionPosition::Prefix,
             content,
         )
+        .map(|section| section.with_token_budget(TOKEN_BUDGET))
     }
 }
 

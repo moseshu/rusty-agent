@@ -16,6 +16,7 @@ pub struct PromptSectionBuilder {
     stability: SectionStability,
     position: SectionPosition,
     token_estimate: Option<usize>,
+    token_budget: Option<usize>,
     content: Option<String>,
 }
 
@@ -29,6 +30,7 @@ impl PromptSectionBuilder {
             stability: SectionStability::Stable,
             position: SectionPosition::Prefix,
             token_estimate: None,
+            token_budget: None,
             content: None,
         }
     }
@@ -87,6 +89,16 @@ impl PromptSectionBuilder {
         self
     }
 
+    /// Declares the largest share of the cached prefix this section may spend.
+    ///
+    /// See [`PromptSection::with_token_budget`] for what the declaration means, and
+    /// [`PromptAssembler::assemble`](crate::assembler::PromptAssembler::assemble) for where it is
+    /// enforced.
+    pub fn token_budget(mut self, budget: usize) -> Self {
+        self.token_budget = Some(budget);
+        self
+    }
+
     /// Sets the text content for the section.
     pub fn content(mut self, content: impl Into<String>) -> Self {
         self.content = Some(content.into());
@@ -122,6 +134,9 @@ impl PromptSectionBuilder {
 
         if let Some(estimate) = self.token_estimate {
             section = section.with_token_estimate(estimate);
+        }
+        if let Some(budget) = self.token_budget {
+            section = section.with_token_budget(budget);
         }
 
         Ok(section)

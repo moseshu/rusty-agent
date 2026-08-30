@@ -85,3 +85,49 @@ fn test_prompt_dump_rendering_and_json() {
     assert!(json_str.contains("\"provider\": \"anthropic\""));
     assert!(json_str.contains("\"prefix_hash\":"));
 }
+
+/// The report carries each section's provenance and the allowance it declared.
+///
+/// Neither is recoverable from the text of the prompt, and both are what a reader of a committed
+/// dump is checking: that this wording is the product's own, and that the tokens it spends are the
+/// tokens it said it would.
+#[test]
+fn test_the_report_shows_provenance_and_the_declared_allowance() {
+    let budgeted = PromptSectionBuilder::new(PromptSectionName::CORE_BEHAVIOR)
+        .purpose("Core behavioral constitution")
+        .source(PromptSource::Capability("planning".into()))
+        .content(cacheable_core_text())
+        .token_budget(4_096)
+        .build()
+        .expect("core");
+    let unbudgeted = fixture_section(PromptSectionName::ROLE, "Fixture role guidance.");
+
+    let prefix = PromptAssembler::new()
+        .add_section(budgeted)
+        .expect("add core")
+        .add_section(unbudgeted)
+        .expect("add role")
+        .assemble()
+        .expect("assemble");
+    let report = PromptDump::from_assembled(&prefix, None, None, None).render_text();
+
+    let row = |name: &str| {
+        report
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("the report must carry a `{name}` row:\n{report}"))
+            .to_owned()
+    };
+
+    assert!(report.contains("Source"), "the header must name the column");
+    assert!(report.contains("Budget"), "the header must name the column");
+    assert!(row("core_behavior").contains("capability(planning)"));
+    assert!(row("core_behavior").contains("4096"));
+    // A section that declared nothing must not read like one that declared a large allowance.
+    assert!(row("role").contains("builtin"));
+    assert!(
+        row("role").contains(" - "),
+        "an undeclared allowance prints as one: {}",
+        row("role")
+    );
+}

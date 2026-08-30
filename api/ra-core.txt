@@ -469,6 +469,7 @@ const fn ra_core::prompt::PromptSection::name(& self) -> & PromptSectionName
 const fn ra_core::prompt::PromptSection::position(& self) -> SectionPosition
 const fn ra_core::prompt::PromptSection::source(& self) -> & PromptSource
 const fn ra_core::prompt::PromptSection::stability(& self) -> SectionStability
+const fn ra_core::prompt::PromptSection::token_budget(& self) -> Option < usize >
 const fn ra_core::prompt::PromptSection::token_estimate(& self) -> usize
 const fn ra_core::prompt::PromptSectionName::from_static(name : & 'static str) -> Self
 const fn ra_core::prompt::ResolvedPrompt::content_hash(& self) -> & ContentHash
@@ -1265,6 +1266,7 @@ fn ra_core::prompt::PromptRole::role_name(& self) -> & str
 fn ra_core::prompt::PromptSection::content(& self) -> & str
 fn ra_core::prompt::PromptSection::new(name : impl Into < PromptSectionName >, purpose : impl Into < String >, source : PromptSource, stability : SectionStability, position : SectionPosition, content : impl Into < String >) -> Result < Self >
 fn ra_core::prompt::PromptSection::purpose(& self) -> & str
+fn ra_core::prompt::PromptSection::with_token_budget(mut self, budget : usize) -> Self
 fn ra_core::prompt::PromptSection::with_token_estimate(mut self, estimate : usize) -> Self
 fn ra_core::prompt::PromptSectionName::as_str(& self) -> & str
 fn ra_core::prompt::PromptSectionName::new(name : impl Into < Cow < 'static , str > >) -> Self

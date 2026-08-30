@@ -22,6 +22,26 @@
 //! [`dump`] is the odd module out: it writes no prompt text. It composes the report that `ra prompt
 //! dump` prints and the snapshot gate commits, which is a product decision about what a dump covers
 //! rather than a section of one.
+//!
+//! # The prefix budget
+//!
+//! Every section declares a `TOKEN_BUDGET` next to its own text, and the assembler refuses a
+//! section that overruns the one it declared. The allowance is stated per section rather than as a
+//! single total because a total is the number nobody defends: any one topic can grow into the room
+//! the others left, and the review that would have caught it sees only a prefix that still fits.
+//!
+//! Two sizes are in use. A section that states a *stance* — identity, engineering judgment,
+//! personality, role — gets 192, and one that enumerates *rules* the model has to apply — editing,
+//! autonomy, channels, formatting, and the generated tool surface — gets 256. Nothing derives these
+//! numbers; they are roughly a third above what each section costs today, which is room to rewrite
+//! a paragraph and not room to add a second topic under an existing heading.
+//!
+//! Their sum is the ceiling on the assembled prefix: 2048 estimated tokens, twice
+//! [`MIN_CACHEABLE_PREFIX_TOKENS`](ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS). The floor and the
+//! ceiling are different kinds of fact — below the floor no provider caches the span at all, while
+//! above the ceiling it is cached and simply costs more every turn than this product has decided a
+//! system prompt is worth — but the pair is what makes the prefix a governed size rather than
+//! whatever the last edit left behind.
 
 pub(crate) mod autonomy;
 pub(crate) mod channels;

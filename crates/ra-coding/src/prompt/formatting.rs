@@ -14,6 +14,11 @@ use ra_core::prompt::{
     PromptSection, PromptSectionName, PromptSource, SectionPosition, SectionStability,
 };
 
+/// Cached-prefix allowance for this section, in estimated tokens.
+///
+/// An enumerated rule list: see the prefix budget note in [the module above](super).
+const TOKEN_BUDGET: usize = 256;
+
 /// Builder for the coding agent's final-answer formatting section.
 pub(crate) struct FormattingPromptBuilder;
 
@@ -41,5 +46,6 @@ impl FormattingPromptBuilder {
             SectionPosition::Prefix,
             content,
         )
+        .map(|section| section.with_token_budget(TOKEN_BUDGET))
     }
 }

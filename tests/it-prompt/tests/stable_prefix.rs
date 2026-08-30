@@ -268,7 +268,10 @@ fn test_assembler_rejects_sections_it_would_not_assemble() {
 #[test]
 fn test_assembler_rejects_two_sections_claiming_one_name_in_a_batch() {
     let first = fixture_section(PromptSectionName::CORE_BEHAVIOR, "First claim on the slot.");
-    let second = fixture_section(PromptSectionName::CORE_BEHAVIOR, "Second claim on the slot.");
+    let second = fixture_section(
+        PromptSectionName::CORE_BEHAVIOR,
+        "Second claim on the slot.",
+    );
 
     let Err(err) = PromptAssembler::new().with_sections(vec![first, second]) else {
         panic!("the assembler must refuse a batch that names one section twice");
@@ -322,6 +325,104 @@ fn test_prefix_token_total_equals_the_sum_of_its_sections() {
 
     let sum: usize = prefix.sections().iter().map(|s| s.token_estimate()).sum();
     assert_eq!(prefix.token_estimate(), sum);
+}
+
+/// A section that spends more than the allowance it declared does not become a prefix.
+///
+/// The refusal is what makes the declaration mean anything. A warning would leave the caller
+/// holding a perfectly usable prefix that every turn of every run overpays for — the failure mode
+/// is a bill, not a broken response, so nothing downstream would ever surface it.
+#[test]
+fn test_a_section_over_its_declared_budget_is_refused_by_assembly() {
+    let over_budget = PromptSectionBuilder::new(PromptSectionName::CORE_BEHAVIOR)
+        .purpose("Core behavior")
+        .source(PromptSource::Builtin)
+        .content("Four".repeat(100))
+        .token_budget(50)
+        .build()
+        .expect("a section may be built over its budget; assembly is where it is refused");
+    assert_eq!(over_budget.token_estimate(), 100);
+
+    let Err(err) = PromptAssembler::new()
+        .add_section(over_budget)
+        .expect("registration accepts it")
+        .assemble()
+    else {
+        panic!("assembly must refuse a section that overruns its declared budget");
+    };
+
+    let message = err.to_string();
+    assert!(message.contains("core_behavior"), "{message}");
+    assert!(
+        message.contains("100"),
+        "the overrun must name the cost: {message}"
+    );
+    assert!(
+        message.contains("50"),
+        "the overrun must name the budget: {message}"
+    );
+}
+
+/// Spending exactly the declared allowance assembles; the limit is a ceiling, not a target.
+#[test]
+fn test_a_section_at_its_declared_budget_assembles() {
+    let exact = PromptSectionBuilder::new(PromptSectionName::CORE_BEHAVIOR)
+        .purpose("Core behavior")
+        .source(PromptSource::Builtin)
+        .content("Four".repeat(100))
+        .token_budget(100)
+        .build()
+        .expect("valid section");
+
+    PromptAssembler::new()
+        .add_section(exact)
+        .expect("add core")
+        .assemble()
+        .expect("a section at its budget must assemble");
+}
+
+/// The allowance is checked against the count the prefix is actually billed for.
+///
+/// This is why the check is at assembly rather than at construction: `token_estimate` may be
+/// replaced afterwards by an exact tokenizer count, and a budget verified before that replacement
+/// would have been verified against a number nobody pays.
+#[test]
+fn test_an_exact_token_count_is_what_the_budget_is_checked_against() {
+    let understated = PromptSectionBuilder::new(PromptSectionName::CORE_BEHAVIOR)
+        .purpose("Core behavior")
+        .source(PromptSource::Builtin)
+        .content("Short text.")
+        .token_estimate(4_000)
+        .token_budget(50)
+        .build()
+        .expect("valid section");
+
+    let Err(err) = PromptAssembler::new()
+        .add_section(understated)
+        .expect("registration accepts it")
+        .assemble()
+    else {
+        panic!("the budget must be checked against the exact count, not the character heuristic");
+    };
+    assert!(err.to_string().contains("4000"), "{err}");
+}
+
+/// A section that declares no allowance is not capped, and that is deliberate.
+///
+/// The assembler cannot invent a number for a topic it has never been told about — a default would
+/// either be loose enough to mean nothing or tight enough to reject a product whose prefix is
+/// simply longer than this one's. What it can do is refuse to let a stated limit be exceeded.
+#[test]
+fn test_a_section_without_a_declared_budget_is_not_capped() {
+    let unbudgeted = fixture_section(PromptSectionName::CORE_BEHAVIOR, &"Four".repeat(1_000));
+    assert_eq!(unbudgeted.token_budget(), None);
+
+    let prefix = PromptAssembler::new()
+        .add_section(unbudgeted)
+        .expect("add core")
+        .assemble()
+        .expect("an undeclared budget cannot be overrun");
+    assert_eq!(prefix.token_estimate(), 1_000);
 }
 
 /// An exact count from a real tokenizer reaches the total instead of being re-estimated away.

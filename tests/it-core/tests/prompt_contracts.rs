@@ -189,7 +189,8 @@ fn test_prompt_section_round_trips_with_an_external_token_estimate() {
         "You are an autonomous engineering assistant.",
     )
     .expect("valid section")
-    .with_token_estimate(9_999);
+    .with_token_estimate(9_999)
+    .with_token_budget(12_000);
 
     let json = serde_json::to_string(&section).expect("serialize");
     let restored: PromptSection = serde_json::from_str(&json).expect("deserialize");
@@ -200,6 +201,45 @@ fn test_prompt_section_round_trips_with_an_external_token_estimate() {
         9_999,
         "an exact count from a real tokenizer must not be recomputed away"
     );
+    assert_eq!(
+        restored.token_budget(),
+        Some(12_000),
+        "the declared allowance travels with the section that declared it"
+    );
+}
+
+/// A section recorded before allowances existed loads, and reports that it declares none.
+///
+/// Every other field here is required, because a section missing one is a section that never
+/// validated. An allowance is different in kind: an older writer could not have carried it, and
+/// `None` is the honest reading of its absence rather than a value invented on the way in. The
+/// same default is what keeps `prompt dump --baseline` able to read a dump recorded last month.
+#[test]
+fn test_a_section_recorded_without_an_allowance_declares_none() {
+    let section = PromptSection::new(
+        PromptSectionName::CORE_BEHAVIOR,
+        "core",
+        PromptSource::Builtin,
+        SectionStability::Stable,
+        SectionPosition::Prefix,
+        "You are an autonomous engineering assistant.",
+    )
+    .expect("valid section");
+
+    let mut wire: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&section).expect("serialize"))
+            .expect("a section is JSON");
+    assert!(
+        wire.as_object_mut()
+            .expect("a section is a JSON object")
+            .remove("token_budget")
+            .is_some(),
+        "the field has to be present for its removal to be testing anything"
+    );
+
+    let restored: PromptSection =
+        serde_json::from_str(&wire.to_string()).expect("an older section must still load");
+    assert_eq!(restored.token_budget(), None);
 }
 
 /// A generated prompt may only occupy volatile tail messages.

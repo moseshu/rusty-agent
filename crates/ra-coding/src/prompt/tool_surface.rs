@@ -34,6 +34,14 @@ use ra_core::{
 /// so a reviewer can distinguish a deliberately invalidated tool table from an accidental edit.
 pub(crate) const TOOL_SCHEMA_REVISION: u32 = 2;
 
+/// Cached-prefix allowance for this section, in estimated tokens.
+///
+/// The only allowance here that a text edit cannot spend on its own: this section is generated from
+/// the advertised tool list, so it grows when tools are added. That is the point of giving it a
+/// limit — a tool surface wide enough to crowd the instructions out of the cached prefix should
+/// have to be argued for, and this is where the argument surfaces.
+const TOKEN_BUDGET: usize = 256;
+
 /// Builds the prompt section and the reviewable digest for one advertised tool surface.
 pub(crate) struct ToolSurfacePromptBuilder;
 
@@ -77,7 +85,7 @@ impl ToolSurfacePromptBuilder {
             SectionPosition::Prefix,
             content,
         )
-        .map(Some)
+        .map(|section| Some(section.with_token_budget(TOKEN_BUDGET)))
     }
 
     /// Builds the committed record: the revision, the surface fingerprint, and the same names.
