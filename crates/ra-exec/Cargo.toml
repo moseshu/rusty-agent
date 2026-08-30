@@ -1,6 +1,6 @@
 [package]
 name = "ra-exec"
-description = "进程执行、PTY、后台 job、沙箱隔离。"
+description = "进程执行、后台 job、沙箱隔离。"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,7 +24,6 @@ docker = []
 [dependencies]
 ra-core = { workspace = true }
 tokio = { workspace = true }
-portable-pty = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -1,6 +1,6 @@
 //! # `ra-exec`
 //!
-//! Process execution, PTY, background jobs, sandbox isolation.
+//! Process execution, background jobs, and sandbox isolation.
 //!
 //! **Boundary**: it runs commands and security policies that are already fully formed. It does not
 //! decide whether a tool should be called and carries no product default permissions; approval
@@ -13,7 +13,6 @@ pub mod command;
 pub mod fs;
 pub mod job;
 pub mod output;
-pub mod pty;
 pub mod sandbox;
 pub mod session;
 

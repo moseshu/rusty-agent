@@ -19,7 +19,7 @@ const fn default_schema_version() -> SchemaVersion {
     EXEC_EVENT_SCHEMA_VERSION
 }
 
-/// An opaque identifier for a command execution or PTY session.
+/// An opaque identifier for a command execution session.
 ///
 /// This is distinct from conversation session history identifiers (`SessionId`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -175,7 +175,7 @@ pub enum ExecStreamKind {
     Stdout,
     /// Standard error stream.
     Stderr,
-    /// Merged stdout and stderr stream (e.g. from PTY).
+    /// Merged stdout and stderr stream.
     Combined,
 }
 
@@ -270,7 +270,7 @@ impl<'de> Deserialize<'de> for ExecYieldReason {
     }
 }
 
-/// Emitted when a command execution or PTY session begins.
+/// Emitted when a command execution session begins.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecStartedEvent {
@@ -282,7 +282,6 @@ pub struct ExecStartedEvent {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
-    pty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
@@ -299,7 +298,6 @@ impl ExecStartedEvent {
             command: command.into(),
             args: Vec::new(),
             cwd: None,
-            pty: false,
             pid: None,
             unknown: Unknown::new(),
         }
@@ -316,13 +314,6 @@ impl ExecStartedEvent {
     #[must_use]
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
-        self
-    }
-
-    /// Sets whether PTY was allocated.
-    #[must_use]
-    pub const fn with_pty(mut self, pty: bool) -> Self {
-        self.pty = pty;
         self
     }
 
@@ -355,12 +346,6 @@ impl ExecStartedEvent {
     #[must_use]
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
-    }
-
-    /// Whether PTY mode was enabled.
-    #[must_use]
-    pub const fn pty(&self) -> bool {
-        self.pty
     }
 
     /// Process identifier, if known.

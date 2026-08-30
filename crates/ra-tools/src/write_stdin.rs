@@ -4,6 +4,10 @@
 //! still owns the process manager that started it; this tool only supplies the session identifier,
 //! writes verbatim input, waits briefly for a response, and reports the new bytes. Splitting every
 //! command-line utility into an extra tool would spend schema budget without adding a capability.
+//!
+//! Sessions currently use standard input pipes, and pipes accept ordinary byte writes. Terminal
+//! allocation and model-initiated interrupts need their own end-to-end contract, so neither is
+//! declared by this tool.
 
 use std::{fmt, sync::Arc, time::Duration};
 

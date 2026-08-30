@@ -231,8 +231,6 @@ pub struct ExecRequest {
     #[serde(default)]
     login: bool,
     #[serde(default)]
-    pty: bool,
-    #[serde(default)]
     limits: ExecLimits,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
@@ -250,7 +248,6 @@ impl ExecRequest {
             env: HashMap::new(),
             shell: None,
             login: false,
-            pty: false,
             limits: ExecLimits::default(),
             unknown: Unknown::new(),
         }
@@ -304,13 +301,6 @@ impl ExecRequest {
         self
     }
 
-    /// Enables or disables PTY allocation.
-    #[must_use]
-    pub const fn with_pty(mut self, pty: bool) -> Self {
-        self.pty = pty;
-        self
-    }
-
     /// Sets explicit execution limits.
     #[must_use]
     pub fn with_limits(mut self, limits: ExecLimits) -> Self {
@@ -352,12 +342,6 @@ impl ExecRequest {
     #[must_use]
     pub const fn login(&self) -> bool {
         self.login
-    }
-
-    /// Whether PTY is enabled.
-    #[must_use]
-    pub const fn pty(&self) -> bool {
-        self.pty
     }
 
     /// Schema version of this execution request.

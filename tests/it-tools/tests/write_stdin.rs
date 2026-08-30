@@ -77,7 +77,7 @@ async fn test_write_stdin_schema_and_identity() {
 }
 
 #[tokio::test]
-async fn test_write_stdin_returns_only_output_since_the_interaction() {
+async fn test_write_stdin_delivers_bytes_to_a_pipe_backed_session() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (exec_command, write_stdin) = tools(&workspace);
     let started = call(

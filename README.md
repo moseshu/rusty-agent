@@ -43,7 +43,7 @@
 | `ra-context` | 上下文预算、压缩、淘汰、归档 |
 | `ra-runtime` | loop 内核：turn 结算、工具分派、guard/hook、审批中断 |
 | `ra-session` | 事件日志、会话存储、resume、fork、checkpoint |
-| `ra-exec` | 进程、PTY、后台 job、沙箱后端 |
+| `ra-exec` | 进程、后台 job、沙箱后端 |
 | `ra-mcp` | MCP client（stdio / SSE / HTTP）与进程内工具服务器 |
 | `ra-protocol` | 控制协议帧、transport、app-server |
 | `ra-eval` | fixture、replay、trace 断言、成本与纪律报告 |

@@ -31,11 +31,9 @@ const fn ra_exec::command::ExecLimits::with_total_timeout(mut self, timeout : Op
 const fn ra_exec::command::ExecRequest::env(& self) -> & HashMap < String , String >
 const fn ra_exec::command::ExecRequest::limits(& self) -> & ExecLimits
 const fn ra_exec::command::ExecRequest::login(& self) -> bool
-const fn ra_exec::command::ExecRequest::pty(& self) -> bool
 const fn ra_exec::command::ExecRequest::schema_version(& self) -> SchemaVersion
 const fn ra_exec::command::ExecRequest::unknown(& self) -> & Unknown
 const fn ra_exec::command::ExecRequest::with_login(mut self, login : bool) -> Self
-const fn ra_exec::command::ExecRequest::with_pty(mut self, pty : bool) -> Self
 const fn ra_exec::output::ExecOutputSummary::duration(& self) -> Duration
 const fn ra_exec::output::ExecOutputSummary::duration_ms(& self) -> u64
 const fn ra_exec::output::ExecOutputSummary::exit_code(& self) -> Option < i32 >
@@ -55,10 +53,6 @@ const fn ra_exec::output::ExecOutputSummary::with_truncated(mut self, truncated 
 const fn ra_exec::output::HeadTailBuffer::capacity(& self) -> usize
 const fn ra_exec::output::HeadTailBuffer::is_truncated(& self) -> bool
 const fn ra_exec::output::HeadTailBuffer::total_bytes(& self) -> usize
-const fn ra_exec::pty::StdinCommand::is_interrupt(& self) -> bool
-const fn ra_exec::pty::StdinCommand::schema_version(& self) -> SchemaVersion
-const fn ra_exec::pty::StdinCommand::session_id(& self) -> & ExecSessionId
-const fn ra_exec::pty::StdinCommand::unknown(& self) -> & Unknown
 const fn ra_exec::session::ExecSessionState::is_active(& self) -> bool
 const fn ra_exec::session::ExecSessionState::is_terminal(& self) -> bool
 const fn ra_exec::session::ExecSessionTransitionError::from(& self) -> & ExecSessionState
@@ -67,8 +61,6 @@ const fn ra_exec::session::ExecSessionTransitionError::to(& self) -> & ExecSessi
 const fn ra_exec::session::ProcessManager::limits(& self) -> & ExecLimits
 const ra_exec::EXEC_SCHEMA_VERSION: ra_core :: compat :: SchemaVersion
 enum ra_exec::fs::RootedOpenError
-enum ra_exec::pty::StdinValidationError
-enum ra_exec::pty::TerminalMode
 enum ra_exec::session::ExecError
 enum ra_exec::session::ExecExecutionResult
 enum ra_exec::session::ExecSessionState
@@ -104,11 +96,6 @@ fn ra_exec::output::HeadTailBuffer::read_from(& self, offset : usize) -> Option 
 fn ra_exec::output::HeadTailBuffer::retained_bytes(& self) -> usize
 fn ra_exec::output::HeadTailBuffer::to_retained_bytes(& self) -> Vec < u8 >
 fn ra_exec::output::HeadTailBuffer::to_string_lossy(& self) -> String
-fn ra_exec::pty::StdinCommand::chars(& self) -> Option < & str >
-fn ra_exec::pty::StdinCommand::interrupt(session_id : impl Into < ExecSessionId >) -> Self
-fn ra_exec::pty::StdinCommand::poll(session_id : impl Into < ExecSessionId >) -> Self
-fn ra_exec::pty::StdinCommand::validate(& self, mode : TerminalMode) -> Result < () , StdinValidationError >
-fn ra_exec::pty::StdinCommand::write(session_id : impl Into < ExecSessionId >, chars : impl Into < String >) -> Self
 fn ra_exec::session::ExecExecutionResult::session_id(& self) -> Option < & ExecSessionId >
 fn ra_exec::session::ExecExecutionResult::summary(& self) -> & ExecOutputSummary
 fn ra_exec::session::ExecSessionState::can_transition_to(& self, next : & Self) -> bool
@@ -119,7 +106,6 @@ mod ra_exec::command
 mod ra_exec::fs
 mod ra_exec::job
 mod ra_exec::output
-mod ra_exec::pty
 mod ra_exec::sandbox
 mod ra_exec::sandbox::bwrap
 mod ra_exec::sandbox::docker
@@ -134,14 +120,10 @@ struct ra_exec::command::ExecRequest
 struct ra_exec::fs::RootedFileSystem
 struct ra_exec::output::ExecOutputSummary
 struct ra_exec::output::HeadTailBuffer
-struct ra_exec::pty::StdinCommand
 struct ra_exec::session::ExecSessionTransitionError
 struct ra_exec::session::ProcessManager
 variant ra_exec::fs::RootedOpenError::Io(io :: Error)
 variant ra_exec::fs::RootedOpenError::OutsideRoot
-variant ra_exec::pty::StdinValidationError::NonTtyInputRejected
-variant ra_exec::pty::TerminalMode::Pipe
-variant ra_exec::pty::TerminalMode::Pty
 variant ra_exec::session::ExecError::AtCapacity { max_sessions: usize }
 variant ra_exec::session::ExecError::SessionNotActive { session_id: ExecSessionId, state: ExecSessionState }
 variant ra_exec::session::ExecError::Spawn { command: String, source: std :: io :: Error }

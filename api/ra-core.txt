@@ -143,12 +143,10 @@ const fn ra_core::event::exec::ExecOutputEvent::stream(& self) -> ExecStreamKind
 const fn ra_core::event::exec::ExecOutputEvent::unknown(& self) -> & Unknown
 const fn ra_core::event::exec::ExecOutputEvent::with_truncated(mut self, truncated : bool) -> Self
 const fn ra_core::event::exec::ExecStartedEvent::pid(& self) -> Option < u32 >
-const fn ra_core::event::exec::ExecStartedEvent::pty(& self) -> bool
 const fn ra_core::event::exec::ExecStartedEvent::schema_version(& self) -> SchemaVersion
 const fn ra_core::event::exec::ExecStartedEvent::session_id(& self) -> & ExecSessionId
 const fn ra_core::event::exec::ExecStartedEvent::unknown(& self) -> & Unknown
 const fn ra_core::event::exec::ExecStartedEvent::with_pid(mut self, pid : u32) -> Self
-const fn ra_core::event::exec::ExecStartedEvent::with_pty(mut self, pty : bool) -> Self
 const fn ra_core::event::exec::ExecYieldedEvent::duration_ms(& self) -> u64
 const fn ra_core::event::exec::ExecYieldedEvent::reason(& self) -> & ExecYieldReason
 const fn ra_core::event::exec::ExecYieldedEvent::schema_version(& self) -> SchemaVersion
