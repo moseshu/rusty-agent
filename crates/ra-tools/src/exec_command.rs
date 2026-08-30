@@ -381,7 +381,27 @@ impl Tool for ExecCommandTool {
             ExecExecutionResult::Yielded {
                 session_id,
                 summary,
-            } => yielded_output(&session_id.to_string(), &summary),
+            } => {
+                // The yielded result is the first delivery on this session's interactive output
+                // stream. Record its exact snapshot rather than the buffers' current end: output
+                // can arrive between the yield and this bookkeeping, and it belongs to the next
+                // `write_stdin` result.
+                //
+                // Discarded on purpose. The only way to fail here is a session the registry no
+                // longer holds, and the identifier below is the whole handle the model gets:
+                // refusing would report a command that actually started as a failure, and take
+                // with it the means to collect that command's output or cancel it. A repeated
+                // line of output is the smaller price, and it is the price of the arm below too.
+                let _ = self
+                    .process_manager
+                    .mark_interactive_output_delivered(
+                        &session_id,
+                        as_u64(summary.stdout_bytes()),
+                        as_u64(summary.stderr_bytes()),
+                    )
+                    .await;
+                yielded_output(&session_id.to_string(), &summary)
+            }
             // `ExecExecutionResult` is `#[non_exhaustive]`, so the wildcard is mandatory. A result
             // this build cannot name is still a result, and answering the call is what keeps the
             // history well formed.

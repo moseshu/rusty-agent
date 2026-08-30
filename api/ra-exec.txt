@@ -6,6 +6,8 @@ async fn ra_exec::session::ProcessManager::evict(& self, session_id : & ExecSess
 async fn ra_exec::session::ProcessManager::execute(& self, request : ExecRequest, emitter : Option < & HostEventEmitter >) -> Result < ExecExecutionResult , ExecError >
 async fn ra_exec::session::ProcessManager::get_output_summary(& self, session_id : & ExecSessionId) -> Option < ExecOutputSummary >
 async fn ra_exec::session::ProcessManager::get_session_state(& self, session_id : & ExecSessionId) -> Option < ExecSessionState >
+async fn ra_exec::session::ProcessManager::interactive_output_cursors(& self, session_id : & ExecSessionId) -> Result < (u64 , u64) , ExecError >
+async fn ra_exec::session::ProcessManager::mark_interactive_output_delivered(& self, session_id : & ExecSessionId, stdout_cursor : u64, stderr_cursor : u64) -> Result < () , ExecError >
 async fn ra_exec::session::ProcessManager::read_output(& self, session_id : & ExecSessionId, cursor : ExecCursor) -> Result < Option < (String , ExecCursor) > , ExecError >
 async fn ra_exec::session::ProcessManager::wait_for_output(& self, session_id : & ExecSessionId, stdout_cursor : u64, stderr_cursor : u64, timeout : Duration) -> Result < () , ExecError >
 async fn ra_exec::session::ProcessManager::write_stdin(& self, session_id : & ExecSessionId, chars : Option < & str >, is_interrupt : bool, emitter : Option < & HostEventEmitter >) -> Result < () , ExecError >

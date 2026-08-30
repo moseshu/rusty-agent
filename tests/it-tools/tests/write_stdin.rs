@@ -130,16 +130,16 @@ async fn test_write_stdin_returns_only_output_since_the_interaction() {
     exec_command.process_manager().cancel(&session_id).await;
 }
 
-/// A poll outlives the session it polls, and answers with how the command ended.
+/// A poll outlives the session it polls and returns output not yet delivered to the model.
 ///
 /// This is the ordinary shape of a background command: it yields at the timeout and finishes while
 /// nobody is watching. An empty `chars` is not a write, so the process being gone is not a reason
 /// to refuse — the model learns the command exited and with what status, rather than being told its
 /// identifier is dead.
 ///
-/// What a poll does *not* recover is the output produced between two calls: the cursor is taken
-/// when the call starts, so bytes that arrived while nobody was polling are already behind it. A
-/// read cursor that survives across calls belongs to the background-job lifecycle, not here.
+/// The second poll is the other half of the guarantee: what the first one delivered is not
+/// delivered again. Without the delivery mark surviving between calls, either the tail is lost or
+/// every poll repeats it, and the pair below is what tells those two apart.
 #[tokio::test]
 async fn test_an_empty_poll_outlives_the_session_it_polls() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -185,8 +185,28 @@ async fn test_an_empty_poll_outlives_the_session_it_polls() {
 
     let text = output.as_text().expect("text output");
     assert!(
-        text.contains("exited with status 0"),
-        "a finished session must report how it ended: {text}"
+        text.contains("after"),
+        "a finished session must return output that arrived after yield: {text}"
+    );
+
+    let repeated = call(
+        &write_stdin,
+        json!({
+            "session_id": session_id.to_string(),
+            "chars": "",
+            "yield_time_ms": 100
+        }),
+    )
+    .await
+    .expect("a repeated poll succeeds");
+    let repeated_text = repeated.as_text().expect("text output");
+    assert!(
+        repeated_text.contains("exited with status 0"),
+        "{repeated_text}"
+    );
+    assert!(
+        !repeated_text.contains("after"),
+        "output repeated: {repeated_text}"
     );
 }
 
