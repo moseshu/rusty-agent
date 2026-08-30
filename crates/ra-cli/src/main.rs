@@ -1,36 +1,22 @@
-//! `ra` --- the rusty-agent command-line entry point.
+//! The `ra` binary: initialize tracing, parse, dispatch, print.
 //!
-//! This is the only crate that uses `anyhow`; library layers use their own `thiserror` errors.
+//! Everything else lives in the library beside it, so the command line can be exercised by the
+//! test workspace — a binary's internals are reachable from nowhere.
 
-use clap::{Parser, Subcommand};
+use std::process::ExitCode;
 
-#[derive(Parser)]
-#[command(name = "ra", version, about = "rusty-agent")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
+use clap::Parser as _;
 
-#[derive(Subcommand)]
-enum Command {
-    /// Runs one task.
-    Run {
-        /// Task description.
-        prompt: String,
-    },
-    /// Environment self-check: config / sandbox / prompt / mcp / provider.
-    Doctor,
-}
-
-fn main() {
+fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Run { prompt } => {
-            tracing::info!(%prompt, "run 尚未实现");
+    match ra_cli::execute(ra_cli::Cli::parse()) {
+        Ok(output) => {
+            print!("{}", output.stdout());
+            output.outcome().exit_code()
         }
-        Command::Doctor => {
-            tracing::info!("doctor 尚未实现");
+        Err(error) => {
+            tracing::error!("{error:#}");
+            ExitCode::FAILURE
         }
     }
 }

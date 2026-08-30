@@ -15,14 +15,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ra_coding::{
     CodingHost,
-    prompt::{assemble_stable_prefix, assemble_stable_prefix_for_tools, tool_surface_snapshot},
+    prompt::{
+        assemble_stable_prefix, assemble_stable_prefix_for_tools,
+        dump::{
+            PLACEHOLDER_CACHE_SCOPE, PromptDumpRequest, SectionChange, compare_prompt_dump,
+            render_prompt_dump, render_prompt_dump_json, shipped_role_names,
+        },
+        tool_surface_snapshot,
+    },
 };
 use ra_core::item::{Message, ModelInputItem, OutputPhase};
 use ra_core::model::{Model, ModelRequest, ModelSettings, ProviderKey};
 use ra_core::prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, PromptRole};
 use ra_core::tool::{DEFAULT_MAX_NO_PROGRESS_STREAK, Tool};
 use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel};
-use ra_prompt::dump::PromptDump;
 use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
 use serde_json::json;
 use wiremock::{
@@ -78,6 +84,10 @@ fn section_content(prefix: &ra_prompt::assembler::StablePrefix, name: &str) -> S
 }
 
 /// The assembled prefix matches the committed snapshot, section for section and hash for hash.
+///
+/// Rendered through [`render_prompt_dump`] — the entry point `ra prompt dump` calls — rather than
+/// by composing a report here. Two compositions would have drifted at the first edit, and the point
+/// of shipping the command is that a user can reproduce this file rather than take it on faith.
 #[test]
 fn test_stable_prefix_matches_the_committed_snapshot() {
     let mut rendered = String::new();
@@ -91,20 +101,24 @@ fn test_stable_prefix_matches_the_committed_snapshot() {
         PromptRole::OneOffAnswer,
         PromptRole::Coordinator,
     ] {
-        let prefix = assemble_stable_prefix(&role).expect("the product prefix must assemble");
-        // The real plan, not `None`: whether this prefix is cacheable at all is the costliest fact
-        // about it, and the snapshot is where a change to it should become visible.
-        let plan = CachePlan::for_prefix(prefix.system_instructions(), Some("<run>"));
         rendered.push_str(&format!("### role: {role}\n"));
-        rendered
-            .push_str(&PromptDump::from_assembled(&prefix, Some(plan), None, None).render_text());
+        rendered.push_str(
+            &render_prompt_dump(&PromptDumpRequest::new().with_role(role.role_name()))
+                .expect("the product prefix must assemble"),
+        );
         rendered.push('\n');
     }
 
-    let prefix = host_backed_prefix();
-    let plan = CachePlan::for_prefix(prefix.system_instructions(), Some("<run>"));
+    let workspace = tempfile::tempdir().expect("workspace");
     rendered.push_str("### host_backed_role: main\n");
-    rendered.push_str(&PromptDump::from_assembled(&prefix, Some(plan), None, None).render_text());
+    rendered.push_str(
+        &render_prompt_dump(
+            &PromptDumpRequest::new()
+                .with_role(PromptRole::Main.role_name())
+                .with_workspace(workspace.path()),
+        )
+        .expect("the host-backed product prefix must assemble"),
+    );
     rendered.push('\n');
 
     let path = snapshot_path();
@@ -126,6 +140,125 @@ fn test_stable_prefix_matches_the_committed_snapshot() {
         baseline, rendered,
         "the assembled stable prefix changed; every cached prefix is invalidated by this. \
          Re-run with BLESS_PROMPT_DUMP=1 and let the diff be reviewed"
+    );
+}
+
+/// A role that does not ship is refused, rather than reported on as a custom role.
+///
+/// `PromptRole::Custom` has no guidance text, so accepting a typo would answer it with a report
+/// that looks entirely real and whose role section is a generated placeholder. A verification entry
+/// point may fail; it may not quietly describe a different agent.
+#[test]
+fn test_a_role_the_product_does_not_ship_is_refused() {
+    let error = render_prompt_dump(&PromptDumpRequest::new().with_role("archaeologist"))
+        .expect_err("an unknown role must not produce a report");
+    let message = error.to_string();
+
+    assert!(message.contains("archaeologist"));
+    for role in shipped_role_names() {
+        assert!(
+            message.contains(role),
+            "the refusal must list the roles that do ship, missing `{role}`: {message}"
+        );
+    }
+}
+
+/// A dump is rendered outside any run, so it records a placeholder scope rather than inventing one.
+///
+/// This is what makes the committed snapshot reproducible from a command line: a real run id would
+/// differ on every invocation and the bytes would never match.
+#[test]
+fn test_a_dump_records_a_placeholder_cache_scope_until_a_run_names_one() {
+    let default = render_prompt_dump(&PromptDumpRequest::new()).expect("dump renders");
+    assert!(default.contains(&format!("Cache Scope:          {PLACEHOLDER_CACHE_SCOPE}")));
+
+    let named = render_prompt_dump(&PromptDumpRequest::new().with_cache_scope("session-42"))
+        .expect("dump renders");
+    assert!(named.contains("Cache Scope:          session-42"));
+}
+
+/// Comparing a build against its own recorded dump reports nothing, and says the cache survives.
+#[test]
+fn test_a_dump_compared_against_itself_reports_no_change() {
+    let request = PromptDumpRequest::new();
+    let recorded = render_prompt_dump_json(&request).expect("dump serializes");
+
+    let diff = compare_prompt_dump(&request, &recorded).expect("baseline is a dump");
+
+    assert!(!diff.prefix_changed());
+    assert!(diff.changes().is_empty());
+    assert!(
+        diff.render_text()
+            .contains("Invalidated by:       nothing; cached prefixes survive")
+    );
+}
+
+/// Inserting one section must not report every section below it as having moved.
+///
+/// Adding the tool surface shifts the index of everything after it, and a report that called all of
+/// them moved would bury the insertion that caused the change under seven consequences of it. The
+/// comparison ranks sections among the ones both dumps share, so only the real causes are named.
+#[test]
+fn test_an_insertion_is_not_reported_as_moving_every_section_below_it() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let toolless = render_prompt_dump_json(&PromptDumpRequest::new()).expect("dump serializes");
+    let host_backed = PromptDumpRequest::new().with_workspace(workspace.path());
+
+    let diff = compare_prompt_dump(&host_backed, &toolless).expect("baseline is a dump");
+
+    assert!(diff.prefix_changed());
+    let named: Vec<&str> = diff.changes().iter().map(SectionChange::name).collect();
+    assert_eq!(
+        named,
+        ["tool_surface", "editing_verification"],
+        "only the added surface and the editing text that names it actually changed"
+    );
+    assert!(
+        !diff
+            .changes()
+            .iter()
+            .any(|change| matches!(change, SectionChange::Moved { .. })),
+        "the relative order of the shared sections is unchanged, so nothing moved"
+    );
+}
+
+/// Two sections swapping places is caught even though every section hash holds.
+///
+/// This is the invalidation no per-section hash can show: the joined prefix — the span a provider
+/// caches — is rewritten while every row above is byte-identical. The baseline is hand-built,
+/// because the assembler's canonical order is exactly what stops the product from producing one.
+#[test]
+fn test_a_reorder_is_named_even_though_every_section_hash_holds() {
+    let request = PromptDumpRequest::new();
+    let mut recorded: serde_json::Value =
+        serde_json::from_str(&render_prompt_dump_json(&request).expect("dump serializes"))
+            .expect("a dump is JSON");
+
+    let sections = recorded["sections"]
+        .as_array_mut()
+        .expect("a dump lists its sections");
+    let autonomy = sections
+        .iter()
+        .position(|section| section["name"] == "autonomy")
+        .expect("the prefix carries an autonomy section");
+    sections.swap(autonomy, autonomy + 1);
+    // A real reorder moves the prefix hash too; leaving the recorded one in place would make the
+    // fixture describe a prefix that cannot exist.
+    recorded["prefix_hash"] = serde_json::Value::String("0".repeat(64));
+
+    let diff = compare_prompt_dump(&request, &recorded.to_string()).expect("baseline is a dump");
+
+    assert!(diff.prefix_changed());
+    let moved: Vec<&str> = diff
+        .changes()
+        .iter()
+        .filter(|change| matches!(change, SectionChange::Moved { .. }))
+        .map(SectionChange::name)
+        .collect();
+    assert_eq!(moved, ["autonomy", "channels"]);
+    assert!(
+        diff.render_text()
+            .contains("Invalidated by:       autonomy, channels")
     );
 }
 
@@ -151,6 +284,40 @@ fn test_host_backed_agent_carries_the_tool_surface_prefix() {
     );
     assert_eq!(agent.tools().len(), 1);
     assert!(prefix.system_instructions().contains("`apply_patch`"));
+}
+
+/// Opening a workspace does not override a role's tool boundary.
+#[test]
+fn test_host_backed_read_only_and_one_off_agents_carry_no_tools() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = CodingHost::open(workspace.path()).expect("coding host builds");
+
+    for role in [
+        PromptRole::ReadOnlySpecialist,
+        PromptRole::Planner,
+        PromptRole::OneOffAnswer,
+    ] {
+        let agent = ra_coding::build_agent_with_host(
+            ra_core::agent::AgentId::new("coding-agent"),
+            "Coding Agent",
+            &role,
+            &host,
+        )
+        .expect("host-backed agent builds");
+
+        assert!(
+            agent.tools().is_empty(),
+            "`{role}` must not receive an editing tool"
+        );
+        assert!(
+            !agent
+                .instructions()
+                .and_then(ra_core::agent::AgentInstructions::as_static)
+                .expect("agent has a stable prefix")
+                .contains("`apply_patch`"),
+            "tool-free agents must not name an unavailable editing entry"
+        );
+    }
 }
 
 /// The tool list and its fingerprint are insensitive to host registration order.
