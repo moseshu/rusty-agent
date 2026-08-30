@@ -379,6 +379,7 @@ fn test_the_one_off_prefix_includes_engineering_judgment() {
             "core_behavior",
             "editing_verification",
             "autonomy",
+            "final_answer",
             "personality",
             "role"
         ],
@@ -458,9 +459,60 @@ fn test_the_product_prefix_includes_autonomous_progress_and_stop_loss() {
             "tool_surface",
             "editing_verification",
             "autonomy",
+            "final_answer",
             "personality",
             "role"
         ]
+    );
+}
+
+/// Formatting is a product-wide rendering contract, not role guidance. Keeping it in the stable
+/// prefix means every role produces UI-compatible text without duplicating the rules in each role
+/// section.
+#[test]
+fn test_every_role_shares_the_output_formatting_contract() {
+    let mut expected: Option<String> = None;
+    for role in [
+        PromptRole::Main,
+        PromptRole::ReadOnlySpecialist,
+        PromptRole::Planner,
+        PromptRole::OneOffAnswer,
+        PromptRole::Coordinator,
+    ] {
+        let formatting = section_content(
+            &assemble_stable_prefix(&role).expect("product prefix assembles"),
+            "final_answer",
+        );
+        let previous = expected.get_or_insert_with(|| formatting.clone());
+        assert_eq!(
+            *previous, formatting,
+            "{role} must keep the shared output-formatting contract"
+        );
+    }
+}
+
+/// The UI renders GitHub-flavored Markdown, so the stable prefix must state the exact conventions
+/// whose violation would visibly break a response: short bold headers, flat lists, usable file
+/// links, and the product's deliberately narrow punctuation policy.
+#[test]
+fn test_the_product_prefix_includes_output_formatting_rules() {
+    let prefix = host_backed_prefix();
+    let formatting = section_content(&prefix, "final_answer");
+
+    assert!(formatting.contains("GitHub-flavored Markdown"));
+    assert!(formatting.contains("`**Short Header**`"));
+    assert!(formatting.contains("one to three words"));
+    assert!(formatting.contains("Do not nest bullets"));
+    assert!(formatting.contains("only `1.` numbering, never `1)`"));
+    assert!(formatting.contains("`[app.rs](/absolute/path/app.rs:12)`"));
+    assert!(formatting.contains("Do not use emoji or em dashes"));
+
+    let names = section_names(&prefix);
+    let position = |wanted: &str| names.iter().position(|name| *name == wanted);
+    assert!(
+        position("autonomy") < position("final_answer")
+            && position("final_answer") < position("personality"),
+        "output formatting must remain between autonomous progress and personality"
     );
 }
 
@@ -559,9 +611,9 @@ fn section_names(prefix: &ra_prompt::assembler::StablePrefix) -> Vec<&str> {
 ///
 /// This pins a fact that is otherwise invisible. The floor is 1024 estimated tokens — every
 /// provider ignores a shorter prefix — and today's prefix carries the identity, engineering,
-/// editing, autonomy, tone, role and advertised-tool sections, landing short of it. So the real
-/// product gets no cache plan, and no `prompt_cache_key` is sent even to an endpoint that declared
-/// support for one.
+/// editing, autonomy, final-answer formatting, tone, role and advertised-tool sections, landing
+/// short of it. So the real product gets no cache plan, and no `prompt_cache_key` is sent even to
+/// an endpoint that declared support for one.
 ///
 /// Measured on the host-backed prefix, which is the longer of the two the product assembles and
 /// the one an agent with tools installed actually carries. A prefix that only cleared the floor
