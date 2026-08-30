@@ -484,6 +484,52 @@ fn test_the_byte_ceiling_is_separate_from_the_entry_count() {
 }
 
 #[test]
+fn test_the_name_character_ceiling_is_separate_from_other_surface_budgets() {
+    let long_name = format!("tool_{}", "n".repeat(32));
+    let registry = ToolRegistry::builder()
+        .register(
+            StubTool::bare("read_file")
+                .advertised_as(&long_name)
+                .shared(),
+        )
+        .build()
+        .expect("a valid registry");
+
+    let profile = ToolProfile::builder(profile_id("core"))
+        .all_registered()
+        .budget(
+            ToolSurfaceBudget::new(1, 1)
+                .expect("a valid budget")
+                .with_max_advertised_name_chars(long_name.chars().count() - 1),
+        )
+        .build()
+        .expect("a valid profile");
+
+    let error = registry
+        .assemble(&profile)
+        .expect_err("a surface over its name-character ceiling must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("characters in model-facing tool names"),
+        "{error}"
+    );
+
+    let profile = ToolProfile::builder(profile_id("core"))
+        .all_registered()
+        .budget(
+            ToolSurfaceBudget::new(1, 1)
+                .expect("a valid budget")
+                .with_max_advertised_name_chars(long_name.chars().count()),
+        )
+        .build()
+        .expect("a valid profile");
+    registry
+        .assemble(&profile)
+        .expect("a surface at its name-character ceiling must assemble");
+}
+
+#[test]
 fn test_registration_order_does_not_change_the_surface() {
     let forwards = ToolRegistry::builder()
         .register(StubTool::bare("read_file").shared())
@@ -568,7 +614,7 @@ fn test_a_configured_budget_is_checked_like_a_constructed_one() {
     assert!(error.to_string().contains("cannot exceed"), "{error}");
 
     let budget: ToolSurfaceBudget = serde_json::from_str(
-        r#"{"min_advertised": 14, "max_advertised": 16, "max_advertised_bytes": 20480}"#,
+        r#"{"min_advertised": 14, "max_advertised": 16, "max_advertised_bytes": 20480, "max_advertised_name_chars": 1024}"#,
     )
     .expect("a valid budget");
     assert_eq!(
@@ -576,6 +622,7 @@ fn test_a_configured_budget_is_checked_like_a_constructed_one() {
         ToolSurfaceBudget::new(14, 16)
             .expect("a valid budget")
             .with_max_advertised_bytes(20 * 1024)
+            .with_max_advertised_name_chars(1024)
     );
 }
 

@@ -67,8 +67,10 @@ const fn ra_runtime::tool::profile::ToolSurface::advertised_count(& self) -> usi
 const fn ra_runtime::tool::profile::ToolSurface::profile(& self) -> & ToolProfileId
 const fn ra_runtime::tool::profile::ToolSurfaceBudget::max_advertised(& self) -> usize
 const fn ra_runtime::tool::profile::ToolSurfaceBudget::max_advertised_bytes(& self) -> Option < usize >
+const fn ra_runtime::tool::profile::ToolSurfaceBudget::max_advertised_name_chars(& self) -> Option < usize >
 const fn ra_runtime::tool::profile::ToolSurfaceBudget::min_advertised(& self) -> usize
 const fn ra_runtime::tool::profile::ToolSurfaceBudget::with_max_advertised_bytes(mut self, bytes : usize) -> Self
+const fn ra_runtime::tool::profile::ToolSurfaceBudget::with_max_advertised_name_chars(mut self, chars : usize) -> Self
 const fn ra_runtime::turn::TurnSettlementRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::batch::TurnExecutionRequest < 'a >::with_max_function_tool_concurrency(mut self, max : usize) -> Self
 const fn ra_runtime::turn::prepare::ActionSurfaceBudget::max_advertised(& self) -> usize

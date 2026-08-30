@@ -6,11 +6,11 @@
 //! string its declaration happened to carry, and none of the sectioning, ordering, prefix hashing,
 //! or dump governance would apply to what the model actually receives.
 //!
-//! The per-topic modules alongside this one hold the product's own prompt text. Nine are written:
-//! `identity`, `engineering`, `editing`, `autonomy`, `channels`, `formatting`, [`personality`],
-//! [`role`], and the generated `tool_surface`. The remaining slots are still empty: writing that
-//! text is a separate piece of work, and filling them with placeholders would freeze wording
-//! nobody has decided on.
+//! The per-topic modules alongside this one hold the product's own prompt text. Ten are written:
+//! `identity`, `engineering`, `tool_use`, `editing`, `autonomy`, `channels`, `formatting`,
+//! [`personality`], [`role`], and the generated `tool_surface`. `frontend` is the one slot still
+//! empty: writing that text is a separate piece of work, and filling it with a placeholder would
+//! freeze wording nobody has decided on.
 //! Each one lands by adding a section to [`assemble_stable_prefix_for_tools`], which is why the
 //! assembly is a list rather than a hardcoded concatenation.
 //!
@@ -30,13 +30,15 @@
 //! single total because a total is the number nobody defends: any one topic can grow into the room
 //! the others left, and the review that would have caught it sees only a prefix that still fits.
 //!
-//! Two sizes are in use. A section that states a *stance* — identity, engineering judgment,
-//! personality, role — gets 192, and one that enumerates *rules* the model has to apply — editing,
-//! autonomy, channels, formatting, and the generated tool surface — gets 256. Nothing derives these
-//! numbers; they are roughly a third above what each section costs today, which is room to rewrite
-//! a paragraph and not room to add a second topic under an existing heading.
+//! Three sizes are in use. A section that states a *stance* — identity, engineering judgment,
+//! personality, role — gets 192, and a rule list the model has to apply — editing, autonomy,
+//! channels, formatting — gets 256. The tool-use behavior contract gets 128, while the generated
+//! tool surface gets 512: the latter has to name every advertised tool and is bounded by the
+//! coding profile's explicit aggregate-name budget. Nothing derives these numbers; they are roughly
+//! a third above what each section costs today, which is room to rewrite a paragraph and not room
+//! to add a second topic under an existing heading.
 //!
-//! Their sum is the ceiling on the assembled prefix: 2048 estimated tokens, twice
+//! Their sum is the ceiling on the assembled prefix: 2432 estimated tokens, more than twice
 //! [`MIN_CACHEABLE_PREFIX_TOKENS`](ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS). The floor and the
 //! ceiling are different kinds of fact — below the floor no provider caches the span at all, while
 //! above the ceiling it is cached and simply costs more every turn than this product has decided a
@@ -72,6 +74,7 @@ use self::identity::IdentityPromptBuilder;
 use self::personality::PersonalityPromptBuilder;
 use self::role::RolePromptBuilder;
 use self::tool_surface::ToolSurfacePromptBuilder;
+use self::tool_use::ToolUsePromptBuilder;
 
 /// Assembles the stable system-instruction prefix for one role.
 ///
@@ -97,8 +100,9 @@ pub fn assemble_stable_prefix(role: &PromptRole) -> Result<StablePrefix> {
 /// Building the inventory from a separate list would let the prompt promise a name the runtime
 /// cannot dispatch, or omit one the provider has advertised.
 ///
-/// The section this adds lists only the advertised names. The schema fingerprint that makes a
-/// description-only edit reviewable belongs to [`tool_surface_snapshot`], which is not
+/// The two sections this adds — the selection rules and the inventory they point at — arrive
+/// together or not at all. The inventory lists only the advertised names; the schema fingerprint
+/// that makes a description-only edit reviewable belongs to [`tool_surface_snapshot`], which is not
 /// model-visible and therefore does not spend cached-prefix tokens on a digest.
 ///
 /// # Errors
@@ -122,7 +126,12 @@ pub fn assemble_stable_prefix_for_tools(
         PersonalityPromptBuilder::build_personality_section()?,
         RolePromptBuilder::build_role_section(role)?,
     ];
+    // One condition for both, read from the inventory builder rather than restated here. Added on
+    // its own, the selection rules would tell an agent whose request carries no tools to choose
+    // from a list its prompt does not contain — and they rank ahead of the role section that says
+    // it has none, so that is the instruction such an agent reads first.
     if let Some(tool_surface) = ToolSurfacePromptBuilder::build_tool_surface_section(tools)? {
+        sections.push(ToolUsePromptBuilder::build_tool_use_section()?);
         sections.push(tool_surface);
     }
 

@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ra_coding::{CodingHost, CodingProfile};
+use ra_coding::{CodingHost, CodingProfile, prompt::assemble_stable_prefix_for_tools};
 use ra_core::{
     error::Result,
+    prompt::PromptRole,
     tool::{Tool, ToolContext, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::tool::{profile::ToolSelection, registry::ToolRegistry};
@@ -175,6 +176,11 @@ fn test_the_tiers_hold_the_measured_bounds() {
             Some(20 * 1024),
             "{tier:?}"
         );
+        assert_eq!(
+            profile.budget().max_advertised_name_chars(),
+            Some(24 * 64),
+            "{tier:?}"
+        );
     }
 }
 
@@ -304,6 +310,134 @@ fn test_a_tier_refuses_to_assemble_while_a_declared_tool_is_missing() {
         missing.iter().any(|name| message.contains(name)),
         "the failure names none of {missing:?}: {message}"
     );
+}
+
+/// The widest surface a tier permits, at the name lengths this product's own entries use.
+///
+/// Filled to the tier's own ceiling rather than to what it declares today: the budget permits that
+/// many entries, so the prompt has to hold that many, and the tenth ordinary tool must not be the
+/// one that discovers otherwise. `Full` names nothing of its own, so it starts from the standard
+/// surface — what it adds at runtime is the host's, and the length of *those* names is the variable
+/// the case below this one pins.
+fn widest_permitted_surface(tier: CodingProfile) -> Vec<Arc<dyn Tool>> {
+    let ceiling = tier
+        .to_tool_profile()
+        .expect("a valid profile")
+        .budget()
+        .max_advertised();
+    let mut names = match tier {
+        CodingProfile::Full => selected_names(CodingProfile::CodexLike),
+        declared => selected_names(declared),
+    };
+    while names.len() < ceiling {
+        names.push(format!("filler_tool_{:02}", names.len()));
+    }
+    names.iter().map(|name| StubTool::shared(name)).collect()
+}
+
+/// The prompt's advertised inventory holds every tier, filled to that tier's own ceiling.
+///
+/// This section is the one part of the cached prefix whose size nobody types: it is generated from
+/// the tool list, and it is refused when it overruns its allowance. Refused means the agent does
+/// not build — so the tiers this product ships have to fit with the ceiling where it stands, and
+/// this is where adding the next tool finds that out.
+#[test]
+fn test_the_prompt_inventory_holds_every_tier_at_its_own_ceiling() {
+    for tier in [
+        CodingProfile::Core,
+        CodingProfile::CodexLike,
+        CodingProfile::Full,
+    ] {
+        let tools = widest_permitted_surface(tier);
+        let prefix = assemble_stable_prefix_for_tools(&PromptRole::Main, &tools)
+            .unwrap_or_else(|error| panic!("{tier:?} at {} entries: {error}", tools.len()));
+        let inventory = prefix
+            .sections()
+            .iter()
+            .find(|section| section.name().as_str() == "tool_surface")
+            .expect("an advertised surface renders an inventory section");
+
+        // No `MEASUREMENT_MARKER` line here, deliberately: the token-budget gate reads the first
+        // marked line it finds, and that one belongs to the byte budget above.
+        assert_eq!(
+            inventory
+                .content()
+                .lines()
+                .filter(|line| line.starts_with("- `"))
+                .count(),
+            tools.len(),
+            "{tier:?} lost an entry between its ceiling and the prompt that names them"
+        );
+    }
+}
+
+/// MCP-style names fit the explicit aggregate-name budget at the full entry ceiling.
+#[test]
+fn test_an_mcp_length_surface_fits_the_prompt_allowance() {
+    let ceiling = CodingProfile::Full
+        .to_tool_profile()
+        .expect("a valid profile")
+        .budget()
+        .max_advertised();
+    let tools: Vec<Arc<dyn Tool>> = (0..ceiling)
+        .map(|index| StubTool::shared(&format!("mcp__issue_tracker__create_issue_{index:02}")))
+        .collect();
+
+    assemble_stable_prefix_for_tools(&PromptRole::Main, &tools)
+        .expect("an MCP-style full surface must assemble");
+}
+
+/// The declared aggregate-name ceiling, not a shorter incidental spelling, sizes the inventory.
+#[test]
+fn test_the_full_name_budget_fits_the_prompt_inventory() {
+    let ceiling = CodingProfile::Full
+        .to_tool_profile()
+        .expect("a valid profile")
+        .budget()
+        .max_advertised();
+    let tools: Vec<Arc<dyn Tool>> = (0..ceiling)
+        .map(|index| {
+            let name = format!("tool_{index:02}_{}", "n".repeat(56));
+            assert_eq!(name.chars().count(), 64, "{name}");
+            StubTool::shared(&name)
+        })
+        .collect();
+
+    assemble_stable_prefix_for_tools(&PromptRole::Main, &tools)
+        .expect("the declared full name budget must fit the inventory");
+}
+
+/// One character past the ceiling is refused by the prompt inventory itself.
+///
+/// The registry checks the same ceiling, but the prompt path does not go through it: an inventory
+/// is built from whatever tool list the agent construction path hands over. Without its own check
+/// the section would grow past the allowance it declares, and the failure would arrive as a budget
+/// overrun naming no cause.
+#[test]
+fn test_a_name_list_past_the_ceiling_is_refused_by_the_prompt_inventory() {
+    let ceiling = CodingProfile::Full
+        .to_tool_profile()
+        .expect("a valid profile")
+        .budget()
+        .max_advertised();
+    let tools: Vec<Arc<dyn Tool>> = (0..ceiling)
+        .map(|index| {
+            // One entry carries the extra character, so the count stays inside the tier and the
+            // aggregate name length is the only thing over.
+            let padding = if index == 0 { 57 } else { 56 };
+            StubTool::shared(&format!("tool_{index:02}_{}", "n".repeat(padding)))
+        })
+        .collect();
+
+    let error = assemble_stable_prefix_for_tools(&PromptRole::Main, &tools)
+        .expect_err("a name list over the declared ceiling must not assemble");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("characters in model-facing tool names"),
+        "{message}"
+    );
+    assert!(message.contains("1536"), "{message}");
 }
 
 #[test]

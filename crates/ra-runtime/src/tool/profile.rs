@@ -96,6 +96,7 @@ pub struct ToolSurfaceBudget {
     min_advertised: usize,
     max_advertised: usize,
     max_advertised_bytes: Option<usize>,
+    max_advertised_name_chars: Option<usize>,
 }
 
 impl ToolSurfaceBudget {
@@ -114,6 +115,7 @@ impl ToolSurfaceBudget {
             min_advertised,
             max_advertised,
             max_advertised_bytes: None,
+            max_advertised_name_chars: None,
         })
     }
 
@@ -125,6 +127,17 @@ impl ToolSurfaceBudget {
     #[must_use]
     pub const fn with_max_advertised_bytes(mut self, bytes: usize) -> Self {
         self.max_advertised_bytes = Some(bytes);
+        self
+    }
+
+    /// Adds a ceiling on the total characters in advertised model-facing names.
+    ///
+    /// This is separate from the schema-byte ceiling because a prompt inventory repeats names
+    /// but not schemas. A profile that renders those names into a cached prefix can therefore
+    /// state the cost of that projection without coupling its allowance to provider wire format.
+    #[must_use]
+    pub const fn with_max_advertised_name_chars(mut self, chars: usize) -> Self {
+        self.max_advertised_name_chars = Some(chars);
         self
     }
 
@@ -145,6 +158,12 @@ impl ToolSurfaceBudget {
     pub const fn max_advertised_bytes(&self) -> Option<usize> {
         self.max_advertised_bytes
     }
+
+    /// Character ceiling on advertised model-facing names, if the profile declared one.
+    #[must_use]
+    pub const fn max_advertised_name_chars(&self) -> Option<usize> {
+        self.max_advertised_name_chars
+    }
 }
 
 /// The wire shape of a budget, before anything has checked it.
@@ -160,6 +179,8 @@ struct DeclaredBudget {
     max_advertised: usize,
     #[serde(default)]
     max_advertised_bytes: Option<usize>,
+    #[serde(default)]
+    max_advertised_name_chars: Option<usize>,
 }
 
 impl TryFrom<DeclaredBudget> for ToolSurfaceBudget {
@@ -167,8 +188,12 @@ impl TryFrom<DeclaredBudget> for ToolSurfaceBudget {
 
     fn try_from(declared: DeclaredBudget) -> Result<Self> {
         let budget = Self::new(declared.min_advertised, declared.max_advertised)?;
-        Ok(match declared.max_advertised_bytes {
+        let budget = match declared.max_advertised_bytes {
             Some(bytes) => budget.with_max_advertised_bytes(bytes),
+            None => budget,
+        };
+        Ok(match declared.max_advertised_name_chars {
+            Some(chars) => budget.with_max_advertised_name_chars(chars),
             None => budget,
         })
     }

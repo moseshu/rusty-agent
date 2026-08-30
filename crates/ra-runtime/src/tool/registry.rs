@@ -119,6 +119,7 @@ impl ToolRegistry {
         let mut names: BTreeMap<String, &ToolLookupKey> = BTreeMap::new();
         let mut advertised = Vec::new();
         let mut advertised_bytes = 0;
+        let mut advertised_name_chars = 0;
         for tool in &tools {
             // Everything the budget pays for can also reach a model surface, so one projection
             // answers every question asked here — which name is claimed, which name is sent, and
@@ -139,6 +140,7 @@ impl ToolRegistry {
             if is_advertised(tool.as_ref()) {
                 advertised.push(definition.name().to_owned());
                 advertised_bytes += definition.advertised_bytes()?;
+                advertised_name_chars += definition.name().chars().count();
             }
         }
 
@@ -164,6 +166,14 @@ impl ToolRegistry {
             return Err(Error::config(format!(
                 "tool profile `{id}` advertises {advertised_bytes} bytes of tool schema, above \
                  its declared ceiling of {max_bytes}"
+            )));
+        }
+        if let Some(max_chars) = budget.max_advertised_name_chars()
+            && advertised_name_chars > max_chars
+        {
+            return Err(Error::config(format!(
+                "tool profile `{id}` advertises {advertised_name_chars} characters in model-facing \
+                 tool names, above its declared ceiling of {max_chars}"
             )));
         }
 
