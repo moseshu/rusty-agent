@@ -700,6 +700,7 @@ const ra_core::model::stream::MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion
 const ra_core::permission::PermissionMode::ALL: & 'static [Self]
 const ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS: usize
 const ra_core::prompt::PromptSectionName::AUTONOMY: Self
+const ra_core::prompt::PromptSectionName::CHANNELS: Self
 const ra_core::prompt::PromptSectionName::CONTEXT_DURABILITY: Self
 const ra_core::prompt::PromptSectionName::CORE_BEHAVIOR: Self
 const ra_core::prompt::PromptSectionName::DYNAMIC_INSTRUCTIONS: Self

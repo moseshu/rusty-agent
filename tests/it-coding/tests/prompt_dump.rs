@@ -17,10 +17,18 @@ use ra_coding::{
     CodingHost,
     prompt::{assemble_stable_prefix, assemble_stable_prefix_for_tools, tool_surface_snapshot},
 };
+use ra_core::item::{Message, ModelInputItem, OutputPhase};
+use ra_core::model::{Model, ModelRequest, ModelSettings, ProviderKey};
 use ra_core::prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, PromptRole};
 use ra_core::tool::{DEFAULT_MAX_NO_PROGRESS_STREAK, Tool};
+use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel};
 use ra_prompt::dump::PromptDump;
 use ra_tools::{exec_command::ExecCommandTool, read_file::ReadFileTool};
+use serde_json::json;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
 
 const TOOL_SURFACE_RENDER_COUNT: usize = 100;
 
@@ -360,8 +368,7 @@ fn test_the_product_prefix_places_engineering_judgment_after_identity() {
     let host_backed = host_backed_prefix();
     let names = section_names(&host_backed);
     assert!(
-        names.iter().position(|name| *name == "core_behavior")
-            < names.iter().position(|name| *name == "tool_surface"),
+        position_of(&names, "core_behavior") < position_of(&names, "tool_surface"),
         "engineering judgment must still precede the advertised tool surface"
     );
 }
@@ -379,6 +386,7 @@ fn test_the_one_off_prefix_includes_engineering_judgment() {
             "core_behavior",
             "editing_verification",
             "autonomy",
+            "channels",
             "final_answer",
             "personality",
             "role"
@@ -413,12 +421,11 @@ fn test_the_product_prefix_includes_editing_and_git_safety_rules() {
     assert!(editing.contains("`git clean`"));
     assert!(editing.contains("`git checkout --`"));
 
-    // The pair, not the whole list: the full order is asserted where autonomy, the section that
+    // The pair, not the whole list: the full order is asserted where channels, the section that
     // most recently joined it, is the subject.
     let names = section_names(&main_prefix);
-    let position = |wanted: &str| names.iter().position(|name| *name == wanted);
     assert!(
-        position("tool_surface") < position("editing_verification"),
+        position_of(&names, "tool_surface") < position_of(&names, "editing_verification"),
         "the editing entry must still follow the surface that advertises it"
     );
 }
@@ -451,18 +458,12 @@ fn test_the_product_prefix_includes_autonomous_progress_and_stop_loss() {
         "the autonomy section reads `three consecutive failures`; update the prompt text with it"
     );
 
-    assert_eq!(
-        section_names(&prefix),
-        [
-            "identity",
-            "core_behavior",
-            "tool_surface",
-            "editing_verification",
-            "autonomy",
-            "final_answer",
-            "personality",
-            "role"
-        ]
+    // The pair, not the whole list: the full order is asserted where channels, the section that
+    // most recently joined it, is the subject.
+    let names = section_names(&prefix);
+    assert!(
+        position_of(&names, "editing_verification") < position_of(&names, "autonomy"),
+        "autonomy must still follow the editing safety rules it builds on"
     );
 }
 
@@ -489,6 +490,72 @@ fn test_every_role_shares_the_output_formatting_contract() {
             "{role} must keep the shared output-formatting contract"
         );
     }
+}
+
+/// Channel choice is a product-wide UI contract. Role guidance may restrict which actions are
+/// available, but it must not change when the user receives progress or a completed delivery.
+#[test]
+fn test_every_role_shares_the_dual_channel_contract() {
+    let mut expected: Option<String> = None;
+    for role in [
+        PromptRole::Main,
+        PromptRole::ReadOnlySpecialist,
+        PromptRole::Planner,
+        PromptRole::OneOffAnswer,
+        PromptRole::Coordinator,
+    ] {
+        let channels = section_content(
+            &assemble_stable_prefix(&role).expect("product prefix assembles"),
+            "channels",
+        );
+        let previous = expected.get_or_insert_with(|| channels.clone());
+        assert_eq!(
+            *previous, channels,
+            "{role} must keep the shared dual-channel contract"
+        );
+    }
+}
+
+/// The runtime owns the mechanical phase assignment. This prompt section instead tells the agent
+/// which of the two channels each thing belongs in, and paces progress against tool batches — the
+/// only cadence a model without a clock can act on.
+///
+/// It says nothing about *whether* a blocker must be reported: `autonomy` owns that duty and
+/// `personality` owns reporting it truthfully. A second cached copy of either is what this section
+/// is scoped to avoid.
+#[test]
+fn test_the_product_prefix_includes_dual_channel_response_rules() {
+    let prefix = host_backed_prefix();
+    let channels = section_content(&prefix, "channels");
+
+    assert!(channels.contains("Use `commentary` for short, scannable progress updates"));
+    assert!(channels.contains("before your first tool call and again before each later batch"));
+    assert!(channels.contains("Use `final` only for the completed response"));
+    assert!(channels.contains("Everything that response depends on belongs there"));
+    assert!(channels.contains("Repeat what an earlier update already said"));
+    assert!(channels.contains("Commentary is progress, not delivery"));
+
+    // The prefix spells the runtime's own phase labels. Pinning them here is what forces a rename
+    // of `OutputPhase` back through this text, rather than leaving a cached prompt directing the
+    // model to a channel that no longer exists.
+    assert!(channels.contains(&format!("`{}`", OutputPhase::Commentary.label())));
+    assert!(channels.contains(&format!("`{}`", OutputPhase::Final.label())));
+
+    // The whole list, asserted here because channels is the section that most recently joined it.
+    assert_eq!(
+        section_names(&prefix),
+        [
+            "identity",
+            "core_behavior",
+            "tool_surface",
+            "editing_verification",
+            "autonomy",
+            "channels",
+            "final_answer",
+            "personality",
+            "role"
+        ]
+    );
 }
 
 /// The UI renders GitHub-flavored Markdown, so the stable prefix must state the exact conventions
@@ -607,31 +674,104 @@ fn section_names(prefix: &ra_prompt::assembler::StablePrefix) -> Vec<&str> {
         .collect()
 }
 
-/// The product's assembled prefix is currently too short for any provider to cache.
+/// Where a section sits in the assembled order, panicking when it is not there at all.
 ///
-/// This pins a fact that is otherwise invisible. The floor is 1024 estimated tokens — every
-/// provider ignores a shorter prefix — and today's prefix carries the identity, engineering,
-/// editing, autonomy, final-answer formatting, tone, role and advertised-tool sections, landing
-/// short of it. So the real product gets no cache plan, and no `prompt_cache_key` is sent even to
-/// an endpoint that declared support for one.
+/// The obvious spelling compares two `Option<usize>`, and `None` sorts *below* every `Some` — so a
+/// pairwise order assertion written that way is satisfied by the earlier section having vanished,
+/// which is the failure it exists to catch.
+fn position_of(names: &[&str], wanted: &str) -> usize {
+    names
+        .iter()
+        .position(|name| *name == wanted)
+        .unwrap_or_else(|| panic!("the assembled prefix must carry a `{wanted}` section"))
+}
+
+/// Lowers one set of system instructions through the production Anthropic codec and hands back the
+/// `system` block that went on the wire.
 ///
-/// Measured on the host-backed prefix, which is the longer of the two the product assembles and
-/// the one an agent with tools installed actually carries. A prefix that only cleared the floor
-/// once tools were attached would otherwise reach the floor without this test noticing.
+/// The compatibility preview in `ra_model::anthropic::smoke` never applies a cache breakpoint, so
+/// sending a request is the only way to observe one. The mocked response is ignored; what is under
+/// test is what the adapter wrote.
+async fn anthropic_system_block(instructions: &str) -> serde_json::Value {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_cache",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let model = AnthropicMessagesModel::new(
+        "claude-cache-test",
+        AnthropicAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+    )
+    .expect("anthropic model builds");
+
+    let settings = ModelSettings::new().with_max_tokens(256);
+    let resolved = ModelSettings::new().resolve(
+        &ProviderKey::new("anthropic"),
+        &ModelSettings::new(),
+        &ModelSettings::new(),
+        &settings,
+    );
+    // The same two moves the runtime's turn preparation makes: name the stable prefix in a plan,
+    // then hand the adapter the prefix that plan names.
+    let request = ModelRequest::new(vec![ModelInputItem::Message(Message::user("go"))], resolved)
+        .with_cache_plan(CachePlan::for_prefix(instructions, Some("run-7")))
+        .with_system_instructions(instructions);
+    model
+        .get_response(request)
+        .await
+        .expect("the request must lower and its cache plan must match its instructions");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock retains requests");
+    serde_json::from_slice::<serde_json::Value>(&requests[0].body).expect("body is JSON")["system"]
+        .clone()
+}
+
+/// The product's assembled prefix now clears the common caching floor, and spends a breakpoint.
 ///
-/// **This is missing content, not a broken threshold.** Most sections are still unwritten, and the
-/// provider's tool table — a different part of the request, which the same cache span covers — is
-/// one tool wide. The assertion is deliberately written to fail once that changes: at that point
-/// caching starts applying to the product, and that is a change worth noticing rather than
-/// discovering on a bill.
-#[test]
-fn test_the_product_prefix_is_still_below_the_caching_floor() {
-    let tokens = host_backed_prefix().token_estimate();
+/// Crossing 1024 estimated tokens is not a number in a report; it switches on provider cache
+/// directives for every real request. So the assertion is made where that switch is observable —
+/// on the wire — rather than on a [`CachePlan`], which is built from a hash and a scope and never
+/// consults a token count. The control below is what keeps this honest: without it the test would
+/// pass on a prefix a tenth of this size.
+///
+/// A passing lowering also proves the plan names the prefix it was attached to, because the codec
+/// re-hashes the instructions and refuses a plan that disagrees.
+///
+/// Measured on the host-backed prefix, the version actually installed on an agent with tools. A
+/// prefix that only cleared the floor after tools were attached would otherwise go unnoticed.
+#[tokio::test]
+async fn test_the_product_prefix_reaches_the_caching_floor_and_earns_a_breakpoint() {
+    let prefix = host_backed_prefix();
+    let tokens = prefix.token_estimate();
 
     assert!(
-        tokens < MIN_CACHEABLE_PREFIX_TOKENS,
-        "the product prefix now reaches {tokens} tokens, at or past the {MIN_CACHEABLE_PREFIX_TOKENS}-token \
-         floor. Caching now applies to the product: re-check the cache plan path end to end and \
-         update this test"
+        tokens >= MIN_CACHEABLE_PREFIX_TOKENS,
+        "the product prefix fell back to {tokens} tokens, below the \
+         {MIN_CACHEABLE_PREFIX_TOKENS}-token caching floor"
+    );
+
+    let system = anthropic_system_block(prefix.system_instructions()).await;
+    assert_eq!(
+        system[0]["cache_control"],
+        json!({"type": "ephemeral"}),
+        "the product prefix clears the floor, so the adapter must mark it as a cache breakpoint"
+    );
+
+    let below_floor = anthropic_system_block("You are a helpful assistant.").await;
+    assert!(
+        below_floor[0].get("cache_control").is_none(),
+        "a prefix below the floor must not spend a breakpoint; without this the assertion above \
+         would hold for any prefix at all"
     );
 }

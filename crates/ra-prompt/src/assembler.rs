@@ -68,33 +68,38 @@ impl fmt::Debug for StablePrefix {
     }
 }
 
+/// Canonical section order, first to last in the assembled prefix.
+///
+/// **This list is the order of the cached artifact**, so moving an entry invalidates every
+/// provider's cached prefix exactly as rewriting a section would. Introducing a topic is an
+/// insertion here rather than a renumbering of ranks, which keeps the diff that reviewers see equal
+/// to the change that was actually made.
+static CANONICAL_SECTION_ORDER: [PromptSectionName; 12] = [
+    PromptSectionName::IDENTITY,
+    PromptSectionName::CORE_BEHAVIOR,
+    PromptSectionName::TOOL_USE,
+    PromptSectionName::TOOL_SURFACE,
+    PromptSectionName::SAFETY,
+    PromptSectionName::EDITING_VERIFICATION,
+    PromptSectionName::AUTONOMY,
+    PromptSectionName::CHANNELS,
+    PromptSectionName::FINAL_ANSWER,
+    PromptSectionName::CONTEXT_DURABILITY,
+    PromptSectionName::PERSONALITY,
+    PromptSectionName::ROLE,
+];
+
 /// Canonical section order priority.
-fn section_order_rank(name: &PromptSectionName) -> (u8, &str) {
-    if *name == PromptSectionName::IDENTITY {
-        (0, name.as_str())
-    } else if *name == PromptSectionName::CORE_BEHAVIOR {
-        (1, name.as_str())
-    } else if *name == PromptSectionName::TOOL_USE {
-        (2, name.as_str())
-    } else if *name == PromptSectionName::TOOL_SURFACE {
-        (3, name.as_str())
-    } else if *name == PromptSectionName::SAFETY {
-        (4, name.as_str())
-    } else if *name == PromptSectionName::EDITING_VERIFICATION {
-        (5, name.as_str())
-    } else if *name == PromptSectionName::AUTONOMY {
-        (6, name.as_str())
-    } else if *name == PromptSectionName::FINAL_ANSWER {
-        (7, name.as_str())
-    } else if *name == PromptSectionName::CONTEXT_DURABILITY {
-        (8, name.as_str())
-    } else if *name == PromptSectionName::PERSONALITY {
-        (9, name.as_str())
-    } else if *name == PromptSectionName::ROLE {
-        (10, name.as_str())
-    } else {
-        (11, name.as_str())
-    }
+///
+/// A name with no canonical position sorts after every name that has one, then by the name itself,
+/// so an unregistered topic lands at the end of the prefix deterministically rather than wherever a
+/// hash iteration happened to put it.
+fn section_order_rank(name: &PromptSectionName) -> (usize, &str) {
+    let rank = CANONICAL_SECTION_ORDER
+        .iter()
+        .position(|canonical| canonical == name)
+        .unwrap_or(CANONICAL_SECTION_ORDER.len());
+    (rank, name.as_str())
 }
 
 /// Assembler that combines stable prompt sections into a deterministic stable prefix.

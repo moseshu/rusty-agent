@@ -1,7 +1,7 @@
 ### role: main
 ======================= PROMPT DUMP REPORT =======================
-Stable Prefix Hash:   980aac8781abe1903ac691a391c2ad5094406302e03de78125aa05812794c8fe
-Total Prefix Tokens:  ~892
+Stable Prefix Hash:   200ebedcbb5c22bdc0f2ae433cd1acaa7c3b6a73ab235c804f6d5c227c8bd6c3
+Total Prefix Tokens:  ~1079
 ------------------------------------------------------------------
 Section Name           Stability Position     Tokens   Bytes      Hash Prefix
 ------------------------------------------------------------------
@@ -9,19 +9,20 @@ identity               stable    prefix       120      479        85045d06035d..
 core_behavior          stable    prefix       134      533        7c2cf73748c8...
 editing_verification   stable    prefix       105      417        fe509d7a713b...
 autonomy               stable    prefix       188      751        8d63f6a264f6...
+channels               stable    prefix       187      747        b44bf55148b8...
 final_answer           stable    prefix       178      709        d502e522ea9f...
 personality            stable    prefix       131      522        b943b1105c14...
 role                   stable    prefix       36       141        83b120785cc2...
 ------------------------------------------------------------------
-Cache Prefix Hash:    980aac8781abe1903ac691a391c2ad5094406302e03de78125aa05812794c8fe
+Cache Prefix Hash:    200ebedcbb5c22bdc0f2ae433cd1acaa7c3b6a73ab235c804f6d5c227c8bd6c3
 Cache Scope:          <run>
-Prompt Clears Floor:  no (~892 vs 1024; the request's tool table also counts)
+Prompt Clears Floor:  yes (~1079 vs 1024; the request's tool table also counts)
 ==================================================================
 
 ### role: read_only_specialist
 ======================= PROMPT DUMP REPORT =======================
-Stable Prefix Hash:   a937226a9fc6cbdf4f36a97ffadded8c009f7c13cf6ba1808b79b3f77ed7ccdb
-Total Prefix Tokens:  ~961
+Stable Prefix Hash:   e46b076dfd9ba602edfc5c1e19fb2fb60e190da398bed1cabae72379796fad31
+Total Prefix Tokens:  ~1148
 ------------------------------------------------------------------
 Section Name           Stability Position     Tokens   Bytes      Hash Prefix
 ------------------------------------------------------------------
@@ -29,19 +30,20 @@ identity               stable    prefix       120      479        85045d06035d..
 core_behavior          stable    prefix       134      533        7c2cf73748c8...
 editing_verification   stable    prefix       105      417        fe509d7a713b...
 autonomy               stable    prefix       188      751        8d63f6a264f6...
+channels               stable    prefix       187      747        b44bf55148b8...
 final_answer           stable    prefix       178      709        d502e522ea9f...
 personality            stable    prefix       131      522        b943b1105c14...
 role                   stable    prefix       105      417        cdbb14a43981...
 ------------------------------------------------------------------
-Cache Prefix Hash:    a937226a9fc6cbdf4f36a97ffadded8c009f7c13cf6ba1808b79b3f77ed7ccdb
+Cache Prefix Hash:    e46b076dfd9ba602edfc5c1e19fb2fb60e190da398bed1cabae72379796fad31
 Cache Scope:          <run>
-Prompt Clears Floor:  no (~961 vs 1024; the request's tool table also counts)
+Prompt Clears Floor:  yes (~1148 vs 1024; the request's tool table also counts)
 ==================================================================
 
 ### role: planner
 ======================= PROMPT DUMP REPORT =======================
-Stable Prefix Hash:   fdd5abc4580a4a9029a204b6eb743fdbccd247a3809ea6e37026c5e5cb9c4ee2
-Total Prefix Tokens:  ~906
+Stable Prefix Hash:   434e7d7a3bd6768484f3deb33768580427eb3a1fcea2fbf73f0e931b0c33fb41
+Total Prefix Tokens:  ~1093
 ------------------------------------------------------------------
 Section Name           Stability Position     Tokens   Bytes      Hash Prefix
 ------------------------------------------------------------------
@@ -49,19 +51,20 @@ identity               stable    prefix       120      479        85045d06035d..
 core_behavior          stable    prefix       134      533        7c2cf73748c8...
 editing_verification   stable    prefix       105      417        fe509d7a713b...
 autonomy               stable    prefix       188      751        8d63f6a264f6...
+channels               stable    prefix       187      747        b44bf55148b8...
 final_answer           stable    prefix       178      709        d502e522ea9f...
 personality            stable    prefix       131      522        b943b1105c14...
 role                   stable    prefix       50       199        7e17ea393f7b...
 ------------------------------------------------------------------
-Cache Prefix Hash:    fdd5abc4580a4a9029a204b6eb743fdbccd247a3809ea6e37026c5e5cb9c4ee2
+Cache Prefix Hash:    434e7d7a3bd6768484f3deb33768580427eb3a1fcea2fbf73f0e931b0c33fb41
 Cache Scope:          <run>
-Prompt Clears Floor:  no (~906 vs 1024; the request's tool table also counts)
+Prompt Clears Floor:  yes (~1093 vs 1024; the request's tool table also counts)
 ==================================================================
 
 ### role: one_off_answer
 ======================= PROMPT DUMP REPORT =======================
-Stable Prefix Hash:   950f6842bfcc0cfd9c89eb52cc4a7ff659b54de25cbabfe4f350d0f4df76570c
-Total Prefix Tokens:  ~957
+Stable Prefix Hash:   9d50aa8f09b618f217e99b7fb40ef7e08a645dd6c8429797ba822cca8ff1927a
+Total Prefix Tokens:  ~1144
 ------------------------------------------------------------------
 Section Name           Stability Position     Tokens   Bytes      Hash Prefix
 ------------------------------------------------------------------
@@ -69,19 +72,20 @@ identity               stable    prefix       120      479        85045d06035d..
 core_behavior          stable    prefix       134      533        7c2cf73748c8...
 editing_verification   stable    prefix       105      417        fe509d7a713b...
 autonomy               stable    prefix       188      751        8d63f6a264f6...
+channels               stable    prefix       187      747        b44bf55148b8...
 final_answer           stable    prefix       178      709        d502e522ea9f...
 personality            stable    prefix       131      522        b943b1105c14...
 role                   stable    prefix       101      402        6edf28fe5525...
 ------------------------------------------------------------------
-Cache Prefix Hash:    950f6842bfcc0cfd9c89eb52cc4a7ff659b54de25cbabfe4f350d0f4df76570c
+Cache Prefix Hash:    9d50aa8f09b618f217e99b7fb40ef7e08a645dd6c8429797ba822cca8ff1927a
 Cache Scope:          <run>
-Prompt Clears Floor:  no (~957 vs 1024; the request's tool table also counts)
+Prompt Clears Floor:  yes (~1144 vs 1024; the request's tool table also counts)
 ==================================================================
 
 ### role: coordinator
 ======================= PROMPT DUMP REPORT =======================
-Stable Prefix Hash:   13caa80585c38b0055a13fbf1cfc02763a884d14f6765f63bd0cfbda5872d178
-Total Prefix Tokens:  ~899
+Stable Prefix Hash:   55a577286584666a6f97cf18663f1c722e42f04f73d21032a19346d011da325a
+Total Prefix Tokens:  ~1086
 ------------------------------------------------------------------
 Section Name           Stability Position     Tokens   Bytes      Hash Prefix
 ------------------------------------------------------------------
@@ -89,19 +93,20 @@ identity               stable    prefix       120      479        85045d06035d..
 core_behavior          stable    prefix       134      533        7c2cf73748c8...
 editing_verification   stable    prefix       105      417        fe509d7a713b...
 autonomy               stable    prefix       188      751        8d63f6a264f6...
+channels               stable    prefix       187      747        b44bf55148b8...
 final_answer           stable    prefix       178      709        d502e522ea9f...
 personality            stable    prefix       131      522        b943b1105c14...
 role                   stable    prefix       43       172        1b141a5aa95a...
 ------------------------------------------------------------------
-Cache Prefix Hash:    13caa80585c38b0055a13fbf1cfc02763a884d14f6765f63bd0cfbda5872d178
+Cache Prefix Hash:    55a577286584666a6f97cf18663f1c722e42f04f73d21032a19346d011da325a
 Cache Scope:          <run>
-Prompt Clears Floor:  no (~899 vs 1024; the request's tool table also counts)
+Prompt Clears Floor:  yes (~1086 vs 1024; the request's tool table also counts)
 ==================================================================
 
 ### host_backed_role: main
 ======================= PROMPT DUMP REPORT =======================
-Stable Prefix Hash:   b0cac080aa6c06a6c2881f6d9d74111b2eedaa6461ea9e962eb6dedac3301a88
-Total Prefix Tokens:  ~993
+Stable Prefix Hash:   1ce9e12292c37232cbb55ec4b4990d04eeb44000841b51e8d648a2f92ceb8045
+Total Prefix Tokens:  ~1180
 ------------------------------------------------------------------
 Section Name           Stability Position     Tokens   Bytes      Hash Prefix
 ------------------------------------------------------------------
@@ -110,12 +115,13 @@ core_behavior          stable    prefix       134      533        7c2cf73748c8..
 tool_surface           stable    prefix       30       118        bd4ec58c9160...
 editing_verification   stable    prefix       176      702        14c60eedf3d9...
 autonomy               stable    prefix       188      751        8d63f6a264f6...
+channels               stable    prefix       187      747        b44bf55148b8...
 final_answer           stable    prefix       178      709        d502e522ea9f...
 personality            stable    prefix       131      522        b943b1105c14...
 role                   stable    prefix       36       141        83b120785cc2...
 ------------------------------------------------------------------
-Cache Prefix Hash:    b0cac080aa6c06a6c2881f6d9d74111b2eedaa6461ea9e962eb6dedac3301a88
+Cache Prefix Hash:    1ce9e12292c37232cbb55ec4b4990d04eeb44000841b51e8d648a2f92ceb8045
 Cache Scope:          <run>
-Prompt Clears Floor:  no (~993 vs 1024; the request's tool table also counts)
+Prompt Clears Floor:  yes (~1180 vs 1024; the request's tool table also counts)
 ==================================================================
 
