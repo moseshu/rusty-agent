@@ -228,6 +228,22 @@ pub struct HeadTailBuffer {
     total_bytes: usize,
 }
 
+/// Retained stream content past a cursor, split wherever the buffer dropped bytes.
+///
+/// [`HeadTailBuffer::read_from`] renders an omission marker in a gap's place, which is the right
+/// answer for a reader that will show the output to someone and the wrong one for a reader that
+/// searches it: the marker is prose the stream never produced, so a literal search would report a
+/// match on the words describing the gap. This carries the gap as structure instead.
+#[derive(Debug, Clone)]
+pub(crate) struct RetainedRead {
+    /// Text continuing directly from the requested offset. Empty when bytes were dropped there.
+    pub(crate) continued: String,
+    /// Text resuming after dropped bytes, when this read crossed a gap.
+    pub(crate) resumed: Option<String>,
+    /// The offset a following read resumes from.
+    pub(crate) next_offset: usize,
+}
+
 impl HeadTailBuffer {
     /// Creates a new buffer with the specified maximum byte capacity.
     #[must_use]
@@ -346,6 +362,45 @@ impl HeadTailBuffer {
             text.push_str(&String::from_utf8_lossy(&tail));
         }
         Some((text, self.total_bytes))
+    }
+
+    /// Reads retained content at or after `offset`, reporting a gap rather than describing one.
+    ///
+    /// The companion to [`Self::read_from`] for a caller that searches the output instead of
+    /// showing it. Surviving text arrives in the order the stream produced it, split into the part
+    /// that continues from `offset` and the part that resumes after dropped bytes, so a search can
+    /// tell that the two are not adjacent. See [`RetainedRead`] for why the rendered marker is
+    /// unusable here.
+    pub(crate) fn read_retained_from(&self, offset: usize) -> Option<RetainedRead> {
+        if offset >= self.total_bytes {
+            return None;
+        }
+        let head_end = self.head.len();
+        let tail_start = self.total_bytes.saturating_sub(self.tail.len());
+        let mut continued = String::new();
+        if offset < head_end {
+            continued.push_str(&String::from_utf8_lossy(&self.head[offset..]));
+        }
+        let tail_from = offset.saturating_sub(tail_start).min(self.tail.len());
+        let tail = if tail_from < self.tail.len() {
+            let bytes: Vec<u8> = self.tail.iter().skip(tail_from).copied().collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            String::new()
+        };
+        // Adjacent exactly when nothing was dropped between where the head stopped and where the
+        // tail begins; otherwise the tail is a separate run that no carried prefix can reach into.
+        let resumed = if tail_start > head_end.max(offset) {
+            Some(tail)
+        } else {
+            continued.push_str(&tail);
+            None
+        };
+        Some(RetainedRead {
+            continued,
+            resumed,
+            next_offset: self.total_bytes,
+        })
     }
 
     /// Returns the raw retained bytes as a continuous vector.
