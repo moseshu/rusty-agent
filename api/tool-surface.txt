@@ -1,4 +1,5 @@
-revision 3; surface SHA-256: e797b26ac5eb289bc85564094e6d109f61740a2f4bc309e6f831135f7d4fa043
+revision 4; surface SHA-256: dc1c8f85e922fb1bf7988836715de434e48f57736e293baaddbf6ce2f9b59f3d
 - `apply_patch`
 - `exec_command`
+- `read_file`
 - `write_stdin`

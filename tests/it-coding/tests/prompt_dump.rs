@@ -66,6 +66,7 @@ fn host_backed_tools() -> Vec<Arc<dyn Tool>> {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
     vec![
+        host.read_file_tool().expect("read_file builds"),
         host.apply_patch_tool().expect("apply_patch builds"),
         host.exec_command_tool().expect("exec_command builds"),
         host.write_stdin_tool().expect("write_stdin builds"),
@@ -287,23 +288,52 @@ fn test_host_backed_agent_carries_the_tool_surface_prefix() {
             .and_then(ra_core::agent::AgentInstructions::as_static),
         Some(prefix.system_instructions())
     );
-    assert_eq!(agent.tools().len(), 3);
+    assert_eq!(agent.tools().len(), 4);
     assert!(prefix.system_instructions().contains("`apply_patch`"));
     assert!(prefix.system_instructions().contains("`exec_command`"));
+    assert!(prefix.system_instructions().contains("`read_file`"));
     assert!(prefix.system_instructions().contains("`write_stdin`"));
 }
 
 /// Opening a workspace does not override a role's tool boundary.
 #[test]
-fn test_host_backed_read_only_and_one_off_agents_carry_no_tools() {
+fn test_host_backed_one_off_agents_carry_no_tools() {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
 
-    for role in [
-        PromptRole::ReadOnlySpecialist,
-        PromptRole::Planner,
-        PromptRole::OneOffAnswer,
-    ] {
+    let agent = ra_coding::build_agent_with_host(
+        ra_core::agent::AgentId::new("coding-agent"),
+        "Coding Agent",
+        &PromptRole::OneOffAnswer,
+        &host,
+    )
+    .expect("host-backed agent builds");
+
+    assert!(agent.tools().is_empty(), "a one-off role answers with none");
+    let instructions = agent
+        .instructions()
+        .and_then(ra_core::agent::AgentInstructions::as_static)
+        .expect("agent has a stable prefix")
+        .to_owned();
+    // With no entries to choose among, the prefix carries neither the inventory nor the rules for
+    // reading it.
+    assert!(
+        !instructions.contains("Available tools:") && !instructions.contains("Tool Use:"),
+        "tool-free agents must not carry tool-selection guidance"
+    );
+}
+
+/// A read-only role keeps what only observes and loses what writes.
+///
+/// The two halves are one guarantee: withholding the editing entries is what the role text
+/// promises, and withholding `read_file` as well would leave a read-only specialist unable to do
+/// the one thing its name claims.
+#[test]
+fn test_host_backed_read_only_agents_keep_only_the_observing_entry() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = CodingHost::open(workspace.path()).expect("coding host builds");
+
+    for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
         let agent = ra_coding::build_agent_with_host(
             ra_core::agent::AgentId::new("coding-agent"),
             "Coding Agent",
@@ -312,24 +342,31 @@ fn test_host_backed_read_only_and_one_off_agents_carry_no_tools() {
         )
         .expect("host-backed agent builds");
 
-        assert!(
-            agent.tools().is_empty(),
-            "`{role}` must not receive an editing tool"
-        );
+        let names = agent
+            .tools()
+            .iter()
+            .map(|tool| tool.origin().name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read_file".to_owned()], "role `{role}`");
+
         let instructions = agent
             .instructions()
             .and_then(ra_core::agent::AgentInstructions::as_static)
             .expect("agent has a stable prefix")
             .to_owned();
         assert!(
-            !instructions.contains("`apply_patch`"),
-            "tool-free agents must not name an unavailable editing entry"
+            instructions.contains("`read_file`"),
+            "role `{role}` must inventory the entry it received"
         );
-        // The same rule one level up: with no entries to choose among, the prefix carries neither
-        // the inventory nor the rules for reading it.
+        // Both halves of the denial: the entry is absent from the inventory, and the editing
+        // section does not instruct the agent to reach for it anyway.
         assert!(
-            !instructions.contains("Available tools:") && !instructions.contains("Tool Use:"),
-            "tool-free agents must not carry tool-selection guidance"
+            !instructions.contains("`apply_patch`"),
+            "role `{role}` must not name an unavailable editing entry"
+        );
+        assert!(
+            !instructions.contains("`exec_command`") && !instructions.contains("`write_stdin`"),
+            "role `{role}` must not name an unavailable execution entry"
         );
     }
 }

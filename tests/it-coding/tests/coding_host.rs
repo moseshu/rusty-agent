@@ -4,16 +4,21 @@ use std::{path::Path, sync::Arc};
 
 use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
+    agent::AgentSpec,
+    context::RunContext,
     event::{
         AgentEvent, ExecEvent, HostEventBody, HostEventEmitter, HostEventSink,
         InMemoryHostEventSink,
         agent::AgentSpawnedEvent,
         exec::{ExecOutputEvent, ExecSessionId, ExecStartedEvent, ExecStreamKind},
     },
-    item::AgentId,
+    item::{AgentId, CallId},
     state::{RunId, RunState},
-    tool::{ObservationMetadata, ToolOutput, Truncation, TruncationStage},
+    tool::{
+        ObservationMetadata, ResourceKind, ToolContext, ToolOutput, Truncation, TruncationStage,
+    },
 };
+use serde_json::json;
 use tempfile::tempdir;
 
 #[test]
@@ -87,6 +92,92 @@ fn test_coding_host_lifecycle_and_emitter() {
     } else {
         panic!("expected exec started event");
     }
+}
+
+#[test]
+fn test_workspace_tools_share_one_resource_boundary() {
+    let workspace = tempdir().expect("must create tempdir");
+    let host = CodingHost::open(workspace.path()).expect("must open coding host");
+    let read_file = host.read_file_tool().expect("read_file builds");
+    let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
+    let exec_command = host.exec_command_tool().expect("exec_command builds");
+
+    let read_options = read_file.options();
+    let patch_options = apply_patch.options();
+    let exec_options = exec_command.options();
+    let read_claims = read_options.resource_claims();
+    let patch_claims = patch_options.resource_claims();
+    let exec_claims = exec_options.resource_claims();
+    assert_eq!(read_claims.len(), 1);
+    assert_eq!(patch_claims.len(), 1);
+    assert_eq!(exec_claims.len(), 1);
+
+    let workspace_resource = read_claims[0].resource();
+    assert_eq!(patch_claims[0].resource(), workspace_resource);
+    assert_eq!(exec_claims[0].resource(), workspace_resource);
+    assert!(!read_claims[0].is_exclusive());
+    assert!(patch_claims[0].is_exclusive());
+    assert!(exec_claims[0].is_exclusive());
+
+    // Agreeing with each other is not enough: three tools that each derived an identity from a
+    // *different* root would also agree, and would then hold three unrelated locks. The identity
+    // has to name this host's canonical root.
+    assert_eq!(workspace_resource.kind(), &ResourceKind::Workspace);
+    assert_eq!(
+        workspace_resource.value(),
+        host.workspace_root().to_string_lossy()
+    );
+}
+
+/// The three tools resolve against one capability, not three handles that happen to agree.
+///
+/// A shared `ResourceId` proves only that they name the same lock. This proves the descriptor
+/// behind it is also shared: the patch entry writes, and the read entry sees the write.
+#[tokio::test]
+async fn test_workspace_tools_resolve_against_one_capability() {
+    let workspace = tempdir().expect("must create tempdir");
+    let host = CodingHost::open(workspace.path()).expect("must open coding host");
+    let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
+    let read_file = host.read_file_tool().expect("read_file builds");
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coding-runner"))
+        .name("Coding runner")
+        .build()
+        .expect("agent");
+    let run = RunContext::new(RunId::new("run-workspace-boundary"), &agent);
+
+    let patch = json!("*** Begin Patch\n*** Add File: note.txt\n+shared\n*** End Patch\n");
+    let patch_call = CallId::new("call-patch");
+    apply_patch
+        .call(ToolContext::new(
+            &run,
+            apply_patch.as_ref(),
+            &patch_call,
+            &patch,
+        ))
+        .await
+        .expect("patch applies");
+
+    let read = json!({ "path": "note.txt" });
+    let read_call = CallId::new("call-read");
+    let output = read_file
+        .call(ToolContext::new(
+            &run,
+            read_file.as_ref(),
+            &read_call,
+            &read,
+        ))
+        .await
+        .expect("read succeeds");
+
+    assert!(
+        output
+            .as_text()
+            .expect("a single text block")
+            .contains("shared"),
+        "the read entry must see what the patch entry wrote"
+    );
 }
 
 #[test]

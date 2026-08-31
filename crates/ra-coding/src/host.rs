@@ -1,10 +1,6 @@
 //! Product host assembly, workspace capability binding, and event routing.
 
-use std::{
-    fmt, io,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fmt, io, path::Path, sync::Arc};
 
 use ra_core::{
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
@@ -13,9 +9,13 @@ use ra_core::{
     tool::{Tool, ToolServices},
 };
 
-use ra_exec::{fs::RootedFileSystem, session::ProcessManager};
+use ra_exec::{
+    fs::{RootedFileSystem, Workspace},
+    session::ProcessManager,
+};
 use ra_tools::{
-    apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, write_stdin::WriteStdinTool,
+    apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, read_file::ReadFileTool,
+    write_stdin::WriteStdinTool,
 };
 
 /// The host runtime context and capabilities for the coding agent.
@@ -30,8 +30,7 @@ use ra_tools::{
 ///   and rollout logs without leaking into model prompts.
 #[derive(Clone)]
 pub struct CodingHost {
-    workspace_root: PathBuf,
-    workspace_fs: Arc<RootedFileSystem>,
+    workspace: Workspace,
     process_manager: Arc<ProcessManager>,
     event_sink: Arc<dyn HostEventSink>,
 }
@@ -39,8 +38,7 @@ pub struct CodingHost {
 impl fmt::Debug for CodingHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CodingHost")
-            .field("workspace_root", &self.workspace_root)
-            .field("workspace_fs", &"<RootedFileSystem>")
+            .field("workspace", &self.workspace)
             .field("has_event_sink", &true)
             .finish_non_exhaustive()
     }
@@ -53,11 +51,9 @@ impl CodingHost {
     ///
     /// Returns [`io::Error`] if `workspace_root` cannot be opened.
     pub fn open(workspace_root: impl AsRef<Path>) -> io::Result<Self> {
-        let workspace_root = std::fs::canonicalize(workspace_root)?;
-        let workspace_fs = Arc::new(RootedFileSystem::open(&workspace_root)?);
+        let workspace = Workspace::open(workspace_root)?;
         Ok(Self {
-            workspace_root,
-            workspace_fs,
+            workspace,
             process_manager: Arc::new(ProcessManager::default()),
             event_sink: Arc::new(NoopHostEventSink),
         })
@@ -73,13 +69,13 @@ impl CodingHost {
     /// The capability-scoped filesystem handle for the workspace root.
     #[must_use]
     pub fn workspace_fs(&self) -> &Arc<RootedFileSystem> {
-        &self.workspace_fs
+        self.workspace.filesystem()
     }
 
     /// The canonical workspace root that command tools use as their initial directory.
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+        self.workspace.root()
     }
 
     /// The manager shared by the command-start and command-interaction tools.
@@ -101,15 +97,18 @@ impl CodingHost {
 
     /// Creates the coding product's workspace-confined patch tool.
     pub fn apply_patch_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(ApplyPatchTool::new(Arc::clone(
-            &self.workspace_fs,
-        ))?))
+        Ok(Arc::new(ApplyPatchTool::for_workspace(&self.workspace)?))
+    }
+
+    /// Creates the workspace-confined file-reading entry.
+    pub fn read_file_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
+        Ok(Arc::new(ReadFileTool::for_workspace(&self.workspace)?))
     }
 
     /// Creates the workspace-rooted command entry backed by this host's session manager.
     pub fn exec_command_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
         Ok(Arc::new(
-            ExecCommandTool::rooted(&self.workspace_root)?
+            ExecCommandTool::for_workspace(&self.workspace)?
                 .with_manager(Arc::clone(&self.process_manager)),
         ))
     }

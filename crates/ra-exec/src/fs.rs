@@ -11,9 +11,76 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use cap_std::{ambient_authority, fs::Dir};
+
+/// One canonical workspace root, the filesystem capability derived from it, and the scheduler
+/// identity that names it.
+///
+/// A product opens this once, then gives every tool that operates on workspace paths a clone.
+/// Keeping the three together prevents one tool from silently using a different root, reopening a
+/// separate handle for the same workspace, or deriving a resource identity that no longer collides
+/// with its neighbours' — the last of which would let a read and a write on the same directory be
+/// admitted concurrently.
+#[derive(Clone)]
+pub struct Workspace {
+    root: PathBuf,
+    filesystem: Arc<RootedFileSystem>,
+    resource_id: ra_core::tool::ResourceId,
+}
+
+impl fmt::Debug for Workspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Workspace")
+            .field("root", &self.root)
+            .field("resource_id", &self.resource_id)
+            .field("filesystem", &"<RootedFileSystem>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Workspace {
+    /// Opens an existing directory as a workspace capability.
+    ///
+    /// The resource identity is derived here rather than by each tool, so a root that cannot name
+    /// one fails at the single point where the workspace is opened instead of at each tool's
+    /// construction.
+    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = std::fs::canonicalize(root)?;
+        let filesystem = RootedFileSystem::open(&root)?;
+        let resource_id = workspace_resource_id(root.to_string_lossy().to_string())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            root,
+            filesystem: Arc::new(filesystem),
+            resource_id,
+        })
+    }
+
+    /// The canonical path used when a process needs an initial working directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The descriptor-scoped filesystem capability for this workspace.
+    #[must_use]
+    pub fn filesystem(&self) -> &Arc<RootedFileSystem> {
+        &self.filesystem
+    }
+
+    /// The identity every tool claiming this workspace must declare.
+    ///
+    /// One value shared by all of them is what makes a read's shared claim and a write's exclusive
+    /// claim describe the same lock.
+    #[must_use]
+    pub const fn resource_id(&self) -> &ra_core::tool::ResourceId {
+        &self.resource_id
+    }
+}
 
 /// A directory capability that can open paths below one workspace root.
 ///

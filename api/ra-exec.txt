@@ -37,6 +37,7 @@ const fn ra_exec::command::ExecRequest::login(& self) -> bool
 const fn ra_exec::command::ExecRequest::schema_version(& self) -> SchemaVersion
 const fn ra_exec::command::ExecRequest::unknown(& self) -> & Unknown
 const fn ra_exec::command::ExecRequest::with_login(mut self, login : bool) -> Self
+const fn ra_exec::fs::Workspace::resource_id(& self) -> & ra_core :: tool :: ResourceId
 const fn ra_exec::job::BackgroundJob::session_id(& self) -> & ExecSessionId
 const fn ra_exec::job::JobSnapshot::is_closed(& self) -> bool
 const fn ra_exec::job::JobSnapshot::is_terminal(& self) -> bool
@@ -97,6 +98,9 @@ fn ra_exec::fs::RootedFileSystem::read_to_string(& self, path : & Path, max_byte
 fn ra_exec::fs::RootedFileSystem::remove_file(& self, path : & Path) -> Result < () , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::rename(& self, from : & Path, to : & Path) -> Result < () , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::write_file(& self, path : & Path, content : & [u8]) -> Result < () , RootedOpenError >
+fn ra_exec::fs::Workspace::filesystem(& self) -> & Arc < RootedFileSystem >
+fn ra_exec::fs::Workspace::open(root : impl AsRef < Path >) -> io :: Result < Self >
+fn ra_exec::fs::Workspace::root(& self) -> & Path
 fn ra_exec::fs::workspace_resource_id(identifier : impl Into < std :: borrow :: Cow < 'static , str > >) -> Result < ra_core :: tool :: ResourceId , ra_core :: error :: Error >
 fn ra_exec::job::BackgroundJob::from_execution_result(process_manager : Arc < ProcessManager >, result : & ExecExecutionResult) -> Option < Self >
 fn ra_exec::job::BackgroundJob::new(process_manager : Arc < ProcessManager >, session_id : impl Into < ExecSessionId >) -> Self
@@ -133,6 +137,7 @@ struct ra_exec::command::ExecCursor
 struct ra_exec::command::ExecLimits
 struct ra_exec::command::ExecRequest
 struct ra_exec::fs::RootedFileSystem
+struct ra_exec::fs::Workspace
 struct ra_exec::job::BackgroundJob
 struct ra_exec::job::JobSnapshot
 struct ra_exec::output::ExecOutputSummary
