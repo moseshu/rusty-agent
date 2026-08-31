@@ -7,6 +7,22 @@ const fn ra_tools::exec_command::ExecCommandLimits::with_default_yield_time_ms(m
 const fn ra_tools::exec_command::ExecCommandLimits::with_max_output_bytes(mut self, bytes : usize) -> Self
 const fn ra_tools::exec_command::ExecCommandTool::limits(& self) -> & ExecCommandLimits
 const fn ra_tools::exec_command::ExecCommandTool::with_limits(mut self, limits : ExecCommandLimits) -> Self
+const fn ra_tools::glob::GlobLimits::max_output_bytes(& self) -> usize
+const fn ra_tools::glob::GlobLimits::max_results(& self) -> usize
+const fn ra_tools::glob::GlobLimits::new() -> Self
+const fn ra_tools::glob::GlobLimits::with_max_output_bytes(mut self, value : usize) -> Self
+const fn ra_tools::glob::GlobLimits::with_max_results(mut self, value : usize) -> Self
+const fn ra_tools::glob::GlobTool::limits(& self) -> & GlobLimits
+const fn ra_tools::glob::GlobTool::with_limits(mut self, limits : GlobLimits) -> Self
+const fn ra_tools::grep::GrepLimits::max_file_bytes(& self) -> usize
+const fn ra_tools::grep::GrepLimits::max_output_bytes(& self) -> usize
+const fn ra_tools::grep::GrepLimits::max_results(& self) -> usize
+const fn ra_tools::grep::GrepLimits::new() -> Self
+const fn ra_tools::grep::GrepLimits::with_max_file_bytes(mut self, value : usize) -> Self
+const fn ra_tools::grep::GrepLimits::with_max_output_bytes(mut self, value : usize) -> Self
+const fn ra_tools::grep::GrepLimits::with_max_results(mut self, value : usize) -> Self
+const fn ra_tools::grep::GrepTool::limits(& self) -> & GrepLimits
+const fn ra_tools::grep::GrepTool::with_limits(mut self, limits : GrepLimits) -> Self
 const fn ra_tools::read_file::ReadFileLimits::default_line_limit(& self) -> u32
 const fn ra_tools::read_file::ReadFileLimits::max_binary_bytes(& self) -> usize
 const fn ra_tools::read_file::ReadFileLimits::max_line_bytes(& self) -> usize
@@ -26,6 +42,12 @@ fn ra_tools::exec_command::ExecCommandTool::process_manager(& self) -> & Arc < P
 fn ra_tools::exec_command::ExecCommandTool::root(& self) -> Option < & Path >
 fn ra_tools::exec_command::ExecCommandTool::rooted(root : impl AsRef < Path >) -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::with_manager(mut self, manager : Arc < ProcessManager >) -> Self
+fn ra_tools::glob::GlobTool::for_workspace(workspace : & Workspace) -> Result < Self >
+fn ra_tools::glob::GlobTool::new() -> Result < Self >
+fn ra_tools::glob::GlobTool::rooted(root : impl AsRef < Path >) -> Result < Self >
+fn ra_tools::grep::GrepTool::for_workspace(workspace : & Workspace) -> Result < Self >
+fn ra_tools::grep::GrepTool::new() -> Result < Self >
+fn ra_tools::grep::GrepTool::rooted(root : impl AsRef < Path >) -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::for_workspace(workspace : & Workspace) -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::new() -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::root(& self) -> Option < & Path >
@@ -49,6 +71,10 @@ mod ra_tools::write_stdin
 struct ra_tools::apply_patch::ApplyPatchTool
 struct ra_tools::exec_command::ExecCommandLimits
 struct ra_tools::exec_command::ExecCommandTool
+struct ra_tools::glob::GlobLimits
+struct ra_tools::glob::GlobTool
+struct ra_tools::grep::GrepLimits
+struct ra_tools::grep::GrepTool
 struct ra_tools::read_file::ReadFileLimits
 struct ra_tools::read_file::ReadFileTool
 struct ra_tools::write_stdin::WriteStdinTool

@@ -42,7 +42,10 @@ async fn test_job_wait_done_observes_terminal_output() {
     };
     assert!(snapshot.is_terminal());
     assert!(snapshot.is_closed());
-    assert_eq!(snapshot.state(), &ExecSessionState::Exited { exit_code: Some(0) });
+    assert_eq!(
+        snapshot.state(),
+        &ExecSessionState::Exited { exit_code: Some(0) }
+    );
     assert_eq!(snapshot.output().stdout(), "done");
 }
 
@@ -112,8 +115,14 @@ async fn test_job_reports_an_unknown_session() {
         "exec-no-longer-retained",
     );
 
-    assert!(matches!(job.snapshot().await, Err(JobError::UnknownJob { .. })));
-    assert!(matches!(job.cancel().await, Err(JobError::UnknownJob { .. })));
+    assert!(matches!(
+        job.snapshot().await,
+        Err(JobError::UnknownJob { .. })
+    ));
+    assert!(matches!(
+        job.cancel().await,
+        Err(JobError::UnknownJob { .. })
+    ));
 }
 
 #[tokio::test]

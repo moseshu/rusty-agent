@@ -84,6 +84,8 @@ pub(crate) fn host_backed_tools(
     }
     let tools = vec![
         host.read_file_tool()?,
+        host.grep_tool()?,
+        host.glob_tool()?,
         host.apply_patch_tool()?,
         host.exec_command_tool()?,
         host.write_stdin_tool()?,

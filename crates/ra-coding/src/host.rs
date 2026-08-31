@@ -14,8 +14,8 @@ use ra_exec::{
     session::ProcessManager,
 };
 use ra_tools::{
-    apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, read_file::ReadFileTool,
-    write_stdin::WriteStdinTool,
+    apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, glob::GlobTool, grep::GrepTool,
+    read_file::ReadFileTool, write_stdin::WriteStdinTool,
 };
 
 /// The host runtime context and capabilities for the coding agent.
@@ -103,6 +103,16 @@ impl CodingHost {
     /// Creates the workspace-confined file-reading entry.
     pub fn read_file_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
         Ok(Arc::new(ReadFileTool::for_workspace(&self.workspace)?))
+    }
+
+    /// Creates the workspace-confined text-search entry.
+    pub fn grep_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
+        Ok(Arc::new(GrepTool::for_workspace(&self.workspace)?))
+    }
+
+    /// Creates the workspace-confined file-pattern lookup entry.
+    pub fn glob_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
+        Ok(Arc::new(GlobTool::for_workspace(&self.workspace)?))
     }
 
     /// Creates the workspace-rooted command entry backed by this host's session manager.

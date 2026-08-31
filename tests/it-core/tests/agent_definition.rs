@@ -69,9 +69,11 @@ fn agent_definition_rejects_self_transfers_duplicate_names_and_empty_history_win
         ))
         .build()
         .unwrap_err();
-    assert!(self_transfer
-        .to_string()
-        .contains("cannot hand off control to itself"));
+    assert!(
+        self_transfer
+            .to_string()
+            .contains("cannot hand off control to itself")
+    );
 
     let duplicate_name = AgentSpec::builder()
         .id(AgentId::new("planner"))
@@ -82,9 +84,11 @@ fn agent_definition_rejects_self_transfers_duplicate_names_and_empty_history_win
         ])
         .build()
         .unwrap_err();
-    assert!(duplicate_name
-        .to_string()
-        .contains("advertises the model-facing action name `delegate` more than once"));
+    assert!(
+        duplicate_name
+            .to_string()
+            .contains("advertises the model-facing action name `delegate` more than once")
+    );
 
     let empty_window = AgentSpec::builder()
         .id(AgentId::new("planner"))
@@ -95,7 +99,9 @@ fn agent_definition_rejects_self_transfers_duplicate_names_and_empty_history_win
         )
         .build()
         .unwrap_err();
-    assert!(empty_window
-        .to_string()
-        .contains("must retain at least one item"));
+    assert!(
+        empty_window
+            .to_string()
+            .contains("must retain at least one item")
+    );
 }

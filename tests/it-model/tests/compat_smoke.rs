@@ -15,11 +15,7 @@ use ra_core::{
 use ra_model::{
     anthropic::smoke::preview_request_payload,
     compat::CompatEndpoint,
-    openai::{
-        auth::OpenAiAuth,
-        chat::OpenAiChatModel,
-        responses::OpenAiResponsesModel,
-    },
+    openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel},
     provider::quirks::ProviderQuirks,
 };
 use serde_json::{Value, json};

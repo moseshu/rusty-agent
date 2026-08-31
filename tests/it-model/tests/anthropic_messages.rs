@@ -109,19 +109,49 @@ async fn lowers_a_messages_request_and_lifts_thinking_text_tools_and_usage() {
     assert_eq!(response.usage().input_tokens(), 20);
     assert_eq!(response.usage().cached_input_tokens(), 4);
     assert_eq!(response.usage().cache_write_tokens(), 6);
-    assert!(matches!(response.output()[0].kind(), RunItemKind::Reasoning(_)));
-    assert!(matches!(response.output()[1].kind(), RunItemKind::Message(_)));
-    assert!(matches!(response.output()[2].kind(), RunItemKind::ToolCall(_)));
+    assert!(matches!(
+        response.output()[0].kind(),
+        RunItemKind::Reasoning(_)
+    ));
+    assert!(matches!(
+        response.output()[1].kind(),
+        RunItemKind::Message(_)
+    ));
+    assert!(matches!(
+        response.output()[2].kind(),
+        RunItemKind::ToolCall(_)
+    ));
 
     let requests = server.received_requests().await.expect("requests retained");
     let sent: Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
-    assert_eq!(requests[0].headers.get("x-api-key").and_then(|value| value.to_str().ok()), Some("test-secret"));
-    assert_eq!(requests[0].headers.get("anthropic-version").and_then(|value| value.to_str().ok()), Some("2023-06-01"));
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-secret")
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
     assert_eq!(sent["model"], MODEL);
     assert_eq!(sent["max_tokens"], 1024);
-    assert_eq!(sent["system"], json!([{"type": "text", "text": "stable system"}]));
-    assert_eq!(sent["messages"], json!([{"role": "user", "content": [{"type": "text", "text": "look this up"}]}]));
-    assert_eq!(sent["tools"][0], json!({"name": "lookup", "input_schema": {"type": "object"}}));
+    assert_eq!(
+        sent["system"],
+        json!([{"type": "text", "text": "stable system"}])
+    );
+    assert_eq!(
+        sent["messages"],
+        json!([{"role": "user", "content": [{"type": "text", "text": "look this up"}]}])
+    );
+    assert_eq!(
+        sent["tools"][0],
+        json!({"name": "lookup", "input_schema": {"type": "object"}})
+    );
 }
 
 /// A redacted block carries no text and no signature, and only replays if it goes back verbatim.
@@ -197,10 +227,7 @@ async fn lowers_effort_and_the_output_schema_into_one_output_config() {
                     .with_max_tokens(1024)
                     .with_effort(Effort::High),
             )
-            .with_output_schema(ModelOutputSchema::new(
-                "answer",
-                json!({"type": "object"}),
-            )),
+            .with_output_schema(ModelOutputSchema::new("answer", json!({"type": "object"}))),
         )
         .await
         .expect("structured output should lower");
@@ -271,11 +298,7 @@ async fn rejects_a_tool_result_separated_from_its_tool_use() {
     let request = request_items(
         vec![
             ModelInputItem::Message(Message::user("look this up")),
-            ModelInputItem::ToolCall(ToolCall::new(
-                call_id.clone(),
-                "lookup",
-                json!({"id": 7}),
-            )),
+            ModelInputItem::ToolCall(ToolCall::new(call_id.clone(), "lookup", json!({"id": 7}))),
             ModelInputItem::Message(Message::user("do something else first")),
             ModelInputItem::ToolCallOutput(ToolCallOutput::new(call_id, json!("found it"))),
         ],
@@ -287,11 +310,13 @@ async fn rejects_a_tool_result_separated_from_its_tool_use() {
         .await
         .expect_err("the invalid tool-result ordering should fail locally");
     assert!(error.to_string().contains("must immediately follow"));
-    assert!(server
-        .received_requests()
-        .await
-        .expect("requests retained")
-        .is_empty());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests retained")
+            .is_empty()
+    );
 }
 
 /// A stream frame whose shape is wrong is a provider failure, never a panic in this process.
@@ -392,7 +417,10 @@ async fn stream_requires_message_stop_and_backfills_the_completed_response() {
     )
     .await;
     let events = model.stream_response(request()).collect::<Vec<_>>().await;
-    assert!(events.iter().all(Result::is_ok), "stream errors: {events:?}");
+    assert!(
+        events.iter().all(Result::is_ok),
+        "stream errors: {events:?}"
+    );
     let completed = events
         .iter()
         .filter_map(|event| event.as_ref().ok())

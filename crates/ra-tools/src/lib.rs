@@ -45,6 +45,7 @@ pub mod glob;
 pub mod grep;
 pub mod mcp_ns;
 pub mod read_file;
+mod search;
 pub mod skill;
 pub mod tool_search;
 pub mod update_plan;

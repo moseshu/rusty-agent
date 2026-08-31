@@ -67,6 +67,8 @@ fn host_backed_tools() -> Vec<Arc<dyn Tool>> {
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
     vec![
         host.read_file_tool().expect("read_file builds"),
+        host.grep_tool().expect("grep builds"),
+        host.glob_tool().expect("glob builds"),
         host.apply_patch_tool().expect("apply_patch builds"),
         host.exec_command_tool().expect("exec_command builds"),
         host.write_stdin_tool().expect("write_stdin builds"),
@@ -288,9 +290,11 @@ fn test_host_backed_agent_carries_the_tool_surface_prefix() {
             .and_then(ra_core::agent::AgentInstructions::as_static),
         Some(prefix.system_instructions())
     );
-    assert_eq!(agent.tools().len(), 4);
+    assert_eq!(agent.tools().len(), 6);
     assert!(prefix.system_instructions().contains("`apply_patch`"));
     assert!(prefix.system_instructions().contains("`exec_command`"));
+    assert!(prefix.system_instructions().contains("`grep`"));
+    assert!(prefix.system_instructions().contains("`glob`"));
     assert!(prefix.system_instructions().contains("`read_file`"));
     assert!(prefix.system_instructions().contains("`write_stdin`"));
 }
@@ -323,13 +327,13 @@ fn test_host_backed_one_off_agents_carry_no_tools() {
     );
 }
 
-/// A read-only role keeps what only observes and loses what writes.
+/// A read-only role keeps the observing entries and loses what writes.
 ///
 /// The two halves are one guarantee: withholding the editing entries is what the role text
-/// promises, and withholding `read_file` as well would leave a read-only specialist unable to do
-/// the one thing its name claims.
+/// promises, and withholding the search entries as well would leave a read-only specialist unable
+/// to inspect either an identified file or an unknown workspace.
 #[test]
-fn test_host_backed_read_only_agents_keep_only_the_observing_entry() {
+fn test_host_backed_read_only_agents_keep_the_observing_entries() {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
 
@@ -347,7 +351,14 @@ fn test_host_backed_read_only_agents_keep_only_the_observing_entry() {
             .iter()
             .map(|tool| tool.origin().name().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file".to_owned()], "role `{role}`");
+        assert_eq!(
+            names,
+            vec!["read_file", "grep", "glob"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            "role `{role}`"
+        );
 
         let instructions = agent
             .instructions()
@@ -357,6 +368,14 @@ fn test_host_backed_read_only_agents_keep_only_the_observing_entry() {
         assert!(
             instructions.contains("`read_file`"),
             "role `{role}` must inventory the entry it received"
+        );
+        assert!(
+            instructions.contains("`grep`"),
+            "role `{role}` must inventory grep"
+        );
+        assert!(
+            instructions.contains("`glob`"),
+            "role `{role}` must inventory glob"
         );
         // Both halves of the denial: the entry is absent from the inventory, and the editing
         // section does not instruct the agent to reach for it anyway.

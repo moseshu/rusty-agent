@@ -98,6 +98,8 @@ fn implemented_core_tools(workspace: &TempDir) -> Vec<Arc<dyn Tool>> {
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
     vec![
         host.read_file_tool().expect("read_file builds"),
+        host.grep_tool().expect("grep builds"),
+        host.glob_tool().expect("glob builds"),
         host.exec_command_tool().expect("exec_command builds"),
         host.write_stdin_tool().expect("write_stdin builds"),
         host.apply_patch_tool().expect("apply_patch builds"),
@@ -276,25 +278,39 @@ fn test_the_implemented_working_tools_stay_within_their_share_of_the_surface() {
 }
 
 #[test]
-fn test_a_tier_refuses_to_assemble_while_a_declared_tool_is_missing() {
-    // Some of the six core entries are still unwritten. The tier fails loudly rather than shipping
-    // a smaller surface than its prompt describes, and it names one of the entries that is gone.
+fn test_the_complete_core_tier_assembles_from_its_real_implementations() {
+    // This is deliberately not a registry of stubs: the profile now makes the native search
+    // entries available, so its complete core surface must assemble from the product host.
     let workspace = TempDir::new().expect("a workspace");
     let registry = ToolRegistry::builder()
         .register_all(implemented_core_tools(&workspace))
         .build()
         .expect("a valid registry");
+    let surface = registry
+        .assemble(
+            &CodingProfile::Core
+                .to_tool_profile()
+                .expect("a valid profile"),
+        )
+        .expect("the complete core surface assembles");
+    assert_eq!(surface.advertised_count(), 6);
+}
 
-    let missing: Vec<String> = selected_keys(CodingProfile::Core)
-        .into_iter()
-        .filter(|key| !registry.contains(key))
-        .map(|key| key.name().to_owned())
-        .collect();
-    assert!(
-        !missing.is_empty(),
-        "every core tool now exists; this test has outlived its subject and should be replaced \
-         by one that assembles the tier"
-    );
+/// Assembly refuses a tier whose declared entries are not all registered.
+///
+/// The happy path above cannot show this: every core entry exists now, so nothing is missing
+/// unless a registry is built without one on purpose. The guarantee is what keeps a tier from
+/// quietly shipping a smaller surface than the prompt it ships with describes, and it survives
+/// here rather than in the test that used to prove it by waiting for an unwritten tool.
+#[test]
+fn test_a_tier_refuses_to_assemble_while_a_declared_tool_is_missing() {
+    let workspace = TempDir::new().expect("a workspace");
+    let mut tools = implemented_core_tools(&workspace);
+    let withheld = tools.pop().expect("the core tier registers tools");
+    let registry = ToolRegistry::builder()
+        .register_all(tools)
+        .build()
+        .expect("a valid registry");
 
     let error = registry
         .assemble(
@@ -307,8 +323,9 @@ fn test_a_tier_refuses_to_assemble_while_a_declared_tool_is_missing() {
     let message = error.to_string();
     assert!(message.contains("core"), "{message}");
     assert!(
-        missing.iter().any(|name| message.contains(name)),
-        "the failure names none of {missing:?}: {message}"
+        message.contains(withheld.origin().name()),
+        "the failure does not name the withheld `{}`: {message}",
+        withheld.origin().name()
     );
 }
 
@@ -461,7 +478,7 @@ fn test_the_declared_names_match_the_tools_that_exist() {
     }
     assert_eq!(
         registry.len(),
-        4,
+        6,
         "a core tool was written without being added to `implemented_core_tools`, or one was \
          removed"
     );

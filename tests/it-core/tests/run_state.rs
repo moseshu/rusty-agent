@@ -12,12 +12,12 @@ use ra_core::{
         AgentId, CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolApproval,
     },
+    permission::PermissionDecision,
     state::{
         GraphCursor, NestedRunRef, PendingControlRequest, RUN_STATE_SCHEMA_VERSION,
         RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, ToolUse, ToolUseAttempt, WorkStateRef,
         WorkspaceLeaseRef,
     },
-    permission::PermissionDecision,
     tool::{ToolLookupKey, ToolNamespace, ToolOrigin},
     usage::{RequestUsage, Usage},
 };
@@ -203,8 +203,12 @@ fn approval_item(id: &str, call: &str) -> RunItem {
     RunItem::new(
         ItemId::new(id),
         RunItemKind::ToolApproval(
-            ToolApproval::new(CallId::new(call), "exec_command", json!({"cmd": "git status"}))
-                .with_tool_origin(&ToolOrigin::new("exec_command").unwrap()),
+            ToolApproval::new(
+                CallId::new(call),
+                "exec_command",
+                json!({"cmd": "git status"}),
+            )
+            .with_tool_origin(&ToolOrigin::new("exec_command").unwrap()),
         ),
     )
 }
@@ -324,8 +328,9 @@ fn test_run_state_retains_approval_answers_and_exact_always_rules() {
         rule.lookup_key(),
         Some(ToolOrigin::new("exec_command").unwrap().lookup_key())
     );
-    let elsewhere = ToolOrigin::namespaced(ToolNamespace::new("mcp_shell").unwrap(), "exec_command")
-        .expect("a same-named tool in another namespace must be constructible");
+    let elsewhere =
+        ToolOrigin::namespaced(ToolNamespace::new("mcp_shell").unwrap(), "exec_command")
+            .expect("a same-named tool in another namespace must be constructible");
     assert!(
         !rule.matches_origin(&elsewhere),
         "an approval answer must not cover a tool the host never saw"

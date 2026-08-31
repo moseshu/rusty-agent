@@ -37,6 +37,8 @@ const fn ra_exec::command::ExecRequest::login(& self) -> bool
 const fn ra_exec::command::ExecRequest::schema_version(& self) -> SchemaVersion
 const fn ra_exec::command::ExecRequest::unknown(& self) -> & Unknown
 const fn ra_exec::command::ExecRequest::with_login(mut self, login : bool) -> Self
+const fn ra_exec::fs::WalkedFiles::stopped_at_limit(& self) -> bool
+const fn ra_exec::fs::WalkedFiles::unreadable_entries(& self) -> usize
 const fn ra_exec::fs::Workspace::resource_id(& self) -> & ra_core :: tool :: ResourceId
 const fn ra_exec::job::BackgroundJob::session_id(& self) -> & ExecSessionId
 const fn ra_exec::job::JobSnapshot::is_closed(& self) -> bool
@@ -97,7 +99,10 @@ fn ra_exec::fs::RootedFileSystem::open_read(& self, path : & Path) -> Result < F
 fn ra_exec::fs::RootedFileSystem::read_to_string(& self, path : & Path, max_bytes : usize) -> Result < (String , bool) , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::remove_file(& self, path : & Path) -> Result < () , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::rename(& self, from : & Path, to : & Path) -> Result < () , RootedOpenError >
+fn ra_exec::fs::RootedFileSystem::walk_files_below(& self, base : & Path, limit : usize, enter : & dyn Fn (& Path) -> bool) -> Result < WalkedFiles , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::write_file(& self, path : & Path, content : & [u8]) -> Result < () , RootedOpenError >
+fn ra_exec::fs::WalkedFiles::files(& self) -> & [PathBuf]
+fn ra_exec::fs::WalkedFiles::into_files(self) -> Vec < PathBuf >
 fn ra_exec::fs::Workspace::filesystem(& self) -> & Arc < RootedFileSystem >
 fn ra_exec::fs::Workspace::open(root : impl AsRef < Path >) -> io :: Result < Self >
 fn ra_exec::fs::Workspace::root(& self) -> & Path
@@ -137,6 +142,7 @@ struct ra_exec::command::ExecCursor
 struct ra_exec::command::ExecLimits
 struct ra_exec::command::ExecRequest
 struct ra_exec::fs::RootedFileSystem
+struct ra_exec::fs::WalkedFiles
 struct ra_exec::fs::Workspace
 struct ra_exec::job::BackgroundJob
 struct ra_exec::job::JobSnapshot
