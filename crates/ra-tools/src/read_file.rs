@@ -57,7 +57,7 @@ use ra_core::{
         ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema, Truncation, TruncationStage,
     },
 };
-use ra_exec::fs::{RootedFileSystem, RootedOpenError};
+use ra_exec::fs::{RootedFileSystem, RootedOpenError, Workspace};
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -216,48 +216,35 @@ impl ReadFileTool {
 
     /// Creates a tool confined to `root`, which must exist.
     ///
-    /// This is the minimal form of R8-5's workspace boundary. It converts the root into a stable
-    /// directory capability and resolves every later component from that handle, following a
-    /// symbolic link only as far as the link stays below the root. The broader shared path policy
-    /// — per-path denies and mount policy — remains R8-5, but a check-then-open escape is not left
-    /// for that milestone.
+    /// The root becomes a stable directory capability and every later component is resolved from
+    /// that handle, following a symbolic link only as far as the link stays below the root. This
+    /// closes the check-then-open escape; it is not a path *policy*, and per-path denies and mount
+    /// rules are still unenforced here.
     pub fn rooted(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let canonical = std::fs::canonicalize(root).map_err(|error| {
+        let workspace = Workspace::open(root).map_err(|error| {
             Error::config(format!(
-                "read_file workspace root `{}` cannot be resolved",
+                "read_file workspace root `{}` cannot be opened as a workspace",
                 root.display()
             ))
             .with_source(error)
         })?;
-        let rooted_filesystem = RootedFileSystem::open(&canonical).map_err(|error| {
-            Error::config(format!(
-                "read_file workspace root `{}` cannot be opened",
-                root.display()
-            ))
-            .with_source(error)
-        })?;
-        let resource_id = ra_exec::fs::workspace_resource_id(
-            canonical.to_string_lossy().to_string(),
-        )
-        .map_err(|error| {
-            Error::config(format!(
-                "read_file workspace root `{}` produces invalid resource identity",
-                canonical.display()
-            ))
-            .with_source(error)
-        })?;
+        Self::for_workspace(&workspace)
+    }
+
+    /// Creates a tool confined to an already-opened workspace capability.
+    pub fn for_workspace(workspace: &Workspace) -> Result<Self> {
         let options = ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
             .with_permission_scope(PermissionScope::Read)
             .with_concurrency(ToolConcurrency::Parallel)
-            .with_resource_claim(ResourceClaim::shared(resource_id));
+            .with_resource_claim(ResourceClaim::shared(workspace.resource_id().clone()));
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ReadFileInput>(TOOL_NAME)?,
             options,
-            root: Some(canonical),
-            rooted_filesystem: Some(Arc::new(rooted_filesystem)),
+            root: Some(workspace.root().to_path_buf()),
+            rooted_filesystem: Some(Arc::clone(workspace.filesystem())),
             limits: ReadFileLimits::new(),
         })
     }

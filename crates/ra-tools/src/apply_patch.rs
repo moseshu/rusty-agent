@@ -17,11 +17,11 @@ use ra_core::{
     error::Result,
     permission::PermissionScope,
     tool::{
-        Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolInput as _, ToolOptions,
-        ToolOrigin, ToolOutput, ToolSchema,
+        ResourceClaim, Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolInput as _,
+        ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
 };
-use ra_exec::fs::RootedFileSystem;
+use ra_exec::fs::{RootedFileSystem, Workspace};
 use ra_macros::ToolInput;
 use ra_patch::{CommittedPatchDelta, PatchAction, PatchConflict, apply_hunks, parse_patch};
 use schemars::JsonSchema;
@@ -61,16 +61,43 @@ impl ApplyPatchTool {
     /// The capability is the caller's to scope: this tool writes wherever the filesystem it is
     /// handed lets it write, and does not resolve or check a root of its own.
     pub fn new(filesystem: Arc<RootedFileSystem>) -> Result<Self> {
+        // An unidentified capability cannot name a lock, so this form serializes against
+        // everything rather than claiming a resource no other tool can agree on.
+        Self::with_options(
+            filesystem,
+            base_options().with_concurrency(ToolConcurrency::Exclusive),
+        )
+    }
+
+    /// Creates a patch tool for an already-opened workspace capability.
+    ///
+    /// Unlike [`Self::new`], this form runs beside calls that do not touch the same workspace and
+    /// excludes only those that do — the workspace's own identity is what makes the narrower
+    /// declaration safe.
+    pub fn for_workspace(workspace: &Workspace) -> Result<Self> {
+        Self::with_options(
+            Arc::clone(workspace.filesystem()),
+            base_options()
+                .with_concurrency(ToolConcurrency::Parallel)
+                .with_resource_claim(ResourceClaim::exclusive(workspace.resource_id().clone())),
+        )
+    }
+
+    fn with_options(filesystem: Arc<RootedFileSystem>, options: ToolOptions) -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ApplyPatchInput::tool_schema(TOOL_NAME)?,
-            options: ToolOptions::new()
-                .with_approval(ToolApprovalPolicy::Always)
-                .with_permission_scope(PermissionScope::Edit)
-                .with_concurrency(ToolConcurrency::Exclusive),
+            options,
             filesystem,
         })
     }
+}
+
+/// The policies both constructors share; only the concurrency declaration differs.
+fn base_options() -> ToolOptions {
+    ToolOptions::new()
+        .with_approval(ToolApprovalPolicy::Always)
+        .with_permission_scope(PermissionScope::Edit)
 }
 
 #[async_trait]

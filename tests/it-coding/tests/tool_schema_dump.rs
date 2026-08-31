@@ -9,13 +9,11 @@ use ra_core::{
         Model, ModelHandoffDefinition, ModelRequest, ModelSettings, ModelToolDefinition,
         ProviderKey,
     },
-    tool::Tool,
 };
 use ra_model::{
     anthropic::smoke::preview_request_payload,
     openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel},
 };
-use ra_tools::read_file::ReadFileTool;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::{
@@ -65,7 +63,7 @@ fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
 
 fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
-    let read_file = ReadFileTool::new().expect("read_file builds");
+    let read_file = host.read_file_tool().expect("read_file builds");
     let exec_command = host.exec_command_tool().expect("exec_command builds");
     let write_stdin = host.write_stdin_tool().expect("write_stdin builds");
     let apply_patch = host.apply_patch_tool().expect("apply_patch builds");

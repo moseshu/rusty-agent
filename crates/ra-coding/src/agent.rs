@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ra_core::agent::{AgentId, AgentSpec};
 use ra_core::error::Result;
+use ra_core::permission::PermissionScope;
 use ra_core::prompt::PromptRole;
 
 use crate::{
@@ -63,22 +64,35 @@ pub fn build_agent_with_host(
 /// A dump that assembled its own list would be a report about a different agent the moment the two
 /// lists diverged — and the report exists to be trusted about exactly this.
 ///
-/// **A read-only or one-off role gets nothing, whatever host is handed in.** Its role text says it
-/// has no editing tools and that an edit will fail; installing one anyway would put a dispatchable
-/// entry behind a prompt that denies it exists, and the `editing` section — which is assembled from
-/// the advertised surface — would then name an entry the same prefix goes on to disown. The host is
+/// **A one-off role gets nothing, whatever host is handed in.** Its role text says it answers
+/// without tool execution, and installing an entry anyway would put a dispatchable tool behind a
+/// prompt that denies it exists.
+///
+/// **A read-only role keeps the entries that only observe.** The filter is each tool's declared
+/// [`PermissionScope`], not a second hand-written list: the role's own guidance says it has no
+/// editing tools and that an edit will fail, and that promise is exactly `Read`. Withholding the
+/// observing entries too would leave a "read-only specialist" unable to read, while hand-listing
+/// the survivors would let the two lists disagree the first time a tool is added. The host is
 /// still accepted for these roles rather than refused: which capabilities a role gets is this
 /// function's answer to give, not the caller's to pre-compute.
 pub(crate) fn host_backed_tools(
     role: &PromptRole,
     host: &CodingHost,
 ) -> Result<Vec<Arc<dyn ra_core::tool::Tool>>> {
-    if role.is_read_only() || role.is_one_off() {
+    if role.is_one_off() {
         return Ok(Vec::new());
     }
-    Ok(vec![
+    let tools = vec![
+        host.read_file_tool()?,
         host.apply_patch_tool()?,
         host.exec_command_tool()?,
         host.write_stdin_tool()?,
-    ])
+    ];
+    if role.is_read_only() {
+        return Ok(tools
+            .into_iter()
+            .filter(|tool| tool.options().permission_scope() == PermissionScope::Read)
+            .collect());
+    }
+    Ok(tools)
 }

@@ -41,7 +41,7 @@ use ra_core::{
 };
 use ra_exec::{
     command::{ExecLimits, ExecRequest},
-    fs::RootedFileSystem,
+    fs::{RootedFileSystem, Workspace},
     output::ExecOutputSummary,
     session::{ExecError, ExecExecutionResult, ProcessManager},
 };
@@ -175,38 +175,28 @@ impl ExecCommandTool {
     /// workspace is the sandbox's job, and this root is what tells it where the workspace is.
     pub fn rooted(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let canonical = std::fs::canonicalize(root).map_err(|error| {
+        let workspace = Workspace::open(root).map_err(|error| {
             Error::config(format!(
-                "exec_command workspace root `{}` cannot be resolved",
+                "exec_command workspace root `{}` cannot be opened as a workspace",
                 root.display()
             ))
             .with_source(error)
         })?;
-        let rooted_filesystem = RootedFileSystem::open(&canonical).map_err(|error| {
-            Error::config(format!(
-                "exec_command workspace root `{}` cannot be opened",
-                root.display()
-            ))
-            .with_source(error)
-        })?;
-        let resource_id = ra_exec::fs::workspace_resource_id(
-            canonical.to_string_lossy().to_string(),
-        )
-        .map_err(|error| {
-            Error::config(format!(
-                "exec_command workspace root `{}` produces invalid resource identity",
-                canonical.display()
-            ))
-            .with_source(error)
-        })?;
+        Self::for_workspace(&workspace)
+    }
+
+    /// Creates a command tool rooted in an already-opened workspace capability.
+    pub fn for_workspace(workspace: &Workspace) -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
-            options: base_options().with_resource_claim(ResourceClaim::exclusive(resource_id)),
+            options: base_options().with_resource_claim(ResourceClaim::exclusive(
+                workspace.resource_id().clone(),
+            )),
             process_manager: Arc::new(ProcessManager::default()),
             limits: ExecCommandLimits::new(),
-            root: Some(canonical),
-            rooted_filesystem: Some(Arc::new(rooted_filesystem)),
+            root: Some(workspace.root().to_path_buf()),
+            rooted_filesystem: Some(Arc::clone(workspace.filesystem())),
         })
     }
 

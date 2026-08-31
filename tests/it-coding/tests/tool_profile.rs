@@ -10,7 +10,6 @@ use ra_core::{
     tool::{Tool, ToolContext, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::tool::{profile::ToolSelection, registry::ToolRegistry};
-use ra_tools::read_file::ReadFileTool;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -98,7 +97,7 @@ fn selected_names(profile: CodingProfile) -> Vec<String> {
 fn implemented_core_tools(workspace: &TempDir) -> Vec<Arc<dyn Tool>> {
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
     vec![
-        Arc::new(ReadFileTool::new().expect("read_file builds")),
+        host.read_file_tool().expect("read_file builds"),
         host.exec_command_tool().expect("exec_command builds"),
         host.write_stdin_tool().expect("write_stdin builds"),
         host.apply_patch_tool().expect("apply_patch builds"),

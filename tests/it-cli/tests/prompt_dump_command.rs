@@ -82,14 +82,36 @@ fn test_the_dump_defaults_to_the_prefix_an_agent_here_would_carry() {
 }
 
 /// A workspace does not grant editing capability to a role that promises it has none.
+///
+/// The two halves are reported separately because they are different guarantees: a one-off role
+/// carries no surface at all, while a read-only role carries one holding exactly the entries that
+/// observe. Asserting the second as "no surface" is what previously hid a read-only specialist with
+/// nothing to read.
 #[test]
-fn test_a_host_backed_dump_keeps_read_only_and_one_off_roles_tool_free() {
-    for role in ["read_only_specialist", "planner", "one_off_answer"] {
+fn test_a_host_backed_dump_keeps_one_off_roles_tool_free() {
+    let report = run(&["ra", "prompt", "dump", "--role", "one_off_answer"]);
+    assert!(
+        !report.stdout().contains("tool_surface"),
+        "a one-off role must not advertise host tools it cannot execute"
+    );
+}
+
+/// A read-only role's report advertises what observes and nothing that writes.
+#[test]
+fn test_a_host_backed_dump_leaves_read_only_roles_the_observing_entry() {
+    for role in ["read_only_specialist", "planner"] {
         let report = run(&["ra", "prompt", "dump", "--role", role]);
+        let stdout = report.stdout();
         assert!(
-            !report.stdout().contains("tool_surface"),
-            "`{role}` must not advertise host tools it cannot execute"
+            stdout.contains("tool_surface"),
+            "`{role}` must advertise the entries it did receive"
         );
+        for withheld in ["apply_patch", "exec_command", "write_stdin"] {
+            assert!(
+                !stdout.contains(withheld),
+                "`{role}` must not advertise `{withheld}`"
+            );
+        }
     }
 }
 

@@ -18,12 +18,15 @@ const fn ra_tools::read_file::ReadFileLimits::with_max_line_bytes(mut self, byte
 const fn ra_tools::read_file::ReadFileLimits::with_max_output_bytes(mut self, bytes : usize) -> Self
 const fn ra_tools::read_file::ReadFileTool::limits(& self) -> & ReadFileLimits
 const fn ra_tools::read_file::ReadFileTool::with_limits(mut self, limits : ReadFileLimits) -> Self
+fn ra_tools::apply_patch::ApplyPatchTool::for_workspace(workspace : & Workspace) -> Result < Self >
 fn ra_tools::apply_patch::ApplyPatchTool::new(filesystem : Arc < RootedFileSystem >) -> Result < Self >
+fn ra_tools::exec_command::ExecCommandTool::for_workspace(workspace : & Workspace) -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::new() -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::process_manager(& self) -> & Arc < ProcessManager >
 fn ra_tools::exec_command::ExecCommandTool::root(& self) -> Option < & Path >
 fn ra_tools::exec_command::ExecCommandTool::rooted(root : impl AsRef < Path >) -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::with_manager(mut self, manager : Arc < ProcessManager >) -> Self
+fn ra_tools::read_file::ReadFileTool::for_workspace(workspace : & Workspace) -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::new() -> Result < Self >
 fn ra_tools::read_file::ReadFileTool::root(& self) -> Option < & Path >
 fn ra_tools::read_file::ReadFileTool::rooted(root : impl AsRef < Path >) -> Result < Self >
