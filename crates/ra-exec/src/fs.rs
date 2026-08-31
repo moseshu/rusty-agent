@@ -266,6 +266,144 @@ impl RootedFileSystem {
         }
         self.root.exists(&relative)
     }
+
+    /// Lists regular files at or below `base` in a stable order, at most `limit` of them.
+    ///
+    /// `base` is resolved like any other path below this capability, and a `base` that cannot be
+    /// opened is the caller's error: a search told to look in a directory that is not there has
+    /// not searched an empty directory, and returning no files would say that it had. A `base`
+    /// naming a regular file yields that one file, so a caller can narrow to a single path.
+    ///
+    /// **Nothing below `base` is fatal.** An entry that cannot be classified or a directory that
+    /// cannot be opened is counted in [`WalkedFiles::unreadable_entries`] and the walk continues;
+    /// one unreadable directory must not cost the caller every result the rest of the tree holds.
+    ///
+    /// `enter` decides which directories are descended into, receiving each one's path relative to
+    /// the capability root. It is what keeps a traversal policy — which build or metadata
+    /// directories a search is not interested in — out of this capability, whose only business is
+    /// that the walk stays inside the root.
+    ///
+    /// Symbolic links are resolved through this capability, never by pathname: a link to a regular
+    /// file inside the root is listed as the ordinary file it is, while a link to a directory is
+    /// skipped, because descending into it would let a link cycle turn the walk into a
+    /// non-terminating one. A link that leaves the root, or that resolves to nothing, is dropped
+    /// by the same resolution.
+    ///
+    /// Callers receive only relative paths and must still open each one through this capability.
+    pub fn walk_files_below(
+        &self,
+        base: &Path,
+        limit: usize,
+        enter: &dyn Fn(&Path) -> bool,
+    ) -> Result<WalkedFiles, RootedOpenError> {
+        let relative = relative_path(base)?;
+        let mut walked = WalkedFiles::default();
+        let directory = if relative.as_os_str().is_empty() {
+            self.root.try_clone().map_err(RootedOpenError::Io)?
+        } else {
+            match self.root.open_dir(&relative) {
+                Ok(directory) => directory,
+                // Not a directory is not necessarily a mistake: a single file is a legitimate
+                // thing to narrow a search to, and only what is neither answers with the error.
+                Err(error) => match self.root.metadata(&relative) {
+                    Ok(metadata) if metadata.is_file() => {
+                        walked.files.push(relative);
+                        return Ok(walked);
+                    }
+                    _ => return Err(classify(error)),
+                },
+            }
+        };
+        walk_directory(&directory, &relative, limit, enter, &mut walked);
+        walked.files.sort();
+        Ok(walked)
+    }
+}
+
+/// What one capability-scoped walk found, and what it could not look at.
+#[derive(Debug, Default)]
+pub struct WalkedFiles {
+    files: Vec<PathBuf>,
+    unreadable_entries: usize,
+    stopped_at_limit: bool,
+}
+
+impl WalkedFiles {
+    /// The files found, sorted, each relative to the capability root.
+    #[must_use]
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// Takes the sorted files, leaving the counts behind.
+    #[must_use]
+    pub fn into_files(self) -> Vec<PathBuf> {
+        self.files
+    }
+
+    /// How many entries the walk could not classify or enter.
+    #[must_use]
+    pub const fn unreadable_entries(&self) -> usize {
+        self.unreadable_entries
+    }
+
+    /// Whether the walk stopped at its file ceiling with more of the tree unvisited.
+    #[must_use]
+    pub const fn stopped_at_limit(&self) -> bool {
+        self.stopped_at_limit
+    }
+}
+
+fn walk_directory(
+    dir: &Dir,
+    prefix: &Path,
+    limit: usize,
+    enter: &dyn Fn(&Path) -> bool,
+    walked: &mut WalkedFiles,
+) {
+    let Ok(entries) = dir.entries() else {
+        walked.unreadable_entries = walked.unreadable_entries.saturating_add(1);
+        return;
+    };
+    for entry in entries {
+        if walked.files.len() >= limit {
+            walked.stopped_at_limit = true;
+            return;
+        }
+        let Ok(entry) = entry else {
+            walked.unreadable_entries = walked.unreadable_entries.saturating_add(1);
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            walked.unreadable_entries = walked.unreadable_entries.saturating_add(1);
+            continue;
+        };
+        let path = prefix.join(entry.file_name());
+        if file_type.is_file() {
+            walked.files.push(path);
+        } else if file_type.is_dir() {
+            if !enter(&path) {
+                continue;
+            }
+            match entry.open_dir() {
+                Ok(child) => {
+                    walk_directory(&child, &path, limit, enter, walked);
+                    if walked.stopped_at_limit {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    walked.unreadable_entries = walked.unreadable_entries.saturating_add(1);
+                }
+            }
+        } else if file_type.is_symlink()
+            && dir
+                .metadata(entry.file_name())
+                .is_ok_and(|metadata| metadata.is_file())
+        {
+            walked.files.push(path);
+        }
+    }
 }
 
 /// Rejects what can be decided without touching the disk, and returns the rest.

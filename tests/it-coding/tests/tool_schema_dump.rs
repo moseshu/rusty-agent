@@ -64,11 +64,15 @@ fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
 fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
     let read_file = host.read_file_tool().expect("read_file builds");
+    let grep = host.grep_tool().expect("grep builds");
+    let glob = host.glob_tool().expect("glob builds");
     let exec_command = host.exec_command_tool().expect("exec_command builds");
     let write_stdin = host.write_stdin_tool().expect("write_stdin builds");
     let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
     vec![
         read_file.model_definition(),
+        grep.model_definition(),
+        glob.model_definition(),
         exec_command.model_definition(),
         write_stdin.model_definition(),
         apply_patch.model_definition(),

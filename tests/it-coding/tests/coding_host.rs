@@ -99,23 +99,35 @@ fn test_workspace_tools_share_one_resource_boundary() {
     let workspace = tempdir().expect("must create tempdir");
     let host = CodingHost::open(workspace.path()).expect("must open coding host");
     let read_file = host.read_file_tool().expect("read_file builds");
+    let grep = host.grep_tool().expect("grep builds");
+    let glob = host.glob_tool().expect("glob builds");
     let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
     let exec_command = host.exec_command_tool().expect("exec_command builds");
 
     let read_options = read_file.options();
+    let grep_options = grep.options();
+    let glob_options = glob.options();
     let patch_options = apply_patch.options();
     let exec_options = exec_command.options();
     let read_claims = read_options.resource_claims();
+    let grep_claims = grep_options.resource_claims();
+    let glob_claims = glob_options.resource_claims();
     let patch_claims = patch_options.resource_claims();
     let exec_claims = exec_options.resource_claims();
     assert_eq!(read_claims.len(), 1);
+    assert_eq!(grep_claims.len(), 1);
+    assert_eq!(glob_claims.len(), 1);
     assert_eq!(patch_claims.len(), 1);
     assert_eq!(exec_claims.len(), 1);
 
     let workspace_resource = read_claims[0].resource();
+    assert_eq!(grep_claims[0].resource(), workspace_resource);
+    assert_eq!(glob_claims[0].resource(), workspace_resource);
     assert_eq!(patch_claims[0].resource(), workspace_resource);
     assert_eq!(exec_claims[0].resource(), workspace_resource);
     assert!(!read_claims[0].is_exclusive());
+    assert!(!grep_claims[0].is_exclusive());
+    assert!(!glob_claims[0].is_exclusive());
     assert!(patch_claims[0].is_exclusive());
     assert!(exec_claims[0].is_exclusive());
 

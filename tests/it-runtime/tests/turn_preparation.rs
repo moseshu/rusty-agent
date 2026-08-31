@@ -499,9 +499,11 @@ async fn action_surface_budget_counts_handoffs_and_their_schema_bytes() {
     )
     .await
     .unwrap_err();
-    assert!(count_error
-        .to_string()
-        .contains("advertises 1 model actions"));
+    assert!(
+        count_error
+            .to_string()
+            .contains("advertises 1 model actions")
+    );
 
     let byte_error = prepare_turn(
         TurnPreparationRequest::new(
@@ -516,9 +518,7 @@ async fn action_surface_budget_counts_handoffs_and_their_schema_bytes() {
     )
     .await
     .unwrap_err();
-    assert!(byte_error
-        .to_string()
-        .contains("bytes of model actions"));
+    assert!(byte_error.to_string().contains("bytes of model actions"));
     assert!(resolver.resolved_names().is_empty());
 }
 

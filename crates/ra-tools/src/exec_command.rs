@@ -190,9 +190,8 @@ impl ExecCommandTool {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
-            options: base_options().with_resource_claim(ResourceClaim::exclusive(
-                workspace.resource_id().clone(),
-            )),
+            options: base_options()
+                .with_resource_claim(ResourceClaim::exclusive(workspace.resource_id().clone())),
             process_manager: Arc::new(ProcessManager::default()),
             limits: ExecCommandLimits::new(),
             root: Some(workspace.root().to_path_buf()),

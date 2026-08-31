@@ -17,6 +17,8 @@ Tool Use:
 Available tools:
 - `apply_patch`
 - `exec_command`
+- `glob`
+- `grep`
 - `read_file`
 - `write_stdin`
 

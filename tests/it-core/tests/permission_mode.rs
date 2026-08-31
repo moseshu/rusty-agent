@@ -176,7 +176,10 @@ fn test_tool_approval_decision_06() {
     assert!(decision.is_allowed());
     assert_eq!(decision.label(), "allow");
     assert_eq!(decision.to_string(), "allow");
-    assert_eq!(decision.updated_input(), Some(&json!({"path": "README.md"})));
+    assert_eq!(
+        decision.updated_input(),
+        Some(&json!({"path": "README.md"}))
+    );
     assert_eq!(decision.updated_permissions(), [update]);
     assert_eq!(decision.denial_message(), None);
     assert!(!decision.interrupts_run());

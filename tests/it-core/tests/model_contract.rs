@@ -271,8 +271,10 @@ async fn test_model_contract_04() {
         .map(|event| event.expect("流事件应成功"))
         .collect()
         .await;
-    let [ModelStreamEvent::RawResponse(raw), ModelStreamEvent::Completed(response)] =
-        events.as_slice()
+    let [
+        ModelStreamEvent::RawResponse(raw),
+        ModelStreamEvent::Completed(response),
+    ] = events.as_slice()
     else {
         panic!("fixture 应产生 raw response 后接 completed，got {events:?}");
     };

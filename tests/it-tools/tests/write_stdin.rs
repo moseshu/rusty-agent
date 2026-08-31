@@ -71,6 +71,10 @@ async fn test_write_stdin_schema_and_identity() {
     assert_eq!(tool.options().approval(), ToolApprovalPolicy::Always);
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Exclusive);
     assert_eq!(
+        tool.model_definition().description(),
+        Some("Writes characters to a running command session and returns output produced afterward.")
+    );
+    assert_eq!(
         tool.schema().input_schema()["required"],
         json!(["chars", "session_id", "yield_time_ms"])
     );

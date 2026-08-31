@@ -252,9 +252,11 @@ fn builder_rejects_a_tool_and_handoff_with_the_same_model_facing_name() {
         .build()
         .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("tools and handoffs share one provider namespace"));
+    assert!(
+        error
+            .to_string()
+            .contains("tools and handoffs share one provider namespace")
+    );
 }
 
 #[test]
@@ -370,7 +372,8 @@ fn build_rejects_an_output_declaration_no_provider_would_accept() {
     let unnamed = reviewer(OutputSchema::json_schema("", review_schema())).unwrap_err();
     assert!(matches!(unnamed, Error::Config { .. }), "{unnamed:?}");
 
-    let not_a_schema = reviewer(OutputSchema::json_schema("review", json!("approved"))).unwrap_err();
+    let not_a_schema =
+        reviewer(OutputSchema::json_schema("review", json!("approved"))).unwrap_err();
     assert!(
         matches!(not_a_schema, Error::Config { .. }),
         "{not_a_schema:?}"
