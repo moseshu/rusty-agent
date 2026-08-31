@@ -1,5 +1,8 @@
 # ra-exec 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_exec::job::BackgroundJob::cancel(& self) -> Result < () , JobError >
+async fn ra_exec::job::BackgroundJob::snapshot(& self) -> Result < JobSnapshot , JobError >
+async fn ra_exec::job::BackgroundJob::wait(& self, until : JobWaitUntil) -> Result < JobWaitResult , JobError >
 async fn ra_exec::session::ProcessManager::active_sessions(& self) -> Vec < ExecSessionId >
 async fn ra_exec::session::ProcessManager::cancel(& self, session_id : & ExecSessionId)
 async fn ra_exec::session::ProcessManager::evict(& self, session_id : & ExecSessionId, reason : ExecEvictionReason)
@@ -34,6 +37,13 @@ const fn ra_exec::command::ExecRequest::login(& self) -> bool
 const fn ra_exec::command::ExecRequest::schema_version(& self) -> SchemaVersion
 const fn ra_exec::command::ExecRequest::unknown(& self) -> & Unknown
 const fn ra_exec::command::ExecRequest::with_login(mut self, login : bool) -> Self
+const fn ra_exec::job::BackgroundJob::session_id(& self) -> & ExecSessionId
+const fn ra_exec::job::JobSnapshot::is_closed(& self) -> bool
+const fn ra_exec::job::JobSnapshot::is_terminal(& self) -> bool
+const fn ra_exec::job::JobSnapshot::output(& self) -> & ExecOutputSummary
+const fn ra_exec::job::JobSnapshot::session_id(& self) -> & ExecSessionId
+const fn ra_exec::job::JobSnapshot::state(& self) -> & ExecSessionState
+const fn ra_exec::job::JobWaitResult::snapshot(& self) -> & JobSnapshot
 const fn ra_exec::output::ExecOutputSummary::duration(& self) -> Duration
 const fn ra_exec::output::ExecOutputSummary::duration_ms(& self) -> u64
 const fn ra_exec::output::ExecOutputSummary::exit_code(& self) -> Option < i32 >
@@ -61,6 +71,9 @@ const fn ra_exec::session::ExecSessionTransitionError::to(& self) -> & ExecSessi
 const fn ra_exec::session::ProcessManager::limits(& self) -> & ExecLimits
 const ra_exec::EXEC_SCHEMA_VERSION: ra_core :: compat :: SchemaVersion
 enum ra_exec::fs::RootedOpenError
+enum ra_exec::job::JobError
+enum ra_exec::job::JobWaitResult
+enum ra_exec::job::JobWaitUntil
 enum ra_exec::session::ExecError
 enum ra_exec::session::ExecExecutionResult
 enum ra_exec::session::ExecSessionState
@@ -85,6 +98,8 @@ fn ra_exec::fs::RootedFileSystem::remove_file(& self, path : & Path) -> Result <
 fn ra_exec::fs::RootedFileSystem::rename(& self, from : & Path, to : & Path) -> Result < () , RootedOpenError >
 fn ra_exec::fs::RootedFileSystem::write_file(& self, path : & Path, content : & [u8]) -> Result < () , RootedOpenError >
 fn ra_exec::fs::workspace_resource_id(identifier : impl Into < std :: borrow :: Cow < 'static , str > >) -> Result < ra_core :: tool :: ResourceId , ra_core :: error :: Error >
+fn ra_exec::job::BackgroundJob::from_execution_result(process_manager : Arc < ProcessManager >, result : & ExecExecutionResult) -> Option < Self >
+fn ra_exec::job::BackgroundJob::new(process_manager : Arc < ProcessManager >, session_id : impl Into < ExecSessionId >) -> Self
 fn ra_exec::output::ExecOutputSummary::new(stdout : impl Into < String >, stderr : impl Into < String >) -> Self
 fn ra_exec::output::ExecOutputSummary::retained_bytes(& self) -> usize
 fn ra_exec::output::ExecOutputSummary::stderr(& self) -> & str
@@ -118,12 +133,22 @@ struct ra_exec::command::ExecCursor
 struct ra_exec::command::ExecLimits
 struct ra_exec::command::ExecRequest
 struct ra_exec::fs::RootedFileSystem
+struct ra_exec::job::BackgroundJob
+struct ra_exec::job::JobSnapshot
 struct ra_exec::output::ExecOutputSummary
 struct ra_exec::output::HeadTailBuffer
 struct ra_exec::session::ExecSessionTransitionError
 struct ra_exec::session::ProcessManager
 variant ra_exec::fs::RootedOpenError::Io(io :: Error)
 variant ra_exec::fs::RootedOpenError::OutsideRoot
+variant ra_exec::job::JobError::EmptyMatch
+variant ra_exec::job::JobError::UnknownJob { session_id: ExecSessionId }
+variant ra_exec::job::JobWaitResult::Done(JobSnapshot)
+variant ra_exec::job::JobWaitResult::Matched { snapshot: JobSnapshot, stream: ExecStreamKind }
+variant ra_exec::job::JobWaitResult::TimedOut(JobSnapshot)
+variant ra_exec::job::JobWaitUntil::Done
+variant ra_exec::job::JobWaitUntil::Match { text: String, timeout: Duration }
+variant ra_exec::job::JobWaitUntil::Timeout(Duration)
 variant ra_exec::session::ExecError::AtCapacity { max_sessions: usize }
 variant ra_exec::session::ExecError::SessionNotActive { session_id: ExecSessionId, state: ExecSessionState }
 variant ra_exec::session::ExecError::Spawn { command: String, source: std :: io :: Error }

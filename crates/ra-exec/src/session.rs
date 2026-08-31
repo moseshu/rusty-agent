@@ -48,7 +48,7 @@ use tokio::{
 
 use crate::{
     command::{ExecCursor, ExecLimits, ExecRequest},
-    output::{ExecOutputSummary, HeadTailBuffer},
+    output::{ExecOutputSummary, HeadTailBuffer, RetainedRead},
 };
 
 /// The default shell used when a request names none.
@@ -335,6 +335,9 @@ struct ExecSession {
     interactive_stderr_cursor: u64,
     output_notify: Arc<Notify>,
     exit_notify: Arc<Notify>,
+    /// Set only after the child is reaped and output readers have stopped or been bounded away.
+    closed: bool,
+    closed_notify: Arc<Notify>,
 }
 
 impl ExecSession {
@@ -354,6 +357,8 @@ impl ExecSession {
             interactive_stderr_cursor: 0,
             output_notify: Arc::new(Notify::new()),
             exit_notify: Arc::new(Notify::new()),
+            closed: false,
+            closed_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -409,6 +414,47 @@ impl ExecSession {
         }
         summary
     }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            state: self.state.clone(),
+            output: self.summary(),
+            closed: self.closed,
+        }
+    }
+}
+
+/// A lifecycle state and output summary captured while holding a session lock.
+pub(crate) struct SessionSnapshot {
+    /// Lifecycle state from the captured instant.
+    pub(crate) state: ExecSessionState,
+    /// Output summary from the captured instant.
+    pub(crate) output: ExecOutputSummary,
+    /// Whether process and output closeout had completed at the captured instant.
+    pub(crate) closed: bool,
+}
+
+/// The result of waiting for a session to finish its complete closeout.
+pub(crate) enum SessionCloseWait {
+    /// The process was reaped and its output readers were closed out.
+    Closed(SessionSnapshot),
+    /// The requested wait interval elapsed while closeout was still pending.
+    TimedOut(SessionSnapshot),
+}
+
+/// The outcome of scanning both output streams under one session lock.
+pub(crate) struct MatchWindow {
+    /// Offset a following stdout scan resumes from.
+    pub(crate) stdout_cursor: usize,
+    /// Offset a following stderr scan resumes from.
+    pub(crate) stderr_cursor: usize,
+    /// Stream and same-instant snapshot when newly retained content matched.
+    pub(crate) matched: Option<(ExecStreamKind, SessionSnapshot)>,
+    /// Present only when the caller must return an observation.
+    ///
+    /// An ordinary non-matching output wake does not need an output summary, so withholding it
+    /// avoids copying the bounded capture buffers once per stream chunk.
+    pub(crate) snapshot: Option<SessionSnapshot>,
 }
 
 /// The set of sessions this manager knows about, and the order they arrived in.
@@ -733,11 +779,12 @@ impl ProcessManager {
 
             // Already-stopping sessions ignore this; what frees their slot is their process ending.
             for session_id in active.iter().take(over) {
-                self.stop(
-                    session_id,
-                    TerminalOutcome::Evicted(ExecEvictionReason::CapacityExceeded),
-                )
-                .await;
+                let _ = self
+                    .stop(
+                        session_id,
+                        TerminalOutcome::Evicted(ExecEvictionReason::CapacityExceeded),
+                    )
+                    .await;
             }
 
             if tokio::time::timeout_at(deadline, freed).await.is_err() {
@@ -761,6 +808,153 @@ impl ProcessManager {
         let session = self.registry.get(session_id).await?;
         let state = session.lock().await.state.clone();
         Some(state)
+    }
+
+    /// Returns one coherent lifecycle state and output-summary snapshot for a retained session.
+    ///
+    /// This is crate-visible because the background-job facade needs to report both facts from the
+    /// same instant. Keeping that lock acquisition here prevents a caller from observing output
+    /// from before an exit alongside a state from after it.
+    pub(crate) async fn session_snapshot(
+        &self,
+        session_id: &ExecSessionId,
+    ) -> Option<SessionSnapshot> {
+        let session = self.registry.get(session_id).await?;
+        let sess = session.lock().await;
+        Some(sess.snapshot())
+    }
+
+    /// Waits for a retained session to finish process and output closeout.
+    ///
+    /// A session can record `Cancelled` or `Expired` before its process group has left. This
+    /// method deliberately waits for the later closeout point: the child has been reaped and its
+    /// readers have finished or reached their bounded drain. The returned snapshot comes from the
+    /// retained session reference that was waited on, so registry retention cannot turn a
+    /// successful close wait into a second lookup failure.
+    pub(crate) async fn wait_for_session_close(
+        &self,
+        session_id: &ExecSessionId,
+        timeout: Option<Duration>,
+    ) -> Option<SessionCloseWait> {
+        let session = self.registry.get(session_id).await?;
+
+        let sess = session.lock().await;
+        let closed_notify = Arc::clone(&sess.closed_notify);
+        let closed = closed_notify.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if sess.closed {
+            return Some(SessionCloseWait::Closed(sess.snapshot()));
+        }
+        drop(sess);
+
+        let notified = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, closed).await.is_ok()
+        } else {
+            closed.await;
+            true
+        };
+        let sess = session.lock().await;
+        if sess.closed || notified {
+            Some(SessionCloseWait::Closed(sess.snapshot()))
+        } else {
+            Some(SessionCloseWait::TimedOut(sess.snapshot()))
+        }
+    }
+
+    /// Scans both output streams past their cursors under one session lock.
+    ///
+    /// The caller's `scan` closure sees the two reads before the lock is released. A full output
+    /// snapshot is built only when the closure found a match, the session closed, or `final_pass`
+    /// says the caller's deadline has elapsed. The ordinary output path therefore copies only the
+    /// newly retained segments rather than both complete capture buffers.
+    ///
+    /// The reads deliberately do not go through [`Self::read_output`]: that path renders an
+    /// omission marker where bytes were dropped, and a literal search would match the marker's own
+    /// words. See [`RetainedRead`].
+    pub(crate) async fn scan_match_window<F>(
+        &self,
+        session_id: &ExecSessionId,
+        stdout_cursor: usize,
+        stderr_cursor: usize,
+        final_pass: bool,
+        scan: F,
+    ) -> Option<MatchWindow>
+    where
+        F: FnOnce(Option<&RetainedRead>, Option<&RetainedRead>) -> Option<ExecStreamKind>,
+    {
+        let session = self.registry.get(session_id).await?;
+        let mut sess = session.lock().await;
+        let stdout = sess.stdout_buffer.read_retained_from(stdout_cursor);
+        let stderr = sess.stderr_buffer.read_retained_from(stderr_cursor);
+        if stdout.is_some() || stderr.is_some() {
+            // Same rule as `read_output`: a session someone is reading from is not idle, and the
+            // sweep would otherwise take it away in the middle of the wait that is watching it.
+            sess.last_active_at = Instant::now();
+        }
+        let matched_stream = scan(stdout.as_ref(), stderr.as_ref());
+        let stdout_cursor = stdout
+            .as_ref()
+            .map_or(stdout_cursor, |read| read.next_offset);
+        let stderr_cursor = stderr
+            .as_ref()
+            .map_or(stderr_cursor, |read| read.next_offset);
+        let (matched, snapshot) = match matched_stream {
+            Some(stream) => (Some((stream, sess.snapshot())), None),
+            None if sess.closed || final_pass => (None, Some(sess.snapshot())),
+            None => (None, None),
+        };
+        Some(MatchWindow {
+            stdout_cursor,
+            stderr_cursor,
+            matched,
+            snapshot,
+        })
+    }
+
+    /// Waits for new output, closeout, or a bounded wait interval, whichever comes first.
+    ///
+    /// Unlike [`Self::wait_for_output`], a recorded terminal state is not itself a result. A
+    /// cancellation records its reason before final output can drain, and a job matcher must keep
+    /// reading through that gap until closeout.
+    ///
+    /// Which of the three ended the wait is deliberately not reported. The caller re-reads and
+    /// re-checks either way, and a caller that branched on the reason would report a timeout while
+    /// output that arrived in the same instant sat unexamined — `tokio::select!` chooses freely
+    /// among branches that are ready together.
+    pub(crate) async fn wait_for_output_or_close(
+        &self,
+        session_id: &ExecSessionId,
+        stdout_cursor: usize,
+        stderr_cursor: usize,
+        timeout: Duration,
+    ) -> Option<()> {
+        let session = self.registry.get(session_id).await?;
+
+        let sess = session.lock().await;
+        let output_notify = Arc::clone(&sess.output_notify);
+        let closed_notify = Arc::clone(&sess.closed_notify);
+        let output = output_notify.notified();
+        let closed = closed_notify.notified();
+        tokio::pin!(output);
+        tokio::pin!(closed);
+        output.as_mut().enable();
+        closed.as_mut().enable();
+
+        if sess.stdout_buffer.total_bytes() > stdout_cursor
+            || sess.stderr_buffer.total_bytes() > stderr_cursor
+            || sess.closed
+        {
+            return Some(());
+        }
+        drop(sess);
+
+        tokio::select! {
+            () = &mut output => {}
+            () = &mut closed => {}
+            () = tokio::time::sleep(timeout) => {}
+        }
+        Some(())
     }
 
     /// Fetches an output summary snapshot of a session.
@@ -1038,7 +1232,16 @@ impl ProcessManager {
     /// its own before it is killed, so the session may still be winding down when this returns —
     /// what has already happened is that its recorded death is a cancellation and nothing else.
     pub async fn cancel(&self, session_id: &ExecSessionId) {
-        self.stop(session_id, TerminalOutcome::Cancelled).await;
+        let _ = self.stop(session_id, TerminalOutcome::Cancelled).await;
+    }
+
+    /// Requests cancellation and reports an identifier the manager no longer retains.
+    ///
+    /// This crate-visible variant lets the background-job facade avoid a stale preliminary lookup.
+    pub(crate) async fn cancel_retained(&self, session_id: &ExecSessionId) -> bool {
+        self.stop(session_id, TerminalOutcome::Cancelled)
+            .await
+            .is_some()
     }
 
     /// Evicts a session due to host policy, terminating its process group.
@@ -1047,7 +1250,8 @@ impl ProcessManager {
     /// the emitter the session was started with — not here. One session has one death, and the
     /// supervisor is the only thing positioned to say what it was.
     pub async fn evict(&self, session_id: &ExecSessionId, reason: ExecEvictionReason) {
-        self.stop(session_id, TerminalOutcome::Evicted(reason))
+        let _ = self
+            .stop(session_id, TerminalOutcome::Evicted(reason))
             .await;
     }
 
@@ -1060,14 +1264,12 @@ impl ProcessManager {
     /// The state written here is the death the session will be reported as having, because
     /// [`ExecSession::finish`] refuses to overwrite one. A deadline that expires while the process
     /// is still draining loses to the reason that already stopped it.
-    async fn stop(&self, session_id: &ExecSessionId, outcome: TerminalOutcome) {
-        let Some(session) = self.registry.get(session_id).await else {
-            return;
-        };
+    async fn stop(&self, session_id: &ExecSessionId, outcome: TerminalOutcome) -> Option<()> {
+        let session = self.registry.get(session_id).await?;
         let never_ran = {
             let mut sess = session.lock().await;
             if sess.state.is_terminal() {
-                return;
+                return Some(());
             }
             sess.request_termination(TerminationSignal::Terminate);
             let recorded = sess.finish(match outcome {
@@ -1086,6 +1288,7 @@ impl ProcessManager {
             // No process, so no supervisor will ever reap it and free its slot.
             self.registry.retire(session_id).await;
         }
+        Some(())
     }
 
     /// Returns the sessions whose process may still be running, oldest first.
@@ -1260,7 +1463,7 @@ async fn supervise(
         .as_ref()
         .ok()
         .and_then(std::process::ExitStatus::code);
-    let (recorded_state, duration_ms, stdout_bytes, stderr_bytes, notify) = {
+    let (recorded_state, duration_ms, stdout_bytes, stderr_bytes, exit_notify, closed_notify) = {
         let mut sess = context.session.lock().await;
         sess.exit_code = exit_code;
         // Only when nothing has ended this session yet. A cancelled session ended when it was
@@ -1278,12 +1481,17 @@ async fn supervise(
         // draining loses here too, which is why the event below is built from what was recorded
         // rather than from the deadline this task happened to observe.
         sess.finish(terminal);
+        // A terminal state can have been recorded much earlier by cancellation. Closeout is the
+        // later fact that the child has been reaped and neither output reader can add to the
+        // summary any more, so background-job `Done` waits on this distinct notification.
+        sess.closed = true;
         (
             sess.state.clone(),
             duration_to_millis(sess.duration()),
             sess.stdout_buffer.total_bytes(),
             sess.stderr_buffer.total_bytes(),
             Arc::clone(&sess.exit_notify),
+            Arc::clone(&sess.closed_notify),
         )
     };
 
@@ -1316,7 +1524,8 @@ async fn supervise(
         }
         let _ = em.emit(ExecEvent::Exited(event));
     }
-    notify.notify_waiters();
+    exit_notify.notify_waiters();
+    closed_notify.notify_waiters();
 }
 
 /// Reads one pipe into the session's buffer, emitting each chunk as it arrives.
