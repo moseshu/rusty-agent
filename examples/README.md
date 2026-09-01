@@ -1,53 +1,64 @@
-# 示例与 Demo 目录 (Examples)
+# Examples
 
-本目录用于存放供开发者快速熟悉和学习 **`rusty-agent`** 框架的可执行示例与样例代码。
+Runnable examples and sample code for getting familiar with the **`rusty-agent`**
+framework.
 
 ---
 
-## 📌 目录定位与使用说明
+## What this directory is for
 
-目前 `rusty-agent` 框架的核心模块（包含 `crates/` 内部组件与基础设施）正在按[开发计划](../Docs/Rusty_Agent_Framework_Development_Plan.md)有序推进开发中。
+The framework's core modules — the components under `crates/` and the surrounding
+infrastructure — are still being built out against the development plan. As
+capabilities land, this directory picks up the corresponding examples.
 
-随着核心功能逐步完成，本目录将陆续补充以下标准的 Rust 示例程序。
+### Shipped
 
-### 已交付
-
-| 示例 | 演示主题 | 说明 |
+| Example | Topic | Notes |
 | :--- | :--- | :--- |
-| **`minimal_agent/`** | 最小自定义 agent | 只依赖 `ra-core` + `ra-runtime`，自带一个 `Tool`、一个 `Model` 与一个 `ModelResolver`，离线跑完「工具调用 → 最终回答」两轮。 |
+| **`minimal_agent/`** | A minimal custom agent | Depends on `ra-core` and `ra-runtime` only. Brings its own `Tool`, `Model`, and `ModelResolver`, and runs the two rounds of "tool call → final answer" entirely offline. |
 
-`minimal_agent` **不是教程，是门禁**。它存在的理由是证明第三方只用内核就能装出一个能跑的 agent，因此它的依赖被 `xtask/src/layering.rs` 的 `ALLOWED_INTERNAL_DEPS` 钉死为那两个 crate——想加第三个来把例子写完，说明某个第三方需要的能力躲进了参考产品，`cargo xtask layering` 会当场失败并点名。**放宽那一行不是修复**。对应里程碑 M1 与 MVP 验收第 6b 项。
+`minimal_agent` **is a gate, not a tutorial.** It exists to prove that a third party
+can assemble a working agent from the kernel alone, so its dependencies are pinned to
+those two crates by `ALLOWED_INTERNAL_DEPS` in `xtask/src/layering.rs`. Needing a third
+crate to finish the example would mean a capability a third party requires has gone
+into a reference product, and `cargo xtask layering` fails on the spot and names it.
+**Relaxing that line is not a fix.** This covers milestone M1 and MVP acceptance item 6b.
 
-它自带 `Model` 也是这个理由的一部分：真实 provider 在 `ra-model`，依赖它只能证明「你能跑本项目的 adapter」，证明不了「你能自带 adapter」。附带好处是无需 API key、无需联网，可以进 CI。
+Bringing its own `Model` is part of the same argument: the real providers live in
+`ra-model`, and depending on them would only prove "you can run this project's
+adapter", not "you can bring your own". The side benefit is that it needs no API key
+and no network, so it runs in CI.
 
 ```bash
 cargo run -p minimal_agent
 ```
 
-### 规划中的示例列表
+### Planned
 
-| 示例文件 | 演示主题 | 说明与核心概念 |
+| Example | Topic | Concepts covered |
 | :--- | :--- | :--- |
-| **`01_basic_agent.rs`** | 基础 Agent 对话 | 演示如何初始化 Provider Client、配置 System Preamble 提示词，并发起多轮对话。 |
-| **`02_custom_tools.rs`** | 自定义工具与 Function Calling | 演示如何使用 `#[tool]` 宏注册自定义 Rust 函数，并处理参数 Schema 与错误。 |
-| **`03_react_loop.rs`** | ReAct 思考与行动循环 | 演示基于 `NextStep` 状态机的 ReAct (Reasoning + Acting) 双通道输出与自纠流程。 |
-| **`04_subagent_as_tool.rs`** | 子 Agent 派生与上下文隔离 | 演示通过 `Agent::as_tool()` 将子 Agent 包装为工具，实现文件级的上下文隔离。 |
-| **`05_mcp_integration.rs`** | MCP 协议集成 | 演示如何连接外部或进程内 MCP (Model Context Protocol) 工具与资源服务器。 |
+| **`01_basic_agent.rs`** | Basic agent conversation | Initializing a provider client, configuring the system preamble, and running a multi-turn conversation. |
+| **`02_custom_tools.rs`** | Custom tools and function calling | Registering a Rust function as a tool with the `#[tool]` macro, and handling argument schemas and errors. |
+| **`03_react_loop.rs`** | The ReAct loop | Reasoning-and-acting dual-channel output and self-correction, driven by the `NextStep` state machine. |
+| **`04_subagent_as_tool.rs`** | Sub-agents and context isolation | Wrapping a sub-agent as a tool via `Agent::as_tool()` for file-level context isolation. |
+| **`05_mcp_integration.rs`** | MCP integration | Connecting to external or in-process Model Context Protocol tool and resource servers. |
 
 ---
 
-## 🚀 运行示例
+## Running an example
 
-每个示例是 workspace 里独立的一个 crate（`examples/*` 已登记为 workspace member），因此用 `-p` 运行，不是 `--example`：
+Each example is its own crate in the workspace (`examples/*` are registered as
+workspace members), so they run with `-p`, not `--example`:
 
 ```bash
 cargo run -p minimal_agent
 ```
 
-`minimal_agent` 自带模型，不需要任何环境变量。规划中的其余示例接真实 provider，届时需要：
+`minimal_agent` supplies its own model and needs no environment variables. The
+planned examples talk to real providers and will need credentials:
 
 ```bash
 export OPENAI_API_KEY="your-openai-api-key"
-# 或
+# or
 export GOOGLE_API_KEY="your-google-api-key"
 ```

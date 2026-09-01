@@ -17,6 +17,53 @@ Two things, not one:
 2. **Reference products built on that framework** — their job is to force the
    framework's abstractions into the right shape.
 
+The goal is a high-performance agent runtime: a single-binary deployment, no
+interpreter or GC in the hot path, bounded and predictable memory under long
+runs, and concurrency that the type system makes safe rather than convention.
+The conceptual model it starts from is not new, and is credited below.
+
+Use it when an application needs to own its agent loop, tool execution, session history,
+approval policy, and provider choice instead of delegating those boundaries to a hosted
+agent runtime. The framework is suitable for interactive coding agents, workflow and
+graph agents, long-running tool-using assistants, and embedded or self-hosted products.
+
+### Core concepts
+
+1. **Agent runtime**: Runs model turns, dispatches tools, and settles each agent turn.
+2. **Model providers**: A shared model contract with OpenAI Responses, OpenAI Chat,
+   Anthropic Messages, and OpenAI-compatible adapters.
+3. **Tools**: Typed tool contracts, input schemas, registration, and execution dispatch.
+4. **MCP**: Model Context Protocol clients for stdio, SSE, and HTTP transports, plus
+   in-process tool servers.
+5. **Prompts**: Prompt assembly, stable prefixes, cache planning, and incremental reminders.
+6. **Context management**: Context budgeting, compaction, archival, and bounded tool output.
+7. **Sessions**: Durable event records, resume, fork, and checkpoint support.
+8. **Execution**: Local processes, background jobs, and sandbox backends for tool work.
+9. **Approvals**: First-class permission checks and interrupts for human-in-the-loop flows.
+10. **Evaluation and protocol**: Replay fixtures and trace assertions, together with control
+   protocol frames and an application-server transport.
+
+## Why Rust
+
+Agent runtimes spend much of their time coordinating fallible, concurrent work: streaming
+model responses, launching or supervising tools, enforcing approvals, preserving session
+history, and fitting a growing conversation into a context window. Rust makes those
+boundaries explicit in the program's types and ownership model.
+
+That choice is practical rather than ideological:
+
+- A deployable agent can be a single native binary, without an interpreter or a garbage
+  collector on the execution path.
+- Ownership and async types make cancellation, resource lifetime, and concurrent tool
+  execution explicit instead of relying on convention.
+- The provider-neutral core can remain a small, strongly typed contract while provider
+  wire formats, sandboxing, and product policy stay in their own layers.
+- Durable session records, bounded tool-result projections, and context compaction can be
+  implemented without silently retaining unbounded in-memory copies.
+
+Rust does not make model output deterministic or eliminate network failure. It gives the
+host application a more explicit and testable way to manage those realities.
+
 ## Layering
 
 Deciding where a piece of code belongs takes two questions:
@@ -38,26 +85,6 @@ Dependencies flow one way, enforced in CI: the kernel does not depend on reusabl
 components or products, reusable components do not depend on products, and products
 have zero dependencies on each other.
 
-## Crates
-
-| Crate | Responsibility |
-| --- | --- |
-| `ra-core` | Shared types and contracts: `RunItem` / `ModelRequest` / `Tool` / `Capability` / `Guard` / `Permission` / `RunState` |
-| `ra-macros` | `#[derive(ToolInput)]` and `#[tool]` procedural macros |
-| `ra-model` | Provider implementations: OpenAI Responses, OpenAI Chat, Anthropic Messages, OpenAI-compatible |
-| `ra-prompt` | Prompt assembly, stable prefixes, cache planning, incremental reminders |
-| `ra-context` | Context budgeting, compaction, eviction, archiving |
-| `ra-runtime` | Loop kernel: turn settlement, tool dispatch, guards and hooks, approval interrupts |
-| `ra-session` | Event log, session storage, resume, fork, checkpoint |
-| `ra-exec` | Processes, background jobs, sandbox backends |
-| `ra-mcp` | MCP client (stdio / SSE / HTTP) and in-process tool servers |
-| `ra-tools` | General-purpose tools shared across products |
-| `ra-protocol` | Control-protocol frames, transport, app server |
-| `ra-eval` | Fixtures, replay, trace assertions, cost and discipline reports |
-| `ra-patch` | V4A `apply_patch` parsing and application |
-| `ra-coding` | Reference product: a coding agent |
-| `ra-cli` | Command-line entry point |
-
 ## Building
 
 Requires Rust 1.97.1, pinned in `rust-toolchain.toml`.
@@ -72,6 +99,11 @@ stays free of test-only crates. Run them, along with the repository's gates, wit
 ```bash
 cargo xtask all
 ```
+
+## Acknowledgements
+
+This project draws conceptual inspiration from the
+[OpenAI Agents SDK for Python](https://github.com/openai/openai-agents-python).
 
 ## License
 
