@@ -1115,6 +1115,8 @@ dependencies = [
 name = "ra-context"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "ra-core",
  "serde",
  "serde_json",

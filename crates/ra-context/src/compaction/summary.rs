@@ -246,7 +246,12 @@ fn render_user_messages(rendered: &mut String, messages: &[String]) {
     }
 }
 
-fn code_fence(text: &str) -> String {
+/// Sizes a Markdown code fence that the enclosed text cannot terminate early.
+///
+/// Shared with [`crate::preflight`], which encloses verbatim user text for the same reason. A
+/// second copy would let the two disagree about what a run of backticks costs, and the disagreement
+/// would only show up as a model reading part of one section as another.
+pub(crate) fn code_fence(text: &str) -> String {
     let mut longest = 0_usize;
     let mut run = 0_usize;
     for character in text.chars() {

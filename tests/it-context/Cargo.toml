@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 ra-core = { path = "../../crates/ra-core" }
+async-trait = "0.1"
 ra-context = { path = "../../crates/ra-context" }
 ra-session = { path = "../../crates/ra-session", default-features = false }
 insta = { version = "1", features = ["json", "redactions"] }
