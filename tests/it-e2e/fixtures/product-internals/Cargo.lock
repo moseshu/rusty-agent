@@ -490,7 +490,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "ra-coding"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "ra-context",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "ra-context"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ra-core",
  "serde",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "ra-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "ra-exec"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cap-std",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "ra-macros"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "ra-mcp"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "ra-patch"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ra-core",
  "serde",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "ra-prompt"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ra-core",
  "serde",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "ra-runtime"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "ra-tools"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
