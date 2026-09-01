@@ -1,64 +1,78 @@
 # rusty-agent
 
-用 Rust 写的 agent 框架，以及用它构建的参考产品。
+An agent framework written in Rust, plus the reference products built with it.
 
-> **当前状态：R0 已完成。** crate 边界、错误、取消、日志、配置、独立测试 workspace
-> 与扩展安全契约已落地；下一阶段开始实现 provider 抽象。
-> 公共 API 处于 `0.0.x`，不提供任何稳定性承诺。
+> **Status.** The kernel contracts, provider implementations, prompt assembly, and
+> context management (budgeting, compaction, tool-output trimming) are in place,
+> alongside the crate boundaries, error and cancellation model, logging, configuration,
+> separate test workspace, and extension-safety contracts.
+> The public API is `0.1.x` and carries no stability guarantee.
 
-## 这是什么
+## What this is
 
-两件事，不是一件：
+Two things, not one:
 
-1. **一套通用 agent 框架** —— 用于实现 ReAct、graph engineering、plan-and-execute、multi-agent 四类智能体；
-2. **用这套框架写出的参考产品** —— 它们的作用是把框架抽象逼到正确的形状。
+1. **A general-purpose agent framework** — for building ReAct, graph-engineering,
+   plan-and-execute, and multi-agent systems;
+2. **Reference products built on that framework** — their job is to force the
+   framework's abstractions into the right shape.
 
-## 分层
+## Layering
 
-判断一段代码的落点只问两句话：
+Deciding where a piece of code belongs takes two questions:
 
-| 提问 | 答「是」则 |
+| Question | If yes |
 | --- | --- |
-| 换成另一个领域的 agent，这段代码要改吗？ | 产品内容 |
-| 不用改，但换个产品要再写一遍吗？ | 可复用件 |
-| 两条都答「否」 | 内核机制 |
+| Would this change for an agent in another domain? | Product content |
+| It wouldn't — but would you rewrite it for another product? | Reusable component |
+| Both answers are no | Kernel mechanism |
 
 ```
-产品层        ra-coding（编码 agent）· 第三方产品
-可复用件层     ra-flow（编排与图引擎）· ra-tools（通用工具）· ra-patch（V4A 补丁）
-内核层        ra-runtime（loop 内核）· ra-core（类型与契约）
-通用服务层     ra-model · ra-prompt · ra-context · ra-session · ra-exec · ra-mcp
+Product          ra-coding (coding agent) · third-party products
+Reusable         ra-flow (orchestration and graph engine, planned) · ra-tools (general tools) · ra-patch (V4A patches)
+Kernel           ra-runtime (loop kernel) · ra-core (types and contracts)
+Shared services  ra-model · ra-prompt · ra-context · ra-session · ra-exec · ra-mcp
 ```
 
-依赖方向单向，由 CI 校验：内核不依赖可复用件与产品，可复用件不依赖产品，产品之间零依赖。
+Dependencies flow one way, enforced in CI: the kernel does not depend on reusable
+components or products, reusable components do not depend on products, and products
+have zero dependencies on each other.
 
-## Crate
+## Crates
 
-| crate | 职责 |
+| Crate | Responsibility |
 | --- | --- |
-| `ra-core` | 公共类型与契约：`RunItem` / `ModelRequest` / `Tool` / `Capability` / `Guard` / `Permission` / `RunState` |
-| `ra-macros` | `#[derive(ToolInput)]` / `#[tool]` 过程宏 |
-| `ra-model` | provider 实现：OpenAI Responses / OpenAI Chat / Anthropic Messages / OpenAI-compatible |
-| `ra-prompt` | 提示词装配、稳定前缀、缓存计划、增量提醒 |
-| `ra-context` | 上下文预算、压缩、淘汰、归档 |
-| `ra-runtime` | loop 内核：turn 结算、工具分派、guard/hook、审批中断 |
-| `ra-session` | 事件日志、会话存储、resume、fork、checkpoint |
-| `ra-exec` | 进程、后台 job、沙箱后端 |
-| `ra-mcp` | MCP client（stdio / SSE / HTTP）与进程内工具服务器 |
-| `ra-protocol` | 控制协议帧、transport、app-server |
-| `ra-eval` | fixture、replay、trace 断言、成本与纪律报告 |
-| `ra-patch` | V4A `apply_patch` 解析与应用 |
-| `ra-coding` | 参考产品：编码 agent |
-| `ra-cli` | 命令行入口 |
+| `ra-core` | Shared types and contracts: `RunItem` / `ModelRequest` / `Tool` / `Capability` / `Guard` / `Permission` / `RunState` |
+| `ra-macros` | `#[derive(ToolInput)]` and `#[tool]` procedural macros |
+| `ra-model` | Provider implementations: OpenAI Responses, OpenAI Chat, Anthropic Messages, OpenAI-compatible |
+| `ra-prompt` | Prompt assembly, stable prefixes, cache planning, incremental reminders |
+| `ra-context` | Context budgeting, compaction, eviction, archiving |
+| `ra-runtime` | Loop kernel: turn settlement, tool dispatch, guards and hooks, approval interrupts |
+| `ra-session` | Event log, session storage, resume, fork, checkpoint |
+| `ra-exec` | Processes, background jobs, sandbox backends |
+| `ra-mcp` | MCP client (stdio / SSE / HTTP) and in-process tool servers |
+| `ra-tools` | General-purpose tools shared across products |
+| `ra-protocol` | Control-protocol frames, transport, app server |
+| `ra-eval` | Fixtures, replay, trace assertions, cost and discipline reports |
+| `ra-patch` | V4A `apply_patch` parsing and application |
+| `ra-coding` | Reference product: a coding agent |
+| `ra-cli` | Command-line entry point |
 
-## 构建
+## Building
 
-需要 Rust 1.97.1（`rust-toolchain.toml` 已固定）。
+Requires Rust 1.97.1, pinned in `rust-toolchain.toml`.
 
 ```bash
 cargo check --workspace
 ```
 
+Behavior tests live in a separate `tests/` workspace, so the main dependency graph
+stays free of test-only crates. Run them, along with the repository's gates, with:
+
+```bash
+cargo xtask all
+```
+
 ## License
 
-Apache-2.0，见 [LICENSE](LICENSE)。
+Apache-2.0. See [LICENSE](LICENSE).
