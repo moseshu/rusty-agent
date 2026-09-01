@@ -6,6 +6,8 @@ const fn ra_context::compaction::CompactionAssessment::usage(& self) -> ContextU
 const fn ra_context::compaction::CompactionLimits::max_items(self) -> Option < usize >
 const fn ra_context::compaction::CompactionLimits::max_single_item_tokens(self) -> Option < usize >
 const fn ra_context::compaction::CompactionLimits::max_total_tokens(self) -> Option < usize >
+const fn ra_context::compaction::CompactionPolicy::limits(self) -> CompactionLimits
+const fn ra_context::compaction::CompactionPolicy::retention(self) -> AnchorRetention
 const fn ra_context::compaction::CompactionReason::label(self) -> & 'static str
 const fn ra_context::compaction::ContextUsage::item_count(self) -> usize
 const fn ra_context::compaction::ContextUsage::largest_item_tokens(self) -> usize
@@ -32,12 +34,16 @@ enum ra_context::compaction::CompactionReason
 enum ra_context::compaction::summary::SummarySlot
 fn ra_context::budget::ToolResultBudget::new(max_bytes : usize, max_tokens : usize) -> Result < Self >
 fn ra_context::budget::ToolResultBudget::project_output(& self, run_id : & RunId, call_id : & CallId, output : ToolOutput) -> Result < ToolOutput >
+fn ra_context::compaction::CompactedModelInput::compacted_item_ids(& self) -> & [ItemId]
+fn ra_context::compaction::CompactedModelInput::items(& self) -> & [ModelInputItem]
 fn ra_context::compaction::CompactionAssessment::is_required(& self) -> bool
 fn ra_context::compaction::CompactionAssessment::reasons(& self) -> & [CompactionReason]
 fn ra_context::compaction::CompactionLimits::assess(self, usage : ContextUsage) -> CompactionAssessment
 fn ra_context::compaction::CompactionLimits::ensure_converges_with(self, retention : AnchorRetention) -> Result < () >
 fn ra_context::compaction::CompactionLimits::for_model(context_windows : & ContextWindowConfig, model : & str, max_items : Option < usize >, max_single_item_tokens : Option < usize >) -> Result < Option < Self > >
 fn ra_context::compaction::CompactionLimits::new(max_items : Option < usize >, max_single_item_tokens : Option < usize >, max_total_tokens : Option < usize >) -> Result < Self >
+fn ra_context::compaction::CompactionPolicy::assess(self, usage : ContextUsage) -> CompactionAssessment
+fn ra_context::compaction::CompactionPolicy::new(limits : CompactionLimits, retention : AnchorRetention) -> Result < Self >
 fn ra_context::compaction::ContextUsage::estimate_model_input(items : & [ModelInputItem]) -> Result < Self >
 fn ra_context::compaction::ContextUsage::new(item_count : usize, largest_item_tokens : usize, total_tokens : usize) -> Result < Self >
 fn ra_context::compaction::anchor::AnchorRetention::new(head_items : usize, max_anchor_items : usize, tail_items : usize) -> Result < Self >
@@ -48,6 +54,7 @@ fn ra_context::compaction::anchor::PreservedSegment < T >::is_empty(& self) -> b
 fn ra_context::compaction::anchor::PreservedSegment < T >::iter(& self) -> impl Iterator < Item = & PreservedItem < T > >
 fn ra_context::compaction::anchor::PreservedSegment < T >::len(& self) -> usize
 fn ra_context::compaction::anchor::PreservedSegment < T >::tail(& self) -> & [PreservedItem < T >]
+fn ra_context::compaction::project_compacted_model_input(history : & [RunItem], policy : CompactionPolicy, anchor_indices : impl IntoIterator < Item = usize >, summary : impl Into < String >) -> Result < CompactedModelInput >
 fn ra_context::compaction::summary::CompactionSummary::render(& self) -> String
 fn ra_context::compaction::summary::CompactionSummary::section(& self, slot : SummarySlot) -> Option < & str >
 fn ra_context::compaction::summary::CompactionSummary::user_messages(& self) -> & [String]
@@ -70,8 +77,10 @@ mod ra_context::eviction
 mod ra_context::preflight
 mod ra_context::window
 struct ra_context::budget::ToolResultBudget
+struct ra_context::compaction::CompactedModelInput
 struct ra_context::compaction::CompactionAssessment
 struct ra_context::compaction::CompactionLimits
+struct ra_context::compaction::CompactionPolicy
 struct ra_context::compaction::ContextUsage
 struct ra_context::compaction::anchor::AnchorRetention
 struct ra_context::compaction::anchor::PreservedItem

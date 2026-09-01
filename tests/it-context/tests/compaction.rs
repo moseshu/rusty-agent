@@ -4,10 +4,40 @@ use std::collections::BTreeMap;
 
 use ra_context::compaction::anchor::AnchorRetention;
 use ra_context::compaction::summary::{CompactionSummaryBuilder, SummarySlot};
-use ra_context::compaction::{CompactionLimits, CompactionReason, ContextUsage};
+use ra_context::compaction::{
+    CompactedModelInput, CompactionLimits, CompactionPolicy, CompactionReason, ContextUsage,
+    project_compacted_model_input,
+};
 use ra_context::window::{ContextWindowConfig, DEFAULT_COMPACTION_THRESHOLD_RATIO};
-use ra_core::item::{Message, ModelInputItem};
+use ra_core::item::{
+    CallId, Compaction, ItemId, McpApprovalRequest, McpApprovalResponse, Message, ModelInputItem,
+    OutputPhase, Reasoning, RunItem, RunItemKind, ToolApproval, ToolCall, ToolCallOutput,
+};
 use ra_core::prompt::estimate_tokens;
+
+/// A projection policy whose only trigger is a total-token ceiling.
+///
+/// Every retention converges with such a trigger, so a projection test states only the retention
+/// shape it is about. Convergence itself is covered separately.
+fn policy(head: usize, anchors: usize, tail: usize) -> CompactionPolicy {
+    CompactionPolicy::new(
+        CompactionLimits::new(None, None, Some(4_000)).expect("a total-token trigger"),
+        AnchorRetention::new(head, anchors, tail).expect("a non-empty retention policy"),
+    )
+    .expect("a total-token trigger converges with any retention")
+}
+
+fn user_message(id: &str, text: &str) -> RunItem {
+    RunItem::new(ItemId::new(id), RunItemKind::Message(Message::user(text)))
+}
+
+fn labels(compacted: &CompactedModelInput) -> Vec<&'static str> {
+    compacted
+        .items()
+        .iter()
+        .map(ModelInputItem::label)
+        .collect()
+}
 
 /// A summary with every slot filled, so a test can restate only the slots it is about.
 fn complete_summary() -> CompactionSummaryBuilder {
@@ -365,4 +395,386 @@ fn anchor_retention_deduplicates_overlap_and_rejects_invalid_indices() {
     let preserved = policy.preserve(&nothing, []).expect("an empty history");
     assert!(preserved.is_empty());
     assert_eq!(preserved.len(), 0);
+}
+
+#[test]
+fn compacted_model_input_is_a_projection_and_never_summarizes_control_records() {
+    let history = vec![
+        RunItem::new(
+            ItemId::new("message-1"),
+            RunItemKind::Message(Message::user("first request")),
+        ),
+        RunItem::new(
+            ItemId::new("approval-1"),
+            RunItemKind::ToolApproval(ToolApproval::new(
+                CallId::new("call-1"),
+                "exec_command",
+                serde_json::json!({"cmd": "git status"}),
+            )),
+        ),
+        RunItem::new(
+            ItemId::new("message-2"),
+            RunItemKind::Message(Message::assistant("working", OutputPhase::Commentary)),
+        ),
+        RunItem::new(
+            ItemId::new("message-3"),
+            RunItemKind::Message(Message::assistant("latest", OutputPhase::Commentary)),
+        ),
+    ];
+
+    let compacted = project_compacted_model_input(
+        &history,
+        policy(1, 0, 1),
+        [],
+        "A durable summary of the omitted work.",
+    )
+    .expect("the middle model item is replaceable");
+
+    assert_eq!(
+        compacted.compacted_item_ids(),
+        &[ItemId::new("message-2")],
+        "the approval stays a control-plane record rather than becoming summary content"
+    );
+    assert_eq!(
+        labels(&compacted),
+        ["message", "compaction", "message"],
+        "the approval is not emitted, and it did not spend the head or tail budget either"
+    );
+    assert_eq!(
+        compacted.items()[1],
+        ModelInputItem::Compaction(Compaction::new(
+            "A durable summary of the omitted work.",
+            vec![ItemId::new("message-2")],
+        ))
+    );
+
+    // Retention is counted in model-visible records, so the three messages fill a head of three.
+    let nothing_to_replace =
+        project_compacted_model_input(&history, policy(3, 0, 0), [], "Unused summary.");
+    assert!(nothing_to_replace.is_err());
+    let blank_summary = project_compacted_model_input(&history, policy(1, 0, 1), [], " \n ");
+    assert!(blank_summary.is_err());
+}
+
+#[test]
+fn compacted_model_input_keeps_a_pending_hosted_approval_request() {
+    let approval = McpApprovalRequest::new(
+        "approval-1",
+        "filesystem",
+        "delete_file",
+        serde_json::json!({"path": "obsolete.txt"}),
+    );
+    let history = vec![
+        user_message("message-0", "clean up the temporary file"),
+        RunItem::new(
+            ItemId::new("mcp-approval-1"),
+            RunItemKind::McpApprovalRequest(approval.clone()),
+        ),
+        user_message("message-1", "please keep the approval request"),
+        user_message("message-2", "what remains to be done?"),
+    ];
+
+    let compacted = project_compacted_model_input(
+        &history,
+        policy(1, 0, 1),
+        [],
+        "The unretained message is summarized.",
+    )
+    .expect("the middle message is replaceable");
+
+    assert_eq!(
+        labels(&compacted),
+        ["message", "compaction", "mcp_approval_request", "message"],
+        "the pending hosted approval survives after the summary"
+    );
+    assert_eq!(
+        compacted.items()[2],
+        ModelInputItem::McpApprovalRequest(approval),
+        "the provider receives the concrete approval protocol item"
+    );
+    assert_eq!(
+        compacted.compacted_item_ids(),
+        &[ItemId::new("message-1")],
+        "the hosted approval is not claimed by the summary"
+    );
+}
+
+#[test]
+fn an_answered_hosted_approval_is_replaced_together_with_its_response() {
+    let history = vec![
+        user_message("message-0", "clean up the temporary file"),
+        RunItem::new(
+            ItemId::new("mcp-request-1"),
+            RunItemKind::McpApprovalRequest(McpApprovalRequest::new(
+                "approval-1",
+                "filesystem",
+                "delete_file",
+                serde_json::json!({"path": "obsolete.txt"}),
+            )),
+        ),
+        RunItem::new(
+            ItemId::new("mcp-response-1"),
+            RunItemKind::McpApprovalResponse(McpApprovalResponse::new("approval-1", true)),
+        ),
+        user_message("message-1", "filler"),
+        user_message("message-2", "what remains to be done?"),
+    ];
+
+    let compacted = project_compacted_model_input(
+        &history,
+        policy(1, 0, 1),
+        [],
+        "The approved deletion and the work after it.",
+    )
+    .expect("the answered approval and the filler are replaceable");
+
+    // Pinning the request because its kind is an interruption would tell the server an approval is
+    // still open that this run granted turns ago, and would leave the history a floor it can never
+    // compact below.
+    assert_eq!(
+        labels(&compacted),
+        ["message", "compaction", "message"],
+        "an answered request is an ordinary record once its response exists"
+    );
+    assert_eq!(
+        compacted.compacted_item_ids(),
+        &[
+            ItemId::new("mcp-request-1"),
+            ItemId::new("mcp-response-1"),
+            ItemId::new("message-1"),
+        ],
+        "the request and the answer are represented by the same summary"
+    );
+
+    // The reverse split is closed too. A tail landing on the response alone does not pull the
+    // request back into retention — widening only ever goes the other way, as it does for a tool
+    // result whose call was replaced — so the response joins its request in the summary.
+    let tail_lands_on_the_response =
+        project_compacted_model_input(&history, policy(1, 0, 3), [], "The approved deletion.")
+            .expect("the answered approval is replaceable");
+    assert_eq!(
+        labels(&tail_lands_on_the_response),
+        ["message", "compaction", "message", "message"],
+        "a response never travels without the request it answers"
+    );
+    assert_eq!(
+        tail_lands_on_the_response.compacted_item_ids(),
+        &[ItemId::new("mcp-request-1"), ItemId::new("mcp-response-1")]
+    );
+}
+
+#[test]
+fn compacted_anchors_are_retained_verbatim_after_the_summary() {
+    let history: Vec<RunItem> = (0..7)
+        .map(|index| user_message(&format!("message-{index}"), &format!("turn {index}")))
+        .collect();
+
+    let compacted = project_compacted_model_input(
+        &history,
+        policy(1, 1, 1),
+        [3],
+        "Everything between the opening turn and the latest one.",
+    )
+    .expect("the unanchored middle is replaceable");
+
+    assert_eq!(
+        labels(&compacted),
+        ["message", "compaction", "message", "message"],
+        "head, then the summary, then the anchor and the tail"
+    );
+    assert_eq!(
+        compacted.items()[2],
+        ModelInputItem::Message(Message::user("turn 3")),
+        "the anchored middle turn survives verbatim rather than being summarized"
+    );
+    assert_eq!(
+        compacted.compacted_item_ids(),
+        &[
+            ItemId::new("message-1"),
+            ItemId::new("message-2"),
+            ItemId::new("message-4"),
+            ItemId::new("message-5"),
+        ],
+        "the anchor is excluded from the summary's coverage on both sides of it"
+    );
+}
+
+#[test]
+fn compacted_model_input_never_strands_a_result_from_its_call() {
+    let history = vec![
+        user_message("message-0", "run the tests"),
+        RunItem::new(
+            ItemId::new("call-1"),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new("call-1"),
+                "run_tests",
+                serde_json::json!({"attempt": 1}),
+            )),
+        ),
+        RunItem::new(
+            ItemId::new("output-1"),
+            RunItemKind::ToolCallOutput(ToolCallOutput::new(
+                CallId::new("call-1"),
+                serde_json::json!({"ok": false}),
+            )),
+        ),
+        RunItem::new(
+            ItemId::new("call-2"),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new("call-2"),
+                "run_tests",
+                serde_json::json!({"attempt": 2}),
+            )),
+        ),
+        RunItem::new(
+            ItemId::new("output-2"),
+            RunItemKind::ToolCallOutput(ToolCallOutput::new(
+                CallId::new("call-2"),
+                serde_json::json!({"ok": false}),
+            )),
+        ),
+    ];
+
+    // A tail of one lands mid-pair. Emitting the retained output alone would be a `tool_result`
+    // with no preceding `tool_use`, which the Anthropic adapter refuses to build a request from.
+    let split = project_compacted_model_input(
+        &history,
+        policy(0, 0, 1),
+        [],
+        "Both attempts failed the same way.",
+    )
+    .expect("a replaced call carries its stranded result into the summary");
+    assert_eq!(labels(&split), ["compaction"]);
+    assert_eq!(
+        split.compacted_item_ids(),
+        &[
+            ItemId::new("message-0"),
+            ItemId::new("call-1"),
+            ItemId::new("output-1"),
+            ItemId::new("call-2"),
+            ItemId::new("output-2"),
+        ],
+        "the stranded result is represented by the summary rather than dropped silently"
+    );
+
+    // A tail that covers the whole pair keeps it, and keeps it adjacent.
+    let intact =
+        project_compacted_model_input(&history, policy(0, 0, 2), [], "The first attempt failed.")
+            .expect("the older pair is replaceable");
+    assert_eq!(
+        labels(&intact),
+        ["compaction", "tool_call", "tool_call_output"]
+    );
+    assert_eq!(
+        intact.compacted_item_ids(),
+        &[
+            ItemId::new("message-0"),
+            ItemId::new("call-1"),
+            ItemId::new("output-1"),
+        ]
+    );
+}
+
+#[test]
+fn compacted_model_input_replaces_a_reasoning_item_whose_follower_is_gone() {
+    let history = vec![
+        user_message("message-0", "explain the failure"),
+        RunItem::new(
+            ItemId::new("reasoning-1"),
+            RunItemKind::Reasoning(Reasoning::new().with_id("rs_1")),
+        ),
+        RunItem::new(
+            ItemId::new("message-1"),
+            RunItemKind::Message(Message::assistant(
+                "because of the lock",
+                OutputPhase::Commentary,
+            )),
+        ),
+        user_message("message-2", "and now?"),
+        RunItem::new(
+            ItemId::new("message-3"),
+            RunItemKind::Message(Message::assistant("retrying", OutputPhase::Commentary)),
+        ),
+    ];
+
+    // The head ends on the reasoning item while the assistant turn it belongs to is replaced.
+    // The inserted summary reads as a valid follower to `InputItemNormalizer`, so nothing
+    // downstream would catch this; the projection has to resolve it here.
+    let compacted = project_compacted_model_input(
+        &history,
+        policy(2, 0, 1),
+        [],
+        "The assistant explained the lock contention.",
+    )
+    .expect("the middle turns are replaceable");
+
+    assert_eq!(
+        labels(&compacted),
+        ["message", "compaction", "message"],
+        "a reasoning item cannot outlive the turn it belongs to"
+    );
+    assert_eq!(
+        compacted.compacted_item_ids(),
+        &[
+            ItemId::new("reasoning-1"),
+            ItemId::new("message-1"),
+            ItemId::new("message-2"),
+        ]
+    );
+}
+
+#[test]
+fn a_summary_inherits_the_coverage_of_the_summary_it_replaces() {
+    let history = vec![
+        RunItem::new(
+            ItemId::new("summary-1"),
+            RunItemKind::Compaction(Compaction::new(
+                "The opening investigation.",
+                vec![ItemId::new("archived-1"), ItemId::new("archived-2")],
+            )),
+        ),
+        user_message("message-1", "keep going"),
+        user_message("message-2", "still going"),
+        user_message("message-3", "latest"),
+    ];
+
+    let compacted = project_compacted_model_input(
+        &history,
+        policy(0, 0, 1),
+        [],
+        "The investigation and everything after it.",
+    )
+    .expect("the earlier summary is itself replaceable");
+
+    assert_eq!(
+        compacted.compacted_item_ids(),
+        &[
+            ItemId::new("archived-1"),
+            ItemId::new("archived-2"),
+            ItemId::new("summary-1"),
+            ItemId::new("message-1"),
+            ItemId::new("message-2"),
+        ],
+        "records the first summary stood for stay covered once it is replaced in turn"
+    );
+}
+
+#[test]
+fn a_compaction_policy_refuses_a_retention_that_cannot_clear_its_item_trigger() {
+    let trigger = CompactionLimits::new(Some(4), None, None).expect("an item trigger");
+    assert!(
+        CompactionPolicy::new(
+            trigger,
+            AnchorRetention::new(3, 2, 2).expect("non-empty policy"),
+        )
+        .is_err(),
+        "seven retained items plus a summary never fall below a four-item trigger"
+    );
+    assert!(
+        CompactionPolicy::new(
+            trigger,
+            AnchorRetention::new(1, 0, 1).expect("non-empty policy"),
+        )
+        .is_ok()
+    );
 }
