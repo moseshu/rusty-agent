@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "examples/*", "xtask"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 # 跟着锁文件里真实需要的最低版本走：`time` 0.3.47（RUSTSEC-2026-0009 的修复版）
 # 要求 1.88。工具链固定在 1.97.1，这个下限只对下游消费者有意义。
@@ -30,20 +30,20 @@ missing_panics_doc = "allow"
 
 [workspace.dependencies]
 # --- 内部 crate ---
-ra-core = { path = "crates/ra-core", version = "0.0.1" }
-ra-macros = { path = "crates/ra-macros", version = "0.0.1" }
-ra-model = { path = "crates/ra-model", version = "0.0.1" }
-ra-prompt = { path = "crates/ra-prompt", version = "0.0.1" }
-ra-context = { path = "crates/ra-context", version = "0.0.1" }
-ra-runtime = { path = "crates/ra-runtime", version = "0.0.1" }
-ra-session = { path = "crates/ra-session", version = "0.0.1" }
-ra-exec = { path = "crates/ra-exec", version = "0.0.1" }
-ra-mcp = { path = "crates/ra-mcp", version = "0.0.1" }
-ra-protocol = { path = "crates/ra-protocol", version = "0.0.1" }
-ra-eval = { path = "crates/ra-eval", version = "0.0.1" }
-ra-patch = { path = "crates/ra-patch", version = "0.0.1" }
-ra-tools = { path = "crates/ra-tools", version = "0.0.1" }
-ra-coding = { path = "crates/ra-coding", version = "0.0.1" }
+ra-core = { path = "crates/ra-core", version = "0.1.0" }
+ra-macros = { path = "crates/ra-macros", version = "0.1.0" }
+ra-model = { path = "crates/ra-model", version = "0.1.0" }
+ra-prompt = { path = "crates/ra-prompt", version = "0.1.0" }
+ra-context = { path = "crates/ra-context", version = "0.1.0" }
+ra-runtime = { path = "crates/ra-runtime", version = "0.1.0" }
+ra-session = { path = "crates/ra-session", version = "0.1.0" }
+ra-exec = { path = "crates/ra-exec", version = "0.1.0" }
+ra-mcp = { path = "crates/ra-mcp", version = "0.1.0" }
+ra-protocol = { path = "crates/ra-protocol", version = "0.1.0" }
+ra-eval = { path = "crates/ra-eval", version = "0.1.0" }
+ra-patch = { path = "crates/ra-patch", version = "0.1.0" }
+ra-tools = { path = "crates/ra-tools", version = "0.1.0" }
+ra-coding = { path = "crates/ra-coding", version = "0.1.0" }
 
 # --- 运行时 ---
 tokio = { version = "1", features = [
