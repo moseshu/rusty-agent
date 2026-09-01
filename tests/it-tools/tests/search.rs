@@ -89,7 +89,9 @@ async fn grep_returns_matches_and_scan_statistics() {
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
     assert_eq!(
         tool.model_definition().description(),
-        Some("Searches workspace text files with a regular expression. Results include `path:line` prefixes.")
+        Some(
+            "Searches workspace text files with a regular expression. Results include `path:line` prefixes."
+        )
     );
     let output = grep(
         &tool,
