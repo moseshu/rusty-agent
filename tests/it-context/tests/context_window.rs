@@ -11,7 +11,10 @@ use ra_context::window::{
 fn built_in_models_follow_the_reference_table_after_normalization() {
     let table = ContextWindowTable::default();
 
-    assert_eq!(table.context_window(" openai/GPT-5.4-PRO "), Some(1_047_576));
+    assert_eq!(
+        table.context_window(" openai/GPT-5.4-PRO "),
+        Some(1_047_576)
+    );
     assert_eq!(table.context_window("gpt-5.3-codex"), Some(400_000));
     assert_eq!(table.context_window("o4-mini-deep-research"), Some(200_000));
     assert_eq!(table.context_window("gpt-4o-mini"), Some(128_000));
@@ -43,7 +46,10 @@ fn host_overrides_replace_builtin_windows_and_add_unknown_models() {
     assert_eq!(config.context_window("gpt-5.3-codex"), Some(512_000));
     assert_eq!(config.compaction_threshold("gpt-5.3-codex"), Some(320_000));
     assert_eq!(config.context_window("local/agent-model"), Some(32_001));
-    assert_eq!(config.compaction_threshold("local/agent-model"), Some(20_000));
+    assert_eq!(
+        config.compaction_threshold("local/agent-model"),
+        Some(20_000)
+    );
 }
 
 #[test]
