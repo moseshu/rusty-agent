@@ -1,6 +1,9 @@
 # ra-context 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 async fn ra_context::archive::read_archived_history(session : & (impl Session + ? Sized), archive_ref : & ArchiveRef) -> Result < Option < ArchivedHistory > >
+async fn ra_context::preflight::InputPreflight::preprocess(& self, input : & [ModelInputItem], summarizer : & dyn InputSummarizer) -> Result < PreprocessedInput >
+async fn ra_context::preflight::InputSummarizer::reduce_summaries(& self, summaries : & [String]) -> Result < String >
+async fn ra_context::preflight::InputSummarizer::summarize_chunk(& self, chunk : & str) -> Result < String >
 const fn ra_context::archive::ArchivedHistory::archive_ref(& self) -> & ArchiveRef
 const fn ra_context::budget::ToolResultBudget::max_bytes(& self) -> usize
 const fn ra_context::budget::ToolResultBudget::max_tokens(& self) -> usize
@@ -27,6 +30,20 @@ const fn ra_context::eviction::ToolOutputTrimmer::preview_chars(& self) -> usize
 const fn ra_context::eviction::ToolOutputTrimmer::recent_items(& self) -> usize
 const fn ra_context::eviction::ToolOutputTrimmer::recent_turns(& self) -> usize
 const fn ra_context::eviction::ToolOutputTrimmer::trimmable_tools(& self) -> Option < & BTreeSet < String > >
+const fn ra_context::preflight::InputPreflight::config(self) -> InputPreflightConfig
+const fn ra_context::preflight::InputPreflight::new(config : InputPreflightConfig) -> Self
+const fn ra_context::preflight::InputPreflightAssessment::input_tokens(self) -> usize
+const fn ra_context::preflight::InputPreflightAssessment::is_accepted(self) -> bool
+const fn ra_context::preflight::InputPreflightAssessment::max_input_tokens(self) -> usize
+const fn ra_context::preflight::InputPreflightAssessment::usage(self) -> ContextUsage
+const fn ra_context::preflight::InputPreflightConfig::map_concurrency(self) -> usize
+const fn ra_context::preflight::InputPreflightConfig::max_chunk_tokens(self) -> usize
+const fn ra_context::preflight::InputPreflightConfig::max_input_tokens(self) -> usize
+const fn ra_context::preflight::InputPreflightConfig::retained_edge_tokens(self) -> usize
+const fn ra_context::preflight::PreprocessedInput::chunks_summarized(& self) -> usize
+const fn ra_context::preflight::PreprocessedInput::original_usage(& self) -> ContextUsage
+const fn ra_context::preflight::PreprocessedInput::usage(& self) -> ContextUsage
+const fn ra_context::preflight::PreprocessedInput::was_preprocessed(& self) -> bool
 const fn ra_context::window::ContextWindowConfig::compaction_threshold_ratio(& self) -> ContextWindowThresholdRatio
 const fn ra_context::window::ContextWindowConfig::context_windows(& self) -> & BTreeMap < String , u64 >
 const fn ra_context::window::ContextWindowConfig::table(& self) -> & ContextWindowTable
@@ -40,6 +57,7 @@ const ra_context::eviction::DEFAULT_MAX_OUTPUT_CHARS: usize
 const ra_context::eviction::DEFAULT_PREVIEW_CHARS: usize
 const ra_context::eviction::DEFAULT_RECENT_ITEMS: usize
 const ra_context::eviction::DEFAULT_RECENT_TURNS: usize
+const ra_context::preflight::DEFAULT_MAP_CONCURRENCY: usize
 const ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO: ContextWindowThresholdRatio
 enum ra_context::compaction::CompactionReason
 enum ra_context::compaction::summary::SummarySlot
@@ -79,6 +97,13 @@ fn ra_context::eviction::ToolOutputTrimmer::new(recent_turns : usize, max_output
 fn ra_context::eviction::ToolOutputTrimmer::trim_model_input(& self, input : & [ModelInputItem]) -> Result < Vec < ModelInputItem > >
 fn ra_context::eviction::ToolOutputTrimmer::with_recent_items(mut self, recent_items : usize) -> Result < Self >
 fn ra_context::eviction::ToolOutputTrimmer::with_trimmable_tools(mut self, trimmable_tools : Option < BTreeSet < String > >) -> Self
+fn ra_context::preflight::InputPreflight::assess(& self, input : & [ModelInputItem]) -> Result < InputPreflightAssessment >
+fn ra_context::preflight::InputPreflightConfig::for_compaction(limits : & CompactionLimits, max_chunk_tokens : usize, retained_edge_tokens : usize) -> Result < Option < Self > >
+fn ra_context::preflight::InputPreflightConfig::for_model(context_windows : & ContextWindowConfig, model : & str, max_chunk_tokens : usize, retained_edge_tokens : usize) -> Result < Option < Self > >
+fn ra_context::preflight::InputPreflightConfig::new(max_input_tokens : usize, max_chunk_tokens : usize, retained_edge_tokens : usize) -> Result < Self >
+fn ra_context::preflight::InputPreflightConfig::with_map_concurrency(mut self, map_concurrency : usize) -> Result < Self >
+fn ra_context::preflight::PreprocessedInput::input(& self) -> & [ModelInputItem]
+fn ra_context::preflight::PreprocessedInput::into_input(self) -> Vec < ModelInputItem >
 fn ra_context::window::ContextWindowConfig::compaction_threshold(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::context_window(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::new(context_windows : BTreeMap < String , u64 >, compaction_threshold_ratio : ContextWindowThresholdRatio) -> Result < Self >
@@ -106,9 +131,14 @@ struct ra_context::compaction::anchor::PreservedSegment
 struct ra_context::compaction::summary::CompactionSummary
 struct ra_context::compaction::summary::CompactionSummaryBuilder
 struct ra_context::eviction::ToolOutputTrimmer
+struct ra_context::preflight::InputPreflight
+struct ra_context::preflight::InputPreflightAssessment
+struct ra_context::preflight::InputPreflightConfig
+struct ra_context::preflight::PreprocessedInput
 struct ra_context::window::ContextWindowConfig
 struct ra_context::window::ContextWindowTable
 struct ra_context::window::ContextWindowThresholdRatio
+trait ra_context::preflight::InputSummarizer
 variant ra_context::compaction::CompactionReason::ItemCount
 variant ra_context::compaction::CompactionReason::SingleItemTokens
 variant ra_context::compaction::CompactionReason::TotalTokens
