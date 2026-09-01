@@ -30,17 +30,22 @@ const BASIS_POINT_ROUNDING_TOLERANCE: f64 = 1e-9;
 
 /// A validated fraction of a context window.
 ///
-/// It serializes as a decimal number in the inclusive range `0.0..=1.0`, so configuration can
-/// express values such as `0.6` without using floating point for threshold arithmetic.
+/// It serializes as a decimal number above `0.0` and at most `1.0`, so configuration can express
+/// values such as `0.6` without using floating point for threshold arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContextWindowThresholdRatio(u16);
 
 impl ContextWindowThresholdRatio {
     /// Creates a ratio from basis points, where 10,000 means the complete context window.
+    ///
+    /// Zero is refused along with anything above the whole window. A zero threshold asks for
+    /// compaction before every request, which is not a policy any history can satisfy; refusing it
+    /// where it is written beats letting every later trigger resolution fail on a number the
+    /// configuration layer had already accepted.
     pub fn new(basis_points: u16) -> Result<Self> {
-        if basis_points > BASIS_POINTS_PER_WHOLE {
+        if basis_points == 0 || basis_points > BASIS_POINTS_PER_WHOLE {
             return Err(Error::config(format!(
-                "a context-window threshold ratio must be between 0 and 1, not {}",
+                "a context-window threshold ratio must be above 0 and at most 1, not {}",
                 f64::from(basis_points) / f64::from(BASIS_POINTS_PER_WHOLE)
             )));
         }
@@ -50,7 +55,7 @@ impl ContextWindowThresholdRatio {
     /// Creates a ratio from a compile-time validated basis-point value.
     #[must_use]
     pub const fn from_basis_points(basis_points: u16) -> Self {
-        assert!(basis_points <= BASIS_POINTS_PER_WHOLE);
+        assert!(basis_points > 0 && basis_points <= BASIS_POINTS_PER_WHOLE);
         Self(basis_points)
     }
 

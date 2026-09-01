@@ -32,7 +32,11 @@ use crate::source;
 /// messages — and turn preparation `match`es it to decide which. A `_` arm would send a third
 /// placement to whichever slot the arm happened to pick, which is the silent misplacement the type
 /// was introduced to make impossible.
-const EXHAUSTIVE_ALLOWED: &[&str] = &["NextStep", "ResolvedInstructions"];
+///
+/// `SummarySlot` is a fixed external format, not an open classification. A tenth slot would make
+/// an existing compaction summary no longer conform to its own durable format, so consumers must
+/// be able to match all nine slots and a format change has to be deliberate and breaking.
+const EXHAUSTIVE_ALLOWED: &[&str] = &["NextStep", "ResolvedInstructions", "SummarySlot"];
 
 /// Structs allowed to have public fields.
 ///

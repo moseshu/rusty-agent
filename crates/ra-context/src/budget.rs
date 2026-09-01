@@ -22,7 +22,7 @@
 use ra_core::{
     error::{Error, Result},
     item::CallId,
-    prompt::estimate_tokens,
+    prompt::{CHARS_PER_TOKEN, estimate_tokens},
     state::RunId,
     tool::{
         ArtifactRef, ModelExcerpt, ObservationMetadata, ToolOutput, ToolOutputBlock,
@@ -37,13 +37,6 @@ pub const DEFAULT_MAX_TOOL_RESULT_TOKENS: usize = 8 * 1024;
 
 /// Marker standing in for the omitted middle of a text body.
 const MARKER: &str = "\n\n[... middle omitted by context budget ...]\n\n";
-
-/// How many characters the shared estimator charges to one token.
-///
-/// Inverting [`estimate_tokens`] is what turns a token allowance into a character allowance, and
-/// the two have to agree: a trimmer that assumed a different ratio would hand back an excerpt the
-/// estimator then priced above the ceiling it was trimmed to fit.
-const CHARS_PER_TOKEN: usize = 4;
 
 /// The share of the byte ceiling opaque blocks may claim before the text body starts losing room.
 ///
