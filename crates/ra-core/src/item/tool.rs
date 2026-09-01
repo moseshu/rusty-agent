@@ -100,6 +100,17 @@ impl ToolCallOutput {
         self
     }
 
+    /// Replaces the model-facing output while preserving this record's identity and metadata.
+    ///
+    /// Context projections use this on a cloned model-input view. The authoritative session item
+    /// remains unchanged, while the `call_id`, error flag, and unknown fields still travel with
+    /// the result sent to the provider.
+    #[must_use]
+    pub fn with_output(mut self, output: Value) -> Self {
+        self.output = output;
+        self
+    }
+
     /// Schema version.
     #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {

@@ -1133,6 +1133,7 @@ fn ra_core::item::tool::ToolApproval::with_tool_origin(mut self, origin : & Tool
 fn ra_core::item::tool::ToolCall::name(& self) -> & str
 fn ra_core::item::tool::ToolCall::new(call_id : CallId, name : impl Into < String >, arguments : Value) -> Self
 fn ra_core::item::tool::ToolCallOutput::new(call_id : CallId, output : Value) -> Self
+fn ra_core::item::tool::ToolCallOutput::with_output(mut self, output : Value) -> Self
 fn ra_core::model::Model::get_retry_advice(& self, _request : & ModelRetryAdviceRequest < '_ >) -> Option < RetryAdvice >
 fn ra_core::model::Model::stream_response(& self, request : ModelRequest) -> ModelStream < '_ >
 fn ra_core::model::ModelProvider::get_model(& self, model_name : Option < & str >) -> Result < Arc < dyn Model > >
