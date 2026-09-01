@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ra_core::{
     error::{Error, Result},
-    item::{CallId, Compaction, ItemId, ModelInputItem, RunItem, RunItemKind},
+    item::{ArchiveRef, CallId, Compaction, ItemId, ModelInputItem, RunItem, RunItemKind},
     prompt::CHARS_PER_TOKEN,
 };
 use serde_json::Value;
@@ -413,6 +413,31 @@ impl CompactedModelInput {
     #[must_use]
     pub fn compacted_item_ids(&self) -> &[ItemId] {
         &self.compacted_item_ids
+    }
+
+    /// Attaches an archive reference to the one summary in this projection.
+    ///
+    /// `notice` is the model-visible retrieval instruction; see [`Compaction::with_archive_ref`]
+    /// for why writing it is the host's job. The returned projection still contains only its
+    /// summary and retained items: the reference is an address for an explicit later lookup, never
+    /// an expansion of archived history.
+    #[must_use]
+    pub fn with_archive_ref(mut self, archive_ref: ArchiveRef, notice: Option<String>) -> Self {
+        // Set in place rather than rebuilt: a summary carries one `ItemId` per replaced record, and
+        // cloning that vector to fill one `Option` would copy hundreds of IDs on the path that runs
+        // precisely because the history is already large.
+        //
+        // `project_compacted_model_input` is the only constructor and always emits exactly one
+        // summary, so the search finds it; should that ever stop holding, the projection comes back
+        // unchanged rather than panicking.
+        let summary = self.items.iter_mut().find_map(|item| match item {
+            ModelInputItem::Compaction(compaction) => Some(compaction),
+            _ => None,
+        });
+        if let Some(compaction) = summary {
+            compaction.set_archive_ref(archive_ref, notice);
+        }
+        self
     }
 }
 

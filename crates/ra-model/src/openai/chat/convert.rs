@@ -107,7 +107,7 @@ async fn lower_item(
         ModelInputItem::Compaction(compaction) => {
             accumulator.push_message(json!({
                 "role": MessageRole::User.label(),
-                "content": compaction.summary()
+                "content": compaction.model_text()
             }));
             Ok(())
         }

@@ -170,7 +170,7 @@ async fn lower_messages(request: &ModelRequest) -> Result<Vec<Value>> {
                 ensure_tool_results_are_adjacent(&pending_tool_results)?;
                 accumulator.push(
                     "user",
-                    vec![json!({"type":"text", "text":compaction.summary()})],
+                    vec![json!({"type":"text", "text":compaction.model_text()})],
                 );
             }
             item => {

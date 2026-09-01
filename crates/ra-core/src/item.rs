@@ -26,7 +26,7 @@ pub mod phase;
 pub mod reasoning;
 pub mod tool;
 
-pub use compaction::Compaction;
+pub use compaction::{ArchiveRef, Compaction};
 pub use content::{
     Base64FileSource, Base64ImageSource, ContentBlock, FileBlock, FileSource, ImageBlock,
     ImageDetail, ImageSource, LocalImageSource, ProviderFileSource, RefusalBlock, TextBlock,
