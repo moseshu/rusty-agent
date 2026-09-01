@@ -20,6 +20,11 @@ const fn ra_context::compaction::anchor::PreservedItem < T >::item(& self) -> & 
 const fn ra_context::compaction::anchor::PreservedItem < T >::source_index(& self) -> usize
 const fn ra_context::compaction::summary::SummarySlot::heading(self) -> & 'static str
 const fn ra_context::compaction::summary::SummarySlot::number(self) -> usize
+const fn ra_context::eviction::ToolOutputTrimmer::max_output_chars(& self) -> usize
+const fn ra_context::eviction::ToolOutputTrimmer::preview_chars(& self) -> usize
+const fn ra_context::eviction::ToolOutputTrimmer::recent_items(& self) -> usize
+const fn ra_context::eviction::ToolOutputTrimmer::recent_turns(& self) -> usize
+const fn ra_context::eviction::ToolOutputTrimmer::trimmable_tools(& self) -> Option < & BTreeSet < String > >
 const fn ra_context::window::ContextWindowConfig::compaction_threshold_ratio(& self) -> ContextWindowThresholdRatio
 const fn ra_context::window::ContextWindowConfig::context_windows(& self) -> & BTreeMap < String , u64 >
 const fn ra_context::window::ContextWindowConfig::table(& self) -> & ContextWindowTable
@@ -29,6 +34,10 @@ const fn ra_context::window::ContextWindowThresholdRatio::from_basis_points(basi
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_BYTES: usize
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS: usize
 const ra_context::compaction::summary::SummarySlot::ALL: [Self ; 9]
+const ra_context::eviction::DEFAULT_MAX_OUTPUT_CHARS: usize
+const ra_context::eviction::DEFAULT_PREVIEW_CHARS: usize
+const ra_context::eviction::DEFAULT_RECENT_ITEMS: usize
+const ra_context::eviction::DEFAULT_RECENT_TURNS: usize
 const ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO: ContextWindowThresholdRatio
 enum ra_context::compaction::CompactionReason
 enum ra_context::compaction::summary::SummarySlot
@@ -62,6 +71,10 @@ fn ra_context::compaction::summary::CompactionSummaryBuilder::build(self) -> Res
 fn ra_context::compaction::summary::CompactionSummaryBuilder::new() -> Self
 fn ra_context::compaction::summary::CompactionSummaryBuilder::with_section(mut self, slot : SummarySlot, content : impl Into < String >) -> Result < Self >
 fn ra_context::compaction::summary::CompactionSummaryBuilder::with_user_messages(mut self, messages : Vec < String >) -> Self
+fn ra_context::eviction::ToolOutputTrimmer::new(recent_turns : usize, max_output_chars : usize, preview_chars : usize) -> Result < Self >
+fn ra_context::eviction::ToolOutputTrimmer::trim_model_input(& self, input : & [ModelInputItem]) -> Result < Vec < ModelInputItem > >
+fn ra_context::eviction::ToolOutputTrimmer::with_recent_items(mut self, recent_items : usize) -> Result < Self >
+fn ra_context::eviction::ToolOutputTrimmer::with_trimmable_tools(mut self, trimmable_tools : Option < BTreeSet < String > >) -> Self
 fn ra_context::window::ContextWindowConfig::compaction_threshold(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::context_window(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::new(context_windows : BTreeMap < String , u64 >, compaction_threshold_ratio : ContextWindowThresholdRatio) -> Result < Self >
@@ -87,6 +100,7 @@ struct ra_context::compaction::anchor::PreservedItem
 struct ra_context::compaction::anchor::PreservedSegment
 struct ra_context::compaction::summary::CompactionSummary
 struct ra_context::compaction::summary::CompactionSummaryBuilder
+struct ra_context::eviction::ToolOutputTrimmer
 struct ra_context::window::ContextWindowConfig
 struct ra_context::window::ContextWindowTable
 struct ra_context::window::ContextWindowThresholdRatio

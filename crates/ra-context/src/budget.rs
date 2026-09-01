@@ -341,7 +341,11 @@ fn measure(blocks: &[ToolOutputBlock]) -> Result<Cost> {
 }
 
 /// The model-visible text of a block list, in the order the tool produced it.
-fn source_text(blocks: &[ToolOutputBlock]) -> String {
+///
+/// Shared with [`eviction`](crate::eviction) so the two stages that shrink a result read the same
+/// text from the same blocks; two joins that disagree on a separator disagree on every count taken
+/// from them.
+pub(crate) fn source_text(blocks: &[ToolOutputBlock]) -> String {
     blocks
         .iter()
         .filter_map(ToolOutputBlock::as_text)
@@ -353,7 +357,7 @@ fn source_text(blocks: &[ToolOutputBlock]) -> String {
 ///
 /// Serialization rather than a match on the variants: [`ToolOutputBlock`] is `#[non_exhaustive]`, so
 /// a match here would need a wildcard that silently prices a future block kind at zero.
-fn opaque_block_bytes(block: &ToolOutputBlock) -> Result<usize> {
+pub(crate) fn opaque_block_bytes(block: &ToolOutputBlock) -> Result<usize> {
     serde_json::to_string(block)
         .map(|serialized| serialized.len())
         .map_err(|error| {

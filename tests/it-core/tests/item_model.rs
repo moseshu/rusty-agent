@@ -317,3 +317,32 @@ fn test_item_model_10() {
     assert_eq!(keys, vec!["a", "z"]);
     assert!(item.unknown().is_empty());
 }
+
+#[test]
+fn replacing_a_tool_output_preserves_the_records_identity_and_metadata() {
+    let mut stored = serde_json::to_value(
+        ToolCallOutput::new(CallId::new("call-1"), json!("the complete result")).with_error(true),
+    )
+    .expect("a tool output serializes");
+    stored
+        .as_object_mut()
+        .expect("tool output data must be an object")
+        .insert("future_field".into(), json!({"keep": true}));
+    let original: ToolCallOutput =
+        serde_json::from_value(stored).expect("an older reader must read a newer output");
+
+    let projected = original.clone().with_output(json!("[Trimmed]"));
+
+    assert_eq!(projected.output(), &json!("[Trimmed]"));
+    assert_eq!(projected.call_id(), original.call_id());
+    assert!(
+        projected.is_error(),
+        "a replayed tool failure must not become an apparent success"
+    );
+    assert_eq!(projected.schema_version(), original.schema_version());
+    assert_eq!(
+        projected.unknown().get("future_field"),
+        original.unknown().get("future_field"),
+        "a field a newer build wrote still travels with the projection"
+    );
+}
