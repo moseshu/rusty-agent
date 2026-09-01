@@ -1,5 +1,7 @@
 # ra-context 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_context::archive::read_archived_history(session : & (impl Session + ? Sized), archive_ref : & ArchiveRef) -> Result < Option < ArchivedHistory > >
+const fn ra_context::archive::ArchivedHistory::archive_ref(& self) -> & ArchiveRef
 const fn ra_context::budget::ToolResultBudget::max_bytes(& self) -> usize
 const fn ra_context::budget::ToolResultBudget::max_tokens(& self) -> usize
 const fn ra_context::compaction::CompactionAssessment::usage(& self) -> ContextUsage
@@ -41,10 +43,12 @@ const ra_context::eviction::DEFAULT_RECENT_TURNS: usize
 const ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO: ContextWindowThresholdRatio
 enum ra_context::compaction::CompactionReason
 enum ra_context::compaction::summary::SummarySlot
+fn ra_context::archive::ArchivedHistory::items(& self) -> & [RunItem]
 fn ra_context::budget::ToolResultBudget::new(max_bytes : usize, max_tokens : usize) -> Result < Self >
 fn ra_context::budget::ToolResultBudget::project_output(& self, run_id : & RunId, call_id : & CallId, output : ToolOutput) -> Result < ToolOutput >
 fn ra_context::compaction::CompactedModelInput::compacted_item_ids(& self) -> & [ItemId]
 fn ra_context::compaction::CompactedModelInput::items(& self) -> & [ModelInputItem]
+fn ra_context::compaction::CompactedModelInput::with_archive_ref(mut self, archive_ref : ArchiveRef, notice : Option < String >) -> Self
 fn ra_context::compaction::CompactionAssessment::is_required(& self) -> bool
 fn ra_context::compaction::CompactionAssessment::reasons(& self) -> & [CompactionReason]
 fn ra_context::compaction::CompactionLimits::assess(self, usage : ContextUsage) -> CompactionAssessment
@@ -89,6 +93,7 @@ mod ra_context::compaction::summary
 mod ra_context::eviction
 mod ra_context::preflight
 mod ra_context::window
+struct ra_context::archive::ArchivedHistory
 struct ra_context::budget::ToolResultBudget
 struct ra_context::compaction::CompactedModelInput
 struct ra_context::compaction::CompactionAssessment

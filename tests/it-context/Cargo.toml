@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 ra-core = { path = "../../crates/ra-core" }
 ra-context = { path = "../../crates/ra-context" }
+ra-session = { path = "../../crates/ra-session", default-features = false }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

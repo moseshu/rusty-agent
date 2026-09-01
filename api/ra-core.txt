@@ -185,6 +185,7 @@ const fn ra_core::item::RunItem::unknown(& self) -> & Unknown
 const fn ra_core::item::RunItemKind::is_interruption(& self) -> bool
 const fn ra_core::item::RunItemKind::label(& self) -> & 'static str
 const fn ra_core::item::RunItemKind::requires_action_binding(& self) -> bool
+const fn ra_core::item::compaction::Compaction::archive_ref(& self) -> Option < & ArchiveRef >
 const fn ra_core::item::compaction::Compaction::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::compaction::Compaction::unknown(& self) -> & Unknown
 const fn ra_core::item::content::Base64FileSource::schema_version(& self) -> SchemaVersion
@@ -1030,9 +1031,17 @@ fn ra_core::item::SessionData::get(& self, key : & str) -> Option < & Value >
 fn ra_core::item::SessionData::is_empty(& self) -> bool
 fn ra_core::item::SessionData::iter(& self) -> impl Iterator < Item = (& String , & Value) >
 fn ra_core::item::SessionData::new() -> Self
+fn ra_core::item::compaction::ArchiveRef::as_str(& self) -> & str
+fn ra_core::item::compaction::ArchiveRef::compaction_item_id(& self) -> Option < & ItemId >
+fn ra_core::item::compaction::ArchiveRef::new(session_id : & SessionId, compaction_item_id : & ItemId) -> Result < Self >
+fn ra_core::item::compaction::ArchiveRef::session_id(& self) -> Option < & SessionId >
+fn ra_core::item::compaction::Compaction::archive_notice(& self) -> Option < & str >
 fn ra_core::item::compaction::Compaction::compacted_items(& self) -> & [ItemId]
+fn ra_core::item::compaction::Compaction::model_text(& self) -> Cow < '_ , str >
 fn ra_core::item::compaction::Compaction::new(summary : impl Into < String >, compacted_items : Vec < ItemId >) -> Self
+fn ra_core::item::compaction::Compaction::set_archive_ref(& mut self, archive_ref : ArchiveRef, notice : Option < String >)
 fn ra_core::item::compaction::Compaction::summary(& self) -> & str
+fn ra_core::item::compaction::Compaction::with_archive_ref(mut self, archive_ref : ArchiveRef, notice : Option < String >) -> Self
 fn ra_core::item::content::Base64FileSource::data(& self) -> & str
 fn ra_core::item::content::Base64FileSource::filename(& self) -> Option < & str >
 fn ra_core::item::content::Base64FileSource::new(data : impl Into < String >) -> Self
@@ -1656,6 +1665,7 @@ struct ra_core::item::ItemProvenance
 struct ra_core::item::RawProviderItem
 struct ra_core::item::RunItem
 struct ra_core::item::SessionData
+struct ra_core::item::compaction::ArchiveRef
 struct ra_core::item::compaction::Compaction
 struct ra_core::item::content::Base64FileSource
 struct ra_core::item::content::Base64ImageSource
