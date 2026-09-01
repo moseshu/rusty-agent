@@ -25,7 +25,7 @@
 use core::fmt;
 use std::sync::Arc;
 
-use crate::{event::HostEventSink, state::WorkStateHandle};
+use crate::{event::HostEventSink, state::WorkStateHandle, tool::ToolOutputProjector};
 
 /// Framework-owned ports handed to a tool, each behind its own accessor.
 ///
@@ -38,6 +38,7 @@ use crate::{event::HostEventSink, state::WorkStateHandle};
 pub struct ToolServices {
     work_state: Option<Arc<dyn WorkStateHandle>>,
     event_sink: Option<Arc<dyn HostEventSink>>,
+    output_projector: Option<Arc<dyn ToolOutputProjector>>,
 }
 
 impl ToolServices {
@@ -46,6 +47,7 @@ impl ToolServices {
         Self {
             work_state: None,
             event_sink: None,
+            output_projector: None,
         }
     }
 
@@ -58,6 +60,12 @@ impl ToolServices {
     /// Installs the host event sink for granular observability and UI streaming.
     pub fn with_event_sink(mut self, event_sink: Arc<dyn HostEventSink>) -> Self {
         self.event_sink = Some(event_sink);
+        self
+    }
+
+    /// Installs the context policy that projects completed tool output before it enters history.
+    pub fn with_output_projector(mut self, output_projector: Arc<dyn ToolOutputProjector>) -> Self {
+        self.output_projector = Some(output_projector);
         self
     }
 
@@ -76,6 +84,12 @@ impl ToolServices {
     pub fn event_sink(&self) -> Option<&Arc<dyn HostEventSink>> {
         self.event_sink.as_ref()
     }
+
+    /// The model-output projection policy, when the host configured one.
+    #[must_use]
+    pub fn output_projector(&self) -> Option<&Arc<dyn ToolOutputProjector>> {
+        self.output_projector.as_ref()
+    }
 }
 
 impl fmt::Debug for ToolServices {
@@ -85,6 +99,7 @@ impl fmt::Debug for ToolServices {
             .debug_struct("ToolServices")
             .field("work_state", &self.work_state.is_some())
             .field("event_sink", &self.event_sink.is_some())
+            .field("output_projector", &self.output_projector.is_some())
             .finish_non_exhaustive()
     }
 }

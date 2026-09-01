@@ -517,6 +517,7 @@ version = "0.0.1"
 dependencies = [
  "ra-core",
  "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
