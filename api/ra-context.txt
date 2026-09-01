@@ -2,6 +2,22 @@
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
 const fn ra_context::budget::ToolResultBudget::max_bytes(& self) -> usize
 const fn ra_context::budget::ToolResultBudget::max_tokens(& self) -> usize
+const fn ra_context::compaction::CompactionAssessment::usage(& self) -> ContextUsage
+const fn ra_context::compaction::CompactionLimits::max_items(self) -> Option < usize >
+const fn ra_context::compaction::CompactionLimits::max_single_item_tokens(self) -> Option < usize >
+const fn ra_context::compaction::CompactionLimits::max_total_tokens(self) -> Option < usize >
+const fn ra_context::compaction::CompactionReason::label(self) -> & 'static str
+const fn ra_context::compaction::ContextUsage::item_count(self) -> usize
+const fn ra_context::compaction::ContextUsage::largest_item_tokens(self) -> usize
+const fn ra_context::compaction::ContextUsage::total_tokens(self) -> usize
+const fn ra_context::compaction::anchor::AnchorRetention::head_items(self) -> usize
+const fn ra_context::compaction::anchor::AnchorRetention::max_anchor_items(self) -> usize
+const fn ra_context::compaction::anchor::AnchorRetention::max_retained_items(self) -> usize
+const fn ra_context::compaction::anchor::AnchorRetention::tail_items(self) -> usize
+const fn ra_context::compaction::anchor::PreservedItem < T >::item(& self) -> & T
+const fn ra_context::compaction::anchor::PreservedItem < T >::source_index(& self) -> usize
+const fn ra_context::compaction::summary::SummarySlot::heading(self) -> & 'static str
+const fn ra_context::compaction::summary::SummarySlot::number(self) -> usize
 const fn ra_context::window::ContextWindowConfig::compaction_threshold_ratio(& self) -> ContextWindowThresholdRatio
 const fn ra_context::window::ContextWindowConfig::context_windows(& self) -> & BTreeMap < String , u64 >
 const fn ra_context::window::ContextWindowConfig::table(& self) -> & ContextWindowTable
@@ -10,9 +26,35 @@ const fn ra_context::window::ContextWindowThresholdRatio::basis_points(self) -> 
 const fn ra_context::window::ContextWindowThresholdRatio::from_basis_points(basis_points : u16) -> Self
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_BYTES: usize
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS: usize
+const ra_context::compaction::summary::SummarySlot::ALL: [Self ; 9]
 const ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO: ContextWindowThresholdRatio
+enum ra_context::compaction::CompactionReason
+enum ra_context::compaction::summary::SummarySlot
 fn ra_context::budget::ToolResultBudget::new(max_bytes : usize, max_tokens : usize) -> Result < Self >
 fn ra_context::budget::ToolResultBudget::project_output(& self, run_id : & RunId, call_id : & CallId, output : ToolOutput) -> Result < ToolOutput >
+fn ra_context::compaction::CompactionAssessment::is_required(& self) -> bool
+fn ra_context::compaction::CompactionAssessment::reasons(& self) -> & [CompactionReason]
+fn ra_context::compaction::CompactionLimits::assess(self, usage : ContextUsage) -> CompactionAssessment
+fn ra_context::compaction::CompactionLimits::ensure_converges_with(self, retention : AnchorRetention) -> Result < () >
+fn ra_context::compaction::CompactionLimits::for_model(context_windows : & ContextWindowConfig, model : & str, max_items : Option < usize >, max_single_item_tokens : Option < usize >) -> Result < Option < Self > >
+fn ra_context::compaction::CompactionLimits::new(max_items : Option < usize >, max_single_item_tokens : Option < usize >, max_total_tokens : Option < usize >) -> Result < Self >
+fn ra_context::compaction::ContextUsage::estimate_model_input(items : & [ModelInputItem]) -> Result < Self >
+fn ra_context::compaction::ContextUsage::new(item_count : usize, largest_item_tokens : usize, total_tokens : usize) -> Result < Self >
+fn ra_context::compaction::anchor::AnchorRetention::new(head_items : usize, max_anchor_items : usize, tail_items : usize) -> Result < Self >
+fn ra_context::compaction::anchor::AnchorRetention::preserve< T : Clone >(self, items : & [T], anchor_indices : impl IntoIterator < Item = usize >) -> Result < PreservedSegment < T > >
+fn ra_context::compaction::anchor::PreservedSegment < T >::anchor(& self) -> & [PreservedItem < T >]
+fn ra_context::compaction::anchor::PreservedSegment < T >::head(& self) -> & [PreservedItem < T >]
+fn ra_context::compaction::anchor::PreservedSegment < T >::is_empty(& self) -> bool
+fn ra_context::compaction::anchor::PreservedSegment < T >::iter(& self) -> impl Iterator < Item = & PreservedItem < T > >
+fn ra_context::compaction::anchor::PreservedSegment < T >::len(& self) -> usize
+fn ra_context::compaction::anchor::PreservedSegment < T >::tail(& self) -> & [PreservedItem < T >]
+fn ra_context::compaction::summary::CompactionSummary::render(& self) -> String
+fn ra_context::compaction::summary::CompactionSummary::section(& self, slot : SummarySlot) -> Option < & str >
+fn ra_context::compaction::summary::CompactionSummary::user_messages(& self) -> & [String]
+fn ra_context::compaction::summary::CompactionSummaryBuilder::build(self) -> Result < CompactionSummary >
+fn ra_context::compaction::summary::CompactionSummaryBuilder::new() -> Self
+fn ra_context::compaction::summary::CompactionSummaryBuilder::with_section(mut self, slot : SummarySlot, content : impl Into < String >) -> Result < Self >
+fn ra_context::compaction::summary::CompactionSummaryBuilder::with_user_messages(mut self, messages : Vec < String >) -> Self
 fn ra_context::window::ContextWindowConfig::compaction_threshold(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::context_window(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::new(context_windows : BTreeMap < String , u64 >, compaction_threshold_ratio : ContextWindowThresholdRatio) -> Result < Self >
@@ -28,6 +70,26 @@ mod ra_context::eviction
 mod ra_context::preflight
 mod ra_context::window
 struct ra_context::budget::ToolResultBudget
+struct ra_context::compaction::CompactionAssessment
+struct ra_context::compaction::CompactionLimits
+struct ra_context::compaction::ContextUsage
+struct ra_context::compaction::anchor::AnchorRetention
+struct ra_context::compaction::anchor::PreservedItem
+struct ra_context::compaction::anchor::PreservedSegment
+struct ra_context::compaction::summary::CompactionSummary
+struct ra_context::compaction::summary::CompactionSummaryBuilder
 struct ra_context::window::ContextWindowConfig
 struct ra_context::window::ContextWindowTable
 struct ra_context::window::ContextWindowThresholdRatio
+variant ra_context::compaction::CompactionReason::ItemCount
+variant ra_context::compaction::CompactionReason::SingleItemTokens
+variant ra_context::compaction::CompactionReason::TotalTokens
+variant ra_context::compaction::summary::SummarySlot::AllUserMessages
+variant ra_context::compaction::summary::SummarySlot::CurrentWork
+variant ra_context::compaction::summary::SummarySlot::ErrorsAndFixes
+variant ra_context::compaction::summary::SummarySlot::FilesAndCodeSections
+variant ra_context::compaction::summary::SummarySlot::KeyTechnicalConcepts
+variant ra_context::compaction::summary::SummarySlot::OptionalNextStep
+variant ra_context::compaction::summary::SummarySlot::PendingTasks
+variant ra_context::compaction::summary::SummarySlot::PrimaryRequestAndIntent
+variant ra_context::compaction::summary::SummarySlot::ProblemSolving

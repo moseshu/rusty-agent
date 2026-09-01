@@ -90,8 +90,14 @@ fn two_decimal_ratios_survive_binary_rounding() {
         assert_eq!(ratio.basis_points(), basis_points);
     }
 
-    for invalid in ["0.60001", "0.123456", "1.00001", "-0.1"] {
-        assert!(serde_json::from_str::<ContextWindowThresholdRatio>(invalid).is_err());
+    // A zero threshold asks for compaction before every request, and no history can satisfy that.
+    // It is refused where it is written rather than at every later trigger resolution.
+    assert!(ContextWindowThresholdRatio::new(0).is_err());
+    for invalid in ["0.60001", "0.123456", "1.00001", "-0.1", "0.0", "0"] {
+        assert!(
+            serde_json::from_str::<ContextWindowThresholdRatio>(invalid).is_err(),
+            "`{invalid}` should not parse as a threshold ratio"
+        );
     }
 }
 

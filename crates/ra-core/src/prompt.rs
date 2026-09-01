@@ -451,6 +451,14 @@ impl fmt::Debug for PromptSection {
     }
 }
 
+/// Characters [`estimate_tokens`] charges to one token.
+///
+/// Standard rule-of-thumb for English prose and code. It is public because inverting the estimator
+/// is what turns a token allowance into a character allowance, and what lets a caller price a
+/// character count it accumulated itself. A private copy of this number in each of those callers
+/// would let them and the estimator disagree about the same text.
+pub const CHARS_PER_TOKEN: usize = 4;
+
 /// Estimates a token count from character length.
 ///
 /// This is the single estimator the whole prompt path shares. A second copy elsewhere would drift
@@ -461,8 +469,7 @@ pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    // Standard rule-of-thumb: ~4 characters per token for English prose and code.
-    text.chars().count().div_ceil(4)
+    text.chars().count().div_ceil(CHARS_PER_TOKEN)
 }
 
 /// Role profiles for specialized agent modes.
