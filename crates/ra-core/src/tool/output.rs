@@ -39,11 +39,12 @@ use serde_json::Value;
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
-    item::{FileBlock, ImageBlock},
+    item::{CallId, FileBlock, ImageBlock},
+    state::RunId,
 };
 
 /// Current tool-output schema version.
-pub const TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+pub const TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
 
 /// A provider-neutral tool result.
 #[non_exhaustive]
@@ -52,6 +53,8 @@ pub struct ToolOutput {
     schema_version: SchemaVersion,
     blocks: Vec<ToolOutputBlock>,
     metadata: ObservationMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_excerpt: Option<ModelExcerpt>,
     #[serde(flatten, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -65,6 +68,8 @@ struct StructuredToolOutputWire {
     blocks: Vec<ToolOutputBlock>,
     #[serde(default)]
     metadata: ObservationMetadata,
+    #[serde(default)]
+    model_excerpt: Option<ModelExcerpt>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -157,6 +162,7 @@ impl ToolOutput {
             schema_version: TOOL_OUTPUT_SCHEMA_VERSION,
             blocks,
             metadata: ObservationMetadata::new(),
+            model_excerpt: None,
             unknown: Unknown::new(),
         })
     }
@@ -178,6 +184,7 @@ impl ToolOutput {
             schema_version: TOOL_OUTPUT_SCHEMA_VERSION,
             blocks: vec![block],
             metadata: ObservationMetadata::new(),
+            model_excerpt: None,
             unknown: Unknown::new(),
         }
     }
@@ -186,6 +193,32 @@ impl ToolOutput {
     #[must_use]
     pub fn with_metadata(mut self, metadata: ObservationMetadata) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Replaces the provider-facing projection while retaining the complete blocks for storage.
+    ///
+    /// A context stage owns this field rather than a tool: the tool reports what it observed, and
+    /// the host decides how much of that observation can enter the next model request.  Keeping
+    /// the complete blocks beside the excerpt makes the session record authoritative without
+    /// duplicating untrimmed output; this field is absent until a projection actually differs.
+    #[must_use]
+    pub fn with_model_excerpt(mut self, model_excerpt: ModelExcerpt) -> Self {
+        self.model_excerpt = Some(model_excerpt);
+        self
+    }
+
+    /// Applies an additive model-facing projection without changing the complete observation.
+    ///
+    /// The runtime, rather than a context-policy implementation, owns this transition so a
+    /// projector cannot replace the result's blocks or overwrite metadata a tool already recorded.
+    #[must_use]
+    pub fn with_model_projection(mut self, projection: ToolOutputProjection) -> Self {
+        if let Some(model_excerpt) = projection.model_excerpt {
+            self.model_excerpt = Some(model_excerpt);
+        }
+        self.metadata.truncations.extend(projection.truncations);
+        self.metadata.guidance.extend(projection.guidance);
         self
     }
 
@@ -222,6 +255,9 @@ impl ToolOutput {
                 let mut output = Self::new(wire.blocks)?;
                 output.schema_version = wire.schema_version;
                 output.metadata = wire.metadata;
+                // No re-validation here: `ModelExcerpt` enforces its own invariants while being
+                // read, so an excerpt cannot reach this point in a shape its constructor rejects.
+                output.model_excerpt = wire.model_excerpt;
                 output.unknown = wire.unknown;
                 Ok(output)
             }
@@ -253,6 +289,12 @@ impl ToolOutput {
         &self.metadata
     }
 
+    /// The bounded model-facing projection, when a context stage installed one.
+    #[must_use]
+    pub const fn model_excerpt(&self) -> Option<&ModelExcerpt> {
+        self.model_excerpt.as_ref()
+    }
+
     /// Mutable metadata, for the stages that observe a result after the tool returned.
     ///
     /// A future context-budget trimmer is the caller this exists for: it cuts a stored result long
@@ -281,11 +323,24 @@ impl ToolOutput {
     /// that may still add to the metadata.
     #[must_use]
     pub fn model_blocks(&self) -> Vec<ToolOutputBlock> {
-        let mut blocks = Vec::with_capacity(self.blocks.len() + 1);
+        let source = self
+            .model_excerpt
+            .as_ref()
+            .map_or_else(|| self.blocks.as_slice(), ModelExcerpt::blocks);
+        let mut blocks = Vec::with_capacity(source.len() + 2);
         if let Some(note) = self.metadata.render() {
             blocks.push(ToolOutputBlock::text(note));
         }
-        blocks.extend(self.blocks.iter().cloned());
+        blocks.extend(source.iter().cloned());
+        if let Some(excerpt) = &self.model_excerpt {
+            // A locator, not an offer. Naming the record lets a person reading the session find the
+            // complete result; promising the *model* it can fetch one would invite a call that no
+            // tool answers, and the retrieval port does not exist yet.
+            blocks.push(ToolOutputBlock::text(format!(
+                "The complete result is retained in the session record as artifact `{}`.",
+                excerpt.artifact_ref()
+            )));
+        }
         blocks
     }
 
@@ -294,6 +349,238 @@ impl ToolOutput {
     pub const fn unknown(&self) -> &Unknown {
         &self.unknown
     }
+}
+
+/// Stable name for the complete result retained outside the model excerpt.
+///
+/// This is an identity, not a path or a promise that this process can fetch the artifact. This
+/// milestone only establishes the link between a bounded prompt projection and the authoritative
+/// session record; a later one gives session and archive implementations the retrieval port.
+///
+/// **A reference must identify one result across the whole store**, so whoever mints one scopes it
+/// by the run as well as the call: a provider only promises a call identifier is unique within its
+/// own conversation, and two sessions reusing `call-1` would otherwise name the same artifact.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ArtifactRef(String);
+
+impl ArtifactRef {
+    /// Creates a stable artifact reference.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+
+    /// String representation of the opaque reference.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(value: &str) -> Result<()> {
+        if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+            return Err(Error::caller(
+                "an artifact reference must be non-empty, trimmed, and contain no control characters",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactRef {
+    /// Reads a stored reference through the same rule the constructor applies.
+    ///
+    /// Validation written only in the constructor is validation not written: checkpoint and rollout
+    /// reach these values by deserializing them, so a derived impl would let an empty or
+    /// control-character reference into a record that every later reader trusts.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+impl core::fmt::Display for ArtifactRef {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Bounded blocks sent to a model in place of a complete tool result.
+///
+/// The companion [`ArtifactRef`] names the full result retained by the session.  The excerpt is
+/// intentionally a block list rather than a text field: a context policy may retain structured
+/// facts while dropping an opaque image or file without pretending that either was text.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelExcerpt {
+    schema_version: SchemaVersion,
+    blocks: Vec<ToolOutputBlock>,
+    artifact_ref: ArtifactRef,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+#[derive(Deserialize)]
+struct ModelExcerptWire {
+    #[serde(default = "model_excerpt_schema_version")]
+    schema_version: SchemaVersion,
+    blocks: Vec<ToolOutputBlock>,
+    artifact_ref: ArtifactRef,
+    #[serde(flatten, default)]
+    unknown: Unknown,
+}
+
+impl<'de> Deserialize<'de> for ModelExcerpt {
+    /// Reads a stored excerpt through the same guard [`ModelExcerpt::new`] applies.
+    ///
+    /// A derived impl would admit a zero-block excerpt, and that value answers its tool call with
+    /// nothing the moment [`ToolOutput::model_blocks`] projects it — one turn later, as a provider
+    /// rejection, rather than here where the record can be named.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelExcerptWire::deserialize(deserializer)?;
+        let excerpt = Self {
+            schema_version: wire.schema_version,
+            blocks: wire.blocks,
+            artifact_ref: wire.artifact_ref,
+            unknown: wire.unknown,
+        };
+        excerpt.validate().map_err(D::Error::custom)?;
+        Ok(excerpt)
+    }
+}
+
+/// Current model-excerpt schema version.
+pub const MODEL_EXCERPT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+const fn model_excerpt_schema_version() -> SchemaVersion {
+    MODEL_EXCERPT_SCHEMA_VERSION
+}
+
+impl ModelExcerpt {
+    /// Creates a non-empty provider-facing excerpt for one complete artifact.
+    pub fn new(blocks: Vec<ToolOutputBlock>, artifact_ref: ArtifactRef) -> Result<Self> {
+        let excerpt = Self {
+            schema_version: MODEL_EXCERPT_SCHEMA_VERSION,
+            blocks,
+            artifact_ref,
+            unknown: Unknown::new(),
+        };
+        excerpt.validate()?;
+        Ok(excerpt)
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Blocks the provider receives before the artifact-reference note.
+    #[must_use]
+    pub fn blocks(&self) -> &[ToolOutputBlock] {
+        &self.blocks
+    }
+
+    /// Stable reference to the complete result retained by the session/archive layer.
+    #[must_use]
+    pub const fn artifact_ref(&self) -> &ArtifactRef {
+        &self.artifact_ref
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+
+    /// The artifact reference is not re-checked here: [`ArtifactRef`] admits no invalid value,
+    /// whether it was constructed or deserialized.
+    fn validate(&self) -> Result<()> {
+        if self.blocks.is_empty() {
+            return Err(Error::caller(
+                "a model excerpt must carry at least one block; otherwise its tool call would be unanswered",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Additive changes a context policy may make to one complete tool result.
+///
+/// This deliberately does not carry the complete blocks or a replacement metadata value. The
+/// runtime applies it to the original [`ToolOutput`], preserving the record while allowing a
+/// policy to install a bounded model excerpt and append facts about that projection.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutputProjection {
+    model_excerpt: Option<ModelExcerpt>,
+    truncations: Vec<Truncation>,
+    guidance: Vec<String>,
+}
+
+impl ToolOutputProjection {
+    /// Creates a projection that leaves the model-facing result unchanged.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            model_excerpt: None,
+            truncations: Vec::new(),
+            guidance: Vec::new(),
+        }
+    }
+
+    /// Replaces the model-facing excerpt while retaining complete blocks for storage.
+    #[must_use]
+    pub fn with_model_excerpt(mut self, model_excerpt: ModelExcerpt) -> Self {
+        self.model_excerpt = Some(model_excerpt);
+        self
+    }
+
+    /// Appends a fact about one stage that trimmed the result.
+    #[must_use]
+    pub fn with_truncation(mut self, truncation: Truncation) -> Self {
+        self.truncations.push(truncation);
+        self
+    }
+
+    /// Appends model-facing guidance produced by the context policy.
+    #[must_use]
+    pub fn with_guidance(mut self, guidance: impl Into<String>) -> Self {
+        self.guidance.push(guidance.into());
+        self
+    }
+}
+
+impl Default for ToolOutputProjection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Projects one complete tool result into the bounded form a model may receive.
+///
+/// The runtime owns the call boundary but not context policy, so it reaches a projector through
+/// [`crate::tool::ToolServices`]. Implementations can provide an excerpt and metadata additions,
+/// but cannot replace complete blocks or existing metadata; the runtime applies the returned
+/// [`ToolOutputProjection`] to the original [`ToolOutput`].
+///
+/// Both identifiers are passed because an [`ArtifactRef`] has to name one result across the whole
+/// store: a call identifier is unique only within the conversation the provider issued it for.
+pub trait ToolOutputProjector: Send + Sync + 'static {
+    /// Returns the additive model-facing projection for one completed call.
+    fn project(
+        &self,
+        run_id: &RunId,
+        call_id: &CallId,
+        output: &ToolOutput,
+    ) -> Result<ToolOutputProjection>;
 }
 
 /// One piece of a tool result.
@@ -382,6 +669,11 @@ impl ObservationMetadata {
     /// Appends a truncation in place, for stages that receive a finished result.
     pub fn push_truncation(&mut self, truncation: Truncation) {
         self.truncations.push(truncation);
+    }
+
+    /// Appends model-facing guidance in place for a stage that receives a finished result.
+    pub fn push_guidance(&mut self, guidance: impl Into<String>) {
+        self.guidance.push(guidance.into());
     }
 
     /// Adds a sentence suggesting what the model might do next.

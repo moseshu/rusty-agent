@@ -1,5 +1,11 @@
 # ra-context 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+const fn ra_context::budget::ToolResultBudget::max_bytes(& self) -> usize
+const fn ra_context::budget::ToolResultBudget::max_tokens(& self) -> usize
+const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_BYTES: usize
+const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS: usize
+fn ra_context::budget::ToolResultBudget::new(max_bytes : usize, max_tokens : usize) -> Result < Self >
+fn ra_context::budget::ToolResultBudget::project_output(& self, run_id : & RunId, call_id : & CallId, output : ToolOutput) -> Result < ToolOutput >
 mod ra_context::archive
 mod ra_context::budget
 mod ra_context::compaction
@@ -8,3 +14,4 @@ mod ra_context::compaction::summary
 mod ra_context::eviction
 mod ra_context::preflight
 mod ra_context::window
+struct ra_context::budget::ToolResultBudget

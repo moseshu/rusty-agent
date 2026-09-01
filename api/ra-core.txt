@@ -602,9 +602,13 @@ const fn ra_core::tool::origin::ToolOrigin::lookup_key(& self) -> & ToolLookupKe
 const fn ra_core::tool::origin::ToolOrigin::namespace(& self) -> Option < & ToolNamespace >
 const fn ra_core::tool::origin::ToolOrigin::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::origin::ToolOrigin::unknown(& self) -> & Unknown
+const fn ra_core::tool::output::ModelExcerpt::artifact_ref(& self) -> & ArtifactRef
+const fn ra_core::tool::output::ModelExcerpt::schema_version(& self) -> SchemaVersion
+const fn ra_core::tool::output::ModelExcerpt::unknown(& self) -> & Unknown
 const fn ra_core::tool::output::ObservationMetadata::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::output::ObservationMetadata::unknown(& self) -> & Unknown
 const fn ra_core::tool::output::ToolOutput::metadata(& self) -> & ObservationMetadata
+const fn ra_core::tool::output::ToolOutput::model_excerpt(& self) -> Option < & ModelExcerpt >
 const fn ra_core::tool::output::ToolOutput::schema_version(& self) -> SchemaVersion
 const fn ra_core::tool::output::ToolOutput::unknown(& self) -> & Unknown
 const fn ra_core::tool::output::Truncation::original_bytes(& self) -> u64
@@ -722,6 +726,7 @@ const ra_core::tool::options::DEFAULT_MAX_REPEAT_STREAK: NonZeroU32
 const ra_core::tool::options::TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_LOOKUP_KEY_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::origin::TOOL_ORIGIN_SCHEMA_VERSION: SchemaVersion
+const ra_core::tool::output::MODEL_EXCERPT_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::output::OBSERVATION_METADATA_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::output::TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::output::TRUNCATION_SCHEMA_VERSION: SchemaVersion
@@ -1463,9 +1468,14 @@ fn ra_core::tool::origin::ToolOrigin::namespaced(namespace : ToolNamespace, name
 fn ra_core::tool::origin::ToolOrigin::new(name : impl Into < String >) -> Result < Self >
 fn ra_core::tool::origin::ToolOrigin::qualified_name(& self) -> & str
 fn ra_core::tool::origin::ToolOrigin::validate(& self) -> Result < () >
+fn ra_core::tool::output::ArtifactRef::as_str(& self) -> & str
+fn ra_core::tool::output::ArtifactRef::new(value : impl Into < String >) -> Result < Self >
+fn ra_core::tool::output::ModelExcerpt::blocks(& self) -> & [ToolOutputBlock]
+fn ra_core::tool::output::ModelExcerpt::new(blocks : Vec < ToolOutputBlock >, artifact_ref : ArtifactRef) -> Result < Self >
 fn ra_core::tool::output::ObservationMetadata::guidance(& self) -> & [String]
 fn ra_core::tool::output::ObservationMetadata::is_truncated(& self) -> bool
 fn ra_core::tool::output::ObservationMetadata::new() -> Self
+fn ra_core::tool::output::ObservationMetadata::push_guidance(& mut self, guidance : impl Into < String >)
 fn ra_core::tool::output::ObservationMetadata::push_truncation(& mut self, truncation : Truncation)
 fn ra_core::tool::output::ObservationMetadata::render(& self) -> Option < String >
 fn ra_core::tool::output::ObservationMetadata::truncations(& self) -> & [Truncation]
@@ -1480,8 +1490,15 @@ fn ra_core::tool::output::ToolOutput::model_blocks(& self) -> Vec < ToolOutputBl
 fn ra_core::tool::output::ToolOutput::new(blocks : Vec < ToolOutputBlock >) -> Result < Self >
 fn ra_core::tool::output::ToolOutput::text(text : impl Into < String >) -> Self
 fn ra_core::tool::output::ToolOutput::with_metadata(mut self, metadata : ObservationMetadata) -> Self
+fn ra_core::tool::output::ToolOutput::with_model_excerpt(mut self, model_excerpt : ModelExcerpt) -> Self
+fn ra_core::tool::output::ToolOutput::with_model_projection(mut self, projection : ToolOutputProjection) -> Self
 fn ra_core::tool::output::ToolOutputBlock::as_text(& self) -> Option < & str >
 fn ra_core::tool::output::ToolOutputBlock::text(text : impl Into < String >) -> Self
+fn ra_core::tool::output::ToolOutputProjection::new() -> Self
+fn ra_core::tool::output::ToolOutputProjection::with_guidance(mut self, guidance : impl Into < String >) -> Self
+fn ra_core::tool::output::ToolOutputProjection::with_model_excerpt(mut self, model_excerpt : ModelExcerpt) -> Self
+fn ra_core::tool::output::ToolOutputProjection::with_truncation(mut self, truncation : Truncation) -> Self
+fn ra_core::tool::output::ToolOutputProjector::project(& self, run_id : & RunId, call_id : & CallId, output : & ToolOutput) -> Result < ToolOutputProjection >
 fn ra_core::tool::output::Truncation::new(stage : TruncationStage, original_bytes : u64, retained_bytes : u64) -> Self
 fn ra_core::tool::resource::ResourceClaim::conflicts_with(& self, other : & Self) -> bool
 fn ra_core::tool::resource::ResourceClaim::deduplicate(claims : impl IntoIterator < Item = Self >) -> Vec < Self >
@@ -1513,7 +1530,9 @@ fn ra_core::tool::schema::ToolSchema::to_model_definition(& self) -> ModelToolDe
 fn ra_core::tool::schema::ToolSchema::validate(& self) -> Result < () >
 fn ra_core::tool::schema::ToolSchema::with_description(mut self, description : impl Into < String >) -> Self
 fn ra_core::tool::services::ToolServices::event_sink(& self) -> Option < & Arc < dyn HostEventSink > >
+fn ra_core::tool::services::ToolServices::output_projector(& self) -> Option < & Arc < dyn ToolOutputProjector > >
 fn ra_core::tool::services::ToolServices::with_event_sink(mut self, event_sink : Arc < dyn HostEventSink >) -> Self
+fn ra_core::tool::services::ToolServices::with_output_projector(mut self, output_projector : Arc < dyn ToolOutputProjector >) -> Self
 fn ra_core::tool::services::ToolServices::with_work_state(mut self, work_state : Arc < dyn WorkStateHandle >) -> Self
 fn ra_core::tool::services::ToolServices::work_state(& self) -> Option < & dyn WorkStateHandle >
 fn ra_core::trace::SpanKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
@@ -1738,8 +1757,11 @@ struct ra_core::tool::options::ToolGuardrailId
 struct ra_core::tool::options::ToolOptions
 struct ra_core::tool::origin::ToolLookupKey
 struct ra_core::tool::origin::ToolOrigin
+struct ra_core::tool::output::ArtifactRef
+struct ra_core::tool::output::ModelExcerpt
 struct ra_core::tool::output::ObservationMetadata
 struct ra_core::tool::output::ToolOutput
+struct ra_core::tool::output::ToolOutputProjection
 struct ra_core::tool::output::Truncation
 struct ra_core::tool::resource::ResourceClaim
 struct ra_core::tool::resource::ResourceId
@@ -1761,6 +1783,7 @@ trait ra_core::prompt::DynamicPromptHandler
 trait ra_core::session::port::Session
 trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
+trait ra_core::tool::output::ToolOutputProjector
 trait ra_core::tool::schema::ToolInput
 trait ra_core::tool::schema::ToolInputRequirements
 type ra_core::agent::AgentDefinition

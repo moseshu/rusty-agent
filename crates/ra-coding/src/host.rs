@@ -2,6 +2,7 @@
 
 use std::{fmt, io, path::Path, sync::Arc};
 
+use ra_context::budget::ToolResultBudget;
 use ra_core::{
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
@@ -90,9 +91,14 @@ impl CodingHost {
         &self.event_sink
     }
 
-    /// Constructs [`ToolServices`] equipped with this host's event sink.
+    /// Constructs [`ToolServices`] with event routing and the coding product's result budget.
+    ///
+    /// The result budget is a host policy, not a tool setting: all completed observations keep
+    /// their full session form, while the runtime projects only an oversized model-facing excerpt.
     pub fn build_tool_services(&self) -> ToolServices {
-        ToolServices::new().with_event_sink(Arc::clone(&self.event_sink))
+        ToolServices::new()
+            .with_event_sink(Arc::clone(&self.event_sink))
+            .with_output_projector(Arc::new(ToolResultBudget::default()))
     }
 
     /// Creates the coding product's workspace-confined patch tool.

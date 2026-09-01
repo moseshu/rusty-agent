@@ -7,6 +7,7 @@ use ra_core::{
         ProviderFileSource, UrlSource,
     },
     tool::{
+        ArtifactRef, MODEL_EXCERPT_SCHEMA_VERSION, ModelExcerpt,
         OBSERVATION_METADATA_SCHEMA_VERSION, ObservationMetadata, TOOL_OUTPUT_SCHEMA_VERSION,
         ToolOutput, ToolOutputBlock, Truncation, TruncationStage,
     },
@@ -316,4 +317,111 @@ fn test_tool_output_16() {
         OBSERVATION_METADATA_SCHEMA_VERSION
     );
     assert!(output.unknown().is_empty());
+}
+
+#[test]
+fn test_tool_output_17() {
+    let artifact = ArtifactRef::new("tool-output/72756e/63616c6c").expect("a stable ref");
+    let excerpt = ModelExcerpt::new(vec![ToolOutputBlock::text("head\n...\ntail")], artifact)
+        .expect("a non-empty excerpt");
+    let output = ToolOutput::text("complete result").with_model_excerpt(excerpt);
+
+    assert_eq!(output.as_text(), Some("complete result"));
+    assert_eq!(
+        output
+            .model_excerpt()
+            .expect("the excerpt is installed")
+            .schema_version(),
+        MODEL_EXCERPT_SCHEMA_VERSION
+    );
+    assert!(
+        output.model_blocks()[0]
+            .as_text()
+            .is_some_and(|text| text.contains("head"))
+    );
+    // The model is told where the record is, not offered a fetch no tool answers.
+    let note = output
+        .model_blocks()
+        .last()
+        .and_then(ToolOutputBlock::as_text)
+        .expect("the artifact note")
+        .to_owned();
+    assert!(note.contains("artifact `tool-output/72756e/63616c6c`"));
+    assert!(note.contains("retained in the session record"));
+    // The complete block is not what the provider receives.
+    assert!(
+        !output
+            .model_blocks()
+            .iter()
+            .filter_map(ToolOutputBlock::as_text)
+            .any(|text| text == "complete result")
+    );
+}
+
+/// Validation written only in a constructor is validation not written: rollout and checkpoint reach
+/// these values by deserializing them.
+#[test]
+fn test_tool_output_18() {
+    let empty_blocks = json!({
+        "schema_version": 2,
+        "blocks": [{ "type": "text", "text": "complete result" }],
+        "model_excerpt": {
+            "schema_version": 1,
+            "blocks": [],
+            "artifact_ref": "tool-output/empty"
+        }
+    });
+    let error = ToolOutput::from_stored(&empty_blocks).expect_err("an empty excerpt is malformed");
+    assert!(
+        error
+            .to_string()
+            .contains("model excerpt must carry at least one block")
+    );
+
+    for reference in ["", "   ", " padded ", "tool-output/\u{7}bell"] {
+        let payload = json!({
+            "schema_version": 2,
+            "blocks": [{ "type": "text", "text": "complete result" }],
+            "model_excerpt": {
+                "schema_version": 1,
+                "blocks": [{ "type": "text", "text": "head" }],
+                "artifact_ref": reference
+            }
+        });
+        let error = ToolOutput::from_stored(&payload)
+            .expect_err("a stored artifact reference is held to the constructor's rule");
+        assert!(
+            error.to_string().contains("artifact reference"),
+            "unexpected rejection for {reference:?}: {error}"
+        );
+    }
+
+    // A reference that satisfies the rule still round-trips, excerpt and all.
+    let readable = json!({
+        "schema_version": 2,
+        "blocks": [{ "type": "text", "text": "complete result" }],
+        "model_excerpt": {
+            "schema_version": 1,
+            "blocks": [{ "type": "text", "text": "head" }],
+            "artifact_ref": "tool-output/72756e/63616c6c"
+        }
+    });
+    let output = ToolOutput::from_stored(&readable)
+        .expect("a well-formed excerpt reads")
+        .expect("it is a tool result");
+    assert_eq!(
+        output
+            .model_excerpt()
+            .expect("the excerpt survived")
+            .artifact_ref()
+            .as_str(),
+        "tool-output/72756e/63616c6c"
+    );
+    let rewritten = serde_json::to_value(&output).expect("it serializes");
+    assert_eq!(
+        ToolOutput::from_stored(&rewritten)
+            .expect("what this build wrote, it reads back")
+            .expect("it is a tool result"),
+        output
+    );
 }

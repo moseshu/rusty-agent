@@ -413,6 +413,10 @@ pub(crate) async fn dispatch_tool_with_admission(
     // 8. Output guardrail, on the result the tool actually produced.
     check_output_guardrails(&options)?;
 
+    // 9. Context projection happens after the guardrail has inspected the complete observation
+    // and immediately before the record is made.  The stored ToolOutput retains those complete
+    // blocks; only its model-facing excerpt changes.
+    let output = project_output(&request, output)?;
     observed_success(&request.call_id, &output)
 }
 
@@ -545,7 +549,10 @@ pub(crate) async fn shape_failure(
                 .run(tool.handle_failure(&context, &error))
                 .await??
             {
-                Some(output) => observed(&request.call_id, &output, Some(error.code())),
+                Some(output) => {
+                    let output = project_output(request, output)?;
+                    observed(&request.call_id, &output, Some(error.code()))
+                }
                 None if is_invalid_input(&error) => {
                     Ok(observed_failure(&request.call_id, name, &error))
                 }
@@ -555,6 +562,21 @@ pub(crate) async fn shape_failure(
         handling => Err(Error::caller(format!(
             "tool `{name}` uses an unsupported failure handling policy `{handling:?}`"
         ))),
+    }
+}
+
+/// Applies the host's context policy without giving the runtime a dependency on its implementation.
+///
+/// An absent projector preserves the historical behavior: every tool result is sent in full. A
+/// configured projector can add an excerpt and projection metadata, while the runtime applies it
+/// to the original complete [`ToolOutput`] before serializing the authoritative session record.
+fn project_output(request: &ToolDispatchRequest, output: ToolOutput) -> Result<ToolOutput> {
+    match request.services.output_projector() {
+        Some(projector) => {
+            let projection = projector.project(request.run.run_id(), &request.call_id, &output)?;
+            Ok(output.with_model_projection(projection))
+        }
+        None => Ok(output),
     }
 }
 
