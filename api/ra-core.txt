@@ -496,6 +496,7 @@ const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::run::RunState::starting_agent(& self) -> Option < & AgentId >
 const fn ra_core::state::run::RunState::tokens_used(& self) -> u64
 const fn ra_core::state::run::RunState::tool_failure(& self) -> & ToolFailureTracker
+const fn ra_core::state::run::RunState::tool_output_references(& self) -> & ToolOutputReferenceTracker
 const fn ra_core::state::run::RunState::tool_use(& self) -> & ToolUseTracker
 const fn ra_core::state::run::RunState::unknown(& self) -> & Unknown
 const fn ra_core::state::run::RunState::usage_totals(& self) -> & Usage
@@ -524,6 +525,10 @@ const fn ra_core::state::tool_failure::ToolOutcome::evidence(& self) -> & Eviden
 const fn ra_core::state::tool_failure::ToolOutcome::identity(& self) -> & ToolUse
 const fn ra_core::state::tool_failure::ToolOutcome::input(& self) -> & ArgumentFingerprint
 const fn ra_core::state::tool_failure::ToolOutcome::is_refusal(& self) -> bool
+const fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::last_completed_turn(& self) -> Option < u64 >
+const fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::run_id(& self) -> & RunId
+const fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::schema_version(& self) -> SchemaVersion
+const fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_use::AgentToolUse::schema_version(& self) -> SchemaVersion
 const fn ra_core::state::tool_use::AgentToolUse::unknown(& self) -> & Unknown
 const fn ra_core::state::tool_use::ToolUseAttempt::call_id(& self) -> & CallId
@@ -721,6 +726,7 @@ const ra_core::state::run::RUN_STATE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::run::RUN_STATE_SCHEMA_VERSION_SUMMARIES: & [(SchemaVersion , & str)]
 const ra_core::state::tool_failure::TOOL_FAILURE_RECENT_LIMIT: usize
 const ra_core::state::tool_failure::TOOL_FAILURE_SCHEMA_VERSION: SchemaVersion
+const ra_core::state::tool_output_reference::TOOL_OUTPUT_REFERENCE_SCHEMA_VERSION: SchemaVersion
 const ra_core::state::tool_use::TOOL_USE_RECENT_LIMIT: usize
 const ra_core::state::tool_use::TOOL_USE_SCHEMA_VERSION: SchemaVersion
 const ra_core::tool::options::DEFAULT_MAX_NO_PROGRESS_STREAK: NonZeroU32
@@ -1344,6 +1350,7 @@ fn ra_core::state::run::RunState::set_pending_interruptions(& mut self, items : 
 fn ra_core::state::run::RunState::settle_interruption_resolution(& mut self, item_id : & ItemId) -> Result < () >
 fn ra_core::state::run::RunState::snapshot_event_seq(& mut self, allocator : & EventSeqAllocator)
 fn ra_core::state::run::RunState::start(run_id : RunId) -> Self
+fn ra_core::state::run::RunState::tool_output_references_mut(& mut self) -> & mut ToolOutputReferenceTracker
 fn ra_core::state::run::RunState::tool_use_mut(& mut self) -> & mut ToolUseTracker
 fn ra_core::state::run::RunState::trackers_mut(& mut self) -> (& mut ToolUseTracker , & mut ToolFailureTracker)
 fn ra_core::state::run::RunState::with_budget(mut self, budget : BudgetSnapshot) -> Self
@@ -1379,6 +1386,10 @@ fn ra_core::state::tool_failure::ToolOutcome::failed(identity : ToolUse, call_id
 fn ra_core::state::tool_failure::ToolOutcome::failure_code(& self) -> Option < & str >
 fn ra_core::state::tool_failure::ToolOutcome::refused(identity : ToolUse, call_id : CallId, arguments : & Value, observation : & Value) -> Self
 fn ra_core::state::tool_failure::ToolOutcome::succeeded(identity : ToolUse, call_id : CallId, arguments : & Value, observation : & Value) -> Self
+fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::is_unreferenced_for(& self, call_id : & CallId, current_turn : u64, max_unreferenced_turns : u64) -> bool
+fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::last_referenced_turn(& self, call_id : & CallId) -> Option < u64 >
+fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::new(run_id : RunId) -> Self
+fn ra_core::state::tool_output_reference::ToolOutputReferenceTracker::record_turn(& mut self, turn : u64, new_outputs : impl IntoIterator < Item = CallId >, referenced_outputs : impl IntoIterator < Item = CallId >) -> Result < () >
 fn ra_core::state::tool_use::AgentToolUse::entries(& self) -> & [ToolUseEntry]
 fn ra_core::state::tool_use::AgentToolUse::entry(& self, identity : & ToolUse) -> Option < & ToolUseEntry >
 fn ra_core::state::tool_use::AgentToolUse::run_calls(& self) -> u32
@@ -1483,6 +1494,7 @@ fn ra_core::tool::output::ArtifactRef::as_str(& self) -> & str
 fn ra_core::tool::output::ArtifactRef::new(value : impl Into < String >) -> Result < Self >
 fn ra_core::tool::output::ModelExcerpt::blocks(& self) -> & [ToolOutputBlock]
 fn ra_core::tool::output::ModelExcerpt::new(blocks : Vec < ToolOutputBlock >, artifact_ref : ArtifactRef) -> Result < Self >
+fn ra_core::tool::output::ModelInputProjector::project_model_input(& self, run_id : & RunId, current_turn : u64, references : & ToolOutputReferenceTracker, input : & [ModelInputItem]) -> Result < Vec < ModelInputItem > >
 fn ra_core::tool::output::ObservationMetadata::guidance(& self) -> & [String]
 fn ra_core::tool::output::ObservationMetadata::is_truncated(& self) -> bool
 fn ra_core::tool::output::ObservationMetadata::new() -> Self
@@ -1510,6 +1522,7 @@ fn ra_core::tool::output::ToolOutputProjection::with_guidance(mut self, guidance
 fn ra_core::tool::output::ToolOutputProjection::with_model_excerpt(mut self, model_excerpt : ModelExcerpt) -> Self
 fn ra_core::tool::output::ToolOutputProjection::with_truncation(mut self, truncation : Truncation) -> Self
 fn ra_core::tool::output::ToolOutputProjector::project(& self, run_id : & RunId, call_id : & CallId, output : & ToolOutput) -> Result < ToolOutputProjection >
+fn ra_core::tool::output::ToolOutputReferenceExtractor::referenced_tool_outputs(& self, response : & ModelResponse) -> Result < Vec < CallId > >
 fn ra_core::tool::output::Truncation::new(stage : TruncationStage, original_bytes : u64, retained_bytes : u64) -> Self
 fn ra_core::tool::resource::ResourceClaim::conflicts_with(& self, other : & Self) -> bool
 fn ra_core::tool::resource::ResourceClaim::deduplicate(claims : impl IntoIterator < Item = Self >) -> Vec < Self >
@@ -1601,6 +1614,7 @@ mod ra_core::session::port
 mod ra_core::state
 mod ra_core::state::run
 mod ra_core::state::tool_failure
+mod ra_core::state::tool_output_reference
 mod ra_core::state::tool_use
 mod ra_core::state::work
 mod ra_core::step
@@ -1749,6 +1763,7 @@ struct ra_core::state::tool_failure::ToolFailureEntry
 struct ra_core::state::tool_failure::ToolFailureRecord
 struct ra_core::state::tool_failure::ToolFailureTracker
 struct ra_core::state::tool_failure::ToolOutcome
+struct ra_core::state::tool_output_reference::ToolOutputReferenceTracker
 struct ra_core::state::tool_use::AgentToolUse
 struct ra_core::state::tool_use::ArgumentFingerprint
 struct ra_core::state::tool_use::ToolUseAttempt
@@ -1795,7 +1810,9 @@ trait ra_core::prompt::DynamicPromptHandler
 trait ra_core::session::port::Session
 trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
+trait ra_core::tool::output::ModelInputProjector
 trait ra_core::tool::output::ToolOutputProjector
+trait ra_core::tool::output::ToolOutputReferenceExtractor
 trait ra_core::tool::schema::ToolInput
 trait ra_core::tool::schema::ToolInputRequirements
 type ra_core::agent::AgentDefinition

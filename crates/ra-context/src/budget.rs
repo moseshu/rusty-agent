@@ -515,8 +515,12 @@ fn exceeded_causes(over_bytes: bool, over_tokens: bool) -> &'static str {
     }
 }
 
-/// Names one result by the run that produced it as well as the call that asked for it.
-fn artifact_ref(run_id: &RunId, call_id: &CallId) -> Result<ArtifactRef> {
+/// Names one result consistently for every context projection in this crate.
+///
+/// The run scope prevents a provider reusing a call ID in another conversation from pointing at
+/// the same retained result. Both the per-result budget and reference-based eviction need this
+/// exact identity, so keeping the encoding here prevents the two stages from drifting apart.
+pub(crate) fn artifact_ref(run_id: &RunId, call_id: &CallId) -> Result<ArtifactRef> {
     ArtifactRef::new(format!(
         "tool-output/{}/{}",
         hex(run_id.as_str()),

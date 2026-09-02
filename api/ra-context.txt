@@ -25,6 +25,10 @@ const fn ra_context::compaction::anchor::PreservedItem < T >::item(& self) -> & 
 const fn ra_context::compaction::anchor::PreservedItem < T >::source_index(& self) -> usize
 const fn ra_context::compaction::summary::SummarySlot::heading(self) -> & 'static str
 const fn ra_context::compaction::summary::SummarySlot::number(self) -> usize
+const fn ra_context::eviction::ToolOutputReferenceTrimmer::max_output_chars(& self) -> usize
+const fn ra_context::eviction::ToolOutputReferenceTrimmer::max_unreferenced_turns(& self) -> u64
+const fn ra_context::eviction::ToolOutputReferenceTrimmer::preview_chars(& self) -> usize
+const fn ra_context::eviction::ToolOutputReferenceTrimmer::trimmable_tools(& self) -> Option < & BTreeSet < String > >
 const fn ra_context::eviction::ToolOutputTrimmer::max_output_chars(& self) -> usize
 const fn ra_context::eviction::ToolOutputTrimmer::preview_chars(& self) -> usize
 const fn ra_context::eviction::ToolOutputTrimmer::recent_items(& self) -> usize
@@ -54,6 +58,7 @@ const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_BYTES: usize
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS: usize
 const ra_context::compaction::summary::SummarySlot::ALL: [Self ; 9]
 const ra_context::eviction::DEFAULT_MAX_OUTPUT_CHARS: usize
+const ra_context::eviction::DEFAULT_MAX_UNREFERENCED_TURNS: u64
 const ra_context::eviction::DEFAULT_PREVIEW_CHARS: usize
 const ra_context::eviction::DEFAULT_RECENT_ITEMS: usize
 const ra_context::eviction::DEFAULT_RECENT_TURNS: usize
@@ -93,6 +98,9 @@ fn ra_context::compaction::summary::CompactionSummaryBuilder::build(self) -> Res
 fn ra_context::compaction::summary::CompactionSummaryBuilder::new() -> Self
 fn ra_context::compaction::summary::CompactionSummaryBuilder::with_section(mut self, slot : SummarySlot, content : impl Into < String >) -> Result < Self >
 fn ra_context::compaction::summary::CompactionSummaryBuilder::with_user_messages(mut self, messages : Vec < String >) -> Self
+fn ra_context::eviction::ToolOutputReferenceTrimmer::new(max_unreferenced_turns : u64, max_output_chars : usize, preview_chars : usize) -> Result < Self >
+fn ra_context::eviction::ToolOutputReferenceTrimmer::trim_model_input(& self, run_id : & RunId, current_turn : u64, references : & ToolOutputReferenceTracker, input : & [ModelInputItem]) -> Result < Vec < ModelInputItem > >
+fn ra_context::eviction::ToolOutputReferenceTrimmer::with_trimmable_tools(mut self, trimmable_tools : Option < BTreeSet < String > >) -> Self
 fn ra_context::eviction::ToolOutputTrimmer::new(recent_turns : usize, max_output_chars : usize, preview_chars : usize) -> Result < Self >
 fn ra_context::eviction::ToolOutputTrimmer::trim_model_input(& self, input : & [ModelInputItem]) -> Result < Vec < ModelInputItem > >
 fn ra_context::eviction::ToolOutputTrimmer::with_recent_items(mut self, recent_items : usize) -> Result < Self >
@@ -130,6 +138,7 @@ struct ra_context::compaction::anchor::PreservedItem
 struct ra_context::compaction::anchor::PreservedSegment
 struct ra_context::compaction::summary::CompactionSummary
 struct ra_context::compaction::summary::CompactionSummaryBuilder
+struct ra_context::eviction::ToolOutputReferenceTrimmer
 struct ra_context::eviction::ToolOutputTrimmer
 struct ra_context::preflight::InputPreflight
 struct ra_context::preflight::InputPreflightAssessment

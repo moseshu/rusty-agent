@@ -35,8 +35,9 @@ use ra_core::{
     permission::{PermissionDecision, PermissionRule},
     state::{PendingControlRequest, RunId, RunState, ToolOutcome, ToolUse, WorkStateHandle},
     tool::{
-        Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
-        ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
+        ModelInputProjector, Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext,
+        ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        ToolServices,
     },
     usage::{RequestUsage, Usage},
 };
@@ -110,6 +111,24 @@ impl Model for ScriptedModel {
                 .map(|response| ModelStreamEvent::Completed(Box::new(response))),
         ])
         .boxed()
+    }
+}
+
+/// Records the runtime projection calls without changing their model input.
+struct RecordingInputProjector {
+    calls: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl ModelInputProjector for RecordingInputProjector {
+    fn project_model_input(
+        &self,
+        _run_id: &RunId,
+        current_turn: u64,
+        _references: &ra_core::state::ToolOutputReferenceTracker,
+        input: &[ModelInputItem],
+    ) -> Result<Vec<ModelInputItem>> {
+        self.calls.lock().unwrap().push((current_turn, input.len()));
+        Ok(input.to_vec())
     }
 }
 
@@ -938,6 +957,96 @@ async fn loops_between_tool_calls_and_final_answer_until_model_requests_nothing(
     assert_eq!(per_request, vec![(10, 4), (20, 6)]);
     assert_eq!(result.state().usage_totals(), &result.usage());
     assert_eq!(result.state().tokens_used(), 40);
+}
+
+#[tokio::test]
+async fn model_input_projector_runs_before_each_request_and_records_settled_outputs() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let config = RunConfig::new().with_model_input_projector(Arc::new(RecordingInputProjector {
+        calls: Arc::clone(&calls),
+    }));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(*calls.lock().unwrap(), vec![(1, 1), (2, 3)]);
+    assert_eq!(
+        result
+            .state()
+            .tool_output_references()
+            .last_referenced_turn(&CallId::new("call-1")),
+        Some(1)
+    );
+}
+
+/// The reference ledger measures staleness in turns of the whole run, so a resumed segment must
+/// keep counting where the last one stopped. A per-segment counter would restart at one, which
+/// both re-opens a turn the ledger has already recorded and makes every earlier result look newer
+/// than the segment now running.
+#[tokio::test]
+async fn a_resumed_segment_continues_the_reference_ledgers_turn_axis() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-2", "call-2", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let config = RunConfig::new().with_model_input_projector(Arc::new(RecordingInputProjector {
+        calls: Arc::clone(&calls),
+    }));
+    let mut carried = RunState::start(RunId::new("run-loop"));
+    carried
+        .tool_output_references_mut()
+        .record_turn(1, [CallId::new("call-1")], [])
+        .expect("an earlier segment recorded its output");
+    carried
+        .tool_output_references_mut()
+        .record_turn(2, [], [])
+        .expect("a completed turn without a tool output advances the ledger");
+    carried
+        .tool_output_references_mut()
+        .record_turn(3, [], [])
+        .expect("the completed-turn high-water mark survives another empty turn");
+    carried
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("the checkpoint represents a started run");
+
+    let result = Runner::run(
+        request(vec![tool], &model, &cancel)
+            .with_config(config)
+            .with_state(carried),
+    )
+    .await
+    .expect("resuming a run with a populated ledger succeeds");
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(4, 1), (5, 3)],
+        "the resumed segment's turns continue the run's axis rather than restarting at one"
+    );
+    assert_eq!(
+        result
+            .state()
+            .tool_output_references()
+            .last_referenced_turn(&CallId::new("call-2")),
+        Some(4)
+    );
+    assert_eq!(
+        result
+            .state()
+            .tool_output_references()
+            .last_referenced_turn(&CallId::new("call-1")),
+        Some(1),
+        "an earlier segment's retention facts survive the resume unchanged"
+    );
 }
 
 /// A resumed run keeps counting from what earlier segments spent, and the two totals that describe

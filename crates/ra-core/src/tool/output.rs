@@ -39,8 +39,8 @@ use serde_json::Value;
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
-    item::{CallId, FileBlock, ImageBlock},
-    state::RunId,
+    item::{CallId, FileBlock, ImageBlock, ModelInputItem, ModelResponse},
+    state::{RunId, ToolOutputReferenceTracker},
 };
 
 /// Current tool-output schema version.
@@ -581,6 +581,32 @@ pub trait ToolOutputProjector: Send + Sync + 'static {
         call_id: &CallId,
         output: &ToolOutput,
     ) -> Result<ToolOutputProjection>;
+}
+
+/// Projects the authoritative input into the bounded view sent to a model.
+///
+/// The runtime owns when a request is made but intentionally does not own context retention
+/// policy. Implementations receive the persisted output-reference ledger so they can retain
+/// results with a recent typed reference without parsing model narration themselves.
+pub trait ModelInputProjector: Send + Sync + 'static {
+    /// Returns the input view for the current model request.
+    fn project_model_input(
+        &self,
+        run_id: &RunId,
+        current_turn: u64,
+        references: &ToolOutputReferenceTracker,
+        input: &[ModelInputItem],
+    ) -> Result<Vec<ModelInputItem>>;
+}
+
+/// Extracts typed references to earlier tool outputs from one model response.
+///
+/// A response's prose is not a retention signal. Products that have a structured reference
+/// contract install this port; without one, the runtime records produced outputs but treats no
+/// response as an explicit reference.
+pub trait ToolOutputReferenceExtractor: Send + Sync + 'static {
+    /// Returns the tool-output call IDs explicitly referenced by this response.
+    fn referenced_tool_outputs(&self, response: &ModelResponse) -> Result<Vec<CallId>>;
 }
 
 /// One piece of a tool result.

@@ -34,12 +34,12 @@ use crate::{
         AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind, ToolApproval,
     },
     permission::{PermissionDecision, PermissionRule},
-    state::{ToolFailureTracker, ToolUseTracker},
+    state::{ToolFailureTracker, ToolOutputReferenceTracker, ToolUseTracker},
     usage::Usage,
 };
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -52,8 +52,12 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
         "Initial resumable run identity, accounting, history, and interruption records.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(2),
         "Persisted host approval answers, exact routing identities, and session permission rules.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted tool-output reference retention facts for context projections across resumes.",
     ),
 ];
 
@@ -497,6 +501,7 @@ pub struct RunState {
     tool_use: ToolUseTracker,
     #[serde(default)]
     tool_failure: ToolFailureTracker,
+    tool_output_references: ToolOutputReferenceTracker,
     #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -566,6 +571,8 @@ struct RunStateRecord {
     #[serde(default)]
     tool_failure: ToolFailureTracker,
     #[serde(default)]
+    tool_output_references: Option<ToolOutputReferenceTracker>,
+    #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default)]
     finish_reason: Option<FinishReason>,
@@ -613,6 +620,7 @@ impl TryFrom<RunStateRecord> for RunState {
             next_host_event_seq,
             tool_use,
             tool_failure,
+            tool_output_references,
             mut budget,
             finish_reason,
             nested_runs,
@@ -638,6 +646,14 @@ impl TryFrom<RunStateRecord> for RunState {
         } else {
             schema_version
         };
+        let tool_output_references = tool_output_references
+            .unwrap_or_else(|| ToolOutputReferenceTracker::new(run_id.clone()));
+        if tool_output_references.run_id() != &run_id {
+            return Err(Error::caller(format!(
+                "run state for `{run_id}` carries tool-output references for `{}`",
+                tool_output_references.run_id()
+            )));
+        }
 
         // Carried in as a total with no split, because that is all the older record said. It counts
         // against the token ceiling and stays out of the input and output counters that cache
@@ -680,6 +696,7 @@ impl TryFrom<RunStateRecord> for RunState {
             next_host_event_seq,
             tool_use,
             tool_failure,
+            tool_output_references,
             budget,
             finish_reason,
             nested_runs,
@@ -706,12 +723,14 @@ impl RunState {
     /// Creates empty state for a new run with the specified run identity.
     #[must_use]
     pub fn start(run_id: RunId) -> Self {
+        let tool_output_references = ToolOutputReferenceTracker::new(run_id.clone());
         Self {
             schema_version: RUN_STATE_SCHEMA_VERSION,
             run_id,
             next_host_event_seq: 0,
             tool_use: ToolUseTracker::new(),
             tool_failure: ToolFailureTracker::new(),
+            tool_output_references,
             budget: BudgetSnapshot::new(),
             finish_reason: None,
             nested_runs: Vec::new(),
@@ -841,6 +860,18 @@ impl RunState {
     #[doc(hidden)]
     pub fn trackers_mut(&mut self) -> (&mut ToolUseTracker, &mut ToolFailureTracker) {
         (&mut self.tool_use, &mut self.tool_failure)
+    }
+
+    /// Tool-output reference retention facts as of the most recently settled turn.
+    #[must_use]
+    pub const fn tool_output_references(&self) -> &ToolOutputReferenceTracker {
+        &self.tool_output_references
+    }
+
+    /// Mutable retention ledger for the runner's completed-turn recording path.
+    #[doc(hidden)]
+    pub fn tool_output_references_mut(&mut self) -> &mut ToolOutputReferenceTracker {
+        &mut self.tool_output_references
     }
 
     /// Recoverable budget accounting as of the most recently completed operation.
