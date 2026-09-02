@@ -1075,6 +1075,18 @@ impl RunState {
         &self.original_input
     }
 
+    /// Whether the model input is reconstructible from this state alone.
+    ///
+    /// False once a segment resumed with caller-supplied input: that projection is the caller's
+    /// and this state never recorded it, so rebuilding the request from
+    /// [`Self::original_input`] plus [`Self::generated_items`] would silently send something the
+    /// caller did not ask for. Anything that reprojects the history — context processing above
+    /// all — has to consult this rather than re-deriving it from its own view of the segment.
+    #[must_use]
+    pub const fn input_history_is_complete(&self) -> bool {
+        self.input_history_is_complete
+    }
+
     /// Authoritative records generated across every completed segment of this run.
     ///
     /// These are the run's in-memory resume projection. The session log may persist the same

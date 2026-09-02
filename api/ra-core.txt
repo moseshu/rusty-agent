@@ -6,6 +6,8 @@ async fn ra_core::agent::HandoffSpec::is_enabled(& self, context : & RunContext)
 async fn ra_core::agent::ToolUseBehaviorHandler::should_stop(& self, tool_results : & [ToolUseResult]) -> Result < bool >
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
+async fn ra_core::capability::ContextProcessor::process_context(& self, request : ContextProcessorRequest, summarizer : & dyn ContextSummarizer) -> Result < ContextProcessorResult >
+async fn ra_core::capability::ContextSummarizer::summarize(& self, request : ContextSummaryRequest) -> Result < ContextSummaryResponse >
 async fn ra_core::model::Model::close(& self) -> Result < () >
 async fn ra_core::model::Model::get_response(& self, request : ModelRequest) -> Result < ModelResponse >
 async fn ra_core::model::ModelProvider::close(& self) -> Result < () >
@@ -57,6 +59,12 @@ const fn ra_core::cancel::CancelScope::kind(& self) -> & ScopeKind
 const fn ra_core::cancel::CancelScope::token(& self) -> & CancellationToken
 const fn ra_core::cancel::Deadline::at(instant : Instant) -> Self
 const fn ra_core::cancel::Deadline::instant(self) -> Instant
+const fn ra_core::capability::ContextProcessorRequest::current_turn(& self) -> u64
+const fn ra_core::capability::ContextProcessorRequest::record_id(& self) -> & ItemId
+const fn ra_core::capability::ContextProcessorRequest::run_id(& self) -> & RunId
+const fn ra_core::capability::ContextSummaryRequest::output_schema(& self) -> Option < & ModelOutputSchema >
+const fn ra_core::capability::ContextSummaryResponse::response(& self) -> & ModelResponse
+const fn ra_core::capability::ContextSummaryResponse::usage(& self) -> & Usage
 const fn ra_core::compat::Compatibility::label(self) -> & 'static str
 const fn ra_core::compat::Compatibility::needs_migration(self) -> bool
 const fn ra_core::compat::SchemaVersion::compatibility(self, local : Self) -> Compatibility
@@ -490,6 +498,7 @@ const fn ra_core::state::run::RunState::budget(& self) -> & BudgetSnapshot
 const fn ra_core::state::run::RunState::current_agent(& self) -> Option < & AgentId >
 const fn ra_core::state::run::RunState::finish_reason(& self) -> Option < FinishReason >
 const fn ra_core::state::run::RunState::graph_cursor(& self) -> Option < & GraphCursor >
+const fn ra_core::state::run::RunState::input_history_is_complete(& self) -> bool
 const fn ra_core::state::run::RunState::next_host_event_seq(& self) -> u64
 const fn ra_core::state::run::RunState::run_id(& self) -> & RunId
 const fn ra_core::state::run::RunState::schema_version(& self) -> SchemaVersion
@@ -923,6 +932,25 @@ fn ra_core::cancel::Deadline::is_expired(self) -> bool
 fn ra_core::cancel::Deadline::remaining(self) -> Duration
 fn ra_core::cancel::ScopeKind::custom(label : impl Into < Cow < 'static , str > >) -> Self
 fn ra_core::cancel::ScopeKind::label(& self) -> & str
+fn ra_core::capability::ContextProcessorRequest::history(& self) -> & [RunItem]
+fn ra_core::capability::ContextProcessorRequest::input(& self) -> & [ModelInputItem]
+fn ra_core::capability::ContextProcessorRequest::model_name(& self) -> Option < & str >
+fn ra_core::capability::ContextProcessorRequest::new(run_id : RunId, current_turn : u64, record_id : ItemId, model_name : Option < String >, prefix : Vec < ModelInputItem >, history : Vec < RunItem >, suffix : Vec < ModelInputItem >, input : Vec < ModelInputItem >) -> Self
+fn ra_core::capability::ContextProcessorRequest::prefix(& self) -> & [ModelInputItem]
+fn ra_core::capability::ContextProcessorRequest::suffix(& self) -> & [ModelInputItem]
+fn ra_core::capability::ContextProcessorResult::generated_items(& self) -> & [RunItem]
+fn ra_core::capability::ContextProcessorResult::input(& self) -> & [ModelInputItem]
+fn ra_core::capability::ContextProcessorResult::model_responses(& self) -> & [ModelResponse]
+fn ra_core::capability::ContextProcessorResult::new(input : Vec < ModelInputItem >) -> Self
+fn ra_core::capability::ContextProcessorResult::usage(& self) -> Usage
+fn ra_core::capability::ContextProcessorResult::with_generated_items(mut self, generated_items : Vec < RunItem >) -> Self
+fn ra_core::capability::ContextProcessorResult::with_model_responses(mut self, model_responses : Vec < ModelResponse >) -> Self
+fn ra_core::capability::ContextSummaryRequest::input(& self) -> & [ModelInputItem]
+fn ra_core::capability::ContextSummaryRequest::instructions(& self) -> & str
+fn ra_core::capability::ContextSummaryRequest::new(input : Vec < ModelInputItem >, instructions : impl Into < String >) -> Self
+fn ra_core::capability::ContextSummaryRequest::with_output_schema(mut self, output_schema : ModelOutputSchema) -> Self
+fn ra_core::capability::ContextSummaryResponse::new(text : impl Into < String >, response : ModelResponse) -> Self
+fn ra_core::capability::ContextSummaryResponse::text(& self) -> & str
 fn ra_core::compat::Unknown::get(& self, key : & str) -> Option < & Value >
 fn ra_core::compat::Unknown::is_empty(& self) -> bool
 fn ra_core::compat::Unknown::iter(& self) -> impl Iterator < Item = (& String , & Value) >
@@ -1174,6 +1202,7 @@ fn ra_core::model::request::ModelRequest::with_cache_plan(mut self, cache_plan :
 fn ra_core::model::request::ModelRequest::with_continuation(mut self, continuation : ConversationContinuation) -> Self
 fn ra_core::model::request::ModelRequest::with_conversation_id(mut self, conversation_id : impl Into < ProviderConversationId >) -> Self
 fn ra_core::model::request::ModelRequest::with_handoffs(mut self, handoffs : Vec < ModelHandoffDefinition >) -> Self
+fn ra_core::model::request::ModelRequest::with_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_core::model::request::ModelRequest::with_output_schema(mut self, output_schema : ModelOutputSchema) -> Self
 fn ra_core::model::request::ModelRequest::with_previous_response_id(mut self, response_id : impl Into < String >) -> Self
 fn ra_core::model::request::ModelRequest::with_system_instructions(mut self, instructions : impl Into < String >) -> Self
@@ -1647,6 +1676,10 @@ struct ra_core::budget::BudgetSnapshot
 struct ra_core::cancel::CancelOnDrop
 struct ra_core::cancel::CancelScope
 struct ra_core::cancel::Deadline
+struct ra_core::capability::ContextProcessorRequest
+struct ra_core::capability::ContextProcessorResult
+struct ra_core::capability::ContextSummaryRequest
+struct ra_core::capability::ContextSummaryResponse
 struct ra_core::compat::SchemaVersion
 struct ra_core::compat::Unknown
 struct ra_core::config::FieldReport
@@ -1803,6 +1836,8 @@ struct ra_core::usage::RequestUsage
 struct ra_core::usage::Usage
 trait ra_core::agent::HandoffAvailabilityHandler
 trait ra_core::agent::ToolUseBehaviorHandler
+trait ra_core::capability::ContextProcessor
+trait ra_core::capability::ContextSummarizer
 trait ra_core::event::sink::HostEventSink
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider

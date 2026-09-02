@@ -29,12 +29,16 @@
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
 
-use std::{any::Any, sync::Arc, time::Instant};
+use std::{any::Any, collections::BTreeSet, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use ra_core::{
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
+    capability::{
+        ContextProcessor, ContextProcessorRequest, ContextSummarizer, ContextSummaryRequest,
+        ContextSummaryResponse,
+    },
     context::RunContext,
     error::{BudgetKind, Error, ProviderErrorKind, Result},
     finish::FinishReason,
@@ -112,6 +116,7 @@ pub struct RunConfig {
     action_surface_budget: ActionSurfaceBudget,
     model_input_projector: Option<Arc<dyn ModelInputProjector>>,
     tool_output_reference_extractor: Option<Arc<dyn ToolOutputReferenceExtractor>>,
+    context_processors: Vec<Arc<dyn ContextProcessor>>,
     permission: PermissionEngine,
 }
 
@@ -136,6 +141,7 @@ impl RunConfig {
             action_surface_budget: ActionSurfaceBudget::default(),
             model_input_projector: None,
             tool_output_reference_extractor: None,
+            context_processors: Vec::new(),
             permission: PermissionEngine::default(),
         }
     }
@@ -274,6 +280,16 @@ impl RunConfig {
         self
     }
 
+    /// Appends a context processor run before each ordinary model request.
+    ///
+    /// Processors receive the authoritative generated history as a read-only value and return a
+    /// model-input projection plus any records the runtime must append. This lets services such as
+    /// context compaction run without the loop kernel depending on their concrete crate.
+    pub fn with_context_processor(mut self, context_processor: Arc<dyn ContextProcessor>) -> Self {
+        self.context_processors.push(context_processor);
+        self
+    }
+
     /// Selects the base permission mode used for every tool call in this run.
     pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission = self.permission.with_mode(mode);
@@ -351,6 +367,12 @@ impl RunConfig {
     ) -> Option<&Arc<dyn ToolOutputReferenceExtractor>> {
         self.tool_output_reference_extractor.as_ref()
     }
+
+    /// Ordered context processors installed for this run.
+    #[must_use]
+    pub fn context_processors(&self) -> &[Arc<dyn ContextProcessor>] {
+        &self.context_processors
+    }
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -380,6 +402,7 @@ impl std::fmt::Debug for RunConfig {
                 "has_tool_output_reference_extractor",
                 &self.tool_output_reference_extractor.is_some(),
             )
+            .field("context_processor_count", &self.context_processors.len())
             .field("permission", &self.permission)
             .finish()
     }
@@ -578,6 +601,12 @@ struct TurnLoopContext<'a> {
     /// A caller-supplied continuation keeps control of this projection. Empty input instead uses
     /// the checkpoint's recorded history, which lets a host resume without rebuilding it.
     input_base: &'a [ModelInputItem],
+    /// Whether this segment's model input is fully reconstructible from `RunState`.
+    ///
+    /// A caller-managed continuation can carry an arbitrary projection the checkpoint does not
+    /// own. Context processing must not replace a partial reconstruction and silently discard
+    /// that input, so processors run only when this is true.
+    authoritative_history_complete: bool,
     model_resolver: &'a Arc<dyn ModelResolver>,
     run_id: &'a RunId,
     app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
@@ -718,6 +747,10 @@ async fn run_loop_inner(
         ra_core::trace::record_error(span, &error);
         return Err(error);
     }
+    // Read from the state that owns it rather than re-derived from this segment's arguments.
+    // `begin_segment` above is what decides it, it survives a checkpoint, and a second encoding
+    // here would have to be kept true by hand across resume paths that never meet.
+    let authoritative_history_complete = state.input_history_is_complete();
     let input_base = segment_input_base(&state, resuming, requested_input);
     // The run gets its own scope, so either its configured deadline or an inherited caller
     // deadline stops this run without cancelling the caller's tree. An armed timer turns the
@@ -755,6 +788,7 @@ async fn run_loop_inner(
     );
     let context = TurnLoopContext {
         input_base: &input_base,
+        authoritative_history_complete,
         model_resolver: &model_resolver,
         run_id: &run_id,
         app_context: app_context.as_ref(),
@@ -1201,6 +1235,10 @@ async fn run_turns(
 /// Runs one turn: prepare, call the model, settle, and say whether the run continues.
 ///
 /// `None` means another turn; `Some` carries the outcome the run ends with.
+///
+/// This is the lifecycle coordinator for one turn. Keeping preparation, context processing,
+/// dispatch, accounting, and settlement together makes their ordering auditable.
+#[allow(clippy::too_many_lines)]
 async fn run_one_turn(
     context: &TurnLoopContext<'_>,
     agent: &mut AgentBinding,
@@ -1210,12 +1248,21 @@ async fn run_one_turn(
     turn_span: &tracing::Span,
 ) -> Result<Option<RunOutcome>> {
     let config = context.config;
-    let input = next_input(
-        context.input_base,
-        progress.segment_items(state),
-        budget_reminder(state, config.budget()),
-    );
-    let input = project_model_input(config, state, progress.reference_turn(), input)?;
+    let reminder = budget_reminder(state, config.budget());
+    // Where the authoritative history sits inside the request, so a context processor can be told
+    // which span of items it owns without counting them again. Preparation appends its own tail
+    // items after this point, and everything past the history is the processor's suffix.
+    let history_span = context.authoritative_history_complete.then(|| HistorySpan {
+        history_len: state
+            .generated_items()
+            .iter()
+            .filter(|item| item.is_model_input())
+            .count(),
+    });
+    let input = match history_span {
+        Some(_) => next_input(state.original_input(), state.generated_items(), reminder),
+        None => next_input(context.input_base, progress.segment_items(state), reminder),
+    };
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
         agent,
@@ -1233,6 +1280,38 @@ async fn run_one_turn(
         preparation = preparation.with_model(model.clone());
     }
     let prepared = prepare_turn(preparation).await?;
+    let (prepared, context_records, context_responses) =
+        process_context_processors(context, state, progress, turn_scope, prepared, history_span)
+            .await?;
+    // Item-level projection runs last, on whatever the coarse transforms produced. A context
+    // processor reprojects whole regions of history; running the projector before it would only
+    // trim items the projector's own output then replaced with the untouched originals.
+    let projected_input = project_model_input(
+        config,
+        state,
+        progress.reference_turn(),
+        prepared.request().input().to_vec(),
+    )?;
+    let prepared = prepared.map_request(|request| request.with_input(projected_input));
+
+    let first_item = progress.segment_items(state).len();
+    let context_usage = context_responses
+        .iter()
+        .fold(Usage::default(), |total, response| {
+            total.accumulate(response.usage())
+        });
+    if context_usage.requests() > 0 {
+        state.record_usage(&context_usage);
+    }
+    for response in context_responses {
+        state.record_model_response(response);
+    }
+    if !context_records.is_empty() {
+        for item in &context_records {
+            emit(context.events, RunStreamEvent::Item(item.clone()));
+        }
+        state.record_generated_items(context_records);
+    }
 
     let streaming_dispatch = StreamedDispatchInput {
         agent_id: agent.public_id().clone(),
@@ -1305,7 +1384,6 @@ async fn run_one_turn(
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
     // The range is relative to the segment, because that is what `RunResult::turn_items` indexes.
-    let first_item = progress.segment_items(state).len();
     state.record_generated_items(settled.session_step_items().iter().cloned());
     let last_item = progress.segment_items(state).len();
 
@@ -1346,6 +1424,170 @@ async fn run_one_turn(
             state.set_current_agent(agent.public_id().clone());
             Ok(None)
         }
+    }
+}
+
+/// Runs every installed context processor and rebuilds the ordinary request from its projection.
+///
+/// Processors are deliberately generic here. The loop knows how to request a summary and append
+/// returned records, but it does not know whether a processor is compaction, redaction, or a
+/// product-specific retention policy.
+async fn process_context_processors(
+    context: &TurnLoopContext<'_>,
+    state: &RunState,
+    progress: &TurnLoopProgress,
+    turn_scope: &CancelScope,
+    prepared: PreparedTurn,
+    history_span: Option<HistorySpan>,
+) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>)> {
+    let processors = context.config.context_processors();
+    if processors.is_empty() {
+        return Ok((prepared, Vec::new(), Vec::new()));
+    }
+    // Only a request this loop assembled can be split into prefix, history, and tail. A segment
+    // resuming on a caller's own projection is skipped rather than guessed at.
+    let Some(span) = history_span else {
+        return Ok((prepared, Vec::new(), Vec::new()));
+    };
+    let Some((prefix, suffix)) = span.split(prepared.request().input(), state.original_input())
+    else {
+        return Ok((prepared, Vec::new(), Vec::new()));
+    };
+
+    let mut input = prepared.request().input().to_vec();
+    let mut history = state.generated_items().to_vec();
+    let mut generated_items: Vec<RunItem> = Vec::new();
+    let mut taken_ids: BTreeSet<ItemId> = history.iter().map(|item| item.id().clone()).collect();
+    let mut model_responses = Vec::new();
+    let summarizer = RunnerContextSummarizer::new(&prepared, turn_scope);
+
+    for (index, processor) in processors.iter().enumerate() {
+        let record_id = ItemId::new(format!("context-{}.{index}", progress.reference_turn()));
+        let request = ContextProcessorRequest::new(
+            state.run_id().clone(),
+            progress.reference_turn(),
+            record_id,
+            prepared.selector().model().map(str::to_owned),
+            prefix.clone(),
+            history.clone(),
+            suffix.clone(),
+            input,
+        );
+        let result = processor.process_context(request, &summarizer).await?;
+        input = result.input().to_vec();
+        for item in result.generated_items() {
+            // Reconciliation names records by ID, so a duplicate is not a detail: it silently
+            // overwrites or double-counts a record instead of failing.
+            if !taken_ids.insert(item.id().clone()) {
+                return Err(Error::caller(format!(
+                    "a context processor emitted record `{}`, which the run already generated",
+                    item.id()
+                )));
+            }
+            history.push(item.clone());
+            generated_items.push(item.clone());
+        }
+        model_responses.extend(result.model_responses().iter().cloned());
+    }
+
+    let prepared = prepared.map_request(|request| request.with_input(input));
+    Ok((prepared, generated_items, model_responses))
+}
+
+/// Where the authoritative history sits inside one assembled request.
+#[derive(Debug, Clone, Copy)]
+struct HistorySpan {
+    history_len: usize,
+}
+
+impl HistorySpan {
+    /// Splits an assembled request into the parts a context processor does not own.
+    ///
+    /// The tail is whatever follows the history, which is more than this loop appended: turn
+    /// preparation adds its own reminder items after the history, and a processor that rebuilt the
+    /// request from the loop's suffix alone would drop them.
+    ///
+    /// The prefix is compared rather than merely counted, so this is a positional claim the
+    /// request has to still satisfy rather than one it is assumed to. Preparation only appends
+    /// today, but its filter stage is where later transforms land, and one that rewrites an item
+    /// in place would keep every length here correct while making the boundaries wrong. `None`
+    /// then means the request no longer has the shape this span describes, and context processing
+    /// is skipped rather than applied to the wrong region.
+    fn split(
+        self,
+        input: &[ModelInputItem],
+        expected_prefix: &[ModelInputItem],
+    ) -> Option<(Vec<ModelInputItem>, Vec<ModelInputItem>)> {
+        let history_end = expected_prefix.len().checked_add(self.history_len)?;
+        let prefix = input.get(..expected_prefix.len())?;
+        if prefix != expected_prefix {
+            return None;
+        }
+        Some((prefix.to_vec(), input.get(history_end..)?.to_vec()))
+    }
+}
+
+/// Executes a context-summary request with the resolved model and stable instructions of a turn.
+struct RunnerContextSummarizer<'a> {
+    model: &'a Arc<dyn Model>,
+    template: &'a ModelRequest,
+    cancel: &'a CancelScope,
+}
+
+impl<'a> RunnerContextSummarizer<'a> {
+    const fn new(prepared: &'a PreparedTurn, cancel: &'a CancelScope) -> Self {
+        Self {
+            model: prepared.model(),
+            template: prepared.request(),
+            cancel,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextSummarizer for RunnerContextSummarizer<'_> {
+    async fn summarize(&self, request: ContextSummaryRequest) -> Result<ContextSummaryResponse> {
+        let mut input = request.input().to_vec();
+        input.push(ModelInputItem::Message(Message::user(
+            request.instructions(),
+        )));
+        let settings = self
+            .template
+            .model_settings()
+            .clone()
+            .reconcile_tool_surface(std::iter::empty::<&str>());
+        let mut model_request =
+            ModelRequest::new(input, settings).with_tracing(self.template.tracing());
+        if let Some(instructions) = self.template.system_instructions() {
+            model_request = model_request.with_system_instructions(instructions);
+        }
+        if let Some(cache_plan) = self.template.cache_plan() {
+            model_request = model_request.with_cache_plan(cache_plan.clone());
+        }
+        if let Some(output_schema) = request.output_schema() {
+            model_request = model_request.with_output_schema(output_schema.clone());
+        }
+        model_request.validate_cache_plan()?;
+        let response = self
+            .cancel
+            .run(self.model.get_response(model_request))
+            .await??;
+        let text = response
+            .output()
+            .iter()
+            .filter_map(|item| match item.kind() {
+                RunItemKind::Message(message) if message.role() == MessageRole::Assistant => {
+                    Some(message.text_content())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        if text.trim().is_empty() {
+            return Err(Error::caller(
+                "the context summary response did not contain assistant text",
+            ));
+        }
+        Ok(ContextSummaryResponse::new(text, response))
     }
 }
 

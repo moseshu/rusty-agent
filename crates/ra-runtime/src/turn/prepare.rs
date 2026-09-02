@@ -253,6 +253,19 @@ impl PreparedTurn {
         &self.request
     }
 
+    /// Rewrites the prepared request without changing its resolved model or executable surface.
+    ///
+    /// Context processing and model-input projection both use this after reworking the history.
+    /// Neither can alter the tools resolved for the turn: handing over only the request keeps
+    /// execution bound to the same snapshot the model is shown.
+    pub(crate) fn map_request(
+        mut self,
+        rewrite: impl FnOnce(ModelRequest) -> ModelRequest,
+    ) -> Self {
+        self.request = rewrite(self.request);
+        self
+    }
+
     /// Enabled executable tools matching the request's tool definitions.
     #[must_use]
     pub fn tools(&self) -> &[Arc<dyn Tool>] {

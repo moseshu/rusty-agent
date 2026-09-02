@@ -42,6 +42,7 @@ fn test_coding_host_lifecycle_and_emitter() {
     assert!(services.event_sink().is_some());
     assert!(services.output_projector().is_some());
     assert!(host.build_run_config().model_input_projector().is_some());
+    assert_eq!(host.build_run_config().context_processors().len(), 1);
 
     // HostEventEmitter bound emission check
     let run_id = RunId::new("run-coding-1");

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use ra_context::compaction::anchor::AnchorRetention;
+use ra_context::compaction::anchor::{AnchorRetention, DEFAULT_TAIL_ITEMS};
 use ra_context::compaction::summary::{CompactionSummaryBuilder, SummarySlot};
 use ra_context::compaction::{
     CompactedModelInput, CompactionLimits, CompactionPolicy, CompactionReason, ContextUsage,
@@ -134,6 +134,19 @@ fn model_window_configuration_becomes_the_total_token_trigger() {
         .expect_err("a threshold that rounds down to zero cannot be a trigger");
     assert!(error.to_string().contains("local/tiny"), "{error}");
     assert!(error.to_string().contains("0.6"), "{error}");
+}
+
+#[test]
+fn default_compaction_capability_uses_a_bounded_recent_working_set() {
+    let capability = ra_context::compaction::CompactionCapability::default();
+
+    assert_eq!(capability.context_windows(), &ContextWindowConfig::default());
+    assert_eq!(capability.retention(), AnchorRetention::default());
+    assert_eq!(capability.retention().head_items(), 0);
+    assert_eq!(capability.retention().max_anchor_items(), 0);
+    assert_eq!(capability.retention().tail_items(), DEFAULT_TAIL_ITEMS);
+    assert_eq!(capability.max_items(), None);
+    assert_eq!(capability.max_single_item_tokens(), None);
 }
 
 #[test]

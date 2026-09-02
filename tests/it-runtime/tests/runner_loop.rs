@@ -15,6 +15,10 @@ use std::{
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use insta::assert_json_snapshot;
+use ra_context::{
+    compaction::{CompactionCapability, anchor::AnchorRetention},
+    window::ContextWindowConfig,
+};
 use ra_core::{
     agent::{AgentId, AgentSpec, ToolUseBehavior, ToolUseBehaviorHandler, ToolUseResult},
     budget::{BudgetLimit, BudgetSnapshot},
@@ -61,6 +65,7 @@ struct ScriptedModel {
     input_items: Mutex<Vec<Vec<ModelInputItem>>>,
     instructions: Mutex<Vec<Option<String>>>,
     tool_choices: Mutex<Vec<Option<ToolChoice>>>,
+    request_surfaces: Mutex<Vec<(usize, usize, bool, bool)>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -72,6 +77,7 @@ impl ScriptedModel {
             input_items: Mutex::new(Vec::new()),
             instructions: Mutex::new(Vec::new()),
             tool_choices: Mutex::new(Vec::new()),
+            request_surfaces: Mutex::new(Vec::new()),
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -91,6 +97,12 @@ impl ScriptedModel {
             .lock()
             .unwrap()
             .push(request.model_settings().tool_choice().cloned());
+        self.request_surfaces.lock().unwrap().push((
+            request.tools().len(),
+            request.handoffs().len(),
+            request.output_schema().is_some(),
+            request.continuation().is_server_managed(),
+        ));
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
             return Err(Error::caller("scripted model ran out of responses"));
@@ -114,9 +126,43 @@ impl Model for ScriptedModel {
     }
 }
 
+/// Fails only the non-streaming summary path while ordinary model turns continue to answer.
+struct SummaryFailingModel {
+    streamed: Mutex<Vec<ModelResponse>>,
+    summary_calls: AtomicUsize,
+}
+
+impl SummaryFailingModel {
+    fn new(streamed: Vec<ModelResponse>) -> Arc<Self> {
+        Arc::new(Self {
+            streamed: Mutex::new(streamed),
+            summary_calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl Model for SummaryFailingModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.summary_calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::provider(
+            ProviderErrorKind::Network,
+            "summary service unavailable",
+        ))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        let mut streamed = self.streamed.lock().unwrap();
+        let response = streamed.remove(0);
+        stream::iter(vec![Ok(ModelStreamEvent::Completed(Box::new(response)))]).boxed()
+    }
+}
+
 /// Records the runtime projection calls without changing their model input.
+#[derive(Default)]
 struct RecordingInputProjector {
     calls: Arc<Mutex<Vec<(u64, usize)>>>,
+    observed: Arc<Mutex<Vec<Vec<ModelInputItem>>>>,
 }
 
 impl ModelInputProjector for RecordingInputProjector {
@@ -128,6 +174,7 @@ impl ModelInputProjector for RecordingInputProjector {
         input: &[ModelInputItem],
     ) -> Result<Vec<ModelInputItem>> {
         self.calls.lock().unwrap().push((current_turn, input.len()));
+        self.observed.lock().unwrap().push(input.to_vec());
         Ok(input.to_vec())
     }
 }
@@ -970,6 +1017,7 @@ async fn model_input_projector_runs_before_each_request_and_records_settled_outp
     let calls = Arc::new(Mutex::new(Vec::new()));
     let config = RunConfig::new().with_model_input_projector(Arc::new(RecordingInputProjector {
         calls: Arc::clone(&calls),
+        ..RecordingInputProjector::default()
     }));
 
     let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
@@ -986,6 +1034,359 @@ async fn model_input_projector_runs_before_each_request_and_records_settled_outp
     );
 }
 
+#[tokio::test]
+async fn compaction_capability_summarizes_and_replaces_generated_history_before_the_next_turn() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ])
+        .with_usage(Usage::from_request(RequestUsage::new(10, 4))),
+        ModelResponse::new(vec![message(
+            "summary-1",
+            r#"{
+                "primary_request_and_intent":"Modify the requested files.",
+                "key_technical_concepts":"Keep the existing tool contract.",
+                "files_and_code_sections":"No file names were retained.",
+                "errors_and_fixes":"None.",
+                "problem_solving":"Two tool calls completed.",
+                "pending_tasks":"Produce the final response.",
+                "current_work":"The tool outputs were compacted.",
+                "optional_next_step":"Review the results."
+            }"#,
+        )])
+        .with_usage(Usage::from_request(RequestUsage::new(3, 2))),
+        ModelResponse::new(vec![message("msg-1", "done")])
+            .with_usage(Usage::from_request(RequestUsage::new(20, 6))),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(3),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new().with_context_processor(Arc::new(compaction));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("the compacted run succeeds");
+
+    assert_eq!(model.inputs.lock().unwrap().as_slice(), &[1, 6, 2]);
+    assert_eq!(
+        model.request_surfaces.lock().unwrap().as_slice(),
+        &[(1, 0, false, false), (0, 0, true, false), (1, 0, false, false)],
+        "the compaction request must not advertise the ordinary tool surface or inherit a server continuation"
+    );
+    assert!(result.new_items().iter().any(|item| matches!(
+        item.kind(),
+        RunItemKind::Compaction(_)
+    )));
+    assert_eq!(result.model_responses().len(), 3);
+    assert_eq!(result.usage().requests(), 3);
+    assert_eq!(result.usage().input_tokens(), 33);
+    assert_eq!(result.usage().output_tokens(), 12);
+    assert_eq!(result.state().usage_totals(), &result.usage());
+}
+
+/// A summary stands for the records it replaced, but those records stay in authoritative history
+/// forever — compaction is a projection and never deletes them. Measuring the stored history
+/// rather than the model-visible view therefore stays over the limit permanently, and the run pays
+/// for a fresh summary on every later turn while the history it measures only grows.
+#[tokio::test]
+async fn a_compacted_history_is_not_summarized_again_on_the_following_turn() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        // Eight history records, comfortably over the limit.
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+            tool_call("c-3", "call-3", "write_file"),
+            tool_call("c-4", "call-4", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("summary-1", COMPACTION_SUMMARY_JSON)]),
+        // The turn right after the compaction asks for one more tool call, so the run has to
+        // process context a third time with the summary already in history. The compacted view
+        // plus that call stays under the limit, so nothing should need summarizing again.
+        ModelResponse::new(vec![tool_call("c-5", "call-5", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(6),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new().with_context_processor(Arc::new(compaction));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("the compacted run succeeds");
+
+    let summaries = result
+        .new_items()
+        .iter()
+        .filter(|item| matches!(item.kind(), RunItemKind::Compaction(_)))
+        .count();
+    assert_eq!(
+        summaries, 1,
+        "one summary must cover the history it replaced instead of one being written per turn"
+    );
+    assert_eq!(
+        model.request_surfaces.lock().unwrap().as_slice(),
+        &[
+            (1, 0, false, false),
+            (0, 0, true, false),
+            (1, 0, false, false),
+            (1, 0, false, false),
+        ],
+        "exactly one structured-output call may appear: a second is a second summary request"
+    );
+    assert_eq!(result.usage().requests(), 4);
+}
+
+#[tokio::test]
+async fn a_later_compaction_summarizes_the_current_projected_view() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+            tool_call("c-3", "call-3", "write_file"),
+            tool_call("c-4", "call-4", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("summary-1", COMPACTION_SUMMARY_JSON)]),
+        ModelResponse::new(vec![
+            tool_call("c-5", "call-5", "write_file"),
+            tool_call("c-6", "call-6", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("summary-2", COMPACTION_SUMMARY_JSON)]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(4),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new().with_context_processor(Arc::new(compaction));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("the run performs both compactions");
+
+    assert_eq!(
+        model.inputs.lock().unwrap().as_slice(),
+        &[1, 10, 2, 7, 2],
+        "the second summary receives the first compacted view, not its original eight records"
+    );
+    assert_eq!(
+        result
+            .new_items()
+            .iter()
+            .filter(|item| matches!(item.kind(), RunItemKind::Compaction(_)))
+            .count(),
+        2
+    );
+}
+
+/// A window that cannot be resolved must leave the request alone rather than invent a capacity.
+#[tokio::test]
+async fn compaction_leaves_the_request_untouched_when_no_window_resolves() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ])
+        .with_usage(Usage::from_request(RequestUsage::new(10, 4))),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    // Model-window driven only: the scripted run resolves no model name, so no limit resolves.
+    let config = RunConfig::new().with_context_processor(Arc::new(CompactionCapability::default()));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("the run succeeds without compaction");
+
+    assert_eq!(
+        model.inputs.lock().unwrap().as_slice(),
+        &[1, 5],
+        "an inert capability must not reshape the request"
+    );
+    assert!(
+        !result
+            .new_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::Compaction(_)))
+    );
+    assert_eq!(result.usage().requests(), 2);
+}
+
+/// Compaction runs because the context is already large. Failing the run at that exact moment
+/// throws away the most work it could possibly throw away, so an unreadable summary has to leave
+/// the turn on its uncompacted input and let the provider judge whether it still fits.
+#[tokio::test]
+async fn an_unreadable_summary_leaves_the_run_going_on_uncompacted_input() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ])
+        .with_usage(Usage::from_request(RequestUsage::new(10, 4))),
+        // Prose where a JSON object was required, which is what a provider that ignores the
+        // structured-output contract returns.
+        ModelResponse::new(vec![message(
+            "summary-1",
+            "Sure! Here is a summary of the conversation so far.",
+        )])
+        .with_usage(Usage::from_request(RequestUsage::new(3, 2))),
+        ModelResponse::new(vec![message("msg-1", "done")])
+            .with_usage(Usage::from_request(RequestUsage::new(20, 6))),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(3),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new().with_context_processor(Arc::new(compaction));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("an unreadable summary must not end the run");
+
+    assert!(
+        !result
+            .new_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::Compaction(_))),
+        "a summary that could not be read must not become an authoritative record"
+    );
+    assert_eq!(
+        model.inputs.lock().unwrap().as_slice(),
+        &[1, 6, 5],
+        "the ordinary turn keeps the full history it would have sent without compaction"
+    );
+    assert_eq!(result.usage().requests(), 3);
+    assert_eq!(result.usage().input_tokens(), 33);
+    assert_eq!(result.usage().output_tokens(), 12);
+}
+
+#[tokio::test]
+async fn an_unavailable_summary_leaves_the_run_going_on_uncompacted_input() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = SummaryFailingModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(3),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new().with_context_processor(Arc::new(compaction));
+    let request = RunRequest::new(
+        agent(vec![tool]),
+        Arc::new(SingleModelResolver {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+        }),
+        RunId::new("run-loop"),
+        cancel.clone(),
+        vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
+    );
+
+    let result = Runner::run(request.with_config(config))
+        .await
+        .expect("an unavailable summary must not end the run");
+
+    assert_eq!(model.summary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.turns(), 2);
+    assert!(
+        !result
+            .new_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::Compaction(_)))
+    );
+}
+
+/// Compaction reprojects whole regions of history; the item-level projector trims what is left.
+/// Running the projector first would only trim items that compaction then replaced with their
+/// untouched originals, so the ordering is what makes both policies hold at once.
+#[tokio::test]
+async fn the_model_input_projector_runs_after_context_processing() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("summary-1", COMPACTION_SUMMARY_JSON)]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let projector = Arc::new(RecordingInputProjector {
+        observed: Arc::clone(&observed),
+        ..RecordingInputProjector::default()
+    });
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(3),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new()
+        .with_context_processor(Arc::new(compaction))
+        .with_model_input_projector(projector.clone());
+
+    Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("the compacted run succeeds");
+
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(
+        observed.len(),
+        2,
+        "the projector runs once per ordinary request, not once per model call"
+    );
+    assert!(
+        observed[1]
+            .iter()
+            .any(|item| matches!(item, ModelInputItem::Compaction(_))),
+        "the projector must observe the compacted view, not the history compaction replaced"
+    );
+}
+
+/// A complete nine-slot summary body, as a provider honouring the output schema would return it.
+const COMPACTION_SUMMARY_JSON: &str = r#"{
+    "primary_request_and_intent":"Modify the requested files.",
+    "key_technical_concepts":"Keep the existing tool contract.",
+    "files_and_code_sections":"No file names were retained.",
+    "errors_and_fixes":"None.",
+    "problem_solving":"Two tool calls completed.",
+    "pending_tasks":"Produce the final response.",
+    "current_work":"The tool outputs were compacted.",
+    "optional_next_step":"Review the results."
+}"#;
+
 /// The reference ledger measures staleness in turns of the whole run, so a resumed segment must
 /// keep counting where the last one stopped. A per-segment counter would restart at one, which
 /// both re-opens a turn the ledger has already recorded and makes every earlier result look newer
@@ -1001,6 +1402,7 @@ async fn a_resumed_segment_continues_the_reference_ledgers_turn_axis() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let config = RunConfig::new().with_model_input_projector(Arc::new(RecordingInputProjector {
         calls: Arc::clone(&calls),
+        ..RecordingInputProjector::default()
     }));
     let mut carried = RunState::start(RunId::new("run-loop"));
     carried
