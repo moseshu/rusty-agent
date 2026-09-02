@@ -36,9 +36,10 @@ pub use origin::{
     ToolOrigin,
 };
 pub use output::{
-    ArtifactRef, MODEL_EXCERPT_SCHEMA_VERSION, ModelExcerpt, OBSERVATION_METADATA_SCHEMA_VERSION,
-    ObservationMetadata, TOOL_OUTPUT_SCHEMA_VERSION, TRUNCATION_SCHEMA_VERSION, ToolOutput,
-    ToolOutputBlock, ToolOutputProjection, ToolOutputProjector, Truncation, TruncationStage,
+    ArtifactRef, MODEL_EXCERPT_SCHEMA_VERSION, ModelExcerpt, ModelInputProjector,
+    OBSERVATION_METADATA_SCHEMA_VERSION, ObservationMetadata, TOOL_OUTPUT_SCHEMA_VERSION,
+    TRUNCATION_SCHEMA_VERSION, ToolOutput, ToolOutputBlock, ToolOutputProjection,
+    ToolOutputProjector, ToolOutputReferenceExtractor, Truncation, TruncationStage,
 };
 pub use resource::{ResourceAccess, ResourceClaim, ResourceId, ResourceKind};
 pub use schema::{

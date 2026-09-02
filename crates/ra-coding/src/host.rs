@@ -2,7 +2,7 @@
 
 use std::{fmt, io, path::Path, sync::Arc};
 
-use ra_context::budget::ToolResultBudget;
+use ra_context::{budget::ToolResultBudget, eviction::ToolOutputReferenceTrimmer};
 use ra_core::{
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
@@ -14,6 +14,7 @@ use ra_exec::{
     fs::{RootedFileSystem, Workspace},
     session::ProcessManager,
 };
+use ra_runtime::runner::RunConfig;
 use ra_tools::{
     apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, glob::GlobTool, grep::GrepTool,
     read_file::ReadFileTool, write_stdin::WriteStdinTool,
@@ -99,6 +100,15 @@ impl CodingHost {
         ToolServices::new()
             .with_event_sink(Arc::clone(&self.event_sink))
             .with_output_projector(Arc::new(ToolResultBudget::default()))
+    }
+
+    /// Constructs the coding product's run policy, including reference-aware tool-output eviction.
+    ///
+    /// This affects only future model requests. Complete observations stay in the session and the
+    /// `RunState` reference ledger lets a resumed run apply the same policy without rebuilding
+    /// retention facts from prose.
+    pub fn build_run_config(&self) -> RunConfig {
+        RunConfig::new().with_model_input_projector(Arc::new(ToolOutputReferenceTrimmer::default()))
     }
 
     /// Creates the coding product's workspace-confined patch tool.

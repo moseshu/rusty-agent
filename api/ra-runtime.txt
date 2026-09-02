@@ -112,12 +112,16 @@ fn ra_runtime::permission::PermissionEngine::new(mode : PermissionMode) -> Self
 fn ra_runtime::permission::PermissionEngine::rules(& self) -> & [PermissionRule]
 fn ra_runtime::permission::PermissionEngine::with_mode(mut self, mode : PermissionMode) -> Self
 fn ra_runtime::permission::PermissionEngine::with_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
+fn ra_runtime::runner::RunConfig::model_input_projector(& self) -> Option < & Arc < dyn ModelInputProjector > >
 fn ra_runtime::runner::RunConfig::new() -> Self
+fn ra_runtime::runner::RunConfig::tool_output_reference_extractor(& self) -> Option < & Arc < dyn ToolOutputReferenceExtractor > >
 fn ra_runtime::runner::RunConfig::with_error_handler(mut self, error_handler : Arc < dyn RunErrorHandler >) -> Self
 fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < String >) -> Self
+fn ra_runtime::runner::RunConfig::with_model_input_projector(mut self, model_input_projector : Arc < dyn ModelInputProjector >) -> Self
 fn ra_runtime::runner::RunConfig::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::runner::RunConfig::with_permission_mode(mut self, mode : PermissionMode) -> Self
 fn ra_runtime::runner::RunConfig::with_permission_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
+fn ra_runtime::runner::RunConfig::with_tool_output_reference_extractor(mut self, tool_output_reference_extractor : Arc < dyn ToolOutputReferenceExtractor >) -> Self
 fn ra_runtime::runner::RunRequest::new(agent : AgentBinding, model_resolver : Arc < dyn ModelResolver >, run_id : RunId, cancel : CancelScope, input : Vec < ModelInputItem >) -> Self
 fn ra_runtime::runner::RunRequest::with_app_context(mut self, app_context : Arc < dyn Any + Send + Sync >) -> Self
 fn ra_runtime::runner::RunRequest::with_config(mut self, config : RunConfig) -> Self

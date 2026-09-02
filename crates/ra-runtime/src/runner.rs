@@ -50,7 +50,7 @@ use ra_core::{
     permission::{PermissionMode, PermissionRule},
     state::{EventSeqAllocator, InterruptionResolution, RunId, RunState, ToolOutcome, ToolUse},
     step::NextStep,
-    tool::ToolServices,
+    tool::{ModelInputProjector, ToolOutputReferenceExtractor, ToolServices},
     trace::SpanKind,
     usage::{RequestUsage, Usage},
 };
@@ -110,6 +110,8 @@ pub struct RunConfig {
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
+    model_input_projector: Option<Arc<dyn ModelInputProjector>>,
+    tool_output_reference_extractor: Option<Arc<dyn ToolOutputReferenceExtractor>>,
     permission: PermissionEngine,
 }
 
@@ -132,6 +134,8 @@ impl RunConfig {
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
+            model_input_projector: None,
+            tool_output_reference_extractor: None,
             permission: PermissionEngine::default(),
         }
     }
@@ -246,6 +250,30 @@ impl RunConfig {
         self
     }
 
+    /// Installs the policy that projects authoritative history into the next model request.
+    ///
+    /// The policy sees a persisted tool-output reference ledger. Its result affects only the
+    /// provider request; `RunState` retains the complete session records for resume and storage.
+    pub fn with_model_input_projector(
+        mut self,
+        model_input_projector: Arc<dyn ModelInputProjector>,
+    ) -> Self {
+        self.model_input_projector = Some(model_input_projector);
+        self
+    }
+
+    /// Installs the product's typed extractor for tool-output references in model responses.
+    ///
+    /// A projector does not parse narration to infer retention. When no extractor is installed,
+    /// produced outputs are tracked but no response is considered an explicit reference.
+    pub fn with_tool_output_reference_extractor(
+        mut self,
+        tool_output_reference_extractor: Arc<dyn ToolOutputReferenceExtractor>,
+    ) -> Self {
+        self.tool_output_reference_extractor = Some(tool_output_reference_extractor);
+        self
+    }
+
     /// Selects the base permission mode used for every tool call in this run.
     pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission = self.permission.with_mode(mode);
@@ -309,6 +337,20 @@ impl RunConfig {
     pub const fn max_function_tool_concurrency(&self) -> usize {
         self.max_function_tool_concurrency
     }
+
+    /// Model-input projection policy, when configured.
+    #[must_use]
+    pub fn model_input_projector(&self) -> Option<&Arc<dyn ModelInputProjector>> {
+        self.model_input_projector.as_ref()
+    }
+
+    /// Typed tool-output reference extractor, when configured.
+    #[must_use]
+    pub fn tool_output_reference_extractor(
+        &self,
+    ) -> Option<&Arc<dyn ToolOutputReferenceExtractor>> {
+        self.tool_output_reference_extractor.as_ref()
+    }
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -330,6 +372,14 @@ impl std::fmt::Debug for RunConfig {
                 &self.tool_name_collision_policy,
             )
             .field("action_surface_budget", &self.action_surface_budget)
+            .field(
+                "has_model_input_projector",
+                &self.model_input_projector.is_some(),
+            )
+            .field(
+                "has_tool_output_reference_extractor",
+                &self.tool_output_reference_extractor.is_some(),
+            )
             .field("permission", &self.permission)
             .finish()
     }
@@ -554,10 +604,24 @@ struct TurnLoopProgress {
     turn_record_owner: Arc<TurnRecordOwner>,
     turn_records: Vec<TurnRecord>,
     turns: u32,
+    /// Turns this run completed before the current segment began.
+    ///
+    /// `turns` counts the segment, because that is what `RunResult`, `TurnRecord`, and the stream
+    /// events describe. The tool-output reference ledger measures staleness across the whole run
+    /// instead, so its two call sites add this base. Captured once, from the restored ledger, and
+    /// never recomputed: reading the high-water mark again mid-segment would count the turns this
+    /// segment has already recorded a second time.
+    reference_turn_base: u64,
     budget_stop: Option<BudgetKind>,
 }
 
 impl TurnLoopProgress {
+    /// The whole run's number for the turn now running, as the reference ledger counts turns.
+    fn reference_turn(&self) -> u64 {
+        self.reference_turn_base
+            .saturating_add(u64::from(self.turns))
+    }
+
     /// Records this segment generated, as a window into the run's own history.
     fn segment_items<'a>(&self, state: &'a RunState) -> &'a [RunItem] {
         state
@@ -675,6 +739,10 @@ async fn run_loop_inner(
         turn_record_owner: TurnRecordOwner::new(),
         turn_records: Vec::new(),
         turns: 0,
+        reference_turn_base: state
+            .tool_output_references()
+            .last_completed_turn()
+            .unwrap_or(0),
         budget_stop: None,
     };
     let permission = config.permission().clone().with_rules(
@@ -1147,6 +1215,7 @@ async fn run_one_turn(
         progress.segment_items(state),
         budget_reminder(state, config.budget()),
     );
+    let input = project_model_input(config, state, progress.reference_turn(), input)?;
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
         agent,
@@ -1192,6 +1261,7 @@ async fn run_one_turn(
     record_usage(turn_span, response.usage());
     state.record_usage(response.usage());
     state.record_model_response(response.clone());
+    let referenced_outputs = referenced_tool_outputs(config, &response)?;
 
     // Settlement sees the same input base the model did and only this segment's preceding items.
     // The base may itself be a full caller-supplied or checkpoint-projected transcript.
@@ -1222,6 +1292,14 @@ async fn run_one_turn(
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches);
     let settled = settle_turn(settlement).await?;
+
+    record_tool_output_references(
+        config,
+        state,
+        progress.reference_turn(),
+        settled.session_step_items(),
+        referenced_outputs,
+    )?;
 
     for item in settled.session_step_items() {
         emit(context.events, RunStreamEvent::Item(item.clone()));
@@ -1269,6 +1347,63 @@ async fn run_one_turn(
             Ok(None)
         }
     }
+}
+
+/// Projects the request input, counting turns the way the reference ledger counts them.
+///
+/// `turn` spans the whole run, not this segment: the ledger it consults was restored with the
+/// checkpoint, and a result last referenced before a resume has to stay comparable with the turn
+/// now being prepared.
+fn project_model_input(
+    config: &RunConfig,
+    state: &RunState,
+    turn: u64,
+    input: Vec<ModelInputItem>,
+) -> Result<Vec<ModelInputItem>> {
+    match config.model_input_projector() {
+        Some(projector) => projector.project_model_input(
+            state.run_id(),
+            turn,
+            state.tool_output_references(),
+            &input,
+        ),
+        None => Ok(input),
+    }
+}
+
+fn referenced_tool_outputs(
+    config: &RunConfig,
+    response: &ModelResponse,
+) -> Result<Vec<ra_core::item::CallId>> {
+    match (
+        config.model_input_projector(),
+        config.tool_output_reference_extractor(),
+    ) {
+        (Some(_), Some(extractor)) => extractor.referenced_tool_outputs(response),
+        (Some(_) | None, None) | (None, Some(_)) => Ok(Vec::new()),
+    }
+}
+
+/// Settles this turn's retention facts, on the same whole-run turn axis the projection used.
+fn record_tool_output_references(
+    config: &RunConfig,
+    state: &mut RunState,
+    turn: u64,
+    items: &[RunItem],
+    referenced_outputs: Vec<ra_core::item::CallId>,
+) -> Result<()> {
+    if config.model_input_projector().is_none() {
+        return Ok(());
+    }
+    let new_outputs = items.iter().filter_map(|item| {
+        let RunItemKind::ToolCallOutput(output) = item.kind() else {
+            return None;
+        };
+        Some(output.call_id().clone())
+    });
+    state
+        .tool_output_references_mut()
+        .record_turn(turn, new_outputs, referenced_outputs)
 }
 
 /// Builds the live context the stage about to run hands to third-party code.
