@@ -1156,10 +1156,12 @@ fn ra_core::model::ModelResolver::resolve_model(& self, model_name : Option < & 
 fn ra_core::model::request::ConversationContinuation::conversation_id(& self) -> Option < & ProviderConversationId >
 fn ra_core::model::request::ConversationContinuation::previous_response_id(& self) -> Option < & str >
 fn ra_core::model::request::ModelHandoffDefinition::advertised_bytes(& self) -> Result < usize >
+fn ra_core::model::request::ModelHandoffDefinition::advertised_chars(& self) -> Result < usize >
 fn ra_core::model::request::ModelHandoffDefinition::description(& self) -> Option < & str >
 fn ra_core::model::request::ModelHandoffDefinition::name(& self) -> & str
 fn ra_core::model::request::ModelHandoffDefinition::new(target_agent : AgentId, name : impl Into < String >, input_schema : Value) -> Self
 fn ra_core::model::request::ModelHandoffDefinition::with_description(mut self, description : impl Into < String >) -> Self
+fn ra_core::model::request::ModelOutputSchema::advertised_chars(& self) -> Result < usize >
 fn ra_core::model::request::ModelOutputSchema::name(& self) -> & str
 fn ra_core::model::request::ModelOutputSchema::new(name : impl Into < String >, schema : Value) -> Self
 fn ra_core::model::request::ModelRequest::handoffs(& self) -> & [ModelHandoffDefinition]
@@ -1177,6 +1179,7 @@ fn ra_core::model::request::ModelRequest::with_previous_response_id(mut self, re
 fn ra_core::model::request::ModelRequest::with_system_instructions(mut self, instructions : impl Into < String >) -> Self
 fn ra_core::model::request::ModelRequest::with_tools(mut self, tools : Vec < ModelToolDefinition >) -> Self
 fn ra_core::model::request::ModelToolDefinition::advertised_bytes(& self) -> Result < usize >
+fn ra_core::model::request::ModelToolDefinition::advertised_chars(& self) -> Result < usize >
 fn ra_core::model::request::ModelToolDefinition::description(& self) -> Option < & str >
 fn ra_core::model::request::ModelToolDefinition::name(& self) -> & str
 fn ra_core::model::request::ModelToolDefinition::new(name : impl Into < String >, input_schema : Value) -> Self

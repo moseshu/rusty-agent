@@ -48,6 +48,18 @@ const fn ra_context::preflight::PreprocessedInput::chunks_summarized(& self) -> 
 const fn ra_context::preflight::PreprocessedInput::original_usage(& self) -> ContextUsage
 const fn ra_context::preflight::PreprocessedInput::usage(& self) -> ContextUsage
 const fn ra_context::preflight::PreprocessedInput::was_preprocessed(& self) -> bool
+const fn ra_context::usage::ContextUsageBreakdown::message_tokens(self) -> usize
+const fn ra_context::usage::ContextUsageBreakdown::model_input(self) -> ContextUsage
+const fn ra_context::usage::ContextUsageBreakdown::reasoning_tokens(self) -> usize
+const fn ra_context::usage::ContextUsageBreakdown::system_tokens(self) -> usize
+const fn ra_context::usage::ContextUsageBreakdown::tokens(self, category : ContextUsageCategory) -> usize
+const fn ra_context::usage::ContextUsageBreakdown::tool_result_tokens(self) -> usize
+const fn ra_context::usage::ContextUsageBreakdown::tool_tokens(self) -> usize
+const fn ra_context::usage::ContextUsageBreakdown::total_tokens(self) -> usize
+const fn ra_context::usage::ContextUsageCategory::label(self) -> & 'static str
+const fn ra_context::usage::ContextWindowUsage::breakdown(self) -> ContextUsageBreakdown
+const fn ra_context::usage::ContextWindowUsage::context_window(self) -> u64
+const fn ra_context::usage::ContextWindowUsage::total_tokens(self) -> usize
 const fn ra_context::window::ContextWindowConfig::compaction_threshold_ratio(& self) -> ContextWindowThresholdRatio
 const fn ra_context::window::ContextWindowConfig::context_windows(& self) -> & BTreeMap < String , u64 >
 const fn ra_context::window::ContextWindowConfig::table(& self) -> & ContextWindowTable
@@ -63,9 +75,12 @@ const ra_context::eviction::DEFAULT_PREVIEW_CHARS: usize
 const ra_context::eviction::DEFAULT_RECENT_ITEMS: usize
 const ra_context::eviction::DEFAULT_RECENT_TURNS: usize
 const ra_context::preflight::DEFAULT_MAP_CONCURRENCY: usize
+const ra_context::usage::ContextUsageCategory::ALL: [Self ; Self :: COUNT]
+const ra_context::usage::ContextUsageCategory::COUNT: usize
 const ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO: ContextWindowThresholdRatio
 enum ra_context::compaction::CompactionReason
 enum ra_context::compaction::summary::SummarySlot
+enum ra_context::usage::ContextUsageCategory
 fn ra_context::archive::ArchivedHistory::items(& self) -> & [RunItem]
 fn ra_context::budget::ToolResultBudget::new(max_bytes : usize, max_tokens : usize) -> Result < Self >
 fn ra_context::budget::ToolResultBudget::project_output(& self, run_id : & RunId, call_id : & CallId, output : ToolOutput) -> Result < ToolOutput >
@@ -112,6 +127,9 @@ fn ra_context::preflight::InputPreflightConfig::new(max_input_tokens : usize, ma
 fn ra_context::preflight::InputPreflightConfig::with_map_concurrency(mut self, map_concurrency : usize) -> Result < Self >
 fn ra_context::preflight::PreprocessedInput::input(& self) -> & [ModelInputItem]
 fn ra_context::preflight::PreprocessedInput::into_input(self) -> Vec < ModelInputItem >
+fn ra_context::usage::ContextUsageBreakdown::estimate_model_request(request : & ModelRequest) -> Result < Self >
+fn ra_context::usage::ContextUsageBreakdown::for_model(self, context_windows : & ContextWindowConfig, model : & str) -> Option < ContextWindowUsage >
+fn ra_context::usage::ContextWindowUsage::occupancy_basis_points(self) -> u64
 fn ra_context::window::ContextWindowConfig::compaction_threshold(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::context_window(& self, model : & str) -> Option < u64 >
 fn ra_context::window::ContextWindowConfig::new(context_windows : BTreeMap < String , u64 >, compaction_threshold_ratio : ContextWindowThresholdRatio) -> Result < Self >
@@ -125,6 +143,7 @@ mod ra_context::compaction::anchor
 mod ra_context::compaction::summary
 mod ra_context::eviction
 mod ra_context::preflight
+mod ra_context::usage
 mod ra_context::window
 struct ra_context::archive::ArchivedHistory
 struct ra_context::budget::ToolResultBudget
@@ -144,6 +163,8 @@ struct ra_context::preflight::InputPreflight
 struct ra_context::preflight::InputPreflightAssessment
 struct ra_context::preflight::InputPreflightConfig
 struct ra_context::preflight::PreprocessedInput
+struct ra_context::usage::ContextUsageBreakdown
+struct ra_context::usage::ContextWindowUsage
 struct ra_context::window::ContextWindowConfig
 struct ra_context::window::ContextWindowTable
 struct ra_context::window::ContextWindowThresholdRatio
@@ -160,3 +181,8 @@ variant ra_context::compaction::summary::SummarySlot::OptionalNextStep
 variant ra_context::compaction::summary::SummarySlot::PendingTasks
 variant ra_context::compaction::summary::SummarySlot::PrimaryRequestAndIntent
 variant ra_context::compaction::summary::SummarySlot::ProblemSolving
+variant ra_context::usage::ContextUsageCategory::Messages
+variant ra_context::usage::ContextUsageCategory::Reasoning
+variant ra_context::usage::ContextUsageCategory::System
+variant ra_context::usage::ContextUsageCategory::ToolResults
+variant ra_context::usage::ContextUsageCategory::Tools

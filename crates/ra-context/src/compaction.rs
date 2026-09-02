@@ -12,11 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use ra_core::{
     error::{Error, Result},
     item::{ArchiveRef, CallId, Compaction, ItemId, ModelInputItem, RunItem, RunItemKind},
-    prompt::CHARS_PER_TOKEN,
 };
-use serde_json::Value;
 
-use crate::{compaction::anchor::AnchorRetention, window::ContextWindowConfig};
+use crate::{compaction::anchor::AnchorRetention, estimate, window::ContextWindowConfig};
 
 /// One reason that the current model-input history needs compaction.
 #[non_exhaustive]
@@ -92,19 +90,13 @@ impl ContextUsage {
 
     /// Estimates usage from the provider-neutral serialized item representation.
     ///
-    /// Every item is walked, so opaque input has a finite local cost rather than disappearing from
-    /// the trigger calculation: a base64 body is a string value like any other.
-    ///
-    /// **Content is priced, wire framing is not.** Field names, delimiters, and JSON escapes are
-    /// excluded, and a character is charged once in the form the model reads rather than twice in
-    /// its escaped form. Measuring the serialized text instead inflates a JSON-shaped tool result
-    /// by roughly a fifth, which has two consequences worth avoiding: the proportional trigger
-    /// [`CompactionLimits::for_model`] derives from a real model window would fire near 50% of that
-    /// window rather than the configured 60%, and an excerpt
-    /// [`ToolResultBudget`](crate::budget::ToolResultBudget) had just trimmed to its per-result
-    /// ceiling would be priced above that same ceiling here — a
-    /// [`CompactionReason::SingleItemTokens`] no amount of compaction can clear. `crate::budget`
-    /// rejected the serialized-JSON basis for the same reason.
+    /// Pricing lives in [`crate::estimate`], which documents what a character is charged for and
+    /// why. This measures items only: system instructions and the request-time tool, handoff, and
+    /// output-schema definitions are not part of the history a compaction trigger reasons about,
+    /// because compaction cannot shrink them. A host that wants the complete request instead —
+    /// definitions included — should read
+    /// [`ContextUsageBreakdown`](crate::usage::ContextUsageBreakdown), which reports this same
+    /// measurement alongside the categories it splits into.
     ///
     /// Provider adapters should still prefer their tokenizer when it is available: multimodal
     /// pricing and request framing are provider-specific and this estimator prices neither.
@@ -113,12 +105,7 @@ impl ContextUsage {
         let mut total_tokens = 0_usize;
 
         for item in items {
-            let rendered = serde_json::to_value(item).map_err(|error| {
-                Error::caller(format!(
-                    "failed to render a model-input item for compaction: {error}"
-                ))
-            })?;
-            let item_tokens = content_chars(&rendered).div_ceil(CHARS_PER_TOKEN);
+            let item_tokens = estimate::item_tokens(item)?;
             largest_item_tokens = largest_item_tokens.max(item_tokens);
             total_tokens = total_tokens
                 .checked_add(item_tokens)
@@ -736,28 +723,6 @@ fn replaced_item_ids(
         }
     }
     ids
-}
-
-/// Counts the characters a model reads from one serialized item.
-///
-/// A walk over the value rather than the length of its serialized text. `ModelInputItem` is
-/// `#[non_exhaustive]` and several of its variants carry provider-opaque maps, so a `match` on the
-/// item would need a wildcard that prices future shapes at zero, while the serialized text charges
-/// for field names, delimiters, and one extra character per escape.
-fn content_chars(value: &Value) -> usize {
-    match value {
-        Value::Null => 0,
-        Value::Bool(true) => "true".len(),
-        Value::Bool(false) => "false".len(),
-        Value::Number(number) => number.to_string().chars().count(),
-        Value::String(text) => text.chars().count(),
-        Value::Array(values) => values
-            .iter()
-            .fold(0, |total, value| total.saturating_add(content_chars(value))),
-        Value::Object(fields) => fields
-            .values()
-            .fold(0, |total, value| total.saturating_add(content_chars(value))),
-    }
 }
 
 pub mod anchor;
