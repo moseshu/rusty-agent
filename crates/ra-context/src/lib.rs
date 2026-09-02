@@ -12,6 +12,8 @@
 pub mod archive;
 pub mod budget;
 pub mod compaction;
+mod estimate;
 pub mod eviction;
 pub mod preflight;
+pub mod usage;
 pub mod window;

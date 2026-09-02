@@ -214,16 +214,33 @@ impl ModelToolDefinition {
     /// which endpoint the run happens to use, and a surface budget has to be comparable across
     /// providers to be worth stating.
     ///
-    /// This is the single definition of the measure, and it sits on the projection rather than on
-    /// [`ToolSchema`](crate::tool::ToolSchema) because the projection is what a provider is sent:
-    /// a tool that advertises itself under a different name than it routes under is billed for
-    /// the name it advertises.
+    /// This is the single definition of the byte measure, and it sits on the projection rather
+    /// than on [`ToolSchema`](crate::tool::ToolSchema) because the projection is what a provider
+    /// is sent: a tool that advertises itself under a different name than it routes under is
+    /// billed for the name it advertises. [`Self::advertised_chars`] counts the same rendering in
+    /// the unit a token estimate needs; the two share one renderer, so which parts an entry
+    /// advertises is still defined exactly once.
     ///
     /// # Errors
     ///
     /// Returns a configuration error if the input schema cannot be rendered.
     pub fn advertised_bytes(&self) -> Result<usize> {
         advertised_definition_bytes(&self.name, self.description.as_deref(), &self.input_schema)
+    }
+
+    /// The same advertised entry counted in characters rather than bytes.
+    ///
+    /// [`Self::advertised_bytes`] stays the measure a surface budget is stated in: a byte ceiling
+    /// is what a transport actually bounds. A token estimate, in contrast, prices characters, and
+    /// a multi-byte description would be charged several times over against a byte count. Both
+    /// read the same rendered entry, so they can never disagree about which parts an entry
+    /// advertises.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the input schema cannot be rendered.
+    pub fn advertised_chars(&self) -> Result<usize> {
+        advertised_definition_chars(&self.name, self.description.as_deref(), &self.input_schema)
     }
 }
 
@@ -309,6 +326,37 @@ impl ModelHandoffDefinition {
     pub fn advertised_bytes(&self) -> Result<usize> {
         advertised_definition_bytes(&self.name, self.description.as_deref(), &self.input_schema)
     }
+
+    /// The same advertised entry counted in characters, matching
+    /// [`ModelToolDefinition::advertised_chars`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the input schema cannot be rendered.
+    pub fn advertised_chars(&self) -> Result<usize> {
+        advertised_definition_chars(&self.name, self.description.as_deref(), &self.input_schema)
+    }
+}
+
+/// Renders the model-visible text of one advertised entry.
+///
+/// The three parts an entry advertises are concatenated because only their combined length is
+/// ever read. Keeping the rendering here rather than in each measure is what lets a byte budget
+/// and a character-based token estimate disagree about the unit while provably counting the same
+/// material: a part added to an entry reaches both measures at once.
+fn render_advertised_definition(
+    name: &str,
+    description: Option<&str>,
+    input_schema: &Value,
+) -> Result<String> {
+    let mut rendered = serde_json::to_string(input_schema).map_err(|error| {
+        Error::config("failed to render advertised action schema").with_source(error)
+    })?;
+    rendered.push_str(name);
+    if let Some(description) = description {
+        rendered.push_str(description);
+    }
+    Ok(rendered)
 }
 
 fn advertised_definition_bytes(
@@ -316,10 +364,19 @@ fn advertised_definition_bytes(
     description: Option<&str>,
     input_schema: &Value,
 ) -> Result<usize> {
-    let input_schema = serde_json::to_string(input_schema).map_err(|error| {
-        Error::config("failed to render advertised action schema").with_source(error)
-    })?;
-    Ok(input_schema.len() + name.len() + description.map_or(0, str::len))
+    Ok(render_advertised_definition(name, description, input_schema)?.len())
+}
+
+fn advertised_definition_chars(
+    name: &str,
+    description: Option<&str>,
+    input_schema: &Value,
+) -> Result<usize> {
+    Ok(
+        render_advertised_definition(name, description, input_schema)?
+            .chars()
+            .count(),
+    )
 }
 
 /// Model-facing structured-output schema.
@@ -376,6 +433,20 @@ impl ModelOutputSchema {
     #[must_use]
     pub const fn strict(&self) -> bool {
         self.strict
+    }
+
+    /// What this schema costs the model to read, in characters.
+    ///
+    /// A structured-output schema occupies the same request-time definition space as a tool, so it
+    /// is measured the same way — minus a description, which this projection does not carry. It is
+    /// deliberately absent from the byte-denominated tool-surface budget: a response format is not
+    /// something a run trims to fit under a tool ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the schema cannot be rendered.
+    pub fn advertised_chars(&self) -> Result<usize> {
+        advertised_definition_chars(&self.name, None, &self.schema)
     }
 }
 
