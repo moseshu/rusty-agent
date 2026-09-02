@@ -2,7 +2,10 @@
 
 use std::{fmt, io, path::Path, sync::Arc};
 
-use ra_context::{budget::ToolResultBudget, eviction::ToolOutputReferenceTrimmer};
+use ra_context::{
+    budget::ToolResultBudget, compaction::CompactionCapability,
+    eviction::ToolOutputReferenceTrimmer,
+};
 use ra_core::{
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
@@ -102,13 +105,16 @@ impl CodingHost {
             .with_output_projector(Arc::new(ToolResultBudget::default()))
     }
 
-    /// Constructs the coding product's run policy, including reference-aware tool-output eviction.
+    /// Constructs the coding product's run policy, including reference-aware tool-output eviction
+    /// and model-window-driven context compaction.
     ///
     /// This affects only future model requests. Complete observations stay in the session and the
     /// `RunState` reference ledger lets a resumed run apply the same policy without rebuilding
     /// retention facts from prose.
     pub fn build_run_config(&self) -> RunConfig {
-        RunConfig::new().with_model_input_projector(Arc::new(ToolOutputReferenceTrimmer::default()))
+        RunConfig::new()
+            .with_model_input_projector(Arc::new(ToolOutputReferenceTrimmer::default()))
+            .with_context_processor(Arc::new(CompactionCapability::default()))
     }
 
     /// Creates the coding product's workspace-confined patch tool.

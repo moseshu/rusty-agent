@@ -606,6 +606,18 @@ impl ModelRequest {
         Ok(())
     }
 
+    /// Replaces the input items, keeping every other resolved field.
+    ///
+    /// A context transform that reprojects the history needs exactly this and nothing else. It
+    /// lives on the type rather than in the caller because this struct is `#[non_exhaustive]` so
+    /// that fields can be added: a caller that rebuilt the request field by field would silently
+    /// drop the next one, with no compile error to say so.
+    #[must_use]
+    pub fn with_input(mut self, input: Vec<ModelInputItem>) -> Self {
+        self.input = input;
+        self
+    }
+
     /// Provider-neutral input items.
     #[must_use]
     pub fn input(&self) -> &[ModelInputItem] {

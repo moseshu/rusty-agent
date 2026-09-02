@@ -8,6 +8,10 @@ const fn ra_context::archive::ArchivedHistory::archive_ref(& self) -> & ArchiveR
 const fn ra_context::budget::ToolResultBudget::max_bytes(& self) -> usize
 const fn ra_context::budget::ToolResultBudget::max_tokens(& self) -> usize
 const fn ra_context::compaction::CompactionAssessment::usage(& self) -> ContextUsage
+const fn ra_context::compaction::CompactionCapability::context_windows(& self) -> & ContextWindowConfig
+const fn ra_context::compaction::CompactionCapability::max_items(& self) -> Option < usize >
+const fn ra_context::compaction::CompactionCapability::max_single_item_tokens(& self) -> Option < usize >
+const fn ra_context::compaction::CompactionCapability::retention(& self) -> AnchorRetention
 const fn ra_context::compaction::CompactionLimits::max_items(self) -> Option < usize >
 const fn ra_context::compaction::CompactionLimits::max_single_item_tokens(self) -> Option < usize >
 const fn ra_context::compaction::CompactionLimits::max_total_tokens(self) -> Option < usize >
@@ -68,6 +72,7 @@ const fn ra_context::window::ContextWindowThresholdRatio::basis_points(self) -> 
 const fn ra_context::window::ContextWindowThresholdRatio::from_basis_points(basis_points : u16) -> Self
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_BYTES: usize
 const ra_context::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS: usize
+const ra_context::compaction::anchor::DEFAULT_TAIL_ITEMS: usize
 const ra_context::compaction::summary::SummarySlot::ALL: [Self ; 9]
 const ra_context::eviction::DEFAULT_MAX_OUTPUT_CHARS: usize
 const ra_context::eviction::DEFAULT_MAX_UNREFERENCED_TURNS: u64
@@ -89,6 +94,7 @@ fn ra_context::compaction::CompactedModelInput::items(& self) -> & [ModelInputIt
 fn ra_context::compaction::CompactedModelInput::with_archive_ref(mut self, archive_ref : ArchiveRef, notice : Option < String >) -> Self
 fn ra_context::compaction::CompactionAssessment::is_required(& self) -> bool
 fn ra_context::compaction::CompactionAssessment::reasons(& self) -> & [CompactionReason]
+fn ra_context::compaction::CompactionCapability::new(context_windows : ContextWindowConfig, retention : AnchorRetention, max_items : Option < usize >, max_single_item_tokens : Option < usize >) -> Result < Self >
 fn ra_context::compaction::CompactionLimits::assess(self, usage : ContextUsage) -> CompactionAssessment
 fn ra_context::compaction::CompactionLimits::ensure_converges_with(self, retention : AnchorRetention) -> Result < () >
 fn ra_context::compaction::CompactionLimits::for_model(context_windows : & ContextWindowConfig, model : & str, max_items : Option < usize >, max_single_item_tokens : Option < usize >) -> Result < Option < Self > >
@@ -149,6 +155,7 @@ struct ra_context::archive::ArchivedHistory
 struct ra_context::budget::ToolResultBudget
 struct ra_context::compaction::CompactedModelInput
 struct ra_context::compaction::CompactionAssessment
+struct ra_context::compaction::CompactionCapability
 struct ra_context::compaction::CompactionLimits
 struct ra_context::compaction::CompactionPolicy
 struct ra_context::compaction::ContextUsage

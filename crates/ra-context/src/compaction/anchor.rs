@@ -9,6 +9,9 @@ use std::collections::BTreeSet;
 
 use ra_core::error::{Error, Result};
 
+/// Number of most-recent model-visible items retained by the default compaction policy.
+pub const DEFAULT_TAIL_ITEMS: usize = 16;
+
 /// Bounded retention policy for a compacted history.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +19,17 @@ pub struct AnchorRetention {
     head_items: usize,
     max_anchor_items: usize,
     tail_items: usize,
+}
+
+impl Default for AnchorRetention {
+    /// Keeps a recent working set while a generated summary represents earlier context.
+    fn default() -> Self {
+        Self {
+            head_items: 0,
+            max_anchor_items: 0,
+            tail_items: DEFAULT_TAIL_ITEMS,
+        }
+    }
 }
 
 impl AnchorRetention {

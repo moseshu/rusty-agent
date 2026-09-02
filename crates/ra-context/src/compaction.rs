@@ -9,12 +9,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use async_trait::async_trait;
 use ra_core::{
+    capability::{
+        ContextProcessor, ContextProcessorRequest, ContextProcessorResult, ContextSummarizer,
+        ContextSummaryRequest,
+    },
     error::{Error, Result},
-    item::{ArchiveRef, CallId, Compaction, ItemId, ModelInputItem, RunItem, RunItemKind},
+    item::{
+        ArchiveRef, CallId, Compaction, ItemId, MessageRole, ModelInputItem, ModelResponse,
+        RunItem, RunItemKind,
+    },
+    model::ModelOutputSchema,
 };
+use serde_json::{Value, json};
 
-use crate::{compaction::anchor::AnchorRetention, estimate, window::ContextWindowConfig};
+use crate::{
+    compaction::{anchor::AnchorRetention, summary::SummarySlot},
+    estimate,
+    window::ContextWindowConfig,
+};
 
 /// One reason that the current model-input history needs compaction.
 #[non_exhaustive]
@@ -367,6 +381,349 @@ impl CompactionAssessment {
         !self.reasons.is_empty()
     }
 }
+
+/// A context-processing capability that compacts generated history when its configured model
+/// window requires it.
+///
+/// The capability owns only policy and summary validation. It asks the runner for the summary
+/// request through [`ContextSummarizer`], so `ra-context` never selects a provider, dispatches a
+/// model call, or mutates `RunState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionCapability {
+    context_windows: ContextWindowConfig,
+    retention: AnchorRetention,
+    max_items: Option<usize>,
+    max_single_item_tokens: Option<usize>,
+}
+
+impl CompactionCapability {
+    /// Creates a model-window-driven compaction capability.
+    ///
+    /// Unknown models remain unmodified unless an explicit item limit is supplied. That follows
+    /// [`CompactionLimits::for_model`]: a host must configure a window rather than letting a name
+    /// imply one.
+    pub fn new(
+        context_windows: ContextWindowConfig,
+        retention: AnchorRetention,
+        max_items: Option<usize>,
+        max_single_item_tokens: Option<usize>,
+    ) -> Result<Self> {
+        if max_items.is_some() || max_single_item_tokens.is_some() {
+            CompactionLimits::new(max_items, max_single_item_tokens, None)?
+                .ensure_converges_with(retention)?;
+        }
+        Ok(Self {
+            context_windows,
+            retention,
+            max_items,
+            max_single_item_tokens,
+        })
+    }
+
+    /// Context-window lookup configuration used to resolve total-token thresholds.
+    #[must_use]
+    pub const fn context_windows(&self) -> &ContextWindowConfig {
+        &self.context_windows
+    }
+
+    /// History regions retained around a summary.
+    #[must_use]
+    pub const fn retention(&self) -> AnchorRetention {
+        self.retention
+    }
+
+    /// Optional explicit item-count trigger.
+    #[must_use]
+    pub const fn max_items(&self) -> Option<usize> {
+        self.max_items
+    }
+
+    /// Optional explicit single-item trigger.
+    #[must_use]
+    pub const fn max_single_item_tokens(&self) -> Option<usize> {
+        self.max_single_item_tokens
+    }
+
+    fn limits_for_model(&self, model: Option<&str>) -> Result<Option<CompactionLimits>> {
+        let Some(model) = model else {
+            if self.max_items.is_none() && self.max_single_item_tokens.is_none() {
+                return Ok(None);
+            }
+            return CompactionLimits::new(self.max_items, self.max_single_item_tokens, None)
+                .map(Some);
+        };
+        CompactionLimits::for_model(
+            &self.context_windows,
+            model,
+            self.max_items,
+            self.max_single_item_tokens,
+        )
+    }
+}
+
+impl Default for CompactionCapability {
+    /// Uses built-in model windows and retains the recent working set around a summary.
+    fn default() -> Self {
+        Self {
+            context_windows: ContextWindowConfig::default(),
+            retention: AnchorRetention::default(),
+            max_items: None,
+            max_single_item_tokens: None,
+        }
+    }
+}
+
+#[async_trait]
+impl ContextProcessor for CompactionCapability {
+    async fn process_context(
+        &self,
+        request: ContextProcessorRequest,
+        summarizer: &dyn ContextSummarizer,
+    ) -> Result<ContextProcessorResult> {
+        let Some(limits) = self.limits_for_model(request.model_name())? else {
+            tracing::debug!(
+                model = request.model_name().unwrap_or("<unresolved>"),
+                "context compaction is installed but inert: no configured context window and no \
+                 explicit item limit"
+            );
+            return Ok(ContextProcessorResult::new(request.input().to_vec()));
+        };
+        if request.history().is_empty() {
+            return Ok(ContextProcessorResult::new(request.input().to_vec()));
+        }
+
+        // What the model would read, not what the session stores. A summary already in the history
+        // stands for the items it replaced, and those items are still authoritative records that
+        // this run will never delete. Measuring them again is how a compacted run decides it must
+        // compact once more on every later turn, paying for a summary call each time and never
+        // getting below a threshold that authoritative history can only grow past.
+        let view = compacted_history_view(request.history());
+        let assessment = limits.assess(ContextUsage::estimate_model_input(&view)?);
+        let visible_input = splice(&request, view);
+        if !assessment.is_required() {
+            return Ok(ContextProcessorResult::new(visible_input));
+        }
+
+        let (projected, response) = self
+            .compact(
+                &request,
+                summarizer,
+                visible_input.clone(),
+                limits,
+                assessment,
+            )
+            .await?;
+        let Some(projected) = projected else {
+            let result = ContextProcessorResult::new(visible_input);
+            return Ok(match response {
+                Some(response) => result.with_model_responses(vec![response]),
+                None => result,
+            });
+        };
+        let compaction = projected
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                ModelInputItem::Compaction(compaction) => Some(compaction.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| Error::caller("a compacted context did not contain its summary"))?;
+        let record = RunItem::new(
+            request.record_id().clone(),
+            RunItemKind::Compaction(compaction),
+        );
+
+        Ok(
+            ContextProcessorResult::new(splice(&request, projected.items().to_vec()))
+                .with_generated_items(vec![record])
+                .with_model_responses(response.into_iter().collect()),
+        )
+    }
+}
+
+impl CompactionCapability {
+    /// Asks for a summary and projects the history around it.
+    ///
+    /// `None` means the summary could not be obtained or understood. Compaction then declines
+    /// rather than failing: the run continues on the uncompacted view and the provider decides
+    /// whether the request still fits, which beats ending a long run at the exact moment its
+    /// context is largest and its work most expensive to lose.
+    async fn compact(
+        &self,
+        request: &ContextProcessorRequest,
+        summarizer: &dyn ContextSummarizer,
+        summary_input: Vec<ModelInputItem>,
+        limits: CompactionLimits,
+        assessment: CompactionAssessment,
+    ) -> Result<(Option<CompactedModelInput>, Option<ModelResponse>)> {
+        let user_messages = user_messages(&summary_input);
+        let summary_request =
+            ContextSummaryRequest::new(summary_input, summary_instruction(assessment.reasons()))
+                .with_output_schema(summary_output_schema());
+        let summary_response = match summarizer.summarize(summary_request).await {
+            Ok(response) => response,
+            Err(error) if error.is_cancelled() => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "context compaction could not obtain a model summary; continuing uncompacted"
+                );
+                return Ok((None, None));
+            }
+        };
+        let response = summary_response.response().clone();
+        let summary = match parse_summary(summary_response.text(), user_messages) {
+            Ok(summary) => summary,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "context compaction could not read the model's summary; continuing uncompacted"
+                );
+                return Ok((None, Some(response)));
+            }
+        };
+        let projected = project_compacted_model_input(
+            request.history(),
+            CompactionPolicy::new(limits, self.retention)?,
+            std::iter::empty(),
+            summary.render(),
+        )?;
+        Ok((Some(projected), Some(response)))
+    }
+}
+
+/// Rebuilds the complete request input around a history projection.
+fn splice(request: &ContextProcessorRequest, history: Vec<ModelInputItem>) -> Vec<ModelInputItem> {
+    let mut input = request.prefix().to_vec();
+    input.extend(history);
+    input.extend(request.suffix().iter().cloned());
+    input
+}
+
+/// The model-visible view of a history that may already contain compaction summaries.
+///
+/// A [`Compaction`] names every item it stands for, including the summary it superseded, so those
+/// records drop out of the view while staying in the authoritative history the session owns. This
+/// is what makes one compaction hold across later turns instead of being recomputed from scratch.
+fn compacted_history_view(history: &[RunItem]) -> Vec<ModelInputItem> {
+    let replaced: BTreeSet<&ItemId> = history
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::Compaction(compaction) => Some(compaction.compacted_items()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    history
+        .iter()
+        .filter(|item| !replaced.contains(item.id()))
+        .filter_map(RunItem::to_model_input)
+        .collect()
+}
+
+fn summary_instruction(reasons: &[CompactionReason]) -> String {
+    let reasons = reasons
+        .iter()
+        .map(|reason| reason.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Summarize the conversation context for continued work. The context reached these limits: {reasons}. Return only one JSON object with these required non-empty string fields: primary_request_and_intent, key_technical_concepts, files_and_code_sections, errors_and_fixes, problem_solving, pending_tasks, current_work, optional_next_step. Do not include user_messages: the runtime preserves those verbatim."
+    )
+}
+
+fn summary_output_schema() -> ModelOutputSchema {
+    let fields = [
+        "primary_request_and_intent",
+        "key_technical_concepts",
+        "files_and_code_sections",
+        "errors_and_fixes",
+        "problem_solving",
+        "pending_tasks",
+        "current_work",
+        "optional_next_step",
+    ];
+    let properties = fields
+        .iter()
+        .map(|field| {
+            (
+                (*field).to_owned(),
+                json!({"type": "string", "minLength": 1}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    ModelOutputSchema::new(
+        "context_compaction_summary",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": fields,
+            "properties": properties,
+        }),
+    )
+    .with_strict(true)
+}
+
+fn parse_summary(text: &str, user_messages: Vec<String>) -> Result<summary::CompactionSummary> {
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        Error::caller("the context summary response is not valid JSON").with_source(error)
+    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::caller("the context summary response must be a JSON object"))?;
+    let fields = [
+        (
+            SummarySlot::PrimaryRequestAndIntent,
+            "primary_request_and_intent",
+        ),
+        (SummarySlot::KeyTechnicalConcepts, "key_technical_concepts"),
+        (SummarySlot::FilesAndCodeSections, "files_and_code_sections"),
+        (SummarySlot::ErrorsAndFixes, "errors_and_fixes"),
+        (SummarySlot::ProblemSolving, "problem_solving"),
+        (SummarySlot::PendingTasks, "pending_tasks"),
+        (SummarySlot::CurrentWork, "current_work"),
+        (SummarySlot::OptionalNextStep, "optional_next_step"),
+    ];
+    let mut builder = summary::CompactionSummaryBuilder::new();
+    for (slot, field) in fields {
+        let content = object.get(field).and_then(Value::as_str).ok_or_else(|| {
+            Error::caller(format!(
+                "the context summary response needs string field `{field}`"
+            ))
+        })?;
+        builder = builder.with_section(slot, content)?;
+    }
+    builder.with_user_messages(user_messages).build()
+}
+
+/// The verbatim user messages a summary must carry, in order.
+///
+/// A user message can be entirely non-text — a pasted screenshot is one — and `text_content`
+/// returns nothing for it. It is still a turn the user took, and the summary slot rejects a blank
+/// entry, so it is marked rather than dropped or turned into an error: dropping it would renumber
+/// every message after it, and erroring would make one image permanently un-compactable and take
+/// the whole run down with it the first time the window filled.
+fn user_messages(input: &[ModelInputItem]) -> Vec<String> {
+    input
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Message(message) if message.role() == MessageRole::User => {
+                Some(message.text_content())
+            }
+            _ => None,
+        })
+        .map(|message| {
+            if message.trim().is_empty() {
+                NON_TEXT_USER_MESSAGE.to_owned()
+            } else {
+                message
+            }
+        })
+        .collect()
+}
+
+/// Stands in for a user message that carried no text, such as an image-only one.
+const NON_TEXT_USER_MESSAGE: &str = "(user message with no text content)";
 
 /// The model-visible result of replacing part of an authoritative history with one summary.
 ///
