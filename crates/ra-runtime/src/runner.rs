@@ -33,11 +33,12 @@ use std::{any::Any, collections::BTreeSet, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use ra_core::{
+    agent::AgentSpec,
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
     capability::{
-        ContextProcessor, ContextProcessorRequest, ContextSummarizer, ContextSummaryRequest,
-        ContextSummaryResponse,
+        Capability, ContextProcessor, ContextProcessorRequest, ContextSummarizer,
+        ContextSummaryRequest, ContextSummaryResponse,
     },
     context::RunContext,
     error::{BudgetKind, Error, ProviderErrorKind, Result},
@@ -75,6 +76,7 @@ pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
     agent::AgentBinding,
+    capability::CapabilityPlan,
     permission::PermissionEngine,
     tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     turn::{
@@ -117,6 +119,7 @@ pub struct RunConfig {
     model_input_projector: Option<Arc<dyn ModelInputProjector>>,
     tool_output_reference_extractor: Option<Arc<dyn ToolOutputReferenceExtractor>>,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
+    capabilities: Vec<Arc<dyn Capability>>,
     permission: PermissionEngine,
 }
 
@@ -142,6 +145,7 @@ impl RunConfig {
             model_input_projector: None,
             tool_output_reference_extractor: None,
             context_processors: Vec::new(),
+            capabilities: Vec::new(),
             permission: PermissionEngine::default(),
         }
     }
@@ -290,6 +294,32 @@ impl RunConfig {
         self
     }
 
+    /// Installs one capability for this run.
+    ///
+    /// A capability is assembled once, when the run starts: its declared dependencies are checked
+    /// against the rest of the installed set, its tools and prompt fragment join the agent instance
+    /// that executes, its settings fold onto that instance's settings layer, and its context
+    /// transform is appended to the processors installed above. Installation order is the assembly
+    /// order, except where a declared dependency moves a capability after the family it names — see
+    /// [`CapabilityPlan`](crate::capability::CapabilityPlan) for the whole rule.
+    ///
+    /// A set that cannot be assembled — a missing dependency, two capabilities claiming one family,
+    /// a dependency circle — fails the run before its first model call rather than reaching a model
+    /// half-assembled.
+    pub fn with_capability(mut self, capability: Arc<dyn Capability>) -> Self {
+        self.capabilities.push(capability);
+        self
+    }
+
+    /// Installs several capabilities, in iteration order.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
+    ) -> Self {
+        self.capabilities.extend(capabilities);
+        self
+    }
+
     /// Selects the base permission mode used for every tool call in this run.
     pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission = self.permission.with_mode(mode);
@@ -373,6 +403,28 @@ impl RunConfig {
     pub fn context_processors(&self) -> &[Arc<dyn ContextProcessor>] {
         &self.context_processors
     }
+
+    /// Capabilities installed for this run, in installation order.
+    ///
+    /// Installation order, not assembly order: the two differ wherever a declared dependency moves
+    /// a capability, and this accessor reports what the host asked for.
+    #[must_use]
+    pub fn capabilities(&self) -> &[Arc<dyn Capability>] {
+        &self.capabilities
+    }
+
+    /// Appends the context transforms an assembled capability set contributed.
+    ///
+    /// Appended rather than merged in front: a processor installed through
+    /// [`Self::with_context_processor`] was put there by the host directly, before any capability
+    /// was resolved, and running the capability chain ahead of it would change what that host
+    /// already had working.
+    pub(crate) fn extend_context_processors(
+        &mut self,
+        context_processors: impl IntoIterator<Item = Arc<dyn ContextProcessor>>,
+    ) {
+        self.context_processors.extend(context_processors);
+    }
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -403,6 +455,14 @@ impl std::fmt::Debug for RunConfig {
                 &self.tool_output_reference_extractor.is_some(),
             )
             .field("context_processor_count", &self.context_processors.len())
+            .field(
+                "capabilities",
+                &self
+                    .capabilities
+                    .iter()
+                    .map(|capability| capability.kind())
+                    .collect::<Vec<_>>(),
+            )
             .field("permission", &self.permission)
             .finish()
     }
@@ -727,7 +787,7 @@ async fn run_loop_inner(
         app_context,
         cancel,
         input: requested_input,
-        config,
+        mut config,
         mut state,
         services,
         event_seqs,
@@ -739,6 +799,19 @@ async fn run_loop_inner(
         ra_core::trace::record_error(span, &error);
         return Err(error);
     }
+
+    // Checked here, beside the rest of the configuration and ahead of the segment: whether the
+    // installed capabilities can be assembled at all is a property of the configuration, and a
+    // missing dependency reported after a model has been paid to read a half-assembled surface is
+    // reported too late. Binding them is a separate step below, because that needs the run.
+    let capability_plan =
+        match CapabilityPlan::resolve(config.capabilities().iter().map(Arc::clone)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                ra_core::trace::record_error(span, &error);
+                return Err(error);
+            }
+        };
 
     // An explicit input remains the caller's continuation base. An empty resumed request chooses
     // the checkpoint projection, so hosts that persist only state do not have to rebuild it.
@@ -765,6 +838,30 @@ async fn run_loop_inner(
         None => cancel,
     };
     let _deadline = arm_deadline(&cancel);
+
+    // Under the run scope rather than ahead of it: a capability resolves its prompt fragment with
+    // third-party asynchronous code, and a run whose assembly reads a slow source is one the
+    // deadline and the caller's interrupt still have to reach.
+    if !capability_plan.is_empty() {
+        let assembly = assemble_capabilities(
+            &capability_plan,
+            &agent,
+            &run_id,
+            app_context.as_ref(),
+            &state,
+            &event_seqs,
+        );
+        match cancel.run(assembly).await.and_then(|result| result) {
+            Ok((execution, context_processors)) => {
+                agent = AgentBinding::prepared(Arc::clone(agent.public()), execution);
+                config.extend_context_processors(context_processors);
+            }
+            Err(error) => {
+                record_terminal_error(span, &error, &cancel);
+                return Err(error);
+            }
+        }
+    }
 
     let mut progress = TurnLoopProgress {
         first_item: state.generated_items().len(),
@@ -872,6 +969,40 @@ async fn run_loop_inner(
     record_run_outcome(span, &result);
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)
+}
+
+/// Binds the run's capabilities and splits what they contribute between the two places it goes.
+///
+/// The agent instance comes back paired with the context processors deliberately. Tools, prompt
+/// text, and sampling settings describe the thing that executes, while a context transform is a
+/// property of the run — and a single "prepared" value carrying both would be a third home for a
+/// pair that has no other reason to be one object.
+///
+/// The instance is assembled onto [`AgentBinding::execution`], not the public agent: a host that
+/// already prepared its own execution instance keeps it, and the identity every record is filed
+/// under stays the one the user configured.
+async fn assemble_capabilities(
+    plan: &CapabilityPlan,
+    agent: &AgentBinding,
+    run_id: &RunId,
+    app_context: Option<&Arc<dyn Any + Send + Sync>>,
+    state: &RunState,
+    event_seqs: &EventSeqAllocator,
+) -> Result<(Arc<AgentSpec>, Vec<Arc<dyn ContextProcessor>>)> {
+    // The public agent, because binding is told who is running rather than what was assembled —
+    // and what was assembled is precisely what does not exist yet at this point.
+    let mut context = RunContext::new(run_id.clone(), agent.public())
+        .with_budget(state.budget().clone())
+        .with_usage_totals(state.usage_totals().clone())
+        .with_pending_control_requests(state.pending_control_requests().to_vec())
+        .with_event_seq_allocator(event_seqs.clone());
+    if let Some(app_context) = app_context {
+        context = context.with_app_context(Arc::clone(app_context));
+    }
+
+    let assembled = plan.assemble(&context).await?;
+    let execution = assembled.prepare_agent(agent.execution())?;
+    Ok((execution, assembled.context_processors().to_vec()))
 }
 
 /// Settles host answers that were checkpointed with an interrupted run before another model call.

@@ -3,9 +3,9 @@
 //! The loop kernel. Its public API must be able to run any agent and contains no business vocabulary.
 //!
 //! **Boundary**: it depends only on the protocol-neutral contracts in `ra-core`. The supported
-//! surface is the agent definition, the runner entry, the tool profile / registry, and the guard
-//! registry; turn settlement, dispatch, budget enforcement, the loop breaker, and the approval flow
-//! are not part of it.
+//! surface is the agent definition, the runner entry, capability assembly, the tool profile /
+//! registry, and the guard registry; turn settlement, dispatch, budget enforcement, the loop
+//! breaker, and the approval flow are not part of it.
 //!
 //! **Stability**: the `Runner` entry signature is `Stable` (it is on the Stable API list); the
 //! turn-settlement machinery is `Internal` — the stage functions here and the `ProcessedResponse` /
@@ -20,7 +20,7 @@
 
 pub mod agent;
 pub(crate) mod budget;
-pub(crate) mod capability;
+pub mod capability;
 pub(crate) mod circuit;
 pub mod guard;
 pub(crate) mod hook;

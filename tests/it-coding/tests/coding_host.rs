@@ -5,6 +5,7 @@ use std::{path::Path, sync::Arc};
 use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
     agent::AgentSpec,
+    capability::CapabilityFamily,
     context::RunContext,
     event::{
         AgentEvent, ExecEvent, HostEventBody, HostEventEmitter, HostEventSink,
@@ -42,7 +43,16 @@ fn test_coding_host_lifecycle_and_emitter() {
     assert!(services.event_sink().is_some());
     assert!(services.output_projector().is_some());
     assert!(host.build_run_config().model_input_projector().is_some());
-    assert_eq!(host.build_run_config().context_processors().len(), 1);
+    assert_eq!(
+        host.build_run_config()
+            .capabilities()
+            .iter()
+            .map(|capability| capability.kind())
+            .collect::<Vec<_>>(),
+        vec![CapabilityFamily::COMPACTION],
+        "compaction is installed as the capability it declares itself to be, so a later capability \
+         that depends on the family finds it installed"
+    );
 
     // HostEventEmitter bound emission check
     let run_id = RunId::new("run-coding-1");
