@@ -5,14 +5,16 @@ use std::collections::BTreeMap;
 use ra_context::compaction::anchor::{AnchorRetention, DEFAULT_TAIL_ITEMS};
 use ra_context::compaction::summary::{CompactionSummaryBuilder, SummarySlot};
 use ra_context::compaction::{
-    CompactedModelInput, CompactionLimits, CompactionPolicy, CompactionReason, ContextUsage,
-    project_compacted_model_input,
+    CompactedModelInput, CompactionCapability, CompactionLimits, CompactionPolicy,
+    CompactionReason, ContextUsage, project_compacted_model_input,
 };
 use ra_context::window::{ContextWindowConfig, DEFAULT_COMPACTION_THRESHOLD_RATIO};
+use ra_core::capability::{Capability, CapabilityFamily};
 use ra_core::item::{
     CallId, Compaction, ItemId, McpApprovalRequest, McpApprovalResponse, Message, ModelInputItem,
     OutputPhase, Reasoning, RunItem, RunItemKind, ToolApproval, ToolCall, ToolCallOutput,
 };
+use ra_core::model::ModelSettings;
 use ra_core::prompt::estimate_tokens;
 
 /// A projection policy whose only trigger is a total-token ceiling.
@@ -789,5 +791,40 @@ fn a_compaction_policy_refuses_a_retention_that_cannot_clear_its_item_trigger() 
             AnchorRetention::new(1, 0, 1).expect("non-empty policy"),
         )
         .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn compaction_is_installed_as_a_capability_whose_whole_contribution_is_the_transform() {
+    let capability = CompactionCapability::default();
+
+    assert_eq!(capability.kind(), CapabilityFamily::COMPACTION);
+    assert!(
+        capability.context_processor().is_some(),
+        "the capability and the processor are one object, so a host installing the capability \
+         cannot end up with the policy and none of the transform"
+    );
+    assert!(
+        capability.tools().is_empty(),
+        "compaction is not something the model calls"
+    );
+    assert!(
+        capability
+            .instructions()
+            .await
+            .expect("no fragment")
+            .is_none(),
+        "the summary instructions go to the summary call, not into a prefix every turn pays for"
+    );
+    assert!(
+        capability.required_capabilities().is_empty(),
+        "compaction reads the history the runtime already hands it"
+    );
+    assert_eq!(
+        capability
+            .sampling_params(ModelSettings::new().with_temperature(0.3))
+            .temperature(),
+        Some(0.3),
+        "the summary request carries its own settings; the agent's are not compaction's to change"
     );
 }

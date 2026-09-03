@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use ra_core::{
     capability::{
-        ContextProcessor, ContextProcessorRequest, ContextProcessorResult, ContextSummarizer,
-        ContextSummaryRequest,
+        Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
+        ContextProcessorResult, ContextSummarizer, ContextSummaryRequest,
     },
     error::{Error, Result},
     item::{
@@ -470,6 +470,22 @@ impl Default for CompactionCapability {
             max_items: None,
             max_single_item_tokens: None,
         }
+    }
+}
+
+#[async_trait]
+impl Capability for CompactionCapability {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::COMPACTION
+    }
+
+    /// Compaction is the whole contribution: no tool, no prompt text, no sampling setting.
+    ///
+    /// The summary request it makes carries its own instructions, and those go to a separate model
+    /// call rather than into the agent's prompt. Putting them in the prefix would spend tokens on
+    /// every turn describing an operation the model never performs.
+    fn context_processor(&self) -> Option<&dyn ContextProcessor> {
+        Some(self)
     }
 }
 

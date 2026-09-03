@@ -1,19 +1,254 @@
-//! Contracts for capabilities that transform model context.
+//! The assembly unit that packages tools, prompt text, sampling settings, and context transforms.
 //!
-//! The tool, prompt, and sampling halves of the assembly surface are not defined yet. Context
-//! processing is the first part that is, so it has a narrow contract of its own instead of
-//! teaching the runner about any particular capability. Implementations live in service or
-//! product crates; the kernel only carries the data and callback boundary they share.
+//! A [`Capability`] is one installable thing an agent can be given. Carrying all four
+//! contributions on one trait is the point: an implementation that adds a tool also adds the
+//! paragraph telling the model the tool exists, and neither can be switched on without the other.
+//! Splitting them across a tool registry, a prompt-fragment registry, and a settings table is what
+//! produces a surface whose prompt describes tools it no longer advertises.
+//!
+//! [`ContextProcessor`] remains a contract of its own rather than a method on the trait. It is the
+//! richest of the four — it is asynchronous, it may ask the runtime for a model-produced summary,
+//! and it emits authoritative records — and it is installed on the run configuration directly by
+//! hosts that want one without an enclosing capability. A capability that transforms context
+//! implements both traits and returns itself from [`Capability::context_processor`], so there is
+//! one context-processing contract rather than a weaker second copy on this trait.
+//!
+//! Implementations live in service or product crates; the kernel only carries the contracts.
+
+use std::{borrow::Cow, collections::BTreeSet, fmt, sync::Arc};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
-    error::Result,
+    context::RunContext,
+    error::{Error, Result},
     item::{ItemId, ModelInputItem, ModelResponse, RunItem},
-    model::ModelOutputSchema,
+    model::{ModelOutputSchema, ModelSettings},
+    prompt::{PromptSection, PromptSource},
     state::RunId,
+    tool::Tool,
     usage::Usage,
 };
+
+/// The family a capability belongs to, and the name a dependency on it is declared against.
+///
+/// This is an open newtype rather than a closed enum, for the same reason
+/// [`ToolNamespace`](crate::tool::ToolNamespace) is one: a plugin or an integration has to be able
+/// to introduce a family without changing `ra-core`. The built-in families are associated
+/// constants so the set has one spelling rather than one per implementor.
+///
+/// # Why not an enum with a `Custom` variant
+///
+/// Because equality is the entire operation this type exists for:
+/// [`Capability::required_capabilities`] is checked by comparing declared families against
+/// installed ones. An enum carrying `Custom(Cow<'static, str>)` beside a `Shell` variant makes
+/// `Custom("shell")` and `Shell` two unequal values naming the same capability — so a third-party
+/// capability that declares its dependency the obvious way fails validation against a capability
+/// that is installed and present. A newtype has one representation per name, and the constructor is
+/// the only way to reach it.
+///
+/// The same reasoning drives the spelling rules in [`CapabilityFamily::new`]: `Shell` and `shell`
+/// would be two names for one thing, so only one of them is a name at all.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct CapabilityFamily(Cow<'static, str>);
+
+impl CapabilityFamily {
+    /// Command execution.
+    pub const SHELL: Self = Self::from_static("shell");
+    /// File reading and workspace traversal.
+    pub const FILESYSTEM: Self = Self::from_static("filesystem");
+    /// Patch application, the editing entry point.
+    pub const APPLY_PATCH: Self = Self::from_static("apply_patch");
+    /// Text and file-pattern search.
+    pub const SEARCH: Self = Self::from_static("search");
+    /// Plan and task tracking.
+    pub const TODO: Self = Self::from_static("todo");
+    /// Context compaction.
+    pub const COMPACTION: Self = Self::from_static("compaction");
+    /// Long-term memory retrieval and retention.
+    pub const MEMORY: Self = Self::from_static("memory");
+    /// Image viewing.
+    pub const VIEW_IMAGE: Self = Self::from_static("view_image");
+    /// Web fetching and search.
+    pub const WEB: Self = Self::from_static("web");
+    /// Skill discovery and loading.
+    pub const SKILLS: Self = Self::from_static("skills");
+
+    /// Creates a family from a name that is already known to be canonical.
+    #[must_use]
+    const fn from_static(name: &'static str) -> Self {
+        Self(Cow::Borrowed(name))
+    }
+
+    /// Creates a family from a name.
+    ///
+    /// A name is lowercase ASCII: it starts with a letter and continues with letters, digits, `_`,
+    /// or `.` — the last for namespacing a third party's own families, as in `plugin.browser`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when the name is empty or holds anything outside that set.
+    pub fn new(name: impl Into<Cow<'static, str>>) -> Result<Self> {
+        let name = name.into();
+        let mut characters = name.chars();
+        let starts_with_letter = characters.next().is_some_and(|c| c.is_ascii_lowercase());
+        let rest_is_canonical = characters
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.');
+        if !starts_with_letter || !rest_is_canonical {
+            return Err(Error::caller(format!(
+                "capability family `{name}` is not a canonical name: it must start with a \
+                 lowercase ASCII letter and continue with lowercase letters, digits, `_`, or `.`"
+            )));
+        }
+        Ok(Self(name))
+    }
+
+    /// Stable string representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Prompt provenance for a section this family contributes.
+    ///
+    /// Assembly attributes a capability's prompt text to the capability, and the family is that
+    /// attribution. Deriving it here rather than at each call site is what keeps the tag in a
+    /// prompt dump equal to the value [`Capability::kind`] returns.
+    #[must_use]
+    pub fn prompt_source(&self) -> PromptSource {
+        PromptSource::Capability(self.as_str().to_owned())
+    }
+}
+
+impl fmt::Display for CapabilityFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityFamily {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// One installable unit of agent capability.
+///
+/// Everything a capability contributes is optional except its identity, so a new contribution
+/// point can be added to this trait without breaking implementations that predate it.
+///
+/// # The order assembly calls these in
+///
+/// 1. The host constructs the capabilities it wants to install. Anything that can fail — opening a
+///    workspace, connecting a store — belongs to that constructor, which is why nothing below is
+///    a place to do work that can fail for configuration reasons.
+/// 2. [`Self::required_capabilities`] is checked against the installed set, before anything else
+///    runs. A missing dependency is a configuration error, and reporting it after a model has been
+///    paid to read a half-assembled surface is reporting it too late.
+/// 3. [`Self::bind`] gives each capability the run it is about to serve.
+/// 4. [`Self::tools`] contributes to the agent's tool set, which a tool profile then selects from.
+/// 5. [`Self::instructions`] contributes prompt sections.
+/// 6. [`Self::sampling_params`] folds over the agent's model-settings layer, in installation order.
+/// 7. [`Self::context_processor`] is installed on the run configuration and runs before each
+///    ordinary model call.
+///
+/// Steps 4 through 7 happen after binding, so anything a capability needs from the run it captured
+/// in step 3 rather than receiving as a parameter here.
+///
+/// # Deviations from the reference contract
+///
+/// - **`clone_for_run` and `bind` are one operation.** The reference implementation deep-copies a
+///   capability per run and then binds a live session into the copy, because binding mutates the
+///   object and one capability instance serves many runs. In Rust a capability is shared as an
+///   `Arc` and never mutated, so [`Self::bind`] returns the bound value instead of writing into
+///   `self` — and the deep copy exists only to make mutation safe, so it has nothing left to do.
+/// - **There is no `process_manifest`.** A manifest there is a sandbox session's declared mount
+///   set; this framework has no such value yet, and inventing one to fill a method signature would
+///   freeze a shape before the sandbox that owns it exists.
+#[async_trait]
+pub trait Capability: Send + Sync + 'static {
+    /// Which family this capability belongs to.
+    ///
+    /// Returned by value rather than borrowed: the built-in families are borrowed constants, and a
+    /// borrowing accessor would force every implementation to store a field purely to have
+    /// something to lend out.
+    fn kind(&self) -> CapabilityFamily;
+
+    /// Families that must be installed alongside this one.
+    ///
+    /// This is a declaration, not a check. Validating it — and reporting which capability is
+    /// missing which dependency — belongs to assembly, which is the only party that knows the
+    /// complete installed set.
+    fn required_capabilities(&self) -> BTreeSet<CapabilityFamily> {
+        BTreeSet::new()
+    }
+
+    /// Tools this capability contributes to the agent.
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    /// The prompt section this capability contributes, resolved once per run.
+    ///
+    /// Resolved during assembly and not again, which is what lets the section reach the cached
+    /// prefix: text that varies per turn invalidates the prompt cache on every call. A capability
+    /// whose contribution genuinely does vary per turn belongs in
+    /// [`ContextProcessor::process_context`], which runs against the live request and writes into
+    /// the tail rather than the prefix.
+    ///
+    /// The section should carry [`CapabilityFamily::prompt_source`] as its source, so a prompt dump
+    /// attributes the text to the capability that wrote it.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever reading the fragment's source material produced.
+    async fn instructions(&self) -> Result<Option<PromptSection>> {
+        Ok(None)
+    }
+
+    /// Model settings this capability needs, folded onto the agent's layer.
+    ///
+    /// Each capability receives the settings the ones before it produced and returns the settings
+    /// the ones after it will see, so the fold is ordered and a later capability can override an
+    /// earlier one on purpose. The result becomes the agent layer of the settings resolve; it does
+    /// not reach the provider or model layers, which are not a capability's to speak for.
+    fn sampling_params(&self, settings: ModelSettings) -> ModelSettings {
+        settings
+    }
+
+    /// The context transformation this capability performs, if it performs one.
+    ///
+    /// An implementation that also implements [`ContextProcessor`] returns `Some(self)`.
+    fn context_processor(&self) -> Option<&dyn ContextProcessor> {
+        None
+    }
+
+    /// Binds this capability to the run it is about to serve.
+    ///
+    /// `None` — the default — means the capability holds no per-run state and the installed value
+    /// is used as it is. `Some` supplies the bound form, which assembly uses in place of the
+    /// installed one for this run only. Returning a new value rather than mutating `self` is what
+    /// lets one installed capability serve concurrent runs without a per-run deep copy.
+    ///
+    /// The parameter is the run context because that is this framework's one live per-run value:
+    /// tools, guards, hooks, and dynamic instructions already read it, and a second per-run context
+    /// object built for capabilities alone would be a second answer to "who is running".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this capability cannot serve the run at all — a dependency it needs is
+    /// absent from the host context, for instance. Assembly propagates it rather than continuing
+    /// with an unbound capability.
+    fn bind(&self, context: &RunContext) -> Result<Option<Arc<dyn Capability>>> {
+        let _ = context;
+        Ok(None)
+    }
+}
 
 /// One context transformation installed by a host.
 ///
@@ -21,6 +256,10 @@ use crate::{
 /// It may replace only the history projection while emitting new authoritative records such as a
 /// compaction summary. The runner appends those records; a processor never mutates `RunState`
 /// itself.
+///
+/// A [`Capability`] that transforms context implements this trait too and returns itself from
+/// [`Capability::context_processor`]. A host may also install a processor on its own, without an
+/// enclosing capability, which is why this is a separate contract rather than a method there.
 #[async_trait]
 pub trait ContextProcessor: Send + Sync {
     /// Transforms the context before the ordinary model request is sent.
