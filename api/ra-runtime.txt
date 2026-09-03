@@ -1,5 +1,6 @@
 # ra-runtime 的公开 API 基线。由 `cargo xtask public-api --bless` 生成。
 # 手改无意义——请改代码后重新生成，并让这份 diff 出现在 code review 里。
+async fn ra_runtime::capability::CapabilityPlan::assemble(& self, context : & RunContext) -> Result < AssembledCapabilities >
 async fn ra_runtime::runner::Runner::run(request : RunRequest) -> Result < RunResult >
 async fn ra_runtime::runner::result::RunErrorHandler::handle(& self, input : RunErrorHandlerInput < '_ >) -> Result < Option < RunErrorHandlerResult > >
 async fn ra_runtime::runner::stream::RunStream::finish(self) -> Result < RunResult >
@@ -106,16 +107,32 @@ fn ra_runtime::agent::AgentRegistry::len(& self) -> usize
 fn ra_runtime::agent::AgentRegistryBuilder::build(self) -> Result < AgentRegistry >
 fn ra_runtime::agent::AgentRegistryBuilder::register(mut self, definition : Arc < AgentDefinition >) -> Self
 fn ra_runtime::agent::AgentRegistryBuilder::register_all(mut self, definitions : impl IntoIterator < Item = Arc < AgentDefinition > >) -> Self
+fn ra_runtime::capability::AssembledCapabilities::capabilities(& self) -> & [Arc < dyn Capability >]
+fn ra_runtime::capability::AssembledCapabilities::context_processors(& self) -> & [Arc < dyn ContextProcessor >]
+fn ra_runtime::capability::AssembledCapabilities::families(& self) -> Vec < CapabilityFamily >
+fn ra_runtime::capability::AssembledCapabilities::is_empty(& self) -> bool
+fn ra_runtime::capability::AssembledCapabilities::prepare_agent(& self, agent : & AgentSpec) -> Result < Arc < AgentSpec > >
+fn ra_runtime::capability::AssembledCapabilities::prompt_sections(& self) -> & [PromptSection]
+fn ra_runtime::capability::AssembledCapabilities::tools(& self) -> & [Arc < dyn Tool >]
+fn ra_runtime::capability::CapabilityPlan::capabilities(& self) -> & [Arc < dyn Capability >]
+fn ra_runtime::capability::CapabilityPlan::contains(& self, family : & CapabilityFamily) -> bool
+fn ra_runtime::capability::CapabilityPlan::families(& self) -> Vec < CapabilityFamily >
+fn ra_runtime::capability::CapabilityPlan::is_empty(& self) -> bool
+fn ra_runtime::capability::CapabilityPlan::len(& self) -> usize
+fn ra_runtime::capability::CapabilityPlan::resolve(installed : impl IntoIterator < Item = Arc < dyn Capability > >) -> Result < Self >
 fn ra_runtime::permission::PermissionEngine::evaluate(& self, scope : PermissionScope, origin : & ToolOrigin, fallback : PermissionDecision) -> PermissionDecision
 fn ra_runtime::permission::PermissionEngine::fixed_decision(& self, scope : PermissionScope, origin : & ToolOrigin) -> Option < PermissionDecision >
 fn ra_runtime::permission::PermissionEngine::new(mode : PermissionMode) -> Self
 fn ra_runtime::permission::PermissionEngine::rules(& self) -> & [PermissionRule]
 fn ra_runtime::permission::PermissionEngine::with_mode(mut self, mode : PermissionMode) -> Self
 fn ra_runtime::permission::PermissionEngine::with_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
+fn ra_runtime::runner::RunConfig::capabilities(& self) -> & [Arc < dyn Capability >]
 fn ra_runtime::runner::RunConfig::context_processors(& self) -> & [Arc < dyn ContextProcessor >]
 fn ra_runtime::runner::RunConfig::model_input_projector(& self) -> Option < & Arc < dyn ModelInputProjector > >
 fn ra_runtime::runner::RunConfig::new() -> Self
 fn ra_runtime::runner::RunConfig::tool_output_reference_extractor(& self) -> Option < & Arc < dyn ToolOutputReferenceExtractor > >
+fn ra_runtime::runner::RunConfig::with_capabilities(mut self, capabilities : impl IntoIterator < Item = Arc < dyn Capability > >) -> Self
+fn ra_runtime::runner::RunConfig::with_capability(mut self, capability : Arc < dyn Capability >) -> Self
 fn ra_runtime::runner::RunConfig::with_context_processor(mut self, context_processor : Arc < dyn ContextProcessor >) -> Self
 fn ra_runtime::runner::RunConfig::with_error_handler(mut self, error_handler : Arc < dyn RunErrorHandler >) -> Self
 fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < String >) -> Self
@@ -209,6 +226,7 @@ fn ra_runtime::turn::prepare::TurnPreparationRequest < 'a >::with_model_settings
 fn ra_runtime::turn::process::process_model_response(response : & ModelResponse, surface : & TurnActionSurface) -> Result < ProcessedResponse >
 fn ra_runtime::turn::resolve::step_items(processed : & ProcessedResponse, execution : & TurnExecution, public : & AgentSpec, next_step : & NextStep) -> Vec < RunItem >
 mod ra_runtime::agent
+mod ra_runtime::capability
 mod ra_runtime::guard
 mod ra_runtime::permission
 mod ra_runtime::runner
@@ -226,6 +244,8 @@ mod ra_runtime::turn::resolve
 struct ra_runtime::agent::AgentBinding
 struct ra_runtime::agent::AgentRegistry
 struct ra_runtime::agent::AgentRegistryBuilder
+struct ra_runtime::capability::AssembledCapabilities
+struct ra_runtime::capability::CapabilityPlan
 struct ra_runtime::permission::PermissionEngine
 struct ra_runtime::runner::RunConfig
 struct ra_runtime::runner::RunRequest

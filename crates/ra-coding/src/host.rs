@@ -111,10 +111,16 @@ impl CodingHost {
     /// This affects only future model requests. Complete observations stay in the session and the
     /// `RunState` reference ledger lets a resumed run apply the same policy without rebuilding
     /// retention facts from prose.
+    ///
+    /// Compaction is installed as a capability rather than as a bare context processor, which is
+    /// what its own declaration says it is: it belongs to the `compaction` family, and installing
+    /// it as a loose processor would leave that family absent from the installed set — so a later
+    /// capability that declares a dependency on it would be refused beside the very thing that
+    /// satisfies it.
     pub fn build_run_config(&self) -> RunConfig {
         RunConfig::new()
             .with_model_input_projector(Arc::new(ToolOutputReferenceTrimmer::default()))
-            .with_context_processor(Arc::new(CompactionCapability::default()))
+            .with_capability(Arc::new(CompactionCapability::default()))
     }
 
     /// Creates the coding product's workspace-confined patch tool.
