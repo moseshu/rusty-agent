@@ -18,9 +18,8 @@ use ra_exec::{
     session::ProcessManager,
 };
 use ra_runtime::runner::RunConfig;
-use ra_tools::{
-    apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, glob::GlobTool, grep::GrepTool,
-    read_file::ReadFileTool, write_stdin::WriteStdinTool,
+use ra_tools::capability::{
+    ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability,
 };
 
 /// The host runtime context and capabilities for the coding agent.
@@ -123,39 +122,63 @@ impl CodingHost {
             .with_capability(Arc::new(CompactionCapability::default()))
     }
 
+    /// Creates the workspace-confined editing capability.
+    pub fn apply_patch_capability(&self) -> ra_core::error::Result<ApplyPatchCapability> {
+        ApplyPatchCapability::for_workspace(&self.workspace)
+    }
+
+    /// Creates the workspace-confined file-reading capability.
+    pub fn filesystem_capability(&self) -> ra_core::error::Result<FilesystemCapability> {
+        FilesystemCapability::for_workspace(&self.workspace)
+    }
+
+    /// Creates the workspace-confined structured-discovery capability.
+    pub fn search_capability(&self) -> ra_core::error::Result<SearchCapability> {
+        SearchCapability::for_workspace(&self.workspace)
+    }
+
+    /// Creates the workspace-rooted execution capability on this host's session manager.
+    ///
+    /// The manager is this host's rather than the capability's own, so the sessions an agent starts
+    /// are the ones this host cancels and reports at closeout.
+    pub fn shell_capability(&self) -> ra_core::error::Result<ShellCapability> {
+        ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))
+    }
+
     /// Creates the coding product's workspace-confined patch tool.
+    ///
+    /// This and the five entries below reach their tool through the capability that owns it rather
+    /// than constructing one directly. A capability is where a tool's configuration is decided —
+    /// which workspace confines it, which process manager it shares — so a second construction path
+    /// beside it is a second set of those decisions, and the two disagree the first time either
+    /// changes.
     pub fn apply_patch_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(ApplyPatchTool::for_workspace(&self.workspace)?))
+        Ok(self.apply_patch_capability()?.apply_patch())
     }
 
     /// Creates the workspace-confined file-reading entry.
     pub fn read_file_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(ReadFileTool::for_workspace(&self.workspace)?))
+        Ok(self.filesystem_capability()?.read_file())
     }
 
     /// Creates the workspace-confined text-search entry.
     pub fn grep_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(GrepTool::for_workspace(&self.workspace)?))
+        Ok(self.search_capability()?.grep())
     }
 
     /// Creates the workspace-confined file-pattern lookup entry.
     pub fn glob_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(GlobTool::for_workspace(&self.workspace)?))
+        Ok(self.search_capability()?.glob())
     }
 
     /// Creates the workspace-rooted command entry backed by this host's session manager.
     pub fn exec_command_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(
-            ExecCommandTool::for_workspace(&self.workspace)?
-                .with_manager(Arc::clone(&self.process_manager)),
-        ))
+        Ok(self.shell_capability()?.exec_command())
     }
 
     /// Creates the input entry for sessions started by [`Self::exec_command_tool`].
     pub fn write_stdin_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
-        Ok(Arc::new(WriteStdinTool::new(Arc::clone(
-            &self.process_manager,
-        ))?))
+        Ok(self.shell_capability()?.write_stdin())
     }
 
     /// Creates an authenticated [`HostEventEmitter`] bound to this host's sink and the given allocator.

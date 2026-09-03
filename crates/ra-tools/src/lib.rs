@@ -26,6 +26,11 @@
 //! Most are still one-line stubs, which is a statement about what has been scheduled rather than
 //! about where it belongs.
 //!
+//! [`capability`] is the one module that advertises nothing. It packages the tools below into the
+//! installable units the assembly layer works in, which is where a fact such as "`write_stdin` can
+//! only address a session `exec_command` started" becomes structural instead of something every
+//! host has to know.
+//!
 //! **Boundary in the other direction**: these are tool *entry points*. The work itself belongs to
 //! the service crates — process execution to [`ra_exec`], MCP transport and lifecycle to
 //! [`ra_mcp`], V4A parsing and hunk application to [`ra_patch`] — and this crate only binds it to a
@@ -40,6 +45,7 @@
 pub mod agent_ns;
 pub mod apply_patch;
 pub mod ask_user;
+pub mod capability;
 pub mod exec_command;
 pub mod glob;
 pub mod grep;
