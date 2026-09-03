@@ -36,6 +36,16 @@ const fn ra_tools::read_file::ReadFileTool::limits(& self) -> & ReadFileLimits
 const fn ra_tools::read_file::ReadFileTool::with_limits(mut self, limits : ReadFileLimits) -> Self
 fn ra_tools::apply_patch::ApplyPatchTool::for_workspace(workspace : & Workspace) -> Result < Self >
 fn ra_tools::apply_patch::ApplyPatchTool::new(filesystem : Arc < RootedFileSystem >) -> Result < Self >
+fn ra_tools::capability::ApplyPatchCapability::apply_patch(& self) -> Arc < dyn Tool >
+fn ra_tools::capability::ApplyPatchCapability::for_workspace(workspace : & Workspace) -> Result < Self >
+fn ra_tools::capability::FilesystemCapability::for_workspace(workspace : & Workspace) -> Result < Self >
+fn ra_tools::capability::FilesystemCapability::read_file(& self) -> Arc < dyn Tool >
+fn ra_tools::capability::SearchCapability::for_workspace(workspace : & Workspace) -> Result < Self >
+fn ra_tools::capability::SearchCapability::glob(& self) -> Arc < dyn Tool >
+fn ra_tools::capability::SearchCapability::grep(& self) -> Arc < dyn Tool >
+fn ra_tools::capability::ShellCapability::exec_command(& self) -> Arc < dyn Tool >
+fn ra_tools::capability::ShellCapability::for_workspace(workspace : & Workspace, process_manager : Arc < ProcessManager >) -> Result < Self >
+fn ra_tools::capability::ShellCapability::write_stdin(& self) -> Arc < dyn Tool >
 fn ra_tools::exec_command::ExecCommandTool::for_workspace(workspace : & Workspace) -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::new() -> Result < Self >
 fn ra_tools::exec_command::ExecCommandTool::process_manager(& self) -> & Arc < ProcessManager >
@@ -57,6 +67,7 @@ fn ra_tools::write_stdin::WriteStdinTool::process_manager(& self) -> & Arc < Pro
 mod ra_tools::agent_ns
 mod ra_tools::apply_patch
 mod ra_tools::ask_user
+mod ra_tools::capability
 mod ra_tools::exec_command
 mod ra_tools::glob
 mod ra_tools::grep
@@ -69,6 +80,10 @@ mod ra_tools::view_image
 mod ra_tools::web
 mod ra_tools::write_stdin
 struct ra_tools::apply_patch::ApplyPatchTool
+struct ra_tools::capability::ApplyPatchCapability
+struct ra_tools::capability::FilesystemCapability
+struct ra_tools::capability::SearchCapability
+struct ra_tools::capability::ShellCapability
 struct ra_tools::exec_command::ExecCommandLimits
 struct ra_tools::exec_command::ExecCommandTool
 struct ra_tools::glob::GlobLimits

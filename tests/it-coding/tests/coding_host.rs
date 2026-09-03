@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc};
 use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
     agent::AgentSpec,
-    capability::CapabilityFamily,
+    capability::{Capability, CapabilityFamily},
     context::RunContext,
     event::{
         AgentEvent, ExecEvent, HostEventBody, HostEventEmitter, HostEventSink,
@@ -19,6 +19,7 @@ use ra_core::{
         ObservationMetadata, ResourceKind, ToolContext, ToolOutput, Truncation, TruncationStage,
     },
 };
+use ra_runtime::capability::CapabilityPlan;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -248,6 +249,128 @@ fn test_dual_channel_strict_isolation() {
     let host_json = serde_json::to_string(host_event).expect("must serialize");
     assert!(!guidance_block.contains(&host_json));
     assert!(!code_block.contains(&host_json));
+}
+
+/// The host's capabilities are one per family and assemble into a coherent plan.
+///
+/// The tool list is asserted against the plan rather than written out here: what a coding agent
+/// installs is whatever these capabilities contribute, and a second list in the test would keep
+/// passing after the product stopped installing one of them.
+#[test]
+fn test_the_host_capabilities_are_one_per_family_and_carry_the_whole_surface() {
+    let workspace = tempdir().expect("must create tempdir");
+    let host = CodingHost::open(workspace.path()).expect("must open coding host");
+
+    let installed: Vec<Arc<dyn Capability>> = vec![
+        Arc::new(host.filesystem_capability().expect("filesystem builds")),
+        Arc::new(host.search_capability().expect("search builds")),
+        Arc::new(host.apply_patch_capability().expect("apply_patch builds")),
+        Arc::new(host.shell_capability().expect("shell builds")),
+    ];
+    let plan = CapabilityPlan::resolve(installed).expect("the installed set is coherent");
+
+    assert_eq!(
+        plan.families(),
+        vec![
+            CapabilityFamily::FILESYSTEM,
+            CapabilityFamily::SEARCH,
+            CapabilityFamily::APPLY_PATCH,
+            CapabilityFamily::SHELL,
+        ],
+        "nothing declares a dependency, so resolution keeps installation order"
+    );
+
+    let contributed: Vec<String> = plan
+        .capabilities()
+        .iter()
+        .flat_map(|capability| capability.tools())
+        .map(|tool| tool.origin().qualified_name().to_owned())
+        .collect();
+    let from_factories: Vec<String> = [
+        host.read_file_tool().expect("read_file builds"),
+        host.grep_tool().expect("grep builds"),
+        host.glob_tool().expect("glob builds"),
+        host.apply_patch_tool().expect("apply_patch builds"),
+        host.exec_command_tool().expect("exec_command builds"),
+        host.write_stdin_tool().expect("write_stdin builds"),
+    ]
+    .iter()
+    .map(|tool| tool.origin().qualified_name().to_owned())
+    .collect();
+    assert_eq!(
+        contributed, from_factories,
+        "the per-tool factories and the capabilities must describe one surface"
+    );
+}
+
+/// Every shell entry the host hands out addresses the host's own session manager.
+///
+/// Each factory call builds a fresh capability, so this is the assertion that the manager comes
+/// from the host rather than from whichever capability happened to construct the tool. Without it,
+/// `write_stdin` would report an unknown session for a command `exec_command` had just started,
+/// and the host would have background jobs its own closeout cannot see.
+#[tokio::test]
+async fn test_every_shell_entry_the_host_builds_shares_its_session_manager() {
+    let workspace = tempdir().expect("must create tempdir");
+    let host = CodingHost::open(workspace.path()).expect("must open coding host");
+    let exec_command = host.exec_command_tool().expect("exec_command builds");
+    let write_stdin = host.write_stdin_tool().expect("write_stdin builds");
+
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coding-runner"))
+        .name("Coding runner")
+        .build()
+        .expect("agent");
+    let run = RunContext::new(RunId::new("run-shared-manager"), &agent);
+
+    let start = json!({
+        "cmd": "read line; printf 'reply:%s\\n' \"$line\"; sleep 30",
+        "workdir": null,
+        "shell": null,
+        "tty": null,
+        "login": null,
+        "yield_time_ms": 100,
+        "timeout_ms": null
+    });
+    exec_command
+        .call(ToolContext::new(
+            &run,
+            exec_command.as_ref(),
+            &CallId::new("call-exec"),
+            &start,
+        ))
+        .await
+        .expect("the command starts");
+
+    let session_id = host
+        .process_manager()
+        .active_sessions()
+        .await
+        .into_iter()
+        .next()
+        .expect("the host's manager owns the session its exec entry started");
+    let answer = json!({
+        "session_id": session_id.to_string(),
+        "chars": "hello from the host\n",
+        "yield_time_ms": 1_000
+    });
+    let output = write_stdin
+        .call(ToolContext::new(
+            &run,
+            write_stdin.as_ref(),
+            &CallId::new("call-stdin"),
+            &answer,
+        ))
+        .await
+        .expect("interactive input succeeds");
+
+    let text = output.as_text().expect("a single text block");
+    assert!(
+        text.contains("reply:hello from the host"),
+        "separately built entries did not address one session: {text}"
+    );
+
+    host.process_manager().cancel(&session_id).await;
 }
 
 #[test]
