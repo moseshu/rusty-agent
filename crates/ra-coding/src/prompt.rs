@@ -64,6 +64,7 @@ use ra_core::error::Result;
 use ra_core::prompt::PromptRole;
 use ra_core::tool::Tool;
 use ra_prompt::assembler::{PromptAssembler, StablePrefix};
+use ra_runtime::tool::profile::ToolSurface;
 
 use self::autonomy::AutonomyPromptBuilder;
 use self::channels::ChannelsPromptBuilder;
@@ -94,6 +95,35 @@ pub fn assemble_stable_prefix(role: &PromptRole) -> Result<StablePrefix> {
     assemble_stable_prefix_for_tools(role, &[])
 }
 
+/// Assembles the stable system-instruction prefix for one assembled tool surface.
+///
+/// **This is the entry point that makes the tool profile one switch instead of two.** The surface
+/// carries both halves of a profile's decision — the tools an agent declares and the advertised
+/// names its budget was charged for — so a prefix built from it cannot describe a tool set the
+/// request does not carry. Changing the profile changes the surface, and the inventory section
+/// changes with it.
+///
+/// Prefer this over [`assemble_stable_prefix_for_tools`] wherever a surface exists. The tool-slice
+/// form still assembles the same text, but it takes a list nobody checked against a budget, and a
+/// caller that built that list separately from the one it installs is the arrangement this signature
+/// removes.
+///
+/// # Errors
+///
+/// Propagates the failures described on [`assemble_stable_prefix_for_tools`], and rejects a surface
+/// whose advertised names differ from the inventory this prefix would render.
+pub fn assemble_stable_prefix_for_surface(
+    role: &PromptRole,
+    surface: &ToolSurface,
+) -> Result<StablePrefix> {
+    let entries = ToolSurfacePromptBuilder::reconcile_with_surface(surface)?;
+    assemble_stable_prefix_with_inventory(
+        role,
+        entries.contains_key("apply_patch"),
+        ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
+    )
+}
+
 /// Assembles the stable system-instruction prefix for one role and its real tool surface.
 ///
 /// Tool declarations must be passed from the same agent construction path that installs them.
@@ -116,6 +146,20 @@ pub fn assemble_stable_prefix_for_tools(
 ) -> Result<StablePrefix> {
     let apply_patch_is_advertised =
         ToolSurfacePromptBuilder::contains_advertised_tool(tools, "apply_patch");
+    let tool_surface = ToolSurfacePromptBuilder::build_tool_surface_section(tools)?;
+    assemble_stable_prefix_with_inventory(role, apply_patch_is_advertised, tool_surface)
+}
+
+/// Assembles the stable prefix once the tool-inventory projection is fixed.
+///
+/// The surface-aware entry point reaches here with names read and reconciled exactly once. The
+/// tool-slice entry point keeps its older convenience contract, where no registry snapshot exists
+/// to compare against.
+fn assemble_stable_prefix_with_inventory(
+    role: &PromptRole,
+    apply_patch_is_advertised: bool,
+    tool_surface: Option<ra_core::prompt::PromptSection>,
+) -> Result<StablePrefix> {
     let mut sections = vec![
         IdentityPromptBuilder::build_identity_section()?,
         EngineeringPromptBuilder::build_engineering_section()?,
@@ -130,7 +174,7 @@ pub fn assemble_stable_prefix_for_tools(
     // its own, the selection rules would tell an agent whose request carries no tools to choose
     // from a list its prompt does not contain — and they rank ahead of the role section that says
     // it has none, so that is the instruction such an agent reads first.
-    if let Some(tool_surface) = ToolSurfacePromptBuilder::build_tool_surface_section(tools)? {
+    if let Some(tool_surface) = tool_surface {
         sections.push(ToolUsePromptBuilder::build_tool_use_section()?);
         sections.push(tool_surface);
     }

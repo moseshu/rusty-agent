@@ -11,8 +11,17 @@
 //! a tool that is planned but absent is loud rather than quietly missing from the surface. The
 //! alternative — assembling whatever happens to exist — is a product that ships with a smaller
 //! tool surface than its prompt describes and no failure anywhere.
+//!
+//! **A tier and a role are different questions.** A tier says what this product advertises; a role
+//! says which capabilities an agent installs, and a read-only one installs nothing that writes. The
+//! role-aware constructor below is where the two meet, by subtracting withheld entries from the
+//! tier's selection and withheld *advertised* entries from its band. What it does not do is relax
+//! the tier: an entry that is missing because nobody wrote it is in no role's withheld set, so it
+//! still fails.
 
-use ra_core::{error::Result, tool::ToolLookupKey};
+use std::collections::BTreeSet;
+
+use ra_core::{error::Result, prompt::PromptRole, tool::ToolLookupKey};
 use ra_runtime::tool::profile::{ToolProfile, ToolProfileId, ToolSurfaceBudget};
 use serde::{Deserialize, Serialize};
 
@@ -91,39 +100,129 @@ impl CodingProfile {
     /// Returns a configuration error if a declared tool name is not a valid lookup key or if the
     /// tier's own bounds are inconsistent — both are mistakes in the constants above.
     pub fn to_tool_profile(self) -> Result<ToolProfile> {
-        let id = ToolProfileId::new(match self {
+        self.narrowed(
+            self.tier_name().to_owned(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Builds the profile for a role that installs only some of what this tier names.
+    ///
+    /// A role selects capabilities, not tools, and a capability it does not install takes its
+    /// entries with it. Without this the read-only roles would be judged against a band measured
+    /// for an agent holding everything, and every one of them would fail the tier's floor — the
+    /// check whose whole purpose is to catch a surface that lost an entry nobody meant to drop.
+    ///
+    /// **The narrowing is subtraction, not a second list.** What the role withheld is derived from
+    /// the capabilities it did not install, so a tool added to one of them is withheld the same day
+    /// it lands. The tier's own list stays the specification for what the product advertises: an
+    /// entry that no capability provides at all is in neither set, so it survives the subtraction
+    /// and still fails assembly loudly.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the failures described on [`Self::to_tool_profile`].
+    pub(crate) fn to_tool_profile_for_role(
+        self,
+        role: &PromptRole,
+        withheld: &BTreeSet<ToolLookupKey>,
+        withheld_advertised: &BTreeSet<ToolLookupKey>,
+    ) -> Result<ToolProfile> {
+        if withheld.is_empty() {
+            return self.to_tool_profile();
+        }
+        // A narrowed tier is a different profile and says so. The identity reaches assembly errors
+        // and the surface's own record, and `core` naming three entries would read there as the
+        // tier having quietly shrunk.
+        self.narrowed(
+            format!("{}-{}", self.tier_name(), role.role_name()),
+            withheld,
+            withheld_advertised,
+        )
+    }
+
+    /// Profile identity of the tier as declared, before any role narrows it.
+    const fn tier_name(self) -> &'static str {
+        match self {
             Self::Core => "core",
             Self::CodexLike => "codex_like",
             Self::Full => "full",
-        })?;
+        }
+    }
 
-        let builder = ToolProfile::builder(id);
-        let builder = match self {
-            // Every tier is a band rather than an exact count, so that adding one entry is a
-            // decision about the surface rather than an edit in two places — a bound that has to
-            // be raised for each ordinary addition teaches whoever makes it to raise it without
-            // looking. The bands are wide enough to breathe and narrow enough that a surface which
-            // dropped several entries lands outside one.
-            Self::Core => builder.include_all(lookup_keys(&CORE)?).budget(
-                ToolSurfaceBudget::new(6, 8)?
-                    .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
-                    .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS),
+    /// The advertised-entry band this tier was measured into.
+    ///
+    /// Every tier is a band rather than an exact count, so that adding one entry is a decision
+    /// about the surface rather than an edit in two places — a bound that has to be raised for each
+    /// ordinary addition teaches whoever makes it to raise it without looking. The bands are wide
+    /// enough to breathe and narrow enough that a surface which dropped several entries lands
+    /// outside one.
+    const fn band(self) -> (usize, usize) {
+        match self {
+            Self::Core => (6, 8),
+            Self::CodexLike => (14, 16),
+            // The ceiling is Claude Code's 24; the floor stays the standard surface's, because
+            // `full` is that surface plus whatever else the host installed.
+            Self::Full => (14, 24),
+        }
+    }
+
+    /// The lookup keys this tier names, or `None` when it takes whatever is registered.
+    fn declared_keys(self) -> Result<Option<Vec<ToolLookupKey>>> {
+        Ok(match self {
+            Self::Core => Some(lookup_keys(&CORE)?),
+            Self::CodexLike => Some(
+                lookup_keys(&CORE)?
+                    .into_iter()
+                    .chain(lookup_keys(&CODEX_LIKE_EXTRA)?)
+                    .collect(),
             ),
-            Self::CodexLike => builder
-                .include_all(lookup_keys(&CORE)?)
-                .include_all(lookup_keys(&CODEX_LIKE_EXTRA)?)
-                .budget(
-                    ToolSurfaceBudget::new(14, 16)?
-                        .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
-                        .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS),
-                ),
-            Self::Full => builder.all_registered().budget(
-                ToolSurfaceBudget::new(14, 24)?
-                    .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
-                    .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS),
-            ),
+            Self::Full => None,
+        })
+    }
+
+    /// Builds this tier's profile with withheld entries removed from its selection and budget.
+    ///
+    /// Both halves, because a selection and a band that disagree are worse than either mistake
+    /// alone: dropping an advertised entry without moving the floor fails every narrowed surface,
+    /// and moving the floor without dropping it fails on a tool the role was never going to
+    /// install. Hidden entries remain part of selection but never consumed a budget slot, so they
+    /// do not move the band.
+    fn narrowed(
+        self,
+        id: String,
+        withheld: &BTreeSet<ToolLookupKey>,
+        withheld_advertised: &BTreeSet<ToolLookupKey>,
+    ) -> Result<ToolProfile> {
+        let declared = self.declared_keys()?;
+        let (floor, ceiling) = self.band();
+        // What the tier would have advertised and this role does not. `full` names nothing of its
+        // own, so every withheld advertised entry is one it would otherwise have taken.
+        let given_up = match &declared {
+            Some(keys) => keys
+                .iter()
+                .filter(|key| withheld_advertised.contains(key))
+                .count(),
+            None => withheld_advertised.len(),
         };
-        builder.build()
+        // The byte and name-character ceilings do not shift: they bound what one turn may cost, and
+        // a smaller surface can only be further under them.
+        let budget = ToolSurfaceBudget::new(
+            floor.saturating_sub(given_up),
+            ceiling.saturating_sub(given_up),
+        )?
+        .with_max_advertised_bytes(MAX_ADVERTISED_BYTES)
+        .with_max_advertised_name_chars(MAX_ADVERTISED_NAME_CHARS);
+
+        let builder = ToolProfile::builder(ToolProfileId::new(id)?);
+        let builder = match declared {
+            Some(keys) => {
+                builder.include_all(keys.into_iter().filter(|key| !withheld.contains(key)))
+            }
+            None => builder.all_registered(),
+        };
+        builder.budget(budget).build()
     }
 }
 

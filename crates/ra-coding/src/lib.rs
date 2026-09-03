@@ -25,6 +25,9 @@ pub mod host;
 pub mod profile;
 pub mod prompt;
 
-pub use agent::{build_agent, build_agent_with_host};
+pub use agent::{
+    HOST_BACKED_PROFILE, build_agent, build_agent_with_host, build_agent_with_profile,
+    host_backed_tool_surface,
+};
 pub use host::CodingHost;
 pub use profile::CodingProfile;

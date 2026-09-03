@@ -351,9 +351,12 @@ fn test_host_backed_read_only_agents_keep_the_observing_entries() {
             .iter()
             .map(|tool| tool.origin().name().to_owned())
             .collect::<Vec<_>>();
+        // Lookup-key order, not the order the capabilities contributed them: the surface is
+        // assembled by a profile, and a tool table whose bytes depended on host startup order
+        // would never hit a cached prefix twice.
         assert_eq!(
             names,
-            vec!["read_file", "grep", "glob"]
+            vec!["glob", "grep", "read_file"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>(),
