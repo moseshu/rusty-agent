@@ -14,7 +14,7 @@
 //!
 //! The provider wire snapshot remains the authority for the full schema.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ra_core::{
@@ -26,6 +26,7 @@ use ra_core::{
     },
     tool::Tool,
 };
+use ra_runtime::tool::profile::ToolSurface;
 
 use crate::profile::MAX_ADVERTISED_NAME_CHARS;
 
@@ -60,6 +61,38 @@ impl ToolSurfacePromptBuilder {
         })
     }
 
+    /// Checks the inventory this builder would render against the names assembly charged for.
+    ///
+    /// This is the seam a profile switch has to survive. The registry decided which entries the
+    /// budget pays for and recorded their model-facing names; the inventory below is rendered from
+    /// the tools that surface carries. The two are separate readings of the same projection, and a
+    /// tool whose [`model_definition`](Tool::model_definition) does not answer the same way twice
+    /// is exactly the case where the prompt would name a surface the provider request does not
+    /// carry — the failure this whole path exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error naming both sides of the disagreement, plus the inventory
+    /// failures described on [`Self::build_tool_surface_section`].
+    pub(crate) fn reconcile_with_surface(
+        surface: &ToolSurface,
+    ) -> Result<BTreeMap<String, ContentHash>> {
+        let rendered = advertised_entries(surface.tools())?;
+        let inventoried: BTreeSet<&str> = rendered.keys().map(String::as_str).collect();
+        let charged: BTreeSet<&str> = surface.advertised_names().collect();
+        if inventoried == charged {
+            return Ok(rendered);
+        }
+
+        Err(Error::config(format!(
+            "the prompt inventory disagrees with the tool surface `{}` it describes: {} named only \
+             by the prompt, {} advertised only in the request",
+            surface.profile(),
+            render_difference(&inventoried, &charged),
+            render_difference(&charged, &inventoried)
+        )))
+    }
+
     /// Builds the model-visible inventory: the advertised names, sorted, and nothing else.
     ///
     /// Registration order is host startup detail, and letting it reach this text would invalidate
@@ -68,6 +101,17 @@ impl ToolSurfacePromptBuilder {
         tools: &[Arc<dyn Tool>],
     ) -> Result<Option<PromptSection>> {
         let entries = advertised_entries(tools)?;
+        Self::build_tool_surface_section_from_entries(&entries)
+    }
+
+    /// Builds the inventory section from one already-validated model-facing projection.
+    ///
+    /// A caller that reconciled a [`ToolSurface`] uses this rather than reading its tools again.
+    /// The model definition is allowed to be supplied by an integration, so a second read after
+    /// reconciliation would reopen the disagreement that the check just closed.
+    pub(crate) fn build_tool_surface_section_from_entries(
+        entries: &BTreeMap<String, ContentHash>,
+    ) -> Result<Option<PromptSection>> {
         if entries.is_empty() {
             return Ok(None);
         }
@@ -81,7 +125,7 @@ impl ToolSurfacePromptBuilder {
         let content = format!(
             "Available tools:\n{}\n\nTheir provider-supplied schemas define the accepted \
              arguments.",
-            render_names(&entries)
+            render_names(entries)
         );
 
         PromptSection::new(
@@ -148,6 +192,22 @@ fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, Conten
         )));
     }
     Ok(entries)
+}
+
+/// Renders one side of a disagreement, or says there is nothing on it.
+///
+/// Both directions are reported even when one is empty: "these two names are only in the prompt"
+/// and "and none is missing from it" are different facts, and a reader who has to infer the second
+/// from silence is guessing.
+fn render_difference(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -> String {
+    let names: Vec<String> = left
+        .difference(right)
+        .map(|name| format!("`{name}`"))
+        .collect();
+    if names.is_empty() {
+        return "nothing".to_owned();
+    }
+    names.join(", ")
 }
 
 fn render_names(entries: &BTreeMap<String, ContentHash>) -> String {

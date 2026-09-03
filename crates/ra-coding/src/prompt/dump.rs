@@ -25,8 +25,8 @@ use ra_core::error::{Error, Result};
 use ra_core::prompt::{CachePlan, PromptRole};
 use ra_prompt::dump::{PromptDump, PromptDumpSection};
 
-use super::{assemble_stable_prefix, assemble_stable_prefix_for_tools};
-use crate::agent::host_backed_tools;
+use super::{assemble_stable_prefix, assemble_stable_prefix_for_surface};
+use crate::agent::{HOST_BACKED_PROFILE, host_backed_tool_surface};
 use crate::host::CodingHost;
 
 /// Cache scope recorded in a report that no run produced.
@@ -145,8 +145,12 @@ impl PromptDumpRequest {
         let role = resolve_role(self.role.as_deref().unwrap_or(DEFAULT_ROLE))?;
         let prefix = match &self.workspace {
             Some(workspace) => {
+                // The same tier the host-backed builder assembles, read from it rather than chosen
+                // here: a report about a different profile than the product ships would look
+                // exactly as trustworthy as this one.
                 let host = open_host(workspace)?;
-                assemble_stable_prefix_for_tools(&role, &host_backed_tools(&role, &host)?)?
+                let surface = host_backed_tool_surface(&role, &host, HOST_BACKED_PROFILE)?;
+                assemble_stable_prefix_for_surface(&role, &surface)?
             }
             None => assemble_stable_prefix(&role)?,
         };
