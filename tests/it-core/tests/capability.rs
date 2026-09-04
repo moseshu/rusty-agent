@@ -8,17 +8,18 @@ use ra_core::{
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
         ContextProcessorResult, ContextSummarizer, ContextSummaryRequest, ContextSummaryResponse,
+        LoadSignal,
     },
     context::RunContext,
     error::Result,
-    item::{ItemId, Message, ModelInputItem, ModelResponse},
+    item::{CallId, ItemId, Message, ModelInputItem, ModelResponse},
     model::ModelSettings,
     prompt::{
         PromptSection, PromptSectionName, PromptSource, SectionPosition, SectionStability,
         estimate_tokens,
     },
-    state::RunId,
-    tool::{Tool, ToolContext, ToolOrigin, ToolOutput, ToolSchema},
+    state::{RunId, ToolUse, ToolUseAttempt, ToolUseTracker},
+    tool::{Tool, ToolContext, ToolNamespace, ToolOrigin, ToolOutput, ToolSchema},
 };
 use serde_json::json;
 
@@ -255,6 +256,13 @@ async fn a_capability_declaring_only_its_kind_contributes_nothing() {
     assert!(capability.required_capabilities().is_empty());
     assert!(capability.tools().is_empty());
     assert!(capability.instructions().await.unwrap().is_none());
+    assert!(capability.deferred_instructions().await.unwrap().is_none());
+    assert!(
+        !capability.wants_deferred_instructions(&LoadSignal::new(7, None)),
+        "the default signal is this capability's own entries having been called, so a capability \
+         with no entries has nothing that can arm it — a default of `true` would deliver text to \
+         every run whether or not it was earned"
+    );
     assert!(capability.context_processor().is_none());
     assert!(
         capability.bind(&run_context("run-1")).unwrap().is_none(),
@@ -264,6 +272,61 @@ async fn a_capability_declaring_only_its_kind_contributes_nothing() {
         capability.sampling_params(settings.clone()).temperature(),
         settings.temperature(),
         "a capability that states no settings must pass the fold through untouched"
+    );
+}
+
+#[test]
+fn a_family_names_its_resident_and_deferred_sections_apart() {
+    let family = CapabilityFamily::WEB;
+
+    assert_eq!(family.prompt_section_name().as_str(), "web");
+    assert_eq!(
+        family.deferred_prompt_section_name().as_str(),
+        "web.deferred",
+        "a capability may contribute in both channels — the line that is true regardless, and the \
+         mechanism that is only worth paying for once the run reaches for it — and one name for \
+         two texts would make a dump report either of them as the other"
+    );
+}
+
+#[test]
+fn the_default_signal_is_this_capabilitys_own_entries_and_it_reads_routing_identity() {
+    let agent = AgentId::new("coder");
+    let capability = SkillsCapability;
+    let mine = capability.tools()[0].origin().lookup_key().clone();
+    let same_name_elsewhere =
+        ToolOrigin::namespaced(ToolNamespace::new("plugin").unwrap(), "load_skill")
+            .unwrap()
+            .lookup_key()
+            .clone();
+
+    let mut tracker = ToolUseTracker::new();
+    tracker.record_turn(
+        &agent,
+        [ToolUseAttempt::new(
+            ToolUse::Tool(same_name_elsewhere),
+            CallId::new("call-1"),
+            &json!({}),
+        )],
+    );
+    assert!(
+        !capability.wants_deferred_instructions(&LoadSignal::new(1, tracker.agent(&agent))),
+        "two servers may both expose `load_skill`, and arming on the name would deliver one \
+         capability's mechanism on another capability's call"
+    );
+
+    tracker.record_turn(
+        &agent,
+        [ToolUseAttempt::new(
+            ToolUse::Tool(mine),
+            CallId::new("call-2"),
+            &json!({}),
+        )],
+    );
+    assert!(
+        capability.wants_deferred_instructions(&LoadSignal::new(2, tracker.agent(&agent))),
+        "the entry this capability actually ships is what earns its text, derived from `tools` \
+         rather than from a list an implementation has to remember to update"
     );
 }
 

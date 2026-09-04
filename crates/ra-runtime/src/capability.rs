@@ -31,6 +31,20 @@
 //!
 //! One capability per family is likewise enforced here rather than upstream: a dependency names a
 //! family, so a family that names two objects cannot say which one it means.
+//!
+//! # Deferred prompt text is resolved here and delivered later
+//!
+//! [`Capability::deferred_instructions`] is read during assembly like every other contribution, so
+//! a capability resolves its text once per run rather than on the turn its signal happens to fire —
+//! a slow source would otherwise pay its cost in the middle of a turn, and a failing one would end
+//! a run that had been going fine. What waits is the *delivery*: the turn loop asks
+//! [`Capability::wants_deferred_instructions`] before each turn and, the first time one answers
+//! yes, writes that fragment into the run's history as a tail message.
+//!
+//! **Nothing here records which fragments have been delivered.** A delivered fragment is in the
+//! history, under an ID derived from its family, and that is the answer — a `delivered` flag beside
+//! it would be a second copy of the same fact, and the two would first disagree on the resume path,
+//! where the history survives a checkpoint and a flag on an in-memory assembly does not.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -43,11 +57,12 @@ use ra_core::{
     agent::AgentSpec,
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
-        ContextProcessorResult, ContextSummarizer,
+        ContextProcessorResult, ContextSummarizer, LoadSignal,
     },
     context::RunContext,
     error::{Error, Result},
-    prompt::{PromptSection, PromptSectionName, PromptSource},
+    item::{ItemId, Message, RunItem, RunItemKind},
+    prompt::{PromptSection, PromptSectionName, PromptSource, SectionPosition},
     tool::Tool,
 };
 
@@ -244,11 +259,13 @@ impl CapabilityPlan {
         }
 
         let prompt_sections = collect_run_prompt_sections(&capabilities).await?;
+        let deferred_prompts = collect_deferred_prompts(&capabilities).await?;
 
         Ok(AssembledCapabilities {
             capabilities,
             tools,
             prompt_sections,
+            deferred_prompts,
             context_processors,
         })
     }
@@ -271,7 +288,13 @@ async fn collect_static_prompt_sections(
                 "resolving the static prompt fragment of capability `{family}`"
             ))
         })?;
-        record_prompt_section(&mut sections, &mut owners, &family, section)?;
+        record_prompt_section(
+            &mut sections,
+            &mut owners,
+            &family,
+            section,
+            PromptChannel::Prefix,
+        )?;
     }
 
     Ok(sections)
@@ -291,18 +314,104 @@ async fn collect_run_prompt_sections(
                 "resolving the prompt fragment of capability `{family}`"
             ))
         })?;
-        record_prompt_section(&mut sections, &mut owners, &family, section)?;
+        record_prompt_section(
+            &mut sections,
+            &mut owners,
+            &family,
+            section,
+            PromptChannel::Prefix,
+        )?;
     }
 
     Ok(sections)
 }
 
-/// Validates and records one capability-owned prefix fragment.
+/// Resolves one ordered capability list's deferred prompt fragments.
+///
+/// Read from the bound capabilities and in assembly order, like the per-run fragments: a deferred
+/// fragment never reaches the cached prefix, so per-run text is legitimate here in a way it is not
+/// in the other two channels.
+async fn collect_deferred_prompts(
+    capabilities: &[Arc<dyn Capability>],
+) -> Result<Vec<DeferredPrompt>> {
+    let mut prompts: Vec<DeferredPrompt> = Vec::new();
+    let mut sections: Vec<PromptSection> = Vec::new();
+    let mut owners: BTreeMap<PromptSectionName, CapabilityFamily> = BTreeMap::new();
+
+    for capability in capabilities {
+        let family = capability.kind();
+        let section = capability.deferred_instructions().await.map_err(|error| {
+            error.with_context(format!(
+                "resolving the deferred prompt fragment of capability `{family}`"
+            ))
+        })?;
+        let before = sections.len();
+        record_prompt_section(
+            &mut sections,
+            &mut owners,
+            &family,
+            section,
+            PromptChannel::Deferred,
+        )?;
+        if sections.len() != before {
+            prompts.push(DeferredPrompt {
+                capability: Arc::clone(capability),
+                record_id: deferred_record_id(&family),
+                section: sections[before].clone(),
+            });
+        }
+    }
+
+    Ok(prompts)
+}
+
+/// The history record ID one family's deferred fragment is delivered under.
+///
+/// Derived from the family rather than from the turn that delivers it, because it is what
+/// "delivered already" is answered with: a per-turn ID would make the same fragment arrive again on
+/// every turn after the signal, which is the per-turn charge deferring exists to avoid.
+fn deferred_record_id(family: &CapabilityFamily) -> ItemId {
+    ItemId::new(format!("capability-prompt.{family}"))
+}
+
+/// Which of the two capability prompt channels a fragment was offered to.
+///
+/// The channels differ in exactly two things — the section name a fragment must claim and the
+/// position it must ask for — so they are one function with a parameter rather than two functions
+/// that would drift on the checks they share.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptChannel {
+    /// Text that joins the agent's cached prefix.
+    Prefix,
+    /// Text delivered into run history once a signal fires.
+    Deferred,
+}
+
+impl PromptChannel {
+    /// The section name a fragment in this channel must claim.
+    fn expected_name(self, family: &CapabilityFamily) -> PromptSectionName {
+        match self {
+            Self::Prefix => family.prompt_section_name(),
+            Self::Deferred => family.deferred_prompt_section_name(),
+        }
+    }
+
+    /// Whether a fragment in this channel may ask for this position.
+    fn accepts(self, position: SectionPosition) -> bool {
+        match self {
+            Self::Prefix => position.is_prefix(),
+            Self::Deferred => position.is_tail_message(),
+        }
+    }
+}
+
+/// Validates and records one capability-owned fragment in one channel.
 fn record_prompt_section(
     sections: &mut Vec<PromptSection>,
     owners: &mut BTreeMap<PromptSectionName, CapabilityFamily>,
     family: &CapabilityFamily,
     section: Option<PromptSection>,
+    channel: PromptChannel,
 ) -> Result<()> {
     let Some(section) = section else {
         return Ok(());
@@ -318,7 +427,7 @@ fn record_prompt_section(
             section.source()
         )));
     }
-    let expected_name = family.prompt_section_name();
+    let expected_name = channel.expected_name(family);
     if section.name() != &expected_name {
         return Err(Error::config(format!(
             "capability `{family}` contributes prompt section `{}`; capability prompt text must \
@@ -326,14 +435,25 @@ fn record_prompt_section(
             section.name()
         )));
     }
-    if !section.position().is_prefix() {
-        return Err(Error::config(format!(
-            "capability `{family}` places its prompt section `{}` at `{}`; a fragment resolved \
-             once per run belongs in the cached prefix, and text that varies per turn belongs in a \
-             context processor, which runs against the live request and writes into the tail",
-            section.name(),
-            section.position()
-        )));
+    if !channel.accepts(section.position()) {
+        return Err(Error::config(match channel {
+            PromptChannel::Prefix => format!(
+                "capability `{family}` places its prompt section `{}` at `{}`; a fragment resolved \
+                 once per run belongs in the cached prefix, and text that varies per turn belongs \
+                 in a context processor, which runs against the live request and writes into the \
+                 tail",
+                section.name(),
+                section.position()
+            ),
+            PromptChannel::Deferred => format!(
+                "capability `{family}` places its deferred prompt section `{}` at `{}`; deferred \
+                 text is delivered into run history as a tail message, and asking for the prefix \
+                 makes it resident text with a delay on it — charged on every turn of every run, \
+                 including the ones that never fire its signal",
+                section.name(),
+                section.position()
+            ),
+        }));
     }
     if let Some(owner) = owners.insert(section.name().clone(), family.clone()) {
         return Err(Error::config(format!(
@@ -345,6 +465,73 @@ fn record_prompt_section(
     sections.push(section);
 
     Ok(())
+}
+
+/// One capability's deferred fragment, resolved and waiting for the signal that delivers it.
+///
+/// It holds the capability rather than a copy of its predicate: the decision is the capability's
+/// own, and asking it directly is what lets an implementation arm on something the assembly layer
+/// has no way to know about.
+#[derive(Clone)]
+pub struct DeferredPrompt {
+    capability: Arc<dyn Capability>,
+    record_id: ItemId,
+    section: PromptSection,
+}
+
+impl DeferredPrompt {
+    /// The family whose text this is.
+    #[must_use]
+    pub fn family(&self) -> CapabilityFamily {
+        self.capability.kind()
+    }
+
+    /// The resolved fragment.
+    #[must_use]
+    pub const fn section(&self) -> &PromptSection {
+        &self.section
+    }
+
+    /// The history record ID this fragment is delivered under.
+    ///
+    /// Stable for the family, so a history that already holds it is the record of the delivery.
+    #[must_use]
+    pub const fn record_id(&self) -> &ItemId {
+        &self.record_id
+    }
+
+    /// Whether this turn's facts have earned the fragment.
+    #[must_use]
+    pub fn is_signalled(&self, signal: &LoadSignal<'_>) -> bool {
+        self.capability.wants_deferred_instructions(signal)
+    }
+
+    /// The authoritative record that delivers this fragment into a run's history.
+    ///
+    /// A user tail message, matching the cross-protocol lowering of dynamic prompts and reminders.
+    /// A system message in input history is not portable: for example, Anthropic accepts system
+    /// text only in its top-level instruction field. It is a record rather than an ephemeral tail
+    /// item because it is delivered once: an item that vanished after the turn that delivered it
+    /// would leave the model with a mechanism it read exactly one time, and re-sending it to fix
+    /// that is the per-turn charge deferring exists to avoid.
+    #[must_use]
+    pub fn to_run_item(&self) -> RunItem {
+        RunItem::new(
+            self.record_id.clone(),
+            RunItemKind::Message(Message::user(self.section.content().to_owned())),
+        )
+    }
+}
+
+impl fmt::Debug for DeferredPrompt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeferredPrompt")
+            .field("family", &self.family())
+            .field("record_id", &self.record_id)
+            .field("section", self.section.name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for CapabilityPlan {
@@ -456,15 +643,17 @@ fn find_cycle(
 
 /// What one run's capabilities contributed, in assembly order.
 ///
-/// The four contributions are kept apart rather than merged into one prepared object, because they
-/// are applied to two different places: tools, prompt text, and sampling settings become the agent
-/// instance that executes, while context processors are installed on the run. Merging them would
-/// mean inventing a third home for the pair that has no other reason to exist.
+/// The contributions are kept apart rather than merged into one prepared object, because they are
+/// applied in three different places: tools, prompt text, and sampling settings become the agent
+/// instance that executes, context processors are installed on the run, and deferred fragments are
+/// held by the turn loop until one of them is earned. Merging them would mean inventing a home for
+/// the group that has no other reason to exist.
 #[non_exhaustive]
 pub struct AssembledCapabilities {
     capabilities: Vec<Arc<dyn Capability>>,
     tools: Vec<Arc<dyn Tool>>,
     prompt_sections: Vec<PromptSection>,
+    deferred_prompts: Vec<DeferredPrompt>,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
 }
 
@@ -494,6 +683,15 @@ impl AssembledCapabilities {
     #[must_use]
     pub fn prompt_sections(&self) -> &[PromptSection] {
         &self.prompt_sections
+    }
+
+    /// Fragments waiting for a signal, in assembly order.
+    ///
+    /// Resolved but undelivered: none of these is in the agent's prefix, and a run whose signals
+    /// never fire never pays for one.
+    #[must_use]
+    pub fn deferred_prompts(&self) -> &[DeferredPrompt] {
+        &self.deferred_prompts
     }
 
     /// Context transformations the capabilities contribute, in assembly order.
@@ -624,6 +822,7 @@ impl fmt::Debug for AssembledCapabilities {
             .field("families", &self.families())
             .field("tools", &tools)
             .field("prompt_sections", &sections)
+            .field("deferred_prompts", &self.deferred_prompts)
             .field("context_processor_count", &self.context_processors.len())
             .finish_non_exhaustive()
     }

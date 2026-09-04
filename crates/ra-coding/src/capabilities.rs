@@ -67,6 +67,21 @@
 //! [`CodingHost::build_run_config`](crate::host::CodingHost::build_run_config), and it is the case
 //! that shows the split is about tools rather than about ownership: it contributes no tool and no
 //! prefix text, so it has nothing to declare twice and nothing to place.
+//!
+//! # What the split costs: deferred fragments from a tool-bearing capability
+//!
+//! [`Capability::deferred_instructions`](ra_core::capability::Capability::deferred_instructions) is
+//! delivered by the turn loop, from the capabilities installed on the run — so a capability that
+//! arrives here instead has no deferred channel. The four below contribute none, and the split
+//! costs nothing today; a capability installed on the run configuration, like `compaction`, has the
+//! channel in full, which is the route for a heavy section that ships no tools of its own.
+//!
+//! It becomes a real limit the first time this product installs a capability that has both tools
+//! and a heavy fragment — a browser, most likely. Resolving it then is the right time, because the
+//! resolution is a choice between things that only that capability can weigh: installing it on the
+//! run as well means teaching assembly to tell "the agent already declares this capability's tools"
+//! apart from "the agent declares a colliding tool of its own", and that distinction is the one
+//! thing the current collision check exists to make.
 
 use std::{collections::BTreeSet, sync::Arc};
 
