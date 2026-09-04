@@ -19,6 +19,13 @@
 //! section name is caught at assembly rather than silently resolved, which is what makes claiming a
 //! shared slot safe.
 //!
+//! Not every section in the assembled prefix is written here. Each installed capability contributes
+//! one of its own, named after its family, and they reach this module already resolved and already
+//! reconciled with the surface they describe. Where they land is not this module's decision either:
+//! the assembler ranks every section by name against `ra-prompt`'s canonical order, so a fragment's
+//! position in the cached span is a reviewable property of that one table rather than a consequence
+//! of the order the calls below happen to be written in.
+//!
 //! [`dump`] is the odd module out: it writes no prompt text. It composes the report that `ra prompt
 //! dump` prints and the snapshot gate commits, which is a product decision about what a dump covers
 //! rather than a section of one.
@@ -38,7 +45,13 @@
 //! a third above what each section costs today, which is room to rewrite a paragraph and not room
 //! to add a second topic under an existing heading.
 //!
-//! Their sum is the ceiling on the assembled prefix: 2432 estimated tokens, more than twice
+//! The four built-in capability fragments declare their own allowances beside their own text, in
+//! `ra-tools`, for the same reason: 96 for the file-reading entry and 128 each for search, patches,
+//! and commands, 480 in total. They are counted in the ceiling below even though nothing here
+//! writes them, because a ceiling that only covered the sections this crate happens to own would
+//! stop describing the prefix the moment a capability was installed.
+//!
+//! Their sum is the ceiling on the assembled prefix: 2912 estimated tokens, more than twice
 //! [`MIN_CACHEABLE_PREFIX_TOKENS`](ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS). The floor and the
 //! ceiling are different kinds of fact — below the floor no provider caches the span at all, while
 //! above the ceiling it is cached and simply costs more every turn than this product has decided a
@@ -61,7 +74,7 @@ pub(crate) mod tool_use;
 use std::sync::Arc;
 
 use ra_core::error::Result;
-use ra_core::prompt::PromptRole;
+use ra_core::prompt::{PromptRole, PromptSection};
 use ra_core::tool::Tool;
 use ra_prompt::assembler::{PromptAssembler, StablePrefix};
 use ra_runtime::tool::profile::ToolSurface;
@@ -97,11 +110,13 @@ pub fn assemble_stable_prefix(role: &PromptRole) -> Result<StablePrefix> {
 
 /// Assembles the stable system-instruction prefix for one assembled tool surface.
 ///
-/// **This is the entry point that makes the tool profile one switch instead of two.** The surface
+/// **This is the entry point that makes the tool profile one switch instead of three.** The surface
 /// carries both halves of a profile's decision — the tools an agent declares and the advertised
 /// names its budget was charged for — so a prefix built from it cannot describe a tool set the
-/// request does not carry. Changing the profile changes the surface, and the inventory section
-/// changes with it.
+/// request does not carry. The capability fragments are the third: they explain the entries the
+/// surface holds, and they are passed in beside it rather than gathered here because deciding which
+/// of them survive a tier needs the installed capabilities, which this module does not see.
+/// [`host_backed_surface`](crate::host_backed_surface) is what produces the two together.
 ///
 /// Prefer this over [`assemble_stable_prefix_for_tools`] wherever a surface exists. The tool-slice
 /// form still assembles the same text, but it takes a list nobody checked against a budget, and a
@@ -110,17 +125,20 @@ pub fn assemble_stable_prefix(role: &PromptRole) -> Result<StablePrefix> {
 ///
 /// # Errors
 ///
-/// Propagates the failures described on [`assemble_stable_prefix_for_tools`], and rejects a surface
-/// whose advertised names differ from the inventory this prefix would render.
+/// Propagates the failures described on [`assemble_stable_prefix_for_tools`], rejects a surface
+/// whose advertised names differ from the inventory this prefix would render, and rejects a
+/// capability fragment claiming a section name the product already registered.
 pub fn assemble_stable_prefix_for_surface(
     role: &PromptRole,
     surface: &ToolSurface,
+    capability_sections: &[PromptSection],
 ) -> Result<StablePrefix> {
     let entries = ToolSurfacePromptBuilder::reconcile_with_surface(surface)?;
     assemble_stable_prefix_with_inventory(
         role,
         entries.contains_key("apply_patch"),
         ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
+        capability_sections,
     )
 }
 
@@ -147,18 +165,20 @@ pub fn assemble_stable_prefix_for_tools(
     let apply_patch_is_advertised =
         ToolSurfacePromptBuilder::contains_advertised_tool(tools, "apply_patch");
     let tool_surface = ToolSurfacePromptBuilder::build_tool_surface_section(tools)?;
-    assemble_stable_prefix_with_inventory(role, apply_patch_is_advertised, tool_surface)
+    assemble_stable_prefix_with_inventory(role, apply_patch_is_advertised, tool_surface, &[])
 }
 
 /// Assembles the stable prefix once the tool-inventory projection is fixed.
 ///
-/// The surface-aware entry point reaches here with names read and reconciled exactly once. The
-/// tool-slice entry point keeps its older convenience contract, where no registry snapshot exists
-/// to compare against.
+/// The surface-aware entry point reaches here with names read and reconciled exactly once, and with
+/// the capability fragments already filtered against that surface. The tool-slice entry point keeps
+/// its older convenience contract, where no registry snapshot exists to compare against and no
+/// capability was installed to speak for one.
 fn assemble_stable_prefix_with_inventory(
     role: &PromptRole,
     apply_patch_is_advertised: bool,
-    tool_surface: Option<ra_core::prompt::PromptSection>,
+    tool_surface: Option<PromptSection>,
+    capability_sections: &[PromptSection],
 ) -> Result<StablePrefix> {
     let mut sections = vec![
         IdentityPromptBuilder::build_identity_section()?,
@@ -178,6 +198,11 @@ fn assemble_stable_prefix_with_inventory(
         sections.push(ToolUsePromptBuilder::build_tool_use_section()?);
         sections.push(tool_surface);
     }
+    // Registered alongside the product's own rather than merged into their text. A capability's
+    // paragraph stays one section with one owner and one hash, so a prompt dump attributes an edit
+    // to the capability that made it — and `with_sections` refuses a fragment that lands on a name
+    // this product already claimed, rather than silently replacing the section it collided with.
+    sections.extend(capability_sections.iter().cloned());
 
     PromptAssembler::new().with_sections(sections)?.assemble()
 }

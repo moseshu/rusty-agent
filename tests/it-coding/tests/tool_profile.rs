@@ -7,7 +7,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use ra_coding::{
-    CodingHost, CodingProfile, build_agent_with_profile, host_backed_tool_surface,
+    CodingHost, CodingProfile, build_agent_with_profile, host_backed_surface,
     prompt::{assemble_stable_prefix_for_surface, assemble_stable_prefix_for_tools},
 };
 use ra_core::{
@@ -612,7 +612,7 @@ fn test_switching_the_tier_switches_the_tools_and_the_inventory_together() {
             .assemble(&tier.to_tool_profile().expect("a valid profile"))
             .expect("a declared tier assembles");
         let advertised: Vec<String> = surface.advertised_names().map(str::to_owned).collect();
-        let prefix = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface)
+        let prefix = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface, &[])
             .expect("the prefix assembles for an assembled surface");
         let instructions = prefix.system_instructions().to_owned();
         assert_eq!(
@@ -673,11 +673,11 @@ fn test_a_prompt_that_disagrees_with_the_advertised_surface_is_refused() {
                 .expect("a valid profile"),
         )
         .expect("the core tier assembles");
-    assemble_stable_prefix_for_surface(&PromptRole::Main, &surface)
+    assemble_stable_prefix_for_surface(&PromptRole::Main, &surface, &[])
         .expect("an agreeing surface assembles a prefix");
 
     renamed.store(true, Ordering::SeqCst);
-    let error = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface)
+    let error = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface, &[])
         .expect_err("a prompt naming a different set must not assemble");
 
     let message = error.to_string();
@@ -725,7 +725,7 @@ fn test_a_reconciled_surface_renders_the_verified_name_snapshot() {
     // Assembly consumed the initial name. Begin the prompt path at the one reconciled read that
     // must also supply its rendered inventory.
     reads.store(0, Ordering::SeqCst);
-    let prefix = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface)
+    let prefix = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface, &[])
         .expect("the reconciled snapshot remains renderable");
 
     assert_eq!(
@@ -743,14 +743,16 @@ fn test_a_reconciled_surface_renders_the_verified_name_snapshot() {
 /// The floor is there to catch a surface that lost an entry, and a read-only agent is short three
 /// on purpose. Both facts have to survive: the profile discounts exactly what the role withheld,
 /// and it says so in its own identity rather than reporting itself as the tier it is not.
-#[test]
-fn test_a_read_only_role_narrows_its_tier_rather_than_failing_the_floor() {
+#[tokio::test]
+async fn test_a_read_only_role_narrows_its_tier_rather_than_failing_the_floor() {
     let workspace = TempDir::new().expect("a workspace");
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
 
     for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
-        let surface = host_backed_tool_surface(&role, &host, CodingProfile::Core)
+        let assembled = host_backed_surface(&role, &host, CodingProfile::Core)
+            .await
             .expect("a read-only role assembles the tier it can hold");
+        let surface = assembled.tool_surface();
 
         assert_eq!(
             surface.advertised_names().collect::<Vec<_>>(),
@@ -766,23 +768,28 @@ fn test_a_read_only_role_narrows_its_tier_rather_than_failing_the_floor() {
 
     // The unnarrowed tier is still the tier: a role that installs everything is judged by the
     // measured band, under the name the product declared it with.
-    let main = host_backed_tool_surface(&PromptRole::Main, &host, CodingProfile::Core)
+    let main = host_backed_surface(&PromptRole::Main, &host, CodingProfile::Core)
+        .await
         .expect("the main role assembles the complete tier");
-    assert_eq!(main.profile().as_str(), "core");
-    assert_eq!(main.advertised_count(), 6);
+    assert_eq!(main.tool_surface().profile().as_str(), "core");
+    assert_eq!(main.tool_surface().advertised_count(), 6);
 }
 
 /// A role that answers without tools assembles an empty surface rather than failing.
-#[test]
-fn test_a_one_off_role_assembles_an_empty_surface() {
+#[tokio::test]
+async fn test_a_one_off_role_assembles_an_empty_surface() {
     let workspace = TempDir::new().expect("a workspace");
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
 
-    let surface = host_backed_tool_surface(&PromptRole::OneOffAnswer, &host, CodingProfile::Core)
+    let assembled = host_backed_surface(&PromptRole::OneOffAnswer, &host, CodingProfile::Core)
+        .await
         .expect("a one-off role assembles nothing at all");
 
-    assert!(surface.is_empty());
-    assert_eq!(surface.advertised_count(), 0);
+    assert!(assembled.tool_surface().is_empty());
+    assert_eq!(assembled.tool_surface().advertised_count(), 0);
+    // Nothing installed means nothing to describe. A fragment surviving here would be a paragraph
+    // about entries this role's own prompt says it does not have.
+    assert!(assembled.capability_sections().is_empty());
 }
 
 /// The agent declares exactly the entries its own prompt inventories.
@@ -790,8 +797,8 @@ fn test_a_one_off_role_assembles_an_empty_surface() {
 /// Both sides are read off the built agent rather than recomputed, because the thing that can go
 /// wrong is precisely a construction path that assembles one list for the provider and another for
 /// the text.
-#[test]
-fn test_the_agent_declares_exactly_what_its_prompt_inventories() {
+#[tokio::test]
+async fn test_the_agent_declares_exactly_what_its_prompt_inventories() {
     let workspace = TempDir::new().expect("a workspace");
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
 
@@ -807,6 +814,7 @@ fn test_the_agent_declares_exactly_what_its_prompt_inventories() {
             &host,
             CodingProfile::Core,
         )
+        .await
         .expect("the core tier builds an agent for every role that holds it");
 
         let declared: Vec<String> = agent
@@ -827,12 +835,96 @@ fn test_the_agent_declares_exactly_what_its_prompt_inventories() {
     }
 }
 
+/// Every entry the surface advertises is explained by the capability that contributed it.
+///
+/// This is the half R10-4 could not reach. The inventory says an agent has `write_stdin`; what
+/// says a session is the thing it writes to is the shell capability's own paragraph, and it arrives
+/// because the capability arrived. The assertion runs over the advertised names rather than over a
+/// list written here, so a tool added to a capability without a word about it in that capability's
+/// fragment fails on the day it lands.
+#[tokio::test]
+async fn test_every_advertised_entry_is_explained_by_the_capability_that_contributed_it() {
+    let workspace = TempDir::new().expect("a workspace");
+    let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
+
+    let assembled = host_backed_surface(&PromptRole::Main, &host, CodingProfile::Core)
+        .await
+        .expect("the main role assembles the complete tier");
+
+    let sections: Vec<&str> = assembled
+        .capability_sections()
+        .iter()
+        .map(|section| section.name().as_str())
+        .collect();
+    assert_eq!(
+        sections,
+        ["filesystem", "search", "apply_patch", "shell"],
+        "every installed capability speaks for the entries it contributed"
+    );
+
+    let explained: String = assembled
+        .capability_sections()
+        .iter()
+        .map(|section| section.content().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for name in assembled.tool_surface().advertised_names() {
+        assert!(
+            explained.contains(&format!("`{name}`")),
+            "`{name}` is advertised with nothing in the prefix saying what it does"
+        );
+    }
+}
+
+/// A role that gives up a capability gives up the paragraph describing it, in the same step.
+///
+/// The withheld half is what the role filter can lose quietly: an agent whose role section says it
+/// has no editing tools, carrying a paragraph about how `apply_patch` matches context lines. The
+/// fragment cannot survive its capability, because the capability is what produced it.
+#[tokio::test]
+async fn test_a_read_only_role_gives_up_the_fragments_of_the_capabilities_it_withheld() {
+    let workspace = TempDir::new().expect("a workspace");
+    let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
+
+    let assembled =
+        host_backed_surface(&PromptRole::ReadOnlySpecialist, &host, CodingProfile::Core)
+            .await
+            .expect("a read-only role assembles the tier it can hold");
+
+    let sections: Vec<&str> = assembled
+        .capability_sections()
+        .iter()
+        .map(|section| section.name().as_str())
+        .collect();
+    assert_eq!(sections, ["filesystem", "search"]);
+
+    let prefix = assemble_stable_prefix_for_surface(
+        &PromptRole::ReadOnlySpecialist,
+        assembled.tool_surface(),
+        assembled.capability_sections(),
+    )
+    .expect("the read-only prefix assembles")
+    .system_instructions()
+    .to_owned();
+    for withheld in ["apply_patch", "exec_command", "write_stdin"] {
+        assert!(
+            !prefix.contains(&format!("`{withheld}`")),
+            "the read-only prefix describes `{withheld}`, which its request does not carry"
+        );
+    }
+    // The kept half is the other side of the same guarantee: withholding the writing capabilities
+    // must not take the reading ones' text with them.
+    assert!(
+        prefix.contains("`read_file`") && prefix.contains("`grep`") && prefix.contains("`glob`")
+    );
+}
+
 /// A tier the installed capabilities cannot satisfy fails before an agent exists.
 ///
 /// The default tier names nine entries nobody has written, and this is what that costs: no agent,
 /// rather than one whose prompt describes a surface the provider was never sent.
-#[test]
-fn test_a_tier_the_host_cannot_satisfy_refuses_to_build_an_agent() {
+#[tokio::test]
+async fn test_a_tier_the_host_cannot_satisfy_refuses_to_build_an_agent() {
     let workspace = TempDir::new().expect("a workspace");
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
 
@@ -843,6 +935,7 @@ fn test_a_tier_the_host_cannot_satisfy_refuses_to_build_an_agent() {
         &host,
         CodingProfile::default(),
     )
+    .await
     .expect_err("the default tier must not build while its entries are unwritten");
 
     let message = error.to_string();
@@ -853,17 +946,22 @@ fn test_a_tier_the_host_cannot_satisfy_refuses_to_build_an_agent() {
 ///
 /// Guards the seam from the other direction: `ToolSurface` is the only shape this prefix builder
 /// takes, so a tool that reaches an agent without passing a budget has nowhere to enter.
-#[test]
-fn test_the_assembled_surface_feeds_the_prefix_and_the_agent_from_one_object() {
+#[tokio::test]
+async fn test_the_assembled_surface_feeds_the_prefix_and_the_agent_from_one_object() {
     let workspace = TempDir::new().expect("a workspace");
     let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
-    let surface: ToolSurface =
-        host_backed_tool_surface(&PromptRole::Main, &host, CodingProfile::Core)
-            .expect("the main role assembles the complete tier");
+    let assembled = host_backed_surface(&PromptRole::Main, &host, CodingProfile::Core)
+        .await
+        .expect("the main role assembles the complete tier");
 
-    let prefix = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface)
-        .expect("the prefix assembles for an assembled surface");
+    let prefix = assemble_stable_prefix_for_surface(
+        &PromptRole::Main,
+        assembled.tool_surface(),
+        assembled.capability_sections(),
+    )
+    .expect("the prefix assembles for an assembled surface");
     let inventoried = inventoried_names(prefix.system_instructions());
+    let surface: ToolSurface = assembled.into_tool_surface();
     let tools: Vec<String> = surface
         .into_tools()
         .iter()

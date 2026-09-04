@@ -33,12 +33,33 @@
 //! refuse a legitimate configuration — one that reads through the shell — to record a habit. The
 //! first real edge in this framework arrives with memory, which cannot read its own store without
 //! one of the two capabilities that reach the filesystem.
+//!
+//! # Why the prompt text is here, beside the tools rather than in a product crate
+//!
+//! Each capability's fragment says what its own entries do and how the pair of them relates — a
+//! session `write_stdin` can address, context lines `apply_patch` matches, a result set `grep`
+//! returns instead of raw text. That is a description of the mechanism, and the mechanism is what
+//! this crate owns; it is the same content as each tool's own model-facing description, one level
+//! up. What is *not* here is any statement about when an agent should reach for them, which is a
+//! product's decision and lives in the product's own sections.
+//!
+//! Carrying it on the capability is what makes the two halves inseparable. The alternative — a
+//! product paragraph that names `apply_patch`, gated on whether `apply_patch` happens to be
+//! advertised — is a gate somebody has to remember to write, once per tool, at every assembly site.
+//! Here the fragment cannot arrive without the entries it describes, because the same object
+//! carries both.
+//!
+//! Each fragment declares its own share of the cached prefix. Together the four cost roughly 280
+//! estimated tokens against 480 declared, which is room to rewrite a paragraph and not room to
+//! teach a second topic under an existing heading.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ra_core::{
     capability::{Capability, CapabilityFamily},
     error::Result,
+    prompt::{PromptSection, SectionPosition, SectionStability},
     tool::Tool,
 };
 use ra_exec::{fs::Workspace, session::ProcessManager};
@@ -47,6 +68,28 @@ use crate::{
     apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, glob::GlobTool, grep::GrepTool,
     read_file::ReadFileTool, write_stdin::WriteStdinTool,
 };
+
+/// Builds one capability's prefix fragment, attributed to the family that wrote it.
+///
+/// The name, the source, and the placement all come from the family rather than from each call
+/// site: they are the three things assembly checks, and a fragment that had to restate them is a
+/// fragment that can get one of them wrong.
+fn fragment(
+    family: &CapabilityFamily,
+    purpose: &str,
+    content: &str,
+    token_budget: usize,
+) -> Result<Option<PromptSection>> {
+    PromptSection::new(
+        family.prompt_section_name(),
+        purpose,
+        family.prompt_source(),
+        SectionStability::Stable,
+        SectionPosition::Prefix,
+        content,
+    )
+    .map(|section| Some(section.with_token_budget(token_budget)))
+}
 
 /// Command execution: starting a session and writing to one that is already running.
 ///
@@ -97,6 +140,22 @@ impl ShellCapability {
     }
 }
 
+/// Cached-prefix allowance for the shell fragment, in estimated tokens.
+const SHELL_TOKEN_BUDGET: usize = 128;
+
+/// What the two entries are to each other, which neither schema can state on its own.
+///
+/// The second sentence is the whole reason this pair is one capability: an agent that does not know
+/// a running command keeps a session will answer an interactive prompt by starting a second
+/// command, and read the same question again.
+const SHELL_FRAGMENT: &str = "Commands:\n\
+                              - `exec_command` runs a command from the workspace root and returns \
+                              its output. A command that has not exited keeps its session, and the \
+                              output names it.\n\
+                              - `write_stdin` writes to a session `exec_command` started. It is \
+                              the only way to answer a running command, and it cannot start one.";
+
+#[async_trait]
 impl Capability for ShellCapability {
     fn kind(&self) -> CapabilityFamily {
         CapabilityFamily::SHELL
@@ -104,6 +163,15 @@ impl Capability for ShellCapability {
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![self.exec_command(), self.write_stdin()]
+    }
+
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        fragment(
+            &self.kind(),
+            "How the command-execution pair addresses a session",
+            SHELL_FRAGMENT,
+            SHELL_TOKEN_BUDGET,
+        )
     }
 }
 
@@ -136,6 +204,22 @@ impl FilesystemCapability {
     }
 }
 
+/// Cached-prefix allowance for the filesystem fragment, in estimated tokens.
+const FILESYSTEM_TOKEN_BUDGET: usize = 96;
+
+/// What the read entry accepts and what confines it.
+///
+/// The confinement is stated because a refused read is otherwise indistinguishable from a missing
+/// file, and an agent that reads the two as the same thing spends a turn looking for a path it was
+/// never going to be allowed to open.
+const FILESYSTEM_FRAGMENT: &str = "Files:\n\
+                                   - `read_file` returns workspace file contents. Paths are \
+                                   relative to the workspace root, and a path leading outside it \
+                                   is refused rather than empty.\n\
+                                   - Ask for a line range when a file is large, and read the region \
+                                   you are about to change before changing it.";
+
+#[async_trait]
 impl Capability for FilesystemCapability {
     fn kind(&self) -> CapabilityFamily {
         CapabilityFamily::FILESYSTEM
@@ -143,6 +227,15 @@ impl Capability for FilesystemCapability {
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![self.read_file()]
+    }
+
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        fragment(
+            &self.kind(),
+            "What the file-reading entry accepts and what confines it",
+            FILESYSTEM_FRAGMENT,
+            FILESYSTEM_TOKEN_BUDGET,
+        )
     }
 }
 
@@ -176,6 +269,27 @@ impl ApplyPatchCapability {
     }
 }
 
+/// Cached-prefix allowance for the patch fragment, in estimated tokens.
+const APPLY_PATCH_TOKEN_BUDGET: usize = 128;
+
+/// How the entry reads a patch, and the one precondition a caller can violate silently.
+///
+/// Context matching is stated because it is the failure an agent cannot diagnose from the error
+/// alone: a patch written against a remembered version of a file fails on text that looks correct
+/// in the transcript, and the fix is to read the file again rather than to reword the patch.
+///
+/// It says nothing about *when* to edit, what to avoid editing with, or which operations the patch
+/// format supports. A product that advertises this entry states the first two as policy, and the
+/// third is in the tool's own schema — restating either here would put one rule in two spans of the
+/// same cached prefix, where editing one leaves the model holding both versions of it.
+const APPLY_PATCH_FRAGMENT: &str = "Patches:\n\
+                                    - `apply_patch` takes one patch, and a single call may change \
+                                    several files at once.\n\
+                                    - Its context lines must match the file as it is on disk now, \
+                                    so re-read a file that changed since you last saw it, and keep \
+                                    each hunk to the lines you mean to change.";
+
+#[async_trait]
 impl Capability for ApplyPatchCapability {
     fn kind(&self) -> CapabilityFamily {
         CapabilityFamily::APPLY_PATCH
@@ -183,6 +297,15 @@ impl Capability for ApplyPatchCapability {
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![self.apply_patch()]
+    }
+
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        fragment(
+            &self.kind(),
+            "How the patch entry reads a patch and what it matches against",
+            APPLY_PATCH_FRAGMENT,
+            APPLY_PATCH_TOKEN_BUDGET,
+        )
     }
 }
 
@@ -224,6 +347,22 @@ impl SearchCapability {
     }
 }
 
+/// Cached-prefix allowance for the search fragment, in estimated tokens.
+const SEARCH_TOKEN_BUDGET: usize = 128;
+
+/// What each of the two entries answers, and why neither is a command away.
+///
+/// The second line is the same argument that makes these one capability, addressed to the model
+/// instead of to a host: an agent holding an execution entry can always run a search command, and
+/// what comes back is raw text that no downstream reader can treat as a result set.
+const SEARCH_FRAGMENT: &str = "Search:\n\
+                               - `grep` matches file contents and returns the matching lines with \
+                               their locations; `glob` matches path patterns and returns paths.\n\
+                               - Prefer them to running a search command. A command answers with \
+                               raw text, which neither the context budget nor a later replay can \
+                               read as a result set.";
+
+#[async_trait]
 impl Capability for SearchCapability {
     fn kind(&self) -> CapabilityFamily {
         CapabilityFamily::SEARCH
@@ -231,5 +370,14 @@ impl Capability for SearchCapability {
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![self.grep(), self.glob()]
+    }
+
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        fragment(
+            &self.kind(),
+            "What each discovery entry answers, and why neither is a command away",
+            SEARCH_FRAGMENT,
+            SEARCH_TOKEN_BUDGET,
+        )
     }
 }

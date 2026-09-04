@@ -24,6 +24,22 @@ Available tools:
 
 Their provider-supplied schemas define the accepted arguments.
 
+Files:
+- `read_file` returns workspace file contents. Paths are relative to the workspace root, and a path leading outside it is refused rather than empty.
+- Ask for a line range when a file is large, and read the region you are about to change before changing it.
+
+Search:
+- `grep` matches file contents and returns the matching lines with their locations; `glob` matches path patterns and returns paths.
+- Prefer them to running a search command. A command answers with raw text, which neither the context budget nor a later replay can read as a result set.
+
+Patches:
+- `apply_patch` takes one patch, and a single call may change several files at once.
+- Its context lines must match the file as it is on disk now, so re-read a file that changed since you last saw it, and keep each hunk to the lines you mean to change.
+
+Commands:
+- `exec_command` runs a command from the workspace root and returns its output. A command that has not exited keeps its session, and the output names it.
+- `write_stdin` writes to a session `exec_command` started. It is the only way to answer a running command, and it cannot start one.
+
 Editing and Git Safety:
 - Use `apply_patch` for direct workspace edits. It is the dedicated tool for creating, modifying, renaming, and deleting files.
 - Do not create or edit files with `cat`, heredocs, or other shell write tricks. Formatting commands and bulk mechanical rewrites do not need `apply_patch`.

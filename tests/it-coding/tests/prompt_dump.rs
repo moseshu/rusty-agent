@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use ra_coding::{
     CodingHost,
     prompt::{
-        assemble_stable_prefix, assemble_stable_prefix_for_tools,
+        assemble_stable_prefix, assemble_stable_prefix_for_surface,
+        assemble_stable_prefix_for_tools,
         dump::{
             PLACEHOLDER_CACHE_SCOPE, PromptDumpRequest, SectionChange, compare_prompt_dump,
             render_prompt_dump, render_prompt_dump_json, shipped_role_names,
@@ -75,9 +76,25 @@ fn host_backed_tools() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-fn host_backed_prefix() -> ra_prompt::assembler::StablePrefix {
-    assemble_stable_prefix_for_tools(&PromptRole::Main, &host_backed_tools())
-        .expect("host-backed product prefix must assemble")
+/// The prefix the product's own host-backed builder assembles for the main role.
+///
+/// Read through `host_backed_surface` rather than rebuilt from a tool list, because a host-backed
+/// prefix is no longer a function of the tools alone: each installed capability contributes a
+/// section of its own, and a helper that skipped them would compare the agent against a prefix
+/// nothing ships.
+async fn host_backed_prefix() -> ra_prompt::assembler::StablePrefix {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = CodingHost::open(workspace.path()).expect("coding host builds");
+    let assembled =
+        ra_coding::host_backed_surface(&PromptRole::Main, &host, ra_coding::HOST_BACKED_PROFILE)
+            .await
+            .expect("the host-backed surface assembles");
+    assemble_stable_prefix_for_surface(
+        &PromptRole::Main,
+        assembled.tool_surface(),
+        assembled.capability_sections(),
+    )
+    .expect("host-backed product prefix must assemble")
 }
 
 fn section_content(prefix: &ra_prompt::assembler::StablePrefix, name: &str) -> String {
@@ -95,8 +112,8 @@ fn section_content(prefix: &ra_prompt::assembler::StablePrefix, name: &str) -> S
 /// Rendered through [`render_prompt_dump`] — the entry point `ra prompt dump` calls — rather than
 /// by composing a report here. Two compositions would have drifted at the first edit, and the point
 /// of shipping the command is that a user can reproduce this file rather than take it on faith.
-#[test]
-fn test_stable_prefix_matches_the_committed_snapshot() {
+#[tokio::test]
+async fn test_stable_prefix_matches_the_committed_snapshot() {
     let mut rendered = String::new();
     // Every role that ships gets a section, because the read-only roles are the ones whose text has
     // to agree with a narrowed tool surface — a prefix edit that quietly re-enables writing is
@@ -111,6 +128,7 @@ fn test_stable_prefix_matches_the_committed_snapshot() {
         rendered.push_str(&format!("### role: {role}\n"));
         rendered.push_str(
             &render_prompt_dump(&PromptDumpRequest::new().with_role(role.role_name()))
+                .await
                 .expect("the product prefix must assemble"),
         );
         rendered.push('\n');
@@ -124,6 +142,7 @@ fn test_stable_prefix_matches_the_committed_snapshot() {
                 .with_role(PromptRole::Main.role_name())
                 .with_workspace(workspace.path()),
         )
+        .await
         .expect("the host-backed product prefix must assemble"),
     );
     rendered.push('\n');
@@ -155,9 +174,10 @@ fn test_stable_prefix_matches_the_committed_snapshot() {
 /// `PromptRole::Custom` has no guidance text, so accepting a typo would answer it with a report
 /// that looks entirely real and whose role section is a generated placeholder. A verification entry
 /// point may fail; it may not quietly describe a different agent.
-#[test]
-fn test_a_role_the_product_does_not_ship_is_refused() {
+#[tokio::test]
+async fn test_a_role_the_product_does_not_ship_is_refused() {
     let error = render_prompt_dump(&PromptDumpRequest::new().with_role("archaeologist"))
+        .await
         .expect_err("an unknown role must not produce a report");
     let message = error.to_string();
 
@@ -174,23 +194,30 @@ fn test_a_role_the_product_does_not_ship_is_refused() {
 ///
 /// This is what makes the committed snapshot reproducible from a command line: a real run id would
 /// differ on every invocation and the bytes would never match.
-#[test]
-fn test_a_dump_records_a_placeholder_cache_scope_until_a_run_names_one() {
-    let default = render_prompt_dump(&PromptDumpRequest::new()).expect("dump renders");
+#[tokio::test]
+async fn test_a_dump_records_a_placeholder_cache_scope_until_a_run_names_one() {
+    let default = render_prompt_dump(&PromptDumpRequest::new())
+        .await
+        .expect("dump renders");
     assert!(default.contains(&format!("Cache Scope:          {PLACEHOLDER_CACHE_SCOPE}")));
 
     let named = render_prompt_dump(&PromptDumpRequest::new().with_cache_scope("session-42"))
+        .await
         .expect("dump renders");
     assert!(named.contains("Cache Scope:          session-42"));
 }
 
 /// Comparing a build against its own recorded dump reports nothing, and says the cache survives.
-#[test]
-fn test_a_dump_compared_against_itself_reports_no_change() {
+#[tokio::test]
+async fn test_a_dump_compared_against_itself_reports_no_change() {
     let request = PromptDumpRequest::new();
-    let recorded = render_prompt_dump_json(&request).expect("dump serializes");
+    let recorded = render_prompt_dump_json(&request)
+        .await
+        .expect("dump serializes");
 
-    let diff = compare_prompt_dump(&request, &recorded).expect("baseline is a dump");
+    let diff = compare_prompt_dump(&request, &recorded)
+        .await
+        .expect("baseline is a dump");
 
     assert!(!diff.prefix_changed());
     assert!(diff.changes().is_empty());
@@ -206,20 +233,32 @@ fn test_a_dump_compared_against_itself_reports_no_change() {
 /// index of everything after them, and a report that called all of those moved would bury the two
 /// insertions under seven consequences of them. The comparison ranks sections among the ones both
 /// dumps share, so only the real causes are named.
-#[test]
-fn test_an_insertion_is_not_reported_as_moving_every_section_below_it() {
+#[tokio::test]
+async fn test_an_insertion_is_not_reported_as_moving_every_section_below_it() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let toolless = render_prompt_dump_json(&PromptDumpRequest::new()).expect("dump serializes");
+    let toolless = render_prompt_dump_json(&PromptDumpRequest::new())
+        .await
+        .expect("dump serializes");
     let host_backed = PromptDumpRequest::new().with_workspace(workspace.path());
 
-    let diff = compare_prompt_dump(&host_backed, &toolless).expect("baseline is a dump");
+    let diff = compare_prompt_dump(&host_backed, &toolless)
+        .await
+        .expect("baseline is a dump");
 
     assert!(diff.prefix_changed());
     let named: Vec<&str> = diff.changes().iter().map(SectionChange::name).collect();
     assert_eq!(
         named,
-        ["tool_use", "tool_surface", "editing_verification"],
-        "only the added pair and the editing text that names an entry actually changed"
+        [
+            "tool_use",
+            "tool_surface",
+            "filesystem",
+            "search",
+            "apply_patch",
+            "shell",
+            "editing_verification"
+        ],
+        "only the added sections and the editing text that names an entry actually changed"
     );
     assert!(
         !diff
@@ -235,12 +274,15 @@ fn test_an_insertion_is_not_reported_as_moving_every_section_below_it() {
 /// This is the invalidation no per-section hash can show: the joined prefix — the span a provider
 /// caches — is rewritten while every row above is byte-identical. The baseline is hand-built,
 /// because the assembler's canonical order is exactly what stops the product from producing one.
-#[test]
-fn test_a_reorder_is_named_even_though_every_section_hash_holds() {
+#[tokio::test]
+async fn test_a_reorder_is_named_even_though_every_section_hash_holds() {
     let request = PromptDumpRequest::new();
-    let mut recorded: serde_json::Value =
-        serde_json::from_str(&render_prompt_dump_json(&request).expect("dump serializes"))
-            .expect("a dump is JSON");
+    let mut recorded: serde_json::Value = serde_json::from_str(
+        &render_prompt_dump_json(&request)
+            .await
+            .expect("dump serializes"),
+    )
+    .expect("a dump is JSON");
 
     let sections = recorded["sections"]
         .as_array_mut()
@@ -254,7 +296,9 @@ fn test_a_reorder_is_named_even_though_every_section_hash_holds() {
     // fixture describe a prefix that cannot exist.
     recorded["prefix_hash"] = serde_json::Value::String("0".repeat(64));
 
-    let diff = compare_prompt_dump(&request, &recorded.to_string()).expect("baseline is a dump");
+    let diff = compare_prompt_dump(&request, &recorded.to_string())
+        .await
+        .expect("baseline is a dump");
 
     assert!(diff.prefix_changed());
     let moved: Vec<&str> = diff
@@ -271,8 +315,8 @@ fn test_a_reorder_is_named_even_though_every_section_hash_holds() {
 }
 
 /// The host-backed prompt records the exact tool that the same builder installs on the agent.
-#[test]
-fn test_host_backed_agent_carries_the_tool_surface_prefix() {
+#[tokio::test]
+async fn test_host_backed_agent_carries_the_tool_surface_prefix() {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
     let agent = ra_coding::build_agent_with_host(
@@ -281,8 +325,9 @@ fn test_host_backed_agent_carries_the_tool_surface_prefix() {
         &PromptRole::Main,
         &host,
     )
+    .await
     .expect("host-backed agent builds");
-    let prefix = host_backed_prefix();
+    let prefix = host_backed_prefix().await;
 
     assert_eq!(
         agent
@@ -300,8 +345,8 @@ fn test_host_backed_agent_carries_the_tool_surface_prefix() {
 }
 
 /// Opening a workspace does not override a role's tool boundary.
-#[test]
-fn test_host_backed_one_off_agents_carry_no_tools() {
+#[tokio::test]
+async fn test_host_backed_one_off_agents_carry_no_tools() {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
 
@@ -311,6 +356,7 @@ fn test_host_backed_one_off_agents_carry_no_tools() {
         &PromptRole::OneOffAnswer,
         &host,
     )
+    .await
     .expect("host-backed agent builds");
 
     assert!(agent.tools().is_empty(), "a one-off role answers with none");
@@ -332,8 +378,8 @@ fn test_host_backed_one_off_agents_carry_no_tools() {
 /// The two halves are one guarantee: withholding the editing entries is what the role text
 /// promises, and withholding the search entries as well would leave a read-only specialist unable
 /// to inspect either an identified file or an unknown workspace.
-#[test]
-fn test_host_backed_read_only_agents_keep_the_observing_entries() {
+#[tokio::test]
+async fn test_host_backed_read_only_agents_keep_the_observing_entries() {
     let workspace = tempfile::tempdir().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
 
@@ -344,6 +390,7 @@ fn test_host_backed_read_only_agents_keep_the_observing_entries() {
             &role,
             &host,
         )
+        .await
         .expect("host-backed agent builds");
 
         let names = agent
@@ -579,8 +626,8 @@ fn test_the_product_prefix_begins_with_the_identity_contract() {
 /// The tool-surface half is asserted on the host-backed prefix, because that is the only one where
 /// a `tool_surface` section exists at all: checked on the bare prefix, "engineering judgment comes
 /// first" would hold no matter which way the two were ranked.
-#[test]
-fn test_the_product_prefix_places_engineering_judgment_after_identity() {
+#[tokio::test]
+async fn test_the_product_prefix_places_engineering_judgment_after_identity() {
     let prefix = assemble_stable_prefix(&PromptRole::Main).expect("prefix");
     let engineering = prefix
         .sections()
@@ -605,7 +652,7 @@ fn test_the_product_prefix_places_engineering_judgment_after_identity() {
 
     // The pair, not the whole list: the full order is asserted once, where the section that most
     // recently joined it is the subject.
-    let host_backed = host_backed_prefix();
+    let host_backed = host_backed_prefix().await;
     let names = section_names(&host_backed);
     assert!(
         position_of(&names, "core_behavior") < position_of(&names, "tool_surface"),
@@ -616,9 +663,9 @@ fn test_the_product_prefix_places_engineering_judgment_after_identity() {
 /// Tool selection is a shared behavior contract, while the adjacent surface supplies the changing
 /// list of names. This keeps a schema addition from becoming an instruction to use a capability
 /// that the current request never advertises.
-#[test]
-fn test_the_product_prefix_includes_the_tool_selection_contract() {
-    let host_backed = host_backed_prefix();
+#[tokio::test]
+async fn test_the_product_prefix_includes_the_tool_selection_contract() {
+    let host_backed = host_backed_prefix().await;
     let tool_use = section_content(&host_backed, "tool_use");
 
     assert!(tool_use.contains("Use only the entries listed under Available tools"));
@@ -701,9 +748,9 @@ fn test_the_one_off_prefix_includes_engineering_judgment() {
 /// The editing section sits after the advertised tool surface and names the dedicated entry the
 /// host-backed agent installs — displacing the shell write path, without claiming to be the only
 /// mechanism that may ever write a file.
-#[test]
-fn test_the_product_prefix_includes_editing_and_git_safety_rules() {
-    let main_prefix = host_backed_prefix();
+#[tokio::test]
+async fn test_the_product_prefix_includes_editing_and_git_safety_rules() {
+    let main_prefix = host_backed_prefix().await;
     let editing = section_content(&main_prefix, "editing_verification");
 
     assert!(editing.contains("`apply_patch` for direct workspace edits"));
@@ -738,9 +785,9 @@ fn test_the_product_prefix_includes_editing_and_git_safety_rules() {
 ///
 /// It says nothing about the role's authority or the deliverable: `identity` owns that contract,
 /// and a second cached copy of it is the thing this section is written to avoid.
-#[test]
-fn test_the_product_prefix_includes_autonomous_progress_and_stop_loss() {
-    let prefix = host_backed_prefix();
+#[tokio::test]
+async fn test_the_product_prefix_includes_autonomous_progress_and_stop_loss() {
+    let prefix = host_backed_prefix().await;
     let autonomy = section_content(&prefix, "autonomy");
 
     assert!(autonomy.contains("Do not stop at analysis or a proposal"));
@@ -826,9 +873,9 @@ fn test_every_role_shares_the_dual_channel_contract() {
 /// It says nothing about *whether* a blocker must be reported: `autonomy` owns that duty and
 /// `personality` owns reporting it truthfully. A second cached copy of either is what this section
 /// is scoped to avoid.
-#[test]
-fn test_the_product_prefix_includes_dual_channel_response_rules() {
-    let prefix = host_backed_prefix();
+#[tokio::test]
+async fn test_the_product_prefix_includes_dual_channel_response_rules() {
+    let prefix = host_backed_prefix().await;
     let channels = section_content(&prefix, "channels");
 
     assert!(channels.contains("Use `commentary` for short, scannable progress updates"));
@@ -845,6 +892,9 @@ fn test_the_product_prefix_includes_dual_channel_response_rules() {
     assert!(channels.contains(&format!("`{}`", OutputPhase::Final.label())));
 
     // The whole list, asserted here because channels is the section that most recently joined it.
+    // The four in the middle are not this crate's text: each installed capability contributes the
+    // paragraph describing its own entries, ranked between the inventory that names them and the
+    // policy sections that assume they have been described.
     assert_eq!(
         section_names(&prefix),
         [
@@ -852,6 +902,10 @@ fn test_the_product_prefix_includes_dual_channel_response_rules() {
             "core_behavior",
             "tool_use",
             "tool_surface",
+            "filesystem",
+            "search",
+            "apply_patch",
+            "shell",
             "editing_verification",
             "autonomy",
             "channels",
@@ -865,9 +919,9 @@ fn test_the_product_prefix_includes_dual_channel_response_rules() {
 /// The UI renders GitHub-flavored Markdown, so the stable prefix must state the exact conventions
 /// whose violation would visibly break a response: short bold headers, flat lists, usable file
 /// links, and the product's deliberately narrow punctuation policy.
-#[test]
-fn test_the_product_prefix_includes_output_formatting_rules() {
-    let prefix = host_backed_prefix();
+#[tokio::test]
+async fn test_the_product_prefix_includes_output_formatting_rules() {
+    let prefix = host_backed_prefix().await;
     let formatting = section_content(&prefix, "final_answer");
 
     assert!(formatting.contains("GitHub-flavored Markdown"));
@@ -915,15 +969,15 @@ fn test_every_role_shares_the_autonomy_section() {
 /// Tool-specific guidance must come from the same advertised surface as the provider request.
 /// A role that could edit in another product configuration still cannot call a tool the current
 /// agent omitted.
-#[test]
-fn test_the_editing_entry_requires_an_advertised_apply_patch_tool() {
+#[tokio::test]
+async fn test_the_editing_entry_requires_an_advertised_apply_patch_tool() {
     let bare_main = assemble_stable_prefix(&PromptRole::Main).expect("bare main prefix");
     assert!(
         !section_content(&bare_main, "editing_verification").contains("`apply_patch`"),
         "a prefix assembled without tools must not promise apply_patch"
     );
 
-    let host_backed_main = host_backed_prefix();
+    let host_backed_main = host_backed_prefix().await;
     assert!(
         section_content(&host_backed_main, "editing_verification").contains("`apply_patch`"),
         "the host-backed agent advertises apply_patch, so its editing guidance must name it"
@@ -1056,7 +1110,7 @@ async fn anthropic_system_block(instructions: &str) -> serde_json::Value {
 /// prefix that only cleared the floor after tools were attached would otherwise go unnoticed.
 #[tokio::test]
 async fn test_the_product_prefix_reaches_the_caching_floor_and_earns_a_breakpoint() {
-    let prefix = host_backed_prefix();
+    let prefix = host_backed_prefix().await;
     let tokens = prefix.token_estimate();
 
     assert!(

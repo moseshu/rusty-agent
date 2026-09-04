@@ -34,29 +34,50 @@
 //!
 //! # Where the resulting set goes
 //!
-//! Today it is read for its tools, by the agent construction path that also assembles the prompt
-//! naming them — through a registry and a profile, so one switch moves both. It is not additionally
-//! installed on [`RunConfig`](ra_runtime::runner::RunConfig), because a capability contributes its
-//! tools at run assembly and the agent already declares them — installing both would declare one
-//! tool twice and fail the build. Moving installation to the run configuration is a later step, and
-//! it has to move together with the prompt fragments: an agent whose tools arrive at assembly needs
-//! its inventory section to arrive the same way, or the prefix describes a surface the request does
-//! not carry.
+//! It is read by the agent construction path, for **both** halves it carries: the tools, which go
+//! through a registry and a profile to become one bounded surface, and the prompt fragments that
+//! describe them, which join the product's own sections in the same stable prefix. One switch moves
+//! both because one object produced both.
 //!
-//! `compaction` is the exception and is installed on the run configuration by
-//! [`CodingHost::build_run_config`](crate::host::CodingHost::build_run_config). It contributes no
-//! tool, so it has nothing to declare twice, and it is role-independent.
+//! It is not additionally installed on [`RunConfig`](ra_runtime::runner::RunConfig). A capability
+//! installed there contributes its tools at run assembly and the agent already declares them, so
+//! installing in both places declares one tool twice and fails the build.
+//!
+//! # Why the fragments arrive here and not at run assembly
+//!
+//! The obvious symmetry would be the other one: move the tools to `RunConfig` and let both halves
+//! arrive when the run does. Two facts rule it out, and both are about the *inventory* section
+//! rather than about the capability fragments.
+//!
+//! The inventory is product text rendered from the assembled surface — it names the entries this
+//! profile advertises — and `ra-runtime` can neither write product text nor reach the assembler
+//! that would place it. So the inventory cannot arrive at run assembly, and a fragment describing
+//! `apply_patch` that arrived without the list saying the agent has it would be describing a
+//! surface nothing in the prefix declares. Second, contributions collected at run assembly are
+//! appended to the agent's instructions in assembly order, downstream of the canonical section
+//! ranking and of the committed prompt dump — so a prefix half-assembled there is a prefix the
+//! snapshot gate no longer covers.
+//!
+//! The direction that satisfies "the fragment cannot arrive without its tools" is therefore this
+//! one: the single place that already turns capabilities into a tool surface also turns them into
+//! prompt sections. [`CapabilityPlan::static_prompt_sections`] is what makes it possible before a run
+//! exists, and it is the same rule the runtime applies to a host's own capabilities.
+//!
+//! `compaction` is installed on the run configuration by
+//! [`CodingHost::build_run_config`](crate::host::CodingHost::build_run_config), and it is the case
+//! that shows the split is about tools rather than about ownership: it contributes no tool and no
+//! prefix text, so it has nothing to declare twice and nothing to place.
 
 use std::{collections::BTreeSet, sync::Arc};
 
 use ra_core::{
     capability::Capability,
-    error::Result,
+    error::{Error, Result},
     permission::PermissionScope,
-    prompt::PromptRole,
+    prompt::{PromptRole, PromptSection},
     tool::{Tool, ToolLookupKey},
 };
-use ra_runtime::capability::CapabilityPlan;
+use ra_runtime::{capability::CapabilityPlan, tool::profile::ToolSurface};
 
 use crate::host::CodingHost;
 
@@ -142,6 +163,96 @@ impl RoleCapabilities {
             .map(|tool| tool.origin().lookup_key().clone())
             .collect()
     }
+
+    /// The prompt fragments the installed capabilities contribute for one assembled surface.
+    ///
+    /// A role decides which capabilities are installed; a tier then decides which of their entries
+    /// the request actually carries. This is where the second decision reaches the prompt: a
+    /// fragment is kept only when every entry it can speak for survived into the advertised
+    /// surface. The alternative is the failure the whole path exists to prevent — a paragraph
+    /// telling the model how `grep` returns its matches, in a request that carries no `grep`.
+    ///
+    /// A family the tier dropped entirely is dropped silently, because that is the tier saying so:
+    /// the surface's own floor is what catches a tier that lost entries it meant to keep, and
+    /// re-reporting it here would name the prompt for a decision the profile made.
+    ///
+    /// A family the tier dropped *in part* is refused. A capability is atomic — that is the whole
+    /// claim of the type — and its fragment describes the family as one thing, so half a family
+    /// leaves text naming an entry the request does not carry with no way to tell which half the
+    /// text meant.
+    ///
+    /// A capability with nothing advertised at all keeps its fragment. Not every capability speaks
+    /// for tools; one that contributes none has nothing for a tier to drop, and gating it on an
+    /// empty intersection would silence exactly the fragments that are pure policy.
+    ///
+    /// # Errors
+    ///
+    /// Propagates fragment resolution and the section checks
+    /// [`CapabilityPlan::static_prompt_sections`] performs, and refuses a tier that advertises part of a
+    /// capability's entries.
+    pub(crate) async fn prompt_sections_for(
+        &self,
+        surface: &ToolSurface,
+    ) -> Result<Vec<PromptSection>> {
+        let charged: BTreeSet<&str> = surface.advertised_names().collect();
+        let mut kept = Vec::new();
+        for section in self.installed.static_prompt_sections().await? {
+            let owner = self.owner_of(&section)?;
+            let (present, absent): (Vec<String>, Vec<String>) = owner
+                .tools()
+                .iter()
+                .filter(|tool| tool.options().is_advertised_to_model())
+                .map(|tool| tool.model_definition().name().to_owned())
+                .partition(|name| charged.contains(name.as_str()));
+
+            if absent.is_empty() {
+                kept.push(section);
+            } else if !present.is_empty() {
+                return Err(Error::config(format!(
+                    "the tool surface `{}` advertises {} of capability `{}` but not {}, and the \
+                     capability's prompt fragment `{}` describes them as one mechanism; a prefix \
+                     built from it would name an entry the request does not carry. Select the \
+                     family's entries together, or leave all of them out",
+                    surface.profile(),
+                    render_names(&present),
+                    owner.kind(),
+                    render_names(&absent),
+                    section.name()
+                )));
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The installed capability a fragment came from.
+    ///
+    /// Matched on provenance rather than on position, because the two lists are not the same
+    /// length: a capability that contributes no fragment leaves no row, and pairing by index would
+    /// attribute every later fragment to the wrong family. Resolution already refused a fragment
+    /// whose source is not its own family's, so the match is exact.
+    fn owner_of(&self, section: &PromptSection) -> Result<&Arc<dyn Capability>> {
+        self.installed
+            .capabilities()
+            .iter()
+            .find(|capability| &capability.kind().prompt_source() == section.source())
+            .ok_or_else(|| {
+                Error::caller(format!(
+                    "prompt fragment `{}` is attributed to `{}`, which is not among the installed \
+                     capabilities",
+                    section.name(),
+                    section.source()
+                ))
+            })
+    }
+}
+
+/// Renders one side of a partial selection, for an error that has to name both.
+fn render_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether installing this capability adds nothing that can change the workspace.

@@ -25,7 +25,7 @@ use crate::{
     error::{Error, Result},
     item::{ItemId, ModelInputItem, ModelResponse, RunItem},
     model::{ModelOutputSchema, ModelSettings},
-    prompt::{PromptSection, PromptSource},
+    prompt::{PromptSection, PromptSectionName, PromptSource},
     state::RunId,
     tool::Tool,
     usage::Usage,
@@ -120,6 +120,23 @@ impl CapabilityFamily {
     pub fn prompt_source(&self) -> PromptSource {
         PromptSource::Capability(self.as_str().to_owned())
     }
+
+    /// The prompt section name a fragment from this family claims.
+    ///
+    /// The family *is* the name, so one family cannot hold two slots in the prefix and two
+    /// families cannot contend for one. Assembly already refuses two capabilities that claim the
+    /// same section name; deriving the name here is what keeps that refusal from being something a
+    /// capability can walk into by accident — a capability free to name its own section is free to
+    /// land on an unrelated topic's slot, and the collision message would say nothing about the two
+    /// having been meant as different things.
+    ///
+    /// It is also what gives the canonical prefix order something stable to rank. A section's
+    /// position in the cached span is keyed on its name, and a name chosen per implementation is a
+    /// name the order table cannot know in advance.
+    #[must_use]
+    pub fn prompt_section_name(&self) -> PromptSectionName {
+        PromptSectionName::new(self.0.clone())
+    }
 }
 
 impl fmt::Display for CapabilityFamily {
@@ -193,6 +210,26 @@ pub trait Capability: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// The prompt section this installed capability contributes to an agent's static prefix.
+    ///
+    /// This method runs before any [`RunContext`] exists, so its answer must depend only on the
+    /// installed capability and host configuration. It is for an agent builder or prompt dump that
+    /// needs to construct one cached prefix shared by many runs. A capability bound to a run must
+    /// not use this method for text it derives from that run; that text belongs to
+    /// [`Self::instructions`].
+    ///
+    /// The section must use both [`CapabilityFamily::prompt_section_name`] and
+    /// [`CapabilityFamily::prompt_source`] for this capability's family. The runtime checks those
+    /// claims so a capability cannot take another topic's prefix slot or make a prompt dump blame
+    /// another contributor.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever reading the static fragment's source material produced.
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        Ok(None)
+    }
+
     /// The prompt section this capability contributes, resolved once per run.
     ///
     /// Resolved during assembly and not again, which is what lets the section reach the cached
@@ -201,8 +238,8 @@ pub trait Capability: Send + Sync + 'static {
     /// [`ContextProcessor::process_context`], which runs against the live request and writes into
     /// the tail rather than the prefix.
     ///
-    /// The section should carry [`CapabilityFamily::prompt_source`] as its source, so a prompt dump
-    /// attributes the text to the capability that wrote it.
+    /// The section must use both [`CapabilityFamily::prompt_section_name`] and
+    /// [`CapabilityFamily::prompt_source`] for this capability's family.
     ///
     /// # Errors
     ///

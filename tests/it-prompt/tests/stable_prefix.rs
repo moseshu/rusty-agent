@@ -1,4 +1,7 @@
-use ra_core::prompt::{PromptRole, PromptSectionName, PromptSource};
+use ra_core::capability::CapabilityFamily;
+use ra_core::prompt::{
+    PromptRole, PromptSection, PromptSectionName, PromptSource, SectionPosition, SectionStability,
+};
 use ra_prompt::assembler::PromptAssembler;
 use ra_prompt::section::PromptSectionBuilder;
 use ra_prompt::stability::{InvalidationReason, PrefixStabilityTracker, assert_prefix_stable};
@@ -136,6 +139,62 @@ fn test_stable_prefix_assembly_order_determinism() {
             "role"
         ],
         "sections must be ordered according to canonical priority"
+    );
+}
+
+/// A built-in capability's fragment is ranked, and it is ranked between the two sections it needs.
+///
+/// The order table spells the four family names as literals, because a `CapabilityFamily` is not
+/// usable in a const context. This is what holds the two spellings together: a family renamed on
+/// one side and not the other would silently stop being ranked, and its paragraph would reappear at
+/// the very end of the prefix — after the role section, and after everything that assumes the tools
+/// have already been described.
+#[test]
+fn test_a_built_in_capability_fragment_is_ranked_between_the_inventory_and_the_rules() {
+    let fragment = |family: &CapabilityFamily| {
+        PromptSection::new(
+            family.prompt_section_name(),
+            "capability fragment",
+            family.prompt_source(),
+            SectionStability::Stable,
+            SectionPosition::Prefix,
+            format!("{family} fragment"),
+        )
+        .expect("a capability fragment is a valid section")
+    };
+
+    let prefix = PromptAssembler::new()
+        .with_sections([
+            fixture_section(PromptSectionName::ROLE, "role"),
+            fragment(&CapabilityFamily::SHELL),
+            fixture_section(PromptSectionName::TOOL_SURFACE, "inventory"),
+            fragment(&CapabilityFamily::APPLY_PATCH),
+            fixture_section(PromptSectionName::EDITING_VERIFICATION, "editing"),
+            fragment(&CapabilityFamily::FILESYSTEM),
+            fragment(&CapabilityFamily::SEARCH),
+        ])
+        .expect("registration")
+        .assemble()
+        .expect("assembly must succeed");
+
+    let names: Vec<&str> = prefix
+        .sections()
+        .iter()
+        .map(|section| section.name().as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "tool_surface",
+            "filesystem",
+            "search",
+            "apply_patch",
+            "shell",
+            "editing_verification",
+            "role"
+        ],
+        "the four built-in fragments are ranked, and the registration order below does not decide \
+         where they land"
     );
 }
 

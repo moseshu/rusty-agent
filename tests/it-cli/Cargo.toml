@@ -14,3 +14,4 @@ ra-coding = { path = "../../crates/ra-coding" }
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

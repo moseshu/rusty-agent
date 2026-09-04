@@ -204,7 +204,7 @@ fn test_the_built_in_capabilities_require_nothing_of_each_other() {
     }
 }
 
-/// A tool capability contributes tools, and takes no position on anything else.
+/// A tool capability contributes tools and the text describing them, and nothing else.
 ///
 /// Sampling settings and the context-processor chain belong to whoever has a reason to change them.
 /// A capability that silently narrowed the sampling layer, or inserted itself into the processor
@@ -236,17 +236,64 @@ async fn test_a_tool_capability_leaves_sampling_and_the_processor_chain_alone() 
             "`{}` installed a context transform",
             capability.kind()
         );
-        // The prompt fragment that names these entries is still assembled by the product, from the
-        // advertised tool list. When it moves onto the capabilities, this is the assertion that
-        // changes.
+    }
+}
+
+/// Each capability's fragment is one section, named and attributed to its own family.
+///
+/// The three properties are what assembly checks, and they are checked here as well because the
+/// failure they prevent is silent from the capability's side: a fragment landing on another
+/// section's name replaces text nobody will miss, and one attributed elsewhere reports the wrong
+/// author in a dump that exists to say who wrote what.
+#[tokio::test]
+async fn test_each_built_in_capability_describes_its_own_entries_in_the_cached_prefix() {
+    let directory = tempfile::tempdir().expect("workspace directory");
+    let workspace = workspace(&directory);
+
+    let capabilities: Vec<Box<dyn Capability>> = vec![
+        Box::new(FilesystemCapability::for_workspace(&workspace).expect("filesystem builds")),
+        Box::new(SearchCapability::for_workspace(&workspace).expect("search builds")),
+        Box::new(ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds")),
+        Box::new(
+            ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
+                .expect("shell builds"),
+        ),
+    ];
+
+    for capability in &capabilities {
+        let family = capability.kind();
+        let section = capability
+            .static_instructions()
+            .await
+            .expect("a built-in fragment resolves")
+            .unwrap_or_else(|| panic!("`{family}` contributes no prompt fragment"));
+
+        assert_eq!(section.name(), &family.prompt_section_name());
+        assert_eq!(section.source(), &family.prompt_source());
+        assert!(section.position().is_prefix(), "`{family}`");
+        assert!(section.stability().is_stable(), "`{family}`");
+
+        // A fragment in the cached prefix is paid for on every turn of every run, so it declares
+        // what it may cost — and the declaration is only worth having if it is met.
+        let budget = section
+            .token_budget()
+            .unwrap_or_else(|| panic!("`{family}` spends prefix tokens without declaring a share"));
         assert!(
-            capability
-                .instructions()
-                .await
-                .expect("resolving a fragment cannot fail for a capability that has none")
-                .is_none(),
-            "`{}` contributed prompt text",
-            capability.kind()
+            section.token_estimate() <= budget,
+            "`{family}` spends {} of its declared {budget}",
+            section.token_estimate()
         );
+
+        // Every entry the capability contributes is named by the text that describes it. This is
+        // the half a product cannot check: it can compare the fragment against the surface, but
+        // only the capability knows an entry exists at all.
+        for tool in capability.tools() {
+            let name = tool.model_definition().name().to_owned();
+            assert!(
+                section.content().contains(&format!("`{name}`")),
+                "`{family}` describes its entries without naming `{name}`: {}",
+                section.content()
+            );
+        }
     }
 }

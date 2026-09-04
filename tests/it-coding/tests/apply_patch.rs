@@ -15,8 +15,8 @@ use ra_core::{
 use serde_json::json;
 use tempfile::TempDir;
 
-#[test]
-fn host_backed_agent_advertises_the_editing_entry() {
+#[tokio::test]
+async fn host_backed_agent_advertises_the_editing_entry() {
     let workspace = TempDir::new().expect("workspace");
     let host = CodingHost::open(workspace.path()).expect("host");
     let agent = build_agent_with_host(
@@ -25,6 +25,7 @@ fn host_backed_agent_advertises_the_editing_entry() {
         &ra_core::prompt::PromptRole::Main,
         &host,
     )
+    .await
     .expect("agent");
 
     // Found by name rather than by position: this case is about the editing entry, and an index

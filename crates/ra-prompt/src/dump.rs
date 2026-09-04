@@ -9,16 +9,24 @@ use serde::{Deserialize, Serialize};
 use crate::assembler::StablePrefix;
 
 /// Horizontal rule of the text report, as wide as the widest row its table can print.
-const RULE: &str =
-    "------------------------------------------------------------------------------------------\n";
+const RULE: &str = "------------------------------------------------------------\
+                    --------------------------------------------\n";
 
 /// Opening banner, on [`RULE`]'s width.
-const BANNER_TOP: &str =
-    "=================================== PROMPT DUMP REPORT ===================================\n";
+const BANNER_TOP: &str = "========================================== PROMPT DUMP REPORT \
+                          ==========================================\n";
 
 /// Closing banner, on [`RULE`]'s width.
-const BANNER_BOTTOM: &str =
-    "==========================================================================================\n";
+const BANNER_BOTTOM: &str = "============================================================\
+                             ============================================\n";
+
+/// Column width of the `Source` cell.
+///
+/// Wide enough for the longest provenance a built-in can print — `capability(apply_patch)` — so a
+/// capability's row lines up with the product's own rather than pushing every column after it to
+/// the right. The committed dump is read as a diff, and a table that reflows when a section changes
+/// owner reports the reflow instead of the change.
+const SOURCE_WIDTH: usize = 24;
 
 /// Inspection summary of a single prompt section.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,7 +242,7 @@ impl PromptDump {
         // something next to the allowance it was written against.
         let _ = writeln!(
             out,
-            "{:<22} {:<10} {:<9} {:<9} {:<7} {:<7} {:<8} Hash Prefix",
+            "{:<22} {:<SOURCE_WIDTH$} {:<9} {:<9} {:<7} {:<7} {:<8} Hash Prefix",
             "Section Name", "Source", "Stability", "Position", "Tokens", "Budget", "Bytes"
         );
         out.push_str(RULE);
@@ -251,7 +259,7 @@ impl PromptDump {
                 .map_or_else(|| "-".to_owned(), |budget| budget.to_string());
             let _ = writeln!(
                 out,
-                "{:<22} {:<10} {:<9} {:<9} {:<7} {budget:<7} {:<8} {hash_short}...",
+                "{:<22} {:<SOURCE_WIDTH$} {:<9} {:<9} {:<7} {budget:<7} {:<8} {hash_short}...",
                 sec.name, sec.source, sec.stability, sec.position, sec.token_estimate, sec.bytes
             );
         }

@@ -7,9 +7,10 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
-    match ra_cli::execute(ra_cli::Cli::parse()) {
+    match ra_cli::execute(ra_cli::Cli::parse()).await {
         Ok(output) => {
             print!("{}", output.stdout());
             output.outcome().exit_code()
