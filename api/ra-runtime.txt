@@ -13,9 +13,12 @@ async fn ra_runtime::turn::resolve::resolve_next_step(processed : & ProcessedRes
 async fn ra_runtime::turn::settle_turn(mut request : TurnSettlementRequest < '_ >) -> Result < SingleStepResult >
 const fn ra_runtime::agent::AgentBinding::execution(& self) -> & Arc < AgentSpec >
 const fn ra_runtime::agent::AgentBinding::public(& self) -> & Arc < AgentSpec >
+const fn ra_runtime::capability::DeferredPrompt::record_id(& self) -> & ItemId
+const fn ra_runtime::capability::DeferredPrompt::section(& self) -> & PromptSection
 const fn ra_runtime::permission::PermissionEngine::mode(& self) -> PermissionMode
 const fn ra_runtime::runner::RunConfig::action_surface_budget(& self) -> ActionSurfaceBudget
 const fn ra_runtime::runner::RunConfig::budget(& self) -> & BudgetLimit
+const fn ra_runtime::runner::RunConfig::context_filters(& self) -> & ContextFilterChain
 const fn ra_runtime::runner::RunConfig::max_function_tool_concurrency(& self) -> usize
 const fn ra_runtime::runner::RunConfig::max_turns(& self) -> u32
 const fn ra_runtime::runner::RunConfig::partial_messages(& self) -> bool
@@ -110,6 +113,7 @@ fn ra_runtime::agent::AgentRegistryBuilder::register(mut self, definition : Arc 
 fn ra_runtime::agent::AgentRegistryBuilder::register_all(mut self, definitions : impl IntoIterator < Item = Arc < AgentDefinition > >) -> Self
 fn ra_runtime::capability::AssembledCapabilities::capabilities(& self) -> & [Arc < dyn Capability >]
 fn ra_runtime::capability::AssembledCapabilities::context_processors(& self) -> & [Arc < dyn ContextProcessor >]
+fn ra_runtime::capability::AssembledCapabilities::deferred_prompts(& self) -> & [DeferredPrompt]
 fn ra_runtime::capability::AssembledCapabilities::families(& self) -> Vec < CapabilityFamily >
 fn ra_runtime::capability::AssembledCapabilities::is_empty(& self) -> bool
 fn ra_runtime::capability::AssembledCapabilities::prepare_agent(& self, agent : & AgentSpec) -> Result < Arc < AgentSpec > >
@@ -121,6 +125,9 @@ fn ra_runtime::capability::CapabilityPlan::families(& self) -> Vec < CapabilityF
 fn ra_runtime::capability::CapabilityPlan::is_empty(& self) -> bool
 fn ra_runtime::capability::CapabilityPlan::len(& self) -> usize
 fn ra_runtime::capability::CapabilityPlan::resolve(installed : impl IntoIterator < Item = Arc < dyn Capability > >) -> Result < Self >
+fn ra_runtime::capability::DeferredPrompt::family(& self) -> CapabilityFamily
+fn ra_runtime::capability::DeferredPrompt::is_signalled(& self, signal : & LoadSignal < '_ >) -> bool
+fn ra_runtime::capability::DeferredPrompt::to_run_item(& self) -> RunItem
 fn ra_runtime::permission::PermissionEngine::evaluate(& self, scope : PermissionScope, origin : & ToolOrigin, fallback : PermissionDecision) -> PermissionDecision
 fn ra_runtime::permission::PermissionEngine::fixed_decision(& self, scope : PermissionScope, origin : & ToolOrigin) -> Option < PermissionDecision >
 fn ra_runtime::permission::PermissionEngine::new(mode : PermissionMode) -> Self
@@ -129,15 +136,14 @@ fn ra_runtime::permission::PermissionEngine::with_mode(mut self, mode : Permissi
 fn ra_runtime::permission::PermissionEngine::with_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
 fn ra_runtime::runner::RunConfig::capabilities(& self) -> & [Arc < dyn Capability >]
 fn ra_runtime::runner::RunConfig::context_processors(& self) -> & [Arc < dyn ContextProcessor >]
-fn ra_runtime::runner::RunConfig::model_input_projector(& self) -> Option < & Arc < dyn ModelInputProjector > >
 fn ra_runtime::runner::RunConfig::new() -> Self
 fn ra_runtime::runner::RunConfig::tool_output_reference_extractor(& self) -> Option < & Arc < dyn ToolOutputReferenceExtractor > >
 fn ra_runtime::runner::RunConfig::with_capabilities(mut self, capabilities : impl IntoIterator < Item = Arc < dyn Capability > >) -> Self
 fn ra_runtime::runner::RunConfig::with_capability(mut self, capability : Arc < dyn Capability >) -> Self
+fn ra_runtime::runner::RunConfig::with_context_filter(mut self, context_filter : Arc < dyn ContextFilter >) -> Self
 fn ra_runtime::runner::RunConfig::with_context_processor(mut self, context_processor : Arc < dyn ContextProcessor >) -> Self
 fn ra_runtime::runner::RunConfig::with_error_handler(mut self, error_handler : Arc < dyn RunErrorHandler >) -> Self
 fn ra_runtime::runner::RunConfig::with_model(mut self, model : impl Into < String >) -> Self
-fn ra_runtime::runner::RunConfig::with_model_input_projector(mut self, model_input_projector : Arc < dyn ModelInputProjector >) -> Self
 fn ra_runtime::runner::RunConfig::with_model_settings(mut self, model_settings : ModelSettings) -> Self
 fn ra_runtime::runner::RunConfig::with_permission_mode(mut self, mode : PermissionMode) -> Self
 fn ra_runtime::runner::RunConfig::with_permission_rules(mut self, rules : impl IntoIterator < Item = PermissionRule >) -> Self
@@ -164,6 +170,7 @@ fn ra_runtime::runner::result::RunResult::original_input(& self) -> & [ModelInpu
 fn ra_runtime::runner::result::RunResult::turn_items(& self, record : & TurnRecord) -> & [RunItem]
 fn ra_runtime::runner::result::RunResult::turn_records(& self) -> & [TurnRecord]
 fn ra_runtime::runner::result::RunResult::usage(& self) -> Usage
+fn ra_runtime::runner::result::TurnRecord::context_filter_reports(& self) -> & [ContextFilterReport]
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::context(& self) -> ToolContext < '_ >
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::new(tool : Arc < dyn Tool >, call_id : CallId, arguments : Value, run : Arc < RunContext >, cancel : CancelScope, history : CallHistory, permission : PermissionEngine) -> Self
 fn ra_runtime::tool::dispatch::ToolDispatchRequest::tool(& self) -> & Arc < dyn Tool >
@@ -247,6 +254,7 @@ struct ra_runtime::agent::AgentRegistry
 struct ra_runtime::agent::AgentRegistryBuilder
 struct ra_runtime::capability::AssembledCapabilities
 struct ra_runtime::capability::CapabilityPlan
+struct ra_runtime::capability::DeferredPrompt
 struct ra_runtime::permission::PermissionEngine
 struct ra_runtime::runner::RunConfig
 struct ra_runtime::runner::RunRequest

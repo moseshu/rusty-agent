@@ -546,7 +546,14 @@ impl PromptProvenance {
         &self.source
     }
 
-    /// Hash of the canonical tail text actually lowered into the model request.
+    /// Hash of the canonical tail text the generator produced and preparation lowered.
+    ///
+    /// **It covers what the generator wrote, not necessarily the bytes that left the process.** A
+    /// [`ContextFilter`](crate::filter::ContextFilter) runs after preparation and may project the
+    /// items this text was lowered into. That is deliberately not folded back in here: this record
+    /// answers "which generator wrote what" and re-hashing a filtered request would make it answer
+    /// neither question completely. What a filter changed is recorded beside it, per filter, by
+    /// [`ContextFilterReport`](crate::filter::ContextFilterReport).
     #[must_use]
     pub const fn content_hash(&self) -> &ContentHash {
         &self.content_hash

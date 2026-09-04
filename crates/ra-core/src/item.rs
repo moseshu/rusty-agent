@@ -17,6 +17,7 @@ use crate::compat::{SchemaVersion, Unknown};
 
 pub mod compaction;
 pub mod content;
+pub mod estimate;
 pub mod handoff;
 pub mod mcp;
 pub mod message;

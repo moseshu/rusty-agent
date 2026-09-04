@@ -5,6 +5,7 @@ use ra_context::eviction::{
     ToolOutputReferenceTrimmer,
 };
 use ra_core::{
+    filter::{ContextFilter, ContextFilterRequest, ModelInputData},
     item::{CallId, ModelInputItem, ToolCall, ToolCallOutput},
     state::{RunId, TOOL_OUTPUT_REFERENCE_SCHEMA_VERSION, ToolOutputReferenceTracker},
     tool::{ToolOutput, ToolOutputBlock},
@@ -487,4 +488,57 @@ fn reference_trimmer_defaults_and_validation_are_explicit() {
         "a field this type neither reads nor exposes must not make two equal configurations differ"
     );
     assert!(ToolOutputReferenceTrimmer::new(0, 100, 20).is_err());
+}
+
+/// The reference-aware trimmer reads the run, the turn, and the ledger from the filter request.
+/// Those three are exactly what separates it from a positional policy, so a chain that failed to
+/// pass them would silently downgrade it to one that keeps everything.
+#[test]
+fn the_reference_trimmer_reads_its_turn_facts_from_the_filter_request() {
+    let run_id = RunId::new("run-1");
+    let stale = CallId::new("call-stale");
+    let large = "grep hit ".repeat(80);
+    let input = vec![
+        call(stale.as_str(), "grep"),
+        structured_output(stale.as_str(), large),
+    ];
+    let mut references = ToolOutputReferenceTracker::new(run_id.clone());
+    references
+        .record_turn(1, [stale.clone()], [])
+        .expect("the result is registered");
+    let trimmer = ToolOutputReferenceTrimmer::new(4, 240, 40).expect("valid limits");
+
+    assert_eq!(trimmer.name(), "tool_output_reference_trimmer");
+
+    let early = trimmer
+        .filter_model_input(
+            &ContextFilterRequest::new(&run_id, 3, &references),
+            ModelInputData::new(input.clone(), None),
+        )
+        .expect("filtering succeeds");
+    assert_eq!(
+        early.input(),
+        input,
+        "three turns on, the result is not yet stale enough to replace"
+    );
+
+    let late = trimmer
+        .filter_model_input(
+            &ContextFilterRequest::new(&run_id, 9, &references),
+            ModelInputData::new(input.clone(), None),
+        )
+        .expect("filtering succeeds");
+    assert!(
+        structured(&late.input()[1]).model_excerpt().is_some(),
+        "nine turns on, the same ledger makes the same result eligible"
+    );
+
+    let other_run = RunId::new("run-2");
+    let error = trimmer
+        .filter_model_input(
+            &ContextFilterRequest::new(&other_run, 9, &references),
+            ModelInputData::new(input, None),
+        )
+        .expect_err("a ledger from another run is refused rather than consulted");
+    assert!(error.to_string().contains("run-1"));
 }

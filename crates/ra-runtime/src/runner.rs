@@ -42,6 +42,10 @@ use ra_core::{
     },
     context::RunContext,
     error::{BudgetKind, Error, ProviderErrorKind, Result},
+    filter::{
+        ContextFilter, ContextFilterChain, ContextFilterReport, ContextFilterRequest,
+        ModelInputData,
+    },
     finish::FinishReason,
     item::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
@@ -55,7 +59,7 @@ use ra_core::{
     permission::{PermissionMode, PermissionRule},
     state::{EventSeqAllocator, InterruptionResolution, RunId, RunState, ToolOutcome, ToolUse},
     step::NextStep,
-    tool::{ModelInputProjector, ToolOutputReferenceExtractor, ToolServices},
+    tool::{ToolOutputReferenceExtractor, ToolServices},
     trace::SpanKind,
     usage::{RequestUsage, Usage},
 };
@@ -116,7 +120,7 @@ pub struct RunConfig {
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
-    model_input_projector: Option<Arc<dyn ModelInputProjector>>,
+    context_filters: ContextFilterChain,
     tool_output_reference_extractor: Option<Arc<dyn ToolOutputReferenceExtractor>>,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
     capabilities: Vec<Arc<dyn Capability>>,
@@ -142,7 +146,7 @@ impl RunConfig {
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
-            model_input_projector: None,
+            context_filters: ContextFilterChain::new(),
             tool_output_reference_extractor: None,
             context_processors: Vec::new(),
             capabilities: Vec::new(),
@@ -260,21 +264,21 @@ impl RunConfig {
         self
     }
 
-    /// Installs the policy that projects authoritative history into the next model request.
+    /// Appends a pure projection applied to the model input before every request.
     ///
-    /// The policy sees a persisted tool-output reference ledger. Its result affects only the
-    /// provider request; `RunState` retains the complete session records for resume and storage.
-    pub fn with_model_input_projector(
-        mut self,
-        model_input_projector: Arc<dyn ModelInputProjector>,
-    ) -> Self {
-        self.model_input_projector = Some(model_input_projector);
+    /// A filter sees a persisted tool-output reference ledger and affects only the provider
+    /// request; `RunState` retains the complete session records for resume and storage.
+    ///
+    /// Filters run in install order, after every context processor, and each one is measured
+    /// separately — see [`ContextFilterChain`] for what that order decides.
+    pub fn with_context_filter(mut self, context_filter: Arc<dyn ContextFilter>) -> Self {
+        self.context_filters.push(context_filter);
         self
     }
 
     /// Installs the product's typed extractor for tool-output references in model responses.
     ///
-    /// A projector does not parse narration to infer retention. When no extractor is installed,
+    /// A filter does not parse narration to infer retention. When no extractor is installed,
     /// produced outputs are tracked but no response is considered an explicit reference.
     pub fn with_tool_output_reference_extractor(
         mut self,
@@ -384,10 +388,10 @@ impl RunConfig {
         self.max_function_tool_concurrency
     }
 
-    /// Model-input projection policy, when configured.
+    /// The model-input filters installed for this run, in the order they run.
     #[must_use]
-    pub fn model_input_projector(&self) -> Option<&Arc<dyn ModelInputProjector>> {
-        self.model_input_projector.as_ref()
+    pub const fn context_filters(&self) -> &ContextFilterChain {
+        &self.context_filters
     }
 
     /// Typed tool-output reference extractor, when configured.
@@ -446,10 +450,7 @@ impl std::fmt::Debug for RunConfig {
                 &self.tool_name_collision_policy,
             )
             .field("action_surface_budget", &self.action_surface_budget)
-            .field(
-                "has_model_input_projector",
-                &self.model_input_projector.is_some(),
-            )
+            .field("context_filters", &self.context_filters)
             .field(
                 "has_tool_output_reference_extractor",
                 &self.tool_output_reference_extractor.is_some(),
@@ -1431,16 +1432,11 @@ async fn run_one_turn(
     let (prepared, context_records, context_responses) =
         process_context_processors(context, state, progress, turn_scope, prepared, history_span)
             .await?;
-    // Item-level projection runs last, on whatever the coarse transforms produced. A context
-    // processor reprojects whole regions of history; running the projector before it would only
-    // trim items the projector's own output then replaced with the untouched originals.
-    let projected_input = project_model_input(
-        config,
-        state,
-        progress.reference_turn(),
-        prepared.request().input().to_vec(),
-    )?;
-    let prepared = prepared.map_request(|request| request.with_input(projected_input));
+    // The filter chain runs last, on whatever the coarse transforms produced. A context processor
+    // reprojects whole regions of history; running a filter before it would only trim items the
+    // processor's own output then replaced with the untouched originals.
+    let (prepared, context_filter_reports) =
+        apply_context_filters(config, state, progress.reference_turn(), prepared)?;
 
     let first_item = progress.segment_items(state).len();
     let context_usage = context_responses
@@ -1544,6 +1540,7 @@ async fn run_one_turn(
         agent.public_id().clone(),
         settled.next_step().clone(),
         first_item..last_item,
+        context_filter_reports,
     ));
 
     // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
@@ -1702,10 +1699,11 @@ impl HistorySpan {
     ///
     /// The prefix is compared rather than merely counted, so this is a positional claim the
     /// request has to still satisfy rather than one it is assumed to. Preparation only appends
-    /// today, but its filter stage is where later transforms land, and one that rewrites an item
-    /// in place would keep every length here correct while making the boundaries wrong. `None`
-    /// then means the request no longer has the shape this span describes, and context processing
-    /// is skipped rather than applied to the wrong region.
+    /// today, and a transform that rewrote or dropped an item there would keep every length here
+    /// correct while making the boundaries wrong — which is one of the reasons the filter chain
+    /// runs after this split rather than before it. `None` then means the request no longer has
+    /// the shape this span describes, and context processing is skipped rather than applied to the
+    /// wrong region.
     fn split(
         self,
         input: &[ModelInputItem],
@@ -1784,42 +1782,55 @@ impl ContextSummarizer for RunnerContextSummarizer<'_> {
     }
 }
 
-/// Projects the request input, counting turns the way the reference ledger counts them.
+/// Projects the request input through the installed filters and records what each one did.
 ///
-/// `turn` spans the whole run, not this segment: the ledger it consults was restored with the
+/// `turn` spans the whole run, not this segment: the ledger a filter consults was restored with the
 /// checkpoint, and a result last referenced before a resume has to stay comparable with the turn
 /// now being prepared.
-fn project_model_input(
+///
+/// The system instructions are handed over so a filter can measure the whole request, and written
+/// back from the prepared request rather than from the chain — the chain refuses a filter that
+/// changed them, so there is nothing here to write back.
+fn apply_context_filters(
     config: &RunConfig,
     state: &RunState,
     turn: u64,
-    input: Vec<ModelInputItem>,
-) -> Result<Vec<ModelInputItem>> {
-    match config.model_input_projector() {
-        Some(projector) => projector.project_model_input(
-            state.run_id(),
-            turn,
-            state.tool_output_references(),
-            &input,
-        ),
-        None => Ok(input),
+    prepared: PreparedTurn,
+) -> Result<(PreparedTurn, Vec<ContextFilterReport>)> {
+    let filters = config.context_filters();
+    if filters.is_empty() {
+        return Ok((prepared, Vec::new()));
     }
+
+    let request = ContextFilterRequest::new(state.run_id(), turn, state.tool_output_references());
+    let data = ModelInputData::new(
+        prepared.request().input().to_vec(),
+        prepared.request().system_instructions().map(str::to_owned),
+    );
+    let (data, reports) = filters.apply(&request, data)?.into_parts();
+    Ok((
+        prepared.map_request(|request| request.with_input(data.into_input())),
+        reports,
+    ))
 }
 
 fn referenced_tool_outputs(
     config: &RunConfig,
     response: &ModelResponse,
 ) -> Result<Vec<ra_core::item::CallId>> {
-    match (
-        config.model_input_projector(),
-        config.tool_output_reference_extractor(),
-    ) {
-        (Some(_), Some(extractor)) => extractor.referenced_tool_outputs(response),
-        (Some(_) | None, None) | (None, Some(_)) => Ok(Vec::new()),
+    match config.tool_output_reference_extractor() {
+        Some(extractor) if !config.context_filters().is_empty() => {
+            extractor.referenced_tool_outputs(response)
+        }
+        Some(_) | None => Ok(Vec::new()),
     }
 }
 
 /// Settles this turn's retention facts, on the same whole-run turn axis the projection used.
+///
+/// Kept for the whole chain rather than for the one filter that consults it. The ledger costs a
+/// list of call IDs per turn, while deciding per filter would mean asking each one whether it reads
+/// retention — a question whose wrong answer is a filter silently seeing an empty ledger.
 fn record_tool_output_references(
     config: &RunConfig,
     state: &mut RunState,
@@ -1827,7 +1838,7 @@ fn record_tool_output_references(
     items: &[RunItem],
     referenced_outputs: Vec<ra_core::item::CallId>,
 ) -> Result<()> {
-    if config.model_input_projector().is_none() {
+    if config.context_filters().is_empty() {
         return Ok(());
     }
     let new_outputs = items.iter().filter_map(|item| {

@@ -25,6 +25,7 @@ use ra_core::{
     cancel::{CancelReason, CancelScope, Deadline},
     context::RunContext,
     error::{Error, ProviderErrorKind, Result, ToolErrorKind},
+    filter::{ContextFilter, ContextFilterRequest, ModelInputData},
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
@@ -39,9 +40,8 @@ use ra_core::{
     permission::{PermissionDecision, PermissionRule},
     state::{PendingControlRequest, RunId, RunState, ToolOutcome, ToolUse, WorkStateHandle},
     tool::{
-        ModelInputProjector, Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext,
-        ToolLookupKey, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
-        ToolServices,
+        Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
+        ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
     },
     usage::{RequestUsage, Usage},
 };
@@ -158,24 +158,59 @@ impl Model for SummaryFailingModel {
     }
 }
 
-/// Records the runtime projection calls without changing their model input.
+/// Records the filter calls without changing their model input.
 #[derive(Default)]
-struct RecordingInputProjector {
+struct RecordingContextFilter {
     calls: Arc<Mutex<Vec<(u64, usize)>>>,
     observed: Arc<Mutex<Vec<Vec<ModelInputItem>>>>,
+    instructions: Arc<Mutex<Vec<Option<String>>>>,
 }
 
-impl ModelInputProjector for RecordingInputProjector {
-    fn project_model_input(
+impl ContextFilter for RecordingContextFilter {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    fn filter_model_input(
         &self,
-        _run_id: &RunId,
-        current_turn: u64,
-        _references: &ra_core::state::ToolOutputReferenceTracker,
-        input: &[ModelInputItem],
-    ) -> Result<Vec<ModelInputItem>> {
-        self.calls.lock().unwrap().push((current_turn, input.len()));
-        self.observed.lock().unwrap().push(input.to_vec());
-        Ok(input.to_vec())
+        request: &ContextFilterRequest<'_>,
+        data: ModelInputData,
+    ) -> Result<ModelInputData> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((request.current_turn(), data.input().len()));
+        self.observed.lock().unwrap().push(data.input().to_vec());
+        self.instructions
+            .lock()
+            .unwrap()
+            .push(data.instructions().map(str::to_owned));
+        Ok(data)
+    }
+}
+
+/// Drops every tool result from the request, so the chain has something real to measure.
+struct ToolOutputDroppingFilter {
+    name: &'static str,
+}
+
+impl ContextFilter for ToolOutputDroppingFilter {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn filter_model_input(
+        &self,
+        _request: &ContextFilterRequest<'_>,
+        data: ModelInputData,
+    ) -> Result<ModelInputData> {
+        let kept: Vec<ModelInputItem> = data
+            .input()
+            .iter()
+            .filter(|item| !matches!(item, ModelInputItem::ToolCallOutput(_)))
+            .cloned()
+            .collect();
+        Ok(data.with_input(kept))
     }
 }
 
@@ -1011,7 +1046,7 @@ async fn loops_between_tool_calls_and_final_answer_until_model_requests_nothing(
 }
 
 #[tokio::test]
-async fn model_input_projector_runs_before_each_request_and_records_settled_outputs() {
+async fn a_context_filter_runs_before_each_request_and_records_settled_outputs() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
@@ -1019,9 +1054,11 @@ async fn model_input_projector_runs_before_each_request_and_records_settled_outp
     ]);
     let cancel = CancelScope::root();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let config = RunConfig::new().with_model_input_projector(Arc::new(RecordingInputProjector {
+    let instructions = Arc::new(Mutex::new(Vec::new()));
+    let config = RunConfig::new().with_context_filter(Arc::new(RecordingContextFilter {
         calls: Arc::clone(&calls),
-        ..RecordingInputProjector::default()
+        instructions: Arc::clone(&instructions),
+        ..RecordingContextFilter::default()
     }));
 
     let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
@@ -1036,6 +1073,80 @@ async fn model_input_projector_runs_before_each_request_and_records_settled_outp
             .last_referenced_turn(&CallId::new("call-1")),
         Some(1)
     );
+
+    // The filter is handed the request's stable instructions even though it may not change them:
+    // a policy that budgets a whole request has to be able to price the prefix it cannot touch.
+    assert_eq!(
+        *instructions.lock().unwrap(),
+        vec![
+            Some("do the thing".to_owned()),
+            Some("do the thing".to_owned())
+        ]
+    );
+
+    // A filter that changed nothing still leaves a record. "Installed and had nothing to do" and
+    // "never installed" are different facts, and only the report distinguishes them.
+    let reports: Vec<&str> = result
+        .turn_records()
+        .iter()
+        .flat_map(|record| record.context_filter_reports())
+        .map(|report| {
+            assert!(!report.changed());
+            assert_eq!(report.chars_saved(), 0);
+            assert_eq!(report.token_estimate_delta(), 0);
+            report.filter()
+        })
+        .collect();
+    assert_eq!(reports, vec!["recording", "recording"]);
+}
+
+/// A report is measured across one filter's own step, so a chain says which filter saved what
+/// rather than only what the request weighed at the end.
+#[tokio::test]
+async fn each_filter_is_measured_across_its_own_step_and_reported_in_chain_order() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let config = RunConfig::new()
+        .with_context_filter(Arc::new(ToolOutputDroppingFilter { name: "dropper" }))
+        .with_context_filter(Arc::new(RecordingContextFilter {
+            observed: Arc::clone(&observed),
+            ..RecordingContextFilter::default()
+        }));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("run succeeds");
+
+    // Second turn: the request carries the call, its result, and the first turn's input. The
+    // dropper removes the result; the recorder that follows sees what the dropper produced.
+    let second_turn = result.turn_records()[1].context_filter_reports();
+    let names: Vec<&str> = second_turn.iter().map(|report| report.filter()).collect();
+    assert_eq!(names, vec!["dropper", "recording"]);
+    assert!(second_turn[0].changed());
+    assert!(second_turn[0].chars_saved() > 0);
+    assert!(second_turn[0].token_estimate_delta() > 0);
+
+    // The second filter changed nothing, so its own report is zero even though the request it
+    // handled had already lost characters. A chain-wide total could not say this.
+    assert!(!second_turn[1].changed());
+    assert_eq!(second_turn[1].chars_saved(), 0);
+
+    let observed = observed.lock().unwrap().clone();
+    assert!(
+        !observed[1]
+            .iter()
+            .any(|item| matches!(item, ModelInputItem::ToolCallOutput(_))),
+        "the second filter must observe the first filter's output, not the original request"
+    );
+
+    // The first turn had no tool result to drop, so the same filter reports no change there. The
+    // per-turn record is what makes "did not fire this turn" readable.
+    assert!(!result.turn_records()[0].context_filter_reports()[0].changed());
 }
 
 #[tokio::test]
@@ -1330,11 +1441,11 @@ async fn an_unavailable_summary_leaves_the_run_going_on_uncompacted_input() {
     );
 }
 
-/// Compaction reprojects whole regions of history; the item-level projector trims what is left.
-/// Running the projector first would only trim items that compaction then replaced with their
-/// untouched originals, so the ordering is what makes both policies hold at once.
+/// Compaction reprojects whole regions of history; the filter chain trims what is left. Running a
+/// filter first would only trim items that compaction then replaced with their untouched
+/// originals, so the ordering is what makes both policies hold at once.
 #[tokio::test]
-async fn the_model_input_projector_runs_after_context_processing() {
+async fn the_context_filter_chain_runs_after_context_processing() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![
@@ -1345,9 +1456,9 @@ async fn the_model_input_projector_runs_after_context_processing() {
         ModelResponse::new(vec![message("msg-1", "done")]),
     ]);
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let projector = Arc::new(RecordingInputProjector {
+    let filter = Arc::new(RecordingContextFilter {
         observed: Arc::clone(&observed),
-        ..RecordingInputProjector::default()
+        ..RecordingContextFilter::default()
     });
     let cancel = CancelScope::root();
     let compaction = CompactionCapability::new(
@@ -1359,7 +1470,7 @@ async fn the_model_input_projector_runs_after_context_processing() {
     .expect("a converging explicit item limit is valid");
     let config = RunConfig::new()
         .with_context_processor(Arc::new(compaction))
-        .with_model_input_projector(projector.clone());
+        .with_context_filter(filter.clone());
 
     Runner::run(request(vec![tool], &model, &cancel).with_config(config))
         .await
@@ -1369,13 +1480,13 @@ async fn the_model_input_projector_runs_after_context_processing() {
     assert_eq!(
         observed.len(),
         2,
-        "the projector runs once per ordinary request, not once per model call"
+        "the chain runs once per ordinary request, not once per model call"
     );
     assert!(
         observed[1]
             .iter()
             .any(|item| matches!(item, ModelInputItem::Compaction(_))),
-        "the projector must observe the compacted view, not the history compaction replaced"
+        "a filter must observe the compacted view, not the history compaction replaced"
     );
 }
 
@@ -1404,9 +1515,9 @@ async fn a_resumed_segment_continues_the_reference_ledgers_turn_axis() {
     ]);
     let cancel = CancelScope::root();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let config = RunConfig::new().with_model_input_projector(Arc::new(RecordingInputProjector {
+    let config = RunConfig::new().with_context_filter(Arc::new(RecordingContextFilter {
         calls: Arc::clone(&calls),
-        ..RecordingInputProjector::default()
+        ..RecordingContextFilter::default()
     }));
     let mut carried = RunState::start(RunId::new("run-loop"));
     carried
