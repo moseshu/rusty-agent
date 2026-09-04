@@ -28,6 +28,12 @@ const SNAPSHOTS: [&str; 3] = [
 /// Runs the gate. When `bless` is true it rewrites the snapshot instead of reconciling.
 pub(crate) fn run(bless: bool) -> Outcome {
     let root = source::workspace_root();
+    if !bless && !source::baselines_present() {
+        return Outcome::skip(
+            "cargo xtask prompt-dump --bless",
+            "api/ 不进版本库，这次 checkout 没有前缀与装配基线可对账",
+        );
+    }
     let missing = SNAPSHOTS
         .iter()
         .find(|snapshot| !PathBuf::from(&root).join(snapshot).is_file());

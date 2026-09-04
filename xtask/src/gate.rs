@@ -5,9 +5,15 @@
 //! One of the nine gates still has nothing to check (the guard registry waits on R7-0). Such an
 //! entry could either print a "not implemented" placeholder or pretend to pass; the first reads as
 //! done, and the second is worse because it manufactures confidence.
-//! So [`Outcome::Skip`] is its own tier, carries **which task is blocking it**, and is counted
-//! separately in the summary: CI never turns red for it, but every run shows how many are still
-//! owed.
+//! So [`Outcome::Skip`] is its own tier, carries **what unblocks it**, and is counted separately in
+//! the summary: CI never turns red for it, but every run shows how many are still owed.
+//!
+//! There are two ways to be blocked, and `blocked_by` names either. One is pending work, as with
+//! the guard registry. The other is a precondition this repository declines to ship: the three
+//! reconciling gates read baselines under `api/`, which is deliberately not in version control, so
+//! a fresh checkout has nothing to compare against and the field names the bless command that would
+//! produce it. Both are the same statement — this run did not check the thing — and neither may
+//! read as a pass.
 
 use core::fmt;
 

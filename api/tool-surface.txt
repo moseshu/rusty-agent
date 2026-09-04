@@ -1,7 +1,0 @@
-revision 5; surface SHA-256: a5a6d27b223d92af59115f3f22bdb9943518f3c3afe6277d9458fc634853227a
-- `apply_patch`
-- `exec_command`
-- `glob`
-- `grep`
-- `read_file`
-- `write_stdin`

@@ -11,6 +11,17 @@ pub(crate) fn workspace_root() -> PathBuf {
     manifest.parent().unwrap_or(manifest).to_path_buf()
 }
 
+/// Whether this checkout holds the baseline directory the reconciling gates read.
+///
+/// `api/` is deliberately out of version control, so a fresh clone has nothing for `public-api`,
+/// `schema-stability`, and `prompt-dump` to compare against — they skip and name the command that
+/// would produce it. **Present but incomplete is a different thing entirely**: a crate or an
+/// artifact somebody added without blessing, which is exactly what those gates are for, so that
+/// stays a failure.
+pub(crate) fn baselines_present() -> bool {
+    workspace_root().join("api").is_dir()
+}
+
 /// A path relative to the workspace root, for error messages.
 pub(crate) fn relative(path: &Path) -> String {
     path.strip_prefix(workspace_root())

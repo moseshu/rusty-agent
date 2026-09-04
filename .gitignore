@@ -34,3 +34,8 @@ target
 
 # 开发文档（不上传 GitHub）——整目录忽略，避免子目录 md 漏传
 /Docs/
+
+# 门禁基线与快照（不上传 GitHub）——本地产物，`cargo xtask <gate> --bless` 生成。
+# 注意代价：它们是 `public-api` / `schema-stability` / `prompt-dump` 三条门禁的对账对象，
+# 不在库里就没法在 review 的 diff 里看见改动，全新 clone 也要先 bless 一次才能跑这三条。
+/api/
