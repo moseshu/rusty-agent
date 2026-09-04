@@ -23,6 +23,7 @@ use ra_core::{
     agent::AgentSpec,
     budget::BudgetSnapshot,
     error::{Error, Result},
+    filter::ContextFilterReport,
     finish::FinishReason,
     item::{
         AgentId, InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse,
@@ -305,6 +306,7 @@ pub struct TurnRecord {
     agent: AgentId,
     next_step: NextStep,
     items: Range<usize>,
+    context_filter_reports: Vec<ContextFilterReport>,
 }
 
 impl TurnRecord {
@@ -314,6 +316,7 @@ impl TurnRecord {
         agent: AgentId,
         next_step: NextStep,
         items: Range<usize>,
+        context_filter_reports: Vec<ContextFilterReport>,
     ) -> Self {
         Self {
             owner,
@@ -321,6 +324,7 @@ impl TurnRecord {
             agent,
             next_step,
             items,
+            context_filter_reports,
         }
     }
 
@@ -360,6 +364,20 @@ impl TurnRecord {
             NextStep::FinalOutput { reason } => Some(*reason),
             NextStep::RunAgain | NextStep::Handoff { .. } | NextStep::Interruption { .. } => None,
         }
+    }
+
+    /// What each installed model-input filter did to this turn's request, in the order they ran.
+    ///
+    /// Empty when no filter is installed, and empty for a turn whose request was never assembled.
+    /// It is per turn rather than per run because that is the granularity a filter acts at: a
+    /// trimmer that fires on turn six and finds nothing on turn seven is reporting two different
+    /// facts, and a run-level total cannot tell them apart.
+    ///
+    /// **This is what the request was, not what the session holds.** A filter projects the model's
+    /// view; the records in [`RunResult::new_items`] are the complete ones either way.
+    #[must_use]
+    pub fn context_filter_reports(&self) -> &[ContextFilterReport] {
+        &self.context_filter_reports
     }
 
     /// Where this turn's records sit in [`RunResult::new_items`].

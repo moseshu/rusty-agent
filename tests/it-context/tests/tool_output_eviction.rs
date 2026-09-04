@@ -7,7 +7,9 @@ use ra_context::eviction::{
     ToolOutputTrimmer,
 };
 use ra_core::{
+    filter::{ContextFilter, ContextFilterRequest, ModelInputData},
     item::{CallId, ImageBlock, ImageSource, Message, ModelInputItem, ToolCall, ToolCallOutput},
+    state::{RunId, ToolOutputReferenceTracker},
     tool::{
         ArtifactRef, ModelExcerpt, ObservationMetadata, ToolOutput, ToolOutputBlock, Truncation,
         TruncationStage,
@@ -462,4 +464,44 @@ fn the_default_trimmer_uses_the_published_constants() {
     assert_eq!(trimmer.max_output_chars(), DEFAULT_MAX_OUTPUT_CHARS);
     assert_eq!(trimmer.preview_chars(), DEFAULT_PREVIEW_CHARS);
     assert_eq!(trimmer.trimmable_tools(), None);
+}
+
+/// The positional trimmer had no way into a run until it became a filter: it was reachable only by
+/// calling it directly, so nothing that assembled a request ever ran it.
+#[test]
+fn the_positional_trimmer_reaches_a_request_as_a_named_filter() {
+    let large_old = "old result ".repeat(40);
+    let input = vec![
+        user("first request"),
+        call("call-1", "search"),
+        output("call-1", large_old),
+        user("second request"),
+        user("third request"),
+    ];
+    let trimmer = ToolOutputTrimmer::new(2, 80, 20).expect("valid limits");
+    let run_id = RunId::new("run-eviction");
+    let references = ToolOutputReferenceTracker::new(run_id.clone());
+    let request = ContextFilterRequest::new(&run_id, 3, &references);
+
+    let filtered = trimmer
+        .filter_model_input(
+            &request,
+            ModelInputData::new(input.clone(), Some("the stable prefix".to_owned())),
+        )
+        .expect("filtering succeeds");
+
+    assert_eq!(trimmer.name(), "tool_output_trimmer");
+    assert_eq!(
+        filtered.input(),
+        trimmer
+            .trim_model_input(&input)
+            .expect("the direct call succeeds"),
+        "the filter is the same projection, not a second policy beside it"
+    );
+    assert!(output_text(&filtered.input()[2]).starts_with("[Trimmed: search output"));
+    assert_eq!(
+        filtered.instructions(),
+        Some("the stable prefix"),
+        "a filter carries the prefix through untouched"
+    );
 }

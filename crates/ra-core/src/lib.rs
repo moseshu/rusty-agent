@@ -27,6 +27,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod event;
+pub mod filter;
 pub mod finish;
 pub mod guard;
 pub mod hook;

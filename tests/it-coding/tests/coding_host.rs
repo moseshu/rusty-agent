@@ -43,7 +43,17 @@ fn test_coding_host_lifecycle_and_emitter() {
     let services = host.build_tool_services();
     assert!(services.event_sink().is_some());
     assert!(services.output_projector().is_some());
-    assert!(host.build_run_config().model_input_projector().is_some());
+    assert_eq!(
+        host.build_run_config()
+            .context_filters()
+            .filters()
+            .iter()
+            .map(|filter| filter.name())
+            .collect::<Vec<_>>(),
+        vec!["tool_output_reference_trimmer"],
+        "the product's retention policy reaches the loop as a named filter, so what it saved shows \
+         up per turn rather than only as a smaller request"
+    );
     assert_eq!(
         host.build_run_config()
             .capabilities()

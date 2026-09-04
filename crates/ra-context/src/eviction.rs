@@ -5,6 +5,11 @@
 //! is a pure projection over [`ModelInputItem`] values, so callers retain the complete session
 //! history and only the request sent to a model becomes smaller.
 //!
+//! Both trimmers here are [`ContextFilter`]s, which is how a run installs one. They are the two
+//! answers to the same question — the positional one protects a recent window, the reference-aware
+//! one protects whatever a later turn still points at — and a host that wants both installs both,
+//! in the order it wants them measured.
+//!
 //! # Provider-neutral boundary
 //!
 //! The upstream filter also recognizes `OpenAI`'s `tool_search_output` item. `ra-core` deliberately
@@ -31,9 +36,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ra_core::{
     error::{Error, Result},
+    filter::{ContextFilter, ContextFilterRequest, ModelInputData},
     item::{CallId, MessageRole, ModelInputItem, ToolCallOutput},
     state::{RunId, ToolOutputReferenceTracker},
-    tool::{ModelExcerpt, ModelInputProjector, ToolOutput, ToolOutputBlock},
+    tool::{ModelExcerpt, ToolOutput, ToolOutputBlock},
 };
 use serde_json::Value;
 
@@ -533,15 +539,47 @@ impl ToolOutputReferenceTrimmer {
     }
 }
 
-impl ModelInputProjector for ToolOutputReferenceTrimmer {
-    fn project_model_input(
+/// The name both trimmers report under is their type in snake case, so a report names the policy
+/// that produced it rather than the milestone that installed it.
+///
+/// The `&str` return is the trait's, not a missed `&'static str`: a filter configured from a host's
+/// own settings file names itself from a `String`, and narrowing the contract to a literal for the
+/// sake of the two implementations that happen to be built in would take that away.
+impl ContextFilter for ToolOutputTrimmer {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "tool_output_trimmer"
+    }
+
+    /// The positional window needs nothing from the turn: its boundary is read off the input.
+    fn filter_model_input(
         &self,
-        run_id: &RunId,
-        current_turn: u64,
-        references: &ToolOutputReferenceTracker,
-        input: &[ModelInputItem],
-    ) -> Result<Vec<ModelInputItem>> {
-        self.trim_model_input(run_id, current_turn, references, input)
+        _request: &ContextFilterRequest<'_>,
+        data: ModelInputData,
+    ) -> Result<ModelInputData> {
+        let input = self.trim_model_input(data.input())?;
+        Ok(data.with_input(input))
+    }
+}
+
+impl ContextFilter for ToolOutputReferenceTrimmer {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "tool_output_reference_trimmer"
+    }
+
+    fn filter_model_input(
+        &self,
+        request: &ContextFilterRequest<'_>,
+        data: ModelInputData,
+    ) -> Result<ModelInputData> {
+        let input = self.trim_model_input(
+            request.run_id(),
+            request.current_turn(),
+            request.tool_output_references(),
+            data.input(),
+        )?;
+        Ok(data.with_input(input))
     }
 }
 

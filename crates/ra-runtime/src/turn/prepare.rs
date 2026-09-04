@@ -1,11 +1,18 @@
 //! Fixed preparation pipeline executed before one model call.
 //!
-//! The order in [`prepare_turn`] is part of the loop contract, and two of the stages consume the
-//! output of an earlier one rather than merely following it: model settings are reconciled against
-//! the tool surface that dynamic availability produced, and the model-input filters run last so
-//! they observe that same final surface. Handoffs, output schemas, and input filters have explicit
-//! stage functions even while their owning milestones are pending, so their future implementations
-//! have one insertion point rather than several call sites to reorder.
+//! The order in [`prepare_turn`] is part of the loop contract, and one stage consumes the output of
+//! an earlier one rather than merely following it: model settings are reconciled against the tool
+//! surface that dynamic availability produced. Handoffs and output schemas have explicit stage
+//! functions even while their owning milestones are pending, so their future implementations have
+//! one insertion point rather than several call sites to reorder.
+//!
+//! **Model-input filters are not one of those stages, and the slot once reserved for them here is
+//! gone.** A filter has to run after the context processors, which need a prepared turn to
+//! summarize with — so the earliest point a filter can run is already past this function. Running
+//! one here would also break the very processors it has to follow: a request is split into prefix,
+//! history, and tail by position, and a filter that dropped an item would move that boundary while
+//! leaving every length check satisfied. The chain lives in the run loop; see
+//! [`ContextFilterChain`](ra_core::filter::ContextFilterChain).
 //!
 //! Every stage that can block runs inside the caller's [`CancelScope`]: dynamic availability calls
 //! third-party `async` code, which the cancellation contract does not allow to be awaited bare.
@@ -21,7 +28,7 @@ use ra_core::{
     item::{AgentId, ModelInputItem},
     model::{
         Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
-        ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing, ResolvedModelSettings,
+        ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing,
     },
     prompt::{CachePlan, PromptProvenance},
     state::ToolUseTracker,
@@ -255,9 +262,9 @@ impl PreparedTurn {
 
     /// Rewrites the prepared request without changing its resolved model or executable surface.
     ///
-    /// Context processing and model-input projection both use this after reworking the history.
-    /// Neither can alter the tools resolved for the turn: handing over only the request keeps
-    /// execution bound to the same snapshot the model is shown.
+    /// Context processing and the model-input filter chain both use this after reworking the
+    /// history. Neither can alter the tools resolved for the turn: handing over only the request
+    /// keeps execution bound to the same snapshot the model is shown.
     pub(crate) fn map_request(
         mut self,
         rewrite: impl FnOnce(ModelRequest) -> ModelRequest,
@@ -626,7 +633,15 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
 
     // 6. Resolve instructions. A generated prompt reads the run, so it runs inside the cancel
     // scope like every other stage that enters third-party code.
-    let instructions = resolve_instructions(
+    //
+    // This is the last stage. What a generated prompt contributed goes to the tail, and the record
+    // of which generator wrote it travels beside the request rather than inside it: the text is
+    // already in the input, and re-deriving the generator from it afterwards is not possible.
+    let TurnInstructions {
+        prefix: instructions,
+        tail_items,
+        provenance: instruction_provenance,
+    } = resolve_instructions(
         agent,
         request.agent.public_id(),
         request.run,
@@ -635,18 +650,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     .await?;
 
     let mut input = request.input;
-    input.extend(instructions.tail_items);
-
-    // 7. Model-input filters are always last, so a filter sees the final tool surface and the
-    // settings that go with it. R10-6b will replace this identity implementation with the
-    // report-producing filter chain without changing the surrounding stage order.
-    let (input, instructions, instruction_provenance) = apply_model_input_filters(
-        input,
-        instructions.prefix,
-        instructions.provenance,
-        surface.tools(),
-        &model_settings,
-    );
+    input.extend(tail_items);
 
     let selector = resolved_model.selector().clone();
     let model = Arc::clone(resolved_model.model());
@@ -831,25 +835,4 @@ async fn resolve_instructions(
             })
         }
     }
-}
-
-/// Applies the model-input filter chain, currently an identity pass with no filters installed.
-///
-/// **The provenance record travels with the text it describes.** A filter can rewrite the input
-/// items and the instructions, and the record names the exact bytes a generated prompt contributed
-/// — so a chain that edits those bytes and leaves the record alone produces a turn whose only
-/// evidence of what was sent describes something else. Passing the record through this signature
-/// puts it in the implementer's hands rather than leaving the invariant to be rediscovered.
-fn apply_model_input_filters(
-    input: Vec<ModelInputItem>,
-    instructions: Option<String>,
-    provenance: Option<PromptProvenance>,
-    _tools: &[Arc<dyn Tool>],
-    _model_settings: &ResolvedModelSettings,
-) -> (
-    Vec<ModelInputItem>,
-    Option<String>,
-    Option<PromptProvenance>,
-) {
-    (input, instructions, provenance)
 }

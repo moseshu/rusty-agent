@@ -6,6 +6,7 @@ async fn ra_core::agent::HandoffSpec::is_enabled(& self, context : & RunContext)
 async fn ra_core::agent::ToolUseBehaviorHandler::should_stop(& self, tool_results : & [ToolUseResult]) -> Result < bool >
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
+async fn ra_core::capability::Capability::deferred_instructions(& self) -> Result < Option < PromptSection > >
 async fn ra_core::capability::Capability::instructions(& self) -> Result < Option < PromptSection > >
 async fn ra_core::capability::Capability::static_instructions(& self) -> Result < Option < PromptSection > >
 async fn ra_core::capability::ContextProcessor::process_context(& self, request : ContextProcessorRequest, summarizer : & dyn ContextSummarizer) -> Result < ContextProcessorResult >
@@ -67,6 +68,8 @@ const fn ra_core::capability::ContextProcessorRequest::run_id(& self) -> & RunId
 const fn ra_core::capability::ContextSummaryRequest::output_schema(& self) -> Option < & ModelOutputSchema >
 const fn ra_core::capability::ContextSummaryResponse::response(& self) -> & ModelResponse
 const fn ra_core::capability::ContextSummaryResponse::usage(& self) -> & Usage
+const fn ra_core::capability::LoadSignal < 'a >::new(turn : u64, tool_use : Option < & 'a AgentToolUse >) -> Self
+const fn ra_core::capability::LoadSignal < 'a >::turn(& self) -> u64
 const fn ra_core::compat::Compatibility::label(self) -> & 'static str
 const fn ra_core::compat::Compatibility::needs_migration(self) -> bool
 const fn ra_core::compat::SchemaVersion::compatibility(self, local : Self) -> Compatibility
@@ -171,6 +174,15 @@ const fn ra_core::event::exec::TerminalInteractionEvent::unknown(& self) -> & Un
 const fn ra_core::event::sink::FnHostEventSink < F >::new(callback : F) -> Self
 const fn ra_core::event::timestamp::EventTimestamp::as_millis(self) -> u64
 const fn ra_core::event::timestamp::EventTimestamp::from_millis(millis : u64) -> Self
+const fn ra_core::filter::ContextFilterChain::new() -> Self
+const fn ra_core::filter::ContextFilterReport::changed(& self) -> bool
+const fn ra_core::filter::ContextFilterReport::chars_saved(& self) -> i64
+const fn ra_core::filter::ContextFilterReport::token_estimate_delta(& self) -> i64
+const fn ra_core::filter::ContextFilterRequest < 'a >::current_turn(& self) -> u64
+const fn ra_core::filter::ContextFilterRequest < 'a >::new(run_id : & 'a RunId, current_turn : u64, tool_output_references : & 'a ToolOutputReferenceTracker) -> Self
+const fn ra_core::filter::ContextFilterRequest < 'a >::run_id(& self) -> & RunId
+const fn ra_core::filter::ContextFilterRequest < 'a >::tool_output_references(& self) -> & ToolOutputReferenceTracker
+const fn ra_core::filter::FilteredModelInput::data(& self) -> & ModelInputData
 const fn ra_core::finish::FinishReason::code(self) -> & 'static str
 const fn ra_core::finish::FinishReason::from_budget_kind(kind : BudgetKind) -> Self
 const fn ra_core::finish::FinishReason::is_complete(self) -> bool
@@ -230,6 +242,7 @@ const fn ra_core::item::content::ThinkingBlock::schema_version(& self) -> Schema
 const fn ra_core::item::content::ThinkingBlock::unknown(& self) -> & Unknown
 const fn ra_core::item::content::UrlSource::schema_version(& self) -> SchemaVersion
 const fn ra_core::item::content::UrlSource::unknown(& self) -> & Unknown
+const fn ra_core::item::estimate::chars_to_tokens(chars : usize) -> usize
 const fn ra_core::item::handoff::HandoffCall::arguments(& self) -> & Value
 const fn ra_core::item::handoff::HandoffCall::call_id(& self) -> & CallId
 const fn ra_core::item::handoff::HandoffCall::schema_version(& self) -> SchemaVersion
@@ -950,7 +963,9 @@ fn ra_core::capability::Capability::kind(& self) -> CapabilityFamily
 fn ra_core::capability::Capability::required_capabilities(& self) -> BTreeSet < CapabilityFamily >
 fn ra_core::capability::Capability::sampling_params(& self, settings : ModelSettings) -> ModelSettings
 fn ra_core::capability::Capability::tools(& self) -> Vec < Arc < dyn Tool > >
+fn ra_core::capability::Capability::wants_deferred_instructions(& self, signal : & LoadSignal < '_ >) -> bool
 fn ra_core::capability::CapabilityFamily::as_str(& self) -> & str
+fn ra_core::capability::CapabilityFamily::deferred_prompt_section_name(& self) -> PromptSectionName
 fn ra_core::capability::CapabilityFamily::new(name : impl Into < Cow < 'static , str > >) -> Result < Self >
 fn ra_core::capability::CapabilityFamily::prompt_section_name(& self) -> PromptSectionName
 fn ra_core::capability::CapabilityFamily::prompt_source(& self) -> PromptSource
@@ -973,6 +988,7 @@ fn ra_core::capability::ContextSummaryRequest::new(input : Vec < ModelInputItem 
 fn ra_core::capability::ContextSummaryRequest::with_output_schema(mut self, output_schema : ModelOutputSchema) -> Self
 fn ra_core::capability::ContextSummaryResponse::new(text : impl Into < String >, response : ModelResponse) -> Self
 fn ra_core::capability::ContextSummaryResponse::text(& self) -> & str
+fn ra_core::capability::LoadSignal < 'a >::tool_called(& self, key : & ToolLookupKey) -> bool
 fn ra_core::compat::Unknown::get(& self, key : & str) -> Option < & Value >
 fn ra_core::compat::Unknown::is_empty(& self) -> bool
 fn ra_core::compat::Unknown::iter(& self) -> impl Iterator < Item = (& String , & Value) >
@@ -1066,6 +1082,21 @@ fn ra_core::event::sink::InMemoryHostEventSink::new() -> Self
 fn ra_core::event::timestamp::EventTimestamp::from_system_time(time : SystemTime) -> Self
 fn ra_core::event::timestamp::EventTimestamp::now() -> Self
 fn ra_core::event::timestamp::EventTimestamp::to_system_time(self) -> SystemTime
+fn ra_core::filter::ContextFilter::filter_model_input(& self, request : & ContextFilterRequest < '_ >, data : ModelInputData) -> Result < ModelInputData >
+fn ra_core::filter::ContextFilter::name(& self) -> & str
+fn ra_core::filter::ContextFilterChain::apply(& self, request : & ContextFilterRequest < '_ >, data : ModelInputData) -> Result < FilteredModelInput >
+fn ra_core::filter::ContextFilterChain::filters(& self) -> & [Arc < dyn ContextFilter >]
+fn ra_core::filter::ContextFilterChain::is_empty(& self) -> bool
+fn ra_core::filter::ContextFilterChain::len(& self) -> usize
+fn ra_core::filter::ContextFilterChain::push(& mut self, filter : Arc < dyn ContextFilter >)
+fn ra_core::filter::ContextFilterReport::filter(& self) -> & str
+fn ra_core::filter::FilteredModelInput::into_parts(self) -> (ModelInputData , Vec < ContextFilterReport >)
+fn ra_core::filter::FilteredModelInput::reports(& self) -> & [ContextFilterReport]
+fn ra_core::filter::ModelInputData::input(& self) -> & [ModelInputItem]
+fn ra_core::filter::ModelInputData::instructions(& self) -> Option < & str >
+fn ra_core::filter::ModelInputData::into_input(self) -> Vec < ModelInputItem >
+fn ra_core::filter::ModelInputData::new(input : Vec < ModelInputItem >, instructions : Option < String >) -> Self
+fn ra_core::filter::ModelInputData::with_input(mut self, input : Vec < ModelInputItem >) -> Self
 fn ra_core::item::AgentId::as_str(& self) -> & str
 fn ra_core::item::AgentId::new(value : impl Into < String >) -> Self
 fn ra_core::item::CallId::as_str(& self) -> & str
@@ -1136,6 +1167,8 @@ fn ra_core::item::content::ThinkingBlock::signature(& self) -> & str
 fn ra_core::item::content::ThinkingBlock::thinking(& self) -> & str
 fn ra_core::item::content::UrlSource::new(url : impl Into < String >) -> Self
 fn ra_core::item::content::UrlSource::url(& self) -> & str
+fn ra_core::item::estimate::item_chars(item : & ModelInputItem) -> Result < usize >
+fn ra_core::item::estimate::item_tokens(item : & ModelInputItem) -> Result < usize >
 fn ra_core::item::handoff::HandoffCall::new(call_id : CallId, target_agent : AgentId, arguments : Value) -> Self
 fn ra_core::item::handoff::HandoffCall::tool_name(& self) -> Option < & str >
 fn ra_core::item::handoff::HandoffCall::with_tool_name(mut self, tool_name : impl Into < String >) -> Self
@@ -1548,7 +1581,6 @@ fn ra_core::tool::output::ArtifactRef::as_str(& self) -> & str
 fn ra_core::tool::output::ArtifactRef::new(value : impl Into < String >) -> Result < Self >
 fn ra_core::tool::output::ModelExcerpt::blocks(& self) -> & [ToolOutputBlock]
 fn ra_core::tool::output::ModelExcerpt::new(blocks : Vec < ToolOutputBlock >, artifact_ref : ArtifactRef) -> Result < Self >
-fn ra_core::tool::output::ModelInputProjector::project_model_input(& self, run_id : & RunId, current_turn : u64, references : & ToolOutputReferenceTracker, input : & [ModelInputItem]) -> Result < Vec < ModelInputItem > >
 fn ra_core::tool::output::ObservationMetadata::guidance(& self) -> & [String]
 fn ra_core::tool::output::ObservationMetadata::is_truncated(& self) -> bool
 fn ra_core::tool::output::ObservationMetadata::new() -> Self
@@ -1636,12 +1668,14 @@ mod ra_core::event::agent
 mod ra_core::event::exec
 mod ra_core::event::sink
 mod ra_core::event::timestamp
+mod ra_core::filter
 mod ra_core::finish
 mod ra_core::guard
 mod ra_core::hook
 mod ra_core::item
 mod ra_core::item::compaction
 mod ra_core::item::content
+mod ra_core::item::estimate
 mod ra_core::item::handoff
 mod ra_core::item::mcp
 mod ra_core::item::message
@@ -1703,6 +1737,7 @@ struct ra_core::capability::ContextProcessorRequest
 struct ra_core::capability::ContextProcessorResult
 struct ra_core::capability::ContextSummaryRequest
 struct ra_core::capability::ContextSummaryResponse
+struct ra_core::capability::LoadSignal
 struct ra_core::compat::SchemaVersion
 struct ra_core::compat::Unknown
 struct ra_core::config::FieldReport
@@ -1731,6 +1766,11 @@ struct ra_core::event::sink::FnHostEventSink
 struct ra_core::event::sink::InMemoryHostEventSink
 struct ra_core::event::sink::NoopHostEventSink
 struct ra_core::event::timestamp::EventTimestamp
+struct ra_core::filter::ContextFilterChain
+struct ra_core::filter::ContextFilterReport
+struct ra_core::filter::ContextFilterRequest
+struct ra_core::filter::FilteredModelInput
+struct ra_core::filter::ModelInputData
 struct ra_core::item::AgentId
 struct ra_core::item::CallId
 struct ra_core::item::ItemId
@@ -1863,6 +1903,7 @@ trait ra_core::capability::Capability
 trait ra_core::capability::ContextProcessor
 trait ra_core::capability::ContextSummarizer
 trait ra_core::event::sink::HostEventSink
+trait ra_core::filter::ContextFilter
 trait ra_core::model::Model
 trait ra_core::model::ModelProvider
 trait ra_core::model::ModelResolver
@@ -1872,7 +1913,6 @@ trait ra_core::prompt::DynamicPromptHandler
 trait ra_core::session::port::Session
 trait ra_core::state::work::WorkStateHandle
 trait ra_core::tool::Tool
-trait ra_core::tool::output::ModelInputProjector
 trait ra_core::tool::output::ToolOutputProjector
 trait ra_core::tool::output::ToolOutputReferenceExtractor
 trait ra_core::tool::schema::ToolInput

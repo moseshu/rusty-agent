@@ -118,7 +118,7 @@ impl CodingHost {
     /// satisfies it.
     pub fn build_run_config(&self) -> RunConfig {
         RunConfig::new()
-            .with_model_input_projector(Arc::new(ToolOutputReferenceTrimmer::default()))
+            .with_context_filter(Arc::new(ToolOutputReferenceTrimmer::default()))
             .with_capability(Arc::new(CompactionCapability::default()))
     }
 
