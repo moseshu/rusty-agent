@@ -23,6 +23,12 @@ pub(crate) fn run(bless: bool) -> Outcome {
             source::relative(&manifest)
         )]);
     }
+    if !bless && !source::baselines_present() {
+        return Outcome::skip(
+            "cargo xtask schema-stability --bless",
+            "api/ 不进版本库，这次 checkout 没有工具 schema 基线可对账",
+        );
+    }
     if !bless && !snapshot.is_file() {
         return Outcome::Fail(vec![format!(
             "缺工具 schema 快照 {SNAPSHOT}——跑 `cargo xtask schema-stability --bless` 生成"

@@ -15,6 +15,7 @@
 use crate::api;
 use crate::extension_safety;
 use crate::gate::Outcome;
+use crate::source;
 
 /// The crates covered by the public-surface contract.
 ///
@@ -39,6 +40,15 @@ const TRACKED: &[&str] = &[
 
 /// Runs the gate. When `bless` is true it rewrites the baseline instead of reconciling.
 pub(crate) fn run(bless: bool) -> Outcome {
+    // The extension-safety and stability-grade halves would still run against the source alone, but
+    // reporting PASS for a gate whose headline half never ran is the manufactured confidence this
+    // outcome type exists to refuse.
+    if !bless && !source::baselines_present() {
+        return Outcome::skip(
+            "cargo xtask public-api --bless",
+            "api/ 不进版本库，这次 checkout 没有公开面基线可对账",
+        );
+    }
     let mut violations = Vec::new();
     let mut blessed = 0_usize;
     let mut missing = Vec::new();
