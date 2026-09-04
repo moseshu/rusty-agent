@@ -572,7 +572,7 @@ impl CompactionCapability {
         limits: CompactionLimits,
         assessment: CompactionAssessment,
     ) -> Result<(Option<CompactedModelInput>, Option<ModelResponse>)> {
-        let user_messages = user_messages(&summary_input);
+        let user_messages = carried_user_messages(&summary_input, request.suffix().len());
         let summary_request =
             ContextSummaryRequest::new(summary_input, summary_instruction(assessment.reasons()))
                 .with_output_schema(summary_output_schema());
@@ -710,6 +710,18 @@ fn parse_summary(text: &str, user_messages: Vec<String>) -> Result<summary::Comp
         builder = builder.with_section(slot, content)?;
     }
     builder.with_user_messages(user_messages).build()
+}
+
+/// The verbatim user turns of a request whose ephemeral tail has been set aside.
+///
+/// [`splice`] puts the tail last, so the trailing `suffix_len` items are the ones the loop rebuilds
+/// for every request — a token-budget reminder is one, and it wears the user role because that is
+/// the only role input history carries across providers. It is not a turn the user took: carrying
+/// it would freeze one turn's remaining-token count into a record that outlives the turn, right
+/// next to the fresh reminder the next request appends anyway.
+fn carried_user_messages(visible_input: &[ModelInputItem], suffix_len: usize) -> Vec<String> {
+    let history_end = visible_input.len().saturating_sub(suffix_len);
+    user_messages(&visible_input[..history_end])
 }
 
 /// The verbatim user messages a summary must carry, in order.

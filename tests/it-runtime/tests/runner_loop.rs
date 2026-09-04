@@ -751,13 +751,17 @@ fn message_with_phase(id: &str, text: &str, phase: OutputPhase) -> RunItem {
     item(id, RunItemKind::Message(Message::assistant(text, phase)))
 }
 
-/// The trailing system message one model call was handed, which is where a reminder belongs.
+/// The trailing user message one model call was handed, which is where a reminder belongs.
+///
+/// The role is part of the assertion: input history is lowered per provider, and a system message
+/// in it is rejected outright by Anthropic, which takes system text only in its own top-level
+/// field.
 fn reminder_text(input: &[ModelInputItem]) -> String {
     match input.last() {
-        Some(ModelInputItem::Message(message)) if message.role() == MessageRole::System => {
+        Some(ModelInputItem::Message(message)) if message.role() == MessageRole::User => {
             message.text_content()
         }
-        other => panic!("expected a trailing system reminder, found {other:?}"),
+        other => panic!("expected a trailing user reminder, found {other:?}"),
     }
 }
 
@@ -2221,7 +2225,8 @@ async fn reaching_turn_limit_ends_softly_instead_of_erroring() {
 
 /// The remaining allowance is told to the model at the **tail of the input**, never in the system
 /// instructions: a number that changes every turn would break the provider's prefix cache on every
-/// call. The reminder is also not a record — it never reaches session history.
+/// call. It rides there as a user message, the one role input history carries on every provider.
+/// The reminder is also not a record — it never reaches session history.
 #[tokio::test]
 async fn the_token_budget_reminder_rides_the_input_tail_and_leaves_the_prefix_alone() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
@@ -2256,10 +2261,69 @@ async fn the_token_budget_reminder_rides_the_input_tail_and_leaves_the_prefix_al
             "Task token budget: 988 tokens remain. Pace the remaining work accordingly."
         ]
     );
+    // By text, not by role: now that the reminder wears the role every other tail item wears,
+    // asserting the absence of a system record would pass without saying anything about it.
     assert!(!result.new_items().iter().any(|item| matches!(
         item.kind(),
-        RunItemKind::Message(message) if message.role() == MessageRole::System
+        RunItemKind::Message(message) if message.text_content().contains("Task token budget")
     )));
+}
+
+/// Compaction preserves user messages verbatim, and the budget reminder wears the user role
+/// because that is the only role input history carries on every provider. It is still not a turn
+/// the user took: carrying it would freeze one turn's remaining-token count inside a record that
+/// outlives the turn, sitting next to the fresh reminder the next request appends anyway.
+#[tokio::test]
+async fn a_compaction_summary_does_not_keep_the_budget_reminder_as_a_user_turn() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ])
+        .with_usage(Usage::from_request(RequestUsage::new(10, 4))),
+        ModelResponse::new(vec![message("summary-1", COMPACTION_SUMMARY_JSON)]),
+        ModelResponse::new(vec![message("msg-1", "done")]),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).expect("one tail record is a valid retention policy"),
+        Some(3),
+        None,
+    )
+    .expect("a converging explicit item limit is valid");
+    let config = RunConfig::new()
+        .with_max_tokens(1_000)
+        .with_context_processor(Arc::new(compaction));
+
+    let result = Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+        .await
+        .expect("the compacted run succeeds");
+
+    let summary = result
+        .new_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::Compaction(compaction) => Some(compaction.summary().to_owned()),
+            _ => None,
+        })
+        .expect("the run compacted its history");
+    assert!(
+        summary.contains("帮我改一下文件"),
+        "the summary keeps the turn the user actually took: {summary}"
+    );
+    assert!(
+        !summary.contains("Task token budget"),
+        "the summary must not keep the loop's own tail item: {summary}"
+    );
+
+    // The reminder itself is unaffected: the turn after the compaction still gets a current one.
+    let inputs = model.input_items.lock().unwrap().clone();
+    assert_eq!(
+        reminder_text(&inputs[2]),
+        "Task token budget: 986 tokens remain. Pace the remaining work accordingly."
+    );
 }
 
 /// The response that crosses the ceiling has already been paid for, so the turn it belongs to is
