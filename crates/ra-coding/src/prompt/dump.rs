@@ -48,10 +48,19 @@ static SHIPPED_ROLES: [PromptRole; 5] = [
     PromptRole::Coordinator,
 ];
 
+/// The roles the product ships, for a second report that has to cover the same ones.
+///
+/// Read from here rather than restated, because "which roles ship" is one fact: a role listed in
+/// one report and not the other would be a role whose prefix is governed by one gate and whose
+/// assembly is governed by none.
+pub(crate) fn shipped_roles() -> &'static [PromptRole] {
+    &SHIPPED_ROLES
+}
+
 /// The role names a dump accepts.
 #[must_use]
 pub fn shipped_role_names() -> Vec<&'static str> {
-    SHIPPED_ROLES.iter().map(PromptRole::role_name).collect()
+    shipped_roles().iter().map(PromptRole::role_name).collect()
 }
 
 /// Resolves a role name against the roles the product ships.

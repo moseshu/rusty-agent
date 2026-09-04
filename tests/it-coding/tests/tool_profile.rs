@@ -1,5 +1,6 @@
 //! The coding agent's three tool surfaces: what each one declares, and what it costs.
 
+use std::collections::BTreeSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -32,6 +33,15 @@ use tempfile::TempDir;
 /// binary from which the measurement was renamed away passes perfectly well, and a budget nobody
 /// measures is not a budget.
 const MEASUREMENT_MARKER: &str = "tool-schema-budget:";
+
+/// The roles the product ships, for the cases that have to cover every one of them.
+static SHIPPED_ROLES: [PromptRole; 5] = [
+    PromptRole::Main,
+    PromptRole::ReadOnlySpecialist,
+    PromptRole::Planner,
+    PromptRole::OneOffAnswer,
+    PromptRole::Coordinator,
+];
 
 /// A stand-in for a tool this product has declared but not yet written.
 ///
@@ -917,6 +927,78 @@ async fn test_a_read_only_role_gives_up_the_fragments_of_the_capabilities_it_wit
     assert!(
         prefix.contains("`read_file`") && prefix.contains("`grep`") && prefix.contains("`glob`")
     );
+}
+
+/// No tier and role assemble a prefix that names an entry their own request does not carry.
+///
+/// The two existing checks each cover one half of one row: assembly refuses a tier that advertises
+/// part of a capability, and the read-only case asserts the three entries it gave up are absent from
+/// its prefix. Neither is a statement about the matrix, and the matrix is where the mistake actually
+/// lives — a section that names an entry unconditionally, or a capability fragment kept for a tier
+/// that dropped its family, is wrong in exactly one of the combinations nobody assembled.
+///
+/// The vocabulary is the widest tier's own list, so a backticked word is judged against the names
+/// this product can advertise at all: `git reset --hard` is prose, `apply_patch` is a promise.
+#[tokio::test]
+async fn test_no_tier_and_role_name_an_entry_their_surface_does_not_advertise() {
+    let workspace = TempDir::new().expect("a workspace");
+    let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
+    let vocabulary: BTreeSet<String> = selected_names(CodingProfile::CodexLike)
+        .into_iter()
+        .collect();
+    for tier in CodingProfile::SHIPPED {
+        for role in &SHIPPED_ROLES {
+            // A tier that names unwritten entries refuses to assemble, which is the loud half of
+            // this guarantee and is asserted on its own below. There is nothing to read here.
+            let Ok(assembled) = host_backed_surface(role, &host, tier).await else {
+                continue;
+            };
+            let advertised: BTreeSet<&str> = assembled.tool_surface().advertised_names().collect();
+            let prefix = assemble_stable_prefix_for_surface(
+                role,
+                assembled.tool_surface(),
+                assembled.capability_sections(),
+            )
+            .expect("an assembled surface must produce a prefix");
+
+            let mut spoken: BTreeSet<String> = BTreeSet::new();
+            for section in prefix.sections() {
+                for named in backticked(section.content()) {
+                    if !vocabulary.contains(&named) {
+                        continue;
+                    }
+                    assert!(
+                        advertised.contains(named.as_str()),
+                        "`{}` in the `{}` prefix of role `{role}` names `{named}`, which that \
+                         request does not carry",
+                        section.name(),
+                        assembled.tool_surface().profile()
+                    );
+                    spoken.insert(named);
+                }
+            }
+            // The other direction, and the control on the one above: a scan that matched nothing —
+            // a changed quoting convention, a section list read from the wrong object — would
+            // report the same clean result as a prefix that genuinely names only what it carries.
+            for name in &advertised {
+                assert!(
+                    spoken.contains(*name),
+                    "the `{}` prefix of role `{role}` advertises `{name}` without naming it",
+                    assembled.tool_surface().profile()
+                );
+            }
+        }
+    }
+}
+
+/// Every backticked span in one section, which is how this product's prompt text names a tool.
+fn backticked(content: &str) -> Vec<String> {
+    content
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A tier the installed capabilities cannot satisfy fails before an agent exists.

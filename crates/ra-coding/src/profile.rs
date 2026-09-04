@@ -93,6 +93,14 @@ pub enum CodingProfile {
 }
 
 impl CodingProfile {
+    /// The tiers this product ships, from the narrowest surface to the widest.
+    ///
+    /// Written out rather than derived, because the enum is `#[non_exhaustive]` and nothing can
+    /// enumerate it. Adding a tier therefore means adding it here as well: a tier absent from this
+    /// list assembles perfectly well and never appears in the committed assembly record, which is
+    /// the one place what it advertises and what that costs would have been written down.
+    pub const SHIPPED: [Self; 3] = [Self::Core, Self::CodexLike, Self::Full];
+
     /// Builds the framework profile this tier describes.
     ///
     /// # Errors
@@ -143,7 +151,7 @@ impl CodingProfile {
     }
 
     /// Profile identity of the tier as declared, before any role narrows it.
-    const fn tier_name(self) -> &'static str {
+    pub(crate) const fn tier_name(self) -> &'static str {
         match self {
             Self::Core => "core",
             Self::CodexLike => "codex_like",
