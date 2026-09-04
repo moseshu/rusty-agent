@@ -114,7 +114,8 @@ fn test_processed_response_01() {
         .build()
         .unwrap();
 
-    // new_items 是响应原序的完整记录，动作只是它的类型化视图，不是第二份副本。
+    // `new_items` is the complete record in the response's own order; the actions are a typed view
+    // of it rather than a second copy.
     let ids = processed
         .new_items()
         .iter()
@@ -158,10 +159,11 @@ fn test_processed_response_02() {
         .unwrap();
 
     let handoff = &processed.handoffs()[0];
-    // 交接在线上就是一次普通函数调用；下一轮重放没有这个名字就补不回去。
+    // A handoff is an ordinary function call on the wire, and the next turn cannot replay it without
+    // that name.
     assert_eq!(handoff.call().tool_name(), Some("transfer_to_reviewer"));
     assert_eq!(handoff.call_id().as_str(), "call-1");
-    // 记录本身不被改写，会话里存的还是 provider 真正发来的那条。
+    // The record itself is not rewritten: what the session stores is still the item the provider sent.
     assert!(matches!(
         processed.new_items()[0].kind(),
         RunItemKind::ToolCall(_)
@@ -195,7 +197,8 @@ fn test_processed_response_03() {
 
 #[test]
 fn test_processed_response_04() {
-    // 名字对不上意味着结算阶段会用模型没点名的实现去跑，然后照样报成功。
+    // A name that does not match means settlement runs an implementation the model never asked for,
+    // and then reports success all the same.
     let error = ProcessedResponse::builder()
         .function(
             tool_call("call-item-1", "call-1", "write_file"),
@@ -219,7 +222,8 @@ fn test_processed_response_04() {
 
 #[test]
 fn test_processed_response_05() {
-    // 两个动作各回一份输出，provider 要么整条请求报错，要么留下错的那份。
+    // Two actions each return one output, so the provider either rejects the whole request or keeps
+    // the wrong one.
     let error = ProcessedResponse::builder()
         .function(
             tool_call("call-item-1", "same-call", "write_file"),
@@ -245,8 +249,9 @@ fn test_processed_response_05() {
 
 #[test]
 fn test_processed_response_06() {
-    // 走 `item()` 的调用会让 `has_tools_or_approvals_to_run()` 答「没事可做」，
-    // 而响应里还压着一个没人会回的 call——症状要到下一次请求才现形。
+    // A call admitted through `item()` makes `has_tools_or_approvals_to_run()` answer "nothing to
+    // do" while the response still holds a call nobody will answer — and the symptom only shows up
+    // on the next request.
     for (label, unclassified) in [
         (
             "tool_call",
@@ -275,7 +280,8 @@ fn test_processed_response_06() {
         );
     }
 
-    // 已经答完的输出和控制面记录不欠任何人东西，走 `item()` 是对的。
+    // An answered output and a control-plane record owe nobody anything, so `item()` is right for
+    // them.
     ProcessedResponse::builder()
         .item(item(
             "out-1",
@@ -301,8 +307,8 @@ fn test_processed_response_07() {
         .build()
         .unwrap();
 
-    // 参考实现把 not-found 排除在这个判据外；那样 `false` 会被读成「没事可做」，
-    // 而下一次请求就带着一个没有结果的 tool call 出去。
+    // The reference implementation leaves not-found out of this predicate. Then `false` reads as
+    // "nothing to do", and the next request goes out carrying a tool call with no result.
     assert!(only_missing.has_tools_or_approvals_to_run());
     assert!(!only_missing.has_interruptions());
 
@@ -340,7 +346,8 @@ fn test_processed_response_08() {
     assert!(processed.has_tools_or_approvals_to_run());
     assert!(processed.has_interruptions());
 
-    // interruptions 是投影而不是字段，判据只有 `is_interruption` 一处，两边不可能各说各话。
+    // Interruptions are a projection rather than a field: `is_interruption` is the only predicate, so
+    // there is no second place that could answer differently.
     let pending = processed
         .interruptions()
         .map(|item| item.id().as_str().to_owned())
@@ -379,7 +386,8 @@ fn test_processed_response_09() {
         .unwrap();
 
     let used = processed.tools_used();
-    // 两个 `search` 来自不同命名空间，是两个身份；第三次调用与第一次才是同一个。
+    // The two `search` entries come from different namespaces and are two identities; the third call
+    // is the one that shares an identity with the first.
     assert_eq!(used.len(), 5);
     assert_eq!(
         used.iter()
@@ -394,7 +402,7 @@ fn test_processed_response_09() {
     }));
     assert!(used.contains(&ToolUse::Unresolved("vanished".to_owned())));
 
-    // 顺序跟着响应走，去重保留首次出现的位置。
+    // Order follows the response, and de-duplication keeps the position of the first occurrence.
     let ToolUse::Tool(first) = &used[0] else {
         panic!("第一条应当是本地工具");
     };
@@ -403,9 +411,10 @@ fn test_processed_response_09() {
         Some("mcp.github")
     );
 
-    // 动作自己报的身份，必须就是投影记账用的那个。R3-6 的熔断器按 `identity()` 查连续段，
-    // 而 R3-6b 按投影记账；两边一旦各算各的，查到的是一个从没被记过的身份——永远读到 0，
-    // 环还在转，而且没有任何断言会挂。
+    // The identity an action reports has to be the one the projection files it under. The breaker
+    // looks up a streak by `identity()` while the tracker files by the projection, so the moment the
+    // two count separately the lookup asks about an identity nothing ever filed — reading zero
+    // forever, with the loop still going round and no assertion failing.
     let mut from_actions = Vec::new();
     from_actions.extend(processed.functions().iter().map(ToolRunFunction::identity));
     from_actions.extend(processed.handoffs().iter().map(ToolRunHandoff::identity));

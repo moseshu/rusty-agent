@@ -465,7 +465,7 @@ fn test_cancel_contract_27() {
         let msg = reason.user_message();
         assert!(!msg.trim().is_empty(), "`{reason}` 的 user_message 为空");
         if matches!(reason, CancelReason::Custom(_)) {
-            continue; // 自定义原因的标签本身就是文案。
+            continue; // a custom reason's label is the prose.
         }
         assert_ne!(msg, reason.code(), "`{reason}` 把机器标识当成了用户文案");
     }

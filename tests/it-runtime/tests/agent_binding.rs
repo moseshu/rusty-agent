@@ -194,8 +194,9 @@ fn test_agent_binding_01() {
 
 #[test]
 fn test_agent_binding_02() {
-    // 一个 sandbox clone 完全可以沿用公共 agent 的 ID——它还是同一个 agent，只是装配方式不同。
-    // 「两个 ID 不一样吗」这个问法会对这种情形答 false，而被换掉的恰恰是要跑的那套工具。
+    // A sandbox clone may perfectly well keep the public agent's ID: it is still the same agent,
+    // assembled differently. Asking "are the two IDs different?" answers false for that case, and
+    // what was swapped is exactly the set of tools about to run.
     let public = public_agent();
     let same_id_clone = AgentSpec::builder()
         .id(public.id().clone())
@@ -229,15 +230,16 @@ async fn test_agent_binding_03() {
     .await
     .unwrap();
 
-    // 广播的是执行实例的工具面。按公共 agent 解析会把 sandbox 步骤刚拿掉的 `write_file`
-    // 重新递给模型，而错要到模型真的调它的时候才现形。
+    // What is advertised is the execution instance's surface. Resolving against the public agent
+    // would hand the model back the `write_file` the sandbox step just removed, and the mistake would
+    // only surface once the model actually called it.
     let advertised = prepared
         .action_surface()
         .advertised_names()
         .collect::<Vec<_>>();
     assert_eq!(advertised, ["read_file"]);
 
-    // 模型选择器同理：跑起来的是执行实例选的那个。
+    // Same for the model selector: what runs is the one the execution instance chose.
     assert_eq!(resolver.seen(), [Some("execution/model".to_owned())]);
 }
 
@@ -262,8 +264,8 @@ async fn test_agent_binding_04() {
     .await
     .unwrap();
 
-    // 工具轨迹记在用户配置的那个 agent 名下。记到执行期 clone 头上，用户配的是 `coder`，
-    // 审计里却出现一个他从没写过的 `coder#sandbox-3f2a`。
+    // The tool trail is filed under the agent the user configured. Filed under the execution clone,
+    // the user configured `coder` and the audit shows a `coder#sandbox-3f2a` they never wrote.
     let agents = tracker
         .agents()
         .map(|(id, _)| id.as_str().to_owned())
@@ -271,12 +273,13 @@ async fn test_agent_binding_04() {
     assert_eq!(agents, ["coder"]);
     assert!(tracker.used_any_this_turn(&AgentId::new("coder")));
 
-    // 本轮生成的每一条记录也一样：会话回读时要用用户认得的说法说清是谁产出的。
+    // Every record this turn produced is the same: read back from the session, it has to say who
+    // produced it in terms the user recognizes.
     assert!(!settled.session_step_items().is_empty());
     for stored in settled.session_step_items() {
         let provenance = stored
             .provenance()
-            .unwrap_or_else(|| panic!("记录 `{}` 没有归属", stored.id()));
+            .unwrap_or_else(|| panic!("record `{}` carries no provenance", stored.id()));
         assert_eq!(provenance.agent_id().as_str(), "coder");
         assert_eq!(provenance.agent_name(), Some("Coder"));
     }
@@ -286,7 +289,7 @@ async fn test_agent_binding_04() {
 async fn test_agent_binding_05() {
     let binding = AgentBinding::direct(public_agent());
     let surface = TurnActionSurface::new(Vec::new(), Vec::new()).unwrap();
-    // 一条已经声明了产出者的记录——R12 的嵌套子 run 就会这么标它自己的项。
+    // A record that already declares its producer, which is how a nested sub-run tags its own items.
     let nested = item(
         "msg-1",
         RunItemKind::Message(Message::assistant("子 agent 说的", OutputPhase::Final)),
@@ -309,7 +312,8 @@ async fn test_agent_binding_05() {
     .await
     .unwrap();
 
-    // 只填空的，不覆盖。已经报了产出者的记录，是从更清楚的地方来的。
+    // Fill in the blanks only, never overwrite: a record that already named its producer came from
+    // somewhere that knew better.
     assert_eq!(
         settled.session_step_items()[0]
             .provenance()
@@ -352,7 +356,7 @@ async fn test_agent_binding_06() {
             .as_str(),
         "coder"
     );
-    // 一轮什么都没要，agent 依然在册：它确实跑了一轮。
+    // A turn that asked for nothing still leaves the agent on file: it did run a turn.
     assert!(tracker.agent(&AgentId::new("coder")).is_some());
     assert!(!tracker.used_any_this_turn(&AgentId::new("coder")));
 }

@@ -206,7 +206,7 @@ fn test_response_classification_01() {
     );
     assert_eq!(processed.handoffs().len(), 1);
     assert_eq!(processed.handoffs()[0].target_agent().as_str(), "reviewer");
-    // 交接在线上就是普通函数调用，重放需要模型当时用的那个名字。
+    // A handoff is an ordinary function call on the wire, and a replay needs the name the model used.
     assert_eq!(
         processed.handoffs()[0].call().tool_name(),
         Some("transfer_to_reviewer")
@@ -225,7 +225,8 @@ fn test_response_classification_02() {
     let surface = TurnActionSurface::new(vec![tool("write_file")], Vec::new()).unwrap();
     let response = ModelResponse::new(vec![tool_call("call-item-1", "call-1", "wrte_file")]);
 
-    // 模型打错一个名字是常事，答案是一条它读得懂的失败观察，而不是一个死掉的 run。
+    // A model mistyping a name is routine, and the answer is a failure observation it can read rather
+    // than a dead run.
     let processed = process_model_response(&response, &surface).unwrap();
     assert!(processed.functions().is_empty());
     assert_eq!(processed.tools_not_found()[0].call_id().as_str(), "call-1");
@@ -259,8 +260,9 @@ async fn test_response_classification_03() {
     .await
     .unwrap();
 
-    // 动作面在准备阶段就建好了，结算走 `into_call` 把它和请求一起接走——
-    // 从 agent 重新推一份就会用「声明的」工具而不是本轮启用快照。
+    // The action surface was built during preparation, and settlement takes it along with the request
+    // through `into_call` — deriving a fresh one from the agent would use the *declared* tools rather
+    // than this turn's enabled snapshot.
     assert_eq!(prepared.action_surface().tools().len(), 1);
     let (surface, _request) = prepared.into_call();
 
@@ -270,7 +272,8 @@ async fn test_response_classification_03() {
     ]);
     let processed = process_model_response(&response, &surface).unwrap();
 
-    // 这一轮被 `is_enabled` 关掉的工具，结算阶段不能把它重新解析出来再跑一遍。
+    // A tool `is_enabled` switched off this turn may not be resolved back into existence and run by
+    // settlement.
     assert_eq!(processed.functions().len(), 1);
     assert_eq!(
         processed.functions()[0].tool().origin().name(),
@@ -302,8 +305,8 @@ async fn test_response_classification_04() {
     .await
     .unwrap();
 
-    // 校验发生在准备阶段而不是调用方主动取快照时——先 `into_request()` 的 runner
-    // 不会因此把一个有歧义的动作面发给模型。
+    // Validation happens during preparation rather than when a caller asks for the snapshot, so a
+    // runner that calls `into_request()` first cannot send the model an ambiguous action surface.
     let surface = prepared.action_surface();
     assert_eq!(surface.tools().len(), 1);
     assert!(surface.find_tool("write_file").is_some());
@@ -312,14 +315,15 @@ async fn test_response_classification_04() {
         surface.advertised_names().collect::<Vec<_>>(),
         ["write_file"]
     );
-    // 请求面与可执行面出自同一份快照。
+    // The advertised surface and the executable one come from one snapshot.
     assert_eq!(prepared.request().tools().len(), 1);
     assert_eq!(prepared.tools().len(), 1);
 }
 
 #[test]
 fn test_response_classification_05() {
-    // handoff 与 tool 共用线上命名空间；留着它就得在结算里随便挑一边，那是静默的错。
+    // Handoffs and tools share one wire namespace; allowing the collision would leave settlement to
+    // pick a side arbitrarily, which is the silent kind of wrong.
     let error = TurnActionSurface::new(
         vec![tool("transfer_to_reviewer")],
         vec![handoff("transfer_to_reviewer", "reviewer")],
@@ -348,7 +352,7 @@ fn test_response_classification_06() {
         )),
     )]);
 
-    // 没人授权过的控制权转移，跑起来比拒绝要糟得多。
+    // A transfer of control nobody authorized is far worse to run than to refuse.
     let error = process_model_response(&response, &surface).unwrap_err();
     assert!(error.to_string().contains("root_admin"));
 

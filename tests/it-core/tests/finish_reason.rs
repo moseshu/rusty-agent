@@ -50,8 +50,8 @@ fn test_finish_reason_02() {
 
 #[test]
 fn test_finish_reason_03() {
-    // R6-6a 把它作为 `RunState` 字段落盘，R9-0 写进 rollout 行，R0-3 写进 trace 字段。
-    // 三处记法不一致的话，replay 与指标就对不上。
+    // This value is persisted as a `RunState` field, written into a rollout line, and recorded as a
+    // trace field. Three spellings that disagree leave replay and the metrics unable to line up.
     for reason in all_reasons() {
         let wire = serde_json::to_value(reason).expect("finish reason 应可序列化");
         assert_eq!(wire, Value::String(reason.code().to_owned()));
@@ -64,15 +64,16 @@ fn test_finish_reason_03() {
 
 #[test]
 fn test_finish_reason_04() {
-    // 旧版本读到新版本写的值，必须是显式失败而不是落到某个默认变体上——
-    // 后者会让「被 guard 拦下」在旧版本里显示成「正常完成」。
+    // An old build reading a value a newer one wrote has to fail explicitly rather than land on some
+    // default variant: the latter shows "stopped by a guardrail" as "completed normally".
     let unknown = serde_json::from_value::<FinishReason>(json!("teleported"));
     assert!(unknown.is_err());
 }
 
 #[test]
 fn test_finish_reason_05() {
-    // 区分的是「谁结束了这个 run」，不是「答得好不好」：模型答错了也仍然是它自己收的尾。
+    // The distinction is who ended the run, not how good the answer was: a model that answered
+    // wrongly still ended the run itself.
     assert!(FinishReason::Final.is_complete());
     assert!(FinishReason::ToolStop.is_complete());
 
@@ -89,7 +90,8 @@ fn test_finish_reason_05() {
 
 #[test]
 fn test_finish_reason_06() {
-    // 「没跑完」不等于「接着跑有意义」：guard 拦下与 error handler 收尾再跑一遍是同样的结果。
+    // "Did not finish" is not "resuming is worth something": a guardrail refusal and an error
+    // handler's closeout both reproduce the same stop on a second run.
     for reason in [
         FinishReason::MaxTurns,
         FinishReason::BudgetExhausted,
@@ -114,8 +116,8 @@ fn test_finish_reason_06() {
 
 #[test]
 fn test_finish_reason_07() {
-    // max_turns 单独留一个原因：宿主对它的反应通常是「agent 在打转」，
-    // 而不是「活儿太大」——后三种才是额度不够。
+    // `max_turns` keeps a reason of its own because a host reacts to it as "the agent is going in
+    // circles" rather than "the job was too large" — the other three are the ones that ran out.
     assert_eq!(
         FinishReason::from_budget_kind(BudgetKind::MaxTurns),
         FinishReason::MaxTurns
@@ -127,7 +129,7 @@ fn test_finish_reason_07() {
         );
     }
 
-    // 两条都是软结束，都能续跑——这正是 R3-8 依赖的性质。
+    // Both are soft endings and both can be resumed, which is the property resumption relies on.
     for kind in [
         BudgetKind::MaxTurns,
         BudgetKind::Tokens,

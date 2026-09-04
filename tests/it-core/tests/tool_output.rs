@@ -16,8 +16,9 @@ use serde_json::json;
 
 #[test]
 fn test_tool_output_01() {
-    // `openai-agents` 从另一头撞过这一格：`all([])` 是 True，空的结构化列表通过了转换
-    // 检查、整条工具结果被静默丢掉，直到下一次请求被 provider 拒了才现形。
+    // `openai-agents` hit this square from the other side: `all([])` is True, so an empty structured
+    // list passed the conversion check, the whole tool result was silently dropped, and it only
+    // surfaced when the provider rejected the next request.
     let error = ToolOutput::new(Vec::new()).unwrap_err();
 
     assert!(error.to_string().contains("at least one block"));
@@ -55,9 +56,10 @@ fn test_tool_output_03() {
 
 #[test]
 fn test_tool_output_04() {
-    // 这些错误出现在 resume 与 rollout replay 里，问的是「几千条里哪一条读不了、怎么坏的」。
-    // `#[serde(untagged)]` 对每一种失败都只会答「data did not match any variant」——真正的
-    // 原因连同产生它的那次尝试一起被丢掉了。
+    // These errors show up during resume and rollout replay, where the question is which of several
+    // thousand records is unreadable and how it broke. `#[serde(untagged)]` answers every failure
+    // with "data did not match any variant" — the real cause is discarded along with the attempt
+    // that produced it.
     let cases = [
         (
             json!({"schema_version": 1, "blocks": [{"type": "bogus"}]}),
@@ -85,9 +87,10 @@ fn test_tool_output_04() {
 
 #[test]
 fn test_tool_output_05() {
-    // 整条判别规则压在这个不变量上：认领的凭据是「带我们自己的版本标记」。哪天有人给
-    // `schema_version` 加了 `skip_serializing_if`，每一条记录都会静默变成「不是我们的」、
-    // 全部退回字符串回放——模型于是读到一坨 JSON 字面量，而没有任何断言会挂。
+    // The whole discrimination rule rests on this invariant: what claims a record is our own version
+    // marker. The day someone puts `skip_serializing_if` on `schema_version`, every record silently
+    // becomes "not ours" and falls back to string replay — the model then reads a lump of JSON
+    // literal, and no assertion fails.
     let output = ToolOutput::text("done").with_metadata(
         ObservationMetadata::new().with_truncation(Truncation::new(TruncationStage::Tool, 90, 4)),
     );
@@ -95,28 +98,30 @@ fn test_tool_output_05() {
 
     assert!(
         stored.get("schema_version").is_some(),
-        "版本标记就是认领凭据"
+        "the version marker is what claims the record"
     );
     let restored = ToolOutput::from_stored(&stored)
-        .expect("自己写的记录不该读不了")
-        .expect("自己写的记录必须被认成工具结果");
+        .expect("a record we wrote ourselves must be readable")
+        .expect("a record we wrote ourselves must be recognized as a tool result");
     assert_eq!(restored, output);
 }
 
 #[test]
 fn test_tool_output_06() {
-    // 中间那一档是这个签名存在的理由：把「读不了」当成「不是我们的」，会让新版本写下的
-    // 记录被静默字符串化成 JSON 塞进模型上下文，而不是在有人看得见的地方失败。
+    // The middle case is why this signature exists: treating "unreadable" as "not ours" would push a
+    // record a newer build wrote into the model's context as stringified JSON instead of failing
+    // where somebody can see it.
     let readable = json!({"schema_version": 1, "blocks": [{"type": "text", "text": "done"}]});
     assert_eq!(
         ToolOutput::from_stored(&readable)
-            .expect("可读的记录不该报错")
-            .expect("它确实是一条工具结果")
+            .expect("a readable record must not error")
+            .expect("it really is a tool result")
             .as_text(),
         Some("done")
     );
 
-    // 宿主在 R2-3 之前存的裸值：不是工具结果，调用方字符串化即可。
+    // A bare value a host stored before this type existed: not a tool result, and a caller may
+    // stringify it.
     for foreign in [
         json!({"rows": 2}),
         json!("plain"),
@@ -125,13 +130,13 @@ fn test_tool_output_06() {
     ] {
         assert!(
             ToolOutput::from_stored(&foreign)
-                .expect("裸值不是错误")
+                .expect("a bare value is not an error")
                 .is_none(),
-            "{foreign} 不该被当成工具结果"
+            "{foreign} must not be taken for a tool result"
         );
     }
 
-    // 声称是工具结果却读不了：报错，不退化。
+    // Claims to be a tool result and cannot be read: an error, not a fallback.
     let error = ToolOutput::from_stored(&json!({
         "schema_version": 1,
         "blocks": [{"type": "bogus"}]
@@ -144,7 +149,8 @@ fn test_tool_output_06() {
 fn test_tool_output_07() {
     assert_eq!(ToolOutput::text("done").as_text(), Some("done"));
 
-    // 拼接会让调用方以为自己拿到了全部，而图片块已经悄悄没了。
+    // Concatenating would let a caller believe it received everything while the image block had
+    // quietly gone.
     let multimodal = ToolOutput::new(vec![
         ToolOutputBlock::text("这是截图"),
         ToolOutputBlock::Image(ImageBlock::new(ImageSource::provider_file("file-1"))),
@@ -156,8 +162,8 @@ fn test_tool_output_07() {
 
 #[test]
 fn test_tool_output_08() {
-    // 绝大多数结果没有截断也没有建议。这种情况下渲染出一个空块，等于每一轮为每个工具
-    // 结果各付一次没有内容的钱。
+    // The vast majority of results carry neither a truncation nor guidance. Rendering an empty block
+    // for those pays, every turn and for every tool result, for content that is not there.
     let quiet = ToolOutput::text("done");
 
     assert!(quiet.metadata().render().is_none());
@@ -166,8 +172,8 @@ fn test_tool_output_08() {
 
 #[test]
 fn test_tool_output_09() {
-    // 工具先按自己的上限截了一刀，R5-1 的预算又截了一刀。只留一格的话，模型被告知的
-    // 损失会比实际的小。
+    // The tool cut once against its own ceiling and the context budget cut again. With room for only
+    // one, the loss the model is told about is smaller than the loss it took.
     let metadata = ObservationMetadata::new()
         .with_truncation(Truncation::new(TruncationStage::Tool, 12_000, 4_000))
         .with_truncation(Truncation::new(TruncationStage::ContextBudget, 4_000, 500));
@@ -184,7 +190,7 @@ fn test_tool_output_09() {
 
 #[test]
 fn test_tool_output_10() {
-    // R5-1 的裁剪发生在工具早就返回之后，它必须能追加而不是重建一份。
+    // Budget trimming happens long after the tool returned, so it has to append rather than rebuild.
     let mut output = ToolOutput::text("部分内容").with_metadata(
         ObservationMetadata::new().with_truncation(Truncation::new(
             TruncationStage::Tool,
@@ -203,8 +209,9 @@ fn test_tool_output_10() {
 
 #[test]
 fn test_tool_output_11() {
-    // 结构化的那份留给宿主（预算、UI、日志），模型读到的是一句话。两者分开，
-    // 「哪些事实值这些 token」就成了渲染策略而不是 wire 格式。
+    // The structured half is for the host — budget, UI, logs — and the model reads one sentence.
+    // Keeping them apart makes "which facts are worth these tokens" a rendering policy rather than a
+    // wire format.
     let output = ToolOutput::text("hit-1\nhit-2").with_metadata(
         ObservationMetadata::new()
             .with_truncation(Truncation::new(TruncationStage::Tool, 9_000, 200))
@@ -213,14 +220,16 @@ fn test_tool_output_11() {
 
     let blocks = output.model_blocks();
     assert_eq!(blocks.len(), 2);
-    let note = blocks[0].as_text().expect("元数据块必须是文本");
+    let note = blocks[0]
+        .as_text()
+        .expect("the metadata block must be text");
     assert!(note.contains("truncated by tool"));
     assert!(note.contains("200"));
     assert!(note.contains("9000"));
     assert!(note.contains("narrow the search with a path prefix"));
     assert_eq!(blocks[1].as_text(), Some("hit-1\nhit-2"));
 
-    // 渲染是投影不是字段：存下来的那份仍然只有正文。
+    // Rendering is a projection rather than a field: what is stored still holds only the body.
     assert_eq!(output.blocks().len(), 1);
 }
 

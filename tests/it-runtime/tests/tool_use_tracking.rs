@@ -193,7 +193,7 @@ async fn test_tool_use_tracking_01() {
 
     settle(&response, &surface, &mut tracker).await.unwrap();
 
-    // 顺序跟着响应走，不跟着 `ProcessedResponse` 的字段排列走。
+    // Order follows the response, not the order the fields sit in on `ProcessedResponse`.
     let recorded = tracker
         .agent(&agent())
         .unwrap()
@@ -212,7 +212,7 @@ async fn test_tool_use_tracking_01() {
             tool_identity("write_file"),
         ]
     );
-    // 纯消息不是一次动作，不该在里面。
+    // A plain message is not an action and does not belong in there.
     assert_eq!(tracker.agent(&agent()).unwrap().turn_calls(), 3);
 }
 
@@ -228,7 +228,8 @@ async fn test_tool_use_tracking_02() {
             &format!("c-{turn}"),
             &format!("call-{turn}"),
             "read_file",
-            // 键序每轮都换：provider 不承诺顺序，指纹要认得出这是同一个调用。
+            // Key order changes every turn: a provider promises none, and the fingerprint has to
+            // recognize this as the same call.
             if turn % 2 == 0 {
                 json!({ "path": "a.txt", "limit": 10 })
             } else {
@@ -262,8 +263,8 @@ async fn test_tool_use_tracking_03() {
 
     settle(&response, &surface, &mut tracker).await.unwrap();
 
-    // 失败的、解析不到的，都是模型又要了一次同样的东西——`reset_tool_choice`
-    // 和熔断器反应的正是这个，只统计跑成功的会让它们都失明。
+    // A failure and an unresolvable name are both the model asking for the same thing again, which is
+    // what `reset_tool_choice` and the breaker react to; counting only what succeeded blinds both.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         tracker
@@ -295,8 +296,8 @@ async fn test_tool_use_tracking_04() {
 
     settle(&response, &surface, &mut tracker).await.unwrap();
 
-    // 工具一次都没跑，但模型确实点了它。记账在执行之前，正是为了让 R3-6 的熔断器
-    // 在 `dispatch_tool` 里看得到本轮的这一次。
+    // The tool never ran and the model did ask for it. Filing happens before execution precisely so
+    // that the breaker inside `dispatch_tool` can see this turn's attempt.
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         tracker.repeat_streak(&agent(), &tool_identity("write_file")),
@@ -325,12 +326,12 @@ async fn test_tool_use_tracking_05() {
     )]);
     let mut tracker = ToolUseTracker::new();
 
-    // 交接要等 R17 才跑得起来，这一轮明确报错。
+    // Handoff execution is not implemented yet, so this turn fails explicitly.
     let error = settle(&response, &surface, &mut tracker).await.unwrap_err();
     assert!(error.to_string().contains("reviewer"));
 
-    // 记账在任何东西动手之前。一轮的结局改变不了「模型要过什么」这个事实，
-    // 审计与熔断器读的都是后者。
+    // Filing happens before anything acts. How a turn ended changes nothing about what the model asked
+    // for, and that is what the audit trail and the breaker read.
     assert_eq!(
         tracker.repeat_streak(&agent(), &ToolUse::Handoff(AgentId::new("reviewer"))),
         1
@@ -367,8 +368,9 @@ async fn test_tool_use_tracking_06() {
         .unwrap();
     }
 
-    // 同一条响应、同一个 call_id，两个 agent 各记各的。去重是每个 agent 各自的窗口，
-    // 不是全局的——否则第二个 agent 的第一次调用会被当成第一个 agent 的重放吞掉。
+    // One response and one `call_id`, filed separately per agent. De-duplication is each agent's own
+    // window rather than a global one; otherwise the second agent's first call would be swallowed as
+    // a replay of the first agent's.
     let read = tool_identity("read_file");
     assert_eq!(tracker.repeat_streak(&AgentId::new("planner"), &read), 1);
     assert_eq!(tracker.repeat_streak(&AgentId::new("executor"), &read), 1);
