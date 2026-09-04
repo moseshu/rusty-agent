@@ -20,9 +20,11 @@
 //! detect and therefore worth a gate.
 
 use ra_coding::{
-    CodingHost, build_agent_with_host,
-    prompt::{assemble_stable_prefix, assemble_stable_prefix_for_tools},
+    CodingHost, HOST_BACKED_PROFILE, build_agent_with_host, host_backed_surface,
+    prompt::{assemble_stable_prefix, assemble_stable_prefix_for_surface},
 };
+use ra_core::agent::AgentInstructions;
+use ra_core::capability::CapabilityFamily;
 use ra_core::prompt::{
     MIN_CACHEABLE_PREFIX_TOKENS, PromptRole, PromptSection, PromptSource, SectionPosition,
     SectionStability,
@@ -44,7 +46,19 @@ static SHIPPED_ROLES: [PromptRole; 5] = [
 /// kinds of fact — below the floor no provider caches the span at all, above the ceiling it is
 /// cached and simply costs more on every turn than this product has decided a system prompt is
 /// worth.
-const PREFIX_TOKEN_CEILING: usize = 2_432;
+const PREFIX_TOKEN_CEILING: usize = 2_912;
+
+/// The capability families whose fragments this repository writes.
+///
+/// Listed rather than accepting any `Capability` provenance: the tag says a capability contributed
+/// the text, not that this repository wrote it, and a plugin's fragment reaching the cached prefix
+/// is precisely the case the provenance check is here to notice.
+static BUILT_IN_FAMILIES: [CapabilityFamily; 4] = [
+    CapabilityFamily::FILESYSTEM,
+    CapabilityFamily::SEARCH,
+    CapabilityFamily::APPLY_PATCH,
+    CapabilityFamily::SHELL,
+];
 
 /// Names whose appearance in shipped prompt text would be a marker of borrowed material.
 ///
@@ -72,20 +86,43 @@ const ATTRIBUTION_MARKERS: [&str; 4] =
     ["copyright", "all rights reserved", "©", "system prompt of"];
 
 /// The prefix an agent the product actually builds carries when it has a host.
-fn host_backed_prefix(role: &PromptRole, host: &CodingHost) -> StablePrefix {
+///
+/// Assembled from the same object the builder installs from, and then checked against the agent
+/// that builder produced. Re-deriving it from the agent's tool list alone would leave out every
+/// section an installed capability contributed — which is most of what a host-backed prefix has
+/// that a bare one does not, and exactly the text this file exists to hold still.
+async fn host_backed_prefix(role: &PromptRole, host: &CodingHost) -> StablePrefix {
+    let assembled = host_backed_surface(role, host, HOST_BACKED_PROFILE)
+        .await
+        .expect("the host-backed surface must assemble");
+    let prefix = assemble_stable_prefix_for_surface(
+        role,
+        assembled.tool_surface(),
+        assembled.capability_sections(),
+    )
+    .expect("the host-backed product prefix must assemble");
+
     let agent = build_agent_with_host(
         ra_core::agent::AgentId::new("prompt-regression-agent"),
         "Prompt Regression Agent",
         role,
         host,
     )
+    .await
     .expect("the host-backed product agent must build");
-    assemble_stable_prefix_for_tools(role, agent.tools())
-        .expect("the host-backed product prefix must assemble")
+    assert_eq!(
+        agent
+            .instructions()
+            .and_then(AgentInstructions::as_static)
+            .expect("the agent carries a stable prefix"),
+        prefix.system_instructions(),
+        "the snapshot below would be of a prefix the `{role}` agent does not carry"
+    );
+    prefix
 }
 
 /// Every prefix the product can ship: each role's own and every host-backed tool variant.
-fn shipped_prefixes() -> Vec<(String, StablePrefix)> {
+async fn shipped_prefixes() -> Vec<(String, StablePrefix)> {
     let mut prefixes: Vec<(String, StablePrefix)> = SHIPPED_ROLES
         .iter()
         .map(|role| {
@@ -100,9 +137,16 @@ fn shipped_prefixes() -> Vec<(String, StablePrefix)> {
     for role in [PromptRole::Main, PromptRole::Coordinator] {
         prefixes.push((
             format!("{}_host_backed", role.role_name()),
-            host_backed_prefix(&role, &host),
+            host_backed_prefix(&role, &host).await,
         ));
     }
+    // The read-only variant is the one whose capability set is narrowed, and its fragments are the
+    // half a role filter can silently keep: text describing an editing entry, in the prefix of an
+    // agent whose own role section says it has none.
+    prefixes.push((
+        format!("{}_host_backed", PromptRole::ReadOnlySpecialist.role_name()),
+        host_backed_prefix(&PromptRole::ReadOnlySpecialist, &host).await,
+    ));
     prefixes
 }
 
@@ -113,9 +157,9 @@ fn shipped_prefixes() -> Vec<(String, StablePrefix)> {
 /// section, and this says what the model now reads.
 ///
 /// Re-run with `INSTA_UPDATE=always` (or `cargo insta review`) after an intentional edit.
-#[test]
-fn test_the_shipped_prompt_text_matches_its_reviewed_snapshot() {
-    for (label, prefix) in shipped_prefixes() {
+#[tokio::test]
+async fn test_the_shipped_prompt_text_matches_its_reviewed_snapshot() {
+    for (label, prefix) in shipped_prefixes().await {
         insta::assert_snapshot!(
             format!("stable_prefix_{label}"),
             prefix.system_instructions()
@@ -128,9 +172,9 @@ fn test_the_shipped_prompt_text_matches_its_reviewed_snapshot() {
 /// The assembler enforces a declared allowance but cannot require one — it has no way to know which
 /// sections belong to this product. So the requirement that a *new* topic arrive with a stated cost
 /// lives here, where the product's own section list is known.
-#[test]
-fn test_every_shipped_section_declares_a_prefix_allowance() {
-    for (label, prefix) in shipped_prefixes() {
+#[tokio::test]
+async fn test_every_shipped_section_declares_a_prefix_allowance() {
+    for (label, prefix) in shipped_prefixes().await {
         for section in prefix.sections() {
             let budget = section.token_budget().unwrap_or_else(|| {
                 panic!(
@@ -155,11 +199,11 @@ fn test_every_shipped_section_declares_a_prefix_allowance() {
 /// defends, because any one topic can grow into the room the others left and the review that would
 /// have caught it sees only a prefix that still fits. This assertion is what makes raising one
 /// section's allowance a visible change to the size of the whole cached span.
-#[test]
-fn test_the_declared_allowances_sum_to_the_prefix_ceiling() {
+#[tokio::test]
+async fn test_the_declared_allowances_sum_to_the_prefix_ceiling() {
     let mut allowances: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
-    for (label, prefix) in shipped_prefixes() {
+    for (label, prefix) in shipped_prefixes().await {
         for section in prefix.sections() {
             let budget = section
                 .token_budget()
@@ -185,9 +229,9 @@ fn test_the_declared_allowances_sum_to_the_prefix_ceiling() {
 }
 
 /// The largest prefix the product ships sits between the caching floor and the declared ceiling.
-#[test]
-fn test_every_shipped_prefix_sits_between_the_caching_floor_and_the_ceiling() {
-    for (label, prefix) in shipped_prefixes() {
+#[tokio::test]
+async fn test_every_shipped_prefix_sits_between_the_caching_floor_and_the_ceiling() {
+    for (label, prefix) in shipped_prefixes().await {
         let tokens = prefix.token_estimate();
         assert!(
             tokens >= MIN_CACHEABLE_PREFIX_TOKENS,
@@ -204,18 +248,25 @@ fn test_every_shipped_prefix_sits_between_the_caching_floor_and_the_ceiling() {
 
 /// No shipped section carries a provenance that points outside this product.
 ///
-/// The default prefix is text this product wrote. A section arriving under `Custom` — the tag that
-/// borrowed material would travel under — or under a capability's or a generator's name is either
-/// not ours or not stable, and either way it does not belong in the span every turn pays for.
-#[test]
-fn test_no_shipped_section_declares_a_third_party_provenance() {
-    for (label, prefix) in shipped_prefixes() {
+/// Two provenances ship, and both are things this repository wrote: the product's own sections
+/// under `Agent`, and one built-in capability's fragment under its own family. A capability's text
+/// is admitted by family rather than by the tag alone — `Capability` is the tag a third-party
+/// plugin's text would also arrive under, and "installed here" is not the same claim as "written
+/// here". Everything else is refused: `Custom` is the tag borrowed material would travel under, and
+/// `Dynamic` is text that is not stable enough for a span every turn pays for.
+#[tokio::test]
+async fn test_no_shipped_section_declares_a_third_party_provenance() {
+    let built_in: Vec<PromptSource> = BUILT_IN_FAMILIES
+        .iter()
+        .map(CapabilityFamily::prompt_source)
+        .collect();
+
+    for (label, prefix) in shipped_prefixes().await {
         for section in prefix.sections() {
-            assert_eq!(
-                section.source(),
-                &PromptSource::Agent,
+            assert!(
+                section.source() == &PromptSource::Agent || built_in.contains(section.source()),
                 "`{}` in the `{label}` prefix declares provenance `{}`; the shipped prefix is the \
-                 product's own text",
+                 product's own text and the built-in capabilities' own fragments",
                 section.name(),
                 section.source()
             );
@@ -224,9 +275,9 @@ fn test_no_shipped_section_declares_a_third_party_provenance() {
 }
 
 /// No shipped prompt text names the third-party material its structure was studied against.
-#[test]
-fn test_no_shipped_prompt_text_carries_a_third_party_source_marker() {
-    for (label, prefix) in shipped_prefixes() {
+#[tokio::test]
+async fn test_no_shipped_prompt_text_carries_a_third_party_source_marker() {
+    for (label, prefix) in shipped_prefixes().await {
         for section in prefix.sections() {
             if let Some(marker) = source_marker_in(section) {
                 panic!(

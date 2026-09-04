@@ -7,8 +7,10 @@
 use clap::{CommandFactory as _, Parser as _};
 use ra_cli::{Cli, CommandOutcome, execute};
 
-fn run(args: &[&str]) -> ra_cli::CommandOutput {
-    execute(Cli::parse_from(args)).expect("the command must carry out")
+async fn run(args: &[&str]) -> ra_cli::CommandOutput {
+    execute(Cli::parse_from(args))
+        .await
+        .expect("the command must carry out")
 }
 
 /// Clap's own consistency check: duplicate long flags, conflicts naming an argument that does not
@@ -21,10 +23,10 @@ fn test_the_command_line_is_internally_consistent() {
 
 /// The default role must be one the product ships, and the flag must reject anything else at parse
 /// time — a report for a role that does not exist would look exactly like a real one.
-#[test]
-fn test_the_role_flag_offers_only_shipped_roles() {
-    let defaulted = run(&["ra", "prompt", "dump", "--no-tools"]);
-    let explicit = run(&["ra", "prompt", "dump", "--no-tools", "--role", "main"]);
+#[tokio::test]
+async fn test_the_role_flag_offers_only_shipped_roles() {
+    let defaulted = run(&["ra", "prompt", "dump", "--no-tools"]).await;
+    let explicit = run(&["ra", "prompt", "dump", "--no-tools", "--role", "main"]).await;
     assert_eq!(
         defaulted.stdout(),
         explicit.stdout(),
@@ -65,15 +67,15 @@ fn test_the_two_prefix_variants_cannot_be_requested_at_once() {
 
 /// The workspace default is the current directory, and the report names the tools an agent opened
 /// there would install.
-#[test]
-fn test_the_dump_defaults_to_the_prefix_an_agent_here_would_carry() {
-    let here = run(&["ra", "prompt", "dump"]);
+#[tokio::test]
+async fn test_the_dump_defaults_to_the_prefix_an_agent_here_would_carry() {
+    let here = run(&["ra", "prompt", "dump"]).await;
     assert!(
         here.stdout().contains("tool_surface"),
         "the default report covers the host-backed prefix, which advertises a tool surface"
     );
 
-    let toolless = run(&["ra", "prompt", "dump", "--no-tools"]);
+    let toolless = run(&["ra", "prompt", "dump", "--no-tools"]).await;
     assert!(
         !toolless.stdout().contains("tool_surface"),
         "`--no-tools` must report the prefix an agent built without a host carries"
@@ -87,9 +89,9 @@ fn test_the_dump_defaults_to_the_prefix_an_agent_here_would_carry() {
 /// carries no surface at all, while a read-only role carries one holding exactly the entries that
 /// observe. Asserting the second as "no surface" is what previously hid a read-only specialist with
 /// nothing to read.
-#[test]
-fn test_a_host_backed_dump_keeps_one_off_roles_tool_free() {
-    let report = run(&["ra", "prompt", "dump", "--role", "one_off_answer"]);
+#[tokio::test]
+async fn test_a_host_backed_dump_keeps_one_off_roles_tool_free() {
+    let report = run(&["ra", "prompt", "dump", "--role", "one_off_answer"]).await;
     assert!(
         !report.stdout().contains("tool_surface"),
         "a one-off role must not advertise host tools it cannot execute"
@@ -97,10 +99,10 @@ fn test_a_host_backed_dump_keeps_one_off_roles_tool_free() {
 }
 
 /// A read-only role's report advertises what observes and nothing that writes.
-#[test]
-fn test_a_host_backed_dump_leaves_read_only_roles_the_observing_entry() {
+#[tokio::test]
+async fn test_a_host_backed_dump_leaves_read_only_roles_the_observing_entry() {
     for role in ["read_only_specialist", "planner"] {
-        let report = run(&["ra", "prompt", "dump", "--role", role]);
+        let report = run(&["ra", "prompt", "dump", "--role", role]).await;
         let stdout = report.stdout();
         assert!(
             stdout.contains("tool_surface"),
@@ -116,9 +118,9 @@ fn test_a_host_backed_dump_leaves_read_only_roles_the_observing_entry() {
 }
 
 /// Both label flags reach the report, and neither changes the prefix underneath it.
-#[test]
-fn test_provider_and_model_label_the_report_without_changing_the_prefix() {
-    let plain = run(&["ra", "prompt", "dump", "--no-tools"]);
+#[tokio::test]
+async fn test_provider_and_model_label_the_report_without_changing_the_prefix() {
+    let plain = run(&["ra", "prompt", "dump", "--no-tools"]).await;
     let labelled = run(&[
         "ra",
         "prompt",
@@ -128,7 +130,8 @@ fn test_provider_and_model_label_the_report_without_changing_the_prefix() {
         "anthropic",
         "--model",
         "claude-test",
-    ]);
+    ])
+    .await;
 
     assert!(labelled.stdout().contains("Provider: anthropic"));
     assert!(labelled.stdout().contains("Model:    claude-test"));
@@ -149,15 +152,15 @@ fn test_provider_and_model_label_the_report_without_changing_the_prefix() {
 
 /// The whole point of the flag: an unchanged prefix exits 0, a moved one exits 1 and names what
 /// moved it. A script gating a release on prompt drift reads exactly this.
-#[test]
-fn test_a_baseline_comparison_reports_drift_through_the_exit_status() {
+#[tokio::test]
+async fn test_a_baseline_comparison_reports_drift_through_the_exit_status() {
     let workspace = tempfile::tempdir().expect("workspace");
     let baseline = workspace.path().join("before.json");
-    let recorded = run(&["ra", "prompt", "dump", "--no-tools", "--json"]);
+    let recorded = run(&["ra", "prompt", "dump", "--no-tools", "--json"]).await;
     std::fs::write(&baseline, recorded.stdout()).expect("baseline is writable");
     let baseline = baseline.to_str().expect("utf-8 path");
 
-    let unchanged = run(&["ra", "prompt", "dump", "--no-tools", "--baseline", baseline]);
+    let unchanged = run(&["ra", "prompt", "dump", "--no-tools", "--baseline", baseline]).await;
     assert_eq!(unchanged.outcome(), CommandOutcome::Succeeded);
     assert!(
         unchanged
@@ -176,16 +179,17 @@ fn test_a_baseline_comparison_reports_drift_through_the_exit_status() {
         "planner",
         "--baseline",
         baseline,
-    ]);
+    ])
+    .await;
     assert_eq!(changed.outcome(), CommandOutcome::PrefixChanged);
     assert!(changed.stdout().contains("Invalidated by:       role"));
 }
 
 /// A recorded dump must be JSON a later build can read back, not just text that happens to look
 /// like it. Without this the comparison flag has no input.
-#[test]
-fn test_the_recorded_dump_is_the_form_the_comparison_reads() {
-    let recorded = run(&["ra", "prompt", "dump", "--no-tools", "--json"]);
+#[tokio::test]
+async fn test_the_recorded_dump_is_the_form_the_comparison_reads() {
+    let recorded = run(&["ra", "prompt", "dump", "--no-tools", "--json"]).await;
     let value: serde_json::Value =
         serde_json::from_str(recorded.stdout()).expect("`--json` must emit JSON");
 
@@ -203,8 +207,8 @@ fn test_the_recorded_dump_is_the_form_the_comparison_reads() {
 
 /// A baseline that is not a dump has to say so. The failure mode this prevents is a comparison
 /// against a half-read or unrelated file reporting every section as new.
-#[test]
-fn test_an_unreadable_baseline_is_refused() {
+#[tokio::test]
+async fn test_an_unreadable_baseline_is_refused() {
     let workspace = tempfile::tempdir().expect("workspace");
     let junk = workspace.path().join("not-a-dump.json");
     std::fs::write(&junk, "{\"hello\": true}").expect("file is writable");
@@ -217,6 +221,7 @@ fn test_an_unreadable_baseline_is_refused() {
         "--baseline",
         junk.to_str().expect("utf-8 path"),
     ]))
+    .await
     .expect_err("a file that is not a dump must be refused");
     assert!(
         format!("{error:#}").contains("not a prompt dump"),
@@ -235,6 +240,7 @@ fn test_an_unreadable_baseline_is_refused() {
             .to_str()
             .expect("utf-8 path"),
     ]))
+    .await
     .expect_err("a baseline that is not there must be refused");
     assert!(format!("{missing:#}").contains("cannot read baseline"));
 }

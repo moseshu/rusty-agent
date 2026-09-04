@@ -7,6 +7,7 @@ async fn ra_core::agent::ToolUseBehaviorHandler::should_stop(& self, tool_result
 async fn ra_core::cancel::CancelScope::cancelled(& self)
 async fn ra_core::cancel::CancelScope::run< F >(& self, fut : F) -> Result < F :: Output , Error > where F : Future ,
 async fn ra_core::capability::Capability::instructions(& self) -> Result < Option < PromptSection > >
+async fn ra_core::capability::Capability::static_instructions(& self) -> Result < Option < PromptSection > >
 async fn ra_core::capability::ContextProcessor::process_context(& self, request : ContextProcessorRequest, summarizer : & dyn ContextSummarizer) -> Result < ContextProcessorResult >
 async fn ra_core::capability::ContextSummarizer::summarize(& self, request : ContextSummaryRequest) -> Result < ContextSummaryResponse >
 async fn ra_core::model::Model::close(& self) -> Result < () >
@@ -951,6 +952,7 @@ fn ra_core::capability::Capability::sampling_params(& self, settings : ModelSett
 fn ra_core::capability::Capability::tools(& self) -> Vec < Arc < dyn Tool > >
 fn ra_core::capability::CapabilityFamily::as_str(& self) -> & str
 fn ra_core::capability::CapabilityFamily::new(name : impl Into < Cow < 'static , str > >) -> Result < Self >
+fn ra_core::capability::CapabilityFamily::prompt_section_name(& self) -> PromptSectionName
 fn ra_core::capability::CapabilityFamily::prompt_source(& self) -> PromptSource
 fn ra_core::capability::ContextProcessorRequest::history(& self) -> & [RunItem]
 fn ra_core::capability::ContextProcessorRequest::input(& self) -> & [ModelInputItem]

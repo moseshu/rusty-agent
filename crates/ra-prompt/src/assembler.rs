@@ -74,11 +74,27 @@ impl fmt::Debug for StablePrefix {
 /// provider's cached prefix exactly as rewriting a section would. Introducing a topic is an
 /// insertion here rather than a renumbering of ranks, which keeps the diff that reviewers see equal
 /// to the change that was actually made.
-static CANONICAL_SECTION_ORDER: [PromptSectionName; 12] = [
+///
+/// The four capability fragments sit directly under the inventory that names their entries and
+/// above the policy sections. Both neighbours are deliberate: a paragraph about what `apply_patch`
+/// does is unreadable before the list saying the agent has it, and the editing rules that follow
+/// are easier to apply after the paragraph explaining what editing costs. Among themselves they run
+/// in the order a coding agent installs them — what reads, what finds, what writes, what runs.
+///
+/// They are spelled as literals because [`CapabilityFamily::prompt_section_name`] is not usable in
+/// a const context; `it-prompt` holds the two spellings together, and a capability family with no
+/// rank here still lands deterministically, at the end, by the rule below.
+///
+/// [`CapabilityFamily::prompt_section_name`]: ra_core::capability::CapabilityFamily::prompt_section_name
+static CANONICAL_SECTION_ORDER: [PromptSectionName; 16] = [
     PromptSectionName::IDENTITY,
     PromptSectionName::CORE_BEHAVIOR,
     PromptSectionName::TOOL_USE,
     PromptSectionName::TOOL_SURFACE,
+    PromptSectionName::from_static("filesystem"),
+    PromptSectionName::from_static("search"),
+    PromptSectionName::from_static("apply_patch"),
+    PromptSectionName::from_static("shell"),
     PromptSectionName::SAFETY,
     PromptSectionName::EDITING_VERIFICATION,
     PromptSectionName::AUTONOMY,

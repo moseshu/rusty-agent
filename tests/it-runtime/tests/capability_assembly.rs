@@ -46,6 +46,7 @@ struct TestCapability {
     requires: BTreeSet<CapabilityFamily>,
     tools: Vec<Arc<dyn Tool>>,
     section: Option<PromptSection>,
+    static_section: Option<PromptSection>,
     temperature: Option<f64>,
     /// What the sampling fold handed this capability, recorded so order is observable.
     observed_temperature: Arc<Mutex<Option<f64>>>,
@@ -64,6 +65,7 @@ impl TestCapability {
             requires: BTreeSet::new(),
             tools: Vec::new(),
             section: None,
+            static_section: None,
             temperature: None,
             observed_temperature: Arc::new(Mutex::new(None)),
             processor: false,
@@ -98,10 +100,25 @@ impl TestCapability {
         self
     }
 
+    fn with_static_section(mut self, name: &str, content: &str) -> Self {
+        self.static_section = Some(
+            PromptSection::new(
+                PromptSectionName::new(name.to_owned()),
+                "static capability fragment",
+                self.kind.prompt_source(),
+                SectionStability::Stable,
+                SectionPosition::Prefix,
+                content,
+            )
+            .unwrap(),
+        );
+        self
+    }
+
     fn with_section_source(mut self, source: PromptSource) -> Self {
         self.section = Some(
             PromptSection::new(
-                PromptSectionName::new("capability_section".to_owned()),
+                self.kind.prompt_section_name(),
                 "capability fragment",
                 source,
                 SectionStability::Stable,
@@ -118,6 +135,21 @@ impl TestCapability {
             PromptSection::new(
                 PromptSectionName::new(name.to_owned()),
                 "capability fragment",
+                self.kind.prompt_source(),
+                SectionStability::Volatile,
+                SectionPosition::TailMessage,
+                "the date is today",
+            )
+            .unwrap(),
+        );
+        self
+    }
+
+    fn with_static_tail_section(mut self, name: &str) -> Self {
+        self.static_section = Some(
+            PromptSection::new(
+                PromptSectionName::new(name.to_owned()),
+                "static capability fragment",
                 self.kind.prompt_source(),
                 SectionStability::Volatile,
                 SectionPosition::TailMessage,
@@ -170,6 +202,10 @@ impl Capability for TestCapability {
 
     async fn instructions(&self) -> Result<Option<PromptSection>> {
         Ok(self.section.clone())
+    }
+
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        Ok(self.static_section.clone())
     }
 
     fn sampling_params(&self, settings: ModelSettings) -> ModelSettings {
@@ -651,25 +687,95 @@ async fn a_capability_prompt_section_must_name_the_capability_that_contributed_i
     );
 }
 
+/// A plan resolves only static fragments before any run exists.
+///
+/// This is the reading an agent builder needs: the cached prefix is one span shared by every run
+/// the agent serves, so the text in it cannot be a function of a run that has not started.
 #[tokio::test]
-async fn two_capabilities_cannot_claim_one_prompt_section() {
+async fn a_plan_resolves_its_static_fragments_before_a_run_exists() {
     let plan = CapabilityPlan::resolve([
-        TestCapability::new(CapabilityFamily::SHELL)
-            .with_section("tool_use", "first")
-            .into_shared(),
         TestCapability::new(CapabilityFamily::SEARCH)
-            .with_section("tool_use", "second")
+            .with_static_section("search", "search fragment")
+            .into_shared(),
+        TestCapability::new(CapabilityFamily::SHELL)
+            .with_static_section("shell", "shell fragment")
             .into_shared(),
     ])
+    .unwrap();
+
+    let before_a_run: Vec<String> = plan
+        .static_prompt_sections()
+        .await
+        .unwrap()
+        .iter()
+        .map(|section| format!("{}:{}", section.name(), section.content()))
+        .collect();
+    assert_eq!(
+        before_a_run,
+        ["search:search fragment", "shell:shell fragment"],
+        "fragments arrive in assembly order, whether or not a run is asking for them"
+    );
+}
+
+/// A static prefix contribution is not read again as a run-bound contribution.
+///
+/// The two methods have different owners: the installed capability writes the prefix an agent
+/// shares, while a bound capability may write text particular to the run it serves. Reusing one
+/// method for both would call it once before binding and again after binding, which makes a dump
+/// disagree with the request a run sends.
+#[tokio::test]
+async fn a_static_fragment_does_not_cross_the_binding_boundary() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::MEMORY)
+        .with_static_section("memory", "static fragment")
+        .binding()
+        .into_shared()])
+    .unwrap();
+
+    let static_sections = plan.static_prompt_sections().await.unwrap();
+    assert_eq!(static_sections.len(), 1);
+
+    let assembled = plan.assemble(&run_context("run-1")).await.unwrap();
+    assert!(
+        assembled.prompt_sections().is_empty(),
+        "the bound form supplies no per-run fragment, so assembly must not re-read the installed \
+         capability's static one"
+    );
+}
+
+/// The run-free reading enforces the same structural prefix rules as the runtime path.
+#[tokio::test]
+async fn a_plan_refuses_invalid_static_fragments_before_a_run_exists() {
+    let claimed = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_static_section("tool_use", "first")
+        .into_shared()])
+    .unwrap();
+    let error = claimed.static_prompt_sections().await.unwrap_err();
+    assert!(
+        error.to_string().contains("`shell`") && error.to_string().contains("`tool_use`"),
+        "{error}"
+    );
+
+    let tail = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::WEB)
+        .with_static_tail_section("web")
+        .into_shared()])
+    .unwrap();
+    let error = tail.static_prompt_sections().await.unwrap_err();
+    assert!(error.to_string().contains("context processor"), "{error}");
+}
+
+#[tokio::test]
+async fn a_per_run_fragment_must_claim_its_own_capability_section() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_section("tool_use", "first")
+        .into_shared()])
     .unwrap();
 
     let error = plan.assemble(&run_context("run-1")).await.unwrap_err();
 
     let message = error.to_string();
     assert!(
-        message.contains("`shell`") && message.contains("`search`"),
-        "one of the two would otherwise be gone from the prefix, visible only as a line missing \
-         from the next prompt dump: {message}"
+        message.contains("`shell`") && message.contains("`tool_use`"),
+        "a capability must not take a product section's slot: {message}"
     );
 }
 

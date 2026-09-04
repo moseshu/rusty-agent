@@ -177,6 +177,29 @@ impl CapabilityPlan {
         self.ordered.is_empty()
     }
 
+    /// The static prompt fragments the installed capabilities contribute, in assembly order.
+    ///
+    /// **Read from the installed capabilities rather than from bound ones, and that is the point
+    /// rather than a shortcut.** These fragments go into a cached prefix, which is one span shared
+    /// by every run an agent serves — so a fragment that only exists once a run has been bound is a
+    /// fragment that cannot be in it. A caller that assembles a prefix before any run exists (an
+    /// agent builder, a prompt dump) reads them here, which is also the only place it can: binding
+    /// takes a [`RunContext`], and at that point there is no run to hand it.
+    ///
+    /// This is deliberately a separate contribution from the per-run fragments
+    /// [`Self::assemble`] reads through [`Capability::instructions`]. A bound capability may
+    /// legitimately produce different per-run text; reading that method here would both violate
+    /// its binding lifecycle and resolve it twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever resolving a fragment produced, a section not named and attributed to its
+    /// own family, a section placed outside the cached prefix, and two capabilities claiming one
+    /// section name.
+    pub async fn static_prompt_sections(&self) -> Result<Vec<PromptSection>> {
+        collect_static_prompt_sections(&self.ordered).await
+    }
+
     /// Binds every capability to this run and collects what the bound forms contribute.
     ///
     /// Binding happens first and for the whole set, before any contribution is read, because
@@ -209,57 +232,18 @@ impl CapabilityPlan {
         }
 
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-        let mut prompt_sections: Vec<PromptSection> = Vec::new();
-        let mut section_owners: BTreeMap<PromptSectionName, CapabilityFamily> = BTreeMap::new();
         let mut context_processors: Vec<Arc<dyn ContextProcessor>> = Vec::new();
 
         for capability in &capabilities {
-            let family = capability.kind();
             tools.extend(capability.tools());
-
-            let section = capability.instructions().await.map_err(|error| {
-                error.with_context(format!(
-                    "resolving the prompt fragment of capability `{family}`"
-                ))
-            })?;
-            if let Some(section) = section {
-                let expected_source = family.prompt_source();
-                if section.source() != &expected_source {
-                    return Err(Error::config(format!(
-                        "capability `{family}` contributes prompt section `{}` with source `{}`; \
-                         capability prompt text must use source `{expected_source}` so prompt dumps \
-                         and assembly errors attribute it to the capability that wrote it",
-                        section.name(),
-                        section.source()
-                    )));
-                }
-                if !section.position().is_prefix() {
-                    return Err(Error::config(format!(
-                        "capability `{family}` places its prompt section `{}` at `{}`; a fragment \
-                         resolved once per run belongs in the cached prefix, and text that varies \
-                         per turn belongs in a context processor, which runs against the live \
-                         request and writes into the tail",
-                        section.name(),
-                        section.position()
-                    )));
-                }
-                if let Some(owner) = section_owners.insert(section.name().clone(), family.clone()) {
-                    return Err(Error::config(format!(
-                        "capabilities `{owner}` and `{family}` both contribute the prompt section \
-                         `{}`; one of the two would be gone from the prefix with nothing said \
-                         about it",
-                        section.name()
-                    )));
-                }
-                prompt_sections.push(section);
-            }
-
             if capability.context_processor().is_some() {
                 context_processors.push(Arc::new(CapabilityContextProcessor {
                     capability: Arc::clone(capability),
                 }));
             }
         }
+
+        let prompt_sections = collect_run_prompt_sections(&capabilities).await?;
 
         Ok(AssembledCapabilities {
             capabilities,
@@ -268,6 +252,99 @@ impl CapabilityPlan {
             context_processors,
         })
     }
+}
+
+/// Resolves one ordered capability list's installed, static prompt fragments.
+///
+/// This is intentionally not shared with the per-run reading: the two methods are different
+/// lifecycle points. They share validation below, so the structural prefix rules stay identical.
+async fn collect_static_prompt_sections(
+    capabilities: &[Arc<dyn Capability>],
+) -> Result<Vec<PromptSection>> {
+    let mut sections: Vec<PromptSection> = Vec::new();
+    let mut owners: BTreeMap<PromptSectionName, CapabilityFamily> = BTreeMap::new();
+
+    for capability in capabilities {
+        let family = capability.kind();
+        let section = capability.static_instructions().await.map_err(|error| {
+            error.with_context(format!(
+                "resolving the static prompt fragment of capability `{family}`"
+            ))
+        })?;
+        record_prompt_section(&mut sections, &mut owners, &family, section)?;
+    }
+
+    Ok(sections)
+}
+
+/// Resolves one ordered capability list's per-run prompt fragments.
+async fn collect_run_prompt_sections(
+    capabilities: &[Arc<dyn Capability>],
+) -> Result<Vec<PromptSection>> {
+    let mut sections: Vec<PromptSection> = Vec::new();
+    let mut owners: BTreeMap<PromptSectionName, CapabilityFamily> = BTreeMap::new();
+
+    for capability in capabilities {
+        let family = capability.kind();
+        let section = capability.instructions().await.map_err(|error| {
+            error.with_context(format!(
+                "resolving the prompt fragment of capability `{family}`"
+            ))
+        })?;
+        record_prompt_section(&mut sections, &mut owners, &family, section)?;
+    }
+
+    Ok(sections)
+}
+
+/// Validates and records one capability-owned prefix fragment.
+fn record_prompt_section(
+    sections: &mut Vec<PromptSection>,
+    owners: &mut BTreeMap<PromptSectionName, CapabilityFamily>,
+    family: &CapabilityFamily,
+    section: Option<PromptSection>,
+) -> Result<()> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+
+    let expected_source = family.prompt_source();
+    if section.source() != &expected_source {
+        return Err(Error::config(format!(
+            "capability `{family}` contributes prompt section `{}` with source `{}`; \
+             capability prompt text must use source `{expected_source}` so prompt dumps and \
+             assembly errors attribute it to the capability that wrote it",
+            section.name(),
+            section.source()
+        )));
+    }
+    let expected_name = family.prompt_section_name();
+    if section.name() != &expected_name {
+        return Err(Error::config(format!(
+            "capability `{family}` contributes prompt section `{}`; capability prompt text must \
+             claim its own section `{expected_name}` so it cannot take another topic's prefix slot",
+            section.name()
+        )));
+    }
+    if !section.position().is_prefix() {
+        return Err(Error::config(format!(
+            "capability `{family}` places its prompt section `{}` at `{}`; a fragment resolved \
+             once per run belongs in the cached prefix, and text that varies per turn belongs in a \
+             context processor, which runs against the live request and writes into the tail",
+            section.name(),
+            section.position()
+        )));
+    }
+    if let Some(owner) = owners.insert(section.name().clone(), family.clone()) {
+        return Err(Error::config(format!(
+            "capabilities `{owner}` and `{family}` both contribute the prompt section `{}`; one \
+             of the two would be gone from the prefix with nothing said about it",
+            section.name()
+        )));
+    }
+    sections.push(section);
+
+    Ok(())
 }
 
 impl fmt::Debug for CapabilityPlan {

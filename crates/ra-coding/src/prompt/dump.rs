@@ -26,7 +26,7 @@ use ra_core::prompt::{CachePlan, PromptRole};
 use ra_prompt::dump::{PromptDump, PromptDumpSection};
 
 use super::{assemble_stable_prefix, assemble_stable_prefix_for_surface};
-use crate::agent::{HOST_BACKED_PROFILE, host_backed_tool_surface};
+use crate::agent::{HOST_BACKED_PROFILE, host_backed_surface};
 use crate::host::CodingHost;
 
 /// Cache scope recorded in a report that no run produced.
@@ -137,11 +137,15 @@ impl PromptDumpRequest {
 
     /// Assembles the prefix this request describes and summarizes it.
     ///
+    /// Asynchronous because a capability resolves its prompt fragment asynchronously, and a report
+    /// that skipped the fragments to stay synchronous would be a report about a prefix the product
+    /// does not send.
+    ///
     /// # Errors
     ///
     /// Returns an error for an unknown role name, a workspace that cannot be opened, and any
     /// prompt assembly failure underneath.
-    fn build(&self) -> Result<PromptDump> {
+    async fn build(&self) -> Result<PromptDump> {
         let role = resolve_role(self.role.as_deref().unwrap_or(DEFAULT_ROLE))?;
         let prefix = match &self.workspace {
             Some(workspace) => {
@@ -149,8 +153,12 @@ impl PromptDumpRequest {
                 // here: a report about a different profile than the product ships would look
                 // exactly as trustworthy as this one.
                 let host = open_host(workspace)?;
-                let surface = host_backed_tool_surface(&role, &host, HOST_BACKED_PROFILE)?;
-                assemble_stable_prefix_for_surface(&role, &surface)?
+                let assembled = host_backed_surface(&role, &host, HOST_BACKED_PROFILE).await?;
+                assemble_stable_prefix_for_surface(
+                    &role,
+                    assembled.tool_surface(),
+                    assembled.capability_sections(),
+                )?
             }
             None => assemble_stable_prefix(&role)?,
         };
@@ -182,8 +190,8 @@ fn open_host(workspace: &Path) -> Result<CodingHost> {
 /// # Errors
 ///
 /// Propagates the failures described on [`PromptDumpRequest::build`].
-pub fn render_prompt_dump(request: &PromptDumpRequest) -> Result<String> {
-    Ok(request.build()?.render_text())
+pub async fn render_prompt_dump(request: &PromptDumpRequest) -> Result<String> {
+    Ok(request.build().await?.render_text())
 }
 
 /// Renders the prompt dump as JSON, the form [`compare_prompt_dump`] reads back.
@@ -191,8 +199,8 @@ pub fn render_prompt_dump(request: &PromptDumpRequest) -> Result<String> {
 /// # Errors
 ///
 /// Propagates the failures described on [`PromptDumpRequest::build`], and serialization failures.
-pub fn render_prompt_dump_json(request: &PromptDumpRequest) -> Result<String> {
-    request.build()?.to_json()
+pub async fn render_prompt_dump_json(request: &PromptDumpRequest) -> Result<String> {
+    request.build().await?.to_json()
 }
 
 /// Compares a recorded dump against the one this build produces.
@@ -203,7 +211,7 @@ pub fn render_prompt_dump_json(request: &PromptDumpRequest) -> Result<String> {
 ///
 /// Returns an error if the baseline is not a prompt dump in JSON form, plus the failures described
 /// on [`PromptDumpRequest::build`].
-pub fn compare_prompt_dump(
+pub async fn compare_prompt_dump(
     request: &PromptDumpRequest,
     baseline_json: &str,
 ) -> Result<PromptDumpDiff> {
@@ -213,7 +221,7 @@ pub fn compare_prompt_dump(
              `prompt dump --json`"
         ))
     })?;
-    Ok(PromptDumpDiff::between(&baseline, &request.build()?))
+    Ok(PromptDumpDiff::between(&baseline, &request.build().await?))
 }
 
 /// One section's fate between two dumps.

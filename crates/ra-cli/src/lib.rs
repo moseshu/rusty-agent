@@ -175,7 +175,7 @@ impl DumpArgs {
 /// Returns an error when the command could not be carried out. A `prompt dump --baseline` whose
 /// prefix moved is not one of those: it is a [`CommandOutcome::PrefixChanged`] alongside the report
 /// naming what moved.
-pub fn execute(cli: Cli) -> anyhow::Result<CommandOutput> {
+pub async fn execute(cli: Cli) -> anyhow::Result<CommandOutput> {
     match cli.command {
         Command::Run { prompt } => {
             tracing::info!(%prompt, "run 尚未实现");
@@ -183,7 +183,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<CommandOutput> {
         }
         Command::Prompt {
             command: PromptCommand::Dump(args),
-        } => execute_prompt_dump(&args),
+        } => execute_prompt_dump(&args).await,
         Command::Doctor => {
             tracing::info!("doctor 尚未实现");
             Ok(CommandOutput::new("", CommandOutcome::Succeeded))
@@ -191,16 +191,16 @@ pub fn execute(cli: Cli) -> anyhow::Result<CommandOutput> {
     }
 }
 
-fn execute_prompt_dump(args: &DumpArgs) -> anyhow::Result<CommandOutput> {
+async fn execute_prompt_dump(args: &DumpArgs) -> anyhow::Result<CommandOutput> {
     let request = args.to_request();
 
     let Some(baseline_path) = &args.baseline else {
         let report = if args.json {
             // The text report ends its own last line; serialized JSON does not, and a redirected
             // file without a trailing newline is a nuisance for everything that reads it back.
-            format!("{}\n", render_prompt_dump_json(&request)?)
+            format!("{}\n", render_prompt_dump_json(&request).await?)
         } else {
-            render_prompt_dump(&request)?
+            render_prompt_dump(&request).await?
         };
         return Ok(CommandOutput::new(report, CommandOutcome::Succeeded));
     };
@@ -211,7 +211,7 @@ fn execute_prompt_dump(args: &DumpArgs) -> anyhow::Result<CommandOutput> {
             baseline_path.display()
         )
     })?;
-    let diff = compare_prompt_dump(&request, &baseline)?;
+    let diff = compare_prompt_dump(&request, &baseline).await?;
     let outcome = if diff.prefix_changed() {
         CommandOutcome::PrefixChanged
     } else {
