@@ -14,9 +14,13 @@
 use std::sync::Arc;
 
 use ra_core::agent::{AgentId, AgentSpec};
+use ra_core::capability::CapabilityFamily;
 use ra_core::error::Result;
 use ra_core::prompt::{PromptRole, PromptSection};
-use ra_runtime::tool::{profile::ToolSurface, registry::ToolRegistry};
+use ra_runtime::tool::{
+    profile::{ToolSurface, ToolSurfaceBudget},
+    registry::ToolRegistry,
+};
 
 use crate::{
     capabilities::RoleCapabilities,
@@ -105,12 +109,21 @@ pub async fn build_agent_with_profile(
 /// The two halves travel together because they were produced together. Handing back only the
 /// surface would let a caller assemble a prefix beside it from some other reading of the same
 /// capabilities, which is the arrangement this whole path exists to remove.
+///
+/// It also carries what the assembly *decided*, which nothing else records: which family each
+/// advertised entry came from, which families the role gave up, and the budget the result was held
+/// to. A surface can be inspected for its entries and a prefix for its sections, but "this entry is
+/// here because the shell capability is installed" exists only where the installed set met the
+/// assembled surface.
 #[must_use]
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct HostBackedSurface {
     tool_surface: ToolSurface,
     capability_sections: Vec<PromptSection>,
+    installed: Vec<InstalledCapability>,
+    withheld: Vec<CapabilityFamily>,
+    budget: ToolSurfaceBudget,
 }
 
 impl HostBackedSurface {
@@ -126,10 +139,60 @@ impl HostBackedSurface {
         &self.capability_sections
     }
 
+    /// The installed capabilities and the entries each of them put on this surface, in install
+    /// order.
+    #[must_use]
+    pub fn installed(&self) -> &[InstalledCapability] {
+        &self.installed
+    }
+
+    /// The families this role declined, and with them every entry and fragment they carry.
+    #[must_use]
+    pub fn withheld_families(&self) -> &[CapabilityFamily] {
+        &self.withheld
+    }
+
+    /// The bounds this surface was assembled against, already narrowed by the role.
+    #[must_use]
+    pub const fn budget(&self) -> &ToolSurfaceBudget {
+        &self.budget
+    }
+
     /// Takes the surface, for the caller that installs its tools on an agent.
     #[must_use]
     pub fn into_tool_surface(self) -> ToolSurface {
         self.tool_surface
+    }
+}
+
+/// One installed capability's share of an assembled surface.
+///
+/// The entries are this family's own, and only the ones the tier kept: a capability whose entries a
+/// tier dropped entirely is still installed and still contributes its sampling settings and context
+/// transform, so it is present here with nothing advertised rather than absent.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct InstalledCapability {
+    family: CapabilityFamily,
+    advertised: Vec<String>,
+}
+
+impl InstalledCapability {
+    pub(crate) const fn new(family: CapabilityFamily, advertised: Vec<String>) -> Self {
+        Self { family, advertised }
+    }
+
+    /// Which family this is.
+    #[must_use]
+    pub const fn family(&self) -> &CapabilityFamily {
+        &self.family
+    }
+
+    /// The model-facing names this family contributed to the surface, sorted as the inventory
+    /// lists them.
+    #[must_use]
+    pub fn advertised(&self) -> &[String] {
+        &self.advertised
     }
 }
 
@@ -164,14 +227,19 @@ pub async fn host_backed_surface(
     let registry = ToolRegistry::builder()
         .register_all(capabilities.tools())
         .build()?;
-    let tool_surface = registry.assemble(&profile.to_tool_profile_for_role(
+    let profile = profile.to_tool_profile_for_role(
         role,
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
-    )?)?;
-    let capability_sections = capabilities.prompt_sections_for(&tool_surface).await?;
+    )?;
+    let budget = *profile.budget();
+    let tool_surface = registry.assemble(&profile)?;
+    let (capability_sections, installed) = capabilities.contributions_for(&tool_surface).await?;
     Ok(HostBackedSurface {
         tool_surface,
         capability_sections,
+        installed,
+        withheld: capabilities.withheld_families(),
+        budget,
     })
 }

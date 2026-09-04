@@ -162,6 +162,31 @@ fn test_selecting_a_tool_no_one_registered_names_it() {
     let message = error.to_string();
     assert!(message.contains("apply_patch"), "{message}");
     assert!(message.contains("coding"), "{message}");
+    // The identity as the profile spelled it, not as `Debug` renders it: a reader has to find the
+    // line they wrote, and the schema version and retained unknown fields are the parts of a key
+    // nobody can act on.
+    assert!(
+        !message.contains("schema_version"),
+        "the refusal reads as a struct dump: {message}"
+    );
+
+    // Every absent key, not the first one. A profile is a list somebody wrote, and reporting one
+    // mistake per attempt makes fixing it as many round trips as there are entries — each report
+    // naming a different key while nothing has improved.
+    let error = registry
+        .assemble(&selecting(
+            "coding",
+            &["read_file", "apply_patch", "web_search", "update_plan"],
+        ))
+        .expect_err("an unregistered selection must fail");
+
+    let message = error.to_string();
+    for missing in ["apply_patch", "web_search", "update_plan"] {
+        assert!(
+            message.contains(missing),
+            "the refusal stops before `{missing}`: {message}"
+        );
+    }
 }
 
 #[test]

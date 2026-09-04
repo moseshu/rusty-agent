@@ -16,7 +16,14 @@ use crate::gate::Outcome;
 use crate::source;
 
 /// Paths of the committed snapshots, relative to the workspace root.
-const SNAPSHOTS: [&str; 2] = ["api/prompt-dump.txt", "api/tool-surface.txt"];
+///
+/// Three files, one gate: an added tool moves all of them, and reconciling them separately would
+/// let a tree exist in which the prefix was blessed and the assembly record was not.
+const SNAPSHOTS: [&str; 3] = [
+    "api/prompt-dump.txt",
+    "api/tool-surface.txt",
+    "api/capability-assembly.txt",
+];
 
 /// Runs the gate. When `bless` is true it rewrites the snapshot instead of reconciling.
 pub(crate) fn run(bless: bool) -> Outcome {
@@ -47,14 +54,14 @@ pub(crate) fn run(bless: bool) -> Outcome {
 
     match command.status() {
         Ok(status) if status.success() && bless => {
-            Outcome::pass(format!("已重写 {} 和 {}", SNAPSHOTS[0], SNAPSHOTS[1]))
+            Outcome::pass(format!("已重写 {}", SNAPSHOTS.join("、")))
         }
         Ok(status) if status.success() => Outcome::pass(format!(
-            "稳定前缀与 {}、工具面与 {} 一致",
-            SNAPSHOTS[0], SNAPSHOTS[1]
+            "稳定前缀与 {}、工具面与 {}、逐档装配与 {} 一致",
+            SNAPSHOTS[0], SNAPSHOTS[1], SNAPSHOTS[2]
         )),
         Ok(_) => Outcome::Fail(vec![format!(
-            "稳定前缀或工具面快照不一致：每一份已缓存的前缀都会因此失效。\
+            "稳定前缀、工具面或逐档装配快照不一致：每一份已缓存的前缀都会因此失效。\
              工具 schema 变更还必须提升 TOOL_SCHEMA_REVISION；确认改动后，运行 \
              `cargo xtask prompt-dump --bless` 让 diff 进 review"
         )]),

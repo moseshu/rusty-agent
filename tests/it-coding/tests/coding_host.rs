@@ -313,6 +313,46 @@ fn test_the_host_capabilities_are_one_per_family_and_carry_the_whole_surface() {
     );
 }
 
+/// None of the capabilities the product installs on an agent declares deferred text.
+///
+/// The deferred channel is delivered by the turn loop, from the capabilities installed on the run
+/// configuration. These four arrive on the agent instead — installing them in both places would
+/// declare their tools twice — so a fragment declared here would be resolved at assembly and then
+/// never delivered to anything. That is the one form of prompt text whose absence costs nothing and
+/// leaves no trace, and it is why the record of what each tier assembles has no deferred column:
+/// the number is structurally zero on this path rather than merely zero today.
+///
+/// The day one of them wants a heavy fragment — a browser is the likely first — this fails, and the
+/// decision it forces is the right one to make then: either the capability moves to the run
+/// configuration, which needs assembly to tell "the agent already declares this capability's tools"
+/// apart from "the agent declares a colliding tool of its own", or the text belongs in the prefix
+/// after all.
+#[tokio::test]
+async fn test_no_capability_installed_on_the_agent_declares_text_nothing_would_deliver() {
+    let workspace = tempdir().expect("must create tempdir");
+    let host = CodingHost::open(workspace.path()).expect("must open coding host");
+
+    let installed: Vec<Arc<dyn Capability>> = vec![
+        Arc::new(host.filesystem_capability().expect("filesystem builds")),
+        Arc::new(host.search_capability().expect("search builds")),
+        Arc::new(host.apply_patch_capability().expect("apply_patch builds")),
+        Arc::new(host.shell_capability().expect("shell builds")),
+    ];
+
+    for capability in installed {
+        let deferred = capability
+            .deferred_instructions()
+            .await
+            .expect("a deferred fragment resolves or is absent");
+        assert!(
+            deferred.is_none(),
+            "`{}` declares a deferred fragment, but a capability installed on the agent has no \
+             channel that delivers one",
+            capability.kind()
+        );
+    }
+}
+
 /// Every shell entry the host hands out addresses the host's own session manager.
 ///
 /// Each factory call builds a fresh capability, so this is the assertion that the manager comes

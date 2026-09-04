@@ -86,7 +86,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use ra_core::{
-    capability::Capability,
+    capability::{Capability, CapabilityFamily},
     error::{Error, Result},
     permission::PermissionScope,
     prompt::{PromptRole, PromptSection},
@@ -94,7 +94,7 @@ use ra_core::{
 };
 use ra_runtime::{capability::CapabilityPlan, tool::profile::ToolSurface};
 
-use crate::host::CodingHost;
+use crate::{agent::InstalledCapability, host::CodingHost};
 
 /// What one role installs, and what being that role costs it.
 ///
@@ -179,7 +179,18 @@ impl RoleCapabilities {
             .collect()
     }
 
-    /// The prompt fragments the installed capabilities contribute for one assembled surface.
+    /// The families this role gave up, in the order they were declared.
+    ///
+    /// Families rather than tool names, because that is the unit the role decided on: a read-only
+    /// agent did not decline three entries, it declined the capabilities those entries belong to.
+    pub(crate) fn withheld_families(&self) -> Vec<CapabilityFamily> {
+        self.withheld
+            .iter()
+            .map(|capability| capability.kind())
+            .collect()
+    }
+
+    /// What the installed capabilities contribute to one assembled surface: fragments and entries.
     ///
     /// A role decides which capabilities are installed; a tier then decides which of their entries
     /// the request actually carries. This is where the second decision reaches the prompt: a
@@ -200,65 +211,93 @@ impl RoleCapabilities {
     /// for tools; one that contributes none has nothing for a tier to drop, and gating it on an
     /// empty intersection would silence exactly the fragments that are pure policy.
     ///
+    /// **The entry attribution falls out of the same walk rather than being asked for separately.**
+    /// Which family produced `write_stdin` is knowable only where the installed set meets the
+    /// assembled surface, and a second walk asking the tools to project their names again could
+    /// answer differently from the one the fragments were filtered against — an integration is
+    /// allowed to be mutable, and a report is exactly where the two readings would be presented as
+    /// one fact.
+    ///
     /// # Errors
     ///
     /// Propagates fragment resolution and the section checks
     /// [`CapabilityPlan::static_prompt_sections`] performs, and refuses a tier that advertises part of a
     /// capability's entries.
-    pub(crate) async fn prompt_sections_for(
+    pub(crate) async fn contributions_for(
         &self,
         surface: &ToolSurface,
-    ) -> Result<Vec<PromptSection>> {
+    ) -> Result<(Vec<PromptSection>, Vec<InstalledCapability>)> {
         let charged: BTreeSet<&str> = surface.advertised_names().collect();
+        let mut fragments = self.installed.static_prompt_sections().await?;
         let mut kept = Vec::new();
-        for section in self.installed.static_prompt_sections().await? {
-            let owner = self.owner_of(&section)?;
-            let (present, absent): (Vec<String>, Vec<String>) = owner
-                .tools()
+        let mut installed = Vec::new();
+
+        for capability in self.installed.capabilities() {
+            let (present, absent) = split_advertised(capability, &charged);
+            // Located by provenance rather than by position: a capability that contributes no
+            // fragment leaves no row, so pairing by index would attribute every later fragment to
+            // the wrong family. Resolution already refused a fragment whose source is not its own
+            // family's, so the match is exact.
+            let source = capability.kind().prompt_source();
+            if let Some(index) = fragments
                 .iter()
-                .filter(|tool| tool.options().is_advertised_to_model())
-                .map(|tool| tool.model_definition().name().to_owned())
-                .partition(|name| charged.contains(name.as_str()));
-
-            if absent.is_empty() {
-                kept.push(section);
-            } else if !present.is_empty() {
-                return Err(Error::config(format!(
-                    "the tool surface `{}` advertises {} of capability `{}` but not {}, and the \
-                     capability's prompt fragment `{}` describes them as one mechanism; a prefix \
-                     built from it would name an entry the request does not carry. Select the \
-                     family's entries together, or leave all of them out",
-                    surface.profile(),
-                    render_names(&present),
-                    owner.kind(),
-                    render_names(&absent),
-                    section.name()
-                )));
+                .position(|fragment| fragment.source() == &source)
+            {
+                let fragment = fragments.remove(index);
+                if absent.is_empty() {
+                    kept.push(fragment);
+                } else if !present.is_empty() {
+                    return Err(Error::config(format!(
+                        "the tool surface `{}` advertises {} of capability `{}` but not {}, and \
+                         the capability's prompt fragment `{}` describes them as one mechanism; a \
+                         prefix built from it would name an entry the request does not carry. \
+                         Select the family's entries together, or leave all of them out",
+                        surface.profile(),
+                        render_names(&present),
+                        capability.kind(),
+                        render_names(&absent),
+                        fragment.name()
+                    )));
+                }
             }
+            installed.push(InstalledCapability::new(capability.kind(), present));
         }
-        Ok(kept)
-    }
 
-    /// The installed capability a fragment came from.
-    ///
-    /// Matched on provenance rather than on position, because the two lists are not the same
-    /// length: a capability that contributes no fragment leaves no row, and pairing by index would
-    /// attribute every later fragment to the wrong family. Resolution already refused a fragment
-    /// whose source is not its own family's, so the match is exact.
-    fn owner_of(&self, section: &PromptSection) -> Result<&Arc<dyn Capability>> {
-        self.installed
-            .capabilities()
-            .iter()
-            .find(|capability| &capability.kind().prompt_source() == section.source())
-            .ok_or_else(|| {
-                Error::caller(format!(
-                    "prompt fragment `{}` is attributed to `{}`, which is not among the installed \
-                     capabilities",
-                    section.name(),
-                    section.source()
-                ))
-            })
+        if let Some(orphan) = fragments.first() {
+            return Err(Error::caller(format!(
+                "prompt fragment `{}` is attributed to `{}`, which is not among the installed \
+                 capabilities",
+                orphan.name(),
+                orphan.source()
+            )));
+        }
+        Ok((kept, installed))
     }
+}
+
+/// One capability's advertised entries, split by whether the assembled surface carries them.
+///
+/// Read once and used for both answers a caller needs — which fragments survive, and which entries
+/// each family put on the surface — because the projection it reads is allowed to change between
+/// calls.
+///
+/// Sorted by model-facing name, the order the surface and the prompt inventory both use. A
+/// capability is free to construct its tools in whatever order suits it, and a report or an error
+/// that echoed that order would present a host's internal arrangement as a fact about the surface.
+fn split_advertised(
+    capability: &Arc<dyn Capability>,
+    charged: &BTreeSet<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut names: Vec<String> = capability
+        .tools()
+        .iter()
+        .filter(|tool| tool.options().is_advertised_to_model())
+        .map(|tool| tool.model_definition().name().to_owned())
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .partition(|name| charged.contains(name.as_str()))
 }
 
 /// Renders one side of a partial selection, for an error that has to name both.

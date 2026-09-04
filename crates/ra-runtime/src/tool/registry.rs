@@ -84,7 +84,7 @@ impl ToolRegistry {
     /// Four things can go wrong, and all four are configuration mistakes that are cheaper to hear
     /// about here than one model call later:
     ///
-    /// - the profile names a tool the registry does not hold;
+    /// - the profile names tools the registry does not hold, and the error names all of them;
     /// - two selected tools project to the same model-facing name;
     /// - the advertised entries fall outside the profile's declared count;
     /// - they cost more than the profile's declared bytes.
@@ -102,14 +102,24 @@ impl ToolRegistry {
         let tools: Vec<Arc<dyn Tool>> = match profile.selection() {
             ToolSelection::Explicit(keys) => {
                 let mut selected = Vec::with_capacity(keys.len());
+                // Every absent key, not the first one. A profile is a list somebody wrote, and a
+                // list is usually wrong in more than one place at once — reporting one key per
+                // attempt turns fixing it into as many round trips as there are mistakes, and each
+                // report names a different key than the last while nothing has improved.
+                let mut missing = Vec::new();
                 for key in keys {
-                    let tool = self.entries.get(key).ok_or_else(|| {
-                        Error::config(format!(
-                            "tool profile `{id}` selects lookup key `{key:?}`, which no registered \
-                             tool provides"
-                        ))
-                    })?;
-                    selected.push(Arc::clone(tool));
+                    match self.entries.get(key) {
+                        Some(tool) => selected.push(Arc::clone(tool)),
+                        None => missing.push(render_lookup_key(key)),
+                    }
+                }
+                if !missing.is_empty() {
+                    return Err(Error::config(format!(
+                        "tool profile `{id}` selects {} lookup {} no registered tool provides: {}",
+                        missing.len(),
+                        if missing.len() == 1 { "key" } else { "keys" },
+                        missing.join(", ")
+                    )));
                 }
                 selected
             }
@@ -131,10 +141,12 @@ impl ToolRegistry {
             let key = tool.origin().lookup_key();
             if let Some(previous) = names.insert(definition.name().to_owned(), key) {
                 return Err(Error::config(format!(
-                    "tool profile `{id}` advertises the name `{}` from two lookup keys \
-                     `{previous:?}` and `{key:?}`; distinct routing identities still have to \
-                     project to distinct model-facing names",
-                    definition.name()
+                    "tool profile `{id}` advertises the name `{}` from two lookup keys {} and {}; \
+                     distinct routing identities still have to project to distinct model-facing \
+                     names",
+                    definition.name(),
+                    render_lookup_key(previous),
+                    render_lookup_key(key)
                 )));
             }
             if is_advertised(tool.as_ref()) {
@@ -184,6 +196,24 @@ impl ToolRegistry {
             advertised_bytes,
         ))
     }
+}
+
+/// One routing identity, as a message a reader has to act on should spell it.
+///
+/// `Debug` prints the schema version and the retained unknown fields alongside the name, and those
+/// are the two parts of a key nobody can do anything about. What a reader needs is the name they
+/// wrote in the profile, qualified the way the rest of the system qualifies it, plus whatever
+/// distinguishes the key from a bare tool that happens to share the name — otherwise a report about
+/// a deferred entry reads as a report about the ordinary one.
+fn render_lookup_key(key: &ToolLookupKey) -> String {
+    let name = key.namespace().map_or_else(
+        || key.name().to_owned(),
+        |ns| format!("{ns}.{}", key.name()),
+    );
+    if key.is_deferred_top_level() {
+        return format!("`{name}` (deferred)");
+    }
+    format!("`{name}`")
 }
 
 impl fmt::Debug for ToolRegistry {

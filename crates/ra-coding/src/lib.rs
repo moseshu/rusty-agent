@@ -16,6 +16,7 @@
 //! (enforced by the layering gate).
 
 pub mod agent;
+pub mod assembly;
 pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub mod dangerous_action;
@@ -26,8 +27,9 @@ pub mod profile;
 pub mod prompt;
 
 pub use agent::{
-    HOST_BACKED_PROFILE, HostBackedSurface, build_agent, build_agent_with_host,
-    build_agent_with_profile, host_backed_surface,
+    HOST_BACKED_PROFILE, HostBackedSurface, InstalledCapability, build_agent,
+    build_agent_with_host, build_agent_with_profile, host_backed_surface,
 };
+pub use assembly::render_capability_assembly;
 pub use host::CodingHost;
 pub use profile::CodingProfile;

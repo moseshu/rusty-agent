@@ -1,4 +1,4 @@
-//! The committed stable-prefix snapshot.
+//! The committed stable-prefix snapshot, and the two records that travel with it.
 //!
 //! The prefix is the span every provider's prompt cache holds, and cache hit rate is the dominant
 //! cost driver of a long run. A one-word edit to a section, or two sections swapping order,
@@ -6,7 +6,14 @@
 //! is impossible if the prefix only exists at runtime. So the assembled dump is written down and
 //! diffed, exactly as the public API baseline is.
 //!
-//! Run with `BLESS_PROMPT_DUMP=1` to rewrite the snapshot after an intentional change, and let the
+//! Three artifacts are committed here, and they answer different questions: `api/prompt-dump.txt`
+//! records what the shipped prefixes are made of, `api/tool-surface.txt` records what the advertised
+//! schemas fingerprint to, and `api/capability-assembly.txt` records what every tier and role
+//! assemble into — the entries each capability contributed, what they cost, and what the prefix came
+//! to. They are blessed together because an added tool moves all three, and a tree where only some
+//! of them were rewritten fails on the file that was left alone rather than on the change.
+//!
+//! Run with `BLESS_PROMPT_DUMP=1` to rewrite the snapshots after an intentional change, and let the
 //! diff appear in review.
 
 use std::path::PathBuf;
@@ -57,6 +64,12 @@ fn tool_surface_snapshot_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../api")
         .join("tool-surface.txt")
+}
+
+fn capability_assembly_snapshot_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../api")
+        .join("capability-assembly.txt")
 }
 
 /// The tools the product's host-backed builder actually installs.
@@ -166,6 +179,54 @@ async fn test_stable_prefix_matches_the_committed_snapshot() {
         baseline, rendered,
         "the assembled stable prefix changed; every cached prefix is invalidated by this. \
          Re-run with BLESS_PROMPT_DUMP=1 and let the diff be reviewed"
+    );
+}
+
+/// What every tier and role assemble into matches the committed record.
+///
+/// The prefix snapshot above covers one tier in one role. This covers the matrix: how many entries
+/// each tier and role advertise, what those entries cost in schema bytes, which capability put each
+/// of them there, what its paragraph spends, and what the assembled prefix came to. A surface grows
+/// one reasonable entry at a time and nothing fails while it does, so the diff on this file is the
+/// moment the trade is visible.
+///
+/// The two tiers that name unwritten entries are rows here as well, carrying the refusal the product
+/// produces. That is the specification stating how far it is from being met, and those rows filling
+/// in is a change nobody should be able to make quietly.
+#[tokio::test]
+async fn test_the_capability_assembly_matches_the_committed_record() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = CodingHost::open(workspace.path()).expect("coding host builds");
+    let rendered = ra_coding::render_capability_assembly(&host)
+        .await
+        .expect("the assembly record must render");
+
+    // A record that named the directory it happened to be rendered in would never reproduce, and
+    // the gate would fail on whoever ran it rather than on what they changed.
+    assert!(
+        !rendered.contains(workspace.path().to_str().expect("a UTF-8 workspace path")),
+        "the assembly record embeds the workspace it was rendered in: {rendered}"
+    );
+
+    let path = capability_assembly_snapshot_path();
+    if std::env::var_os("BLESS_PROMPT_DUMP").is_some() {
+        let _writing = lock_snapshots();
+        refuse_bless_without_revision_bump(&rendered_tool_surface());
+        std::fs::write(&path, &rendered).expect("assembly record must be writable");
+        return;
+    }
+
+    let baseline = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing capability assembly record at {}: {err}. Run with BLESS_PROMPT_DUMP=1 to \
+             create it",
+            path.display()
+        )
+    });
+    assert_eq!(
+        baseline, rendered,
+        "what a tier and role assemble into changed; every turn of every run pays for the \
+         difference. Re-run with BLESS_PROMPT_DUMP=1 and let the diff be reviewed"
     );
 }
 
