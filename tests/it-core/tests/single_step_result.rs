@@ -62,8 +62,8 @@ fn pending_response() -> ProcessedResponse {
         .unwrap()
 }
 
-/// 与 `pending_response()` 同源的那条模型响应。两者必须是同一批记录，否则 `build()`
-/// 会先在一致性那一条上报错。
+/// The model response `pending_response()` was built from. The two have to be the same batch of
+/// records, or `build()` fails on the consistency check first.
 fn pending_model_response() -> ModelResponse {
     ModelResponse::new(vec![mcp_approval("approval-1")])
 }
@@ -126,7 +126,7 @@ fn test_single_step_result_02() {
         .next_step(NextStep::RunAgain)
         .build()
         .unwrap_err();
-    // 默认成 new_step_items 的那一刻，过滤掉的记录就再也没进过会话。
+    // The moment this defaults to `new_step_items`, a filtered record has never reached the session.
     assert!(error.to_string().contains("no default"));
 }
 
@@ -142,7 +142,7 @@ fn test_single_step_result_03() {
         .unwrap_err();
     assert!(error.to_string().contains("msg-2"));
 
-    // 反过来是允许的：会话保留了模型这轮看不到的完整记录。
+    // The other direction is allowed: the session keeps records this turn does not show the model.
     settled()
         .new_step_items(vec![message("msg-1", "完事了")])
         .session_step_items(vec![
@@ -152,7 +152,8 @@ fn test_single_step_result_03() {
         .build()
         .unwrap();
 
-    // 相同 ID 不等于同一条记录；否则给模型的内容和会话里的历史会分叉。
+    // The same ID is not the same record; otherwise what the model was given and what the session
+    // holds diverge.
     let error = settled()
         .new_step_items(vec![message("msg-1", "被过滤器改写过")])
         .build()
@@ -194,7 +195,7 @@ fn test_single_step_result_05() {
         assert!(error.to_string().contains("pending approvals"));
     }
 
-    // 结束是允许的：run 已经完了，没有谁还欠一个决定。
+    // Ending is allowed: the run is over, so nobody still owes a decision.
     SingleStepResult::builder()
         .model_response(pending_model_response())
         .processed_response(pending_response())
@@ -215,8 +216,8 @@ fn test_single_step_result_06() {
         .unwrap_err();
     assert!(error.to_string().contains("approval-1"));
 
-    // 执行阶段生成的审批项**不**来自模型响应（`needs_approval` 触发的那种），
-    // 所以只要求会话里有它，不要求它出现在 `processed_response` 里。
+    // An approval raised during execution does **not** come from the model response — the kind
+    // `needs_approval` triggers — so it is required in the session and not in `processed_response`.
     settled()
         .next_step(NextStep::interruption(vec![tool_approval("approval-1")]).unwrap())
         .session_step_items(vec![
@@ -231,7 +232,8 @@ fn test_single_step_result_06() {
 fn test_single_step_result_07() {
     let session = vec![mcp_approval("approval-1"), tool_approval("approval-2")];
 
-    // 停下来却只问其中一部分，剩下那条要等一个永远不会来的轮次。
+    // Stopping while asking about only some of them leaves the rest waiting for a turn that never
+    // comes.
     let error = SingleStepResult::builder()
         .model_response(pending_model_response())
         .processed_response(pending_response())
@@ -258,8 +260,8 @@ fn test_single_step_result_07() {
 
 #[test]
 fn test_single_step_result_08() {
-    // 别的都拦不住这种错配：用量记的是一次调用，绑定的动作来自另一次，
-    // resume 重放的又是第三个故事。
+    // Nothing else catches this mismatch: usage is filed against one call, the bound actions came
+    // from another, and a resume replays a third story.
     let error = settled()
         .model_response(ModelResponse::new(vec![message("msg-9", "另一次调用")]))
         .build()
@@ -281,7 +283,8 @@ fn test_single_step_result_08() {
         .unwrap_err();
     assert!(out_of_order.to_string().contains("same order"));
 
-    // ID 对得上、内容对不上，正是只比 ID 会放行而错配照旧的那一格。
+    // Matching IDs with different content is exactly the case an ID-only comparison waves through
+    // while the mismatch stands.
     let rewritten = ProcessedResponse::builder()
         .item(message("msg-1", "被改写过的内容"))
         .build()
@@ -292,8 +295,9 @@ fn test_single_step_result_08() {
 
 #[test]
 fn test_single_step_result_09() {
-    // `new_step_items` 允许被过滤，过滤成空时「送模型的项是会话的子集」那条
-    // 恒成立——真正危险的正是这一格：模型确实产出了记录，会话一条没存。
+    // `new_step_items` may be filtered, and filtered to empty the rule "what the model was given is
+    // a subset of the session" holds trivially — which is what makes this the dangerous case: the
+    // model did produce records and the session stored none of them.
     let error = settled()
         .new_step_items(Vec::new())
         .session_step_items(Vec::new())
@@ -301,8 +305,8 @@ fn test_single_step_result_09() {
         .unwrap_err();
     assert!(error.to_string().contains("msg-1"));
 
-    // 会话记录可以比线上那份更厚（provenance / session_data / raw payload 就是干这个的），
-    // 所以校验 ID 与 payload，而不是按整条 record 相等。
+    // A session record may carry more than the wire one did — provenance, session data, and the raw
+    // payload exist for that — so the check is on ID and payload rather than on whole-record equality.
     settled()
         .new_step_items(Vec::new())
         .session_step_items(vec![
@@ -313,7 +317,7 @@ fn test_single_step_result_09() {
         .build()
         .unwrap();
 
-    // 但同 ID 的另一条 payload 不是对模型输出的持久化。
+    // A different payload under the same ID is not a persisted copy of what the model produced.
     let error = settled()
         .new_step_items(Vec::new())
         .session_step_items(vec![message("msg-1", "被换成另一句话")])
@@ -324,8 +328,9 @@ fn test_single_step_result_09() {
 
 #[test]
 fn test_single_step_result_10() {
-    // R3-10：通道是「这一轮怎么收的场」的结论，provider 说了不算——它完全可以一边要工具
-    // 一边把消息标成 final。所以结算改这一个字段并把改过的那份存下去是允许的。
+    // The channel is a conclusion about how this turn ended, and the provider does not decide it — it
+    // is free to ask for a tool and mark the message `final` in the same breath. So settlement may
+    // change that one field and store the changed record.
     SingleStepResult::builder()
         .model_response(ModelResponse::new(vec![message("msg-1", "完事了")]))
         .processed_response(quiet_response())
@@ -341,7 +346,7 @@ fn test_single_step_result_10() {
         .build()
         .unwrap();
 
-    // 松的只有这一格：正文变了照样是把模型说过的话换掉。
+    // That one field is the only slack: changed body text is still replacing what the model said.
     let error = SingleStepResult::builder()
         .model_response(ModelResponse::new(vec![message("msg-1", "完事了")]))
         .processed_response(quiet_response())
@@ -367,8 +372,8 @@ fn test_single_step_result_10() {
 
 #[test]
 fn test_single_step_result_11() {
-    // 终态轮唯一的 assistant 消息是交付；把它存成 commentary 会让 `final_message()` 说
-    // `None`，即使 `NextStep` 已经说这轮结束了。
+    // On a terminal turn the one assistant message is the delivery; storing it as commentary makes
+    // `final_message()` answer `None` even though `NextStep` already said the turn ended.
     let error = settled()
         .new_step_items(Vec::new())
         .session_step_items(vec![item(
@@ -379,7 +384,8 @@ fn test_single_step_result_11() {
         .unwrap_err();
     assert!(error.to_string().contains("requires `final`"));
 
-    // 反过来，尚要继续的轮绝不能把模型的预判提前当成交付。
+    // The other way round, a turn that is still going may never promote the model's guess to a
+    // delivery.
     let error = SingleStepResult::builder()
         .model_response(ModelResponse::new(vec![message("msg-1", "完事了")]))
         .processed_response(quiet_response())
@@ -390,8 +396,8 @@ fn test_single_step_result_11() {
         .unwrap_err();
     assert!(error.to_string().contains("requires `commentary`"));
 
-    // 一条都没定过通道的 assistant 消息同样过不去：R3-10 的两个通道是**必选一个**，
-    // 「没标」不是第三种状态，UI 与 `final_message()` 都没有它的位置。
+    // An assistant message with no channel at all fails too: one of the two channels is **required**,
+    // "unmarked" is not a third state, and neither the UI nor `final_message()` has a place for it.
     let error = settled()
         .new_step_items(Vec::new())
         .session_step_items(vec![item(
@@ -405,8 +411,9 @@ fn test_single_step_result_11() {
 
 #[test]
 fn test_single_step_result_12() {
-    // 规则只有一处推导：`resolve_output_phases` 与 `build()` 里的闸门读同一个模块。这条
-    // 测试是那句话的可执行形式——生产者的产物必须原样通过闸门，两边一旦分头演化就在这里红。
+    // The rule is derived in one place: `resolve_output_phases` and the gate inside `build()` read the
+    // same module. This test is the executable form of that sentence — what the producer emits has to
+    // pass the gate unchanged, and the day the two evolve apart it goes red here.
     let narration = message("msg-1", "先说明思路");
     let delivery = message("msg-2", "最后交付");
     let output = message("call-1.output", "工具结果");
@@ -472,7 +479,7 @@ fn test_single_step_result_13() {
         .build()
         .unwrap();
 
-    // 同一个 ItemId 在 carried 与 session 里也不能各自有一份不同的 phase。
+    // One `ItemId` may not carry a different phase in the carried list and in the session either.
     let error = SingleStepResult::builder()
         .model_response(ModelResponse::new(vec![first.clone(), last.clone()]))
         .processed_response(processed)
@@ -488,8 +495,9 @@ fn test_single_step_result_13() {
 
 #[test]
 fn test_single_step_result_14() {
-    // `NextStep::Interruption` 刻意可以直接构造（结算在框架内部），所以那个构造器
-    // 是约定不是闸门。闸门放在这里：混进一条非审批项，run 会永远等一个没人被问到的决定。
+    // `NextStep::Interruption` is deliberately constructible directly, since settlement lives inside
+    // the framework, so that constructor is a convention rather than a gate. The gate is here: with a
+    // non-approval item mixed in, the run waits forever on a decision nobody was asked for.
     let error = settled()
         .next_step(NextStep::Interruption {
             items: vec![message("msg-1", "完事了")],
@@ -526,7 +534,8 @@ fn test_single_step_result_15() {
         .unwrap_err();
     assert!(error.to_string().contains("session_step_items"));
 
-    // 模型产物被过滤掉也不能让这一轮覆盖以前那条同 ID 的历史。
+    // A filtered-out model item still may not let this turn overwrite an earlier record of the same
+    // ID.
     let error = settled()
         .pre_step_items(vec![message("msg-1", "上一轮")])
         .new_step_items(Vec::new())
@@ -573,7 +582,8 @@ fn test_single_step_result_17() {
     assert_eq!(ids, ["msg-0", "msg-1"]);
     assert_eq!(result.original_input().len(), 1);
     assert_eq!(result.model_response().output().len(), 1);
-    // 中断恢复要靠它拿回本轮绑定好的动作，而不是重新猜模型的意思。
+    // Resuming from an interruption recovers the actions this turn bound rather than guessing at the
+    // model's intent again.
     assert!(!result.processed_response().has_interruptions());
     assert!(matches!(
         result.next_step(),

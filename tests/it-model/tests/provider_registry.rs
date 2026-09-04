@@ -183,7 +183,8 @@ fn test_provider_registry_03() {
     assert_eq!(bare.selector().provider().as_str(), "default");
     assert_eq!(bare.selector().model(), Some("model-without-prefix"));
 
-    // 注入 runner 时走的是 trait object 那条路；它和固有方法必须是同一个解析，不是两套。
+    // A runner is injected with the trait object, so that path and the inherent method have to be
+    // one resolution rather than two.
     let resolver: &dyn ModelResolver = &registry;
     let provider_default = resolver
         .resolve_model(None)

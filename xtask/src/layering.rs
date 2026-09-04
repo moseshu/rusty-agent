@@ -406,7 +406,7 @@ fn check_dependencies(graph: &Graph) -> Vec<String> {
             };
             let is_direct = deps.iter().any(|d| d.name == target);
             if is_direct {
-                continue; // 上面已报过
+                continue; // already reported above
             }
             if let Some(rule) = forbidden(layer, target_layer) {
                 transitive.push(format!(
@@ -466,7 +466,7 @@ fn check_product_references(graph: &Graph) -> (Vec<String>, usize) {
             continue;
         };
         if !layer.is_framework() {
-            continue; // 产品自己和 ra-cli 允许提产品名
+            continue; // the product itself and ra-cli may name the product
         }
 
         let src = root.join("crates").join(name).join("src");

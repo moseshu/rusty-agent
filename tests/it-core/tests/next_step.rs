@@ -96,14 +96,16 @@ fn test_next_step_02() {
     let NextStep::Handoff { new_agent } = &step else {
         panic!("应当是 handoff");
     };
-    // R3-12 的绑定要靠稳定身份反查，这里必须还是同一个实例而不是等价副本。
+    // Binding resolves an agent by stable identity, so this has to still be the same instance
+    // rather than an equivalent copy.
     assert!(Arc::ptr_eq(new_agent, &reviewer));
     assert_eq!(new_agent.id().as_str(), "reviewer");
 }
 
 #[test]
 fn test_next_step_03() {
-    // 一个变体背四种含义正是 R3-1b 要拆掉的东西：宿主对这两种的反应完全不同。
+    // One variant carrying four meanings is what splitting this apart removed: a host reacts to
+    // these two in completely different ways.
     let concluded = NextStep::FinalOutput {
         reason: FinishReason::Final,
     };
@@ -139,7 +141,8 @@ fn test_next_step_04() {
 
 #[test]
 fn test_next_step_05() {
-    // 混进一条非审批项，run 会永远等一个没人被问到的决定，而症状（挂住）离病因很远。
+    // With a non-approval item mixed in, the run waits forever on a decision nobody was asked for,
+    // and the symptom — a hang — is a long way from the cause.
     let error = NextStep::interruption(vec![
         tool_approval("call-1"),
         item(
@@ -174,7 +177,8 @@ fn test_next_step_06() {
         .is_interruption()
     );
 
-    // 已经答完的那条不再是待决项，否则 resume 会把同一个审批再问一遍。
+    // An answered item is no longer pending; otherwise a resume would ask for the same approval
+    // a second time.
     assert!(!RunItemKind::Message(Message::user("hi")).is_interruption());
     assert!(
         !RunItemKind::ToolCall(ToolCall::new(

@@ -12,8 +12,8 @@
 //! names collide. Inside an agent, calls are keyed by [`ToolUse`], which carries a
 //! [`ToolLookupKey`] rather than a model-facing tool name: two MCP servers may both expose `search`,
 //! and folding them into one counter would make the breaker fire on two unrelated tools while
-//! missing a real repeat. This is the "不能只按可重名的 agent name 或 tool name 统计" constraint of
-//! the milestone, expressed in the type rather than in a comment.
+//! missing a real repeat. This is the milestone's "never count by an agent name or a tool name
+//! that is allowed to collide" constraint, expressed in the type rather than in a comment.
 //!
 //! # Why the arguments are hashed and the history is bounded
 //!
