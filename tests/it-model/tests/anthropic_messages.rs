@@ -319,6 +319,54 @@ async fn rejects_a_tool_result_separated_from_its_tool_use() {
     );
 }
 
+#[tokio::test]
+async fn accepts_a_deferred_user_tail_after_the_tool_result_it_explains() {
+    let server = MockServer::start().await;
+    let model = model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_deferred",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+    )
+    .await;
+    let call_id = CallId::new("call_deferred");
+    let request = request_items(
+        vec![
+            ModelInputItem::Message(Message::user("look this up")),
+            ModelInputItem::ToolCall(ToolCall::new(call_id.clone(), "lookup", json!({"id": 7}))),
+            ModelInputItem::ToolCallOutput(ToolCallOutput::new(call_id, json!("found it"))),
+            ModelInputItem::Message(Message::user(
+                "The lookup result is available through the local cache.",
+            )),
+        ],
+        ModelSettings::new().with_max_tokens(1024),
+    );
+
+    model
+        .get_response(request)
+        .await
+        .expect("a user tail after a settled tool call should lower");
+
+    let requests = server.received_requests().await.expect("requests retained");
+    let sent: Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
+    assert_eq!(
+        sent["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "look this up"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_deferred", "name": "lookup", "input": {"id": 7}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_deferred", "content": "found it"},
+                {"type": "text", "text": "The lookup result is available through the local cache."}
+            ]}
+        ])
+    );
+}
+
 /// A stream frame whose shape is wrong is a provider failure, never a panic in this process.
 #[tokio::test]
 async fn rejects_malformed_stream_frames_instead_of_panicking() {

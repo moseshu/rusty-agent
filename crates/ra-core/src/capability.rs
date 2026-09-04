@@ -13,6 +13,29 @@
 //! implements both traits and returns itself from [`Capability::context_processor`], so there is
 //! one context-processing contract rather than a weaker second copy on this trait.
 //!
+//! # Three prompt channels, separated by what each one costs
+//!
+//! Prompt text has three contribution points because a cached prefix charges for text differently
+//! depending on when it is resolved and where it lands:
+//!
+//! | Method | Resolved | Lands in | Charged |
+//! | --- | --- | --- | --- |
+//! | [`Capability::static_instructions`] | before any run exists | cached prefix | every turn, at the cache rate |
+//! | [`Capability::instructions`] | once per run, at assembly | cached prefix | every turn of that run, at the cache rate |
+//! | [`Capability::deferred_instructions`] | once per run, at assembly | run history, once a signal fires | once, in full, and only in the runs that fire |
+//!
+//! The third exists because the first two are paid for by runs that never touch the capability. A
+//! browser or heavy-media capability carries several hundred tokens explaining a mechanism most
+//! tasks never reach, and residency turns that into a per-turn charge on every task. The deferred
+//! channel keeps the resident share down to whatever policy is true regardless — usually nothing —
+//! and delivers the mechanism when the run gives a reason to.
+//!
+//! **Deferred text is written into the run's history exactly once, not re-sent each turn.** Both
+//! halves of that are load-bearing. Re-sending it every turn would put it after the cached span on
+//! every call, which costs *more* than residency once a run runs long — the opposite of what
+//! deferring is for. Sending it once and letting it stay in history means the model keeps it, and
+//! every turn after the first carries it inside the span a cache read already covers.
+//!
 //! Implementations live in service or product crates; the kernel only carries the contracts.
 
 use std::{borrow::Cow, collections::BTreeSet, fmt, sync::Arc};
@@ -26,8 +49,8 @@ use crate::{
     item::{ItemId, ModelInputItem, ModelResponse, RunItem},
     model::{ModelOutputSchema, ModelSettings},
     prompt::{PromptSection, PromptSectionName, PromptSource},
-    state::RunId,
-    tool::Tool,
+    state::{AgentToolUse, RunId, ToolUse},
+    tool::{Tool, ToolLookupKey},
     usage::Usage,
 };
 
@@ -137,6 +160,68 @@ impl CapabilityFamily {
     pub fn prompt_section_name(&self) -> PromptSectionName {
         PromptSectionName::new(self.0.clone())
     }
+
+    /// The prompt section name a deferred fragment from this family claims.
+    ///
+    /// A separate name from [`Self::prompt_section_name`] because a capability may legitimately
+    /// contribute in both channels: the resident line that is true whether or not the run ever
+    /// reaches for it, and the mechanism that is only worth paying for once it does. Two texts
+    /// under one name would make a prompt dump report one of them as the other.
+    #[must_use]
+    pub fn deferred_prompt_section_name(&self) -> PromptSectionName {
+        PromptSectionName::new(format!("{}.deferred", self.0))
+    }
+}
+
+/// What a capability may read when deciding whether its deferred text has been earned.
+///
+/// # Why this carries structured facts and no text
+///
+/// The tempting signal is the user's request — load the browser fragment when the task "is about"
+/// browsing. That is a keyword match over natural language, and it fails on the first request
+/// written in another language or phrased around the goal rather than the tool. Control flow reads
+/// structured state; the facts here are the ones the run itself recorded.
+///
+/// The default signal in [`Capability::wants_deferred_instructions`] is the strongest of them: the
+/// model called one of this capability's own entries. A tool schema is small and already resident,
+/// so the model can reach for an entry from the inventory alone; the paragraph explaining what the
+/// mechanism does then arrives with the first result, which is also the first turn it could
+/// possibly be acted on.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct LoadSignal<'a> {
+    turn: u64,
+    tool_use: Option<&'a AgentToolUse>,
+}
+
+impl<'a> LoadSignal<'a> {
+    /// Creates the facts one turn offers a deferred fragment.
+    ///
+    /// `tool_use` is `None` for an agent that has not called anything yet, which is the same
+    /// answer as an agent whose record holds no matching entry — the tracker only files an agent
+    /// once it has something to file.
+    #[must_use]
+    pub const fn new(turn: u64, tool_use: Option<&'a AgentToolUse>) -> Self {
+        Self { turn, tool_use }
+    }
+
+    /// Whole-run ordinal of the turn about to be prepared.
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// Whether this agent has called the tool with this routing identity during the run.
+    ///
+    /// Keyed on [`ToolLookupKey`] rather than on the model-facing name, for the reason the tracker
+    /// itself is: two servers may both expose `search`, and a name would arm one capability's text
+    /// on another capability's call.
+    #[must_use]
+    pub fn tool_called(&self, key: &ToolLookupKey) -> bool {
+        self.tool_use
+            .and_then(|use_| use_.entry(&ToolUse::Tool(key.clone())))
+            .is_some_and(|entry| entry.run_calls() > 0)
+    }
 }
 
 impl fmt::Display for CapabilityFamily {
@@ -169,12 +254,15 @@ impl<'de> Deserialize<'de> for CapabilityFamily {
 ///    paid to read a half-assembled surface is reporting it too late.
 /// 3. [`Self::bind`] gives each capability the run it is about to serve.
 /// 4. [`Self::tools`] contributes to the agent's tool set, which a tool profile then selects from.
-/// 5. [`Self::instructions`] contributes prompt sections.
+/// 5. [`Self::instructions`] contributes prompt sections, and [`Self::deferred_instructions`]
+///    contributes the ones that wait for a signal.
 /// 6. [`Self::sampling_params`] folds over the agent's model-settings layer, in installation order.
 /// 7. [`Self::context_processor`] is installed on the run configuration and runs before each
 ///    ordinary model call.
+/// 8. [`Self::wants_deferred_instructions`] is asked before each turn, until the deferred text has
+///    been delivered.
 ///
-/// Steps 4 through 7 happen after binding, so anything a capability needs from the run it captured
+/// Steps 4 through 8 happen after binding, so anything a capability needs from the run it captured
 /// in step 3 rather than receiving as a parameter here.
 ///
 /// # Deviations from the reference contract
@@ -246,6 +334,47 @@ pub trait Capability: Send + Sync + 'static {
     /// Returns whatever reading the fragment's source material produced.
     async fn instructions(&self) -> Result<Option<PromptSection>> {
         Ok(None)
+    }
+
+    /// The prompt section this capability contributes only once the run has earned it.
+    ///
+    /// Resolved during assembly like [`Self::instructions`], and delivered later: the text waits
+    /// until [`Self::wants_deferred_instructions`] answers `true`, and is then written once into
+    /// the run's own history as a tail message. It never enters the cached prefix, which is what
+    /// makes it free for the runs that never fire the signal.
+    ///
+    /// This is where a heavy mechanism belongs — a browser, an image pipeline, a design system's
+    /// rules — while whatever is true regardless of the task stays in the resident channel. A
+    /// capability may contribute in both; the two claim different section names for that reason.
+    ///
+    /// The section must use [`CapabilityFamily::deferred_prompt_section_name`] and
+    /// [`CapabilityFamily::prompt_source`] for this capability's family, and must ask for
+    /// [`SectionPosition::TailMessage`](crate::prompt::SectionPosition::TailMessage). A deferred
+    /// fragment that asked for the prefix would be a resident fragment with a delay on it, which
+    /// is the arrangement that pays for the text on every turn *and* on every run.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever reading the fragment's source material produced.
+    async fn deferred_instructions(&self) -> Result<Option<PromptSection>> {
+        Ok(None)
+    }
+
+    /// Whether the run has given a reason to load [`Self::deferred_instructions`].
+    ///
+    /// Asked once per turn until it answers `true`, and never again after the text has been
+    /// delivered: a signal that has fired is not something a later turn can un-fire, and the text
+    /// stays in history regardless.
+    ///
+    /// **The default is the capability's own entries having been called**, derived from
+    /// [`Self::tools`] rather than from a list an implementation maintains beside it — a second
+    /// list is one more thing to update when a tool is added, and the failure it produces is text
+    /// that never arrives. Override it for a capability whose text is earned by something else it
+    /// can read from [`LoadSignal`], never by matching words in the conversation.
+    fn wants_deferred_instructions(&self, signal: &LoadSignal<'_>) -> bool {
+        self.tools()
+            .iter()
+            .any(|tool| signal.tool_called(tool.origin().lookup_key()))
     }
 
     /// Model settings this capability needs, folded onto the agent's layer.

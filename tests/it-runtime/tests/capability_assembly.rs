@@ -1,7 +1,7 @@
 //! Contracts for validating an installed capability set and folding it into one agent.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -15,11 +15,14 @@ use ra_core::{
     cancel::CancelScope,
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
-        ContextProcessorResult, ContextSummarizer,
+        ContextProcessorResult, ContextSummarizer, LoadSignal,
     },
     context::RunContext,
     error::Result,
-    item::{ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
+    item::{
+        CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
+        RunItemKind, ToolCall,
+    },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelStreamEvent, ProviderKey, ResolvedModel,
@@ -47,6 +50,9 @@ struct TestCapability {
     tools: Vec<Arc<dyn Tool>>,
     section: Option<PromptSection>,
     static_section: Option<PromptSection>,
+    deferred_section: Option<PromptSection>,
+    /// How many times the deferred fragment's source material was read.
+    deferred_resolutions: Arc<AtomicUsize>,
     temperature: Option<f64>,
     /// What the sampling fold handed this capability, recorded so order is observable.
     observed_temperature: Arc<Mutex<Option<f64>>>,
@@ -66,6 +72,8 @@ impl TestCapability {
             tools: Vec::new(),
             section: None,
             static_section: None,
+            deferred_section: None,
+            deferred_resolutions: Arc::new(AtomicUsize::new(0)),
             temperature: None,
             observed_temperature: Arc::new(Mutex::new(None)),
             processor: false,
@@ -160,6 +168,57 @@ impl TestCapability {
         self
     }
 
+    fn with_deferred_section(mut self, content: &str) -> Self {
+        self.deferred_section = Some(
+            PromptSection::new(
+                self.kind.deferred_prompt_section_name(),
+                "deferred capability fragment",
+                self.kind.prompt_source(),
+                SectionStability::Stable,
+                SectionPosition::TailMessage,
+                content,
+            )
+            .unwrap(),
+        );
+        self
+    }
+
+    /// A deferred fragment claiming a name other than its family's deferred one.
+    fn with_deferred_section_named(mut self, name: &str) -> Self {
+        self.deferred_section = Some(
+            PromptSection::new(
+                PromptSectionName::new(name.to_owned()),
+                "deferred capability fragment",
+                self.kind.prompt_source(),
+                SectionStability::Stable,
+                SectionPosition::TailMessage,
+                "deferred capability text",
+            )
+            .unwrap(),
+        );
+        self
+    }
+
+    /// A deferred fragment asking to be resident after all.
+    fn with_deferred_section_in_prefix(mut self) -> Self {
+        self.deferred_section = Some(
+            PromptSection::new(
+                self.kind.deferred_prompt_section_name(),
+                "deferred capability fragment",
+                self.kind.prompt_source(),
+                SectionStability::Stable,
+                SectionPosition::Prefix,
+                "deferred capability text",
+            )
+            .unwrap(),
+        );
+        self
+    }
+
+    fn deferred_resolutions(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.deferred_resolutions)
+    }
+
     fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
         self
@@ -206,6 +265,13 @@ impl Capability for TestCapability {
 
     async fn static_instructions(&self) -> Result<Option<PromptSection>> {
         Ok(self.static_section.clone())
+    }
+
+    // Deliberately no `wants_deferred_instructions` override: the cases below exercise the trait's
+    // own default, which is what a capability that adds a tool gets without writing anything.
+    async fn deferred_instructions(&self) -> Result<Option<PromptSection>> {
+        self.deferred_resolutions.fetch_add(1, Ordering::SeqCst);
+        Ok(self.deferred_section.clone())
     }
 
     fn sampling_params(&self, settings: ModelSettings) -> ModelSettings {
@@ -312,21 +378,40 @@ struct RecordingModel {
     tools: Mutex<Vec<Vec<String>>>,
     temperatures: Mutex<Vec<Option<f64>>>,
     inputs: Mutex<Vec<Vec<ModelInputItem>>>,
+    /// One tool name per turn to call before answering; turns past the end answer for good.
+    script: Mutex<VecDeque<String>>,
 }
 
 impl RecordingModel {
     fn new() -> Arc<Self> {
+        Self::scripted(&[])
+    }
+
+    /// Answers with one tool call per scripted name, then with a final message.
+    fn scripted(calls: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             instructions: Mutex::new(Vec::new()),
             tools: Mutex::new(Vec::new()),
             temperatures: Mutex::new(Vec::new()),
             inputs: Mutex::new(Vec::new()),
+            script: Mutex::new(calls.iter().map(|name| (*name).to_owned()).collect()),
         })
     }
 
+    /// Every message the model was sent on one turn, in order.
+    fn messages(&self, turn: usize) -> Vec<String> {
+        self.inputs.lock().unwrap()[turn]
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn answer(&self, request: &ModelRequest) -> ModelResponse {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let turn = self.calls.fetch_add(1, Ordering::SeqCst);
         self.instructions
             .lock()
             .unwrap()
@@ -343,10 +428,21 @@ impl RecordingModel {
             .unwrap()
             .push(request.model_settings().temperature());
         self.inputs.lock().unwrap().push(request.input().to_vec());
-        ModelResponse::new(vec![RunItem::new(
-            ItemId::new("msg-1"),
-            RunItemKind::Message(Message::assistant("done", OutputPhase::Final)),
-        )])
+        let scripted = self.script.lock().unwrap().pop_front();
+        match scripted {
+            Some(name) => ModelResponse::new(vec![RunItem::new(
+                ItemId::new(format!("call-{turn}")),
+                RunItemKind::ToolCall(ToolCall::new(
+                    CallId::new(format!("call-{turn}")),
+                    name,
+                    json!({}),
+                )),
+            )]),
+            None => ModelResponse::new(vec![RunItem::new(
+                ItemId::new(format!("msg-{turn}")),
+                RunItemKind::Message(Message::assistant("done", OutputPhase::Final)),
+            )]),
+        }
     }
 }
 
@@ -935,6 +1031,337 @@ async fn a_run_with_no_capabilities_is_left_exactly_as_it_was() {
     );
     assert!(model.tools.lock().unwrap()[0].is_empty());
     assert_eq!(result.last_agent().id(), agent().id());
+}
+
+// -- deferred fragments -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_deferred_fragment_costs_a_run_that_never_reaches_for_it_nothing() {
+    let model = RecordingModel::new();
+    let cancel = CancelScope::root();
+    let capability = TestCapability::new(CapabilityFamily::WEB)
+        .with_tool("browse")
+        .with_section("web", "The `browse` entry fetches a page.")
+        .with_deferred_section("Browsing: coordinates are viewport-relative, and a screenshot ...");
+    let resolutions = capability.deferred_resolutions();
+    let config = RunConfig::new().with_capability(capability.into_shared());
+
+    let result = Runner::run(run_request(&model, config, &cancel))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        model.instructions.lock().unwrap()[0].as_deref(),
+        Some("do the thing\n\nThe `browse` entry fetches a page."),
+        "the resident half is the only half in the cached prefix; deferring exists because the \
+         other half would be charged on every turn of every run"
+    );
+    assert!(
+        !model
+            .messages(0)
+            .iter()
+            .any(|text| text.contains("Browsing:")),
+        "and it is not in the tail either — a run that never called the entry has earned nothing"
+    );
+    assert!(
+        !result
+            .new_items()
+            .iter()
+            .any(|item| item.id().as_str().starts_with("capability-prompt.")),
+        "nothing was delivered, so there is no record of a delivery"
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "the text is still resolved once at assembly: a source read on the turn its signal fires \
+         would pay for itself mid-turn, and fail a run that was going fine"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_fragment_arrives_once_the_model_reaches_for_the_entry_it_describes() {
+    let model = RecordingModel::scripted(&["browse"]);
+    let cancel = CancelScope::root();
+    let config = RunConfig::new().with_capability(
+        TestCapability::new(CapabilityFamily::WEB)
+            .with_tool("browse")
+            .with_deferred_section("Browsing: coordinates are viewport-relative.")
+            .into_shared(),
+    );
+
+    let result = Runner::run(run_request(&model, config, &cancel))
+        .await
+        .unwrap();
+
+    assert!(
+        !model
+            .messages(0)
+            .iter()
+            .any(|text| text.contains("Browsing:")),
+        "the first turn had nothing to go on but the entry's own schema"
+    );
+    assert!(
+        model
+            .messages(1)
+            .iter()
+            .any(|text| text.contains("Browsing:")),
+        "the turn that carries the first result is also the first turn the mechanism could be \
+         acted on, so that is where it arrives"
+    );
+    let delivered: Vec<&str> = result
+        .new_items()
+        .iter()
+        .map(|item| item.id().as_str())
+        .filter(|id| id.starts_with("capability-prompt."))
+        .collect();
+    assert_eq!(
+        delivered,
+        vec!["capability-prompt.web"],
+        "delivery is an authoritative record, filed under the family that earned it"
+    );
+    assert!(
+        result.new_items().iter().any(|item| {
+            item.id().as_str() == "capability-prompt.web"
+                && matches!(item.kind(), RunItemKind::Message(message) if message.role() == MessageRole::User)
+        }),
+        "a delivered fragment is a user tail message, so every supported protocol can carry it in \
+         input history"
+    );
+    assert!(
+        model.instructions.lock().unwrap()[1]
+            .as_deref()
+            .is_some_and(|text| !text.contains("Browsing:")),
+        "and it never joins the cached prefix, which is what a later turn would have to rebuild"
+    );
+}
+
+#[tokio::test]
+async fn a_delivered_fragment_is_not_delivered_again_on_the_turns_after_it() {
+    let model = RecordingModel::scripted(&["browse", "browse"]);
+    let cancel = CancelScope::root();
+    let config = RunConfig::new().with_capability(
+        TestCapability::new(CapabilityFamily::WEB)
+            .with_tool("browse")
+            .with_deferred_section("Browsing: coordinates are viewport-relative.")
+            .into_shared(),
+    );
+
+    let result = Runner::run(run_request(&model, config, &cancel))
+        .await
+        .unwrap();
+
+    let repeats = model
+        .messages(2)
+        .iter()
+        .filter(|text| text.contains("Browsing:"))
+        .count();
+    assert_eq!(
+        repeats, 1,
+        "the fragment stays in history, so re-sending it would be a second copy — and rebuilding \
+         it into every tail is the per-turn charge deferring exists to avoid"
+    );
+    assert_eq!(
+        result
+            .new_items()
+            .iter()
+            .filter(|item| item.id().as_str() == "capability-prompt.web")
+            .count(),
+        1,
+        "one delivery, one record; the record is also what says it already happened"
+    );
+}
+
+#[tokio::test]
+async fn one_capabilitys_call_does_not_arm_another_capabilitys_text() {
+    let model = RecordingModel::scripted(&["browse"]);
+    let cancel = CancelScope::root();
+    let config = RunConfig::new()
+        .with_capability(
+            TestCapability::new(CapabilityFamily::WEB)
+                .with_tool("browse")
+                .with_deferred_section("Browsing: coordinates are viewport-relative.")
+                .into_shared(),
+        )
+        .with_capability(
+            TestCapability::new(CapabilityFamily::VIEW_IMAGE)
+                .with_tool("view_image")
+                .with_deferred_section("Images: a screenshot is downsampled before it is attached.")
+                .into_shared(),
+        );
+
+    let result = Runner::run(run_request(&model, config, &cancel))
+        .await
+        .unwrap();
+
+    let delivered: Vec<&str> = result
+        .new_items()
+        .iter()
+        .map(|item| item.id().as_str())
+        .filter(|id| id.starts_with("capability-prompt."))
+        .collect();
+    assert_eq!(
+        delivered,
+        vec!["capability-prompt.web"],
+        "the default signal is the capability's own entries, read off its own tools; a shared \
+         trigger would charge every deferred fragment for the first tool call of any of them"
+    );
+}
+
+#[tokio::test]
+async fn a_capability_may_decide_its_own_signal_instead_of_taking_the_default() {
+    let model = RecordingModel::scripted(&["nothing"]);
+    let cancel = CancelScope::root();
+    let config = RunConfig::new().with_capability(Arc::new(TurnArmedCapability {
+        kind: CapabilityFamily::SKILLS,
+        turn: 2,
+    }) as Arc<dyn Capability>);
+
+    Runner::run(run_request(&model, config, &cancel))
+        .await
+        .unwrap();
+
+    assert!(
+        !model
+            .messages(0)
+            .iter()
+            .any(|text| text.contains("Skills:")),
+        "the first turn does not satisfy the override's own condition"
+    );
+    assert!(
+        model
+            .messages(1)
+            .iter()
+            .any(|text| text.contains("Skills:")),
+        "a capability with no tools has no default signal to speak of, so the decision has to be \
+         one it can make itself — from structured facts, never from words in the conversation"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_fragment_must_claim_its_familys_deferred_section() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::WEB)
+        .with_deferred_section_named("web")
+        .into_shared()])
+    .unwrap();
+
+    let error = plan
+        .assemble(&run_context("run-deferred"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("`web.deferred`"),
+        "the resident and deferred halves are two texts, and one name for both would report one \
+         of them as the other: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_fragment_that_asks_for_the_prefix_is_refused() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::WEB)
+        .with_deferred_section_in_prefix()
+        .into_shared()])
+    .unwrap();
+
+    let error = plan
+        .assemble(&run_context("run-deferred"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("resident text with a delay on it"),
+        "a deferred fragment placed in the prefix is charged on every turn of every run, which is \
+         the arrangement it was written to avoid: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_run_does_not_deliver_a_fragment_its_own_history_already_holds() {
+    let model = RecordingModel::scripted(&["browse"]);
+    let cancel = CancelScope::root();
+    let capability = || {
+        TestCapability::new(CapabilityFamily::WEB)
+            .with_tool("browse")
+            .with_deferred_section("Browsing: coordinates are viewport-relative.")
+            .into_shared()
+    };
+
+    let first = Runner::run(run_request(
+        &model,
+        RunConfig::new().with_capability(capability()),
+        &cancel,
+    ))
+    .await
+    .unwrap();
+    let carried = first.state().clone();
+
+    let resumed = Runner::run(
+        RunRequest::new(
+            AgentBinding::direct(agent()),
+            Arc::new(FixedResolver {
+                model: Arc::clone(&model),
+            }),
+            RunId::new("run-capabilities"),
+            cancel.clone(),
+            Vec::new(),
+        )
+        .with_config(RunConfig::new().with_capability(capability()))
+        .with_state(carried),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !resumed
+            .new_items()
+            .iter()
+            .any(|item| item.id().as_str() == "capability-prompt.web"),
+        "the signal is still satisfied on a resume — what says the text already arrived is the \
+         history, which a checkpoint carries and an in-memory flag would not"
+    );
+    let last = model.inputs.lock().unwrap().len() - 1;
+    assert_eq!(
+        model
+            .messages(last)
+            .iter()
+            .filter(|text| text.contains("Browsing:"))
+            .count(),
+        1,
+        "and the resumed segment still shows the model the fragment exactly once"
+    );
+}
+
+/// A capability whose deferred text is earned by the turn count rather than by its own entries.
+struct TurnArmedCapability {
+    kind: CapabilityFamily,
+    turn: u64,
+}
+
+#[async_trait]
+impl Capability for TurnArmedCapability {
+    fn kind(&self) -> CapabilityFamily {
+        self.kind.clone()
+    }
+
+    async fn deferred_instructions(&self) -> Result<Option<PromptSection>> {
+        Ok(Some(
+            PromptSection::new(
+                self.kind.deferred_prompt_section_name(),
+                "deferred capability fragment",
+                self.kind.prompt_source(),
+                SectionStability::Stable,
+                SectionPosition::TailMessage,
+                "Skills: a skill is loaded by name.",
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn wants_deferred_instructions(&self, signal: &LoadSignal<'_>) -> bool {
+        signal.turn() >= self.turn
+    }
 }
 
 /// A processor installed directly by a host, which marks the input it saw.

@@ -38,7 +38,7 @@ use ra_core::{
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
     capability::{
         Capability, ContextProcessor, ContextProcessorRequest, ContextSummarizer,
-        ContextSummaryRequest, ContextSummaryResponse,
+        ContextSummaryRequest, ContextSummaryResponse, LoadSignal,
     },
     context::RunContext,
     error::{BudgetKind, Error, ProviderErrorKind, Result},
@@ -76,7 +76,7 @@ pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
     agent::AgentBinding,
-    capability::CapabilityPlan,
+    capability::{CapabilityPlan, DeferredPrompt},
     permission::PermissionEngine,
     tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     turn::{
@@ -677,6 +677,8 @@ struct TurnLoopContext<'a> {
     permission: &'a PermissionEngine,
     events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
     event_seqs: &'a EventSeqAllocator,
+    /// Capability fragments resolved at assembly and still waiting for the signal that earns them.
+    deferred_prompts: &'a [DeferredPrompt],
 }
 
 /// What the loop produces, whichever way it ends.
@@ -839,6 +841,7 @@ async fn run_loop_inner(
     };
     let _deadline = arm_deadline(&cancel);
 
+    let mut deferred_prompts: Vec<DeferredPrompt> = Vec::new();
     // Under the run scope rather than ahead of it: a capability resolves its prompt fragment with
     // third-party asynchronous code, and a run whose assembly reads a slow source is one the
     // deadline and the caller's interrupt still have to reach.
@@ -852,9 +855,10 @@ async fn run_loop_inner(
             &event_seqs,
         );
         match cancel.run(assembly).await.and_then(|result| result) {
-            Ok((execution, context_processors)) => {
+            Ok((execution, context_processors, deferred)) => {
                 agent = AgentBinding::prepared(Arc::clone(agent.public()), execution);
                 config.extend_context_processors(context_processors);
+                deferred_prompts = deferred;
             }
             Err(error) => {
                 record_terminal_error(span, &error, &cancel);
@@ -896,6 +900,7 @@ async fn run_loop_inner(
         permission: &permission,
         events: events.as_ref(),
         event_seqs: &event_seqs,
+        deferred_prompts: &deferred_prompts,
     };
     let interrupted_turn = resolve_interrupted_turn(&context, &agent, &mut state).await;
 
@@ -973,10 +978,11 @@ async fn run_loop_inner(
 
 /// Binds the run's capabilities and splits what they contribute between the two places it goes.
 ///
-/// The agent instance comes back paired with the context processors deliberately. Tools, prompt
-/// text, and sampling settings describe the thing that executes, while a context transform is a
-/// property of the run — and a single "prepared" value carrying both would be a third home for a
-/// pair that has no other reason to be one object.
+/// The agent instance comes back paired with the context processors and the deferred prompts
+/// deliberately. Tools, prompt text, and sampling settings describe the thing that executes, while
+/// a context transform is a property of the run and a deferred fragment belongs to the turn loop
+/// that waits for its signal — and a single "prepared" value carrying all three would be a home for
+/// a group that has no other reason to be one object.
 ///
 /// The instance is assembled onto [`AgentBinding::execution`], not the public agent: a host that
 /// already prepared its own execution instance keeps it, and the identity every record is filed
@@ -988,7 +994,11 @@ async fn assemble_capabilities(
     app_context: Option<&Arc<dyn Any + Send + Sync>>,
     state: &RunState,
     event_seqs: &EventSeqAllocator,
-) -> Result<(Arc<AgentSpec>, Vec<Arc<dyn ContextProcessor>>)> {
+) -> Result<(
+    Arc<AgentSpec>,
+    Vec<Arc<dyn ContextProcessor>>,
+    Vec<DeferredPrompt>,
+)> {
     // The public agent, because binding is told who is running rather than what was assembled —
     // and what was assembled is precisely what does not exist yet at this point.
     let mut context = RunContext::new(run_id.clone(), agent.public())
@@ -1002,7 +1012,11 @@ async fn assemble_capabilities(
 
     let assembled = plan.assemble(&context).await?;
     let execution = assembled.prepare_agent(agent.execution())?;
-    Ok((execution, assembled.context_processors().to_vec()))
+    Ok((
+        execution,
+        assembled.context_processors().to_vec(),
+        assembled.deferred_prompts().to_vec(),
+    ))
 }
 
 /// Settles host answers that were checkpointed with an interrupted run before another model call.
@@ -1379,6 +1393,9 @@ async fn run_one_turn(
     turn_span: &tracing::Span,
 ) -> Result<Option<RunOutcome>> {
     let config = context.config;
+    // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
+    // request that also carries the tool result which earned it.
+    deliver_deferred_prompts(context, agent, state, progress.reference_turn());
     let reminder = budget_reminder(state, config.budget());
     // Where the authoritative history sits inside the request, so a context processor can be told
     // which span of items it owns without counting them again. Preparation appends its own tail
@@ -1556,6 +1573,51 @@ async fn run_one_turn(
             Ok(None)
         }
     }
+}
+
+/// Delivers every deferred capability fragment this turn has earned into authoritative history.
+///
+/// # Why history rather than the turn's tail
+///
+/// A fragment is delivered once and then stays. The alternative — rebuilding it into the tail of
+/// every subsequent turn — puts it after the cached span on every call, which costs more per turn
+/// than leaving the text resident in the prefix would have; deferring would then be a way to make
+/// long runs more expensive rather than less. Written into history it is paid for once, and every
+/// later turn carries it inside the span a cache read already covers.
+///
+/// # Why "delivered already" is read back from history
+///
+/// The record ID comes from the family, so a history that holds it is the record of the delivery.
+/// Keeping a flag beside the prompts instead would be a second copy of that fact, and the two would
+/// first disagree on a resume: the history survives a checkpoint, an in-memory flag does not, and
+/// the run would re-deliver a fragment it can see in its own transcript.
+fn deliver_deferred_prompts(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+    turn: u64,
+) {
+    if context.deferred_prompts.is_empty() {
+        return;
+    }
+
+    let delivered: BTreeSet<&ItemId> = state.generated_items().iter().map(RunItem::id).collect();
+    let signal = LoadSignal::new(turn, state.tool_use().agent(agent.public_id()));
+    let items: Vec<RunItem> = context
+        .deferred_prompts
+        .iter()
+        .filter(|prompt| !delivered.contains(prompt.record_id()))
+        .filter(|prompt| prompt.is_signalled(&signal))
+        .map(DeferredPrompt::to_run_item)
+        .collect();
+
+    if items.is_empty() {
+        return;
+    }
+    for item in &items {
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+    }
+    state.record_generated_items(items);
 }
 
 /// Runs every installed context processor and rebuilds the ordinary request from its projection.
