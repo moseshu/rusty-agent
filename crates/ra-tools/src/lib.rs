@@ -5,9 +5,16 @@
 //! **Boundary**: a tool belongs here when swapping the product out would not change a line of it —
 //! only force it to be written again. `exec_command`, `write_stdin`, `read_file`, `grep`, `glob`,
 //! `view_image`, `web_search`, `web_fetch`, `ask_user`, `update_plan`, `skill`, `tool_search`,
-//! `apply_patch`, and the `agent.*` / `mcp.*` families all meet that test. What does not: a
-//! product's editing discipline, command preferences, sandbox profile, and dangerous-command
-//! judgement — those are product content and stay in the product crate.
+//! `apply_patch`, `memory_search` / `memory_read` / `memory_list`, and the `agent.*` / `mcp.*`
+//! families all meet that test. What does not: a product's editing discipline, command preferences,
+//! sandbox profile, and dangerous-command judgement — those are product content and stay in the
+//! product crate.
+//!
+//! The three memory entries meet it in the way that is easiest to get wrong. What a store *holds*
+//! is entirely a product's and a deployment's business; how it is read — find lines, read a
+//! document, see what exists — is not, and neither is the fact that those three reach a
+//! [`MemoryStore`](ra_core::memory::MemoryStore) rather than the workspace. The pipeline that
+//! decides what memory is worth keeping lives outside this framework altogether.
 //!
 //! **`apply_patch` was the one entry originally excluded, and that call was wrong.** The reasoning
 //! had been that "the V4A wrapper and the editing discipline around it" is what a second product
@@ -50,6 +57,7 @@ pub mod exec_command;
 pub mod glob;
 pub mod grep;
 pub mod mcp_ns;
+pub mod memory;
 pub mod read_file;
 mod search;
 pub mod skill;

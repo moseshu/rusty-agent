@@ -122,6 +122,7 @@ pub struct RunConfig {
     action_surface_budget: ActionSurfaceBudget,
     context_filters: ContextFilterChain,
     tool_output_reference_extractor: Option<Arc<dyn ToolOutputReferenceExtractor>>,
+    memory_usage_sink: Option<Arc<dyn ra_core::memory::MemoryUsageSink>>,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
     capabilities: Vec<Arc<dyn Capability>>,
     permission: PermissionEngine,
@@ -148,6 +149,7 @@ impl RunConfig {
             action_surface_budget: ActionSurfaceBudget::default(),
             context_filters: ContextFilterChain::new(),
             tool_output_reference_extractor: None,
+            memory_usage_sink: None,
             context_processors: Vec::new(),
             capabilities: Vec::new(),
             permission: PermissionEngine::default(),
@@ -285,6 +287,16 @@ impl RunConfig {
         tool_output_reference_extractor: Arc<dyn ToolOutputReferenceExtractor>,
     ) -> Self {
         self.tool_output_reference_extractor = Some(tool_output_reference_extractor);
+        self
+    }
+
+    /// Delivers validated final memory citations to a host-owned sink, with a 100 ms timeout.
+    /// The sink should enqueue durably and deduplicate by run, final item, and citation token.
+    pub fn with_memory_usage_sink(
+        mut self,
+        sink: Arc<dyn ra_core::memory::MemoryUsageSink>,
+    ) -> Self {
+        self.memory_usage_sink = Some(sink);
         self
     }
 
@@ -444,6 +456,7 @@ impl std::fmt::Debug for RunConfig {
             .field("model_settings", &self.model_settings)
             .field("tracing", &self.tracing)
             .field("has_error_handler", &self.error_handler.is_some())
+            .field("has_memory_usage_sink", &self.memory_usage_sink.is_some())
             .field("partial_messages", &self.partial_messages)
             .field(
                 "tool_name_collision_policy",
@@ -972,6 +985,9 @@ async fn run_loop_inner(
     if let Some(message) = final_message {
         result = result.with_final_message(message);
     }
+    if let Some(sink) = &config.memory_usage_sink {
+        crate::memory::report_final_citations(&result, sink, &run_id).await;
+    }
     record_run_outcome(span, &result);
     emit(events.as_ref(), RunStreamEvent::Finished(outcome));
     Ok(result)
@@ -1467,8 +1483,19 @@ async fn run_one_turn(
         max_function_tool_concurrency: config.max_function_tool_concurrency,
         permission: context.permission.clone(),
     };
+    // Only a configured sink can ever read these, and deriving them is not free: it deserializes
+    // every tool output in the request and compares it against the authoritative record, once per
+    // turn, and what it produces is persisted into `RunState` and therefore into every checkpoint.
+    // A run that installed no sink would be paying that on every turn to accumulate evidence
+    // nothing will read.
+    let memory_exposures = if config.memory_usage_sink.is_some() {
+        crate::memory::request_exposures(prepared.request(), state)
+    } else {
+        Vec::new()
+    };
     let (surface, response, streamed_dispatches) =
         call_model(turn_scope, prepared, context, streaming_dispatch).await?;
+    state.record_memory_exposures(memory_exposures);
 
     // Both facts about a completed call are recorded here, before settlement, and the stop
     // either may cause is *not* taken here. The response has already been paid for, so its

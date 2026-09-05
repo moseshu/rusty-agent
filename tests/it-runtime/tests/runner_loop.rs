@@ -1,4 +1,214 @@
-//! R3-7 contracts for the agent loop and its two entry points.
+//! Contracts for the agent loop and its two entry points.
+
+mod memory_feedback {
+    use super::*;
+    use ra_core::memory::*;
+    use ra_tools::memory::MemorySearchTool;
+
+    struct Store;
+    #[async_trait]
+    impl MemoryStore for Store {
+        async fn list(&self, _: MemoryListRequest) -> Result<MemoryListing> {
+            Ok(MemoryListing::new(vec![]))
+        }
+        async fn read(&self, request: MemoryReadRequest) -> Result<MemoryExcerpt> {
+            Ok(
+                MemoryExcerpt::new(request.record().clone(), "row", "content")
+                    .with_revision(MemoryRevision::new("v1")),
+            )
+        }
+        async fn search(&self, _: MemorySearchRequest) -> Result<MemoryHits> {
+            Ok(MemoryHits::new(vec![
+                MemoryHit::new(MemoryRecordId::new("row:1"), "row", "content")
+                    .with_revision(MemoryRevision::new("v1")),
+            ]))
+        }
+    }
+
+    #[derive(Default)]
+    struct Sink {
+        events: Mutex<Vec<MemoryUsage>>,
+        attempts: AtomicUsize,
+        stall: bool,
+        fail: bool,
+    }
+    #[async_trait]
+    impl MemoryUsageSink for Sink {
+        async fn record_usage(&self, usage: MemoryUsage) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(Error::caller("sink unavailable"));
+            }
+            self.events.lock().unwrap().push(usage);
+            Ok(())
+        }
+    }
+
+    fn evidence(revision: &str) -> MemoryExposure {
+        MemoryExposure::new(
+            MemoryRecordId::new("row:1"),
+            MemoryRevision::new(revision),
+            None,
+            "content",
+        )
+    }
+
+    fn script(final_text: &str) -> Arc<ScriptedModel> {
+        ScriptedModel::new(vec![
+            ModelResponse::new(vec![tool_call_with_arguments(
+                "memory-call",
+                "c1",
+                "memory_search",
+                json!({"queries":["content"], "mode":null, "record":null, "case_sensitive":null, "max_hits":null, "cursor":null}),
+            )]),
+            ModelResponse::new(vec![message("memory-final", final_text)]),
+        ])
+    }
+
+    #[tokio::test]
+    async fn memory_feedback_requires_valid_final_citations_and_deduplicates() {
+        let good = evidence("v1");
+        let wrong = evidence("v2");
+        for (text, expected) in [
+            ("No memory used.".to_owned(), 0),
+            (
+                format!(
+                    "Answer [[memory:{}]] [[memory:{}]] [[memory:{}]] [[memory:unknown]]",
+                    good.token(),
+                    good.token(),
+                    wrong.token()
+                ),
+                1,
+            ),
+        ] {
+            let sink = Arc::new(Sink::default());
+            let tool: Arc<dyn Tool> = Arc::new(MemorySearchTool::new(Arc::new(Store)).unwrap());
+            let model = script(&text);
+            let result = Runner::run(
+                request(vec![tool], &model, &CancelScope::root())
+                    .with_config(RunConfig::new().with_memory_usage_sink(sink.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.final_text(), text);
+            assert_eq!(sink.events.lock().unwrap().len(), expected);
+            assert_eq!(
+                result.state().memory_exposures(),
+                std::slice::from_ref(&good),
+                "{:#?}",
+                model.input_items.lock().unwrap()
+            );
+            let restored: RunState =
+                serde_json::from_value(serde_json::to_value(result.state()).unwrap()).unwrap();
+            assert_eq!(restored.memory_exposures(), std::slice::from_ref(&good));
+            if expected == 1 {
+                let events = sink.events.lock().unwrap();
+                assert_eq!(events[0].citations(), std::slice::from_ref(&good));
+                assert_eq!(events[0].final_item_id().as_str(), "memory-final");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_feedback_outage_does_not_withhold_final_answer() {
+        for (stall, fail) in [(true, false), (false, true)] {
+            let sink = Arc::new(Sink {
+                stall,
+                fail,
+                ..Default::default()
+            });
+            let tool: Arc<dyn Tool> = Arc::new(MemorySearchTool::new(Arc::new(Store)).unwrap());
+            let text = format!("Answer [[memory:{}]]", evidence("v1").token());
+            let model = script(&text);
+            let result = timeout(
+                Duration::from_secs(2),
+                Runner::run(
+                    request(vec![tool], &model, &CancelScope::root())
+                        .with_config(RunConfig::new().with_memory_usage_sink(sink.clone())),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.final_text(), text);
+            assert_eq!(sink.attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A run with no sink derives and persists no evidence at all.
+    ///
+    /// Evidence exists to be read by a sink, and deriving it is not free: it deserializes every
+    /// tool output in the request and compares it against the authoritative record, once per turn,
+    /// and what it produces is written into `RunState` and therefore into every checkpoint. A run
+    /// that installed no sink has nothing that could ever read it, so it must not pay for it —
+    /// least of all in the size of its own persisted state.
+    #[tokio::test]
+    async fn memory_evidence_is_not_accumulated_without_a_sink() {
+        let tool: Arc<dyn Tool> = Arc::new(MemorySearchTool::new(Arc::new(Store)).unwrap());
+        let text = format!("Answer [[memory:{}]]", evidence("v1").token());
+        let model = script(&text);
+        let result = Runner::run(request(vec![tool], &model, &CancelScope::root()))
+            .await
+            .unwrap();
+
+        assert_eq!(result.final_text(), text, "the run itself is unaffected");
+        assert!(
+            result.state().memory_exposures().is_empty(),
+            "evidence was accumulated into checkpointed state with nothing to read it"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_feedback_rejects_evidence_removed_before_the_model_call() {
+        let sink = Arc::new(Sink::default());
+        let tool: Arc<dyn Tool> = Arc::new(MemorySearchTool::new(Arc::new(Store)).unwrap());
+        let model = script(&format!("Answer [[memory:{}]]", evidence("v1").token()));
+        let result = Runner::run(
+            request(vec![tool], &model, &CancelScope::root()).with_config(
+                RunConfig::new()
+                    .with_memory_usage_sink(sink.clone())
+                    .with_context_filter(Arc::new(ToolOutputDroppingFilter {
+                        name: "drop-memory",
+                    })),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.state().memory_exposures().is_empty());
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_feedback_survives_resume_without_counting_the_tool_call() {
+        let sink = Arc::new(Sink::default());
+        let tool: Arc<dyn Tool> = Arc::new(MemorySearchTool::new(Arc::new(Store)).unwrap());
+        let model = script(&format!("Answer [[memory:{}]]", evidence("v1").token()));
+        let cancel = CancelScope::root();
+        let first = Runner::run(
+            request(vec![tool.clone()], &model, &cancel).with_config(
+                RunConfig::new()
+                    .with_max_turns(1)
+                    .with_memory_usage_sink(sink.clone()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(sink.events.lock().unwrap().is_empty());
+        let state: RunState =
+            serde_json::from_value(serde_json::to_value(first.state()).unwrap()).unwrap();
+        let result = Runner::run(
+            resume_request(vec![tool], &model, &cancel, state)
+                .with_config(RunConfig::new().with_memory_usage_sink(sink.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(!result.final_text().is_empty());
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+    }
+}
 
 use std::{
     future::Future,
@@ -1192,13 +1402,19 @@ async fn compaction_capability_summarizes_and_replaces_generated_history_before_
     assert_eq!(model.inputs.lock().unwrap().as_slice(), &[1, 6, 2]);
     assert_eq!(
         model.request_surfaces.lock().unwrap().as_slice(),
-        &[(1, 0, false, false), (0, 0, true, false), (1, 0, false, false)],
+        &[
+            (1, 0, false, false),
+            (0, 0, true, false),
+            (1, 0, false, false)
+        ],
         "the compaction request must not advertise the ordinary tool surface or inherit a server continuation"
     );
-    assert!(result.new_items().iter().any(|item| matches!(
-        item.kind(),
-        RunItemKind::Compaction(_)
-    )));
+    assert!(
+        result
+            .new_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::Compaction(_)))
+    );
     assert_eq!(result.model_responses().len(), 3);
     assert_eq!(result.usage().requests(), 3);
     assert_eq!(result.usage().input_tokens(), 33);

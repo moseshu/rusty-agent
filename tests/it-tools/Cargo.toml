@@ -9,6 +9,7 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+async-trait = "0.1"
 ra-core = { path = "../../crates/ra-core" }
 ra-tools = { path = "../../crates/ra-tools" }
 ra-exec = { path = "../../crates/ra-exec" }

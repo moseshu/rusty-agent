@@ -2,11 +2,17 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ra_core::{
     agent::AgentSpec,
     capability::{Capability, CapabilityFamily},
     context::RunContext,
+    error::Result,
     item::{AgentId, CallId},
+    memory::{
+        MemoryExcerpt, MemoryHit, MemoryHits, MemoryListRequest, MemoryListing, MemoryReadRequest,
+        MemoryRecord, MemoryRecordId, MemoryRecordKind, MemorySearchRequest, MemoryStore,
+    },
     model::ModelSettings,
     permission::PermissionScope,
     state::RunId,
@@ -14,13 +20,72 @@ use ra_core::{
 };
 use ra_exec::{fs::Workspace, session::ProcessManager};
 use ra_tools::capability::{
-    ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability,
+    ApplyPatchCapability, FilesystemCapability, MemoryCapability, SearchCapability, ShellCapability,
 };
 use serde_json::json;
 use tempfile::TempDir;
 
 fn workspace(directory: &TempDir) -> Workspace {
     Workspace::open(directory.path()).expect("workspace opens")
+}
+
+/// A store holding one record, whose text a test chooses.
+///
+/// The text is a parameter because one case turns on it: the memory fragment must be the same
+/// whatever the store holds, and a store with no contents to vary could not show that.
+struct OneRecordStore {
+    text: &'static str,
+}
+
+impl OneRecordStore {
+    fn id() -> MemoryRecordId {
+        MemoryRecordId::new("m1")
+    }
+}
+
+#[async_trait]
+impl MemoryStore for OneRecordStore {
+    async fn list(&self, _request: MemoryListRequest) -> Result<MemoryListing> {
+        Ok(MemoryListing::new(vec![MemoryRecord::new(
+            Self::id(),
+            "MEMORY.md",
+            MemoryRecordKind::Record,
+        )]))
+    }
+
+    async fn read(&self, request: MemoryReadRequest) -> Result<MemoryExcerpt> {
+        Ok(MemoryExcerpt::new(
+            request.record().clone(),
+            "MEMORY.md",
+            self.text,
+        ))
+    }
+
+    async fn search(&self, _request: MemorySearchRequest) -> Result<MemoryHits> {
+        Ok(MemoryHits::new(vec![MemoryHit::new(
+            Self::id(),
+            "MEMORY.md",
+            self.text,
+        )]))
+    }
+}
+
+fn memory_capability(text: &'static str) -> MemoryCapability {
+    MemoryCapability::new(Arc::new(OneRecordStore { text })).expect("memory builds")
+}
+
+/// The five capabilities this crate backs, built over one workspace and one store.
+fn built_in(workspace: &Workspace) -> Vec<Box<dyn Capability>> {
+    vec![
+        Box::new(FilesystemCapability::for_workspace(workspace).expect("filesystem builds")),
+        Box::new(SearchCapability::for_workspace(workspace).expect("search builds")),
+        Box::new(ApplyPatchCapability::for_workspace(workspace).expect("apply_patch builds")),
+        Box::new(
+            ShellCapability::for_workspace(workspace, Arc::new(ProcessManager::default()))
+                .expect("shell builds"),
+        ),
+        Box::new(memory_capability("the workspace pins its toolchain")),
+    ]
 }
 
 fn advertised_names(capability: &dyn Capability) -> Vec<String> {
@@ -62,6 +127,7 @@ fn test_each_built_in_capability_contributes_its_own_entries() {
     let apply_patch = ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds");
     let shell = ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
         .expect("shell builds");
+    let memory = memory_capability("anything");
 
     assert_eq!(filesystem.kind(), CapabilityFamily::FILESYSTEM);
     assert_eq!(advertised_names(&filesystem), ["read_file"]);
@@ -71,6 +137,11 @@ fn test_each_built_in_capability_contributes_its_own_entries() {
     assert_eq!(advertised_names(&apply_patch), ["apply_patch"]);
     assert_eq!(shell.kind(), CapabilityFamily::SHELL);
     assert_eq!(advertised_names(&shell), ["exec_command", "write_stdin"]);
+    assert_eq!(memory.kind(), CapabilityFamily::MEMORY);
+    assert_eq!(
+        advertised_names(&memory),
+        ["memory_search", "memory_read", "memory_list"]
+    );
 }
 
 /// The observing families observe, and the two that change things say so.
@@ -86,6 +157,7 @@ fn test_a_capability_is_uniform_in_what_its_entries_may_do() {
     let observing: Vec<Box<dyn Capability>> = vec![
         Box::new(FilesystemCapability::for_workspace(&workspace).expect("filesystem builds")),
         Box::new(SearchCapability::for_workspace(&workspace).expect("search builds")),
+        Box::new(memory_capability("anything")),
     ];
     for capability in &observing {
         for tool in capability.tools() {
@@ -176,26 +248,23 @@ async fn test_the_shell_pair_shares_the_session_manager_it_was_built_with() {
     process_manager.cancel(&session_id).await;
 }
 
-/// None of the built-in four requires another, so a host may install any subset.
+/// None of the built-in five requires another, so a host may install any subset.
 ///
 /// A dependency is a hard assembly error and an ordering edge, not documentation of a habit.
 /// Declaring `apply_patch` -> `filesystem` because editing usually follows reading would refuse a
 /// configuration that reads through the shell, which is a configuration that works.
+///
+/// **Memory is in this list on purpose.** It was expected to bring the first real edge, on the
+/// reasoning that a memory capability cannot read its own store without a family that reaches the
+/// filesystem. That is true of the arrangement where memory only contributes prompt text and the
+/// model reads the store with `read_file` or a shell command; this one brings its own three
+/// entries, so the edge is gone because the dependency is. If a later change routes memory through
+/// the workspace tools again, this assertion is what says so.
 #[test]
 fn test_the_built_in_capabilities_require_nothing_of_each_other() {
     let directory = tempfile::tempdir().expect("workspace directory");
-    let workspace = workspace(&directory);
 
-    let capabilities: Vec<Box<dyn Capability>> = vec![
-        Box::new(FilesystemCapability::for_workspace(&workspace).expect("filesystem builds")),
-        Box::new(SearchCapability::for_workspace(&workspace).expect("search builds")),
-        Box::new(ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds")),
-        Box::new(
-            ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
-                .expect("shell builds"),
-        ),
-    ];
-    for capability in &capabilities {
+    for capability in &built_in(&workspace(&directory)) {
         assert!(
             capability.required_capabilities().is_empty(),
             "`{}` declares a dependency",
@@ -212,17 +281,8 @@ fn test_the_built_in_capabilities_require_nothing_of_each_other() {
 #[tokio::test]
 async fn test_a_tool_capability_leaves_sampling_and_the_processor_chain_alone() {
     let directory = tempfile::tempdir().expect("workspace directory");
-    let workspace = workspace(&directory);
 
-    let capabilities: Vec<Box<dyn Capability>> = vec![
-        Box::new(FilesystemCapability::for_workspace(&workspace).expect("filesystem builds")),
-        Box::new(SearchCapability::for_workspace(&workspace).expect("search builds")),
-        Box::new(ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds")),
-        Box::new(
-            ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
-                .expect("shell builds"),
-        ),
-    ];
+    let capabilities = built_in(&workspace(&directory));
     let settings = ModelSettings::new().with_temperature(0.25);
     for capability in &capabilities {
         assert_eq!(
@@ -248,19 +308,8 @@ async fn test_a_tool_capability_leaves_sampling_and_the_processor_chain_alone() 
 #[tokio::test]
 async fn test_each_built_in_capability_describes_its_own_entries_in_the_cached_prefix() {
     let directory = tempfile::tempdir().expect("workspace directory");
-    let workspace = workspace(&directory);
 
-    let capabilities: Vec<Box<dyn Capability>> = vec![
-        Box::new(FilesystemCapability::for_workspace(&workspace).expect("filesystem builds")),
-        Box::new(SearchCapability::for_workspace(&workspace).expect("search builds")),
-        Box::new(ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds")),
-        Box::new(
-            ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
-                .expect("shell builds"),
-        ),
-    ];
-
-    for capability in &capabilities {
+    for capability in &built_in(&workspace(&directory)) {
         let family = capability.kind();
         let section = capability
             .static_instructions()
@@ -296,4 +345,67 @@ async fn test_each_built_in_capability_describes_its_own_entries_in_the_cached_p
             );
         }
     }
+}
+
+/// The memory fragment is the same whatever the store holds.
+///
+/// This is R10-8's hard constraint made structural. The fragment lands in the cached prefix, which
+/// is one span shared by every run of an agent and read from cache on every turn. Text derived from
+/// the store would move that span whenever memory changed; text derived from a *query* would move it
+/// every turn, which is the arrangement that turns a cache read into a full-price prefix on every
+/// call. What the store holds reaches the model through tool results, in the tail, where varying
+/// content costs what it costs and nothing else.
+///
+/// Two stores whose contents differ, one fragment: a capability that had read its store to write
+/// the paragraph would fail here rather than in production, where the symptom is a cache hit rate
+/// and not an error.
+#[tokio::test]
+async fn test_the_memory_fragment_does_not_vary_with_what_the_store_holds() {
+    let one = memory_capability("the workspace pins its toolchain")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("memory contributes a fragment");
+    let other = memory_capability("nothing of the kind, and rather longer than the first")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("memory contributes a fragment");
+
+    assert_eq!(
+        one.content(),
+        other.content(),
+        "the memory fragment is a function of its store, so the cached prefix moves with memory"
+    );
+    assert!(
+        !one.content().contains("toolchain"),
+        "the fragment quotes the store: {}",
+        one.content()
+    );
+}
+
+/// Everything a memory entry returns leaves through a tool result, never through the prefix.
+///
+/// The companion to the case above, from the other end: the fragment is constant *and* the store's
+/// contents do reach the model, so the constraint is that they arrive in the tail rather than that
+/// they never arrive. A memory surface that satisfied the first without the second would be a
+/// capability whose entries return nothing.
+#[tokio::test]
+async fn test_what_a_memory_entry_returns_reaches_the_model_as_a_tool_result() {
+    let memory = memory_capability("the workspace pins its toolchain");
+    let search = memory
+        .tools()
+        .into_iter()
+        .find(|tool| tool.origin().qualified_name() == "memory_search")
+        .expect("the memory family advertises a search entry");
+
+    let output = call(&search, json!({ "queries": ["toolchain"] })).await;
+
+    assert!(
+        output
+            .as_text()
+            .is_some_and(|text| text.contains("the workspace pins its toolchain")),
+        "the store's contents did not reach the model at all: {:?}",
+        output.as_text()
+    );
 }
