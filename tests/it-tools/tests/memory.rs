@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use ra_core::{
     agent::AgentSpec,
     context::RunContext,
-    error::Result,
+    error::{BudgetKind, Error, GuardrailStage, Result, ToolErrorKind},
     item::{AgentId, CallId},
     memory::{
         MemoryAnchor, MemoryBudget, MemoryCursor, MemoryExcerpt, MemoryHit, MemoryHits,
@@ -49,6 +49,7 @@ struct FixtureStore {
     oversized: bool,
     too_many: bool,
     unavailable: bool,
+    untyped_failure: bool,
 }
 #[async_trait]
 impl MemoryStore for FixtureStore {
@@ -68,6 +69,11 @@ impl MemoryStore for FixtureStore {
                 reason: "private connection".into(),
             }
             .into_error("memory_read"));
+        }
+        if self.untyped_failure {
+            return Err(ra_core::error::Error::config(
+                "pool exhausted on memory-primary.internal:5432",
+            ));
         }
         Ok(if self.oversized {
             MemoryExcerpt::new(id(), "huge", "。".repeat(20_000))
@@ -328,4 +334,85 @@ async fn successive_budgeted_reads_reconstruct_unicode_record_without_loss() {
         }
     }
     assert_eq!(recovered, text);
+}
+
+/// A store that reports a failure in its own vocabulary still answers the model in words.
+///
+/// `MemoryStore` is a third-party extension point, so a backend returning something other than a
+/// `MemoryStoreError` is routine rather than a framework bug. These entries take
+/// `ToolFailureHandling::Custom`, where declining to handle a failure propagates it and ends the
+/// turn — so without a fallback an unrecognised store error takes down a whole run over a memory
+/// lookup the run can finish without. The sentence is generic on purpose: the store's own message
+/// is developer-facing text this crate did not write and may name a host or a connection.
+#[tokio::test]
+async fn an_untyped_backend_failure_is_answered_rather_than_fatal() {
+    let tool = MemoryReadTool::new(Arc::new(FixtureStore {
+        untyped_failure: true,
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let output = call(&tool, json!({"record":id()})).await;
+    let text = output.as_text().unwrap();
+
+    assert!(!text.is_empty(), "the turn would have ended instead");
+    assert!(
+        !text.contains("memory-primary.internal"),
+        "the backend's plumbing reached the model: {text}"
+    );
+    assert!(
+        output
+            .metadata()
+            .guidance()
+            .join(" ")
+            .contains("Continue without memory"),
+        "{:?}",
+        output.metadata().guidance()
+    );
+}
+
+#[tokio::test]
+async fn memory_tools_preserve_control_errors_instead_of_returning_observations() {
+    let store = Arc::new(FixtureStore::default());
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(MemoryReadTool::new(store.clone()).unwrap()),
+        Box::new(MemorySearchTool::new(store.clone()).unwrap()),
+        Box::new(MemoryListTool::new(store).unwrap()),
+    ];
+    let errors = [
+        Error::budget(BudgetKind::Tokens, "token budget exhausted"),
+        Error::guardrail(GuardrailStage::ToolOutput, "memory-policy", "stop"),
+        Error::cancelled("user stopped the run"),
+        Error::tool(ToolErrorKind::Cancelled, "memory", "backend cancelled"),
+        Error::tool(ToolErrorKind::Cancelled, "memory", "backend cancelled").with_source(
+            MemoryStoreError::Unavailable {
+                reason: "connection closed".into(),
+            },
+        ),
+    ];
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("probe"))
+        .name("Probe")
+        .build()
+        .unwrap();
+    let run = RunContext::new(RunId::new("memory-controls"), &agent);
+    let call_id = CallId::new("memory-call");
+    let args = json!({});
+    for tool in tools {
+        for error in &errors {
+            let output = tool
+                .handle_failure(
+                    &ToolContext::new(&run, tool.as_ref(), &call_id, &args),
+                    error,
+                )
+                .await
+                .unwrap();
+            assert!(
+                output.is_none(),
+                "{} swallowed {}",
+                tool.schema().name(),
+                error.code()
+            );
+        }
+    }
 }
