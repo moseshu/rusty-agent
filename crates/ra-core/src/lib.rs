@@ -32,6 +32,7 @@ pub mod finish;
 pub mod guard;
 pub mod hook;
 pub mod item;
+pub mod memory;
 pub mod model;
 pub mod output;
 pub mod permission;

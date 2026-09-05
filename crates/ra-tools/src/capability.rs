@@ -16,8 +16,8 @@
 //!
 //! # What is not here yet, and why it is absent rather than empty
 //!
-//! The built-in set names ten families. Four are backed here, `compaction` is backed by
-//! `ra-context`, and the remaining five — `todo`, `memory`, `view_image`, `web`, `skills` — have no
+//! The built-in set names ten families. Five are backed here, `compaction` is backed by
+//! `ra-context`, and the remaining four — `todo`, `view_image`, `web`, `skills` — have no
 //! capability type because their tools are not written yet. A capability that contributed nothing
 //! would be worse than a missing one: it would put its family in the installed set, so a dependency
 //! on it would validate against a capability that does nothing, and a surface that is short several
@@ -26,13 +26,26 @@
 //!
 //! # Dependencies
 //!
-//! None of the four declares one. A declared dependency is a hard assembly error and an ordering
-//! edge, and none of these four needs another to function: `apply_patch` creates files without
+//! None of the five declares one. A declared dependency is a hard assembly error and an ordering
+//! edge, and none of these five needs another to function: `apply_patch` creates files without
 //! reading any, `grep` returns the matched lines rather than a path to go read, and a shell needs
 //! nothing. Declaring `apply_patch` -> `filesystem` because editing usually follows reading would
-//! refuse a legitimate configuration — one that reads through the shell — to record a habit. The
-//! first real edge in this framework arrives with memory, which cannot read its own store without
-//! one of the two capabilities that reach the filesystem.
+//! refuse a legitimate configuration — one that reads through the shell — to record a habit.
+//!
+//! **Memory was expected to be the first real edge, and it is not.** The reasoning had been that a
+//! memory capability cannot read its own store without one of the two families that reach the
+//! filesystem — which is true of the arrangement where memory contributes prompt text and the model
+//! reads the store with `read_file` or a shell command. [`MemoryCapability`] takes the other branch
+//! and brings its own three entries, so the store is reached through a
+//! [`MemoryStore`](ra_core::memory::MemoryStore) that no other family is involved in. The edge
+//! disappears because the dependency did, not because it was overlooked: the arrangement that has
+//! one is the arrangement where the memory root is just another path in the workspace, and that is
+//! also the arrangement where nothing structural keeps an agent inside it.
+//!
+//! So this framework still has no dependency edge in its built-in set. The validation machinery is
+//! not thereby unused — a third-party capability declares against these families — but the first
+//! built-in edge is still ahead, and inventing one to exercise the mechanism would be the
+//! `apply_patch` -> `filesystem` mistake with a different pair of names.
 //!
 //! # Why the prompt text is here, beside the tools rather than in a product crate
 //!
@@ -49,24 +62,30 @@
 //! Here the fragment cannot arrive without the entries it describes, because the same object
 //! carries both.
 //!
-//! Each fragment declares its own share of the cached prefix. Together the four cost roughly 280
-//! estimated tokens against 480 declared, which is room to rewrite a paragraph and not room to
+//! Each fragment declares its own share of the cached prefix. Together the five cost roughly 400
+//! estimated tokens against 640 declared, which is room to rewrite a paragraph and not room to
 //! teach a second topic under an existing heading.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use ra_core::{
     capability::{Capability, CapabilityFamily},
     error::Result,
+    memory::MemoryStore,
     prompt::{PromptSection, SectionPosition, SectionStability},
     tool::Tool,
 };
 use ra_exec::{fs::Workspace, session::ProcessManager};
 
 use crate::{
-    apply_patch::ApplyPatchTool, exec_command::ExecCommandTool, glob::GlobTool, grep::GrepTool,
-    read_file::ReadFileTool, write_stdin::WriteStdinTool,
+    apply_patch::ApplyPatchTool,
+    exec_command::ExecCommandTool,
+    glob::GlobTool,
+    grep::GrepTool,
+    memory::{MemoryListTool, MemoryReadTool, MemorySearchTool},
+    read_file::ReadFileTool,
+    write_stdin::WriteStdinTool,
 };
 
 /// Builds one capability's prefix fragment, attributed to the family that wrote it.
@@ -378,6 +397,113 @@ impl Capability for SearchCapability {
             "What each discovery entry answers, and why neither is a command away",
             SEARCH_FRAGMENT,
             SEARCH_TOKEN_BUDGET,
+        )
+    }
+}
+
+/// Reading what earlier work concluded: finding it, reading it, and seeing what exists.
+///
+/// The three are one capability because they are one traversal — search to locate, read to see the
+/// whole of what was located, list to learn what there is to search. A surface holding search alone
+/// can find a line and never see the paragraph it sits in; one holding read alone requires the
+/// model to already know a path it has no way to have learned.
+///
+/// **The store is a parameter, and that is what makes this family independent.** The three entries
+/// reach a [`MemoryStore`] and nothing else, so installing memory neither requires nor implies a
+/// capability that reaches the workspace, and an agent given memory cannot read past its root — not
+/// because the prompt asked it not to, but because these entries cannot express a path the store
+/// will not resolve.
+pub struct MemoryCapability {
+    search: Arc<MemorySearchTool>,
+    read: Arc<MemoryReadTool>,
+    list: Arc<MemoryListTool>,
+}
+
+impl fmt::Debug for MemoryCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryCapability")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemoryCapability {
+    /// Creates the memory triad over one store.
+    ///
+    /// The store is shared rather than owned three times over, for the reason the shell pair shares
+    /// one process manager: a listing and the read that follows it have to be answered by the same
+    /// store, or a path the model was just handed comes back as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when any of the three identities or schemas cannot be built.
+    pub fn new(store: Arc<dyn MemoryStore>) -> Result<Self> {
+        Ok(Self {
+            search: Arc::new(MemorySearchTool::new(Arc::clone(&store))?),
+            read: Arc::new(MemoryReadTool::new(Arc::clone(&store))?),
+            list: Arc::new(MemoryListTool::new(store)?),
+        })
+    }
+
+    /// The entry that finds lines.
+    #[must_use]
+    pub fn search(&self) -> Arc<dyn Tool> {
+        self.search.clone()
+    }
+
+    /// The entry that returns a whole document.
+    #[must_use]
+    pub fn read(&self) -> Arc<dyn Tool> {
+        self.read.clone()
+    }
+
+    /// The entry that enumerates what the store holds.
+    #[must_use]
+    pub fn list(&self) -> Arc<dyn Tool> {
+        self.list.clone()
+    }
+}
+
+/// Cached-prefix allowance for the memory fragment, in estimated tokens.
+const MEMORY_TOKEN_BUDGET: usize = 160;
+
+/// What the store is, how the three entries relate, and the one thing a model must not assume.
+///
+/// The staleness line is here rather than in a product's policy because it is a property of the
+/// mechanism: a store returns what an earlier run concluded, and nothing in the retrieval path
+/// re-checks that it is still true. A model that reads memory as current fact will report a moved
+/// function or a renamed flag with the confidence of something it just looked at.
+///
+/// **This text is a constant, and that is load-bearing.** It is resolved before any run exists and
+/// lands in the cached prefix, so it must not vary with what the store holds — a fragment built by
+/// reading the store would move the prefix every time memory changed, and one built per query would
+/// move it every turn. What the store holds arrives as tool results, in the tail.
+const MEMORY_FRAGMENT: &str = "Memory:\n\
+                               - Stored memory holds what earlier runs concluded about this \
+                               workspace. `memory_search` finds records, `memory_read` returns \
+                               one, and `memory_list` shows what exists. Each result carries the \
+                               identifier the other two take; send it back exactly, and do not \
+                               invent one.\n\
+                               - It records what was true when it was written. Verify anything you \
+                               are about to act on, and say when an answer rests on memory you did \
+                               not re-check.";
+
+#[async_trait]
+impl Capability for MemoryCapability {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::MEMORY
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![self.search(), self.read(), self.list()]
+    }
+
+    async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        fragment(
+            &self.kind(),
+            "What the memory entries reach, and why what they return is not current fact",
+            MEMORY_FRAGMENT,
+            MEMORY_TOKEN_BUDGET,
         )
     }
 }

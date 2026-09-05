@@ -641,6 +641,8 @@ pub struct ObservationMetadata {
     truncations: Vec<Truncation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     guidance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_exposures: Vec<crate::memory::MemoryExposure>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -652,6 +654,20 @@ impl Default for ObservationMetadata {
 }
 
 impl ObservationMetadata {
+    /// Attaches evidence rendered in this tool result. It survives persistence without becoming
+    /// model instructions; the tool separately supplies bounded citation guidance.
+    #[must_use]
+    pub fn with_memory_exposures(mut self, exposures: Vec<crate::memory::MemoryExposure>) -> Self {
+        self.memory_exposures = exposures;
+        self
+    }
+
+    /// Versioned evidence made available by this tool result.
+    #[must_use]
+    pub fn memory_exposures(&self) -> &[crate::memory::MemoryExposure] {
+        &self.memory_exposures
+    }
+
     /// Creates empty metadata.
     #[must_use]
     pub fn new() -> Self {
@@ -659,6 +675,7 @@ impl ObservationMetadata {
             schema_version: OBSERVATION_METADATA_SCHEMA_VERSION,
             truncations: Vec::new(),
             guidance: Vec::new(),
+            memory_exposures: Vec::new(),
             unknown: Unknown::new(),
         }
     }

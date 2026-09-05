@@ -502,6 +502,8 @@ pub struct RunState {
     #[serde(default)]
     tool_failure: ToolFailureTracker,
     tool_output_references: ToolOutputReferenceTracker,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_exposures: Vec<crate::memory::MemoryExposure>,
     #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -573,6 +575,8 @@ struct RunStateRecord {
     #[serde(default)]
     tool_output_references: Option<ToolOutputReferenceTracker>,
     #[serde(default)]
+    memory_exposures: Vec<crate::memory::MemoryExposure>,
+    #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default)]
     finish_reason: Option<FinishReason>,
@@ -622,6 +626,7 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_failure,
             tool_output_references,
             mut budget,
+            memory_exposures,
             finish_reason,
             nested_runs,
             workspace_lease,
@@ -697,6 +702,7 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_use,
             tool_failure,
             tool_output_references,
+            memory_exposures,
             budget,
             finish_reason,
             nested_runs,
@@ -731,6 +737,7 @@ impl RunState {
             tool_use: ToolUseTracker::new(),
             tool_failure: ToolFailureTracker::new(),
             tool_output_references,
+            memory_exposures: Vec::new(),
             budget: BudgetSnapshot::new(),
             finish_reason: None,
             nested_runs: Vec::new(),
@@ -866,6 +873,25 @@ impl RunState {
     #[must_use]
     pub const fn tool_output_references(&self) -> &ToolOutputReferenceTracker {
         &self.tool_output_references
+    }
+
+    /// Versioned memory evidence included in successful model requests in this run.
+    #[must_use]
+    pub fn memory_exposures(&self) -> &[crate::memory::MemoryExposure] {
+        &self.memory_exposures
+    }
+
+    /// Records newly exposed memory evidence without duplicating a previously exposed token.
+    pub fn record_memory_exposures(&mut self, exposures: Vec<crate::memory::MemoryExposure>) {
+        for evidence in exposures {
+            if !self
+                .memory_exposures
+                .iter()
+                .any(|existing| existing.token() == evidence.token())
+            {
+                self.memory_exposures.push(evidence);
+            }
+        }
     }
 
     /// Mutable retention ledger for the runner's completed-turn recording path.
