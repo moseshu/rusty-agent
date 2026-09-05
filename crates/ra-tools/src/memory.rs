@@ -323,16 +323,40 @@ const fn store_next_step(failure: &MemoryStoreError) -> &'static str {
 /// Both halves come from the typed value: the sentence from the failure's own `Display`, the next
 /// step from [`store_next_step`]. Neither is scraped back out of the framework error's message.
 fn failure_output(error: &Error) -> Option<ToolOutput> {
+    // Control signals must reach the runner, even when they carry a store-specific cause.
+    // They stop or close out work rather than describe an optional lookup that failed.
+    if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+        return None;
+    }
     if let Some(failure) = MemoryToolFailure::of(error) {
         return Some(
             ToolOutput::text(failure.to_string())
                 .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step())),
         );
     }
-    MemoryStoreError::of(error).map(|failure| {
-        ToolOutput::text(failure.to_string())
-            .with_metadata(ObservationMetadata::new().with_guidance(store_next_step(failure)))
-    })
+    if let Some(failure) = MemoryStoreError::of(error) {
+        return Some(
+            ToolOutput::text(failure.to_string())
+                .with_metadata(ObservationMetadata::new().with_guidance(store_next_step(failure))),
+        );
+    }
+    // Everything else is a store that reported a failure in its own vocabulary rather than as a
+    // `MemoryStoreError`. That is not a framework bug to surface as one: `MemoryStore` is a
+    // third-party extension point, so an error this crate cannot name is a routine event.
+    //
+    // **It still has to become a sentence.** These entries take `ToolFailureHandling::Custom`,
+    // where returning `None` propagates the error and ends the turn — so an unrecognized store
+    // failure would take down a whole run over a memory lookup the run can finish without. What
+    // the model is told is generic on purpose: the error's own message is a developer-facing
+    // string this crate did not write and cannot vouch for, and it may name a host, a table, or a
+    // connection.
+    Some(
+        ToolOutput::text("The memory store could not answer.").with_metadata(
+            ObservationMetadata::new().with_guidance(
+                "Continue without memory, and say the answer is unverified against it.",
+            ),
+        ),
+    )
 }
 
 /// Serializes exactly the representation measured by the backend. An invalid oversized response

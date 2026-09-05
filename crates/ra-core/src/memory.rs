@@ -92,7 +92,10 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result, ToolErrorKind};
+use crate::{
+    compat::{SchemaVersion, Unknown},
+    error::{Error, Result, ToolErrorKind},
+};
 
 /// Declares an opaque, store-issued handle: a newtype over a string nothing outside the store
 /// interprets.
@@ -917,14 +920,34 @@ pub fn memory_response_json(response: &impl Serialize) -> Result<String> {
     serde_json::to_string(response).map_err(|error| Error::caller(error.to_string()))
 }
 
+/// Current memory-exposure schema version.
+pub const MEMORY_EXPOSURE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+const fn memory_exposure_schema_version() -> SchemaVersion {
+    MEMORY_EXPOSURE_SCHEMA_VERSION
+}
+
 /// Versioned evidence actually rendered by a memory tool. The token identifies this exact excerpt.
+///
+/// It carries its own [`SchemaVersion`] and retained [`Unknown`] keys because it is a *nested*
+/// persisted record: copies of it live in [`RunState`](crate::state::RunState) and in
+/// [`ObservationMetadata`](crate::tool::ObservationMetadata), and a parent's `Unknown` cannot
+/// capture unknown keys one level down. Without them, a checkpoint written by a newer version and
+/// resumed by an older one loses whatever that newer version added — and what is lost here is the
+/// evidence a retention pass ranks on, so the loss shows up as memory that was used being scored as
+/// memory that was not. [`Truncation`](crate::tool::Truncation) sits in the same metadata struct and
+/// is shaped the same way for the same reason.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryExposure {
+    #[serde(default = "memory_exposure_schema_version")]
+    schema_version: SchemaVersion,
     record: MemoryRecordId,
     revision: MemoryRevision,
     anchor: Option<MemoryAnchor>,
     token: String,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
 }
 
 impl MemoryExposure {
@@ -951,11 +974,25 @@ impl MemoryExposure {
             hash.update(field.as_bytes());
         }
         Self {
+            schema_version: MEMORY_EXPOSURE_SCHEMA_VERSION,
             record,
             revision,
             anchor,
             token: format!("mem-{:x}", hash.finalize()),
+            unknown: Unknown::new(),
         }
+    }
+
+    /// Schema version this evidence was written with.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
     }
 
     /// Token accepted by the final citation protocol.
@@ -980,10 +1017,24 @@ impl MemoryExposure {
     }
 }
 
+/// Current memory-usage schema version.
+pub const MEMORY_USAGE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+const fn memory_usage_schema_version() -> SchemaVersion {
+    MEMORY_USAGE_SCHEMA_VERSION
+}
+
 /// Citations accepted for one final delivery. Sinks must deduplicate by run, final item and token.
+///
+/// Versioned and `Unknown`-retaining for the reason [`MemoryExposure`] is: a sink is a third-party
+/// implementation that may durably enqueue this value and replay it later, so a field this version
+/// does not know has to survive being stored and handed back rather than being dropped on the way
+/// through.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryUsage {
+    #[serde(default = "memory_usage_schema_version")]
+    schema_version: SchemaVersion,
     /// Run that produced the final citation.
     run_id: crate::state::RunId,
     /// Agent responsible for the final delivery.
@@ -992,6 +1043,8 @@ pub struct MemoryUsage {
     final_item_id: crate::item::ItemId,
     /// Validated and deduplicated excerpt references.
     citations: Vec<MemoryExposure>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
 }
 
 impl MemoryUsage {
@@ -1028,11 +1081,25 @@ impl MemoryUsage {
         citations: Vec<MemoryExposure>,
     ) -> Self {
         Self {
+            schema_version: MEMORY_USAGE_SCHEMA_VERSION,
             run_id,
             agent_id,
             final_item_id,
             citations,
+            unknown: Unknown::new(),
         }
+    }
+
+    /// Schema version this event was written with.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
     }
 }
 
