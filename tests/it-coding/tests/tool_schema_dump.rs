@@ -61,11 +61,19 @@ fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
     )
 }
 
+/// Every entry this product can actually build, in the order the host installs them.
+///
+/// The list is the implemented half of the advertised set, not the whole of it: a tier still names
+/// entries nobody has written, and a schema cannot be measured for one of those. It grows as they
+/// land, which is the point — a schema is a wire format the moment a model sees it, and this is
+/// where its bytes are written down and diffed.
 fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
     let host = CodingHost::open(workspace.path()).expect("coding host builds");
     let read_file = host.read_file_tool().expect("read_file builds");
     let grep = host.grep_tool().expect("grep builds");
     let glob = host.glob_tool().expect("glob builds");
+    let view_image = host.view_image_tool().expect("view_image builds");
+    let update_plan = host.update_plan_tool().expect("update_plan builds");
     let exec_command = host.exec_command_tool().expect("exec_command builds");
     let write_stdin = host.write_stdin_tool().expect("write_stdin builds");
     let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
@@ -73,6 +81,8 @@ fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
         read_file.model_definition(),
         grep.model_definition(),
         glob.model_definition(),
+        view_image.model_definition(),
+        update_plan.model_definition(),
         exec_command.model_definition(),
         write_stdin.model_definition(),
         apply_patch.model_definition(),

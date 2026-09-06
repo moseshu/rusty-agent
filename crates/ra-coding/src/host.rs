@@ -19,7 +19,8 @@ use ra_exec::{
 };
 use ra_runtime::runner::RunConfig;
 use ra_tools::capability::{
-    ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability,
+    ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability, TodoCapability,
+    ViewImageCapability,
 };
 
 /// The host runtime context and capabilities for the coding agent.
@@ -137,6 +138,21 @@ impl CodingHost {
         SearchCapability::for_workspace(&self.workspace)
     }
 
+    /// Creates the workspace-confined image capability.
+    pub fn view_image_capability(&self) -> ra_core::error::Result<ViewImageCapability> {
+        ViewImageCapability::for_workspace(&self.workspace)
+    }
+
+    /// Creates the plan-board capability.
+    ///
+    /// The only one that takes nothing from this host: a plan reaches no workspace and no process,
+    /// so there is nothing here for it to be confined to. It is a method anyway, beside the others,
+    /// because where a coding agent's capabilities come from is one answer rather than "the host,
+    /// except for this one".
+    pub fn todo_capability(&self) -> ra_core::error::Result<TodoCapability> {
+        TodoCapability::new()
+    }
+
     /// Creates the workspace-rooted execution capability on this host's session manager.
     ///
     /// The manager is this host's rather than the capability's own, so the sessions an agent starts
@@ -169,6 +185,16 @@ impl CodingHost {
     /// Creates the workspace-confined file-pattern lookup entry.
     pub fn glob_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
         Ok(self.search_capability()?.glob())
+    }
+
+    /// Creates the workspace-confined image entry.
+    pub fn view_image_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
+        Ok(self.view_image_capability()?.view_image())
+    }
+
+    /// Creates the plan-board entry.
+    pub fn update_plan_tool(&self) -> ra_core::error::Result<Arc<dyn Tool>> {
+        Ok(self.todo_capability()?.update_plan())
     }
 
     /// Creates the workspace-rooted command entry backed by this host's session manager.

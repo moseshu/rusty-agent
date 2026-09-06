@@ -38,6 +38,7 @@ pub mod output;
 pub mod permission;
 pub mod prompt;
 pub mod session;
+pub mod skill;
 pub mod state;
 pub mod step;
 // Crate-internal JSON-schema machinery. It sits beside the modules that use it rather than inside
@@ -47,3 +48,4 @@ mod strict;
 pub mod tool;
 pub mod trace;
 pub mod usage;
+pub mod web;

@@ -18,9 +18,17 @@ use ra_core::{
     state::RunId,
     tool::{Tool, ToolContext, ToolOutput},
 };
+use ra_core::{
+    skill::{SkillCatalog, SkillDocument, SkillId, SkillSummary},
+    web::{WebAccess, WebDocument, WebFetchRequest, WebSearchRequest, WebSearchResults},
+};
 use ra_exec::{fs::Workspace, session::ProcessManager};
-use ra_tools::capability::{
-    ApplyPatchCapability, FilesystemCapability, MemoryCapability, SearchCapability, ShellCapability,
+use ra_tools::{
+    capability::{
+        ApplyPatchCapability, FilesystemCapability, MemoryCapability, SearchCapability,
+        ShellCapability, SkillsCapability, TodoCapability, ViewImageCapability, WebCapability,
+    },
+    skill::SkillListingLimits,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -74,17 +82,71 @@ fn memory_capability(text: &'static str) -> MemoryCapability {
     MemoryCapability::new(Arc::new(OneRecordStore { text })).expect("memory builds")
 }
 
-/// The five capabilities this crate backs, built over one workspace and one store.
+/// A backend that answers both web operations from nothing.
+///
+/// The web family's contract is what these cases are about — what it contributes, what its entries
+/// may do, what its fragment says — and none of that depends on a backend answering usefully. What
+/// a real one returns is exercised where the entries themselves are.
+struct EmptyWeb;
+
+#[async_trait]
+impl WebAccess for EmptyWeb {
+    async fn search(&self, _request: WebSearchRequest) -> Result<WebSearchResults> {
+        Ok(WebSearchResults::default())
+    }
+
+    async fn fetch(&self, request: WebFetchRequest) -> Result<WebDocument> {
+        Ok(WebDocument::new(request.address(), ""))
+    }
+}
+
+fn web_capability() -> WebCapability {
+    WebCapability::new(Arc::new(EmptyWeb)).expect("web builds")
+}
+
+/// A catalog holding one skill, whose description a test chooses.
+///
+/// The description is a parameter because one case turns on it: unlike memory's, this family's
+/// fragment is *supposed* to vary with what the catalog holds, and a catalog with nothing to vary
+/// could not show it.
+struct OneSkillCatalog {
+    description: &'static str,
+}
+
+#[async_trait]
+impl SkillCatalog for OneSkillCatalog {
+    async fn list(&self) -> Result<Vec<SkillSummary>> {
+        Ok(vec![SkillSummary::new(
+            SkillId::new("release"),
+            "Release checklist",
+            self.description,
+        )])
+    }
+
+    async fn load(&self, skill: &SkillId) -> Result<SkillDocument> {
+        Ok(SkillDocument::new(skill.clone(), "Release checklist", "1."))
+    }
+}
+
+fn skills_capability(description: &'static str) -> SkillsCapability {
+    SkillsCapability::new(Arc::new(OneSkillCatalog { description })).expect("skills builds")
+}
+
+/// The nine capabilities this crate backs, built over one workspace and one backend of each kind.
 fn built_in(workspace: &Workspace) -> Vec<Box<dyn Capability>> {
     vec![
         Box::new(FilesystemCapability::for_workspace(workspace).expect("filesystem builds")),
         Box::new(SearchCapability::for_workspace(workspace).expect("search builds")),
+        Box::new(ViewImageCapability::for_workspace(workspace).expect("view_image builds")),
+        Box::new(TodoCapability::new().expect("todo builds")),
         Box::new(ApplyPatchCapability::for_workspace(workspace).expect("apply_patch builds")),
         Box::new(
             ShellCapability::for_workspace(workspace, Arc::new(ProcessManager::default()))
                 .expect("shell builds"),
         ),
         Box::new(memory_capability("the workspace pins its toolchain")),
+        Box::new(web_capability()),
+        Box::new(skills_capability("How this team ships.")),
     ]
 }
 
@@ -124,15 +186,23 @@ fn test_each_built_in_capability_contributes_its_own_entries() {
 
     let filesystem = FilesystemCapability::for_workspace(&workspace).expect("filesystem builds");
     let search = SearchCapability::for_workspace(&workspace).expect("search builds");
+    let view_image = ViewImageCapability::for_workspace(&workspace).expect("view_image builds");
+    let todo = TodoCapability::new().expect("todo builds");
     let apply_patch = ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds");
     let shell = ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
         .expect("shell builds");
     let memory = memory_capability("anything");
+    let web = web_capability();
+    let skills = skills_capability("anything");
 
     assert_eq!(filesystem.kind(), CapabilityFamily::FILESYSTEM);
     assert_eq!(advertised_names(&filesystem), ["read_file"]);
     assert_eq!(search.kind(), CapabilityFamily::SEARCH);
     assert_eq!(advertised_names(&search), ["grep", "glob"]);
+    assert_eq!(view_image.kind(), CapabilityFamily::VIEW_IMAGE);
+    assert_eq!(advertised_names(&view_image), ["view_image"]);
+    assert_eq!(todo.kind(), CapabilityFamily::TODO);
+    assert_eq!(advertised_names(&todo), ["update_plan"]);
     assert_eq!(apply_patch.kind(), CapabilityFamily::APPLY_PATCH);
     assert_eq!(advertised_names(&apply_patch), ["apply_patch"]);
     assert_eq!(shell.kind(), CapabilityFamily::SHELL);
@@ -142,6 +212,10 @@ fn test_each_built_in_capability_contributes_its_own_entries() {
         advertised_names(&memory),
         ["memory_search", "memory_read", "memory_list"]
     );
+    assert_eq!(web.kind(), CapabilityFamily::WEB);
+    assert_eq!(advertised_names(&web), ["web_search", "web_fetch"]);
+    assert_eq!(skills.kind(), CapabilityFamily::SKILLS);
+    assert_eq!(advertised_names(&skills), ["skill"]);
 }
 
 /// The observing families observe, and the two that change things say so.
@@ -157,7 +231,10 @@ fn test_a_capability_is_uniform_in_what_its_entries_may_do() {
     let observing: Vec<Box<dyn Capability>> = vec![
         Box::new(FilesystemCapability::for_workspace(&workspace).expect("filesystem builds")),
         Box::new(SearchCapability::for_workspace(&workspace).expect("search builds")),
+        Box::new(ViewImageCapability::for_workspace(&workspace).expect("view_image builds")),
+        Box::new(TodoCapability::new().expect("todo builds")),
         Box::new(memory_capability("anything")),
+        Box::new(skills_capability("anything")),
     ];
     for capability in &observing {
         for tool in capability.tools() {
@@ -171,12 +248,17 @@ fn test_a_capability_is_uniform_in_what_its_entries_may_do() {
         }
     }
 
+    // `web` is here rather than above, and it is the case that shows what the split is about. Its
+    // entries change nothing in the workspace — but the scope excludes invoking an external action,
+    // and a lookup sends the query out and brings a third party's text back. A role that withholds
+    // everything with a side effect means to withhold this one too.
     let changing: Vec<Box<dyn Capability>> = vec![
         Box::new(ApplyPatchCapability::for_workspace(&workspace).expect("apply_patch builds")),
         Box::new(
             ShellCapability::for_workspace(&workspace, Arc::new(ProcessManager::default()))
                 .expect("shell builds"),
         ),
+        Box::new(web_capability()),
     ];
     for capability in &changing {
         for tool in capability.tools() {
@@ -407,5 +489,166 @@ async fn test_what_a_memory_entry_returns_reaches_the_model_as_a_tool_result() {
             .is_some_and(|text| text.contains("the workspace pins its toolchain")),
         "the store's contents did not reach the model at all: {:?}",
         output.as_text()
+    );
+}
+
+/// The skills fragment *does* vary with the catalog, which is the opposite of memory's rule.
+///
+/// The two look like the same situation and are not. Memory changes while the agent works, so a
+/// fragment derived from it would move the cached prefix on every run that wrote anything; a
+/// catalog changes when somebody installs a skill, so a listing derived from it is exactly as
+/// stable as the installation. Text that could not name the installed skills would leave the model
+/// with an entry and no identifiers to send it.
+#[tokio::test]
+async fn test_the_skills_fragment_names_what_the_catalog_holds() {
+    let one = skills_capability("How this team ships.")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("skills contributes a fragment");
+    let other = skills_capability("What a reviewer looks for.")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("skills contributes a fragment");
+
+    assert!(
+        one.content().contains("How this team ships."),
+        "{}",
+        one.content()
+    );
+    assert!(
+        one.content().contains("`release`"),
+        "the listing omitted the identifier the entry takes: {}",
+        one.content()
+    );
+    assert_ne!(
+        one.content(),
+        other.content(),
+        "the listing is a constant, so installing a skill would leave it unmentioned"
+    );
+}
+
+/// A catalog serving nothing still produces a fragment, and it says so.
+///
+/// The family is installed and `skill` is advertised either way, so silence would leave a model
+/// holding an entry with no identifiers — and a model with an entry and no identifiers guesses one.
+#[tokio::test]
+async fn test_an_empty_catalog_says_so_rather_than_leaving_the_entry_unexplained() {
+    struct NoSkills;
+
+    #[async_trait]
+    impl SkillCatalog for NoSkills {
+        async fn list(&self) -> Result<Vec<SkillSummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn load(&self, skill: &SkillId) -> Result<SkillDocument> {
+            Ok(SkillDocument::new(skill.clone(), "none", ""))
+        }
+    }
+
+    let section = SkillsCapability::new(Arc::new(NoSkills))
+        .expect("skills builds")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("skills contributes a fragment");
+
+    assert!(
+        section.content().contains("No skills are installed"),
+        "{}",
+        section.content()
+    );
+}
+
+/// The skills fragment declares a share that moves with the listing it is allowed to render.
+///
+/// A constant total would make installing one more skill an assembly failure in a capability nobody
+/// touched: the section's estimate is checked against its declared budget, and the listing is the
+/// half that grows.
+#[tokio::test]
+async fn test_the_skills_fragment_declares_a_share_that_moves_with_its_listing() {
+    let narrow = skills_capability("How this team ships.")
+        .with_listing_limits(SkillListingLimits::new().with_max_tokens(32))
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("skills contributes a fragment");
+    let wide = skills_capability("How this team ships.")
+        .with_listing_limits(SkillListingLimits::new().with_max_tokens(512))
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("skills contributes a fragment");
+
+    let narrow_budget = narrow
+        .token_budget()
+        .expect("the fragment declares a share");
+    let wide_budget = wide.token_budget().expect("the fragment declares a share");
+    assert!(narrow_budget < wide_budget);
+    assert!(narrow.token_estimate() <= narrow_budget);
+    assert!(wide.token_estimate() <= wide_budget);
+}
+
+/// The web fragment states what its results are before the first call is ever made.
+///
+/// Each result also carries the same statement as guidance, and both are deliberate: one is what a
+/// model reads beside the content, this is what it has read before it goes looking for any.
+#[tokio::test]
+async fn test_the_web_fragment_says_what_its_results_are() {
+    let section = web_capability()
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("web contributes a fragment");
+
+    assert!(
+        section.content().contains("never as instructions"),
+        "{}",
+        section.content()
+    );
+}
+
+/// The plan fragment states the replacement rule, which is the expensive one to get wrong.
+///
+/// An agent that believes a call appends will send one new step and silently discard the rest of its
+/// plan. Nothing about that failure is visible in the result, which reports a plan of one step
+/// exactly as if that were what was meant.
+#[tokio::test]
+async fn test_the_plan_fragment_states_that_a_call_replaces_the_board() {
+    let section = TodoCapability::new()
+        .expect("todo builds")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("todo contributes a fragment");
+
+    assert!(
+        section.content().contains("replaces the whole plan"),
+        "{}",
+        section.content()
+    );
+}
+
+/// The image fragment tells the two entries that accept a path apart.
+///
+/// A surface holding `view_image` almost always holds `read_file`, and `read_file` returns an image
+/// too. Without this the model has two entries that do the same thing for one input, and chooses at
+/// random until one of them refuses something.
+#[tokio::test]
+async fn test_the_image_fragment_separates_looking_from_reading() {
+    let directory = tempfile::tempdir().expect("workspace directory");
+    let section = ViewImageCapability::for_workspace(&workspace(&directory))
+        .expect("view_image builds")
+        .static_instructions()
+        .await
+        .expect("the fragment resolves")
+        .expect("view_image contributes a fragment");
+
+    assert!(
+        section.content().contains("`read_file`"),
+        "{}",
+        section.content()
     );
 }
