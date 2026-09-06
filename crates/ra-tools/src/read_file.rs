@@ -41,7 +41,7 @@
 use std::{
     borrow::Cow,
     fmt,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -62,6 +62,8 @@ use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt as _;
+
+use crate::rooted::{Media, RootedRefusal, relative_in_root};
 
 /// The advertised name. Identity and schema must agree on it or [`Tool::validate`] refuses.
 const TOOL_NAME: &str = "read_file";
@@ -271,55 +273,28 @@ impl ReadFileTool {
     /// Resolves a model-supplied path into one this tool will open, or into the reason it will
     /// not.
     ///
-    /// Two different reasons, deliberately: a path that **left the workspace** and a path spelled
-    /// with **`..`** are refused by different rules and produce different sentences. Only the
-    /// first is a boundary violation; the second is a spelling this tool declines to interpret,
-    /// and it is often a file that is perfectly well inside the root.
+    /// The confinement rule itself is [`relative_in_root`], shared with every other tool that opens
+    /// a file the model named. What stays here is the ambient case, which has no root to be confined
+    /// to, and the two sentences this tool renders for the two refusals.
     ///
-    /// **An absolute path inside the workspace is accepted.** It is the same request written
-    /// another way, and it is the way a model writes it after reading one out of a search result;
-    /// refusing it would buy nothing, because what survives the strip is resolved through the
-    /// capability exactly like any other relative path. The comparison is lexical against the
-    /// canonical root, so a host alias for the same directory — `/tmp` for `/private/tmp` — is not
-    /// recognized. Recognizing it would mean canonicalizing model input before the open, which is
-    /// the first half of the race this tool is built to avoid.
+    /// They stay apart because they are not the same news. Only a path that **left the workspace**
+    /// is a boundary violation; a path spelled with **`..`** is a spelling this tool declines to
+    /// interpret, and it is often a file that is perfectly well inside the root.
     fn resolve(&self, requested: &str) -> ReadResult<ResolvedPath> {
-        let requested_path = Path::new(requested);
         let Some(root) = &self.root else {
             // Let the OS resolve ambient paths exactly as it normally would.  In particular,
             // normalizing `link/../file` before opening changes POSIX's symbolic-link semantics.
-            return Ok(ResolvedPath::Ambient(requested_path.to_path_buf()));
+            return Ok(ResolvedPath::Ambient(PathBuf::from(requested)));
         };
-        let relative = if requested_path.is_absolute() {
-            match requested_path.strip_prefix(root) {
-                Ok(relative) => relative.to_path_buf(),
-                Err(_) => return Err(ReadFileFailure::OutsideRoot(requested.to_owned())),
+        match relative_in_root(root, requested) {
+            Ok(relative) => Ok(ResolvedPath::Rooted(relative)),
+            Err(RootedRefusal::OutsideRoot) => {
+                Err(ReadFileFailure::OutsideRoot(requested.to_owned()))
             }
-        } else {
-            requested_path.to_path_buf()
-        };
-        for component in relative.components() {
-            match component {
-                // `..` is refused rather than normalized away, because normalizing it changes
-                // which file was asked for: POSIX pops a symbolic link's *target*, so `a/b/../c`
-                // and `a/c` name different files whenever `a/b` is a link.
-                //
-                // It gets its own refusal instead of sharing one with a path that left the
-                // workspace, because the two are not the same news. `src/../README.md` may well
-                // be inside the root, and telling the model it is outside sends it looking for a
-                // boundary problem it does not have — while the thing it can actually do, spell
-                // the path without `..`, goes unsaid.
-                Component::ParentDir => {
-                    return Err(ReadFileFailure::AmbiguousParent(requested.to_owned()));
-                }
-                // Reachable on Windows, where `C:file` is relative and still carries a prefix.
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(ReadFileFailure::OutsideRoot(requested.to_owned()));
-                }
-                Component::CurDir | Component::Normal(_) => {}
+            Err(RootedRefusal::AmbiguousParent) => {
+                Err(ReadFileFailure::AmbiguousParent(requested.to_owned()))
             }
         }
-        Ok(ResolvedPath::Rooted(relative))
     }
 
     async fn read(&self, input: &ReadFileInput) -> ReadResult<ToolOutput> {
@@ -797,34 +772,6 @@ impl fmt::Display for ReadFileFailure {
 }
 
 impl std::error::Error for ReadFileFailure {}
-
-/// What a path's extension says the bytes are.
-///
-/// Extension only, deliberately: sniffing content would let a `.rs` file that happens to start
-/// with a magic number come back as an image, and the model named the path it wanted.
-enum Media {
-    Image(&'static str),
-    Pdf,
-    Text,
-}
-
-impl Media {
-    fn of(path: &Path) -> Self {
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
-        match extension.as_deref() {
-            Some("png") => Self::Image("image/png"),
-            Some("jpg" | "jpeg") => Self::Image("image/jpeg"),
-            Some("gif") => Self::Image("image/gif"),
-            Some("webp") => Self::Image("image/webp"),
-            Some("bmp") => Self::Image("image/bmp"),
-            Some("pdf") => Self::Pdf,
-            _ => Self::Text,
-        }
-    }
-}
 
 /// The half-open line range a read returns.
 struct Window {

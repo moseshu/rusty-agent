@@ -1,4 +1,4 @@
-//! Composition of Shell / Filesystem / `ApplyPatch` / Search / Compaction.
+//! Composition of Filesystem / Search / `ViewImage` / Todo / `ApplyPatch` / Shell / Compaction.
 //!
 //! The built-in capability types live in [`ra_tools::capability`]; what this module decides is
 //! which of them a coding agent installs for a given role, and in what order. That is the product
@@ -108,15 +108,21 @@ pub(crate) struct RoleCapabilities {
 impl RoleCapabilities {
     /// Resolves the tool-bearing capabilities a coding agent installs for one role.
     ///
-    /// The order the plan is built in is the order the tools reach the registry: discovery first,
-    /// then the editing entry, then execution. Nothing here declares a dependency, so resolution
-    /// keeps it.
+    /// The order the plan is built in is the order the tools reach the registry: observation first,
+    /// then the plan board, then the editing entry, then execution. Nothing here declares a
+    /// dependency, so resolution keeps it.
     ///
     /// **A one-off role installs nothing, whatever host is handed in.** Its role text says it
     /// answers without tool execution, and installing a capability anyway would put dispatchable
-    /// entries behind a prompt that denies they exist. It withholds all four rather than never
+    /// entries behind a prompt that denies they exist. It withholds every one rather than never
     /// naming them: the profile has to be told that an empty surface is this role's shape and not a
     /// tier that lost every entry it declared.
+    ///
+    /// **`web` and `skills` are absent here rather than withheld.** Both are constructed from
+    /// something this host does not have — a web backend, a skill catalog — and a role cannot
+    /// withhold a capability nobody could build. The tier still names their entries, so a surface
+    /// missing them fails assembly by name, which is the difference between "this deployment has no
+    /// web access" and "this role does not get it".
     ///
     /// # Errors
     ///
@@ -127,6 +133,8 @@ impl RoleCapabilities {
         let declared: Vec<Arc<dyn Capability>> = vec![
             Arc::new(host.filesystem_capability()?),
             Arc::new(host.search_capability()?),
+            Arc::new(host.view_image_capability()?),
+            Arc::new(host.todo_capability()?),
             Arc::new(host.apply_patch_capability()?),
             Arc::new(host.shell_capability()?),
         ];

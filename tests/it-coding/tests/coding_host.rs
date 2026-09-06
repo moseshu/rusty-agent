@@ -274,6 +274,8 @@ fn test_the_host_capabilities_are_one_per_family_and_carry_the_whole_surface() {
     let installed: Vec<Arc<dyn Capability>> = vec![
         Arc::new(host.filesystem_capability().expect("filesystem builds")),
         Arc::new(host.search_capability().expect("search builds")),
+        Arc::new(host.view_image_capability().expect("view_image builds")),
+        Arc::new(host.todo_capability().expect("todo builds")),
         Arc::new(host.apply_patch_capability().expect("apply_patch builds")),
         Arc::new(host.shell_capability().expect("shell builds")),
     ];
@@ -284,6 +286,8 @@ fn test_the_host_capabilities_are_one_per_family_and_carry_the_whole_surface() {
         vec![
             CapabilityFamily::FILESYSTEM,
             CapabilityFamily::SEARCH,
+            CapabilityFamily::VIEW_IMAGE,
+            CapabilityFamily::TODO,
             CapabilityFamily::APPLY_PATCH,
             CapabilityFamily::SHELL,
         ],
@@ -300,6 +304,8 @@ fn test_the_host_capabilities_are_one_per_family_and_carry_the_whole_surface() {
         host.read_file_tool().expect("read_file builds"),
         host.grep_tool().expect("grep builds"),
         host.glob_tool().expect("glob builds"),
+        host.view_image_tool().expect("view_image builds"),
+        host.update_plan_tool().expect("update_plan builds"),
         host.apply_patch_tool().expect("apply_patch builds"),
         host.exec_command_tool().expect("exec_command builds"),
         host.write_stdin_tool().expect("write_stdin builds"),
@@ -313,12 +319,43 @@ fn test_the_host_capabilities_are_one_per_family_and_carry_the_whole_surface() {
     );
 }
 
+/// The families this host cannot build are absent from it, rather than present and inert.
+///
+/// `web` and `skills` are constructed from a backend and a catalog this product does not have, so
+/// there is no factory here to call. That is the intended shape: a capability contributing an entry
+/// that answers "not configured" would put its family in the installed set — satisfying a dependency
+/// on it — and would advertise a tool the model can only be refused by.
+///
+/// The assertion is the one thing a test can hold: what the host does install names no family it
+/// cannot serve. The tier still declares `web_search`, `web_fetch`, and `skill`, so a surface
+/// missing them fails assembly by name, which is where that gap is supposed to be visible.
+#[test]
+fn test_the_host_installs_no_family_it_has_no_backend_for() {
+    let workspace = tempdir().expect("must create tempdir");
+    let host = CodingHost::open(workspace.path()).expect("must open coding host");
+
+    let installed: Vec<Arc<dyn Capability>> = vec![
+        Arc::new(host.filesystem_capability().expect("filesystem builds")),
+        Arc::new(host.search_capability().expect("search builds")),
+        Arc::new(host.view_image_capability().expect("view_image builds")),
+        Arc::new(host.todo_capability().expect("todo builds")),
+        Arc::new(host.apply_patch_capability().expect("apply_patch builds")),
+        Arc::new(host.shell_capability().expect("shell builds")),
+    ];
+    let families = CapabilityPlan::resolve(installed)
+        .expect("the installed set is coherent")
+        .families();
+
+    assert!(!families.contains(&CapabilityFamily::WEB));
+    assert!(!families.contains(&CapabilityFamily::SKILLS));
+}
+
 /// None of the capabilities the product installs on an agent declares deferred text.
 ///
 /// The deferred channel is delivered by the turn loop, from the capabilities installed on the run
-/// configuration. These four arrive on the agent instead — installing them in both places would
-/// declare their tools twice — so a fragment declared here would be resolved at assembly and then
-/// never delivered to anything. That is the one form of prompt text whose absence costs nothing and
+/// configuration. These arrive on the agent instead — installing them in both places would declare
+/// their tools twice — so a fragment declared here would be resolved at assembly and then never
+/// delivered to anything. That is the one form of prompt text whose absence costs nothing and
 /// leaves no trace, and it is why the record of what each tier assembles has no deferred column:
 /// the number is structurally zero on this path rather than merely zero today.
 ///
@@ -335,6 +372,8 @@ async fn test_no_capability_installed_on_the_agent_declares_text_nothing_would_d
     let installed: Vec<Arc<dyn Capability>> = vec![
         Arc::new(host.filesystem_capability().expect("filesystem builds")),
         Arc::new(host.search_capability().expect("search builds")),
+        Arc::new(host.view_image_capability().expect("view_image builds")),
+        Arc::new(host.todo_capability().expect("todo builds")),
         Arc::new(host.apply_patch_capability().expect("apply_patch builds")),
         Arc::new(host.shell_capability().expect("shell builds")),
     ];

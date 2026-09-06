@@ -30,8 +30,8 @@
 //!
 //! **The module list is the complete advertised tool set**, and it is complete before the tools
 //! are: a module that does not exist yet is a module the next implementer fills in somewhere else.
-//! Most are still one-line stubs, which is a statement about what has been scheduled rather than
-//! about where it belongs.
+//! Four are still one-line stubs — [`agent_ns`], [`ask_user`], [`mcp_ns`], [`tool_search`] — which
+//! is a statement about what has been scheduled rather than about where it belongs.
 //!
 //! [`capability`] is the one module that advertises nothing. It packages the tools below into the
 //! installable units the assembly layer works in, which is where a fact such as "`write_stdin` can
@@ -59,6 +59,7 @@ pub mod grep;
 pub mod mcp_ns;
 pub mod memory;
 pub mod read_file;
+mod rooted;
 mod search;
 pub mod skill;
 pub mod tool_search;
