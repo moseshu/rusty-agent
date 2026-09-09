@@ -142,7 +142,10 @@ fn model_window_configuration_becomes_the_total_token_trigger() {
 fn default_compaction_capability_uses_a_bounded_recent_working_set() {
     let capability = ra_context::compaction::CompactionCapability::default();
 
-    assert_eq!(capability.context_windows(), &ContextWindowConfig::default());
+    assert_eq!(
+        capability.context_windows(),
+        &ContextWindowConfig::default()
+    );
     assert_eq!(capability.retention(), AnchorRetention::default());
     assert_eq!(capability.retention().head_items(), 0);
     assert_eq!(capability.retention().max_anchor_items(), 0);

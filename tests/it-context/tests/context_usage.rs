@@ -85,14 +85,11 @@ fn separates_every_model_visible_source_without_double_counting() {
         + output_schema.advertised_chars().expect("schema renders");
     let expected_tools = definition_chars.div_ceil(4);
 
-    let request = ModelRequest::new(
-        vec![message, tool_call, tool_result, reasoning],
-        settings(),
-    )
-    .with_system_instructions("abcd")
-    .with_tools(vec![tool])
-    .with_handoffs(vec![handoff])
-    .with_output_schema(output_schema);
+    let request = ModelRequest::new(vec![message, tool_call, tool_result, reasoning], settings())
+        .with_system_instructions("abcd")
+        .with_tools(vec![tool])
+        .with_handoffs(vec![handoff])
+        .with_output_schema(output_schema);
 
     let usage = breakdown(&request);
 
@@ -220,10 +217,7 @@ fn every_model_input_variant_lands_in_a_deliberate_category() {
             ContextUsageCategory::Messages,
         ),
         (
-            ModelInputItem::Compaction(Compaction::new(
-                "a summary of earlier work",
-                Vec::new(),
-            )),
+            ModelInputItem::Compaction(Compaction::new("a summary of earlier work", Vec::new())),
             ContextUsageCategory::Messages,
         ),
     ];
