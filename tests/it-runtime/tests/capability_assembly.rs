@@ -514,7 +514,7 @@ fn run_request(model: &Arc<RecordingModel>, config: RunConfig, cancel: &CancelSc
 // -- validation and order -----------------------------------------------------------------------
 
 #[test]
-fn a_declared_dependency_is_also_an_ordering_edge() {
+fn a_declared_dependency_does_not_move_the_capability_that_declared_it() {
     let plan = CapabilityPlan::resolve([
         TestCapability::new(CapabilityFamily::MEMORY)
             .requiring(CapabilityFamily::SHELL)
@@ -525,14 +525,15 @@ fn a_declared_dependency_is_also_an_ordering_edge() {
 
     assert_eq!(
         families(&plan),
-        vec!["shell", "memory"],
-        "a capability declaring a dependency must be assembled after the family it names, or the \
-         one arrangement its own declaration calls wrong is the one that runs"
+        vec!["memory", "shell"],
+        "a dependency asks for `shell` to be installed, not for it to be installed first. Deriving \
+         an order from the declaration was removed once it turned out nothing declares one; the \
+         host decides the fold by the order it writes the installs in"
     );
 }
 
 #[test]
-fn capabilities_no_dependency_constrains_keep_installation_order() {
+fn capabilities_are_folded_in_the_order_the_host_installed_them() {
     let plan = CapabilityPlan::resolve([
         TestCapability::new(CapabilityFamily::TODO).into_shared(),
         TestCapability::new(CapabilityFamily::WEB)
@@ -545,11 +546,9 @@ fn capabilities_no_dependency_constrains_keep_installation_order() {
 
     assert_eq!(
         families(&plan),
-        vec!["todo", "filesystem", "web", "search"],
-        "the edge costs exactly one swap: `filesystem` moves ahead of the `web` that requires it, \
-         and `search` — which no edge touches — keeps its place. Sending `web` to the end instead \
-         would satisfy the same dependency while pushing it behind every unrelated capability the \
-         host happened to install after it"
+        vec!["todo", "web", "filesystem", "search"],
+        "every capability keeps its place, including the one whose dependency is installed after \
+         it: the declaration is satisfied by presence"
     );
 }
 
@@ -603,14 +602,14 @@ fn a_capability_cannot_depend_on_its_own_family() {
 
     assert!(
         error.to_string().contains("its own family"),
-        "a one-node circle deserves its own message; reported as a cycle it would name one \
-         capability twice and read like a defect in the report: {error}"
+        "a presence check would satisfy this declaration with the capability itself and verify \
+         nothing; the family it actually meant would go unchecked with nothing said: {error}"
     );
 }
 
 #[test]
-fn capabilities_that_require_one_another_have_no_order_to_pick() {
-    let error = CapabilityPlan::resolve([
+fn capabilities_that_require_one_another_are_all_present_and_all_accepted() {
+    let plan = CapabilityPlan::resolve([
         TestCapability::new(CapabilityFamily::MEMORY)
             .requiring(CapabilityFamily::SHELL)
             .into_shared(),
@@ -621,13 +620,14 @@ fn capabilities_that_require_one_another_have_no_order_to_pick() {
             .requiring(CapabilityFamily::MEMORY)
             .into_shared(),
     ])
-    .unwrap_err();
+    .unwrap();
 
-    let message = error.to_string();
-    assert!(
-        message.contains("`memory` -> `shell` -> `search` -> `memory`"),
-        "the circle itself is the actionable part: a list of the capabilities involved leaves the \
-         reader to work out which edge to cut; got: {message}"
+    assert_eq!(
+        families(&plan),
+        vec!["memory", "shell", "search"],
+        "a circle has no order to derive, and none is derived: each capability asked for a family \
+         that is installed, which is the whole of what the declaration claims. The earlier version \
+         rejected this because it was sorting the graph"
     );
 }
 
@@ -718,16 +718,12 @@ async fn tools_prompt_text_and_settings_all_reach_the_instance_that_executes() {
 }
 
 #[tokio::test]
-async fn the_sampling_fold_follows_assembly_order_rather_than_installation_order() {
-    let dependent = Arc::new(
-        TestCapability::new(CapabilityFamily::MEMORY)
-            .requiring(CapabilityFamily::SHELL)
-            .with_temperature(0.9),
-    );
-    let dependency = Arc::new(TestCapability::new(CapabilityFamily::SHELL).with_temperature(0.2));
+async fn the_sampling_fold_hands_each_capability_what_the_ones_before_it_produced() {
+    let first = Arc::new(TestCapability::new(CapabilityFamily::SHELL).with_temperature(0.2));
+    let second = Arc::new(TestCapability::new(CapabilityFamily::MEMORY).with_temperature(0.9));
     let plan = CapabilityPlan::resolve([
-        Arc::clone(&dependent) as Arc<dyn Capability>,
-        Arc::clone(&dependency) as Arc<dyn Capability>,
+        Arc::clone(&first) as Arc<dyn Capability>,
+        Arc::clone(&second) as Arc<dyn Capability>,
     ])
     .unwrap();
 
@@ -735,15 +731,15 @@ async fn the_sampling_fold_follows_assembly_order_rather_than_installation_order
     let prepared = assembled.prepare_agent(&agent()).unwrap();
 
     assert_eq!(
-        *dependency.observed_temperature.lock().unwrap(),
+        *first.observed_temperature.lock().unwrap(),
         None,
-        "the dependency folds first and sees only the agent's layer"
+        "the first capability installed folds first and sees only the agent's layer"
     );
     assert_eq!(
-        *dependent.observed_temperature.lock().unwrap(),
+        *second.observed_temperature.lock().unwrap(),
         Some(0.2),
-        "a capability that declared a dependency must see what that dependency produced, which is \
-         the whole reason the edge reorders the fold"
+        "the fold is a chain, so a capability sees what the ones installed before it produced. \
+         Which capability that is, is the host's own install order — no declaration reorders it"
     );
     assert_eq!(prepared.model_settings().temperature(), Some(0.9));
 }

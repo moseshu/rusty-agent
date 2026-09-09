@@ -133,8 +133,8 @@ impl RoleCapabilities {
     /// # Errors
     ///
     /// Propagates tool construction failures, and any incoherence the plan finds in the installed
-    /// set — two capabilities claiming one family, a dependency nothing installs, or a dependency
-    /// cycle.
+    /// set — two capabilities claiming one family, a dependency nothing installs, or a capability
+    /// requiring its own family.
     pub(crate) fn resolve(role: &PromptRole, host: &CodingHost) -> Result<Self> {
         let declared: Vec<Arc<dyn Capability>> = vec![
             Arc::new(host.filesystem_capability()?),
