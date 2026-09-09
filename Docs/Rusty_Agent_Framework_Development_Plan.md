@@ -880,8 +880,8 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 | 顺序 | 任务 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| R7-1 | `Guardrail` 输入/输出两层 | TODO | 对齐 `openai-agents-python` 的 `guardrail.py`：输入护栏支持上游的并行默认值与串行配置，tripwire 中止运行；输出护栏检查最终输出。结论的持久化及恢复复用按 SDK 运行状态契约核对。<br>**身份表示待按契约确定**：上游使用 `get_name()` 返回字符串，不预先要求 guardrail、tool guardrail 与 hook 共用受限语法或全局唯一性。若实际持久化或归因需求需要 newtype，可考虑 `CheckId`，但须说明作用域与必要性，并保留上游允许的名称语义；该名称不是本任务的既定公共 API。 |
-| R7-3 | 工具入参 / 结果护栏 | TODO | 对齐 `tool_guardrails.py`：三态 `allow` / `reject_content{message}` / `raise_exception` 与上游逐字对应。入参拒绝时工具一次不跑、出参拒绝只换模型那份视图。`pre_approval_tool_input_guardrails` 可在审批前预检，但批准后执行前**必须**再检查一次。宿主装、按名字挂在工具上、不占任何预算——预算这个概念随 guard 家族一起撤销了。 |
+| R7-1 | `Guardrail` 输入/输出两层 | **DONE** | 对齐 `openai-agents-python` 的 `guardrail.py`：输入护栏支持上游的并行默认值与串行配置，tripwire 中止运行；输出护栏检查最终输出。结论的持久化及恢复复用按 SDK 运行状态契约核对。<br>**身份表示待按契约确定**：上游使用 `get_name()` 返回字符串，不预先要求 guardrail、tool guardrail 与 hook 共用受限语法或全局唯一性。若实际持久化或归因需求需要 newtype，可考虑 `CheckId`，但须说明作用域与必要性，并保留上游允许的名称语义；该名称不是本任务的既定公共 API。 <br>**落地形态**：契约在 `ra-core::guardrail`（`GuardrailFunctionOutput` / 两个结果类型 / `GuardrailFinalOutput` / `GuardrailEvidence`），派发在 `ra-runtime::guardrail`，接线在 `runner`。身份用 `name() -> &str`，**未引入 newtype**，也不要求唯一——同名两个都跑、都记。<br>**四处偏离都写在模块文档里**：① 结果存名字而非活对象（持久化所迫，不赋予名字身份）；② 拒绝携带 `GuardrailEvidence`（对齐上游异常的 `guardrail_result` + `run_data`，因为被拒的 run 没有 result 可读，证据只记进 state 等于宿主拿不到）；③ 输入阶段的阻塞半场与 turns 共用同一条 wall-clock 翻译，输出阶段**刻意不共用**（那里答案已存在且未被检查，翻译成完成结果等于把未检查的输出交出去）；④ 恢复用显式标记而非比对判决（名字可重复、被取消的检查没有判决），标记在**阻塞半场通过后**置位——阻塞检查被 deadline 打断时什么都没发出去，续跑重试拿得回保证；赛跑检查没返回则不重试，它的模型调用已经发生。 |
+| R7-3 | 工具入参 / 结果护栏 | **DOING（契约已落地，派发待接）** | 对齐 `tool_guardrails.py`：三态 `allow` / `reject_content{message}` / `raise_exception` 与上游逐字对应。入参拒绝时工具一次不跑、出参拒绝只换模型那份视图。`pre_approval_tool_input_guardrails` 可在审批前预检，但批准后执行前**必须**再检查一次。宿主装、按名字挂在工具上、不占任何预算——预算这个概念随 guard 家族一起撤销了。 <br>**已完成**：契约在 `ra-core::guardrail::tool`，三态与 `tool_guardrails.py` 逐字对应，身份用基线上已有的 `ToolGuardrailId`（注册表引用，与运行级的展示名称是两回事，不统一）。<br>**待做**：`ra-runtime` 侧的解析与派发、`RunConfig` 的四个安装入口、结果进 `RunState`。 |
 | R7-4 | `UserHook` 事件面 | TODO | 事件集对齐 codex `hooks/src/events/`（session_start / session_end / user_prompt_submit / pre_tool_use / post_tool_use / permission_request / stop / compact / interrupt）与 `protocol/src/protocol.rs:1585` 的 subagent_start / subagent_stop。<br>**能拒的有四个**：`pre_tool_use`、`permission_request` 决定一次调用；`stop`、`subagent_stop` 决定一次交付——拦截必须携带续跑提示，`stop_hook_active` 向 hook 标明已进入阻断后的续跑，不能据此假定框架自动挡住第二次阻断，无提示的拦截发 Warning 并忽略（照 codex `core/src/session/turn.rs:566-588`）。<br>hook 是宿主扩展点：覆盖不了权限策略的拒绝，也不承载框架纪律——框架已经没有纪律可承载。 |
 
 ### R7 已撤销（2026-09-09）
@@ -913,7 +913,7 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 | 能力 | 标准 |
 | --- | --- |
-| 两层护栏 | `InputGuardrail` 与首个模型调用并跑、tripwire 抛 `Error::Guardrail` 并 cancel 该轮；`OutputGuardrail` 只在 loop 自己走到结论时问；结论进 `RunState`、随检查点往返，续接按持久化结论决定复用还是重试 |
+| 两层护栏 | **已达成（R7-1）**：`InputGuardrail` 默认与首个模型调用并跑、`run_in_parallel() == false` 的改为发出请求前先跑完；tripwire 抛 `Error::Guardrail` 并 cancel 该轮，**拒绝携带 `GuardrailEvidence`** 让宿主在没有 result 的情况下仍读得到判决与 `output_info`。`OutputGuardrail` 只在 loop 自己走到结论时问，且工具结果成为答案时也看得到实际内容。结论进 `RunState`、随检查点往返，续接由显式标记决定是否重跑 |
 | 工具边界 | 三态与 `tool_guardrails.py` 逐字对应；入参拒绝时工具一次不跑、出参拒绝只换模型那份视图；审批前预检不免除批准后的再检查；声明了没人装的检查在首个模型调用前就让 run 停下；每条完成的检查连证据进 `RunState` 并随检查点往返 |
 | hook 面对齐 codex | 事件集与 codex 一致；`stop` / `subagent_stop` 可携带有效提示请求续跑；`stop_hook_active` 如实传给 hook，不作为自动拒绝第二次阻断的上限；无续跑提示的阻断发 Warning 并忽略。额外次数限制须作为显式产品策略 |
 | 分层清楚 | hook 的 `Allow` 覆盖不了权限策略的拒绝；归因码说得清是护栏、hook 还是权限链拦的 |
