@@ -167,9 +167,14 @@ impl HostBackedSurface {
 
 /// One installed capability's share of an assembled surface.
 ///
-/// The entries are this family's own, and only the ones the tier kept: a capability whose entries a
-/// tier dropped entirely is still installed and still contributes its sampling settings and context
-/// transform, so it is present here with nothing advertised rather than absent.
+/// The entries are this family's own, and only the ones the tier kept. A capability whose entries a
+/// tier dropped entirely is still installed and still owns its prefix paragraph, so it is present
+/// here with nothing advertised rather than absent.
+///
+/// It contributes **only** its tools and its static prompt text on this path. Sampling settings and
+/// context transforms are read where capabilities are installed on the run configuration, and
+/// nothing on the agent-construction path reads them — see the installation table on
+/// [`ra_core::capability`].
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InstalledCapability {

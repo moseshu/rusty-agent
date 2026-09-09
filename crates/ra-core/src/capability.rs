@@ -36,6 +36,43 @@
 //! deferring is for. Sending it once and letting it stay in history means the model keeps it, and
 //! every turn after the first carries it inside the span a cache read already covers.
 //!
+//! # Two installation points, and which contributions each one carries
+//!
+//! A capability reaches an agent by one of two routes, and **they do not carry the same
+//! contributions**. Choose a route that carries every contribution the implementation needs:
+//!
+//! | Contribution | Installed where the agent is built | Installed on the run configuration |
+//! | --- | --- | --- |
+//! | [`Capability::tools`] | yes — through the product's registry and tier | yes — appended to the agent's own |
+//! | [`Capability::static_instructions`] | yes | **no** — refused at assembly |
+//! | [`Capability::instructions`] | no — there is no run to bind to yet | yes |
+//! | [`Capability::deferred_instructions`] | no — delivery is the turn loop's | yes |
+//! | [`Capability::sampling_params`] | no | yes |
+//! | [`Capability::context_processor`] | no | yes |
+//! | [`Capability::bind`] | no — binding takes a run | yes, after static-text validation and before run contributions are read |
+//!
+//! **A capability whose text is static belongs where the agent is built.** Static text is resolved
+//! before any run exists precisely so it can sit in the cached prefix, and the prefix is assembled
+//! once, with a section order and a committed dump behind it. Run assembly happens after the agent
+//! exists and can only append, downstream of that ranking — so a static fragment arriving there has
+//! nowhere to land. Installing one on the run configuration is a configuration error rather than a
+//! silent drop: the tools would arrive and the paragraph declaring them would not, which is the
+//! exact failure carrying four contributions on one trait exists to prevent.
+//!
+//! **A capability that needs binding, per-run or deferred instructions, sampling settings, or
+//! context processing belongs on the run configuration.** This applies whether or not it has
+//! tools. The agent-construction path does not consume these contributions; installing compaction
+//! there, for example, would lose its runtime behavior. A capability contributing only tools can
+//! use either route.
+//!
+//! A capability that combines static text with runtime contributions has no route that carries
+//! everything today. The host must explicitly adapt its composition, for example by moving the
+//! text to the per-run instruction channel, before installing it on the run configuration.
+//!
+//! **Declaring the same tool on both routes fails validation by lookup key.** The routes do not
+//! merge duplicate tools. A capability with no tools does not cause that collision, though static
+//! text is still refused on the run configuration.
+//!
 //! Implementations live in service or product crates; the kernel only carries the contracts.
 
 use std::{borrow::Cow, collections::BTreeSet, fmt, sync::Arc};

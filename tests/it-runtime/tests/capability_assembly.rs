@@ -819,23 +819,80 @@ async fn a_plan_resolves_its_static_fragments_before_a_run_exists() {
 /// shares, while a bound capability may write text particular to the run it serves. Reusing one
 /// method for both would call it once before binding and again after binding, which makes a dump
 /// disagree with the request a run sends.
+///
+/// Read from the run-free side, because the other side now refuses the arrangement outright — see
+/// the test below.
 #[tokio::test]
 async fn a_static_fragment_does_not_cross_the_binding_boundary() {
     let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::MEMORY)
         .with_static_section("memory", "static fragment")
+        .with_section("memory", "per-run fragment")
         .binding()
         .into_shared()])
     .unwrap();
 
-    let static_sections = plan.static_prompt_sections().await.unwrap();
-    assert_eq!(static_sections.len(), 1);
+    let resolved = plan.static_prompt_sections().await.unwrap();
+    let sections: Vec<&str> = resolved.iter().map(|section| section.content()).collect();
+    assert_eq!(
+        sections,
+        ["static fragment"],
+        "the run-free reading takes the static method only; the per-run text belongs to a bound \
+         form that does not exist yet"
+    );
+}
+
+/// Run assembly refuses a capability that carries static prefix text.
+///
+/// Static text exists to sit in the cached prefix, and the prefix is assembled where the agent is
+/// built — with a section order and a committed dump behind it. Run assembly happens afterwards and
+/// can only append, so a static fragment arriving here has nowhere to land. Accepting it silently
+/// would install the capability's tools and drop the paragraph declaring them, which is the one
+/// outcome packing four contributions onto one trait exists to prevent.
+#[tokio::test]
+async fn run_assembly_refuses_a_capability_carrying_static_prefix_text() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_tool("exec_command")
+        .with_static_section("shell", "static fragment")
+        .into_shared()])
+    .unwrap();
+
+    let error = plan.assemble(&run_context("run-1")).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("capability `shell`") && message.contains("section `shell`"),
+        "the refusal names the capability and its section: {message}"
+    );
+    assert!(
+        message.contains("where the agent is built"),
+        "the refusal names the route that does carry static text: {message}"
+    );
+    assert!(
+        message.contains("deferred_instructions"),
+        "the refusal names the other way out — moving the text to a channel this route reads: \
+         {message}"
+    );
+}
+
+/// A capability with no static text assembles on the run path with everything else intact.
+///
+/// The counterpart to the refusal above: the check is about one channel, not about tools. A
+/// capability that keeps its text in the per-run channel contributes on this route in full.
+#[tokio::test]
+async fn run_assembly_accepts_a_capability_whose_text_is_per_run() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_tool("exec_command")
+        .with_section("shell", "per-run fragment")
+        .into_shared()])
+    .unwrap();
 
     let assembled = plan.assemble(&run_context("run-1")).await.unwrap();
-    assert!(
-        assembled.prompt_sections().is_empty(),
-        "the bound form supplies no per-run fragment, so assembly must not re-read the installed \
-         capability's static one"
-    );
+    assert_eq!(assembled.tools().len(), 1);
+    let sections: Vec<&str> = assembled
+        .prompt_sections()
+        .iter()
+        .map(|section| section.content())
+        .collect();
+    assert_eq!(sections, ["per-run fragment"]);
 }
 
 /// The run-free reading enforces the same structural prefix rules as the runtime path.
