@@ -7,8 +7,8 @@
 //! the single carrier that crosses a run-segment boundary.
 //!
 //! It deliberately belongs to `ra-core`: it already carries the run's own history — generated
-//! items, model responses, pending approvals — and guardrail results join them when they land, and
-//! a persisted wire type cannot live in `ra-runtime` without reversing the dependency direction.
+//! items, model responses, pending approvals, and the verdicts its guardrails reached — and a
+//! persisted wire type cannot live in `ra-runtime` without reversing the dependency direction.
 //!
 //! # Not to be confused with `WorkState`
 //!
@@ -30,6 +30,7 @@ use crate::{
     compat::{SchemaVersion, Unknown},
     error::{BudgetKind, Error, Result},
     finish::FinishReason,
+    guardrail::{InputGuardrailResult, OutputGuardrailResult},
     item::{
         AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind, ToolApproval,
     },
@@ -504,6 +505,12 @@ pub struct RunState {
     tool_output_references: ToolOutputReferenceTracker,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     memory_exposures: Vec<crate::memory::MemoryExposure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input_guardrail_results: Vec<InputGuardrailResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    output_guardrail_results: Vec<OutputGuardrailResult>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    input_guardrails_started: bool,
     #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -577,6 +584,12 @@ struct RunStateRecord {
     #[serde(default)]
     memory_exposures: Vec<crate::memory::MemoryExposure>,
     #[serde(default)]
+    input_guardrail_results: Vec<InputGuardrailResult>,
+    #[serde(default)]
+    output_guardrail_results: Vec<OutputGuardrailResult>,
+    #[serde(default)]
+    input_guardrails_started: bool,
+    #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default)]
     finish_reason: Option<FinishReason>,
@@ -627,6 +640,9 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_output_references,
             mut budget,
             memory_exposures,
+            input_guardrail_results,
+            output_guardrail_results,
+            input_guardrails_started,
             finish_reason,
             nested_runs,
             workspace_lease,
@@ -703,6 +719,9 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_failure,
             tool_output_references,
             memory_exposures,
+            input_guardrail_results,
+            output_guardrail_results,
+            input_guardrails_started,
             budget,
             finish_reason,
             nested_runs,
@@ -738,6 +757,9 @@ impl RunState {
             tool_failure: ToolFailureTracker::new(),
             tool_output_references,
             memory_exposures: Vec::new(),
+            input_guardrail_results: Vec::new(),
+            output_guardrail_results: Vec::new(),
+            input_guardrails_started: false,
             budget: BudgetSnapshot::new(),
             finish_reason: None,
             nested_runs: Vec::new(),
@@ -1262,6 +1284,64 @@ impl RunState {
             .retain(|entry| entry.item_id != *item_id);
         self.pending_interruptions.retain(|id| id != item_id);
         Ok(())
+    }
+
+    /// What this run's input guardrails concluded, in the order their verdicts arrived.
+    ///
+    /// **Arrival order, not registration order.** Checks are collected as each completes, and the
+    /// blocking half of the stage finishes before the raced half starts, so nothing about this
+    /// list says which declaration produced which verdict. A reader that needs that has to be
+    /// given it explicitly; a name repeated across two registrations appears twice here.
+    #[must_use]
+    pub fn input_guardrail_results(&self) -> &[InputGuardrailResult] {
+        &self.input_guardrail_results
+    }
+
+    /// What this run's output guardrails concluded, in the order their verdicts arrived.
+    #[must_use]
+    pub fn output_guardrail_results(&self) -> &[OutputGuardrailResult] {
+        &self.output_guardrail_results
+    }
+
+    /// Whether blocking input checks passed and the raced stage was admitted.
+    ///
+    /// The mark is independent of verdict names and counts because names need not be unique.
+    /// It stays false when blocking checks time out, so a continuation must retry them before
+    /// calling the model. Once true, pending raced checks are not retried on continuation.
+    /// This separates the pre-model blocking requirement from first-turn racing semantics;
+    /// resumable budget stops can occur before this runtime has made its first model call.
+    #[must_use]
+    pub const fn input_guardrails_started(&self) -> bool {
+        self.input_guardrails_started
+    }
+
+    /// Marks blocking checks as passed and admits the raced stage.
+    ///
+    /// Call only after all blocking checks pass, even when there are no raced checks.
+    #[doc(hidden)]
+    pub const fn mark_input_guardrails_started(&mut self) {
+        self.input_guardrails_started = true;
+    }
+
+    /// Records what one input-guardrail stage concluded.
+    ///
+    /// Appends rather than replaces: the blocking and raced halves report separately, and a
+    /// continuation adds to what earlier segments recorded.
+    #[doc(hidden)]
+    pub fn record_input_guardrail_results(
+        &mut self,
+        results: impl IntoIterator<Item = InputGuardrailResult>,
+    ) {
+        self.input_guardrail_results.extend(results);
+    }
+
+    /// Records what one output-guardrail stage concluded.
+    #[doc(hidden)]
+    pub fn record_output_guardrail_results(
+        &mut self,
+        results: impl IntoIterator<Item = OutputGuardrailResult>,
+    ) {
+        self.output_guardrail_results.extend(results);
     }
 
     /// Starts or resumes a segment under a stable public agent identity.

@@ -25,6 +25,7 @@ use ra_core::{
     error::{Error, Result},
     filter::ContextFilterReport,
     finish::FinishReason,
+    guardrail::{InputGuardrailResult, OutputGuardrailResult},
     item::{
         AgentId, InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse,
         OutputPhase, RunItem, RunItemKind,
@@ -335,6 +336,15 @@ impl TurnRecord {
         self.turn
     }
 
+    /// The range this turn's records occupy in the current segment's items.
+    ///
+    /// For a reader that has to look at one turn rather than the segment: the output guardrails
+    /// examine what the *concluding* turn produced, and every turn before it settled results of
+    /// its own that are not part of the answer.
+    pub(super) const fn item_range(&self) -> &Range<usize> {
+        &self.items
+    }
+
     /// The **public** agent that ran the turn.
     ///
     /// Per turn rather than per run, because that is the granularity a handoff changes it at:
@@ -593,6 +603,31 @@ impl RunResult {
         self.final_message.as_ref()
     }
 
+    /// What this run's input guardrails concluded, in the order their verdicts arrived.
+    ///
+    /// A projection of [`Self::state`], not a copy: the verdicts belong to the **run**, which is
+    /// what the checkpoint carries. That is also why this list is not empty on a run that was
+    /// resumed and never re-checked — the input was examined once, when the run opened, and this
+    /// reports those verdicts rather than the empty set the resuming segment produced.
+    ///
+    /// **A tripped verdict is in here**, and so is every sibling that finished before it. The
+    /// refusal ends the run through [`Error::Guardrail`](ra_core::error::Error::Guardrail), but the
+    /// evidence it was argued from is recorded first — a refusal nobody can audit is worse than
+    /// none.
+    #[must_use]
+    pub fn input_guardrail_results(&self) -> &[InputGuardrailResult] {
+        self.state.input_guardrail_results()
+    }
+
+    /// What this run's output guardrails concluded, in the order their verdicts arrived.
+    ///
+    /// Empty for a run that did not reach its own conclusion: an exhausted budget, the turn cap, or
+    /// an interruption leaves no answer the agent chose, so no output guardrail was asked.
+    #[must_use]
+    pub fn output_guardrail_results(&self) -> &[OutputGuardrailResult] {
+        self.state.output_guardrail_results()
+    }
+
     /// The text of [`Self::final_message`], empty when the run delivered none.
     ///
     /// **It reads that one field and nothing else.** The temptation this method exists to remove is
@@ -641,7 +676,7 @@ impl RunResult {
     }
 }
 
-fn find_final_message(items: &[RunItem]) -> Option<&Message> {
+pub(super) fn find_final_message(items: &[RunItem]) -> Option<&Message> {
     items.iter().rev().find_map(|item| match item.kind() {
         RunItemKind::Message(message)
             if matches!(message.role(), MessageRole::Assistant)

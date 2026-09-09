@@ -256,6 +256,22 @@ pub enum GuardrailStage {
     ToolOutput,
 }
 
+impl GuardrailStage {
+    /// Stable machine-readable slug, for traces, error codes, and reports.
+    ///
+    /// Fixed here rather than derived from the variant name so that renaming a variant does not
+    /// silently repartition every metric already collected under the old spelling.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+            Self::ToolInput => "tool_input",
+            Self::ToolOutput => "tool_output",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // dimension one: by subsystem
 // ---------------------------------------------------------------------------
@@ -373,10 +389,15 @@ pub enum Error {
     Guardrail {
         /// Where it fired.
         stage: GuardrailStage,
-        /// Guard identity, from the guard registry.
+        /// The name the tripping check reported itself under.
         guardrail: String,
         /// Developer-facing description.
         message: String,
+        /// Every verdict the refused stage reached, the tripping one included.
+        ///
+        /// Boxed so a refusal costs one pointer in every `Result` this error travels in, and
+        /// optional because not every refusal comes from a stage that collected verdicts.
+        evidence: Option<Box<crate::guardrail::GuardrailEvidence>>,
     },
 
     /// A deliberate cancellation. **Not a failure.**
@@ -480,6 +501,32 @@ impl Error {
             stage,
             guardrail: guardrail.into(),
             message: message.into(),
+            evidence: None,
+        }
+    }
+
+    /// Attaches the verdicts the refused stage reached.
+    ///
+    /// Separate from the constructor because the two are known at different points: the refusal is
+    /// built beside the verdict that produced it, and the siblings that had already finished are
+    /// held by the stage running them.
+    #[must_use]
+    pub fn with_guardrail_evidence(
+        mut self,
+        collected: crate::guardrail::GuardrailEvidence,
+    ) -> Self {
+        if let Self::Guardrail { evidence, .. } = &mut self {
+            *evidence = Some(Box::new(collected));
+        }
+        self
+    }
+
+    /// The verdicts a guardrail refusal carries, and `None` for every other error.
+    #[must_use]
+    pub fn guardrail_evidence(&self) -> Option<&crate::guardrail::GuardrailEvidence> {
+        match self {
+            Self::Guardrail { evidence, .. } => evidence.as_deref(),
+            _ => None,
         }
     }
 

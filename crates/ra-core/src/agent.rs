@@ -8,16 +8,17 @@
 //!
 //! Several agent concerns have dedicated later milestones. Dynamic prompts and output schemas have
 //! their protocol-neutral declarations here; output parsing and validation remain with the
-//! structured-output contract. Handoffs have a protocol-neutral declaration here; hooks,
-//! guardrails, and capabilities wait for their own contracts. Private fields and the
-//! non-exhaustive public types let those additions remain source compatible; placeholder strings
-//! would freeze the wrong identities and callback shapes.
+//! structured-output contract. Handoffs have a protocol-neutral declaration here; hooks and
+//! capabilities wait for their own contracts. Private fields and the non-exhaustive public types
+//! let those additions remain source compatible; placeholder strings would freeze the wrong
+//! identities and callback shapes.
 
 use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
 
 use crate::{
     context::RunContext,
     error::{Error, Result},
+    guardrail::{InputGuardrail, OutputGuardrail},
     item::{CallId, RunItem, ToolCallOutput},
     model::{ModelHandoffDefinition, ModelSettings},
     output::OutputSchema,
@@ -598,6 +599,8 @@ pub struct AgentSpec {
     tools: Vec<Arc<dyn Tool>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
+    input_guardrails: Vec<Arc<dyn InputGuardrail>>,
+    output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
 }
 
 /// Public name for an immutable agent declaration.
@@ -629,6 +632,8 @@ impl AgentSpec {
             tools: self.tools.clone(),
             handoffs: self.handoffs.clone(),
             tool_use_behavior: self.tool_use_behavior.clone(),
+            input_guardrails: self.input_guardrails.clone(),
+            output_guardrails: self.output_guardrails.clone(),
         }
     }
 
@@ -699,6 +704,29 @@ impl AgentSpec {
     pub const fn tool_use_behavior(&self) -> &ToolUseBehavior {
         &self.tool_use_behavior
     }
+
+    /// Checks applied to the run's input before this agent acts on it.
+    ///
+    /// They belong to the **public** declaration for the reason
+    /// [`Self::output_schema`] does: what the run promised to check is what the user configured,
+    /// and a preparation step that substituted an execution instance must not be able to drop it.
+    /// Only the agent a run **starts** with contributes these — an input guardrail examines the
+    /// caller's input, which an agent reached by a handoff never sees.
+    #[must_use]
+    pub fn input_guardrails(&self) -> &[Arc<dyn InputGuardrail>] {
+        &self.input_guardrails
+    }
+
+    /// Checks applied to the run's final output before it is delivered.
+    ///
+    /// Contributed by the agent that **finishes** the run: the answer being delivered is that
+    /// agent's, and so is the promise about what may be in it. That is a different agent from the
+    /// one that started the run only once a handoff can settle one, which settlement does not yet
+    /// allow.
+    #[must_use]
+    pub fn output_guardrails(&self) -> &[Arc<dyn OutputGuardrail>] {
+        &self.output_guardrails
+    }
 }
 
 impl fmt::Debug for AgentSpec {
@@ -718,6 +746,22 @@ impl fmt::Debug for AgentSpec {
             .field("tools", &tools)
             .field("handoffs", &self.handoffs)
             .field("tool_use_behavior", &self.tool_use_behavior)
+            .field(
+                "input_guardrails",
+                &self
+                    .input_guardrails
+                    .iter()
+                    .map(|guardrail| guardrail.name())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "output_guardrails",
+                &self
+                    .output_guardrails
+                    .iter()
+                    .map(|guardrail| guardrail.name())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -734,6 +778,8 @@ pub struct AgentSpecBuilder {
     tools: Vec<Arc<dyn Tool>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
+    input_guardrails: Vec<Arc<dyn InputGuardrail>>,
+    output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
 }
 
 impl AgentSpecBuilder {
@@ -749,6 +795,8 @@ impl AgentSpecBuilder {
             tools: Vec::new(),
             handoffs: Vec::new(),
             tool_use_behavior: ToolUseBehavior::default(),
+            input_guardrails: Vec::new(),
+            output_guardrails: Vec::new(),
         }
     }
 
@@ -870,6 +918,48 @@ impl AgentSpecBuilder {
         self
     }
 
+    /// Adds one check applied to the run's input before this agent acts on it.
+    pub fn input_guardrail(mut self, guardrail: Arc<dyn InputGuardrail>) -> Self {
+        self.input_guardrails.push(guardrail);
+        self
+    }
+
+    /// Adds input guardrails in iteration order.
+    pub fn input_guardrails(
+        mut self,
+        guardrails: impl IntoIterator<Item = Arc<dyn InputGuardrail>>,
+    ) -> Self {
+        self.input_guardrails.extend(guardrails);
+        self
+    }
+
+    /// Removes input guardrails inherited through [`AgentSpec::to_builder`].
+    pub fn clear_input_guardrails(mut self) -> Self {
+        self.input_guardrails.clear();
+        self
+    }
+
+    /// Adds one check applied to the run's final output before it is delivered.
+    pub fn output_guardrail(mut self, guardrail: Arc<dyn OutputGuardrail>) -> Self {
+        self.output_guardrails.push(guardrail);
+        self
+    }
+
+    /// Adds output guardrails in iteration order.
+    pub fn output_guardrails(
+        mut self,
+        guardrails: impl IntoIterator<Item = Arc<dyn OutputGuardrail>>,
+    ) -> Self {
+        self.output_guardrails.extend(guardrails);
+        self
+    }
+
+    /// Removes output guardrails inherited through [`AgentSpec::to_builder`].
+    pub fn clear_output_guardrails(mut self) -> Self {
+        self.output_guardrails.clear();
+        self
+    }
+
     /// Validates the declaration and returns its shared immutable form.
     pub fn build(self) -> Result<Arc<AgentSpec>> {
         let id = self
@@ -939,6 +1029,9 @@ impl AgentSpecBuilder {
             }
         }
 
+        // Guardrails are deliberately not checked for repeated names here. A name is a display
+        // string, two checks may share one, and both run — the same as declaring them upstream.
+
         Ok(Arc::new(AgentSpec {
             id,
             name,
@@ -949,6 +1042,8 @@ impl AgentSpecBuilder {
             tools: self.tools,
             handoffs: self.handoffs,
             tool_use_behavior: self.tool_use_behavior,
+            input_guardrails: self.input_guardrails,
+            output_guardrails: self.output_guardrails,
         }))
     }
 }

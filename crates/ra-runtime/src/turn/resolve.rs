@@ -51,7 +51,8 @@ pub async fn resolve_next_step(
 
     // The model asked for nothing further. This is deliberately *not* keyed on message content or
     // on an output phase: "no actions requested" is a structural fact every provider expresses the
-    // same way, while reading intent out of the text is the control flow R7-10 forbids.
+    // same way, while reading intent out of the text would make the loop's own control flow depend
+    // on how a model happened to word its answer.
     Ok(NextStep::FinalOutput {
         reason: FinishReason::Final,
     })
