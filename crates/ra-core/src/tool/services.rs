@@ -51,6 +51,16 @@ impl ToolServices {
         }
     }
 
+    /// The empty set, as a borrow that outlives any caller.
+    ///
+    /// For a borrowed view whose services are optional: a default that allocated would make
+    /// constructing one fallible, and a default that borrowed a local would not outlive the
+    /// construction. Nothing is installed, so every port answers `None`.
+    pub fn none() -> &'static Self {
+        static NONE: ToolServices = ToolServices::new();
+        &NONE
+    }
+
     /// Installs the task state the run participates in.
     pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
         self.work_state = Some(work_state);

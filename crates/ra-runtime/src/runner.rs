@@ -29,7 +29,7 @@
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
 
-use std::{any::Any, collections::BTreeSet, sync::Arc, time::Instant};
+use std::{any::Any, collections::BTreeSet, future::Future, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use ra_core::{
@@ -47,6 +47,10 @@ use ra_core::{
         ModelInputData,
     },
     finish::FinishReason,
+    guardrail::{
+        GuardrailEvidence, GuardrailFinalOutput, InputGuardrail, InputGuardrailResult,
+        OutputGuardrail, merge_input_guardrails, merge_output_guardrails,
+    },
     item::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolApproval, ToolCallOutput,
@@ -76,12 +80,13 @@ pub use result::{
     ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
     RunOutcome, RunResult, TurnRecord,
 };
-use result::{TurnRecordOwner, aggregate_usage};
+use result::{TurnRecordOwner, aggregate_usage, find_final_message};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
     agent::AgentBinding,
     capability::{CapabilityPlan, DeferredPrompt},
+    guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     permission::PermissionEngine,
     tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     turn::{
@@ -127,6 +132,8 @@ pub struct RunConfig {
     context_processors: Vec<Arc<dyn ContextProcessor>>,
     capabilities: Vec<Arc<dyn Capability>>,
     permission: PermissionEngine,
+    input_guardrails: Vec<Arc<dyn InputGuardrail>>,
+    output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
 }
 
 impl Default for RunConfig {
@@ -154,6 +161,8 @@ impl RunConfig {
             context_processors: Vec::new(),
             capabilities: Vec::new(),
             permission: PermissionEngine::default(),
+            input_guardrails: Vec::new(),
+            output_guardrails: Vec::new(),
         }
     }
 
@@ -430,6 +439,34 @@ impl RunConfig {
         &self.capabilities
     }
 
+    /// Adds one check applied to this run's input before an agent acts on it.
+    ///
+    /// Run-level rather than agent-level, and the two are added together: an agent's own guardrails
+    /// travel with the declaration wherever it is used, while these belong to this execution of it.
+    /// One identity may not appear in both — see [`merge_input_guardrails`].
+    pub fn with_input_guardrail(mut self, guardrail: Arc<dyn InputGuardrail>) -> Self {
+        self.input_guardrails.push(guardrail);
+        self
+    }
+
+    /// Adds one check applied to this run's final output before it is delivered.
+    pub fn with_output_guardrail(mut self, guardrail: Arc<dyn OutputGuardrail>) -> Self {
+        self.output_guardrails.push(guardrail);
+        self
+    }
+
+    /// Input guardrails this run adds to the starting agent's own.
+    #[must_use]
+    pub fn input_guardrails(&self) -> &[Arc<dyn InputGuardrail>] {
+        &self.input_guardrails
+    }
+
+    /// Output guardrails this run adds to the finishing agent's own.
+    #[must_use]
+    pub fn output_guardrails(&self) -> &[Arc<dyn OutputGuardrail>] {
+        &self.output_guardrails
+    }
+
     /// Appends the context transforms an assembled capability set contributed.
     ///
     /// Appended rather than merged in front: a processor installed through
@@ -479,6 +516,22 @@ impl std::fmt::Debug for RunConfig {
                     .collect::<Vec<_>>(),
             )
             .field("permission", &self.permission)
+            .field(
+                "input_guardrails",
+                &self
+                    .input_guardrails
+                    .iter()
+                    .map(|guardrail| guardrail.name())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "output_guardrails",
+                &self
+                    .output_guardrails
+                    .iter()
+                    .map(|guardrail| guardrail.name())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -817,6 +870,22 @@ async fn run_loop_inner(
         return Err(error);
     }
 
+    // Merged here, beside the rest of the configuration: two guardrails declared under one
+    // identity is a configuration mistake, and the only thing worse than refusing it is refusing it
+    // after the run has paid for a model call. The output list is merged now and used much later
+    // for the same reason — a run that would have been refused at delivery should not be started.
+    //
+    // Merged against the **starting** agent, which is what a run has today: settlement refuses
+    // handoffs, so nobody else can finish it. When a handoff can finish a run, the output list has
+    // to be re-merged against whoever settled, because those guardrails belong to the agent whose
+    // answer is being delivered.
+    let input_guardrails =
+        merge_input_guardrails(agent.public().input_guardrails(), config.input_guardrails());
+    let output_guardrails = merge_output_guardrails(
+        agent.public().output_guardrails(),
+        config.output_guardrails(),
+    );
+
     // Checked here, beside the rest of the configuration and ahead of the segment: whether the
     // installed capabilities can be assembled at all is a property of the configuration, and a
     // missing dependency reported after a model has been paid to read a half-assembled surface is
@@ -917,14 +986,44 @@ async fn run_loop_inner(
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
     };
-    let interrupted_turn = resolve_interrupted_turn(&context, &agent, &mut state).await;
-
-    // Settling checkpointed answers and running turns are one stage as far as stopping is
-    // concerned: both execute tools under the run scope, so both can be the thing a deadline
-    // interrupts. Joining them into a single `Result` before the match below is what keeps the
-    // translation underneath a single statement of the rule rather than two copies to keep in step.
-    let stepped = match interrupted_turn {
-        Ok(()) => run_turns(&context, &mut agent, &mut state, &mut progress).await,
+    // The stage runs once per run, on the segment that opens it. A continuation does not repeat
+    // the caller's opening input, so a check written against that input has nothing new to look
+    // at — and the reference implementation gates the same way, on being the run's first turn.
+    //
+    // Decided by an explicit mark rather than by comparing the verdicts already recorded: two
+    // checks may share a name, and a check cancelled before it finished leaves no verdict at all,
+    // so neither the names nor the count of results can say whether the stage has happened.
+    let input_check = (!state.input_guardrails_started())
+        .then(|| {
+            InputGuardrailCheck::prepare(
+                input_guardrails,
+                live_context(&context, &agent, &state),
+                state.original_input().to_vec(),
+            )
+        })
+        .flatten();
+    // The blocking half of the input stage, the settlement of checkpointed answers, and the turns
+    // themselves are one stage as far as stopping is concerned: all three run under the run scope,
+    // so any of them can be what a deadline interrupts. Joining them into a single `Result` before
+    // the match below is what keeps the translation underneath a single statement of the rule
+    // rather than three copies to keep in step — a deadline that expired while a blocking check
+    // was still thinking is the same budget stop it would have been one line later.
+    let stepped = match run_blocking_input_guardrails(input_check, &mut state, &cancel).await {
+        Ok(input_check) => match resolve_interrupted_turn(&context, &agent, &mut state).await {
+            // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn,
+            // and the caller composing runs should not hold all of it inline.
+            Ok(()) => {
+                Box::pin(run_turns(
+                    &context,
+                    &mut agent,
+                    &mut state,
+                    &mut progress,
+                    input_check,
+                ))
+                .await
+            }
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
 
@@ -963,6 +1062,63 @@ async fn run_loop_inner(
                 return Err(error);
             }
         };
+
+    // Only for a run that reached its own conclusion. A run stopped from outside — an exhausted
+    // budget, the turn cap, an interrupt — has no answer the agent chose, and the closeout above is
+    // the host's own text rather than something the host needs protecting from.
+    //
+    // Under the run scope, so a guardrail is bounded by the same deadline everything else is.
+    //
+    // **A deadline that expires here is deliberately not translated into a budget stop**, which is
+    // the one place this stage differs from the two before it. Those run before there is an answer,
+    // so an expiry there is a run that produced nothing and is resumable. Here the answer exists
+    // and has not been cleared: reporting a completion would hand back exactly the output the check
+    // was installed to look at, with nobody having looked. It stops as an error instead.
+    if let Some(reason) = outcome
+        .finish_reason()
+        .filter(|reason| reason.is_complete())
+    {
+        let verdicts = {
+            // The delivery the guardrails examine is the one the result will report, resolved the
+            // same way: a closeout outranks the model's own last word. A complete run has no
+            // closeout today, and stating the rule here rather than relying on that keeps the two
+            // answers from parting company if it ever does.
+            let delivered = final_message
+                .as_ref()
+                .or_else(|| find_final_message(progress.segment_items(&state)));
+            // A run that stopped on a tool result has no assistant message carrying its answer, so
+            // the concluding turn's outputs go with it. Without them a guardrail on such a run
+            // examines an empty string and reports a pass.
+            let tool_outputs = concluding_turn_tool_outputs(&state, &progress);
+            let mut delivery = GuardrailFinalOutput::new(reason).with_tool_outputs(&tool_outputs);
+            if let Some(message) = delivered {
+                delivery = delivery.with_message(message);
+            }
+            let run = live_context(&context, &agent, &state);
+            run_output_guardrails(&output_guardrails, &run, &delivery, &cancel).await
+        };
+        match verdicts {
+            // Recorded before the stop is propagated, and recorded whether or not one fired: a
+            // refusal whose evidence went out with it is a refusal nobody can audit.
+            Ok(outcome) => {
+                let (results, stop) = outcome.into_parts();
+                state.record_output_guardrail_results(results);
+                if let Some(error) = stop {
+                    let error = error.with_guardrail_evidence(GuardrailEvidence::Output(
+                        state.output_guardrail_results().to_vec(),
+                    ));
+                    record_progress_usage(span, progress.segment_responses(&state));
+                    record_terminal_error(span, &error, &cancel);
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                record_progress_usage(span, progress.segment_responses(&state));
+                record_terminal_error(span, &error, &cancel);
+                return Err(error);
+            }
+        }
+    }
 
     if let Some(reason) = outcome.finish_reason() {
         state = state.with_finish_reason(reason);
@@ -1315,11 +1471,15 @@ fn record_terminal_error(span: &tracing::Span, error: &Error, scope: &CancelScop
 }
 
 /// Runs turns until something says to stop.
+///
+/// `input_check`, when present, is raced against the **first** turn. See
+/// [`race_input_guardrails`] for what that race decides and what it deliberately does not.
 async fn run_turns(
     context: &TurnLoopContext<'_>,
     agent: &mut AgentBinding,
     state: &mut RunState,
     progress: &mut TurnLoopProgress,
+    mut input_check: Option<InputGuardrailCheck>,
 ) -> Result<RunOutcome> {
     let config = context.config;
     let outcome = loop {
@@ -1371,9 +1531,23 @@ async fn run_turns(
             usage.reasoning_tokens = tracing::field::Empty,
         );
         let turn_started = Instant::now();
-        let step = run_one_turn(context, agent, state, progress, &turn_scope, &turn_span)
-            .instrument(turn_span.clone())
-            .await;
+        let turn = run_one_turn(context, agent, state, progress, &turn_scope, &turn_span)
+            .instrument(turn_span.clone());
+        let (verdicts, step) = match input_check.take() {
+            // Boxed because this arm holds the whole turn future *and* the guardrail stage, and
+            // the loop's own future would otherwise carry both on every iteration — including the
+            // ones after the first, where the stage is long since gone.
+            Some(check) => {
+                Box::pin(race_input_guardrails(
+                    check,
+                    turn,
+                    &turn_scope,
+                    context.cancel,
+                ))
+                .await
+            }
+            None => (Ok(StageOutcome::empty_stage()), turn.await),
+        };
         turn_span.record(
             ra_core::trace::field::DURATION_MS,
             duration_ms(turn_started.elapsed()),
@@ -1381,6 +1555,25 @@ async fn run_turns(
         match &step {
             Ok(_) => ra_core::trace::record_outcome(&turn_span, ra_core::trace::SpanOutcome::Ok),
             Err(error) => record_terminal_error(&turn_span, error, &turn_scope),
+        }
+
+        // Ahead of the turn's own result, and that order is the decision: a refused input outranks
+        // whatever the turn it was racing managed to produce, including the cancellation the
+        // refusal itself caused.
+        //
+        // The verdicts are recorded before the refusal is raised, and recorded whether or not one
+        // fired: the checks that had already passed are evidence the stage ran, and the tripping
+        // one is the evidence the refusal is argued from.
+        let (verdicts, refusal) = verdicts?.into_parts();
+        state.record_input_guardrail_results(verdicts);
+        if let Some(error) = refusal {
+            // Re-attached from the run's own record rather than kept as the dispatcher left it.
+            // The stage runs in two halves and each dispatcher call sees only its own verdicts, so
+            // a refusal from the raced half would otherwise omit everything the blocking half had
+            // already concluded — the checks that passed being exactly what says the stage ran.
+            return Err(error.with_guardrail_evidence(GuardrailEvidence::Input(
+                state.input_guardrail_results().to_vec(),
+            )));
         }
 
         // A turn that reached a conclusion ends the loop with it; anything else means another
@@ -1393,6 +1586,115 @@ async fn run_turns(
         state.snapshot_event_seq(context.event_seqs);
     };
     Ok(outcome)
+}
+
+/// Runs the half of the input stage that must finish before anything is sent.
+///
+/// A tripwire here refuses the run with no model call having happened, which is what a host gives
+/// up the racing default to get. What comes back is the raced half, or `None` when the stage was
+/// entirely blocking and has nothing left to race.
+///
+/// Errors are returned rather than handled, so the caller can put them through the same wall-clock
+/// translation the turns go through: a deadline that expired during a blocking check is the same
+/// budget stop it would be one line later, and reporting it as a bare cancellation here would make
+/// the outcome depend on which half of the stage a check happened to be in.
+async fn run_blocking_input_guardrails(
+    input_check: Option<InputGuardrailCheck>,
+    state: &mut RunState,
+    cancel: &CancelScope,
+) -> Result<Option<InputGuardrailCheck>> {
+    let Some(mut check) = input_check else {
+        return Ok(None);
+    };
+    // Recorded before the refusal is raised, and recorded whether or not one fired.
+    let (verdicts, refusal) = check.run_blocking(cancel).await?.into_parts();
+    state.record_input_guardrail_results(verdicts);
+    if let Some(error) = refusal {
+        return Err(error.with_guardrail_evidence(GuardrailEvidence::Input(
+            state.input_guardrail_results().to_vec(),
+        )));
+    }
+    // A checkpoint before this boundary must retry the blocking checks. Once they pass,
+    // the raced half may be abandoned without re-entering it on a continuation.
+    state.mark_input_guardrails_started();
+    Ok((!check.is_empty()).then_some(check))
+}
+
+/// Runs the input guardrails alongside the first turn, and stops that turn when one trips.
+///
+/// # What the race buys, and what it costs
+///
+/// A guardrail is usually a model call, so running it before the first one would double the latency
+/// of every run to protect against the fraction that are refused. Running it beside them costs
+/// nothing on a run that passes.
+///
+/// What it costs on a run that is refused is stated rather than hidden: the turn is **cancelled**
+/// the moment a tripwire fires, so a check that returns while the model call is still in flight
+/// stops the run before any tool executes — the ordinary case, since the two calls are of
+/// comparable length. A guardrail slower than the whole turn does not: it returns after that turn's
+/// tools have already run, and the refusal then ends the run rather than preventing it. A check
+/// that must be decided before anything executes belongs at the tool boundary, where approval and
+/// the tool guardrails sit.
+///
+/// A successful turn still waits for its input verdict. A failed turn drops a pending guardrail
+/// future because there is no answer left to approve. When the guardrail fails first, the turn is
+/// cancelled and drained so its model call and tool execution unwind through the framework.
+async fn race_input_guardrails(
+    check: InputGuardrailCheck,
+    turn: impl Future<Output = Result<Option<RunOutcome>>>,
+    turn_scope: &CancelScope,
+    run_scope: &CancelScope,
+) -> (
+    Result<StageOutcome<InputGuardrailResult>>,
+    Result<Option<RunOutcome>>,
+) {
+    let guardrails = check.run(run_scope);
+    tokio::pin!(guardrails, turn);
+
+    let mut verdicts = None;
+    let step = loop {
+        tokio::select! {
+            // Biased so the refusal is seen on the wake-up that produced it. Left to chance, a
+            // turn that becomes ready in the same wake-up could settle first and run its tools
+            // after the input had already been refused.
+            biased;
+            result = &mut guardrails, if verdicts.is_none() => {
+                // Nothing this turn produces can be delivered now, and everything it is still
+                // doing is being paid for. `PeerFailure` is the reason it is: another task in the
+                // same batch failed and continuing is pointless.
+                //
+                // A cancellation is excluded, and not as a nicety. It means a scope above already
+                // stopped this run and is propagating into the turn on its own; stamping
+                // `PeerFailure` on the turn as well would relabel a user's interrupt or an expired
+                // deadline as a guardrail's doing, in the one field attribution reads.
+                //
+                // A tripwire is one of the two ways this arm stops the turn, and it does not
+                // arrive as an `Err`: the stage returns its verdicts either way and carries the
+                // refusal beside them, so the stop has to be read out of the outcome rather than
+                // off the `Result`.
+                let stops_the_turn = match result.as_ref() {
+                    Ok(outcome) => outcome.refuses(),
+                    Err(error) => !error.is_cancelled(),
+                };
+                if stops_the_turn {
+                    turn_scope.cancel(CancelReason::PeerFailure);
+                }
+                verdicts = Some(result);
+            }
+            step = &mut turn => break step,
+        }
+    };
+
+    let verdicts = match verdicts {
+        Some(verdicts) => verdicts,
+        // Preserve the turn's error and drop the pending check. Guardrail futures own cleanup of
+        // any spawned work, as specified by the InputGuardrail cancellation contract.
+        None if step.is_err() => Ok(StageOutcome::empty_stage()),
+        // The turn won the race. The verdict is still owed — a guardrail that has not answered has
+        // not approved anything — so it is awaited rather than dropped.
+        None => guardrails.await,
+    };
+    (verdicts, step)
 }
 
 /// Runs one turn: prepare, call the model, settle, and say whether the run continues.
@@ -1870,6 +2172,37 @@ fn apply_context_filters(
         }),
         reports,
     ))
+}
+
+/// The tool outputs the **concluding** turn settled, for a delivery whose answer is one of them.
+///
+/// Scoped to that one turn, and the scope is the point. A run that looked something up on turn one
+/// and finished on turn two settled results on both, but only the second turn's are candidates for
+/// the answer — handing over the segment's would let an earlier turn's result decide the verdict
+/// on a final output it is not part of. It would also make the answer depend on whether the run
+/// had been resumed, since a resumed segment starts its history part-way through.
+///
+/// Which of the turn's results a policy promoted is still not re-derived: `stop_on_first_tool`, a
+/// name list, and a host's handler each pick a different subset, and a second reading of that
+/// decision would sooner or later disagree with the first.
+fn concluding_turn_tool_outputs(
+    state: &RunState,
+    progress: &TurnLoopProgress,
+) -> Vec<ToolCallOutput> {
+    let Some(record) = progress.turn_records.last() else {
+        return Vec::new();
+    };
+    let items = progress.segment_items(state);
+    let range = record.item_range().clone();
+    items
+        .get(range)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) => Some(output.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn referenced_tool_outputs(
