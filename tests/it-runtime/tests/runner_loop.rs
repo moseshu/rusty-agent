@@ -235,7 +235,7 @@ use ra_core::{
     cancel::{CancelReason, CancelScope, Deadline},
     context::RunContext,
     error::{Error, ProviderErrorKind, Result, ToolErrorKind},
-    filter::{ContextFilter, ContextFilterRequest, ModelInputData},
+    filter::{ContextFilter, ContextFilterReport, ContextFilterRequest, ModelInputData},
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
@@ -276,6 +276,8 @@ struct ScriptedModel {
     instructions: Mutex<Vec<Option<String>>>,
     tool_choices: Mutex<Vec<Option<ToolChoice>>>,
     request_surfaces: Mutex<Vec<(usize, usize, bool, bool)>>,
+    /// Per call: the cache scope, and whether the plan's hash matches the prefix actually sent.
+    cache_plans: Mutex<Vec<(Option<String>, bool)>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -288,6 +290,7 @@ impl ScriptedModel {
             instructions: Mutex::new(Vec::new()),
             tool_choices: Mutex::new(Vec::new()),
             request_surfaces: Mutex::new(Vec::new()),
+            cache_plans: Mutex::new(Vec::new()),
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -312,6 +315,13 @@ impl ScriptedModel {
             request.handoffs().len(),
             request.output_schema().is_some(),
             request.continuation().is_server_managed(),
+        ));
+        self.cache_plans.lock().unwrap().push((
+            request
+                .cache_plan()
+                .and_then(|plan| plan.cache_scope())
+                .map(str::to_owned),
+            request.validate_cache_plan().is_ok(),
         ));
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
@@ -1255,6 +1265,73 @@ async fn loops_between_tool_calls_and_final_answer_until_model_requests_nothing(
     assert_eq!(result.state().tokens_used(), 40);
 }
 
+/// Replaces the stable prefix on every call.
+struct PrefixRewritingFilter;
+
+impl ContextFilter for PrefixRewritingFilter {
+    fn name(&self) -> &str {
+        "prefix_rewriter"
+    }
+
+    fn filter_model_input(
+        &self,
+        _request: &ContextFilterRequest<'_>,
+        data: ModelInputData,
+    ) -> Result<ModelInputData> {
+        Ok(data.with_instructions(Some("a redacted prefix".to_owned())))
+    }
+}
+
+/// A filter that replaces the prefix has its replacement sent, with the cache plan rebuilt on it.
+///
+/// Preparation attaches a plan naming the prefix by hash, and the dispatch path validates that the
+/// hash matches the text going out — so a projection written back without rebuilding the plan would
+/// be rejected at that boundary rather than sent. The scope is the other half: it identifies the
+/// conversation rather than the bytes, so it survives a prefix that did not.
+#[tokio::test]
+async fn a_filter_that_replaces_the_prefix_has_it_sent_with_the_plan_rebuilt_on_it() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "done")])]);
+    let cancel = CancelScope::root();
+    let config = RunConfig::new().with_context_filter(Arc::new(PrefixRewritingFilter));
+
+    let result = Runner::run(request(Vec::new(), &model, &cancel).with_config(config))
+        .await
+        .expect("a replaced prefix is a projection, not a failure");
+
+    assert_eq!(
+        *model.instructions.lock().unwrap(),
+        vec![Some("a redacted prefix".to_owned())],
+        "the filter's replacement is what the provider was sent, not the agent's original"
+    );
+
+    let plans = model.cache_plans.lock().unwrap().clone();
+    assert_eq!(plans.len(), 1);
+    let (scope, hash_matches) = &plans[0];
+    assert!(
+        *hash_matches,
+        "the plan names the prefix by hash, and the prefix changed; a plan left holding the old \
+         hash would be refused at the dispatch boundary"
+    );
+    assert!(
+        scope.is_some(),
+        "the cache scope identifies the conversation rather than the text, so replacing the prefix \
+         does not drop it"
+    );
+
+    let changed: Vec<bool> = result
+        .turn_records()
+        .iter()
+        .flat_map(|record| record.context_filter_reports())
+        .map(ContextFilterReport::instructions_changed)
+        .collect();
+    assert_eq!(
+        changed,
+        vec![true],
+        "the move is reported: the next turn starts from a cold prefix, and that is the host's to \
+         weigh"
+    );
+}
+
 #[tokio::test]
 async fn a_context_filter_runs_before_each_request_and_records_settled_outputs() {
     let tool = Arc::new(ScriptedTool::new("write_file"));
@@ -1284,8 +1361,8 @@ async fn a_context_filter_runs_before_each_request_and_records_settled_outputs()
         Some(1)
     );
 
-    // The filter is handed the request's stable instructions even though it may not change them:
-    // a policy that budgets a whole request has to be able to price the prefix it cannot touch.
+    // The filter is handed the request's stable instructions. This one only reads them; the test
+    // below covers a filter that replaces them.
     assert_eq!(
         *instructions.lock().unwrap(),
         vec![

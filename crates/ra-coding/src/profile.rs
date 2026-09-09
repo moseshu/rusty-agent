@@ -161,6 +161,12 @@ impl CodingProfile {
 
     /// The advertised-entry band this tier was measured into.
     ///
+    /// **These numbers are this product's, and they bind nothing outside it.** They were measured
+    /// against a coding agent's surface; a retrieval product or a two-tool assistant states its own
+    /// and is not held to these. The framework checks a surface against whatever band its profile
+    /// declared — see [`ToolSurfaceBudget`](ra_runtime::tool::profile::ToolSurfaceBudget) — and has
+    /// no band of its own.
+    ///
     /// Every tier is a band rather than an exact count, so that adding one entry is a decision
     /// about the surface rather than an edit in two places — a bound that has to be raised for each
     /// ordinary addition teaches whoever makes it to raise it without looking. The bands are wide

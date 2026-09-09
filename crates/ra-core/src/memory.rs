@@ -26,20 +26,28 @@
 //! strings and nothing parses them**, which is exactly what lets each store choose the one that is
 //! true of itself.
 //!
-//! # What a store is not asked to do
+//! # What a store is asked to do, and what this trait does not decide
 //!
-//! There is **no `put` and no `forget`**, and their absence is the design rather than a gap.
+//! This trait is a **read contract**: `list`, `read`, `search`. There is no `put` and no `forget`
+//! on it.
 //!
-//! In the reference system the model may never write memory: the only write it can reach is a note
-//! filed for a later consolidation pass to consider, and even that is gated on the user having
-//! asked for it. What rewrites the durable artifacts is an offline agent, running outside the loop,
-//! against the whole corpus rather than one run's impression of it. Deletion is the same shape from
-//! the other side — records leave because a retention window and a usage ranking dropped them, not
-//! because something in a run decided they were wrong.
+//! That is a statement about this trait's scope, **not a policy that products may not have writable
+//! memory**. An earlier version argued the second: the reference product never lets a model write
+//! memory — its only reachable write is a note filed for a later consolidation pass, itself gated
+//! on the user asking — so a `put` here would hand out a write path that product deliberately
+//! withholds. The observation is accurate and the conclusion did not follow. One product's choice
+//! is not every product's, and a framework that encodes it leaves a host with a legitimate need
+//! unable to express it.
 //!
-//! A `put` here would hand a running agent a write path that system deliberately withholds, and a
-//! `forget` would let one run's mistaken confidence erase a conclusion every later run depends on.
-//! Both belong to the offline pipeline, and the pipeline is not part of the agent loop.
+//! What is true is that nothing yet says what a write would have to answer for: whether it is
+//! append or replace, what happens to a record two runs edit, whether deletion is a tombstone or a
+//! removal, whether any of it is transactional. Those are decided by a real consumer, and there is
+//! none. So the write contract is **absent rather than forbidden** — a host that needs one today
+//! installs its own tool against its own store, which nothing here prevents, and when a second host
+//! needs the same shape it becomes worth defining once.
+//!
+//! Read operations stay separate from it either way: a store that only answers reads implements
+//! this trait and nothing more.
 //!
 //! # Usage feedback
 //!
@@ -881,6 +889,10 @@ impl MemoryHits {
 /// A store issues every identity, anchor, and cursor a caller can name, so it is also the only
 /// party that has to validate them. There is no path to confine and no traversal to refuse: an
 /// identity a store did not issue is one it does not recognize.
+///
+/// Reading is the whole of this contract, and that bounds the trait rather than the product: a host
+/// whose memory is writable installs its own write path against its own store. See the module
+/// documentation for why no write contract is defined here yet.
 #[async_trait]
 pub trait MemoryStore: Send + Sync + 'static {
     /// Enumerates records in scope.
