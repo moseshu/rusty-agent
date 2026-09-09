@@ -29,7 +29,6 @@ pub mod error;
 pub mod event;
 pub mod filter;
 pub mod finish;
-pub mod guard;
 pub mod hook;
 pub mod item;
 pub mod memory;
