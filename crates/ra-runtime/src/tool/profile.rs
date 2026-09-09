@@ -78,6 +78,12 @@ impl<'de> Deserialize<'de> for ToolProfileId {
 
 /// The ceiling — and floor — one profile holds its advertised surface to.
 ///
+/// **Every number in it comes from the profile that declares it.** This type carries no default
+/// band and no framework-wide limit: the coding product's tiers, a retrieval product's, and a
+/// conversational agent with two tools each state their own, and none of them is answerable to
+/// another's. What the framework owns is the check — that a surface stays inside whatever its own
+/// profile wrote down — and the reason a floor exists at all.
+///
 /// Both bounds count only entries the model will actually be shown: a tool that is registered but
 /// withheld from the tool list costs nothing per turn and is not measured. The count is the
 /// declared worst case rather than what any single turn ends up sending, because a tool with

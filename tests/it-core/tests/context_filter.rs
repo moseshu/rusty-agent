@@ -88,6 +88,23 @@ impl ContextFilter for InstructionRewriter {
     }
 }
 
+/// Returns data with no instructions at all.
+struct InstructionRemover;
+
+impl ContextFilter for InstructionRemover {
+    fn name(&self) -> &str {
+        "instruction_remover"
+    }
+
+    fn filter_model_input(
+        &self,
+        _request: &ContextFilterRequest<'_>,
+        data: ModelInputData,
+    ) -> Result<ModelInputData> {
+        Ok(data.with_instructions(None))
+    }
+}
+
 /// Fails rather than projecting.
 struct Failing;
 
@@ -260,10 +277,13 @@ fn filters_run_in_install_order_and_each_report_covers_only_its_own_step() {
     );
 }
 
-/// The instructions are the cached prefix. A filter may price them and may not rewrite them, and
-/// the chain says so by name rather than silently restoring the originals.
+/// A filter may read the instructions and may replace them; the chain reports the move.
+///
+/// Replacing the prefix costs cache residency, and that cost is the host's to weigh. What the chain
+/// owes it is the fact: `instructions_changed` says the prefix moved this turn, separately from the
+/// savings, because a small prefix edit and a large input trim report the same number.
 #[test]
-fn a_filter_may_read_the_instructions_but_not_replace_them() {
+fn a_filter_may_replace_the_instructions_and_the_chain_reports_it() {
     let run_id = RunId::new("run-filter");
     let tracker = tracker();
     let request = ContextFilterRequest::new(&run_id, 1, &tracker);
@@ -272,23 +292,58 @@ fn a_filter_may_read_the_instructions_but_not_replace_them() {
     let mut readonly = ContextFilterChain::new();
     readonly.push(Arc::clone(&recorder) as Arc<dyn ContextFilter>);
 
-    readonly
+    let untouched = readonly
         .apply(&request, data(&["keep me"]))
         .expect("reading the instructions is allowed");
     assert_eq!(
         instructions.lock().unwrap().clone(),
         vec![Some("the stable prefix".to_owned())]
     );
+    assert!(
+        !untouched.reports()[0].instructions_changed(),
+        "a filter that only read the prefix did not move it"
+    );
 
     let mut rewriting = ContextFilterChain::new();
     rewriting.push(Arc::new(InstructionRewriter));
-    let error = rewriting
+    let filtered = rewriting
         .apply(&request, data(&["keep me"]))
-        .expect_err("rewriting the instructions is refused");
+        .expect("replacing the instructions is a projection, not an error");
 
-    let message = error.to_string();
-    assert!(message.contains("instruction_rewriter"), "{message}");
-    assert!(message.contains("cached prefix"), "{message}");
+    assert_eq!(filtered.data().instructions(), Some("a different prefix"));
+    let report = &filtered.reports()[0];
+    assert!(report.changed());
+    assert!(
+        report.instructions_changed(),
+        "the move is reported on its own: it costs a cold prefix on the next turn, which the \
+         savings figure does not say"
+    );
+    assert!(
+        report.chars_saved() != 0,
+        "the instructions are measured alongside the input, so a pass that only touched the \
+         prefix does not report a saving of zero on a request whose size it changed"
+    );
+}
+
+/// A filter may drop the prefix entirely, and that is a projection like any other.
+#[test]
+fn a_filter_may_remove_the_instructions_altogether() {
+    let run_id = RunId::new("run-filter");
+    let tracker = tracker();
+    let request = ContextFilterRequest::new(&run_id, 1, &tracker);
+    let mut chain = ContextFilterChain::new();
+    chain.push(Arc::new(InstructionRemover));
+
+    let filtered = chain
+        .apply(&request, data(&["keep me"]))
+        .expect("removing the prefix is allowed");
+
+    assert_eq!(filtered.data().instructions(), None);
+    assert!(filtered.reports()[0].instructions_changed());
+    assert!(
+        filtered.reports()[0].chars_saved() > 0,
+        "dropping the prefix made the request smaller by exactly its length"
+    );
 }
 
 /// A projection that failed halfway is not a request. The chain stops and hands the error back

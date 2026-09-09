@@ -20,16 +20,26 @@
 //!
 //! # What a filter may change
 //!
-//! [`ModelInputData`] carries the request's input *and* its system instructions, but only the input
-//! can be replaced. The instructions are the cached prefix: their bytes are what a provider's prompt
-//! cache keys on, and a filter runs per turn, so a filter that rewrote them would move the cached
-//! span on every call and cost more than everything trimming saves. This is the same rule
-//! [`ResolvedPrompt`](crate::prompt::ResolvedPrompt) applies one stage earlier, where a per-run
-//! generator is refused the prefix and given the volatile tail instead. The instructions are still
-//! handed over because a filter that budgets a whole request has to be able to measure them.
+//! [`ModelInputData`] carries the request's input *and* its system instructions, and **both can be
+//! replaced**, matching the upstream contract this type is named after.
 //!
-//! The chain enforces this rather than trusting it: a filter that returns different instructions is
-//! refused by name, not quietly ignored.
+//! An earlier version refused a filter that returned different instructions, on the grounds that
+//! the instructions are the cached prefix and rewriting them per turn moves the span a provider's
+//! prompt cache keys on. That cost is real, and it is still real — but it is the host's to weigh,
+//! not this chain's to forbid. A host that redacts credentials out of its own prefix, or that
+//! trims a prompt that turned out too long for a smaller model, is doing something legitimate that
+//! a cache argument was being used to prevent.
+//!
+//! So the cost is **measured instead of refused**: [`ContextFilterReport::instructions_changed`]
+//! says whether a filter moved the prefix this turn, and the savings it reports cover the
+//! instructions as well as the input. A host that cares about cache residency reads that flag; one
+//! that has a reason to pay reads it and proceeds.
+//!
+//! Writing the change back is the caller's job and it is not optional: a projection whose new
+//! instructions never reached the provider would report a saving the request did not get. Anything
+//! derived from the prefix — a [`CachePlan`](crate::prompt::CachePlan)'s hash, most of all — is
+//! rebuilt from the text actually sent. The cache *scope* is not: it identifies a conversation
+//! rather than a body of text, so it stays what the host set it to.
 //!
 //! # Reports are measured, not declared
 //!
@@ -43,16 +53,16 @@ use std::{fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{Error, Result},
+    error::Result,
     item::{ModelInputItem, estimate},
     state::{RunId, ToolOutputReferenceTracker},
 };
 
 /// The model-facing request one filter may project.
 ///
-/// Named after the upstream `ModelInputData` it mirrors. The deviation is that
-/// [`Self::instructions`] is readable but not replaceable; see the module documentation for why the
-/// cached prefix is not a per-turn filter's to rewrite.
+/// Named after the upstream `ModelInputData` it mirrors, and matching it: both halves are readable
+/// and both are replaceable. See the module documentation for what replacing the instructions costs
+/// and who is told about it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelInputData {
@@ -76,7 +86,7 @@ impl ModelInputData {
         &self.input
     }
 
-    /// Stable system instructions this request carries, for measurement only.
+    /// Stable system instructions this request carries.
     #[must_use]
     pub fn instructions(&self) -> Option<&str> {
         self.instructions.as_deref()
@@ -84,12 +94,25 @@ impl ModelInputData {
 
     /// Replaces the input, keeping the instructions this data arrived with.
     ///
-    /// The only mutator a filter has, and the reason it takes `self` by value: the returned data is
-    /// the filter's whole answer, so there is no partially rewritten intermediate for a later stage
-    /// to observe.
+    /// Takes `self` by value like its sibling below: the returned data is the filter's whole
+    /// answer, so there is no partially rewritten intermediate for a later stage to observe.
     #[must_use]
     pub fn with_input(mut self, input: Vec<ModelInputItem>) -> Self {
         self.input = input;
+        self
+    }
+
+    /// Replaces the system instructions, keeping the input this data arrived with.
+    ///
+    /// `None` sends the request with no stable prefix at all, which is a projection rather than an
+    /// oversight and is passed through as one.
+    ///
+    /// What this costs is in the module documentation: the prefix is what a provider's prompt cache
+    /// keys on, so a filter that rewrites it every turn moves that span every turn. The chain
+    /// reports the move rather than preventing it.
+    #[must_use]
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
         self
     }
 
@@ -97,6 +120,15 @@ impl ModelInputData {
     #[must_use]
     pub fn into_input(self) -> Vec<ModelInputItem> {
         self.input
+    }
+
+    /// Takes both halves out, for a caller rebuilding the whole request.
+    ///
+    /// The caller that writes a projection back needs both or neither: writing the input while
+    /// dropping changed instructions would send a request the reports do not describe.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ModelInputItem>, Option<String>) {
+        (self.input, self.instructions)
     }
 }
 
@@ -185,8 +217,9 @@ pub trait ContextFilter: Send + Sync + 'static {
 /// smaller**, and a redaction that replaces a short secret with a longer marker reports negative
 /// savings rather than wrapping around to a large one.
 ///
-/// Only the input is measured. The instructions cannot change, so charging them to both sides would
-/// add the same constant to each and leave every delta exactly where it is.
+/// The instructions are measured alongside the input, because a filter may replace them: a pass
+/// that trimmed only the prefix would otherwise report a saving of zero on a request it made
+/// smaller.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextFilterReport {
@@ -194,6 +227,10 @@ pub struct ContextFilterReport {
     changed: bool,
     chars_saved: i64,
     token_estimate_delta: i64,
+    /// Defaulted so a report persisted before instructions became replaceable still loads, reading
+    /// as the `false` that was the only possibility when it was written.
+    #[serde(default)]
+    instructions_changed: bool,
 }
 
 impl ContextFilterReport {
@@ -204,16 +241,23 @@ impl ContextFilterReport {
             changed: false,
             chars_saved: 0,
             token_estimate_delta: 0,
+            instructions_changed: false,
         }
     }
 
     /// Reports the difference one filter made, measured on both sides of its own step.
-    fn measured(filter: &str, before: &InputMeasure, after: &InputMeasure) -> Self {
+    fn measured(
+        filter: &str,
+        before: &InputMeasure,
+        after: &InputMeasure,
+        instructions_changed: bool,
+    ) -> Self {
         Self {
             filter: filter.to_owned(),
             changed: true,
             chars_saved: saved(before.chars, after.chars),
             token_estimate_delta: saved(before.tokens, after.tokens),
+            instructions_changed,
         }
     }
 
@@ -249,6 +293,18 @@ impl ContextFilterReport {
     #[must_use]
     pub const fn token_estimate_delta(&self) -> i64 {
         self.token_estimate_delta
+    }
+
+    /// Whether this filter moved the stable prefix.
+    ///
+    /// Reported on its own rather than folded into [`Self::changed`] because the two have different
+    /// consequences. Trimming the input costs the tokens it removed and nothing else; replacing the
+    /// instructions also moves the span a provider's prompt cache keys on, so the turn after it
+    /// starts from a cold prefix. A host weighing residency reads this; the savings above do not
+    /// say it, because a small prefix edit and a large input trim can report the same number.
+    #[must_use]
+    pub const fn instructions_changed(&self) -> bool {
+        self.instructions_changed
     }
 }
 
@@ -332,8 +388,7 @@ impl ContextFilterChain {
     ///
     /// # Errors
     ///
-    /// Returns whatever error a filter produced, or a caller error when a filter returned different
-    /// system instructions — which it may not do, for the reason in the module documentation.
+    /// Returns whatever error a filter produced, and whatever measuring an item produced.
     pub fn apply(
         &self,
         request: &ContextFilterRequest<'_>,
@@ -348,24 +403,23 @@ impl ContextFilterChain {
             let before_instructions = data.instructions().map(str::to_owned);
             let filtered = filter.filter_model_input(request, data)?;
 
-            if filtered.instructions() != before_instructions.as_deref() {
-                return Err(Error::caller(format!(
-                    "context filter `{}` changed the system instructions; a filter projects the \
-                     request input only, because the instructions are the cached prefix and \
-                     rewriting them per turn moves the span the cache keys on",
-                    filter.name()
-                )));
-            }
-
-            let report = if filtered.input() == before_input.as_slice() {
+            let instructions_changed = filtered.instructions() != before_instructions.as_deref();
+            let report = if filtered.input() == before_input.as_slice() && !instructions_changed {
                 ContextFilterReport::unchanged(filter.name())
             } else {
+                // The cached measure is only reusable when the previous step left the prefix alone;
+                // otherwise it was taken against instructions this step no longer starts from.
                 let before = match measure.take() {
                     Some(measure) => measure,
-                    None => InputMeasure::of(&before_input)?,
+                    None => InputMeasure::of(&before_input, before_instructions.as_deref())?,
                 };
-                let after = InputMeasure::of(filtered.input())?;
-                let report = ContextFilterReport::measured(filter.name(), &before, &after);
+                let after = InputMeasure::of(filtered.input(), filtered.instructions())?;
+                let report = ContextFilterReport::measured(
+                    filter.name(),
+                    &before,
+                    &after,
+                    instructions_changed,
+                );
                 measure = Some(after);
                 report
             };
@@ -386,24 +440,30 @@ impl fmt::Debug for ContextFilterChain {
     }
 }
 
-/// What one input measured, on both bases at once.
+/// What one request measured, on both bases at once.
 ///
 /// Both numbers come from the same walk. Deriving the token estimate from the character total
 /// afterwards would round once over the sum instead of once per item, which is not the basis the
-/// context limits it gets compared against were built on.
+/// context limits it gets compared against were built on — and for the same reason the
+/// instructions are rounded as their own item rather than added to the character total first.
 struct InputMeasure {
     chars: usize,
     tokens: usize,
 }
 
 impl InputMeasure {
-    fn of(input: &[ModelInputItem]) -> Result<Self> {
+    fn of(input: &[ModelInputItem], instructions: Option<&str>) -> Result<Self> {
         let mut chars = 0usize;
         let mut tokens = 0usize;
         for item in input {
             let item_chars = estimate::item_chars(item)?;
             chars = chars.saturating_add(item_chars);
             tokens = tokens.saturating_add(estimate::chars_to_tokens(item_chars));
+        }
+        if let Some(instructions) = instructions {
+            let instruction_chars = instructions.chars().count();
+            chars = chars.saturating_add(instruction_chars);
+            tokens = tokens.saturating_add(estimate::chars_to_tokens(instruction_chars));
         }
         Ok(Self { chars, tokens })
     }

@@ -512,6 +512,19 @@ impl ModelRequest {
         self
     }
 
+    /// Sends this request with no stable prefix.
+    ///
+    /// Drops the cache plan with it, and not as a convenience: a plan states the hash of the prefix
+    /// that will be sent, so one left attached to a request that now sends none describes text that
+    /// does not exist — which [`Self::validate_cache_plan`] rejects, at the provider boundary,
+    /// naming the plan rather than the removal that stranded it.
+    #[must_use]
+    pub fn without_system_instructions(mut self) -> Self {
+        self.system_instructions = None;
+        self.cache_plan = None;
+        self
+    }
+
     /// Attaches a provider-neutral cache plan for the stable system-instruction prefix.
     #[must_use]
     pub fn with_cache_plan(mut self, cache_plan: CachePlan) -> Self {

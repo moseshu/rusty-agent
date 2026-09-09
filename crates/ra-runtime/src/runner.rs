@@ -57,6 +57,7 @@ use ra_core::{
         RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
     permission::{PermissionMode, PermissionRule},
+    prompt::CachePlan,
     state::{EventSeqAllocator, InterruptionResolution, RunId, RunState, ToolOutcome, ToolUse},
     step::NextStep,
     tool::{ToolOutputReferenceExtractor, ToolServices},
@@ -316,12 +317,12 @@ impl RunConfig {
     /// against the rest of the installed set, its tools and prompt fragment join the agent instance
     /// that executes, its settings fold onto that instance's settings layer, and its context
     /// transform is appended to the processors installed above. Installation order is the assembly
-    /// order, except where a declared dependency moves a capability after the family it names — see
+    /// order; dependencies check presence without reordering capabilities — see
     /// [`CapabilityPlan`](crate::capability::CapabilityPlan) for the whole rule.
     ///
-    /// A set that cannot be assembled — a missing dependency, two capabilities claiming one family,
-    /// a dependency circle — fails the run before its first model call rather than reaching a model
-    /// half-assembled.
+    /// A missing dependency, two capabilities claiming one family, or a capability requiring its
+    /// own family fails the run before its first model call. Mutually dependent capabilities are
+    /// accepted when every required family is installed.
     pub fn with_capability(mut self, capability: Arc<dyn Capability>) -> Self {
         self.capabilities.push(capability);
         self
@@ -1815,9 +1816,15 @@ impl ContextSummarizer for RunnerContextSummarizer<'_> {
 /// checkpoint, and a result last referenced before a resume has to stay comparable with the turn
 /// now being prepared.
 ///
-/// The system instructions are handed over so a filter can measure the whole request, and written
-/// back from the prepared request rather than from the chain — the chain refuses a filter that
-/// changed them, so there is nothing here to write back.
+/// Both halves of the projection are written back, and anything derived from the prefix is rebuilt
+/// from the text that will actually be sent. A filter may replace the system instructions — the
+/// chain measures that rather than refusing it — so a cache plan carried by the prepared request
+/// would otherwise still hold the hash of a prefix this turn is no longer sending, and the
+/// request's own validation would reject it at the provider boundary.
+///
+/// The cache **scope** is deliberately carried across unchanged. It identifies the conversation a
+/// cache entry belongs to rather than the bytes in it, so a host that keeps one stable key per
+/// session keeps it here too; only the prefix hash follows the text.
 fn apply_context_filters(
     config: &RunConfig,
     state: &RunState,
@@ -1830,13 +1837,37 @@ fn apply_context_filters(
     }
 
     let request = ContextFilterRequest::new(state.run_id(), turn, state.tool_output_references());
+    let before_instructions = prepared.request().system_instructions().map(str::to_owned);
     let data = ModelInputData::new(
         prepared.request().input().to_vec(),
-        prepared.request().system_instructions().map(str::to_owned),
+        before_instructions.clone(),
     );
     let (data, reports) = filters.apply(&request, data)?.into_parts();
+    let (input, instructions) = data.into_parts();
+    let instructions_changed = instructions != before_instructions;
+
     Ok((
-        prepared.map_request(|request| request.with_input(data.into_input())),
+        prepared.map_request(|request| {
+            let request = request.with_input(input);
+            if !instructions_changed {
+                return request;
+            }
+            let scope = request
+                .cache_plan()
+                .and_then(|plan| plan.cache_scope())
+                .map(str::to_owned);
+            match instructions {
+                Some(instructions) => {
+                    let plan = CachePlan::for_prefix(&instructions, scope.as_deref());
+                    request
+                        .with_system_instructions(instructions)
+                        .with_cache_plan(plan)
+                }
+                // A projection that removed the prefix leaves nothing for a plan to key on, so the
+                // plan goes with it rather than being kept against text that is no longer there.
+                None => request.without_system_instructions(),
+            }
+        }),
         reports,
     ))
 }
