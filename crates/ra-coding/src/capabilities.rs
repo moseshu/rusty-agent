@@ -43,6 +43,12 @@
 //! installed there contributes its tools at run assembly and the agent already declares them, so
 //! installing in both places declares one tool twice and fails the build.
 //!
+//! Nor could these four go there *instead*: every one of them contributes
+//! [`Capability::static_instructions`](ra_core::capability::Capability::static_instructions), and
+//! run assembly refuses a capability carrying static prefix text. The framework-level statement of
+//! which route carries which contribution is the table on [`ra_core::capability`]; what follows is
+//! why this product's split lands where it does.
+//!
 //! # Why the fragments arrive here and not at run assembly
 //!
 //! The obvious symmetry would be the other one: move the tools to `RunConfig` and let both halves

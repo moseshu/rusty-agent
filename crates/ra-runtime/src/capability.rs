@@ -217,7 +217,8 @@ impl CapabilityPlan {
 
     /// Binds every capability to this run and collects what the bound forms contribute.
     ///
-    /// Binding happens first and for the whole set, before any contribution is read, because
+    /// After rejecting installed static prompt fragments, binding happens for the whole set before
+    /// any run contribution is read, because
     /// [`Capability::bind`] is what gives a capability the run it serves — a fragment or a tool
     /// read from the unbound value would describe a different run than the one about to start.
     ///
@@ -225,7 +226,10 @@ impl CapabilityPlan {
     ///
     /// Propagates a binding failure, a failure to resolve a prompt fragment, a bound form that
     /// changed its family, and a fragment that asks for a placement outside the cached prefix.
+    /// Rejects installed capabilities that contribute static prompt text.
     pub async fn assemble(&self, context: &RunContext) -> Result<AssembledCapabilities> {
+        refuse_static_prefix_text(&self.ordered).await?;
+
         let mut capabilities: Vec<Arc<dyn Capability>> = Vec::with_capacity(self.ordered.len());
         for installed in &self.ordered {
             let family = installed.kind();
@@ -269,6 +273,45 @@ impl CapabilityPlan {
             context_processors,
         })
     }
+}
+
+/// Refuses a capability whose prompt text only the agent-construction path can place.
+///
+/// [`Capability::static_instructions`] is resolved before any run exists and belongs in the cached
+/// prefix, which is assembled where the agent is built. Nothing on this path reads it: run assembly
+/// reads [`Capability::instructions`] and [`Capability::deferred_instructions`], and appends what
+/// they return to the agent that already exists.
+///
+/// So a capability installed here carrying static text would contribute its tools and lose its
+/// paragraph — the model would receive an entry nothing in the prefix declares, which is the one
+/// outcome the four-contributions-on-one-trait design exists to prevent. It fails here instead,
+/// naming the two ways out.
+///
+/// The check reads the **installed** capabilities rather than the bound ones, matching the
+/// lifecycle the method is declared at, and it runs before any binding so a misconfiguration costs
+/// nothing that has to be undone.
+async fn refuse_static_prefix_text(capabilities: &[Arc<dyn Capability>]) -> Result<()> {
+    for capability in capabilities {
+        let family = capability.kind();
+        let section = capability.static_instructions().await.map_err(|error| {
+            error.with_context(format!(
+                "resolving the static prompt fragment of capability `{family}`"
+            ))
+        })?;
+        if let Some(section) = section {
+            return Err(Error::config(format!(
+                "capability `{family}` contributes the static prefix section `{}`, and it is \
+                 installed on the run configuration; static text is resolved before a run exists \
+                 and is placed where the agent's cached prefix is assembled, so nothing on this \
+                 path would carry it and the capability's tools would reach the model with no \
+                 paragraph declaring them. Install it where the agent is built instead, or move \
+                 the text to `instructions` (per run, into the prefix) or \
+                 `deferred_instructions` (delivered into history on a signal)",
+                section.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Resolves one ordered capability list's installed, static prompt fragments.

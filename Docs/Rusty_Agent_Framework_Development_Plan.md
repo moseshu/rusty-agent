@@ -1069,7 +1069,9 @@ Codex 本地仓库的 `LICENSE` 为 Apache-2.0；若确有必要复制其实现�
 
 ## R10 Capability 装配层
 
-> **定位（2026-09-09 审查后收窄）**：`Capability` 对齐上游 `openai-agents-python/src/agents/sandbox/capabilities/capability.py`——上游确有这个概念，含工具、提示、上下文处理与依赖声明，所以 R10 不是凭空设计。但**上游那套服务于 sandbox，我们把它推广成通用装配单元，这一步是自行论证的扩展**，因此它是一种**可选的装配方式**：普通工具与 agent 无须经过 capability 才能装上。<br>**待解决的复杂度信号**：现在有两条装配入口——`ra-coding::build_agent` 在产品构造时装工具与静态提示，`RunConfig::with_capability` 在运行时装 capability，两边支持的贡献种类还不一致。**先统一或写清这两个入口各自的职责，再谈补全任何组合**；不要为了凑齐验收继续加触发机制。
+> **定位（2026-09-09 审查后收窄）**：`Capability` 对齐上游 `openai-agents-python/src/agents/sandbox/capabilities/capability.py`——上游确有这个概念，含工具、提示、上下文处理与依赖声明，所以 R10 不是凭空设计。但**上游那套服务于 sandbox，我们把它推广成通用装配单元，这一步是自行论证的扩展**，因此它是一种**可选的装配方式**：普通工具与 agent 无须经过 capability 才能装上。<br>**这个复杂度信号已于 2026-09-09 结清**，结论见下一段。
+>
+> **两条装配入口的职责（2026-09-09 定，原为待解决的复杂度信号）**：两条路**携带的贡献不同**，应按 capability 所需的全部贡献选择入口。<br>**① 在构造 agent 处装**（`ra-coding::host_backed_surface` → `build_agent_with_profile` 这一类）：带 `tools` 与 `static_instructions`。静态文本正是为了进缓存前缀才在 run 之前解析，而前缀只在这里装配一次，背后有段序与已提交的 prompt dump。<br>**② 在 `RunConfig::with_capability` 装**：带 `bind`、`tools`、`instructions`、`deferred_instructions`、`sampling_params`、`context_processor`——**唯独不带 `static_instructions`**。这条路在 agent 已经存在之后才跑，只能追加，落在段序与 dump 的下游，静态片段无处安放。<br>**判据**：只有工具 → 两条路均可；有静态文本 → 由 ① 承载；需要 `bind`、per-run / deferred 提示、采样参数或上下文处理 → 必须由 ② 承载，与有无工具无关（compaction 需要运行时入口）。同时贡献静态文本和运行时行为的 capability，目前没有能完整承载它的单一入口，宿主须显式调整组合，例如将静态文本改为 per-run 提示后走 ②。**两处声明相同工具会按 lookup key 冲突而失败，不会自动合并；无工具的 capability 不触发该冲突，但静态文本在 ② 仍会被拒绝。**<br>**已落地的强制**：`CapabilityPlan::assemble` 现在会**拒绝**携带静态前缀文本的 capability——此前是静默丢弃：工具进得去、声明它的那段话没了，模型收到一个前缀里查无此物的入口。权威表述在 `ra-core::capability` 的模块文档，产品侧的具体取舍在 `ra-coding::capabilities`。
 
 > Capability 把工具 + 提示片段 + 采样参数 + 上下文变换 + 依赖声明**捆在一起装**，这一点对齐上游 `sandbox/capabilities/capability.py` 的同名概念。**但它是一种可选的装配方式，不是一等强制单元**（2026-09-09 收窄，见上）——普通工具与 agent 不经过它照样能装。
 
