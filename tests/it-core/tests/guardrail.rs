@@ -8,7 +8,7 @@ use ra_core::{
     context::RunContext,
     error::{Error, GuardrailStage, Recoverability, Result},
     finish::FinishReason,
-        guardrail::{
+    guardrail::{
         GuardrailFinalOutput, GuardrailFunctionOutput, InputGuardrail, InputGuardrailResult,
         OutputGuardrail, OutputGuardrailResult, merge_input_guardrails, merge_output_guardrails,
     },
@@ -204,10 +204,7 @@ fn a_run_adds_its_own_guardrails_after_the_agent_declares_its_own() {
     let run: Vec<Arc<dyn InputGuardrail>> = vec![Fixed::new("pii"), Fixed::new("topic")];
 
     let merged = merge_input_guardrails(&agent, &run);
-    let names: Vec<&str> = merged
-        .iter()
-        .map(|guardrail| guardrail.name())
-        .collect();
+    let names: Vec<&str> = merged.iter().map(|guardrail| guardrail.name()).collect();
     // Declaration order, and the agent's first: the verdicts are recorded in this order, and a
     // reader lining up two runs of the same agent needs it to be the same order both times.
     assert_eq!(names, ["prompt_injection", "pii", "topic"]);
@@ -291,10 +288,7 @@ fn a_derived_agent_carries_the_guardrails_it_was_derived_from() {
         .unwrap();
 
     let derived = agent.to_builder().name("Reviewer").build().unwrap();
-    assert_eq!(
-        derived.input_guardrails()[0].name(),
-        "prompt_injection"
-    );
+    assert_eq!(derived.input_guardrails()[0].name(), "prompt_injection");
     assert_eq!(derived.output_guardrails()[0].name(), "pii");
 
     // Dropping them is explicit, for the reason clearing tools or instructions is: a variant that
