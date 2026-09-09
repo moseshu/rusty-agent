@@ -17,7 +17,6 @@ mod feature_matrix;
 mod gate;
 mod inline_tests;
 mod layering;
-mod pending;
 mod prompt_dump;
 mod public_api;
 mod schema_stability;
@@ -53,8 +52,6 @@ enum Task {
         #[arg(long)]
         bless: bool,
     },
-    /// Checks `Guard_Registry.md` against the code, and that hard-blocking guards number <= 8.
-    GuardRegistry,
     /// Checks what the coding product's advertised tool table costs a turn. Per-prompt-section
     /// ceilings are not part of it; they wait on R4-7.
     TokenBudget,
@@ -93,7 +90,6 @@ fn all_gates() -> Vec<(&'static str, Outcome)> {
         ("public-api", public_api::run(false)),
         ("schema-stability", schema_stability::run(false)),
         ("prompt-dump", prompt_dump::run(false)),
-        ("guard-registry", pending::guard_registry()),
         ("token-budget", token_budget::run()),
         ("feature-matrix", feature_matrix::run()),
         ("test", tests_workspace::run(&[])),
@@ -108,7 +104,6 @@ fn main() -> std::process::ExitCode {
         Task::PublicApi { bless } => vec![("public-api", public_api::run(bless))],
         Task::SchemaStability { bless } => vec![("schema-stability", schema_stability::run(bless))],
         Task::PromptDump { bless } => vec![("prompt-dump", prompt_dump::run(bless))],
-        Task::GuardRegistry => vec![("guard-registry", pending::guard_registry())],
         Task::TokenBudget => vec![("token-budget", token_budget::run())],
         Task::FeatureMatrix => vec![("feature-matrix", feature_matrix::run())],
         Task::Test { args } => vec![("test", tests_workspace::run(&args))],

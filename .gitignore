@@ -32,8 +32,13 @@ target
 # eval fixture 输出
 /fixtures/out/
 
-# 开发文档（不上传 GitHub）——整目录忽略，避免子目录 md 漏传
-/Docs/
+# 开发文档——分析类文档不上传，唯独开发计划进库。
+# 计划文档是执行依据，它的每次修订理由（尤其撤销记录）需要可追溯；
+# 一次性分析文档没有这个需要，继续忽略。
+# 用 `/Docs/*` 而不是 `/Docs/`：git 无法重新纳入一个被排除的目录下的文件，
+# 排除目录内容才能让下面这条否定生效。
+/Docs/*
+!/Docs/Rusty_Agent_Framework_Development_Plan.md
 
 # 门禁基线与快照（不上传 GitHub）——本地产物，`cargo xtask <gate> --bless` 生成。
 # 注意代价：它们是 `public-api` / `schema-stability` / `prompt-dump` 三条门禁的对账对象，

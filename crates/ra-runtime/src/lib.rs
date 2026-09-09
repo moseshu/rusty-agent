@@ -22,7 +22,6 @@ pub mod agent;
 pub(crate) mod budget;
 pub mod capability;
 pub(crate) mod circuit;
-pub mod guard;
 pub(crate) mod hook;
 pub(crate) mod memory;
 pub mod permission;

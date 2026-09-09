@@ -21,7 +21,6 @@ pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub mod dangerous_action;
 pub(crate) mod final_answer;
-pub(crate) mod guards;
 pub mod host;
 pub mod profile;
 pub mod prompt;

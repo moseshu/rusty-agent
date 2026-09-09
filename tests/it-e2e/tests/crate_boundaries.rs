@@ -11,7 +11,7 @@ use ra_model::{fallback, openai, protocol, provider, retry, usage};
 #[allow(unused_imports)]
 use ra_patch::{apply, parse, render};
 #[allow(unused_imports)]
-use ra_runtime::{agent, guard, runner, tool};
+use ra_runtime::{agent, runner, tool};
 
 #[test]
 fn intended_facades_are_public() {
