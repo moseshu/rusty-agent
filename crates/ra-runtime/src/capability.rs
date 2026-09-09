@@ -1,35 +1,26 @@
-//! Capability assembly and dependency-topology validation.
+//! Capability assembly and installed-set validation.
 //!
 //! [`Capability`] declares what one installable unit contributes. This module is where a set of
 //! them becomes one agent, and it owns the two decisions no single capability can make: whether the
 //! installed set is coherent, and what order it is folded in.
 //!
-//! # Order is not a presentation choice
+//! # A dependency says "present", not "before"
 //!
-//! Three of the four contributions are order-sensitive. The sampling fold hands each capability
-//! what the ones before it produced, prompt fragments reach the cached prefix in the order they are
-//! assembled, and context processors run as a chain over the same request. A set with no defined
-//! order is therefore a set whose prompt text and model settings are decided by whichever sequence
-//! the host happened to write down — and two capabilities that disagree resolve by luck.
+//! [`Capability::required_capabilities`] is a presence check and nothing else, matching the
+//! reference implementation's `required_capability_types`: the set it names must be installed, and
+//! whether it is installed before or after is not this declaration's business.
 //!
-//! A declared dependency is consequently also an ordering edge: a `memory` capability that requires
-//! `shell` is assembled after it, so it folds onto the shell settings and its fragment follows the
-//! shell fragment. Everything a dependency does not constrain keeps installation order.
+//! **The order capabilities are folded in is the order the host installed them**, always. Order is
+//! not arbitrary — the sampling fold hands each capability what the ones before it produced, prompt
+//! fragments reach the prefix in assembly order, and context processors run as a chain — but the
+//! host is the one who decides it, by writing the installs down in the order it wants. A host that
+//! needs `memory` folded onto `shell`'s settings installs `shell` first.
 //!
-//! # Deviation from the reference contract
+//! Mutually dependent capabilities are accepted when every required family is present. Presence
+//! does not impose an order on sampling folds or context processors; the host controls those by
+//! installation order, matching the reference contract.
 //!
-//! The reference implementation checks that every required type is present — a set difference with
-//! no topology in it — and then assembles in declaration order. Two things are added here, both
-//! because ordering carries meaning in this framework that it does not carry there:
-//!
-//! - **A dependency orders as well as requires.** Declaration order alone accepts installing
-//!   `memory` before the `shell` it depends on and silently folds the dependent first, which is the
-//!   one arrangement its own declaration says is wrong.
-//! - **A cycle is rejected rather than resolved by iteration accident.** Two capabilities that
-//!   require each other have no assembly order at all, and picking one by list position would make
-//!   the resulting prompt and settings an artifact of how the host typed them.
-//!
-//! One capability per family is likewise enforced here rather than upstream: a dependency names a
+//! One capability per family is still enforced here rather than upstream: a dependency names a
 //! family, so a family that names two objects cannot say which one it means.
 //!
 //! # Deferred prompt text is resolved here and delivered later
@@ -80,18 +71,17 @@ pub struct CapabilityPlan {
 }
 
 impl CapabilityPlan {
-    /// Validates the installed set and freezes the order assembly will use.
+    /// Validates the installed set and keeps the order assembly will fold it in.
     ///
-    /// The order is installation order wherever dependencies leave it free, and dependency order
-    /// wherever they do not: each capability is placed after every family it requires and otherwise
-    /// as early as it can go, so a declared dependency costs one swap rather than a rearrangement.
+    /// The order is the one the caller installed. A declared dependency is checked for presence and
+    /// moves nothing — see the module documentation for why deriving an order was removed.
     ///
     /// # Errors
     ///
     /// Returns a configuration error when two capabilities claim one family, when a declared
-    /// dependency names a family nothing installs, when a capability declares its own family, or
-    /// when a group of them depends in a circle. Every message names the capabilities involved,
-    /// because the fix is always to install or remove one of them.
+    /// dependency names a family nothing installs, or when a capability declares its own family.
+    /// Every message names the capabilities involved, because the fix is always to install or
+    /// remove one of them.
     pub fn resolve(installed: impl IntoIterator<Item = Arc<dyn Capability>>) -> Result<Self> {
         let installed: Vec<Arc<dyn Capability>> = installed.into_iter().collect();
         let families: Vec<CapabilityFamily> = installed
@@ -140,21 +130,20 @@ impl CapabilityPlan {
             )));
         }
 
-        // A capability that names its own family is a one-node cycle, and it is worth its own
-        // message: the cycle report below would name one capability twice and read like a bug in
-        // the report.
+        // Refused rather than satisfied by the capability itself. Under a presence check it would
+        // pass trivially, and passing is the problem: a capability naming its own family meant a
+        // different one, and the dependency it intended would go unchecked with nothing said.
         for (family, required) in families.iter().zip(&requirements) {
             if required.contains(family) {
                 return Err(Error::config(format!(
-                    "capability `{family}` declares its own family as a dependency; nothing can be \
-                     assembled after itself"
+                    "capability `{family}` declares its own family as a dependency; it would be \
+                     satisfied by itself and check nothing. Name the family it actually needs, or \
+                     drop the declaration"
                 )));
             }
         }
 
-        Ok(Self {
-            ordered: order_by_dependency(installed, &families, &requirements, &provider_of)?,
-        })
+        Ok(Self { ordered: installed })
     }
 
     /// The installed capabilities, in the order assembly folds them.
@@ -583,104 +572,6 @@ impl fmt::Debug for CapabilityPlan {
             .debug_struct("CapabilityPlan")
             .field("families", &self.families())
             .finish()
-    }
-}
-
-/// Places every capability after the families it requires, keeping installation order otherwise.
-///
-/// The ready set is drained by smallest installed position, so each capability lands as early as
-/// its dependencies allow. That makes the result the topological order closest to what the host
-/// wrote down — a dependency edge moves the two capabilities it joins past each other and leaves
-/// everything else where it was, rather than sending the dependent behind every unrelated
-/// capability installed after it.
-fn order_by_dependency(
-    installed: Vec<Arc<dyn Capability>>,
-    families: &[CapabilityFamily],
-    requirements: &[BTreeSet<CapabilityFamily>],
-    provider_of: &BTreeMap<CapabilityFamily, usize>,
-) -> Result<Vec<Arc<dyn Capability>>> {
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); installed.len()];
-    let mut pending: Vec<usize> = vec![0; installed.len()];
-    for (index, required) in requirements.iter().enumerate() {
-        pending[index] = required.len();
-        for family in required {
-            // Every required family has a provider: an absent one was reported above.
-            if let Some(&provider) = provider_of.get(family) {
-                dependents[provider].push(index);
-            }
-        }
-    }
-
-    let mut ready: BTreeSet<usize> = (0..installed.len())
-        .filter(|index| pending[*index] == 0)
-        .collect();
-    let mut order: Vec<usize> = Vec::with_capacity(installed.len());
-    while let Some(&next) = ready.iter().next() {
-        ready.remove(&next);
-        order.push(next);
-        for &dependent in &dependents[next] {
-            pending[dependent] -= 1;
-            if pending[dependent] == 0 {
-                ready.insert(dependent);
-            }
-        }
-    }
-
-    if order.len() != installed.len() {
-        let cycle = find_cycle(&pending, requirements, provider_of);
-        let rendered: Vec<String> = cycle
-            .iter()
-            .chain(cycle.first())
-            .map(|index| format!("`{}`", families[*index]))
-            .collect();
-        return Err(Error::config(format!(
-            "these capabilities require one another in a circle: {}. Assembly order is what makes \
-             the sampling fold, the prompt order, and the context-processor chain deterministic, \
-             and a circle has no order to pick",
-            rendered.join(" -> ")
-        )));
-    }
-
-    // Rebuilt by index rather than by removing from the source, so the reordering is one move of
-    // each element and the source list is never left with holes to reason about.
-    let mut ordered: Vec<Option<Arc<dyn Capability>>> = installed.into_iter().map(Some).collect();
-    Ok(order
-        .into_iter()
-        .filter_map(|index| ordered[index].take())
-        .collect())
-}
-
-/// Finds one cycle among the capabilities that never became ready.
-///
-/// A capability with unmet requirements after the topological drain has at least one required
-/// family whose provider is also still unmet, so following that edge can never dead-end — which
-/// makes revisiting a node the only way the walk can end, and the revisited node the entry into a
-/// cycle.
-fn find_cycle(
-    pending: &[usize],
-    requirements: &[BTreeSet<CapabilityFamily>],
-    provider_of: &BTreeMap<CapabilityFamily, usize>,
-) -> Vec<usize> {
-    let blocked = |index: usize| pending[index] > 0;
-    let mut path: Vec<usize> = Vec::new();
-    let mut visited: BTreeMap<usize, usize> = BTreeMap::new();
-    let Some(mut current) = (0..pending.len()).find(|index| blocked(*index)) else {
-        return Vec::new();
-    };
-    loop {
-        if let Some(&position) = visited.get(&current) {
-            return path.split_off(position);
-        }
-        visited.insert(current, path.len());
-        path.push(current);
-        let next = requirements[current]
-            .iter()
-            .filter_map(|family| provider_of.get(family).copied())
-            .find(|index| blocked(*index));
-        match next {
-            Some(next) => current = next,
-            None => return path,
-        }
     }
 }
 
