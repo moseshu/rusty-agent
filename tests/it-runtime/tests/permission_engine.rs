@@ -117,6 +117,8 @@ async fn dispatch(tool: Arc<dyn Tool>, permission: PermissionEngine) -> ToolDisp
     ))
     .await
     .expect("permission decisions must settle as a dispatch result")
+    .into_parts()
+    .0
 }
 
 #[tokio::test]

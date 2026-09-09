@@ -25,7 +25,10 @@ use ra_core::{
     error::{Error, Result},
     filter::ContextFilterReport,
     finish::FinishReason,
-    guardrail::{InputGuardrailResult, OutputGuardrailResult},
+    guardrail::{
+        InputGuardrailResult, OutputGuardrailResult, ToolInputGuardrailResult,
+        ToolOutputGuardrailResult,
+    },
     item::{
         AgentId, InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse,
         OutputPhase, RunItem, RunItemKind,
@@ -626,6 +629,21 @@ impl RunResult {
     #[must_use]
     pub fn output_guardrail_results(&self) -> &[OutputGuardrailResult] {
         self.state.output_guardrail_results()
+    }
+
+    /// What the checks on this run's tool call arguments concluded, in settlement order.
+    ///
+    /// A projection of [`Self::state`], for the reason the run-level lists are: the decisions belong
+    /// to the run, so a segment that resumed an earlier one reports what that one recorded too.
+    #[must_use]
+    pub fn tool_input_guardrail_results(&self) -> &[ToolInputGuardrailResult] {
+        self.state.tool_input_guardrail_results()
+    }
+
+    /// What the checks on this run's tool call results concluded, in settlement order.
+    #[must_use]
+    pub fn tool_output_guardrail_results(&self) -> &[ToolOutputGuardrailResult] {
+        self.state.tool_output_guardrail_results()
     }
 
     /// The text of [`Self::final_message`], empty when the run delivered none.

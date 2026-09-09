@@ -2,6 +2,7 @@
 
 #[doc(hidden)]
 pub mod dispatch;
+pub mod guardrail;
 pub mod profile;
 pub mod registry;
 pub(crate) mod render;

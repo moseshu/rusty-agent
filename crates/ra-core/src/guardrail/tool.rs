@@ -515,11 +515,8 @@ impl ToolGuardrailVerdict {
 ///
 /// `firings` is `(identity, decision)` for each guardrail the tool declared, in declaration order.
 ///
-/// # Ties
-///
-/// A raise beats a rejection, and among equals the first by declaration order wins while the rest
-/// are dropped rather than concatenated. One call gets one answer: two refusal messages for one
-/// call is two explanations the model has to reconcile, and neither is the one it needs.
+/// The first non-allow decision wins, matching the sequential tool guardrail chain upstream.
+/// Later decisions are not consumed after a rejection or a raise.
 ///
 /// # Why the stage is not a parameter
 ///
@@ -554,34 +551,23 @@ fn reduce(
     refusal: &str,
     firings: impl IntoIterator<Item = (ToolGuardrailId, ToolGuardrailFunctionOutput)>,
 ) -> Result<ToolGuardrailVerdict> {
-    let mut verdict = ToolGuardrailVerdict::Allow;
-    let mut raised: Option<(ToolGuardrailId, String)> = None;
-
     for (guardrail, output) in firings {
         match output.behavior() {
             ToolGuardrailBehavior::Allow => {}
             ToolGuardrailBehavior::RejectContent { message } => {
-                if verdict.is_allow() {
-                    verdict = ToolGuardrailVerdict::RejectContent {
-                        guardrail,
-                        message: message.clone(),
-                    };
-                }
+                return Ok(ToolGuardrailVerdict::RejectContent {
+                    guardrail,
+                    message: message.clone(),
+                });
             }
             ToolGuardrailBehavior::RaiseException => {
-                if raised.is_none() {
-                    raised = Some((guardrail, output.detail()));
-                }
+                return Err(Error::guardrail(
+                    stage,
+                    guardrail.as_str(),
+                    format!("{refusal} ({})", output.detail()),
+                ));
             }
         }
     }
-
-    match raised {
-        Some((guardrail, detail)) => Err(Error::guardrail(
-            stage,
-            guardrail.as_str(),
-            format!("{refusal} ({detail})"),
-        )),
-        None => Ok(verdict),
-    }
+    Ok(ToolGuardrailVerdict::Allow)
 }

@@ -34,6 +34,7 @@ pub mod process;
 pub mod resolve;
 
 use crate::permission::PermissionEngine;
+use crate::tool::guardrail::ToolGuardrails;
 use batch::{
     DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, StreamedFunctionDispatches, TurnExecutionRequest,
     execute_actions,
@@ -63,6 +64,7 @@ pub struct TurnSettlementRequest<'a> {
     services: ToolServices,
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
+    guardrails: ToolGuardrails,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
@@ -105,6 +107,7 @@ impl<'a> TurnSettlementRequest<'a> {
             services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             permission,
+            guardrails: ToolGuardrails::default(),
             streamed_dispatches: None,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
@@ -114,6 +117,12 @@ impl<'a> TurnSettlementRequest<'a> {
     /// Sets the framework ports the tools this turn calls are handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Sets the tool guardrails this turn's calls resolve their declarations against.
+    pub fn with_tool_guardrails(mut self, guardrails: ToolGuardrails) -> Self {
+        self.guardrails = guardrails;
         self
     }
 
@@ -188,6 +197,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         request.permission.clone(),
     )
     .with_services(request.services.clone())
+    .with_tool_guardrails(request.guardrails.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
     let execution_request = match request.streamed_dispatches {
         Some(streamed_dispatches) => {
@@ -241,6 +251,11 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         .pre_step_items(request.pre_step_items)
         .new_step_items(items.clone())
         .session_step_items(items)
+        // Carried out of the turn that produced them rather than recorded here: the two trackers
+        // above are run state this function was handed mutably, while these are a product of the
+        // settlement, and the loop records them beside everything else the turn returned.
+        .tool_input_guardrail_results(execution.tool_input_guardrail_results().to_vec())
+        .tool_output_guardrail_results(execution.tool_output_guardrail_results().to_vec())
         .processed_response(processed)
         .next_step(next_step)
         .build()

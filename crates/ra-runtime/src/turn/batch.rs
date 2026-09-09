@@ -46,6 +46,7 @@ use ra_core::{
     cancel::{CancelReason, CancelScope, DRAIN_GRACE, ScopeKind},
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
+    guardrail::{ToolInputGuardrailResult, ToolOutputGuardrailResult},
     item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
     state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
     step::{ProcessedResponse, ToolRunFunction},
@@ -61,8 +62,10 @@ use tracing::{Instrument, error, info_span, warn};
 
 use crate::permission::PermissionEngine;
 use crate::tool::dispatch::{
-    CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool_with_admission, duration_ms,
+    CallHistory, ToolDispatch, ToolDispatchOutcome, ToolDispatchRequest, ToolGuardrailRecords,
+    dispatch_tool_with_admission, duration_ms,
 };
+use crate::tool::guardrail::ToolGuardrails;
 
 /// Default cap for all function-tool dispatch chains in one model response.
 ///
@@ -88,6 +91,8 @@ pub struct TurnExecution {
     function_results: Vec<FunctionToolResult>,
     tool_results: Vec<ToolUseResult>,
     outcomes: Vec<ToolOutcome>,
+    tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
+    tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
 }
 
 /// One completed task, retained until the whole batch is known to be safe to settle.
@@ -96,6 +101,7 @@ struct CompletedDispatch {
     call_id: CallId,
     tool: ToolOrigin,
     dispatch: ToolDispatch,
+    guardrails: ToolGuardrailRecords,
 }
 
 /// Result produced by the supervised task for one call.
@@ -103,7 +109,7 @@ struct DispatchTaskResult {
     order: usize,
     call_id: CallId,
     tool: ToolOrigin,
-    result: Result<ToolDispatch>,
+    result: Result<ToolDispatchOutcome>,
 }
 
 /// The error classes used to choose one batch-level outcome when several calls fail together.
@@ -182,6 +188,21 @@ impl TurnExecution {
         &self.tool_results
     }
 
+    /// What the checks on this turn's tool call arguments concluded, in model order.
+    ///
+    /// A raise is absent by construction: it ends the turn as an [`Error`], and the decisions
+    /// behind it travel on that error rather than here.
+    #[must_use]
+    pub fn tool_input_guardrail_results(&self) -> &[ToolInputGuardrailResult] {
+        &self.tool_input_guardrail_results
+    }
+
+    /// What the checks on this turn's tool call results concluded, in model order.
+    #[must_use]
+    pub fn tool_output_guardrail_results(&self) -> &[ToolOutputGuardrailResult] {
+        &self.tool_output_guardrail_results
+    }
+
     /// How each answered call turned out, in the response's model order.
     ///
     /// Three things distinguish this from `new_items`. A call still awaiting approval is absent —
@@ -208,6 +229,7 @@ pub struct TurnExecutionRequest<'a> {
     services: ToolServices,
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
+    guardrails: ToolGuardrails,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
 }
 
@@ -232,6 +254,7 @@ impl<'a> TurnExecutionRequest<'a> {
             services: ToolServices::new(),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             permission,
+            guardrails: ToolGuardrails::default(),
             streamed_dispatches: None,
         }
     }
@@ -239,6 +262,12 @@ impl<'a> TurnExecutionRequest<'a> {
     /// Sets the framework ports every tool in this batch is handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Sets the tool guardrails every call in this batch resolves its declarations against.
+    pub fn with_tool_guardrails(mut self, guardrails: ToolGuardrails) -> Self {
+        self.guardrails = guardrails;
         self
     }
 
@@ -415,6 +444,7 @@ pub(crate) struct StreamedFunctionDispatches {
     cancel: CancelScope,
     services: ToolServices,
     permission: PermissionEngine,
+    guardrails: ToolGuardrails,
 }
 
 struct StreamedFunctionCall {
@@ -447,6 +477,7 @@ impl StreamedFunctionDispatches {
         services: ToolServices,
         max_function_tool_concurrency: usize,
         permission: PermissionEngine,
+        guardrails: ToolGuardrails,
     ) -> Self {
         Self {
             dispatches: JoinSet::new(),
@@ -462,6 +493,7 @@ impl StreamedFunctionDispatches {
             cancel,
             services,
             permission,
+            guardrails,
         }
     }
 
@@ -510,7 +542,8 @@ impl StreamedFunctionDispatches {
             history,
             self.permission.clone(),
         )
-        .with_services(self.services.clone());
+        .with_services(self.services.clone())
+        .with_tool_guardrails(self.guardrails.clone());
         let tool = action.tool().origin().clone();
         let function_span = function_span(&tool, &call_id);
         let task_id = spawn_dispatch_task(
@@ -681,7 +714,8 @@ fn spawn_function_dispatches(
             history,
             request.permission.clone(),
         )
-        .with_services(request.services.clone());
+        .with_services(request.services.clone())
+        .with_tool_guardrails(request.guardrails.clone());
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let call_id = action.call_id().clone();
@@ -789,10 +823,10 @@ fn spawn_dispatch_task(
 /// Records the terminal result of one function-tool dispatch without leaking its payload.
 fn record_function_outcome(
     span: &tracing::Span,
-    result: &Result<ToolDispatch>,
+    result: &Result<ToolDispatchOutcome>,
     cancel: &CancelScope,
 ) {
-    match result {
+    match result.as_ref().map(ToolDispatchOutcome::dispatch) {
         Ok(ToolDispatch::Observed(observation)) => match observation.failure_code() {
             Some(code) => {
                 span.record(ra_core::trace::field::ERROR_CODE, code);
@@ -950,12 +984,16 @@ fn record_task_result(
                 debug_assert_eq!(recorded_order, Some(task.order));
             }
             match task.result {
-                Ok(dispatch) => collected.completed.push(CompletedDispatch {
-                    order: task.order,
-                    call_id: task.call_id,
-                    tool: task.tool,
-                    dispatch,
-                }),
+                Ok(outcome) => {
+                    let (dispatch, guardrails) = outcome.into_parts();
+                    collected.completed.push(CompletedDispatch {
+                        order: task.order,
+                        call_id: task.call_id,
+                        tool: task.tool,
+                        dispatch,
+                        guardrails,
+                    });
+                }
                 Err(error) if ignore_cancellation && error.is_cancelled() => {}
                 Err(error) => merge_failure(
                     &mut collected.failure,
@@ -1109,6 +1147,15 @@ fn settle_dispatches(
 
     collected.completed.sort_by_key(|completed| completed.order);
     for completed in collected.completed {
+        // Filed for every call, ahead of the branch on what it decided: a check that allowed is the
+        // record that separates a call nothing looked at from one that was cleared.
+        let (input_verdicts, output_verdicts) = completed.guardrails.into_parts();
+        execution
+            .tool_input_guardrail_results
+            .extend(input_verdicts);
+        execution
+            .tool_output_guardrail_results
+            .extend(output_verdicts);
         match completed.dispatch {
             ToolDispatch::Observed(observation) => {
                 // `order` indexes the same list the dispatch was spawned from, so the action it

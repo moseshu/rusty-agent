@@ -30,7 +30,10 @@ use crate::{
     compat::{SchemaVersion, Unknown},
     error::{BudgetKind, Error, Result},
     finish::FinishReason,
-    guardrail::{InputGuardrailResult, OutputGuardrailResult},
+    guardrail::{
+        InputGuardrailResult, OutputGuardrailResult, ToolInputGuardrailResult,
+        ToolOutputGuardrailResult,
+    },
     item::{
         AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind, ToolApproval,
     },
@@ -509,6 +512,10 @@ pub struct RunState {
     input_guardrail_results: Vec<InputGuardrailResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     output_guardrail_results: Vec<OutputGuardrailResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     input_guardrails_started: bool,
     #[serde(default)]
@@ -588,6 +595,10 @@ struct RunStateRecord {
     #[serde(default)]
     output_guardrail_results: Vec<OutputGuardrailResult>,
     #[serde(default)]
+    tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
+    #[serde(default)]
+    tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
+    #[serde(default)]
     input_guardrails_started: bool,
     #[serde(default)]
     budget: BudgetSnapshot,
@@ -630,6 +641,10 @@ struct RunStateRecord {
 impl TryFrom<RunStateRecord> for RunState {
     type Error = Error;
 
+    // Its length is the struct's field count, twice: once taken apart and once put back together.
+    // Splitting it would not shorten anything, it would only move half the mirror somewhere the
+    // "field for field" claim above can no longer be checked by reading one function.
+    #[allow(clippy::too_many_lines)]
     fn try_from(record: RunStateRecord) -> std::result::Result<Self, Self::Error> {
         let RunStateRecord {
             schema_version,
@@ -642,6 +657,8 @@ impl TryFrom<RunStateRecord> for RunState {
             memory_exposures,
             input_guardrail_results,
             output_guardrail_results,
+            tool_input_guardrail_results,
+            tool_output_guardrail_results,
             input_guardrails_started,
             finish_reason,
             nested_runs,
@@ -721,6 +738,8 @@ impl TryFrom<RunStateRecord> for RunState {
             memory_exposures,
             input_guardrail_results,
             output_guardrail_results,
+            tool_input_guardrail_results,
+            tool_output_guardrail_results,
             input_guardrails_started,
             budget,
             finish_reason,
@@ -759,6 +778,8 @@ impl RunState {
             memory_exposures: Vec::new(),
             input_guardrail_results: Vec::new(),
             output_guardrail_results: Vec::new(),
+            tool_input_guardrail_results: Vec::new(),
+            tool_output_guardrail_results: Vec::new(),
             input_guardrails_started: false,
             budget: BudgetSnapshot::new(),
             finish_reason: None,
@@ -1301,6 +1322,40 @@ impl RunState {
     #[must_use]
     pub fn output_guardrail_results(&self) -> &[OutputGuardrailResult] {
         &self.output_guardrail_results
+    }
+
+    /// What this run's tool input guardrails concluded, in settlement order.
+    ///
+    /// One entry per completed check per call, so a tool checked on ten turns files ten sets. Each
+    /// carries the tool and the call it examined, which is what tells two verdicts under the same
+    /// identity apart.
+    #[must_use]
+    pub fn tool_input_guardrail_results(&self) -> &[ToolInputGuardrailResult] {
+        &self.tool_input_guardrail_results
+    }
+
+    /// What this run's tool output guardrails concluded, in settlement order.
+    #[must_use]
+    pub fn tool_output_guardrail_results(&self) -> &[ToolOutputGuardrailResult] {
+        &self.tool_output_guardrail_results
+    }
+
+    /// Records what one turn's tool input guardrails concluded.
+    #[doc(hidden)]
+    pub fn record_tool_input_guardrail_results(
+        &mut self,
+        results: impl IntoIterator<Item = ToolInputGuardrailResult>,
+    ) {
+        self.tool_input_guardrail_results.extend(results);
+    }
+
+    /// Records what one turn's tool output guardrails concluded.
+    #[doc(hidden)]
+    pub fn record_tool_output_guardrail_results(
+        &mut self,
+        results: impl IntoIterator<Item = ToolOutputGuardrailResult>,
+    ) {
+        self.tool_output_guardrail_results.extend(results);
     }
 
     /// Whether blocking input checks passed and the raced stage was admitted.

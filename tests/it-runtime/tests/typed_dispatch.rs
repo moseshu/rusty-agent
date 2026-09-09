@@ -106,7 +106,7 @@ async fn typed_decode_failure_is_an_observation_not_a_stopped_run() {
     let result = dispatch_tool(request)
         .await
         .expect("invalid arguments are returned to the model");
-    let ToolDispatch::Observed(observation) = result else {
+    let ToolDispatch::Observed(observation) = result.into_parts().0 else {
         panic!("invalid arguments must be a model-visible observation");
     };
     assert_eq!(observation.failure_code(), Some("tool.invalid_input"));
@@ -143,7 +143,7 @@ async fn context_budget_projects_before_the_tool_output_enters_history() {
     )));
 
     let result = dispatch_tool(request).await.expect("dispatch succeeds");
-    let ToolDispatch::Observed(observation) = result else {
+    let ToolDispatch::Observed(observation) = result.into_parts().0 else {
         panic!("the tool completed with an observation");
     };
     let stored: ToolOutput = serde_json::from_value(observation.output().output().clone())
@@ -189,7 +189,7 @@ async fn a_projector_can_only_add_to_the_complete_tool_output() {
     .with_services(ToolServices::new().with_output_projector(Arc::new(AppendingProjector)));
 
     let result = dispatch_tool(request).await.expect("dispatch succeeds");
-    let ToolDispatch::Observed(observation) = result else {
+    let ToolDispatch::Observed(observation) = result.into_parts().0 else {
         panic!("the tool completed with an observation");
     };
     let stored: ToolOutput = serde_json::from_value(observation.output().output().clone())
