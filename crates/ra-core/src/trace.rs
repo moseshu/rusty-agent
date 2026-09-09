@@ -194,6 +194,11 @@ pub mod field {
     pub const GUARDRAIL_STAGE: &str = "guardrail.stage";
     /// Whether it actually blocked (whether the tripwire fired).
     pub const GUARDRAIL_TRIGGERED: &str = "guardrail.triggered";
+    /// Which decision a tool guardrail reached, valued by `ToolGuardrailBehavior::code`.
+    ///
+    /// Only the two tool boundaries record it: a run-level guardrail has one way to block, so
+    /// `guardrail.triggered` already says everything there is to say about it.
+    pub const GUARDRAIL_BEHAVIOR: &str = "guardrail.behavior";
 
     // -- mcp ---------------------------------------------------------------
 
@@ -236,6 +241,7 @@ pub mod field {
         GUARDRAIL_ID,
         GUARDRAIL_STAGE,
         GUARDRAIL_TRIGGERED,
+        GUARDRAIL_BEHAVIOR,
         MCP_SERVER,
     ];
 }

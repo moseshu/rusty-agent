@@ -49,7 +49,8 @@ use ra_core::{
     finish::FinishReason,
     guardrail::{
         GuardrailEvidence, GuardrailFinalOutput, InputGuardrail, InputGuardrailResult,
-        OutputGuardrail, merge_input_guardrails, merge_output_guardrails,
+        OutputGuardrail, ToolInputGuardrail, ToolOutputGuardrail, merge_input_guardrails,
+        merge_output_guardrails,
     },
     item::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
@@ -88,7 +89,10 @@ use crate::{
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     permission::PermissionEngine,
-    tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
+    tool::dispatch::{
+        CallHistory, ToolDispatch, ToolDispatchRequest, ToolGuardrailRecords, dispatch_tool,
+    },
+    tool::guardrail::ToolGuardrails,
     turn::{
         TurnSettlementRequest,
         batch::{DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, StreamedFunctionDispatches, StreamedStart},
@@ -134,6 +138,9 @@ pub struct RunConfig {
     permission: PermissionEngine,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
+    tool_input_guardrails: Vec<Arc<dyn ToolInputGuardrail>>,
+    tool_output_guardrails: Vec<Arc<dyn ToolOutputGuardrail>>,
+    pre_approval_tool_input_guardrails: bool,
 }
 
 impl Default for RunConfig {
@@ -163,6 +170,9 @@ impl RunConfig {
             permission: PermissionEngine::default(),
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
+            tool_input_guardrails: Vec::new(),
+            tool_output_guardrails: Vec::new(),
+            pre_approval_tool_input_guardrails: false,
         }
     }
 
@@ -467,6 +477,75 @@ impl RunConfig {
         &self.output_guardrails
     }
 
+    /// Installs one check a tool may declare over its arguments.
+    ///
+    /// Run-level, and there is no agent-level counterpart to merge with: a tool names the check it
+    /// wants by [`ToolGuardrailId`](ra_core::tool::ToolGuardrailId) and this is where the object
+    /// behind that name comes from. Installing something no tool declares is allowed and does
+    /// nothing; declaring something nobody installed stops the run before its first model call.
+    ///
+    /// Unlike a run-level guardrail's name, this identity is a lookup key, so two installations
+    /// under one ID are refused when the run starts.
+    pub fn with_tool_input_guardrail(mut self, guardrail: Arc<dyn ToolInputGuardrail>) -> Self {
+        self.tool_input_guardrails.push(guardrail);
+        self
+    }
+
+    /// Installs several argument checks, in iteration order.
+    pub fn with_tool_input_guardrails(
+        mut self,
+        guardrails: impl IntoIterator<Item = Arc<dyn ToolInputGuardrail>>,
+    ) -> Self {
+        self.tool_input_guardrails.extend(guardrails);
+        self
+    }
+
+    /// Installs one check a tool may declare over its results.
+    pub fn with_tool_output_guardrail(mut self, guardrail: Arc<dyn ToolOutputGuardrail>) -> Self {
+        self.tool_output_guardrails.push(guardrail);
+        self
+    }
+
+    /// Installs several result checks, in iteration order.
+    pub fn with_tool_output_guardrails(
+        mut self,
+        guardrails: impl IntoIterator<Item = Arc<dyn ToolOutputGuardrail>>,
+    ) -> Self {
+        self.tool_output_guardrails.extend(guardrails);
+        self
+    }
+
+    /// Also checks a call's arguments *before* the host is interrupted to approve it.
+    ///
+    /// Off by default, and it buys one thing: nobody is asked to approve a call that is going to be
+    /// refused anyway. It costs the check twice on every approved call.
+    ///
+    /// **It does not replace the check after the answer comes back.** That one always runs, because
+    /// an approval can return in a later process against a registry the host has since changed, and
+    /// a decision reached before the interruption is not a decision about the run that resumes.
+    pub const fn with_pre_approval_tool_input_guardrails(mut self, enabled: bool) -> Self {
+        self.pre_approval_tool_input_guardrails = enabled;
+        self
+    }
+
+    /// Argument checks this run installed, in installation order.
+    #[must_use]
+    pub fn tool_input_guardrails(&self) -> &[Arc<dyn ToolInputGuardrail>] {
+        &self.tool_input_guardrails
+    }
+
+    /// Result checks this run installed, in installation order.
+    #[must_use]
+    pub fn tool_output_guardrails(&self) -> &[Arc<dyn ToolOutputGuardrail>] {
+        &self.tool_output_guardrails
+    }
+
+    /// Whether a call awaiting approval has its arguments checked before the host is interrupted.
+    #[must_use]
+    pub const fn pre_approval_tool_input_guardrails(&self) -> bool {
+        self.pre_approval_tool_input_guardrails
+    }
+
     /// Appends the context transforms an assembled capability set contributed.
     ///
     /// Appended rather than merged in front: a processor installed through
@@ -531,6 +610,26 @@ impl std::fmt::Debug for RunConfig {
                     .iter()
                     .map(|guardrail| guardrail.name())
                     .collect::<Vec<_>>(),
+            )
+            .field(
+                "tool_input_guardrails",
+                &self
+                    .tool_input_guardrails
+                    .iter()
+                    .map(|guardrail| guardrail.id().as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "tool_output_guardrails",
+                &self
+                    .tool_output_guardrails
+                    .iter()
+                    .map(|guardrail| guardrail.id().as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "pre_approval_tool_input_guardrails",
+                &self.pre_approval_tool_input_guardrails,
             )
             .finish()
     }
@@ -743,6 +842,7 @@ struct TurnLoopContext<'a> {
     closeout_cancel: &'a CancelScope,
     config: &'a RunConfig,
     permission: &'a PermissionEngine,
+    tool_guardrails: &'a ToolGuardrails,
     events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
     event_seqs: &'a EventSeqAllocator,
     /// Capability fragments resolved at assembly and still waiting for the signal that earns them.
@@ -951,6 +1051,27 @@ async fn run_loop_inner(
         }
     }
 
+    // Indexed and checked after assembly, because a capability contributes tools of its own and a
+    // declaration on one of them has to resolve like any other. Before the first model call, which
+    // is the point: a run that names a check nobody installed is misconfigured, and finding that
+    // out after a model has been paid to choose a tool is finding it out too late.
+    let tool_guardrails = match ToolGuardrails::install(
+        config.tool_input_guardrails().iter().map(Arc::clone),
+        config.tool_output_guardrails().iter().map(Arc::clone),
+        config.pre_approval_tool_input_guardrails(),
+    )
+    .and_then(|guardrails| {
+        guardrails
+            .preflight(agent.execution().tools())
+            .map(|()| guardrails)
+    }) {
+        Ok(guardrails) => guardrails,
+        Err(error) => {
+            record_terminal_error(span, &error, &cancel);
+            return Err(error);
+        }
+    };
+
     let mut progress = TurnLoopProgress {
         first_item: state.generated_items().len(),
         first_response: state.model_responses().len(),
@@ -982,6 +1103,7 @@ async fn run_loop_inner(
         closeout_cancel: &closeout_cancel,
         config: &config,
         permission: &permission,
+        tool_guardrails: &tool_guardrails,
         events: events.as_ref(),
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
@@ -1228,7 +1350,7 @@ async fn resolve_interrupted_turn(
         };
         let provenance = item.provenance().cloned();
         let approval = approval.clone();
-        let (output, outcome) = match answer.resolution() {
+        let (output, outcome, guardrails) = match answer.resolution() {
             InterruptionResolution::Reject { .. } => {
                 let output = ToolCallOutput::new(
                     approval.call_id().clone(),
@@ -1249,17 +1371,23 @@ async fn resolve_interrupted_turn(
                         output.output(),
                     )
                 });
-                (output, outcome)
+                (output, outcome, ToolGuardrailRecords::default())
             }
             InterruptionResolution::Approve { .. } => {
-                let (output, outcome) =
+                let (output, outcome, guardrails) =
                     execute_approved_call(context, agent, state, &approval, answer.item_id())
                         .await?;
-                (output, Some(outcome))
+                (output, Some(outcome), guardrails)
             }
             _ => return Err(Error::caller("unsupported interruption resolution")),
         };
         outcomes.extend(outcome);
+        // The post-approval check the contract requires is inside the dispatch above; what is left
+        // here is filing what it decided, so a run resumed in a second process leaves the same
+        // evidence a run that never paused would have.
+        let (input_verdicts, output_verdicts) = guardrails.into_parts();
+        state.record_tool_input_guardrail_results(input_verdicts);
+        state.record_tool_output_guardrail_results(output_verdicts);
         let mut output_item = RunItem::new(
             ItemId::new(format!("{}.output", approval.call_id())),
             RunItemKind::ToolCallOutput(output),
@@ -1290,7 +1418,7 @@ async fn execute_approved_call(
     state: &RunState,
     approval: &ToolApproval,
     item_id: &ItemId,
-) -> Result<(ToolCallOutput, ToolOutcome)> {
+) -> Result<(ToolCallOutput, ToolOutcome, ToolGuardrailRecords)> {
     let key = approval.lookup_key().ok_or_else(|| {
         Error::caller(format!(
             "approval `{item_id}` cannot resume because it has no serialized tool lookup key"
@@ -1338,11 +1466,13 @@ async fn execute_approved_call(
             context.permission.clone(),
         )
         .with_services(context.services.clone())
+        .with_tool_guardrails(context.tool_guardrails.clone())
         .with_approval_granted(),
     )
     .await?;
 
     let call_id = approval.call_id().clone();
+    let (dispatch, guardrails) = dispatch.into_parts();
     match dispatch {
         ToolDispatch::Observed(observation) => {
             let failure_code = observation.failure_code();
@@ -1359,13 +1489,13 @@ async fn execute_approved_call(
                     ToolOutcome::succeeded(identity, call_id, approval.arguments(), output.output())
                 }
             };
-            Ok((output, outcome))
+            Ok((output, outcome, guardrails))
         }
         ToolDispatch::Refused(refusal) => {
             let output = refusal.into_output();
             let outcome =
                 ToolOutcome::refused(identity, call_id, approval.arguments(), output.output());
-            Ok((output, outcome))
+            Ok((output, outcome, guardrails))
         }
         ToolDispatch::AwaitingApproval(_) => Err(Error::caller(
             "an approved tool call requested approval again",
@@ -1785,6 +1915,7 @@ async fn run_one_turn(
         services: context.services.clone(),
         max_function_tool_concurrency: config.max_function_tool_concurrency,
         permission: context.permission.clone(),
+        guardrails: context.tool_guardrails.clone(),
     };
     // Only a configured sink can ever read these, and deriving them is not free: it deserializes
     // every tool output in the request and compares it against the authoritative record, once per
@@ -1842,9 +1973,16 @@ async fn run_one_turn(
     .with_original_input(segment_original_input)
     .with_pre_step_items(pre_step_items)
     .with_services(context.services.clone())
+    .with_tool_guardrails(context.tool_guardrails.clone())
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches);
     let settled = settle_turn(settlement).await?;
+
+    // Recorded straight after settlement, alongside the items: these are decisions this turn's
+    // calls produced, and a checkpoint taken from here on has to carry the evidence for what the
+    // model was shown.
+    state.record_tool_input_guardrail_results(settled.tool_input_guardrail_results().to_vec());
+    state.record_tool_output_guardrail_results(settled.tool_output_guardrail_results().to_vec());
 
     record_tool_output_references(
         config,
@@ -2323,6 +2461,7 @@ struct StreamedDispatchInput {
     services: ToolServices,
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
+    guardrails: ToolGuardrails,
 }
 
 impl StreamedDispatchInput {
@@ -2336,6 +2475,7 @@ impl StreamedDispatchInput {
             self.services.clone(),
             self.max_function_tool_concurrency,
             self.permission.clone(),
+            self.guardrails.clone(),
         )
     }
 }

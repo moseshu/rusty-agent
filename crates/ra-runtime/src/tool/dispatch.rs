@@ -1,9 +1,14 @@
 //! One tool invocation, in the only permitted stage order (R3-4).
 //!
-//! The chain is typed argument decoding -> repeat admission -> permission -> approval -> input
-//! guardrail -> invoke -> output guardrail. Every stage that can refuse does so by **returning a
-//! value**, never by throwing prose a caller has to read. That is what keeps the turn's control
-//! flow out of error strings.
+//! The chain is guardrail resolution -> typed argument decoding -> repeat admission -> permission
+//! -> approval -> input guardrail -> invoke -> output guardrail. Every stage that can refuse does
+//! so by **returning a value**, never by throwing prose a caller has to read. That is what keeps
+//! the turn's control flow out of error strings.
+//!
+//! Resolution is first and separate from the two stages that use it, because it answers a
+//! configuration question rather than one about this call: whether the checks the tool names exist
+//! at all. A declaration nobody installed stops the call before a host has been interrupted about
+//! it, and before a decoding failure can reach a handler whose text the output checks are owed.
 //!
 //! # Framework error text must never reach the model
 //!
@@ -24,6 +29,10 @@ use ra_core::{
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
+    guardrail::{
+        ToolGuardrailVerdict, ToolInputGuardrail, ToolInputGuardrailData, ToolInputGuardrailResult,
+        ToolOutputGuardrail, ToolOutputGuardrailData, ToolOutputGuardrailResult,
+    },
     item::{CallId, ToolApproval, ToolCallOutput},
     permission::PermissionDecision,
     tool::{
@@ -35,6 +44,91 @@ use serde_json::{Value, json};
 
 use crate::circuit;
 use crate::permission::PermissionEngine;
+use crate::tool::guardrail::{ToolGuardrails, check_tool_input, check_tool_output};
+
+/// Stable code the model-visible answer to a refused call is recorded under.
+///
+/// The two match [`Error::code`] for the same guardrail stage. A refusal is not carried as an
+/// `Error` — the run continues — but a report that groups by code has to see one vocabulary,
+/// not two spellings of the same boundary.
+const TOOL_INPUT_GUARDRAIL_CODE: &str = "guardrail.tool_input";
+const TOOL_OUTPUT_GUARDRAIL_CODE: &str = "guardrail.tool_output";
+
+/// What one call's dispatch produced: the decision, and what the checks around it concluded.
+///
+/// The two travel together because the second is not derivable from the first. A check that
+/// allowed leaves no trace in the decision at all, and "this check ran and found nothing" is
+/// exactly what separates a checked call from an unchecked one afterwards.
+#[must_use]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDispatchOutcome {
+    dispatch: ToolDispatch,
+    guardrails: ToolGuardrailRecords,
+}
+
+impl ToolDispatchOutcome {
+    /// What the chain decided.
+    #[must_use]
+    pub const fn dispatch(&self) -> &ToolDispatch {
+        &self.dispatch
+    }
+
+    /// What the checks declared on this tool concluded about this call.
+    pub const fn guardrails(&self) -> &ToolGuardrailRecords {
+        &self.guardrails
+    }
+
+    /// Takes the decision and the records apart.
+    pub fn into_parts(self) -> (ToolDispatch, ToolGuardrailRecords) {
+        (self.dispatch, self.guardrails)
+    }
+}
+
+/// Every tool guardrail decision reached about one call, by boundary.
+///
+/// Held apart rather than in one list with a stage tag, for the reason
+/// [`ToolInputGuardrailResult`] and [`ToolOutputGuardrailResult`] are separate types: they are
+/// produced at opposite ends of a call and recorded in different places, and one list would make
+/// filing an output decision where the input ones go a runtime mistake rather than a compile error.
+#[must_use]
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolGuardrailRecords {
+    input: Vec<ToolInputGuardrailResult>,
+    output: Vec<ToolOutputGuardrailResult>,
+}
+
+impl ToolGuardrailRecords {
+    /// What the checks on this call's arguments decided, in declaration order.
+    #[must_use]
+    pub fn input(&self) -> &[ToolInputGuardrailResult] {
+        &self.input
+    }
+
+    /// What the checks on this call's result decided, in declaration order.
+    #[must_use]
+    pub fn output(&self) -> &[ToolOutputGuardrailResult] {
+        &self.output
+    }
+
+    /// Whether no declared check reached a decision about this call.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.input.is_empty() && self.output.is_empty()
+    }
+
+    /// Takes both lists out.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ToolInputGuardrailResult>,
+        Vec<ToolOutputGuardrailResult>,
+    ) {
+        (self.input, self.output)
+    }
+}
 
 /// What the chain decided about one call.
 #[non_exhaustive]
@@ -188,6 +282,7 @@ pub struct ToolDispatchRequest {
     caller: ToolCaller,
     services: ToolServices,
     permission: PermissionEngine,
+    guardrails: ToolGuardrails,
     approval_granted: bool,
 }
 
@@ -220,6 +315,7 @@ impl ToolDispatchRequest {
             caller: ToolCaller::Direct,
             services: ToolServices::new(),
             permission,
+            guardrails: ToolGuardrails::default(),
             approval_granted: false,
         }
     }
@@ -233,6 +329,16 @@ impl ToolDispatchRequest {
     /// Sets the framework ports the tool is handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Sets the tool guardrails this run installed, which the tool's declarations resolve against.
+    ///
+    /// A request that is not given them can still dispatch a tool that declares none. A tool that
+    /// declares one is refused, which is the same answer an installed set that is missing it gives:
+    /// running the call would execute it unchecked under a name that says it was checked.
+    pub fn with_tool_guardrails(mut self, guardrails: ToolGuardrails) -> Self {
+        self.guardrails = guardrails;
         self
     }
 
@@ -272,18 +378,59 @@ impl ToolDispatchRequest {
             None => context,
         }
     }
+
+    /// The view of this call its input guardrails are given.
+    ///
+    /// Built from the same fields [`Self::context`] is: a check deciding over a different view of
+    /// the call than the tool receives would be deciding about something adjacent to what happens.
+    fn guardrail_input_data(&self) -> ToolInputGuardrailData<'_> {
+        ToolInputGuardrailData::new(
+            &self.run,
+            self.tool.origin(),
+            &self.call_id,
+            &self.arguments,
+        )
+        .with_services(&self.services)
+    }
 }
 
 /// Runs one call through the fixed chain.
-pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatch> {
+pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatchOutcome> {
     dispatch_tool_with_admission(request, None, Instant::now()).await
 }
 
 /// Runs one call through the fixed chain, optionally coordinating with a batch resource admission gate.
+///
+/// The guardrail records are collected as the chain runs and returned beside its decision. A chain
+/// that ends in [`Err`] loses them, with one exception that matters: a
+/// [`RaiseException`](ra_core::guardrail::ToolGuardrailBehavior::RaiseException) carries every
+/// decision it reached on the error itself, because the run it ends produces no result to read them
+/// from.
 pub(crate) async fn dispatch_tool_with_admission(
     request: ToolDispatchRequest,
     admission: Option<&crate::turn::batch::ResourceAdmissionGate>,
     admission_started: Instant,
+) -> Result<ToolDispatchOutcome> {
+    let mut guardrails = ToolGuardrailRecords::default();
+    let dispatch = run_chain(&request, admission, admission_started, &mut guardrails).await?;
+    Ok(ToolDispatchOutcome {
+        dispatch,
+        guardrails,
+    })
+}
+
+/// The nine stages, in the only permitted order.
+///
+/// Long on purpose. The order is the contract this module documents, and every stage that can
+/// refuse reads the two above it — splitting the chain into three functions would put that order
+/// somewhere no single function states it, which is the drift having one insertion point per
+/// milestone exists to prevent.
+#[allow(clippy::too_many_lines)]
+async fn run_chain(
+    request: &ToolDispatchRequest,
+    admission: Option<&crate::turn::batch::ResourceAdmissionGate>,
+    admission_started: Instant,
+    records: &mut ToolGuardrailRecords,
 ) -> Result<ToolDispatch> {
     let tool = &request.tool;
     let options = tool.options();
@@ -304,13 +451,33 @@ pub(crate) async fn dispatch_tool_with_admission(
         ));
     }
 
+    // Both boundaries are resolved before anything else looks at the call, and ahead of the
+    // permission stage in particular: a declaration that names nothing installed stops this call
+    // before a host is interrupted about it, and before a decoding failure can reach a handler
+    // whose text the output checks are owed a look at. A call whose result cannot be checked should
+    // not have produced the result either, which is why the second list is resolved here and not
+    // after the tool has run.
+    let input_guardrails = request.guardrails.resolve_input(&options, tool.origin())?;
+    let output_guardrails = request.guardrails.resolve_output(&options, tool.origin())?;
+
     // Typed function tools are decoded exactly once at the common invocation boundary. A tool
     // implementation receives the checked value from its context instead of each implementation
     // independently reinterpreting provider JSON. Untyped and remote tools retain the parsed
     // JSON-only contract.
     let decoded_input = match tool.decode_input(&request.arguments) {
         Ok(decoded) => decoded,
-        Err(error) => return shape_failure(tool, &request, &options, &name, error).await,
+        Err(error) => {
+            return shape_failure(
+                tool,
+                request,
+                &options,
+                &name,
+                error,
+                &output_guardrails,
+                records,
+            )
+            .await;
+        }
     };
 
     // 2. Loop-breaker admission, before approval so a host is not asked about a call that will not
@@ -321,45 +488,19 @@ pub(crate) async fn dispatch_tool_with_admission(
         return Ok(refused(&request.call_id, &name, &reason));
     }
 
-    // 3. Permission policy and approval, before anything runs. A fixed rule or mode decision is
-    // resolved without entering third-party code. Only the remaining default path asks a dynamic
-    // tool whether it needs approval.
-    let permission = resolve_permission(tool, &options, &request).await?;
-    match permission {
-        PermissionDecision::Allow => {}
-        PermissionDecision::Deny => {
-            return Ok(refused(
-                &request.call_id,
-                &name,
-                &Error::tool(
-                    ToolErrorKind::PermissionDenied,
-                    &name,
-                    "the permission policy denied this tool call",
-                ),
-            ));
-        }
-        PermissionDecision::Ask => {
-            let mut approval = ToolApproval::new(
-                request.call_id.clone(),
-                tool.model_definition().name(),
-                request.arguments.clone(),
-            );
-            if let Some(namespace) = tool.origin().namespace() {
-                approval = approval.with_namespace(namespace.as_str());
-            }
-            approval = approval.with_tool_origin(tool.origin());
-            return Ok(ToolDispatch::AwaitingApproval(approval));
-        }
-        _ => {
-            return Err(Error::caller(format!(
-                "tool `{name}` has an unsupported permission decision `{permission:?}`"
-            )));
-        }
+    // 3. Permission policy and approval, before anything runs.
+    if let Some(answer) =
+        admit_permission(request, &options, &name, &input_guardrails, records).await?
+    {
+        return Ok(answer);
     }
 
-    // 4. Input guardrail. R7-3 owns the contract; the stage exists so it lands in one place, and
-    // so its position relative to approval is decided here rather than per call site.
-    check_input_guardrails(&options)?;
+    // 4. Input guardrail, on the arguments the tool is about to be handed. A refusal here means the
+    // tool runs zero times, which is the whole reason this boundary exists rather than only the one
+    // after the call.
+    if let Some(refusal) = check_input_guardrails(request, &input_guardrails, records).await? {
+        return Ok(refusal);
+    }
 
     // 5. Dynamic resource claims evaluation.
     // Exclusive tools run alone under a global write gate and skip fine-grained claims.
@@ -370,7 +511,18 @@ pub(crate) async fn dispatch_tool_with_admission(
             .await;
         match claims_result {
             Ok(Ok(claims)) => claims,
-            Ok(Err(error)) => return shape_failure(tool, &request, &options, &name, error).await,
+            Ok(Err(error)) => {
+                return shape_failure(
+                    tool,
+                    request,
+                    &options,
+                    &name,
+                    error,
+                    &output_guardrails,
+                    records,
+                )
+                .await;
+            }
             Err(error) => return Err(error),
         }
     } else {
@@ -407,17 +559,88 @@ pub(crate) async fn dispatch_tool_with_admission(
 
     let output = match outcome {
         Ok(output) => output,
-        Err(error) => return shape_failure(tool, &request, &options, &name, error).await,
+        Err(error) => {
+            return shape_failure(
+                tool,
+                request,
+                &options,
+                &name,
+                error,
+                &output_guardrails,
+                records,
+            )
+            .await;
+        }
     };
 
-    // 8. Output guardrail, on the result the tool actually produced.
-    check_output_guardrails(&options)?;
+    // 8. Output guardrail, on the complete result the tool actually produced.
+    //
+    // The tool has run and whatever it did stands; what a refusal here replaces is the answer the
+    // model reads. That answer *is* the record in this framework — history is what the next request
+    // is built from — so the refused content does not travel on beside the message that replaced it.
+    if let Some(replacement) =
+        check_output_guardrails(request, &output_guardrails, &output, records).await?
+    {
+        return Ok(replacement);
+    }
 
     // 9. Context projection happens after the guardrail has inspected the complete observation
     // and immediately before the record is made.  The stored ToolOutput retains those complete
     // blocks; only its model-facing excerpt changes.
-    let output = project_output(&request, output)?;
+    let output = project_output(request, output)?;
     observed_success(&request.call_id, &output)
+}
+
+/// Runs the permission stage, returning the answer the chain gives instead of running the tool.
+///
+/// `None` means the call may proceed. A fixed rule or mode decision is resolved without entering
+/// third-party code; only the remaining default path asks a dynamic tool whether it needs approval.
+async fn admit_permission(
+    request: &ToolDispatchRequest,
+    options: &ToolOptions,
+    name: &str,
+    input_guardrails: &[Arc<dyn ToolInputGuardrail>],
+    records: &mut ToolGuardrailRecords,
+) -> Result<Option<ToolDispatch>> {
+    let tool = &request.tool;
+    let permission = resolve_permission(tool, options, request).await?;
+    match permission {
+        PermissionDecision::Allow => Ok(None),
+        PermissionDecision::Deny => Ok(Some(refused(
+            &request.call_id,
+            name,
+            &Error::tool(
+                ToolErrorKind::PermissionDenied,
+                name,
+                "the permission policy denied this tool call",
+            ),
+        ))),
+        PermissionDecision::Ask => {
+            // The optional pre-approval pass. It exists so nobody is asked to approve a call that
+            // is going to be refused anyway — and it does not settle the question: the check after
+            // the answer comes back still runs, against whatever the host has installed by then.
+            // See [`ToolInputGuardrail`] for why that one is not a formality.
+            if request.guardrails.checks_before_approval()
+                && let Some(refusal) =
+                    check_input_guardrails(request, input_guardrails, records).await?
+            {
+                return Ok(Some(refusal));
+            }
+            let mut approval = ToolApproval::new(
+                request.call_id.clone(),
+                tool.model_definition().name(),
+                request.arguments.clone(),
+            );
+            if let Some(namespace) = tool.origin().namespace() {
+                approval = approval.with_namespace(namespace.as_str());
+            }
+            approval = approval.with_tool_origin(tool.origin());
+            Ok(Some(ToolDispatch::AwaitingApproval(approval)))
+        }
+        _ => Err(Error::caller(format!(
+            "tool `{name}` has an unsupported permission decision `{permission:?}`"
+        ))),
+    }
 }
 
 /// Applies fixed rule and mode decisions before consulting a tool's dynamic approval callback.
@@ -496,12 +719,20 @@ pub(crate) fn duration_ms(duration: std::time::Duration) -> u64 {
 }
 
 /// Turns an invocation failure into either a model-visible observation or a stopped turn.
+///
+/// The output guardrails are carried in because one branch below produces tool-authored text the
+/// model will read — [`ToolFailureHandling::Custom`] — and that is a tool result like any other. The
+/// branches that render a stable code are not offered to them: a code and a qualified name are the
+/// framework's own vocabulary, with nothing a check written about tool content could inspect.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn shape_failure(
     tool: &Arc<dyn Tool>,
     request: &ToolDispatchRequest,
     options: &ToolOptions,
     name: &str,
     error: Error,
+    output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
+    records: &mut ToolGuardrailRecords,
 ) -> Result<ToolDispatch> {
     // A cancellation is never an observation. Reporting it to the model as a tool failure would
     // let the loop continue past the very thing that asked it to stop, and the run would keep
@@ -550,6 +781,12 @@ pub(crate) async fn shape_failure(
                 .await??
             {
                 Some(output) => {
+                    if let Some(replacement) =
+                        check_output_guardrails(request, output_guardrails, &output, records)
+                            .await?
+                    {
+                        return Ok(replacement);
+                    }
                     let output = project_output(request, output)?;
                     observed(&request.call_id, &output, Some(error.code()))
                 }
@@ -610,21 +847,83 @@ pub(crate) async fn needs_approval(
     }
 }
 
-// The two stages below always succeed today and will not once their owning milestone lands.
-// Narrowing the return type now would take the `?` off the call sites, and a stage that reads like
-// a no-op is a stage someone tidies away — which is exactly what having one insertion point per
-// milestone is meant to prevent.
-
-/// R7-3's insertion point for tool input guardrails.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) const fn check_input_guardrails(_options: &ToolOptions) -> Result<()> {
-    Ok(())
+/// Asks the checks declared on this tool about the call's arguments.
+///
+/// `Ok(None)` is the ordinary answer: nothing declared, or every check allowed. `Ok(Some(_))` is a
+/// refusal the model reads in place of the call it asked for, and `Err` is a raise — or a check
+/// that could not decide, which is not a refusal and must not be reported as one.
+async fn check_input_guardrails(
+    request: &ToolDispatchRequest,
+    guardrails: &[Arc<dyn ToolInputGuardrail>],
+    records: &mut ToolGuardrailRecords,
+) -> Result<Option<ToolDispatch>> {
+    if guardrails.is_empty() {
+        return Ok(None);
+    }
+    let data = request.guardrail_input_data();
+    let verdict = check_tool_input(guardrails, &data, &request.cancel, &mut records.input).await?;
+    match verdict {
+        ToolGuardrailVerdict::Allow => Ok(None),
+        ToolGuardrailVerdict::RejectContent { message, .. } => {
+            // `Refused`, not a failed observation: the tool did not run, and a record that said it
+            // had would hand the no-progress breaker evidence about a tool that never executed.
+            Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
+                guardrail_message(&request.call_id, message)?,
+                TOOL_INPUT_GUARDRAIL_CODE,
+            ))))
+        }
+        verdict => Err(unsupported_verdict(&verdict)),
+    }
 }
 
-/// R7-3's insertion point for tool output guardrails.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) const fn check_output_guardrails(_options: &ToolOptions) -> Result<()> {
-    Ok(())
+/// Asks the checks declared on this tool about what the call produced.
+///
+/// `Ok(Some(_))` carries the message the model reads instead of the result.
+async fn check_output_guardrails(
+    request: &ToolDispatchRequest,
+    guardrails: &[Arc<dyn ToolOutputGuardrail>],
+    output: &ToolOutput,
+    records: &mut ToolGuardrailRecords,
+) -> Result<Option<ToolDispatch>> {
+    if guardrails.is_empty() {
+        return Ok(None);
+    }
+    let data = ToolOutputGuardrailData::new(request.guardrail_input_data(), output);
+    let verdict =
+        check_tool_output(guardrails, &data, &request.cancel, &mut records.output).await?;
+    match verdict {
+        ToolGuardrailVerdict::Allow => Ok(None),
+        ToolGuardrailVerdict::RejectContent { message, .. } => {
+            // `Observed`, because the tool did run: its side effects stand, and the records owe the
+            // streak counters the truth about that. Classified as a failure so no stop policy can
+            // promote a refused result to the run's answer.
+            Ok(Some(ToolDispatch::Observed(ToolObservation::failed(
+                guardrail_message(&request.call_id, message)?,
+                TOOL_OUTPUT_GUARDRAIL_CODE,
+            ))))
+        }
+        verdict => Err(unsupported_verdict(&verdict)),
+    }
+}
+
+/// Renders a guardrail's own message as the answer the model reads.
+///
+/// Host-authored text written for the model, which is why it reaches the model at all — the ban in
+/// this module's documentation is on *framework* prose, written for logs and for the person at the
+/// keyboard. It is flagged as an error so that a refusal can never be promoted to the run's answer
+/// by a tool-use stop policy, which cannot inspect what it stops on.
+fn guardrail_message(call_id: &CallId, message: String) -> Result<ToolCallOutput> {
+    let payload = serde_json::to_value(ToolOutput::text(message)).map_err(|error| {
+        Error::caller("failed to render a tool guardrail's message as provider-neutral JSON")
+            .with_source(error)
+    })?;
+    Ok(ToolCallOutput::new(call_id.clone(), payload).with_error(true))
+}
+
+fn unsupported_verdict(verdict: &ToolGuardrailVerdict) -> Error {
+    Error::caller(format!(
+        "a tool guardrail reduced to the unsupported verdict `{verdict:?}`"
+    ))
 }
 
 pub(crate) fn observed_success(call_id: &CallId, output: &ToolOutput) -> Result<ToolDispatch> {

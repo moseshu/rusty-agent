@@ -16,16 +16,18 @@
 //! The last two exist separately because context budgeting filters the model-facing view while the
 //! session stays authoritative. Collapsing them means a filter silently deletes history.
 //!
-//! # What is deliberately absent
+//! # Two of the four guardrail result lists, not four
 //!
-//! **The four guardrail result lists.** Input, output, tool-input, and tool-output guardrail
-//! results are named as fields here, and they do belong here — but `InputGuardrailResult`,
-//! `OutputGuardrailResult`, and the three-state tool guardrail result are the guardrail
-//! subsystem's types and do not exist yet. Standing in a `Vec<Value>` or a bare `bool` freezes the
-//! wrong shape before the contract is written, which is the same call made when `FinalOutput` got
-//! a [`FinishReason`](crate::finish::FinishReason) instead of a placeholder output value. This
-//! struct is `#[non_exhaustive]` with private fields and a builder precisely so the guardrail
-//! subsystem can add them without a breaking change.
+//! The tool-input and tool-output verdicts this turn's calls produced are here, because a turn is
+//! what produces them: every call the response bound is bracketed by the checks its tool declared,
+//! and the run has no other moment at which to collect them.
+//!
+//! The run-level two are **not**, and that is not an omission waiting to be filled. A run's input
+//! is checked once for the whole run and its final output once at delivery, so neither belongs to
+//! any particular turn; both are recorded straight into
+//! [`RunState`](crate::state::RunState) by the loop that runs them. A copy here would be a second
+//! place for the same fact, and the turn that happened to carry it would look like the turn that
+//! caused it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,6 +37,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
+    guardrail::{ToolInputGuardrailResult, ToolOutputGuardrailResult},
     item::{ItemId, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
 };
 
@@ -50,6 +53,8 @@ pub struct SingleStepResult {
     new_step_items: Vec<RunItem>,
     session_step_items: Vec<RunItem>,
     nested_history_owned_items: Vec<ItemId>,
+    tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
+    tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
     processed_response: ProcessedResponse,
     next_step: NextStep,
 }
@@ -103,6 +108,22 @@ impl SingleStepResult {
         &self.nested_history_owned_items
     }
 
+    /// What the checks on this turn's tool calls concluded about their arguments.
+    ///
+    /// One entry per completed check per call, in settlement order. A check that refused is here
+    /// beside the ones that allowed: the refusal is already reflected in what the model was shown,
+    /// and this is the only record of the evidence behind it.
+    #[must_use]
+    pub fn tool_input_guardrail_results(&self) -> &[ToolInputGuardrailResult] {
+        &self.tool_input_guardrail_results
+    }
+
+    /// What the checks on this turn's tool calls concluded about their results.
+    #[must_use]
+    pub fn tool_output_guardrail_results(&self) -> &[ToolOutputGuardrailResult] {
+        &self.tool_output_guardrail_results
+    }
+
     /// This turn's classification, kept because resuming an interruption needs the bound actions
     /// that produced it rather than a fresh guess at what the model meant.
     #[must_use]
@@ -138,6 +159,8 @@ pub struct SingleStepResultBuilder {
     new_step_items: Vec<RunItem>,
     session_step_items: Option<Vec<RunItem>>,
     nested_history_owned_items: Vec<ItemId>,
+    tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
+    tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
     processed_response: Option<ProcessedResponse>,
     next_step: Option<NextStep>,
 }
@@ -181,6 +204,21 @@ impl SingleStepResultBuilder {
     /// Marks stored items as belonging to a nested run.
     pub fn nested_history_owned_items(mut self, item_ids: Vec<ItemId>) -> Self {
         self.nested_history_owned_items = item_ids;
+        self
+    }
+
+    /// Sets what the checks on this turn's tool call arguments concluded.
+    pub fn tool_input_guardrail_results(mut self, results: Vec<ToolInputGuardrailResult>) -> Self {
+        self.tool_input_guardrail_results = results;
+        self
+    }
+
+    /// Sets what the checks on this turn's tool call results concluded.
+    pub fn tool_output_guardrail_results(
+        mut self,
+        results: Vec<ToolOutputGuardrailResult>,
+    ) -> Self {
+        self.tool_output_guardrail_results = results;
         self
     }
 
@@ -233,6 +271,8 @@ impl SingleStepResultBuilder {
             new_step_items: self.new_step_items,
             session_step_items,
             nested_history_owned_items: self.nested_history_owned_items,
+            tool_input_guardrail_results: self.tool_input_guardrail_results,
+            tool_output_guardrail_results: self.tool_output_guardrail_results,
             processed_response,
             next_step,
         })

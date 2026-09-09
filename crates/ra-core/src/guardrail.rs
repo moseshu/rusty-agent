@@ -158,6 +158,14 @@ pub enum GuardrailEvidence {
     Input(Vec<InputGuardrailResult>),
     /// Verdicts from the stage that examines what the run is about to deliver.
     Output(Vec<OutputGuardrailResult>),
+    /// Verdicts from the checks that examine one call's arguments before it runs.
+    ///
+    /// Carried for the same reason the run-level ones are, and it matters more here: a
+    /// [`RaiseException`](tool::ToolGuardrailBehavior::RaiseException) ends the run from inside a
+    /// tool batch, so the decisions its siblings reached never reach a checkpoint.
+    ToolInput(Vec<ToolInputGuardrailResult>),
+    /// Verdicts from the checks that examine one call's result before the model is shown it.
+    ToolOutput(Vec<ToolOutputGuardrailResult>),
 }
 
 impl GuardrailEvidence {
@@ -167,24 +175,44 @@ impl GuardrailEvidence {
         match self {
             Self::Input(_) => GuardrailStage::Input,
             Self::Output(_) => GuardrailStage::Output,
+            Self::ToolInput(_) => GuardrailStage::ToolInput,
+            Self::ToolOutput(_) => GuardrailStage::ToolOutput,
         }
     }
 
-    /// The input verdicts, or `None` when this evidence is from the other stage.
+    /// The run-input verdicts, or `None` when this evidence is from another stage.
     #[must_use]
     pub fn input(&self) -> Option<&[InputGuardrailResult]> {
         match self {
             Self::Input(results) => Some(results),
-            Self::Output(_) => None,
+            _ => None,
         }
     }
 
-    /// The output verdicts, or `None` when this evidence is from the other stage.
+    /// The run-output verdicts, or `None` when this evidence is from another stage.
     #[must_use]
     pub fn output(&self) -> Option<&[OutputGuardrailResult]> {
         match self {
             Self::Output(results) => Some(results),
-            Self::Input(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The tool-argument verdicts, or `None` when this evidence is from another stage.
+    #[must_use]
+    pub fn tool_input(&self) -> Option<&[ToolInputGuardrailResult]> {
+        match self {
+            Self::ToolInput(results) => Some(results),
+            _ => None,
+        }
+    }
+
+    /// The tool-result verdicts, or `None` when this evidence is from another stage.
+    #[must_use]
+    pub fn tool_output(&self) -> Option<&[ToolOutputGuardrailResult]> {
+        match self {
+            Self::ToolOutput(results) => Some(results),
+            _ => None,
         }
     }
 }
