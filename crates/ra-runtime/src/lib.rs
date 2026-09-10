@@ -23,7 +23,7 @@ pub(crate) mod budget;
 pub mod capability;
 pub(crate) mod circuit;
 pub(crate) mod guardrail;
-pub(crate) mod hook;
+pub mod hook;
 pub(crate) mod memory;
 pub mod permission;
 pub mod runner;

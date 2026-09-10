@@ -33,6 +33,7 @@ pub mod process;
 #[doc(hidden)]
 pub mod resolve;
 
+use crate::hook::UserHooks;
 use crate::permission::PermissionEngine;
 use crate::tool::guardrail::ToolGuardrails;
 use batch::{
@@ -65,6 +66,7 @@ pub struct TurnSettlementRequest<'a> {
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
+    user_hooks: UserHooks,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
@@ -108,6 +110,7 @@ impl<'a> TurnSettlementRequest<'a> {
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             permission,
             guardrails: ToolGuardrails::default(),
+            user_hooks: UserHooks::default(),
             streamed_dispatches: None,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
@@ -117,6 +120,12 @@ impl<'a> TurnSettlementRequest<'a> {
     /// Sets the framework ports the tools this turn calls are handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Installs the host hooks consulted by this execution path.
+    pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
+        self.user_hooks = hooks;
         self
     }
 
@@ -198,6 +207,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     )
     .with_services(request.services.clone())
     .with_tool_guardrails(request.guardrails.clone())
+    .with_user_hooks(request.user_hooks.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
     let execution_request = match request.streamed_dispatches {
         Some(streamed_dispatches) => {

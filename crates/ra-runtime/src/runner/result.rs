@@ -332,6 +332,12 @@ impl TurnRecord {
         }
     }
 
+    /// A stop hook changed a candidate delivery into another turn, with a recorded prompt.
+    pub(super) fn continue_after_hook(&mut self, end: usize) {
+        self.next_step = NextStep::RunAgain;
+        self.items.end = end;
+    }
+
     /// Which turn this was, counting from 1 — the same number
     /// [`RunStreamEvent::TurnStarted`](super::RunStreamEvent::TurnStarted) carries.
     #[must_use]
@@ -447,8 +453,8 @@ impl RunResult {
         turn_records: Vec<TurnRecord>,
         turns: u32,
         state: RunState,
+        final_message: Option<Message>,
     ) -> Self {
-        let final_message = find_final_message(&new_items).cloned();
         Self {
             outcome,
             last_agent,
@@ -461,15 +467,6 @@ impl RunResult {
             state,
             final_message,
         }
-    }
-
-    /// Overrides the delivered message with one a [`RunErrorHandler`] produced.
-    ///
-    /// A closeout speaks for a run that stopped without answering, so it outranks whatever the
-    /// model last said — including nothing at all.
-    pub(super) fn with_final_message(mut self, message: Message) -> Self {
-        self.final_message = Some(message);
-        self
     }
 
     /// How the run ended.

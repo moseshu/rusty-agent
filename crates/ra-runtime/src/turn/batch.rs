@@ -60,6 +60,7 @@ use tokio::{
 };
 use tracing::{Instrument, error, info_span, warn};
 
+use crate::hook::UserHooks;
 use crate::permission::PermissionEngine;
 use crate::tool::dispatch::{
     CallHistory, ToolDispatch, ToolDispatchOutcome, ToolDispatchRequest, ToolGuardrailRecords,
@@ -230,6 +231,7 @@ pub struct TurnExecutionRequest<'a> {
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
+    user_hooks: UserHooks,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
 }
 
@@ -255,6 +257,7 @@ impl<'a> TurnExecutionRequest<'a> {
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             permission,
             guardrails: ToolGuardrails::default(),
+            user_hooks: UserHooks::default(),
             streamed_dispatches: None,
         }
     }
@@ -262,6 +265,12 @@ impl<'a> TurnExecutionRequest<'a> {
     /// Sets the framework ports every tool in this batch is handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Installs the host hooks consulted by this execution path.
+    pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
+        self.user_hooks = hooks;
         self
     }
 
@@ -445,6 +454,7 @@ pub(crate) struct StreamedFunctionDispatches {
     services: ToolServices,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
+    user_hooks: UserHooks,
 }
 
 struct StreamedFunctionCall {
@@ -478,6 +488,7 @@ impl StreamedFunctionDispatches {
         max_function_tool_concurrency: usize,
         permission: PermissionEngine,
         guardrails: ToolGuardrails,
+        user_hooks: UserHooks,
     ) -> Self {
         Self {
             dispatches: JoinSet::new(),
@@ -494,6 +505,7 @@ impl StreamedFunctionDispatches {
             services,
             permission,
             guardrails,
+            user_hooks,
         }
     }
 
@@ -543,7 +555,8 @@ impl StreamedFunctionDispatches {
             self.permission.clone(),
         )
         .with_services(self.services.clone())
-        .with_tool_guardrails(self.guardrails.clone());
+        .with_tool_guardrails(self.guardrails.clone())
+        .with_user_hooks(self.user_hooks.clone());
         let tool = action.tool().origin().clone();
         let function_span = function_span(&tool, &call_id);
         let task_id = spawn_dispatch_task(
@@ -715,7 +728,8 @@ fn spawn_function_dispatches(
             request.permission.clone(),
         )
         .with_services(request.services.clone())
-        .with_tool_guardrails(request.guardrails.clone());
+        .with_tool_guardrails(request.guardrails.clone())
+        .with_user_hooks(request.user_hooks.clone());
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let call_id = action.call_id().clone();
