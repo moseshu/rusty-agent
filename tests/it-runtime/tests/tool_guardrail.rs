@@ -828,13 +828,15 @@ async fn tool_guardrails_short_circuit_in_declaration_order() {
     }
 }
 
+/// Both reducers have this shape, which is the only reason one loop can drive them.
+type Reducer = fn(
+    Vec<(ToolGuardrailId, ToolGuardrailFunctionOutput)>,
+) -> Result<ra_core::guardrail::ToolGuardrailVerdict>;
+
 #[test]
 fn core_reduction_preserves_the_first_non_allow_decision() {
     use ra_core::guardrail::{reduce_tool_input_guardrails, reduce_tool_output_guardrails};
-    let reducers: [fn(
-        Vec<(ToolGuardrailId, ToolGuardrailFunctionOutput)>,
-    ) -> Result<ra_core::guardrail::ToolGuardrailVerdict>; 2] =
-        [reduce_tool_input_guardrails, reduce_tool_output_guardrails];
+    let reducers: [Reducer; 2] = [reduce_tool_input_guardrails, reduce_tool_output_guardrails];
     for reduce in reducers {
         let result = reduce(vec![
             (
