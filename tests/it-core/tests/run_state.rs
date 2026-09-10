@@ -270,8 +270,8 @@ fn test_run_state_history_checkpoint_roundtrip() {
     assert_eq!(restored.starting_agent(), Some(&agent));
     assert_eq!(restored.current_agent(), Some(&agent));
     assert_eq!(restored.original_input(), original_input);
-    assert_eq!(restored.generated_items(), [approval.clone()]);
-    assert_eq!(restored.model_responses(), [response.clone()]);
+    assert_eq!(restored.generated_items(), std::slice::from_ref(&approval));
+    assert_eq!(restored.model_responses(), std::slice::from_ref(&response));
     assert_eq!(restored.last_model_response(), Some(&response));
     assert_eq!(
         restored.pending_interruptions(),
