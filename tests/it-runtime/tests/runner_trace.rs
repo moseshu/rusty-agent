@@ -37,6 +37,7 @@ use ra_core::{
     cancel::{CancelReason, CancelScope},
     error::{Error, ProviderErrorKind, Result, ToolErrorKind},
     finish::FinishReason,
+    hook::{HookDecision, HookEvent, HookEventName, UserHook, UserHookContext},
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
         ToolCall,
@@ -46,6 +47,7 @@ use ra_core::{
         ModelSelector, ModelSettings, ModelStream, ModelStreamEvent, NormalizedProviderError,
         ProviderKey, ResolvedModel, RetryBackoffSettings, RetryDecision, RetryPolicyContext,
     },
+    permission::{PermissionDecision, PermissionRule},
     state::RunId,
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin,
@@ -55,6 +57,7 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
+    hook::UserHookRegistration,
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
 };
 use serde_json::json;
@@ -354,6 +357,11 @@ impl ScriptedTool {
     /// than about two zeroes.
     fn taking(mut self, handler_time: Duration) -> Self {
         self.handler_time = handler_time;
+        self
+    }
+
+    fn approved_by(mut self, approval: ToolApprovalPolicy) -> Self {
+        self.options = self.options.with_approval(approval);
         self
     }
 }
@@ -829,4 +837,63 @@ async fn no_span_or_event_carries_model_content_tool_arguments_or_tool_output() 
         !spans.all().is_empty(),
         "the assertion above is worthless if nothing was captured"
     );
+}
+
+/// Who stopped the call has to survive into the trace, because the model-visible answer to a
+/// refusal is deliberately the same shape whoever produced it. An optional host callback, the
+/// run's permission policy and a check the tool declared are three different things to fix.
+struct RefusingHook(HookDecision);
+
+#[async_trait]
+impl UserHook for RefusingHook {
+    fn name(&self) -> &str {
+        "refusing hook"
+    }
+
+    async fn call(&self, _: &UserHookContext<'_>, _: &HookEvent<'_>) -> Result<HookDecision> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_call_names_the_boundary_that_refused_it() {
+    for (event, policy, expected) in [
+        (
+            Some(HookEventName::PreToolUse),
+            ToolApprovalPolicy::Never,
+            "hook.pre_tool_use",
+        ),
+        (
+            Some(HookEventName::PermissionRequest),
+            ToolApprovalPolicy::Always,
+            "hook.permission_request",
+        ),
+        (None, ToolApprovalPolicy::Never, "tool.permission_denied"),
+    ] {
+        let tool = Arc::new(ScriptedTool::new("write_file").approved_by(policy));
+        let calls = Arc::clone(&tool.calls);
+        let model = tool_then_answer();
+        let cancel = CancelScope::root();
+        let mut config = RunConfig::new();
+        config = match event {
+            Some(event) => config.with_user_hook(UserHookRegistration::new(
+                event,
+                Arc::new(RefusingHook(HookDecision::Deny {
+                    message: "the host refused this call".to_owned(),
+                })),
+            )),
+            None => config.with_permission_rules([PermissionRule::new(PermissionDecision::Deny)]),
+        };
+        let (spans, _text, guard) = capture();
+
+        Runner::run(request(vec![tool], &model, &cancel).with_config(config))
+            .await
+            .unwrap();
+        drop(guard);
+
+        let function = spans.only("function");
+        assert_eq!(function.field("outcome"), Some("error"), "{function:?}");
+        assert_eq!(function.field("error.code"), Some(expected), "{function:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{expected}");
+    }
 }

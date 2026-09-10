@@ -36,6 +36,7 @@ pub use self::{
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::Result,
+    hook::HookReport,
     item::AgentId,
     state::{EventSeqAllocator, RunId},
 };
@@ -55,6 +56,8 @@ pub enum HostEventBody {
     Exec(ExecEvent),
     /// Multi-agent orchestration event.
     Agent(AgentEvent),
+    /// Completion of one host hook callback.
+    Hook(HookReport),
     /// Forward-compatible unknown event family.
     Unknown {
         /// Family identifier tag.
@@ -73,6 +76,12 @@ impl From<ExecEvent> for HostEventBody {
 impl From<AgentEvent> for HostEventBody {
     fn from(a: AgentEvent) -> Self {
         Self::Agent(a)
+    }
+}
+
+impl From<HookReport> for HostEventBody {
+    fn from(report: HookReport) -> Self {
+        Self::Hook(report)
     }
 }
 
@@ -104,6 +113,14 @@ impl Serialize for HostEventBody {
                 };
                 envelope.serialize(serializer)
             }
+            Self::Hook(report) => {
+                let data = serde_json::to_value(report).map_err(serde::ser::Error::custom)?;
+                Envelope {
+                    family: "hook",
+                    data: &data,
+                }
+                .serialize(serializer)
+            }
             Self::Unknown { family, data } => {
                 let envelope = Envelope { family, data };
                 envelope.serialize(serializer)
@@ -131,6 +148,10 @@ impl<'de> Deserialize<'de> for HostEventBody {
                 let agent: AgentEvent =
                     serde_json::from_value(data).map_err(serde::de::Error::custom)?;
                 Ok(Self::Agent(agent))
+            }
+            "hook" => {
+                let report = serde_json::from_value(data).map_err(serde::de::Error::custom)?;
+                Ok(Self::Hook(report))
             }
             other => Ok(Self::Unknown {
                 family: other.to_owned(),

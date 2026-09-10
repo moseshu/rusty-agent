@@ -25,6 +25,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use ra_core::hook::{HookDecision, HookEvent, ToolHookData};
 use ra_core::{
     cancel::CancelScope,
     context::RunContext,
@@ -43,6 +44,7 @@ use ra_core::{
 use serde_json::{Value, json};
 
 use crate::circuit;
+use crate::hook::UserHooks;
 use crate::permission::PermissionEngine;
 use crate::tool::guardrail::{ToolGuardrails, check_tool_input, check_tool_output};
 
@@ -53,6 +55,14 @@ use crate::tool::guardrail::{ToolGuardrails, check_tool_input, check_tool_output
 /// not two spellings of the same boundary.
 const TOOL_INPUT_GUARDRAIL_CODE: &str = "guardrail.tool_input";
 const TOOL_OUTPUT_GUARDRAIL_CODE: &str = "guardrail.tool_output";
+
+/// The same, for the two boundaries a host hook can refuse a call at.
+///
+/// Separate from the guardrail codes and from the permission chain's `tool.permission_denied`,
+/// because those are the three things a reader of a refused call has to be able to tell apart:
+/// a check the tool declared, an optional host callback, and the run's policy.
+const PRE_TOOL_USE_HOOK_CODE: &str = "hook.pre_tool_use";
+const PERMISSION_REQUEST_HOOK_CODE: &str = "hook.permission_request";
 
 /// What one call's dispatch produced: the decision, and what the checks around it concluded.
 ///
@@ -283,6 +293,7 @@ pub struct ToolDispatchRequest {
     services: ToolServices,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
+    user_hooks: UserHooks,
     approval_granted: bool,
 }
 
@@ -316,6 +327,7 @@ impl ToolDispatchRequest {
             services: ToolServices::new(),
             permission,
             guardrails: ToolGuardrails::default(),
+            user_hooks: UserHooks::default(),
             approval_granted: false,
         }
     }
@@ -329,6 +341,15 @@ impl ToolDispatchRequest {
     /// Sets the framework ports the tool is handed.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Installs the host hooks consulted by this execution path.
+    ///
+    /// A request that is not given them runs no callback at all; hooks are optional and no event
+    /// is mandatory, which is the difference from the guardrail set below.
+    pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
+        self.user_hooks = hooks;
         self
     }
 
@@ -573,6 +594,15 @@ async fn run_chain(
         }
     };
 
+    run_user_hook(
+        request,
+        HookEvent::PostToolUse {
+            call: tool_hook_data(request),
+            output: &output,
+        },
+    )
+    .await?;
+
     // 8. Output guardrail, on the complete result the tool actually produced.
     //
     // The tool has run and whatever it did stands; what a refusal here replaces is the answer the
@@ -591,6 +621,28 @@ async fn run_chain(
     observed_success(&request.call_id, &output)
 }
 
+fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
+    ToolHookData::new(request.tool.origin(), &request.call_id, &request.arguments)
+}
+
+async fn run_user_hook(
+    request: &ToolDispatchRequest,
+    event: HookEvent<'_>,
+) -> Result<HookDecision> {
+    if !request.user_hooks.has_event(event.name()) {
+        return Ok(HookDecision::Continue);
+    }
+    request
+        .user_hooks
+        .bind(
+            Arc::clone(&request.run),
+            request.cancel.clone(),
+            request.services.clone(),
+        )
+        .dispatch(event)
+        .await
+}
+
 /// Runs the permission stage, returning the answer the chain gives instead of running the tool.
 ///
 /// `None` means the call may proceed. A fixed rule or mode decision is resolved without entering
@@ -604,6 +656,16 @@ async fn admit_permission(
 ) -> Result<Option<ToolDispatch>> {
     let tool = &request.tool;
     let permission = resolve_permission(tool, options, request).await?;
+    // A policy denial is final; no hook grant is consulted on that path.
+    if !matches!(permission, PermissionDecision::Deny)
+        && let HookDecision::Deny { message } =
+            run_user_hook(request, HookEvent::PreToolUse(tool_hook_data(request))).await?
+    {
+        return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
+            guardrail_message(&request.call_id, message)?,
+            PRE_TOOL_USE_HOOK_CODE,
+        ))));
+    }
     match permission {
         PermissionDecision::Allow => Ok(None),
         PermissionDecision::Deny => Ok(Some(refused(
@@ -625,6 +687,21 @@ async fn admit_permission(
                     check_input_guardrails(request, input_guardrails, records).await?
             {
                 return Ok(Some(refusal));
+            }
+            match run_user_hook(
+                request,
+                HookEvent::PermissionRequest(tool_hook_data(request)),
+            )
+            .await?
+            {
+                HookDecision::Allow => return Ok(None),
+                HookDecision::Deny { message } => {
+                    return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
+                        guardrail_message(&request.call_id, message)?,
+                        PERMISSION_REQUEST_HOOK_CODE,
+                    ))));
+                }
+                _ => {}
             }
             let mut approval = ToolApproval::new(
                 request.call_id.clone(),

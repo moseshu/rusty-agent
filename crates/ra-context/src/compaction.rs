@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
+use ra_core::hook::CompactTrigger;
 use ra_core::{
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
@@ -520,6 +521,9 @@ impl ContextProcessor for CompactionCapability {
             return Ok(ContextProcessorResult::new(visible_input));
         }
 
+        request
+            .notify_pre_compact(CompactTrigger::Automatic)
+            .await?;
         let (projected, response) = self
             .compact(
                 &request,
@@ -544,6 +548,9 @@ impl ContextProcessor for CompactionCapability {
                 _ => None,
             })
             .ok_or_else(|| Error::caller("a compacted context did not contain its summary"))?;
+        request
+            .notify_post_compact(CompactTrigger::Automatic, &compaction)
+            .await?;
         let record = RunItem::new(
             request.record_id().clone(),
             RunItemKind::Compaction(compaction),

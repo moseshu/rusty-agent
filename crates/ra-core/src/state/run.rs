@@ -493,6 +493,15 @@ impl PendingControlRequest {
 /// earlier layout still counts. That is the whole of the migration, and it is on the way in rather
 /// than at a call site, because a resumed run that has to remember to migrate is a resumed run that
 /// silently gets its allowance back the day someone forgets.
+///
+/// # Why the latch fields stay separate bools
+///
+/// Four of them are one-shot markers of things that already happened — input checks were sent, a
+/// stop hook already asked for more work, a child announced itself, the input history is whole.
+/// They are independent, not the states of one machine, and each is a serialized field with a
+/// documented shape. Grouping any two of them to satisfy a field-count heuristic would change the
+/// checkpoint's JSON for a reason that has nothing to do with what a checkpoint means.
+#[allow(clippy::struct_excessive_bools)]
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RunStateRecord")]
@@ -518,6 +527,12 @@ pub struct RunState {
     tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     input_guardrails_started: bool,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    stop_hook_active: bool,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    subagent_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_run_id: Option<RunId>,
     #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -576,6 +591,9 @@ impl Eq for RunState {}
 /// the process that wrote it: a disk, an older build, an editor. Every invariant the run relies on
 /// afterwards is therefore checked here rather than assumed, because the alternative is not a
 /// crash — it is a run that resumes as something quietly different from what was paused.
+// Mirrors `RunState` field for field, including its latch bools; see that type for why they stay
+// separate. Regrouping them here alone would break the mirror the round-trip test relies on.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize)]
 struct RunStateRecord {
     #[serde(default = "run_state_schema_version")]
@@ -600,6 +618,12 @@ struct RunStateRecord {
     tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
     #[serde(default)]
     input_guardrails_started: bool,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    stop_hook_active: bool,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    subagent_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_run_id: Option<RunId>,
     #[serde(default)]
     budget: BudgetSnapshot,
     #[serde(default)]
@@ -660,6 +684,9 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_input_guardrail_results,
             tool_output_guardrail_results,
             input_guardrails_started,
+            stop_hook_active,
+            subagent_started,
+            parent_run_id,
             finish_reason,
             nested_runs,
             workspace_lease,
@@ -741,6 +768,9 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_input_guardrail_results,
             tool_output_guardrail_results,
             input_guardrails_started,
+            stop_hook_active,
+            subagent_started,
+            parent_run_id,
             budget,
             finish_reason,
             nested_runs,
@@ -781,6 +811,9 @@ impl RunState {
             tool_input_guardrail_results: Vec::new(),
             tool_output_guardrail_results: Vec::new(),
             input_guardrails_started: false,
+            stop_hook_active: false,
+            subagent_started: false,
+            parent_run_id: None,
             budget: BudgetSnapshot::new(),
             finish_reason: None,
             nested_runs: Vec::new(),
@@ -1322,6 +1355,48 @@ impl RunState {
     #[must_use]
     pub fn output_guardrail_results(&self) -> &[OutputGuardrailResult] {
         &self.output_guardrail_results
+    }
+
+    /// Whether a stop hook has already requested continuation in this logical run.
+    #[must_use]
+    pub const fn stop_hook_active(&self) -> bool {
+        self.stop_hook_active
+    }
+
+    /// Records an accepted stop-hook continuation before the next model call.
+    #[doc(hidden)]
+    pub fn mark_stop_hook_active(&mut self) {
+        self.stop_hook_active = true;
+    }
+
+    /// Explicit parent identity, present only for a host-created child run.
+    #[must_use]
+    pub const fn parent_run_id(&self) -> Option<&RunId> {
+        self.parent_run_id.as_ref()
+    }
+
+    /// Assigns a parent before a run begins. Restored runs keep their recorded identity.
+    #[doc(hidden)]
+    pub fn assign_parent_run_id(&mut self, parent: RunId) -> Result<()> {
+        if parent == self.run_id || self.current_agent.is_some() || self.parent_run_id.is_some() {
+            return Err(Error::caller(
+                "a parent run must be distinct and assigned once before the child starts",
+            ));
+        }
+        self.parent_run_id = Some(parent);
+        Ok(())
+    }
+
+    /// Whether the child-start notification was completed in an earlier segment.
+    #[must_use]
+    pub const fn subagent_started(&self) -> bool {
+        self.subagent_started
+    }
+
+    /// Prevents an approval resume from announcing the same child again.
+    #[doc(hidden)]
+    pub fn mark_subagent_started(&mut self) {
+        self.subagent_started = true;
     }
 
     /// What this run's tool input guardrails concluded, in settlement order.

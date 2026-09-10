@@ -52,6 +52,7 @@ use ra_core::{
         OutputGuardrail, ToolInputGuardrail, ToolOutputGuardrail, merge_input_guardrails,
         merge_output_guardrails,
     },
+    hook::{HookDecision, HookEvent, HookEventName, StopHookData},
     item::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolApproval, ToolCallOutput,
@@ -88,6 +89,7 @@ use crate::{
     agent::AgentBinding,
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
+    hook::{UserHookRegistration, UserHooks},
     permission::PermissionEngine,
     tool::dispatch::{
         CallHistory, ToolDispatch, ToolDispatchRequest, ToolGuardrailRecords, dispatch_tool,
@@ -141,6 +143,7 @@ pub struct RunConfig {
     tool_input_guardrails: Vec<Arc<dyn ToolInputGuardrail>>,
     tool_output_guardrails: Vec<Arc<dyn ToolOutputGuardrail>>,
     pre_approval_tool_input_guardrails: bool,
+    user_hooks: UserHooks,
 }
 
 impl Default for RunConfig {
@@ -173,6 +176,7 @@ impl RunConfig {
             tool_input_guardrails: Vec::new(),
             tool_output_guardrails: Vec::new(),
             pre_approval_tool_input_guardrails: false,
+            user_hooks: UserHooks::default(),
         }
     }
 
@@ -477,6 +481,25 @@ impl RunConfig {
         &self.output_guardrails
     }
 
+    /// Installs an optional host hook for its declared event.
+    /// These are distinct from SDK lifecycle observers and tool guardrails.
+    pub fn with_user_hook(mut self, registration: UserHookRegistration) -> Self {
+        self.user_hooks = self.user_hooks.with_hook(registration);
+        self
+    }
+
+    /// Installs a shared host hook registry, also usable for host-owned session events.
+    pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
+        self.user_hooks = hooks;
+        self
+    }
+
+    /// Host event hooks installed for this run.
+    #[must_use]
+    pub const fn user_hooks(&self) -> &UserHooks {
+        &self.user_hooks
+    }
+
     /// Installs one check a tool may declare over its arguments.
     ///
     /// Run-level, and there is no agent-level counterpart to merge with: a tool names the check it
@@ -627,6 +650,7 @@ impl std::fmt::Debug for RunConfig {
                     .map(|guardrail| guardrail.id().as_str())
                     .collect::<Vec<_>>(),
             )
+            .field("user_hooks", &self.user_hooks)
             .field(
                 "pre_approval_tool_input_guardrails",
                 &self.pre_approval_tool_input_guardrails,
@@ -694,6 +718,13 @@ impl RunRequest {
     pub fn with_config(mut self, config: RunConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Marks a fresh run as a child of another run. The parent is persisted in [`RunState`] so
+    /// approval resume uses `SubagentStop` without relying on the host to repeat this setting.
+    pub fn with_parent_run_id(mut self, parent: RunId) -> Result<Self> {
+        self.state.assign_parent_run_id(parent)?;
+        Ok(self)
     }
 
     /// Attaches the host's own state object.
@@ -929,14 +960,75 @@ async fn run_loop(
         usage.reasoning_tokens = tracing::field::Empty,
     );
     let started = Instant::now();
+    // Everything a cancellation notification needs, captured before the loop consumes the request
+    // — and only when someone is listening, so the default run pays nothing for it.
+    let interrupt = request
+        .config
+        .user_hooks()
+        .has_event(HookEventName::Interrupt)
+        .then(|| InterruptNotice::new(&request));
     let result = run_loop_inner(request, events, &agent_span)
         .instrument(agent_span.clone())
         .await;
+    if let Some(interrupt) = interrupt
+        && result
+            .as_ref()
+            .is_err_and(ra_core::error::Error::is_cancelled)
+    {
+        interrupt.notify().await;
+    }
     agent_span.record(
         ra_core::trace::field::DURATION_MS,
         duration_ms(started.elapsed()),
     );
     result
+}
+
+/// What it takes to tell a host that its run was cancelled, held across the loop that consumed it.
+///
+/// A cancelled run returns no [`RunResult`], so the callback is handed the entry checkpoint's read
+/// view rather than accounting invented for a turn that never settled. It runs under a fresh scope
+/// of its own — the run's is already cancelled, and a callback under it would be dropped before it
+/// started — bounded by the same drain grace everything else gets on the way out. Its decision is
+/// discarded: cancellation is a notification, and nothing said here revives the run.
+struct InterruptNotice {
+    hooks: UserHooks,
+    cancel: CancelScope,
+    run: Arc<RunContext>,
+    services: ToolServices,
+}
+
+impl InterruptNotice {
+    fn new(request: &RunRequest) -> Self {
+        let mut run = RunContext::new(request.run_id.clone(), request.agent.public())
+            .with_budget(request.state.budget().clone())
+            .with_usage_totals(request.state.usage_totals().clone())
+            .with_event_seq_allocator(request.event_seqs.clone());
+        if let Some(app_context) = &request.app_context {
+            run = run.with_app_context(Arc::clone(app_context));
+        }
+        Self {
+            hooks: request.config.user_hooks().clone(),
+            cancel: request.cancel.clone(),
+            run: Arc::new(run),
+            services: request.services.clone(),
+        }
+    }
+
+    async fn notify(self) {
+        let Some(reason) = self.cancel.reason() else {
+            return;
+        };
+        let cleanup =
+            CancelScope::root().with_deadline(Deadline::after(ra_core::cancel::DRAIN_GRACE));
+        let _cleanup_deadline = arm_deadline(&cleanup);
+        let _ = self
+            .hooks
+            .bind(self.run, cleanup.clone(), self.services)
+            .dispatch(HookEvent::Interrupt { reason: &reason })
+            .await;
+        cleanup.cancel(reason);
+    }
 }
 
 /// Runs the agent loop after the outer agent span has been installed.
@@ -1130,24 +1222,43 @@ async fn run_loop_inner(
     // the match below is what keeps the translation underneath a single statement of the rule
     // rather than three copies to keep in step — a deadline that expired while a blocking check
     // was still thinking is the same budget stop it would have been one line later.
-    let stepped = match run_blocking_input_guardrails(input_check, &mut state, &cancel).await {
-        Ok(input_check) => match resolve_interrupted_turn(&context, &agent, &mut state).await {
-            // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn,
-            // and the caller composing runs should not hold all of it inline.
-            Ok(()) => {
-                Box::pin(run_turns(
-                    &context,
-                    &mut agent,
-                    &mut state,
-                    &mut progress,
-                    input_check,
-                ))
-                .await
-            }
+    let stepped = async {
+        if !state.subagent_started()
+            && let Some(parent) = state.parent_run_id().cloned()
+        {
+            config
+                .user_hooks()
+                .bind(
+                    Arc::new(live_context(&context, &agent, &state)),
+                    cancel.clone(),
+                    services.clone(),
+                )
+                .dispatch(HookEvent::SubagentStart {
+                    parent_run_id: &parent,
+                })
+                .await?;
+            state.mark_subagent_started();
+        }
+        match run_blocking_input_guardrails(input_check, &mut state, &cancel).await {
+            Ok(input_check) => match resolve_interrupted_turn(&context, &agent, &mut state).await {
+                // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn,
+                // and the caller composing runs should not hold all of it inline.
+                Ok(()) => {
+                    Box::pin(run_turns(
+                        &context,
+                        &mut agent,
+                        &mut state,
+                        &mut progress,
+                        input_check,
+                    ))
+                    .await
+                }
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
-        },
-        Err(error) => Err(error),
-    };
+        }
+    }
+    .await;
 
     // The one place an expired wall clock is read back as a budget stop. Everything under the run
     // scope reports expiry the same way any other cancellation is reported, which is what lets the
@@ -1185,6 +1296,11 @@ async fn run_loop_inner(
             }
         };
 
+    // Resolve delivery once for both output checks and the result. A blocked candidate stays in
+    // history, but its turn no longer has a final-output decision.
+    let final_message =
+        final_message.or_else(|| concluding_turn_message(&state, &progress).cloned());
+
     // Only for a run that reached its own conclusion. A run stopped from outside — an exhausted
     // budget, the turn cap, an interrupt — has no answer the agent chose, and the closeout above is
     // the host's own text rather than something the host needs protecting from.
@@ -1205,9 +1321,7 @@ async fn run_loop_inner(
             // same way: a closeout outranks the model's own last word. A complete run has no
             // closeout today, and stating the rule here rather than relying on that keeps the two
             // answers from parting company if it ever does.
-            let delivered = final_message
-                .as_ref()
-                .or_else(|| find_final_message(progress.segment_items(&state)));
+            let delivered = final_message.as_ref();
             // A run that stopped on a tool result has no assistant message carrying its answer, so
             // the concluding turn's outputs go with it. Without them a guardrail on such a run
             // examines an empty string and reports a pass.
@@ -1250,7 +1364,7 @@ async fn run_loop_inner(
     // Cut out of the run's history rather than accumulated alongside it: a result reports the
     // segment it ran, and the checkpoint it carries reports every segment.
     let (new_items, model_responses) = segment_records(&progress, &state);
-    let mut result = RunResult::new(
+    let result = RunResult::new(
         outcome.clone(),
         Arc::clone(agent.public()),
         input_base,
@@ -1260,10 +1374,8 @@ async fn run_loop_inner(
         progress.turn_records,
         progress.turns,
         state,
+        final_message,
     );
-    if let Some(message) = final_message {
-        result = result.with_final_message(message);
-    }
     if let Some(sink) = &config.memory_usage_sink {
         crate::memory::report_final_citations(&result, sink, &run_id).await;
     }
@@ -1467,6 +1579,7 @@ async fn execute_approved_call(
         )
         .with_services(context.services.clone())
         .with_tool_guardrails(context.tool_guardrails.clone())
+        .with_user_hooks(context.config.user_hooks().clone())
         .with_approval_granted(),
     )
     .await?;
@@ -1709,13 +1822,88 @@ async fn run_turns(
         // A turn that reached a conclusion ends the loop with it; anything else means another
         // turn. The two states stay `Option` rather than becoming a second control-flow enum:
         // `NextStep` is the one that names what a turn decided, and it is answered inside.
-        match step? {
-            None => {}
-            Some(outcome) => break outcome,
+        //
+        // The one thing that can overrule a conclusion is a stop hook asking for more work, and
+        // it is asked here rather than inside the turn because the question is about the run's
+        // delivery: a turn does not know whether its own answer is the one being handed over.
+        if let Some(outcome) = step?
+            && !continue_from_stop_hook(context, agent, state, progress, &outcome).await?
+        {
+            break outcome;
         }
         state.snapshot_event_seq(context.event_seqs);
     };
     Ok(outcome)
+}
+
+/// Checks the candidate delivery after input checks have passed and before output guardrails.
+/// Accepted continuation is persisted as user-role history, including for tool-stop deliveries.
+async fn continue_from_stop_hook(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+    progress: &mut TurnLoopProgress,
+    outcome: &RunOutcome,
+) -> Result<bool> {
+    let Some(reason) = outcome
+        .finish_reason()
+        .filter(|reason| reason.is_complete())
+    else {
+        return Ok(false);
+    };
+    let event_name = if state.parent_run_id().is_some() {
+        HookEventName::SubagentStop
+    } else {
+        HookEventName::Stop
+    };
+    if !context.config.user_hooks().has_event(event_name) {
+        return Ok(false);
+    }
+    let decision = {
+        let outputs = concluding_turn_tool_outputs(state, progress);
+        let delivery = StopHookData::new(
+            reason,
+            concluding_turn_message(state, progress),
+            &outputs,
+            state.stop_hook_active(),
+        );
+        let event = match state.parent_run_id() {
+            Some(parent) => HookEvent::SubagentStop {
+                parent_run_id: parent,
+                delivery,
+            },
+            None => HookEvent::Stop(delivery),
+        };
+        context
+            .config
+            .user_hooks()
+            .bind(
+                Arc::new(live_context(context, agent, state)),
+                context.cancel.clone(),
+                context.services.clone(),
+            )
+            .dispatch(event)
+            .await?
+    };
+    let HookDecision::Block { prompt } = decision else {
+        return Ok(false);
+    };
+    // Numbered by the whole run's turn, like the compaction record next door, and for the same
+    // reason: at most one continuation follows any one turn, so the identity is unique without
+    // consulting history — and a resumed segment does not restart the numbering and collide with
+    // what the previous one wrote.
+    let item = RunItem::new(
+        ItemId::new(format!("hook-continuation-{}", progress.reference_turn())),
+        RunItemKind::Message(Message::text(MessageRole::User, prompt)),
+    );
+    state.mark_stop_hook_active();
+    state.record_generated_items([item.clone()]);
+    emit(context.events, RunStreamEvent::Item(item));
+    let end = progress.segment_items(state).len();
+    if let Some(record) = progress.turn_records.last_mut() {
+        record.continue_after_hook(end);
+    }
+    Ok(true)
 }
 
 /// Runs the half of the input stage that must finish before anything is sent.
@@ -1878,9 +2066,16 @@ async fn run_one_turn(
         preparation = preparation.with_model(model.clone());
     }
     let prepared = prepare_turn(preparation).await?;
-    let (prepared, context_records, context_responses) =
-        process_context_processors(context, state, progress, turn_scope, prepared, history_span)
-            .await?;
+    let (prepared, context_records, context_responses) = process_context_processors(
+        context,
+        state,
+        progress,
+        turn_scope,
+        prepared,
+        history_span,
+        preparation_context,
+    )
+    .await?;
     // The filter chain runs last, on whatever the coarse transforms produced. A context processor
     // reprojects whole regions of history; running a filter before it would only trim items the
     // processor's own output then replaced with the untouched originals.
@@ -1916,6 +2111,7 @@ async fn run_one_turn(
         max_function_tool_concurrency: config.max_function_tool_concurrency,
         permission: context.permission.clone(),
         guardrails: context.tool_guardrails.clone(),
+        user_hooks: context.config.user_hooks().clone(),
     };
     // Only a configured sink can ever read these, and deriving them is not free: it deserializes
     // every tool output in the request and compares it against the authoritative record, once per
@@ -1974,6 +2170,7 @@ async fn run_one_turn(
     .with_pre_step_items(pre_step_items)
     .with_services(context.services.clone())
     .with_tool_guardrails(context.tool_guardrails.clone())
+    .with_user_hooks(context.config.user_hooks().clone())
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches);
     let settled = settle_turn(settlement).await?;
@@ -2097,6 +2294,7 @@ async fn process_context_processors(
     turn_scope: &CancelScope,
     prepared: PreparedTurn,
     history_span: Option<HistorySpan>,
+    run: RunContext,
 ) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>)> {
     let processors = context.config.context_processors();
     if processors.is_empty() {
@@ -2118,6 +2316,21 @@ async fn process_context_processors(
     let mut taken_ids: BTreeSet<ItemId> = history.iter().map(|item| item.id().clone()).collect();
     let mut model_responses = Vec::new();
     let summarizer = RunnerContextSummarizer::new(&prepared, turn_scope);
+    let hooks = (context
+        .config
+        .user_hooks()
+        .has_event(HookEventName::PreCompact)
+        || context
+            .config
+            .user_hooks()
+            .has_event(HookEventName::PostCompact))
+    .then(|| {
+        Arc::new(context.config.user_hooks().bind(
+            Arc::new(run),
+            turn_scope.clone(),
+            context.services.clone(),
+        ))
+    });
 
     for (index, processor) in processors.iter().enumerate() {
         let record_id = ItemId::new(format!("context-{}.{index}", progress.reference_turn()));
@@ -2131,6 +2344,10 @@ async fn process_context_processors(
             suffix.clone(),
             input,
         );
+        let request = match &hooks {
+            Some(hooks) => request.with_user_hook_dispatcher(hooks.clone()),
+            None => request,
+        };
         let result = processor.process_context(request, &summarizer).await?;
         input = result.input().to_vec();
         for item in result.generated_items() {
@@ -2312,6 +2529,21 @@ fn apply_context_filters(
     ))
 }
 
+/// Only a turn that still proposes final output can supply the delivered assistant message.
+/// Earlier blocked candidates remain untouched in history.
+fn concluding_turn_message<'a>(
+    state: &'a RunState,
+    progress: &TurnLoopProgress,
+) -> Option<&'a Message> {
+    let record = progress.turn_records.last()?;
+    record.finish_reason()?;
+    find_final_message(
+        progress
+            .segment_items(state)
+            .get(record.item_range().clone())?,
+    )
+}
+
 /// The tool outputs the **concluding** turn settled, for a delivery whose answer is one of them.
 ///
 /// Scoped to that one turn, and the scope is the point. A run that looked something up on turn one
@@ -2462,6 +2694,7 @@ struct StreamedDispatchInput {
     max_function_tool_concurrency: usize,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
+    user_hooks: UserHooks,
 }
 
 impl StreamedDispatchInput {
@@ -2476,6 +2709,7 @@ impl StreamedDispatchInput {
             self.max_function_tool_concurrency,
             self.permission.clone(),
             self.guardrails.clone(),
+            self.user_hooks.clone(),
         )
     }
 }

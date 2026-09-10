@@ -83,7 +83,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use crate::{
     context::RunContext,
     error::{Error, Result},
-    item::{ItemId, ModelInputItem, ModelResponse, RunItem},
+    hook::{CompactTrigger, HookEvent, UserHookDispatcher},
+    item::{Compaction, ItemId, ModelInputItem, ModelResponse, RunItem},
     model::{ModelOutputSchema, ModelSettings},
     prompt::{PromptSection, PromptSectionName, PromptSource},
     state::{AgentToolUse, RunId, ToolUse},
@@ -475,7 +476,7 @@ pub trait ContextProcessor: Send + Sync {
 
 /// Facts a context processor needs for one pending model request.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContextProcessorRequest {
     run_id: RunId,
     current_turn: u64,
@@ -485,6 +486,23 @@ pub struct ContextProcessorRequest {
     history: Vec<RunItem>,
     suffix: Vec<ModelInputItem>,
     input: Vec<ModelInputItem>,
+    user_hooks: Option<Arc<dyn UserHookDispatcher>>,
+}
+
+impl fmt::Debug for ContextProcessorRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContextProcessorRequest")
+            .field("run_id", &self.run_id)
+            .field("current_turn", &self.current_turn)
+            .field("record_id", &self.record_id)
+            .field("model_name", &self.model_name)
+            .field("prefix", &self.prefix)
+            .field("history", &self.history)
+            .field("suffix", &self.suffix)
+            .field("input", &self.input)
+            .field("user_hooks", &self.user_hooks.is_some())
+            .finish()
+    }
 }
 
 impl ContextProcessorRequest {
@@ -510,7 +528,46 @@ impl ContextProcessorRequest {
             history,
             suffix,
             input,
+            user_hooks: None,
         }
+    }
+
+    /// Attaches the runner's existing host hook dispatcher without a dependency on its runtime.
+    #[must_use]
+    pub fn with_user_hook_dispatcher(mut self, hooks: Arc<dyn UserHookDispatcher>) -> Self {
+        self.user_hooks = Some(hooks);
+        self
+    }
+
+    /// Announces an actual compaction attempt, after the processor has checked its threshold.
+    pub async fn notify_pre_compact(&self, trigger: CompactTrigger) -> Result<()> {
+        if let Some(hooks) = &self.user_hooks {
+            hooks
+                .dispatch(HookEvent::PreCompact {
+                    record_id: &self.record_id,
+                    trigger,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Announces a successfully created compaction. Skipped when an attempt falls back unchanged.
+    pub async fn notify_post_compact(
+        &self,
+        trigger: CompactTrigger,
+        compaction: &Compaction,
+    ) -> Result<()> {
+        if let Some(hooks) = &self.user_hooks {
+            hooks
+                .dispatch(HookEvent::PostCompact {
+                    record_id: &self.record_id,
+                    trigger,
+                    compaction,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Identity of the run whose context is being processed.
