@@ -61,6 +61,7 @@ use tokio::{
 use tracing::{Instrument, error, info_span, warn};
 
 use crate::hook::UserHooks;
+use crate::lifecycle::LifecycleHooks;
 use crate::permission::PermissionEngine;
 use crate::tool::dispatch::{
     CallHistory, ToolDispatch, ToolDispatchOutcome, ToolDispatchRequest, ToolGuardrailRecords,
@@ -232,6 +233,7 @@ pub struct TurnExecutionRequest<'a> {
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
+    lifecycle: LifecycleHooks,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
 }
 
@@ -258,6 +260,7 @@ impl<'a> TurnExecutionRequest<'a> {
             permission,
             guardrails: ToolGuardrails::default(),
             user_hooks: UserHooks::default(),
+            lifecycle: LifecycleHooks::new(),
             streamed_dispatches: None,
         }
     }
@@ -271,6 +274,12 @@ impl<'a> TurnExecutionRequest<'a> {
     /// Installs the host hooks consulted by this execution path.
     pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
         self.user_hooks = hooks;
+        self
+    }
+
+    /// Sets the lifecycle narration every invocation in this batch is announced to.
+    pub fn with_lifecycle_hooks(mut self, lifecycle: LifecycleHooks) -> Self {
+        self.lifecycle = lifecycle;
         self
     }
 
@@ -455,6 +464,7 @@ pub(crate) struct StreamedFunctionDispatches {
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
+    lifecycle: LifecycleHooks,
 }
 
 struct StreamedFunctionCall {
@@ -489,6 +499,7 @@ impl StreamedFunctionDispatches {
         permission: PermissionEngine,
         guardrails: ToolGuardrails,
         user_hooks: UserHooks,
+        lifecycle: LifecycleHooks,
     ) -> Self {
         Self {
             dispatches: JoinSet::new(),
@@ -506,6 +517,7 @@ impl StreamedFunctionDispatches {
             permission,
             guardrails,
             user_hooks,
+            lifecycle,
         }
     }
 
@@ -556,7 +568,8 @@ impl StreamedFunctionDispatches {
         )
         .with_services(self.services.clone())
         .with_tool_guardrails(self.guardrails.clone())
-        .with_user_hooks(self.user_hooks.clone());
+        .with_user_hooks(self.user_hooks.clone())
+        .with_lifecycle_hooks(self.lifecycle.clone());
         let tool = action.tool().origin().clone();
         let function_span = function_span(&tool, &call_id);
         let task_id = spawn_dispatch_task(
@@ -729,7 +742,8 @@ fn spawn_function_dispatches(
         )
         .with_services(request.services.clone())
         .with_tool_guardrails(request.guardrails.clone())
-        .with_user_hooks(request.user_hooks.clone());
+        .with_user_hooks(request.user_hooks.clone())
+        .with_lifecycle_hooks(request.lifecycle.clone());
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let call_id = action.call_id().clone();
