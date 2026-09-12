@@ -4,8 +4,8 @@
 //!
 //! **Boundary**: it depends only on the protocol-neutral contracts in `ra-core`. The supported
 //! surface is the agent definition, the runner entry, capability assembly, the tool profile /
-//! registry, and the guard registry; turn settlement, dispatch, budget enforcement, the loop
-//! breaker, and the approval flow are not part of it.
+//! registry, the host-hook registry, and the lifecycle hook set; turn settlement, dispatch, budget
+//! enforcement, the loop breaker, and the approval flow are not part of it.
 //!
 //! **Stability**: the `Runner` entry signature is `Stable` (it is on the Stable API list); the
 //! turn-settlement machinery is `Internal` — the stage functions here and the `ProcessedResponse` /
@@ -24,6 +24,7 @@ pub mod capability;
 pub(crate) mod circuit;
 pub(crate) mod guardrail;
 pub mod hook;
+pub mod lifecycle;
 pub(crate) mod memory;
 pub mod permission;
 pub mod runner;

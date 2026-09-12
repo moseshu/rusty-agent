@@ -20,6 +20,12 @@
 //! [`ToolFailureHandling::Custom`] plus [`Tool::handle_failure`], which lets the tool write its own
 //! model-facing text.
 //!
+//! The [lifecycle](ra_core::lifecycle) narration sits one step further in still, immediately around
+//! the invocation and below the admission gate, and it is not a stage: it decides nothing, so it
+//! carries no number in the order above and cannot refuse anything. What it brackets is
+//! execution — which is why every call it announced is announced again when it settles, whichever
+//! way that went.
+//!
 //! Concurrency ceilings and batching are deliberately absent: R3-4b owns the batch shape and R3-4c
 //! owns what happens when several of these run at once.
 
@@ -35,6 +41,7 @@ use ra_core::{
         ToolOutputGuardrail, ToolOutputGuardrailData, ToolOutputGuardrailResult,
     },
     item::{CallId, ToolApproval, ToolCallOutput},
+    lifecycle::{ToolEndInput, ToolStartInput},
     permission::PermissionDecision,
     tool::{
         Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
@@ -45,6 +52,7 @@ use serde_json::{Value, json};
 
 use crate::circuit;
 use crate::hook::UserHooks;
+use crate::lifecycle::{LifecycleHooks, dispatch as lifecycle_dispatch};
 use crate::permission::PermissionEngine;
 use crate::tool::guardrail::{ToolGuardrails, check_tool_input, check_tool_output};
 
@@ -294,6 +302,7 @@ pub struct ToolDispatchRequest {
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
+    lifecycle: LifecycleHooks,
     approval_granted: bool,
 }
 
@@ -328,6 +337,7 @@ impl ToolDispatchRequest {
             permission,
             guardrails: ToolGuardrails::default(),
             user_hooks: UserHooks::default(),
+            lifecycle: LifecycleHooks::new(),
             approval_granted: false,
         }
     }
@@ -360,6 +370,15 @@ impl ToolDispatchRequest {
     /// running the call would execute it unchecked under a name that says it was checked.
     pub fn with_tool_guardrails(mut self, guardrails: ToolGuardrails) -> Self {
         self.guardrails = guardrails;
+        self
+    }
+
+    /// Sets the lifecycle narration this run and its running agent installed.
+    ///
+    /// Default-empty for the same reason the hooks above are: narration is installed by the host on
+    /// the run or on the agent, and a tool declares nothing that would claim otherwise.
+    pub fn with_lifecycle_hooks(mut self, lifecycle: LifecycleHooks) -> Self {
+        self.lifecycle = lifecycle;
         self
     }
 
@@ -565,6 +584,20 @@ async fn run_chain(
         None
     };
 
+    // Lifecycle narration, immediately around the invocation and nowhere wider. It is not a stage:
+    // it decides nothing, and it is unnumbered so the numbering keeps meaning "a point where this
+    // call can still be refused". Every stage above decides whether the call happens at all, so
+    // announcing a tool start ahead of them would announce tools the chain then refuses to run, and
+    // a host counting invocations would be counting decisions. It sits below the admission gate
+    // too, so the pair brackets execution rather than execution plus queueing — the waiting already
+    // has its own field.
+    lifecycle_dispatch::tool_start(
+        &request.lifecycle,
+        &lifecycle_call(request),
+        &request.cancel,
+    )
+    .await?;
+
     // 7. Invoke tool.
     let outcome = invoke(
         tool,
@@ -577,6 +610,8 @@ async fn run_chain(
 
     // Release fine-grained resource locks immediately upon invoke completion.
     drop(permits);
+
+    announce_invocation_end(request, &outcome).await?;
 
     let output = match outcome {
         Ok(output) => output,
@@ -623,6 +658,40 @@ async fn run_chain(
 
 fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
     ToolHookData::new(request.tool.origin(), &request.call_id, &request.arguments)
+}
+
+/// The view of one call the lifecycle narration is built from.
+///
+/// One constructor, for the reason [`tool_hook_data`] is one: what a callback is told before the
+/// invocation and what it is told after it must describe the same call.
+///
+/// It is a separate type from [`ToolHookData`] even though the fields coincide today, because the
+/// two families are told different things about a call as they diverge: a deciding hook is handed
+/// everything it might refuse the call over, while narration is handed what happened. A shared view
+/// would make the next field added for one of them appear in the other.
+fn lifecycle_call(request: &ToolDispatchRequest) -> ToolStartInput<'_> {
+    ToolStartInput::new(
+        &request.run,
+        request.tool.origin(),
+        &request.call_id,
+        &request.arguments,
+    )
+    .with_services(&request.services)
+}
+
+/// Tells the lifecycle narration how the invocation it announced settled.
+///
+/// Runs before any output transformation, including asynchronous custom failure handling and the
+/// output guardrails, so an observer measures invocation rather than settlement.
+async fn announce_invocation_end(
+    request: &ToolDispatchRequest,
+    outcome: &Result<ToolOutput>,
+) -> Result<()> {
+    if request.lifecycle.is_empty() {
+        return Ok(());
+    }
+    let settled = ToolEndInput::new(lifecycle_call(request), outcome);
+    lifecycle_dispatch::tool_end(&request.lifecycle, &settled, &request.cancel).await
 }
 
 async fn run_user_hook(

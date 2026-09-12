@@ -32,6 +32,7 @@ pub mod finish;
 pub mod guardrail;
 pub mod hook;
 pub mod item;
+pub mod lifecycle;
 pub mod memory;
 pub mod model;
 pub mod output;

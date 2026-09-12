@@ -69,7 +69,7 @@ pub struct RunAgent {
 }
 
 impl RunAgent {
-    fn from_spec(agent: &AgentSpec) -> Self {
+    pub(crate) fn from_spec(agent: &AgentSpec) -> Self {
         Self {
             id: agent.id().clone(),
             name: agent.name().to_owned(),

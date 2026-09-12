@@ -9,6 +9,12 @@
 //! by the session owner: a run is not a session. Subagent identity must likewise be supplied by the
 //! host, never guessed from an agent name. Stop continuation uses ordinary user-role history and
 //! the existing run budget, not a separate retry budget.
+//!
+//! The SDK lifecycle observers this surface is *not* live next door, in
+//! [`lifecycle`](crate::lifecycle). That family decides nothing at any of its moments, so an
+//! observer never lands in the count kept of what changed a run; it also propagates a callback's
+//! failure instead of reporting and ignoring it, because an observer that failed has no verdict
+//! to fall back to. The two are installed separately and neither can stand in for the other.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -34,6 +34,7 @@ pub mod process;
 pub mod resolve;
 
 use crate::hook::UserHooks;
+use crate::lifecycle::LifecycleHooks;
 use crate::permission::PermissionEngine;
 use crate::tool::guardrail::ToolGuardrails;
 use batch::{
@@ -67,6 +68,7 @@ pub struct TurnSettlementRequest<'a> {
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
+    lifecycle: LifecycleHooks,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
@@ -111,6 +113,7 @@ impl<'a> TurnSettlementRequest<'a> {
             permission,
             guardrails: ToolGuardrails::default(),
             user_hooks: UserHooks::default(),
+            lifecycle: LifecycleHooks::new(),
             streamed_dispatches: None,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
@@ -126,6 +129,12 @@ impl<'a> TurnSettlementRequest<'a> {
     /// Installs the host hooks consulted by this execution path.
     pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
         self.user_hooks = hooks;
+        self
+    }
+
+    /// Sets the lifecycle narration this run and its running agent installed.
+    pub fn with_lifecycle_hooks(mut self, lifecycle: LifecycleHooks) -> Self {
+        self.lifecycle = lifecycle;
         self
     }
 
@@ -208,6 +217,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     .with_services(request.services.clone())
     .with_tool_guardrails(request.guardrails.clone())
     .with_user_hooks(request.user_hooks.clone())
+    .with_lifecycle_hooks(request.lifecycle.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
     let execution_request = match request.streamed_dispatches {
         Some(streamed_dispatches) => {

@@ -8,10 +8,10 @@
 //!
 //! Several agent concerns have dedicated later milestones. Dynamic prompts and output schemas have
 //! their protocol-neutral declarations here; output parsing and validation remain with the
-//! structured-output contract. Handoffs have a protocol-neutral declaration here; hooks and
-//! capabilities wait for their own contracts. Private fields and the non-exhaustive public types
-//! let those additions remain source compatible; placeholder strings would freeze the wrong
-//! identities and callback shapes.
+//! structured-output contract. Handoffs have a protocol-neutral declaration here; capabilities
+//! wait for their own contract. Private fields and the non-exhaustive public types let those
+//! additions remain source compatible; placeholder strings would freeze the wrong identities and
+//! callback shapes.
 
 use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
 
@@ -20,6 +20,7 @@ use crate::{
     error::{Error, Result},
     guardrail::{InputGuardrail, OutputGuardrail},
     item::{CallId, RunItem, ToolCallOutput},
+    lifecycle::LifecycleHook,
     model::{ModelHandoffDefinition, ModelSettings},
     output::OutputSchema,
     prompt::{DynamicPromptHandler, ResolvedPrompt},
@@ -601,6 +602,7 @@ pub struct AgentSpec {
     tool_use_behavior: ToolUseBehavior,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
+    lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
 }
 
 /// Public name for an immutable agent declaration.
@@ -634,6 +636,7 @@ impl AgentSpec {
             tool_use_behavior: self.tool_use_behavior.clone(),
             input_guardrails: self.input_guardrails.clone(),
             output_guardrails: self.output_guardrails.clone(),
+            lifecycle_hooks: self.lifecycle_hooks.clone(),
         }
     }
 
@@ -727,6 +730,18 @@ impl AgentSpec {
     pub fn output_guardrails(&self) -> &[Arc<dyn OutputGuardrail>] {
         &self.output_guardrails
     }
+
+    /// Lifecycle narration told about what happens while this agent is the one running.
+    ///
+    /// It belongs to the **public** declaration for the reason [`Self::output_schema`] does: a
+    /// preparation step that substitutes an execution instance must not be able to silence the
+    /// narration the user configured. It is also the one contribution that does *not* stop at the
+    /// agent that starts the run — an agent reached by a handoff brings its own, and the one that
+    /// handed over stops being told anything.
+    #[must_use]
+    pub fn lifecycle_hooks(&self) -> &[Arc<dyn LifecycleHook>] {
+        &self.lifecycle_hooks
+    }
 }
 
 impl fmt::Debug for AgentSpec {
@@ -762,6 +777,14 @@ impl fmt::Debug for AgentSpec {
                     .map(|guardrail| guardrail.name())
                     .collect::<Vec<_>>(),
             )
+            .field(
+                "lifecycle_hooks",
+                &self
+                    .lifecycle_hooks
+                    .iter()
+                    .map(|hook| hook.name())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -780,6 +803,7 @@ pub struct AgentSpecBuilder {
     tool_use_behavior: ToolUseBehavior,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
+    lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
 }
 
 impl AgentSpecBuilder {
@@ -797,6 +821,7 @@ impl AgentSpecBuilder {
             tool_use_behavior: ToolUseBehavior::default(),
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
+            lifecycle_hooks: Vec::new(),
         }
     }
 
@@ -960,6 +985,27 @@ impl AgentSpecBuilder {
         self
     }
 
+    /// Adds one lifecycle narration scoped to this agent.
+    pub fn lifecycle_hook(mut self, hook: Arc<dyn LifecycleHook>) -> Self {
+        self.lifecycle_hooks.push(hook);
+        self
+    }
+
+    /// Adds lifecycle narration in iteration order.
+    pub fn lifecycle_hooks(
+        mut self,
+        hooks: impl IntoIterator<Item = Arc<dyn LifecycleHook>>,
+    ) -> Self {
+        self.lifecycle_hooks.extend(hooks);
+        self
+    }
+
+    /// Removes lifecycle narration inherited through [`AgentSpec::to_builder`].
+    pub fn clear_lifecycle_hooks(mut self) -> Self {
+        self.lifecycle_hooks.clear();
+        self
+    }
+
     /// Validates the declaration and returns its shared immutable form.
     pub fn build(self) -> Result<Arc<AgentSpec>> {
         let id = self
@@ -1044,6 +1090,7 @@ impl AgentSpecBuilder {
             tool_use_behavior: self.tool_use_behavior,
             input_guardrails: self.input_guardrails,
             output_guardrails: self.output_guardrails,
+            lifecycle_hooks: self.lifecycle_hooks,
         }))
     }
 }

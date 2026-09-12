@@ -57,6 +57,9 @@ use ra_core::{
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolApproval, ToolCallOutput,
     },
+    lifecycle::{
+        AgentEndInput, AgentStartInput, HandoffInput, LifecycleHook, LlmEndInput, LlmStartInput,
+    },
     model::{
         Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
         ModelStreamEvent, ModelTracing, ReplaySafety, RetryAdvice, RetryBackoff, RetryDecision,
@@ -90,6 +93,7 @@ use crate::{
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     hook::{UserHookRegistration, UserHooks},
+    lifecycle::{LifecycleHooks, dispatch as lifecycle_dispatch},
     permission::PermissionEngine,
     tool::dispatch::{
         CallHistory, ToolDispatch, ToolDispatchRequest, ToolGuardrailRecords, dispatch_tool,
@@ -144,6 +148,7 @@ pub struct RunConfig {
     tool_output_guardrails: Vec<Arc<dyn ToolOutputGuardrail>>,
     pre_approval_tool_input_guardrails: bool,
     user_hooks: UserHooks,
+    lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
 }
 
 impl Default for RunConfig {
@@ -177,6 +182,7 @@ impl RunConfig {
             tool_output_guardrails: Vec::new(),
             pre_approval_tool_input_guardrails: false,
             user_hooks: UserHooks::default(),
+            lifecycle_hooks: Vec::new(),
         }
     }
 
@@ -500,6 +506,26 @@ impl RunConfig {
         &self.user_hooks
     }
 
+    /// Installs one lifecycle narration over the whole run.
+    ///
+    /// The run-scoped half of [`ra_core::lifecycle`]; the agent-scoped half is declared on the
+    /// agent, so that an agent reached by a handoff brings its own. This one decides nothing at any
+    /// of its seven moments, which is what lets it be installed with no matcher and no
+    /// declaration — there is no scope a mistake here could widen.
+    ///
+    /// Two hooks may share a display name, exactly as two guardrails or two host hooks may: nothing
+    /// looks one up by it.
+    pub fn with_lifecycle_hook(mut self, hook: Arc<dyn LifecycleHook>) -> Self {
+        self.lifecycle_hooks.push(hook);
+        self
+    }
+
+    /// Lifecycle narration installed on this run, in declaration order.
+    #[must_use]
+    pub fn lifecycle_hooks(&self) -> &[Arc<dyn LifecycleHook>] {
+        &self.lifecycle_hooks
+    }
+
     /// Installs one check a tool may declare over its arguments.
     ///
     /// Run-level, and there is no agent-level counterpart to merge with: a tool names the check it
@@ -651,6 +677,14 @@ impl std::fmt::Debug for RunConfig {
                     .collect::<Vec<_>>(),
             )
             .field("user_hooks", &self.user_hooks)
+            .field(
+                "lifecycle_hooks",
+                &self
+                    .lifecycle_hooks
+                    .iter()
+                    .map(|hook| hook.name())
+                    .collect::<Vec<_>>(),
+            )
             .field(
                 "pre_approval_tool_input_guardrails",
                 &self.pre_approval_tool_input_guardrails,
@@ -1078,6 +1112,13 @@ async fn run_loop_inner(
         config.output_guardrails(),
     );
 
+    // Indexed against the agent the run **starts** with: the agent-scoped half moves to whoever
+    // control is transferred to, which is a thing that happens later and only once. Nothing is
+    // validated here, because there is nothing to validate — a lifecycle hook's name is a display
+    // label two hooks may share, and no event has to be subscribed to.
+    let mut lifecycle =
+        LifecycleHooks::installed(config.lifecycle_hooks(), agent.public().lifecycle_hooks());
+
     // Checked here, beside the rest of the configuration and ahead of the segment: whether the
     // installed capabilities can be assembled at all is a property of the configuration, and a
     // missing dependency reported after a model has been paid to read a half-assembled surface is
@@ -1239,24 +1280,33 @@ async fn run_loop_inner(
                 .await?;
             state.mark_subagent_started();
         }
-        match run_blocking_input_guardrails(input_check, &mut state, &cancel).await {
-            Ok(input_check) => match resolve_interrupted_turn(&context, &agent, &mut state).await {
-                // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn,
-                // and the caller composing runs should not hold all of it inline.
-                Ok(()) => {
-                    Box::pin(run_turns(
-                        &context,
-                        &mut agent,
-                        &mut state,
-                        &mut progress,
-                        input_check,
-                    ))
-                    .await
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
+        // The opening half of the agent bracket. An activation is every time the running agent
+        // changes, and the start of a segment is one: a run continued in another process gets a
+        // fresh set of hook objects, and a host that set something up on the first segment has
+        // nothing set up on the continuation unless it is told again. `is_resumed` is what tells
+        // the two apart.
+        if !lifecycle.is_empty() {
+            let run = live_context(&context, &agent, &state);
+            let mut starting =
+                AgentStartInput::new(&run, context.input_base).with_services(&services);
+            if resuming {
+                starting = starting.resumed();
+            }
+            lifecycle_dispatch::agent_start(&lifecycle, &starting, &cancel).await?;
         }
+        let input_check = run_blocking_input_guardrails(input_check, &mut state, &cancel).await?;
+        resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await?;
+        // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn, and
+        // the caller composing runs should not hold all of it inline.
+        Box::pin(run_turns(
+            &context,
+            &mut agent,
+            &mut state,
+            &mut progress,
+            &mut lifecycle,
+            input_check,
+        ))
+        .await
     }
     .await;
 
@@ -1300,6 +1350,34 @@ async fn run_loop_inner(
     // history, but its turn no longer has a final-output decision.
     let final_message =
         final_message.or_else(|| concluding_turn_message(&state, &progress).cloned());
+
+    // The closing half of the agent bracket, and ahead of the output guardrails: an observer is
+    // told the answer the agent produced, not the one a check may go on to refuse. Only a run that
+    // ended with an answer reaches here — a run handed back with approvals outstanding raises
+    // nothing, and a run that failed or was cancelled returned long before this line.
+    //
+    // Only final answers close the agent lifecycle; resumable budget stops do not.
+    if !lifecycle.is_empty()
+        && let Some(reason) = outcome
+            .finish_reason()
+            .filter(|reason| reason.is_complete())
+    {
+        let run = live_context(&context, &agent, &state);
+        let tool_outputs = concluding_turn_tool_outputs(&state, &progress);
+        let mut ending = AgentEndInput::new(&run, reason)
+            .with_services(&services)
+            .with_tool_outputs(&tool_outputs);
+        if let Some(message) = &final_message {
+            ending = ending.with_message(message);
+        }
+        if let Err(error) =
+            lifecycle_dispatch::agent_end(&lifecycle, &ending, &closeout_cancel).await
+        {
+            record_progress_usage(span, progress.segment_responses(&state));
+            record_terminal_error(span, &error, &closeout_cancel);
+            return Err(error);
+        }
+    }
 
     // Only for a run that reached its own conclusion. A run stopped from outside — an exhausted
     // budget, the turn cap, an interrupt — has no answer the agent chose, and the closeout above is
@@ -1436,6 +1514,7 @@ async fn resolve_interrupted_turn(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     state: &mut RunState,
+    lifecycle: &LifecycleHooks,
 ) -> Result<()> {
     let answers = state.pending_interruption_resolutions().to_vec();
     // Filed once for the whole stage rather than once per answer, because these are the tail of a
@@ -1486,9 +1565,15 @@ async fn resolve_interrupted_turn(
                 (output, outcome, ToolGuardrailRecords::default())
             }
             InterruptionResolution::Approve { .. } => {
-                let (output, outcome, guardrails) =
-                    execute_approved_call(context, agent, state, &approval, answer.item_id())
-                        .await?;
+                let (output, outcome, guardrails) = execute_approved_call(
+                    context,
+                    agent,
+                    state,
+                    lifecycle,
+                    &approval,
+                    answer.item_id(),
+                )
+                .await?;
                 (output, Some(outcome), guardrails)
             }
             _ => return Err(Error::caller("unsupported interruption resolution")),
@@ -1528,6 +1613,7 @@ async fn execute_approved_call(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     state: &RunState,
+    lifecycle: &LifecycleHooks,
     approval: &ToolApproval,
     item_id: &ItemId,
 ) -> Result<(ToolCallOutput, ToolOutcome, ToolGuardrailRecords)> {
@@ -1580,6 +1666,7 @@ async fn execute_approved_call(
         .with_services(context.services.clone())
         .with_tool_guardrails(context.tool_guardrails.clone())
         .with_user_hooks(context.config.user_hooks().clone())
+        .with_lifecycle_hooks(lifecycle.clone())
         .with_approval_granted(),
     )
     .await?;
@@ -1722,6 +1809,7 @@ async fn run_turns(
     agent: &mut AgentBinding,
     state: &mut RunState,
     progress: &mut TurnLoopProgress,
+    lifecycle: &mut LifecycleHooks,
     mut input_check: Option<InputGuardrailCheck>,
 ) -> Result<RunOutcome> {
     let config = context.config;
@@ -1774,8 +1862,16 @@ async fn run_turns(
             usage.reasoning_tokens = tracing::field::Empty,
         );
         let turn_started = Instant::now();
-        let turn = run_one_turn(context, agent, state, progress, &turn_scope, &turn_span)
-            .instrument(turn_span.clone());
+        let turn = run_one_turn(
+            context,
+            agent,
+            state,
+            progress,
+            lifecycle,
+            &turn_scope,
+            &turn_span,
+        )
+        .instrument(turn_span.clone());
         let (verdicts, step) = match input_check.take() {
             // Boxed because this arm holds the whole turn future *and* the guardrail stage, and
             // the loop's own future would otherwise carry both on every iteration — including the
@@ -2021,12 +2117,13 @@ async fn race_input_guardrails(
 ///
 /// This is the lifecycle coordinator for one turn. Keeping preparation, context processing,
 /// dispatch, accounting, and settlement together makes their ordering auditable.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_one_turn(
     context: &TurnLoopContext<'_>,
     agent: &mut AgentBinding,
     state: &mut RunState,
     progress: &mut TurnLoopProgress,
+    lifecycle: &mut LifecycleHooks,
     turn_scope: &CancelScope,
     turn_span: &tracing::Span,
 ) -> Result<Option<RunOutcome>> {
@@ -2112,6 +2209,7 @@ async fn run_one_turn(
         permission: context.permission.clone(),
         guardrails: context.tool_guardrails.clone(),
         user_hooks: context.config.user_hooks().clone(),
+        lifecycle: lifecycle.clone(),
     };
     // Only a configured sink can ever read these, and deriving them is not free: it deserializes
     // every tool output in the request and compares it against the authoritative record, once per
@@ -2123,6 +2221,20 @@ async fn run_one_turn(
     } else {
         Vec::new()
     };
+    // The model identity outlives the request it came from: `into_call` consumes the preparation,
+    // and the closing half of this bracket has to name the same model the opening half did.
+    let selector = prepared.selector().clone();
+    // Announced once for the whole logical call rather than once per physical request. Retries and
+    // a provider fallback happen inside it, and are already on the generation spans underneath; a
+    // callback per attempt would make a host counting model calls count retries, and would leave
+    // the pair unpaired on exactly the calls that had trouble.
+    if !lifecycle.is_empty() {
+        let run = live_context(context, agent, state);
+        let calling = LlmStartInput::new(&run, &selector, prepared.request().input())
+            .with_system_instructions(prepared.request().system_instructions())
+            .with_services(context.services);
+        lifecycle_dispatch::llm_start(lifecycle, &calling, turn_scope).await?;
+    }
     let (surface, response, streamed_dispatches) =
         call_model(turn_scope, prepared, context, streaming_dispatch).await?;
     state.record_memory_exposures(memory_exposures);
@@ -2141,6 +2253,16 @@ async fn run_one_turn(
     record_usage(turn_span, response.usage());
     state.record_usage(response.usage());
     state.record_model_response(response.clone());
+
+    // After the spend has been recorded, so a callback reads the run's totals with the call it is
+    // being told about already in them. A call that produced no response never reaches here: it did
+    // not end, it failed, and the run's own error is what says so.
+    if !lifecycle.is_empty() {
+        let run = live_context(context, agent, state);
+        let answered = LlmEndInput::new(&run, &selector, &response).with_services(context.services);
+        lifecycle_dispatch::llm_end(lifecycle, &answered, turn_scope).await?;
+    }
+
     let referenced_outputs = referenced_tool_outputs(config, &response)?;
 
     // Settlement sees the same input base the model did and only this segment's preceding items.
@@ -2171,6 +2293,7 @@ async fn run_one_turn(
     .with_services(context.services.clone())
     .with_tool_guardrails(context.tool_guardrails.clone())
     .with_user_hooks(context.config.user_hooks().clone())
+    .with_lifecycle_hooks(lifecycle.clone())
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches);
     let settled = settle_turn(settlement).await?;
@@ -2230,8 +2353,25 @@ async fn run_one_turn(
         // instance has no say over who runs the next one. Unreachable until R17 — settlement
         // refuses handoffs — but the state machine has to say what it does about it.
         NextStep::Handoff { new_agent } => {
+            // Handoff belongs to the receiving agent, while the input still names the source.
+            let receiving = lifecycle.rebound(new_agent.lifecycle_hooks());
+            if !receiving.is_empty() {
+                let run = live_context(context, agent, state);
+                let transfer = HandoffInput::new(&run, new_agent).with_services(context.services);
+                lifecycle_dispatch::handoff(&receiving, &transfer, turn_scope).await?;
+            }
             *agent = AgentBinding::direct(Arc::clone(new_agent));
             state.set_current_agent(agent.public_id().clone());
+            // Narration follows control. The departing agent's hooks stop here — one that kept
+            // reporting would attribute the next agent's model calls and tool runs to it — and the
+            // arriving agent's take over, together with the run-scoped half that spans both.
+            *lifecycle = receiving;
+            if !lifecycle.is_empty() {
+                let run = live_context(context, agent, state);
+                let starting =
+                    AgentStartInput::new(&run, context.input_base).with_services(context.services);
+                lifecycle_dispatch::agent_start(lifecycle, &starting, turn_scope).await?;
+            }
             Ok(None)
         }
     }
@@ -2695,6 +2835,7 @@ struct StreamedDispatchInput {
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
+    lifecycle: LifecycleHooks,
 }
 
 impl StreamedDispatchInput {
@@ -2710,6 +2851,7 @@ impl StreamedDispatchInput {
             self.permission.clone(),
             self.guardrails.clone(),
             self.user_hooks.clone(),
+            self.lifecycle.clone(),
         )
     }
 }
