@@ -3,8 +3,10 @@
 //! [`settle_turn`] is the whole of R3-4: one model response goes in, one [`SingleStepResult`] comes
 //! out, and the stages in between run in a fixed order — classify, answer, decide, record. Each
 //! stage lives in its own module so the milestones that replace one of them (R3-4b the batch shape,
-//! R3-5 the tool-stop policy, R7 the guardrails, R17 handoffs) have one insertion point rather than
-//! a scattering of call sites.
+//! R3-5 the tool-stop policy, R7 the guardrails) have one insertion point rather than a scattering
+//! of call sites. A transfer of control is the one stage that does not fit that shape: it is
+//! decided in `resolve`, recorded in `batch`, and projected here, because what it hands over is
+//! assembled from three lists only this function holds at once.
 //!
 //! The streaming path (R3-7) consumes this same function. Two settlement paths would be two loops,
 //! and the second one drifts.
@@ -12,12 +14,13 @@
 use std::sync::Arc;
 
 use ra_core::{
+    agent::{HandoffInputData, HandoffInputFilter},
     cancel::CancelScope,
     context::RunContext,
-    error::Result,
+    error::{Error, Result},
     item::{ModelInputItem, ModelResponse, RunItem},
     state::{ToolFailureTracker, ToolUseTracker},
-    step::SingleStepResult,
+    step::{NextStep, ProcessedResponse, SingleStepResult},
     tool::ToolServices,
 };
 
@@ -72,6 +75,7 @@ pub struct TurnSettlementRequest<'a> {
     streamed_dispatches: Option<StreamedFunctionDispatches>,
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
+    handoff_input_filter: Option<Arc<dyn HandoffInputFilter>>,
 }
 
 impl<'a> TurnSettlementRequest<'a> {
@@ -117,6 +121,7 @@ impl<'a> TurnSettlementRequest<'a> {
             streamed_dispatches: None,
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
+            handoff_input_filter: None,
         }
     }
 
@@ -170,6 +175,12 @@ impl<'a> TurnSettlementRequest<'a> {
         self.pre_step_items = items;
         self
     }
+
+    /// Sets the transform applied to a transfer that declares none of its own.
+    pub fn with_handoff_input_filter(mut self, filter: Arc<dyn HandoffInputFilter>) -> Self {
+        self.handoff_input_filter = Some(filter);
+        self
+    }
 }
 
 /// Settles one turn in the only permitted stage order.
@@ -219,7 +230,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     .with_user_hooks(request.user_hooks.clone())
     .with_lifecycle_hooks(request.lifecycle.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
-    let execution_request = match request.streamed_dispatches {
+    let execution_request = match request.streamed_dispatches.take() {
         Some(streamed_dispatches) => {
             execution_request.with_streamed_dispatches(streamed_dispatches)
         }
@@ -265,11 +276,20 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     // session stores, instead of each having to know to go look it up.
     let next_step = rebind_interruption(next_step, &items)?;
 
+    // 5. Project, and only on the turn that transfers control. Everything above produced the
+    // authoritative records; this decides how much of them the *next* agent is shown. The two
+    // answers are deliberately different values — `session_step_items` below is always the complete
+    // set, and the carried-forward list is what a projection or a filter is allowed to narrow.
+    let (input_history, pre_handoff_items, new_items) =
+        project_handoff_input(&request, &processed, &next_step, &items)
+            .await?
+            .into_parts();
+
     SingleStepResult::builder()
-        .original_input(request.original_input)
+        .original_input(input_history)
         .model_response(request.response.clone())
-        .pre_step_items(request.pre_step_items)
-        .new_step_items(items.clone())
+        .pre_step_items(pre_handoff_items)
+        .new_step_items(new_items)
         .session_step_items(items)
         // Carried out of the turn that produced them rather than recorded here: the two trackers
         // above are run state this function was handed mutably, while these are a product of the
@@ -279,4 +299,58 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         .processed_response(processed)
         .next_step(next_step)
         .build()
+}
+
+/// Decides what the agent taking over is shown, and leaves every other turn untouched.
+///
+/// Two narrowings run here, in one order and never the other way round. The declared
+/// [`HistoryProjection`](ra_core::agent::HistoryProjection) is applied first because it is the
+/// ceiling the *declaration* wrote down; the filter then runs on whatever that produced, so a host
+/// transform can narrow, reshape, or redact further but is never handed context the declaration
+/// withheld — it does not receive it in the first place.
+///
+/// A per-handoff filter replaces the run-level one rather than running after it. Chaining them
+/// would mean a host that configured a default for the run cannot exempt a single transfer from it,
+/// which is the only reason to set one per handoff.
+async fn project_handoff_input(
+    request: &TurnSettlementRequest<'_>,
+    processed: &ProcessedResponse,
+    next_step: &NextStep,
+    items: &[RunItem],
+) -> Result<HandoffInputData> {
+    let complete = HandoffInputData::new(
+        request.original_input.clone(),
+        request.pre_step_items.clone(),
+        items.to_vec(),
+    );
+    if !matches!(next_step, NextStep::Handoff { .. }) {
+        return Ok(complete);
+    }
+    let Some(handoff) = processed.handoffs().first() else {
+        return Err(Error::caller(
+            "the turn settled as a transfer of control but bound no handoff to project history for",
+        ));
+    };
+
+    let projected = complete.project(handoff.spec().history_projection(), handoff.call_id())?;
+    let filter = handoff
+        .spec()
+        .input_filter()
+        .or(request.handoff_input_filter.as_ref());
+    match filter {
+        None => Ok(projected),
+        // Third-party `async` code, so it is never awaited bare — the cancellation contract's one
+        // rule. The exit check is the same one the tool-stop policy makes for the same reason:
+        // `CancelScope::run` polls the future before it looks at the cancellation, so a filter that
+        // becomes ready in the wake-up that delivered the interrupt would otherwise hand a cancelled
+        // run a fresh agent and a fresh input to spend on.
+        Some(filter) => {
+            let data = request
+                .cancel
+                .run(filter.filter(&request.run, projected))
+                .await??;
+            request.cancel.ensure_not_cancelled()?;
+            Ok(data)
+        }
+    }
 }

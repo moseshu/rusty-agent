@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
-    agent::{AgentId, AgentSpec},
+    agent::{AgentId, AgentSpec, HandoffSpec},
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result},
@@ -14,8 +14,8 @@ use ra_core::{
         RunItem, RunItemKind, ToolCall,
     },
     model::{
-        ApiProtocol, Model, ModelHandoffDefinition, ModelRequest, ModelResolver, ModelSelector,
-        ModelSettings, ModelStream, ModelToolDefinition, ProviderKey, ResolvedModel,
+        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
+        ModelToolDefinition, ProviderKey, ResolvedModel,
     },
     state::{RunId, ToolUseTracker},
     step::ToolUse,
@@ -25,7 +25,8 @@ use ra_runtime::{
     agent::AgentBinding,
     turn::{
         prepare::{
-            ToolNameCollisionPolicy, TurnActionSurface, TurnPreparationRequest, prepare_turn,
+            PreparedHandoff, ToolNameCollisionPolicy, TurnActionSurface, TurnPreparationRequest,
+            prepare_turn,
         },
         process::process_model_response,
     },
@@ -136,17 +137,26 @@ fn dynamic_tool(name: &str, enabled: bool) -> Arc<dyn Tool> {
     Arc::new(StubTool::new(name, ToolAvailability::Dynamic, enabled))
 }
 
-fn handoff(name: &str, target: &str) -> ModelHandoffDefinition {
-    ModelHandoffDefinition::new(
+fn handoff(name: &str, target: &str) -> PreparedHandoff {
+    let spec = HandoffSpec::new(
         AgentId::new(target),
-        name,
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        }),
-    )
+        ToolSchema::new(
+            name,
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap(),
+    );
+    let target = AgentSpec::builder()
+        .id(AgentId::new(target))
+        .name(target)
+        .build()
+        .unwrap();
+    PreparedHandoff::new(spec, target).unwrap()
 }
 
 /// Wraps a plain agent as the binding preparation and settlement take (R3-12). These tests are not
@@ -368,6 +378,35 @@ fn test_response_classification_06() {
     assert_eq!(processed.handoffs()[0].target_agent().as_str(), "reviewer");
 }
 
+/// Two transfers to one agent are told apart by the name the model called.
+#[test]
+fn test_response_classification_06b() {
+    let surface = TurnActionSurface::new(
+        Vec::new(),
+        vec![
+            handoff("transfer_to_reviewer", "reviewer"),
+            handoff("escalate_to_reviewer", "reviewer"),
+        ],
+    )
+    .unwrap();
+    let response = ModelResponse::new(vec![item(
+        "call-item-1",
+        RunItemKind::HandoffCall(
+            HandoffCall::new(CallId::new("call-1"), AgentId::new("reviewer"), json!({}))
+                .with_tool_name("escalate_to_reviewer"),
+        ),
+    )]);
+
+    // Two declarations reaching one agent may project history differently, so the name decides
+    // which one ran — the identity alone cannot, which is what the refusal next door is about.
+    let processed = process_model_response(&response, &surface).unwrap();
+    assert_eq!(
+        processed.handoffs()[0].call().tool_name(),
+        Some("escalate_to_reviewer")
+    );
+    assert_eq!(processed.handoffs()[0].target_agent().as_str(), "reviewer");
+}
+
 #[test]
 fn test_response_classification_07() {
     let surface = TurnActionSurface::new(
@@ -477,4 +516,29 @@ fn test_response_classification_11() {
             .collect::<Vec<_>>(),
         ["search"]
     );
+}
+
+#[test]
+fn typed_handoffs_reject_ambiguous_missing_and_mismatched_names() {
+    let surface = TurnActionSurface::new(
+        Vec::new(),
+        vec![
+            handoff("narrow", "reviewer"),
+            handoff("wide", "reviewer"),
+            handoff("other", "writer"),
+        ],
+    )
+    .unwrap();
+    for name in [None, Some("missing"), Some("other")] {
+        let call = HandoffCall::new(CallId::new("call"), AgentId::new("reviewer"), json!({}));
+        let call = match name {
+            Some(name) => call.with_tool_name(name),
+            None => call,
+        };
+        let response = ModelResponse::new(vec![item("transfer", RunItemKind::HandoffCall(call))]);
+        assert!(
+            process_model_response(&response, &surface).is_err(),
+            "accepted {name:?}"
+        );
+    }
 }

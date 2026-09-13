@@ -89,12 +89,14 @@ impl<'a> RunErrorData<'a> {
     /// The continuation base this segment began from.
     ///
     /// This is either caller-supplied input or an automatic projection from the checkpoint.
+    /// After a handoff it is the receiving agent's projected input instead.
     #[must_use]
     pub fn original_input(&self) -> &'a [ModelInputItem] {
         self.original_input
     }
 
     /// Records this segment produced before the terminal condition.
+    /// After a handoff these are only the records following its projected input boundary.
     #[must_use]
     pub fn new_items(&self) -> &'a [RunItem] {
         self.new_items
@@ -674,10 +676,34 @@ impl RunResult {
     /// It extends this result's continuation base with the records this segment produced. For an
     /// automatic checkpoint resume that base already contains the prior recorded history; for an
     /// explicit resume it remains the caller-provided input.
+    ///
+    /// **A transfer of control replaces both halves.** Once a handoff has narrowed what the agent
+    /// now holding the run may see, this segment's own records are no longer what to send it — and
+    /// handing them over through a convenience projection is the same silent expansion the handoff's
+    /// [`HistoryProjection`](ra_core::agent::HistoryProjection) exists to prevent, with the host
+    /// given no way to notice. A caller that wants the unprojected history reads
+    /// [`RunState::generated_items`](ra_core::state::RunState::generated_items), which says what it
+    /// is.
     #[must_use]
     pub fn continuation_input(&self, policy: ContinuationInput) -> Vec<ModelInputItem> {
-        let mut items = self.original_input.clone();
-        items.extend(self.new_items.iter().filter_map(RunItem::to_model_input));
+        let items = match self.state.handoff_projection() {
+            None => {
+                let mut items = self.original_input.clone();
+                items.extend(self.new_items.iter().filter_map(RunItem::to_model_input));
+                items
+            }
+            // A projection naming a boundary the history does not hold is a broken checkpoint, and
+            // the infallible answer to it has to be the narrow one: sending the projection alone
+            // loses work, while falling back to the records loses the restriction.
+            Some(projection) => match self.state.model_input_base() {
+                Ok((base, carried)) => {
+                    let mut items = base.to_vec();
+                    items.extend(carried.iter().filter_map(RunItem::to_model_input));
+                    items
+                }
+                Err(_) => projection.input().to_vec(),
+            },
+        };
         match policy {
             ContinuationInput::PreserveAll => items,
             // A normalization failure means an item could not be rendered as JSON, which cannot

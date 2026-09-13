@@ -43,7 +43,7 @@ use crate::{
 };
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(4);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -60,8 +60,14 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
         "Persisted host approval answers, exact routing identities, and session permission rules.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(3),
         "Persisted tool-output reference retention facts for context projections across resumes.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the model-input projection a transfer of control installs. An older runtime \
+         reads this checkpoint without it and rebuilds the request from the whole history, which \
+         hands the receiving agent the transcript the transfer withheld.",
     ),
 ];
 
@@ -366,6 +372,59 @@ impl WorkStateRef {
     }
 }
 
+/// The model input a settled transfer of control installed, and where history resumes behind it.
+///
+/// A handoff may narrow what the receiving agent sees — through the declared
+/// [`HistoryProjection`](crate::agent::HistoryProjection), through a
+/// [`HandoffInputFilter`](crate::agent::HandoffInputFilter), or both — while the session keeps every
+/// record. Those two facts can only stay true together if the narrowed view is *state*: rebuilding
+/// the next request from the opening input and the complete history would hand the receiving agent
+/// exactly the transcript the projection withheld, and it would do it silently, on the first turn
+/// after a resume.
+///
+/// `resume_after` names the last record folded into `input` rather than counting how many there
+/// were. A position is only meaningful against the list it was taken from; an identity still says
+/// what it means in a checkpoint read by another build, and a run whose history no longer contains
+/// it refuses rather than guessing at a boundary.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandoffProjection {
+    input: Vec<ModelInputItem>,
+    resume_after: ItemId,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl HandoffProjection {
+    /// Creates the projection a settled transfer installs.
+    #[must_use]
+    pub fn new(input: Vec<ModelInputItem>, resume_after: ItemId) -> Self {
+        Self {
+            input,
+            resume_after,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Model input the receiving agent continues from.
+    #[must_use]
+    pub fn input(&self) -> &[ModelInputItem] {
+        &self.input
+    }
+
+    /// The last record folded into [`Self::input`]; history carries on after it.
+    #[must_use]
+    pub const fn resume_after(&self) -> &ItemId {
+        &self.resume_after
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
 /// Persistent cursor within an execution graph topology.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +626,8 @@ pub struct RunState {
     permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
     input_history_is_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_projection: Option<HandoffProjection>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -658,6 +719,8 @@ struct RunStateRecord {
     permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
     input_history_is_complete: bool,
+    #[serde(default)]
+    handoff_projection: Option<HandoffProjection>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -703,6 +766,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_interruption_resolutions,
             permission_rules,
             input_history_is_complete,
+            handoff_projection,
             unknown,
         } = record;
 
@@ -788,6 +852,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_interruption_resolutions,
             permission_rules,
             input_history_is_complete,
+            handoff_projection,
             unknown,
         })
     }
@@ -831,6 +896,7 @@ impl RunState {
             pending_interruption_resolutions: Vec::new(),
             permission_rules: Vec::new(),
             input_history_is_complete: true,
+            handoff_projection: None,
             unknown: Unknown::new(),
         }
     }
@@ -1194,9 +1260,50 @@ impl RunState {
     /// These are the run's in-memory resume projection. The session log may persist the same
     /// records as the durable source of history; retaining this projection makes a checkpoint
     /// self-sufficient between a pause and the session store's next materialization.
+    ///
+    /// **This is the session's view, not the model's.** After a transfer of control narrowed what
+    /// the receiving agent may see, the two differ; [`Self::model_input_base`] is the one to build a
+    /// request from.
     #[must_use]
     pub fn generated_items(&self) -> &[RunItem] {
         &self.generated_items
+    }
+
+    /// The model input this run continues from, and the records generated since.
+    ///
+    /// Without a transfer of control these are the run's opening input and its whole history, which
+    /// is the projection [`Self::original_input`] and [`Self::generated_items`] describe on their
+    /// own. Once a handoff has installed a [`HandoffProjection`], they are that projection and only
+    /// the records appended after it — which is the entire point of installing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when an installed projection names a record this history no longer
+    /// contains. Continuing would mean choosing a boundary, and both choices are wrong: taking all
+    /// the records re-sends the history the projection withheld, and taking none discards the work
+    /// done since the transfer.
+    pub fn model_input_base(&self) -> Result<(&[ModelInputItem], &[RunItem])> {
+        let Some(projection) = &self.handoff_projection else {
+            return Ok((&self.original_input, &self.generated_items));
+        };
+        let boundary = self
+            .generated_items
+            .iter()
+            .position(|item| item.id() == projection.resume_after())
+            .ok_or_else(|| {
+                Error::caller(format!(
+                    "the model input projection resumes after record `{}`, which this run's history \
+                     does not contain",
+                    projection.resume_after()
+                ))
+            })?;
+        Ok((projection.input(), &self.generated_items[boundary + 1..]))
+    }
+
+    /// The model-input projection a transfer of control installed, if one is in force.
+    #[must_use]
+    pub const fn handoff_projection(&self) -> Option<&HandoffProjection> {
+        self.handoff_projection.as_ref()
     }
 
     /// Completed model responses across every segment of this run.
@@ -1483,6 +1590,11 @@ impl RunState {
     /// The state records the opening input only once. A caller may still supply a model-input
     /// projection when it resumes, but that makes its input history incomplete: later segments
     /// must also provide input instead of asking the runner to project this checkpoint.
+    ///
+    /// Supplying input also **discards a projection a handoff installed**, and that is the honest
+    /// reading of what the caller did: the two are answers to the same question, and keeping the
+    /// framework's answer would silently overrule the one the caller just gave — while keeping both
+    /// would send the caller's input on top of a history it had already replaced.
     #[doc(hidden)]
     pub fn begin_segment(&mut self, agent: AgentId, input: Vec<ModelInputItem>) -> Result<()> {
         if self.pending_interruptions.iter().any(|id| {
@@ -1506,6 +1618,7 @@ impl RunState {
             Some(_) => {
                 if !input.is_empty() {
                     self.input_history_is_complete = false;
+                    self.handoff_projection = None;
                 }
                 Ok(())
             }
@@ -1523,6 +1636,30 @@ impl RunState {
     pub fn set_current_agent(&mut self, agent: AgentId) {
         debug_assert!(self.starting_agent.is_some());
         self.current_agent = Some(agent);
+    }
+
+    /// Installs the model input a settled transfer of control hands the receiving agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when the projection resumes after a record this run never generated.
+    /// Accepting it would produce a state whose next request cannot be built at all, and the
+    /// failure would surface one turn later with nothing left to say which transfer caused it.
+    #[doc(hidden)]
+    pub fn install_handoff_projection(&mut self, projection: HandoffProjection) -> Result<()> {
+        if !self
+            .generated_items
+            .iter()
+            .any(|item| item.id() == projection.resume_after())
+        {
+            return Err(Error::caller(format!(
+                "a transfer of control projected history up to record `{}`, which this run never \
+                 generated",
+                projection.resume_after()
+            )));
+        }
+        self.handoff_projection = Some(projection);
+        Ok(())
     }
 
     /// Appends settled records to the checkpoint's resume projection.

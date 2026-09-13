@@ -8,7 +8,7 @@
 //! final answer outranks another turn, because that is the round trip the promotion exists to save;
 //! and anything still owed an answer outranks concluding.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use ra_core::{
     agent::{AgentSpec, ToolUseBehavior},
@@ -32,9 +32,14 @@ pub async fn resolve_next_step(
         return NextStep::interruption(execution.interruptions().to_vec());
     }
 
-    // Handoffs never reach here today: `execute_actions` refuses them before this point, because
-    // resolving a target to a runnable agent is R17's contract. When R17 lands, this is where the
-    // resolved declaration becomes `NextStep::Handoff`.
+    // The first transfer in model order, which is the one `execute_actions` performed and wrote a
+    // record for. Reading `processed` rather than re-picking a winner keeps the decision and the
+    // history that documents it from ever naming two different agents.
+    if let Some(handoff) = processed.handoffs().first() {
+        return Ok(NextStep::Handoff {
+            new_agent: Arc::clone(handoff.target()),
+        });
+    }
 
     if check_for_final_output_from_tools(execution, tool_use_behavior, cancel).await? {
         return Ok(NextStep::FinalOutput {

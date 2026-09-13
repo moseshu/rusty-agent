@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ra_core::{
+    agent::{AgentSpec, HandoffSpec},
     error::Result,
     item::{
         AgentId, CallId, ItemId, McpApprovalRequest, Message, OutputPhase, RunItem, RunItemKind,
@@ -63,6 +64,21 @@ fn namespaced_tool(namespace: &str, name: &str) -> Arc<dyn Tool> {
     })
 }
 
+fn agent(id: &str) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new(id))
+        .name(id)
+        .build()
+        .unwrap()
+}
+
+fn handoff_spec(target: &str) -> HandoffSpec {
+    HandoffSpec::new(
+        AgentId::new(target),
+        schema(&format!("transfer_to_{target}")),
+    )
+}
+
 fn item(id: &str, kind: RunItemKind) -> RunItem {
     RunItem::new(ItemId::new(id), kind)
 }
@@ -104,7 +120,8 @@ fn test_processed_response_01() {
         .unwrap()
         .handoff(
             tool_call("call-item-2", "call-2", "transfer_to_reviewer"),
-            AgentId::new("reviewer"),
+            handoff_spec("reviewer"),
+            agent("reviewer"),
         )
         .unwrap()
         .mcp_approval(mcp_approval("approval-1", "req-1"))
@@ -152,7 +169,8 @@ fn test_processed_response_02() {
     let processed = ProcessedResponse::builder()
         .handoff(
             tool_call("call-item-1", "call-1", "transfer_to_reviewer"),
-            AgentId::new("reviewer"),
+            handoff_spec("reviewer"),
+            agent("reviewer"),
         )
         .unwrap()
         .build()
@@ -182,14 +200,14 @@ fn test_processed_response_03() {
     );
 
     let ok = ProcessedResponse::builder()
-        .handoff(typed.clone(), AgentId::new("reviewer"))
+        .handoff(typed.clone(), handoff_spec("reviewer"), agent("reviewer"))
         .unwrap()
         .build()
         .unwrap();
     assert_eq!(ok.handoffs()[0].target_agent().as_str(), "reviewer");
 
     let error = ProcessedResponse::builder()
-        .handoff(typed, AgentId::new("planner"))
+        .handoff(typed, handoff_spec("planner"), agent("planner"))
         .unwrap_err();
     assert!(error.to_string().contains("reviewer"));
     assert!(error.to_string().contains("planner"));
@@ -375,7 +393,8 @@ fn test_processed_response_09() {
         .unwrap()
         .handoff(
             tool_call("call-item-4", "call-4", "transfer_to_reviewer"),
-            AgentId::new("reviewer"),
+            handoff_spec("reviewer"),
+            agent("reviewer"),
         )
         .unwrap()
         .mcp_approval(mcp_approval("approval-1", "req-1"))

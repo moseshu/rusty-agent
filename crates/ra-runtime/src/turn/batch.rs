@@ -47,7 +47,7 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
     guardrail::{ToolInputGuardrailResult, ToolOutputGuardrailResult},
-    item::{AgentId, CallId, ItemId, RunItem, RunItemKind, ToolCallOutput},
+    item::{AgentId, CallId, HandoffOutput, ItemId, RunItem, RunItemKind, ToolCallOutput},
     state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
     step::{ProcessedResponse, ToolRunFunction},
     tool::{ResourceClaim, ResourceId, ToolConcurrency, ToolOrigin, ToolServices},
@@ -340,17 +340,6 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
         return Err(error);
     }
 
-    // Preparation can advertise and classify a handoff, but a transfer of control still needs the
-    // graph runtime to resolve its target to a runnable agent and replace the active binding. Until
-    // that execution contract exists, fail loudly rather than letting the turn continue as if the
-    // model had asked for nothing.
-    if let Err(error) = execute_handoffs(processed) {
-        if let Some(dispatches) = streamed_dispatches.take() {
-            dispatches.cancel_and_drain().await;
-        }
-        return Err(error);
-    }
-
     // Decisions the model's own response raised (hosted approvals) are asked about first: they are
     // already stored records, and the host sees them in the order the model produced them.
     execution
@@ -411,6 +400,11 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
             .with_error(true),
         ));
     }
+
+    // Last, and after the interruptions are known. A transfer record says control moved, and a turn
+    // that stops to ask a human has not moved it — writing one before that is settled would leave
+    // history claiming a transfer the run then did not make.
+    execute_handoffs(processed, request.agent_id, &mut execution);
 
     Ok(execution)
 }
@@ -1285,16 +1279,86 @@ fn outcome(
     )
 }
 
-/// Insertion point for executing a transfer of control once the graph runtime owns it.
-fn execute_handoffs(processed: &ProcessedResponse) -> Result<()> {
-    match processed.handoffs().first() {
-        None => Ok(()),
-        Some(handoff) => Err(Error::caller(format!(
-            "the response hands off to agent `{}`, but resolving a handoff target to a runnable \
-             agent is R17's contract and does not exist yet",
-            handoff.target_agent()
-        ))),
+/// Answers every transfer the response requested, and performs at most one of them.
+///
+/// # Why the first one wins and the rest are refused
+///
+/// Control is singular: two transfers in one response are two answers to "who speaks next", and
+/// nothing in the response says which the model meant. Taking the first in model order is the
+/// reference implementation's rule and the only one that does not depend on how a provider happened
+/// to order a parallel call block. The losers are still *answered* — a call with no output makes the
+/// next request malformed — and answered as failures, because a silent success output would tell
+/// the model that both transfers happened.
+///
+/// A turn that stops to ask a human performs none of them: the transfer would be recorded now and
+/// taken after the answer comes back, and anything reading history in between would see a run
+/// attributed to an agent that had not started.
+fn execute_handoffs(
+    processed: &ProcessedResponse,
+    source: &AgentId,
+    execution: &mut TurnExecution,
+) {
+    let mut handoffs = processed.handoffs().iter();
+    let taken = if execution.interruptions.is_empty() {
+        handoffs.next()
+    } else {
+        None
+    };
+
+    if let Some(handoff) = taken {
+        let target = handoff.target();
+        execution.new_items.push(RunItem::new(
+            output_item_id(handoff.call_id()),
+            RunItemKind::HandoffOutput(
+                HandoffOutput::new(
+                    handoff.call_id().clone(),
+                    source.clone(),
+                    target.id().clone(),
+                )
+                // The reference implementation's transfer message, kept verbatim. It is what the
+                // receiving agent reads as the answer to the call that moved control, and matching
+                // it keeps a prompt written against that ecosystem working here unchanged.
+                .with_note(transfer_message(target.name())),
+            ),
+        ));
     }
+
+    for refused in handoffs {
+        let reason = match taken {
+            Some(winner) => format!(
+                "control already transferred to `{}` in this response",
+                winner.target_agent()
+            ),
+            None => {
+                "this turn stopped for a pending decision before control could transfer".to_owned()
+            }
+        };
+        // Not one of the tool error kinds: nothing was dispatched, refused by a policy, or found
+        // missing. What the model has to read is that this particular transfer did not happen, and
+        // borrowing a kind that names a different cause would put a misleading code in history.
+        execution.new_items.push(output_item(
+            refused.call_id(),
+            ToolCallOutput::new(
+                refused.call_id().clone(),
+                json!({
+                    "error": {
+                        "code": HANDOFF_NOT_PERFORMED,
+                        "target_agent": refused.target_agent().as_str(),
+                        "message": reason,
+                    }
+                }),
+            )
+            .with_error(true),
+        ));
+    }
+}
+
+/// Machine-readable code answering a transfer the turn declined to perform.
+const HANDOFF_NOT_PERFORMED: &str = "handoff_not_performed";
+
+/// What the agent receiving control reads as the answer to the call that moved it.
+fn transfer_message(agent_name: &str) -> String {
+    json!({ "assistant": agent_name }).to_string() // layering-allow: assistant = model role, not a product
 }
 
 fn output_item(call_id: &CallId, output: ToolCallOutput) -> RunItem {

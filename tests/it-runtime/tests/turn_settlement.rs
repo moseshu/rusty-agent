@@ -13,7 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::{AgentId, AgentSpec},
+    agent::{AgentId, AgentSpec, HandoffSpec, HistoryProjection},
     cancel::{CancelReason, CancelScope},
     context::RunContext,
     error::{Error, GuardrailStage, Result, ToolErrorKind},
@@ -22,7 +22,6 @@ use ra_core::{
         CallId, ItemId, McpApprovalRequest, Message, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolCall,
     },
-    model::ModelHandoffDefinition,
     state::{RunId, ToolFailureTracker, ToolUseTracker},
     step::NextStep,
     tool::{
@@ -35,7 +34,7 @@ use ra_runtime::{
     turn::{
         TurnSettlementRequest,
         batch::{TurnExecutionRequest, execute_actions},
-        prepare::TurnActionSurface,
+        prepare::{PreparedHandoff, TurnActionSurface},
         process::process_model_response,
         settle_turn,
     },
@@ -1825,25 +1824,163 @@ async fn test_turn_settlement_21() {
 
 #[tokio::test]
 async fn test_turn_settlement_22() {
-    let handoff = ModelHandoffDefinition::new(
-        AgentId::new("reviewer"),
-        "transfer_to_reviewer",
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        }),
-    );
-    let surface = TurnActionSurface::new(Vec::new(), vec![handoff]).unwrap();
-    let response = ModelResponse::new(vec![tool_call(
-        "call-item-1",
-        "call-1",
-        "transfer_to_reviewer",
+    let surface = handoff_surface(vec![(
+        "reviewer",
+        HandoffSpec::new(
+            AgentId::new("reviewer"),
+            handoff_schema("transfer_to_reviewer"),
+        ),
     )]);
+    let response = ModelResponse::new(vec![
+        message("msg-1", "转给审阅者"),
+        tool_call("call-item-1", "call-1", "transfer_to_reviewer"),
+    ]);
     let cancel = CancelScope::root();
 
-    let error = settle_turn(TurnSettlementRequest::new(
+    let settled = settle_turn(
+        TurnSettlementRequest::new(
+            &binding(),
+            &response,
+            &surface,
+            run(),
+            &cancel,
+            &mut ToolUseTracker::new(),
+            &mut ToolFailureTracker::new(),
+            Default::default(),
+        )
+        .with_original_input(vec![ra_core::item::ModelInputItem::Message(Message::user(
+            "请处理",
+        ))]),
+    )
+    .await
+    .unwrap();
+
+    // Control moves to the agent the turn advertised, not to an identity looked up again later.
+    let NextStep::Handoff { new_agent } = settled.next_step() else {
+        panic!("一次转交应当settle成 handoff: {:?}", settled.next_step());
+    };
+    assert_eq!(new_agent.id().as_str(), "reviewer");
+
+    // The call that moved control is answered, and answered as a transfer rather than as a tool
+    // result: an unanswered call makes the next request malformed.
+    let transfer = settled
+        .session_step_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::HandoffOutput(output) => Some(output),
+            _ => None,
+        })
+        .expect("转交必须留下配对的完成记录");
+    assert_eq!(transfer.call_id().as_str(), "call-1");
+    assert_eq!(transfer.source_agent().as_str(), "main");
+    assert_eq!(transfer.target_agent().as_str(), "reviewer");
+
+    // The session keeps everything; what the receiving agent carries forward is only the transfer,
+    // because `HistoryProjection::None` is the default.
+    assert_eq!(settled.session_step_items().len(), 3);
+    assert!(settled.original_input().is_empty());
+    let carried = settled
+        .new_step_items()
+        .iter()
+        .map(|item| item.id().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(carried, ["call-item-1", "call-1.output"]);
+}
+
+#[tokio::test]
+async fn test_turn_settlement_22b() {
+    // Two transfers in one response are two answers to "who speaks next". The first in model order
+    // wins; the loser is still answered, because a call with no output is a malformed history.
+    let surface = handoff_surface(vec![
+        (
+            "reviewer",
+            HandoffSpec::new(
+                AgentId::new("reviewer"),
+                handoff_schema("transfer_to_reviewer"),
+            )
+            .with_history_projection(HistoryProjection::Full),
+        ),
+        (
+            "planner",
+            HandoffSpec::new(
+                AgentId::new("planner"),
+                handoff_schema("transfer_to_planner"),
+            ),
+        ),
+    ]);
+    let response = ModelResponse::new(vec![
+        tool_call("call-item-1", "call-1", "transfer_to_reviewer"),
+        tool_call("call-item-2", "call-2", "transfer_to_planner"),
+    ]);
+    let cancel = CancelScope::root();
+
+    let settled = settle_turn(
+        TurnSettlementRequest::new(
+            &binding(),
+            &response,
+            &surface,
+            run(),
+            &cancel,
+            &mut ToolUseTracker::new(),
+            &mut ToolFailureTracker::new(),
+            Default::default(),
+        )
+        .with_original_input(vec![ra_core::item::ModelInputItem::Message(Message::user(
+            "请处理",
+        ))]),
+    )
+    .await
+    .unwrap();
+
+    let NextStep::Handoff { new_agent } = settled.next_step() else {
+        panic!("第一条转交应当获胜: {:?}", settled.next_step());
+    };
+    assert_eq!(new_agent.id().as_str(), "reviewer");
+
+    let refused = output_for(settled.session_step_items(), "call-2");
+    assert!(refused.is_error());
+    assert_eq!(
+        refused.output()["error"]["code"],
+        json!("handoff_not_performed")
+    );
+
+    // The winner declared `Full`, so the caller's input and both records travel with it.
+    assert_eq!(settled.original_input().len(), 1);
+    assert_eq!(settled.new_step_items().len(), 4);
+}
+
+#[tokio::test]
+async fn a_turn_that_stops_to_ask_performs_no_transfer_but_still_answers_it() {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file", Behavior::Succeed("ok"))
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let reviewer = AgentSpec::builder()
+        .id(AgentId::new("reviewer"))
+        .name("reviewer")
+        .build()
+        .unwrap();
+    let surface = TurnActionSurface::new(
+        vec![tool],
+        vec![
+            PreparedHandoff::new(
+                HandoffSpec::new(
+                    AgentId::new("reviewer"),
+                    handoff_schema("transfer_to_reviewer"),
+                ),
+                reviewer,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let response = ModelResponse::new(vec![
+        tool_call("call-item-1", "call-1", "write_file"),
+        tool_call("call-item-2", "call-2", "transfer_to_reviewer"),
+    ]);
+    let cancel = CancelScope::root();
+
+    let settled = settle_turn(TurnSettlementRequest::new(
         &binding(),
         &response,
         &surface,
@@ -1854,10 +1991,54 @@ async fn test_turn_settlement_22() {
         Default::default(),
     ))
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("reviewer"));
-    assert!(error.to_string().contains("R17"));
+    // A pending decision outranks the transfer. Recording the transfer anyway would leave history
+    // claiming control moved to an agent that never got a turn.
+    assert!(matches!(settled.next_step(), NextStep::Interruption { .. }));
+    assert!(
+        !settled
+            .session_step_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::HandoffOutput(_)))
+    );
+
+    // The call is still answered: an unanswered call makes the next request malformed, and the
+    // model is told why this one did not happen.
+    let refused = output_for(settled.session_step_items(), "call-2");
+    assert!(refused.is_error());
+    assert_eq!(
+        refused.output()["error"]["code"],
+        json!("handoff_not_performed")
+    );
+}
+
+fn handoff_schema(name: &str) -> ToolSchema {
+    ToolSchema::new(
+        name,
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    )
+    .unwrap()
+}
+
+fn handoff_surface(handoffs: Vec<(&str, HandoffSpec)>) -> TurnActionSurface {
+    let prepared = handoffs
+        .into_iter()
+        .map(|(target, spec)| {
+            let target = AgentSpec::builder()
+                .id(AgentId::new(target))
+                .name(target)
+                .build()
+                .unwrap();
+            PreparedHandoff::new(spec, target).unwrap()
+        })
+        .collect();
+    TurnActionSurface::new(Vec::new(), prepared).unwrap()
 }
 
 #[tokio::test]

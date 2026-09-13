@@ -14,9 +14,9 @@ use ra_core::{
     },
     permission::PermissionDecision,
     state::{
-        GraphCursor, NestedRunRef, PendingControlRequest, RUN_STATE_SCHEMA_VERSION,
-        RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, ToolUse, ToolUseAttempt, WorkStateRef,
-        WorkspaceLeaseRef,
+        GraphCursor, HandoffProjection, NestedRunRef, PendingControlRequest,
+        RUN_STATE_SCHEMA_VERSION, RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, ToolUse,
+        ToolUseAttempt, WorkStateRef, WorkspaceLeaseRef,
     },
     tool::{ToolLookupKey, ToolNamespace, ToolOrigin},
     usage::{RequestUsage, Usage},
@@ -580,6 +580,77 @@ fn test_run_state_allows_a_resumed_segment_that_carries_its_own_input() {
         .begin_segment(AgentId::new("planner"), Vec::new())
         .expect_err("a restored checkpoint must bind back to the agent that owns it");
     assert!(error.to_string().contains("expects current agent `coder`"));
+}
+
+/// A transfer of control replaces the base the next request is built from, and survives a
+/// checkpoint — otherwise the first turn after a resume re-sends exactly the history the transfer
+/// withheld from the agent that took over.
+#[test]
+fn test_run_state_carries_the_model_input_projection_a_transfer_installed() {
+    let agent = AgentId::new("coder");
+    let opening = vec![ModelInputItem::Message(Message::user("start"))];
+    let mut state = RunState::start(RunId::new("run-handoff-projection"));
+    state
+        .begin_segment(agent.clone(), opening.clone())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![
+        commentary_item("msg-1", "thinking"),
+        commentary_item("msg-2", "transferring"),
+    ]);
+
+    // Without a projection the base is the run's own opening input and its whole history.
+    let (base, carried) = state.model_input_base().unwrap();
+    assert_eq!(base, opening);
+    assert_eq!(carried.len(), 2);
+
+    let projection = HandoffProjection::new(
+        vec![ModelInputItem::Message(Message::user("the brief"))],
+        ItemId::new("msg-2"),
+    );
+    state
+        .install_handoff_projection(projection.clone())
+        .expect("the boundary record is part of this run's history");
+    state.record_generated_items(vec![commentary_item("msg-3", "after the transfer")]);
+
+    let restored: RunState =
+        serde_json::from_value(serde_json::to_value(&state).expect("state must serialize"))
+            .expect("the projection must survive a checkpoint");
+    assert_eq!(restored.handoff_projection(), Some(&projection));
+    let (base, carried) = restored.model_input_base().unwrap();
+    assert_eq!(base.len(), 1);
+    assert_eq!(ids(carried), ["msg-3"]);
+    // The session keeps everything either way; only the model-facing view was narrowed.
+    assert_eq!(restored.generated_items().len(), 3);
+
+    // A caller that supplies its own input is answering the same question, so its answer replaces
+    // the framework's rather than being layered on top of it.
+    let mut resumed = restored;
+    resumed
+        .begin_segment(agent, vec![ModelInputItem::Message(Message::user("now X"))])
+        .expect("a caller-managed continuation may take over the projection");
+    assert!(resumed.handoff_projection().is_none());
+    let (base, carried) = resumed.model_input_base().unwrap();
+    assert_eq!(base, opening);
+    assert_eq!(carried.len(), 3);
+}
+
+/// A projection whose boundary the history no longer holds refuses rather than picking a boundary.
+#[test]
+fn test_run_state_refuses_a_projection_that_names_no_stored_record() {
+    let mut state = RunState::start(RunId::new("run-handoff-boundary"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(vec![commentary_item("msg-1", "thinking")]);
+
+    let error = state
+        .install_handoff_projection(HandoffProjection::new(Vec::new(), ItemId::new("msg-404")))
+        .expect_err("a boundary this run never generated cannot be accepted");
+    assert!(error.to_string().contains("msg-404"));
+}
+
+fn ids(items: &[RunItem]) -> Vec<&str> {
+    items.iter().map(|item| item.id().as_str()).collect()
 }
 
 /// Unanswered questions block the next segment, and clearing them is what unblocks it.

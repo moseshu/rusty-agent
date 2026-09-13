@@ -21,7 +21,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use futures::future::try_join_all;
 use ra_core::{
-    agent::{AgentSpec, ResolvedInstructions},
+    agent::{AgentSpec, HandoffSpec, ResolvedInstructions},
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result},
@@ -35,7 +35,7 @@ use ra_core::{
     tool::{Tool, ToolAvailability},
 };
 
-use crate::agent::AgentBinding;
+use crate::agent::{AgentBinding, AgentRegistry};
 
 /// What to do when two actions claim one model-facing tool name.
 ///
@@ -146,6 +146,7 @@ pub struct TurnPreparationRequest<'a> {
     tracing: ModelTracing,
     collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
+    agent_registry: Option<&'a AgentRegistry>,
 }
 
 impl<'a> TurnPreparationRequest<'a> {
@@ -188,6 +189,7 @@ impl<'a> TurnPreparationRequest<'a> {
             tracing: ModelTracing::Disabled,
             collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
+            agent_registry: None,
         }
     }
 
@@ -224,6 +226,17 @@ impl<'a> TurnPreparationRequest<'a> {
         action_surface_budget: ActionSurfaceBudget,
     ) -> Self {
         self.action_surface_budget = action_surface_budget;
+        self
+    }
+
+    /// Supplies the declarations this turn resolves its handoff targets against.
+    ///
+    /// A declaration names its target by stable identity, which is what lets two agents transfer
+    /// control to each other; turning that identity back into a declaration needs somewhere to look
+    /// it up. An agent that declares no handoff never consults this, so an ordinary single-agent run
+    /// has nothing to configure.
+    pub const fn with_agent_registry(mut self, agent_registry: &'a AgentRegistry) -> Self {
+        self.agent_registry = Some(agent_registry);
         self
     }
 }
@@ -337,6 +350,95 @@ impl fmt::Debug for PreparedTurn {
     }
 }
 
+/// One advertised transfer of control, bound to the agent that would receive it.
+///
+/// The declaration and the resolved target travel together from here to settlement, which is what
+/// makes the transfer the model was offered the transfer that actually happens. Resolving the
+/// identity again at settlement would leave a window in which a differently populated registry
+/// answers the same name with a different agent — and the run would continue as someone the model
+/// never saw.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct PreparedHandoff {
+    spec: HandoffSpec,
+    definition: ModelHandoffDefinition,
+    target: Arc<AgentSpec>,
+}
+
+impl PreparedHandoff {
+    /// Binds one declaration to the declaration of the agent it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when `target` is not the agent `spec` declares, and a configuration
+    /// error when the declared history projection is one this runtime cannot apply.
+    pub fn new(spec: HandoffSpec, target: Arc<AgentSpec>) -> Result<Self> {
+        if spec.target_agent() != target.id() {
+            return Err(Error::caller(format!(
+                "a handoff declared for agent `{}` was bound to the declaration of `{}`",
+                spec.target_agent(),
+                target.id()
+            )));
+        }
+        // Refused before the turn advertises it, not when the model calls it. A projection that
+        // cannot be applied makes the transfer unexecutable, and finding that out afterwards means
+        // finding it out with the model call already paid for and the run with nowhere to go.
+        if spec.history_projection().requires_summarizer() {
+            return Err(Error::config(format!(
+                "the handoff to agent `{}` declares a summary history projection, which this \
+                 runtime cannot produce; declare `Full`, `LastItems`, or `None`",
+                spec.target_agent()
+            )));
+        }
+        let definition = spec.model_definition();
+        Ok(Self {
+            spec,
+            definition,
+            target,
+        })
+    }
+
+    /// The declaration that offers the transfer.
+    #[must_use]
+    pub const fn spec(&self) -> &HandoffSpec {
+        &self.spec
+    }
+
+    /// What the provider is told about the transfer.
+    #[must_use]
+    pub const fn definition(&self) -> &ModelHandoffDefinition {
+        &self.definition
+    }
+
+    /// The declaration of the agent that would take over.
+    #[must_use]
+    pub const fn target(&self) -> &Arc<AgentSpec> {
+        &self.target
+    }
+
+    /// Model-facing name of this transfer.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.definition.name()
+    }
+
+    /// Stable identity of the agent that would take over.
+    #[must_use]
+    pub const fn target_agent(&self) -> &AgentId {
+        self.definition.target_agent()
+    }
+}
+
+impl fmt::Debug for PreparedHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHandoff")
+            .field("name", &self.name())
+            .field("target_agent", self.target_agent())
+            .finish_non_exhaustive()
+    }
+}
+
 /// What one turn advertised, retained across the model call.
 ///
 /// The model answers with names, and settlement has to map each name back to the exact object the
@@ -348,21 +450,21 @@ impl fmt::Debug for PreparedTurn {
 pub struct TurnActionSurface {
     tools: Vec<Arc<dyn Tool>>,
     tool_names: Vec<String>,
-    handoffs: Vec<ModelHandoffDefinition>,
+    handoffs: Vec<PreparedHandoff>,
 }
 
 impl TurnActionSurface {
     /// Builds a snapshot, rejecting a surface that advertises one name twice.
     ///
     /// Use [`Self::new_with_collision_policy`] to retain a deterministic winner instead.
-    pub fn new(tools: Vec<Arc<dyn Tool>>, handoffs: Vec<ModelHandoffDefinition>) -> Result<Self> {
+    pub fn new(tools: Vec<Arc<dyn Tool>>, handoffs: Vec<PreparedHandoff>) -> Result<Self> {
         Self::new_with_collision_policy(tools, handoffs, ToolNameCollisionPolicy::Error)
     }
 
     /// Builds a snapshot under an explicit model-facing name-collision policy.
     pub fn new_with_collision_policy(
         mut tools: Vec<Arc<dyn Tool>>,
-        mut handoffs: Vec<ModelHandoffDefinition>,
+        mut handoffs: Vec<PreparedHandoff>,
         policy: ToolNameCollisionPolicy,
     ) -> Result<Self> {
         let tool_names: Vec<String> = tools
@@ -471,10 +573,23 @@ impl TurnActionSurface {
             .collect()
     }
 
-    /// Handoffs this turn advertised.
+    /// Handoffs this turn advertised, each bound to the agent it would transfer control to.
     #[must_use]
-    pub fn handoffs(&self) -> &[ModelHandoffDefinition] {
+    pub fn handoffs(&self) -> &[PreparedHandoff] {
         &self.handoffs
+    }
+
+    /// Model-handoff projections for exactly the transfers in this snapshot.
+    ///
+    /// The provider request is built from this for the reason [`Self::tool_definitions`] gives: a
+    /// warning-resolved collision is filtered out of the snapshot, and a request rebuilt from the
+    /// pre-policy inventory would advertise the entry settlement can no longer resolve.
+    #[must_use]
+    pub fn handoff_definitions(&self) -> Vec<ModelHandoffDefinition> {
+        self.handoffs
+            .iter()
+            .map(|handoff| handoff.definition().clone())
+            .collect()
     }
 
     /// Number of entries this turn sends in its flat model-facing action namespace.
@@ -495,7 +610,7 @@ impl TurnActionSurface {
             .chain(
                 self.handoffs
                     .iter()
-                    .map(ModelHandoffDefinition::advertised_bytes),
+                    .map(|handoff| handoff.definition().advertised_bytes()),
             )
             .try_fold(0_usize, |total, bytes| {
                 total.checked_add(bytes?).ok_or_else(|| {
@@ -514,9 +629,9 @@ impl TurnActionSurface {
             .find_map(|(tool, advertised)| (advertised == name).then_some(tool))
     }
 
-    /// Resolves a model-facing name to its handoff definition.
+    /// Resolves a model-facing name to the transfer it was advertised as.
     #[must_use]
-    pub fn find_handoff(&self, name: &str) -> Option<&ModelHandoffDefinition> {
+    pub fn find_handoff(&self, name: &str) -> Option<&PreparedHandoff> {
         self.handoffs
             .iter()
             .rev()
@@ -524,6 +639,10 @@ impl TurnActionSurface {
     }
 
     /// Whether this turn offered a transfer to the given agent.
+    ///
+    /// Deliberately a predicate rather than a lookup. Two declarations may target one agent under
+    /// different names, so an identity does not select a transfer — classification resolves by the
+    /// name the model called and refuses an identity that could mean either.
     #[must_use]
     pub fn advertises_handoff_to(&self, target: &AgentId) -> bool {
         self.handoffs
@@ -541,7 +660,7 @@ impl TurnActionSurface {
         self.tool_names
             .iter()
             .map(String::as_str)
-            .chain(self.handoffs.iter().map(ModelHandoffDefinition::name))
+            .chain(self.handoffs.iter().map(PreparedHandoff::name))
     }
 }
 
@@ -570,7 +689,7 @@ impl fmt::Debug for TurnActionSurface {
         let handoffs = self
             .handoffs
             .iter()
-            .map(ModelHandoffDefinition::name)
+            .map(PreparedHandoff::name)
             .collect::<Vec<_>>();
         formatter
             .debug_struct("TurnActionSurface")
@@ -591,9 +710,12 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
     let tools = resolve_enabled_tools(agent, request.run, request.cancel).await?;
 
-    // 2. Resolve enabled handoffs after tools. Sealing the two into one surface here — not lazily
-    // at settlement — is what applies the collision policy before the model call is paid for.
-    let handoffs = resolve_handoffs(agent, request.run, request.cancel).await?;
+    // 2. Resolve enabled handoffs after tools, binding each to the agent that would receive it.
+    // Sealing the two into one surface here — not lazily at settlement — is what applies the
+    // collision policy before the model call is paid for, and what keeps the turn from advertising
+    // a transfer whose target cannot be resolved into anything runnable.
+    let handoffs =
+        resolve_handoffs(agent, request.run, request.cancel, request.agent_registry).await?;
     let surface = TurnActionSurface::new_with_collision_policy(
         tools.advertised,
         handoffs,
@@ -656,7 +778,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let model = Arc::clone(resolved_model.model());
     let mut model_request = ModelRequest::new(input, model_settings)
         .with_tools(tool_definitions)
-        .with_handoffs(surface.handoffs().to_vec())
+        .with_handoffs(surface.handoff_definitions())
         .with_tracing(request.tracing);
     if let Some(instructions) = instructions {
         // The cache scope is the run for now. It wants to be the session id, so that a resumed or
@@ -751,20 +873,39 @@ async fn resolve_handoffs(
     agent: &AgentSpec,
     context: &RunContext,
     cancel: &CancelScope,
-) -> Result<Vec<ModelHandoffDefinition>> {
+    registry: Option<&AgentRegistry>,
+) -> Result<Vec<PreparedHandoff>> {
+    if agent.handoffs().is_empty() {
+        return Ok(Vec::new());
+    }
     let decisions = cancel
         .run(try_join_all(agent.handoffs().iter().map(
             |handoff| async move { handoff.is_enabled(context).await },
         )))
         .await??;
 
-    Ok(agent
-        .handoffs()
-        .iter()
-        .zip(decisions)
-        .filter(|(_, enabled)| *enabled)
-        .map(|(handoff, _)| handoff.model_definition())
-        .collect())
+    let mut prepared = Vec::new();
+    for (handoff, enabled) in agent.handoffs().iter().zip(decisions) {
+        if !enabled {
+            continue;
+        }
+        // Only the transfers this turn will actually offer are resolved. A declaration that dynamic
+        // availability turned off is not this turn's problem, and refusing the turn over a target
+        // it was never going to advertise would make an unrelated registry gap look like a defect
+        // in the agent that happens to be running.
+        let target = registry
+            .and_then(|registry| registry.get(handoff.target_agent()))
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "agent `{}` offers a handoff to `{}`, but that agent is not in the run's agent \
+                     registry; a transfer the runtime cannot resolve must not be advertised",
+                    agent.id(),
+                    handoff.target_agent()
+                ))
+            })?;
+        prepared.push(PreparedHandoff::new(handoff.clone(), Arc::clone(target))?);
+    }
+    Ok(prepared)
 }
 
 fn resolve_output_schema(public_agent: &AgentSpec) -> Option<ModelOutputSchema> {
