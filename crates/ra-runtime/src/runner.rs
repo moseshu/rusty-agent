@@ -33,7 +33,7 @@ use std::{any::Any, collections::BTreeSet, future::Future, sync::Arc, time::Inst
 
 use futures::StreamExt;
 use ra_core::{
-    agent::AgentSpec,
+    agent::{AgentSpec, HandoffInputData, HandoffInputFilter},
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
     capability::{
@@ -67,7 +67,10 @@ use ra_core::{
     },
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
-    state::{EventSeqAllocator, InterruptionResolution, RunId, RunState, ToolOutcome, ToolUse},
+    state::{
+        EventSeqAllocator, HandoffProjection, InterruptionResolution, RunId, RunState, ToolOutcome,
+        ToolUse,
+    },
     step::NextStep,
     tool::{ToolOutputReferenceExtractor, ToolServices},
     trace::SpanKind,
@@ -89,7 +92,7 @@ use result::{TurnRecordOwner, aggregate_usage, find_final_message};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
-    agent::AgentBinding,
+    agent::{AgentBinding, AgentRegistry},
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     hook::{UserHookRegistration, UserHooks},
@@ -136,6 +139,8 @@ pub struct RunConfig {
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
+    agent_registry: AgentRegistry,
+    handoff_input_filter: Option<Arc<dyn HandoffInputFilter>>,
     context_filters: ContextFilterChain,
     tool_output_reference_extractor: Option<Arc<dyn ToolOutputReferenceExtractor>>,
     memory_usage_sink: Option<Arc<dyn ra_core::memory::MemoryUsageSink>>,
@@ -170,6 +175,8 @@ impl RunConfig {
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
+            agent_registry: AgentRegistry::default(),
+            handoff_input_filter: None,
             context_filters: ContextFilterChain::new(),
             tool_output_reference_extractor: None,
             memory_usage_sink: None,
@@ -296,6 +303,26 @@ impl RunConfig {
         self
     }
 
+    /// Sets the declarations this run resolves handoff targets against.
+    ///
+    /// A run whose agents declare no handoff never consults it. One whose agents do has to supply
+    /// it: a declaration names its target by identity so that two agents can transfer control to
+    /// each other, and nothing in the running agent can turn that identity back into something
+    /// runnable on its own.
+    pub fn with_agent_registry(mut self, agent_registry: AgentRegistry) -> Self {
+        self.agent_registry = agent_registry;
+        self
+    }
+
+    /// Sets the transform applied to every transfer that declares none of its own.
+    ///
+    /// It is a default, not a stage: a handoff carrying its own filter uses that one instead of
+    /// this, so a single transfer can opt out of a run-wide policy by declaring what it wants.
+    pub fn with_handoff_input_filter(mut self, filter: Arc<dyn HandoffInputFilter>) -> Self {
+        self.handoff_input_filter = Some(filter);
+        self
+    }
+
     /// Appends a pure projection applied to the model input before every request.
     ///
     /// A filter sees a persisted tool-output reference ledger and affects only the provider
@@ -391,6 +418,18 @@ impl RunConfig {
     #[must_use]
     pub const fn action_surface_budget(&self) -> ActionSurfaceBudget {
         self.action_surface_budget
+    }
+
+    /// Declarations this run resolves handoff targets against.
+    #[must_use]
+    pub const fn agent_registry(&self) -> &AgentRegistry {
+        &self.agent_registry
+    }
+
+    /// Transform applied to a transfer of control that declares none of its own.
+    #[must_use]
+    pub const fn handoff_input_filter(&self) -> Option<&Arc<dyn HandoffInputFilter>> {
+        self.handoff_input_filter.as_ref()
     }
 
     /// Permission evaluator shared by every turn of this run.
@@ -629,6 +668,8 @@ impl std::fmt::Debug for RunConfig {
                 &self.tool_name_collision_policy,
             )
             .field("action_surface_budget", &self.action_surface_budget)
+            .field("agent_registry", &self.agent_registry)
+            .field("handoff_input_filter", &self.handoff_input_filter.is_some())
             .field("context_filters", &self.context_filters)
             .field(
                 "has_tool_output_reference_extractor",
@@ -971,9 +1012,9 @@ async fn run_loop(
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
 ) -> Result<RunResult> {
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
-    // this span keeps the original name because it is the whole run's span — per-agent attribution
-    // is what a handoff span and the agent span its target opens are for, and neither exists while
-    // settlement still refuses handoffs.
+    // this span keeps the original name because it is the whole run's span. Per-agent attribution
+    // is what the turn spans underneath carry, each recording the agent that ran it; a span that
+    // renamed itself on a transfer would leave one run reported under two names.
     let agent_name = request.agent.public().name().to_owned();
     let agent_span = info_span!(
         "agent",
@@ -1101,12 +1142,15 @@ async fn run_loop_inner(
     // after the run has paid for a model call. The output list is merged now and used much later
     // for the same reason — a run that would have been refused at delivery should not be started.
     //
-    // Merged against the **starting** agent, which is what a run has today: settlement refuses
-    // handoffs, so nobody else can finish it. When a handoff can finish a run, the output list has
-    // to be re-merged against whoever settled, because those guardrails belong to the agent whose
-    // answer is being delivered.
+    // Merged against the **starting** agent, and the two lists mean different things by that. The
+    // input checks examine the caller's input, which only the starting agent ever sees, so this is
+    // their final form. The output list belongs to whoever's answer is delivered, and a handoff can
+    // make that somebody else — so this merge is the early refusal for the ordinary run, and the
+    // delivery site re-merges when control has moved. The starting agent's declaration is still
+    // checked here, because a run that would be refused at delivery should not be started.
     let input_guardrails =
         merge_input_guardrails(agent.public().input_guardrails(), config.input_guardrails());
+    let starting_agent = Arc::clone(agent.public());
     let output_guardrails = merge_output_guardrails(
         agent.public().output_guardrails(),
         config.output_guardrails(),
@@ -1394,6 +1438,19 @@ async fn run_loop_inner(
         .finish_reason()
         .filter(|reason| reason.is_complete())
     {
+        // Re-merged only when control moved, because the checks belong to the agent whose answer is
+        // being handed over. A refusal here is late — the model call has been paid for — but the
+        // alternative is worse in both directions: running the starting agent's checks on another
+        // agent's answer applies a promise nobody made about it, and skipping the receiving agent's
+        // own checks delivers an answer it declared had to be examined.
+        let output_guardrails = if Arc::ptr_eq(agent.public(), &starting_agent) {
+            output_guardrails
+        } else {
+            merge_output_guardrails(
+                agent.public().output_guardrails(),
+                config.output_guardrails(),
+            )
+        };
         let verdicts = {
             // The delivery the guardrails examine is the one the result will report, resolved the
             // same way: a closeout outranks the model's own last word. A complete run has no
@@ -2132,20 +2189,11 @@ async fn run_one_turn(
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
     let reminder = budget_reminder(state, config.budget());
-    // Where the authoritative history sits inside the request, so a context processor can be told
-    // which span of items it owns without counting them again. Preparation appends its own tail
-    // items after this point, and everything past the history is the processor's suffix.
-    let history_span = context.authoritative_history_complete.then(|| HistorySpan {
-        history_len: state
-            .generated_items()
-            .iter()
-            .filter(|item| item.is_model_input())
-            .count(),
-    });
-    let input = match history_span {
-        Some(_) => next_input(state.original_input(), state.generated_items(), reminder),
-        None => next_input(context.input_base, progress.segment_items(state), reminder),
-    };
+    // What this turn's request is built from: the base the run continues on, and the records
+    // appended since. The two ways of decomposing that are equivalent until a transfer of control
+    // narrows the base — after which only the state knows what the receiving agent may see.
+    let turn_input = TurnInput::resolve(context, state, progress)?;
+    let input = next_input(turn_input.base(), turn_input.carried(), reminder);
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
         agent,
@@ -2158,18 +2206,18 @@ async fn run_one_turn(
     .with_model_settings(config.model_settings.clone())
     .with_tracing(config.tracing)
     .with_tool_name_collision_policy(config.tool_name_collision_policy())
-    .with_action_surface_budget(config.action_surface_budget());
+    .with_action_surface_budget(config.action_surface_budget())
+    .with_agent_registry(config.agent_registry());
     if let Some(model) = &config.model {
         preparation = preparation.with_model(model.clone());
     }
     let prepared = prepare_turn(preparation).await?;
     let (prepared, context_records, context_responses) = process_context_processors(
         context,
-        state,
         progress,
         turn_scope,
         prepared,
-        history_span,
+        &turn_input,
         preparation_context,
     )
     .await?;
@@ -2265,10 +2313,12 @@ async fn run_one_turn(
 
     let referenced_outputs = referenced_tool_outputs(config, &response)?;
 
-    // Settlement sees the same input base the model did and only this segment's preceding items.
-    // The base may itself be a full caller-supplied or checkpoint-projected transcript.
-    let segment_original_input = context.input_base.to_vec();
-    let pre_step_items = progress.segment_items(state).to_vec();
+    // Settlement sees exactly the decomposition the request was built from, because it is what a
+    // transfer of control projects: the base this run continues on, and the records added to it
+    // since. Handing it a differently sliced but equivalent view would work until the day a handoff
+    // narrowed one of them, at which point the projection and the request would describe two
+    // different conversations.
+    let (segment_original_input, pre_step_items) = turn_input.into_parts();
 
     // Built again rather than reused from preparation: the call above has been paid for, and the
     // spend a tool reads has to include it. The two contexts are the same run and the same agent —
@@ -2296,6 +2346,10 @@ async fn run_one_turn(
     .with_lifecycle_hooks(lifecycle.clone())
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches);
+    let settlement = match config.handoff_input_filter() {
+        Some(filter) => settlement.with_handoff_input_filter(Arc::clone(filter)),
+        None => settlement,
+    };
     let settled = settle_turn(settlement).await?;
 
     // Recorded straight after settlement, alongside the items: these are decisions this turn's
@@ -2350,9 +2404,35 @@ async fn run_one_turn(
         }
         // Control transfers to another agent, which speaks next. The new agent arrives as a
         // public declaration, so it binds directly: whatever prepared *this* turn's execution
-        // instance has no say over who runs the next one. Unreachable until R17 — settlement
-        // refuses handoffs — but the state machine has to say what it does about it.
+        // instance has no say over who runs the next one.
         NextStep::Handoff { new_agent } => {
+            // What the receiving agent continues from, which is the settled turn's carried-forward
+            // view rather than the session's. The session keeps every record either way; this is
+            // the half a declared projection and a host filter were allowed to narrow, and building
+            // it from the stored records instead would quietly undo both.
+            //
+            // The boundary is the last record this turn stored. Everything the run appends after it
+            // — the next turns, a deferred fragment, an error handler's message — carries on behind
+            // the projection instead of being folded into it.
+            let projected = HandoffInputData::new(
+                settled.original_input().to_vec(),
+                settled.pre_step_items().to_vec(),
+                settled.new_step_items().to_vec(),
+            )
+            .into_model_input();
+            let boundary = state
+                .generated_items()
+                .last()
+                .map(RunItem::id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::caller(
+                        "a transfer of control settled without the run having stored any record; \
+                         there is nothing for the receiving agent's history to resume after",
+                    )
+                })?;
+            state.install_handoff_projection(HandoffProjection::new(projected, boundary))?;
+
             // Handoff belongs to the receiving agent, while the input still names the source.
             let receiving = lifecycle.rebound(new_agent.lifecycle_hooks());
             if !receiving.is_empty() {
@@ -2367,9 +2447,13 @@ async fn run_one_turn(
             // arriving agent's take over, together with the run-scoped half that spans both.
             *lifecycle = receiving;
             if !lifecycle.is_empty() {
+                // The input the arriving agent is starting on, not the one the run opened with:
+                // an observer told otherwise would be shown a transcript this agent never receives.
+                let (projected, _) = state.model_input_base()?;
+                let projected = projected.to_vec();
                 let run = live_context(context, agent, state);
                 let starting =
-                    AgentStartInput::new(&run, context.input_base).with_services(context.services);
+                    AgentStartInput::new(&run, &projected).with_services(context.services);
                 lifecycle_dispatch::agent_start(lifecycle, &starting, turn_scope).await?;
             }
             Ok(None)
@@ -2429,11 +2513,10 @@ fn deliver_deferred_prompts(
 /// product-specific retention policy.
 async fn process_context_processors(
     context: &TurnLoopContext<'_>,
-    state: &RunState,
     progress: &TurnLoopProgress,
     turn_scope: &CancelScope,
     prepared: PreparedTurn,
-    history_span: Option<HistorySpan>,
+    turn_input: &TurnInput,
     run: RunContext,
 ) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>)> {
     let processors = context.config.context_processors();
@@ -2442,16 +2525,18 @@ async fn process_context_processors(
     }
     // Only a request this loop assembled can be split into prefix, history, and tail. A segment
     // resuming on a caller's own projection is skipped rather than guessed at.
-    let Some(span) = history_span else {
+    let Some(span) = turn_input.history_span else {
         return Ok((prepared, Vec::new(), Vec::new()));
     };
-    let Some((prefix, suffix)) = span.split(prepared.request().input(), state.original_input())
-    else {
+    let Some((prefix, suffix)) = span.split(prepared.request().input(), turn_input.base()) else {
         return Ok((prepared, Vec::new(), Vec::new()));
     };
 
     let mut input = prepared.request().input().to_vec();
-    let mut history = state.generated_items().to_vec();
+    // The records behind the base, which after a transfer of control is less than the run's whole
+    // history. A processor owns what the model is being shown; it is not the place to reintroduce
+    // what the transfer decided the receiving agent may not see.
+    let mut history = turn_input.carried().to_vec();
     let mut generated_items: Vec<RunItem> = Vec::new();
     let mut taken_ids: BTreeSet<ItemId> = history.iter().map(|item| item.id().clone()).collect();
     let mut model_responses = Vec::new();
@@ -2475,7 +2560,7 @@ async fn process_context_processors(
     for (index, processor) in processors.iter().enumerate() {
         let record_id = ItemId::new(format!("context-{}.{index}", progress.reference_turn()));
         let request = ContextProcessorRequest::new(
-            state.run_id().clone(),
+            context.run_id.clone(),
             progress.reference_turn(),
             record_id,
             prepared.selector().model().map(str::to_owned),
@@ -2507,6 +2592,60 @@ async fn process_context_processors(
 
     let prepared = prepared.map_request(|request| request.with_input(input));
     Ok((prepared, generated_items, model_responses))
+}
+
+/// What one turn's model input is built from: a base, and the records appended to it since.
+///
+/// Three sources can answer that, and which one does is a fact about how the run got here rather
+/// than a preference. A transfer of control outranks both others: it installed a base precisely
+/// because the receiving agent may not see everything the session holds, and rebuilding from the
+/// history would hand over exactly what the projection withheld. Otherwise a run whose history is
+/// wholly reconstructible uses the state's own decomposition, which is what lets context processing
+/// own the whole run rather than one segment; and a continuation carrying the caller's projection
+/// uses that, because the state never recorded it.
+#[derive(Debug, Clone)]
+struct TurnInput {
+    base: Vec<ModelInputItem>,
+    carried: Vec<RunItem>,
+    /// `None` when this segment's input is not reconstructible from state, which is what makes a
+    /// positional split of the assembled request unsafe — see [`HistorySpan`].
+    history_span: Option<HistorySpan>,
+}
+
+impl TurnInput {
+    fn resolve(
+        context: &TurnLoopContext<'_>,
+        state: &RunState,
+        progress: &TurnLoopProgress,
+    ) -> Result<Self> {
+        let (base, carried) = if state.handoff_projection().is_some() {
+            state.model_input_base()?
+        } else if context.authoritative_history_complete {
+            (state.original_input(), state.generated_items())
+        } else {
+            (context.input_base, progress.segment_items(state))
+        };
+        let history_span = context.authoritative_history_complete.then(|| HistorySpan {
+            history_len: carried.iter().filter(|item| item.is_model_input()).count(),
+        });
+        Ok(Self {
+            base: base.to_vec(),
+            carried: carried.to_vec(),
+            history_span,
+        })
+    }
+
+    fn base(&self) -> &[ModelInputItem] {
+        &self.base
+    }
+
+    fn carried(&self) -> &[RunItem] {
+        &self.carried
+    }
+
+    fn into_parts(self) -> (Vec<ModelInputItem>, Vec<RunItem>) {
+        (self.base, self.carried)
+    }
 }
 
 /// Where the authoritative history sits inside one assembled request.
@@ -3316,12 +3455,17 @@ async fn deliver_budget_closeout(
     };
 
     let error = Error::budget(kind, "the configured run budget was exhausted");
-    // The same base and segment window the model used. The base can already contain the complete
-    // checkpoint projection, while an explicit caller continuation remains caller-controlled.
+    // A closeout speaks for the current agent and must respect the history its handoff allowed.
+    // Ordinary runs retain the segment decomposition exposed by the error-handler contract.
+    let (base, carried) = if state.handoff_projection().is_some() {
+        state.model_input_base()?
+    } else {
+        (context.input_base, progress.segment_items(state))
+    };
     let data = RunErrorData::new(
         agent.public(),
-        context.input_base,
-        progress.segment_items(state),
+        base,
+        carried,
         progress.segment_responses(state),
         progress.turns,
         state.budget().clone(),

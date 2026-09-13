@@ -8,10 +8,10 @@
 //!
 //! Several agent concerns have dedicated later milestones. Dynamic prompts and output schemas have
 //! their protocol-neutral declarations here; output parsing and validation remain with the
-//! structured-output contract. Handoffs have a protocol-neutral declaration here; capabilities
-//! wait for their own contract. Private fields and the non-exhaustive public types let those
-//! additions remain source compatible; placeholder strings would freeze the wrong identities and
-//! callback shapes.
+//! structured-output contract. Handoffs have their own module and are re-exported here, because
+//! they are part of what an agent declares; capabilities wait for their own contract.
+//! Private fields and the non-exhaustive public types let those additions remain source
+//! compatible; placeholder strings would freeze the wrong identities and callback shapes.
 
 use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
 
@@ -21,184 +21,21 @@ use crate::{
     guardrail::{InputGuardrail, OutputGuardrail},
     item::{CallId, RunItem, ToolCallOutput},
     lifecycle::LifecycleHook,
-    model::{ModelHandoffDefinition, ModelSettings},
+    model::ModelSettings,
     output::OutputSchema,
     prompt::{DynamicPromptHandler, ResolvedPrompt},
     state::NestedRunRef,
-    tool::{Tool, ToolOrigin, ToolSchema},
+    tool::{Tool, ToolOrigin},
 };
 use async_trait::async_trait;
 
+mod handoff;
+
 pub use crate::item::AgentId;
-
-/// Controls how much predecessor history a handoff gives its target as model input.
-///
-/// This declares a model-input projection only. It never changes the authoritative session
-/// history, which retains the complete records that led to the transfer. The default is
-/// deliberately [`None`](Self::None): silently granting another agent the caller's complete
-/// transcript is both a context-cost surprise and an authority expansion.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub enum HistoryProjection {
-    /// Do not provide predecessor history to the receiving agent.
-    #[default]
-    None,
-    /// Provide the complete predecessor history.
-    Full,
-    /// Provide the most recent number of input items.
-    LastItems(usize),
-    /// Provide a separately generated summary.
-    Summary,
-}
-
-impl HistoryProjection {
-    /// Validates parameterized projection forms.
-    pub fn validate(&self) -> Result<()> {
-        if matches!(self, Self::LastItems(0)) {
-            return Err(Error::config(
-                "a handoff history projection must retain at least one item",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Evaluates whether a handoff is available during a particular turn.
-///
-/// The handler receives the same live context as dynamic instructions and tools. It cannot
-/// modify model input or session history; it only decides whether this transfer reaches the
-/// current turn's action surface.
-#[async_trait]
-pub trait HandoffAvailabilityHandler: Send + Sync + 'static {
-    /// Returns whether the handoff may be offered during this turn.
-    async fn is_enabled(&self, context: &RunContext) -> Result<bool>;
-}
-
-struct HandoffAvailabilityFn<F>(F);
-
-#[async_trait]
-impl<F, Fut> HandoffAvailabilityHandler for HandoffAvailabilityFn<F>
-where
-    F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<bool>> + Send + 'static,
-{
-    async fn is_enabled(&self, context: &RunContext) -> Result<bool> {
-        (self.0)(context).await
-    }
-}
-
-/// Declarative, provider-neutral transfer of control to another agent.
-///
-/// A handoff is not a function tool: when a model calls it, the receiving agent becomes the
-/// active agent and continues the run. This type freezes only the declaration. Executing the
-/// transfer and projecting history are graph-runtime responsibilities, so they remain outside
-/// this contract until the graph runtime owns those behaviors.
-#[non_exhaustive]
-#[derive(Clone)]
-pub struct HandoffSpec {
-    target_agent: AgentId,
-    schema: ToolSchema,
-    history_projection: HistoryProjection,
-    availability: Option<Arc<dyn HandoffAvailabilityHandler>>,
-}
-
-impl HandoffSpec {
-    /// Creates an always-enabled handoff with no predecessor history by default.
-    #[must_use]
-    pub fn new(target_agent: AgentId, schema: ToolSchema) -> Self {
-        Self {
-            target_agent,
-            schema,
-            history_projection: HistoryProjection::None,
-            availability: None,
-        }
-    }
-
-    /// Sets the model-input history projection for the receiving agent.
-    #[must_use]
-    pub fn with_history_projection(mut self, history_projection: HistoryProjection) -> Self {
-        self.history_projection = history_projection;
-        self
-    }
-
-    /// Installs an asynchronous per-turn availability handler.
-    #[must_use]
-    pub fn with_availability(mut self, availability: Arc<dyn HandoffAvailabilityHandler>) -> Self {
-        self.availability = Some(availability);
-        self
-    }
-
-    /// Installs an asynchronous per-turn availability function.
-    #[must_use]
-    pub fn with_availability_fn<F, Fut>(mut self, f: F) -> Self
-    where
-        F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<bool>> + Send + 'static,
-    {
-        self.availability = Some(Arc::new(HandoffAvailabilityFn(f)));
-        self
-    }
-
-    /// Stable identity of the agent that receives control.
-    #[must_use]
-    pub const fn target_agent(&self) -> &AgentId {
-        &self.target_agent
-    }
-
-    /// Model-facing function declaration used to invoke the transfer.
-    #[must_use]
-    pub const fn schema(&self) -> &ToolSchema {
-        &self.schema
-    }
-
-    /// Model-input history the receiving agent may see.
-    #[must_use]
-    pub const fn history_projection(&self) -> &HistoryProjection {
-        &self.history_projection
-    }
-
-    /// Revalidates the declaration before a registry accepts it.
-    pub fn validate(&self) -> Result<()> {
-        validate_required_text("handoff target agent id", self.target_agent.as_str())?;
-        self.schema.validate()?;
-        self.history_projection.validate()
-    }
-
-    /// Resolves the provider-neutral model declaration.
-    #[must_use]
-    pub fn model_definition(&self) -> ModelHandoffDefinition {
-        let definition = ModelHandoffDefinition::new(
-            self.target_agent.clone(),
-            self.schema.name(),
-            self.schema.input_schema().clone(),
-        )
-        .with_strict(self.schema.strict_json_schema());
-        match self.schema.description() {
-            Some(description) => definition.with_description(description.to_owned()),
-            None => definition,
-        }
-    }
-
-    /// Evaluates dynamic availability, or returns `true` for a static declaration.
-    pub async fn is_enabled(&self, context: &RunContext) -> Result<bool> {
-        match &self.availability {
-            Some(handler) => handler.is_enabled(context).await,
-            None => Ok(true),
-        }
-    }
-}
-
-impl fmt::Debug for HandoffSpec {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("HandoffSpec")
-            .field("target_agent", &self.target_agent)
-            .field("schema", &self.schema)
-            .field("history_projection", &self.history_projection)
-            .field("dynamic_availability", &self.availability.is_some())
-            .finish()
-    }
-}
+pub use handoff::{
+    HandoffAvailabilityHandler, HandoffInputData, HandoffInputFilter, HandoffSpec,
+    HistoryProjection,
+};
 
 struct DynamicPromptFn<F>(F);
 
@@ -723,9 +560,9 @@ impl AgentSpec {
     /// Checks applied to the run's final output before it is delivered.
     ///
     /// Contributed by the agent that **finishes** the run: the answer being delivered is that
-    /// agent's, and so is the promise about what may be in it. That is a different agent from the
-    /// one that started the run only once a handoff can settle one, which settlement does not yet
-    /// allow.
+    /// agent's, and so is the promise about what may be in it. Once a handoff has moved control,
+    /// that is a different agent from the one the run started with, and the delivery stage reads
+    /// this from whoever ended up holding the answer.
     #[must_use]
     pub fn output_guardrails(&self) -> &[Arc<dyn OutputGuardrail>] {
         &self.output_guardrails

@@ -31,10 +31,8 @@
 ///
 /// `Internal` but technically reachable, the same deliberate trade [`turn`](crate::turn) carries
 /// and for the same reason: tests live in a separate workspace, so a module with no `pub` path has
-/// no way to be tested at all — and [`LifecycleEvent::Handoff`](ra_core::lifecycle::LifecycleEvent)
-/// has no reachable call site while settlement refuses handoffs, so the loop cannot exercise it.
-/// The other six moments are covered through the runner, which is where they belong. No
-/// compatibility promise.
+/// no way to be tested at all. Every moment is reachable through the runner, which is where they
+/// are covered. No compatibility promise.
 #[doc(hidden)]
 pub mod dispatch;
 

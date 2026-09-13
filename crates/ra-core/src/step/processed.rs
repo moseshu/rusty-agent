@@ -32,6 +32,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
+    agent::{AgentSpec, HandoffSpec},
     error::{Error, Result},
     item::{
         AgentId, CallId, HandoffCall, ItemId, McpApprovalRequest, RunItem, RunItemKind, ToolCall,
@@ -109,17 +110,20 @@ impl fmt::Debug for ToolRunFunction {
     }
 }
 
-/// A model call bound to the handoff target it named.
+/// A model call bound to the declaration that transfers control and to the agent taking over.
 ///
-/// It carries an [`AgentId`] rather than an `Arc<AgentSpec>` because resolving an identity to a
-/// declaration needs an agent registry that does not exist yet.
-/// [`NextStep::Handoff`](super::NextStep::Handoff) is where the resolved declaration belongs;
-/// this is the evidence that produces it.
+/// It holds both for the reason [`ToolRunFunction`] holds a resolved [`Tool`]: settlement must
+/// transfer control to the agent *this turn advertised*, and it must project history through the
+/// declaration that was on offer when the model chose it. Re-resolving either from an identity at
+/// settlement time would let a registry change between the model call and the transfer, and the
+/// run would continue as a different agent than the one the model was shown.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolRunHandoff {
     item_id: ItemId,
     call: HandoffCall,
+    spec: HandoffSpec,
+    target: Arc<AgentSpec>,
 }
 
 impl ToolRunHandoff {
@@ -148,10 +152,33 @@ impl ToolRunHandoff {
         self.call.target_agent()
     }
 
+    /// The declaration that offered this transfer, including its history projection and filter.
+    #[must_use]
+    pub const fn spec(&self) -> &HandoffSpec {
+        &self.spec
+    }
+
+    /// The declaration of the agent taking over.
+    #[must_use]
+    pub const fn target(&self) -> &Arc<AgentSpec> {
+        &self.target
+    }
+
     /// How the tool-use tracker identifies this call. See [`ToolRunFunction::identity`].
     #[must_use]
     pub fn identity(&self) -> ToolUse {
         ToolUse::Handoff(self.target_agent().clone())
+    }
+}
+
+impl fmt::Debug for ToolRunHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRunHandoff")
+            .field("item_id", &self.item_id)
+            .field("call_id", self.call.call_id())
+            .field("target_agent", self.call.target_agent())
+            .finish_non_exhaustive()
     }
 }
 
@@ -498,14 +525,31 @@ impl ProcessedResponseBuilder {
         Ok(self)
     }
 
-    /// Records a call bound to the agent it transfers control to.
+    /// Records a call bound to the declaration it came from and the agent it transfers control to.
     ///
     /// The item may be either wire form: an ordinary [`RunItemKind::ToolCall`], which is how a
     /// handoff actually reaches a provider, or an adapter-typed [`RunItemKind::HandoffCall`]. In
-    /// the second case the item's own target has to agree with `target_agent`, because a
+    /// the second case the item's own target has to agree with the resolved one, because a
     /// disagreement means the adapter and the turn's advertised surface resolved the same name to
     /// two different agents.
-    pub fn handoff(mut self, item: RunItem, target_agent: AgentId) -> Result<Self> {
+    ///
+    /// `spec` and `target` have to name the same agent for the same reason a bound function call
+    /// has to match its tool's advertised name: a declaration projecting history for one agent
+    /// while control moves to another is a transfer nobody declared.
+    pub fn handoff(
+        mut self,
+        item: RunItem,
+        spec: HandoffSpec,
+        target: Arc<AgentSpec>,
+    ) -> Result<Self> {
+        if spec.target_agent() != target.id() {
+            return Err(Error::caller(format!(
+                "a handoff declared for agent `{}` was bound to the declaration of `{}`",
+                spec.target_agent(),
+                target.id()
+            )));
+        }
+        let target_agent = target.id().clone();
         let call = match item.kind() {
             RunItemKind::ToolCall(call) => HandoffCall::new(
                 call.call_id().clone(),
@@ -533,6 +577,8 @@ impl ProcessedResponseBuilder {
         self.handoffs.push(ToolRunHandoff {
             item_id: item.id().clone(),
             call,
+            spec,
+            target,
         });
         self.new_items.push(item);
         Ok(self)

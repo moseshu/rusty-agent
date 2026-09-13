@@ -22,13 +22,28 @@ use ra_core::{
     },
 };
 use ra_runtime::{
-    agent::AgentBinding,
+    agent::{AgentBinding, AgentRegistry},
     runner::ActionSurfaceBudget,
     turn::prepare::{PreparedTurn, TurnPreparationRequest, prepare_turn},
 };
 use serde_json::{Value, json};
 
 type Events = Arc<Mutex<Vec<String>>>;
+
+/// The declarations a turn resolves its handoff targets against.
+fn registry(ids: &[&str]) -> AgentRegistry {
+    let mut builder = AgentRegistry::builder();
+    for id in ids {
+        builder = builder.register(
+            AgentSpec::builder()
+                .id(AgentId::new(*id))
+                .name(*id)
+                .build()
+                .unwrap(),
+        );
+    }
+    builder.build().unwrap()
+}
 
 struct FakeModel;
 
@@ -371,14 +386,18 @@ async fn dynamic_handoffs_are_resolved_into_the_same_turn_surface_as_tools() {
     let context = host(&agent);
     let cancel = CancelScope::root();
 
-    let prepared = prepare_turn(TurnPreparationRequest::new(
-        &direct(&agent),
-        &resolver,
-        &context,
-        &cancel,
-        &ToolUseTracker::new(),
-        Vec::new(),
-    ))
+    let registry = registry(&["reviewer", "writer"]);
+    let prepared = prepare_turn(
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_agent_registry(&registry),
+    )
     .await
     .unwrap();
 
@@ -444,14 +463,18 @@ async fn cancellation_interrupts_a_dynamic_handoff_before_model_resolution() {
         })
     };
 
-    let error = prepare_turn(TurnPreparationRequest::new(
-        &direct(&agent),
-        &resolver,
-        &context,
-        &cancel,
-        &ToolUseTracker::new(),
-        Vec::new(),
-    ))
+    let registry = registry(&["reviewer"]);
+    let error = prepare_turn(
+        TurnPreparationRequest::new(
+            &direct(&agent),
+            &resolver,
+            &context,
+            &cancel,
+            &ToolUseTracker::new(),
+            Vec::new(),
+        )
+        .with_agent_registry(&registry),
+    )
     .await
     .unwrap_err();
     canceller.await.unwrap();
@@ -485,6 +508,7 @@ async fn action_surface_budget_counts_handoffs_and_their_schema_bytes() {
     let context = host(&agent);
     let cancel = CancelScope::root();
     let binding = direct(&agent);
+    let registry = registry(&["reviewer"]);
 
     let count_error = prepare_turn(
         TurnPreparationRequest::new(
@@ -495,6 +519,7 @@ async fn action_surface_budget_counts_handoffs_and_their_schema_bytes() {
             &ToolUseTracker::new(),
             Vec::new(),
         )
+        .with_agent_registry(&registry)
         .with_action_surface_budget(ActionSurfaceBudget::new(0)),
     )
     .await
@@ -514,6 +539,7 @@ async fn action_surface_budget_counts_handoffs_and_their_schema_bytes() {
             &ToolUseTracker::new(),
             Vec::new(),
         )
+        .with_agent_registry(&registry)
         .with_action_surface_budget(ActionSurfaceBudget::new(1).with_max_advertised_bytes(0)),
     )
     .await

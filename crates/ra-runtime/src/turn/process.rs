@@ -33,7 +33,11 @@ pub fn process_model_response(
         builder = match item.kind() {
             RunItemKind::ToolCall(call) => {
                 if let Some(handoff) = surface.find_handoff(call.name()) {
-                    builder.handoff(item.clone(), handoff.target_agent().clone())?
+                    builder.handoff(
+                        item.clone(),
+                        handoff.spec().clone(),
+                        Arc::clone(handoff.target()),
+                    )?
                 } else if let Some(tool) = surface.find_tool(call.name()) {
                     builder.function(item.clone(), Arc::clone(tool))?
                 } else {
@@ -47,13 +51,33 @@ pub fn process_model_response(
             // offer: a transfer to an agent this turn never advertised is a control transfer
             // nobody authorised, and running it would be worse than refusing it.
             RunItemKind::HandoffCall(call) => {
-                if !surface.advertises_handoff_to(call.target_agent()) {
+                let resolved = if let Some(name) = call.tool_name() {
+                    surface.find_handoff(name)
+                } else {
+                    let mut candidates = surface
+                        .handoffs()
+                        .iter()
+                        .filter(|handoff| handoff.target_agent() == call.target_agent());
+                    let first = candidates.next();
+                    if candidates.next().is_some() {
+                        return Err(Error::caller(format!(
+                            "the handoff to agent `{}` is ambiguous without a tool name",
+                            call.target_agent()
+                        )));
+                    }
+                    first
+                };
+                let Some(handoff) = resolved else {
                     return Err(Error::caller(format!(
                         "the response hands off to agent `{}`, which this turn did not advertise",
                         call.target_agent()
                     )));
-                }
-                builder.handoff(item.clone(), call.target_agent().clone())?
+                };
+                builder.handoff(
+                    item.clone(),
+                    handoff.spec().clone(),
+                    Arc::clone(handoff.target()),
+                )?
             }
             RunItemKind::McpApprovalRequest(_) => builder.mcp_approval(item.clone())?,
             // Messages, reasoning, outputs, control-plane records, and — because `RunItemKind` is

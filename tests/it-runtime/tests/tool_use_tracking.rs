@@ -7,7 +7,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::AgentSpec,
+    agent::{AgentSpec, HandoffSpec},
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
@@ -15,7 +15,6 @@ use ra_core::{
         AgentId, CallId, ItemId, McpApprovalRequest, Message, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolCall,
     },
-    model::ModelHandoffDefinition,
     state::{RunId, ToolFailureTracker, ToolUse, ToolUseTracker},
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput,
@@ -24,7 +23,11 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
-    turn::{TurnSettlementRequest, prepare::TurnActionSurface, settle_turn},
+    turn::{
+        TurnSettlementRequest,
+        prepare::{PreparedHandoff, TurnActionSurface},
+        settle_turn,
+    },
 };
 use serde_json::{Value, json};
 
@@ -307,17 +310,29 @@ async fn test_tool_use_tracking_04() {
 
 #[tokio::test]
 async fn test_tool_use_tracking_05() {
-    let handoff = ModelHandoffDefinition::new(
+    let spec = HandoffSpec::new(
         AgentId::new("reviewer"),
-        "transfer_to_reviewer",
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        }),
+        ToolSchema::new(
+            "transfer_to_reviewer",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap(),
     );
-    let surface = TurnActionSurface::new(Vec::new(), vec![handoff]).unwrap();
+    let reviewer = AgentSpec::builder()
+        .id(AgentId::new("reviewer"))
+        .name("reviewer")
+        .build()
+        .unwrap();
+    let surface = TurnActionSurface::new(
+        Vec::new(),
+        vec![PreparedHandoff::new(spec, reviewer).unwrap()],
+    )
+    .unwrap();
     let response = ModelResponse::new(vec![call(
         "c-1",
         "call-1",
@@ -326,9 +341,7 @@ async fn test_tool_use_tracking_05() {
     )]);
     let mut tracker = ToolUseTracker::new();
 
-    // Handoff execution is not implemented yet, so this turn fails explicitly.
-    let error = settle(&response, &surface, &mut tracker).await.unwrap_err();
-    assert!(error.to_string().contains("reviewer"));
+    settle(&response, &surface, &mut tracker).await.unwrap();
 
     // Filing happens before anything acts. How a turn ended changes nothing about what the model asked
     // for, and that is what the audit trail and the breaker read.

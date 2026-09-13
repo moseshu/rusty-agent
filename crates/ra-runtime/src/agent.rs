@@ -133,8 +133,9 @@ impl fmt::Debug for AgentBinding {
 ///
 /// Applications may populate the builder from configuration, plugins, or direct API calls; this
 /// registry deliberately does not assign meaning to the source. Building it validates that every
-/// handoff target is present in this declaration set and makes that set available for later target
-/// resolution. Direct runs do not consult this registry yet; live child-run state, admission, and
+/// handoff target is present in this declaration set and makes that set available for target
+/// resolution. Turn preparation consults it to bind every transfer it is about to advertise, so a
+/// run whose agents declare handoffs has to be given one; live child-run state, admission, and
 /// lifecycle stay outside this immutable configuration registry.
 #[non_exhaustive]
 #[derive(Clone, Default)]
