@@ -20,6 +20,7 @@
 
 pub mod agent;
 pub mod exec;
+pub mod file;
 pub mod sink;
 pub mod timestamp;
 
@@ -30,6 +31,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use self::{
     agent::{AgentEvent, AgentOperationId},
     exec::ExecEvent,
+    file::FileEvent,
     sink::{FnHostEventSink, HostEventSink, InMemoryHostEventSink, NoopHostEventSink},
     timestamp::EventTimestamp,
 };
@@ -56,6 +58,8 @@ pub enum HostEventBody {
     Exec(ExecEvent),
     /// Multi-agent orchestration event.
     Agent(AgentEvent),
+    /// File read or change performed by a tool.
+    File(FileEvent),
     /// Completion of one host hook callback.
     Hook(HookReport),
     /// Forward-compatible unknown event family.
@@ -76,6 +80,12 @@ impl From<ExecEvent> for HostEventBody {
 impl From<AgentEvent> for HostEventBody {
     fn from(a: AgentEvent) -> Self {
         Self::Agent(a)
+    }
+}
+
+impl From<FileEvent> for HostEventBody {
+    fn from(event: FileEvent) -> Self {
+        Self::File(event)
     }
 }
 
@@ -109,6 +119,14 @@ impl Serialize for HostEventBody {
                 let data = serde_json::to_value(agent).map_err(serde::ser::Error::custom)?;
                 let envelope = Envelope {
                     family: "agent",
+                    data: &data,
+                };
+                envelope.serialize(serializer)
+            }
+            Self::File(event) => {
+                let data = serde_json::to_value(event).map_err(serde::ser::Error::custom)?;
+                let envelope = Envelope {
+                    family: "file",
                     data: &data,
                 };
                 envelope.serialize(serializer)
@@ -148,6 +166,11 @@ impl<'de> Deserialize<'de> for HostEventBody {
                 let agent: AgentEvent =
                     serde_json::from_value(data).map_err(serde::de::Error::custom)?;
                 Ok(Self::Agent(agent))
+            }
+            "file" => {
+                let event: FileEvent =
+                    serde_json::from_value(data).map_err(serde::de::Error::custom)?;
+                Ok(Self::File(event))
             }
             "hook" => {
                 let report = serde_json::from_value(data).map_err(serde::de::Error::custom)?;
@@ -321,6 +344,15 @@ impl HostEventEmitter {
     /// Returns [`Error`] if sequence allocation is exhausted.
     pub fn emit_exec(&self, event: ExecEvent) -> Result<u64> {
         self.emit(HostEventBody::Exec(event))
+    }
+
+    /// Emits a file read or change event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if sequence allocation is exhausted.
+    pub fn emit_file(&self, event: FileEvent) -> Result<u64> {
+        self.emit(HostEventBody::File(event))
     }
 
     /// Emits a multi-agent orchestration event.

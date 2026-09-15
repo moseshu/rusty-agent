@@ -25,8 +25,9 @@ use ra_core::{
             ExecOutputEvent, ExecSessionId, ExecStartedEvent, ExecStreamKind, ExecYieldReason,
             ExecYieldedEvent, TerminalInteractionEvent,
         },
+        file::{FileChangeKind, FileChangedEvent, FileEvent, FileReadEvent},
     },
-    item::AgentId,
+    item::{AgentId, CallId},
     state::{RunId, RunState},
     tool::ToolServices,
 };
@@ -760,5 +761,94 @@ fn test_stream_kind_stays_closed_and_rejects_unknown_names() {
     assert!(
         rejected.is_err(),
         "an unknown stream kind must be rejected, not guessed"
+    );
+}
+
+/// The file family travels in the same envelope as the others, and degrades the same three ways.
+#[test]
+fn test_file_events_round_trip_and_degrade_like_every_other_family() {
+    let sink = Arc::new(InMemoryHostEventSink::new());
+    let allocator = RunState::start(RunId::new("run-file-1")).restore_event_seq_allocator(None);
+    let emitter = HostEventEmitter::new(AgentId::new("coder"), allocator, Arc::clone(&sink) as _);
+
+    emitter
+        .emit_file(FileEvent::Read(
+            FileReadEvent::new(CallId::new("call-1"), "src/lib.rs", 480)
+                .with_line_window(1, 40, 96),
+        ))
+        .expect("must emit");
+    emitter
+        .emit_file(FileEvent::Changed(
+            FileChangedEvent::new(CallId::new("call-2"), "src/lib.rs", FileChangeKind::Updated)
+                .with_line_counts(3, 1),
+        ))
+        .expect("must emit");
+
+    let events = sink.events();
+    assert_eq!(events.len(), 2);
+    let wire = serde_json::to_value(&events[0]).expect("must serialize");
+    assert_eq!(wire["body"]["family"], "file");
+    assert_eq!(wire["body"]["data"]["kind"], "read");
+    assert_eq!(wire["body"]["data"]["path"], "src/lib.rs");
+    let restored: HostEvent = serde_json::from_value(wire.clone()).expect("must deserialize");
+    assert_eq!(&restored, &events[0]);
+
+    // An unknown kind in this family degrades to `Unknown` rather than failing the envelope.
+    let newer = json!({
+        "schema_version": 1,
+        "seq": 7,
+        "run_id": "run-file-1",
+        "agent_id": "coder",
+        "at": 1_700_000_000_000_u64,
+        "body": {
+            "family": "file",
+            "data": { "schema_version": 1, "kind": "renamed_directory", "path": "src" }
+        }
+    });
+    let event: HostEvent = serde_json::from_value(newer.clone()).expect("must deserialize");
+    assert!(matches!(
+        event.body(),
+        HostEventBody::File(FileEvent::Unknown(_))
+    ));
+    assert_eq!(
+        serde_json::to_value(&event).expect("must serialize"),
+        newer,
+        "an unknown kind is written back verbatim"
+    );
+
+    // An unknown change label inside a known kind keeps the typed event around it.
+    let labelled = json!({
+        "schema_version": 1,
+        "seq": 8,
+        "run_id": "run-file-1",
+        "agent_id": "coder",
+        "at": 1_700_000_000_000_u64,
+        "body": {
+            "family": "file",
+            "data": {
+                "schema_version": 1,
+                "kind": "changed",
+                "call_id": "call-9",
+                "path": "src/lib.rs",
+                "change": "chmod",
+                "lines_added": 0,
+                "lines_removed": 0
+            }
+        }
+    });
+    let event: HostEvent = serde_json::from_value(labelled.clone()).expect("must deserialize");
+    match event.body() {
+        HostEventBody::File(FileEvent::Changed(change)) => {
+            assert_eq!(change.change().as_str(), "chmod");
+            assert!(
+                change.unknown().is_empty(),
+                "a label is not an unknown field"
+            );
+        }
+        other => panic!("expected a typed Changed event: {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(&event).expect("must serialize"),
+        labelled
     );
 }

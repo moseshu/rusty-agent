@@ -49,6 +49,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
+    event::{FileEvent, file::FileReadEvent},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
     permission::PermissionScope,
     tool::{
@@ -297,7 +298,7 @@ impl ReadFileTool {
         }
     }
 
-    async fn read(&self, input: &ReadFileInput) -> ReadResult<ToolOutput> {
+    async fn read(&self, input: &ReadFileInput) -> ReadResult<(ToolOutput, ReadFact)> {
         let path = self.resolve(&input.path)?;
         let mut file = self.open_file(&input.path, &path).await?;
         let metadata = file
@@ -313,21 +314,29 @@ impl ReadFileTool {
                 let bytes = self
                     .read_whole(&input.path, &mut file, metadata.len())
                     .await?;
-                Ok(ToolOutput::block(ToolOutputBlock::Image(ImageBlock::new(
-                    ImageSource::base64(media_type, BASE64.encode(bytes)),
-                ))))
+                let fact = ReadFact::whole(bytes.len());
+                Ok((
+                    ToolOutput::block(ToolOutputBlock::Image(ImageBlock::new(
+                        ImageSource::base64(media_type, BASE64.encode(bytes)),
+                    ))),
+                    fact,
+                ))
             }
             Media::Pdf => {
                 let bytes = self
                     .read_whole(&input.path, &mut file, metadata.len())
                     .await?;
+                let fact = ReadFact::whole(bytes.len());
                 let mut source = Base64FileSource::new(BASE64.encode(bytes));
                 if let Some(name) = path.as_path().file_name().and_then(|name| name.to_str()) {
                     source = source.with_filename(name);
                 }
-                Ok(ToolOutput::block(ToolOutputBlock::File(FileBlock::new(
-                    FileSource::Base64(source),
-                ))))
+                Ok((
+                    ToolOutput::block(ToolOutputBlock::File(FileBlock::new(FileSource::Base64(
+                        source,
+                    )))),
+                    fact,
+                ))
             }
             Media::Text => self.render_text_stream(input, &mut file).await,
         }
@@ -414,7 +423,7 @@ impl ReadFileTool {
         &self,
         input: &ReadFileInput,
         file: &mut tokio::fs::File,
-    ) -> ReadResult<ToolOutput> {
+    ) -> ReadResult<(ToolOutput, ReadFact)> {
         const CHUNK_BYTES: usize = 8 * 1024;
         let requested_start = to_usize(input.offset.unwrap_or(1)).max(1) - 1;
         let requested_limit =
@@ -468,7 +477,10 @@ impl ReadFileTool {
         }
 
         if bytes_seen == 0 {
-            return Ok(ToolOutput::text("The file is empty (0 bytes)."));
+            return Ok((
+                ToolOutput::text("The file is empty (0 bytes)."),
+                ReadFact::whole(0),
+            ));
         }
         if line.has_content() {
             let source = line.finish(false);
@@ -488,27 +500,26 @@ impl ReadFileTool {
             end: requested_end.min(total),
         };
         if window.is_empty() {
-            // The offset the model sent, not the clamped one it turned into: told "no lines at
-            // offset 3" after asking for 9, the model has to work out which of the two numbers is
-            // its own.
-            return Ok(ToolOutput::text(format!(
-                "No lines at offset {}; the file has {total} lines.",
-                input.offset.unwrap_or(1)
-            ))
-            .with_metadata(
-                ObservationMetadata::new()
-                    .with_guidance(format!("Read again with an offset between 1 and {total}.")),
+            return Ok((
+                no_lines_output(input.offset.unwrap_or(1), total),
+                // The read happened whatever the window came to: the file was opened and every
+                // byte of it was scanned to find out how many lines it has.
+                ReadFact::lines(bytes_seen, requested_start, 0, total),
             ));
         }
 
         let (rendering, rendered_lossy) = renderer.finish();
-        Ok(self.finish_text_output(
-            input,
-            total,
-            &window,
-            bytes_from_window_start,
-            rendering,
-            rendered_lossy || utf8.finish(),
+        let fact = ReadFact::lines(bytes_seen, window.start, rendering.emitted_lines, total);
+        Ok((
+            self.finish_text_output(
+                input,
+                total,
+                &window,
+                bytes_from_window_start,
+                rendering,
+                rendered_lossy || utf8.finish(),
+            ),
+            fact,
         ))
     }
 
@@ -611,7 +622,12 @@ impl Tool for ReadFileTool {
             },
             Ok,
         )?;
-        self.read(&input).await.map_err(ReadFileFailure::into_error)
+        let (output, fact) = self
+            .read(&input)
+            .await
+            .map_err(ReadFileFailure::into_error)?;
+        record_read(&context, &input.path, &fact);
+        Ok(output)
     }
 
     fn options(&self) -> ToolOptions {
@@ -652,6 +668,81 @@ impl Tool for ReadFileTool {
                 .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step()))
         }))
     }
+}
+
+/// Answers a window that selected nothing.
+///
+/// Reports the offset the model sent, not the clamped one it turned into: told "no lines at offset
+/// 3" after asking for 9, the model has to work out which of the two numbers is its own.
+fn no_lines_output(requested_offset: u32, total: usize) -> ToolOutput {
+    ToolOutput::text(format!(
+        "No lines at offset {requested_offset}; the file has {total} lines."
+    ))
+    .with_metadata(
+        ObservationMetadata::new()
+            .with_guidance(format!("Read again with an offset between 1 and {total}.")),
+    )
+}
+
+/// Records a read on the host's event channel, where the session log can keep it.
+///
+/// A read that no host is listening to records nothing, and a channel that refuses the record says
+/// so in the log rather than silently: the read has already happened either way, and the gap
+/// between what a run did and what its log says is exactly what makes a log worth distrusting. It
+/// is not raised to the model — the model has the file.
+fn record_read(context: &ToolContext<'_>, path: &str, fact: &ReadFact) {
+    let Some(emitter) = context.event_emitter() else {
+        return;
+    };
+    let mut event = FileReadEvent::new(context.call_id().clone(), path, fact.bytes_read);
+    if let Some((first_line, line_count, total_lines)) = fact.window {
+        event = event.with_line_window(first_line, line_count, total_lines);
+    }
+    if let Err(error) = emitter.emit_file(FileEvent::Read(event)) {
+        tracing::warn!(
+            path,
+            call_id = %context.call_id(),
+            %error,
+            "a file read could not be recorded on the host event channel"
+        );
+    }
+}
+
+/// What a completed read did, as the session record needs it.
+///
+/// Built by the branch that performed the read rather than derived from the result afterwards: a
+/// window the model asked for and a window this tool chose are indistinguishable once they are
+/// rendered, and only one of the two is a fact about the file.
+struct ReadFact {
+    bytes_read: u64,
+    /// First line (1-based), lines returned, and lines in the file, for a read that returned lines.
+    window: Option<(u32, u32, u32)>,
+}
+
+impl ReadFact {
+    /// A read of a whole file, with no line window to report.
+    fn whole(bytes_read: usize) -> Self {
+        Self {
+            bytes_read: as_u64(bytes_read),
+            window: None,
+        }
+    }
+
+    /// A read that returned `count` lines starting at zero-based `start`, from a file of `total`.
+    fn lines(bytes_read: usize, start: usize, count: usize, total: usize) -> Self {
+        Self {
+            bytes_read: as_u64(bytes_read),
+            window: Some((
+                as_u32(start.saturating_add(1)),
+                as_u32(count),
+                as_u32(total),
+            )),
+        }
+    }
+}
+
+fn as_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 type ReadResult<T> = std::result::Result<T, ReadFileFailure>;

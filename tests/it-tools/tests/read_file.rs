@@ -1,13 +1,17 @@
 //! R2-8 `read_file`: one multimodal read entry, plus the window and ceiling facts it reports.
 
-use std::io::Write as _;
+use std::{io::Write as _, sync::Arc};
 
 use ra_core::{
     agent::AgentSpec,
     context::RunContext,
+    event::{FileEvent, HostEventBody, HostEventSink, InMemoryHostEventSink},
     item::{AgentId, CallId},
-    state::RunId,
-    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolOutputBlock, TruncationStage},
+    state::{RunId, RunState},
+    tool::{
+        Tool, ToolConcurrency, ToolContext, ToolOutput, ToolOutputBlock, ToolServices,
+        TruncationStage,
+    },
 };
 use ra_tools::read_file::{ReadFileLimits, ReadFileTool};
 use serde_json::{Value, json};
@@ -691,4 +695,109 @@ async fn test_read_file_32() {
             .expect("a renderable schema");
         assert_eq!(again, first);
     }
+}
+
+/// A read leaves a fact on the host channel: which file, which lines, how much came off the disk.
+///
+/// Without it a session log can say what commands a run ran and not what files it read, and the
+/// version table this project declined to build was declined on the grounds that these events are
+/// the record instead.
+#[tokio::test]
+async fn test_a_read_is_recorded_on_the_host_event_channel() {
+    let dir = workspace("notes.txt", "alpha\nbravo\ncharlie\ndelta\n");
+    let tool = rooted(&dir);
+    let sink = Arc::new(InMemoryHostEventSink::new());
+    let services = ToolServices::new().with_event_sink(Arc::clone(&sink) as Arc<dyn HostEventSink>);
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("reader"))
+        .name("Reader")
+        .build()
+        .expect("an agent");
+    let state = RunState::start(RunId::new("run-read-file"));
+    let run = RunContext::new(RunId::new("run-read-file"), agent.as_ref())
+        .with_event_seq_allocator(state.restore_event_seq_allocator(None));
+    let call_id = CallId::new("call-read-1");
+    let arguments = json!({"path": "notes.txt", "offset": 2, "limit": 2});
+
+    tool.call(ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services))
+        .await
+        .expect("the read succeeds");
+
+    let events = sink.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let HostEventBody::File(FileEvent::Read(read)) = events[0].body() else {
+        panic!("a read must be recorded as a file read: {:?}", events[0]);
+    };
+    assert_eq!(read.call_id(), &call_id);
+    assert_eq!(read.path(), "notes.txt");
+    assert_eq!(read.first_line(), Some(2));
+    assert_eq!(read.line_count(), Some(2));
+    assert_eq!(read.total_lines(), Some(4));
+    assert_eq!(
+        read.bytes_read(),
+        26,
+        "the whole file was scanned to find the window, and that is what the record says"
+    );
+    assert!(
+        serde_json::to_string(&events[0]).is_ok(),
+        "the record has to survive the log it is written to"
+    );
+}
+
+/// Nothing is recorded when no host is listening, and the read still happens.
+#[tokio::test]
+async fn test_a_read_without_a_listening_host_still_reads() {
+    let dir = workspace("notes.txt", "alpha\n");
+    let tool = rooted(&dir);
+
+    let output = read(
+        &tool,
+        &json!({"path": "notes.txt", "offset": null, "limit": null}),
+    )
+    .await
+    .expect("the read succeeds");
+
+    assert!(output.as_text().expect("text output").contains("alpha"));
+}
+
+#[tokio::test]
+async fn test_read_event_counts_only_lines_delivered_after_truncation() {
+    let dir = workspace("notes.txt", "alpha\nbravo\ncharlie\ndelta\n");
+    let tool = rooted(&dir).with_limits(ReadFileLimits::new().with_max_output_bytes(1));
+    let sink = Arc::new(InMemoryHostEventSink::new());
+    let services = ToolServices::new().with_event_sink(Arc::clone(&sink) as Arc<dyn HostEventSink>);
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("reader"))
+        .name("Reader")
+        .build()
+        .expect("an agent");
+    let state = RunState::start(RunId::new("run-read-file"));
+    let run = RunContext::new(RunId::new("run-read-file"), agent.as_ref())
+        .with_event_seq_allocator(state.restore_event_seq_allocator(None));
+    let call_id = CallId::new("call-read-1");
+    let arguments = json!({"path": "notes.txt", "offset": 2, "limit": 2});
+
+    tool.call(ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services))
+        .await
+        .expect("the read succeeds");
+
+    let events = sink.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let HostEventBody::File(FileEvent::Read(read)) = events[0].body() else {
+        panic!("a read must be recorded as a file read: {:?}", events[0]);
+    };
+    assert_eq!(read.call_id(), &call_id);
+    assert_eq!(read.path(), "notes.txt");
+    assert_eq!(read.first_line(), Some(2));
+    assert_eq!(read.line_count(), Some(1));
+    assert_eq!(read.total_lines(), Some(4));
+    assert_eq!(
+        read.bytes_read(),
+        26,
+        "the whole file was scanned to find the window, and that is what the record says"
+    );
+    assert!(
+        serde_json::to_string(&events[0]).is_ok(),
+        "the record has to survive the log it is written to"
+    );
 }

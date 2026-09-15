@@ -15,6 +15,10 @@ use std::{fmt, io::Read as _, path::Path, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     error::Result,
+    event::{
+        FileEvent,
+        file::{FileChangeKind, FileChangedEvent},
+    },
     permission::PermissionScope,
     tool::{
         ResourceClaim, Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolInput as _,
@@ -133,7 +137,10 @@ impl Tool for ApplyPatchTool {
         let mut committed = CommittedPatchDelta::empty();
         for action in plan.actions() {
             match self.apply_action(action, &committed) {
-                Ok(delta) => committed = delta,
+                Ok(delta) => {
+                    record_change(&context, action, &committed, &delta);
+                    committed = delta;
+                }
                 Err(error) => return Ok(ToolOutput::text(render_stop(&committed, &error))),
             }
         }
@@ -233,6 +240,89 @@ impl ApplyPatchTool {
             PatchToolFailure::Message(format!("`{}` is not UTF-8 text", path.display()))
         })
     }
+}
+
+/// Records one committed change on the host's event channel, as it lands.
+///
+/// **Per action, not per patch.** Application is best effort: three files written and the
+/// fourth refused is three files changed, and a record written once at the end would describe
+/// that run as having changed nothing — while the three files sit changed on disk. A channel
+/// that refuses the record says so in the log rather than silently, for the same reason: the
+/// write has already happened, and a log that quietly disagrees with the filesystem is worse
+/// than no log.
+fn record_change(
+    context: &ToolContext<'_>,
+    action: &PatchAction,
+    before: &CommittedPatchDelta,
+    after: &CommittedPatchDelta,
+) {
+    let Some(emitter) = context.event_emitter() else {
+        return;
+    };
+    // An action this build cannot name is an action it could not have applied — `apply_action`
+    // refuses those — so there is nothing committed here to record.
+    let Some(change) = FileChange::of(action) else {
+        return;
+    };
+    let mut event = FileChangedEvent::new(
+        context.call_id().clone(),
+        change.path.display().to_string(),
+        change.kind,
+    )
+    .with_line_counts(
+        as_u64(after.lines_added().saturating_sub(before.lines_added())),
+        as_u64(after.lines_removed().saturating_sub(before.lines_removed())),
+    );
+    if let Some(destination) = change.moved_to {
+        event = event.with_moved_to(destination.display().to_string());
+    }
+    if let Err(error) = emitter.emit_file(FileEvent::Changed(event)) {
+        tracing::warn!(
+            path = %change.path.display(),
+            call_id = %context.call_id(),
+            %error,
+            "a committed file change could not be recorded on the host event channel"
+        );
+    }
+}
+
+/// What one committed action did, as the session record needs it.
+struct FileChange<'a> {
+    path: &'a Path,
+    kind: FileChangeKind,
+    moved_to: Option<&'a Path>,
+}
+
+impl<'a> FileChange<'a> {
+    fn of(action: &'a PatchAction) -> Option<Self> {
+        match action {
+            PatchAction::AddFile { path, .. } => Some(Self {
+                path,
+                kind: FileChangeKind::Added,
+                moved_to: None,
+            }),
+            PatchAction::UpdateFile { path, .. } => Some(Self {
+                path,
+                kind: FileChangeKind::Updated,
+                moved_to: None,
+            }),
+            PatchAction::DeleteFile { path } => Some(Self {
+                path,
+                kind: FileChangeKind::Deleted,
+                moved_to: None,
+            }),
+            PatchAction::MoveFile { from, to } => Some(Self {
+                path: from,
+                kind: FileChangeKind::Moved,
+                moved_to: Some(to),
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn append_delta(
