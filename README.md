@@ -100,6 +100,17 @@ stays free of test-only crates. Run them, along with the repository's gates, wit
 cargo xtask all
 ```
 
+A command is only confined if the platform's sandbox backend actually works — Seatbelt
+on macOS, bubblewrap on Linux. This reports what will confine commands here and then
+proves it, by writing outside the workspace and reaching for the network on purpose:
+
+```bash
+cargo run -p ra-cli --bin ra -- doctor sandbox
+```
+
+It exits non-zero when it cannot conclude that this machine confines a command, and
+distinguishes "not confined" from "could not be checked" in its output.
+
 ## Acknowledgements
 
 This project draws conceptual inspiration from the

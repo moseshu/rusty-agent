@@ -43,6 +43,40 @@ demands its host the same day. `it-e2e/tests/workspace_contract.rs` uses that sa
 derivation to assert the inverse — workspace isolation, zero inline tests, and the
 modern `foo.rs + foo/` module layout.
 
+## The `test-api` feature
+
+Two crates (`ra-exec`, `ra-coding`) carry a `test-api` feature whose only contents are
+thin re-exports of private functions, gated as `#[cfg(feature = "test-api")] pub mod
+test_api`. It exists because the alternative is worse in both directions: making those
+functions `pub` puts them in the public surface forever, and leaving them private means
+the behaviour nobody can reach is also the behaviour nobody can protect.
+
+What it is *for* is narrow, and both current cases are the same shape — **code that
+cannot be exercised from a test on the machine most people are sitting at**:
+
+- `ra-exec::sandbox::bwrap::test_api` — the Linux BPF filter and the descriptor that
+  carries it to bubblewrap. Neither compiles on macOS. Before this door existed, the
+  line that attaches the syscall policy could be deleted and every test on every
+  platform still passed.
+- `ra-coding::doctor::test_api` — fault injection for the sandbox self-check: a probe
+  shell that does not exist, one that lies, one that never finishes. Each is a way the
+  check used to report a pass it had not earned, and none can be produced by calling
+  the public entry point.
+
+Three rules keep it from turning into a second API:
+
+1. **Re-exports only.** No logic lives in a `test_api` module; if a helper is worth
+   writing, it is worth writing where the code is and re-exporting.
+2. **It is not a workaround for an awkward public API.** If a test wants something
+   because a *caller* would want it too, that is a missing public method, not a door.
+3. **`--all-features` compiles it.** The `feature-matrix` gate covers both extremes, so
+   a `test_api` that stops compiling fails CI like anything else.
+4. **It lands in the public-surface baseline.** `cargo xtask public-api` parses source
+   rather than compiling, so it records a `test_api` item even on a platform where the
+   module is `cfg`'d out — which is the point: widening the door shows up as a baseline
+   diff in review instead of passing unnoticed. (`ra-coding` has no baseline, being a
+   product nothing depends on, so its door is reviewed the ordinary way.)
+
 ## Running
 
 ```bash
