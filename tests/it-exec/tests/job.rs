@@ -431,10 +431,18 @@ async fn test_retention_evicts_around_a_watched_job() {
 }
 
 /// Runs a command to completion and returns a handle to its retained session.
+///
+/// **The command is delayed on purpose.** A job handle exists only for a result that yielded, so
+/// this has to see `Yielded` before it can wait for `Done` — and `printf x` against a 1 ms yield
+/// timeout is a coin flip: when the supervisor reaps the child inside that millisecond the result is
+/// `Completed`, there is no session to hand back, and the assertion in [`start_job_with`] fails for
+/// reasons that have nothing to do with the test that called this. Measured at roughly one run in
+/// ten. The delay makes yielding a certainty; every caller here is asking about what happens *after*
+/// the command finishes, so none of them cares that it started 50 ms later.
 async fn run_to_completion(manager: Arc<ProcessManager>, command: &str) -> BackgroundJob {
     let job = start_job_with(
         Arc::clone(&manager),
-        command,
+        &format!("sleep 0.05; {command}"),
         ExecLimits::new().with_initial_yield_timeout(Duration::from_millis(1)),
     )
     .await;
