@@ -66,6 +66,9 @@ cap-std = "4.0.2"
 # 代码面。`process` 是取消契约要的那一半：只杀 leader 会留下孤儿，`kill_process_group`
 # 才能让 SIGTERM → 宽限期 → SIGKILL 落到整个进程组。
 rustix = { version = "1", features = ["fs", "process"] }
+# `doctor sandbox` 要一个不可预测名字、0o700、随句柄删除的目录：它拿自己造的目录当靶子，
+# 而可预测的路径在共享 /tmp 上既能被抢先创建，也不能拿去做递归删除。
+tempfile = "3"
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }

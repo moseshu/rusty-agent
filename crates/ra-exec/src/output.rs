@@ -6,7 +6,7 @@ use ra_core::compat::{SchemaVersion, Unknown};
 pub use ra_core::event::exec::ExecEvictionReason;
 use serde::{Deserialize, Serialize};
 
-use crate::EXEC_SCHEMA_VERSION;
+use crate::{EXEC_SCHEMA_VERSION, sandbox::SandboxReport};
 
 const fn default_schema_version() -> SchemaVersion {
     EXEC_SCHEMA_VERSION
@@ -50,6 +50,13 @@ pub struct ExecOutputSummary {
     exit_code: Option<i32>,
     #[serde(default)]
     is_truncated: bool,
+    /// What confined the command, when the executor was asked to confine it.
+    ///
+    /// Absent in records written before this field existed, and absent is not "unconfined": a
+    /// record from an older build has nothing to say either way, while a command that really ran
+    /// with no backend says so with [`crate::sandbox::SandboxLevel::Unconfined`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<SandboxReport>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -72,8 +79,22 @@ impl ExecOutputSummary {
             duration_ms: 0,
             exit_code: None,
             is_truncated: false,
+            sandbox: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records what confined the command this summary describes.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: SandboxReport) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// What confined the command, when the executor was asked to confine it.
+    #[must_use]
+    pub const fn sandbox(&self) -> Option<&SandboxReport> {
+        self.sandbox.as_ref()
     }
 
     /// Sets the byte count for standard output.

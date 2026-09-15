@@ -54,6 +54,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install sandbox test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       # 只有 FAIL 让这一步变红；被测对象尚未存在的几条报 SKIP 并在汇总里计数，
       # 每次 CI 输出都会提醒还欠几条。
       - name: 九条门禁

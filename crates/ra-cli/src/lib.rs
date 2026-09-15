@@ -25,6 +25,18 @@ use ra_coding::prompt::dump::{
 /// it is distinguished from the code a real error exits with.
 const EXIT_PREFIX_CHANGED: u8 = 1;
 
+/// Exit code for a `doctor` run that could not conclude the machine is sound.
+///
+/// Its own code rather than [`EXIT_PREFIX_CHANGED`]: a script that runs both would otherwise have
+/// to parse the output to tell "the prompt moved" from "this machine cannot confine a command",
+/// which are answers with nothing in common.
+///
+/// **One code covers both ways of not being sound.** `doctor sandbox` distinguishes "not confined"
+/// from "could not be verified", and the distinction belongs in the report a person reads; a caller
+/// that must not run unconfined acts identically on the two, and a third status would only invite
+/// scripts to treat one of them as success.
+const EXIT_CHECK_FAILED: u8 = 2;
+
 /// How a command concluded, before it becomes a process exit code.
 ///
 /// [`ExitCode`] is neither comparable nor constructible back into a number, so a command that only
@@ -37,6 +49,8 @@ pub enum CommandOutcome {
     Succeeded,
     /// `prompt dump --baseline` found the stable prefix had moved.
     PrefixChanged,
+    /// A `doctor` run could not conclude that this machine does what it should.
+    CheckFailed,
 }
 
 impl CommandOutcome {
@@ -46,6 +60,7 @@ impl CommandOutcome {
         match self {
             Self::Succeeded => ExitCode::SUCCESS,
             Self::PrefixChanged => ExitCode::from(EXIT_PREFIX_CHANGED),
+            Self::CheckFailed => ExitCode::from(EXIT_CHECK_FAILED),
         }
     }
 }
@@ -99,7 +114,19 @@ enum Command {
         command: PromptCommand,
     },
     /// Environment self-check: config / sandbox / prompt / mcp / provider.
-    Doctor,
+    Doctor {
+        #[command(subcommand)]
+        command: Option<DoctorCommand>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DoctorCommand {
+    /// Reports what will confine this machine's commands, and proves it by trying to escape.
+    ///
+    /// Exits 2 when a check fails, so that a machine whose sandbox does not work fails a pipeline
+    /// rather than printing a warning nobody reads.
+    Sandbox,
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,11 +211,26 @@ pub async fn execute(cli: Cli) -> anyhow::Result<CommandOutput> {
         Command::Prompt {
             command: PromptCommand::Dump(args),
         } => execute_prompt_dump(&args).await,
-        Command::Doctor => {
-            tracing::info!("doctor 尚未实现");
-            Ok(CommandOutput::new("", CommandOutcome::Succeeded))
+        Command::Doctor {
+            command: Some(DoctorCommand::Sandbox),
+        } => execute_doctor_sandbox().await,
+        Command::Doctor { command: None } => {
+            // The other checks belong to their own tasks; only the sandbox one exists, and a
+            // bare `doctor` that silently reported nothing would read as "all clear".
+            tracing::info!("doctor 的其余自检尚未实现，先跑 `ra doctor sandbox`");
+            execute_doctor_sandbox().await
         }
     }
+}
+
+async fn execute_doctor_sandbox() -> anyhow::Result<CommandOutput> {
+    let (report, doctor) = ra_coding::doctor::render_sandbox_doctor().await?;
+    let outcome = if doctor.is_healthy() {
+        CommandOutcome::Succeeded
+    } else {
+        CommandOutcome::CheckFailed
+    };
+    Ok(CommandOutput::new(report, outcome))
 }
 
 async fn execute_prompt_dump(args: &DumpArgs) -> anyhow::Result<CommandOutput> {

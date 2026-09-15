@@ -20,6 +20,7 @@ pub mod assembly;
 pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub mod dangerous_action;
+pub mod doctor;
 pub(crate) mod final_answer;
 pub mod host;
 pub mod profile;
