@@ -10,6 +10,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-api = []
+
 [dependencies]
 ra-core = { workspace = true }
 ra-runtime = { workspace = true }
@@ -28,3 +31,4 @@ tracing = { workspace = true }
 schemars = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
+tempfile = { workspace = true }

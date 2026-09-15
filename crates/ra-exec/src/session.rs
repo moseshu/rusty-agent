@@ -55,7 +55,7 @@ use tokio::{
 use crate::{
     command::{ExecCursor, ExecLimits, ExecRequest},
     output::{ExecOutputSummary, HeadTailBuffer, RetainedRead},
-    sandbox::ExecEnvironment,
+    sandbox::{Confinement, ExecEnvironment, SandboxCommand},
     tmpdir::{TMPDIR_ENV_VAR, TempDirUse},
 };
 
@@ -224,6 +224,17 @@ pub enum ExecError {
         /// What the scratch directory refused, with its own chain intact.
         #[source]
         source: crate::tmpdir::TempDirError,
+    },
+    /// The confinement the host asked for could not be set up, so nothing was started.
+    ///
+    /// Its own variant rather than a [`Self::Spawn`] with a cause: no process was launched and the
+    /// command is not why. A caller reading "cannot start `rm -rf build`" would go looking at the
+    /// command line for a fault that is in the host's sandbox configuration or in the machine.
+    #[error("cannot confine the command as this host requires")]
+    Sandbox {
+        /// What the sandbox refused, with its own chain intact.
+        #[source]
+        source: crate::sandbox::SandboxError,
     },
     /// No session with that identifier is known to this manager.
     #[error("execution session `{session_id}` is not known")]
@@ -397,6 +408,9 @@ struct ExecSession {
     /// Set only after the child is reaped and output readers have stopped or been bounded away.
     closed: bool,
     closed_notify: Arc<Notify>,
+    /// What confined this command, recorded once the process exists so that every summary the
+    /// session produces — completed, yielded, or read back later — carries the same answer.
+    sandbox: Option<crate::sandbox::SandboxReport>,
 }
 
 impl ExecSession {
@@ -419,6 +433,7 @@ impl ExecSession {
             exit_notify: Arc::new(Notify::new()),
             closed: false,
             closed_notify: Arc::new(Notify::new()),
+            sandbox: None,
         }
     }
 
@@ -471,6 +486,9 @@ impl ExecSession {
         .with_truncated(self.stdout_buffer.is_truncated() || self.stderr_buffer.is_truncated());
         if let Some(code) = self.exit_code {
             summary = summary.with_exit_code(code);
+        }
+        if let Some(sandbox) = &self.sandbox {
+            summary = summary.with_sandbox(sandbox.clone());
         }
         summary
     }
@@ -776,6 +794,33 @@ impl ProcessManager {
         &self.limits
     }
 
+    /// Works out what will confine this command and what the command line becomes under it.
+    ///
+    /// Resolved per command rather than once per manager, because the inputs are per command: the
+    /// policy and the run's scratch directory both belong to the environment at the moment the
+    /// command starts, and a manager-wide answer computed at construction would be stale for any
+    /// host that changes either.
+    ///
+    /// **It is not what catches a sandbox that disappears mid-run.** Whether a backend can run here
+    /// is probed once per process, so a binary removed after the first command is not noticed by
+    /// this call. What covers that case is the spawn itself: the wrapped command line names the
+    /// backend's program, and executing a program that is no longer there fails the command. The
+    /// invariant held is "never quietly unconfined", not "always freshly probed".
+    ///
+    /// Wrapping happens here too, rather than inside the spawn, so that a policy the backend cannot
+    /// express — an unresolvable root, say — is reported as the sandbox failure it is rather than as
+    /// a command that would not start.
+    fn confine(&self, request: &ExecRequest) -> Result<(Confinement, SandboxCommand), ExecError> {
+        let confinement = self
+            .environment
+            .resolve_confinement()
+            .map_err(|source| ExecError::Sandbox { source })?;
+        let launched = confinement
+            .apply(shell_invocation(request))
+            .map_err(|source| ExecError::Sandbox { source })?;
+        Ok((confinement, launched))
+    }
+
     /// Spawns and executes a command according to the given request.
     ///
     /// If the process completes within the effective initial yield timeout, it returns
@@ -835,7 +880,16 @@ impl ProcessManager {
             }
         };
 
-        let mut child = match spawn_child(&request, &self.environment) {
+        let (confinement, launched) = match self.confine(&request) {
+            Ok(confined) => confined,
+            Err(error) => {
+                self.abandon_unstarted(&session_id, &session, &error.to_string())
+                    .await;
+                return Err(error);
+            }
+        };
+
+        let mut child = match spawn_child(&request, &self.environment, &launched) {
             Ok(child) => child,
             Err(error) => {
                 self.abandon_unstarted(&session_id, &session, &error.to_string())
@@ -859,6 +913,7 @@ impl ProcessManager {
             sess.started_at = Some(Instant::now());
             sess.last_active_at = Instant::now();
             sess.pid = pid;
+            sess.sandbox = Some(confinement.report());
             *sess.child_stdin.lock().await = child_stdin;
             sess.terminate = Some(terminate_tx);
             (Arc::clone(&sess.exit_notify), Arc::clone(&sess.child_stdin))
@@ -1901,18 +1956,32 @@ fn emit_output(
     ));
 }
 
-/// Builds and starts the child process for a request.
-fn spawn_child(request: &ExecRequest, environment: &ExecEnvironment) -> std::io::Result<Child> {
+/// The shell invocation a request asks for, before any backend wraps it.
+fn shell_invocation(request: &ExecRequest) -> SandboxCommand {
     let shell = request.shell().unwrap_or_else(|| Path::new(DEFAULT_SHELL));
-    let mut cmd = Command::new(shell);
+    let mut args: Vec<String> = Vec::new();
     if request.login() {
-        cmd.arg("-l");
+        args.push("-l".to_owned());
     }
-    cmd.arg("-c");
-    cmd.arg(request.command());
+    args.push("-c".to_owned());
+    args.push(request.command().to_owned());
     // POSIX gives the words after the command string to the shell as `$0`, `$1`, and so on, which
     // is the only way a caller can pass data to a command without it going through quoting.
-    cmd.args(request.args());
+    args.extend(request.args().iter().cloned());
+    SandboxCommand::new(shell, args)
+}
+
+/// Builds and starts the child process for a request.
+///
+/// `launched` is the command after any backend has wrapped it. Everything else this function sets
+/// up — the scrubbed environment, the resource ceilings, the process group — is installed on
+/// whatever ends up being executed, so it holds whether or not a backend is in front of it.
+fn spawn_child(
+    request: &ExecRequest,
+    environment: &ExecEnvironment,
+    launched: &SandboxCommand,
+) -> std::io::Result<Child> {
+    let mut cmd = Command::from(launched.prepare()?);
 
     // The directory a process *starts* in. It is not a boundary, and the baseline backend's docs
     // say so at length: the first `cd ..` leaves it.
