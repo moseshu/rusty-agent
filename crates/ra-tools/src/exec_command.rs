@@ -33,6 +33,7 @@ use std::{
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
+    event::exec::ExecSessionId,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool, ToolApprovalPolicy,
         ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
@@ -43,11 +44,13 @@ use ra_exec::{
     command::{ExecLimits, ExecRequest},
     fs::{RootedFileSystem, Workspace},
     output::ExecOutputSummary,
-    session::{ExecError, ExecExecutionResult, ProcessManager},
+    session::{ExecError, ExecExecutionResult, ExecSessionState, ProcessManager},
 };
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+use crate::session_return::{ReturnReason, SessionReturn, Watched};
 
 /// The advertised name. Identity and schema must agree on it or [`Tool::validate`] refuses.
 const TOOL_NAME: &str = "exec_command";
@@ -357,6 +360,9 @@ impl Tool for ExecCommandTool {
         let request = self
             .request(input)
             .map_err(ExecCommandFailure::into_error)?;
+        // Read before the request is handed over, because the yielded result reports how long it
+        // waited and the effective figure is the one the request carries, not the one asked for.
+        let yielded_after = request.limits().initial_yield_timeout();
 
         let emitter = context.event_emitter();
         let outcome = self
@@ -389,7 +395,7 @@ impl Tool for ExecCommandTool {
                         as_u64(summary.stderr_bytes()),
                     )
                     .await;
-                yielded_output(&session_id.to_string(), &summary)
+                yielded_output(&session_id, &summary, yielded_after)
             }
             // `ExecExecutionResult` is `#[non_exhaustive]`, so the wildcard is mandatory. A result
             // this build cannot name is still a result, and answering the call is what keeps the
@@ -453,33 +459,44 @@ fn completed_output(summary: &ExecOutputSummary) -> ToolOutput {
 }
 
 /// Renders a command that was still running when the yield timeout elapsed.
-fn yielded_output(session_id: &str, summary: &ExecOutputSummary) -> ToolOutput {
-    let captured = render_streams(summary);
-    let body = if captured.is_empty() {
-        format!("Command is still running and has produced no output yet (session {session_id}).")
-    } else {
-        format!("Command is still running (session {session_id}). Output so far:\n\n{captured}")
-    };
-
-    let metadata = with_truncation(
-        ObservationMetadata::new().with_guidance(format!(
-            "The command is running in the background as session `{session_id}`; send input to it or collect the rest of its output with that identifier."
-        )),
-        summary,
-    );
-    ToolOutput::text(body).with_metadata(metadata)
+///
+/// Said in the same vocabulary `write_stdin` uses, because it is the same news: here is some output,
+/// here is where the session stands, and here is whether that output is all of it. The model reads
+/// both results in one conversation and cannot tell a difference in wording from a difference in
+/// what happened.
+fn yielded_output(
+    session_id: &ExecSessionId,
+    summary: &ExecOutputSummary,
+    waited: Duration,
+) -> ToolOutput {
+    // A yield snapshot predates closeout. Keep that observation even if the process has since
+    // finished: only a subsequent poll can deliver the bytes produced after this snapshot.
+    SessionReturn {
+        session_id,
+        watched: Watched::Closeout,
+        waited,
+        reason: ReturnReason::Timeout,
+        state: ExecSessionState::Running,
+        closed: false,
+        exit_code: summary.exit_code(),
+        stdout: summary.stdout().to_owned(),
+        stderr: summary.stderr().to_owned(),
+        matched: None,
+        // This first delivery carries everything the session has produced, so the whole capture is
+        // the span it covers and the whole capture's loss is the span's loss.
+        delivered_bytes: as_u64(summary.total_bytes()),
+        omitted_bytes: as_u64(
+            summary
+                .total_bytes()
+                .saturating_sub(summary.retained_bytes()),
+        ),
+    }
+    .render()
 }
 
 /// Joins the two streams, labelling stderr only when there is something on both.
 fn render_streams(summary: &ExecOutputSummary) -> String {
-    let stdout = summary.stdout().trim();
-    let stderr = summary.stderr().trim();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => stdout.to_owned(),
-        (true, false) => stderr.to_owned(),
-        (false, false) => format!("{stdout}\n\n--- stderr ---\n{stderr}"),
-    }
+    crate::session_return::render_streams(summary.stdout().trim(), summary.stderr().trim())
 }
 
 /// Records what the capture ceiling cut, in source bytes on both sides of the pair.

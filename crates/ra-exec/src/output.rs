@@ -364,6 +364,21 @@ impl HeadTailBuffer {
         Some((text, self.total_bytes))
     }
 
+    /// Bytes this buffer dropped inside the span a read from `offset` covers.
+    ///
+    /// The companion number to [`Self::read_from`], which announces the same gap in prose. A caller
+    /// delivering one span at a time needs it separately: what its result lost is a fact about that
+    /// span, and the buffer's lifetime totals describe a different, larger thing.
+    #[must_use]
+    pub fn omitted_from(&self, offset: usize) -> usize {
+        if offset >= self.total_bytes {
+            return 0;
+        }
+        let head_end = self.head.len();
+        let tail_start = self.total_bytes.saturating_sub(self.tail.len());
+        tail_start.saturating_sub(head_end.max(offset))
+    }
+
     /// Reads retained content at or after `offset`, reporting a gap rather than describing one.
     ///
     /// The companion to [`Self::read_from`] for a caller that searches the output instead of

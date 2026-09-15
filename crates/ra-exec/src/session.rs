@@ -21,6 +21,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -310,6 +311,45 @@ enum TerminalOutcome {
     Evicted(ExecEvictionReason),
 }
 
+/// One span of a session's output, and what the capture ceiling cost that span.
+///
+/// The omitted count belongs to the span rather than to the session: a caller delivering output
+/// incrementally reports what *this* delivery lost, and the session's lifetime totals are a
+/// different, larger number that would overstate every poll after the first.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ExecRead {
+    text: String,
+    next: ExecCursor,
+    omitted_bytes: usize,
+}
+
+impl ExecRead {
+    /// The output text, carrying an omission marker wherever the capture ceiling dropped bytes.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Takes the output text.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Where a following read of this stream resumes.
+    #[must_use]
+    pub const fn next(&self) -> &ExecCursor {
+        &self.next
+    }
+
+    /// Bytes the capture ceiling dropped inside this span.
+    #[must_use]
+    pub const fn omitted_bytes(&self) -> usize {
+        self.omitted_bytes
+    }
+}
+
 struct ExecSession {
     state: ExecSessionState,
     stdout_buffer: HeadTailBuffer,
@@ -331,6 +371,7 @@ struct ExecSession {
     /// while the model has one shared `write_stdin` conversation with a session. Keeping the
     /// latter here means a command can finish between two model calls without its unread tail
     /// being mistaken for output that was already delivered.
+    interaction: Arc<Mutex<()>>,
     interactive_stdout_cursor: u64,
     interactive_stderr_cursor: u64,
     output_notify: Arc<Notify>,
@@ -353,6 +394,7 @@ impl ExecSession {
             child_stdin: Arc::new(Mutex::new(None)),
             terminate: None,
             exit_code: None,
+            interaction: Arc::new(Mutex::new(())),
             interactive_stdout_cursor: 0,
             interactive_stderr_cursor: 0,
             output_notify: Arc::new(Notify::new()),
@@ -473,6 +515,14 @@ struct RegistryState {
 
 struct SessionRegistry {
     state: Mutex<RegistryState>,
+    /// How many sessions are waiting on each session, for the two policies that would otherwise
+    /// take a session away from the caller watching it.
+    ///
+    /// A blocking lock rather than the asynchronous one above, for two reasons: it is never held
+    /// across an await, and a guard that releases its watch on drop cannot await anything. Keeping
+    /// it out of [`RegistryState`] is what lets the retirement path consult it while already
+    /// holding that lock.
+    watched: std::sync::Mutex<HashMap<ExecSessionId, usize>>,
     /// How many finished sessions stay readable before the oldest is dropped.
     retention: usize,
     /// Fires whenever a session leaves the active set, so a caller waiting for room can stop
@@ -488,9 +538,45 @@ impl SessionRegistry {
                 active: VecDeque::new(),
                 retired: VecDeque::new(),
             }),
+            watched: std::sync::Mutex::new(HashMap::new()),
             retention,
             retired_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Records that someone is waiting on this session until the returned guard is dropped.
+    fn watch(self: &Arc<Self>, session_id: &ExecSessionId) -> SessionWatch {
+        *self
+            .watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_insert(0) += 1;
+        SessionWatch {
+            registry: Arc::clone(self),
+            session_id: session_id.clone(),
+        }
+    }
+
+    fn end_watch(&self, session_id: &ExecSessionId) {
+        let mut watched = self
+            .watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = watched.get_mut(session_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                watched.remove(session_id);
+            }
+        }
+    }
+
+    /// Whether anything is currently waiting on this session.
+    fn is_watched(&self, session_id: &ExecSessionId) -> bool {
+        self.watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(session_id)
     }
 
     async fn register(&self, session_id: ExecSessionId, session: Arc<Mutex<ExecSession>>) {
@@ -528,7 +614,15 @@ impl SessionRegistry {
             }
             state.retired.push_back(session_id.clone());
             while state.retired.len() > self.retention {
-                if let Some(dropped) = state.retired.pop_front() {
+                // A session someone is waiting on keeps its place, and the next oldest unwatched
+                // one goes instead. The wait is about to return that session's final output, and
+                // dropping it here would turn a result the caller had already earned into "no such
+                // session". When every retired session is being watched the window stays over full
+                // until one of those waits ends, which is bounded by the waits themselves.
+                let Some(index) = state.retired.iter().position(|id| !self.is_watched(id)) else {
+                    break;
+                };
+                if let Some(dropped) = state.retired.remove(index) {
                     state.sessions.remove(&dropped);
                 }
             }
@@ -543,6 +637,49 @@ impl SessionRegistry {
 
     fn retirement_signal(&self) -> Arc<Notify> {
         Arc::clone(&self.retired_notify)
+    }
+}
+
+/// Declares that a caller is waiting on one session, for as long as this value lives.
+///
+/// Two policies exist to take a session away from a caller who stopped caring: the idle sweep and
+/// the retention window. Neither should fire against a session someone is waiting on right now —
+/// the first would kill the process the caller is waiting for, and the second would discard the
+/// answer. Neither exemption reaches the total deadline or an explicit cancellation: those are
+/// about the command itself rather than about whether anyone is still interested.
+pub struct SessionWatch {
+    registry: Arc<SessionRegistry>,
+    session_id: ExecSessionId,
+}
+
+impl fmt::Debug for SessionWatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionWatch")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SessionWatch {
+    fn drop(&mut self) {
+        self.registry.end_watch(&self.session_id);
+    }
+}
+
+/// Holds one session's interactive turn: reading its delivery positions, acting, and advancing them.
+///
+/// Opaque rather than the lock it holds. Every handle this crate hands out is its own type, and the
+/// one exception would be this one — returning the runtime's guard directly would make which async
+/// runtime `ra-exec` happens to use, and which version of it, part of this crate's public contract
+/// for callers that only ever pass the value back to a `drop`.
+pub struct InteractionGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl fmt::Debug for InteractionGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("InteractionGuard").finish()
     }
 }
 
@@ -810,6 +947,14 @@ impl ProcessManager {
         Some(state)
     }
 
+    /// Declares that the caller is waiting on this session until the guard is dropped.
+    ///
+    /// See [`SessionWatch`] for what the declaration buys and what it deliberately does not.
+    #[must_use]
+    pub fn watch_session(&self, session_id: &ExecSessionId) -> SessionWatch {
+        self.registry.watch(session_id)
+    }
+
     /// Returns one coherent lifecycle state and output-summary snapshot for a retained session.
     ///
     /// This is crate-visible because the background-job facade needs to report both facts from the
@@ -993,6 +1138,31 @@ impl ProcessManager {
         ))
     }
 
+    /// Serializes interactive input and output delivery for one session.
+    ///
+    /// Control signals must be sent before acquiring this guard so blocked input cannot prevent
+    /// cancellation. Callers should bound acquisition when a control signal may be ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::UnknownSession`] if the manager no longer retains the identifier.
+    pub async fn lock_interaction(
+        &self,
+        session_id: &ExecSessionId,
+    ) -> Result<InteractionGuard, ExecError> {
+        let session =
+            self.registry
+                .get(session_id)
+                .await
+                .ok_or_else(|| ExecError::UnknownSession {
+                    session_id: session_id.clone(),
+                })?;
+        let lock = Arc::clone(&session.lock().await.interaction);
+        Ok(InteractionGuard {
+            _guard: lock.lock_owned().await,
+        })
+    }
+
     /// Records output through these positions as delivered by the interactive tool.
     ///
     /// Positions advance only and are clamped to output the session has actually produced. That
@@ -1041,7 +1211,7 @@ impl ProcessManager {
         &self,
         session_id: &ExecSessionId,
         cursor: ExecCursor,
-    ) -> Result<Option<(String, ExecCursor)>, ExecError> {
+    ) -> Result<Option<ExecRead>, ExecError> {
         let session =
             self.registry
                 .get(session_id)
@@ -1065,11 +1235,16 @@ impl ProcessManager {
         let Some((text, next_offset)) = buffer.read_from(offset) else {
             return Ok(None);
         };
+        let omitted_bytes = buffer.omitted_from(offset);
         // A poll is interaction: a session someone is reading from is not an idle session, and the
         // idle sweep would otherwise take it away while it was being watched.
         sess.last_active_at = Instant::now();
         let next = ExecCursor::new(cursor.stream(), next_offset as u64);
-        Ok(Some((text, next)))
+        Ok(Some(ExecRead {
+            text,
+            next,
+            omitted_bytes,
+        }))
     }
 
     /// Waits until either output stream advances beyond the supplied cursors, the session exits,
@@ -1385,10 +1560,19 @@ async fn watch_process(
                 hard_kill_at = Some(begin_termination(child, context.pid, &mut outcome));
             }
             () = sleep_until(idle_at) => {
+                // A session someone is waiting on is not idle, whatever its output has been doing.
+                // The sweep exists to reclaim processes nobody is watching any more; firing it into
+                // a wait would kill the very process that wait is about, and hand the caller an
+                // expiry in place of the answer it asked for. Read before the session lock is
+                // taken, because that is the order every other path here takes these two.
+                let watched = context.registry.is_watched(&context.session_id);
                 // Re-checked against the session rather than trusted: output and interactive input
                 // both count as activity, and either may have arrived since this timer was armed.
                 let idle_for = {
-                    let sess = context.session.lock().await;
+                    let mut sess = context.session.lock().await;
+                    if watched {
+                        sess.last_active_at = Instant::now();
+                    }
                     Instant::now().saturating_duration_since(sess.last_active_at)
                 };
                 match context.idle_timeout.and_then(|limit| limit.checked_sub(idle_for)) {

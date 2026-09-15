@@ -402,15 +402,17 @@ async fn test_process_manager_stdin_and_cursor_read() {
         .expect("write succeeds");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (text, next_cursor) = manager
+    let read = manager
         .read_output(&session_id, ExecCursor::stdout_start())
         .await
         .expect("reading output succeeds")
         .expect("the echoed line has arrived");
-    assert!(text.contains("interactive line 1"));
-    assert_eq!(next_cursor.offset(), text.len() as u64);
+    assert!(read.text().contains("interactive line 1"));
+    assert_eq!(read.next().offset(), read.text().len() as u64);
+    assert_eq!(read.omitted_bytes(), 0, "nothing was cut from this span");
 
     // A second read from the returned cursor has nothing to add.
+    let next_cursor = *read.next();
     assert!(
         manager
             .read_output(&session_id, next_cursor)
