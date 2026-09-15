@@ -1,10 +1,16 @@
-//! Background job lifecycle plus `wait{until: done|timeout|match}`.
+//! Background job lifecycle plus `wait{until: output|done|timeout|match}`.
 //!
 //! A background job is a view of one execution session, not a second process owner. The
 //! [`ProcessManager`](crate::session::ProcessManager) that started the command remains solely
 //! responsible for its child, process group, capture buffers, deadlines, and termination. This
-//! module adds the consumer-side lifecycle contract: inspect a job, wait for it to finish, wait
-//! for a bounded interval, or stop when retained output contains a literal string.
+//! module adds the consumer-side lifecycle contract: inspect a job, wait for new output, wait for
+//! it to finish, wait for a bounded interval, or stop when retained output contains a literal
+//! string.
+//!
+//! Every wait here declares itself to the session for as long as it runs, so that the two policies
+//! that reclaim sessions nobody is watching — the idle sweep and the retention window — do not fire
+//! against the one session a caller is waiting on. Neither the total deadline nor an explicit
+//! cancellation is affected: those are about the command, not about who is still interested.
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -14,6 +20,7 @@ use crate::{
     output::{ExecOutputSummary, RetainedRead},
     session::{
         ExecExecutionResult, ExecSessionState, ProcessManager, SessionCloseWait, SessionSnapshot,
+        SessionWatch,
     },
 };
 
@@ -69,6 +76,17 @@ impl BackgroundJob {
         &self.session_id
     }
 
+    /// Declares that this job is being worked with until the returned guard is dropped.
+    ///
+    /// Each wait below takes one of these for its own duration. A caller doing more than waiting —
+    /// reading the output it just waited for, then recording how much of it was delivered — wants
+    /// one across the whole sequence, because the session has to still be there for the steps that
+    /// follow the wait, not only for the wait itself.
+    #[must_use]
+    pub fn watch(&self) -> SessionWatch {
+        self.process_manager.watch_session(&self.session_id)
+    }
+
     /// Returns the current state and output captured for this job from one instant.
     ///
     /// # Errors
@@ -118,10 +136,53 @@ impl BackgroundJob {
             JobWaitUntil::Done => self.wait_for_done(None).await,
             JobWaitUntil::Timeout(timeout) => self.wait_for_done(Some(timeout)).await,
             JobWaitUntil::Match { text, timeout } => self.wait_for_match(text, timeout).await,
+            JobWaitUntil::Output {
+                delivered_stdout,
+                delivered_stderr,
+                timeout,
+            } => {
+                self.wait_for_output(delivered_stdout, delivered_stderr, timeout)
+                    .await
+            }
         }
     }
 
+    /// Waits for either stream to produce bytes past what the caller has already taken.
+    ///
+    /// Closeout outranks new output. Both can be true when the wait returns, and of the two only
+    /// closeout says the output is complete; reporting the other would leave a caller asking again
+    /// for a session that has nothing left to give.
+    async fn wait_for_output(
+        &self,
+        delivered_stdout: u64,
+        delivered_stderr: u64,
+        timeout: Duration,
+    ) -> Result<JobWaitResult, JobError> {
+        let _watch = self.process_manager.watch_session(&self.session_id);
+        self.process_manager
+            .wait_for_output_or_close(
+                &self.session_id,
+                as_usize(delivered_stdout),
+                as_usize(delivered_stderr),
+                timeout,
+            )
+            .await
+            .ok_or_else(|| self.unknown_job())?;
+        let snapshot = self.snapshot().await?;
+        if snapshot.is_closed() {
+            return Ok(JobWaitResult::Done(snapshot));
+        }
+        let advanced = snapshot.output().stdout_bytes() > as_usize(delivered_stdout)
+            || snapshot.output().stderr_bytes() > as_usize(delivered_stderr);
+        Ok(if advanced {
+            JobWaitResult::OutputReady(snapshot)
+        } else {
+            JobWaitResult::TimedOut(snapshot)
+        })
+    }
+
     async fn wait_for_done(&self, timeout: Option<Duration>) -> Result<JobWaitResult, JobError> {
+        let _watch = self.process_manager.watch_session(&self.session_id);
         let outcome = self
             .process_manager
             .wait_for_session_close(&self.session_id, timeout)
@@ -146,6 +207,7 @@ impl BackgroundJob {
             return Err(JobError::EmptyMatch);
         }
 
+        let _watch = self.process_manager.watch_session(&self.session_id);
         let deadline = tokio::time::Instant::now() + timeout;
         let mut stdout_cursor = 0_usize;
         let mut stderr_cursor = 0_usize;
@@ -175,8 +237,16 @@ impl BackgroundJob {
             stdout_cursor = window.stdout_cursor;
             stderr_cursor = window.stderr_cursor;
             if let Some((stream, snapshot)) = window.matched {
+                let excerpt = match stream {
+                    ExecStreamKind::Stdout => stdout_matcher.take_excerpt(),
+                    _ => stderr_matcher.take_excerpt(),
+                };
                 let snapshot = self.job_snapshot(snapshot);
-                return Ok(JobWaitResult::Matched { snapshot, stream });
+                return Ok(JobWaitResult::Matched {
+                    snapshot,
+                    stream,
+                    excerpt,
+                });
             }
             if let Some(snapshot) = window.snapshot {
                 let snapshot = self.job_snapshot(snapshot);
@@ -215,6 +285,7 @@ impl BackgroundJob {
 struct StreamMatcher<'a> {
     needle: &'a str,
     suffix: String,
+    excerpt: Option<String>,
 }
 
 impl<'a> StreamMatcher<'a> {
@@ -222,7 +293,13 @@ impl<'a> StreamMatcher<'a> {
         Self {
             needle,
             suffix: String::new(),
+            excerpt: None,
         }
+    }
+
+    /// Takes the window around the match this matcher found.
+    fn take_excerpt(&mut self) -> String {
+        self.excerpt.take().unwrap_or_default()
     }
 
     /// Scans one read, treating a gap inside it as a break no carried prefix can cross.
@@ -244,15 +321,65 @@ impl<'a> StreamMatcher<'a> {
     fn push(&mut self, text: &str) -> bool {
         let mut candidate = std::mem::take(&mut self.suffix);
         candidate.push_str(text);
-        let matched = candidate.contains(self.needle);
+        let matched = candidate.find(self.needle);
+        if let Some(at) = matched {
+            self.excerpt = Some(excerpt_around(&candidate, at, self.needle.len()));
+        }
         let keep = self.needle.len().saturating_sub(1);
         let mut start = candidate.len().saturating_sub(keep);
         while start < candidate.len() && !candidate.is_char_boundary(start) {
             start = start.saturating_add(1);
         }
         candidate[start..].clone_into(&mut self.suffix);
-        matched
+        matched.is_some()
     }
+}
+
+/// How much text on each side of a match the excerpt carries.
+const EXCERPT_CONTEXT_BYTES: usize = 30;
+
+/// Renders a short single-line window around a match.
+///
+/// A caller that matched on output produced before it ever asked has a result to explain: the wait
+/// returned, and the bytes it returns may contain nothing resembling the text that ended it. Runs of
+/// whitespace collapse so that one line of a result can hold the window whatever the stream did with
+/// newlines; it is an excerpt, not a transcript.
+fn excerpt_around(text: &str, at: usize, needle_len: usize) -> String {
+    let start = floor_boundary(text, at.saturating_sub(EXCERPT_CONTEXT_BYTES));
+    let end = ceil_boundary(
+        text,
+        at.saturating_add(needle_len)
+            .saturating_add(EXCERPT_CONTEXT_BYTES)
+            .min(text.len()),
+    );
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push('…');
+    }
+    let window = text[start..end].split_whitespace().collect::<Vec<_>>();
+    excerpt.push_str(&window.join(" "));
+    if end < text.len() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+fn floor_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index = index.saturating_sub(1);
+    }
+    index
+}
+
+fn ceil_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn as_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 /// A coherent lifecycle and output snapshot of one background job.
@@ -312,6 +439,19 @@ pub enum JobWaitUntil {
         /// Maximum time spent waiting for the literal text.
         timeout: Duration,
     },
+    /// Wait until either stream passes the offsets the caller already took, the job closes, or
+    /// `timeout` elapses.
+    ///
+    /// The offsets are what makes this about output the caller has not seen rather than about a
+    /// session that may have been printing for minutes before anyone asked.
+    Output {
+        /// Stdout offset the caller has already delivered onward.
+        delivered_stdout: u64,
+        /// Stderr offset the caller has already delivered onward.
+        delivered_stderr: u64,
+        /// Maximum time spent waiting.
+        timeout: Duration,
+    },
 }
 
 /// The observed reason a background-job wait returned.
@@ -331,7 +471,11 @@ pub enum JobWaitResult {
         snapshot: JobSnapshot,
         /// The stream that contained the requested text.
         stream: ExecStreamKind,
+        /// A short window around the match, whitespace collapsed onto one line.
+        excerpt: String,
     },
+    /// A stream produced output past the offsets the caller had already taken.
+    OutputReady(JobSnapshot),
 }
 
 impl JobWaitResult {
@@ -339,9 +483,10 @@ impl JobWaitResult {
     #[must_use]
     pub const fn snapshot(&self) -> &JobSnapshot {
         match self {
-            Self::Done(snapshot) | Self::TimedOut(snapshot) | Self::Matched { snapshot, .. } => {
-                snapshot
-            }
+            Self::Done(snapshot)
+            | Self::TimedOut(snapshot)
+            | Self::OutputReady(snapshot)
+            | Self::Matched { snapshot, .. } => snapshot,
         }
     }
 }

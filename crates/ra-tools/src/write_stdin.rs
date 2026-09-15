@@ -1,13 +1,31 @@
-//! Writes input to a running session and returns output produced afterward.
+//! Writes input to a running session, waits on it, and returns output not yet delivered.
 //!
 //! This is deliberately the only interactive companion to `exec_command`. A background process
 //! still owns the process manager that started it; this tool only supplies the session identifier,
-//! writes verbatim input, waits briefly for a response, and reports the new bytes. Splitting every
-//! command-line utility into an extra tool would spend schema budget without adding a capability.
+//! writes verbatim input, waits for one of three conditions, and reports the bytes the model has
+//! not been given yet. Splitting every way of waiting into its own tool would spend schema budget
+//! without adding a capability — the reference implementation waits by calling its execution tool
+//! again with a time limit, and so does this one.
 //!
-//! Sessions currently use standard input pipes, and pipes accept ordinary byte writes. Terminal
-//! allocation and model-initiated interrupts need their own end-to-end contract, so neither is
-//! declared by this tool.
+//! **Returned output is what has not been delivered, not what arrived during this call.** A command
+//! that printed while nobody was asking has that output waiting here; a session carries the
+//! delivery positions across calls, so nothing is repeated and nothing is skipped.
+//!
+//! # Waiting for a condition, within a limit
+//!
+//! `until` names the condition and `yield_time_ms` bounds it. They are separate on purpose: a
+//! timeout is the ceiling on every wait rather than a third thing to wait for, and a call that
+//! could hang forever waiting for a command to finish is a call a model cannot safely make.
+//! Reaching the limit ends the wait and nothing else — the command keeps running.
+//!
+//! # Stopping a command is an argument, not a character
+//!
+//! Sessions currently use standard input pipes, and pipes accept ordinary byte writes. `"\u{3}"`
+//! sent through `chars` is therefore one byte of input, and this tool writes it as such;
+//! interrupting the process is `control: interrupt`, which sends a signal to its process group.
+//! Quietly translating one into the other would break the verbatim-write contract for every program
+//! that reads raw keystrokes. Terminal allocation still has no end-to-end contract and is not
+//! declared here.
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -23,25 +41,59 @@ use ra_core::{
 };
 use ra_exec::{
     command::ExecCursor,
-    session::{ExecError, ExecSessionState, ProcessManager},
+    job::{BackgroundJob, JobError, JobWaitResult, JobWaitUntil},
+    session::{ExecError, ProcessManager},
 };
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+use crate::session_return::{ReturnReason, SessionReturn, Watched};
 
 const TOOL_NAME: &str = "write_stdin";
 const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
 
 #[derive(Debug, Deserialize, JsonSchema, ToolInput)]
 #[serde(deny_unknown_fields)]
-/// Writes characters to a running command session and returns output produced afterward.
+/// Writes characters to a running command session, then waits and returns output not yet delivered.
 struct WriteStdinInput {
     /// Identifier returned when `exec_command` left a command running.
     session_id: String,
-    /// Characters to send exactly as written. Send an empty string to wait for more output.
+    /// Characters to send exactly as written. Send an empty string to wait without sending input.
     chars: String,
-    /// Milliseconds to wait for output after writing (default: 1000).
+    /// What ends the wait (default: `output`). Every mode also ends when `yield_time_ms` elapses,
+    /// which leaves the command running.
+    until: Option<WaitCondition>,
+    /// Literal text to wait for in this session's output. Required by `until: match`, and rejected
+    /// otherwise. The search covers output this session has already produced, including output from
+    /// before this call.
+    match_text: Option<String>,
+    /// Signal to send instead of input. Requires `chars` to be empty.
+    control: Option<SessionControl>,
+    /// Milliseconds to wait (default: 1000). The host may cap this.
     yield_time_ms: Option<u64>,
+}
+
+/// What ends a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WaitCondition {
+    /// Return as soon as there is output the model has not been given.
+    Output,
+    /// Return when the command has finished and all of its output has been collected.
+    Done,
+    /// Return when `match_text` appears in the output.
+    Match,
+}
+
+/// A signal to deliver to a session's process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SessionControl {
+    /// Interrupt the command, as Ctrl-C does, letting it stop on its own terms.
+    Interrupt,
+    /// Stop the command for good.
+    Cancel,
 }
 
 /// The interactive input companion to `exec_command`.
@@ -70,7 +122,7 @@ impl WriteStdinTool {
             options: ToolOptions::new()
                 .with_approval(ToolApprovalPolicy::Always)
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_concurrency(ToolConcurrency::Exclusive),
+                .with_concurrency(ToolConcurrency::Parallel),
             process_manager,
         })
     }
@@ -79,6 +131,24 @@ impl WriteStdinTool {
     #[must_use]
     pub fn process_manager(&self) -> &Arc<ProcessManager> {
         &self.process_manager
+    }
+
+    /// Decodes arguments, whether or not the runtime decoded them first.
+    fn input(&self, context: &mut ToolContext<'_>) -> Result<WriteStdinInput> {
+        context
+            .take_decoded_input::<WriteStdinInput>()?
+            .map_or_else(
+                || {
+                    serde_json::from_value(context.arguments().clone()).map_err(|error| {
+                        WriteStdinFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
+                            input_type: self.func_schema.input_type_name(),
+                            message: error.to_string(),
+                        })
+                        .into_error()
+                    })
+                },
+                Ok,
+            )
     }
 }
 
@@ -103,92 +173,116 @@ impl Tool for WriteStdinTool {
             .map_err(|error| WriteStdinFailure::BadArguments(error).into_error())
     }
 
+    // Session serialization belongs to the manager's interaction guard inside the deadline.
+    // A resource claim here would queue before that deadline starts. Control signals are sent
+    // before taking the guard, while all output delivery still takes the same guard.
     async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
-        let input = context
-            .take_decoded_input::<WriteStdinInput>()?
-            .map_or_else(
-                || {
-                    serde_json::from_value(context.arguments().clone()).map_err(|error| {
-                        WriteStdinFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
-                            input_type: self.func_schema.input_type_name(),
-                            message: error.to_string(),
-                        })
-                        .into_error()
-                    })
+        let input = self.input(&mut context)?;
+        let plan = WaitPlan::of(&input).map_err(WriteStdinFailure::into_error)?;
+        let session_id = ExecSessionId::new(input.session_id.clone());
+        let job = BackgroundJob::new(Arc::clone(&self.process_manager), session_id.clone());
+        // Held for the whole call rather than only for the wait. The steps that matter most come
+        // after the wait returns — reading the output it waited for, then recording how much of it
+        // was delivered — and a session reclaimed in between would turn an answer this call had
+        // already earned into "no such session".
+        let _watch = job.watch();
+
+        // One budget for the call, not one per phase. Taking the delivery lock, writing input, and
+        // waiting are three things that can each block, and giving each of them the full
+        // `yield_time_ms` would let a call that asked to wait one second take three — while the
+        // argument's own description promises the one. Every phase below spends what is left of it.
+        let waited = Duration::from_millis(plan.yield_time_ms)
+            .min(self.process_manager.limits().initial_yield_timeout());
+        let deadline = tokio::time::Instant::now() + waited;
+        let emitter = context.event_emitter();
+        match input.control {
+            Some(SessionControl::Cancel) => {
+                job.cancel()
+                    .await
+                    .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
+            }
+            Some(SessionControl::Interrupt) => {
+                self.process_manager
+                    .write_stdin(&session_id, None, true, emitter.as_ref())
+                    .await
+                    .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
+            }
+            None => {}
+        }
+
+        let _interaction = if let Ok(result) =
+            tokio::time::timeout_at(deadline, self.process_manager.lock_interaction(&session_id))
+                .await
+        {
+            result.map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?
+        } else {
+            // Said in the same vocabulary as every other result: this one returned without looking,
+            // which is a different fact from a wait that looked and saw nothing, and the snapshot
+            // still has to answer where the session stands.
+            let snapshot = job
+                .snapshot()
+                .await
+                .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
+            return Ok(SessionReturn {
+                session_id: &session_id,
+                watched: plan.watched(),
+                waited,
+                reason: ReturnReason::Contended {
+                    control_sent: input.control.is_some(),
                 },
-                Ok,
-            )?;
-        let session_id = ExecSessionId::new(input.session_id);
+                state: snapshot.state().clone(),
+                closed: snapshot.is_closed(),
+                exit_code: snapshot.output().exit_code(),
+                stdout: String::new(),
+                stderr: String::new(),
+                matched: None,
+                delivered_bytes: 0,
+                omitted_bytes: 0,
+            }
+            .render());
+        };
         let (stdout_cursor, stderr_cursor) = self
             .process_manager
             .interactive_output_cursors(&session_id)
             .await
             .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
-        let emitter = context.event_emitter();
-        if let Err(error) = self
-            .process_manager
-            .write_stdin(&session_id, Some(&input.chars), false, emitter.as_ref())
-            .await
-        {
-            // An empty `chars` is a poll, and a poll has to survive the session's exit. A command
-            // that yielded and then finished holds the output the model was waiting for, and the
-            // manager still serves it; refusing here because the process is gone would drop that
-            // output and make `exec_command`'s own guidance — collect the rest with this
-            // identifier — false. Sending characters to a finished session is still a mistake, and
-            // still reported as one.
-            let failure = WriteStdinFailure::from_exec(&error);
-            if !input.chars.is_empty() || !matches!(failure, WriteStdinFailure::SessionNotActive(_))
-            {
-                return Err(failure.into_error());
-            }
+        if input.control.is_none() {
+            self.send_input(&session_id, &input.chars, deadline, emitter.as_ref())
+                .await?;
         }
-        let requested_yield =
-            Duration::from_millis(input.yield_time_ms.unwrap_or(DEFAULT_YIELD_TIME_MS));
-        let yield_timeout =
-            requested_yield.min(self.process_manager.limits().initial_yield_timeout());
+
+        let outcome = job
+            .wait(plan.until(stdout_cursor, stderr_cursor, remaining(deadline)))
+            .await
+            .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
+
+        let stdout = self
+            .deliver(&session_id, ExecStreamKind::Stdout, stdout_cursor)
+            .await?;
+        let stderr = self
+            .deliver(&session_id, ExecStreamKind::Stderr, stderr_cursor)
+            .await?;
         self.process_manager
-            .wait_for_output(&session_id, stdout_cursor, stderr_cursor, yield_timeout)
+            .mark_interactive_output_delivered(&session_id, stdout.next, stderr.next)
             .await
             .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
 
-        let (stdout, next_stdout_cursor) = self
-            .process_manager
-            .read_output(
-                &session_id,
-                ExecCursor::new(ExecStreamKind::Stdout, stdout_cursor),
-            )
-            .await
-            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?
-            .map_or((None, stdout_cursor), |(text, cursor)| {
-                (Some(text), cursor.offset())
-            });
-        let (stderr, next_stderr_cursor) = self
-            .process_manager
-            .read_output(
-                &session_id,
-                ExecCursor::new(ExecStreamKind::Stderr, stderr_cursor),
-            )
-            .await
-            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?
-            .map_or((None, stderr_cursor), |(text, cursor)| {
-                (Some(text), cursor.offset())
-            });
-        self.process_manager
-            .mark_interactive_output_delivered(&session_id, next_stdout_cursor, next_stderr_cursor)
-            .await
-            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
-        let state = self
-            .process_manager
-            .get_session_state(&session_id)
-            .await
-            .ok_or_else(|| WriteStdinFailure::UnknownSession(session_id.clone()).into_error())?;
-
-        Ok(render_output(
-            &session_id,
-            stdout.as_deref(),
-            stderr.as_deref(),
-            &state,
-        ))
+        let snapshot = outcome.snapshot();
+        Ok(SessionReturn {
+            session_id: &session_id,
+            watched: plan.watched(),
+            waited,
+            reason: reason_of(&outcome),
+            state: snapshot.state().clone(),
+            closed: snapshot.is_closed(),
+            exit_code: snapshot.output().exit_code(),
+            stdout: stdout.text,
+            stderr: stderr.text,
+            matched: matched_of(&outcome),
+            delivered_bytes: stdout.delivered.saturating_add(stderr.delivered),
+            omitted_bytes: stdout.omitted.saturating_add(stderr.omitted),
+        }
+        .render())
     }
 
     fn options(&self) -> ToolOptions {
@@ -204,42 +298,182 @@ impl Tool for WriteStdinTool {
     }
 }
 
-fn render_output(
-    session_id: &ExecSessionId,
-    stdout: Option<&str>,
-    stderr: Option<&str>,
-    state: &ExecSessionState,
-) -> ToolOutput {
-    let body = match (
-        stdout.filter(|text| !text.is_empty()),
-        stderr.filter(|text| !text.is_empty()),
-    ) {
-        (Some(stdout), Some(stderr)) => format!("{stdout}\n\n--- stderr ---\n{stderr}"),
-        (Some(stdout), None) => stdout.to_owned(),
-        (None, Some(stderr)) => stderr.to_owned(),
-        (None, None) if state.is_active() => format!(
-            "Session {session_id} is still running and has produced no output since the last interaction."
-        ),
-        (None, None) => match state {
-            ExecSessionState::Exited {
-                exit_code: Some(code),
-            } => {
-                format!(
-                    "Session {session_id} exited with status {code} and produced no new output."
-                )
+impl WriteStdinTool {
+    /// Bounds writes without pretending a timed-out write was atomic.
+    async fn send_input(
+        &self,
+        session_id: &ExecSessionId,
+        chars: &str,
+        deadline: tokio::time::Instant,
+        emitter: Option<&ra_core::event::HostEventEmitter>,
+    ) -> Result<()> {
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.process_manager
+                .write_stdin(session_id, Some(chars), false, emitter),
+        )
+        .await
+        .map_err(|_| WriteStdinFailure::InputTimedOut.into_error())?;
+        if let Err(error) = result {
+            // Empty input is a poll: it must still collect output after the process exits.
+            let failure = WriteStdinFailure::from_exec(&error);
+            if !chars.is_empty() || !matches!(failure, WriteStdinFailure::SessionNotActive(_)) {
+                return Err(failure.into_error());
             }
-            ExecSessionState::Exited { exit_code: None } => {
-                format!("Session {session_id} finished and produced no new output.")
-            }
-            other => format!("Session {session_id} ended as {other:?} and produced no new output."),
-        },
-    };
-    ToolOutput::text(body)
+        }
+        Ok(())
+    }
+
+    /// Reads one stream from the position this call is delivering from.
+    ///
+    /// The delivery position advances to what this read covers and no further, so bytes that arrive
+    /// between the read and the next call stay undelivered rather than being marked as sent.
+    async fn deliver(
+        &self,
+        session_id: &ExecSessionId,
+        stream: ExecStreamKind,
+        from: u64,
+    ) -> Result<Delivery> {
+        let read = self
+            .process_manager
+            .read_output(session_id, ExecCursor::new(stream, from))
+            .await
+            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
+        Ok(read.map_or_else(
+            || Delivery {
+                text: String::new(),
+                next: from,
+                delivered: 0,
+                omitted: 0,
+            },
+            |read| Delivery {
+                next: read.next().offset(),
+                delivered: read.next().offset().saturating_sub(from),
+                omitted: as_u64(read.omitted_bytes()),
+                text: read.into_text(),
+            },
+        ))
+    }
 }
+
+/// One stream's contribution to a result.
+struct Delivery {
+    text: String,
+    next: u64,
+    delivered: u64,
+    omitted: u64,
+}
+
+/// The validated wait this call performs.
+struct WaitPlan {
+    condition: WaitCondition,
+    text: Option<String>,
+    yield_time_ms: u64,
+}
+
+impl WaitPlan {
+    /// Checks that the arguments describe one wait, and that the wait is one this tool can perform.
+    fn of(input: &WriteStdinInput) -> WaitResult<Self> {
+        let condition = input.until.unwrap_or(WaitCondition::Output);
+        let text = input.match_text.clone().filter(|text| !text.is_empty());
+        match (condition, &text) {
+            (WaitCondition::Match, None) => return Err(WriteStdinFailure::MatchTextMissing),
+            (WaitCondition::Output | WaitCondition::Done, Some(_)) => {
+                return Err(WriteStdinFailure::MatchTextUnused);
+            }
+            _ => {}
+        }
+        if input.control.is_some() && !input.chars.is_empty() {
+            return Err(WriteStdinFailure::ControlWithInput);
+        }
+        Ok(Self {
+            condition,
+            text,
+            yield_time_ms: input.yield_time_ms.unwrap_or(DEFAULT_YIELD_TIME_MS),
+        })
+    }
+
+    /// The condition, as the job facade names it.
+    fn until(&self, stdout_cursor: u64, stderr_cursor: u64, timeout: Duration) -> JobWaitUntil {
+        match (self.condition, &self.text) {
+            (WaitCondition::Match, Some(text)) => JobWaitUntil::Match {
+                text: text.clone(),
+                timeout,
+            },
+            // A bounded wait for closeout is exactly what the job facade's `Timeout` already is:
+            // it returns early when the command finishes and its output is collected.
+            (WaitCondition::Done, _) | (WaitCondition::Match, None) => {
+                JobWaitUntil::Timeout(timeout)
+            }
+            (WaitCondition::Output, _) => JobWaitUntil::Output {
+                delivered_stdout: stdout_cursor,
+                delivered_stderr: stderr_cursor,
+                timeout,
+            },
+        }
+    }
+
+    /// The condition, as the result describes it.
+    fn watched(&self) -> Watched<'_> {
+        match (self.condition, &self.text) {
+            (WaitCondition::Match, Some(text)) => Watched::Text(text),
+            (WaitCondition::Done, _) | (WaitCondition::Match, None) => Watched::Closeout,
+            (WaitCondition::Output, _) => Watched::NewOutput,
+        }
+    }
+}
+
+/// Why the wait returned.
+///
+/// The wildcard is not a default: a result this build cannot name is classified from the snapshot it
+/// carries, so an unnamed variant still reports whether the output is complete.
+fn reason_of(outcome: &JobWaitResult) -> ReturnReason {
+    match outcome {
+        JobWaitResult::Done(_) => ReturnReason::Done,
+        JobWaitResult::Matched { .. } => ReturnReason::Matched,
+        JobWaitResult::OutputReady(_) => ReturnReason::Output,
+        JobWaitResult::TimedOut(_) => ReturnReason::Timeout,
+        other => {
+            if other.snapshot().is_closed() {
+                ReturnReason::Done
+            } else {
+                ReturnReason::Timeout
+            }
+        }
+    }
+}
+
+fn matched_of(outcome: &JobWaitResult) -> Option<(ExecStreamKind, String)> {
+    match outcome {
+        JobWaitResult::Matched {
+            stream, excerpt, ..
+        } => Some((*stream, excerpt.clone())),
+        _ => None,
+    }
+}
+
+fn as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// What is left of the call's budget.
+///
+/// Zero once it is spent, which is a wait that looks once and returns rather than one that refuses:
+/// the caller asked for a bounded look, and a phase reached with nothing left still owes it an
+/// answer about what is there now.
+fn remaining(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+type WaitResult<T> = std::result::Result<T, WriteStdinFailure>;
 
 #[derive(Debug)]
 enum WriteStdinFailure {
     BadArguments(ToolArgumentDecodeError),
+    MatchTextMissing,
+    MatchTextUnused,
+    ControlWithInput,
+    InputTimedOut,
     UnknownSession(ExecSessionId),
     SessionNotActive(ExecSessionId),
     StdinClosed(ExecSessionId),
@@ -250,12 +484,16 @@ enum WriteStdinFailure {
 impl WriteStdinFailure {
     const fn kind(&self) -> ToolErrorKind {
         match self {
-            Self::BadArguments(_) | Self::UnknownSession(_) | Self::SessionNotActive(_) => {
-                ToolErrorKind::InvalidInput
-            }
-            Self::StdinClosed(_) | Self::StdinWrite(_) | Self::Execution(_) => {
-                ToolErrorKind::ExecutionFailed
-            }
+            Self::BadArguments(_)
+            | Self::MatchTextMissing
+            | Self::MatchTextUnused
+            | Self::ControlWithInput
+            | Self::UnknownSession(_)
+            | Self::SessionNotActive(_) => ToolErrorKind::InvalidInput,
+            Self::InputTimedOut
+            | Self::StdinClosed(_)
+            | Self::StdinWrite(_)
+            | Self::Execution(_) => ToolErrorKind::ExecutionFailed,
         }
     }
 
@@ -278,12 +516,35 @@ impl WriteStdinFailure {
             other => Self::Execution(other.to_string()),
         }
     }
+
+    fn from_job(error: &JobError) -> Self {
+        match error {
+            JobError::UnknownJob { session_id } => Self::UnknownSession(session_id.clone()),
+            other => Self::Execution(other.to_string()),
+        }
+    }
 }
 
 impl fmt::Display for WriteStdinFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadArguments(reason) => write!(formatter, "Invalid arguments: {reason}."),
+            Self::MatchTextMissing => write!(
+                formatter,
+                "`until: match` needs `match_text` to say what to wait for."
+            ),
+            Self::MatchTextUnused => write!(
+                formatter,
+                "`match_text` only applies to `until: match`; send `until: match` or drop it."
+            ),
+            Self::InputTimedOut => write!(
+                formatter,
+                "Standard input timed out. Some bytes may already have been written; do not blindly resend the input. Poll the session or send control: cancel."
+            ),
+            Self::ControlWithInput => write!(
+                formatter,
+                "`control` sends a signal rather than input, so `chars` must be empty."
+            ),
             Self::UnknownSession(session_id) => {
                 write!(formatter, "No running session is known as `{session_id}`.")
             }

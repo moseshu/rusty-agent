@@ -61,6 +61,7 @@ pub mod memory;
 pub mod read_file;
 mod rooted;
 mod search;
+mod session_return;
 pub mod skill;
 pub mod tool_search;
 pub mod update_plan;

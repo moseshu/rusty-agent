@@ -82,10 +82,19 @@ async fn test_job_wait_match_identifies_the_output_stream() {
         })
         .await
         .expect("job is retained");
-    let JobWaitResult::Matched { snapshot, stream } = result else {
+    let JobWaitResult::Matched {
+        snapshot,
+        stream,
+        excerpt,
+    } = result
+    else {
         panic!("matching output must report a match: {result:?}");
     };
     assert_eq!(stream, ExecStreamKind::Stderr);
+    assert!(
+        excerpt.contains("ready on stderr"),
+        "the excerpt must show what matched: {excerpt}"
+    );
     assert!(snapshot.output().stderr().contains("ready on stderr"));
     assert!(snapshot.state().is_active());
 
@@ -182,7 +191,10 @@ async fn test_job_match_on_stdout_wins_when_the_process_closes() {
         })
         .await
         .expect("job is retained");
-    let JobWaitResult::Matched { snapshot, stream } = result else {
+    let JobWaitResult::Matched {
+        snapshot, stream, ..
+    } = result
+    else {
         panic!("matching final stdout must win over closeout: {result:?}");
     };
     assert_eq!(stream, ExecStreamKind::Stdout);
@@ -253,4 +265,183 @@ async fn test_job_done_waits_for_cancelled_process_closeout() {
     assert_eq!(snapshot.state(), &ExecSessionState::Cancelled);
     assert!(snapshot.is_closed());
     assert!(!manager.active_sessions().await.contains(job.session_id()));
+}
+
+/// An output wait is about output the caller has not taken, not about a stream that has ever moved.
+#[tokio::test]
+async fn test_job_output_wait_starts_from_what_the_caller_already_took() {
+    let manager = Arc::new(ProcessManager::default());
+    let job = start_job(
+        Arc::clone(&manager),
+        "printf 'first\\n'; sleep 0.3; printf 'second\\n'; sleep 30",
+    )
+    .await;
+
+    // The first line is already retained, so a wait that started from zero would return at once
+    // and report output the caller had seen as if it were new.
+    let produced = job
+        .snapshot()
+        .await
+        .expect("job is retained")
+        .output()
+        .stdout_bytes() as u64;
+    let result = job
+        .wait(JobWaitUntil::Output {
+            delivered_stdout: produced,
+            delivered_stderr: 0,
+            timeout: Duration::from_secs(2),
+        })
+        .await
+        .expect("job is retained");
+    let JobWaitResult::OutputReady(snapshot) = result else {
+        panic!("new output must report itself: {result:?}");
+    };
+    assert!(snapshot.output().stdout().contains("second"));
+    assert!(snapshot.state().is_active());
+
+    job.cancel().await.expect("job is still retained");
+}
+
+/// Closeout outranks undelivered output, because only one of the two says to stop asking.
+///
+/// This is the shape of a poll that arrives after the command is already over: there are bytes
+/// nobody has taken *and* nothing more will ever arrive. Reporting the output alone would leave the
+/// caller to poll a finished session again for a tail that does not exist.
+#[tokio::test]
+async fn test_job_output_wait_reports_closeout_over_undelivered_output() {
+    let manager = Arc::new(ProcessManager::default());
+    let job = run_to_completion(Arc::clone(&manager), "printf last").await;
+
+    let result = job
+        .wait(JobWaitUntil::Output {
+            delivered_stdout: 0,
+            delivered_stderr: 0,
+            timeout: Duration::from_secs(2),
+        })
+        .await
+        .expect("job is retained");
+    let JobWaitResult::Done(snapshot) = result else {
+        panic!("a finished job must report done: {result:?}");
+    };
+    assert!(snapshot.is_closed());
+    assert!(snapshot.output().stdout().contains("last"));
+}
+
+/// A silent job someone is waiting on is not an idle job.
+///
+/// The sweep exists to reclaim processes nobody is watching. Firing it into a wait kills the very
+/// process that wait is about and hands the caller an expiry in place of the answer it asked for —
+/// and a command that prints nothing until it succeeds is exactly the command worth waiting for.
+#[tokio::test]
+async fn test_a_watched_job_outlives_the_idle_sweep() {
+    let manager = Arc::new(ProcessManager::new(
+        ExecLimits::new().with_idle_timeout(Some(Duration::from_millis(150))),
+    ));
+    let job = start_job_with(
+        Arc::clone(&manager),
+        "sleep 30",
+        quick_yield().with_idle_timeout(Some(Duration::from_millis(150))),
+    )
+    .await;
+
+    let result = job
+        .wait(JobWaitUntil::Timeout(Duration::from_millis(900)))
+        .await
+        .expect("job is retained");
+    let JobWaitResult::TimedOut(snapshot) = result else {
+        panic!("a watched silent job must outlive six idle windows: {result:?}");
+    };
+    assert!(
+        snapshot.state().is_active(),
+        "the idle sweep took a session that was being waited on: {:?}",
+        snapshot.state()
+    );
+
+    job.cancel().await.expect("job is still retained");
+}
+
+/// The exemption is the wait, not a disabled sweep: nobody watching means idle still means idle.
+#[tokio::test]
+async fn test_an_unwatched_silent_job_is_still_swept() {
+    let manager = Arc::new(ProcessManager::new(
+        ExecLimits::new().with_idle_timeout(Some(Duration::from_millis(150))),
+    ));
+    let job = start_job_with(
+        Arc::clone(&manager),
+        "sleep 30",
+        quick_yield().with_idle_timeout(Some(Duration::from_millis(150))),
+    )
+    .await;
+
+    // Polled to a deadline rather than asserted at a fixed moment: the sweep is prompt, but this
+    // test shares a machine with every other command these tests start.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = job.snapshot().await.expect("job is retained");
+        if snapshot.state().is_terminal() {
+            assert_eq!(
+                snapshot.state(),
+                &ExecSessionState::Expired {
+                    reason: ra_core::event::exec::ExecEvictionReason::IdleTimeout
+                }
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an unwatched idle session was never swept"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A finished job a caller is still working with keeps its place in the retention window.
+///
+/// The window is where a caller collects what it waited for. Between a wait returning and its
+/// output being read, other sessions can finish and push the oldest one out; doing that to the
+/// session a caller is holding turns a result it had already earned into "no such job".
+#[tokio::test]
+async fn test_retention_evicts_around_a_watched_job() {
+    // Two finished sessions stay readable, so the third retirement drops one of the first two.
+    let manager = Arc::new(ProcessManager::new(ExecLimits::new().with_max_sessions(2)));
+    let first = run_to_completion(Arc::clone(&manager), "printf first").await;
+    let second = run_to_completion(Arc::clone(&manager), "printf second").await;
+
+    let watch = first.watch();
+    let third = run_to_completion(Arc::clone(&manager), "printf third").await;
+
+    assert!(
+        first.snapshot().await.is_ok(),
+        "a watched job must survive another session's retirement"
+    );
+    assert!(
+        matches!(second.snapshot().await, Err(JobError::UnknownJob { .. })),
+        "the oldest unwatched job is the one that makes room"
+    );
+    assert!(third.snapshot().await.is_ok());
+
+    // And the exemption ends with the watch: the next retirement takes the job it was protecting.
+    drop(watch);
+    let fourth = run_to_completion(Arc::clone(&manager), "printf fourth").await;
+    assert!(matches!(
+        first.snapshot().await,
+        Err(JobError::UnknownJob { .. })
+    ));
+    assert!(fourth.snapshot().await.is_ok());
+}
+
+/// Runs a command to completion and returns a handle to its retained session.
+async fn run_to_completion(manager: Arc<ProcessManager>, command: &str) -> BackgroundJob {
+    let job = start_job_with(
+        Arc::clone(&manager),
+        command,
+        ExecLimits::new().with_initial_yield_timeout(Duration::from_millis(1)),
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), job.wait(JobWaitUntil::Done))
+        .await
+        .expect("a short command finishes quickly")
+        .expect("job is retained through its own closeout");
+    assert!(matches!(result, JobWaitResult::Done(_)));
+    job
 }

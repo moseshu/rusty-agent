@@ -35,7 +35,7 @@ use crate::profile::MAX_ADVERTISED_NAME_CHARS;
 /// Raise this value whenever any model-facing name, description, strictness flag, or input schema
 /// changes. The tool-surface snapshot rejects a changed fingerprint with an unchanged revision,
 /// so a reviewer can distinguish a deliberately invalidated tool table from an accidental edit.
-pub(crate) const TOOL_SCHEMA_REVISION: u32 = 5;
+pub(crate) const TOOL_SCHEMA_REVISION: u32 = 6;
 
 /// Cached-prefix allowance for this section, in estimated tokens.
 ///
