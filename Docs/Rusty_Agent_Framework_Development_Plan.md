@@ -1020,7 +1020,7 @@ Codex 本地仓库的 `LICENSE` 为 Apache-2.0；若确有必要复制其实现�
 
 | 能力 | 标准 |
 | --- | --- |
-| Codex 语义对齐 | `exec_command` + `write_stdin` + `apply_patch` 能完成一个真实多文件修改任务 |
+| Codex 语义对齐 | **已达成**：`exec_command` + `write_stdin` + `apply_patch` 能完成一个真实多文件修改任务。<br>**这条此前既没标达成、也没人说过为什么不做**——三个工具各自的测试都在 `it-tools`，那些证明的是「工具能用」，而本条唯一要证的是「三个合起来能干成一件事」，没有任何测试覆盖。现补 `it-e2e/tests/coding_task.rs`：同一个版本号散在两个文件里，**一次 patch 同时改两处**；项目自带的检查脚本必须同意这次修改，所以得真跑它；而脚本是交互式的（打印 `READY` 后等 stdin），命令因此越过 yield，答案只能写进一个已经在跑的 session。<br>**模型不是固定脚本**：它读被交给的工具输出再决定下一步，因为第三步没有别的走法——session id 是运行时才有的，固定脚本叫不出它的名字。这顺带把一件值得单独断言的事变成断言：**模型要续接 session 所需要的那个标识，确实出现在工具给它的正文里**，而不是只躺在某条它永远看不到的记录的字段上；测试也按 provider 的做法只读文本块，不去 JSON 信封里捞。<br>**两次变异验证过它不是装饰**：只改一个文件时被挡下；两个文件都改但值不一致时，**是项目自己的检查脚本报出 `MISMATCH file=2.0.0 code=9.9.9`**，也就是 exec + write_stdin 这半边真的承重。<br>**顺带发现的产品事实**：默认权限模式下这个 run 会停在第一次 `apply_patch` 上等审批，一步都走不下去——这是对的，且各有归属测试（`it-runtime/tests/permission_engine.rs` 管引擎、`it-coding/tests/apply_patch.rs` 管审批看到什么），所以本条像一个执行已批准任务的宿主那样显式答掉这道闸，量的才是三个工具把活干完，不是闸门本身 |
 | 隔离可信 | 三个平台后端各有 smoke：越界写被拒、网络策略生效、fail-closed。**两达成一未做（R8-8 / R8-9）**：seatbelt 在 macOS 上真 spawn 验过三项，bwrap 在 Linux CI 上原生验过三项（`it-exec/tests/sandbox_linux.rs`：宿主路径型 Unix socket、x32 syscall 编号、两档各自的文件边界），docker 后端（R8-10）未做。fail-closed 是这条里唯一**不靠平台**的部分，用显式传入后端的 `resolve_confinement_with` 在任何机器上都测得到：没有后端、后端不可用、够不到请求档位、降级会把网络还回来，四种都拒 |
 | 后台可收尾 | **已达成（R8-3a）**：模型可见的等待与控制入口，形态是 `write_stdin{until, match_text, control}` 而不是第三个工具；名字 `background_shell_wait` 与 R2-8 的工具词表冲突，已作废。对应 codex 的 `unified_exec` + `write_stdin`：等待就是再调一次并带上时限。**原先挂在这里的 `background_job_closed` 交付点提醒随 R7-7 撤销**——收尾是产品提示词的事，不是框架 gate；宿主若要在交付点拦一次，走 R7-4 的 `stop` hook |
 
