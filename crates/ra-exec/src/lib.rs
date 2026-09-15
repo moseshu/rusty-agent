@@ -15,6 +15,7 @@ pub mod job;
 pub mod output;
 pub mod sandbox;
 pub mod session;
+pub mod tmpdir;
 
 /// Default schema version for process execution structures.
 pub const EXEC_SCHEMA_VERSION: ra_core::compat::SchemaVersion =

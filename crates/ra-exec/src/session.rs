@@ -18,6 +18,11 @@
 //! [`DRAIN_GRACE`]. The group is the point: the child is a shell, and
 //! signalling only the shell leaves whatever it started behind as orphans that keep running and
 //! keep holding the output pipes open.
+//!
+//! Scratch cleanup covers the tracked process group. If group exit cannot be confirmed at
+//! closeout, the directory requires host recovery even after the session reports completion.
+//! Processes that deliberately escape the group need backend containment; this local executor
+//! cannot establish their lifetime from a process-group probe.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -50,6 +55,8 @@ use tokio::{
 use crate::{
     command::{ExecCursor, ExecLimits, ExecRequest},
     output::{ExecOutputSummary, HeadTailBuffer, RetainedRead},
+    sandbox::ExecEnvironment,
+    tmpdir::{TMPDIR_ENV_VAR, TempDirUse},
 };
 
 /// The default shell used when a request names none.
@@ -206,6 +213,17 @@ pub enum ExecError {
         /// The operating system's refusal.
         #[source]
         source: std::io::Error,
+    },
+    /// The run's scratch directory could not be taken up, so nothing was started.
+    ///
+    /// Separate from [`Self::Spawn`] because no process was launched and the command is not why:
+    /// reporting it as a failure to start `{command}` would send a reader looking at the command
+    /// line for a fault that is in the run's own directory.
+    #[error("cannot take up the run's scratch directory")]
+    Scratch {
+        /// What the scratch directory refused, with its own chain intact.
+        #[source]
+        source: crate::tmpdir::TempDirError,
     },
     /// No session with that identifier is known to this manager.
     #[error("execution session `{session_id}` is not known")]
@@ -687,6 +705,7 @@ impl fmt::Debug for InteractionGuard {
 pub struct ProcessManager {
     registry: Arc<SessionRegistry>,
     limits: ExecLimits,
+    environment: Arc<ExecEnvironment>,
 }
 
 impl Default for ProcessManager {
@@ -707,7 +726,44 @@ impl ProcessManager {
         Self {
             registry: Arc::new(SessionRegistry::new(retention)),
             limits,
+            environment: Arc::new(ExecEnvironment::new()),
         }
+    }
+
+    /// Records a session that was registered but never got a process, and takes it back out.
+    ///
+    /// Both pre-spawn failures land here so that a session which existed for a moment cannot be
+    /// left `Starting` in the registry — a state nothing would ever move it out of.
+    async fn abandon_unstarted(
+        &self,
+        session_id: &ExecSessionId,
+        session: &Arc<Mutex<ExecSession>>,
+        error: &str,
+    ) {
+        {
+            let mut sess = session.lock().await;
+            sess.finish(ExecSessionState::Failed {
+                error: error.to_owned(),
+            });
+        }
+        self.registry.retire(session_id).await;
+    }
+
+    /// Sets how every child this manager spawns is set up: its environment, its ceilings, and the
+    /// scratch directory it is pointed at.
+    ///
+    /// Configured here rather than per request because each of those is a bound on what a command
+    /// may do, and requests are built from model output — see [`ExecEnvironment`].
+    #[must_use]
+    pub fn with_environment(mut self, environment: ExecEnvironment) -> Self {
+        self.environment = Arc::new(environment);
+        self
+    }
+
+    /// How this manager sets up the children it spawns.
+    #[must_use]
+    pub fn environment(&self) -> &ExecEnvironment {
+        &self.environment
     }
 
     /// The ceilings this manager holds every command to.
@@ -762,16 +818,28 @@ impl ProcessManager {
             let _ = sess.state.transition_to(ExecSessionState::Starting);
         }
 
-        let mut child = match spawn_child(&request) {
+        // Taken before the process exists, not after it yields: a handle acquired later could fail
+        // while a command is already writing into the directory, and there would be nothing useful
+        // left to do about it.
+        let temp_dir_use = match self
+            .environment
+            .temp_dir()
+            .map(|dir| dir.use_handle())
+            .transpose()
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.abandon_unstarted(&session_id, &session, &error.to_string())
+                    .await;
+                return Err(ExecError::Scratch { source: error });
+            }
+        };
+
+        let mut child = match spawn_child(&request, &self.environment) {
             Ok(child) => child,
             Err(error) => {
-                {
-                    let mut sess = session.lock().await;
-                    sess.finish(ExecSessionState::Failed {
-                        error: error.to_string(),
-                    });
-                }
-                self.registry.retire(&session_id).await;
+                self.abandon_unstarted(&session_id, &session, &error.to_string())
+                    .await;
                 return Err(ExecError::Spawn {
                     command: request.command().to_owned(),
                     source: error,
@@ -817,6 +885,7 @@ impl ProcessManager {
             &request,
             (&session_id, &session),
             emitter,
+            temp_dir_use,
         );
 
         tokio::select! {
@@ -841,6 +910,7 @@ impl ProcessManager {
     }
 
     /// Starts the output readers and the one task that owns the child process.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_supervisor(
         &self,
         child: Child,
@@ -849,6 +919,7 @@ impl ProcessManager {
         request: &ExecRequest,
         session: (&ExecSessionId, &Arc<Mutex<ExecSession>>),
         emitter: Option<&HostEventEmitter>,
+        temp_dir_use: Option<TempDirUse>,
     ) -> tokio::task::JoinHandle<()> {
         let (session_id, session) = session;
         let stdout_task = spawn_stream_reader(
@@ -874,6 +945,7 @@ impl ProcessManager {
             total_timeout: request.limits().total_timeout(),
             idle_timeout: request.limits().idle_timeout(),
             stdin: pipes.stdin,
+            temp_dir_use,
         };
         tokio::spawn(supervise(
             child,
@@ -1493,6 +1565,11 @@ struct SupervisorContext {
     idle_timeout: Option<Duration>,
     /// Closed once the process is gone, which is what lets a reader on the other side see EOF.
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// Held for as long as this process can still write. The supervisor outlives the tool call that
+    /// started the command — that is what "backgrounded" means here — so this is the handle that
+    /// makes a run's scratch directory survive until the last thing using it is reaped, rather than
+    /// until the call that happened to create it returned.
+    temp_dir_use: Option<TempDirUse>,
 }
 
 /// What watching one process to its end produced.
@@ -1641,6 +1718,19 @@ async fn supervise(
             session_id = %context.session_id,
             "output readers outlived the process; abandoning the remaining pipe"
         );
+    }
+
+    // Reaping the shell and draining its pipes do not prove that its descendants exited.
+    // Do not kill legitimate background work or wait indefinitely for it. Instead preserve the
+    // scratch directory and require host recovery if the group still exists or cannot be probed.
+    // Check after drain so short-lived descendants have had time to finish. Never clear a prior
+    // recovery mark by polling a bare PID later: it may have been reused by then.
+    if let Some(usage) = &context.temp_dir_use
+        && !tracked_exit_confirmed(context.pid)
+    {
+        usage.require_recovery();
+        tracing::warn!(session_id = %context.session_id,
+                "scratch directory retained for host recovery: descendant exit unconfirmed");
     }
 
     let exit_code = status
@@ -1812,7 +1902,7 @@ fn emit_output(
 }
 
 /// Builds and starts the child process for a request.
-fn spawn_child(request: &ExecRequest) -> std::io::Result<Child> {
+fn spawn_child(request: &ExecRequest, environment: &ExecEnvironment) -> std::io::Result<Child> {
     let shell = request.shell().unwrap_or_else(|| Path::new(DEFAULT_SHELL));
     let mut cmd = Command::new(shell);
     if request.login() {
@@ -1824,16 +1914,54 @@ fn spawn_child(request: &ExecRequest) -> std::io::Result<Child> {
     // is the only way a caller can pass data to a command without it going through quoting.
     cmd.args(request.args());
 
+    // The directory a process *starts* in. It is not a boundary, and the baseline backend's docs
+    // say so at length: the first `cd ..` leaves it.
     if let Some(cwd) = request.cwd() {
         cmd.current_dir(cwd);
     }
 
-    // Set before the caller's own variables, so a request can still override them deliberately.
+    // Scrub, then inject — in that order, or the injection is scrubbed. Clearing first is what
+    // makes the policy's answer the whole answer: without it every filter below would sit on top of
+    // an inherited environment that still had everything in it.
+    cmd.env_clear();
+    cmd.envs(environment.env_policy().derive());
+
+    // Terminal noise, set before the caller's own variables so a request can still override them.
     cmd.env("NO_COLOR", "1");
     cmd.env("TERM", "dumb");
     cmd.env("PAGER", "cat");
     for (key, val) in request.env() {
         cmd.env(key, val);
+    }
+
+    // Last, and deliberately not overridable by the request: this names the directory the run is
+    // tracking and will later clean up. A command that could repoint it would send its scratch
+    // files somewhere nobody is counting, and the cleanup would report success having removed an
+    // empty directory.
+    if let Some(temp_dir) = environment.temp_dir() {
+        cmd.env(TMPDIR_ENV_VAR, temp_dir.path());
+    }
+
+    // Ceilings are installed in the child, between fork and exec, so they bound this command and
+    // nothing else in the process. A failure here fails the spawn rather than being logged: a
+    // command that runs without the ceiling its host asked for is the case this exists to prevent.
+    #[cfg(unix)]
+    {
+        let limits = environment.resource_limits().clone();
+        if !limits.is_empty() {
+            // SAFETY: the closure runs in the forked child, between `fork` and `exec`, where the
+            // child is single-threaded and only async-signal-safe work is sound. This closure makes
+            // `getrlimit`/`setrlimit` calls and nothing else: it allocates nothing, takes no lock,
+            // and calls into no library that might. That is the hazard `pre_exec` is unsafe for —
+            // a fork can copy a lock another thread held, and anything reaching for that lock in
+            // the child deadlocks a process no one is watching.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(cmd.as_std_mut(), move || {
+                    limits.apply_to_current_process()
+                });
+            }
+        }
     }
 
     cmd.stdout(std::process::Stdio::piped());
@@ -1866,6 +1994,42 @@ fn emit_started(
         started = started.with_pid(pid);
     }
     let _ = em.emit(ExecEvent::Started(started));
+}
+
+/// Whether everything this executor was tracking for the session is known to have exited.
+///
+/// **It answers for what is tracked, not for every descendant.** On Unix the tracked set is the
+/// child's process group, so the probe below covers the ordinary `cmd &` case — a backgrounded job
+/// stays in its parent's group, and so does an orphan adopted by init, because reparenting does not
+/// change group membership. What escapes is a process that moves itself out with `setsid` or
+/// `setpgid`, and no probe from here can find it again; that is the boundary R8-9 and R8-10 exist
+/// to close, not one to chase with a cleverer probe.
+///
+/// Permission errors and unknown identifiers are not exit: only `ESRCH` — no such process group —
+/// confirms it, so every other answer counts as unconfirmed and holds the directory back.
+#[cfg(unix)]
+fn tracked_exit_confirmed(pid: Option<u32>) -> bool {
+    use rustix::process::{Pid, test_kill_process_group};
+    let Some(group) = pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw)
+    else {
+        return false;
+    };
+    matches!(test_kill_process_group(group), Err(rustix::io::Errno::SRCH))
+}
+
+/// Off Unix there is no process group to outlive the child, because none was created: `spawn_child`
+/// sets one only under `cfg(unix)`. The tracked set is therefore the direct child alone, and it has
+/// been reaped by the time this is asked.
+///
+/// Returning "unconfirmed" here would read as caution but would not buy any: it would mark every
+/// run's directory for recovery and leave a platform where cleanup never succeeds, which is not a
+/// stricter guarantee, only a broken one. Untracked descendants are the documented boundary above,
+/// and on this platform that boundary is simply wider.
+#[cfg(not(unix))]
+fn tracked_exit_confirmed(_pid: Option<u32>) -> bool {
+    true
 }
 
 /// Sends a signal to the child's process group, falling back to the child alone.

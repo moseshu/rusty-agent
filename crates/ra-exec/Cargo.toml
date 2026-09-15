@@ -7,8 +7,22 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
+# Only this crate permits a reviewed local unsafe exception.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
 [features]
 # 后端 feature 可叠加。**默认开原生后端**：`seatbelt` 与 `bwrap` 在 `sandbox.rs` 里
