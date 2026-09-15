@@ -937,14 +937,14 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 | R8-5a | 文件版本表 / Read Ledger | **DEFERRED（不实现）** | 不创建 `ReadRevisionSnapshot`、读前置条件或“未变更”缓存投影。当前 coding loop 依赖模型上下文、`apply_patch` 匹配结果和必要时重读来处理陈旧内容；工具事件是可回放事实来源。只有真实 A/B 能证明独立版本追踪的收益高于状态同步、恢复和 token 成本时，才可重新评估；在此之前不得为它设计 port、crate 依赖或验收门槛 |
 | R8-5b | **文件事实进 Session 工具事件** | **DONE** | R8-5 移交项②。`read_file` 与 `apply_patch` 都不碰 `context.event_emitter()`，所以 session log 记得下命令、记不下一次 run 读写了哪些文件——而 R8-5a 推迟版本表的理由**正建立在「工具事件是可回放事实来源」上**，这个来源目前不存在。<br>事件走自己的族（不塞进 exec 族，它们不是进程事实），记录实际发生的读取与修改：关联 tool call、路径、读取范围或修改类型及结果；**`apply_patch` 部分成功后失败也必须留下已提交修改的事实**，日志持久化失败要可见，不能把已写盘的修改伪装成没有发生。<br>**承诺就到这里**：这是 `read_file` / `apply_patch` 的工具操作记录，不是 shell 任意文件访问的完整审计，也不自动等于可重建文件内容。<br>**与 R8-3a 同批但独立交付**：内部 Session 事件不改模型工具 schema，不能拿它当「必须合并修改」的理由<br>**落地形态**：`ra-core::event::file`（`FileEvent` / `FileReadEvent` / `FileChangeEvent` / `FileChangeKind`）自成一族，进 `HostEventBody::File`；`read_file` 与 `apply_patch` 经 `ToolContext::event_emitter` 发出。<br>**三处偏离**：① **不塞进 exec 族**——读文件不是进程事实，合进去等于让每个 exec 事件消费者去过滤根本不来自进程的记录；② **行数记「模型收到的」而不是「窗口选中的」**，被输出上限截短的窗口只报活下来那几行；③ **sink 拒收要 `tracing` 留痕**（`ra-tools` 因此新增 `tracing` 依赖）——已经写盘的修改不能因为记不下来就变成没发生。<br>**承诺边界**：这是 `read_file` / `apply_patch` 的工具操作记录，不是 shell 任意文件访问的完整审计，也不等于可重建文件内容。<br>**验收**：`tests/it-core/tests/host_event.rs` 信封与往返，两份工具测试覆盖部分应用仍逐条记账、move 带两个路径、截断窗口只计已投递行数、没有宿主在听时读取照样成功 |
 | R8-6 | 检索工具 | **DONE** | `grep` / `glob` 已在 `ra-tools/src/{grep,glob}.rs` 实现为 Rust-native 一等工具：正则文本检索与确定性文件模式匹配均经 workspace capability 遍历，返回匹配数、扫描/跳过统计、工具阶段截断与收窄建议；文本工具跳过二进制、过大和不可读文件，且读取实际受上限约束，避免文件在 metadata 预检后增长时无界读入。目录 symlink 不递归跟随，防止循环或越界遍历。两项均已装配到 `CodingHost`，主角色拿到 6 项 core surface，只读角色保留 3 项观察工具。`rg --files` / `find` / `git grep` 等临时或长尾检索仍通过 `exec_command` 收编。 |
-| R8-7 | 沙箱后端：unix_local | TODO | 基线：工作区根限制 + 环境变量清理 + 资源上限（AF P41-1 的 shell 资源上限策略） |
-| R8-8 | 沙箱后端：macOS seatbelt | TODO | sandbox-exec profile；读侧降级需**透明化**并叠加敏感路径读拒绝（AF P14.1 的实测结论） |
+| R8-7 | 沙箱后端：unix_local | TODO | 基线后端：进程初始 `cwd`、环境变量清理、资源上限（rlimit）。<br>**它提供的不是隔离**（2026-09-15 修正：原文写「工作区根限制」，与文件工具那条同名而强度完全不同）。`ra-exec::fs::Workspace` 的 cap-std 根限制约束的是**走它的文件工具**，本条约束的是**一个被拉起的进程**——`cwd` 与环境变量拦不住子进程读写根外任意路径。真正的路径限制由 R8-8 / R8-9 / R8-10 施加；本条在 codex 的分类里对应 `SandboxType::None`，表示本次执行未使用平台沙箱，不代表宿主机器没有可用的平台沙箱。<br>**出处改写**：原文引 AF 的 shell 资源上限策略，按「不以 AF 为设计依据」的裁决删除。环境构造参考 codex `core/src/unified_exec` 与 R8-A 已采纳的条目（`NO_COLOR=1` / `TERM=dumb` / 禁 pager）；rlimit 是 Rusty 的设计选择，不宣称该目录已有对应实现，具体限制项与平台差异须在实现时明确。<br>**同名不同物在案**：openai 的 `sandbox/sandboxes/unix_local.py` 是一个有 start / stop / from_state 的长生命周期 session，不是围栏；本条只借了名字，没有借形状 |
+| R8-8 | 沙箱后端：macOS seatbelt | TODO | `sandbox-exec` profile。<br>**读侧写成具名档位，不写「透明化」**（2026-09-15 修正：原依据取自 AF 实测结论，按「不以 AF 为设计依据」的裁决删除；且「透明化」是态度不是契约）。参考 codex `codex-rs/sandboxing/src/seatbelt.rs` 的策略组合方式：文件读写策略、平台默认集与拒绝规则分别组合；`seatbelt_read_only_platform_defaults.sbpl` 提供 `:minimal` 请求的平台默认集，基础规则见 `seatbelt_base_policy.sbpl`。**具名配置及允许的降级关系由 Rusty 定义**，这些源码不证明上游已有按强弱排序的降级档位。Rusty 必须明确各配置的实际权限，并在结果里返回**实际生效的配置**。<br>**降级不是默认行为**：请求的保证兑现不了就拒绝；只有宿主显式允许较弱档位时才降级，且降到哪一档必须随结果返回，不能只写进日志。后端整体不可用时按 `crates/ra-exec/src/sandbox.rs` 已定的规则构造失败，不静默退回 R8-7 |
 | R8-9 | 沙箱后端：Linux bwrap + seccomp | TODO | 严格 allowlist、网络隔离、fail-closed；`ra-cli doctor sandbox` 自检 |
 | R8-10 | 沙箱后端：docker | TODO | 对齐 openai `sandboxes/docker.py`；用于强隔离与可复现环境 |
 | R8-11 | Manifest / Snapshot / 物化 | TODO | 工作区清单、快照与还原（openai `sandbox/manifest.py` / `snapshot.py` / `materialization.py`）；供 worktree 隔离与 loop 回滚 |
-| R8-11a | **`WorkspaceLease` 生命周期** | TODO | 提供工作区租约原语：申请、校验、回收、crash-safe cleanup。<br>**互斥只在宿主选了独占或串行策略时承诺**（2026-09-09 修正：原先无条件写「同一可写工作区同一时刻只有一个持有者」，与 R12-5 允许的共享策略直接冲突——不能一边允许共享，一边承诺框架必然阻止覆盖）。选 `ExclusiveWrite` 时框架保证同一工作区同时只有一个持有者，选串行时保证不重叠；**选共享时并发与冲突责任由宿主承担**，框架只如实记录谁在持有。<br>**lease 不围绕 worktree 定义**：`mode: ReadOnly \| ExclusiveWrite` 与生命周期是通用的；具体隔离手段与它的恢复信息由实现提供——git worktree 实现自然带 `worktree_ref` 与 `base_revision`，容器实现带镜像与卷标识，内存实现可能什么都不带。框架不要求每种实现都产出 git 概念。<br>何时申请、能否并发、如何 join 由 R12-5 决定 |
-| R8-12 | 网络策略 | TODO | 默认放行/deny 策略、域名 allowlist；`web_fetch` / `web_search` 走同一策略层。**同时作为 R7-11 的数据外发执行点**：请求按 source trust、目标域、工具身份和是否携带 Secret 判定，默认拒绝将 `Secret` 或未获授权的 `UntrustedData` 发送到外部；决策与被拒原因以脱敏形式进入 trace。 |
-| R8-13 | 运行期临时目录 | TODO | 每个 run 一个系统临时目录并自动清理；注入 `RUSTY_AGENT_TMPDIR` 给 shell/tool/hook（AF P21） |
+| R8-11a | **`WorkspaceLease` 生命周期** | TODO | 提供工作区租约原语：申请、校验、回收、crash-safe cleanup。<br>**互斥只在宿主选了独占或串行策略时承诺**（2026-09-09 修正：原先无条件写「同一可写工作区同一时刻只有一个持有者」，与 R12-5 允许的共享策略直接冲突——不能一边允许共享，一边承诺框架必然阻止覆盖）。选 `ExclusiveWrite` 时框架保证同一工作区同时只有一个持有者，选串行时保证不重叠；**选共享时并发与冲突责任由宿主承担**，框架只如实记录谁在持有。<br>**lease 不围绕 worktree 定义**：`mode: ReadOnly \| ExclusiveWrite` 与生命周期是通用的；具体隔离手段与它的恢复信息由实现提供——git worktree 实现自然带 `worktree_ref` 与 `base_revision`，容器实现带镜像与卷标识，内存实现可能什么都不带。框架不要求每种实现都产出 git 概念。<br>何时申请、能否并发、如何 join 由 R12-5 决定。<br>**待裁决，本条不自行决定（2026-09-15 提出）**：lease 与 R3-4d 的 `ResourceClaim` 会落在**同一个身份键**上——`ResourceId` 由工作区根在 `ra-exec::fs` 单点派生，lease 要守的也是同一个工作区。工具 claim 用于进程内、单批次调度，lease 则承担跨 run 的持有与崩溃恢复；同一个身份键不意味着两者自动共用一把锁。**实现前必须明确两者如何协作**：若工具 admission 无法识别 lease 持有者，并把该持有者自己的 claim 当成外部竞争者，则可能自阻塞。待裁决内容包括持有者身份、授权传递、工具 claim 与 lease 的兼容规则，以及后台进程的持有期限；不能简单绕过其中一层。相关既成事实两条：`exec_command` 声明 `ResourceClaim::exclusive(workspace)`，而 admission permit 在 `invoke` 返回时即释放（`ra-runtime::tool::dispatch`）；后台进程按 R8-A 已采纳的裁决在调用返回或被取消后仍由 session manager 持有并继续写。**取消请求不等于进程已退出，写权限的释放点因此不能是 invoke 的返回** |
+| R8-12 | 网络策略 | TODO | 默认放行/deny 策略、域名 allowlist；`web_fetch` / `web_search` 走同一策略层。<br>**悬空引用已删**（2026-09-15 修正）：原文写「作为 R7-11 的数据外发执行点……按 source trust 判定，默认拒绝把 `Secret` 或未获授权的 `UntrustedData` 发到外部」。**R7-11 整条已在 R7 缩减裁决中撤销**，`ContentTrust` 三值枚举不存在也不会有（代码里零命中），R11-2b 早已把凭据外发重新归到本条，只有本行漏改。<br>**凭据外发按 R11-2b 的裁决办**：显式 policy ＋ 输出端尽力脱敏（参考 codex `secrets` crate 的 `redact_secrets`），**不做输入侧 provenance 类型**。<br>**两个执行点，能力不同，谁也替不了谁**：① 工具层——`web_fetch` / `web_search` / MCP 出站按目标域与工具身份准入，这一层知道自己在发什么；② 沙箱后端层——shell 拉起的任意进程只能由后端管（codex 的 `NetworkProxy` / `ManagedNetworkSandboxContext` 与 `seatbelt_network_policy.sbpl`，Linux 走 netns），这一层管得住连接但看不见载荷。**域名 allowlist 单独不构成防泄露承诺**。两处的决策与拒绝原因都以脱敏形式进 trace |
+| R8-13 | 运行期临时目录 | TODO | 每个 run 一个系统临时目录，注入 `RUSTY_AGENT_TMPDIR` 给 shell / tool / hook（原文引 AF P21，按「不以 AF 为设计依据」的裁决删除出处，保留这件事本身）。<br>**清理有前置条件，不是「调用结束就删」**（2026-09-15 修正：原文只写「自动清理」，没说等谁）：必须等使用者全部退出——后台进程仍存活时不删，否则删的是一个正在被写的目录；可恢复的 run 在暂停期间保留目录，恢复后仍指向同一个；异常退出保留并由 `doctor` 回收，不指望进程退出钩子；重复清理必须幂等，且只删自己创建的那一层，不碰宿主给定的父目录。<br>**顺序上它是后端的输入，不是后端之上的验收项**：每个沙箱后端的写策略都要包含这个目录，`RUSTY_AGENT_TMPDIR` 的注入还要与 R8-7 的环境清理定先后（先洗再注），所以本条与 R8-7 同批，不排在四个后端之后 |
 
 ### R8-A 本地 Codex Rust 源码对照与采纳裁决（2026-08-11）
 
@@ -1044,7 +1044,7 @@ Codex 本地仓库的 `LICENSE` 为 Apache-2.0；若确有必要复制其实现�
 | R9-6 | 会话链重建 | TODO | 按 `parent_uuid` 重建对话链，分叉时选最优分支（claude `_build_conversation_chain` + `_pick_best`） |
 | R9-7 | resume 与物化 | TODO | 本地缺失时从外部 store 物化后 resume；`load_timeout_ms` 防挂死；subkey（subagent transcript）一并物化；路径穿越校验。**「物化到临时 JSONL」是 `JsonlStore` 这一个后端的实现方式**（2026-09-09 修正）——port 层只要求「resume 前能拿到该会话的 items」，后端怎么落地由它自己定，内存后端与远端后端不需要落盘 |
 | R9-8 | 会话变更族 | TODO | `rename` / `tag` / `delete` / **`fork`**（按 uuid 链重建父子关系生成新会话），每个都有 store 版本 |
-| R9-9 | 崩溃安全 checkpoint | TODO | 增量持久化 todo / file_references / 部分产物；cancel / fail / max-turns 时写 partial snapshot（AF P24.5） |
+| R9-9 | 崩溃安全 checkpoint | TODO | 增量持久化 todo / file_references / 部分产物；cancel / fail / max-turns 时写 partial snapshot。<br>**出处按裁决删除**（原引 AF P24.5）：条目本身保留，它是 R12-A 已采纳的关闭顺序「…→ 终止子进程/释放 lease → **flush checkpoint** → 释放 registry/reservation」在单 run 上的落点，站在本文自己的不变量上，不需要外部出处 |
 | R9-10 | 文件检查点与 rewind | TODO | 编辑前备份，`rewind_files(user_message_id)` 回滚到某条用户消息时的状态（claude `enable_file_checkpointing`） |
 | R9-11 | 长跑性能治理 | TODO | 连接池、批量写、索引；长 run（1000+ 事件）下写入不成为瓶颈的基准测试 |
 | R9-12 | Session input / persistence 对账 | TODO | 参考 `run_internal/session_persistence.py`：生成 `SessionInputPlan{prepared_for_model, append_for_turn, history_refs}`；session callback 重排/过滤/复制时仍只追加真正的新项。用 `PersistenceCursor{current_turn_persisted_item_count}` 支持 streaming/resume 幂等追加；retry 只 rewind fingerprint 精确匹配的尾部 suffix，失败时恢复已 pop 项并等待 cleanup 可见；guardrail trip、resumed turn、nested-history ownership 和 provider conversation sanitization 都走同一入口 |
@@ -1126,7 +1126,7 @@ Codex 本地仓库的 `LICENSE` 为 Apache-2.0；若确有必要复制其实现�
 | R11-8 | Skills：发现与白名单 | TODO | 从 `.rusty-agent/skills/` 与插件发现；白名单过滤。**明确文档化：白名单是上下文过滤器，不是沙箱**——未列出的 skill 文件仍在磁盘上、仍可被 Read/Bash 读到（claude 文档的诚实说明，照抄这个边界声明） |
 | R11-9 | Skills：加载与规模硬化 | TODO | `load_skill` 工具；大 skill 的分块与 token 上限；skill 内容进上下文的位置遵守 R4（尾部而非前缀） |
 | R11-10 | 插件系统 | TODO | 本地/内置/Git 插件安装与发现；插件可提供 commands / agents / skills / hooks / MCP servers；**权限风险推导与工具级风险覆盖** |
-| R11-11 | 插件安全模型 | TODO | catalog 元数据、权限/风险摘要、checksum/签名状态、显式安装确认、启用/禁用/卸载（AF P18 的完整安全模型）。安装记录必须锁定 canonical source（本地绝对路径或 Git URL + commit）、版本、内容 digest、签名验证结果与声明的工具/MCP/hook 权限；更新或来源漂移一律重新审批。R11-8 的白名单只是上下文过滤，**不构成**插件可执行代码或 MCP 的信任授权；其运行权限仍交 R6 / R7-11 / R8-12 判定。 |
+| R11-11 | 插件安全模型 | TODO | catalog 元数据、权限/风险摘要、checksum/签名状态、显式安装确认、启用/禁用/卸载（原引 AF P18，出处按裁决删除，条目本身保留）。安装记录必须锁定 canonical source（本地绝对路径或 Git URL + commit）、版本、内容 digest、签名验证结果与声明的工具/MCP/hook 权限；更新或来源漂移一律重新审批。R11-8 的白名单只是上下文过滤，**不构成**插件可执行代码或 MCP 的信任授权；其运行权限仍交 R6 与 R8-12 判定（原写 R6 / R7-11 / R8-12，R7-11 整条已在 R7 缩减裁决中撤销，属悬空引用）。 |
 | R11-12 | MCP 工具元数据解析 | TODO | 对齐 openai `_mcp_tool_metadata.py`：title / description 有多个来源（`annotations.title` → `title` → `name`），按优先级解析并缓存。**关键区分**：`description_for_model`（进 schema，占 token 预算，受 R2-10 约束）与 `title` / `description_for_ui`（只给宿主渲染，不进请求）是两个字段。把 UI 文案塞进 schema 是白烧 token |
 
 ### R11 复用 Codex MCP 栈的取舍
@@ -1233,7 +1233,7 @@ Codex 的 `McpBinding`（`codex-mcp/src/binding.rs`）做的是「冻结目录�
 | R12-2 | `Agent::as_tool()` | TODO | 把 agent 包成工具（openai `agent.py:576`）：独立上下文、结果回灌父级。**这是 Codex/CC 的主形态，优先于 handoff**。必须显式区分 `as_tool` 与 handoff：前者接收生成 input、子 agent 完成后父 agent 继续；后者传递/过滤历史并转移控制权。结构化输入可借鉴 `AgentAsToolInput` / `StructuredInputSchemaInfo`，但最终仍转换成协议中立 `InputItem` |
 | R12-3 | 嵌套审批镜像 | TODO | 子 agent 内的审批中断要冒泡到父 run 的 `Interruption`，批准后镜像回子 agent（openai `_nested_approvals_status` / `_apply_mirrored_approval`） |
 | R12-4 | 子 agent 事件转发 | TODO | 子 agent 的 RunItem 事件按需转发给订阅者（可折叠展示） |
-| R12-5 | 并发、工作区隔离与取消传播 | TODO | `AgentPool` 并发上限；父 run cancel 传播到所有子 agent，恢复/取消时不得遗留工作区或进程。<br>**隔离策略由宿主选择，不写死 worktree**（2026-09-09 修正：原文要求「任何可能写入的 agent 必须拿独立 `ExclusiveWrite` worktree」，那是 git 专有策略）。框架提供 R8-11a 的 lease 原语与一个隔离选项，**选项的具体公开类型现在不定死**——先落地「共享 / 串行 / 独立工作区」三种语义，形态等第一个真实产品定。<br>**进 `RunState` 的是 lease 标识与清理责任**；恢复所需的其余信息由隔离实现自己提供并自描述——`base_revision` 只属于 git 实现，不是所有后端都有的字段。<br>**并写冲突仍不自动合并**：框架不让最后完成者静默覆盖，但「怎样算冲突、要不要 merge node」由宿主决定 |
+| R12-5 | 并发、工作区隔离与取消传播 | TODO | `AgentPool` 并发上限；父 run cancel 传播到所有子 agent，恢复/取消时不得遗留工作区或进程。<br>**隔离策略由宿主选择，不写死 worktree**（2026-09-09 修正：原文要求「任何可能写入的 agent 必须拿独立 `ExclusiveWrite` worktree」，那是 git 专有策略）。框架提供 R8-11a 的 lease 原语与一个隔离选项，**选项的具体公开类型现在不定死**——先落地「共享 / 串行 / 独立工作区」三种语义，形态等第一个真实产品定。<br>**进 `RunState` 的是 lease 标识与清理责任**；恢复所需的其余信息由隔离实现自己提供并自描述——`base_revision` 只属于 git 实现，不是所有后端都有的字段。<br>**并写冲突不自动合并，且承诺按隔离策略分档**（2026-09-15 修正：原文写「框架不让最后完成者静默覆盖」，与同日修正的 R8-11a「选共享时并发与冲突责任由宿主承担，框架只如实记录谁在持有」直接冲突——共享模式下框架没有任何机制能兑现这句）。`ExclusiveWrite` 与串行策略下，lease 保证参与该租约协议的写入者不重叠；**不保证基于陈旧内容的后续写入不会覆盖已有修改**，也不约束未参与协议的外部写入者。版本冲突检测与发布策略由宿主决定；**共享策略下框架只记录持有者，覆盖与冲突责任在宿主**；独立工作区要到发布/合并阶段才谈得上冲突检测，且「怎样算冲突、要不要 merge node」仍由宿主决定 |
 | R12-6 | 预算继承与累计用量 | TODO | **先做三件确定需要的**：跨父子 agent 的**累计** token / 费用 / wall-clock、显式深度上限与防递归、取消传播。<br>**统一 reservation 系统暂缓**（2026-09-09 修正）：把 token、费用、进程、网络调用提前收进一套预留/回收机制过重，且没有产品在驱动它。子 agent 启动前的可回收 reservation 按实际场景逐个增加，不预先建总账 |
 | R12-7 | 子 agent 结果返回与轨迹引用 | TODO | **默认支持直接返回子 agent 的结论**（2026-09-09 修正：原文照 CC 的 `Agent.outputFile` 强制「主上下文只留 `agent_id` + 文件指针」——那是一种降低上下文成本的手段，不该固化成子 agent 契约；一个只回一行结论的子 agent 走文件指针纯属绕路）。<br>**完整轨迹的独立存储与按需取回是可选项**：子 agent 完整轨迹可写独立文件并作为主会话 subkey（R9-2 的 `list_subkeys`），父级用 `agent_output` 按需取回；探索型子 agent 开它，问答型子 agent 不开。由产品配置。<br>**独立存储不等于脱离主时间线**：无论选哪种，子 run 的 spawn / complete 与审批冒泡都必须在主时间线上可见 |
 | R12-7b | 停滞子 agent 止损 | TODO | 父 agent 可检测子 agent 停滞并发"强制收敛"消息（CC 实测的 `SendMessage` 止损催收），而不是干等到超时 |
@@ -1275,7 +1275,7 @@ ra-tools::agent                 只做 schema、参数校验、模型可见 Tool
   ▼
 ra-runtime::agent::AgentControl root run tree 的 live registry、状态迁移、审批/取消/预算 admission
   ├── ra-session 的 AgentGraphStore  持久 edge、checkpoint、subkey、恢复所需状态
-  ├── ra-exec 的 WorkspaceLeaseManager  分配/回收 read-only 或 exclusive worktree
+  ├── ra-exec 的 WorkspaceLeaseManager  分配/回收 ReadOnly 或 ExclusiveWrite 工作区（worktree 只是其一种实现）
   ├── ra-runtime::RunnerFactory  启动/恢复 child run，并挂到父 CancelScope
   └── HostEvent::Agent(..)      UI/trace 事件族，走 R8-0 的统一信封；不是模型上下文
   ▼
@@ -1289,9 +1289,9 @@ ra-coding / ra-assistant         定义角色、profile、委派策略与是否 
 | `ra-core::agent` | `AgentId` / `AgentPath` / `AgentStatus` / `SpawnRequest` / `HistoryProjection` / `AgentTreeSnapshot` 等可序列化值对象；`AgentControlPort`、`AgentGraphStore`、`WorkspaceLeaseManager` 等**端口 trait**（经 `ToolServices` 递给工具，见下）；agent 事件族的**载荷**（信封是 R8-0 的 `HostEvent`） | Tokio task、HashMap live registry、文件/数据库 I/O、模型或产品策略 |
 | `ra-runtime::agent` | root-scoped `AgentControl`、`AgentRegistry`、并发/深度 limiter、budget reservation、取消与审批镜像、幂等状态机、`RunnerFactory` 调用 | SQL/JSONL 实现、worktree/sandbox 实现、拓扑专属的 supervisor 规则 |
 | `ra-session` | `AgentGraphStore` 实现：parent-child edge、operation id、状态、subkey 指针、checkpoint 与恢复查询 | 运行中的 task 句柄、预算或 lease 的最终决策 |
-| `ra-exec` | `WorkspaceLeaseManager` 实现、worktree 物化/清理、子进程归属与终止 | agent role、历史投影、图的路由判断 |
+| `ra-exec` | `WorkspaceLeaseManager` 实现、工作区物化/清理（git worktree、容器卷、临时副本各是一种实现，框架不预设哪一种）、子进程归属与终止 | agent role、历史投影、图的路由判断 |
 | `ra-tools::agent` | `agent.*` namespace 的输入/输出 schema 与薄适配；经 `ToolContext` 的 `ToolServices` 取显式 `AgentControlPort` 访问控制面 | 应用上下文 downcast、自行 spawn `Runner`、自管 registry/budget/lease |
-| `ra-flow` | `AgentNode`、supervisor/fan-out/pipeline/debate 的图定义、调度、join/barrier、图级 budget admission | 直接读写 session store、直接创建 worktree、绕过 `AgentControl` 启动 child run |
+| `ra-flow` | `AgentNode`、supervisor/fan-out/pipeline/debate 的图定义、调度、join/barrier、图级 budget admission | 直接读写 session store、自行物化工作区（含 worktree）、绕过 `AgentControl` 启动 child run |
 | `ra-coding` / `ra-assistant` | AgentDefinition、角色 prompt、工具/profile allowlist、委派触发策略和产品验收 | 运行时状态机、跨产品的资源清理或持久化实现 |
 | `ra-protocol` / UI | 控制请求与事件订阅的 transport/渲染 | 把 UI 事件当作 agent 的权威状态或模型输入 |
 
@@ -1364,7 +1364,7 @@ R12 的定位是「只提供内核机制，拓扑归 R17」。上面这套东西
 | R13-7 | 生命周期正确性 | TODO | **`result` 帧 ≠ run 结束**：在途任务集合非空时不关输入通道；只有能可靠到终态的任务类型（子 agent / workflow）才允许延迟收尾——background shell / 长驻 monitor 不算（claude `DEFERRING_TASK_TYPES` 的血泪注释） |
 | R13-8 | 事件订阅与拉取 | TODO | `run.subscribe` 流式订阅 + 断线后按 offset 补拉；订阅滞后（lagged）时的恢复语义 |
 | R13-9 | 线程 / 运行时 API | TODO | thread CRUD、run 启动/暂停/恢复/取消、审批 API、trace 查询 |
-| R13-10 | 连接生命周期硬化 | TODO | 心跳探活、自动重连、重连后刷新与重订阅、请求默认超时与长操作 override（AF P38 全套） |
+| R13-10 | 连接生命周期硬化 | TODO | 心跳探活、自动重连、重连后刷新与重订阅、请求默认超时与长操作 override（原引 AF P38，出处按裁决删除；这几件是通用连接治理，条目本身保留） |
 | R13-11 | 结构化输出 | TODO | `output_format: {type: json_schema, schema}`；最终结果按 schema 校验 |
 
 ### R13 非目标
@@ -1400,7 +1400,7 @@ R12 的定位是「只提供内核机制，拓扑归 R17」。上面这套东西
 | R14-6 | 真实 provider 门禁 | TODO | 分阶段：mock 全绿 → 单 provider pilot → confirmatory。**样本量按指标定，不设统一数字**（2026-09-09 修正）：原文的 `n≥3` / `n≥10` 对所有默认值变更一刀切，缺少针对具体指标方差的依据。改为实验指导——变更前写明要动的指标、预期效应量与判据，由该指标的观测方差决定样本量。「一次跑不能当结论」这条保留 |
 | R14-7 | 对照任务集 | TODO | 覆盖：单文件修改、跨文件依赖闭环、超大文档定位、只读分析报告、多交付物产出、失败恢复、后台长跑、多 agent 汇总 |
 | R14-7a | **对抗、安全与多 agent E2E 套件** | TODO | 在 R14-7 的固定任务集上追加：两个 writer 的 worktree 冲突与显式 merge、父图/子 run 总预算耗尽、kill/restart 后 lease 与子进程回收、恶意网页/MCP/skill/plugin 输出尝试改变控制指令、未经授权的外发、secret 进入 trace/UI/模型输入。fixture 同时断言功能结果与安全不变量（无越界写、无未授权外发、无 Secret 落盘）；对提醒或 guard 的默认启用采用 AgentForge P67 式的 shadow/control/treatment 真实 provider A/B 门禁，收益、额外 token、误伤和 replay 一项不达标则不升级默认策略。 |
-| R14-8 | 失败沉淀为回归用例 | TODO | eval 失败自动生成回归用例草稿 + 归因标签（AF P39） |
+| R14-8 | 失败沉淀为回归用例 | TODO | eval 失败自动生成回归用例草稿 + 归因标签（原引 AF P39，出处按裁决删除，条目本身保留） |
 | R14-9 | 跨版本回归锁 | TODO | prompt 段、工具 schema、`NextStep` 序列进快照回归。**纪律指标已移除**（随 R7-6/7/8 撤销） |
 
 ### R14 非目标
@@ -1432,7 +1432,7 @@ R12 的定位是「只提供内核机制，拓扑归 R17」。上面这套东西
 | R15-1 | 工具历史驱动的验证摘要 | TODO | final 成型从当前 run 的 Session / 工具事件提取实际编辑、执行过的命令及结果。它是一次性呈现投影，不持久化、不绑定 criterion、不成为权威状态。<br>**已知限制：压缩之后这条投影的可靠性依赖 summary 质量，这是本次裁决换来的代价，写在这里不是为了推翻它。** 被删除的验证账本原本承担一件事——让「改了但没验证」熬过压缩。现在验证事实的权威在 `Session`，但**模型看的是上下文投影**，而 R5-3 会压缩它：压缩之后这个事实是否还在，取决于 9 段式 summary 的第 4 段（Errors and fixes）与第 8 段（Current Work）有没有抓住它。这是**摘要质量属性，不是机制保证**。<br>两条后果要认下来：① **R5-3 的摘要规格因此多背了一份责任**——它现在是"改后未验证"唯一的跨压缩载体，R5-3 的验收里应有一条针对该事实的保留断言（**已落地**：`an_edit_made_but_not_yet_verified_survives_into_the_summary`，断言该事实渲染后仍分别落在第 4 段与第 5 段之间、第 8 段与第 9 段之间，把两段并成一坨散文会挂）；② final 成型若发生在压缩之后，`Session` 仍是权威、可回查，所以 R15-1 应**直接读工具事件历史而不是读模型上下文**——这条不做，长 run 的 final 会随摘要一起失真。R14-4a 度量这个失真的实际发生率 |
 | R15-2 | 改后验证提醒与诚实披露 | TODO | 最后一次持久化编辑后，可向模型发送一次软提醒以选择 targeted verification；未验证、验证失败或环境受阻必须在 final 中如实说明。提醒不阻止收尾、不触发自动续跑 |
 | R15-3 | Closeout / auto-continuation 实验 | **DEFERRED（默认不做）** | 不移植 AgentForge P46 的 fast path，也不依据验证状态实现 closeout gate。只有 eval 先证实尾随只读工具造成真实空转，且 A/B 证实修复不增加 token、轮数或假完成时，才单独立项 |
-| R15-4 | Final answer 模式 | TODO | `Minimal` / `Engineering` / `EvidenceBrief` / `AnalysisReport` / `ArtifactSummary`；按任务类型选择，只作用于呈现层，不改 loop/closeout/verification（AF P60/P62） |
+| R15-4 | Final answer 模式 | TODO | `Minimal` / `Engineering` / `EvidenceBrief` / `AnalysisReport` / `ArtifactSummary`；按任务类型选择，只作用于呈现层，不改 loop/closeout/verification（原引 AF P60/P62，出处按裁决删除；五档的取舍属 Rusty 自己的设计选择，要不要这么分由 R14 的度量决定） |
 | R15-5 | 事实型 final 槽位 | TODO | final 的“改了什么 / 实际怎么验证 / 剩余风险 / 未完成项”从工具历史与模型当前上下文组织；仅检查已声称的命令是否存在于历史，不推断 criterion 覆盖率，也不硬拦 |
 | R15-6 | Bounded continuation | TODO | 预算/轮次耗尽时的有界继续：明确剩余工作、显式续跑而非无声中断 |
 | R15-7 | 诚实呈现 | TODO | 部分完成、被阻塞、降级执行必须在 final 里明说；**测试失败要贴输出，跳过的步骤要说明** |
@@ -1740,7 +1740,7 @@ R6-6a、R8-0、R9-2a、R9-0a、R9-0b 五条按编号分别属于第 10、9、14 
 | 54 | R12-3 | 嵌套审批镜像 |
 | 55 | R12-6 | 预算继承、预留与总账 |
 | 56 | R12-7 | 子 agent 上下文文件级隔离 |
-| 57 | R12-5 | 并发、工作区 lease 与取消传播（**只做契约与 `RunState` 形状**；真正的 worktree 创建与 writer admission 依赖 R8-11a，归第 12 步） |
+| 57 | R12-5 | 并发、工作区 lease 与取消传播（**只做契约与 `RunState` 形状**；真正的工作区物化与 writer admission 依赖 R8-11a，归第 12 步。2026-09-15：原文此处写「worktree 创建」，与 R8-11a / R12-5 已取消强制 worktree 的裁决不符，改为通用措辞） |
 | 58 | R12-4 | 子 agent 事件转发 |
 | 59 | R12-7b | 停滞子 agent 止损 |
 
@@ -1776,6 +1776,27 @@ R6-6a、R8-0、R9-2a、R9-0a、R9-0b 五条按编号分别属于第 10、9、14 
 ### 之后
 
 按梯队表第 11 步起：R7 与 R3-9 全部已完成（生命周期 hook 走 `ra_runtime::lifecycle` 这条独立注册路径，不复用 `ra_runtime::hook` 的决定型注册面），**批次 I 两条做完之后是第 12 步 R8-7..R8-13 + R8-11a / R12-5 完整执行** → 第三梯队 R9-0 起。**R4-0h 前端设计段**的前置（R10-5 按需加载）已就位，可随时落地，仍不进常驻前缀。
+
+#### 第 12 步的措辞更正（2026-09-15，以本节为准；梯队表按惯例不改）
+
+开工前核对第 12 步范围时，发现四处与已生效裁决不符，正文已改，梯队表第 12 步那一行保持原样存档：
+
+1. **「实际 worktree 生命周期」作废，改为通用工作区生命周期。** 梯队表写的是「完成 `WorkspaceLease` 的实际 worktree 生命周期」，而 R8-11a 与 R12-5 在 2026-09-09 已取消强制 worktree，这一处漏改。git worktree 只是隔离实现之一，**基础 `Runner`、handoff 与只调 API 的 agent 不因此需要 git**。同一处措辞在 R12-B 的分层图与分层表、批次 G 第 57 条也一并改掉。
+2. **R12-5 的「框架不让最后完成者静默覆盖」按隔离策略分档。** 它与 R8-11a 同日修正的「共享模式下框架只如实记录持有者」正面冲突，共享模式下没有任何机制能兑现那句承诺。独占与串行也只保证参与租约协议的写入者不重叠，不保证基于陈旧内容的后续写入不会覆盖已有修改。
+3. **R8-7 / R8-8 / R8-13 的 AF 出处删除**（AF P41-1 / P14.1 / P21），依「不以 AF 为设计依据」的裁决；事情本身保留：环境构造与沙箱策略组合参考 codex 的 `unified_exec` 与 `sandboxing`；rlimit、具名配置及降级关系属于 Rusty 的设计选择，不归因为上游已有契约。**R8-12 的 `ContentTrust` / `Secret` / `UntrustedData` 词表删除**——R7-11 整条早已撤销，R11-2b 也已把凭据外发重新归到 R8-12，只有 R8-12 自己那行漏改。
+4. **R8-13 与 R8-7 同批，不排在四个后端之后。** 临时目录是每个后端写策略的输入，`RUSTY_AGENT_TMPDIR` 的注入还要与环境清理定先后；放在后端之后等于四个后端各写一遍再改一遍。
+
+**尚未裁决、不在上述改动内**：lease 与 `ResourceClaim` 如何协作，包括持有者身份、授权传递、兼容规则与后台进程持有期限（见 R8-11a 的待裁决段）。这一条定下来之前，第 12 步的 writer admission 没有可实现的契约。
+
+#### AF 出处清理（2026-09-15，全文一次做完）
+
+依「不以 AF 为设计依据」的裁决，把**拿 AF 当正面依据**的引用一次清干净，共八条：第 12 步内的 R8-7（P41-1）、R8-8（P14.1）、R8-13（P21），以及 R9-9（P24.5）、R11-11（P18）、R13-10（P38）、R14-8（P39）、R15-4（P60/P62）。
+
+**做法是删出处、留条目，不是顺手补一个新出处。** 清理时发现两类错误，记在这里免得再犯：① R8-7 原把资源上限一并算到 codex `unified_exec` 头上，可 codex 全仓只有 `process-hardening` 给**自己**设 `RLIMIT_CORE=0`、`utils/pty` 读一次 `RLIMIT_NOFILE`，对子进程没有任何资源上限策略；② R8-8 原称 codex 有"可枚举的降级档"，而 `Minimal` 只是 `FileSystemSpecialPath` 的一个路径记号，由 `include_platform_defaults()` 一个布尔决定拼不拼进策略，不是按强弱排序的梯子。**换出处必须回源码核过，核不动就写成 Rusty 自己的设计选择**，这比挂一个错的上游更诚实。
+
+**保留不动的是拿 AF 当反面教材的那些行**（"全局非目标"表的 P68 / P43-2、R2 工具面里 43-44 个工具与双 profile 并存那几条）：它们记的是"不做什么"以及当初为什么排除，属于历史观察而不是设计依据。
+
+顺带修掉同类的一处悬空引用：R11-11 的"运行权限交 R6 / R7-11 / R8-12 判定"——R7-11 早已撤销，与 R8-12 是同一处漏改。
 
 ---
 
