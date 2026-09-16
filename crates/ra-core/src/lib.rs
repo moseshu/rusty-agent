@@ -38,6 +38,7 @@ pub mod model;
 pub mod output;
 pub mod permission;
 pub mod prompt;
+pub mod sandbox;
 pub mod session;
 pub mod skill;
 pub mod state;
