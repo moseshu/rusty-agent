@@ -18,9 +18,16 @@
 //! the other.
 
 pub mod error;
+pub mod registry;
+pub mod snapshot;
 pub mod types;
 
 pub use error::{ErrorCategory, ErrorCode, OpName, SandboxError, SandboxErrorDetails};
+pub use registry::{
+    DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
+    session_state_kind, snapshot_kind,
+};
+pub use snapshot::{NOOP_SNAPSHOT_TYPE, Snapshot};
 pub use types::{
     ErrorContext, ExecResult, ExposedPortEndpoint, FileMode, Group, Permissions,
     PermissionsParseError, UnsupportedScheme, User,
