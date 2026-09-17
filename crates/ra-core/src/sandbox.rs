@@ -18,16 +18,24 @@
 //! the other.
 
 pub mod error;
+pub mod manifest;
 pub mod registry;
 pub mod snapshot;
+pub mod state;
 pub mod types;
 
 pub use error::{ErrorCategory, ErrorCode, OpName, SandboxError, SandboxErrorDetails};
+pub use manifest::{
+    DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, MANIFEST_VERSION, Manifest,
+};
 pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
     session_state_kind, snapshot_kind,
 };
 pub use snapshot::{NOOP_SNAPSHOT_TYPE, Snapshot};
+pub use state::{
+    ExposedPortsError, SandboxSessionState, UnsupportedPersistence, normalize_exposed_ports,
+};
 pub use types::{
     ErrorContext, ExecResult, ExposedPortEndpoint, FileMode, Group, Permissions,
     PermissionsParseError, UnsupportedScheme, User,
