@@ -18,19 +18,28 @@
 //! the other.
 
 pub mod error;
+pub mod files;
 pub mod manifest;
+pub mod pty;
 pub mod registry;
+pub mod session;
 pub mod snapshot;
 pub mod state;
 pub mod types;
 
 pub use error::{ErrorCategory, ErrorCode, OpName, SandboxError, SandboxErrorDetails};
+pub use files::{EntryKind, FileEntry};
 pub use manifest::{
     DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, MANIFEST_VERSION, Manifest,
 };
+pub use pty::{PtyExecUpdate, PtyProcessId, PtyStartRequest, PtyWriteRequest};
 pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
     session_state_kind, snapshot_kind,
+};
+pub use session::{
+    AsUser, CreateRequest, ExecRequest, SandboxClient, SandboxResult, SandboxSession,
+    ShellInvocation,
 };
 pub use snapshot::{NOOP_SNAPSHOT_TYPE, Snapshot};
 pub use state::{

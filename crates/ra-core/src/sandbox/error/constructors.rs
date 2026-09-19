@@ -49,7 +49,10 @@ impl SandboxError {
             .with_context("exit_code", result.exit_code)
             .with_context("stdout", stdout)
             .with_context("stderr", stderr);
-        error.details = Some(SandboxErrorDetails::ExecNonZero { command, result });
+        error.details = Some(Box::new(SandboxErrorDetails::ExecNonZero {
+            command,
+            result,
+        }));
         error
     }
 
@@ -59,7 +62,10 @@ impl SandboxError {
         let mut error = Self::new(ErrorCode::ExecTimeout, OpName::Exec, "command timed out")
             .with_command_context(&command)
             .with_context("timeout_s", timeout_s);
-        error.details = Some(SandboxErrorDetails::ExecTimeout { command, timeout_s });
+        error.details = Some(Box::new(SandboxErrorDetails::ExecTimeout {
+            command,
+            timeout_s,
+        }));
         error
     }
 
@@ -74,7 +80,7 @@ impl SandboxError {
                 .unwrap_or("exec transport error"),
         )
         .with_command_context(&command);
-        error.details = Some(SandboxErrorDetails::ExecTransport { command });
+        error.details = Some(Box::new(SandboxErrorDetails::ExecTransport { command }));
         error
     }
 
@@ -87,7 +93,9 @@ impl SandboxError {
             format!("PTY session not found: {session_id}"),
         )
         .with_context("session_id", session_id);
-        error.details = Some(SandboxErrorDetails::PtySessionNotFound { session_id });
+        error.details = Some(Box::new(SandboxErrorDetails::PtySessionNotFound {
+            session_id,
+        }));
         error
     }
 

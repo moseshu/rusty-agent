@@ -338,7 +338,10 @@ pub struct SandboxError {
     #[source]
     cause: Option<Box<dyn std::error::Error + Send + Sync>>,
     retryable: Option<bool>,
-    details: Option<SandboxErrorDetails>,
+    // Boxed to keep the error small. Every sandbox operation returns this in a `Result`, so the
+    // whole call graph pays for its size on the success path too, and the payload is carried by a
+    // handful of failures rather than by most of them.
+    details: Option<Box<SandboxErrorDetails>>,
 }
 
 impl SandboxError {
@@ -435,7 +438,7 @@ impl SandboxError {
 
     /// Typed failure data, preserved independently of diagnostic context overrides.
     #[must_use]
-    pub const fn details(&self) -> Option<&SandboxErrorDetails> {
-        self.details.as_ref()
+    pub fn details(&self) -> Option<&SandboxErrorDetails> {
+        self.details.as_deref()
     }
 }
