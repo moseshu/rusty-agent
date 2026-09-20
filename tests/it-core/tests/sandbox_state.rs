@@ -1,5 +1,4 @@
-//! `ra-core::sandbox::{manifest, state}`: what a session declares its workspace should contain, and
-//! what it needs in order to be resumed.
+//! `ra-core::sandbox::state`: what a session needs in order to be resumed.
 //!
 //! The behavior pinned here is what a resume depends on:
 //! - exposed ports normalize the way the reference normalizes them, including which values it
@@ -9,103 +8,18 @@
 //!   describes the same sandbox when another host reads it
 //! - a modelled field cannot also live among the backend-specific ones, where the two could
 //!   disagree
+//!
+//! What a manifest declares is pinned in `sandbox_manifest.rs`.
 
 use ra_core::sandbox::{
-    DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, DiscriminatedPayload, Group,
-    MANIFEST_VERSION, Manifest, SandboxSessionState, Snapshot, User, normalize_exposed_ports,
+    DiscriminatedPayload, Entry, Environment, Manifest, SandboxPathGrant, SandboxSessionState,
+    Snapshot, normalize_exposed_ports,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 fn state() -> SandboxSessionState {
     SandboxSessionState::new("stub", Snapshot::new("local", "snap-1"), Manifest::new())
-}
-
-// --- manifest -----------------------------------------------------------------------------
-
-#[test]
-fn a_fresh_manifest_carries_the_reference_defaults() {
-    let manifest = Manifest::new();
-
-    assert_eq!(manifest.version, MANIFEST_VERSION);
-    assert_eq!(manifest.root, DEFAULT_MANIFEST_ROOT);
-    assert_eq!(manifest.root, "/workspace");
-    assert!(manifest.entries.is_empty());
-    assert!(manifest.users.is_empty());
-    assert!(manifest.groups.is_empty());
-    assert!(!manifest.grants_extra_paths());
-}
-
-#[test]
-fn the_remote_mount_allowlist_reads_and_moves_but_does_not_fetch_or_execute() {
-    let allowlist = &DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST;
-
-    assert_eq!(allowlist.len(), 18);
-    for expected in ["ls", "find", "stat", "cat", "grep", "cp", "mkdir", "rm"] {
-        assert!(allowlist.contains(&expected), "{expected} must be allowed");
-    }
-    // Nothing that reaches the network or runs a program: widening this is a backend's own
-    // manifest to declare, not a default anybody inherits.
-    for refused in ["curl", "wget", "sh", "bash", "chmod", "sudo", "ssh"] {
-        assert!(
-            !allowlist.contains(&refused),
-            "{refused} must not be allowed by default"
-        );
-    }
-}
-
-#[test]
-fn a_manifest_round_trips_including_the_parts_not_yet_modelled() {
-    // Entries and grants are carried as written until materialization is ported. A host that does
-    // not model them must still hand back a manifest that describes the same workspace.
-    let manifest = Manifest::new()
-        .with_root("/srv/work")
-        .with_user(User::new("agent"))
-        .with_group(Group::new("staff", vec![User::new("agent")]))
-        .with_entry("README.md", json!({"type": "local_file", "path": "/tmp/r"}));
-
-    let rendered = serde_json::to_value(&manifest).expect("serialize");
-    let back: Manifest = serde_json::from_value(rendered.clone()).expect("deserialize");
-
-    assert_eq!(back, manifest);
-    assert_eq!(back.root, "/srv/work");
-    assert_eq!(
-        rendered["entries"]["README.md"],
-        json!({"type": "local_file", "path": "/tmp/r"})
-    );
-}
-
-#[test]
-fn a_manifest_reads_back_with_every_field_omitted() {
-    // `{}` is a valid manifest: an empty workspace at the default root. Making any field required
-    // would reject configuration the reference accepts.
-    let empty: Manifest = serde_json::from_value(json!({})).expect("empty manifest");
-    assert_eq!(empty, Manifest::new());
-
-    let partial: Manifest =
-        serde_json::from_value(json!({"version": 1, "root": "/workspace"})).expect("partial");
-    assert_eq!(partial, Manifest::new());
-
-    let rooted: Manifest = serde_json::from_value(json!({"root": "/srv"})).expect("root only");
-    assert_eq!(rooted.version, MANIFEST_VERSION);
-    assert_eq!(rooted.root, "/srv");
-    assert_eq!(
-        rooted.remote_mount_command_allowlist.len(),
-        DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST.len()
-    );
-}
-
-#[test]
-fn a_manifest_version_this_does_not_understand_is_refused() {
-    // Reading a later format with rules written for this one would materialize a workspace from
-    // entries that no longer mean what they used to.
-    for unsupported in [json!({"version": 2}), json!({"version": 0})] {
-        let error = serde_json::from_value::<Manifest>(unsupported.clone()).expect_err("refuse");
-        assert!(
-            error.to_string().contains("unsupported manifest version"),
-            "{unsupported} must be refused, got {error}"
-        );
-    }
 }
 
 // --- exposed ports ------------------------------------------------------------------------
@@ -377,11 +291,11 @@ fn a_state_carrying_mount_authority_refuses_to_be_persisted() {
         Snapshot::new("local", "snap-1"),
         Manifest::new().with_entry(
             "data",
-            json!({
-                "type": "s3_mount",
-                "secret_access_key": "AKIAsecret",
-                "session_token": "tok",
-            }),
+            Entry::new(ra_core::sandbox::EntryContent::Extension(
+                DiscriminatedPayload::new("s3_mount")
+                    .with_field("secret_access_key", "AKIAsecret")
+                    .with_field("session_token", "tok"),
+            )),
         ),
     );
 
@@ -404,9 +318,13 @@ fn a_state_carrying_mount_authority_refuses_to_be_persisted() {
 #[test]
 fn every_unmodelled_manifest_field_closes_the_persistence_path() {
     let mut environment = Manifest::new();
-    environment.environment = Some(json!({"AWS_SECRET_ACCESS_KEY": "s"}));
-    let mut grants = Manifest::new();
-    grants.extra_path_grants = vec![json!({"path": "/w", "host_path": "/home/user/.aws"})];
+    environment.environment = Environment::new().with("AWS_SECRET_ACCESS_KEY", "s");
+    let grants = Manifest::new().with_path_grant(
+        SandboxPathGrant::new("/w")
+            .expect("absolute")
+            .with_host_path("/home/user/.aws")
+            .expect("absolute host source"),
+    );
 
     for (manifest, field) in [(environment, "environment"), (grants, "extra_path_grants")] {
         let state = SandboxSessionState::new("stub", Snapshot::noop(), manifest);
