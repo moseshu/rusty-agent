@@ -17,21 +17,47 @@
 //! files, and can be stopped, serialized and resumed. The two compose, and neither substitutes for
 //! the other.
 
+pub mod entries;
+pub mod environment;
 pub mod error;
 pub mod files;
 pub mod manifest;
+pub mod manifest_render;
+pub mod materialization;
 pub mod pty;
 pub mod registry;
 pub mod session;
 pub mod snapshot;
 pub mod state;
 pub mod types;
+pub mod workspace_paths;
 
+pub use entries::mounts::{
+    AzureBlobMount, BUILTIN_MOUNT_TYPES, BoxMount, BoxSubType, DEFAULT_S3_PROVIDER,
+    DOCKER_VOLUME_STRATEGY_TYPE, FuseCacheType, FuseOptions, GcsMount, IN_CONTAINER_STRATEGY_TYPE,
+    Mount, MountConfigError, MountPattern, MountProvider, MountStrategy, MountpointOptions,
+    R2Mount, RcloneMode, RcloneOptions, S3FilesMount, S3FilesOptions, S3Mount, authority_fields,
+    authority_file_fields, builtin_mount_strategy_registry, configured_authority_fields,
+    credential_set, mount_strategy_kind, url_carries_inline_authority, url_fields,
+};
+pub use entries::{
+    DEFAULT_GIT_HOST, Entry, EntryContent, EntryOwner, EntryRenderError, builtin_entry_registry,
+    default_entry_permissions, entry_kind, resolve_workspace_path,
+};
+pub use environment::{
+    EnvEntry, EnvMember, EnvValue, EnvValueResolver, Environment, STR_ENV_VALUE_TYPE,
+    UnresolvableEnvValues, builtin_env_value_registry, env_value_kind,
+};
 pub use error::{ErrorCategory, ErrorCode, OpName, SandboxError, SandboxErrorDetails};
 pub use files::{EntryKind, FileEntry};
 pub use manifest::{
     DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, MANIFEST_VERSION, Manifest,
+    ManifestParseError, ManifestRegistries, MountCredentialAuthority, MountExposureError,
 };
+pub use manifest_render::{
+    MAX_MANIFEST_DESCRIPTION_CHARS, render_manifest_description, truncate_manifest_description,
+};
+pub use materialization::{MaterializationResult, MaterializedFile};
 pub use pty::{PtyExecUpdate, PtyProcessId, PtyStartRequest, PtyWriteRequest};
 pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
@@ -48,4 +74,9 @@ pub use state::{
 pub use types::{
     ErrorContext, ExecResult, ExposedPortEndpoint, FileMode, Group, Permissions,
     PermissionsParseError, UnsupportedScheme, User,
+};
+pub use workspace_paths::{
+    CwdError, InvalidWorkspaceRoot, PathGrantError, PosixPath, SandboxPathGrant,
+    SandboxWorkspaceScope, ScopePathError, WorkspacePathPolicy, normalize_sandbox_cwd,
+    windows_absolute_path,
 };

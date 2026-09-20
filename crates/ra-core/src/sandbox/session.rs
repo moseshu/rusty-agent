@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
 use super::manifest::Manifest;
+use super::materialization::MaterializationResult;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
 use super::registry::DiscriminatedPayload;
 use super::snapshot::Snapshot;
@@ -381,11 +382,18 @@ pub trait SandboxSession: Send + Sync {
 
     /// Materializes the whole manifest.
     ///
+    /// Returns a receipt of what was written. An empty one does not mean nothing was written — an
+    /// entry materialized by a command inside the sandbox cannot hash its own files without reading
+    /// them back out — so a caller reads it as "these files, for certain" rather than "only these".
+    ///
     /// # Errors
     ///
     /// Returns the backend's failure to materialize it.
-    async fn apply_manifest(&self, _provision_accounts: bool) -> SandboxResult<()> {
-        Ok(())
+    async fn apply_manifest(
+        &self,
+        _provision_accounts: bool,
+    ) -> SandboxResult<MaterializationResult> {
+        Ok(MaterializationResult::new())
     }
 
     /// Runs after a successful start.
@@ -613,7 +621,9 @@ pub trait SandboxSession: Send + Sync {
             // files that were never meant to survive.
             self.reapply_ephemeral_manifest().await
         } else {
-            self.apply_manifest(self.should_provision_accounts()).await
+            self.apply_manifest(self.should_provision_accounts())
+                .await
+                .map(|_receipt| ())
         }
     }
 

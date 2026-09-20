@@ -286,7 +286,7 @@ impl SandboxSessionState {
         if !self.manifest.entries.is_empty() {
             return Err(UnsupportedPersistence { field: "entries" });
         }
-        if self.manifest.environment.is_some() {
+        if !self.manifest.environment.is_empty() {
             return Err(UnsupportedPersistence {
                 field: "environment",
             });

@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    AsUser, CreateRequest, DiscriminatedPayload, EntryKind, ErrorCode, ExecRequest, ExecResult,
-    FileEntry, Manifest, OpName, Permissions, PtyProcessId, PtyStartRequest, PtyWriteRequest,
-    SandboxClient, SandboxError, SandboxResult, SandboxSession, SandboxSessionState, Snapshot,
+    AsUser, CreateRequest, DiscriminatedPayload, Entry, EntryContent, EntryKind, ErrorCode,
+    ExecRequest, ExecResult, FileEntry, Manifest, MaterializationResult, OpName, Permissions,
+    PtyProcessId, PtyStartRequest, PtyWriteRequest, SandboxClient, SandboxError, SandboxResult,
+    SandboxSession, SandboxSessionState, Snapshot,
 };
 
 /// Which hook a backend was asked for, in the order it was asked.
@@ -227,9 +228,12 @@ impl SandboxSession for Backend {
         Ok(())
     }
 
-    async fn apply_manifest(&self, _provision_accounts: bool) -> SandboxResult<()> {
+    async fn apply_manifest(
+        &self,
+        _provision_accounts: bool,
+    ) -> SandboxResult<MaterializationResult> {
         self.note("apply_manifest");
-        Ok(())
+        Ok(MaterializationResult::new())
     }
 
     async fn after_start(&self) -> SandboxResult<()> {
@@ -916,7 +920,12 @@ async fn a_client_refuses_to_serialize_a_state_that_still_carries_authority() {
     let carrying = SandboxSessionState::new(
         "recording",
         Snapshot::noop(),
-        Manifest::new().with_entry("data", serde_json::json!({"secret_access_key": "AKIA"})),
+        Manifest::new().with_entry(
+            "data",
+            Entry::new(EntryContent::Extension(
+                DiscriminatedPayload::new("s3_mount").with_field("secret_access_key", "AKIA"),
+            )),
+        ),
     );
     let client = StubClient {
         needs_options: false,
