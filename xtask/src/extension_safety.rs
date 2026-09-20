@@ -38,11 +38,51 @@ use crate::source;
 /// be able to match all nine slots and a format change has to be deliberate and breaking.
 const EXHAUSTIVE_ALLOWED: &[&str] = &["NextStep", "ResolvedInstructions", "SummarySlot"];
 
-/// Structs allowed to have public fields.
+/// Structs allowed to have public fields, by the file they are declared in and their name.
 ///
-/// An empty table is both the current fact and the desired state. Adding one means leaving a name
-/// and a reason here.
-const PUBLIC_FIELDS_ALLOWED: &[&str] = &[];
+/// The bar is narrow on purpose: a **configuration record carried over field for field from an
+/// upstream model**, where the repository's porting rule already fixes the shape and a builder would
+/// be this implementation inventing a surface the reference does not have. Everything else uses a
+/// constructor or a builder, and the rest of the crate's public structs still do.
+///
+/// Scoped by path so the exemption cannot spread to a same-named type elsewhere, and listed one by
+/// one so adding an eleventh is a decision somebody makes rather than a module-wide pass. Each entry
+/// names the upstream type it mirrors.
+const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
+    // Mount provider records: `sandbox/entries/mounts/providers/*.py`. Each is the provider's own
+    // field list — bucket, container, credentials, endpoints — and a manifest written against the
+    // reference has to read back here field for field.
+    ("crates/ra-core/src/sandbox/entries/mounts.rs", "S3Mount"),
+    ("crates/ra-core/src/sandbox/entries/mounts.rs", "GcsMount"),
+    (
+        "crates/ra-core/src/sandbox/entries/mounts.rs",
+        "AzureBlobMount",
+    ),
+    ("crates/ra-core/src/sandbox/entries/mounts.rs", "BoxMount"),
+    ("crates/ra-core/src/sandbox/entries/mounts.rs", "R2Mount"),
+    (
+        "crates/ra-core/src/sandbox/entries/mounts.rs",
+        "S3FilesMount",
+    ),
+    // Mount pattern option records: `sandbox/entries/mounts/patterns.py`. Same argument — these are
+    // the options each mount tool takes, spelled the way the reference spells them.
+    (
+        "crates/ra-core/src/sandbox/entries/mounts.rs",
+        "FuseOptions",
+    ),
+    (
+        "crates/ra-core/src/sandbox/entries/mounts.rs",
+        "MountpointOptions",
+    ),
+    (
+        "crates/ra-core/src/sandbox/entries/mounts.rs",
+        "RcloneOptions",
+    ),
+    (
+        "crates/ra-core/src/sandbox/entries/mounts.rs",
+        "S3FilesOptions",
+    ),
+];
 
 /// The valid stability levels.
 const LEVELS: &[&str] = &["Stable", "Evolving", "Internal"];
@@ -120,7 +160,10 @@ fn check_items(items: &[Item], where_: &str, violations: &mut Vec<String>) {
             }
             Item::Struct(s) if matches!(s.vis, Visibility::Public(_)) => {
                 let name = s.ident.to_string();
-                if PUBLIC_FIELDS_ALLOWED.contains(&name.as_str()) {
+                if PUBLIC_FIELDS_ALLOWED
+                    .iter()
+                    .any(|(path, allowed)| *allowed == name && where_.starts_with(path))
+                {
                     continue;
                 }
                 for field in &s.fields {
