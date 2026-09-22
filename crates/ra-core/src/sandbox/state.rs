@@ -197,6 +197,19 @@ impl SandboxSessionState {
         self
     }
 
+    /// Forgets the fingerprint, because there is no longer one that can be trusted.
+    ///
+    /// Not the same as leaving the old one in place. A snapshot that was persisted without a
+    /// fingerprint, or one whose fingerprint could not be computed, must not be compared against
+    /// the value some earlier persist left behind — that comparison can only report a match that is
+    /// not one.
+    #[must_use]
+    pub fn without_snapshot_fingerprint(mut self) -> Self {
+        self.snapshot_fingerprint = None;
+        self.snapshot_fingerprint_version = None;
+        self
+    }
+
     /// Records that the workspace root was confirmed to exist.
     #[must_use]
     pub const fn with_workspace_root_ready(mut self, ready: bool) -> Self {

@@ -20,6 +20,7 @@
 //! the archive path is. It changes with them.
 
 pub mod defaults;
+pub mod lifecycle;
 
 use std::path::{Path, PathBuf};
 

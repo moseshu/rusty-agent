@@ -32,7 +32,7 @@ use super::manifest::Manifest;
 use super::materialization::MaterializationResult;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
 use super::registry::DiscriminatedPayload;
-use super::snapshot::{Snapshot, SnapshotSource, SnapshotSpec};
+use super::snapshot::{Snapshot, SnapshotFingerprint, SnapshotSource, SnapshotSpec};
 use super::state::SandboxSessionState;
 use super::types::{ExecResult, ExposedPortEndpoint, User};
 
@@ -371,6 +371,18 @@ pub trait SandboxSession: Send + Sync {
         Ok(())
     }
 
+    /// Removes an entry while clearing the workspace for snapshot restoration.
+    ///
+    /// Backends whose ordinary removal follows the final symlink must override this to remove
+    /// the entry itself after validating its parent, leaving the link target untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's failure to validate or remove the entry.
+    async fn remove_workspace_entry_on_resume(&self, path: &str) -> SandboxResult<()> {
+        self.rm(path, true, None).await
+    }
+
     /// Rebuilds the manifest state that was deliberately never persisted.
     ///
     /// # Errors
@@ -448,6 +460,26 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns [`ErrorCode::SnapshotPersistError`] or the backend's own failure.
     async fn persist_snapshot(&self) -> SandboxResult<()> {
+        Ok(())
+    }
+
+    /// Records what the workspace hashed to when the snapshot was taken, or that nothing did.
+    ///
+    /// Called by the snapshot lifecycle as part of persisting, and `None` is as meaningful as a
+    /// value: it says this persist produced no fingerprint, so the one an earlier persist left
+    /// behind must not be compared against a later workspace.
+    ///
+    /// A backend that does not keep its state across a stop can ignore this, as it ignores
+    /// [`Self::record_workspace_root_ready`], and will simply have nothing to compare next time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's failure to record it.
+    async fn record_snapshot_fingerprint(
+        &self,
+        fingerprint: Option<SnapshotFingerprint>,
+    ) -> SandboxResult<()> {
+        let _ = fingerprint;
         Ok(())
     }
 

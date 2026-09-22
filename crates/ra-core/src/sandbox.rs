@@ -72,8 +72,8 @@ pub use session::{
     ShellInvocation,
 };
 pub use snapshot::{
-    LOCAL_SNAPSHOT_TYPE, NOOP_SNAPSHOT_TYPE, REMOTE_SNAPSHOT_TYPE, Snapshot, SnapshotPathError,
-    SnapshotSource, SnapshotSpec, builtin_snapshot_registry, resolve_snapshot,
+    LOCAL_SNAPSHOT_TYPE, NOOP_SNAPSHOT_TYPE, REMOTE_SNAPSHOT_TYPE, Snapshot, SnapshotFingerprint,
+    SnapshotPathError, SnapshotSource, SnapshotSpec, builtin_snapshot_registry, resolve_snapshot,
 };
 pub use state::{
     ExposedPortsError, SandboxSessionState, UnsupportedPersistence, normalize_exposed_ports,

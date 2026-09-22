@@ -21,6 +21,7 @@ pub mod host_paths;
 pub mod listing;
 #[cfg(unix)]
 pub mod materialize;
+pub mod runtime_helpers;
 pub mod shell;
 pub mod snapshot;
 pub mod unix_local;

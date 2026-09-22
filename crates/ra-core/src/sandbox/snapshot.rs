@@ -47,6 +47,40 @@ const CLIENT_DEPENDENCY_KEY_FIELD: &str = "client_dependency_key";
 /// Who claims the built-in snapshot types, so a host's own type cannot silently take one over.
 const BUILTIN_REGISTRANT: &str = "ra_core::sandbox::snapshot";
 
+/// What a workspace hashed to when its snapshot was taken, and which scheme produced the hash.
+///
+/// The two travel together because a hash compared under the wrong scheme is worse than no hash: it
+/// can report a match that is not one, and a session would then skip restoring a snapshot it
+/// needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFingerprint {
+    fingerprint: String,
+    version: String,
+}
+
+impl SnapshotFingerprint {
+    /// Records a hash and the scheme it came from.
+    #[must_use]
+    pub fn new(fingerprint: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            fingerprint: fingerprint.into(),
+            version: version.into(),
+        }
+    }
+
+    /// What the workspace hashed to.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Which scheme produced it.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
 /// A host directory that cannot be named in a snapshot payload.
 ///
 /// Carries the path as the host would show it — which is lossy, and is why this exists: the lossy

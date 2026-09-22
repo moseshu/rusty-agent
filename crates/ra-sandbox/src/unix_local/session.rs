@@ -13,12 +13,14 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, EnvValueResolver, ErrorCode, ExecRequest, ExecResult, ExposedPortEndpoint, FileEntry,
     Manifest, MaterializationResult, OpName, SandboxConcurrencyLimits, SandboxError, SandboxResult,
-    SandboxSession, SandboxSessionState, User,
+    SandboxSession, SandboxSessionState, SnapshotFingerprint, User,
 };
 
 use crate::host_paths::HostWorkspacePaths;
 use crate::listing::parse_ls_la;
 use crate::materialize::{ManifestApplier, manifest_base_dir};
+use crate::snapshot::lifecycle::SnapshotLifecycle;
+use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
 use super::{UNIX_LOCAL_BACKEND_ID, archive, exec, files};
 
@@ -43,6 +45,12 @@ pub struct UnixLocalSandboxSession {
     env_values: Arc<dyn EnvValueResolver>,
     /// How much of a manifest application may be in flight at once.
     concurrency_limits: SandboxConcurrencyLimits,
+    /// Where this session's snapshot is read from and written to.
+    ///
+    /// Held by the session for the same reason the environment policy is: which storage a host
+    /// wired up is the host's decision, and a state that travelled from elsewhere must not be able
+    /// to point this session at something else.
+    snapshot_store: Arc<dyn SnapshotStore>,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxSession {
@@ -69,7 +77,20 @@ impl UnixLocalSandboxSession {
             host_environment_allowlist,
             env_values,
             concurrency_limits: SandboxConcurrencyLimits::default(),
+            snapshot_store: Arc::new(BuiltinSnapshotStore),
         }
+    }
+
+    /// Reads and writes this session's snapshot through `store` instead of the built-in one.
+    #[must_use]
+    pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
+        self.snapshot_store = store;
+        self
+    }
+
+    /// The snapshot half of this session's lifecycle.
+    fn snapshots(&self) -> SnapshotLifecycle<'_> {
+        SnapshotLifecycle::new(self, self.snapshot_store.as_ref())
     }
 
     /// Paces manifest application with these limits instead of the defaults.
@@ -540,6 +561,59 @@ impl SandboxSession for UnixLocalSandboxSession {
         let manifest = self.manifest();
         assert_host_path_grants_unsupported(&manifest)?;
         self.applier()?.apply_ephemeral(&manifest).await.map(|_| ())
+    }
+
+    /// Whether the snapshot this session carries has something stored.
+    async fn snapshot_restorable(&self) -> SandboxResult<bool> {
+        self.snapshots().restorable().await
+    }
+
+    /// Replaces the workspace with what the snapshot holds.
+    async fn restore_snapshot(&self) -> SandboxResult<()> {
+        self.snapshots().restore_on_resume().await
+    }
+
+    async fn remove_workspace_entry_on_resume(&self, path: &str) -> SandboxResult<()> {
+        let entry = std::path::Path::new(path);
+        let name = entry.file_name().ok_or_else(|| {
+            SandboxError::workspace_archive_write(path)
+                .with_context("reason", "resume cleanup requires a child entry")
+        })?;
+        let parent = entry.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = self.normalize_path(parent.to_str().unwrap_or("."), true)?;
+        // Resolve and authorize the parent, but never follow the entry being removed. A stray
+        // link may point outside the workspace or be dangling; neither target is ours to remove.
+        files::remove(&parent.join(name), true)
+    }
+
+    /// Whether the workspace already matches the snapshot closely enough to keep it.
+    ///
+    /// **Not reached on this backend.** The lifecycle only asks when workspace content survived a
+    /// stop, and a local directory is never reported as preserved — the same answer the reference's
+    /// local backend gives. Wired up anyway so that the fingerprint this session records on persist
+    /// has the reader it was recorded for.
+    async fn can_skip_snapshot_restore(&self, is_running: bool) -> SandboxResult<bool> {
+        self.snapshots().can_skip_restore(is_running).await
+    }
+
+    /// Writes the workspace into the snapshot's storage.
+    async fn persist_snapshot(&self) -> SandboxResult<()> {
+        self.snapshots().persist().await
+    }
+
+    async fn record_snapshot_fingerprint(
+        &self,
+        fingerprint: Option<SnapshotFingerprint>,
+    ) -> SandboxResult<()> {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let updated = match fingerprint {
+            Some(fingerprint) => guard
+                .clone()
+                .with_snapshot_fingerprint(fingerprint.fingerprint(), fingerprint.version()),
+            None => guard.clone().without_snapshot_fingerprint(),
+        };
+        *guard = updated;
+        Ok(())
     }
 
     /// Runs after a successful start.
