@@ -26,6 +26,12 @@ Apply these rules to every Rust source file (`.rs`), including tests.
 
 # Porting Over Redesign
 
+- For every rusty-agent framework development review, explicitly check alignment with the
+  `openai-agents-python` framework contract and the `codex` implementation model. Read the relevant
+  upstream implementation and tests before judging parity; identify what can be ported directly,
+  distinguish necessary Rust adaptations from product extensions, and report behavioral or
+  architectural deviations as review findings rather than accepting a separate redesign.
+
 - When a capability already exists in `openai-agents-python` or in `codex`, port it. Read that
   implementation first and carry over its public surface, field meanings, defaults, merge order,
   errors, ownership and recovery semantics. Do not write a separate design for something upstream
