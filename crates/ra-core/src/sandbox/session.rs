@@ -32,7 +32,7 @@ use super::manifest::Manifest;
 use super::materialization::MaterializationResult;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
 use super::registry::DiscriminatedPayload;
-use super::snapshot::Snapshot;
+use super::snapshot::{Snapshot, SnapshotSource, SnapshotSpec};
 use super::state::SandboxSessionState;
 use super::types::{ExecResult, ExposedPortEndpoint, User};
 
@@ -734,8 +734,12 @@ pub trait SandboxSession: Send + Sync {
 /// How a client was asked to make a session.
 #[derive(Debug, Clone, Default)]
 pub struct CreateRequest {
-    /// What to start the workspace from, or nothing.
-    pub snapshot: Option<Snapshot>,
+    /// What to start the workspace from and persist back to, or nothing.
+    ///
+    /// Either a snapshot that already names stored content, or a spec saying where to put one; the
+    /// client settles it with [`resolve_snapshot`](super::snapshot::resolve_snapshot) once it has
+    /// chosen the session's id.
+    pub snapshot: Option<SnapshotSource>,
     /// What the workspace should contain.
     pub manifest: Option<Manifest>,
     /// The backend's own settings: an image, a template, an endpoint.
@@ -753,10 +757,17 @@ impl CreateRequest {
         Self::default()
     }
 
-    /// Starts the workspace from `snapshot`.
+    /// Starts the workspace from `snapshot`, which already names stored content.
     #[must_use]
     pub fn with_snapshot(mut self, snapshot: Snapshot) -> Self {
-        self.snapshot = Some(snapshot);
+        self.snapshot = Some(SnapshotSource::Snapshot(snapshot));
+        self
+    }
+
+    /// Stores the workspace where `spec` says, under the id the client gives the session.
+    #[must_use]
+    pub fn with_snapshot_spec(mut self, spec: SnapshotSpec) -> Self {
+        self.snapshot = Some(SnapshotSource::Spec(spec));
         self
     }
 

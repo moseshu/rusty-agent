@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    CreateRequest, DEFAULT_MANIFEST_ROOT, EnvValueResolver, ErrorCode, NOOP_SNAPSHOT_TYPE, OpName,
-    SandboxClient, SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, Snapshot, UnresolvableEnvValues,
+    CreateRequest, DEFAULT_MANIFEST_ROOT, EnvValueResolver, ErrorCode, OpName, SandboxClient,
+    SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
+    UnresolvableEnvValues, resolve_snapshot,
 };
 use uuid::Uuid;
 
@@ -197,9 +197,19 @@ impl SandboxClient for UnixLocalSandboxClient {
         }
 
         let session_id = Uuid::new_v4();
-        let snapshot = request
-            .snapshot
-            .unwrap_or_else(|| Snapshot::new(NOOP_SNAPSHOT_TYPE, session_id.to_string()));
+        // A caller that named storage gets it as it stands; one that only said where to put a
+        // snapshot has it named after this session, and one that said nothing gets the snapshot
+        // that stores nothing — under the same id, so that turning storage on later does not
+        // change what the session is called.
+        let snapshot = resolve_snapshot(request.snapshot.as_ref(), &session_id.to_string())
+            .map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    OpName::Start,
+                    error.to_string(),
+                )
+                .with_cause(error)
+            })?;
         let state = SandboxSessionState::new(UNIX_LOCAL_BACKEND_ID, snapshot, manifest)
             .with_session_id(session_id)
             .with_exposed_ports(options.exposed_ports().iter().copied())

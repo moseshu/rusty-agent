@@ -182,6 +182,45 @@ impl SandboxError {
         .with_context("path", path)
     }
 
+    /// Constructs a failure to write a snapshot's bytes to its storage.
+    #[must_use]
+    pub fn snapshot_persist(snapshot_id: &str, path: &str) -> Self {
+        Self::new(
+            ErrorCode::SnapshotPersistError,
+            OpName::SnapshotPersist,
+            "failed to persist snapshot",
+        )
+        .with_context("snapshot_id", snapshot_id)
+        .with_context("path", path)
+    }
+
+    /// Constructs a failure to read a snapshot's bytes back from its storage.
+    #[must_use]
+    pub fn snapshot_restore(snapshot_id: &str, path: &str) -> Self {
+        Self::new(
+            ErrorCode::SnapshotRestoreError,
+            OpName::SnapshotRestore,
+            "failed to restore snapshot",
+        )
+        .with_context("snapshot_id", snapshot_id)
+        .with_context("path", path)
+    }
+
+    /// Constructs a refusal to restore from storage that holds nothing to restore.
+    ///
+    /// Filed under restore rather than a family of its own, as the reference files it: the caller
+    /// asked to restore, and what it needs to know is that it cannot.
+    #[must_use]
+    pub fn snapshot_not_restorable(snapshot_id: &str, path: &str) -> Self {
+        Self::new(
+            ErrorCode::SnapshotNotRestorable,
+            OpName::SnapshotRestore,
+            "snapshot is not restorable",
+        )
+        .with_context("snapshot_id", snapshot_id)
+        .with_context("path", path)
+    }
+
     /// Constructs a workspace preparation failure.
     #[must_use]
     pub fn workspace_start(path: &str, message: Option<&str>) -> Self {
