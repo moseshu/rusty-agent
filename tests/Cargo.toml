@@ -19,6 +19,7 @@ members = [
     "it-runtime",
     "it-session",
     "it-exec",
+    "it-sandbox",
     "it-mcp",
     "it-protocol",
     "it-eval",

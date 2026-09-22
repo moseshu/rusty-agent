@@ -38,6 +38,7 @@ ra-context = { path = "crates/ra-context", version = "0.1.0" }
 ra-runtime = { path = "crates/ra-runtime", version = "0.1.0" }
 ra-session = { path = "crates/ra-session", version = "0.1.0" }
 ra-exec = { path = "crates/ra-exec", version = "0.1.0" }
+ra-sandbox = { path = "crates/ra-sandbox", version = "0.1.0" }
 ra-mcp = { path = "crates/ra-mcp", version = "0.1.0" }
 ra-protocol = { path = "crates/ra-protocol", version = "0.1.0" }
 ra-eval = { path = "crates/ra-eval", version = "0.1.0" }
@@ -69,6 +70,10 @@ rustix = { version = "1", features = ["fs", "process"] }
 # `doctor sandbox` 要一个不可预测名字、0o700、随句柄删除的目录：它拿自己造的目录当靶子，
 # 而可预测的路径在共享 /tmp 上既能被抢先创建，也不能拿去做递归删除。
 tempfile = "3"
+# 工作区归档（`persist_workspace` / `hydrate_workspace`）。上游用 Python 的 `tarfile` 在进程内
+# 读写 tar，所以移植也在进程内做：调用宿主的 `tar` 会把「归档里有什么」交给一个版本和行为都
+# 不由我们决定的外部程序，而成员路径的越界检查正是这一步要守的东西。
+tar = "0.4"
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }

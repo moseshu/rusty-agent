@@ -1,0 +1,19 @@
+[package]
+name = "it-sandbox"
+description = "ra-sandbox 的集成测试。不随主 workspace 发布。"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-core = { path = "../../crates/ra-core" }
+ra-sandbox = { path = "../../crates/ra-sandbox" }
+async-trait = "0.1"
+rstest = "0.23"
+serde_json = "1"
+tar = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

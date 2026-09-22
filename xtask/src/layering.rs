@@ -60,9 +60,8 @@ impl Layer {
     }
 }
 
-/// The layer allowlist. The target shape is 17 crates; the ones not yet created (`ra-tools`,
-/// `ra-flow`, `ra-assistant`) are registered in advance so the gate binds them the day they
-/// appear.
+/// The layer allowlist. The target shape is 18 crates; the ones not yet created (`ra-flow`,
+/// `ra-assistant`) are registered in advance so the gate binds them the day they appear.
 const LAYERS: &[(&str, Layer)] = &[
     ("ra-core", Layer::Kernel),
     ("ra-macros", Layer::Kernel),
@@ -71,6 +70,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-prompt", Layer::Service),
     ("ra-context", Layer::Service),
     ("ra-exec", Layer::Service),
+    ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
     ("ra-mcp", Layer::Service),
     ("ra-protocol", Layer::Service),
@@ -93,7 +93,7 @@ const LAYERS: &[(&str, Layer)] = &[
 /// Layer rules catch an obvious inversion but not an edge like `ra-core -> ra-model`, where both
 /// sides are framework yet the responsibilities are already backwards. This turns the development
 /// plan's crate table into an allowlist; a new dependency has to answer why it belongs on that
-/// boundary first. The three not-yet-created crates are pre-registered and bound from day one.
+/// boundary first. The two not-yet-created crates are pre-registered and bound from day one.
 ///
 /// **This table is the single source of truth for the dependency graph**; the graph in
 /// [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §1 has to agree with it.
@@ -117,6 +117,13 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-prompt", &["ra-core"]),
     ("ra-context", &["ra-core"]),
     ("ra-exec", &["ra-core"]),
+    // The sandbox backends. `ra-core` alone today: the local backend spawns its own processes
+    // rather than going through `ra-exec`, because the environment policy, resource ceilings and
+    // per-command fence that crate applies are this product's, not the ported contract's, and
+    // inheriting them would change what a ported session does. The edge to `ra-exec` gets added
+    // when terminal support reuses its process supervision, and the one to `ra-tools` when the
+    // default capabilities ship the tools that bind to a session.
+    ("ra-sandbox", &["ra-core"]),
     ("ra-session", &["ra-core"]),
     ("ra-mcp", &["ra-core"]),
     ("ra-protocol", &["ra-core", "ra-session"]),
