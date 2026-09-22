@@ -141,6 +141,15 @@ fn a_fingerprint_and_its_scheme_travel_together_or_not_at_all() {
     let state = state().with_snapshot_fingerprint("abc123", "v2");
 
     assert_eq!(state.snapshot_fingerprint(), Some(("abc123", "v2")));
+
+    // And forgetting one is a decision, not an omission: a persist that could not hash the
+    // workspace has to clear what an earlier persist recorded, or the next resume compares a new
+    // workspace against an old workspace's hash.
+    let forgotten = state.without_snapshot_fingerprint();
+    assert_eq!(forgotten.snapshot_fingerprint(), None);
+    let rendered = forgotten.to_json().expect("persistable");
+    assert!(rendered.get("snapshot_fingerprint").is_none());
+    assert!(rendered.get("snapshot_fingerprint_version").is_none());
 }
 
 #[test]

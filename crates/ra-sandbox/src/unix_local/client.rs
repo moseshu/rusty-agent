@@ -15,6 +15,8 @@ use ra_core::sandbox::{
 };
 use uuid::Uuid;
 
+use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
+
 use super::session::assert_host_path_grants_unsupported;
 use super::{
     DEFAULT_WORKSPACE_PREFIX, UNIX_LOCAL_BACKEND_ID, UnixLocalSandboxClientOptions,
@@ -33,6 +35,7 @@ pub struct UnixLocalSandboxClient {
     host_environment_allowlist: Option<BTreeSet<String>>,
     env_values: Arc<dyn EnvValueResolver>,
     concurrency_limits: SandboxConcurrencyLimits,
+    snapshot_store: Arc<dyn SnapshotStore>,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxClient {
@@ -65,6 +68,7 @@ impl UnixLocalSandboxClient {
             host_environment_allowlist: None,
             env_values: Arc::new(UnresolvableEnvValues),
             concurrency_limits: SandboxConcurrencyLimits::default(),
+            snapshot_store: Arc::new(BuiltinSnapshotStore),
         }
     }
 
@@ -92,6 +96,7 @@ impl UnixLocalSandboxClient {
             host_environment_allowlist: Some(names.into_iter().collect()),
             env_values: Arc::new(UnresolvableEnvValues),
             concurrency_limits: SandboxConcurrencyLimits::default(),
+            snapshot_store: Arc::new(BuiltinSnapshotStore),
         }
     }
 
@@ -99,6 +104,17 @@ impl UnixLocalSandboxClient {
     #[must_use]
     pub fn with_env_value_resolver(mut self, resolver: Arc<dyn EnvValueResolver>) -> Self {
         self.env_values = resolver;
+        self
+    }
+
+    /// Reads and writes snapshots through `store` in every session this client makes.
+    ///
+    /// Held here rather than taken from a session state, as the environment policy is: which
+    /// storage exists is something the process running the SDK knows, and a state that arrived from
+    /// another host must not be able to name one of its own.
+    #[must_use]
+    pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
+        self.snapshot_store = store;
         self
     }
 
@@ -127,7 +143,8 @@ impl UnixLocalSandboxClient {
                 self.host_environment_allowlist.clone(),
                 Arc::clone(&self.env_values),
             )
-            .with_concurrency_limits(self.concurrency_limits),
+            .with_concurrency_limits(self.concurrency_limits)
+            .with_snapshot_store(Arc::clone(&self.snapshot_store)),
         )
     }
 
