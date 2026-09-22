@@ -10,8 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ra_core::sandbox::{
     CreateRequest, DEFAULT_MANIFEST_ROOT, EnvValueResolver, ErrorCode, NOOP_SNAPSHOT_TYPE, OpName,
-    SandboxClient, SandboxError, SandboxResult, SandboxSession, SandboxSessionState, Snapshot,
-    UnresolvableEnvValues,
+    SandboxClient, SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession,
+    SandboxSessionState, Snapshot, UnresolvableEnvValues,
 };
 use uuid::Uuid;
 
@@ -32,6 +32,7 @@ use super::{
 pub struct UnixLocalSandboxClient {
     host_environment_allowlist: Option<BTreeSet<String>>,
     env_values: Arc<dyn EnvValueResolver>,
+    concurrency_limits: SandboxConcurrencyLimits,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxClient {
@@ -63,6 +64,7 @@ impl UnixLocalSandboxClient {
         Self {
             host_environment_allowlist: None,
             env_values: Arc::new(UnresolvableEnvValues),
+            concurrency_limits: SandboxConcurrencyLimits::default(),
         }
     }
 
@@ -89,6 +91,7 @@ impl UnixLocalSandboxClient {
         Self {
             host_environment_allowlist: Some(names.into_iter().collect()),
             env_values: Arc::new(UnresolvableEnvValues),
+            concurrency_limits: SandboxConcurrencyLimits::default(),
         }
     }
 
@@ -96,6 +99,17 @@ impl UnixLocalSandboxClient {
     #[must_use]
     pub fn with_env_value_resolver(mut self, resolver: Arc<dyn EnvValueResolver>) -> Self {
         self.env_values = resolver;
+        self
+    }
+
+    /// Paces manifest application in every session this client makes.
+    ///
+    /// Held here for the same reason the environment policy is: it is a decision the process
+    /// running the SDK makes about its own machine, and a session state that travelled from a host
+    /// with more capacity must not widen it on arrival.
+    #[must_use]
+    pub const fn with_concurrency_limits(mut self, limits: SandboxConcurrencyLimits) -> Self {
+        self.concurrency_limits = limits;
         self
     }
 
@@ -107,11 +121,14 @@ impl UnixLocalSandboxClient {
 
     /// Builds a session over a state this client already vetted.
     fn open(&self, state: SandboxSessionState) -> Box<dyn SandboxSession> {
-        Box::new(UnixLocalSandboxSession::new(
-            state,
-            self.host_environment_allowlist.clone(),
-            Arc::clone(&self.env_values),
-        ))
+        Box::new(
+            UnixLocalSandboxSession::new(
+                state,
+                self.host_environment_allowlist.clone(),
+                Arc::clone(&self.env_values),
+            )
+            .with_concurrency_limits(self.concurrency_limits),
+        )
     }
 
     /// Refuses a state another backend wrote.

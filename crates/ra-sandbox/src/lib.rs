@@ -19,5 +19,7 @@
 
 pub mod host_paths;
 pub mod listing;
+#[cfg(unix)]
+pub mod materialize;
 pub mod shell;
 pub mod unix_local;

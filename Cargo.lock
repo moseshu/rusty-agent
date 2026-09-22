@@ -1286,9 +1286,11 @@ name = "ra-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "ra-core",
  "rustix",
  "serde_json",
+ "sha2",
  "tar",
  "tempfile",
  "tokio",

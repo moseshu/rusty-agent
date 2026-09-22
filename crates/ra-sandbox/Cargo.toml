@@ -13,7 +13,9 @@ workspace = true
 [dependencies]
 ra-core = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

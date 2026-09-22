@@ -12,23 +12,27 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, EnvValueResolver, ErrorCode, ExecRequest, ExecResult, ExposedPortEndpoint, FileEntry,
-    Manifest, MaterializationResult, OpName, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, User,
+    Manifest, MaterializationResult, OpName, SandboxConcurrencyLimits, SandboxError, SandboxResult,
+    SandboxSession, SandboxSessionState, User,
 };
 
 use crate::host_paths::HostWorkspacePaths;
 use crate::listing::parse_ls_la;
+use crate::materialize::{ManifestApplier, manifest_base_dir};
 
 use super::{UNIX_LOCAL_BACKEND_ID, archive, exec, files};
 
 /// A local workspace, and the commands run against it.
+///
+/// Clones share lifecycle state so an owned materialization cleanup can retain the same session.
+#[derive(Clone)]
 pub struct UnixLocalSandboxSession {
     /// The durable half, which several hooks update as the lifecycle runs.
-    state: Mutex<SandboxSessionState>,
+    state: Arc<Mutex<SandboxSessionState>>,
     /// Whether start has finished. Set only after the workspace is populated, because a session
     /// that reports itself running before then invites a resume to trust a workspace that is still
     /// being built.
-    running: AtomicBool,
+    running: Arc<AtomicBool>,
     /// Which host variables reach a command, or all of them when there is no list.
     ///
     /// **Held by the session, never by the state.** A resumed session takes this from the client
@@ -37,6 +41,8 @@ pub struct UnixLocalSandboxSession {
     host_environment_allowlist: Option<BTreeSet<String>>,
     /// How a manifest's non-literal environment values are fetched.
     env_values: Arc<dyn EnvValueResolver>,
+    /// How much of a manifest application may be in flight at once.
+    concurrency_limits: SandboxConcurrencyLimits,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxSession {
@@ -58,11 +64,36 @@ impl UnixLocalSandboxSession {
         env_values: Arc<dyn EnvValueResolver>,
     ) -> Self {
         Self {
-            state: Mutex::new(state),
-            running: AtomicBool::new(false),
+            state: Arc::new(Mutex::new(state)),
+            running: Arc::new(AtomicBool::new(false)),
             host_environment_allowlist,
             env_values,
+            concurrency_limits: SandboxConcurrencyLimits::default(),
         }
+    }
+
+    /// Paces manifest application with these limits instead of the defaults.
+    ///
+    /// **The reference sets these on a session that already exists**, from the run configuration,
+    /// which has not been carried over yet. Until it has, the client that makes a session is where
+    /// a host says how much work may be in flight.
+    #[must_use]
+    pub const fn with_concurrency_limits(mut self, limits: SandboxConcurrencyLimits) -> Self {
+        self.concurrency_limits = limits;
+        self
+    }
+
+    /// The applier that puts this session's manifest in its workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::SandboxConfigInvalid`] when this process has no readable working
+    /// directory, which is what a manifest's relative sources are measured from.
+    fn applier(&self) -> SandboxResult<ManifestApplier> {
+        Ok(
+            ManifestApplier::new(Arc::new(self.clone()), manifest_base_dir()?)
+                .with_limits(self.concurrency_limits),
+        )
     }
 
     /// The state as it stands, copied out from under the lock.
@@ -485,23 +516,30 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     async fn apply_manifest(
         &self,
-        _provision_accounts: bool,
+        provision_accounts: bool,
     ) -> SandboxResult<MaterializationResult> {
         let manifest = self.manifest();
         assert_host_path_grants_unsupported(&manifest)?;
+        // Refused whatever `provision_accounts` says. The flag asks whether the accounts still need
+        // creating; this backend cannot create one at all, and materializing content that is meant
+        // to belong to a missing account would hand it to whoever runs the SDK instead.
         assert_accounts_unsupported(&manifest)?;
-        if !manifest.entries.is_empty() {
-            return Err(SandboxError::new(
-                ErrorCode::SandboxConfigInvalid,
-                OpName::Materialize,
-                "materializing manifest entries is not implemented yet in the `unix_local` \
-                 backend; a manifest that declares entries would otherwise start a session with an \
-                 empty workspace",
-            )
-            .with_context("backend", UNIX_LOCAL_BACKEND_ID)
-            .with_context("entries", manifest.entries.len()));
-        }
-        Ok(MaterializationResult::new())
+        self.applier()?
+            .apply_manifest(&manifest, provision_accounts)
+            .await
+    }
+
+    /// Rebuilds the entries that were deliberately never persisted.
+    ///
+    /// **Not reached on this backend yet**: it is only called for a workspace whose content
+    /// survived a stop, and nothing here reports one — snapshots are not carried over, so every
+    /// start materializes the whole manifest. It is implemented anyway because that is the entry
+    /// point the snapshot lifecycle calls, and because an ephemeral application is a different
+    /// answer from a full one rather than a cheaper one.
+    async fn reapply_ephemeral_manifest(&self) -> SandboxResult<()> {
+        let manifest = self.manifest();
+        assert_host_path_grants_unsupported(&manifest)?;
+        self.applier()?.apply_ephemeral(&manifest).await.map(|_| ())
     }
 
     /// Runs after a successful start.
