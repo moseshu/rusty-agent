@@ -71,7 +71,10 @@ pub use session::{
     AsUser, CreateRequest, ExecRequest, SandboxClient, SandboxResult, SandboxSession,
     ShellInvocation,
 };
-pub use snapshot::{NOOP_SNAPSHOT_TYPE, Snapshot};
+pub use snapshot::{
+    LOCAL_SNAPSHOT_TYPE, NOOP_SNAPSHOT_TYPE, REMOTE_SNAPSHOT_TYPE, Snapshot, SnapshotPathError,
+    SnapshotSource, SnapshotSpec, builtin_snapshot_registry, resolve_snapshot,
+};
 pub use state::{
     ExposedPortsError, SandboxSessionState, UnsupportedPersistence, normalize_exposed_ports,
 };

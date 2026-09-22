@@ -22,4 +22,5 @@ pub mod listing;
 #[cfg(unix)]
 pub mod materialize;
 pub mod shell;
+pub mod snapshot;
 pub mod unix_local;

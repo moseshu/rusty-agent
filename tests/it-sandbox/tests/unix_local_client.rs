@@ -6,7 +6,7 @@
 
 use ra_core::sandbox::{
     CreateRequest, DiscriminatedPayload, ErrorCode, ExecRequest, Manifest, SandboxClient,
-    SandboxPathGrant, SandboxSession, ShellInvocation,
+    SandboxPathGrant, SandboxSession, ShellInvocation, SnapshotSpec,
 };
 use ra_sandbox::unix_local::{
     UNIX_LOCAL_BACKEND_ID, UnixLocalSandboxClient, UnixLocalSandboxClientOptions,
@@ -187,6 +187,40 @@ async fn a_published_port_resolves_to_this_machine_and_an_unpublished_one_does_n
     assert_eq!(error.retryable(), Some(false));
 
     client.delete(session.as_ref()).await.expect("delete");
+}
+
+#[tokio::test]
+async fn a_session_takes_the_storage_it_was_asked_for_and_is_named_after_itself() {
+    let client = UnixLocalSandboxClient::new();
+    let snapshots = tempfile::tempdir().expect("temp");
+
+    // Told where to keep snapshots but not what to call one: the session is the only thing that
+    // can say, and it has not been created yet when the caller writes the run configuration down.
+    let session = client
+        .create(CreateRequest::new().with_snapshot_spec(SnapshotSpec::Local {
+            base_path: snapshots.path().to_path_buf(),
+        }))
+        .await
+        .expect("create");
+    let state = session.state();
+
+    assert_eq!(
+        state.snapshot(),
+        &ra_core::sandbox::Snapshot::local(state.session_id().to_string(), snapshots.path())
+            .expect("named")
+    );
+
+    // Told nothing: still a snapshot, still named after the session, and it stores nothing.
+    let plain = client.create(CreateRequest::new()).await.expect("create");
+    let plain_state = plain.state();
+    assert!(plain_state.snapshot().is_noop());
+    assert_eq!(
+        plain_state.snapshot().id(),
+        plain_state.session_id().to_string()
+    );
+
+    client.delete(session.as_ref()).await.expect("delete");
+    client.delete(plain.as_ref()).await.expect("delete");
 }
 
 #[tokio::test]
