@@ -164,6 +164,7 @@ pub(crate) async fn run(
         .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         // Its own group, so a timeout can reach everything the command started rather than only the
         // command itself.
         .process_group(0);
@@ -175,6 +176,7 @@ pub(crate) async fn run(
         .spawn()
         .map_err(|error| transport_failure(command, &error))?;
     let pid = child.id();
+    let mut group_guard = ProcessGroupGuard(pid);
     let handle = child.stdin.take();
     let feed = async move {
         if let (Some(bytes), Some(mut handle)) = (stdin, handle) {
@@ -196,7 +198,6 @@ pub(crate) async fn run(
             match tokio::time::timeout(Duration::from_secs_f64(seconds.max(0.0)), finish).await {
                 Ok(output) => output,
                 Err(_elapsed) => {
-                    kill_process_group(pid);
                     return Err(SandboxError::exec_timeout(command.to_vec(), timeout_s));
                 }
             }
@@ -204,6 +205,7 @@ pub(crate) async fn run(
         None => finish.await,
     };
     let output = output.map_err(|error| transport_failure(command, &error))?;
+    group_guard.0 = None;
 
     Ok(ExecResult::new(
         output.stdout,
@@ -229,6 +231,15 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| status.signal().map_or(0, |signal| -signal))
+}
+
+/// Stops the whole command tree when its future is dropped, before checkout cleanup can run.
+struct ProcessGroupGuard(Option<u32>);
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        kill_process_group(self.0);
+    }
 }
 
 /// Kills everything the command started, by group.

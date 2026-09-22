@@ -298,3 +298,35 @@ async fn a_signalled_command_reports_the_signal_that_ended_it() {
     assert_eq!(result.exit_code, -15);
     client.delete(session.as_ref()).await.expect("delete");
 }
+
+#[tokio::test]
+async fn dropping_exec_stops_descendants_before_they_can_write_again() {
+    let (_directory, root) = workspace();
+    let client = UnixLocalSandboxClient::new();
+    let session = session_at(&client, &root).await;
+    let request = ExecRequest::new([
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "{ (sleep 0.4; printf late > late.txt) & printf ready > ready.txt; wait; }".to_owned(),
+    ])
+    .with_shell(ShellInvocation::None);
+    let mut running = Box::pin(session.exec(request));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::select! {
+            result = &mut running => panic!("command finished before cancellation: {result:?}"),
+            () = async {
+                while !root.join("ready.txt").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => {}
+        }
+    })
+    .await
+    .expect("command started");
+    drop(running);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        !root.join("late.txt").exists(),
+        "a cancelled descendant wrote into the workspace"
+    );
+}

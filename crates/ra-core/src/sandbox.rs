@@ -57,7 +57,11 @@ pub use manifest::{
 pub use manifest_render::{
     MAX_MANIFEST_DESCRIPTION_CHARS, render_manifest_description, truncate_manifest_description,
 };
-pub use materialization::{MaterializationResult, MaterializedFile};
+pub use materialization::{
+    ConcurrencyLimitError, DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY,
+    DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY, MaterializationResult, MaterializedFile,
+    SandboxConcurrencyLimits,
+};
 pub use pty::{PtyExecUpdate, PtyProcessId, PtyStartRequest, PtyWriteRequest};
 pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,

@@ -83,3 +83,103 @@ impl FromIterator<MaterializedFile> for MaterializationResult {
         }
     }
 }
+
+/// How many manifest entries are materialized at once unless a host says otherwise.
+pub const DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY: usize = 4;
+
+/// How many files one copied host directory contributes at once unless a host says otherwise.
+pub const DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY: usize = 4;
+
+/// How much of a manifest application may be in flight at once.
+///
+/// Two limits rather than one, because they bound different things: a manifest with four large
+/// directory entries and a directory holding four thousand files are not the same amount of work,
+/// and a single number would have to be wrong for one of them. `None` means unbounded — every unit
+/// of that kind starts at once — which is what a caller asks for when the backend, not this, is the
+/// thing doing the rationing.
+///
+/// **The reference declares this on its run configuration** (`run_config.py`) and applies it to a
+/// session after the session exists. It lives next to the materialization it governs here because
+/// the run configuration has not been carried over yet; when it is, it passes one of these rather
+/// than growing its own pair of numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxConcurrencyLimits {
+    manifest_entries: Option<usize>,
+    local_dir_files: Option<usize>,
+}
+
+impl Default for SandboxConcurrencyLimits {
+    fn default() -> Self {
+        Self {
+            manifest_entries: Some(DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY),
+            local_dir_files: Some(DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY),
+        }
+    }
+}
+
+impl SandboxConcurrencyLimits {
+    /// The limits a host gets when it does not choose.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Materializes at most `limit` manifest entries at once, or all of them when `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConcurrencyLimitError::ManifestEntries`] for a limit of zero, which asks for work
+    /// to proceed with nothing in flight and would otherwise read as "unbounded" to whatever
+    /// divided by it.
+    pub fn with_manifest_entries(
+        mut self,
+        limit: Option<usize>,
+    ) -> Result<Self, ConcurrencyLimitError> {
+        if limit == Some(0) {
+            return Err(ConcurrencyLimitError::ManifestEntries);
+        }
+        self.manifest_entries = limit;
+        Ok(self)
+    }
+
+    /// Copies at most `limit` files of one host directory at once, or all of them when `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConcurrencyLimitError::LocalDirFiles`] for a limit of zero, as
+    /// [`Self::with_manifest_entries`] does.
+    pub fn with_local_dir_files(
+        mut self,
+        limit: Option<usize>,
+    ) -> Result<Self, ConcurrencyLimitError> {
+        if limit == Some(0) {
+            return Err(ConcurrencyLimitError::LocalDirFiles);
+        }
+        self.local_dir_files = limit;
+        Ok(self)
+    }
+
+    /// How many manifest entries may be materialized at once.
+    #[must_use]
+    pub const fn manifest_entries(self) -> Option<usize> {
+        self.manifest_entries
+    }
+
+    /// How many files of one copied host directory may be in flight at once.
+    #[must_use]
+    pub const fn local_dir_files(self) -> Option<usize> {
+        self.local_dir_files
+    }
+}
+
+/// A concurrency limit that would stop work rather than pace it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ConcurrencyLimitError {
+    /// The manifest entry limit was zero.
+    #[error("max_entry_concurrency must be at least 1")]
+    ManifestEntries,
+    /// The copied-directory file limit was zero.
+    #[error("max_concurrency must be at least 1")]
+    LocalDirFiles,
+}
