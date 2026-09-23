@@ -26,6 +26,7 @@
 
 use async_trait::async_trait;
 
+use super::archive::{CompressionScheme, SandboxArchiveLimits};
 use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
 use super::manifest::Manifest;
@@ -199,6 +200,34 @@ pub trait SandboxSession: Send + Sync {
 
     // --- the workspace --------------------------------------------------------------------
 
+    /// Validates access and returns the path the backend's file operations use.
+    ///
+    /// The default applies the manifest's lexical path policy. Backends that resolve filesystem
+    /// links must override this so callers can derive destinations from the same resolved path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for an invalid root, or the path policy's access refusal.
+    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+        let state = self.state();
+        let manifest = state.manifest();
+        let policy = super::workspace_paths::WorkspacePathPolicy::new(
+            &manifest.root,
+            manifest.extra_path_grants.clone(),
+        )
+        .map_err(|error| {
+            SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                OpName::Write,
+                error.to_string(),
+            )
+        })?;
+        Ok(policy
+            .normalize_sandbox_path(path, for_write)?
+            .as_str()
+            .to_owned())
+    }
+
     /// Lists a directory.
     ///
     /// # Errors
@@ -235,6 +264,36 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the backend's failure to write it.
     async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()>;
+
+    /// Writes an archive into the workspace and unpacks it beside itself.
+    ///
+    /// The archive lands at `path` and its members are written into the directory that holds it, so
+    /// a caller ends up with both. `scheme` says which format it is in; `None` reads it from the
+    /// archive's own extension. `limits` bound what unpacking may cost, and **`None` means no
+    /// bounds at all** — the reference's default, where a caller opts into the built-in ceilings by
+    /// passing them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidCompressionScheme`] when the format is unstated and cannot be
+    /// read from the name, [`ErrorCode::WorkspaceArchiveWriteError`] for an archive that is
+    /// malformed, that would write outside the workspace, or that exceeds a limit, and the
+    /// backend's own failure to write.
+    async fn extract(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        scheme: Option<CompressionScheme>,
+        limits: Option<SandboxArchiveLimits>,
+    ) -> SandboxResult<()> {
+        let _ = (path, data, scheme, limits);
+        Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            OpName::Write,
+            "unpacking an archive is not supported by this sandbox session",
+        )
+        .with_context("backend", self.backend_id().to_owned()))
+    }
 
     /// Streams the whole workspace out, so it can be moved or kept.
     ///

@@ -17,6 +17,7 @@
 //! files, and can be stopped, serialized and resumed. The two compose, and neither substitutes for
 //! the other.
 
+pub mod archive;
 pub mod entries;
 pub mod environment;
 pub mod error;
@@ -32,6 +33,11 @@ pub mod state;
 pub mod types;
 pub mod workspace_paths;
 
+pub use archive::{
+    ArchiveLimitError, CompressionScheme, DEFAULT_MAX_ARCHIVE_EXTRACTED_BYTES,
+    DEFAULT_MAX_ARCHIVE_INPUT_BYTES, DEFAULT_MAX_ARCHIVE_MEMBERS, SandboxArchiveLimits,
+    file_name_suffix,
+};
 pub use entries::mounts::{
     AzureBlobMount, BUILTIN_MOUNT_TYPES, BoxMount, BoxSubType, DEFAULT_S3_PROVIDER,
     DOCKER_VOLUME_STRATEGY_TYPE, FuseCacheType, FuseOptions, GcsMount, IN_CONTAINER_STRATEGY_TYPE,
