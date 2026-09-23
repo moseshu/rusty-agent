@@ -872,3 +872,270 @@ async fn a_zip_member_that_is_a_link_and_a_climb_is_refused_as_the_climb() {
     );
     assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
 }
+
+/// A zip holding these members in this order; a name ending in `/` is a directory.
+fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, body) in members {
+        writer
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .expect("member");
+        std::io::Write::write_all(&mut writer, body).expect("body");
+    }
+    writer.finish().expect("archive").into_inner()
+}
+
+#[tokio::test]
+async fn a_zip_path_given_twice_is_refused_unless_both_are_directories() {
+    // Spelled differently, the same path once normalized; and a file and a directory that share
+    // a name.
+    for (first, second, duplicate) in [
+        ("notes.md", "./notes.md", "notes.md"),
+        ("src", "src/", "src"),
+        ("src/", "src", "src"),
+    ] {
+        let session = RecordingSession::new();
+        let data = zip_of(&[(first, b""), (second, b"")]);
+
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data, None, None)
+            .await
+            .expect_err("refused");
+
+        assert_eq!(
+            error
+                .context()
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some(format!("duplicate archive path: {duplicate}").as_str()),
+            "{first} then {second}"
+        );
+        assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+    }
+
+    // Two directories are the same request made twice, which is not ambiguous.
+    let session = RecordingSession::new();
+    let data = zip_of(&[("src/", b""), ("src/./", b"")]);
+    WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, None)
+        .await
+        .expect("extract");
+    assert!(session.mkdirs().contains(&"/workspace/src".to_owned()));
+}
+
+#[tokio::test]
+async fn a_zip_path_that_descends_through_a_file_is_refused_from_either_side() {
+    let orders: [[(&str, &[u8]); 2]; 2] = [
+        [("src", b"a file"), ("src/main.rs", b"under it")],
+        [("src/main.rs", b"under it"), ("src", b"a file")],
+    ];
+    for members in orders {
+        let session = RecordingSession::new();
+        let data = zip_of(&members);
+
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data, None, None)
+            .await
+            .expect_err("refused");
+
+        // Either way round, the member that cannot be written is the one under the file.
+        assert_eq!(
+            error
+                .context()
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some("archive path descends through non-directory: src")
+        );
+        assert_eq!(
+            error
+                .context()
+                .get("member")
+                .and_then(|value| value.as_str()),
+            Some("src/main.rs")
+        );
+        assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+    }
+}
+
+/// A zip in which `renamed` is spelled `as_name` everywhere, so two entries share one name. The
+/// writer refuses to produce that itself; an archive from elsewhere need not.
+fn zip_renaming(members: &[(&str, &[u8])], renamed: &str, as_name: &str) -> Vec<u8> {
+    assert_eq!(renamed.len(), as_name.len());
+    let mut data = zip_of(members);
+    let mut start = 0;
+    while let Some(found) = data[start..]
+        .windows(renamed.len())
+        .position(|window| window == renamed.as_bytes())
+    {
+        let at = start + found;
+        data[at..at + renamed.len()].copy_from_slice(as_name.as_bytes());
+        start = at + renamed.len();
+    }
+    data
+}
+
+#[tokio::test]
+async fn a_zip_naming_one_file_twice_is_refused_rather_than_unpacked_as_the_last() {
+    // The `zip` crate keys members by name, so without a check of its own the second entry would
+    // quietly replace the first.
+    let session = RecordingSession::new();
+    let data = zip_renaming(
+        &[("notes.md", b"first"), ("notez.md", b"second")],
+        "notez.md",
+        "notes.md",
+    );
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("duplicate archive path: notes.md")
+    );
+    assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+
+    // One directory named twice is still the same request made twice.
+    let session = RecordingSession::new();
+    let data = zip_renaming(&[("src/", b""), ("srd/", b"")], "srd/", "src/");
+    WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, None)
+        .await
+        .expect("extract");
+    assert!(session.mkdirs().contains(&"/workspace/src".to_owned()));
+}
+
+#[tokio::test]
+async fn repeated_zip_directories_still_count_towards_member_limits() {
+    let data = zip_renaming(&[("src/", b""), ("srd/", b"")], "srd/", "src/");
+    for limit in [1, 2] {
+        let session = RecordingSession::new();
+        let limits = SandboxArchiveLimits::default().with_max_members(Some(limit)).expect("limit");
+        let result = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data.clone(), None, Some(limits)).await;
+        if limit == 1 {
+            let error = result.expect_err("two entries exceed the member limit");
+            assert_eq!(error.context().get("reason").and_then(|v| v.as_str()), Some("archive member count exceeds limit"));
+            assert_eq!(error.context().get("actual").and_then(|v| v.as_u64()), Some(2));
+            assert!(session.mkdirs().is_empty());
+        } else {
+            result.expect("the exact limit allows both directory entries");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_link_hidden_by_a_repeated_zip_directory_is_refused() {
+    for made_by in [ZIP_MADE_BY_DOS, ZIP_MADE_BY_UNIX] {
+        let mut data = zip_renaming(&[("src/", b""), ("srd/", b"")], "srd/", "src/");
+        let first = data.windows(4).position(|w| w == b"PK\x01\x02").expect("header");
+        data[first + 5] = made_by;
+        data[first + 38..first + 42].copy_from_slice(&ZIP_SYMLINK_ATTRIBUTES.to_le_bytes());
+        let session = RecordingSession::new();
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data, None, None).await.expect_err("hidden link");
+        assert_eq!(error.context().get("reason").and_then(|v| v.as_str()), Some("link member not allowed"));
+        assert_eq!(error.context().get("member").and_then(|v| v.as_str()), Some("src/"));
+        assert!(session.mkdirs().is_empty());
+        assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+    }
+}
+
+#[tokio::test]
+async fn repeated_zip_directories_still_count_all_declared_bytes() {
+    let data = zip_renaming(&[("src/", b"1234"), ("srd/", b"567")], "srd/", "src/");
+    for limit in [6, 7] {
+        let session = RecordingSession::new();
+        let limits = SandboxArchiveLimits::default().with_max_extracted_bytes(Some(limit)).expect("limit");
+        let result = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data.clone(), None, Some(limits)).await;
+        if limit == 6 {
+            let error = result.expect_err("all original directory sizes count");
+            assert_eq!(error.context().get("reason").and_then(|v| v.as_str()), Some("archive extracted size exceeds limit"));
+            assert_eq!(error.context().get("actual").and_then(|v| v.as_u64()), Some(7));
+            assert!(session.mkdirs().is_empty());
+        } else {
+            result.expect("exact extracted size limit");
+        }
+    }
+}
+
+/// Encodes the first central record's size in ZIP64's extra field instead of its 32-bit field.
+fn first_zip_size_as_zip64(mut data: Vec<u8>, size: u64) -> Vec<u8> {
+    let start = data.windows(4).position(|w| w == b"PK\x01\x02").expect("central header");
+    let name_len = usize::from(u16::from_le_bytes([data[start + 28], data[start + 29]]));
+    let extra_len = u16::from_le_bytes([data[start + 30], data[start + 31]]);
+    data[start + 24..start + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+    data[start + 30..start + 32].copy_from_slice(&(extra_len + 12).to_le_bytes());
+    let mut extra = vec![1, 0, 8, 0];
+    extra.extend_from_slice(&size.to_le_bytes());
+    let at = start + 46 + name_len;
+    data.splice(at..at, extra);
+    let end = data.windows(4).position(|w| w == b"PK\x05\x06").expect("end record");
+    let old = u32::from_le_bytes(data[end + 12..end + 16].try_into().expect("size field"));
+    data[end + 12..end + 16].copy_from_slice(&(old + 12).to_le_bytes());
+    data
+}
+
+#[tokio::test]
+async fn a_collapsed_zip64_directory_uses_its_extended_size() {
+    let data = first_zip_size_as_zip64(
+        zip_renaming(&[("src/", b"12345"), ("srd/", b"")], "srd/", "src/"), 5,
+    );
+    for limit in [4, 5] {
+        let session = RecordingSession::new();
+        let limits = SandboxArchiveLimits::default().with_max_extracted_bytes(Some(limit)).expect("limit");
+        let result = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data.clone(), None, Some(limits)).await;
+        if limit == 4 {
+            let error = result.expect_err("hidden ZIP64 size exceeds limit");
+            assert_eq!(error.context().get("actual").and_then(|v| v.as_u64()), Some(5));
+            assert!(session.mkdirs().is_empty());
+        } else {
+            result.expect("the extended size is five, not the 32-bit sentinel");
+        }
+    }
+}
+
+#[tokio::test]
+async fn collapsed_zip_names_use_cp437_when_utf8_is_not_flagged() {
+    let mut data = zip_renaming(&[("a/", b""), ("b/", b"")], "b/", "a/");
+    let headers: Vec<_> = data.windows(4).enumerate().filter_map(|(at, signature)| {
+        match signature {
+            b"PK\x03\x04" => Some((at, 6, 30)),
+            b"PK\x01\x02" => Some((at, 8, 46)),
+            _ => None,
+        }
+    }).collect();
+    for (at, flags, name) in headers {
+        data[at + flags + 1] &= !8;
+        data[at + name] = 0x82;
+    }
+    let session = RecordingSession::new();
+    let limits = SandboxArchiveLimits::default().with_max_members(Some(1)).expect("limit");
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data.clone(), None, Some(limits)).await.expect_err("two entries");
+    assert_eq!(error.context().get("member").and_then(|v| v.as_str()), Some("\u{e9}/"));
+    WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, None).await.expect("valid CP437 names");
+    assert!(session.mkdirs().contains(&"/workspace/\u{e9}".to_owned()));
+}
+
+#[tokio::test]
+async fn collapsed_zip_root_entries_are_ignored_before_type_and_limit_checks() {
+    let mut data = zip_renaming(&[(".", b"12345"), ("x", b"12345")], "x", ".");
+    let first = data.windows(4).position(|w| w == b"PK\x01\x02").expect("header");
+    data[first + 38..first + 42].copy_from_slice(&ZIP_SYMLINK_ATTRIBUTES.to_le_bytes());
+    let limits = SandboxArchiveLimits::default()
+        .with_max_members(Some(1)).expect("member limit")
+        .with_max_extracted_bytes(Some(1)).expect("size limit");
+    let session = RecordingSession::new();
+    WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, Some(limits)).await.expect("root entries skipped");
+    assert!(session.mkdirs().is_empty());
+    assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}

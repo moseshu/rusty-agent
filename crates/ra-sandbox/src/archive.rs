@@ -101,11 +101,18 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
                     None => Self::validate_tar(path, data.as_slice(), limits)?,
                 };
                 let tar_data = Self::decode_tar(path, &data, &plan)?;
-                self.apply(path, &destination_root, &tar_data, plan).await
+                self.apply(path, &destination_root, plan, |member| {
+                    Self::tar_content(path, &tar_data, member)
+                })
+                .await
             }
             CompressionScheme::Zip => {
                 let plan = Self::validate_zip(path, &data, limits)?;
-                self.apply_zip(path, &destination_root, &data, plan).await
+                let mut archive = Self::open_zip(path, &data)?;
+                self.apply(path, &destination_root, plan, |member| {
+                    Self::zip_content(path, &mut archive, member)
+                })
+                .await
             }
             _ => Err(SandboxError::new(
                 ErrorCode::InvalidCompressionScheme,
@@ -156,14 +163,25 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         Ok(Cow::Owned(tar_data))
     }
 
+    /// Reads a zip's central directory.
+    fn open_zip<'d>(
+        path: &str,
+        data: &'d [u8],
+    ) -> SandboxResult<zip::ZipArchive<Cursor<&'d [u8]>>> {
+        zip::ZipArchive::new(Cursor::new(data)).map_err(|error| {
+            Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+        })
+    }
+
+    /// Reads every zip member's entry in the central directory, and refuses the archive if any of
+    /// them is not extractable.
     fn validate_zip(
         path: &str,
         data: &[u8],
         limits: Option<SandboxArchiveLimits>,
-    ) -> SandboxResult<Vec<ZipMember>> {
-        let mut archive = zip::ZipArchive::new(Cursor::new(data)).map_err(|error| {
-            Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
-        })?;
+    ) -> SandboxResult<Vec<PlannedMember<ZipContent>>> {
+        let mut archive = Self::open_zip(path, data)?;
+        Self::validate_collapsed_zip_entries(path, data, &archive, limits)?;
         let mut plan = Vec::new();
         let mut members: BTreeMap<PosixPath, bool> = BTreeMap::new();
         let mut extracted_bytes = 0_u64;
@@ -203,12 +221,14 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
                 );
             }
             members.insert(relative.clone(), is_directory);
-            plan.push(ZipMember {
-                index,
+            plan.push(PlannedMember {
                 name,
                 relative,
                 is_directory,
-                size: member.size(),
+                content: ZipContent {
+                    index,
+                    size: member.size(),
+                },
             });
         }
         for member in &plan {
@@ -223,6 +243,76 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             }
         }
         Ok(plan)
+    }
+
+    /// Checks every original record when the ZIP reader has collapsed same-named entries.
+    ///
+    /// Repeated directories are allowed only after each one's attributes and declared size have
+    /// been checked. They still count as separate members, as they do in Python's `infolist()`.
+    fn validate_collapsed_zip_entries(
+        path: &str,
+        data: &[u8],
+        archive: &zip::ZipArchive<Cursor<&[u8]>>,
+        limits: Option<SandboxArchiveLimits>,
+    ) -> SandboxResult<()> {
+        let listed =
+            zip_central_entries(data, archive.central_directory_start()).map_err(|error| {
+                Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+            })?;
+        if listed.len() <= archive.len() {
+            return Ok(());
+        }
+        let mut members: BTreeMap<PosixPath, bool> = BTreeMap::new();
+        let mut paths = Vec::new();
+        let mut extracted_bytes = 0_u64;
+        for member in listed {
+            let name = member.name;
+            let Some(relative) = Self::safe_zip_path(path, &name, member.external_attributes)?
+            else {
+                continue;
+            };
+            let count = paths.len() + 1;
+            if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_members)
+                && count > limit
+            {
+                return Err(Self::refuse(path, "archive member count exceeds limit")
+                    .with_context("limit", limit as u64)
+                    .with_context("actual", count as u64)
+                    .with_context("member", name));
+            }
+            extracted_bytes = extracted_bytes.saturating_add(member.size);
+            if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_extracted_bytes)
+                && extracted_bytes > limit
+            {
+                return Err(Self::refuse(path, "archive extracted size exceeds limit")
+                    .with_context("limit", limit)
+                    .with_context("actual", extracted_bytes)
+                    .with_context("member", name));
+            }
+            let is_directory = name.ends_with('/');
+            if let Some(previous) = members.get(&relative)
+                && !(*previous && is_directory)
+            {
+                return Err(
+                    Self::refuse(path, &format!("duplicate archive path: {relative}"))
+                        .with_context("member", name),
+                );
+            }
+            members.insert(relative.clone(), is_directory);
+            paths.push((name, relative));
+        }
+        for (name, relative) in paths {
+            for parent in ancestors(&relative) {
+                if members.get(&parent).is_some_and(|is_dir| !is_dir) {
+                    return Err(Self::refuse(
+                        path,
+                        &format!("archive path descends through non-directory: {parent}"),
+                    )
+                    .with_context("member", name));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validates one zip member's path and type, or answers `None` for the archive's own root.
@@ -258,59 +348,35 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         Ok(Some(PosixPath::new(name).normalized()))
     }
 
-    async fn apply_zip(
-        &mut self,
+    /// A zip member's bytes, held to the size its entry declares.
+    fn zip_content(
         path: &str,
-        destination_root: &str,
-        data: &[u8],
-        plan: Vec<ZipMember>,
-    ) -> SandboxResult<()> {
-        let mut archive = zip::ZipArchive::new(Cursor::new(data)).map_err(|error| {
+        archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+        member: &PlannedMember<ZipContent>,
+    ) -> SandboxResult<Vec<u8>> {
+        let unreadable = |error: &dyn std::fmt::Display| {
             Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
-        })?;
-        for member in plan {
-            self.refuse_symlink_parents(path, destination_root, &member.name, &member.relative)
-                .await?;
-            let destination = join(destination_root, &member.relative);
-            if member.is_directory {
-                self.session.mkdir(&destination, true, None).await?;
-                self.record(destination_root, &member.relative, EntryKind::Directory);
-                continue;
-            }
-            let parent = parent_of(&destination);
-            self.session.mkdir(&parent, true, None).await?;
-            if let Some(relative_parent) = parent_relative(&member.relative) {
-                self.record(destination_root, &relative_parent, EntryKind::Directory);
-            }
-            let bytes = {
-                let mut file = archive.by_index(member.index).map_err(|error| {
-                    Self::refuse(path, "unreadable archive")
-                        .with_context("os_error", error.to_string())
-                })?;
-                // The limits were checked against the size the archive declares, and nothing in
-                // the zip reader holds a member to it: a deflate stream can inflate far past what
-                // its header claims. One byte past the declared size is enough to know it lied.
-                let mut bytes = Vec::new();
-                file.by_ref()
-                    .take(member.size.saturating_add(1))
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| {
-                        Self::refuse(path, "unreadable archive")
-                            .with_context("os_error", error.to_string())
-                    })?;
-                if bytes.len() as u64 != member.size {
-                    return Err(
-                        Self::refuse(path, "archive member size does not match header")
-                            .with_context("member", member.name.clone())
-                            .with_context("declared", member.size),
-                    );
-                }
-                bytes
-            };
-            self.session.write(&destination, bytes, None).await?;
-            self.record(destination_root, &member.relative, EntryKind::File);
+        };
+        let declared = member.content.size;
+        let mut file = archive
+            .by_index(member.content.index)
+            .map_err(|error| unreadable(&error))?;
+        // The limits were checked against the size the archive declares, and nothing in the zip
+        // reader holds a member to it: a deflate stream can inflate far past what its header
+        // claims. One byte past the declared size is enough to know it lied.
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(declared.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| unreadable(&error))?;
+        if bytes.len() as u64 != declared {
+            return Err(
+                Self::refuse(path, "archive member size does not match header")
+                    .with_context("member", member.name.clone())
+                    .with_context("declared", declared),
+            );
         }
-        Ok(())
+        Ok(bytes)
     }
 
     /// Reads the format from the archive's own name.
@@ -452,16 +518,30 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         Ok(plan)
     }
 
-    /// Writes every member the plan describes, in the order the archive declared it.
+    /// A tar member's bytes, taken by the range the header pass recorded.
     ///
-    /// Each member's bytes are taken from the archive by the range the header pass recorded rather
-    /// than from a live tar reader: that reader is not `Sync`, and a session write is an `await`.
-    async fn apply(
+    /// Not from a live tar reader: that reader is not `Sync`, and a session write is an `await`.
+    fn tar_content(
+        archive_path: &str,
+        data: &[u8],
+        member: &PlannedMember,
+    ) -> SandboxResult<Vec<u8>> {
+        data.get(member.content.clone())
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                Self::refuse(archive_path, "archive member content is truncated")
+                    .with_context("member", member.name.clone())
+            })
+    }
+
+    /// Writes every member the plan describes, in the order the archive declared it, taking each
+    /// file's bytes from `content`.
+    async fn apply<C>(
         &mut self,
         archive_path: &str,
         destination_root: &str,
-        data: &[u8],
-        plan: Vec<PlannedMember>,
+        plan: Vec<PlannedMember<C>>,
+        mut content: impl FnMut(&PlannedMember<C>) -> SandboxResult<Vec<u8>>,
     ) -> SandboxResult<()> {
         for member in plan {
             self.refuse_symlink_parents(
@@ -484,13 +564,8 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             if let Some(relative_parent) = parent_relative(&member.relative) {
                 self.record(destination_root, &relative_parent, EntryKind::Directory);
             }
-            let bytes = data.get(member.content).ok_or_else(|| {
-                Self::refuse(archive_path, "archive member content is truncated")
-                    .with_context("member", member.name.clone())
-            })?;
-            self.session
-                .write(&destination, bytes.to_vec(), None)
-                .await?;
+            let bytes = content(&member)?;
+            self.session.write(&destination, bytes, None).await?;
             self.record(destination_root, &member.relative, EntryKind::File);
         }
         Ok(())
@@ -625,19 +700,18 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
     }
 }
 
-/// One member the archive is allowed to write, and where its bytes are.
-struct PlannedMember {
+/// One member the archive is allowed to write, and where its bytes are: a range of the tar for a
+/// tar member, an entry of the central directory for a zip one.
+struct PlannedMember<C = std::ops::Range<usize>> {
     name: String,
     relative: PosixPath,
     is_directory: bool,
-    content: std::ops::Range<usize>,
+    content: C,
 }
 
-struct ZipMember {
+/// Where a zip member's bytes are.
+struct ZipContent {
     index: usize,
-    name: String,
-    relative: PosixPath,
-    is_directory: bool,
     /// The uncompressed size the archive declares, which is what the limits were checked against.
     size: u64,
 }
@@ -675,6 +749,101 @@ fn windows_drive(name: &str) -> bool {
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic())
         && characters.next() == Some(':')
+}
+
+/// The metadata used to validate one original central-directory record.
+struct ZipCentralEntry {
+    name: String,
+    size: u64,
+    external_attributes: u32,
+}
+
+/// Reads original central records, including entries hidden by the reader's name index.
+/// Only the uncompressed size from ZIP64 is needed; payload decoding remains the ZIP reader's job.
+fn zip_central_entries(data: &[u8], directory_start: u64) -> std::io::Result<Vec<ZipCentralEntry>> {
+    const HEADER_LEN: usize = 46;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid ZIP central directory",
+        )
+    };
+    let mut entries = Vec::new();
+    let mut at = usize::try_from(directory_start).map_err(|_| invalid())?;
+    while data.get(at..at.saturating_add(4)) == Some(b"PK\x01\x02") {
+        let header = data
+            .get(at..at.saturating_add(HEADER_LEN))
+            .ok_or_else(invalid)?;
+        let field =
+            |offset: usize| usize::from(u16::from_le_bytes([header[offset], header[offset + 1]]));
+        let name_start = at + HEADER_LEN;
+        let name_end = name_start.checked_add(field(28)).ok_or_else(invalid)?;
+        let extra_end = name_end.checked_add(field(30)).ok_or_else(invalid)?;
+        let record_end = extra_end.checked_add(field(32)).ok_or_else(invalid)?;
+        let raw_name = data.get(name_start..name_end).ok_or_else(invalid)?;
+        let extra = data.get(name_end..extra_end).ok_or_else(invalid)?;
+        data.get(extra_end..record_end).ok_or_else(invalid)?;
+        let name = zip_member_name(raw_name, field(8) & (1 << 11) != 0)?;
+        let size = u32::from_le_bytes(header[24..28].try_into().map_err(|_| invalid())?);
+        let size = if size == u32::MAX {
+            zip64_uncompressed_size(extra)?
+        } else {
+            u64::from(size)
+        };
+        let external_attributes =
+            u32::from_le_bytes(header[38..42].try_into().map_err(|_| invalid())?);
+        entries.push(ZipCentralEntry {
+            name,
+            size,
+            external_attributes,
+        });
+        at = record_end;
+    }
+    Ok(entries)
+}
+
+/// ZIP64 puts the uncompressed size first when its ordinary field contains the sentinel.
+fn zip64_uncompressed_size(mut extra: &[u8]) -> std::io::Result<u64> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing or truncated ZIP64 size",
+        )
+    };
+    while extra.len() >= 4 {
+        let tag = u16::from_le_bytes([extra[0], extra[1]]);
+        let length = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
+        let body = extra.get(4..4 + length).ok_or_else(invalid)?;
+        if tag == 1 {
+            let size = body.get(..8).ok_or_else(invalid)?;
+            return Ok(u64::from_le_bytes(size.try_into().map_err(|_| invalid())?));
+        }
+        extra = &extra[4 + length..];
+    }
+    Err(invalid())
+}
+
+/// Python's ZIP reader uses UTF-8 when flagged, otherwise the fixed CP437 character set.
+fn zip_member_name(raw: &[u8], utf8: bool) -> std::io::Result<String> {
+    const CP437_HIGH: &str = "\u{c7}\u{fc}\u{e9}\u{e2}\u{e4}\u{e0}\u{e5}\u{e7}\u{ea}\u{eb}\u{e8}\u{ef}\u{ee}\u{ec}\u{c4}\u{c5}\u{c9}\u{e6}\u{c6}\u{f4}\u{f6}\u{f2}\u{fb}\u{f9}\u{ff}\u{d6}\u{dc}\u{a2}\u{a3}\u{a5}\u{20a7}\u{192}\u{e1}\u{ed}\u{f3}\u{fa}\u{f1}\u{d1}\u{aa}\u{ba}\u{bf}\u{2310}\u{ac}\u{bd}\u{bc}\u{a1}\u{ab}\u{bb}\u{2591}\u{2592}\u{2593}\u{2502}\u{2524}\u{2561}\u{2562}\u{2556}\u{2555}\u{2563}\u{2551}\u{2557}\u{255d}\u{255c}\u{255b}\u{2510}\u{2514}\u{2534}\u{252c}\u{251c}\u{2500}\u{253c}\u{255e}\u{255f}\u{255a}\u{2554}\u{2569}\u{2566}\u{2560}\u{2550}\u{256c}\u{2567}\u{2568}\u{2564}\u{2565}\u{2559}\u{2558}\u{2552}\u{2553}\u{256b}\u{256a}\u{2518}\u{250c}\u{2588}\u{2584}\u{258c}\u{2590}\u{2580}\u{3b1}\u{df}\u{393}\u{3c0}\u{3a3}\u{3c3}\u{b5}\u{3c4}\u{3a6}\u{398}\u{3a9}\u{3b4}\u{221e}\u{3c6}\u{3b5}\u{2229}\u{2261}\u{b1}\u{2265}\u{2264}\u{2320}\u{2321}\u{f7}\u{2248}\u{b0}\u{2219}\u{b7}\u{221a}\u{207f}\u{b2}\u{25a0}\u{a0}";
+    let name = if utf8 {
+        std::str::from_utf8(raw)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            .to_owned()
+    } else {
+        let high: Vec<char> = CP437_HIGH.chars().collect();
+        raw.iter()
+            .map(|byte| {
+                if *byte < 128 {
+                    char::from(*byte)
+                } else {
+                    high[usize::from(*byte) - 128]
+                }
+            })
+            .collect()
+    };
+    // ZipInfo truncates a filename at the first NUL before the framework inspects it.
+    Ok(name.split('\0').next().unwrap_or_default().to_owned())
 }
 
 /// Every proper ancestor of a workspace-relative path, nearest first.
