@@ -803,3 +803,72 @@ async fn a_zip_member_larger_than_its_header_declares_is_refused() {
         );
     }
 }
+
+/// A one-member zip whose central directory says `made_by` wrote it, with these attributes.
+fn zip_with_attributes(name: &str, made_by: u8, external_attributes: u32) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file(name, zip::write::SimpleFileOptions::default())
+        .expect("member");
+    std::io::Write::write_all(&mut writer, b"/etc/passwd").expect("body");
+    let mut data = writer.finish().expect("archive").into_inner();
+    // The system that made a member is the high byte of "version made by", at offset 5 of the
+    // central header; the external attributes are at offset 38.
+    let start = data
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("central header");
+    data[start + 5] = made_by;
+    data[start + 38..start + 42].copy_from_slice(&external_attributes.to_le_bytes());
+    data
+}
+
+const ZIP_MADE_BY_DOS: u8 = 0;
+const ZIP_MADE_BY_UNIX: u8 = 3;
+const ZIP_SYMLINK_ATTRIBUTES: u32 = 0o120_777 << 16;
+
+#[rstest]
+#[case::made_on_unix(ZIP_MADE_BY_UNIX)]
+// The `zip` crate reports a DOS-made member as a regular file whatever its high bits say. The
+// reference reads the bits regardless, and so does this.
+#[case::made_on_dos(ZIP_MADE_BY_DOS)]
+#[tokio::test]
+async fn a_zip_link_member_is_refused_whichever_system_made_it(#[case] made_by: u8) {
+    let session = RecordingSession::new();
+    let data = zip_with_attributes("link", made_by, ZIP_SYMLINK_ATTRIBUTES);
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, None)
+        .await
+        .expect_err("link member");
+
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("link member not allowed")
+    );
+    assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}
+
+#[tokio::test]
+async fn a_zip_member_that_is_a_link_and_a_climb_is_refused_as_the_climb() {
+    let session = RecordingSession::new();
+    let data = zip_with_attributes("../escape", ZIP_MADE_BY_UNIX, ZIP_SYMLINK_ATTRIBUTES);
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, None)
+        .await
+        .expect_err("unsafe member");
+
+    assert_eq!(
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("parent traversal")
+    );
+    assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}

@@ -24,6 +24,7 @@ use ra_core::sandbox::{
     CompressionScheme, EntryKind, ErrorCode, OpName, PosixPath, SandboxArchiveLimits, SandboxError,
     SandboxResult, SandboxSession, file_name_suffix,
 };
+use zip::read::HasZipMetadata;
 
 /// Unpacks archives into one session's workspace.
 pub struct WorkspaceArchiveExtractor<'a> {
@@ -172,13 +173,8 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             })?;
             let name = member.name().to_owned();
             let is_directory = member.is_dir();
-            let mode = member.unix_mode().unwrap_or(0) & 0o170_000;
-            if mode == 0o120_000 {
-                return Err(
-                    Self::refuse(path, "link member not allowed").with_context("member", name)
-                );
-            }
-            let relative = Self::safe_zip_path(path, &name)?;
+            let relative =
+                Self::safe_zip_path(path, &name, member.get_metadata().external_attributes)?;
             let Some(relative) = relative else { continue };
             let count = plan.len() + 1;
             if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_members)
@@ -229,7 +225,17 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         Ok(plan)
     }
 
-    fn safe_zip_path(path: &str, name: &str) -> SandboxResult<Option<PosixPath>> {
+    /// Validates one zip member's path and type, or answers `None` for the archive's own root.
+    ///
+    /// The type comes from the high half of the external attributes whatever system the archive
+    /// says made it, as the reference reads it: the `zip` crate's `unix_mode` invents a regular
+    /// file for a DOS-made member, which would let a link through under that label. Path rules
+    /// come first, so a member that is both a link and a climb is reported as the climb.
+    fn safe_zip_path(
+        path: &str,
+        name: &str,
+        external_attributes: u32,
+    ) -> SandboxResult<Option<PosixPath>> {
         if matches!(name, "" | "." | "./") {
             return Ok(None);
         }
@@ -241,6 +247,8 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             Some("absolute path")
         } else if PosixPath::new(name).parts().contains(&"..") {
             Some("parent traversal")
+        } else if (external_attributes >> 16) & 0o170_000 == 0o120_000 {
+            Some("link member not allowed")
         } else {
             None
         };
