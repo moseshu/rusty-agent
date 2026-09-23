@@ -25,7 +25,8 @@ pub const DEFAULT_MAX_ARCHIVE_MEMBERS: usize = 100_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionScheme {
-    /// An uncompressed tar archive.
+    /// A tar archive, plain or compressed with gzip, bzip2 or xz; the compression is read from the
+    /// archive's own bytes, not from its name.
     Tar,
     /// A zip archive.
     Zip,
