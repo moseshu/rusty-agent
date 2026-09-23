@@ -658,14 +658,20 @@ async fn compressed_tar_formats_are_unpacked() {
     let mut bzip = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
     std::io::Write::write_all(&mut bzip, &original).expect("bzip body");
     let bzip = bzip.finish().expect("bzip");
-    let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+    let mut xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6))
+        .expect("xz writer");
     std::io::Write::write_all(&mut xz, &original).expect("xz body");
     let xz = xz.finish().expect("xz");
     for data in [gzip, bzip, xz] {
         let session = RecordingSession::new();
         WorkspaceArchiveExtractor::new(&session)
-            .extract(ARCHIVE_PATH, data, None, None).await.expect("extract");
-        assert_eq!(session.written("/workspace/incoming/README.md"), Some(b"# bundle".to_vec()));
+            .extract(ARCHIVE_PATH, data, None, None)
+            .await
+            .expect("extract");
+        assert_eq!(
+            session.written("/workspace/incoming/README.md"),
+            Some(b"# bundle".to_vec())
+        );
     }
 }
 
@@ -674,13 +680,19 @@ async fn zip_rejects_unsafe_paths_before_writing_members() {
     for name in ["../escape", "/absolute", "C:/drive", "dir\\file"] {
         let session = RecordingSession::new();
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        writer.start_file("safe.txt", zip::write::SimpleFileOptions::default()).expect("safe");
+        writer
+            .start_file("safe.txt", zip::write::SimpleFileOptions::default())
+            .expect("safe");
         std::io::Write::write_all(&mut writer, b"safe").expect("body");
-        writer.start_file(name, zip::write::SimpleFileOptions::default()).expect("unsafe");
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("unsafe");
         std::io::Write::write_all(&mut writer, b"bad").expect("body");
         let data = writer.finish().expect("archive").into_inner();
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, None).await.expect_err("unsafe member");
+            .extract("/workspace/bundle.zip", data, None, None)
+            .await
+            .expect_err("unsafe member");
         assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
         assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
     }
@@ -690,12 +702,18 @@ async fn zip_rejects_unsafe_paths_before_writing_members() {
 async fn zip_checks_declared_size_before_writing_members() {
     let session = RecordingSession::new();
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    writer.start_file("large.txt", zip::write::SimpleFileOptions::default()).expect("member");
+    writer
+        .start_file("large.txt", zip::write::SimpleFileOptions::default())
+        .expect("member");
     std::io::Write::write_all(&mut writer, b"12345").expect("body");
     let data = writer.finish().expect("archive").into_inner();
-    let limits = SandboxArchiveLimits::default().with_max_extracted_bytes(Some(4)).expect("limit");
+    let limits = SandboxArchiveLimits::default()
+        .with_max_extracted_bytes(Some(4))
+        .expect("limit");
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, Some(limits)).await.expect_err("oversize");
+        .extract("/workspace/bundle.zip", data, None, Some(limits))
+        .await
+        .expect_err("oversize");
     assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
     assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
 }
@@ -1138,4 +1156,30 @@ async fn collapsed_zip_root_entries_are_ignored_before_type_and_limit_checks() {
         .extract("/workspace/bundle.zip", data, None, Some(limits)).await.expect("root entries skipped");
     assert!(session.mkdirs().is_empty());
     assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}
+
+#[tokio::test]
+async fn a_tar_split_across_concatenated_xz_streams_is_refused() {
+    let session = RecordingSession::new();
+    let original = bundle();
+    // End the first stream inside a file's payload. Python's streaming tar reader uses a
+    // single LZMADecompressor, so the second stream cannot complete this truncated member.
+    let (head, tail) = original.split_at(1024 + 6);
+    let mut data = Vec::new();
+    for part in [head, tail] {
+        let mut xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6))
+            .expect("xz writer");
+        std::io::Write::write_all(&mut xz, part).expect("xz body");
+        data.extend(xz.finish().expect("xz"));
+    }
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data.clone(), None, None)
+        .await
+        .expect_err("the first xz stream contains an incomplete tar");
+
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(session.written(ARCHIVE_PATH), Some(data));
+    assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
+    assert!(session.mkdirs().is_empty());
 }

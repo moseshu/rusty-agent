@@ -129,7 +129,9 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         } else if data.starts_with(b"BZh") {
             Some(Box::new(bzip2::read::BzDecoder::new(data)))
         } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
-            Some(Box::new(xz2::read::XzDecoder::new(data)))
+            // Python's tarfile streaming mode uses one LZMADecompressor and does not continue
+            // into another xz stream to complete a truncated tar.
+            Some(Box::new(lzma_rust2::XzReader::new(data, false)))
         } else {
             None
         }
