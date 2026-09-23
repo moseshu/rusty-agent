@@ -74,9 +74,11 @@ tempfile = "3"
 # 读写 tar，所以移植也在进程内做：调用宿主的 `tar` 会把「归档里有什么」交给一个版本和行为都
 # 不由我们决定的外部程序，而成员路径的越界检查正是这一步要守的东西。
 tar = "0.4"
+# 解压全走纯 Rust 实现：bzip2 用 libbz2-rs-sys 后端（经特性合并也覆盖 zip 的 bzip2），xz 用
+# lzma-rust2 而非绑定 liblzma 的 xz2，交叉编译到 Windows 等目标时不需要对应的 C 工具链。
 flate2 = "1"
-bzip2 = "0.5"
-xz2 = "0.1"
+bzip2 = { version = "0.5", default-features = false, features = ["libbz2-rs-sys"] }
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "xz"] }
 zip = { version = "2.4", default-features = false, features = ["deflate", "bzip2", "lzma"] }
 
 # --- 序列化 ---
