@@ -16,7 +16,9 @@
 //! Size is the other half. A few kilobytes of members can declare gigabytes of files, so the
 //! ceilings a caller supplied are checked against the headers, before any member's content is read.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
 
 use ra_core::sandbox::{
     CompressionScheme, EntryKind, ErrorCode, OpName, PosixPath, SandboxArchiveLimits, SandboxError,
@@ -66,16 +68,6 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             Some(scheme) => scheme,
             None => Self::infer_scheme(path)?,
         };
-        if scheme == CompressionScheme::Zip {
-            return Err(SandboxError::new(
-                ErrorCode::SandboxConfigInvalid,
-                OpName::Write,
-                "unpacking a zip archive is not carried over yet",
-            )
-            .with_context("path", path)
-            .with_context("scheme", scheme.as_str()));
-        }
-
         // Infer the format from the caller's name, but place members beside the backend-resolved
         // archive. A leaf symlink can put the archive in a different directory.
         let normalized_path = self.session.validate_path_access(path, true).await?;
@@ -98,8 +90,219 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         // leaves the workspace holding the archive and nothing unpacked from it. Only the headers
         // are read here: an archive that declares more than the ceilings allow is refused without
         // its content ever being held.
-        let plan = Self::validate_tar(path, &data, limits)?;
-        self.apply(path, &destination_root, &data, plan).await
+        match scheme {
+            CompressionScheme::Tar => {
+                // A compressed tar is checked while it streams out of its decoder, so a few
+                // kilobytes that decompress to gigabytes are refused on their headers rather than
+                // after being inflated. Only what the plan needs is then decoded to be written.
+                let plan = match Self::tar_decoder(&data) {
+                    Some(decoder) => Self::validate_tar(path, decoder, limits)?,
+                    None => Self::validate_tar(path, data.as_slice(), limits)?,
+                };
+                let tar_data = Self::decode_tar(path, &data, &plan)?;
+                self.apply(path, &destination_root, &tar_data, plan).await
+            }
+            CompressionScheme::Zip => {
+                let plan = Self::validate_zip(path, &data, limits)?;
+                self.apply_zip(path, &destination_root, &data, plan).await
+            }
+            _ => Err(SandboxError::new(
+                ErrorCode::InvalidCompressionScheme,
+                OpName::Write,
+                "compression scheme must be one of 'zip' 'tar'",
+            )),
+        }
+    }
+
+    /// A decoder for a compressed tar, chosen by its magic bytes, or `None` for a plain one.
+    fn tar_decoder(data: &[u8]) -> Option<Box<dyn Read + '_>> {
+        if data.starts_with(&[0x1f, 0x8b]) {
+            Some(Box::new(flate2::read::MultiGzDecoder::new(data)))
+        } else if data.starts_with(b"BZh") {
+            Some(Box::new(bzip2::read::BzDecoder::new(data)))
+        } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+            Some(Box::new(xz2::read::XzDecoder::new(data)))
+        } else {
+            None
+        }
+    }
+
+    /// The tar bytes the plan's members are taken from.
+    ///
+    /// A compressed tar is decoded only as far as the last planned member's content ends: the
+    /// plan has already been checked against the limits, and whatever the stream holds after
+    /// that is never needed.
+    fn decode_tar<'d>(
+        path: &str,
+        data: &'d [u8],
+        plan: &[PlannedMember],
+    ) -> SandboxResult<Cow<'d, [u8]>> {
+        let Some(decoder) = Self::tar_decoder(data) else {
+            return Ok(Cow::Borrowed(data));
+        };
+        let needed = plan
+            .iter()
+            .map(|member| member.content.end)
+            .max()
+            .unwrap_or(0);
+        let mut tar_data = Vec::new();
+        decoder
+            .take(u64::try_from(needed).unwrap_or(u64::MAX))
+            .read_to_end(&mut tar_data)
+            .map_err(|error| {
+                Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+            })?;
+        Ok(Cow::Owned(tar_data))
+    }
+
+    fn validate_zip(
+        path: &str,
+        data: &[u8],
+        limits: Option<SandboxArchiveLimits>,
+    ) -> SandboxResult<Vec<ZipMember>> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(data)).map_err(|error| {
+            Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+        })?;
+        let mut plan = Vec::new();
+        let mut members: BTreeMap<PosixPath, bool> = BTreeMap::new();
+        let mut extracted_bytes = 0_u64;
+        for index in 0..archive.len() {
+            let member = archive.by_index(index).map_err(|error| {
+                Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+            })?;
+            let name = member.name().to_owned();
+            let is_directory = member.is_dir();
+            let mode = member.unix_mode().unwrap_or(0) & 0o170_000;
+            if mode == 0o120_000 {
+                return Err(
+                    Self::refuse(path, "link member not allowed").with_context("member", name)
+                );
+            }
+            let relative = Self::safe_zip_path(path, &name)?;
+            let Some(relative) = relative else { continue };
+            let count = plan.len() + 1;
+            if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_members)
+                && count > limit
+            {
+                return Err(Self::refuse(path, "archive member count exceeds limit")
+                    .with_context("limit", limit as u64)
+                    .with_context("actual", count as u64)
+                    .with_context("member", name));
+            }
+            extracted_bytes = extracted_bytes.saturating_add(member.size());
+            if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_extracted_bytes)
+                && extracted_bytes > limit
+            {
+                return Err(Self::refuse(path, "archive extracted size exceeds limit")
+                    .with_context("limit", limit)
+                    .with_context("actual", extracted_bytes)
+                    .with_context("member", name));
+            }
+            if let Some(previous) = members.get(&relative)
+                && !(*previous && is_directory)
+            {
+                return Err(
+                    Self::refuse(path, &format!("duplicate archive path: {relative}"))
+                        .with_context("member", name),
+                );
+            }
+            members.insert(relative.clone(), is_directory);
+            plan.push(ZipMember {
+                index,
+                name,
+                relative,
+                is_directory,
+                size: member.size(),
+            });
+        }
+        for member in &plan {
+            for parent in ancestors(&member.relative) {
+                if members.get(&parent).is_some_and(|is_dir| !is_dir) {
+                    return Err(Self::refuse(
+                        path,
+                        &format!("archive path descends through non-directory: {parent}"),
+                    )
+                    .with_context("member", member.name.clone()));
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    fn safe_zip_path(path: &str, name: &str) -> SandboxResult<Option<PosixPath>> {
+        if matches!(name, "" | "." | "./") {
+            return Ok(None);
+        }
+        let reason = if windows_drive(name) {
+            Some("windows drive path")
+        } else if name.contains('\\') {
+            Some("windows path separator")
+        } else if name.starts_with('/') {
+            Some("absolute path")
+        } else if PosixPath::new(name).parts().contains(&"..") {
+            Some("parent traversal")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(Self::refuse(path, reason).with_context("member", name.to_owned()));
+        }
+        Ok(Some(PosixPath::new(name).normalized()))
+    }
+
+    async fn apply_zip(
+        &mut self,
+        path: &str,
+        destination_root: &str,
+        data: &[u8],
+        plan: Vec<ZipMember>,
+    ) -> SandboxResult<()> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(data)).map_err(|error| {
+            Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+        })?;
+        for member in plan {
+            self.refuse_symlink_parents(path, destination_root, &member.name, &member.relative)
+                .await?;
+            let destination = join(destination_root, &member.relative);
+            if member.is_directory {
+                self.session.mkdir(&destination, true, None).await?;
+                self.record(destination_root, &member.relative, EntryKind::Directory);
+                continue;
+            }
+            let parent = parent_of(&destination);
+            self.session.mkdir(&parent, true, None).await?;
+            if let Some(relative_parent) = parent_relative(&member.relative) {
+                self.record(destination_root, &relative_parent, EntryKind::Directory);
+            }
+            let bytes = {
+                let mut file = archive.by_index(member.index).map_err(|error| {
+                    Self::refuse(path, "unreadable archive")
+                        .with_context("os_error", error.to_string())
+                })?;
+                // The limits were checked against the size the archive declares, and nothing in
+                // the zip reader holds a member to it: a deflate stream can inflate far past what
+                // its header claims. One byte past the declared size is enough to know it lied.
+                let mut bytes = Vec::new();
+                file.by_ref()
+                    .take(member.size.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| {
+                        Self::refuse(path, "unreadable archive")
+                            .with_context("os_error", error.to_string())
+                    })?;
+                if bytes.len() as u64 != member.size {
+                    return Err(
+                        Self::refuse(path, "archive member size does not match header")
+                            .with_context("member", member.name.clone())
+                            .with_context("declared", member.size),
+                    );
+                }
+                bytes
+            };
+            self.session.write(&destination, bytes, None).await?;
+            self.record(destination_root, &member.relative, EntryKind::File);
+        }
+        Ok(())
     }
 
     /// Reads the format from the archive's own name.
@@ -127,9 +330,9 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
     ///
     /// Headers only: a member's content is read when it is written, so an archive that declares
     /// more than the ceilings allow is refused without ever being held.
-    fn validate_tar(
+    fn validate_tar<R: Read>(
         archive_path: &str,
-        data: &[u8],
+        data: R,
         limits: Option<SandboxArchiveLimits>,
     ) -> SandboxResult<Vec<PlannedMember>> {
         let mut plan: Vec<PlannedMember> = Vec::new();
@@ -420,6 +623,15 @@ struct PlannedMember {
     relative: PosixPath,
     is_directory: bool,
     content: std::ops::Range<usize>,
+}
+
+struct ZipMember {
+    index: usize,
+    name: String,
+    relative: PosixPath,
+    is_directory: bool,
+    /// The uncompressed size the archive declares, which is what the limits were checked against.
+    size: u64,
 }
 
 /// What kind of thing an archive member claims to be.
