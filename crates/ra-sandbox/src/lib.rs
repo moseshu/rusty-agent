@@ -17,6 +17,7 @@
 //! be stopped and resumed. The local backend does use a host fence where the reference does, but
 //! that is one step inside it, not the same thing.
 
+pub mod archive;
 pub mod host_paths;
 pub mod listing;
 #[cfg(unix)]

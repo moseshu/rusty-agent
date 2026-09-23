@@ -1,0 +1,649 @@
+//! `ra-sandbox::archive`: unpacking an archive a caller handed in.
+//!
+//! An archive is input that names its own destinations, so almost everything here is refusal: a
+//! member that climbs out with `..`, one that spells an absolute path or a Windows drive, a link in
+//! either direction, the same path twice, a path that descends through a file, and a path whose
+//! parent is already a symlink in the workspace. The session underneath is a recorder, so what was
+//! written — and what was not — is visible without a real workspace.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use ra_core::sandbox::{
+    AsUser, CompressionScheme, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest,
+    Permissions, SandboxArchiveLimits, SandboxError, SandboxResult, SandboxSession,
+    SandboxSessionState, Snapshot,
+};
+use ra_sandbox::archive::WorkspaceArchiveExtractor;
+use rstest::rstest;
+
+/// Where these archives are unpacked.
+const ARCHIVE_PATH: &str = "/workspace/incoming/bundle.tar";
+
+/// One thing the extractor asked the session to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Call {
+    Mkdir(String),
+    Write(String, Vec<u8>),
+}
+
+/// A session that records what it was asked to write, and lists what it was told to hold.
+struct RecordingSession {
+    state: SandboxSessionState,
+    calls: Mutex<Vec<Call>>,
+    listings: BTreeMap<String, Vec<FileEntry>>,
+}
+
+impl RecordingSession {
+    fn new() -> Self {
+        Self {
+            state: SandboxSessionState::new(
+                "recording",
+                Snapshot::noop(),
+                Manifest::new().with_root("/workspace"),
+            ),
+            calls: Mutex::new(Vec::new()),
+            listings: BTreeMap::new(),
+        }
+    }
+
+    /// Says that `directory` already holds `name`, as something of `kind`.
+    fn holding(mut self, directory: &str, name: &str, kind: EntryKind) -> Self {
+        self.listings.insert(
+            directory.to_owned(),
+            vec![
+                FileEntry::new(format!("{directory}/{name}"), Permissions::default())
+                    .with_kind(kind),
+            ],
+        );
+        self
+    }
+
+    fn calls(&self) -> Vec<Call> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    /// The paths written, in order.
+    fn writes(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Write(path, _) => Some(path),
+                Call::Mkdir(_) => None,
+            })
+            .collect()
+    }
+
+    /// What was written to one path.
+    fn written(&self, path: &str) -> Option<Vec<u8>> {
+        self.calls().into_iter().find_map(|call| match call {
+            Call::Write(written, bytes) if written == path => Some(bytes),
+            _ => None,
+        })
+    }
+
+    /// The directories created, in order.
+    fn mkdirs(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Mkdir(path) => Some(path),
+                Call::Write(..) => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl SandboxSession for RecordingSession {
+    fn backend_id(&self) -> &str {
+        "recording"
+    }
+
+    fn state(&self) -> SandboxSessionState {
+        self.state.clone()
+    }
+
+    async fn exec(&self, _request: ExecRequest) -> SandboxResult<ExecResult> {
+        Ok(ExecResult::new(Vec::new(), Vec::new(), 0))
+    }
+
+    async fn running(&self) -> SandboxResult<bool> {
+        Ok(true)
+    }
+
+    async fn ls(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        self.listings
+            .get(path)
+            .cloned()
+            .ok_or_else(|| SandboxError::workspace_read_not_found(path))
+    }
+
+    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+        Ok(())
+    }
+
+    async fn mkdir(&self, path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(Call::Mkdir(path.to_owned()));
+        Ok(())
+    }
+
+    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        Err(SandboxError::workspace_read_not_found(path))
+    }
+
+    async fn write(&self, path: &str, data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(Call::Write(path.to_owned(), data));
+        Ok(())
+    }
+
+    async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    async fn hydrate_workspace(&self, _data: Vec<u8>) -> SandboxResult<()> {
+        Ok(())
+    }
+}
+
+/// Builds a tar out of members described as (name, kind, body).
+fn archive(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    build(&mut builder);
+    builder.into_inner().expect("archive")
+}
+
+/// Adds a member under a name the archive writer would otherwise refuse to produce.
+fn member(
+    builder: &mut tar::Builder<Vec<u8>>,
+    name: &str,
+    entry_type: tar::EntryType,
+    body: &[u8],
+) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    let raw = header.as_gnu_mut().expect("a gnu header");
+    raw.name[..name.len()].copy_from_slice(name.as_bytes());
+    header.set_cksum();
+    builder.append(&header, body).expect("member");
+}
+
+/// Adds a link member aimed wherever the caller likes.
+fn link_member(
+    builder: &mut tar::Builder<Vec<u8>>,
+    name: &str,
+    entry_type: tar::EntryType,
+    target: &str,
+) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_size(0);
+    header.set_mode(0o777);
+    builder
+        .append_link(&mut header, name, target)
+        .expect("member");
+}
+
+/// An ordinary two-file archive with a directory in it.
+fn bundle() -> Vec<u8> {
+    archive(|builder| {
+        member(builder, "src/", tar::EntryType::Directory, b"");
+        member(builder, "src/main.rs", tar::EntryType::Regular, b"fn main() {}");
+        member(builder, "README.md", tar::EntryType::Regular, b"# bundle");
+    })
+}
+
+#[tokio::test]
+async fn an_archive_is_written_where_it_was_asked_and_unpacked_beside_itself() {
+    let session = RecordingSession::new();
+    let data = bundle();
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data.clone(), None, None)
+        .await
+        .expect("extract");
+
+    // The archive itself lands first: it is what the caller handed over.
+    assert_eq!(session.written(ARCHIVE_PATH), Some(data));
+    assert_eq!(
+        session.writes(),
+        vec![
+            ARCHIVE_PATH.to_owned(),
+            "/workspace/incoming/src/main.rs".to_owned(),
+            "/workspace/incoming/README.md".to_owned(),
+        ]
+    );
+    assert_eq!(
+        session.written("/workspace/incoming/src/main.rs"),
+        Some(b"fn main() {}".to_vec())
+    );
+    // A directory member is created, and so is the parent of every file written.
+    assert!(session.mkdirs().contains(&"/workspace/incoming/src".to_owned()));
+}
+
+#[tokio::test]
+async fn members_named_from_the_archive_root_land_without_the_prefix() {
+    // `tar -cf - .` names every member `./…`, which is what an archive produced by the shell looks
+    // like. The leading `.` is part of naming the archive's own root, not part of the destination.
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, "./", tar::EntryType::Directory, b"");
+        member(builder, "./src/", tar::EntryType::Directory, b"");
+        member(builder, "./src/main.rs", tar::EntryType::Regular, b"fn main() {}");
+    });
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect("extract");
+
+    assert_eq!(
+        session.writes(),
+        vec![
+            ARCHIVE_PATH.to_owned(),
+            "/workspace/incoming/src/main.rs".to_owned()
+        ]
+    );
+    assert!(
+        session
+            .mkdirs()
+            .contains(&"/workspace/incoming/src".to_owned())
+    );
+}
+
+#[rstest]
+#[case("/etc/passwd", "absolute path")]
+#[case("../escape", "parent traversal")]
+#[case("nested/../../escape", "parent traversal")]
+#[case("c:/windows", "windows drive path")]
+#[case("nested\\escape", "windows path separator")]
+#[tokio::test]
+async fn a_member_that_names_somewhere_else_is_refused(
+    #[case] name: &str,
+    #[case] reason: &str,
+) {
+    let session = RecordingSession::new();
+    let data = archive(|builder| member(builder, name, tar::EntryType::Regular, b"payload"));
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some(reason)
+    );
+    // The archive landed, because that is what the caller asked for; nothing was unpacked from it.
+    assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
+    assert!(session.mkdirs().is_empty());
+}
+
+#[tokio::test]
+async fn links_are_refused_in_both_directions() {
+    for (entry_type, reason) in [
+        (tar::EntryType::Symlink, "symlink member not allowed"),
+        (tar::EntryType::Link, "hardlink member not allowed"),
+    ] {
+        let session = RecordingSession::new();
+        let data = archive(|builder| link_member(builder, "link", entry_type, "/etc/passwd"));
+
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract(ARCHIVE_PATH, data, None, None)
+            .await
+            .expect_err("refused");
+
+        assert_eq!(
+            error.context().get("reason").and_then(|value| value.as_str()),
+            Some(reason)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_member_that_is_neither_a_file_nor_a_directory_is_refused() {
+    let session = RecordingSession::new();
+    let data = archive(|builder| member(builder, "pipe", tar::EntryType::Fifo, b""));
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("unsupported member type")
+    );
+}
+
+#[rstest]
+#[case(tar::EntryType::Regular, "archive root member must be directory")]
+#[case(tar::EntryType::Symlink, "archive root symlink")]
+#[case(tar::EntryType::Link, "archive root hardlink")]
+#[tokio::test]
+async fn the_archives_own_root_may_only_be_a_directory(
+    #[case] entry_type: tar::EntryType,
+    #[case] reason: &str,
+) {
+    let session = RecordingSession::new();
+    let data = archive(|builder| member(builder, ".", entry_type, b""));
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some(reason)
+    );
+}
+
+#[tokio::test]
+async fn the_archives_own_root_directory_is_skipped_rather_than_written() {
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, ".", tar::EntryType::Directory, b"");
+        member(builder, "notes.md", tar::EntryType::Regular, b"kept");
+    });
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect("extract");
+
+    assert_eq!(
+        session.writes(),
+        vec![
+            ARCHIVE_PATH.to_owned(),
+            "/workspace/incoming/notes.md".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_same_path_twice_is_refused_unless_both_are_directories() {
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, "notes.md", tar::EntryType::Regular, b"first");
+        member(builder, "notes.md", tar::EntryType::Regular, b"second");
+    });
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("duplicate archive path: notes.md")
+    );
+
+    // Two directories are the same request made twice, which is not ambiguous.
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, "src/", tar::EntryType::Directory, b"");
+        member(builder, "src/", tar::EntryType::Directory, b"");
+    });
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect("extract");
+}
+
+#[tokio::test]
+async fn a_path_that_descends_through_a_file_is_refused_from_either_side() {
+    // The file arrives first, and the member under it is the one that cannot be written.
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, "src", tar::EntryType::Regular, b"a file");
+        member(builder, "src/main.rs", tar::EntryType::Regular, b"under it");
+    });
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("archive path descends through non-directory: src")
+    );
+    assert_eq!(
+        error.context().get("member").and_then(|value| value.as_str()),
+        Some("src/main.rs")
+    );
+
+    // The other order, where the conflict is only visible once the file turns up: the refusal names
+    // the member that needed a directory, because that is the one that cannot be written.
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, "src/main.rs", tar::EntryType::Regular, b"under it");
+        member(builder, "src", tar::EntryType::Regular, b"a file");
+    });
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("archive path descends through non-directory: src")
+    );
+    assert_eq!(
+        error.context().get("member").and_then(|value| value.as_str()),
+        Some("src/main.rs")
+    );
+}
+
+#[tokio::test]
+async fn a_member_landing_under_an_existing_symlink_is_refused() {
+    // The workspace already holds `incoming/data` as a link. Writing `data/secret` through it would
+    // land wherever the link points, which is not this workspace's decision to make.
+    let session = RecordingSession::new().holding("/workspace/incoming", "data", EntryKind::Symlink);
+    let data = archive(|builder| {
+        member(builder, "data/secret", tar::EntryType::Regular, b"payload");
+    });
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("symlink in parent path: data")
+    );
+    assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
+}
+
+#[tokio::test]
+async fn an_existing_directory_of_the_same_name_is_not_a_symlink() {
+    let session =
+        RecordingSession::new().holding("/workspace/incoming", "data", EntryKind::Directory);
+    let data = archive(|builder| {
+        member(builder, "data/secret", tar::EntryType::Regular, b"payload");
+    });
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect("extract");
+
+    assert!(
+        session
+            .writes()
+            .contains(&"/workspace/incoming/data/secret".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn an_archive_larger_than_the_caller_allows_is_refused_before_it_is_read() {
+    let session = RecordingSession::new();
+    let limits = SandboxArchiveLimits::default()
+        .with_max_input_bytes(Some(16))
+        .expect("limit");
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, bundle(), None, Some(limits))
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("archive input size exceeds limit")
+    );
+    assert_eq!(
+        error.context().get("limit").and_then(serde_json::Value::as_u64),
+        Some(16)
+    );
+    // Not even the archive itself: it is bigger than this caller agreed to accept.
+    assert!(session.calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_archive_with_more_members_than_the_caller_allows_is_refused() {
+    let session = RecordingSession::new();
+    let limits = SandboxArchiveLimits::default()
+        .with_max_members(Some(2))
+        .expect("limit");
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, bundle(), None, Some(limits))
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("archive member count exceeds limit")
+    );
+    assert_eq!(
+        error.context().get("actual").and_then(serde_json::Value::as_u64),
+        Some(3)
+    );
+    assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
+}
+
+#[tokio::test]
+async fn an_archive_that_would_unpack_to_more_than_the_caller_allows_is_refused() {
+    // Read from the headers, so a small archive declaring an enormous file is refused without any
+    // of it being read.
+    let session = RecordingSession::new();
+    let limits = SandboxArchiveLimits::default()
+        .with_max_extracted_bytes(Some(8))
+        .expect("limit");
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, bundle(), None, Some(limits))
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        error.context().get("reason").and_then(|value| value.as_str()),
+        Some("archive extracted size exceeds limit")
+    );
+    assert_eq!(
+        error.context().get("limit").and_then(serde_json::Value::as_u64),
+        Some(8)
+    );
+}
+
+#[tokio::test]
+async fn a_caller_who_sets_no_limits_gets_none() {
+    // The reference's default: `extract` without limits imposes nothing, and opting in is what
+    // `SandboxArchiveLimits` is for.
+    let session = RecordingSession::new();
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, bundle(), None, None)
+        .await
+        .expect("extract");
+
+    assert_eq!(session.writes().len(), 3);
+}
+
+#[test]
+fn a_ceiling_of_zero_is_refused_where_it_is_written_down() {
+    // Zero would refuse every archive, including an empty one, and reads as "unlimited" at a
+    // glance.
+    assert!(
+        SandboxArchiveLimits::default()
+            .with_max_input_bytes(Some(0))
+            .is_err()
+    );
+    assert!(
+        SandboxArchiveLimits::default()
+            .with_max_extracted_bytes(Some(0))
+            .is_err()
+    );
+    assert!(
+        SandboxArchiveLimits::default()
+            .with_max_members(Some(0))
+            .is_err()
+    );
+    // `None` is how a caller turns one off.
+    let unlimited = SandboxArchiveLimits::default()
+        .with_max_members(None)
+        .expect("limit");
+    assert_eq!(unlimited.max_members(), None);
+}
+
+#[rstest]
+#[case("/workspace/bundle.tar", None, "tar")]
+#[case("/workspace/bundle.zip", None, "zip")]
+// An explicit scheme wins over the name, which is how a caller unpacks `payload.bin`.
+#[case("/workspace/payload.bin", Some(CompressionScheme::Tar), "tar")]
+fn the_format_comes_from_the_name_unless_the_caller_says_otherwise(
+    #[case] path: &str,
+    #[case] given: Option<CompressionScheme>,
+    #[case] expected: &str,
+) {
+    let scheme = given.or_else(|| {
+        CompressionScheme::from_file_name(path.rsplit('/').next().expect("a name"))
+    });
+    assert_eq!(scheme.map(CompressionScheme::as_str), Some(expected));
+}
+
+#[rstest]
+// A name with no extension says nothing about its format.
+#[case("/workspace/bundle", "could not determine compression scheme")]
+// `archive.tar.gz` names `gz`, which is a format this does not unpack — the reference reads only
+// the last extension too.
+#[case("/workspace/bundle.tar.gz", "compression scheme must be one of 'zip' 'tar'")]
+#[tokio::test]
+async fn an_archive_whose_format_cannot_be_read_is_refused(
+    #[case] path: &str,
+    #[case] message: &str,
+) {
+    let session = RecordingSession::new();
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(path, bundle(), None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(error.error_code(), ErrorCode::InvalidCompressionScheme);
+    assert_eq!(error.message(), message);
+    assert!(session.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_zip_archive_is_refused_rather_than_unpacked_as_something_else() {
+    let session = RecordingSession::new();
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", bundle(), None, None)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
+    assert!(error.message().contains("zip"), "{error}");
+    assert!(session.calls().is_empty());
+}

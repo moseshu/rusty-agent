@@ -11,11 +11,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    AsUser, EnvValueResolver, ErrorCode, ExecRequest, ExecResult, ExposedPortEndpoint, FileEntry,
-    Manifest, MaterializationResult, OpName, SandboxConcurrencyLimits, SandboxError, SandboxResult,
-    SandboxSession, SandboxSessionState, SnapshotFingerprint, User,
+    AsUser, CompressionScheme, EnvValueResolver, ErrorCode, ExecRequest, ExecResult,
+    ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, OpName, SandboxArchiveLimits,
+    SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
+    SnapshotFingerprint, User,
 };
 
+use crate::archive::WorkspaceArchiveExtractor;
 use crate::host_paths::HostWorkspacePaths;
 use crate::listing::parse_ls_la;
 use crate::materialize::{ManifestApplier, manifest_base_dir};
@@ -351,6 +353,17 @@ impl SandboxSession for UnixLocalSandboxSession {
         Ok(self.running.load(Ordering::SeqCst))
     }
 
+    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+        let normalized = self.normalize_path(path, for_write)?;
+        normalized.to_str().map(str::to_owned).ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                OpName::Write,
+                "resolved workspace path is not valid UTF-8",
+            )
+        })
+    }
+
     async fn ls(&self, path: &str, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         let normalized = self.normalize_path(path, false)?;
         let Some(user) = user else {
@@ -497,6 +510,23 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     async fn hydrate_workspace(&self, data: Vec<u8>) -> SandboxResult<()> {
         archive::hydrate(&self.workspace_root(), &data)
+    }
+
+    /// Writes an archive into the workspace and unpacks it beside itself.
+    ///
+    /// Through the shared extractor rather than this backend's own filesystem code, because every
+    /// member it writes goes through this session's `mkdir` and `write` — the same path checks an
+    /// ordinary write gets, applied to input that chose its own paths.
+    async fn extract(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        scheme: Option<CompressionScheme>,
+        limits: Option<SandboxArchiveLimits>,
+    ) -> SandboxResult<()> {
+        WorkspaceArchiveExtractor::new(self)
+            .extract(path, data, scheme, limits)
+            .await
     }
 
     async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
