@@ -74,6 +74,10 @@ tempfile = "3"
 # 读写 tar，所以移植也在进程内做：调用宿主的 `tar` 会把「归档里有什么」交给一个版本和行为都
 # 不由我们决定的外部程序，而成员路径的越界检查正是这一步要守的东西。
 tar = "0.4"
+flate2 = "1"
+bzip2 = "0.5"
+xz2 = "0.1"
+zip = { version = "2.4", default-features = false, features = ["deflate", "bzip2", "lzma"] }
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }

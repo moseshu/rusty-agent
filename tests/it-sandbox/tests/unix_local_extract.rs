@@ -86,6 +86,33 @@ async fn an_archive_unpacks_beside_itself_in_the_workspace() {
 }
 
 #[tokio::test]
+async fn a_zip_archive_unpacks_into_a_real_workspace() {
+    let workspace = tempfile::tempdir().expect("temp");
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(CreateRequest::new().with_manifest(manifest_at(workspace.path())))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file("nested/hello.txt", zip::write::SimpleFileOptions::default())
+        .expect("member");
+    std::io::Write::write_all(&mut writer, b"hello from zip").expect("body");
+    let archive = writer.finish().expect("archive").into_inner();
+
+    session
+        .extract("incoming/bundle.zip", archive, None, None)
+        .await
+        .expect("extract");
+    assert_eq!(
+        std::fs::read(workspace.path().join("incoming/nested/hello.txt")).expect("read"),
+        b"hello from zip"
+    );
+}
+
+#[tokio::test]
 async fn a_member_that_climbs_out_of_the_workspace_is_refused() {
     let outside = tempfile::tempdir().expect("temp");
     let workspace = tempfile::tempdir().expect("temp");

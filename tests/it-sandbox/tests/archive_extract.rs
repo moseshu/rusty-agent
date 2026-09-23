@@ -635,15 +635,171 @@ async fn an_archive_whose_format_cannot_be_read_is_refused(
 }
 
 #[tokio::test]
-async fn a_zip_archive_is_refused_rather_than_unpacked_as_something_else() {
+async fn a_zip_archive_is_unpacked_beside_itself() {
     let session = RecordingSession::new();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer.start_file("src/main.rs", zip::write::SimpleFileOptions::default()).expect("member");
+    std::io::Write::write_all(&mut writer, b"fn main() {}").expect("body");
+    let data = writer.finish().expect("archive").into_inner();
+    WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data.clone(), None, None)
+        .await
+        .expect("extract");
+    assert_eq!(session.written("/workspace/bundle.zip"), Some(data));
+    assert_eq!(session.written("/workspace/src/main.rs"), Some(b"fn main() {}".to_vec()));
+}
+
+#[tokio::test]
+async fn compressed_tar_formats_are_unpacked() {
+    let original = bundle();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gzip, &original).expect("gzip body");
+    let gzip = gzip.finish().expect("gzip");
+    let mut bzip = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    std::io::Write::write_all(&mut bzip, &original).expect("bzip body");
+    let bzip = bzip.finish().expect("bzip");
+    let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+    std::io::Write::write_all(&mut xz, &original).expect("xz body");
+    let xz = xz.finish().expect("xz");
+    for data in [gzip, bzip, xz] {
+        let session = RecordingSession::new();
+        WorkspaceArchiveExtractor::new(&session)
+            .extract(ARCHIVE_PATH, data, None, None).await.expect("extract");
+        assert_eq!(session.written("/workspace/incoming/README.md"), Some(b"# bundle".to_vec()));
+    }
+}
+
+#[tokio::test]
+async fn zip_rejects_unsafe_paths_before_writing_members() {
+    for name in ["../escape", "/absolute", "C:/drive", "dir\\file"] {
+        let session = RecordingSession::new();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file("safe.txt", zip::write::SimpleFileOptions::default()).expect("safe");
+        std::io::Write::write_all(&mut writer, b"safe").expect("body");
+        writer.start_file(name, zip::write::SimpleFileOptions::default()).expect("unsafe");
+        std::io::Write::write_all(&mut writer, b"bad").expect("body");
+        let data = writer.finish().expect("archive").into_inner();
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data, None, None).await.expect_err("unsafe member");
+        assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+        assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+    }
+}
+
+#[tokio::test]
+async fn zip_checks_declared_size_before_writing_members() {
+    let session = RecordingSession::new();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer.start_file("large.txt", zip::write::SimpleFileOptions::default()).expect("member");
+    std::io::Write::write_all(&mut writer, b"12345").expect("body");
+    let data = writer.finish().expect("archive").into_inner();
+    let limits = SandboxArchiveLimits::default().with_max_extracted_bytes(Some(4)).expect("limit");
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.zip", data, None, Some(limits)).await.expect_err("oversize");
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}
+
+/// Compresses a tar the way a caller would hand it over as `.tar.gz`.
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, data).expect("gzip body");
+    encoder.finish().expect("gzip")
+}
+
+#[tokio::test]
+async fn a_compressed_tar_over_the_extracted_size_limit_is_refused_before_writing_members() {
+    let session = RecordingSession::new();
+    // Compresses to a few hundred bytes, and declares far more than the ceiling allows.
+    let data = gzip(&archive(|builder| {
+        member(
+            builder,
+            "zeros.bin",
+            tar::EntryType::Regular,
+            &vec![0; 64 * 1024],
+        );
+    }));
+    let limits = SandboxArchiveLimits::default()
+        .with_max_extracted_bytes(Some(1024))
+        .expect("limit");
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", bundle(), None, None)
+        .extract(ARCHIVE_PATH, data, None, Some(limits))
         .await
-        .expect_err("refused");
+        .expect_err("oversize");
 
-    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
-    assert!(error.message().contains("zip"), "{error}");
-    assert!(session.calls().is_empty());
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
+}
+
+#[tokio::test]
+async fn a_compressed_tar_is_decoded_only_as_far_as_its_members_reach() {
+    let session = RecordingSession::new();
+    // A second gzip member that cannot be decoded follows the tar. Reading the stream to its end
+    // would fail on it; the tar has already ended, so nothing needs to.
+    let mut data = gzip(&bundle());
+    data.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data, None, None)
+        .await
+        .expect("extract");
+
+    assert_eq!(
+        session.written("/workspace/incoming/README.md"),
+        Some(b"# bundle".to_vec())
+    );
+}
+
+/// A one-member zip whose headers claim the member is `declared` bytes, whatever it holds.
+fn zip_with_declared_size(method: zip::CompressionMethod, body: &[u8], declared: u32) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "payload.bin",
+            zip::write::SimpleFileOptions::default().compression_method(method),
+        )
+        .expect("member");
+    std::io::Write::write_all(&mut writer, body).expect("body");
+    let mut data = writer.finish().expect("archive").into_inner();
+    // The uncompressed size sits at offset 22 of the local header and 24 of the central one.
+    for (signature, offset) in [(b"PK\x03\x04", 22), (b"PK\x01\x02", 24)] {
+        let start = data
+            .windows(4)
+            .position(|window| window == signature)
+            .expect("header");
+        data[start + offset..start + offset + 4].copy_from_slice(&declared.to_le_bytes());
+    }
+    data
+}
+
+#[tokio::test]
+async fn a_zip_member_larger_than_its_header_declares_is_refused() {
+    for method in [
+        zip::CompressionMethod::Stored,
+        zip::CompressionMethod::Deflated,
+    ] {
+        let session = RecordingSession::new();
+        let data = zip_with_declared_size(method, &[b'x'; 4096], 1);
+        // The declared size fits the ceiling; what the member really holds does not.
+        let limits = SandboxArchiveLimits::default()
+            .with_max_extracted_bytes(Some(16))
+            .expect("limit");
+
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data, None, Some(limits))
+            .await
+            .expect_err("size mismatch");
+
+        assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+        assert!(
+            format!("{error:?}").contains("does not match header"),
+            "{method:?}: {error:?}"
+        );
+        assert_eq!(
+            session.written("/workspace/payload.bin"),
+            None,
+            "{method:?}"
+        );
+    }
 }
