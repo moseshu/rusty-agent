@@ -125,7 +125,9 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
     /// A decoder for a compressed tar, chosen by its magic bytes, or `None` for a plain one.
     fn tar_decoder(data: &[u8]) -> Option<Box<dyn Read + '_>> {
         if data.starts_with(&[0x1f, 0x8b]) {
-            Some(Box::new(flate2::read::MultiGzDecoder::new(data)))
+            // One gzip member only: Python's streaming tar reader uses a single zlib
+            // decompressor, so a later member cannot complete a truncated tar.
+            Some(Box::new(flate2::read::GzDecoder::new(data)))
         } else if data.starts_with(b"BZh") {
             Some(Box::new(bzip2::read::BzDecoder::new(data)))
         } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {

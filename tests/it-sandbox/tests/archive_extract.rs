@@ -1183,3 +1183,24 @@ async fn a_tar_split_across_concatenated_xz_streams_is_refused() {
     assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
     assert!(session.mkdirs().is_empty());
 }
+
+#[tokio::test]
+async fn a_tar_split_across_concatenated_gzip_members_is_refused() {
+    let session = RecordingSession::new();
+    let original = bundle();
+    // End the first member inside a file's payload. Python's streaming tar reader uses a single
+    // zlib decompressor, so the second member cannot complete this truncated one.
+    let (head, tail) = original.split_at(1024 + 6);
+    let mut data = gzip(head);
+    data.extend(gzip(tail));
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(ARCHIVE_PATH, data.clone(), None, None)
+        .await
+        .expect_err("the first gzip member contains an incomplete tar");
+
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(session.written(ARCHIVE_PATH), Some(data));
+    assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
+    assert!(session.mkdirs().is_empty());
+}
