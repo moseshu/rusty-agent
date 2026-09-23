@@ -16,7 +16,7 @@ use ra_core::sandbox::{
     AsUser, Entry, EntryOwner, ErrorCode, ExecRequest, ExecResult, FileEntry, FileMode, Group,
     Manifest, Mount, MountPattern, MountProvider, MountStrategy, MountpointOptions,
     NOOP_SNAPSHOT_TYPE, Permissions, S3Mount, SandboxConcurrencyLimits, SandboxError,
-    SandboxResult, SandboxSession, SandboxSessionState, Snapshot, User,
+    SandboxResult, SandboxSession, SandboxSessionState, SessionResources, Snapshot, User,
 };
 use ra_sandbox::materialize::ManifestApplier;
 
@@ -30,6 +30,7 @@ enum Call {
 
 /// A session that records what it was asked to do and answers plausibly.
 struct RecordingSession {
+    resources: SessionResources,
     state: SandboxSessionState,
     calls: Mutex<Vec<Call>>,
     written: Mutex<BTreeMap<String, Vec<u8>>>,
@@ -54,6 +55,7 @@ struct RecordingSession {
 impl RecordingSession {
     fn new(manifest: Manifest) -> Self {
         Self {
+            resources: SessionResources::new(),
             state: SandboxSessionState::new(
                 "recording",
                 Snapshot::new(NOOP_SNAPSHOT_TYPE, "test"),
@@ -122,6 +124,10 @@ impl RecordingSession {
 impl SandboxSession for RecordingSession {
     fn backend_id(&self) -> &str {
         "recording"
+    }
+
+    fn resources(&self) -> &SessionResources {
+        &self.resources
     }
 
     fn state(&self) -> SandboxSessionState {

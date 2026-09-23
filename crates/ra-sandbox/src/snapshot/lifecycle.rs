@@ -73,7 +73,12 @@ impl<'a> SnapshotLifecycle<'a> {
     ///
     /// Returns the storage's failure to answer.
     pub async fn restorable(&self) -> SandboxResult<bool> {
-        self.store.restorable(self.session.state().snapshot()).await
+        self.store
+            .restorable(
+                self.session.state().snapshot(),
+                &self.session.dependencies(),
+            )
+            .await
     }
 
     /// Writes the workspace into the session's storage.
@@ -110,7 +115,11 @@ impl<'a> SnapshotLifecycle<'a> {
             }
         };
         let archive = self.session.persist_workspace().await?;
-        if let Err(error) = self.store.persist(state.snapshot(), archive).await {
+        if let Err(error) = self
+            .store
+            .persist(state.snapshot(), archive, &self.session.dependencies())
+            .await
+        {
             // The cached value describes a workspace that was never stored. Leaving it behind would
             // let the next start compare against it and skip a restore that has to happen.
             if recorded.is_some() {
@@ -134,7 +143,13 @@ impl<'a> SnapshotLifecycle<'a> {
     /// Returns the failure to clear the workspace, to read the archive, or to extract it.
     pub async fn restore_on_resume(&self) -> SandboxResult<()> {
         self.clear_workspace_root().await?;
-        let archive = self.store.restore(self.session.state().snapshot()).await?;
+        let archive = self
+            .store
+            .restore(
+                self.session.state().snapshot(),
+                &self.session.dependencies(),
+            )
+            .await?;
         self.session.hydrate_workspace(archive).await
     }
 

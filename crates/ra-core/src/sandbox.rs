@@ -18,6 +18,7 @@
 //! the other.
 
 pub mod archive;
+pub mod dependencies;
 pub mod entries;
 pub mod environment;
 pub mod error;
@@ -27,6 +28,7 @@ pub mod manifest_render;
 pub mod materialization;
 pub mod pty;
 pub mod registry;
+pub mod resources;
 pub mod session;
 pub mod snapshot;
 pub mod state;
@@ -37,6 +39,10 @@ pub use archive::{
     ArchiveLimitError, CompressionScheme, DEFAULT_MAX_ARCHIVE_EXTRACTED_BYTES,
     DEFAULT_MAX_ARCHIVE_INPUT_BYTES, DEFAULT_MAX_ARCHIVE_MEMBERS, SandboxArchiveLimits,
     file_name_suffix,
+};
+pub use dependencies::{
+    CloseDependency, Dependencies, DependenciesError, DependencyFactory, DependencyFactoryError,
+    DependencyFactoryResult, DependencyKey, DependencyValue, FactoryOptions, dependency_factory,
 };
 pub use entries::mounts::{
     AzureBlobMount, BUILTIN_MOUNT_TYPES, BoxMount, BoxSubType, DEFAULT_S3_PROVIDER,
@@ -73,6 +79,7 @@ pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
     session_state_kind, snapshot_kind,
 };
+pub use resources::{PreStopHook, SessionResources, pre_stop_hook};
 pub use session::{
     AsUser, CreateRequest, ExecRequest, SandboxClient, SandboxResult, SandboxSession,
     ShellInvocation,

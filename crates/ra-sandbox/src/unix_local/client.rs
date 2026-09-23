@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    CreateRequest, DEFAULT_MANIFEST_ROOT, EnvValueResolver, ErrorCode, OpName, SandboxClient,
-    SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    UnresolvableEnvValues, resolve_snapshot,
+    CreateRequest, DEFAULT_MANIFEST_ROOT, Dependencies, EnvValueResolver, ErrorCode, OpName,
+    SandboxClient, SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession,
+    SandboxSessionState, UnresolvableEnvValues, resolve_snapshot,
 };
 use uuid::Uuid;
 
@@ -36,6 +36,8 @@ pub struct UnixLocalSandboxClient {
     env_values: Arc<dyn EnvValueResolver>,
     concurrency_limits: SandboxConcurrencyLimits,
     snapshot_store: Arc<dyn SnapshotStore>,
+    /// The bindings every session this client makes starts from, or `None` for none.
+    dependencies: Option<Dependencies>,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxClient {
@@ -69,6 +71,7 @@ impl UnixLocalSandboxClient {
             env_values: Arc::new(UnresolvableEnvValues),
             concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
+            dependencies: None,
         }
     }
 
@@ -97,6 +100,7 @@ impl UnixLocalSandboxClient {
             env_values: Arc::new(UnresolvableEnvValues),
             concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
+            dependencies: None,
         }
     }
 
@@ -115,6 +119,17 @@ impl UnixLocalSandboxClient {
     #[must_use]
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = store;
+        self
+    }
+
+    /// Gives every session this client makes its own copy of `dependencies`.
+    ///
+    /// A copy rather than the container itself, as the reference's client makes one: each session
+    /// gets its own factory cache and its own owned resources, so closing one session does not
+    /// close what another is still using.
+    #[must_use]
+    pub fn with_dependencies(mut self, dependencies: Dependencies) -> Self {
+        self.dependencies = Some(dependencies);
         self
     }
 
@@ -137,15 +152,22 @@ impl UnixLocalSandboxClient {
 
     /// Builds a session over a state this client already vetted.
     fn open(&self, state: SandboxSessionState) -> Box<dyn SandboxSession> {
-        Box::new(
-            UnixLocalSandboxSession::new(
-                state,
-                self.host_environment_allowlist.clone(),
-                Arc::clone(&self.env_values),
-            )
-            .with_concurrency_limits(self.concurrency_limits)
-            .with_snapshot_store(Arc::clone(&self.snapshot_store)),
+        let session = UnixLocalSandboxSession::new(
+            state,
+            self.host_environment_allowlist.clone(),
+            Arc::clone(&self.env_values),
         )
+        .with_concurrency_limits(self.concurrency_limits)
+        .with_snapshot_store(Arc::clone(&self.snapshot_store));
+        session.set_dependencies(self.resolve_dependencies());
+        Box::new(session)
+    }
+
+    /// A fresh copy of the configured dependencies for one session, or `None` when there are none.
+    fn resolve_dependencies(&self) -> Option<Arc<Dependencies>> {
+        self.dependencies
+            .as_ref()
+            .map(|template| Arc::new(template.clone_bindings()))
     }
 
     /// Refuses a state another backend wrote.

@@ -19,20 +19,28 @@
 //!
 //! This is the protocol. The decorating layer the reference wraps around a session — events,
 //! tracing, concurrency limits, path validation — is an implementation and belongs in the service
-//! crate, as does every backend. The dependency container threaded through these calls, and the
-//! owner-driven cleanup the runtime performs instead of [`SandboxSession::close`], land with the
-//! tasks that port them; the difference between the two closing paths is recorded on `close` so
-//! that whoever ports the second does not assume it is the same sequence.
+//! crate, as does every backend. The owner-driven cleanup the runtime performs instead of
+//! [`SandboxSession::close`] lands with the task that ports it; the difference between the two
+//! closing paths is recorded on `close` so that whoever ports the second does not assume it is the
+//! same sequence.
+//!
+//! What the reference keeps as attributes of its base class — the dependency container, the
+//! pre-stop callbacks, the close lock — a backend embeds as one [`SessionResources`] and hands out
+//! from [`SandboxSession::resources`].
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use super::archive::{CompressionScheme, SandboxArchiveLimits};
+use super::dependencies::Dependencies;
 use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
 use super::manifest::Manifest;
 use super::materialization::MaterializationResult;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
 use super::registry::DiscriminatedPayload;
+use super::resources::{PreStopHook, SessionResources};
 use super::snapshot::{Snapshot, SnapshotFingerprint, SnapshotSource, SnapshotSpec};
 use super::state::SandboxSessionState;
 use super::types::{ExecResult, ExposedPortEndpoint, User};
@@ -122,6 +130,35 @@ pub trait SandboxSession: Send + Sync {
     /// either forbid that or have to escape the lock that guards it, so the caller gets a copy of
     /// what the state was when it asked.
     fn state(&self) -> SandboxSessionState;
+
+    /// The dependency container, pre-stop callbacks and close lock this session holds.
+    ///
+    /// Every session has them, as every session on the reference does; the lifecycle defaults below
+    /// are written against them.
+    fn resources(&self) -> &SessionResources;
+
+    // --- dependencies and pre-stop callbacks -----------------------------------------------
+
+    /// The session's dependency container, created empty the first time it is asked for.
+    ///
+    /// Snapshot storage and manifest materialization resolve what they need from here — a remote
+    /// snapshot's storage client, for one.
+    fn dependencies(&self) -> Arc<Dependencies> {
+        self.resources().dependencies()
+    }
+
+    /// Replaces the session's dependency container; `None` leaves the current one in place.
+    ///
+    /// A client calls this with its own copy of the template it was configured with, so each
+    /// session gets its own factory cache and owned-resource lifecycle.
+    fn set_dependencies(&self, dependencies: Option<Arc<Dependencies>>) {
+        self.resources().set_dependencies(dependencies);
+    }
+
+    /// Registers a callback to run once before the workspace is persisted.
+    fn register_pre_stop_hook(&self, hook: PreStopHook) {
+        self.resources().register_pre_stop_hook(hook);
+    }
 
     // --- capability probes ----------------------------------------------------------------
 
@@ -586,7 +623,7 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the first callback failure, on the call that actually ran them.
     async fn run_pre_stop_hooks(&self) -> SandboxResult<()> {
-        Ok(())
+        self.resources().run_pre_stop_hooks().await
     }
 
     /// Whether the pre-stop callbacks have ever failed.
@@ -596,7 +633,7 @@ pub trait SandboxSession: Send + Sync {
     /// second close would persist a workspace the first one deliberately refused to persist —
     /// exactly the state the failed callback was there to prevent.
     fn pre_stop_hooks_failed(&self) -> bool {
-        false
+        self.resources().pre_stop_hooks_failed()
     }
 
     /// Releases whatever the session was holding on behalf of its caller.
@@ -607,24 +644,9 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the backend's failure to release them.
     async fn close_dependencies(&self) -> SandboxResult<()> {
+        self.resources().close_dependencies().await;
         Ok(())
     }
-
-    /// Takes the guard that keeps two closes from interleaving.
-    ///
-    /// The reference holds a lock across its whole close. A backend that can be closed from two
-    /// places at once must make this wait for the other to finish; one that cannot need not do
-    /// anything. Returning `false` says the session is already closed and this call should stop.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend's failure to take it.
-    async fn begin_close(&self) -> SandboxResult<bool> {
-        Ok(true)
-    }
-
-    /// Releases the guard taken by [`Self::begin_close`].
-    async fn end_close(&self) {}
 
     // --- lifecycle ------------------------------------------------------------------------
     //
@@ -754,7 +776,7 @@ pub trait SandboxSession: Send + Sync {
 
     /// Closes a session the caller holds directly.
     ///
-    /// Held under [`Self::begin_close`] so two closes cannot interleave, then: pre-stop callbacks,
+    /// Held under the session's close lock so two closes cannot interleave, then: pre-stop callbacks,
     /// stop, shutdown, and dependencies released whatever happened. Three refusals are deliberate
     /// and easy to smooth away by accident:
     ///
@@ -774,12 +796,8 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the first failure recorded, after every step that was still eligible has run.
     async fn close(&self) -> SandboxResult<()> {
-        if !self.begin_close().await? {
-            return Ok(());
-        }
-        let outcome = self.close_guarded().await;
-        self.end_close().await;
-        outcome
+        let _closing = self.resources().lock_close().await;
+        self.close_guarded().await
     }
 
     /// The close itself, with the guard already held.
