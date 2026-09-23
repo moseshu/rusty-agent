@@ -19,6 +19,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
+use std::sync::LazyLock;
 
 use ra_core::sandbox::{
     CompressionScheme, EntryKind, ErrorCode, OpName, PosixPath, SandboxArchiveLimits, SandboxError,
@@ -193,10 +194,17 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             let member = archive.by_index(index).map_err(|error| {
                 Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
             })?;
-            let name = member.name().to_owned();
-            let is_directory = member.is_dir();
-            let relative =
-                Self::safe_zip_path(path, &name, member.get_metadata().external_attributes)?;
+            // The name is decoded from its raw bytes by the same rules as the collapsed-entry pass,
+            // not taken from the crate: that one decodes invalid UTF-8 lossily and keeps whatever
+            // follows a NUL, where the reference refuses the one and truncates at the other.
+            let metadata = member.get_metadata();
+            let name =
+                zip_member_name(&metadata.file_name_raw, metadata.is_utf8).map_err(|error| {
+                    Self::refuse(path, "unreadable archive")
+                        .with_context("os_error", error.to_string())
+                })?;
+            let is_directory = name.ends_with('/');
+            let relative = Self::safe_zip_path(path, &name, metadata.external_attributes)?;
             let Some(relative) = relative else { continue };
             let count = plan.len() + 1;
             if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_members)
@@ -827,22 +835,23 @@ fn zip64_uncompressed_size(mut extra: &[u8]) -> std::io::Result<u64> {
     Err(invalid())
 }
 
+/// The characters CP437 gives bytes `0x80..=0xff`, in order; the lower half is ASCII. Split
+/// into a table once rather than for every name decoded.
+static CP437_HIGH: LazyLock<Vec<char>> = LazyLock::new(|| CP437_HIGH_CHARS.chars().collect());
+
+const CP437_HIGH_CHARS: &str = "\u{c7}\u{fc}\u{e9}\u{e2}\u{e4}\u{e0}\u{e5}\u{e7}\u{ea}\u{eb}\u{e8}\u{ef}\u{ee}\u{ec}\u{c4}\u{c5}\u{c9}\u{e6}\u{c6}\u{f4}\u{f6}\u{f2}\u{fb}\u{f9}\u{ff}\u{d6}\u{dc}\u{a2}\u{a3}\u{a5}\u{20a7}\u{192}\u{e1}\u{ed}\u{f3}\u{fa}\u{f1}\u{d1}\u{aa}\u{ba}\u{bf}\u{2310}\u{ac}\u{bd}\u{bc}\u{a1}\u{ab}\u{bb}\u{2591}\u{2592}\u{2593}\u{2502}\u{2524}\u{2561}\u{2562}\u{2556}\u{2555}\u{2563}\u{2551}\u{2557}\u{255d}\u{255c}\u{255b}\u{2510}\u{2514}\u{2534}\u{252c}\u{251c}\u{2500}\u{253c}\u{255e}\u{255f}\u{255a}\u{2554}\u{2569}\u{2566}\u{2560}\u{2550}\u{256c}\u{2567}\u{2568}\u{2564}\u{2565}\u{2559}\u{2558}\u{2552}\u{2553}\u{256b}\u{256a}\u{2518}\u{250c}\u{2588}\u{2584}\u{258c}\u{2590}\u{2580}\u{3b1}\u{df}\u{393}\u{3c0}\u{3a3}\u{3c3}\u{b5}\u{3c4}\u{3a6}\u{398}\u{3a9}\u{3b4}\u{221e}\u{3c6}\u{3b5}\u{2229}\u{2261}\u{b1}\u{2265}\u{2264}\u{2320}\u{2321}\u{f7}\u{2248}\u{b0}\u{2219}\u{b7}\u{221a}\u{207f}\u{b2}\u{25a0}\u{a0}";
+
 /// Python's ZIP reader uses UTF-8 when flagged, otherwise the fixed CP437 character set.
 fn zip_member_name(raw: &[u8], utf8: bool) -> std::io::Result<String> {
-    const CP437_HIGH: &str = "\u{c7}\u{fc}\u{e9}\u{e2}\u{e4}\u{e0}\u{e5}\u{e7}\u{ea}\u{eb}\u{e8}\u{ef}\u{ee}\u{ec}\u{c4}\u{c5}\u{c9}\u{e6}\u{c6}\u{f4}\u{f6}\u{f2}\u{fb}\u{f9}\u{ff}\u{d6}\u{dc}\u{a2}\u{a3}\u{a5}\u{20a7}\u{192}\u{e1}\u{ed}\u{f3}\u{fa}\u{f1}\u{d1}\u{aa}\u{ba}\u{bf}\u{2310}\u{ac}\u{bd}\u{bc}\u{a1}\u{ab}\u{bb}\u{2591}\u{2592}\u{2593}\u{2502}\u{2524}\u{2561}\u{2562}\u{2556}\u{2555}\u{2563}\u{2551}\u{2557}\u{255d}\u{255c}\u{255b}\u{2510}\u{2514}\u{2534}\u{252c}\u{251c}\u{2500}\u{253c}\u{255e}\u{255f}\u{255a}\u{2554}\u{2569}\u{2566}\u{2560}\u{2550}\u{256c}\u{2567}\u{2568}\u{2564}\u{2565}\u{2559}\u{2558}\u{2552}\u{2553}\u{256b}\u{256a}\u{2518}\u{250c}\u{2588}\u{2584}\u{258c}\u{2590}\u{2580}\u{3b1}\u{df}\u{393}\u{3c0}\u{3a3}\u{3c3}\u{b5}\u{3c4}\u{3a6}\u{398}\u{3a9}\u{3b4}\u{221e}\u{3c6}\u{3b5}\u{2229}\u{2261}\u{b1}\u{2265}\u{2264}\u{2320}\u{2321}\u{f7}\u{2248}\u{b0}\u{2219}\u{b7}\u{221a}\u{207f}\u{b2}\u{25a0}\u{a0}";
     let name = if utf8 {
         std::str::from_utf8(raw)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
             .to_owned()
     } else {
-        let high: Vec<char> = CP437_HIGH.chars().collect();
         raw.iter()
-            .map(|byte| {
-                if *byte < 128 {
-                    char::from(*byte)
-                } else {
-                    high[usize::from(*byte) - 128]
-                }
+            .map(|byte| match byte.checked_sub(128) {
+                Some(high) => CP437_HIGH[usize::from(high)],
+                None => char::from(*byte),
             })
             .collect()
     };
