@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, CompressionScheme, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest,
     Permissions, SandboxArchiveLimits, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, Snapshot,
+    SandboxSessionState, SessionResources, Snapshot,
 };
 use ra_sandbox::archive::WorkspaceArchiveExtractor;
 use rstest::rstest;
@@ -30,6 +30,7 @@ enum Call {
 
 /// A session that records what it was asked to write, and lists what it was told to hold.
 struct RecordingSession {
+    resources: SessionResources,
     state: SandboxSessionState,
     calls: Mutex<Vec<Call>>,
     listings: BTreeMap<String, Vec<FileEntry>>,
@@ -38,6 +39,7 @@ struct RecordingSession {
 impl RecordingSession {
     fn new() -> Self {
         Self {
+            resources: SessionResources::new(),
             state: SandboxSessionState::new(
                 "recording",
                 Snapshot::noop(),
@@ -99,6 +101,10 @@ impl RecordingSession {
 impl SandboxSession for RecordingSession {
     fn backend_id(&self) -> &str {
         "recording"
+    }
+
+    fn resources(&self) -> &SessionResources {
+        &self.resources
     }
 
     fn state(&self) -> SandboxSessionState {

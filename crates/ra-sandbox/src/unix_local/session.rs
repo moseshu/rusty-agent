@@ -14,7 +14,7 @@ use ra_core::sandbox::{
     AsUser, CompressionScheme, EnvValueResolver, ErrorCode, ExecRequest, ExecResult,
     ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, OpName, SandboxArchiveLimits,
     SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    SnapshotFingerprint, User,
+    SessionResources, SnapshotFingerprint, User,
 };
 
 use crate::archive::WorkspaceArchiveExtractor;
@@ -53,6 +53,9 @@ pub struct UnixLocalSandboxSession {
     /// wired up is the host's decision, and a state that travelled from elsewhere must not be able
     /// to point this session at something else.
     snapshot_store: Arc<dyn SnapshotStore>,
+    /// The dependency container, pre-stop callbacks and close lock every session holds. Shared by
+    /// clones, as the state is: a clone is the same session.
+    resources: Arc<SessionResources>,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxSession {
@@ -80,6 +83,7 @@ impl UnixLocalSandboxSession {
             env_values,
             concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
+            resources: Arc::new(SessionResources::new()),
         }
     }
 
@@ -332,6 +336,10 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     fn state(&self) -> SandboxSessionState {
         self.state_now()
+    }
+
+    fn resources(&self) -> &SessionResources {
+        &self.resources
     }
 
     /// Whether this session can allocate a terminal.

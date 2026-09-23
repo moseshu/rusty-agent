@@ -4,9 +4,18 @@
 //! whether it created that directory or was handed one. Getting it backwards in either direction is
 //! expensive: delete a caller's project directory, or leak one temporary directory per run.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 use ra_core::sandbox::{
-    CreateRequest, DiscriminatedPayload, ErrorCode, ExecRequest, Manifest, SandboxClient,
-    SandboxPathGrant, SandboxSession, ShellInvocation, SnapshotSpec,
+    CreateRequest, Dependencies, DependencyValue, DiscriminatedPayload, ErrorCode, ExecRequest,
+    FactoryOptions, Manifest, SandboxClient, SandboxPathGrant, SandboxSession, ShellInvocation,
+    Snapshot, SnapshotSpec, dependency_factory,
+};
+use ra_sandbox::snapshot::{
+    RemoteSnapshotClient, RemoteSnapshotError, remote_snapshot_client_dependency,
 };
 use ra_sandbox::unix_local::{
     UNIX_LOCAL_BACKEND_ID, UnixLocalSandboxClient, UnixLocalSandboxClientOptions,
@@ -282,4 +291,119 @@ async fn the_environment_policy_comes_from_the_resuming_client_not_from_the_stat
         "unset",
         "and a client that closes it keeps it closed"
     );
+}
+
+/// Remote storage in memory.
+#[derive(Default)]
+struct MemoryRemote {
+    stored: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+#[async_trait]
+impl RemoteSnapshotClient for MemoryRemote {
+    async fn upload(&self, snapshot_id: &str, data: Vec<u8>) -> Result<(), RemoteSnapshotError> {
+        self.stored
+            .lock()
+            .expect("stored")
+            .insert(snapshot_id.to_owned(), data);
+        Ok(())
+    }
+
+    async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>, RemoteSnapshotError> {
+        self.stored
+            .lock()
+            .expect("stored")
+            .get(snapshot_id)
+            .cloned()
+            .ok_or_else(|| RemoteSnapshotError::new(format!("no snapshot {snapshot_id}")))
+    }
+
+    async fn exists(&self, snapshot_id: &str) -> Result<bool, RemoteSnapshotError> {
+        Ok(self
+            .stored
+            .lock()
+            .expect("stored")
+            .contains_key(snapshot_id))
+    }
+}
+
+#[tokio::test]
+async fn a_session_persists_to_the_remote_client_its_dependencies_name() {
+    let workspace = tempfile::tempdir().expect("temp");
+    let remote = Arc::new(MemoryRemote::default());
+    let session = UnixLocalSandboxClient::new()
+        .create(
+            CreateRequest::new()
+                .with_manifest(manifest_at(workspace.path()))
+                .with_snapshot(Snapshot::remote("snap-123", "tests.remote_snapshot_client")),
+        )
+        .await
+        .expect("create");
+    // Bound before start: starting asks the remote storage whether there is anything to restore.
+    let dependencies = Dependencies::new();
+    dependencies
+        .bind_value(
+            "tests.remote_snapshot_client",
+            remote_snapshot_client_dependency(remote.clone()),
+            false,
+        )
+        .expect("bound");
+    session.set_dependencies(Some(Arc::new(dependencies)));
+    session.start().await.expect("start");
+    std::fs::write(workspace.path().join("notes.txt"), b"kept").expect("write");
+
+    session.stop().await.expect("stop");
+
+    let stored = remote.stored.lock().expect("stored");
+    assert!(stored.contains_key("snap-123"));
+    assert!(!stored["snap-123"].is_empty());
+}
+
+#[tokio::test]
+async fn every_session_gets_its_own_copy_of_the_client_dependencies() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let template = Dependencies::new();
+    template
+        .bind_factory(
+            "tests.per_session",
+            FactoryOptions::default(),
+            dependency_factory(move |_| {
+                let call = counter.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(DependencyValue::new(Arc::new(call))) }
+            }),
+        )
+        .expect("bound");
+    let client = UnixLocalSandboxClient::new().with_dependencies(template);
+    let first = client.create(CreateRequest::new()).await.expect("first");
+    let second = client.create(CreateRequest::new()).await.expect("second");
+
+    let from_first = first
+        .dependencies()
+        .require_as::<usize>("tests.per_session", None)
+        .await
+        .expect("first value");
+    let again_from_first = first
+        .dependencies()
+        .require_as::<usize>("tests.per_session", None)
+        .await
+        .expect("cached");
+    let from_second = second
+        .dependencies()
+        .require_as::<usize>("tests.per_session", None)
+        .await
+        .expect("second value");
+
+    // Each session ran the factory in its own container, and caches only its own result.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(Arc::ptr_eq(&from_first, &again_from_first));
+    assert_ne!(*from_first, *from_second);
+
+    // Closing one session releases its container, not the other's.
+    first.close().await.expect("close");
+    assert!(first.dependencies().is_closed());
+    assert!(!second.dependencies().is_closed());
+    for session in [first, second] {
+        client.delete(session.as_ref()).await.expect("delete");
+    }
 }

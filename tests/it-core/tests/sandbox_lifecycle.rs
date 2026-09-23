@@ -17,7 +17,7 @@ use ra_core::sandbox::{
     AsUser, CreateRequest, DiscriminatedPayload, Entry, EntryContent, EntryKind, ErrorCode,
     ExecRequest, ExecResult, FileEntry, Manifest, MaterializationResult, OpName, Permissions,
     PtyProcessId, PtyStartRequest, PtyWriteRequest, SandboxClient, SandboxError, SandboxResult,
-    SandboxSession, SandboxSessionState, Snapshot,
+    SandboxSession, SandboxSessionState, SessionResources, Snapshot,
 };
 
 /// Which hook a backend was asked for, in the order it was asked.
@@ -53,11 +53,11 @@ struct Recorded {
     state: SandboxSessionState,
     pre_stop_hooks_ran: bool,
     pre_stop_hooks_failed: bool,
-    closing: bool,
 }
 
 struct Backend {
     inner: Mutex<Recorded>,
+    resources: SessionResources,
     log: Transcript,
     faults: Faults,
     answers: Answers,
@@ -74,8 +74,8 @@ impl Backend {
                 state,
                 pre_stop_hooks_ran: false,
                 pre_stop_hooks_failed: false,
-                closing: false,
             }),
+            resources: SessionResources::new(),
             log: Transcript::default(),
             faults,
             answers,
@@ -115,6 +115,10 @@ impl SandboxSession for Backend {
 
     fn state(&self) -> SandboxSessionState {
         self.inner.lock().expect("state").state.clone()
+    }
+
+    fn resources(&self) -> &SessionResources {
+        &self.resources
     }
 
     async fn exec(&self, _request: ExecRequest) -> SandboxResult<ExecResult> {
@@ -261,6 +265,9 @@ impl SandboxSession for Backend {
 
     async fn before_stop(&self) -> SandboxResult<()> {
         self.note("before_stop");
+        // A real stop waits on something. Yielding here gives a second, concurrent close the chance
+        // to interleave, which is what the close lock is there to prevent.
+        tokio::task::yield_now().await;
         Ok(())
     }
 
@@ -345,21 +352,6 @@ impl SandboxSession for Backend {
             ));
         }
         Ok(())
-    }
-
-    async fn begin_close(&self) -> SandboxResult<bool> {
-        let mut inner = self.inner.lock().expect("state");
-        if inner.closing {
-            drop(inner);
-            self.note("begin_close:busy");
-            return Ok(false);
-        }
-        inner.closing = true;
-        Ok(true)
-    }
-
-    async fn end_close(&self) {
-        self.inner.lock().expect("state").closing = false;
     }
 }
 
@@ -704,18 +696,30 @@ async fn the_first_failure_is_the_one_reported() {
 }
 
 #[tokio::test]
-async fn a_close_that_finds_the_guard_taken_does_nothing() {
-    // Two closes must not interleave. A backend that says the guard is held gets an immediate,
-    // quiet return rather than a second pass over the same teardown.
+async fn two_closes_run_one_after_the_other() {
+    // The reference holds a lock across a whole close, so a second close waits and then runs its
+    // own pass — it is not turned away. The pre-stop callbacks have already run by then, so that
+    // pass is told nothing went wrong and goes on to stop and shut down again.
     let session = Backend::with_answers(Answers::default());
-    session
-        .begin_close()
-        .await
-        .expect("guard taken by someone else");
 
-    session.close().await.expect("no-op");
+    let (first, second) = tokio::join!(session.close(), session.close());
+    first.expect("first close");
+    second.expect("second close");
 
-    assert_eq!(session.transcript(), ["begin_close:busy"]);
+    let pass = [
+        "before_stop",
+        "persist_snapshot",
+        "after_stop",
+        "before_shutdown",
+        "shutdown_backend",
+        "after_shutdown",
+        "close_dependencies",
+    ];
+    let mut expected = vec!["run_pre_stop_hooks"];
+    expected.extend(pass);
+    expected.push("run_pre_stop_hooks:already_ran");
+    expected.extend(pass);
+    assert_eq!(session.transcript(), expected);
 }
 
 // --- the workspace surface -------------------------------------------------------------------

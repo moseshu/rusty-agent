@@ -9,13 +9,14 @@
 //! is visible without a real workspace.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    AsUser, Entry, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, Mount,
-    MountPattern, MountProvider, MountStrategy, MountpointOptions, Permissions, S3Mount,
-    SandboxError, SandboxResult, SandboxSession, SandboxSessionState, Snapshot, SnapshotFingerprint,
+    AsUser, Dependencies, Entry, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry,
+    Manifest, Mount, MountPattern, MountProvider, MountStrategy, MountpointOptions, Permissions,
+    S3Mount, SandboxError, SandboxResult, SandboxSession, SandboxSessionState, SessionResources,
+    Snapshot, SnapshotFingerprint,
 };
 use ra_sandbox::runtime_helpers::workspace_fingerprint_helper;
 use ra_sandbox::snapshot::SnapshotStore;
@@ -47,6 +48,7 @@ enum Call {
 
 /// A session that records what it was asked to do and answers as configured.
 struct RecordingSession {
+    resources: SessionResources,
     state: Mutex<SandboxSessionState>,
     calls: Mutex<Vec<Call>>,
     /// What the fingerprint helper prints, or the exit code it fails with.
@@ -60,6 +62,7 @@ struct RecordingSession {
 impl RecordingSession {
     fn new(snapshot: Snapshot, manifest: Manifest) -> Self {
         Self {
+            resources: SessionResources::new(),
             state: Mutex::new(SandboxSessionState::new("recording", snapshot, manifest)),
             calls: Mutex::new(Vec::new()),
             fingerprint: Ok(record("workspace-hash")),
@@ -136,6 +139,10 @@ impl RecordingSession {
 impl SandboxSession for RecordingSession {
     fn backend_id(&self) -> &str {
         "recording"
+    }
+
+    fn resources(&self) -> &SessionResources {
+        &self.resources
     }
 
     fn state(&self) -> SandboxSessionState {
@@ -254,7 +261,12 @@ impl RecordingStore {
 
 #[async_trait]
 impl SnapshotStore for RecordingStore {
-    async fn persist(&self, _snapshot: &Snapshot, data: Vec<u8>) -> SandboxResult<()> {
+    async fn persist(
+        &self,
+        _snapshot: &Snapshot,
+        data: Vec<u8>,
+        _dependencies: &Arc<Dependencies>,
+    ) -> SandboxResult<()> {
         if self.refuses_to_persist {
             return Err(SandboxError::snapshot_persist("snap-1", "/snapshots"));
         }
@@ -262,11 +274,19 @@ impl SnapshotStore for RecordingStore {
         Ok(())
     }
 
-    async fn restore(&self, _snapshot: &Snapshot) -> SandboxResult<Vec<u8>> {
+    async fn restore(
+        &self,
+        _snapshot: &Snapshot,
+        _dependencies: &Arc<Dependencies>,
+    ) -> SandboxResult<Vec<u8>> {
         Ok(self.restores_with.clone())
     }
 
-    async fn restorable(&self, _snapshot: &Snapshot) -> SandboxResult<bool> {
+    async fn restorable(
+        &self,
+        _snapshot: &Snapshot,
+        _dependencies: &Arc<Dependencies>,
+    ) -> SandboxResult<bool> {
         Ok(true)
     }
 }
