@@ -733,7 +733,7 @@ fn third_party_driver_options_count_as_authority_as_a_whole() {
         },
     );
 
-    assert!(configured_authority_fields(&with_options).contains("driver_options"));
+    assert!(configured_authority_fields(&with_options).contains("mount_strategy.driver_options"));
     assert!(
         configured_authority_fields(&mount(s3(), MountStrategy::docker_volume("rclone")))
             .is_empty()

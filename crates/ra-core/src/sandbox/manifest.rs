@@ -38,6 +38,7 @@ use super::entries::{Entry, EntryContent, builtin_entry_registry, invalid_entry_
 use super::environment::{Environment, builtin_env_value_registry};
 use super::error::SandboxError;
 use super::manifest_render::{MAX_MANIFEST_DESCRIPTION_CHARS, render_manifest_description};
+use super::mount_security::{Provenance, manifest_mount_provenance};
 use super::registry::{RegistryError, TypeRegistry};
 use super::types::{Group, User};
 use super::workspace_paths::{PathGrantError, PosixPath, SandboxPathGrant, windows_absolute_path};
@@ -226,6 +227,15 @@ pub enum MountExposureError {
     /// A path climbed through a parent segment.
     #[error("Mount credential exposure paths must not contain parent segments.")]
     ParentSegments,
+    /// The manifest holds a mount that is not one of the built-in kinds.
+    ///
+    /// Checked before anything is recorded: an acknowledgement is only meaningful for a mount whose
+    /// configuration this crate knows how to read.
+    #[error("custom mount implementations are not supported at the sandbox credential boundary")]
+    CustomMount,
+    /// The manifest holds a mount strategy that is not one of the built-in kinds.
+    #[error("custom mount strategies are not supported at the sandbox credential boundary")]
+    CustomStrategy,
 }
 
 impl Default for Manifest {
@@ -311,7 +321,8 @@ impl Manifest {
     /// # Errors
     ///
     /// Returns [`MountExposureError`] when no path is named, or a path is the root, written with
-    /// backslashes, a wildcard, or contains a parent segment.
+    /// backslashes, a wildcard, or contains a parent segment; and when the manifest holds a custom
+    /// mount or mount strategy, whose exposure cannot be acknowledged at all.
     pub fn with_in_container_mount_credential_exposure_acknowledged(
         self,
         mount_paths: &[&str],
@@ -351,6 +362,10 @@ impl Manifest {
                     .ok_or(MountExposureError::RootPath)?,
             );
         }
+        manifest_mount_provenance(&self).map_err(|provenance| match provenance {
+            Provenance::CustomMount => MountExposureError::CustomMount,
+            Provenance::CustomStrategy => MountExposureError::CustomStrategy,
+        })?;
         let target = match authority {
             MountCredentialAuthority::MountScoped => &mut self.credential_exposure.mount_scoped,
             MountCredentialAuthority::Broad => &mut self.credential_exposure.broad,
@@ -391,6 +406,15 @@ impl Manifest {
             _ => None,
         };
         alternate.is_some_and(|alternate| acknowledged.contains(&alternate))
+    }
+
+    /// Takes over another manifest's credential exposure acknowledgements, replacing this one's.
+    ///
+    /// How a manifest rebuilt from persisted state gets the decisions the application made about
+    /// the trusted manifest it was rebound from: they were never persisted, so they can only come
+    /// from there.
+    pub(crate) fn copy_mount_credential_exposure_policy_from(&mut self, source: &Self) {
+        self.credential_exposure = source.credential_exposure.clone();
     }
 
     /// The workspace root, forced absolute.

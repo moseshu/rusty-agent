@@ -233,4 +233,14 @@ impl SandboxError {
         )
         .with_context("path", path)
     }
+
+    /// Constructs an invalid or incomplete mount configuration failure.
+    ///
+    /// Raised while a manifest is being checked, before anything is materialized, which is why
+    /// the operation is `materialize` whatever the caller was doing when it asked.
+    #[must_use]
+    pub fn mount_config(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::MountConfigInvalid, OpName::Materialize, message)
+            .with_retryable(Some(false))
+    }
 }

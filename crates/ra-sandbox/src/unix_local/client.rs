@@ -218,6 +218,7 @@ impl SandboxClient for UnixLocalSandboxClient {
         // this client reject a configuration the reference lets a caller hold — the same manifest
         // can be handed to a container backend that can honour it.
         assert_host_path_grants_unsupported(&manifest)?;
+        self.validate_manifest_for_create(&manifest)?;
 
         let mut workspace_root_owned = false;
         if manifest.root == DEFAULT_MANIFEST_ROOT {
@@ -271,6 +272,9 @@ impl SandboxClient for UnixLocalSandboxClient {
     /// lifecycle's job rather than this one's.
     async fn resume(&self, state: SandboxSessionState) -> SandboxResult<Box<dyn SandboxSession>> {
         Self::assert_own_state(&state, OpName::Start)?;
+        // A state read back from storage may still be missing the authority that was stripped on
+        // the way there; it has to be rebound from a trusted manifest before it can run.
+        state.assert_path_grants_rebound()?;
         assert_host_path_grants_unsupported(state.manifest())?;
         Ok(self.open(state))
     }

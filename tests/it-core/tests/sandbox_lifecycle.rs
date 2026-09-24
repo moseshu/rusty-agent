@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, CreateRequest, DiscriminatedPayload, Entry, EntryContent, EntryKind, ErrorCode,
-    ExecRequest, ExecResult, FileEntry, Manifest, MaterializationResult, OpName, Permissions,
-    PtyProcessId, PtyStartRequest, PtyWriteRequest, SandboxClient, SandboxError, SandboxResult,
+    ExecRequest, ExecResult, FileEntry, Manifest, MaterializationResult, Mount, MountPattern,
+    MountProvider, MountStrategy, OpName, Permissions, PtyProcessId, PtyStartRequest,
+    PtyWriteRequest, RcloneOptions, S3Mount, SandboxClient, SandboxError, SandboxResult,
     SandboxSession, SandboxSessionState, SessionResources, Snapshot,
 };
 
@@ -920,8 +921,8 @@ async fn a_client_drives_a_session_through_the_same_lifecycle() {
 }
 
 #[tokio::test]
-async fn a_client_refuses_to_serialize_a_state_that_still_carries_authority() {
-    let carrying = SandboxSessionState::new(
+async fn a_client_refuses_to_serialize_a_forged_mount() {
+    let forged = SandboxSessionState::new(
         "recording",
         Snapshot::noop(),
         Manifest::new().with_entry(
@@ -935,15 +936,77 @@ async fn a_client_refuses_to_serialize_a_state_that_still_carries_authority() {
         needs_options: false,
     };
 
-    let error = client
-        .serialize_session_state(&carrying)
-        .expect_err("refuse");
+    let error = client.serialize_session_state(&forged).expect_err("refuse");
 
-    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
-    assert_eq!(error.op(), OpName::PersistWorkspace);
-    assert!(!error.message().contains("AKIA"), "leaked: {error}");
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    assert!(!format!("{error:?}").contains("AKIA"), "leaked: {error}");
 
     let plain = SandboxSessionState::new("recording", Snapshot::noop(), Manifest::new());
     let rendered = client.serialize_session_state(&plain).expect("serialize");
     assert_eq!(rendered["type"], serde_json::json!("recording"));
+}
+
+/// A manifest the credential boundary refuses: bucket keys handed to a helper inside the sandbox,
+/// with no acknowledgement for the path.
+fn refused_at_the_credential_boundary() -> SandboxSessionState {
+    let provider = MountProvider::S3(S3Mount {
+        bucket: "bucket".to_owned(),
+        access_key_id: Some("access-key".to_owned()),
+        secret_access_key: Some("boundary-secret".to_owned()),
+        ..S3Mount::default()
+    });
+    let strategy = MountStrategy::in_container(MountPattern::Rclone(RcloneOptions::default()));
+    let manifest = Manifest::new().with_entry(
+        "data",
+        Entry::mount(Mount::new(provider, strategy).expect("supported")),
+    );
+    SandboxSessionState::new("recording", Snapshot::noop(), manifest)
+}
+
+#[tokio::test]
+async fn a_start_refused_at_the_credential_boundary_runs_nothing() {
+    let backend = Backend::with_answers(Answers::default());
+    backend.inner.lock().expect("state").state = refused_at_the_credential_boundary();
+
+    let error = backend.start().await.expect_err("refuse");
+
+    // Refused before the guarded block, so not even the failure hook runs: nothing started.
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    assert!(
+        backend.transcript().is_empty(),
+        "{:?}",
+        backend.transcript()
+    );
+    assert!(!format!("{error:?}").contains("boundary-secret"));
+}
+
+#[tokio::test]
+async fn a_stop_refused_at_the_credential_boundary_persists_nothing() {
+    let backend = Backend::with_answers(Answers::default());
+    backend.inner.lock().expect("state").state = refused_at_the_credential_boundary();
+
+    let error = backend.stop().await.expect_err("refuse");
+
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    assert!(
+        backend.transcript().is_empty(),
+        "{:?}",
+        backend.transcript()
+    );
+}
+
+#[tokio::test]
+async fn a_client_refuses_a_manifest_for_create_at_the_credential_boundary() {
+    let client = StubClient {
+        needs_options: false,
+    };
+
+    let error = client
+        .validate_manifest_for_create(refused_at_the_credential_boundary().manifest())
+        .expect_err("refuse");
+
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    client
+        .validate_manifest_for_create(&Manifest::new())
+        .expect("nothing to refuse");
 }

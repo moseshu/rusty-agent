@@ -34,7 +34,7 @@
 //! synthesizes, teardown across a snapshot, and the credential boundary checked at activation belong
 //! to the backend that owns a session.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value};
 
@@ -653,6 +653,17 @@ impl Mount {
     #[must_use]
     pub fn at(mut self, mount_path: impl Into<String>) -> Self {
         self.path = Some(mount_path.into());
+        self
+    }
+
+    /// The same mount, attached by a different strategy.
+    ///
+    /// Not re-checked against the support matrix: this is how an activation check asks about the
+    /// strategy that is actually about to run, which may be a backend's replacement for the
+    /// declared one, and refusing it here would answer a different question.
+    #[must_use]
+    pub(crate) fn with_strategy(mut self, strategy: MountStrategy) -> Self {
+        self.strategy = strategy;
         self
     }
 
@@ -1483,54 +1494,80 @@ pub fn credential_set(
     }
 }
 
-/// Which of this mount's authority fields are actually set.
-///
-/// The question a host asks before letting a manifest cross a trust boundary: a mount with nothing
-/// here carries no credentials, whatever type it is.
-#[must_use]
-pub fn configured_authority_fields(mount: &Mount) -> BTreeSet<String> {
-    let mount_type = mount.type_name();
-    let fields = mount.to_fields();
-    let mut configured = BTreeSet::new();
-
-    for field in authority_fields(mount_type) {
-        if fields.get(*field).is_some_and(|value| !value.is_null()) {
-            configured.insert((*field).to_owned());
-        }
-    }
-    for field in url_fields(mount_type) {
-        if fields
-            .get(*field)
-            .and_then(Value::as_str)
-            .is_some_and(url_carries_inline_authority)
-        {
-            configured.insert((*field).to_owned());
-        }
-    }
-    // Third-party driver options cannot be classified by name, so the whole field counts as
-    // authority whenever it holds anything.
-    if let MountStrategy::DockerVolume { driver_options, .. } = mount.strategy()
-        && !driver_options.is_empty()
-    {
-        configured.insert("driver_options".to_owned());
-    }
-    configured
-}
-
 /// Whether a URL carries credentials in its userinfo or query.
 ///
-/// Deliberately blunt: any `@`, any userinfo, and any query at all counts. An endpoint that needs a
-/// query string is rare, and treating a rare false positive as authority costs a caller one
-/// acknowledgement, while missing one leaks a credential into durable state.
+/// Deliberately blunt, and read the way the reference reads it through Python's `urlsplit`: any
+/// `@` counts, any non-empty query counts, and so does a value `urlsplit` refuses to parse at all.
+/// An endpoint that needs a query string is rare, and treating a rare false positive as authority
+/// costs a caller one acknowledgement, while missing one leaks a credential into durable state.
+///
+/// A `?` after a `#` belongs to the fragment, not the query, and does not count; an empty query
+/// (`https://host/?`) does not count either.
 #[must_use]
 pub fn url_carries_inline_authority(value: &str) -> bool {
-    if value.contains('@') {
+    if value.contains('@') || netloc_is_malformed(value) {
         return true;
     }
-    let Some((_, rest)) = value.split_once("//") else {
-        return value.contains('?');
+    let before_fragment = value.split_once('#').map_or(value, |(head, _)| head);
+    before_fragment
+        .split_once('?')
+        .is_some_and(|(_, query)| !query.is_empty())
+}
+
+/// Whether `urlsplit` would refuse the URL's network location.
+///
+/// It refuses a location with an unbalanced bracket, and one whose bracketed host is not an IPv6
+/// address (or an `IPvFuture` literal), which is what a caller who pasted half an address gets.
+fn netloc_is_malformed(value: &str) -> bool {
+    let rest = match value.split_once(':') {
+        Some((scheme, rest)) if is_url_scheme(scheme) => rest,
+        _ => value,
     };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest[..authority_end].contains(':') && rest[..authority_end].contains('@')
-        || rest[authority_end..].contains('?')
+    let Some(after) = rest.strip_prefix("//") else {
+        return false;
+    };
+    let netloc = &after[..after.find(['/', '?', '#']).unwrap_or(after.len())];
+    let opens = netloc.contains('[');
+    if opens != netloc.contains(']') {
+        return true;
+    }
+    if !opens {
+        return false;
+    }
+    let Some((before, bracketed)) = netloc.split_once('[') else {
+        return false;
+    };
+    if !before.is_empty() {
+        return true;
+    }
+    let (host, port) = bracketed.split_once(']').unwrap_or((bracketed, ""));
+    if !port.is_empty() && !port.starts_with(':') {
+        return true;
+    }
+    !bracketed_host_is_valid(host)
+}
+
+/// Whether text before the first `:` is a scheme, by the rule `urlsplit` applies.
+fn is_url_scheme(candidate: &str) -> bool {
+    candidate
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Whether a bracketed host is an address `urlsplit` accepts.
+fn bracketed_host_is_valid(host: &str) -> bool {
+    if let Some(future) = host.strip_prefix('v') {
+        // `v<hex>.<anything>`, the IPvFuture form.
+        return future.split_once('.').is_some_and(|(version, tail)| {
+            !version.is_empty()
+                && version.chars().all(|c| c.is_ascii_hexdigit())
+                && !tail.is_empty()
+        });
+    }
+    let address = host.split_once('%').map_or(host, |(address, _)| address);
+    address.parse::<std::net::Ipv6Addr>().is_ok()
 }
