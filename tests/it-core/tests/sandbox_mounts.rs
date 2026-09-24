@@ -218,6 +218,13 @@ fn a_mount_path_that_resolves_back_inside_the_workspace_is_normalized() {
         manifest.mount_targets().expect("resolvable")[0].1.as_str(),
         "/workspace/actual"
     );
+    let skip: Vec<String> = manifest
+        .ephemeral_persistence_paths()
+        .expect("resolvable")
+        .into_iter()
+        .map(|path| path.as_str().to_owned())
+        .collect();
+    assert_eq!(skip, ["actual", "logical"]);
 }
 
 #[test]

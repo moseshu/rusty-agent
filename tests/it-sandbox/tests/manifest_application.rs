@@ -988,3 +988,253 @@ async fn a_batch_failure_waits_for_cancelled_checkout_cleanup() {
     .await
     .expect("batch cancellation and cleanup finished");
 }
+
+// --- the rest of the reference's `test_entries.py` and `test_manifest_application.py` ---------
+
+/// The commands that removed the temporary checkout, with where each ran.
+fn removals(commands: &[String]) -> Vec<(usize, &String)> {
+    commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| command.starts_with("rm -rf --"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_checkout_still_removes_its_temporary_clone_afterwards() {
+    // Removed before the clone and again after whatever failed, so a failure between them does not
+    // leave the tree in the sandbox's temporary directory.
+    for (failing, failed_step, code) in [
+        ("git", "git clone", ErrorCode::GitCloneError),
+        ("cp", "cp -R --", ErrorCode::GitCopyError),
+    ] {
+        let manifest = manifest().with_entry("vendor", Entry::git_repo("acme/widgets", "main"));
+        let session = Arc::new(RecordingSession::new(manifest.clone()).failing(failing, 1));
+
+        let error = applier(&session)
+            .apply_manifest(&manifest, false)
+            .await
+            .expect_err("the checkout fails");
+
+        assert_eq!(error.error_code(), code, "{failing}");
+        let commands = session.commands();
+        let removed = removals(&commands);
+        assert_eq!(removed.len(), 2, "{commands:?}");
+        assert_eq!(removed[0].1, removed[1].1, "the same directory both times");
+        let failed_at = commands
+            .iter()
+            .position(|command| command.starts_with(failed_step))
+            .expect("the failing step ran");
+        assert!(removed[1].0 > failed_at, "{commands:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_spelling_of_a_subpath_outside_the_repository_is_refused_before_anything_runs() {
+    for (subpath, reason) in [
+        ("   ", "empty"),
+        ("/docs", "absolute"),
+        ("../outside", "parent_traversal"),
+        ("docs/../../outside", "parent_traversal"),
+        ("C:/repo", "windows_path"),
+        ("C:repo", "windows_path"),
+        ("C:", "windows_path"),
+        (" c:repo ", "windows_path"),
+        ("docs\\outside", "windows_path"),
+    ] {
+        let manifest = manifest().with_entry(
+            "vendor",
+            Entry::git_repo("acme/widgets", "main").with_subpath(subpath),
+        );
+        let session = Arc::new(RecordingSession::new(manifest.clone()));
+
+        let error = applier(&session)
+            .apply_manifest(&manifest, false)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("`{subpath}` should be refused"));
+
+        assert_eq!(error.error_code(), ErrorCode::GitSubpathError, "{subpath}");
+        assert_eq!(
+            error
+                .context()
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some(reason),
+            "{subpath}"
+        );
+        assert_eq!(
+            error
+                .context()
+                .get("subpath")
+                .and_then(|value| value.as_str()),
+            Some(subpath)
+        );
+        assert!(session.commands().is_empty(), "{subpath}");
+    }
+}
+
+#[tokio::test]
+async fn every_spelling_of_the_repository_root_copies_the_whole_checkout() {
+    for subpath in ["", ".", "./", "./.", " ./ "] {
+        let manifest = manifest().with_entry(
+            "vendor",
+            Entry::git_repo("acme/widgets", "main").with_subpath(subpath),
+        );
+        let session = Arc::new(RecordingSession::new(manifest.clone()));
+
+        applier(&session)
+            .apply_manifest(&manifest, false)
+            .await
+            .unwrap_or_else(|error| panic!("`{subpath}` should be accepted: {error:?}"));
+
+        let copy = session
+            .commands()
+            .into_iter()
+            .find(|command| command.starts_with("cp -R --"))
+            .expect("a copy");
+        let mut arguments = copy.split_whitespace().skip(3);
+        let source = arguments.next().expect("a source");
+        assert!(source.starts_with("/tmp/sandbox-git-"), "{source}");
+        assert!(
+            source.ends_with("/.") && !source.ends_with("//."),
+            "`{subpath}` copied from {source}"
+        );
+        assert_eq!(arguments.next(), Some("/workspace/vendor/"));
+    }
+}
+
+#[tokio::test]
+async fn a_permission_command_that_fails_fails_the_application() {
+    let manifest = manifest().with_entry("copied.txt", Entry::file("hello"));
+    let session = Arc::new(RecordingSession::new(manifest.clone()).failing("chmod", 1));
+    let error = applier(&session)
+        .apply_manifest(&manifest, false)
+        .await
+        .expect_err("chmod failed");
+    assert_eq!(error.error_code(), ErrorCode::ExecNonzero);
+
+    // Ownership is settled first, and a failure there stops the entry before its mode is touched.
+    let owned = self::manifest().with_entry(
+        "copied.txt",
+        Entry::file("hello").owned_by(EntryOwner::User(User::new("sandbox-user"))),
+    );
+    let session = Arc::new(RecordingSession::new(owned.clone()).failing("chgrp", 1));
+    let error = applier(&session)
+        .apply_manifest(&owned, false)
+        .await
+        .expect_err("chgrp failed");
+    assert_eq!(error.error_code(), ErrorCode::ExecNonzero);
+    let commands = session.commands();
+    assert!(
+        commands.contains(&"chgrp sandbox-user /workspace/copied.txt".to_owned()),
+        "{commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|command| command.starts_with("chmod")),
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn accounts_are_provisioned_with_the_references_commands_each_exactly_once() {
+    // `alice` is both a user and a member; `bob` is only a member. Each gets an account once, and
+    // no member gets a group of its own name from `groupadd`: `useradd -U` makes that one.
+    let manifest = manifest()
+        .with_user(User::new("alice"))
+        .with_group(Group::new(
+            "dev",
+            vec![User::new("alice"), User::new("bob")],
+        ));
+    let session = Arc::new(RecordingSession::new(manifest.clone()));
+
+    applier(&session)
+        .apply_manifest(&manifest, true)
+        .await
+        .expect("apply");
+
+    let commands = session.commands();
+    assert_eq!(commands[0], "groupadd dev", "{commands:?}");
+    for name in ["alice", "bob"] {
+        assert!(
+            !commands.contains(&format!("groupadd {name}")),
+            "{commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| **command == format!("useradd -U -M -s /usr/sbin/nologin {name}"))
+                .count(),
+            1,
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&format!("usermod -aG dev {name}")),
+            "{commands:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_provisioning_failure_reports_the_command_and_what_it_printed() {
+    let manifest = manifest().with_group(Group::new("dev", Vec::new()));
+    let session = Arc::new(RecordingSession::new(manifest.clone()).failing("groupadd", 9));
+
+    let error = applier(&session)
+        .apply_manifest(&manifest, true)
+        .await
+        .expect_err("groupadd failed");
+
+    assert_eq!(error.error_code(), ErrorCode::ExecNonzero);
+    assert_eq!(
+        error
+            .context()
+            .get("command_str")
+            .and_then(|value| value.as_str()),
+        Some("groupadd dev")
+    );
+    assert_eq!(
+        error
+            .context()
+            .get("stderr")
+            .and_then(|value| value.as_str()),
+        Some("groupadd refused")
+    );
+    // Only one stream said anything, so the message is that stream without a label.
+    assert_eq!(error.message(), "groupadd refused");
+}
+
+#[tokio::test]
+async fn a_split_grant_authorizes_a_local_source_by_its_host_path() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let top = std::fs::canonicalize(directory.path()).expect("resolve");
+    let base = top.join("base");
+    let outside = top.join("outside");
+    std::fs::create_dir(&base).expect("base");
+    std::fs::create_dir(&outside).expect("outside");
+    std::fs::write(outside.join("secret.txt"), "secret").expect("write");
+    let grant = ra_core::sandbox::SandboxPathGrant::new("/mnt/shared-data")
+        .expect("grant")
+        .with_host_path(&outside.to_string_lossy())
+        .expect("host path")
+        .read_only(true);
+    let manifest = manifest().with_path_grant(grant).with_entry(
+        "copied.txt",
+        Entry::local_file(outside.join("secret.txt").to_string_lossy().into_owned()),
+    );
+    let session = Arc::new(RecordingSession::new(manifest.clone()));
+
+    ManifestApplier::new(session.clone(), base)
+        .apply_manifest(&manifest, false)
+        .await
+        .expect("apply");
+
+    assert_eq!(
+        session
+            .written
+            .lock()
+            .expect("written")
+            .get("/workspace/copied.txt"),
+        Some(&b"secret".to_vec())
+    );
+}
