@@ -36,13 +36,16 @@ use super::archive::{CompressionScheme, SandboxArchiveLimits};
 use super::dependencies::Dependencies;
 use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
-use super::manifest::Manifest;
+use super::manifest::{Manifest, ManifestRegistries};
 use super::materialization::MaterializationResult;
+use super::mount_security::validate_manifest_mount_credential_boundaries;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
-use super::registry::DiscriminatedPayload;
+use super::registry::{DiscriminatedPayload, TypeRegistry};
 use super::resources::{PreStopHook, SessionResources};
 use super::snapshot::{Snapshot, SnapshotFingerprint, SnapshotSource, SnapshotSpec};
-use super::state::SandboxSessionState;
+use super::state::{
+    InvalidSessionStatePayload, REDACTED_HOST_PATH_GRANT_PATHS_KEY, SandboxSessionState,
+};
 use super::types::{ExecResult, ExposedPortEndpoint, User};
 
 /// What a sandbox operation returns when it can fail.
@@ -648,6 +651,19 @@ pub trait SandboxSession: Send + Sync {
         Ok(())
     }
 
+    /// Checks the session's manifest at the mount credential boundary of its own backend.
+    ///
+    /// Run again at each lifecycle step that could act on a mount, because the manifest a session
+    /// holds can change between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the boundary failure.
+    fn validate_mount_credential_boundaries(&self) -> SandboxResult<()> {
+        let state = self.state();
+        validate_manifest_mount_credential_boundaries(state.manifest(), Some(state.state_type()))
+    }
+
     // --- lifecycle ------------------------------------------------------------------------
     //
     // Defaults, as they are on the reference's base class. Overridable for the same reason they
@@ -664,6 +680,9 @@ pub trait SandboxSession: Send + Sync {
     /// Returns the first failure from the guarded block, given the backend's wording. The failure
     /// hook has already run by then.
     async fn start(&self) -> SandboxResult<bool> {
+        // Before the guarded block, as the reference has it: a manifest refused at the credential
+        // boundary never started anything, so there is no failed start to clean up after.
+        self.validate_mount_credential_boundaries()?;
         match self.start_guarded().await {
             Ok(preserved) => {
                 self.after_start().await?;
@@ -705,6 +724,7 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the failure of whichever branch ran.
     async fn start_workspace(&self, root_ready_at_start: bool) -> SandboxResult<()> {
+        self.validate_mount_credential_boundaries()?;
         let preserved = self.workspace_state_preserved_on_start() && root_ready_at_start;
 
         if self.snapshot_restorable().await? {
@@ -750,6 +770,9 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the persistence failure, given the backend's wording.
     async fn stop(&self) -> SandboxResult<()> {
+        // Outside the persist-and-settle sequence: a refusal here means nothing was attempted, so
+        // there is nothing for the after-stop hook to settle.
+        self.validate_mount_credential_boundaries()?;
         let outcome = async {
             self.before_stop().await?;
             self.persist_snapshot().await
@@ -982,23 +1005,73 @@ pub trait SandboxClient: Send + Sync {
     /// Returns the backend's failure to release them, with the session still the caller's.
     async fn delete(&self, session: &dyn SandboxSession) -> SandboxResult<()>;
 
-    /// Renders a session state into something a host can store.
+    /// Checks a manifest before anything is created for it.
+    ///
+    /// Runs the mount credential boundary for this backend, so a manifest that would expose
+    /// credentials it should not is refused while nothing exists yet to clean up.
     ///
     /// # Errors
     ///
-    /// Refuses a state whose manifest still carries mount authority, because writing it out would
-    /// put credentials on disk ahead of the redaction that is supposed to remove them.
+    /// Returns the boundary failure.
+    fn validate_manifest_for_create(&self, manifest: &Manifest) -> SandboxResult<()> {
+        validate_manifest_mount_credential_boundaries(manifest, Some(self.backend_id()))
+    }
+
+    /// Renders a session state into something a host can store.
+    ///
+    /// Mount authority is stripped (see [`SandboxSessionState::to_json`]), and so is every path
+    /// grant with a host source: a host path is authority on this host, and the paths that were
+    /// dropped are listed under [`REDACTED_HOST_PATH_GRANT_PATHS_KEY`] so a reader knows to ask a
+    /// trusted manifest for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::MountConfigInvalid`] for a manifest holding a custom mount or mount
+    /// strategy, or one carrying authority that cannot be rendered safely.
     fn serialize_session_state(
         &self,
         state: &SandboxSessionState,
     ) -> SandboxResult<serde_json::Value> {
-        state.to_json().map_err(|error| {
+        let (persistable, dropped) = state.without_host_path_grants();
+        let mut payload = persistable.to_json()?;
+        if !dropped.is_empty()
+            && let serde_json::Value::Object(fields) = &mut payload
+        {
+            fields.insert(
+                REDACTED_HOST_PATH_GRANT_PATHS_KEY.to_owned(),
+                serde_json::Value::from(dropped.into_iter().collect::<Vec<_>>()),
+            );
+        }
+        Ok(payload)
+    }
+
+    /// Reads back a state this backend wrote.
+    ///
+    /// Sanitizes before reading (see [`SandboxSessionState::parse`]), and refuses a state some
+    /// other backend wrote. The result may still need its authority rebound from a trusted manifest
+    /// before [`Self::resume`] accepts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::SandboxConfigInvalid`] with a fixed message for any payload that does
+    /// not read, including one written by a different backend; the message never quotes it.
+    fn deserialize_session_state(
+        &self,
+        payload: serde_json::Value,
+        snapshots: &TypeRegistry,
+        manifests: &ManifestRegistries,
+    ) -> SandboxResult<SandboxSessionState> {
+        let invalid = |error: InvalidSessionStatePayload| {
             SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,
-                OpName::PersistWorkspace,
+                OpName::Start,
                 error.to_string(),
             )
-            .with_context("field", error.field)
-        })
+        };
+        let state = SandboxSessionState::parse(payload, snapshots, manifests).map_err(invalid)?;
+        if state.state_type() != self.backend_id() {
+            return Err(invalid(InvalidSessionStatePayload::Invalid));
+        }
+        Ok(state)
     }
 }

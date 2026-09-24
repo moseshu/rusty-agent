@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    CreateRequest, Dependencies, DependencyValue, DiscriminatedPayload, ErrorCode, ExecRequest,
-    FactoryOptions, Manifest, SandboxClient, SandboxPathGrant, SandboxSession, ShellInvocation,
-    Snapshot, SnapshotSpec, dependency_factory,
+    CreateRequest, Dependencies, DependencyValue, DiscriminatedPayload, Entry, ErrorCode,
+    ExecRequest, FactoryOptions, Manifest, ManifestRegistries, Mount, MountPattern, MountProvider,
+    MountStrategy, RcloneOptions, S3Mount, SandboxClient, SandboxPathGrant, SandboxSession,
+    ShellInvocation, Snapshot, SnapshotSpec, builtin_snapshot_registry, dependency_factory,
 };
 use ra_sandbox::snapshot::{
     RemoteSnapshotClient, RemoteSnapshotError, remote_snapshot_client_dependency,
@@ -206,9 +207,11 @@ async fn a_session_takes_the_storage_it_was_asked_for_and_is_named_after_itself(
     // Told where to keep snapshots but not what to call one: the session is the only thing that
     // can say, and it has not been created yet when the caller writes the run configuration down.
     let session = client
-        .create(CreateRequest::new().with_snapshot_spec(SnapshotSpec::Local {
-            base_path: snapshots.path().to_path_buf(),
-        }))
+        .create(
+            CreateRequest::new().with_snapshot_spec(SnapshotSpec::Local {
+                base_path: snapshots.path().to_path_buf(),
+            }),
+        )
         .await
         .expect("create");
     let state = session.state();
@@ -406,4 +409,90 @@ async fn every_session_gets_its_own_copy_of_the_client_dependencies() {
     for session in [first, second] {
         client.delete(session.as_ref()).await.expect("delete");
     }
+}
+
+/// A manifest whose S3 mount hands its keys to a helper inside the sandbox, acknowledged for its
+/// path.
+fn acknowledged_in_container_keys(root: &std::path::Path) -> Manifest {
+    let provider = MountProvider::S3(S3Mount {
+        bucket: "bucket".to_owned(),
+        access_key_id: Some("access-key".to_owned()),
+        secret_access_key: Some("unix-local-secret".to_owned()),
+        ..S3Mount::default()
+    });
+    let strategy = MountStrategy::in_container(MountPattern::Rclone(RcloneOptions::default()));
+    manifest_at(root)
+        .with_entry(
+            "data",
+            Entry::mount(Mount::new(provider, strategy).expect("supported")),
+        )
+        .with_in_container_mount_credential_exposure_acknowledged(&["data"])
+        .expect("acknowledged")
+}
+
+#[tokio::test]
+async fn a_manifest_refused_at_the_credential_boundary_is_refused_before_create() {
+    let root = tempfile::tempdir().expect("temp");
+    let provider = MountProvider::S3(S3Mount {
+        bucket: "bucket".to_owned(),
+        ..S3Mount::default()
+    });
+    // A volume driver belongs to the container runtime, which this backend does not have.
+    let manifest = manifest_at(root.path()).with_entry(
+        "data",
+        Entry::mount(
+            Mount::new(provider, MountStrategy::docker_volume("rclone")).expect("supported"),
+        ),
+    );
+
+    let error = UnixLocalSandboxClient::new()
+        .create(CreateRequest::new().with_manifest(manifest))
+        .await
+        .err()
+        .expect("a strategy owned by another backend");
+
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    assert_eq!(
+        error
+            .context()
+            .get("sandbox_backend")
+            .and_then(serde_json::Value::as_str),
+        Some(UNIX_LOCAL_BACKEND_ID)
+    );
+}
+
+#[tokio::test]
+async fn a_state_read_back_from_storage_resumes_only_once_its_mount_authority_is_rebound() {
+    let root = tempfile::tempdir().expect("temp");
+    let trusted = acknowledged_in_container_keys(root.path());
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(CreateRequest::new().with_manifest(trusted.clone()))
+        .await
+        .expect("create");
+
+    let payload = client
+        .serialize_session_state(&session.state())
+        .expect("serialize");
+    assert!(!payload.to_string().contains("unix-local-secret"));
+    let restored = client
+        .deserialize_session_state(
+            payload,
+            &builtin_snapshot_registry(),
+            &ManifestRegistries::builtin(),
+        )
+        .expect("deserialize");
+
+    let error = client
+        .resume(restored.clone())
+        .await
+        .err()
+        .expect("the keys were stripped on the way to storage");
+    assert!(error.message().contains("cannot be resumed"), "{error}");
+
+    let rebound = restored
+        .rebind_persisted_mount_authority(Some(&trusted), UNIX_LOCAL_BACKEND_ID)
+        .expect("rebind");
+    let resumed = client.resume(rebound).await.expect("resume");
+    assert_eq!(resumed.state().manifest(), &trusted);
 }

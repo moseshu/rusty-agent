@@ -189,7 +189,7 @@ impl EntryContent {
     }
 
     /// Whether this content is external storage that must never be persisted.
-    const fn is_mount(&self) -> bool {
+    pub(crate) const fn is_mount(&self) -> bool {
         matches!(self, Self::Mount(_))
     }
 }
@@ -421,6 +421,14 @@ impl Entry {
     #[must_use]
     pub const fn children(&self) -> Option<&BTreeMap<String, Self>> {
         match &self.content {
+            EntryContent::Dir { children } => Some(children),
+            _ => None,
+        }
+    }
+
+    /// What is declared inside this entry, for replacing one of them in place.
+    pub(crate) const fn children_mut(&mut self) -> Option<&mut BTreeMap<String, Self>> {
+        match &mut self.content {
             EntryContent::Dir { children } => Some(children),
             _ => None,
         }

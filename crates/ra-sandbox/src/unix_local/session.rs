@@ -14,7 +14,7 @@ use ra_core::sandbox::{
     AsUser, CompressionScheme, EnvValueResolver, ErrorCode, ExecRequest, ExecResult,
     ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, OpName, SandboxArchiveLimits,
     SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    SessionResources, SnapshotFingerprint, User,
+    SessionResources, SnapshotFingerprint, User, validate_manifest_mount_credential_boundaries,
 };
 
 use crate::archive::WorkspaceArchiveExtractor;
@@ -579,6 +579,9 @@ impl SandboxSession for UnixLocalSandboxSession {
     ) -> SandboxResult<MaterializationResult> {
         let manifest = self.manifest();
         assert_host_path_grants_unsupported(&manifest)?;
+        // The start path has already checked this, but a host may apply a manifest directly, and
+        // that is the reference's other entry into materialization.
+        validate_manifest_mount_credential_boundaries(&manifest, Some(UNIX_LOCAL_BACKEND_ID))?;
         // Refused whatever `provision_accounts` says. The flag asks whether the accounts still need
         // creating; this backend cannot create one at all, and materializing content that is meant
         // to belong to a missing account would hand it to whoever runs the SDK instead.

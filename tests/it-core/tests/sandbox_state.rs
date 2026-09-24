@@ -8,14 +8,21 @@
 //!   describes the same sandbox when another host reads it
 //! - a modelled field cannot also live among the backend-specific ones, where the two could
 //!   disagree
+//! - a persisted state carries no host path source, gets its grants back only from a trusted
+//!   manifest, and a payload that fails to read is never quoted back
+//!
+//! Mount authority in persisted states is pinned in `sandbox_mount_security.rs`.
 //!
 //! What a manifest declares is pinned in `sandbox_manifest.rs`.
 
+use async_trait::async_trait;
 use ra_core::sandbox::{
-    DiscriminatedPayload, Entry, Environment, Manifest, SandboxPathGrant, SandboxSessionState,
-    Snapshot, normalize_exposed_ports,
+    CreateRequest, DiscriminatedPayload, Entry, Environment, ErrorCode, InvalidSessionStatePayload,
+    Manifest, ManifestRegistries, REDACTED_HOST_PATH_GRANT_PATHS_KEY, REDACTED_MOUNT_AUTHORITY_KEY,
+    SandboxClient, SandboxPathGrant, SandboxResult, SandboxSession, SandboxSessionState, Snapshot,
+    builtin_snapshot_registry, normalize_exposed_ports,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn state() -> SandboxSessionState {
@@ -290,12 +297,10 @@ fn a_state_without_a_session_id_is_given_one() {
 }
 
 #[test]
-fn a_state_carrying_mount_authority_refuses_to_be_persisted() {
-    // An S3 mount's secret key lives in an entry, and a grant naming a host path has to be dropped
-    // and recorded as needing rebinding rather than written out. The reference does that while
-    // serializing; leaving it for the read side would put the credentials on disk first and
-    // sanitize them afterwards.
-    let with_secret = SandboxSessionState::new(
+fn an_entry_forging_a_mount_type_is_refused_rather_than_persisted() {
+    // Something that only names a built-in mount type would have its fields read by rules written
+    // for a shape it does not have, so it cannot cross the credential boundary at all.
+    let forged = SandboxSessionState::new(
         "stub",
         Snapshot::new("local", "snap-1"),
         Manifest::new().with_entry(
@@ -308,37 +313,340 @@ fn a_state_carrying_mount_authority_refuses_to_be_persisted() {
         ),
     );
 
-    let error = with_secret.to_json().expect_err("refuse");
-    assert_eq!(error.field, "entries");
-    assert!(error.to_string().contains("credentials on disk"));
+    let error = forged.to_json().expect_err("refuse");
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    assert!(
+        error.message().contains("custom mount implementations"),
+        "{error}"
+    );
 
     // The refusal has to bite on the serde path too, which is the one a host actually persists
     // through.
-    let rendered = serde_json::to_string(&with_secret);
-    assert!(rendered.is_err(), "serde must refuse as well");
-    let message = rendered.expect_err("refuse").to_string();
+    let message = serde_json::to_string(&forged)
+        .expect_err("serde must refuse as well")
+        .to_string();
     assert!(!message.contains("AKIAsecret"), "leaked: {message}");
     assert!(!message.contains("tok"), "leaked: {message}");
-
-    // A manifest with nothing unmodelled in it has no authority to redact and persists normally.
-    assert!(state().to_json().is_ok());
 }
 
 #[test]
-fn every_unmodelled_manifest_field_closes_the_persistence_path() {
-    let mut environment = Manifest::new();
-    environment.environment = Environment::new().with("AWS_SECRET_ACCESS_KEY", "s");
-    let grants = Manifest::new().with_path_grant(
+fn the_environment_and_host_sources_are_written_by_the_state_itself() {
+    // The state renders them as they are, as the reference's state does. Dropping host sources is
+    // the client's job when it writes a state for storage, and reading one back drops any that got
+    // through and marks them for a rebind.
+    let mut manifest = Manifest::new().with_path_grant(
         SandboxPathGrant::new("/w")
             .expect("absolute")
             .with_host_path("/home/user/.aws")
             .expect("absolute host source"),
     );
+    manifest.environment = Environment::new().with("AWS_REGION", "us-east-1");
+    let state = SandboxSessionState::new("stub", Snapshot::noop(), manifest);
 
-    for (manifest, field) in [(environment, "environment"), (grants, "extra_path_grants")] {
-        let state = SandboxSessionState::new("stub", Snapshot::noop(), manifest);
-        assert_eq!(state.to_json().expect_err("refuse").field, field);
+    let rendered = state.to_json().expect("persistable");
+
+    assert_eq!(
+        rendered["manifest"]["environment"]["value"]["AWS_REGION"],
+        json!("us-east-1")
+    );
+    assert_eq!(
+        rendered["manifest"]["extra_path_grants"][0]["host_path"],
+        json!("/home/user/.aws")
+    );
+    assert!(rendered.get(REDACTED_MOUNT_AUTHORITY_KEY).is_none());
+}
+
+// --- reading a persisted state ---------------------------------------------------------------
+//
+// Ported from the reference's `tests/sandbox/test_session_state_roundtrip.py`.
+
+/// A client for the `stub` backend, used only for its state round trip.
+struct StubClient;
+
+#[async_trait]
+impl SandboxClient for StubClient {
+    fn backend_id(&self) -> &str {
+        "stub"
     }
+
+    async fn create(&self, _request: CreateRequest) -> SandboxResult<Box<dyn SandboxSession>> {
+        panic!("create is not used by these tests")
+    }
+
+    async fn resume(&self, _state: SandboxSessionState) -> SandboxResult<Box<dyn SandboxSession>> {
+        panic!("resume is not used by these tests")
+    }
+
+    async fn delete(&self, _session: &dyn SandboxSession) -> SandboxResult<()> {
+        panic!("delete is not used by these tests")
+    }
+}
+
+fn parse(payload: Value) -> Result<SandboxSessionState, InvalidSessionStatePayload> {
+    SandboxSessionState::parse(
+        payload,
+        &builtin_snapshot_registry(),
+        &ManifestRegistries::builtin(),
+    )
+}
+
+fn deserialize(payload: Value) -> SandboxResult<SandboxSessionState> {
+    StubClient.deserialize_session_state(
+        payload,
+        &builtin_snapshot_registry(),
+        &ManifestRegistries::builtin(),
+    )
+}
+
+fn host_backed_grant() -> SandboxPathGrant {
+    SandboxPathGrant::new("/mnt/shared-data")
+        .expect("absolute")
+        .with_host_path("/srv/shared-data")
+        .expect("absolute host source")
+        .read_only(true)
+}
+
+#[test]
+fn parse_rejects_invalid_payloads() {
+    assert_eq!(
+        parse(json!({})).expect_err("refuse"),
+        InvalidSessionStatePayload::Invalid
+    );
+    assert_eq!(
+        parse(json!({"type": "missing"})).expect_err("refuse"),
+        InvalidSessionStatePayload::Invalid
+    );
+    let error = parse(json!("not-a-state")).expect_err("refuse");
+    assert_eq!(error, InvalidSessionStatePayload::NotAnObject);
+    assert!(error.to_string().contains("session state payload must be"));
+}
+
+#[test]
+fn parse_redacts_malformed_payload_errors() {
+    let sentinel = "session-state-parse-secret";
+    for payload in [
+        json!({"type": sentinel}),
+        json!({
+            "type": "stub",
+            "snapshot": {"type": "noop", "id": "snapshot"},
+            "manifest": {"entries": {"data": {"type": "unknown", "token": sentinel}}},
+        }),
+        json!({
+            "type": "stub",
+            "session_id": [],
+            "snapshot": {"type": "noop", "id": "snapshot"},
+            "manifest": {"entries": {"data": {
+                "type": "s3_mount",
+                "bucket": "bucket",
+                "secret_access_key": {"secret": sentinel},
+                "mount_strategy": {"type": "docker_volume", "driver": "rclone"},
+            }}},
+        }),
+        json!({
+            "type": "stub",
+            "snapshot": {"type": "noop", "id": "snapshot"},
+            "manifest": [sentinel],
+        }),
+    ] {
+        let error = parse(payload).expect_err("refuse");
+
+        assert_eq!(
+            error.to_string(),
+            "sandbox session state payload is invalid"
+        );
+        assert!(!format!("{error:?}").contains(sentinel));
+    }
+}
+
+#[test]
+fn client_serialization_redacts_host_paths_and_rebinds_from_trusted_manifest() {
+    let trusted = Manifest::new().with_path_grant(host_backed_grant());
+    let state = SandboxSessionState::new("stub", Snapshot::noop(), trusted.clone());
+
+    let payload = StubClient
+        .serialize_session_state(&state)
+        .expect("serialize");
+
+    assert!(!payload.to_string().contains("/srv/shared-data"));
+    assert_eq!(
+        payload[REDACTED_HOST_PATH_GRANT_PATHS_KEY],
+        json!(["/mnt/shared-data"])
+    );
+    // An empty collection is left out of a rendered manifest.
+    assert!(payload["manifest"].get("extra_path_grants").is_none());
+
+    let restored = deserialize(payload).expect("deserialize");
+    assert!(restored.manifest().extra_path_grants.is_empty());
+    assert_eq!(restored.path_grants_require_rebind(), ["/mnt/shared-data"]);
+    let error = restored.assert_path_grants_rebound().expect_err("refuse");
+    assert!(error.message().contains("must be rebound"), "{error}");
+
+    let rebound = restored
+        .rebind_persisted_path_grants(Some(&trusted))
+        .expect("rebind");
+    assert_eq!(
+        rebound.manifest().extra_path_grants,
+        trusted.extra_path_grants
+    );
+    assert!(rebound.path_grants_require_rebind().is_empty());
+    assert!(restored.manifest().extra_path_grants.is_empty());
+    rebound.assert_path_grants_rebound().expect("resumable");
+}
+
+#[test]
+fn a_rebind_needs_a_trusted_host_source_for_every_dropped_path() {
+    let state = SandboxSessionState::new(
+        "stub",
+        Snapshot::noop(),
+        Manifest::new().with_path_grant(host_backed_grant()),
+    );
+    let restored = deserialize(
+        StubClient
+            .serialize_session_state(&state)
+            .expect("serialize"),
+    )
+    .expect("deserialize");
+
+    let error = restored
+        .rebind_persisted_path_grants(None)
+        .expect_err("refuse");
+    assert!(
+        error
+            .message()
+            .contains("require a current trusted manifest"),
+        "{error}"
+    );
+
+    let path_only = Manifest::new()
+        .with_path_grant(SandboxPathGrant::new("/mnt/shared-data").expect("absolute"));
+    let error = restored
+        .rebind_persisted_path_grants(Some(&path_only))
+        .expect_err("refuse");
+    assert!(
+        error.message().ends_with("path grants: /mnt/shared-data"),
+        "{error}"
+    );
+}
+
+#[test]
+fn path_only_grants_preserve_a_direct_round_trip() {
+    let manifest = Manifest::new()
+        .with_path_grant(
+            SandboxPathGrant::new("/mnt/shared-data")
+                .expect("absolute")
+                .read_only(true),
+        )
+        .with_path_grant(SandboxPathGrant::new("/mnt/shared-data").expect("absolute"));
+    let state = SandboxSessionState::new("stub", Snapshot::noop(), manifest.clone());
+
+    let restored = deserialize(
+        StubClient
+            .serialize_session_state(&state)
+            .expect("serialize"),
+    )
+    .expect("deserialize");
+
+    assert!(restored.path_grants_require_rebind().is_empty());
+    restored.assert_path_grants_rebound().expect("resumable");
+    assert_eq!(
+        restored.manifest().extra_path_grants,
+        manifest.extra_path_grants
+    );
+}
+
+#[test]
+fn a_removed_redaction_marker_does_not_restore_a_host_backed_grant() {
+    let state = SandboxSessionState::new(
+        "stub",
+        Snapshot::noop(),
+        Manifest::new().with_path_grant(host_backed_grant()),
+    );
+    let mut payload = StubClient
+        .serialize_session_state(&state)
+        .expect("serialize");
+    payload
+        .as_object_mut()
+        .expect("object")
+        .remove(REDACTED_HOST_PATH_GRANT_PATHS_KEY);
+
+    let restored = deserialize(payload).expect("deserialize");
+
+    // Forgetting that a grant was wanted is all a payload can do; it cannot bring the source back.
+    assert!(restored.path_grants_require_rebind().is_empty());
+    assert!(restored.manifest().extra_path_grants.is_empty());
+    restored
+        .assert_path_grants_rebound()
+        .expect("nothing left to rebind");
+}
+
+#[test]
+fn deserialization_discards_an_unmarked_serialized_host_path() {
+    let trusted = Manifest::new().with_path_grant(host_backed_grant());
+    let state = SandboxSessionState::new("stub", Snapshot::noop(), trusted.clone());
+    // Written by the state itself, which leaves host sources in.
+    let payload = state.to_json().expect("render");
+
+    let restored = deserialize(payload).expect("deserialize");
+
+    assert!(restored.manifest().extra_path_grants.is_empty());
+    assert_eq!(restored.path_grants_require_rebind(), ["/mnt/shared-data"]);
+    let error = restored.assert_path_grants_rebound().expect_err("refuse");
+    assert!(error.message().contains("must be rebound"), "{error}");
+
+    let rebound = restored
+        .rebind_persisted_path_grants(Some(&trusted))
+        .expect("rebind");
+    rebound.assert_path_grants_rebound().expect("resumable");
+    assert_eq!(
+        rebound.manifest().extra_path_grants,
+        trusted.extra_path_grants
+    );
+}
+
+#[test]
+fn authority_markers_are_flags_rather_than_backend_fields() {
+    let state = SandboxSessionState::new("stub", Snapshot::noop(), Manifest::new())
+        .with_field(REDACTED_MOUNT_AUTHORITY_KEY, true)
+        .with_field(REDACTED_HOST_PATH_GRANT_PATHS_KEY, json!(["/x"]));
+
+    // A caller cannot set one by hand...
+    assert!(state.field(REDACTED_MOUNT_AUTHORITY_KEY).is_none());
+    assert!(
+        state
+            .to_json()
+            .expect("render")
+            .get(REDACTED_MOUNT_AUTHORITY_KEY)
+            .is_none()
+    );
+
+    // ...and one read from a payload becomes the flag, not a field carried along.
+    let mut payload = state.to_json().expect("render");
+    payload[REDACTED_MOUNT_AUTHORITY_KEY] = json!(true);
+    let restored = parse(payload).expect("parse");
+    assert!(restored.mount_authority_redacted());
+    assert!(restored.field(REDACTED_MOUNT_AUTHORITY_KEY).is_none());
+}
+
+#[test]
+fn parse_reads_legacy_discriminator_free_str_env_values() {
+    let mut payload = SandboxSessionState::new("stub", Snapshot::noop(), Manifest::new())
+        .to_json()
+        .expect("render");
+    payload["manifest"]["environment"] = json!({"value": {
+        "DIRECT": {"value": "direct-value"},
+        "ENTRY": {
+            "description": "typed entry",
+            "ephemeral": true,
+            "value": {"value": "entry-value"},
+        },
+    }});
+
+    let restored = parse(payload).expect("parse");
+
+    assert_eq!(
+        restored.manifest().environment.to_json()["value"]["DIRECT"],
+        json!({"type": "str", "value": "direct-value"})
+    );
 }
 
 #[test]

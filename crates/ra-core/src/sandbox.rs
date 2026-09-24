@@ -26,6 +26,7 @@ pub mod files;
 pub mod manifest;
 pub mod manifest_render;
 pub mod materialization;
+pub mod mount_security;
 pub mod pty;
 pub mod registry;
 pub mod resources;
@@ -49,8 +50,8 @@ pub use entries::mounts::{
     DOCKER_VOLUME_STRATEGY_TYPE, FuseCacheType, FuseOptions, GcsMount, IN_CONTAINER_STRATEGY_TYPE,
     Mount, MountConfigError, MountPattern, MountProvider, MountStrategy, MountpointOptions,
     R2Mount, RcloneMode, RcloneOptions, S3FilesMount, S3FilesOptions, S3Mount, authority_fields,
-    authority_file_fields, builtin_mount_strategy_registry, configured_authority_fields,
-    credential_set, mount_strategy_kind, url_carries_inline_authority, url_fields,
+    authority_file_fields, builtin_mount_strategy_registry, credential_set, mount_strategy_kind,
+    url_carries_inline_authority, url_fields,
 };
 pub use entries::{
     DEFAULT_GIT_HOST, Entry, EntryContent, EntryOwner, EntryRenderError, builtin_entry_registry,
@@ -74,6 +75,14 @@ pub use materialization::{
     DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY, MaterializationResult, MaterializedFile,
     SandboxConcurrencyLimits,
 };
+pub use mount_security::{
+    CREDENTIALLESS_MOUNT_AUTHORITY_KEY, InvalidRawManifest, REDACTED_MOUNT_AUTHORITY_KEY,
+    configured_authority_fields, manifest_has_configured_mount_authority,
+    rclone_config_value_fields, rebind_manifest_mount_authority, sanitize_manifest_mount_authority,
+    sanitize_raw_manifest_mount_authority, sanitize_raw_session_state_mount_authority,
+    validate_manifest_mount_credential_boundaries, validate_manifest_mount_provenance,
+    validate_mount_activation_credential_boundary,
+};
 pub use pty::{PtyExecUpdate, PtyProcessId, PtyStartRequest, PtyWriteRequest};
 pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
@@ -89,7 +98,8 @@ pub use snapshot::{
     SnapshotPathError, SnapshotSource, SnapshotSpec, builtin_snapshot_registry, resolve_snapshot,
 };
 pub use state::{
-    ExposedPortsError, SandboxSessionState, UnsupportedPersistence, normalize_exposed_ports,
+    ExposedPortsError, InvalidSessionStatePayload, REDACTED_HOST_PATH_GRANT_PATHS_KEY,
+    SandboxSessionState, normalize_exposed_ports,
 };
 pub use types::{
     ErrorContext, ExecResult, ExposedPortEndpoint, FileMode, Group, Permissions,
