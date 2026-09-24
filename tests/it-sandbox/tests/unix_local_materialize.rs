@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ra_core::sandbox::{
-    CreateRequest, Entry, ErrorCode, Group, Manifest, MaterializationResult, Mount, MountPattern,
-    MountProvider, MountStrategy, MountpointOptions, S3Mount, SandboxClient,
-    SandboxConcurrencyLimits, SandboxPathGrant, SandboxSession, User,
+    CreateRequest, Entry, ErrorCode, Group, Manifest, MaterializationResult, MaterializedFile,
+    Mount, MountPattern, MountProvider, MountStrategy, MountpointOptions, PosixPath, S3Mount,
+    SandboxClient, SandboxConcurrencyLimits, SandboxError, SandboxPathGrant, SandboxResult,
+    SandboxSession, User,
 };
 use ra_sandbox::materialize::ManifestApplier;
+use ra_sandbox::mounts::MountLifecycle;
 use ra_sandbox::unix_local::UnixLocalSandboxClient;
 
 /// `sha256("hello")`, so a receipt can be checked without recomputing it here.
@@ -421,8 +423,56 @@ async fn a_manifest_that_declares_a_group_is_refused_for_the_same_reason() {
     assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
 }
 
+/// A mount lifecycle that refuses every attach, as a sandbox without the mount's tool would.
+struct RefusingMounts;
+
+#[async_trait::async_trait]
+impl MountLifecycle for RefusingMounts {
+    async fn activate(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _dest: &PosixPath,
+        _base_dir: &Path,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        Err(SandboxError::mount_tool_missing("mount-s3"))
+    }
+
+    async fn deactivate(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _dest: &PosixPath,
+        _base_dir: &Path,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+
+    async fn teardown_for_snapshot(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _path: &PosixPath,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+
+    async fn restore_after_snapshot(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _path: &PosixPath,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
-async fn a_manifest_that_declares_a_mount_is_refused_until_the_mount_lifecycle_lands() {
+async fn a_mount_that_cannot_be_attached_stops_the_start_without_leaving_a_directory() {
     let (_directory, manifest) = workspace();
     let mount = Mount::new(
         MountProvider::S3(S3Mount {
@@ -436,11 +486,27 @@ async fn a_manifest_that_declares_a_mount_is_refused_until_the_mount_lifecycle_l
     .expect("a supported provider and strategy");
     let manifest = manifest.with_entry("mounted", Entry::mount(mount));
     let root = manifest.root.clone();
-    let session = session_for(manifest).await;
+    // A lifecycle that refuses, rather than the builtin one: whether this host has `mount-s3` is not
+    // something the test should depend on, and the question is what the session does with the
+    // refusal.
+    let session: Arc<dyn SandboxSession> = UnixLocalSandboxClient::new()
+        .with_mount_lifecycle(Arc::new(RefusingMounts))
+        .create(CreateRequest::new().with_manifest(manifest))
+        .await
+        .expect("create")
+        .into();
 
     let error = session.start().await.expect_err("refused");
 
-    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
+    let mut codes = vec![error.error_code()];
+    let mut cause = std::error::Error::source(&error);
+    while let Some(inner) = cause {
+        if let Some(inner) = inner.downcast_ref::<SandboxError>() {
+            codes.push(inner.error_code());
+        }
+        cause = inner.source();
+    }
+    assert!(codes.contains(&ErrorCode::MountMissingTool), "{codes:?}");
     // Refused rather than left as an ordinary empty directory, which is what a workspace would come
     // up with if the entry were quietly skipped.
     assert!(!Path::new(&root).join("mounted").exists());

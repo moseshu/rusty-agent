@@ -78,7 +78,8 @@ pub use materialization::{
 pub use mount_security::{
     CREDENTIALLESS_MOUNT_AUTHORITY_KEY, InvalidRawManifest, REDACTED_MOUNT_AUTHORITY_KEY,
     configured_authority_fields, manifest_has_configured_mount_authority,
-    rclone_config_value_fields, rebind_manifest_mount_authority, sanitize_manifest_mount_authority,
+    mount_has_configured_authority, rclone_config_value_fields, rebind_manifest_mount_authority,
+    replace_protected_mount_error, sanitize_manifest_mount_authority,
     sanitize_raw_manifest_mount_authority, sanitize_raw_session_state_mount_authority,
     validate_manifest_mount_credential_boundaries, validate_manifest_mount_provenance,
     validate_mount_activation_credential_boundary,

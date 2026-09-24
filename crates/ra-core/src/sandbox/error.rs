@@ -360,6 +360,18 @@ pub struct SandboxError {
     // whole call graph pays for its size on the success path too, and the payload is carried by a
     // handful of failures rather than by most of them.
     details: Option<Box<SandboxErrorDetails>>,
+    redaction: Redaction,
+}
+
+/// Whether a failure's data may leave a mount boundary as it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Redaction {
+    #[default]
+    None,
+    /// Its context or cause may hold credential-derived data.
+    Redacted,
+    /// As `Redacted`, but its message was written without any.
+    RedactedSafeMessage,
 }
 
 impl SandboxError {
@@ -374,7 +386,44 @@ impl SandboxError {
             cause: None,
             retryable: error_code.default_retryable(),
             details: None,
+            redaction: Redaction::None,
         }
+    }
+
+    /// Marks the failure as carrying data that must not cross a mount lifecycle boundary as it is.
+    ///
+    /// The reference's `_mark_error_data_redacted`. Nothing is removed here; the boundary a failure
+    /// crosses on its way out of a mount operation replaces a marked one with a copy that keeps
+    /// only its code, operation and retryability.
+    #[must_use]
+    pub fn with_data_redacted(mut self) -> Self {
+        if self.redaction == Redaction::None {
+            self.redaction = Redaction::Redacted;
+        }
+        self
+    }
+
+    /// Marks the failure as [`Self::with_data_redacted`] does, and its message as safe to keep.
+    ///
+    /// For a validation failure whose message names only fields, never their values: the
+    /// replacement a boundary makes keeps the message rather than a generic one.
+    #[must_use]
+    pub const fn with_safe_redacted_message(mut self) -> Self {
+        self.redaction = Redaction::RedactedSafeMessage;
+        self
+    }
+
+    /// Whether the failure was marked by [`Self::with_data_redacted`] or
+    /// [`Self::with_safe_redacted_message`].
+    #[must_use]
+    pub const fn is_data_redacted(&self) -> bool {
+        !matches!(self.redaction, Redaction::None)
+    }
+
+    /// Whether the failure's message was marked safe to keep through a replacement.
+    #[must_use]
+    pub const fn has_safe_redacted_message(&self) -> bool {
+        matches!(self.redaction, Redaction::RedactedSafeMessage)
     }
 
     /// Overrides the code's documented retryability with what the raiser knows.

@@ -174,6 +174,35 @@ impl Default for FuseOptions {
     }
 }
 
+impl FuseOptions {
+    /// The cache directory, checked to be a workspace-relative path.
+    ///
+    /// The cache is scratch state the session writes through its own workspace-scoped operations,
+    /// so a path that is absolute — in either flavour — or that climbs out is refused. `None` when
+    /// the default is to be used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::sandbox::ErrorCode::MountConfigInvalid`] carrying the path as `cache_path`.
+    pub fn checked_cache_path(&self) -> Result<Option<PosixPath>, SandboxError> {
+        let Some(cache_path) = &self.cache_path else {
+            return Ok(None);
+        };
+        let refused = |rendered: &str| {
+            SandboxError::mount_config("blobfuse cache_path must be relative to the workspace root")
+                .with_context("cache_path", rendered)
+        };
+        if let Some(windows_path) = windows_absolute_path(cache_path) {
+            return Err(refused(&windows_path));
+        }
+        let posix = PosixPath::coerce(cache_path);
+        if posix.is_absolute() || posix.parts().contains(&"..") {
+            return Err(refused(posix.as_str()));
+        }
+        Ok(Some(posix))
+    }
+}
+
 /// Whether a FUSE mount caches blocks or whole files.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -964,7 +993,7 @@ fn read_pattern(value: &Value) -> Result<MountPattern, String> {
 /// Reads the options of a FUSE mount.
 fn read_fuse_pattern(fields: &JsonMap<String, Value>) -> Result<MountPattern, String> {
     let defaults = FuseOptions::default();
-    Ok(MountPattern::Fuse(FuseOptions {
+    let options = FuseOptions {
         allow_other: opt_bool(fields, "allow_other")?.unwrap_or(defaults.allow_other),
         log_type: opt_str(fields, "log_type")?.unwrap_or(defaults.log_type),
         log_level: opt_str(fields, "log_level")?.unwrap_or(defaults.log_level),
@@ -985,7 +1014,13 @@ fn read_fuse_pattern(fields: &JsonMap<String, Value>) -> Result<MountPattern, St
         attr_cache_timeout_sec: opt_u64(fields, "attr_cache_timeout_sec")?,
         entry_cache_timeout_sec: opt_u64(fields, "entry_cache_timeout_sec")?,
         negative_entry_cache_timeout_sec: opt_u64(fields, "negative_entry_cache_timeout_sec")?,
-    }))
+    };
+    // Checked on the way in, as the reference checks it at construction: a cache directory that
+    // cannot be used should stop the manifest, not the mount command minutes later.
+    options
+        .checked_cache_path()
+        .map_err(|error| error.message().to_owned())?;
+    Ok(MountPattern::Fuse(options))
 }
 
 /// Reads the options of an rclone mount.

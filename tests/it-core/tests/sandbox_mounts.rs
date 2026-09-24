@@ -548,6 +548,34 @@ fn a_mount_pattern_naming_a_tool_nothing_can_run_is_refused() {
 }
 
 #[test]
+fn a_blobfuse_cache_outside_the_workspace_is_refused_when_the_manifest_is_read() {
+    // The reference refuses it when the pattern is built, so a manifest carrying one never loads.
+    for cache_path in [
+        "/tmp/blobfuse-cache",
+        "../blobfuse-cache",
+        "C:\\blobfuse-cache",
+    ] {
+        let payload = json!({
+            "type": "azure_blob_mount",
+            "account": "acct",
+            "container": "container",
+            "mount_strategy": {
+                "type": "in_container",
+                "pattern": {"type": "fuse", "cache_path": cache_path},
+            },
+        });
+
+        let error = Entry::parse(&ManifestRegistries::builtin(), &payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("blobfuse cache_path must be relative to the workspace root"),
+            "{cache_path}: {error}"
+        );
+    }
+}
+
+#[test]
 fn a_mount_strategy_a_host_registered_is_carried_verbatim() {
     // Strategies are open upstream, so a platform with its own attach mechanism keeps working —
     // once the host has said it has one.

@@ -243,4 +243,32 @@ impl SandboxError {
         Self::new(ErrorCode::MountConfigInvalid, OpName::Materialize, message)
             .with_retryable(Some(false))
     }
+
+    /// Constructs a failure for a mount whose tool is not installed in the sandbox.
+    #[must_use]
+    pub fn mount_tool_missing(tool: &str) -> Self {
+        Self::new(
+            ErrorCode::MountMissingTool,
+            OpName::Materialize,
+            format!("required mount tool missing: {tool}"),
+        )
+        .with_retryable(Some(false))
+        .with_context("tool", tool)
+    }
+
+    /// Constructs a failure for a mount command that ran and did not succeed.
+    ///
+    /// `command` and `stderr` are recorded as given; a caller whose command line or output may
+    /// carry credentials redacts them first.
+    #[must_use]
+    pub fn mount_command(command: &str, stderr: &str) -> Self {
+        Self::new(
+            ErrorCode::MountFailed,
+            OpName::Materialize,
+            "mount command failed",
+        )
+        .with_retryable(Some(false))
+        .with_context("command", command)
+        .with_context("stderr", stderr)
+    }
 }
