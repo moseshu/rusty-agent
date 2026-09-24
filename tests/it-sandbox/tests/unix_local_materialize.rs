@@ -476,3 +476,237 @@ async fn a_large_copied_directory_is_paced_by_the_limit_it_was_given() {
     sorted.sort_unstable();
     assert_eq!(listed, sorted);
 }
+
+// --- sources, against the reference's `test_entries.py` -------------------------------------
+
+/// A base directory and a sibling outside it, under one canonicalized parent.
+fn base_and_outside() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let top = std::fs::canonicalize(directory.path()).expect("resolve");
+    let base = top.join("base");
+    let outside = top.join("outside");
+    std::fs::create_dir(&base).expect("base");
+    std::fs::create_dir(&outside).expect("outside");
+    std::fs::write(outside.join("secret.txt"), "secret").expect("write");
+    (directory, base, outside)
+}
+
+/// Applies one entry against `base`, returning the refusal it is expected to produce.
+async fn refusal(manifest: Manifest, base: PathBuf) -> ra_core::sandbox::SandboxError {
+    let session = session_for(manifest.clone()).await;
+    ManifestApplier::new(session, base)
+        .apply_manifest(&manifest, false)
+        .await
+        .expect_err("refused")
+}
+
+fn context<'a>(error: &'a ra_core::sandbox::SandboxError, key: &str) -> Option<&'a str> {
+    error.context().get(key).and_then(|value| value.as_str())
+}
+
+#[tokio::test]
+async fn a_source_that_climbs_out_of_the_base_directory_is_refused_either_way_it_is_written() {
+    let (_directory, base, outside) = base_and_outside();
+    for (entry, code) in [
+        (
+            Entry::local_file("../outside/secret.txt"),
+            ErrorCode::LocalFileReadError,
+        ),
+        (
+            Entry::local_file(outside.join("secret.txt").to_string_lossy().into_owned()),
+            ErrorCode::LocalFileReadError,
+        ),
+        (
+            Entry::local_dir(Some("../outside".to_owned())),
+            ErrorCode::LocalDirReadError,
+        ),
+        (
+            Entry::local_dir(Some(outside.to_string_lossy().into_owned())),
+            ErrorCode::LocalDirReadError,
+        ),
+    ] {
+        let (_workspace, manifest) = workspace();
+        let root = manifest.root.clone();
+        let error = refusal(manifest.with_entry("copied", entry), base.clone()).await;
+
+        assert_eq!(error.error_code(), code);
+        assert_eq!(context(&error, "reason"), Some("outside_base_dir"));
+        assert_eq!(
+            context(&error, "base_dir"),
+            Some(base.to_string_lossy().as_ref())
+        );
+        assert!(!Path::new(&root).join("copied").exists());
+    }
+}
+
+#[tokio::test]
+async fn a_source_no_grant_covers_names_the_grants_that_were_checked() {
+    let (_directory, base, outside) = base_and_outside();
+    let other = base.parent().expect("a parent").join("other");
+    std::fs::create_dir(&other).expect("other");
+    let (_workspace, manifest) = workspace();
+    let manifest = manifest
+        .with_path_grant(SandboxPathGrant::new(&other.to_string_lossy()).expect("grant"))
+        .with_entry(
+            "copied.txt",
+            Entry::local_file(outside.join("secret.txt").to_string_lossy().into_owned()),
+        );
+
+    let error = refusal(manifest, base).await;
+
+    assert_eq!(context(&error, "reason"), Some("outside_base_dir"));
+    assert_eq!(
+        error.context().get("extra_path_grants"),
+        Some(&serde_json::json!([other.to_string_lossy()]))
+    );
+}
+
+#[tokio::test]
+async fn an_absolute_source_inside_the_base_directory_needs_no_grant() {
+    let (_sources, base) = sources();
+    std::fs::create_dir(base.join("source")).expect("source");
+    std::fs::write(base.join("source/safe.txt"), "safe").expect("write");
+    let (_workspace, manifest) = workspace();
+    let manifest = manifest
+        .with_entry(
+            "file.txt",
+            Entry::local_file(base.join("source/safe.txt").to_string_lossy().into_owned()),
+        )
+        .with_entry(
+            "dir",
+            Entry::local_dir(Some(base.join("source").to_string_lossy().into_owned())),
+        );
+    let root = manifest.root.clone();
+    let session = session_for(manifest.clone()).await;
+
+    ManifestApplier::new(session, base)
+        .apply_manifest(&manifest, false)
+        .await
+        .expect("apply");
+
+    assert_eq!(read(&root, "file.txt"), "safe");
+    assert_eq!(read(&root, "dir/safe.txt"), "safe");
+}
+
+#[tokio::test]
+async fn a_granted_directory_outside_the_base_is_copied_even_when_the_grant_is_read_only() {
+    // Read-only limits what the sandbox may write there, not whether the manifest may read it.
+    let (_directory, base, outside) = base_and_outside();
+    let (_workspace, manifest) = workspace();
+    let manifest = manifest
+        .with_path_grant(
+            SandboxPathGrant::new(&outside.to_string_lossy())
+                .expect("grant")
+                .read_only(true),
+        )
+        .with_entry(
+            "copied",
+            Entry::local_dir(Some(outside.to_string_lossy().into_owned())),
+        );
+    let root = manifest.root.clone();
+    let session = session_for(manifest.clone()).await;
+
+    ManifestApplier::new(session, base)
+        .apply_manifest(&manifest, false)
+        .await
+        .expect("apply");
+
+    assert_eq!(read(&root, "copied/secret.txt"), "secret");
+}
+
+#[tokio::test]
+async fn a_grant_read_back_from_a_manifest_payload_authorizes_its_source() {
+    let (_directory, base, outside) = base_and_outside();
+    let (_workspace, manifest) = workspace();
+    let root = manifest.root.clone();
+    let parsed = Manifest::parse(
+        &ra_core::sandbox::ManifestRegistries::builtin(),
+        &serde_json::json!({
+            "root": root,
+            "extra_path_grants": [{"path": outside.to_string_lossy()}],
+            "entries": {"copied.txt": {
+                "type": "local_file",
+                "src": outside.join("secret.txt").to_string_lossy(),
+            }},
+        }),
+    )
+    .expect("parse");
+    let session = session_for(parsed.clone()).await;
+
+    ManifestApplier::new(session, base)
+        .apply_manifest(&parsed, false)
+        .await
+        .expect("apply");
+
+    assert_eq!(read(&root, "copied.txt"), "secret");
+}
+
+#[tokio::test]
+async fn every_symlink_on_the_way_to_a_source_is_refused_by_name() {
+    let (_sources, base) = sources();
+    std::fs::create_dir_all(base.join("secret-dir/sub")).expect("target tree");
+    std::fs::write(base.join("secret-dir/sub/secret.txt"), "secret").expect("write");
+    std::fs::write(base.join("secret.txt"), "secret").expect("write");
+    std::os::unix::fs::symlink(base.join("secret-dir"), base.join("link")).expect("dir link");
+    std::os::unix::fs::symlink(base.join("secret.txt"), base.join("link.txt")).expect("file link");
+    std::os::unix::fs::symlink(base.join("secret-dir"), base.join("dir-link.txt"))
+        .expect("leaf link to a directory");
+
+    for (entry, code, child) in [
+        // An ancestor of the source.
+        (
+            Entry::local_file("link/sub/secret.txt"),
+            ErrorCode::LocalFileReadError,
+            "link",
+        ),
+        (
+            Entry::local_dir(Some("link/sub".to_owned())),
+            ErrorCode::LocalDirReadError,
+            "link",
+        ),
+        // The source file itself, whether it points at a file or a directory.
+        (
+            Entry::local_file("link.txt"),
+            ErrorCode::LocalFileReadError,
+            "link.txt",
+        ),
+        (
+            Entry::local_file("dir-link.txt"),
+            ErrorCode::LocalFileReadError,
+            "dir-link.txt",
+        ),
+    ] {
+        let (_workspace, manifest) = workspace();
+        let root = manifest.root.clone();
+        let error = refusal(manifest.with_entry("copied", entry), base.clone()).await;
+
+        assert_eq!(error.error_code(), code, "{child}");
+        assert_eq!(context(&error, "reason"), Some("symlink_not_supported"));
+        assert_eq!(context(&error, "child"), Some(child));
+        assert!(!Path::new(&root).join("copied").exists(), "{child}");
+    }
+}
+
+#[tokio::test]
+async fn a_link_inside_a_copied_directory_is_refused_by_name_whatever_it_points_at() {
+    let (_sources, base) = sources();
+    std::fs::create_dir_all(base.join("src")).expect("source tree");
+    std::fs::create_dir_all(base.join("secret-dir")).expect("secret tree");
+    std::fs::write(base.join("src/safe.txt"), "safe").expect("write");
+    std::fs::write(base.join("secret.txt"), "secret").expect("write");
+    std::fs::write(base.join("secret-dir/secret.txt"), "secret").expect("write");
+
+    for (link, target) in [("link.txt", "secret.txt"), ("linked-dir", "secret-dir")] {
+        let link_path = base.join("src").join(link);
+        std::os::unix::fs::symlink(base.join(target), &link_path).expect("link");
+        let (_workspace, manifest) = workspace();
+        let manifest = manifest.with_entry("copied", Entry::local_dir(Some("src".to_owned())));
+
+        let error = refusal(manifest, base.clone()).await;
+
+        assert_eq!(error.error_code(), ErrorCode::LocalDirReadError);
+        assert_eq!(context(&error, "reason"), Some("symlink_not_supported"));
+        assert_eq!(context(&error, "child"), Some(link));
+        std::fs::remove_file(&link_path).expect("unlink");
+    }
+}

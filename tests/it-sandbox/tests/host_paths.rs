@@ -325,3 +325,169 @@ fn revisiting_a_completed_symlink_is_not_a_cycle() {
         paths.resolved_root().join("target/new.txt"),
     );
 }
+
+// --- the reference's `test_workspace_paths.py`, host half -------------------------------------
+
+#[test]
+fn a_workspace_reached_through_an_alias_resolves_the_way_the_reference_resolves_it() {
+    let fixture = fixture();
+    let target = fixture.workspace.join("target.txt");
+    fs::write(&target, "hello").expect("target");
+    std::os::unix::fs::symlink(&target, fixture.workspace.join("link.txt")).expect("leaf link");
+    std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("outside-link"))
+        .expect("escape link");
+    let alias = fixture
+        .workspace
+        .parent()
+        .expect("parent")
+        .join("workspace-alias");
+    std::os::unix::fs::symlink(&fixture.workspace, &alias).expect("root alias");
+    let paths = HostWorkspacePaths::new(&alias.to_string_lossy(), Vec::new()).expect("policy");
+    let resolved_target = fs::canonicalize(&target).expect("resolve");
+
+    for path in [
+        "target.txt".to_owned(),
+        "nested/../target.txt".to_owned(),
+        "link.txt".to_owned(),
+        alias.join("target.txt").to_string_lossy().into_owned(),
+        target.to_string_lossy().into_owned(),
+    ] {
+        assert_eq!(
+            paths.normalize_path(&path, false).expect(&path),
+            resolved_target,
+            "{path}"
+        );
+    }
+
+    let error = paths
+        .normalize_path("outside-link/secret.txt", false)
+        .expect_err("a link out of the workspace");
+    assert_eq!(
+        error.message(),
+        "manifest path must not escape root: outside-link/secret.txt"
+    );
+    assert_eq!(
+        error
+            .context()
+            .get("reason")
+            .and_then(serde_json::Value::as_str),
+        Some("escape_root")
+    );
+
+    let outside = fixture.outside.join("secret.txt");
+    let error = paths
+        .normalize_path(&outside.to_string_lossy(), false)
+        .expect_err("outside the workspace");
+    assert_eq!(
+        error.message(),
+        format!(
+            "manifest path must be relative: {}",
+            outside.to_string_lossy()
+        )
+    );
+    assert_eq!(
+        error
+            .context()
+            .get("reason")
+            .and_then(serde_json::Value::as_str),
+        Some("absolute")
+    );
+}
+
+#[test]
+fn a_drive_path_is_refused_as_absolute_against_a_host_root() {
+    // On the hosts this backend runs on a drive path is not absolute, so without the check it
+    // would be anchored under the workspace as though it were relative.
+    let fixture = fixture();
+    let paths = policy(&fixture, Vec::new());
+
+    for path in ["C:/tmp/secret.txt", "C:\\tmp\\secret.txt"] {
+        for for_write in [false, true] {
+            let error = paths
+                .normalize_path(path, for_write)
+                .expect_err("a drive path");
+            assert_eq!(error.error_code(), ErrorCode::InvalidManifestPath);
+            assert_eq!(
+                error.message(),
+                "manifest path must be relative: C:/tmp/secret.txt"
+            );
+            assert_eq!(
+                error
+                    .context()
+                    .get("rel")
+                    .and_then(serde_json::Value::as_str),
+                Some("C:/tmp/secret.txt")
+            );
+        }
+    }
+}
+
+#[test]
+fn a_read_only_grant_named_through_an_alias_refuses_a_write_to_its_real_path() {
+    let fixture = fixture();
+    let alias = fixture
+        .outside
+        .parent()
+        .expect("parent")
+        .join("allowed-alias");
+    std::os::unix::fs::symlink(&fixture.outside, &alias).expect("grant alias");
+    let grant = SandboxPathGrant::new(&alias.to_string_lossy())
+        .expect("grant")
+        .read_only(true);
+    let paths = policy(&fixture, vec![grant]);
+    let target = fs::canonicalize(&fixture.outside)
+        .expect("resolve")
+        .join("cache.db");
+
+    let error = paths
+        .normalize_path(&target.to_string_lossy(), true)
+        .expect_err("a write through a read-only grant");
+
+    assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(
+        error.message(),
+        format!(
+            "failed to write archive for path: {}",
+            target.to_string_lossy()
+        )
+    );
+    // The grant is named the way it was written, not the way it resolved.
+    assert_eq!(
+        error
+            .context()
+            .get("grant_path")
+            .and_then(serde_json::Value::as_str),
+        Some(alias.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn a_split_grant_resolves_its_host_source_once_and_keeps_that_answer() {
+    let fixture = fixture();
+    let alias = fixture
+        .outside
+        .parent()
+        .expect("parent")
+        .join("source-alias");
+    std::os::unix::fs::symlink(&fixture.outside, &alias).expect("source alias");
+    let grant = SandboxPathGrant::new("/mnt/shared-data")
+        .expect("grant")
+        .with_host_path(&alias.to_string_lossy())
+        .expect("host path");
+
+    let resolved = sandbox_path_grant_host_path(&grant).expect("resolved source");
+    // Repointing the alias afterwards does not move what was already resolved.
+    fs::remove_file(&alias).expect("unlink");
+    std::os::unix::fs::symlink("/", &alias).expect("repoint");
+
+    assert_eq!(
+        resolved,
+        fs::canonicalize(&fixture.outside).expect("resolve")
+    );
+    assert_eq!(
+        sandbox_path_grant_host_path(&grant)
+            .expect_err("the repointed source is the whole filesystem")
+            .to_string(),
+        "sandbox path grant path must not resolve to filesystem root"
+    );
+}

@@ -481,6 +481,25 @@ fn a_grant_round_trips_through_serialization_and_is_revalidated_on_the_way_back(
     );
 }
 
+#[test]
+fn a_manifest_renders_each_grant_with_its_access_and_what_it_is_for() {
+    let manifest = ra_core::sandbox::Manifest::new()
+        .with_path_grant(grant("/tmp").with_description("temporary files"))
+        .with_path_grant(
+            grant("/opt/toolchain")
+                .read_only(true)
+                .with_description("compiler runtime"),
+        );
+
+    assert_eq!(
+        serde_json::to_value(&manifest).expect("render")["extra_path_grants"],
+        json!([
+            {"path": "/tmp", "read_only": false, "description": "temporary files"},
+            {"path": "/opt/toolchain", "read_only": true, "description": "compiler runtime"},
+        ])
+    );
+}
+
 // --- run working directory ----------------------------------------------------------------
 
 #[test]
@@ -611,13 +630,17 @@ fn a_session_resource_becomes_absolute_once_there_is_a_working_directory() {
             .as_str(),
         "/workspace/.agents/my-skill"
     );
-    assert_eq!(
-        scope
-            .model_resource_path("C:/workspace", ".agents/my-skill")
-            .expect("drive root")
-            .as_str(),
-        "C:/workspace/.agents/my-skill"
-    );
+    // A drive root reads the same whichever separator it was written with.
+    for root in ["C:/workspace", "C:\\workspace"] {
+        assert_eq!(
+            scope
+                .model_resource_path(root, ".agents/my-skill")
+                .expect("drive root")
+                .as_str(),
+            "C:/workspace/.agents/my-skill",
+            "{root}"
+        );
+    }
     // Without one, the existing workspace-root-relative representation is preserved.
     assert_eq!(
         SandboxWorkspaceScope::root()

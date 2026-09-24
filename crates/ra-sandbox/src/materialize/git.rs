@@ -234,7 +234,12 @@ impl GitCheckout<'_> {
         // Checked against what was written rather than the tidied form: a backslash is a separator
         // on one platform and an ordinary character in a filename on this one, and a subpath that
         // means two different directories depending on where it is read is not one to resolve.
-        if declared.contains('\\') || ra_core::sandbox::windows_absolute_path(trimmed).is_some() {
+        // A Windows drive also includes drive-relative paths such as `C:repo` and `C:`.
+        let has_windows_drive = matches!(
+            trimmed.as_bytes(),
+            [letter, b':', ..] if letter.is_ascii_alphabetic()
+        );
+        if declared.contains('\\') || has_windows_drive {
             return Err(git_subpath(self.repo, declared, "windows_path"));
         }
         if subpath.parts().contains(&"..") {
