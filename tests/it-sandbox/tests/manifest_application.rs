@@ -619,9 +619,10 @@ async fn a_mount_is_refused_after_everything_queued_before_it_has_been_written()
     let error = applier(&session)
         .apply_manifest(&manifest, false)
         .await
-        .expect_err("mount lifecycle is not implemented yet");
+        .expect_err("in-container mount patterns are not implemented yet");
 
     assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
+    assert_eq!(error.context().get("pattern"), Some(&"mountpoint".into()));
     // The entries queued before the mount ran first: a mount is applied alone, and what was already
     // in flight is finished rather than abandoned.
     assert_eq!(

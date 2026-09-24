@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-use ra_core::sandbox::{Manifest, PosixPath, SandboxError};
+use ra_core::sandbox::{PosixPath, SandboxError};
 
 /// Writes the workspace into a tar stream.
 ///
@@ -29,15 +29,12 @@ use ra_core::sandbox::{Manifest, PosixPath, SandboxError};
 ///
 /// Returns [`ra_core::sandbox::ErrorCode::WorkspaceArchiveReadError`] when the workspace root is
 /// missing or cannot be walked.
-pub(crate) fn persist(root: &Path, manifest: &Manifest) -> Result<Vec<u8>, SandboxError> {
+pub(crate) fn persist(root: &Path, skip: &BTreeSet<PosixPath>) -> Result<Vec<u8>, SandboxError> {
     let rendered = root.to_string_lossy().into_owned();
     if !root.exists() {
         return Err(SandboxError::workspace_archive_read(&rendered)
             .with_context("reason", "workspace_root_not_found"));
     }
-    let skip = manifest.ephemeral_persistence_paths().map_err(|error| {
-        SandboxError::workspace_archive_read(&rendered).with_sandbox_cause(error)
-    })?;
 
     let mut builder = tar::Builder::new(Vec::new());
     builder.follow_symlinks(false);
@@ -47,7 +44,7 @@ pub(crate) fn persist(root: &Path, manifest: &Manifest) -> Result<Vec<u8>, Sandb
     builder
         .append_dir(Path::new("."), root)
         .map_err(|error| failure(&error))?;
-    append_children(&mut builder, root, Path::new(""), &skip).map_err(|error| failure(&error))?;
+    append_children(&mut builder, root, Path::new(""), skip).map_err(|error| failure(&error))?;
     builder.into_inner().map_err(|error| failure(&error))
 }
 

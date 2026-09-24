@@ -126,6 +126,45 @@ async fn what_the_manifest_called_ephemeral_is_not_written_out() {
 }
 
 #[tokio::test]
+async fn what_the_session_excluded_at_runtime_is_not_written_out() {
+    let (_temp, root, session) = fixture(Manifest::new()).await;
+    std::fs::create_dir_all(root.join(".sandbox-rclone-config/session")).expect("config");
+    std::fs::write(
+        root.join(".sandbox-rclone-config/session/remote.conf"),
+        b"[remote]\nsecret_access_key = sk\n",
+    )
+    .expect("config file");
+    std::fs::write(root.join("keep.txt"), b"durable").expect("keep");
+    session
+        .register_persist_workspace_skip_path(".sandbox-rclone-config")
+        .expect("inside the workspace");
+
+    let archive = session.persist_workspace().await.expect("persist");
+    let names: Vec<String> = tar::Archive::new(archive.as_slice())
+        .entries()
+        .expect("entries")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .path()
+                .expect("path")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+    // Generated mount configuration carries credentials and is rebuilt on every mount; a snapshot
+    // that kept it would be storing secrets nobody asked it to.
+    assert!(names.iter().any(|name| name == "keep.txt"), "{names:?}");
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with(".sandbox-rclone-config")),
+        "{names:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_workspace_that_is_not_there_cannot_be_written_out() {
     let (temp, _root, session) = fixture(Manifest::new()).await;
     drop(temp);

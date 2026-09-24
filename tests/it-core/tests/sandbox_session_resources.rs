@@ -1,5 +1,6 @@
 //! The lifecycle defaults a session gets from its `SessionResources`: dependencies, pre-stop
-//! callbacks and the close lock, as the reference's base session provides them.
+//! callbacks, runtime persistence exclusions and the close lock, as the reference's base session
+//! provides them.
 //!
 //! The session here overrides nothing those defaults touch, so every assertion is about the default
 //! itself. Stop is observed through `persist_snapshot` and shutdown through `shutdown_backend`.
@@ -9,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    AsUser, CloseDependency, Dependencies, DependencyValue, ErrorCode, ExecRequest, ExecResult,
-    FactoryOptions, FileEntry, Manifest, OpName, SandboxError, SandboxResult, SandboxSession,
+    AsUser, CloseDependency, Dependencies, DependencyValue, Entry, ErrorCode, ExecRequest,
+    ExecResult, FactoryOptions, FileEntry, GcsMount, Manifest, Mount, MountPattern, MountProvider,
+    MountStrategy, MountpointOptions, OpName, SandboxError, SandboxResult, SandboxSession,
     SandboxSessionState, SessionResources, Snapshot, dependency_factory, pre_stop_hook,
 };
 
@@ -25,8 +27,12 @@ struct Plain {
 
 impl Plain {
     fn new() -> Self {
+        Self::with_manifest(Manifest::new())
+    }
+
+    fn with_manifest(manifest: Manifest) -> Self {
         Self {
-            state: SandboxSessionState::new("plain", Snapshot::noop(), Manifest::new()),
+            state: SandboxSessionState::new("plain", Snapshot::noop(), manifest),
             resources: SessionResources::new(),
             log: Transcript::default(),
             fail_persist: AtomicBool::new(false),
@@ -302,4 +308,107 @@ async fn a_close_cancelled_during_its_callbacks_never_persists_on_a_later_close(
     session.close().await.expect("second close");
     assert_eq!(session.transcript(), ["hook", "shutdown"]);
     assert_eq!(resource.calls.load(Ordering::SeqCst), 1);
+}
+
+// --- paths a session excludes from its snapshots at runtime ------------------------------------
+
+/// A session whose manifest mounts a bucket at `mount_path`, as the reference's fixture does.
+fn mounted_at(mount_path: &str) -> Plain {
+    let mount = Mount::new(
+        MountProvider::Gcs(GcsMount {
+            bucket: "bucket".to_owned(),
+            ..GcsMount::default()
+        }),
+        MountStrategy::in_container(MountPattern::Mountpoint(MountpointOptions::default())),
+    )
+    .expect("supported")
+    .at(mount_path);
+    Plain::with_manifest(Manifest::new().with_entry("remote", Entry::mount(mount)))
+}
+
+#[test]
+fn a_runtime_skip_path_may_not_overlap_where_a_mount_attaches() {
+    for (skip_path, mount_path) in [
+        ("data", "data"),
+        ("logs", "logs/remote"),
+        ("data/tmp", "data"),
+    ] {
+        let session = mounted_at(mount_path);
+
+        let error = session
+            .register_persist_workspace_skip_path(skip_path)
+            .expect_err("overlaps the mount");
+
+        assert_eq!(
+            error.error_code(),
+            ErrorCode::MountConfigInvalid,
+            "{skip_path}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "persist workspace skip path must not overlap mount path"
+        );
+        assert_eq!(
+            error.context().get("mount_path"),
+            Some(&serde_json::json!(mount_path))
+        );
+        assert!(
+            session
+                .resources()
+                .persist_workspace_skip_paths()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn a_runtime_skip_path_beside_a_mount_is_recorded_and_left_out_of_snapshots() {
+    let session = mounted_at("data");
+
+    let registered = session
+        .register_persist_workspace_skip_path("logs/events.jsonl")
+        .expect("does not overlap");
+
+    assert_eq!(registered.as_str(), "logs/events.jsonl");
+    let skipped: Vec<String> = session
+        .persist_workspace_skip_relpaths()
+        .expect("paths")
+        .iter()
+        .map(|path| path.as_str().to_owned())
+        .collect();
+    // Beside what the manifest itself leaves out, which here is the mount under both the name it was
+    // declared at and the path it attaches to.
+    assert_eq!(skipped, ["data", "logs/events.jsonl", "remote"]);
+}
+
+#[test]
+fn a_runtime_skip_path_names_somewhere_inside_the_workspace() {
+    let session = Plain::new();
+
+    for (path, reason) in [
+        ("/tmp/x", "absolute"),
+        ("../x", "escape_root"),
+        ("C:/x", "absolute"),
+    ] {
+        let error = session
+            .register_persist_workspace_skip_path(path)
+            .expect_err("not a workspace-relative path");
+        assert_eq!(error.error_code(), ErrorCode::InvalidManifestPath, "{path}");
+        assert_eq!(
+            error.context().get("reason"),
+            Some(&serde_json::json!(reason)),
+            "{path}"
+        );
+    }
+    // The root itself is not a concrete path: excluding it would exclude everything.
+    for path in ["", "."] {
+        let error = session
+            .register_persist_workspace_skip_path(path)
+            .expect_err("the workspace root");
+        assert_eq!(
+            error.error_code(),
+            ErrorCode::SandboxConfigInvalid,
+            "{path:?}"
+        );
+    }
 }

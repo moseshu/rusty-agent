@@ -201,7 +201,7 @@ impl<'a> SnapshotLifecycle<'a> {
             resume_manifest_digest(state.manifest())?,
         ];
         command.extend(
-            fingerprint_skip_relpaths(state.manifest())?
+            fingerprint_skip_relpaths(self.session)?
                 .iter()
                 .map(|path| path.as_str().to_owned()),
         );
@@ -379,19 +379,26 @@ pub fn resume_manifest_digest(manifest: &Manifest) -> SandboxResult<String> {
     Ok(format!("{:x}", Sha256::digest(rendered.as_bytes())))
 }
 
-/// The workspace-relative paths a fingerprint leaves out.
+/// The workspace-relative paths a fingerprint of `session` leaves out.
 ///
-/// Everything the manifest declared as not worth persisting, plus everything an ephemeral mount
-/// owns. Both are content this workspace does not keep, so hashing them would make the fingerprint
+/// Everything a snapshot of the session leaves out — what the manifest declared as not worth
+/// persisting and what the session registered at runtime — plus everything an ephemeral mount owns.
+/// All of it is content this workspace does not keep, so hashing it would make the fingerprint
 /// answer a question about somebody else's storage.
 ///
 /// # Errors
 ///
 /// Returns the manifest's failure to resolve its own declared paths.
-pub fn fingerprint_skip_relpaths(manifest: &Manifest) -> SandboxResult<BTreeSet<PosixPath>> {
-    let root = PosixPath::new(manifest.root.clone());
-    let mut skip = manifest.ephemeral_persistence_paths()?;
-    skip.extend(mount_skip_relpaths(manifest, &root)?);
+pub fn fingerprint_skip_relpaths(
+    session: &dyn SandboxSession,
+) -> SandboxResult<BTreeSet<PosixPath>> {
+    let state = session.state();
+    let manifest = state.manifest();
+    let mut skip = session.persist_workspace_skip_relpaths()?;
+    skip.extend(mount_skip_relpaths(
+        manifest,
+        &PosixPath::new(manifest.root.clone()),
+    )?);
     Ok(skip)
 }
 

@@ -1,11 +1,13 @@
 //! What every session holds for its caller besides its workspace: the dependency container, the
-//! callbacks to run before it stops, and the lock that keeps two closes from interleaving.
+//! callbacks to run before it stops, the paths it created that no snapshot should keep, and the lock
+//! that keeps two closes from interleaving.
 //!
 //! The reference keeps these as attributes of its base session class, so every backend has them
 //! without writing any of it. A trait has no fields, so a backend embeds one of these and hands it
 //! out from [`SandboxSession::resources`](super::session::SandboxSession::resources); the lifecycle
 //! defaults do the rest.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::future::{BoxFuture, FutureExt};
@@ -13,6 +15,7 @@ use futures::future::{BoxFuture, FutureExt};
 use super::dependencies::Dependencies;
 use super::error::SandboxError;
 use super::session::SandboxResult;
+use super::workspace_paths::PosixPath;
 
 /// A callback run once before the session's workspace is persisted.
 pub type PreStopHook = Arc<dyn Fn() -> BoxFuture<'static, SandboxResult<()>> + Send + Sync>;
@@ -45,6 +48,8 @@ struct HookState {
 pub struct SessionResources {
     dependencies: Mutex<DependencySlot>,
     hooks: Mutex<HookState>,
+    /// Workspace-relative paths this session created at runtime and no snapshot should keep.
+    persist_skip_paths: Mutex<BTreeSet<PosixPath>>,
     /// Held across a whole run of the pre-stop callbacks, as the reference holds its lock.
     hooks_run: tokio::sync::Mutex<()>,
     /// Held across a whole close.
@@ -170,6 +175,21 @@ impl SessionResources {
             }
         };
         dependencies.close().await;
+    }
+
+    /// Records a workspace-relative path that later snapshots leave out.
+    ///
+    /// Takes the path as given: checking that it names somewhere inside the workspace, and nowhere a
+    /// mount owns, needs the manifest, which is the session's to supply. See
+    /// [`SandboxSession::register_persist_workspace_skip_path`](super::session::SandboxSession::register_persist_workspace_skip_path).
+    pub fn add_persist_workspace_skip_path(&self, path: PosixPath) {
+        lock(&self.persist_skip_paths).insert(path);
+    }
+
+    /// The paths recorded by [`Self::add_persist_workspace_skip_path`].
+    #[must_use]
+    pub fn persist_workspace_skip_paths(&self) -> BTreeSet<PosixPath> {
+        lock(&self.persist_skip_paths).clone()
     }
 
     /// Takes the lock a close holds from start to finish, so two closes cannot interleave.

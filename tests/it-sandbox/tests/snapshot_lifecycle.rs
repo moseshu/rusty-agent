@@ -614,14 +614,27 @@ fn what_is_left_out_of_a_hash_is_what_is_left_out_of_the_archive() {
     let manifest = manifest()
         .with_entry("cache.txt", Entry::file("scratch").ephemeral(true))
         .with_entry("mounted", Entry::mount(mount).ephemeral(true));
+    let session = RecordingSession::new(Snapshot::noop(), manifest);
+    // What the session created at runtime and excluded from its archives is excluded from the hash
+    // for the same reason.
+    session
+        .register_persist_workspace_skip_path(".sandbox-rclone-config/session")
+        .expect("outside every mount");
 
-    let skipped: Vec<String> = fingerprint_skip_relpaths(&manifest)
+    let skipped: Vec<String> = fingerprint_skip_relpaths(&session)
         .expect("skip paths")
         .iter()
         .map(|path| path.as_str().to_owned())
         .collect();
 
-    assert_eq!(skipped, vec!["cache.txt".to_owned(), "mounted".to_owned()]);
+    assert_eq!(
+        skipped,
+        vec![
+            ".sandbox-rclone-config/session".to_owned(),
+            "cache.txt".to_owned(),
+            "mounted".to_owned()
+        ]
+    );
 }
 
 #[test]

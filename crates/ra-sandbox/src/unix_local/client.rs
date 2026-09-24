@@ -15,6 +15,7 @@ use ra_core::sandbox::{
 };
 use uuid::Uuid;
 
+use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
 use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
 use super::session::assert_host_path_grants_unsupported;
@@ -36,6 +37,8 @@ pub struct UnixLocalSandboxClient {
     env_values: Arc<dyn EnvValueResolver>,
     concurrency_limits: SandboxConcurrencyLimits,
     snapshot_store: Arc<dyn SnapshotStore>,
+    /// How mounts are attached in every session this client makes, and detached before a delete.
+    mount_lifecycle: Arc<dyn MountLifecycle>,
     /// The bindings every session this client makes starts from, or `None` for none.
     dependencies: Option<Dependencies>,
 }
@@ -71,6 +74,7 @@ impl UnixLocalSandboxClient {
             env_values: Arc::new(UnresolvableEnvValues),
             concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
+            mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             dependencies: None,
         }
     }
@@ -100,6 +104,7 @@ impl UnixLocalSandboxClient {
             env_values: Arc::new(UnresolvableEnvValues),
             concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
+            mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             dependencies: None,
         }
     }
@@ -119,6 +124,16 @@ impl UnixLocalSandboxClient {
     #[must_use]
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = store;
+        self
+    }
+
+    /// Attaches mounts with `lifecycle` in every session this client makes, and detaches them with
+    /// it before a delete.
+    ///
+    /// For a host whose manifests use a mount strategy of its own.
+    #[must_use]
+    pub fn with_mount_lifecycle(mut self, lifecycle: Arc<dyn MountLifecycle>) -> Self {
+        self.mount_lifecycle = lifecycle;
         self
     }
 
@@ -158,7 +173,8 @@ impl UnixLocalSandboxClient {
             Arc::clone(&self.env_values),
         )
         .with_concurrency_limits(self.concurrency_limits)
-        .with_snapshot_store(Arc::clone(&self.snapshot_store));
+        .with_snapshot_store(Arc::clone(&self.snapshot_store))
+        .with_mount_lifecycle(Arc::clone(&self.mount_lifecycle));
         session.set_dependencies(self.resolve_dependencies());
         Box::new(session)
     }
@@ -291,20 +307,38 @@ impl SandboxClient for UnixLocalSandboxClient {
             return Ok(());
         }
 
-        // The reference unmounts the workspace's ephemeral mounts before removing the root, and
-        // leaves the root alone when an unmount fails, because deleting through a live mount would
-        // delete what is on the other side of it. Mount lifecycle is not ported yet, so a manifest
-        // that declares one takes the same branch as a failed unmount.
-        let mounted = state
-            .manifest()
-            .mount_targets()
-            .is_ok_and(|targets| !targets.is_empty());
-        if mounted {
-            tracing::warn!(
-                backend = UNIX_LOCAL_BACKEND_ID,
-                "leaving the workspace root in place: it declares mounts, and unmounting is not \
-                 implemented yet"
-            );
+        // Every ephemeral mount is detached before the root is removed, and the root is left alone
+        // when any of them could not be: deleting through a live mount would delete what is on the
+        // other side of it. A manifest whose mounts cannot even be resolved is treated the same
+        // way, since where they are attached is then unknown.
+        let targets = match state.manifest().ephemeral_mount_targets() {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(
+                    backend = UNIX_LOCAL_BACKEND_ID,
+                    error = %error,
+                    "leaving the workspace root in place: its mounts could not be resolved"
+                );
+                return Ok(());
+            }
+        };
+        let mut unmount_failed = false;
+        for (mount, target) in targets {
+            if let Err(error) = self
+                .mount_lifecycle
+                .unmount(mount, session, &target, std::path::Path::new("/"))
+                .await
+            {
+                unmount_failed = true;
+                tracing::warn!(
+                    backend = UNIX_LOCAL_BACKEND_ID,
+                    mount_path = target.as_str(),
+                    error = %error,
+                    "failed to unmount a workspace mount before deleting the root"
+                );
+            }
+        }
+        if unmount_failed {
             return Ok(());
         }
 

@@ -835,6 +835,16 @@ fn resolve_within_root(
     Ok(PosixPath::new(components.join("/")))
 }
 
+/// Reads a workspace-relative path, refusing one that is absolute or climbs out of the workspace.
+///
+/// The same rules a declared entry path is held to, for paths that arrive from elsewhere — a
+/// session registering something it created at runtime.
+pub(crate) fn validated_relative_path(path: &str) -> Result<PosixPath, SandboxError> {
+    let path = coerce_entry_path(path)?;
+    validate_entry_path(&path)?;
+    Ok(path)
+}
+
 /// Refuses a path that does not name somewhere inside the workspace.
 fn validate_entry_path(path: &PosixPath) -> Result<(), SandboxError> {
     if let Some(windows_path) = windows_absolute_path(path.as_str()) {
