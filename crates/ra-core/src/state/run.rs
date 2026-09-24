@@ -38,12 +38,13 @@ use crate::{
         AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind, ToolApproval,
     },
     permission::{PermissionDecision, PermissionRule},
+    sandbox::{builtin_entry_registry, sanitize_run_state_sandbox_mount_authority},
     state::{ToolFailureTracker, ToolOutputReferenceTracker, ToolUseTracker},
     usage::Usage,
 };
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(4);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(5);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -64,10 +65,16 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
         "Persisted tool-output reference retention facts for context projections across resumes.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(4),
         "Persisted the model-input projection a transfer of control installs. An older runtime \
          reads this checkpoint without it and rebuilds the request from the whole history, which \
          hands the receiving agent the transcript the transfer withheld.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted what resumes each sandbox agent's session. An older runtime carries it as an \
+         unknown field and starts every sandbox agent on a fresh workspace, losing the one the \
+         paused run was working in.",
     ),
 ];
 
@@ -628,6 +635,12 @@ pub struct RunState {
     input_history_is_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_projection: Option<HandoffProjection>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_sandbox_envelope"
+    )]
+    sandbox: Option<serde_json::Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -721,6 +734,8 @@ struct RunStateRecord {
     input_history_is_complete: bool,
     #[serde(default)]
     handoff_projection: Option<HandoffProjection>,
+    #[serde(default)]
+    sandbox: Option<serde_json::Value>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -767,8 +782,15 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            sandbox,
             unknown,
         } = record;
+        // Before anything else reads it: a checkpoint is the one input that arrives from outside
+        // the process, and one written by hand or by an older build may carry mount authority.
+        let sandbox = sandbox
+            .as_ref()
+            .map(sanitize_sandbox_envelope)
+            .transpose()?;
 
         let schema_version = if schema_version <= RUN_STATE_SCHEMA_VERSION {
             RUN_STATE_SCHEMA_VERSION
@@ -853,6 +875,7 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            sandbox,
             unknown,
         })
     }
@@ -897,6 +920,7 @@ impl RunState {
             permission_rules: Vec::new(),
             input_history_is_complete: true,
             handoff_projection: None,
+            sandbox: None,
             unknown: Unknown::new(),
         }
     }
@@ -1097,6 +1121,39 @@ impl RunState {
     pub fn with_nested_runs(mut self, nested_runs: Vec<NestedRunRef>) -> Self {
         self.nested_runs = nested_runs;
         self
+    }
+
+    /// What resumes the sandbox sessions this run's sandbox agents used, if any.
+    ///
+    /// Written by the runtime when a run ends, from each session's state as its client serialized
+    /// it, and read back when the run is continued. Kept as the document the runtime wrote rather
+    /// than a typed value: only the client that wrote a session's state can read it, and this
+    /// checkpoint is read long before any client is known.
+    ///
+    /// **Never carries mount authority.** Every way in — this setter, deserialization — strips it
+    /// (see [`sanitize_run_state_sandbox_mount_authority`]), and serialization strips it again, so
+    /// a checkpoint on disk holds no bucket key whatever a host put here.
+    #[must_use]
+    pub const fn sandbox_resume_state(&self) -> Option<&serde_json::Value> {
+        self.sandbox.as_ref()
+    }
+
+    /// Replaces what resumes this run's sandbox sessions, with mount authority stripped.
+    ///
+    /// `None` forgets it, which is what a run that could not settle its sandboxes records: a state
+    /// describing sessions whose cleanup failed would resume a workspace nobody can vouch for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error, quoting nothing, for an envelope without the documented shape or a
+    /// session state whose manifest cannot be sanitized. The checkpoint is left with no sandbox
+    /// state rather than the one it had, as the reference clears it.
+    pub fn set_sandbox_resume_state(&mut self, sandbox: Option<serde_json::Value>) -> Result<()> {
+        self.sandbox = None;
+        self.sandbox = sandbox
+            .map(|payload| sanitize_sandbox_envelope(&payload))
+            .transpose()?;
+        Ok(())
     }
 
     /// Workspace lease reference held by this run, if any.
@@ -1746,6 +1803,35 @@ fn validate_interruption_resolutions(
         }
     }
     Ok(())
+}
+
+/// Strips mount authority from a checkpoint's sandbox envelope.
+///
+/// Judged against the built-in entry types. A checkpoint is read before any host registry is
+/// known, so a custom entry that looks like a mount is refused here rather than trusted; one that
+/// does not is carried as it is, for the client that reads it to route.
+fn sanitize_sandbox_envelope(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    sanitize_run_state_sandbox_mount_authority(payload, &builtin_entry_registry())
+        .map(|(sanitized, _)| sanitized)
+        .map_err(|error| Error::caller(error.to_string()))
+}
+
+/// Writes the sandbox envelope with mount authority stripped once more.
+///
+/// The field is sanitized on every way in, so this only repeats that; it is here so the one place
+/// a checkpoint leaves the process does not depend on every way in having been found.
+// The signature is serde's: `serialize_with` hands the field by reference.
+#[allow(clippy::ref_option)]
+fn serialize_sandbox_envelope<S: serde::Serializer>(
+    sandbox: &Option<serde_json::Value>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let sanitized = sandbox
+        .as_ref()
+        .map(sanitize_sandbox_envelope)
+        .transpose()
+        .map_err(|error| <S::Error as serde::ser::Error>::custom(error.user_message()))?;
+    sanitized.serialize(serializer)
 }
 
 /// Checks that every named interruption resolves to an interruption record the run generated.

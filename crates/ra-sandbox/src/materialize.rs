@@ -225,6 +225,27 @@ impl ManifestApplier {
         Ok(())
     }
 
+    /// Materializes entries at the absolute paths given, without touching the rest of the manifest.
+    ///
+    /// For a running session a capability changed: only the delta is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_manifest`].
+    pub async fn apply_entry_list(
+        &self,
+        entries: &[(PosixPath, Entry)],
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        let queued = entries
+            .iter()
+            .map(|(dest, entry)| (dest.clone(), entry))
+            .collect();
+        let cleanup = git::CleanupTasks::default();
+        let result = self.apply_entry_batch(queued, &cleanup).await;
+        cleanup.wait().await;
+        result
+    }
+
     /// Joins cancellation cleanup before a batch result leaves the application.
     async fn apply_entries(
         &self,

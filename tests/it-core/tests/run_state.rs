@@ -175,7 +175,12 @@ fn test_run_state_extension_slots_roundtrip() {
         .with_call_id(CallId::new("call-exec"))
         .with_description("approve dangerous action");
 
-    let state = RunState::start(run_id.clone())
+    let sandbox = serde_json::json!({
+        "backend_id": "unix_local",
+        "current_agent_key": "coder",
+        "sessions_by_agent": {},
+    });
+    let mut state = RunState::start(run_id.clone())
         .with_next_host_event_seq(8)
         .with_finish_reason(finish_reason)
         .with_nested_runs(vec![nested_run.clone()])
@@ -184,6 +189,9 @@ fn test_run_state_extension_slots_roundtrip() {
         .with_graph_cursor(cursor.clone())
         .with_usage_totals(usage.clone())
         .with_pending_control_requests(vec![control_req.clone()]);
+    state
+        .set_sandbox_resume_state(Some(sandbox.clone()))
+        .unwrap();
 
     let serialized = serde_json::to_string(&state).expect("state with all slots must serialize");
     let restored: RunState = serde_json::from_str(&serialized).expect("state must deserialize");
@@ -197,6 +205,7 @@ fn test_run_state_extension_slots_roundtrip() {
     assert_eq!(restored.graph_cursor(), Some(&cursor));
     assert_eq!(restored.usage_totals(), &usage);
     assert_eq!(restored.pending_control_requests(), &[control_req]);
+    assert_eq!(restored.sandbox_resume_state(), Some(&sandbox));
 }
 
 fn approval_item(id: &str, call: &str) -> RunItem {

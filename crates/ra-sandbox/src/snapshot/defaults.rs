@@ -225,6 +225,21 @@ pub fn resolve_default_local_snapshot_spec(host: &SnapshotHost) -> SandboxResult
     Ok(SnapshotSpec::Local { base_path })
 }
 
+/// Settles on the managed directory of the machine this process is running on.
+///
+/// What the reference's runner falls back to when a run configuration names no snapshot: a new
+/// session's workspace is persisted here, so a run that is paused and continued finds it again.
+/// This crate's clients answer [`SandboxClient::default_snapshot_spec`] with it.
+///
+/// [`SandboxClient::default_snapshot_spec`]: ra_core::sandbox::SandboxClient::default_snapshot_spec
+///
+/// # Errors
+///
+/// As [`SnapshotHost::current`] and [`resolve_default_local_snapshot_spec`].
+pub fn resolve_current_default_local_snapshot_spec() -> SandboxResult<SnapshotSpec> {
+    resolve_default_local_snapshot_spec(&SnapshotHost::current()?)
+}
+
 /// Creates the managed directory, restricted to this account where the platform can say so.
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]

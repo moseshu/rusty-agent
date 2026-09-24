@@ -471,6 +471,14 @@ impl RunResult {
         }
     }
 
+    /// Records what resumes the run's sandbox sessions, once they have been cleaned up.
+    pub(super) fn set_sandbox_resume_state(
+        &mut self,
+        sandbox: Option<serde_json::Value>,
+    ) -> ra_core::error::Result<()> {
+        self.state.set_sandbox_resume_state(sandbox)
+    }
+
     /// How the run ended.
     #[must_use]
     pub const fn outcome(&self) -> &RunOutcome {

@@ -320,6 +320,17 @@ impl Entry {
         self
     }
 
+    /// Replaces everything declared inside this directory, keeping its own metadata.
+    ///
+    /// Ignored by content that is not a directory, as [`Self::with_child`] is.
+    #[must_use]
+    pub fn with_children(mut self, replacement: BTreeMap<String, Self>) -> Self {
+        if let EntryContent::Dir { children } = &mut self.content {
+            *children = replacement;
+        }
+        self
+    }
+
     /// Records what this entry is for.
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {

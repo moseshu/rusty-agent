@@ -9,7 +9,8 @@
 //! Several agent concerns have dedicated later milestones. Dynamic prompts and output schemas have
 //! their protocol-neutral declarations here; output parsing and validation remain with the
 //! structured-output contract. Handoffs have their own module and are re-exported here, because
-//! they are part of what an agent declares; capabilities wait for their own contract.
+//! they are part of what an agent declares. A sandbox agent is an ordinary declaration carrying a
+//! [`SandboxAgentConfig`]; capabilities installed on it travel there.
 //! Private fields and the non-exhaustive public types let those additions remain source
 //! compatible; placeholder strings would freeze the wrong identities and callback shapes.
 
@@ -24,6 +25,7 @@ use crate::{
     model::ModelSettings,
     output::OutputSchema,
     prompt::{DynamicPromptHandler, ResolvedPrompt},
+    sandbox::SandboxAgentConfig,
     state::NestedRunRef,
     tool::{Tool, ToolOrigin},
 };
@@ -440,6 +442,7 @@ pub struct AgentSpec {
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
+    sandbox: Option<Arc<SandboxAgentConfig>>,
 }
 
 /// Public name for an immutable agent declaration.
@@ -474,6 +477,7 @@ impl AgentSpec {
             input_guardrails: self.input_guardrails.clone(),
             output_guardrails: self.output_guardrails.clone(),
             lifecycle_hooks: self.lifecycle_hooks.clone(),
+            sandbox: self.sandbox.clone(),
         }
     }
 
@@ -579,6 +583,15 @@ impl AgentSpec {
     pub fn lifecycle_hooks(&self) -> &[Arc<dyn LifecycleHook>] {
         &self.lifecycle_hooks
     }
+
+    /// What makes this a sandbox agent, or `None` for an ordinary one.
+    ///
+    /// A sandbox agent runs only under a run configuration that says how to reach a sandbox; the
+    /// runtime refuses one without it rather than running it with no workspace.
+    #[must_use]
+    pub const fn sandbox(&self) -> Option<&Arc<SandboxAgentConfig>> {
+        self.sandbox.as_ref()
+    }
 }
 
 impl fmt::Debug for AgentSpec {
@@ -622,6 +635,7 @@ impl fmt::Debug for AgentSpec {
                     .map(|hook| hook.name())
                     .collect::<Vec<_>>(),
             )
+            .field("sandbox", &self.sandbox)
             .finish_non_exhaustive()
     }
 }
@@ -641,6 +655,7 @@ pub struct AgentSpecBuilder {
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
+    sandbox: Option<Arc<SandboxAgentConfig>>,
 }
 
 impl AgentSpecBuilder {
@@ -659,6 +674,7 @@ impl AgentSpecBuilder {
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
             lifecycle_hooks: Vec::new(),
+            sandbox: None,
         }
     }
 
@@ -843,6 +859,18 @@ impl AgentSpecBuilder {
         self
     }
 
+    /// Makes this a sandbox agent.
+    pub fn sandbox(mut self, config: SandboxAgentConfig) -> Self {
+        self.sandbox = Some(Arc::new(config));
+        self
+    }
+
+    /// Makes this an ordinary agent again.
+    pub fn clear_sandbox(mut self) -> Self {
+        self.sandbox = None;
+        self
+    }
+
     /// Validates the declaration and returns its shared immutable form.
     pub fn build(self) -> Result<Arc<AgentSpec>> {
         let id = self
@@ -928,6 +956,7 @@ impl AgentSpecBuilder {
             input_guardrails: self.input_guardrails,
             output_guardrails: self.output_guardrails,
             lifecycle_hooks: self.lifecycle_hooks,
+            sandbox: self.sandbox,
         }))
     }
 }

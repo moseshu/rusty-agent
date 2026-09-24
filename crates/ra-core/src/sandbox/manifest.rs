@@ -417,6 +417,20 @@ impl Manifest {
         self.credential_exposure = source.credential_exposure.clone();
     }
 
+    /// Adds another manifest's credential exposure acknowledgements to this one's.
+    ///
+    /// How a manifest a capability rebuilt keeps the decisions the application made about the one
+    /// it was handed: a capability that returns a fresh manifest cannot copy a private policy it
+    /// never saw, and dropping the acknowledgement would refuse a mount the host had accepted.
+    pub(crate) fn merge_mount_credential_exposure_policy_from(&mut self, source: &Self) {
+        self.credential_exposure
+            .mount_scoped
+            .extend(source.credential_exposure.mount_scoped.iter().cloned());
+        self.credential_exposure
+            .broad
+            .extend(source.credential_exposure.broad.iter().cloned());
+    }
+
     /// The workspace root, forced absolute.
     fn normalized_root(&self) -> PosixPath {
         let root = PosixPath::coerce(&self.root).normalized();

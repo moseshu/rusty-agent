@@ -251,6 +251,17 @@ impl SandboxSessionState {
         self
     }
 
+    /// Describes the same session with a different manifest.
+    ///
+    /// Every other field — including what still has to be rebound from a trusted manifest — is
+    /// kept: swapping the manifest is not a rebind, and a state that forgot its pending rebind here
+    /// would resume with whatever authority the new manifest happened to carry.
+    #[must_use]
+    pub fn with_manifest(mut self, manifest: Manifest) -> Self {
+        self.manifest = manifest;
+        self
+    }
+
     /// Records that the workspace root was confirmed to exist.
     #[must_use]
     pub const fn with_workspace_root_ready(mut self, ready: bool) -> Self {
