@@ -826,14 +826,14 @@ async fn a_docker_volume_mount_is_already_attached_on_a_backend_that_attaches_vo
 }
 
 #[tokio::test]
-async fn an_in_container_mount_stops_where_its_pattern_would_run_a_command() {
+async fn an_in_container_mount_runs_its_patterns_tool_once_the_boundary_has_passed() {
     let events = Events::default();
     let session = Session::new(Manifest::new(), &events);
     let mount = s3_mount(MountStrategy::in_container(MountPattern::Mountpoint(
         MountpointOptions::default(),
     )));
 
-    let error = BuiltinMountLifecycle
+    BuiltinMountLifecycle
         .apply(
             &mount,
             &session,
@@ -841,11 +841,17 @@ async fn an_in_container_mount_stops_where_its_pattern_would_run_a_command() {
             Path::new("/"),
         )
         .await
-        .expect_err("the pattern's commands are not carried over yet");
+        .expect("mounts");
 
-    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
-    assert_eq!(error.context().get("pattern"), Some(&json!("mountpoint")));
-    assert!(session.untouched());
+    let commands = session.commands.lock().expect("commands").clone();
+    assert_eq!(
+        commands.first().map(|command| command.join(" ")),
+        Some("command -v mount-s3 >/dev/null 2>&1".to_owned())
+    );
+    assert_eq!(
+        commands.last().map(|command| command.join(" ")),
+        Some("sh -lc mount-s3 --no-sign-request --read-only bucket /workspace/data".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -875,14 +881,11 @@ async fn a_strategy_or_mount_type_a_host_registered_has_no_builtin_lifecycle() {
         .teardown_for_snapshot(&custom_type, custom_type.strategy(), &session, &dest)
         .await
         .expect_err("no in-container adapter for it");
-    assert_eq!(
-        error.to_string(),
-        "in-container mounts are not supported for this mount type"
-    );
-    assert_eq!(
-        error.context().get("mount_type"),
-        Some(&json!("host_mount"))
-    );
+    // A mount type this crate cannot read may hide authority, so the refusal leaves the boundary
+    // replaced: still a configuration failure, with nothing of the mount in it.
+    assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
+    assert_eq!(error.to_string(), "sandbox mount configuration is invalid");
+    assert!(error.context().is_empty());
 }
 
 // --- manifest application hands mounts to the lifecycle ----------------------------------------

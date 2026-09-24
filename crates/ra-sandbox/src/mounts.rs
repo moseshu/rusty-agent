@@ -13,24 +13,40 @@
 //! [`BuiltinMountLifecycle`] covers the two strategies the reference ships; a host with a strategy
 //! of its own implements the trait and delegates the rest to the builtin one.
 //!
-//! # What an in-container mount does not do yet
+//! # An in-container mount, end to end
 //!
-//! Running an in-container mount means building the pattern's runtime configuration from the
-//! provider's fields and then running the pattern's commands — `mount-s3`, `rclone`, `blobfuse2`,
-//! `mount.s3files`. Neither half is carried over yet. Until they are, an in-container mount is
-//! refused at the point it would run a command, after the credential boundary has been checked, so
-//! a workspace never comes up with a mount point that is an ordinary empty directory.
+//! The provider's fields are turned into what its pattern runs with ([`config`]), and the pattern
+//! runs its tool inside the sandbox ([`patterns`]). A Docker-volume mount is attached by the
+//! container runtime instead; [`docker_volume_driver_config`] is what that runtime is handed.
+//!
+//! # What a failure may say
+//!
+//! A mount failure can carry what the mount was configured with: a command line, a tool's output, a
+//! credential file's path. Every lifecycle method here, and each pattern, lets a failure out as it
+//! is only when nothing about the call carries mount authority. Otherwise — the mount carries
+//! credentials, the session's manifest does, or the failure was marked redacted where it was raised
+//! — it is replaced as [`ra_core::sandbox::replace_protected_mount_error`] describes: the code, the
+//! operation and the retryability survive, the context and the cause do not.
 
 use std::path::Path;
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    ErrorCode, MaterializedFile, Mount, MountPattern, MountStrategy, OpName, PosixPath,
-    SandboxError, SandboxResult, SandboxSession, validate_mount_activation_credential_boundary,
+    ErrorCode, MaterializedFile, Mount, MountStrategy, OpName, PosixPath, SandboxError,
+    SandboxResult, SandboxSession, manifest_has_configured_mount_authority,
+    mount_has_configured_authority, replace_protected_mount_error,
+    validate_mount_activation_credential_boundary,
 };
 
+pub mod config;
+pub mod patterns;
 mod transition;
 
+pub use config::{
+    DockerVolumeDriverConfig, MountPatternConfig, build_in_container_mount_config,
+    docker_volume_driver_config,
+};
+pub use patterns::{apply_pattern, unapply_pattern};
 pub use transition::{
     ArchiveErrorKind, EphemeralMountRemoval, restore_detached_mounts,
     with_ephemeral_mounts_removed, workspace_archive_error_summary,
@@ -118,9 +134,14 @@ pub trait MountLifecycle: Send + Sync {
         dest: &PosixPath,
         base_dir: &Path,
     ) -> SandboxResult<Vec<MaterializedFile>> {
-        check_activation_boundary(mount, mount.strategy(), session, dest)?;
-        self.activate(mount, mount.strategy(), session, dest, base_dir)
-            .await
+        let result = match check_activation_boundary(mount, mount.strategy(), session, dest) {
+            Ok(()) => {
+                self.activate(mount, mount.strategy(), session, dest, base_dir)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        protect(result, Some(mount), session)
     }
 
     /// Detaches a mount with its declared strategy, for manifest teardown.
@@ -135,8 +156,10 @@ pub trait MountLifecycle: Send + Sync {
         dest: &PosixPath,
         base_dir: &Path,
     ) -> SandboxResult<()> {
-        self.deactivate(mount, mount.strategy(), session, dest, base_dir)
-            .await
+        let result = self
+            .deactivate(mount, mount.strategy(), session, dest, base_dir)
+            .await;
+        protect(result, Some(mount), session)
     }
 }
 
@@ -163,19 +186,24 @@ impl MountLifecycle for BuiltinMountLifecycle {
         dest: &PosixPath,
         _base_dir: &Path,
     ) -> SandboxResult<Vec<MaterializedFile>> {
-        match strategy {
+        let result = match strategy {
             MountStrategy::InContainer { pattern } => {
-                check_activation_boundary(mount, strategy, session, dest)?;
-                let mount_path = in_container_mount_path(mount, session, dest)?;
-                apply_pattern(mount, pattern, session, &mount_path)?;
-                Ok(Vec::new())
+                async {
+                    check_activation_boundary(mount, strategy, session, dest)?;
+                    let mount_path = in_container_mount_path(mount, session, dest)?;
+                    let config =
+                        build_in_container_mount_config(mount, pattern, session, true).await?;
+                    apply_pattern(pattern, session, &mount_path, &config).await?;
+                    Ok(Vec::new())
+                }
+                .await
             }
             MountStrategy::DockerVolume { .. } => {
-                require_volume_mounts(mount, session)?;
-                Ok(Vec::new())
+                require_volume_mounts(mount, session).map(|()| Vec::new())
             }
             _ => Err(unsupported_strategy(mount, strategy)),
-        }
+        };
+        protect(result, Some(mount), session)
     }
 
     async fn deactivate(
@@ -186,14 +214,20 @@ impl MountLifecycle for BuiltinMountLifecycle {
         dest: &PosixPath,
         _base_dir: &Path,
     ) -> SandboxResult<()> {
-        match strategy {
+        let result = match strategy {
             MountStrategy::InContainer { pattern } => {
-                let mount_path = in_container_mount_path(mount, session, dest)?;
-                unapply_pattern(mount, pattern, session, &mount_path)
+                async {
+                    let mount_path = in_container_mount_path(mount, session, dest)?;
+                    let config =
+                        build_in_container_mount_config(mount, pattern, session, false).await?;
+                    unapply_pattern(pattern, session, &mount_path, &config).await
+                }
+                .await
             }
             MountStrategy::DockerVolume { .. } => require_volume_mounts(mount, session),
             _ => Err(unsupported_strategy(mount, strategy)),
-        }
+        };
+        protect(result, Some(mount), session)
     }
 
     async fn teardown_for_snapshot(
@@ -203,14 +237,20 @@ impl MountLifecycle for BuiltinMountLifecycle {
         session: &dyn SandboxSession,
         path: &PosixPath,
     ) -> SandboxResult<()> {
-        match strategy {
+        let result = match strategy {
             MountStrategy::InContainer { pattern } => {
-                require_in_container_support(mount)?;
-                unapply_pattern(mount, pattern, session, path)
+                async {
+                    require_in_container_support(mount)?;
+                    let config =
+                        build_in_container_mount_config(mount, pattern, session, false).await?;
+                    unapply_pattern(pattern, session, path, &config).await
+                }
+                .await
             }
             MountStrategy::DockerVolume { .. } => Ok(()),
             _ => Err(unsupported_strategy(mount, strategy)),
-        }
+        };
+        protect(result, Some(mount), session)
     }
 
     async fn restore_after_snapshot(
@@ -220,23 +260,50 @@ impl MountLifecycle for BuiltinMountLifecycle {
         session: &dyn SandboxSession,
         path: &PosixPath,
     ) -> SandboxResult<()> {
-        match strategy {
+        let result = match strategy {
             MountStrategy::InContainer { pattern } => {
-                let state = session.state();
-                validate_mount_activation_credential_boundary(
-                    mount,
-                    strategy,
-                    Some(state.manifest()),
-                    Some(path.as_str()),
-                    Some(session.backend_id()),
-                )?;
-                require_in_container_support(mount)?;
-                apply_pattern(mount, pattern, session, path)
+                async {
+                    let state = session.state();
+                    validate_mount_activation_credential_boundary(
+                        mount,
+                        strategy,
+                        Some(state.manifest()),
+                        Some(path.as_str()),
+                        Some(session.backend_id()),
+                    )?;
+                    require_in_container_support(mount)?;
+                    let config =
+                        build_in_container_mount_config(mount, pattern, session, true).await?;
+                    apply_pattern(pattern, session, path, &config).await
+                }
+                .await
             }
             MountStrategy::DockerVolume { .. } => Ok(()),
             _ => Err(unsupported_strategy(mount, strategy)),
-        }
+        };
+        protect(result, Some(mount), session)
     }
+}
+
+/// Lets a failure out of a mount boundary, replacing it when the call carried mount authority.
+///
+/// Authority is carried when `mount` has or may hide some, when the session's manifest does, or when
+/// the failure was marked redacted where it was raised.
+pub(crate) fn protect<T>(
+    result: SandboxResult<T>,
+    mount: Option<&Mount>,
+    session: &dyn SandboxSession,
+) -> SandboxResult<T> {
+    result.map_err(|error| {
+        let authority = error.is_data_redacted()
+            || mount.is_some_and(mount_has_configured_authority)
+            || manifest_has_configured_mount_authority(session.state().manifest());
+        if authority {
+            replace_protected_mount_error(&error)
+        } else {
+            error
+        }
+    })
 }
 
 /// Checks the credential boundary for a mount about to be attached at `dest`.
@@ -293,46 +360,6 @@ fn require_volume_mounts(mount: &Mount, session: &dyn SandboxSession) -> Sandbox
     )
     .with_context("mount_type", mount.type_name())
     .with_context("session_type", session.backend_id()))
-}
-
-/// Runs an in-container pattern's attach commands.
-///
-/// Not carried over yet: see the module documentation.
-fn apply_pattern(
-    mount: &Mount,
-    pattern: &MountPattern,
-    _session: &dyn SandboxSession,
-    _path: &PosixPath,
-) -> SandboxResult<()> {
-    Err(pattern_not_carried_over(mount, pattern))
-}
-
-/// Runs an in-container pattern's detach commands.
-///
-/// Not carried over yet: see the module documentation.
-fn unapply_pattern(
-    mount: &Mount,
-    pattern: &MountPattern,
-    _session: &dyn SandboxSession,
-    _path: &PosixPath,
-) -> SandboxResult<()> {
-    Err(pattern_not_carried_over(mount, pattern))
-}
-
-/// The refusal for an in-container pattern whose commands are not carried over yet.
-fn pattern_not_carried_over(mount: &Mount, pattern: &MountPattern) -> SandboxError {
-    SandboxError::new(
-        ErrorCode::SandboxConfigInvalid,
-        OpName::Materialize,
-        format!(
-            "cannot run a `{}` mount with the `{}` pattern: in-container mount patterns are not \
-             implemented yet",
-            mount.type_name(),
-            pattern.as_str()
-        ),
-    )
-    .with_context("mount_type", mount.type_name())
-    .with_context("pattern", pattern.as_str())
 }
 
 /// The refusal for a strategy this crate has no lifecycle for.

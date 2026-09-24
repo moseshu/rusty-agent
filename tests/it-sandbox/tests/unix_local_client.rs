@@ -537,23 +537,17 @@ async fn a_delete_detaches_every_mount_before_it_removes_the_root() {
 #[tokio::test]
 async fn a_delete_leaves_the_root_alone_when_a_mount_could_not_be_detached() {
     // Removing the root through a live mount would remove what is on the other side of it.
-    for lifecycle in [
-        Arc::new(Unmounts {
-            detached: Mutex::new(Vec::new()),
-            fails: true,
-        }) as Arc<dyn MountLifecycle>,
-        // The builtin lifecycle cannot run an in-container pattern's commands yet, so it cannot
-        // detach one either.
-        Arc::new(ra_sandbox::mounts::BuiltinMountLifecycle),
-    ] {
-        let client = UnixLocalSandboxClient::new().with_mount_lifecycle(lifecycle);
-        let (session, root) = owned_with_mount(&client).await;
+    let lifecycle = Arc::new(Unmounts {
+        detached: Mutex::new(Vec::new()),
+        fails: true,
+    });
+    let client = UnixLocalSandboxClient::new().with_mount_lifecycle(lifecycle);
+    let (session, root) = owned_with_mount(&client).await;
 
-        client.delete(session.as_ref()).await.expect("best effort");
+    client.delete(session.as_ref()).await.expect("best effort");
 
-        assert!(root.join("data").is_dir());
-        std::fs::remove_dir_all(&root).expect("clean up");
-    }
+    assert!(root.join("data").is_dir());
+    std::fs::remove_dir_all(&root).expect("clean up");
 }
 
 #[tokio::test]

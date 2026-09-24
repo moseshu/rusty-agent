@@ -1420,6 +1420,7 @@ dependencies = [
  "futures",
  "lzma-rust2",
  "ra-core",
+ "regex",
  "rustix",
  "serde_json",
  "sha2",

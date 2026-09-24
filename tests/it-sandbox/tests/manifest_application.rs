@@ -614,15 +614,17 @@ async fn a_mount_is_refused_after_everything_queued_before_it_has_been_written()
         .with_entry("a.txt", Entry::file("first"))
         .with_entry("b.txt", Entry::file("second"))
         .with_entry("mounted", Entry::mount(mount));
-    let session = Arc::new(RecordingSession::new(manifest.clone()));
+    // The sandbox has no `mount-s3`, so the mount stops at its tool check.
+    let session = Arc::new(
+        RecordingSession::new(manifest.clone()).failing("command -v mount-s3 >/dev/null 2>&1", 1),
+    );
 
     let error = applier(&session)
         .apply_manifest(&manifest, false)
         .await
-        .expect_err("in-container mount patterns are not implemented yet");
+        .expect_err("the mount's tool is missing");
 
-    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
-    assert_eq!(error.context().get("pattern"), Some(&"mountpoint".into()));
+    assert_eq!(error.error_code(), ErrorCode::MountMissingTool);
     // The entries queued before the mount ran first: a mount is applied alone, and what was already
     // in flight is finished rather than abandoned.
     assert_eq!(

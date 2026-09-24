@@ -712,6 +712,41 @@ fn mount_has_or_may_hide_authority(mount: &Mount) -> bool {
     !configured_authority_fields(mount).is_empty()
 }
 
+/// Whether a mount carries authority, or is of a kind that could hide some.
+///
+/// The question a mount lifecycle boundary asks before letting a failure out as it is: a custom
+/// mount or strategy is assumed to, since this crate cannot read its configuration.
+#[must_use]
+pub fn mount_has_configured_authority(mount: &Mount) -> bool {
+    mount_has_or_may_hide_authority(mount)
+}
+
+/// The failure a mount lifecycle boundary lets out in place of one that may carry authority.
+///
+/// Keeps the code, the operation and the retryability, which are what a caller branches on, and
+/// drops the context and the cause, which are where a command line, its output or a credential
+/// file's path would be. The message is kept only when it was marked safe; otherwise it is one of
+/// two fixed sentences. The replacement is itself marked, so a further boundary leaves it alone.
+#[must_use]
+pub fn replace_protected_mount_error(error: &SandboxError) -> SandboxError {
+    let message = if error.error_code() == ErrorCode::MountConfigInvalid {
+        if error.has_safe_redacted_message() {
+            error.message()
+        } else {
+            "sandbox mount configuration is invalid"
+        }
+    } else {
+        "sandbox operation failed while using a protected mount configuration"
+    };
+    let replacement = SandboxError::new(error.error_code(), error.op(), message)
+        .with_retryable(error.retryable());
+    if error.has_safe_redacted_message() {
+        replacement.with_safe_redacted_message()
+    } else {
+        replacement.with_data_redacted()
+    }
+}
+
 /// Whether anything in a manifest carries mount authority, or could.
 ///
 /// Decides whether a failure while handling the manifest may quote it: when this is true, errors
@@ -801,7 +836,12 @@ pub(crate) fn manifest_mount_provenance(manifest: &Manifest) -> Result<(), Prove
 ///
 /// Returns [`ErrorCode::MountConfigInvalid`] naming which of the two it was.
 pub fn validate_manifest_mount_provenance(manifest: &Manifest) -> Result<(), SandboxError> {
-    manifest_mount_provenance(manifest).map_err(Provenance::into_error)
+    manifest_mount_provenance(manifest).map_err(validation_error)
+}
+
+/// A provenance refusal, marked as a validation failure whose message quotes no values.
+fn validation_error(provenance: Provenance) -> SandboxError {
+    provenance.into_error().with_safe_redacted_message()
 }
 
 // --- the boundary --------------------------------------------------------------------------------
@@ -1118,7 +1158,8 @@ pub fn validate_manifest_mount_credential_boundaries(
 ) -> Result<(), SandboxError> {
     validate_manifest_mount_provenance(manifest)?;
     for (mount, mount_path) in manifest.mount_targets()? {
-        mount_boundary_error(manifest, mount, mount_path.as_str(), provider_backend_id)?;
+        mount_boundary_error(manifest, mount, mount_path.as_str(), provider_backend_id)
+            .map_err(SandboxError::with_safe_redacted_message)?;
     }
     Ok(())
 }
@@ -1139,7 +1180,7 @@ pub fn validate_mount_activation_credential_boundary(
     mount_path: Option<&str>,
     provider_backend_id: Option<&str>,
 ) -> Result<(), SandboxError> {
-    mount_provenance(mount, strategy).map_err(Provenance::into_error)?;
+    mount_provenance(mount, strategy).map_err(validation_error)?;
     let activation_mount = mount.clone().with_strategy(strategy.clone());
     let standalone;
     let manifest = if let Some(manifest) = manifest {
@@ -1163,6 +1204,7 @@ pub fn validate_mount_activation_credential_boundary(
         &mount_path,
         provider_backend_id,
     )
+    .map_err(SandboxError::with_safe_redacted_message)
 }
 
 // --- durable state -------------------------------------------------------------------------------
@@ -1828,7 +1870,8 @@ pub fn rebind_manifest_mount_authority(
             "sandbox mount configuration can be rebound only from a current trusted mount \
              configuration with exactly matching credential-free topology",
         )
-        .with_context("sandbox_backend", provider_backend_id));
+        .with_context("sandbox_backend", provider_backend_id)
+        .with_safe_redacted_message());
     }
 
     let trusted_mounts: BTreeMap<String, Entry> = trusted
