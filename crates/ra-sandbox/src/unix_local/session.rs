@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    AsUser, CompressionScheme, EnvValueResolver, ErrorCode, ExecRequest, ExecResult,
-    ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, OpName, SandboxArchiveLimits,
-    SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    SessionResources, SnapshotFingerprint, User, validate_manifest_mount_credential_boundaries,
+    AsUser, CompressionScheme, Entry, EnvValueResolver, ErrorCode, ExecRequest, ExecResult,
+    ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, MaterializedFile, OpName,
+    PosixPath, SandboxArchiveLimits, SandboxConcurrencyLimits, SandboxError, SandboxResult,
+    SandboxSession, SandboxSessionState, SessionResources, SnapshotFingerprint, User,
+    validate_manifest_mount_credential_boundaries,
 };
 
 use crate::archive::WorkspaceArchiveExtractor;
@@ -47,8 +48,6 @@ pub struct UnixLocalSandboxSession {
     host_environment_allowlist: Option<BTreeSet<String>>,
     /// How a manifest's non-literal environment values are fetched.
     env_values: Arc<dyn EnvValueResolver>,
-    /// How much of a manifest application may be in flight at once.
-    concurrency_limits: SandboxConcurrencyLimits,
     /// Where this session's snapshot is read from and written to.
     ///
     /// Held by the session for the same reason the environment policy is: which storage a host
@@ -85,7 +84,6 @@ impl UnixLocalSandboxSession {
             running: Arc::new(AtomicBool::new(false)),
             host_environment_allowlist,
             env_values,
-            concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
             mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             resources: Arc::new(SessionResources::new()),
@@ -113,12 +111,12 @@ impl UnixLocalSandboxSession {
 
     /// Paces manifest application with these limits instead of the defaults.
     ///
-    /// **The reference sets these on a session that already exists**, from the run configuration,
-    /// which has not been carried over yet. Until it has, the client that makes a session is where
-    /// a host says how much work may be in flight.
+    /// The runner sets the run configuration's limits on a session once it exists, as the
+    /// reference's does, and those replace whatever was set here; this is for a host driving a
+    /// session directly.
     #[must_use]
-    pub const fn with_concurrency_limits(mut self, limits: SandboxConcurrencyLimits) -> Self {
-        self.concurrency_limits = limits;
+    pub fn with_concurrency_limits(self, limits: SandboxConcurrencyLimits) -> Self {
+        self.resources.set_concurrency_limits(limits);
         self
     }
 
@@ -131,7 +129,7 @@ impl UnixLocalSandboxSession {
     fn applier(&self) -> SandboxResult<ManifestApplier> {
         Ok(
             ManifestApplier::new(Arc::new(self.clone()), manifest_base_dir()?)
-                .with_limits(self.concurrency_limits)
+                .with_limits(self.resources.concurrency_limits())
                 .with_mount_lifecycle(Arc::clone(&self.mount_lifecycle)),
         )
     }
@@ -634,8 +632,9 @@ impl SandboxSession for UnixLocalSandboxSession {
         scheme: Option<CompressionScheme>,
         limits: Option<SandboxArchiveLimits>,
     ) -> SandboxResult<()> {
+        // A caller that names no limits gets the session's, which the run configuration sets.
         WorkspaceArchiveExtractor::new(self)
-            .extract(path, data, scheme, limits)
+            .extract(path, data, scheme, limits.or_else(|| self.archive_limits()))
             .await
     }
 
@@ -691,6 +690,19 @@ impl SandboxSession for UnixLocalSandboxSession {
         self.applier()?
             .apply_manifest(&manifest, provision_accounts)
             .await
+    }
+
+    fn replace_manifest(&self, manifest: Manifest) -> SandboxResult<()> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = state.clone().with_manifest(manifest);
+        Ok(())
+    }
+
+    async fn apply_manifest_entries(
+        &self,
+        entries: Vec<(PosixPath, Entry)>,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        self.applier()?.apply_entry_list(&entries).await
     }
 
     /// Rebuilds the entries that were deliberately never persisted.

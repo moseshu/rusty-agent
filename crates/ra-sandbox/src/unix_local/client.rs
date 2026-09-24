@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     CreateRequest, DEFAULT_MANIFEST_ROOT, Dependencies, EnvValueResolver, ErrorCode, OpName,
     SandboxClient, SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, UnresolvableEnvValues, resolve_snapshot,
+    SandboxSessionState, SnapshotSpec, UnresolvableEnvValues, resolve_snapshot,
 };
 use uuid::Uuid;
 
@@ -208,6 +208,12 @@ impl UnixLocalSandboxClient {
 impl SandboxClient for UnixLocalSandboxClient {
     fn backend_id(&self) -> &str {
         UNIX_LOCAL_BACKEND_ID
+    }
+
+    /// The directory the reference's runner uses when a run names no snapshot, in this account's
+    /// per-user state directory.
+    fn default_snapshot_spec(&self) -> SandboxResult<SnapshotSpec> {
+        crate::snapshot::defaults::resolve_current_default_local_snapshot_spec()
     }
 
     /// Whether a session can be made with no options supplied.

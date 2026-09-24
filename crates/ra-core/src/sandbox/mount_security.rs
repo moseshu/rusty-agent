@@ -1725,6 +1725,98 @@ pub fn sanitize_raw_session_state_mount_authority(
     sanitize_raw_session_state(payload, &|type_name| entries.is_registered(type_name))
 }
 
+/// Why a checkpoint's sandbox resume state was refused.
+///
+/// Says which of the two checks failed and nothing about the payload, which is where credentials
+/// would be.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidRunStateSandbox {
+    /// The envelope is not an object, or a session state or `sessions_by_agent` entry in it is not
+    /// one.
+    #[error("RunState sandbox resume state has an invalid envelope")]
+    Envelope,
+    /// A session state's manifest has a shape the sanitizer cannot vouch for.
+    #[error("RunState sandbox resume state contains an invalid manifest")]
+    Manifest,
+}
+
+/// Whether a resume envelope has the documented shape: an object whose `session_state`, if
+/// present, is an object, and whose `sessions_by_agent`, if present, maps to objects whose own
+/// `session_state`, if present, is an object.
+fn run_state_sandbox_envelope_is_valid(payload: &Value) -> bool {
+    let Value::Object(envelope) = payload else {
+        return false;
+    };
+    if envelope
+        .get("session_state")
+        .is_some_and(|state| !state.is_object())
+    {
+        return false;
+    }
+    match envelope.get("sessions_by_agent") {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(sessions)) => sessions.values().all(|entry| match entry {
+            Value::Object(entry) => entry.get("session_state").is_none_or(Value::is_object),
+            _ => false,
+        }),
+        Some(_) => false,
+    }
+}
+
+/// Strips mount authority from every session state a run's checkpoint carries.
+///
+/// The reference runs this on a checkpoint's sandbox envelope both when it is written and when it
+/// is read. Each state in it was sanitized by the client that serialized it, but the envelope also
+/// carries entries copied forward from earlier checkpoints for agents that did not run, and
+/// whatever a host put there itself; none of those passed through a client on the way.
+///
+/// Returns the sanitized copy and whether anything was removed. `entries` decides which custom
+/// entry types count as registered, as for [`sanitize_raw_session_state_mount_authority`].
+///
+/// # Errors
+///
+/// Returns [`InvalidRunStateSandbox::Envelope`] for an envelope without the documented shape, and
+/// [`InvalidRunStateSandbox::Manifest`] for a state whose manifest cannot be sanitized.
+pub fn sanitize_run_state_sandbox_mount_authority(
+    payload: &Value,
+    entries: &TypeRegistry,
+) -> Result<(Value, bool), InvalidRunStateSandbox> {
+    if !run_state_sandbox_envelope_is_valid(payload) {
+        return Err(InvalidRunStateSandbox::Envelope);
+    }
+    let registered = |type_name: &str| entries.is_registered(type_name);
+    let sanitize = |state: &Value| {
+        sanitize_raw_session_state(state, &registered).map_err(|_| InvalidRunStateSandbox::Manifest)
+    };
+    let Value::Object(mut envelope) = payload.clone() else {
+        return Err(InvalidRunStateSandbox::Envelope);
+    };
+    let mut redacted = false;
+    if let Some(state) = envelope.get("session_state") {
+        let (state, state_redacted) = sanitize(state)?;
+        envelope.insert("session_state".to_owned(), state);
+        redacted |= state_redacted;
+    }
+    if let Some(Value::Object(sessions)) = envelope.get_mut("sessions_by_agent") {
+        for entry in sessions.values_mut() {
+            let Value::Object(fields) = entry else {
+                return Err(InvalidRunStateSandbox::Envelope);
+            };
+            if let Some(state) = fields.get("session_state") {
+                let (state, state_redacted) = sanitize(state)?;
+                fields.insert("session_state".to_owned(), state);
+                redacted |= state_redacted;
+            } else {
+                let (state, state_redacted) = sanitize(entry)?;
+                *entry = state;
+                redacted |= state_redacted;
+            }
+        }
+    }
+    Ok((Value::Object(envelope), redacted))
+}
+
 /// The types of the custom entries a typed manifest holds.
 ///
 /// A typed manifest only holds a custom entry if the host registered or built it, so for its own

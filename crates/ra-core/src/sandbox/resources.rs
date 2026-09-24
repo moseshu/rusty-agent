@@ -12,8 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::future::{BoxFuture, FutureExt};
 
+use super::archive::SandboxArchiveLimits;
 use super::dependencies::Dependencies;
 use super::error::SandboxError;
+use super::materialization::SandboxConcurrencyLimits;
 use super::session::SandboxResult;
 use super::workspace_paths::PosixPath;
 
@@ -54,6 +56,10 @@ pub struct SessionResources {
     hooks_run: tokio::sync::Mutex<()>,
     /// Held across a whole close.
     close: tokio::sync::Mutex<()>,
+    /// How much manifest application may have in flight at once.
+    concurrency_limits: Mutex<SandboxConcurrencyLimits>,
+    /// What unpacking an archive may cost when a caller names no limits of its own.
+    archive_limits: Mutex<Option<SandboxArchiveLimits>>,
 }
 
 impl std::fmt::Debug for SessionResources {
@@ -195,6 +201,32 @@ impl SessionResources {
     /// Takes the lock a close holds from start to finish, so two closes cannot interleave.
     pub async fn lock_close(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.close.lock().await
+    }
+
+    /// Paces this session's manifest application with `limits`.
+    ///
+    /// A value set after the session exists, as the reference's runner sets it from the run
+    /// configuration once a session has been created or resumed.
+    pub fn set_concurrency_limits(&self, limits: SandboxConcurrencyLimits) {
+        *lock(&self.concurrency_limits) = limits;
+    }
+
+    /// The limits manifest application is paced with.
+    #[must_use]
+    pub fn concurrency_limits(&self) -> SandboxConcurrencyLimits {
+        *lock(&self.concurrency_limits)
+    }
+
+    /// Bounds what unpacking an archive may cost when a caller names no limits; `None` means no
+    /// bounds, which is the reference's default.
+    pub fn set_archive_limits(&self, limits: Option<SandboxArchiveLimits>) {
+        *lock(&self.archive_limits) = limits;
+    }
+
+    /// The archive limits a caller that names none is held to.
+    #[must_use]
+    pub fn archive_limits(&self) -> Option<SandboxArchiveLimits> {
+        *lock(&self.archive_limits)
     }
 }
 

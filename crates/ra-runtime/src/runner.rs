@@ -114,6 +114,7 @@ use crate::{
 };
 
 use crate::budget::budget_reminder;
+use crate::sandbox::{SandboxRunConfig, SandboxRuntime};
 
 /// Default turn cap.
 ///
@@ -154,6 +155,7 @@ pub struct RunConfig {
     pre_approval_tool_input_guardrails: bool,
     user_hooks: UserHooks,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
+    sandbox: Option<SandboxRunConfig>,
 }
 
 impl Default for RunConfig {
@@ -190,7 +192,23 @@ impl RunConfig {
             pre_approval_tool_input_guardrails: false,
             user_hooks: UserHooks::default(),
             lifecycle_hooks: Vec::new(),
+            sandbox: None,
         }
+    }
+
+    /// Configures how this run reaches the sandboxes its sandbox agents run in.
+    ///
+    /// Without one, a sandbox agent is refused when it is about to run rather than run with no
+    /// workspace.
+    pub fn with_sandbox(mut self, sandbox: SandboxRunConfig) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// How this run reaches its sandboxes, if it does.
+    #[must_use]
+    pub const fn sandbox(&self) -> Option<&SandboxRunConfig> {
+        self.sandbox.as_ref()
     }
 
     /// Sets the turn cap. Zero is rejected when the run starts rather than silently meaning
@@ -685,6 +703,7 @@ impl std::fmt::Debug for RunConfig {
                     .collect::<Vec<_>>(),
             )
             .field("permission", &self.permission)
+            .field("sandbox", &self.sandbox)
             .field(
                 "input_guardrails",
                 &self
@@ -897,7 +916,11 @@ impl Runner {
     /// dispatcher its stream starts tools through — and a caller that composes runs should not
     /// have to hold all of it inline on the stack.
     pub async fn run(request: RunRequest) -> Result<RunResult> {
-        Box::pin(run_loop(request, None)).await
+        let sandbox = sandbox_runtime(&request);
+        let mut abandoned = ReleaseSandboxOnDrop(Some(Arc::clone(&sandbox)));
+        let result = Box::pin(run_loop(request, None, sandbox)).await;
+        abandoned.0 = None;
+        result
     }
 
     /// Runs the agent, announcing each turn's records as they are produced.
@@ -910,6 +933,10 @@ impl Runner {
     /// [`DRAIN_GRACE`](ra_core::cancel::DRAIN_GRACE) to reach a terminal state before aborting it,
     /// and that grace period is a timer. Without one the abort backstop is lost; cancellation
     /// itself still reaches the run.
+    ///
+    /// **An aborted run's sandboxes are still released.** The drain grace bounds the run, not the
+    /// cleanup of the sessions it owns: after aborting a run that did not stop in time, the reaper
+    /// waits for that cleanup — or starts it, if the run never got that far.
     #[must_use]
     pub fn run_streamed(mut request: RunRequest) -> RunStream {
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -918,8 +945,11 @@ impl Runner {
         let scope = request.cancel.child(ScopeKind::Run);
         request.cancel = scope.clone();
         let guard = scope.cancel_on_drop(CancelReason::UserInterrupt);
-        let task = tokio::spawn(async move { Box::pin(run_loop(request, Some(sender))).await });
-        RunStream::new(receiver, task, guard)
+        let sandbox = sandbox_runtime(&request);
+        let supervised = sandbox.enabled().then(|| Arc::clone(&sandbox));
+        let task =
+            tokio::spawn(async move { Box::pin(run_loop(request, Some(sender), sandbox)).await });
+        RunStream::new(receiver, task, guard, supervised)
     }
 }
 
@@ -953,6 +983,8 @@ struct TurnLoopContext<'a> {
     event_seqs: &'a EventSeqAllocator,
     /// Capability fragments resolved at assembly and still waiting for the signal that earns them.
     deferred_prompts: &'a [DeferredPrompt],
+    /// Prepares sandbox agents before their turns.
+    sandbox: &'a SandboxRuntime,
 }
 
 /// What the loop produces, whichever way it ends.
@@ -1010,6 +1042,7 @@ impl TurnLoopProgress {
 async fn run_loop(
     request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
+    sandbox: Arc<SandboxRuntime>,
 ) -> Result<RunResult> {
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
@@ -1042,7 +1075,12 @@ async fn run_loop(
         .user_hooks()
         .has_event(HookEventName::Interrupt)
         .then(|| InterruptNotice::new(&request));
-    let result = run_loop_inner(request, events, &agent_span)
+    // Settled after the loop, whichever way it ended: the sessions the run owns are cleaned up on
+    // a failed or cancelled run exactly as on a finished one.
+    let result = run_loop_inner(request, events, &agent_span, &sandbox)
+        .instrument(agent_span.clone())
+        .await;
+    let result = settle_sandbox(&sandbox, result)
         .instrument(agent_span.clone())
         .await;
     if let Some(interrupt) = interrupt
@@ -1116,6 +1154,7 @@ async fn run_loop_inner(
     request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
     span: &tracing::Span,
+    sandbox: &SandboxRuntime,
 ) -> Result<RunResult> {
     let RunRequest {
         mut agent,
@@ -1130,7 +1169,9 @@ async fn run_loop_inner(
         event_seqs,
     } = request;
 
-    if let Err(error) = validate_config(&config) {
+    if let Err(error) =
+        validate_config(&config).and_then(|()| sandbox.assert_agent_supported(agent.public()))
+    {
         // Ahead of the run scope, so there is no cancellation to attribute and no aggregate to
         // report — but the span still has to say the run ended and why.
         ra_core::trace::record_error(span, &error);
@@ -1284,6 +1325,7 @@ async fn run_loop_inner(
         events: events.as_ref(),
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
+        sandbox,
     };
     // The stage runs once per run, on the segment that opens it. A continuation does not repeat
     // the caller's opening input, so a check written against that input has nothing new to look
@@ -1339,6 +1381,16 @@ async fn run_loop_inner(
             lifecycle_dispatch::agent_start(&lifecycle, &starting, &cancel).await?;
         }
         let input_check = run_blocking_input_guardrails(input_check, &mut state, &cancel).await?;
+        // Only when an interrupted turn has answers to settle: an approved call runs on the tools
+        // the prepared agent carries. After the blocking checks either way, so a tripped one stops
+        // the run before a sandbox is created, started or changed. Every other run is prepared at
+        // the top of its first turn, as the reference prepares at the top of each loop.
+        if !state.pending_interruption_resolutions().is_empty() {
+            agent = cancel
+                .run(sandbox.prepare_agent(&agent))
+                .await
+                .and_then(|prepared| prepared)?;
+        }
         resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await?;
         // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn, and
         // the caller composing runs should not hold all of it inline.
@@ -1679,8 +1731,10 @@ async fn execute_approved_call(
             "approval `{item_id}` cannot resume because it has no serialized tool lookup key"
         ))
     })?;
+    // The execution instance's tools, because that is what runs: a capability contributes tools
+    // to it alone, and a call the host approved on one of those must still find it on resume.
     let tool = agent
-        .public()
+        .execution()
         .tools()
         .iter()
         .find(|tool| tool.origin().lookup_key() == key)
@@ -1789,6 +1843,58 @@ fn segment_records(
         progress.segment_items(state).to_vec(),
         progress.segment_responses(state).to_vec(),
     )
+}
+
+/// Releases a run's sandbox sessions when the caller drops [`Runner::run`] before it finished.
+///
+/// A dropped future cannot await its own cleanup, and the reference's `finally` would have: so the
+/// cleanup is handed to a task of its own, which starts it if the run never got that far and
+/// otherwise waits for the one already under way. Disarmed once the run has settled itself.
+struct ReleaseSandboxOnDrop(Option<Arc<SandboxRuntime>>);
+
+impl Drop for ReleaseSandboxOnDrop {
+    fn drop(&mut self) {
+        let Some(sandbox) = self.0.take().filter(|sandbox| sandbox.enabled()) else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move { sandbox.finish_cleanup().await }));
+        }
+    }
+}
+
+/// The sandbox half of one run, built from the request before the loop consumes it.
+fn sandbox_runtime(request: &RunRequest) -> Arc<SandboxRuntime> {
+    Arc::new(SandboxRuntime::new(
+        request.config.sandbox().cloned(),
+        request.state.sandbox_resume_state().cloned(),
+    ))
+}
+
+/// Cleans up the run's sandbox sessions and records what resumes them on the result.
+///
+/// A cleanup failure is logged rather than returned, as on the reference: the run's own outcome is
+/// what the caller asked for, and a finished run is not turned into a failed one because releasing
+/// its sandbox did not go cleanly. The result then carries no resume state, since one describing
+/// sessions whose cleanup failed would resume a workspace nobody can vouch for. A run with no
+/// sandbox configuration keeps whatever resume state it was continued with.
+async fn settle_sandbox(
+    sandbox: &Arc<SandboxRuntime>,
+    result: Result<RunResult>,
+) -> Result<RunResult> {
+    if !sandbox.enabled() {
+        return result;
+    }
+    let cleanup = sandbox.cleanup().await;
+    if let Err(error) = &cleanup {
+        warn!(error = %error, "failed to clean up sandbox resources after run");
+    }
+    result.map(|mut result| {
+        if let Err(error) = result.set_sandbox_resume_state(cleanup.unwrap_or(None)) {
+            warn!(error = %error, "failed to record what resumes the run's sandbox sessions");
+        }
+        result
+    })
 }
 
 /// Records the run-level aggregate without creating a second accounting source.
@@ -2185,6 +2291,12 @@ async fn run_one_turn(
     turn_span: &tracing::Span,
 ) -> Result<Option<RunOutcome>> {
     let config = context.config;
+    // Every turn, as the reference prepares: a transfer of control may have brought a sandbox agent
+    // in, and a session that stopped since the last turn is started again.
+    *agent = turn_scope
+        .run(context.sandbox.prepare_agent(agent))
+        .await
+        .and_then(|prepared| prepared)?;
     // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());

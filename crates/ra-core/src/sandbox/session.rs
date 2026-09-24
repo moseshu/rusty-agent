@@ -35,10 +35,11 @@ use async_trait::async_trait;
 
 use super::archive::{CompressionScheme, SandboxArchiveLimits};
 use super::dependencies::Dependencies;
+use super::entries::Entry;
 use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
 use super::manifest::{Manifest, ManifestRegistries, validated_relative_path};
-use super::materialization::MaterializationResult;
+use super::materialization::{MaterializationResult, MaterializedFile, SandboxConcurrencyLimits};
 use super::mount_security::validate_manifest_mount_credential_boundaries;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
 use super::registry::{DiscriminatedPayload, TypeRegistry};
@@ -225,6 +226,95 @@ pub trait SandboxSession: Send + Sync {
         let mut skip = self.state().manifest().ephemeral_persistence_paths()?;
         skip.extend(self.resources().persist_workspace_skip_paths());
         Ok(skip)
+    }
+
+    // --- what the run configuration sets on a session it did not build --------------------
+
+    /// Paces this session's manifest application with `limits` from now on.
+    ///
+    /// The reference's runner sets this on every session it uses — created, resumed or handed in —
+    /// once the session exists, which is why it is a setter rather than something only a client
+    /// chooses at construction.
+    fn set_concurrency_limits(&self, limits: SandboxConcurrencyLimits) {
+        self.resources().set_concurrency_limits(limits);
+    }
+
+    /// The limits manifest application is paced with.
+    fn concurrency_limits(&self) -> SandboxConcurrencyLimits {
+        self.resources().concurrency_limits()
+    }
+
+    /// Bounds what unpacking an archive may cost when the caller of [`Self::extract`] names no
+    /// limits; `None`, the default, means no bounds.
+    fn set_archive_limits(&self, limits: Option<SandboxArchiveLimits>) {
+        self.resources().set_archive_limits(limits);
+    }
+
+    /// The archive limits a caller that names none is held to.
+    fn archive_limits(&self) -> Option<SandboxArchiveLimits> {
+        self.resources().archive_limits()
+    }
+
+    /// Replaces the manifest this session's state carries, leaving the workspace alone.
+    ///
+    /// The reference assigns a new state to the session; here the state lives behind whatever the
+    /// backend guards it with, so the backend is the one that writes it. What changes is only the
+    /// description: materializing a changed manifest into a running workspace is
+    /// [`Self::apply_manifest_entries`].
+    ///
+    /// # Errors
+    ///
+    /// The default refuses with [`ErrorCode::SandboxConfigInvalid`]: a backend that cannot write
+    /// its own state cannot take a manifest from the run configuration, and pretending it did would
+    /// materialize one manifest while persisting another.
+    fn replace_manifest(&self, manifest: Manifest) -> SandboxResult<()> {
+        let _ = manifest;
+        Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            OpName::Start,
+            "replacing the manifest is not supported by this sandbox session",
+        )
+        .with_context("backend", self.backend_id().to_owned()))
+    }
+
+    /// Materializes entries into a workspace that already exists, each at the absolute path given.
+    ///
+    /// For changes a capability made to a running session it was handed: only what changed is
+    /// written, and relative sources are measured from wherever this session measures its
+    /// manifest's from.
+    ///
+    /// # Errors
+    ///
+    /// The default refuses with [`ErrorCode::SandboxConfigInvalid`]; a backend returns its own
+    /// failure to materialize.
+    async fn apply_manifest_entries(
+        &self,
+        entries: Vec<(PosixPath, Entry)>,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        let _ = entries;
+        Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            OpName::Materialize,
+            "materializing individual manifest entries is not supported by this sandbox session",
+        )
+        .with_context("backend", self.backend_id().to_owned()))
+    }
+
+    /// Checks that `manifest` may be applied to this session.
+    ///
+    /// Runs the mount credential boundary for this session's backend. `session_running` says
+    /// whether the workspace is live, for a backend whose answer depends on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the boundary failure.
+    async fn validate_manifest_application(
+        &self,
+        manifest: &Manifest,
+        session_running: bool,
+    ) -> SandboxResult<()> {
+        let _ = session_running;
+        validate_manifest_mount_credential_boundaries(manifest, Some(self.state().state_type()))
     }
 
     // --- capability probes ----------------------------------------------------------------
@@ -1014,6 +1104,25 @@ pub trait SandboxClient: Send + Sync {
     /// cannot start.
     fn supports_default_options(&self) -> bool {
         false
+    }
+
+    /// Where a fresh session's snapshot goes when the run configuration names none.
+    ///
+    /// The reference's runner falls back to a directory it manages in the user's own account, so a
+    /// run that is paused and continued finds its workspace again, and to a snapshot that stores
+    /// nothing only when that directory cannot be made. Finding and making the directory is
+    /// filesystem work, which neither this crate nor the runtime does; the client, which a host
+    /// builds from a service crate that can, answers instead. The runtime treats a failure here as
+    /// the reference treats a directory it could not make, and stores nothing.
+    ///
+    /// The default stores nothing. A backend whose workspace does not outlive its session should
+    /// override it, or a paused run comes back to an empty workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's failure to settle on a place.
+    fn default_snapshot_spec(&self) -> SandboxResult<SnapshotSpec> {
+        Ok(SnapshotSpec::Noop)
     }
 
     /// Checks that options, if given, were meant for this backend.

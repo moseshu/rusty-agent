@@ -87,6 +87,7 @@ use crate::{
     item::{Compaction, ItemId, ModelInputItem, ModelResponse, RunItem},
     model::{ModelOutputSchema, ModelSettings},
     prompt::{PromptSection, PromptSectionName, PromptSource},
+    sandbox::{Manifest, SandboxResult, SandboxSession, SandboxWorkspaceScope, User},
     state::{AgentToolUse, RunId, ToolUse},
     tool::{Tool, ToolLookupKey},
     usage::Usage,
@@ -310,9 +311,15 @@ impl<'de> Deserialize<'de> for CapabilityFamily {
 ///   object and one capability instance serves many runs. In Rust a capability is shared as an
 ///   `Arc` and never mutated, so [`Self::bind`] returns the bound value instead of writing into
 ///   `self` — and the deep copy exists only to make mutation safe, so it has nothing left to do.
-/// - **There is no `process_manifest`.** A manifest there is a sandbox session's declared mount
-///   set; this framework has no such value yet, and inventing one to fill a method signature would
-///   freeze a shape before the sandbox that owns it exists.
+/// - **Binding to a sandbox is its own step, and one operation rather than three.** The reference
+///   binds a session, a user and a working-directory scope with three setters on the per-run copy.
+///   [`Self::bind_sandbox`] takes all three at once and returns the bound value, for the reason
+///   [`Self::bind`] does. It is separate from [`Self::bind`] because it happens at a different
+///   time: once per agent, when a sandbox agent is prepared, rather than once per run.
+/// - **Sandbox instructions read the manifest from the binding.** The reference passes the
+///   session's manifest to `instructions(manifest)`; here a capability installed on a sandbox agent
+///   receives it in [`SandboxBinding::manifest`] and answers [`Self::instructions`] from the bound
+///   value, so the method keeps one signature on both installation routes.
 #[async_trait]
 pub trait Capability: Send + Sync + 'static {
     /// Which family this capability belongs to.
@@ -451,6 +458,104 @@ pub trait Capability: Send + Sync + 'static {
     fn bind(&self, context: &RunContext) -> Result<Option<Arc<dyn Capability>>> {
         let _ = context;
         Ok(None)
+    }
+
+    /// Changes the manifest a sandbox agent's session is created or resumed with.
+    ///
+    /// Called in installation order, each capability receiving what the one before it returned, on
+    /// a copy the host's own manifest is not affected by. Credential exposure the host acknowledged
+    /// on the manifest it was handed survives into whatever this returns, even a manifest built
+    /// from scratch. The default returns it unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sandbox failure that refuses the manifest. When the manifest carries mount
+    /// authority, the runtime replaces the failure with one that says what failed and nothing
+    /// else, because the message is free to quote what it was handed.
+    fn process_manifest(&self, manifest: Manifest) -> SandboxResult<Manifest> {
+        Ok(manifest)
+    }
+
+    /// Binds this capability to the sandbox session a sandbox agent runs against.
+    ///
+    /// `None` — the default — means the capability does not use the session and the installed
+    /// value serves as it is. `Some` supplies the bound form, which that agent uses in place of the
+    /// installed one for as long as the session lasts.
+    ///
+    /// Called again when only the user commands run as changes, with the same session; a
+    /// capability that captured the user must answer with a value bound to the new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this capability cannot use the session at all.
+    fn bind_sandbox(&self, binding: &SandboxBinding) -> Result<Option<Arc<dyn Capability>>> {
+        let _ = binding;
+        Ok(None)
+    }
+}
+
+/// What a capability installed on a sandbox agent is bound to.
+///
+/// The session is shared rather than owned: the runtime decides when it stops, and a capability
+/// that held it past then would be holding a workspace that is gone.
+#[derive(Clone)]
+pub struct SandboxBinding {
+    session: Arc<dyn SandboxSession>,
+    run_as: Option<User>,
+    workspace_scope: SandboxWorkspaceScope,
+    manifest: Manifest,
+}
+
+impl SandboxBinding {
+    /// Describes one preparation of a sandbox agent.
+    #[must_use]
+    pub fn new(
+        session: Arc<dyn SandboxSession>,
+        run_as: Option<User>,
+        workspace_scope: SandboxWorkspaceScope,
+        manifest: Manifest,
+    ) -> Self {
+        Self {
+            session,
+            run_as,
+            workspace_scope,
+            manifest,
+        }
+    }
+
+    /// The session every tool this capability contributes operates on.
+    #[must_use]
+    pub fn session(&self) -> &Arc<dyn SandboxSession> {
+        &self.session
+    }
+
+    /// Who commands and file operations run as, or `None` for the session's own user.
+    #[must_use]
+    pub const fn run_as(&self) -> Option<&User> {
+        self.run_as.as_ref()
+    }
+
+    /// Where relative paths a model writes are measured from.
+    #[must_use]
+    pub const fn workspace_scope(&self) -> &SandboxWorkspaceScope {
+        &self.workspace_scope
+    }
+
+    /// The session's manifest as it stood when the agent was prepared.
+    #[must_use]
+    pub const fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+}
+
+impl fmt::Debug for SandboxBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxBinding")
+            .field("backend", &self.session.backend_id())
+            .field("run_as", &self.run_as)
+            .field("workspace_scope", &self.workspace_scope)
+            .finish_non_exhaustive()
     }
 }
 

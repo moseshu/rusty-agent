@@ -21,9 +21,12 @@ use ra_core::{
     item::{AgentId, Message, RunItem},
     model::RawResponseEvent,
 };
+use std::sync::Arc;
+
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::result::{RunOutcome, RunResult};
+use crate::sandbox::SandboxRuntime;
 
 /// One thing that happened during a run.
 ///
@@ -82,6 +85,9 @@ pub struct RunStream {
     events: mpsc::UnboundedReceiver<RunStreamEvent>,
     task: Option<JoinHandle<Result<RunResult>>>,
     cancel: Option<CancelOnDrop>,
+    /// The run's sandbox sessions, for the reaper to see released after an abort. `None` for a
+    /// run with no sandbox configuration.
+    sandbox: Option<Arc<SandboxRuntime>>,
 }
 
 impl RunStream {
@@ -89,11 +95,13 @@ impl RunStream {
         events: mpsc::UnboundedReceiver<RunStreamEvent>,
         task: JoinHandle<Result<RunResult>>,
         cancel: CancelOnDrop,
+        sandbox: Option<Arc<SandboxRuntime>>,
     ) -> Self {
         Self {
             events,
             task: Some(task),
             cancel: Some(cancel),
+            sandbox,
         }
     }
 
@@ -158,7 +166,7 @@ impl Drop for RunStream {
         if let Some(cancel) = &self.cancel {
             cancel.scope().cancel(CancelReason::UserInterrupt);
         }
-        reap_cancelled_task(task);
+        reap_cancelled_task(task, self.sandbox.take());
     }
 }
 
@@ -175,7 +183,18 @@ impl Drop for RunStream {
 /// uncooperative run degrades to the plain detach this function exists to prevent. It is the
 /// **backstop** that is lost, not the cancellation: the signal was already sent before this call,
 /// and a run that observes its scope stops at its next checkpoint regardless.
-fn reap_cancelled_task(mut task: JoinHandle<Result<RunResult>>) {
+///
+/// # The grace bounds the run, not its sandboxes
+///
+/// Once the run's task has ended — by itself or by the abort — the reaper waits for the run's
+/// sandbox sessions to be released, with no deadline. That cleanup runs on a task of its own, so
+/// the abort cannot cut it off between stop and delete; the reaper starts it if the run never got
+/// that far. Stopping a session persists its workspace, which can outlast any grace worth giving a
+/// provider call, and a sandbox left half released is one nothing will ever release.
+fn reap_cancelled_task(
+    mut task: JoinHandle<Result<RunResult>>,
+    sandbox: Option<Arc<SandboxRuntime>>,
+) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         // `run_streamed` required a Tokio runtime to create this handle. A stream can nevertheless
         // be moved and dropped after that runtime has gone away; aborting is the only synchronous
@@ -188,6 +207,9 @@ fn reap_cancelled_task(mut task: JoinHandle<Result<RunResult>>) {
         if tokio::time::timeout(DRAIN_GRACE, &mut task).await.is_err() {
             task.abort();
             let _ = task.await;
+        }
+        if let Some(sandbox) = sandbox {
+            sandbox.finish_cleanup().await;
         }
     }));
 }
