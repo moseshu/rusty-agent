@@ -258,3 +258,104 @@ async fn a_long_symlink_chain_cannot_read_or_write_outside_the_workspace() {
         b"original"
     );
 }
+
+/// The message of a refusal, asserted to be a path-policy one.
+fn refused_path(error: Option<ra_core::sandbox::SandboxError>) -> String {
+    let error = error.expect("refused");
+    assert_eq!(
+        error.error_code(),
+        ErrorCode::InvalidManifestPath,
+        "{error}"
+    );
+    error.message().to_owned()
+}
+
+#[tokio::test]
+async fn a_path_that_climbs_out_is_refused_as_escaping_the_root_by_every_operation() {
+    let (_temp, _root, session) = fixture(Vec::new()).await;
+
+    for message in [
+        refused_path(session.read("../secret.txt", None).await.err()),
+        refused_path(
+            session
+                .write("../secret.txt", b"nope".to_vec(), None)
+                .await
+                .err(),
+        ),
+        refused_path(session.ls("../outside", None).await.err()),
+        refused_path(session.mkdir("../outside", true, None).await.err()),
+        refused_path(session.rm("../outside", false, None).await.err()),
+    ] {
+        assert!(message.contains("must not escape root"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_symlink_out_of_the_workspace_is_refused_as_escaping_the_root() {
+    let (_temp, root, session) = fixture(Vec::new()).await;
+    let outside = tempfile::tempdir().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), root.join("link")).expect("link");
+
+    for message in [
+        refused_path(session.mkdir("link/nested", true, None).await.err()),
+        refused_path(session.ls("link", None).await.err()),
+        refused_path(session.rm("link/file.txt", false, None).await.err()),
+    ] {
+        assert!(message.contains("must not escape root"), "{message}");
+    }
+    assert!(!outside.path().join("nested").exists());
+}
+
+#[tokio::test]
+async fn a_writable_grant_outside_the_workspace_can_be_written_and_read_back() {
+    let granted = tempfile::tempdir().expect("granted");
+    let granted_root = std::fs::canonicalize(granted.path()).expect("canonical");
+    let grant = SandboxPathGrant::new(&granted_root.to_string_lossy()).expect("grant");
+    let (_temp, _root, session) = fixture(vec![grant]).await;
+    let result = granted_root
+        .join("result.txt")
+        .to_string_lossy()
+        .into_owned();
+
+    session
+        .write(&result, b"scratch output".to_vec(), None)
+        .await
+        .expect("write");
+
+    assert_eq!(
+        session.read(&result, None).await.expect("read"),
+        b"scratch output"
+    );
+}
+
+#[tokio::test]
+async fn a_write_under_a_read_only_grant_names_the_grant_that_refused_it() {
+    let granted = tempfile::tempdir().expect("granted");
+    let granted_root = std::fs::canonicalize(granted.path()).expect("canonical");
+    let grant = SandboxPathGrant::new(&granted_root.to_string_lossy())
+        .expect("grant")
+        .read_only(true);
+    let (_temp, _root, session) = fixture(vec![grant]).await;
+    let result = granted_root
+        .join("result.txt")
+        .to_string_lossy()
+        .into_owned();
+
+    let error = session
+        .write(&result, b"scratch output".to_vec(), None)
+        .await
+        .expect_err("read-only");
+
+    assert_eq!(
+        error.message(),
+        format!("failed to write archive for path: {result}")
+    );
+    assert_eq!(
+        serde_json::to_value(error.context()).expect("context"),
+        serde_json::json!({
+            "path": result,
+            "reason": "read_only_extra_path_grant",
+            "grant_path": granted_root.to_string_lossy(),
+        })
+    );
+}

@@ -20,7 +20,7 @@ use ra_core::sandbox::{ExecRequest, ExecResult, SandboxError, SandboxPathGrant, 
 use crate::host_paths::resolve_without_strictness;
 use crate::shell;
 
-use super::confine::confined_exec_command;
+use super::confine::HostConfinement;
 
 /// Shapes a caller's request into the argument vector that will be run.
 ///
@@ -66,6 +66,15 @@ pub fn prepare_exec_command(request: &ExecRequest) -> Vec<String> {
         command = elevated;
     }
     command
+}
+
+/// Whether a command's arguments that name something inside the workspace are rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgumentPaths {
+    /// Rewritten relative to the workspace, as every command the reference runs is.
+    WorkspaceRelative,
+    /// Passed exactly as given, for a script that has to be handed an absolute path.
+    AsWritten,
 }
 
 /// Rewrites arguments that point inside the workspace so they are relative to it.
@@ -140,14 +149,21 @@ pub(crate) async fn run(
     cwd: &Path,
     extra_path_grants: &[SandboxPathGrant],
     stdin: Option<Vec<u8>>,
+    argument_paths: ArgumentPaths,
 ) -> Result<ExecResult, SandboxError> {
     let workspace_root = resolve_without_strictness(cwd).map_err(|error| {
         SandboxError::exec_transport(command.to_vec(), Some(&error.to_string()))
             .with_sandbox_cause(error)
     })?;
-    let parts = workspace_relative_command_parts(command, &workspace_root);
+    let parts = match argument_paths {
+        ArgumentPaths::WorkspaceRelative => {
+            workspace_relative_command_parts(command, &workspace_root)
+        }
+        ArgumentPaths::AsWritten => command.to_vec(),
+    };
     let (process_cwd, parts) = shell_workspace_process_context(parts, &workspace_root, cwd);
-    let exec_command = confined_exec_command(parts, &workspace_root, env, extra_path_grants)?;
+    let exec_command =
+        HostConfinement::current().wrap(parts, &workspace_root, env, extra_path_grants)?;
 
     let Some((program, arguments)) = exec_command.split_first() else {
         return Err(SandboxError::exec_transport(

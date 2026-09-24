@@ -284,3 +284,28 @@ async fn reused_extractor_refreshes_listings_after_success_and_failure() {
         b"fn main() {}"
     );
 }
+
+#[tokio::test]
+async fn an_archive_path_outside_the_workspace_is_refused_before_anything_is_written() {
+    let workspace = tempfile::tempdir().expect("temp");
+    let session = UnixLocalSandboxClient::new()
+        .create(CreateRequest::new().with_manifest(manifest_at(workspace.path())))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let error = session
+        .extract("/tmp/bundle.tar", bundle(), None, None)
+        .await
+        .expect_err("an absolute archive path");
+
+    assert_eq!(
+        error.error_code(),
+        ra_core::sandbox::ErrorCode::InvalidManifestPath
+    );
+    assert!(
+        error.message().contains("must be relative"),
+        "{}",
+        error.message()
+    );
+}
