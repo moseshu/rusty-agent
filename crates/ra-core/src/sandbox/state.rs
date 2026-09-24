@@ -368,21 +368,31 @@ impl SandboxSessionState {
     }
 
     /// Renders the state around an already rendered manifest.
+    ///
+    /// Every modelled field is written, the fingerprint pair as `null` when there is none: that is
+    /// the reference's released shape, and a reader that checks it field by field should find the
+    /// same keys whichever implementation wrote the state.
     fn render(&self, manifest: Value) -> Value {
-        let mut payload = self.extra.clone();
-        payload = payload
+        self.extra
+            .clone()
             .with_field("session_id", self.session_id.to_string())
             .with_field("snapshot", Value::from(self.snapshot.clone()))
             .with_field("manifest", manifest)
             .with_field("exposed_ports", Value::from(self.exposed_ports.clone()))
-            .with_field("workspace_root_ready", self.workspace_root_ready);
-        if let Some(fingerprint) = &self.snapshot_fingerprint {
-            payload = payload.with_field("snapshot_fingerprint", fingerprint.clone());
-        }
-        if let Some(version) = &self.snapshot_fingerprint_version {
-            payload = payload.with_field("snapshot_fingerprint_version", version.clone());
-        }
-        payload.to_json()
+            .with_field(
+                "snapshot_fingerprint",
+                self.snapshot_fingerprint
+                    .clone()
+                    .map_or(Value::Null, Value::from),
+            )
+            .with_field(
+                "snapshot_fingerprint_version",
+                self.snapshot_fingerprint_version
+                    .clone()
+                    .map_or(Value::Null, Value::from),
+            )
+            .with_field("workspace_root_ready", self.workspace_root_ready)
+            .to_json()
     }
 
     /// The state as a client writes it: grants with a host source dropped, and their paths.

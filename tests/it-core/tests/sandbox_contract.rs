@@ -111,6 +111,38 @@ fn broadly_scoped_failures_stay_unclassified() {
 }
 
 #[test]
+fn the_named_constructors_carry_the_references_retryability() {
+    // The reference's own tests build these through the named error classes rather than a code,
+    // so the constructors are checked here too: a constructor that set its own answer would
+    // disagree with the code it raises.
+    assert_eq!(
+        SandboxError::workspace_read_not_found("/workspace/missing.txt").retryable(),
+        Some(false)
+    );
+    assert_eq!(
+        SandboxError::workspace_write_type("/workspace/out.txt", "str").retryable(),
+        Some(false)
+    );
+    assert_eq!(
+        SandboxError::exec_timeout(vec!["python".into(), "script.py".into()], Some(1.0))
+            .retryable(),
+        Some(false)
+    );
+    for unknown in [
+        SandboxError::workspace_archive_read("/workspace"),
+        SandboxError::snapshot_persist("snap", "/tmp/snap"),
+        SandboxError::snapshot_restore("snap", "/tmp/snap"),
+    ] {
+        assert_eq!(unknown.retryable(), None, "{unknown}");
+    }
+
+    let stop = SandboxError::workspace_stop("/workspace").with_sandbox_cause(
+        SandboxError::workspace_archive_read("/workspace").with_retryable(Some(false)),
+    );
+    assert_eq!(stop.retryable(), Some(false));
+}
+
+#[test]
 fn a_non_sandbox_cause_does_not_supply_retryability() {
     let error = SandboxError::new(
         ErrorCode::GitCloneError,

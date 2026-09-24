@@ -154,9 +154,10 @@ fn a_fingerprint_and_its_scheme_travel_together_or_not_at_all() {
     // workspace against an old workspace's hash.
     let forgotten = state.without_snapshot_fingerprint();
     assert_eq!(forgotten.snapshot_fingerprint(), None);
+    // Written as `null` rather than left out, which is the reference's released shape.
     let rendered = forgotten.to_json().expect("persistable");
-    assert!(rendered.get("snapshot_fingerprint").is_none());
-    assert!(rendered.get("snapshot_fingerprint_version").is_none());
+    assert_eq!(rendered["snapshot_fingerprint"], Value::Null);
+    assert_eq!(rendered["snapshot_fingerprint_version"], Value::Null);
 }
 
 #[test]

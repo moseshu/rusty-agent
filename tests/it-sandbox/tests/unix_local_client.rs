@@ -13,7 +13,8 @@ use ra_core::sandbox::{
     CreateRequest, Dependencies, DependencyValue, DiscriminatedPayload, Entry, ErrorCode,
     ExecRequest, FactoryOptions, Manifest, ManifestRegistries, Mount, MountPattern, MountProvider,
     MountStrategy, RcloneOptions, S3Mount, SandboxClient, SandboxPathGrant, SandboxSession,
-    ShellInvocation, Snapshot, SnapshotSpec, builtin_snapshot_registry, dependency_factory,
+    ShellInvocation, Snapshot, SnapshotSpec, TypeRegistry, builtin_snapshot_registry,
+    client_options_kind, dependency_factory,
 };
 use ra_sandbox::snapshot::{
     RemoteSnapshotClient, RemoteSnapshotError, remote_snapshot_client_dependency,
@@ -495,4 +496,111 @@ async fn a_state_read_back_from_storage_resumes_only_once_its_mount_authority_is
         .expect("rebind");
     let resumed = client.resume(rebound).await.expect("resume");
     assert_eq!(resumed.state().manifest(), &trusted);
+}
+
+// --- wire shapes ---------------------------------------------------------------------------
+//
+// The unix-local rows of the reference's `test_client_options.py` and
+// `test_compatibility_guards.py`: what this backend's options and states look like on the wire.
+
+#[test]
+fn this_backends_options_are_routed_by_their_registered_type() {
+    let mut registry = TypeRegistry::new(client_options_kind());
+    UnixLocalSandboxClientOptions::register(&mut registry).expect("register");
+
+    let payload = registry
+        .parse(&serde_json::json!({"type": "unix_local", "exposed_ports": [8080]}))
+        .expect("parse");
+
+    assert_eq!(
+        UnixLocalSandboxClientOptions::from_payload(&payload).expect("options"),
+        UnixLocalSandboxClientOptions::new()
+            .with_exposed_ports([8080])
+            .expect("ports")
+    );
+}
+
+#[test]
+fn this_backends_options_round_trip_with_their_one_field() {
+    let mut registry = TypeRegistry::new(client_options_kind());
+    UnixLocalSandboxClientOptions::register(&mut registry).expect("register");
+    let options = UnixLocalSandboxClientOptions::new()
+        .with_exposed_ports([8080])
+        .expect("ports");
+
+    let rendered = options.to_payload().to_json();
+    let restored =
+        UnixLocalSandboxClientOptions::from_payload(&registry.parse(&rendered).expect("parse"))
+            .expect("options");
+
+    assert_eq!(UNIX_LOCAL_BACKEND_ID, "unix_local");
+    assert_eq!(
+        rendered,
+        serde_json::json!({"type": "unix_local", "exposed_ports": [8080]})
+    );
+    assert_eq!(restored, options);
+    assert_eq!(restored.to_payload().to_json(), rendered);
+}
+
+#[test]
+fn another_owner_cannot_take_this_backends_options_type() {
+    let mut registry = TypeRegistry::new(client_options_kind());
+    registry
+        .register(UNIX_LOCAL_BACKEND_ID, "ImpostorSandboxClientOptions")
+        .expect("register");
+
+    let error = UnixLocalSandboxClientOptions::register(&mut registry).expect_err("refuse");
+
+    assert!(error.to_string().contains("already registered"), "{error}");
+}
+
+#[tokio::test]
+async fn this_backends_state_renders_its_fields_and_round_trips() {
+    let root = tempfile::tempdir().expect("temp");
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(CreateRequest::new().with_manifest(manifest_at(root.path())))
+        .await
+        .expect("create");
+
+    let payload = client
+        .serialize_session_state(&session.state())
+        .expect("serialize");
+    let mut keys: Vec<&str> = payload
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "exposed_ports",
+            "manifest",
+            "session_id",
+            "snapshot",
+            "snapshot_fingerprint",
+            "snapshot_fingerprint_version",
+            "type",
+            "workspace_root_owned",
+            "workspace_root_ready",
+        ]
+    );
+    assert_eq!(payload["type"], serde_json::json!(UNIX_LOCAL_BACKEND_ID));
+
+    let restored = client
+        .deserialize_session_state(
+            payload.clone(),
+            &builtin_snapshot_registry(),
+            &ManifestRegistries::builtin(),
+        )
+        .expect("deserialize");
+    assert_eq!(restored, session.state());
+    assert_eq!(
+        client
+            .serialize_session_state(&restored)
+            .expect("serialize"),
+        payload
+    );
 }
