@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ra_core::sandbox::{
     CreateRequest, Dependencies, DependencyValue, DiscriminatedPayload, Entry, ErrorCode,
-    ExecRequest, FactoryOptions, Manifest, ManifestRegistries, Mount, MountPattern, MountProvider,
-    MountStrategy, RcloneOptions, S3Mount, SandboxClient, SandboxPathGrant, SandboxSession,
-    ShellInvocation, Snapshot, SnapshotSpec, TypeRegistry, builtin_snapshot_registry,
-    client_options_kind, dependency_factory,
+    ExecRequest, FactoryOptions, Manifest, ManifestRegistries, MaterializedFile, Mount,
+    MountPattern, MountProvider, MountStrategy, PosixPath, RcloneOptions, S3Mount, SandboxClient,
+    SandboxPathGrant, SandboxResult, SandboxSession, ShellInvocation, Snapshot, SnapshotSpec,
+    TypeRegistry, builtin_snapshot_registry, client_options_kind, dependency_factory,
 };
+use ra_sandbox::mounts::MountLifecycle;
 use ra_sandbox::snapshot::{
     RemoteSnapshotClient, RemoteSnapshotError, remote_snapshot_client_dependency,
 };
@@ -429,6 +430,130 @@ fn acknowledged_in_container_keys(root: &std::path::Path) -> Manifest {
         )
         .with_in_container_mount_credential_exposure_acknowledged(&["data"])
         .expect("acknowledged")
+}
+
+/// Detaches mounts by recording where, and fails when told to.
+struct Unmounts {
+    detached: Mutex<Vec<String>>,
+    fails: bool,
+}
+
+#[async_trait]
+impl MountLifecycle for Unmounts {
+    async fn activate(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _dest: &PosixPath,
+        _base_dir: &std::path::Path,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        Ok(Vec::new())
+    }
+
+    async fn deactivate(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        dest: &PosixPath,
+        _base_dir: &std::path::Path,
+    ) -> SandboxResult<()> {
+        self.detached
+            .lock()
+            .expect("detached")
+            .push(dest.as_str().to_owned());
+        if self.fails {
+            return Err(ra_core::sandbox::SandboxError::mount_config(
+                "still attached",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn teardown_for_snapshot(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _path: &PosixPath,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+
+    async fn restore_after_snapshot(
+        &self,
+        _mount: &Mount,
+        _strategy: &MountStrategy,
+        _session: &dyn SandboxSession,
+        _path: &PosixPath,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+}
+
+/// An owned workspace whose manifest mounts a bucket at `data`, created on disk.
+async fn owned_with_mount(
+    client: &UnixLocalSandboxClient,
+) -> (Box<dyn SandboxSession>, std::path::PathBuf) {
+    let mount = Mount::new(
+        MountProvider::S3(S3Mount {
+            bucket: "bucket".to_owned(),
+            ..S3Mount::default()
+        }),
+        MountStrategy::in_container(MountPattern::Rclone(RcloneOptions::default())),
+    )
+    .expect("supported");
+    let session = client
+        .create(
+            CreateRequest::new()
+                .with_manifest(Manifest::new().with_entry("data", Entry::mount(mount))),
+        )
+        .await
+        .expect("create");
+    let root = std::path::PathBuf::from(&session.state().manifest().root);
+    std::fs::create_dir_all(root.join("data")).expect("mount point");
+    (session, root)
+}
+
+#[tokio::test]
+async fn a_delete_detaches_every_mount_before_it_removes_the_root() {
+    let lifecycle = Arc::new(Unmounts {
+        detached: Mutex::new(Vec::new()),
+        fails: false,
+    });
+    let client = UnixLocalSandboxClient::new().with_mount_lifecycle(Arc::clone(&lifecycle) as _);
+    let (session, root) = owned_with_mount(&client).await;
+
+    client.delete(session.as_ref()).await.expect("delete");
+
+    assert_eq!(
+        *lifecycle.detached.lock().expect("detached"),
+        [format!("{}/data", root.to_string_lossy())]
+    );
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn a_delete_leaves_the_root_alone_when_a_mount_could_not_be_detached() {
+    // Removing the root through a live mount would remove what is on the other side of it.
+    for lifecycle in [
+        Arc::new(Unmounts {
+            detached: Mutex::new(Vec::new()),
+            fails: true,
+        }) as Arc<dyn MountLifecycle>,
+        // The builtin lifecycle cannot run an in-container pattern's commands yet, so it cannot
+        // detach one either.
+        Arc::new(ra_sandbox::mounts::BuiltinMountLifecycle),
+    ] {
+        let client = UnixLocalSandboxClient::new().with_mount_lifecycle(lifecycle);
+        let (session, root) = owned_with_mount(&client).await;
+
+        client.delete(session.as_ref()).await.expect("best effort");
+
+        assert!(root.join("data").is_dir());
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
 }
 
 #[tokio::test]

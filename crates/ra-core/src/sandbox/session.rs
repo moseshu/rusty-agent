@@ -28,6 +28,7 @@
 //! pre-stop callbacks, the close lock — a backend embeds as one [`SessionResources`] and hands out
 //! from [`SandboxSession::resources`].
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,7 +37,7 @@ use super::archive::{CompressionScheme, SandboxArchiveLimits};
 use super::dependencies::Dependencies;
 use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
-use super::manifest::{Manifest, ManifestRegistries};
+use super::manifest::{Manifest, ManifestRegistries, validated_relative_path};
 use super::materialization::MaterializationResult;
 use super::mount_security::validate_manifest_mount_credential_boundaries;
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
@@ -47,6 +48,7 @@ use super::state::{
     InvalidSessionStatePayload, REDACTED_HOST_PATH_GRANT_PATHS_KEY, SandboxSessionState,
 };
 use super::types::{ExecResult, ExposedPortEndpoint, User};
+use super::workspace_paths::PosixPath;
 
 /// What a sandbox operation returns when it can fail.
 pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
@@ -161,6 +163,68 @@ pub trait SandboxSession: Send + Sync {
     /// Registers a callback to run once before the workspace is persisted.
     fn register_pre_stop_hook(&self, hook: PreStopHook) {
         self.resources().register_pre_stop_hook(hook);
+    }
+
+    // --- what a snapshot leaves out -------------------------------------------------------
+
+    /// Excludes a path this session created at runtime from every later workspace snapshot.
+    ///
+    /// For side effects that are not workspace state — generated mount configuration, a sink's
+    /// output. The path is workspace-relative and returned as it was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidManifestPath`] for a path that is absolute or climbs out of the
+    /// workspace, [`ErrorCode::SandboxConfigInvalid`] for one that names the workspace root itself,
+    /// and [`ErrorCode::MountConfigInvalid`] for one that overlaps where a mount attaches: excluding
+    /// a mount's path, or a directory containing one, would change what the mount's own exclusion
+    /// already decides.
+    fn register_persist_workspace_skip_path(&self, path: &str) -> SandboxResult<PosixPath> {
+        let relative = validated_relative_path(path)?;
+        if relative.parts().is_empty() {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                OpName::PersistWorkspace,
+                "Persist workspace skip paths must target a concrete relative path.",
+            ));
+        }
+        let state = self.state();
+        let manifest = state.manifest();
+        let root = PosixPath::coerce(&manifest.root);
+        // The shallowest overlapping mount is the one reported, alphabetically among equals, so the
+        // refusal names the same mount however the manifest happens to be ordered.
+        let overlapping = manifest
+            .mount_targets()?
+            .into_iter()
+            .filter_map(|(_, target)| target.relative_to(&root))
+            .filter(|mount| relative.is_under(mount) || mount.is_under(&relative))
+            .min_by(|left, right| {
+                (left.parts().len(), left.as_str()).cmp(&(right.parts().len(), right.as_str()))
+            });
+        if let Some(mount) = overlapping {
+            return Err(SandboxError::mount_config(
+                "persist workspace skip path must not overlap mount path",
+            )
+            .with_context("skip_path", relative.as_str())
+            .with_context("mount_path", mount.as_str()));
+        }
+        self.resources()
+            .add_persist_workspace_skip_path(relative.clone());
+        Ok(relative)
+    }
+
+    /// Every workspace-relative path a snapshot of this session leaves out.
+    ///
+    /// What the manifest declared as not worth keeping, plus what was registered at runtime through
+    /// [`Self::register_persist_workspace_skip_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the manifest's failure to resolve its own declared paths.
+    fn persist_workspace_skip_relpaths(&self) -> SandboxResult<BTreeSet<PosixPath>> {
+        let mut skip = self.state().manifest().ephemeral_persistence_paths()?;
+        skip.extend(self.resources().persist_workspace_skip_paths());
+        Ok(skip)
     }
 
     // --- capability probes ----------------------------------------------------------------
@@ -795,6 +859,19 @@ pub trait SandboxSession: Send + Sync {
         self.before_shutdown().await?;
         self.shutdown_backend().await?;
         self.after_shutdown().await
+    }
+
+    /// Makes the session unusable after a mount was detached or reattached with an unknown outcome.
+    ///
+    /// A mount that may or may not still be attached leaves a workspace nobody can describe: a
+    /// snapshot might record somebody else's storage, and a delete might reach through to it. The
+    /// default shuts the session down; a backend with a cheaper way to fence it off may override.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure to shut down.
+    async fn terminate_ambiguous_mount_transition(&self) -> SandboxResult<()> {
+        self.shutdown().await
     }
 
     /// Closes a session the caller holds directly.

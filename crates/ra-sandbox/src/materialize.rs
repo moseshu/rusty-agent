@@ -18,7 +18,8 @@
 //!
 //! Entries are materialized concurrently up to a limit, with two exceptions that are ordering
 //! decisions rather than optimisations. A mount attaches somebody else's storage at a path, so it
-//! is applied alone, with everything queued before it flushed first. And two entries whose paths
+//! is applied alone, with everything queued before it flushed first. What attaching one involves is
+//! the [`MountLifecycle`]'s business; the applier only decides when. And two entries whose paths
 //! overlap — a directory and something inside it — are applied in the order the manifest declared
 //! them, because otherwise the one that creates the parent can lose a race with the one that fills
 //! it.
@@ -51,6 +52,8 @@ use gather::gather_in_order;
 use git::GitCheckout;
 use local::LocalSource;
 
+use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
+
 /// Where a relative `src` in a manifest is measured from.
 ///
 /// The directory the SDK process is running in, which is the reference's answer and the only one
@@ -76,6 +79,7 @@ pub struct ManifestApplier {
     session: Arc<dyn SandboxSession>,
     base_dir: PathBuf,
     limits: SandboxConcurrencyLimits,
+    mounts: Arc<dyn MountLifecycle>,
 }
 
 impl std::fmt::Debug for ManifestApplier {
@@ -85,7 +89,7 @@ impl std::fmt::Debug for ManifestApplier {
             .field("backend", &self.session.backend_id())
             .field("base_dir", &self.base_dir)
             .field("limits", &self.limits)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -101,6 +105,7 @@ impl ManifestApplier {
             session,
             base_dir,
             limits: SandboxConcurrencyLimits::default(),
+            mounts: Arc::new(BuiltinMountLifecycle),
         }
     }
 
@@ -108,6 +113,15 @@ impl ManifestApplier {
     #[must_use]
     pub const fn with_limits(mut self, limits: SandboxConcurrencyLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Attaches mounts with `mounts` instead of [`BuiltinMountLifecycle`].
+    ///
+    /// For a host whose manifests use a mount strategy of its own.
+    #[must_use]
+    pub fn with_mount_lifecycle(mut self, mounts: Arc<dyn MountLifecycle>) -> Self {
+        self.mounts = mounts;
         self
     }
 
@@ -320,15 +334,13 @@ impl ManifestApplier {
                     .await?;
                     Vec::new()
                 }
-                // Attaching storage is a lifecycle of its own — it has to be detached before a
-                // snapshot and reattached after one — and none of it is carried over yet. Refusing
-                // here rather than returning an empty receipt is what keeps a workspace from coming
-                // up with a mount point that is an ordinary empty directory.
+                // No ownership or mode is applied afterwards, as the reference applies none: a
+                // mount's permissions are the provider's, and fixed at the entry default.
                 EntryContent::Mount(mount) => {
-                    return Err(unsupported_entry(
-                        mount.type_name(),
-                        "mount lifecycle is not implemented yet",
-                    ));
+                    return self
+                        .mounts
+                        .apply(mount, self.session.as_ref(), &dest, &self.base_dir)
+                        .await;
                 }
                 // A host registered the type, so the manifest parses; putting it in a workspace
                 // would take the code that came with it, which does not reach this crate.

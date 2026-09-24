@@ -234,6 +234,24 @@ impl ErrorCode {
             | Self::SnapshotRestoreError => None,
         }
     }
+
+    /// Whether this is a failure to move bytes into or out of the workspace.
+    ///
+    /// The reference's `WorkspaceIOError` family, which sits inside the runtime category rather than
+    /// beside it: a stop or start failure is a runtime failure too, but not one of these. Callers
+    /// that record what an operation failed with distinguish the two.
+    #[must_use]
+    pub const fn is_workspace_io(self) -> bool {
+        matches!(
+            self,
+            Self::ApplyPatchFileNotFound
+                | Self::ApplyPatchDecodeError
+                | Self::WorkspaceReadNotFound
+                | Self::WorkspaceArchiveReadError
+                | Self::WorkspaceArchiveWriteError
+                | Self::WorkspaceWriteTypeError
+        )
+    }
 }
 
 impl fmt::Display for ErrorCode {

@@ -21,6 +21,7 @@ use crate::archive::WorkspaceArchiveExtractor;
 use crate::host_paths::HostWorkspacePaths;
 use crate::listing::parse_ls_la;
 use crate::materialize::{ManifestApplier, manifest_base_dir};
+use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
 use crate::snapshot::lifecycle::SnapshotLifecycle;
 use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
@@ -53,6 +54,8 @@ pub struct UnixLocalSandboxSession {
     /// wired up is the host's decision, and a state that travelled from elsewhere must not be able
     /// to point this session at something else.
     snapshot_store: Arc<dyn SnapshotStore>,
+    /// How the manifest's mounts are attached.
+    mount_lifecycle: Arc<dyn MountLifecycle>,
     /// The dependency container, pre-stop callbacks and close lock every session holds. Shared by
     /// clones, as the state is: a clone is the same session.
     resources: Arc<SessionResources>,
@@ -83,6 +86,7 @@ impl UnixLocalSandboxSession {
             env_values,
             concurrency_limits: SandboxConcurrencyLimits::default(),
             snapshot_store: Arc::new(BuiltinSnapshotStore),
+            mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             resources: Arc::new(SessionResources::new()),
         }
     }
@@ -91,6 +95,13 @@ impl UnixLocalSandboxSession {
     #[must_use]
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = store;
+        self
+    }
+
+    /// Attaches the manifest's mounts with `lifecycle` instead of the built-in one.
+    #[must_use]
+    pub fn with_mount_lifecycle(mut self, lifecycle: Arc<dyn MountLifecycle>) -> Self {
+        self.mount_lifecycle = lifecycle;
         self
     }
 
@@ -119,7 +130,8 @@ impl UnixLocalSandboxSession {
     fn applier(&self) -> SandboxResult<ManifestApplier> {
         Ok(
             ManifestApplier::new(Arc::new(self.clone()), manifest_base_dir()?)
-                .with_limits(self.concurrency_limits),
+                .with_limits(self.concurrency_limits)
+                .with_mount_lifecycle(Arc::clone(&self.mount_lifecycle)),
         )
     }
 
@@ -512,8 +524,11 @@ impl SandboxSession for UnixLocalSandboxSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
-        let manifest = self.manifest();
-        archive::persist(Path::new(&manifest.root), &manifest)
+        let root = self.manifest().root;
+        let skip = self.persist_workspace_skip_relpaths().map_err(|error| {
+            SandboxError::workspace_archive_read(&root).with_sandbox_cause(error)
+        })?;
+        archive::persist(Path::new(&root), &skip)
     }
 
     async fn hydrate_workspace(&self, data: Vec<u8>) -> SandboxResult<()> {
