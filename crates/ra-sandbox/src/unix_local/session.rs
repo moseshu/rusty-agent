@@ -25,6 +25,7 @@ use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
 use crate::snapshot::lifecycle::SnapshotLifecycle;
 use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
+use super::exec::ArgumentPaths;
 use super::{UNIX_LOCAL_BACKEND_ID, archive, exec, files};
 
 /// A local workspace, and the commands run against it.
@@ -242,10 +243,20 @@ impl UnixLocalSandboxSession {
         command: &[String],
         timeout_s: Option<f64>,
         stdin: Option<Vec<u8>>,
+        argument_paths: ArgumentPaths,
     ) -> SandboxResult<ExecResult> {
         let (env, cwd) = self.exec_context().await?;
         let grants = self.manifest().extra_path_grants;
-        exec::run(command, timeout_s, &env, &cwd, &grants, stdin).await
+        exec::run(
+            command,
+            timeout_s,
+            &env,
+            &cwd,
+            &grants,
+            stdin,
+            argument_paths,
+        )
+        .await
     }
 
     /// Asks, as another account, whether an operation would be permitted.
@@ -269,6 +280,81 @@ impl UnixLocalSandboxSession {
             .with_shell(ra_core::sandbox::ShellInvocation::None)
             .as_user(user.clone());
         self.exec(request).await
+    }
+
+    /// Explains a read the other account was refused: missing, or not readable.
+    ///
+    /// Only an exit of 1 from the access check is a "no"; anything else — `sudo` refusing, a shell
+    /// that could not start — is a failure to ask, reported as a read failure without probing. After
+    /// a "no", the existence probe runs as the same account and decides which of the two it was.
+    ///
+    /// **The probe is handed its path as written, where the reference's is not.** The reference
+    /// runs it through the same exec as every command, which on this backend rewrites an absolute
+    /// path inside the workspace into a relative one — and the probe resolves a relative path as
+    /// though it began at `/`. Run against the reference itself, a file that exists but cannot be
+    /// read is reported as missing. The probe was written for backends that pass arguments through;
+    /// passing this one through is what makes its answer mean what it says.
+    async fn refused_read(
+        &self,
+        path: &str,
+        path_arg: &str,
+        result: &ExecResult,
+        user: User,
+    ) -> SandboxError {
+        let context = |error: SandboxError| {
+            error
+                .with_context(
+                    "command",
+                    vec![
+                        "sh".to_owned(),
+                        "-lc".to_owned(),
+                        "<read_access_check>".to_owned(),
+                        path_arg.to_owned(),
+                    ],
+                )
+                .with_context("stdout_bytes", result.stdout.len())
+                .with_context("stderr", files::diagnostic_text(&result.stderr))
+        };
+        if result.exit_code != 1 {
+            return context(SandboxError::workspace_archive_read(path));
+        }
+
+        let probe = ExecRequest::new([
+            "sh".to_owned(),
+            "-c".to_owned(),
+            files::READ_PATH_PROBE_SCRIPT.to_owned(),
+            "sh".to_owned(),
+            path_arg.to_owned(),
+        ])
+        .with_shell(ra_core::sandbox::ShellInvocation::None)
+        .as_user(user);
+        let probe = match self
+            .run_prepared(
+                &exec::prepare_exec_command(&probe),
+                Some(files::READ_PATH_PROBE_TIMEOUT_S),
+                None,
+                ArgumentPaths::AsWritten,
+            )
+            .await
+        {
+            Ok(probe) => probe,
+            Err(error) => {
+                return context(SandboxError::workspace_archive_read(path))
+                    .with_sandbox_cause(error);
+            }
+        };
+        let error = if probe.exit_code == 1 {
+            SandboxError::workspace_read_not_found(path)
+        } else {
+            SandboxError::workspace_archive_read(path)
+        };
+        context(error)
+            .with_context("existence_probe_exit_code", probe.exit_code)
+            .with_context("existence_probe_stdout_bytes", probe.stdout.len())
+            .with_context(
+                "existence_probe_stderr",
+                files::diagnostic_text(&probe.stderr),
+            )
     }
 
     /// Refuses an operation the other account would not have been allowed to perform.
@@ -366,7 +452,13 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
         let command = exec::prepare_exec_command(&request);
-        self.run_prepared(&command, request.timeout_s, None).await
+        self.run_prepared(
+            &command,
+            request.timeout_s,
+            None,
+            ArgumentPaths::WorkspaceRelative,
+        )
+        .await
     }
 
     async fn running(&self) -> SandboxResult<bool> {
@@ -459,28 +551,16 @@ impl SandboxSession for UnixLocalSandboxSession {
     async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
         let normalized = self.normalize_path(path, false)?;
         if let Some(user) = user {
-            let arguments = vec![normalized.to_string_lossy().into_owned()];
+            let path_arg = normalized.to_string_lossy().into_owned();
             let result = self
-                .check_as_user(files::READ_ACCESS_CHECK_SCRIPT, &arguments, &user)
+                .check_as_user(
+                    files::READ_ACCESS_CHECK_SCRIPT,
+                    std::slice::from_ref(&path_arg),
+                    &user,
+                )
                 .await?;
             if !result.ok() {
-                // The reference runs a shell probe here that resolves the path itself in order to
-                // separate "is not there" from "may not be read". This asks the shell the same
-                // question more simply, which differs only for a path whose parent directory the
-                // account cannot search: that is reported as a read failure rather than as missing.
-                // The full probe arrives with the runtime helper scripts.
-                let exists = self
-                    .check_as_user(r#"[ -e "$1" ]"#, &arguments, &user)
-                    .await?;
-                return Err(if exists.exit_code == 1 {
-                    SandboxError::workspace_read_not_found(path)
-                } else {
-                    SandboxError::workspace_archive_read(path)
-                }
-                .with_context(
-                    "stderr",
-                    String::from_utf8_lossy(&result.stderr).into_owned(),
-                ));
+                return Err(self.refused_read(path, &path_arg, &result, user).await);
             }
         }
         files::read_file(&normalized, path)
@@ -507,7 +587,14 @@ impl SandboxSession for UnixLocalSandboxSession {
             .with_shell(ra_core::sandbox::ShellInvocation::None)
             .as_user(user);
         let prepared = exec::prepare_exec_command(&request);
-        let result = self.run_prepared(&prepared, None, Some(data)).await?;
+        let result = self
+            .run_prepared(
+                &prepared,
+                None,
+                Some(data),
+                ArgumentPaths::WorkspaceRelative,
+            )
+            .await?;
         if result.ok() {
             return Ok(());
         }

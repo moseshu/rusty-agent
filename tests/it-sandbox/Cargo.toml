@@ -22,3 +22,5 @@ zip = { version = "2.4", default-features = false, features = ["deflate", "bzip2
 tempfile = "3"
 uuid = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

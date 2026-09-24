@@ -432,10 +432,22 @@ fn acknowledged_in_container_keys(root: &std::path::Path) -> Manifest {
         .expect("acknowledged")
 }
 
-/// Detaches mounts by recording where, and fails when told to.
+/// Detaches mounts by recording where, and whether that path was still on disk, and fails with
+/// the given message when told to.
 struct Unmounts {
     detached: Mutex<Vec<String>>,
-    fails: bool,
+    present: Mutex<Vec<bool>>,
+    failure: Option<&'static str>,
+}
+
+impl Unmounts {
+    fn new(failure: Option<&'static str>) -> Self {
+        Self {
+            detached: Mutex::new(Vec::new()),
+            present: Mutex::new(Vec::new()),
+            failure,
+        }
+    }
 }
 
 #[async_trait]
@@ -463,10 +475,12 @@ impl MountLifecycle for Unmounts {
             .lock()
             .expect("detached")
             .push(dest.as_str().to_owned());
-        if self.fails {
-            return Err(ra_core::sandbox::SandboxError::mount_config(
-                "still attached",
-            ));
+        self.present
+            .lock()
+            .expect("present")
+            .push(std::path::Path::new(dest.as_str()).exists());
+        if let Some(failure) = self.failure {
+            return Err(ra_core::sandbox::SandboxError::mount_config(failure));
         }
         Ok(())
     }
@@ -518,10 +532,7 @@ async fn owned_with_mount(
 
 #[tokio::test]
 async fn a_delete_detaches_every_mount_before_it_removes_the_root() {
-    let lifecycle = Arc::new(Unmounts {
-        detached: Mutex::new(Vec::new()),
-        fails: false,
-    });
+    let lifecycle = Arc::new(Unmounts::new(None));
     let client = UnixLocalSandboxClient::new().with_mount_lifecycle(Arc::clone(&lifecycle) as _);
     let (session, root) = owned_with_mount(&client).await;
 
@@ -537,10 +548,7 @@ async fn a_delete_detaches_every_mount_before_it_removes_the_root() {
 #[tokio::test]
 async fn a_delete_leaves_the_root_alone_when_a_mount_could_not_be_detached() {
     // Removing the root through a live mount would remove what is on the other side of it.
-    let lifecycle = Arc::new(Unmounts {
-        detached: Mutex::new(Vec::new()),
-        fails: true,
-    });
+    let lifecycle = Arc::new(Unmounts::new(Some("still attached")));
     let client = UnixLocalSandboxClient::new().with_mount_lifecycle(lifecycle);
     let (session, root) = owned_with_mount(&client).await;
 
@@ -721,5 +729,127 @@ async fn this_backends_state_renders_its_fields_and_round_trips() {
             .serialize_session_state(&restored)
             .expect("serialize"),
         payload
+    );
+}
+
+#[tokio::test]
+async fn a_default_root_is_replaced_by_a_private_directory_and_the_rest_of_the_manifest_is_kept() {
+    let client = UnixLocalSandboxClient::new();
+    let manifest = Manifest::new().with_entry("default.txt", Entry::file(b"default".to_vec()));
+
+    let session = client
+        .create(CreateRequest::new().with_manifest(manifest.clone()))
+        .await
+        .expect("create");
+    let state = session.state();
+    let root = std::path::PathBuf::from(&state.manifest().root);
+
+    assert_eq!(state.manifest().entries, manifest.entries);
+    assert_ne!(state.manifest().root, manifest.root);
+    assert!(root.is_absolute());
+    assert!(root.is_dir(), "made at create, not at start");
+    assert!(workspace_root_owned(&state));
+
+    // Never started, and still the client's to remove.
+    client.delete(session.as_ref()).await.expect("delete");
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn nested_mounts_are_detached_deepest_first_while_the_root_is_still_there() {
+    let lifecycle = Arc::new(Unmounts::new(None));
+    let client = UnixLocalSandboxClient::new().with_mount_lifecycle(Arc::clone(&lifecycle) as _);
+    let mount = || {
+        Entry::mount(
+            Mount::new(
+                MountProvider::S3(S3Mount {
+                    bucket: "bucket".to_owned(),
+                    ..S3Mount::default()
+                }),
+                MountStrategy::in_container(MountPattern::Rclone(RcloneOptions::default())),
+            )
+            .expect("supported"),
+        )
+    };
+    let session = client
+        .create(
+            CreateRequest::new().with_manifest(
+                Manifest::new()
+                    .with_entry("outer", mount())
+                    .with_entry("outer/child", mount()),
+            ),
+        )
+        .await
+        .expect("create");
+    let root = std::path::PathBuf::from(&session.state().manifest().root);
+    std::fs::create_dir_all(root.join("outer/child")).expect("mount points");
+
+    client.delete(session.as_ref()).await.expect("delete");
+
+    assert_eq!(
+        *lifecycle.detached.lock().expect("detached"),
+        [
+            root.join("outer/child").to_string_lossy().into_owned(),
+            root.join("outer").to_string_lossy().into_owned(),
+        ]
+    );
+    assert_eq!(*lifecycle.present.lock().expect("present"), [true, true]);
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn a_port_published_twice_is_published_once_and_resolves_to_a_plain_local_endpoint() {
+    let options = UnixLocalSandboxClientOptions::new()
+        .with_exposed_ports([8765, 8765])
+        .expect("ports");
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(CreateRequest::new().with_options(options.to_payload()))
+        .await
+        .expect("create");
+
+    let endpoint = session.resolve_exposed_port(8765).await.expect("endpoint");
+
+    assert_eq!(session.state().exposed_ports(), [8765]);
+    assert_eq!(
+        endpoint,
+        ra_core::sandbox::ExposedPortEndpoint::new("127.0.0.1", 8765)
+    );
+    assert!(!endpoint.tls);
+    assert_eq!(endpoint.url_for("ws").expect("ws"), "ws://127.0.0.1:8765/");
+
+    let error = session
+        .resolve_exposed_port(9000)
+        .await
+        .expect_err("not published");
+    assert_eq!(
+        error.context().get("exposed_ports"),
+        Some(&serde_json::json!([8765]))
+    );
+    client.delete(session.as_ref()).await.expect("delete");
+}
+
+#[test]
+fn a_state_keeps_its_local_snapshot_through_a_round_trip() {
+    let client = UnixLocalSandboxClient::new();
+    let snapshot = Snapshot::local("local-snapshot", "/tmp/snapshots").expect("snapshot");
+    let state = ra_core::sandbox::SandboxSessionState::new(
+        UNIX_LOCAL_BACKEND_ID,
+        snapshot.clone(),
+        Manifest::new(),
+    );
+
+    let restored = client
+        .deserialize_session_state(
+            client.serialize_session_state(&state).expect("serialize"),
+            &builtin_snapshot_registry(),
+            &ManifestRegistries::builtin(),
+        )
+        .expect("deserialize");
+
+    assert_eq!(restored.snapshot(), &snapshot);
+    assert_eq!(
+        restored.snapshot().local_base_path(),
+        Some(std::path::PathBuf::from("/tmp/snapshots"))
     );
 }

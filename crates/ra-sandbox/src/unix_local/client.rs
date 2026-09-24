@@ -311,29 +311,29 @@ impl SandboxClient for UnixLocalSandboxClient {
         // when any of them could not be: deleting through a live mount would delete what is on the
         // other side of it. A manifest whose mounts cannot even be resolved is treated the same
         // way, since where they are attached is then unknown.
-        let targets = match state.manifest().ephemeral_mount_targets() {
-            Ok(targets) => targets,
-            Err(error) => {
-                tracing::warn!(
-                    backend = UNIX_LOCAL_BACKEND_ID,
-                    error = %error,
-                    "leaving the workspace root in place: its mounts could not be resolved"
-                );
-                return Ok(());
-            }
+        //
+        // **The warnings carry no mount path and no error.** That is the reference's default for
+        // tool data in logs: a mount's name and its failure are the configuration and output of
+        // whatever the workspace was attached to, and can name buckets and credentials. The
+        // reference can be told to log them; the switch that says so has not been carried over.
+        let Ok(targets) = state.manifest().ephemeral_mount_targets() else {
+            tracing::warn!(
+                backend = UNIX_LOCAL_BACKEND_ID,
+                "leaving the workspace root in place: its mounts could not be resolved"
+            );
+            return Ok(());
         };
         let mut unmount_failed = false;
         for (mount, target) in targets {
-            if let Err(error) = self
+            if self
                 .mount_lifecycle
                 .unmount(mount, session, &target, std::path::Path::new("/"))
                 .await
+                .is_err()
             {
                 unmount_failed = true;
                 tracing::warn!(
                     backend = UNIX_LOCAL_BACKEND_ID,
-                    mount_path = target.as_str(),
-                    error = %error,
                     "failed to unmount a workspace mount before deleting the root"
                 );
             }

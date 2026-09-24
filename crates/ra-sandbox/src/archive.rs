@@ -755,7 +755,7 @@ impl From<tar::EntryType> for MemberKind {
 }
 
 /// Whether a member name starts with a Windows drive, which names a filesystem of its own.
-fn windows_drive(name: &str) -> bool {
+pub(crate) fn windows_drive(name: &str) -> bool {
     let mut characters = name.chars();
     characters
         .next()

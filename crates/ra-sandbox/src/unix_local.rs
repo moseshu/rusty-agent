@@ -32,6 +32,8 @@ mod session;
 #[cfg(unix)]
 pub use client::UnixLocalSandboxClient;
 #[cfg(unix)]
+pub use confine::HostConfinement;
+#[cfg(unix)]
 pub use exec::prepare_exec_command;
 #[cfg(unix)]
 pub use session::UnixLocalSandboxSession;
