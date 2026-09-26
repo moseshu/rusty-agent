@@ -50,6 +50,7 @@ pub struct AnthropicMessagesProvider {
     auth: Arc<AnthropicAuth>,
     client: reqwest::Client,
     default_model: String,
+    custom_tools_as_functions: bool,
     models: Mutex<BTreeMap<String, Arc<dyn Model>>>,
 }
 
@@ -68,8 +69,19 @@ impl AnthropicMessagesProvider {
             auth: Arc::new(auth),
             client,
             default_model,
+            custom_tools_as_functions: false,
             models: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Chooses whether a custom tool is advertised as a function taking one string `input`.
+    ///
+    /// Off by default: Messages has no custom tool form, so one is refused. Turning it on is this
+    /// framework's extension and drops the tool's grammar — see [`crate::custom_tools`].
+    #[must_use]
+    pub const fn with_custom_tools_as_functions(mut self, enabled: bool) -> Self {
+        self.custom_tools_as_functions = enabled;
+        self
     }
 
     /// Default provider-facing model identifier.
@@ -108,11 +120,14 @@ impl ModelProvider for AnthropicMessagesProvider {
         if let Some(model) = models.get(name) {
             return Ok(Arc::clone(model));
         }
-        let model: Arc<dyn Model> = Arc::new(AnthropicMessagesModel::from_parts(
-            name.to_owned(),
-            Arc::clone(&self.auth),
-            self.client.clone(),
-        ));
+        let model: Arc<dyn Model> = Arc::new(
+            AnthropicMessagesModel::from_parts(
+                name.to_owned(),
+                Arc::clone(&self.auth),
+                self.client.clone(),
+            )
+            .with_custom_tools_as_functions(self.custom_tools_as_functions),
+        );
         models.insert(name.to_owned(), Arc::clone(&model));
         Ok(model)
     }
@@ -124,6 +139,7 @@ pub struct AnthropicMessagesModel {
     model: String,
     auth: Arc<AnthropicAuth>,
     client: reqwest::Client,
+    custom_tools_as_functions: bool,
 }
 
 impl AnthropicMessagesModel {
@@ -145,7 +161,18 @@ impl AnthropicMessagesModel {
             model,
             auth,
             client,
+            custom_tools_as_functions: false,
         }
+    }
+
+    /// Chooses whether a custom tool is advertised as a function taking one string `input`.
+    ///
+    /// Off by default: Messages has no custom tool form, so one is refused. Turning it on is this
+    /// framework's extension and drops the tool's grammar — see [`crate::custom_tools`].
+    #[must_use]
+    pub const fn with_custom_tools_as_functions(mut self, enabled: bool) -> Self {
+        self.custom_tools_as_functions = enabled;
+        self
     }
 
     /// Provider-facing model identifier.
@@ -155,7 +182,13 @@ impl AnthropicMessagesModel {
     }
 
     async fn send(&self, request: &ModelRequest, streaming: bool) -> Result<reqwest::Response> {
-        let body = request::build_request_body(&self.model, request, streaming).await?;
+        let body = request::build_request_body(
+            &self.model,
+            request,
+            self.custom_tools_as_functions,
+            streaming,
+        )
+        .await?;
         let mut http = self
             .client
             .post(format!("{}/messages", self.auth.base_url()))
@@ -227,6 +260,7 @@ impl AnthropicMessagesModel {
             &payload,
             facts.request_id,
             request.handoffs(),
+            &crate::custom_tools::advertised_as_functions(self.custom_tools_as_functions, &request),
             request.model_settings().provider(),
         )
     }
@@ -255,12 +289,16 @@ impl Model for AnthropicMessagesModel {
         futures_stream::once(async move {
             let provider = request.model_settings().provider().clone();
             let handoffs = request.handoffs().to_vec();
+            let custom_tools = crate::custom_tools::advertised_as_functions(
+                model.custom_tools_as_functions,
+                &request,
+            );
             let unstarted = unstarted_replay_safety(request.continuation());
             match model.send(&request, true).await {
                 Ok(response) if response.status().is_success() => {
                     let facts = ResponseFacts::read(&response);
                     if !is_event_stream(&response) { return futures_stream::once(async move { Err(Error::provider(ProviderErrorKind::Behavior, "Anthropic Messages was asked to stream but did not return text/event-stream")) }).boxed(); }
-                    stream::events(response, provider, handoffs, facts.request_id, unstarted)
+                    stream::events(response, provider, handoffs, custom_tools, facts.request_id, unstarted)
                 }
                 Ok(response) => futures_stream::once(failed_stream(response, unstarted)).boxed(),
                 Err(error) => futures_stream::once(async move { Err(stamp_replay_safety(error, unstarted)) }).boxed(),

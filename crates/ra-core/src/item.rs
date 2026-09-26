@@ -43,7 +43,7 @@ pub use normalization::{
 };
 pub use phase::OutputPhase;
 pub use reasoning::Reasoning;
-pub use tool::{ToolApproval, ToolCall, ToolCallOutput};
+pub use tool::{ToolApproval, ToolCall, ToolCallKind, ToolCallOutput};
 
 /// Current run-item schema version.
 pub const RUN_ITEM_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use ra_core::{
     error::{Error, Result},
-    item::{ContentBlock, MessageRole, ModelInputItem},
+    item::{ContentBlock, MessageRole, ModelInputItem, ToolCallKind},
     model::{Effort, ModelRequest, ThinkingConfig, ToolChoice},
     tool::{ToolOutput, ToolOutputBlock},
 };
@@ -169,6 +169,12 @@ fn lower_messages(request: &ModelRequest) -> Result<Vec<Value>> {
                     ));
                 }
             },
+            ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::Custom => {
+                return Err(crate::custom_tools::unsupported(
+                    "the Anthropic compatibility preview",
+                    call.name(),
+                ));
+            }
             ModelInputItem::ToolCall(call) => {
                 let block = json!({
                     "type": "tool_use",
@@ -266,6 +272,12 @@ fn lower_message_content(blocks: &[ContentBlock]) -> Result<Vec<Value>> {
 }
 
 fn insert_tools(body: &mut Map<String, Value>, request: &ModelRequest) -> Result<BTreeSet<String>> {
+    if let Some(custom) = request.tools().iter().find(|tool| tool.kind().is_custom()) {
+        return Err(crate::custom_tools::unsupported(
+            "the Anthropic compatibility preview",
+            custom.name(),
+        ));
+    }
     let mut names = BTreeSet::new();
     let tools = request
         .tools()

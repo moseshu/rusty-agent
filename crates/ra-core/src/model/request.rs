@@ -140,6 +140,103 @@ impl ConversationContinuation {
     }
 }
 
+/// The syntax a custom tool's grammar is written in.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomToolGrammarSyntax {
+    /// A Lark grammar.
+    Lark,
+    /// A regular expression.
+    Regex,
+}
+
+impl CustomToolGrammarSyntax {
+    /// The name the syntax goes by on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lark => "lark",
+            Self::Regex => "regex",
+        }
+    }
+}
+
+/// What a custom tool's raw input is constrained to.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CustomToolFormat {
+    /// Any text.
+    Text,
+    /// Text the grammar accepts.
+    Grammar {
+        /// How the grammar is written.
+        syntax: CustomToolGrammarSyntax,
+        /// The grammar itself.
+        definition: String,
+    },
+}
+
+/// How a tool takes its input.
+///
+/// A function tool takes a JSON object described by its input schema. A custom tool takes one raw
+/// string — the reference's `CustomTool`, which exists so a model can write something like a patch
+/// without escaping it into JSON — optionally constrained by a [`CustomToolFormat`].
+///
+/// # Only one provider speaks the custom form
+///
+/// `OpenAI` Responses carries custom tools natively. The reference refuses them on Chat Completions,
+/// and Anthropic Messages has no counterpart; those adapters refuse a custom tool unless their
+/// caller opts into advertising it as a function taking one string, which is this framework's own
+/// extension rather than something the reference does.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelToolKind {
+    /// Takes a JSON object.
+    #[default]
+    Function,
+    /// Takes one raw string.
+    Custom {
+        /// What the string is constrained to, when anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<CustomToolFormat>,
+    },
+}
+
+impl ModelToolKind {
+    /// Whether this is the default, function form.
+    #[must_use]
+    pub const fn is_function(&self) -> bool {
+        matches!(self, Self::Function)
+    }
+
+    /// Whether this is the custom form.
+    #[must_use]
+    pub const fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
+
+    /// The custom form's constraint, when it is custom and has one.
+    #[must_use]
+    pub const fn custom_format(&self) -> Option<&CustomToolFormat> {
+        match self {
+            Self::Custom { format } => format.as_ref(),
+            Self::Function => None,
+        }
+    }
+}
+
+/// The input schema a custom tool reports: one string.
+///
+/// A custom tool has no JSON arguments; its raw input reaches the tool as a JSON string, and this
+/// is the schema that describes what the tool is handed.
+#[must_use]
+pub fn custom_tool_input_schema() -> Value {
+    serde_json::json!({"type": "string"})
+}
+
 /// Model-facing projection of an executable tool.
 ///
 /// [`Tool`](crate::tool::Tool) and its [`ToolOptions`](crate::tool::ToolOptions) own invocation,
@@ -152,6 +249,7 @@ pub struct ModelToolDefinition {
     description: Option<String>,
     input_schema: Value,
     strict: bool,
+    kind: ModelToolKind,
 }
 
 impl ModelToolDefinition {
@@ -165,6 +263,34 @@ impl ModelToolDefinition {
             description: None,
             input_schema,
             strict: false,
+            kind: ModelToolKind::Function,
+        }
+    }
+
+    /// Creates a custom tool definition, taking one raw string constrained by `format`.
+    #[must_use]
+    pub fn custom(name: impl Into<String>, format: Option<CustomToolFormat>) -> Self {
+        let mut definition = Self::new(name, custom_tool_input_schema());
+        definition.kind = ModelToolKind::Custom { format };
+        definition
+    }
+
+    /// How the tool takes its input.
+    #[must_use]
+    pub const fn kind(&self) -> &ModelToolKind {
+        &self.kind
+    }
+
+    /// What the entry advertises as its input: the schema of a function, or the format of a custom
+    /// tool, which is where a grammar's size lives.
+    fn advertised_input(&self) -> Result<Value> {
+        match &self.kind {
+            ModelToolKind::Custom {
+                format: Some(format),
+            } => serde_json::to_value(format).map_err(|error| {
+                Error::config("failed to render a custom tool's format").with_source(error)
+            }),
+            _ => Ok(self.input_schema.clone()),
         }
     }
 
@@ -225,7 +351,11 @@ impl ModelToolDefinition {
     ///
     /// Returns a configuration error if the input schema cannot be rendered.
     pub fn advertised_bytes(&self) -> Result<usize> {
-        advertised_definition_bytes(&self.name, self.description.as_deref(), &self.input_schema)
+        advertised_definition_bytes(
+            &self.name,
+            self.description.as_deref(),
+            &self.advertised_input()?,
+        )
     }
 
     /// The same advertised entry counted in characters rather than bytes.
@@ -240,7 +370,11 @@ impl ModelToolDefinition {
     ///
     /// Returns a configuration error if the input schema cannot be rendered.
     pub fn advertised_chars(&self) -> Result<usize> {
-        advertised_definition_chars(&self.name, self.description.as_deref(), &self.input_schema)
+        advertised_definition_chars(
+            &self.name,
+            self.description.as_deref(),
+            &self.advertised_input()?,
+        )
     }
 }
 

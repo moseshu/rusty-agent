@@ -13,9 +13,6 @@
 //!
 //! # Deviations from the reference
 //!
-//! - **The size ceiling is checked after the read.** The reference reads at most one byte past
-//!   10 MB from a file handle. A session's `read` returns the whole file, so a larger file is read
-//!   before it is refused; what the model receives is the same.
 //! - **An unreadable file names the failure's code.** The reference reports the Python exception's
 //!   class name (`unable to read image at … : PermissionError`); a session failure here has no
 //!   class, and its code is its stable name.
@@ -279,9 +276,15 @@ impl ViewImageTool {
             .unwrap_or_else(|| resolved_path.clone())
             .to_string();
 
+        // One byte past the ceiling, as the reference reads from its file handle: enough to tell an
+        // oversized file from one exactly at the limit, and never the whole of it.
         let payload = match self
             .session
-            .read(resolved_path.as_str(), self.user.clone())
+            .read_up_to(
+                resolved_path.as_str(),
+                self.user.clone(),
+                u64::try_from(MAX_IMAGE_BYTES + 1).unwrap_or(u64::MAX),
+            )
             .await
         {
             Ok(payload) => payload,

@@ -13,14 +13,14 @@
 //! an assistant message is currently open. So the loop keeps one draft assistant message, attaches
 //! to it, and flushes when a user or tool message forces the turn to close.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     item::{
         CallId, ContentBlock, FileBlock, FileSource, HandoffCall, ImageBlock, InputItemNormalizer,
         ItemId, Message, MessageRole, ModelInputItem, ModelResponse, RawProviderItem, Reasoning,
-        RunItem, RunItemKind, ThinkingBlock, ToolCall,
+        RunItem, RunItemKind, ThinkingBlock, ToolCall, ToolCallKind,
     },
     model::{ModelHandoffDefinition, ModelRequest, ProviderKey},
     tool::{ToolOutput, ToolOutputBlock},
@@ -82,6 +82,16 @@ async fn lower_item(
         ModelInputItem::Reasoning(reasoning) => {
             accumulator.absorb_reasoning(reasoning, codec);
             Ok(())
+        }
+        ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::Custom => {
+            if !codec.options.custom_tools_as_functions() {
+                return Err(crate::custom_tools::unsupported(
+                    "the Chat Completions API",
+                    call.name(),
+                ));
+            }
+            let arguments = crate::custom_tools::function_arguments(call)?;
+            accumulator.push_tool_call(call.call_id(), call.name(), &arguments)
         }
         ModelInputItem::ToolCall(call) => {
             accumulator.push_tool_call(call.call_id(), call.name(), call.arguments())
@@ -618,6 +628,7 @@ pub(crate) fn convert_completion(
     payload: &Value,
     request_id: Option<String>,
     handoffs: &[ModelHandoffDefinition],
+    custom_tools: &BTreeSet<String>,
     provider: &ProviderKey,
 ) -> Result<ModelResponse> {
     if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
@@ -659,6 +670,7 @@ pub(crate) fn convert_completion(
         finish_reason,
         completion_id,
         handoffs,
+        custom_tools,
         provider,
     )?;
     let mut response = ModelResponse::new(items).with_usage(convert_usage(payload.get("usage")));
@@ -709,6 +721,7 @@ fn lift_message(
     finish_reason: Option<&str>,
     completion_id: &str,
     handoffs: &[ModelHandoffDefinition],
+    custom_tools: &BTreeSet<String>,
     provider: &ProviderKey,
 ) -> Result<Vec<RunItem>> {
     let text = non_empty(message.get("content"));
@@ -741,7 +754,7 @@ fn lift_message(
         items.push(next.item(RunItemKind::Message(assistant), message, provider));
     }
     for call in tool_calls {
-        let Some(kind) = lift_tool_call(codec, call, handoffs)? else {
+        let Some(kind) = lift_tool_call(codec, call, handoffs, custom_tools)? else {
             continue;
         };
         items.push(next.item(kind, call, provider));
@@ -754,6 +767,7 @@ fn lift_tool_call(
     codec: &ChatCodec,
     call: &Value,
     handoffs: &[ModelHandoffDefinition],
+    custom_tools: &BTreeSet<String>,
 ) -> Result<Option<RunItemKind>> {
     let call_type = call
         .get("type")
@@ -775,15 +789,28 @@ fn lift_tool_call(
         .pointer("/function/arguments")
         .and_then(Value::as_str)
         .unwrap_or("{}");
-    tool_call_item(CallId::new(call_id), name, arguments, handoffs).map(Some)
+    tool_call_item(
+        CallId::new(call_id),
+        name,
+        arguments,
+        handoffs,
+        custom_tools,
+    )
+    .map(Some)
 }
 
 /// Turns a wire tool call into the item kind it denotes, resolving handoffs by advertised name.
+///
+/// `custom_tools` names the custom tools this request advertised as functions taking one string
+/// `input`; a call to one becomes a custom call carrying that string. A call whose arguments are not
+/// such an object stays a function call, so the tool reports the malformed input to the model rather
+/// than the turn failing on it.
 pub(crate) fn tool_call_item(
     call_id: CallId,
     name: &str,
     arguments: &str,
     handoffs: &[ModelHandoffDefinition],
+    custom_tools: &BTreeSet<String>,
 ) -> Result<RunItemKind> {
     let arguments = if arguments.trim().is_empty() {
         Value::Object(Map::new())
@@ -795,6 +822,15 @@ pub(crate) fn tool_call_item(
             .with_source(error)
         })?
     };
+    if custom_tools.contains(name)
+        && let Some(input) = arguments
+            .get(crate::custom_tools::FUNCTION_INPUT)
+            .and_then(Value::as_str)
+    {
+        return Ok(RunItemKind::ToolCall(ToolCall::custom(
+            call_id, name, input,
+        )));
+    }
     match handoffs.iter().find(|handoff| handoff.name() == name) {
         Some(handoff) => Ok(RunItemKind::HandoffCall(
             HandoffCall::new(call_id, handoff.target_agent().clone(), arguments)

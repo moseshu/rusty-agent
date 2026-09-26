@@ -284,6 +284,25 @@ impl UnixLocalSandboxSession {
         self.exec(request).await
     }
 
+    /// Resolves a path for reading, and when another account is named, checks that it may read it.
+    async fn readable_path(&self, path: &str, user: AsUser) -> SandboxResult<PathBuf> {
+        let normalized = self.normalize_path(path, false)?;
+        if let Some(user) = user {
+            let path_arg = normalized.to_string_lossy().into_owned();
+            let result = self
+                .check_as_user(
+                    files::READ_ACCESS_CHECK_SCRIPT,
+                    std::slice::from_ref(&path_arg),
+                    &user,
+                )
+                .await?;
+            if !result.ok() {
+                return Err(self.refused_read(path, &path_arg, &result, user).await);
+            }
+        }
+        Ok(normalized)
+    }
+
     /// Explains a read the other account was refused: missing, or not readable.
     ///
     /// Only an exit of 1 from the access check is a "no"; anything else — `sudo` refusing, a shell
@@ -586,21 +605,13 @@ impl SandboxSession for UnixLocalSandboxSession {
     }
 
     async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
-        let normalized = self.normalize_path(path, false)?;
-        if let Some(user) = user {
-            let path_arg = normalized.to_string_lossy().into_owned();
-            let result = self
-                .check_as_user(
-                    files::READ_ACCESS_CHECK_SCRIPT,
-                    std::slice::from_ref(&path_arg),
-                    &user,
-                )
-                .await?;
-            if !result.ok() {
-                return Err(self.refused_read(path, &path_arg, &result, user).await);
-            }
-        }
-        files::read_file(&normalized, path)
+        let normalized = self.readable_path(path, user).await?;
+        files::read_file(&normalized, path, None)
+    }
+
+    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
+        let normalized = self.readable_path(path, user).await?;
+        files::read_file(&normalized, path, Some(max_bytes))
     }
 
     async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {

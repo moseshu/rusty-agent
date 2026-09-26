@@ -466,6 +466,25 @@ pub trait SandboxSession: Send + Sync {
     /// failure to read it.
     async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>>;
 
+    /// Reads at most `max_bytes` from the start of a file.
+    ///
+    /// The reference's `read` returns a file handle, and a caller with a ceiling reads only up to
+    /// it — `view_image` reads one byte past its limit, so an oversized file is refused without ever
+    /// being held in memory. [`Self::read`] returns the whole file, so this is that bounded read.
+    /// A caller detects "larger than the ceiling" by asking for one byte more than it accepts.
+    ///
+    /// The default reads the whole file and truncates it, which keeps the answer right but not the
+    /// memory bound. A backend that can stop early — any that reads a real file — must override it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
+        let mut data = self.read(path, user).await?;
+        data.truncate(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        Ok(data)
+    }
+
     /// Writes a file into the workspace.
     ///
     /// # Errors

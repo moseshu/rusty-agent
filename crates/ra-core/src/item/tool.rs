@@ -6,11 +6,52 @@ use serde_json::Value;
 use super::CallId;
 use crate::{
     compat::{SchemaVersion, Unknown},
+    model::ModelToolKind,
     tool::{ToolLookupKey, ToolOrigin},
 };
 
 /// Current tool-item schema version.
 pub const TOOL_ITEM_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// Whether a call, and the output answering it, belong to a function tool or a custom one.
+///
+/// A custom call carries one raw string where a function call carries a JSON object; its arguments
+/// are that string as a JSON string. Only a provider that speaks the custom form natively — `OpenAI`
+/// Responses, where the two travel as different item types — needs to tell them apart when it
+/// replays history, and it needs it on the output as much as on the call: a continuation that sends
+/// only the new output has nothing else to go on.
+///
+/// Omitted from the record for a function call, which is every record written before custom tools
+/// existed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallKind {
+    /// A call to a function tool.
+    #[default]
+    Function,
+    /// A call to a custom tool.
+    Custom,
+}
+
+impl ToolCallKind {
+    /// Whether this is a function call.
+    #[must_use]
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference
+    pub const fn is_function(&self) -> bool {
+        matches!(self, Self::Function)
+    }
+}
+
+impl From<&ModelToolKind> for ToolCallKind {
+    fn from(kind: &ModelToolKind) -> Self {
+        if kind.is_custom() {
+            Self::Custom
+        } else {
+            Self::Function
+        }
+    }
+}
 
 /// A provider-neutral tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,11 +60,19 @@ pub struct ToolCall {
     call_id: CallId,
     name: String,
     arguments: Value,
+    #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
+    kind: ToolCallKind,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
 
 impl ToolCall {
+    /// Creates a call to a custom tool, whose arguments are its raw input as a JSON string.
+    #[must_use]
+    pub fn custom(call_id: CallId, name: impl Into<String>, input: impl Into<String>) -> Self {
+        Self::new(call_id, name, Value::String(input.into())).with_kind(ToolCallKind::Custom)
+    }
+
     /// Creates a tool call.
     #[must_use]
     pub fn new(call_id: CallId, name: impl Into<String>, arguments: Value) -> Self {
@@ -32,8 +81,22 @@ impl ToolCall {
             call_id,
             name: name.into(),
             arguments,
+            kind: ToolCallKind::Function,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records whether this belongs to a function tool or a custom one.
+    #[must_use]
+    pub const fn with_kind(mut self, kind: ToolCallKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Whether this belongs to a function tool or a custom one.
+    #[must_use]
+    pub const fn kind(&self) -> ToolCallKind {
+        self.kind
     }
 
     /// Schema version.
@@ -75,6 +138,8 @@ pub struct ToolCallOutput {
     output: Value,
     #[serde(default)]
     is_error: bool,
+    #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
+    kind: ToolCallKind,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -88,8 +153,22 @@ impl ToolCallOutput {
             call_id,
             output,
             is_error: false,
+            kind: ToolCallKind::Function,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records whether this belongs to a function tool or a custom one.
+    #[must_use]
+    pub const fn with_kind(mut self, kind: ToolCallKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Whether this belongs to a function tool or a custom one.
+    #[must_use]
+    pub const fn kind(&self) -> ToolCallKind {
+        self.kind
     }
 
     /// Marks this as a tool failure observation that can be replayed to the model, rather than a
@@ -158,6 +237,8 @@ pub struct ToolApproval {
     // routing key widens every message and reasoning record the session stores by the same amount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lookup_key: Option<Box<ToolLookupKey>>,
+    #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
+    kind: ToolCallKind,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -173,8 +254,22 @@ impl ToolApproval {
             arguments,
             namespace: None,
             lookup_key: None,
+            kind: ToolCallKind::Function,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records whether this belongs to a function tool or a custom one.
+    #[must_use]
+    pub const fn with_kind(mut self, kind: ToolCallKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Whether this belongs to a function tool or a custom one.
+    #[must_use]
+    pub const fn kind(&self) -> ToolCallKind {
+        self.kind
     }
 
     /// Sets the tool namespace.

@@ -53,6 +53,8 @@ struct ScriptedSession {
     resources: SessionResources,
     script: Mutex<VecDeque<SandboxResult<Vec<u8>>>>,
     reads: Mutex<Vec<(String, AsUser)>>,
+    /// The byte limit of each read, `None` for an unbounded one.
+    limits: Mutex<Vec<Option<u64>>>,
 }
 
 impl ScriptedSession {
@@ -66,11 +68,16 @@ impl ScriptedSession {
             resources: SessionResources::new(),
             script: Mutex::new(script.into()),
             reads: Mutex::new(Vec::new()),
+            limits: Mutex::new(Vec::new()),
         })
     }
 
     fn reads(&self) -> Vec<(String, AsUser)> {
         self.reads.lock().unwrap().clone()
+    }
+
+    fn limits(&self) -> Vec<Option<u64>> {
+        self.limits.lock().unwrap().clone()
     }
 
     fn read_paths(&self) -> Vec<String> {
@@ -128,12 +135,15 @@ impl SandboxSession for ScriptedSession {
     }
 
     async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
-        self.reads.lock().unwrap().push((path.to_owned(), user));
-        self.script
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("the script has an answer for this read")
+        self.limits.lock().unwrap().push(None);
+        self.answer(path, user)
+    }
+
+    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
+        self.limits.lock().unwrap().push(Some(max_bytes));
+        let mut data = self.answer(path, user)?;
+        data.truncate(usize::try_from(max_bytes).unwrap());
+        Ok(data)
     }
 
     async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
@@ -146,6 +156,17 @@ impl SandboxSession for ScriptedSession {
 
     async fn hydrate_workspace(&self, _data: Vec<u8>) -> SandboxResult<()> {
         Err(not_scripted())
+    }
+}
+
+impl ScriptedSession {
+    fn answer(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
+        self.reads.lock().unwrap().push((path.to_owned(), user));
+        self.script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the script has an answer for this read")
     }
 }
 
@@ -415,6 +436,12 @@ async fn an_image_over_10mb_is_refused() {
         .await
         .unwrap();
 
+    // Read one byte past the ceiling, and no more: the reference's `read(_MAX_IMAGE_BYTES + 1)`.
+    assert_eq!(
+        scripted.limits(),
+        vec![Some(u64::try_from(MAX_IMAGE_BYTES).unwrap() + 1)]
+    );
+
     assert_eq!(
         text(&output),
         "image path `images/huge.png` exceeded the allowed size of 10MB; resize or compress the \
@@ -680,4 +707,25 @@ fn every_signature_the_reference_recognises_is_recognised() {
         Some("image/svg+xml")
     );
     assert_eq!(detect_image_mime_type("dir/a.svg.", b"x"), None);
+}
+
+/// Every image read is bounded, so no file is ever held whole: the ceiling is enforced by how much
+/// is read, not only by what is said afterwards.
+#[tokio::test]
+async fn every_image_read_is_bounded_to_one_byte_past_the_ceiling() {
+    let scripted = ScriptedSession::new(vec![
+        Ok(png()),
+        Ok(b"hello\n".to_vec()),
+        Err(SandboxError::workspace_read_not_found(
+            "/workspace/gone.png",
+        )),
+    ]);
+    let tool = tool(&scripted);
+
+    for path in ["dot.png", "notes.txt", "gone.png"] {
+        invoke(&tool, &json!({"path": path})).await.unwrap();
+    }
+
+    let bound = Some(u64::try_from(MAX_IMAGE_BYTES).unwrap() + 1);
+    assert_eq!(scripted.limits(), vec![bound; 3]);
 }

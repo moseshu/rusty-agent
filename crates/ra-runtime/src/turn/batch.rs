@@ -47,7 +47,9 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
     guardrail::{ToolInputGuardrailResult, ToolOutputGuardrailResult},
-    item::{AgentId, CallId, HandoffOutput, ItemId, RunItem, RunItemKind, ToolCallOutput},
+    item::{
+        AgentId, CallId, HandoffOutput, ItemId, RunItem, RunItemKind, ToolCallKind, ToolCallOutput,
+    },
     state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
     step::{ProcessedResponse, ToolRunFunction},
     tool::{ResourceClaim, ResourceId, ToolConcurrency, ToolOrigin, ToolServices},
@@ -397,7 +399,8 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
                 missing.call_id().clone(),
                 json!({ "error": { "code": error.code(), "tool": missing.name() } }),
             )
-            .with_error(true),
+            .with_error(true)
+            .with_kind(missing.call().kind()),
         ));
     }
 
@@ -1178,6 +1181,12 @@ fn settle_dispatches(
         execution
             .tool_output_guardrail_results
             .extend(output_verdicts);
+        // Whatever answers the call is of the call's kind, so a provider that tells function and
+        // custom calls apart replays the answer as the right item.
+        let kind = processed
+            .functions()
+            .get(completed.order)
+            .map_or(ToolCallKind::Function, |action| action.call().kind());
         match completed.dispatch {
             ToolDispatch::Observed(observation) => {
                 // `order` indexes the same list the dispatch was spawned from, so the action it
@@ -1195,7 +1204,7 @@ fn settle_dispatches(
                         ),
                     });
                 }
-                let output = observation.into_output();
+                let output = observation.into_output().with_kind(kind);
                 let item = output_item(&completed.call_id, output.clone());
                 if output.is_error() {
                     execution
@@ -1227,7 +1236,7 @@ fn settle_dispatches(
                         refusal.output().output(),
                     ));
                 }
-                let output = refusal.into_output();
+                let output = refusal.into_output().with_kind(kind);
                 let item = output_item(&completed.call_id, output.clone());
                 execution
                     .function_results
@@ -1244,7 +1253,7 @@ fn settle_dispatches(
             ToolDispatch::AwaitingApproval(approval) => {
                 let item = RunItem::new(
                     approval_item_id(&completed.call_id),
-                    RunItemKind::ToolApproval(approval),
+                    RunItemKind::ToolApproval(approval.with_kind(kind)),
                 );
                 execution
                     .function_results

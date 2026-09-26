@@ -1656,7 +1656,8 @@ async fn resolve_interrupted_turn(
                     approval.call_id().clone(),
                     serde_json::json!({"code": "approval_rejected", "tool": approval.tool_name()}),
                 )
-                .with_error(true);
+                .with_error(true)
+                .with_kind(approval.kind());
                 // Filed as a refusal, the same as a call the permission stage declines below: both
                 // are "the runtime answered without running the tool", which is what
                 // `ToolOutcome::refused` names. Recording nothing instead would leave an earlier
@@ -1696,7 +1697,7 @@ async fn resolve_interrupted_turn(
         state.record_tool_output_guardrail_results(output_verdicts);
         let mut output_item = RunItem::new(
             ItemId::new(format!("{}.output", approval.call_id())),
-            RunItemKind::ToolCallOutput(output),
+            RunItemKind::ToolCallOutput(output.with_kind(approval.kind())),
         );
         if let Some(provenance) = provenance {
             output_item = output_item.with_provenance(provenance);

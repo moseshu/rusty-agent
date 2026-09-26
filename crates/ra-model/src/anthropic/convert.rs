@@ -1,5 +1,7 @@
 //! Lift an Anthropic Messages response into provider-neutral run items.
 
+use std::collections::BTreeSet;
+
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     item::{
@@ -17,6 +19,7 @@ pub(crate) fn convert_response(
     payload: &Value,
     request_id: Option<String>,
     handoffs: &[ModelHandoffDefinition],
+    custom_tools: &BTreeSet<String>,
     provider: &ProviderKey,
 ) -> Result<ModelResponse> {
     if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
@@ -86,7 +89,14 @@ pub(crate) fn convert_response(
                     payload,
                 );
                 start = index + 1;
-                output.push(tool_item(block, id, index, handoffs, provider)?);
+                output.push(tool_item(
+                    block,
+                    id,
+                    index,
+                    handoffs,
+                    custom_tools,
+                    provider,
+                )?);
             }
             other => {
                 return Err(behavior_error(format!(
@@ -160,6 +170,7 @@ fn tool_item(
     response_id: &str,
     index: usize,
     handoffs: &[ModelHandoffDefinition],
+    custom_tools: &BTreeSet<String>,
     provider: &ProviderKey,
 ) -> Result<RunItem> {
     let call_id = CallId::new(required_str(block, "id", "tool_use block")?);
@@ -168,7 +179,17 @@ fn tool_item(
         .get("input")
         .cloned()
         .ok_or_else(|| behavior_error("Anthropic tool_use block.input is required"))?;
-    let kind = if let Some(handoff) = handoffs.iter().find(|handoff| handoff.name() == name) {
+    // A custom tool advertised as a function comes back as a custom call carrying its `input`. One
+    // whose input is not such an object stays a function call, so the tool reports the malformed
+    // input to the model rather than the turn failing on it.
+    let custom_input = custom_tools
+        .contains(name)
+        .then(|| input.get(crate::custom_tools::FUNCTION_INPUT))
+        .flatten()
+        .and_then(Value::as_str);
+    let kind = if let Some(custom_input) = custom_input {
+        RunItemKind::ToolCall(ToolCall::custom(call_id, name, custom_input))
+    } else if let Some(handoff) = handoffs.iter().find(|handoff| handoff.name() == name) {
         RunItemKind::HandoffCall(
             HandoffCall::new(call_id, handoff.target_agent().clone(), input).with_tool_name(name),
         )

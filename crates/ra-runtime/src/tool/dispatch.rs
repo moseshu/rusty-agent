@@ -20,6 +20,12 @@
 //! [`ToolFailureHandling::Custom`] plus [`Tool::handle_failure`], which lets the tool write its own
 //! model-facing text.
 //!
+//! A custom tool — one taking raw input rather than JSON — has that path by default. The reference's
+//! custom-tool runner reports a tool that raised with the error's own text, so the model can correct
+//! the input it wrote; here that is the message the tool put on its [`Error::Tool`], never the
+//! framework's rendering of it, and the stable code for any other error, as the reference falls back
+//! to the exception's class name when its text is empty.
+//!
 //! The [lifecycle](ra_core::lifecycle) narration sits one step further in still, immediately around
 //! the invocation and below the admission gate, and it is not a stage: it decides nothing, so it
 //! carries no number in the order above and cannot refuse anything. What it brackets is
@@ -40,7 +46,7 @@ use ra_core::{
         ToolGuardrailVerdict, ToolInputGuardrail, ToolInputGuardrailData, ToolInputGuardrailResult,
         ToolOutputGuardrail, ToolOutputGuardrailData, ToolOutputGuardrailResult,
     },
-    item::{CallId, ToolApproval, ToolCallOutput},
+    item::{CallId, ToolApproval, ToolCallKind, ToolCallOutput},
     lifecycle::{ToolEndInput, ToolStartInput},
     permission::PermissionDecision,
     tool::{
@@ -780,7 +786,9 @@ async fn admit_permission(
             if let Some(namespace) = tool.origin().namespace() {
                 approval = approval.with_namespace(namespace.as_str());
             }
-            approval = approval.with_tool_origin(tool.origin());
+            approval = approval
+                .with_tool_origin(tool.origin())
+                .with_kind(ToolCallKind::from(tool.model_definition().kind()));
             Ok(Some(ToolDispatch::AwaitingApproval(approval)))
         }
         _ => Err(Error::caller(format!(
@@ -907,6 +915,9 @@ pub(crate) async fn shape_failure(
     }
 
     match options.failure_handling() {
+        ToolFailureHandling::ModelVisible if tool.model_definition().kind().is_custom() => {
+            custom_tool_failure(request, &error, output_guardrails, records).await
+        }
         ToolFailureHandling::ModelVisible => Ok(observed_failure(&request.call_id, name, &error)),
         ToolFailureHandling::Propagate => Err(error),
         // The one path where a tool writes its own model-facing failure text. Returning `None`
@@ -964,6 +975,31 @@ fn project_output(request: &ToolDispatchRequest, output: ToolOutput) -> Result<T
 }
 
 /// Whether this refusal is an argument object the model can correct on its next turn.
+/// Answers a custom tool's failure with the text the tool wrote for it.
+///
+/// Tool-authored text, which is why it goes through the output checks as a tool's own answer does,
+/// and why only an [`Error::Tool`]'s message is used: any other error's text is framework prose, so
+/// it is reported by its code. Recorded as a failure, like every other failure observation.
+async fn custom_tool_failure(
+    request: &ToolDispatchRequest,
+    error: &Error,
+    output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
+    records: &mut ToolGuardrailRecords,
+) -> Result<ToolDispatch> {
+    let text = match error {
+        Error::Tool { message, .. } if !message.is_empty() => message.clone(),
+        _ => error.code().to_owned(),
+    };
+    let output = ToolOutput::text(text);
+    if let Some(replacement) =
+        check_output_guardrails(request, output_guardrails, &output, records).await?
+    {
+        return Ok(replacement);
+    }
+    let output = project_output(request, output)?;
+    observed(&request.call_id, &output, Some(error.code()))
+}
+
 fn is_invalid_input(error: &Error) -> bool {
     matches!(
         error,

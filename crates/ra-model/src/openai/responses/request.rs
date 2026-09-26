@@ -6,10 +6,10 @@ use ra_core::{
     error::{Error, Result},
     item::{
         ContentBlock, FileBlock, FileSource, ImageBlock, InputItemNormalizer, Message, MessageRole,
-        ModelInputItem, OutputPhase,
+        ModelInputItem, OutputPhase, ToolCallKind,
     },
     model::{
-        ConversationContinuation, Effort, ModelHandoffDefinition, ModelRequest,
+        ConversationContinuation, CustomToolFormat, Effort, ModelHandoffDefinition, ModelRequest,
         ModelToolDefinition, ToolChoice,
     },
     prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
@@ -92,7 +92,7 @@ pub(crate) async fn build_request_body(
         if let Some(tool_choice) = request.model_settings().tool_choice() {
             body.insert(
                 "tool_choice".to_owned(),
-                lower_tool_choice(Some(tool_choice), &tools.function_names)?,
+                lower_tool_choice(Some(tool_choice), &tools)?,
             );
         } else if !body.contains_key("tool_choice") {
             body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
@@ -110,7 +110,7 @@ pub(crate) async fn build_request_body(
         }
         body.insert(
             "tool_choice".to_owned(),
-            lower_tool_choice(Some(tool_choice), &tools.function_names)?,
+            lower_tool_choice(Some(tool_choice), &tools)?,
         );
     }
 
@@ -345,6 +345,19 @@ async fn lower_input_item(item: &ModelInputItem, request: &ModelRequest) -> Resu
     match item {
         ModelInputItem::Message(message) => lower_message(message).await,
         ModelInputItem::Reasoning(reasoning) => Ok(lower_reasoning(reasoning)),
+        ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::Custom => Ok(json!({
+            "type": "custom_tool_call",
+            "call_id": call.call_id().as_str(),
+            "name": call.name(),
+            "input": custom_input(call)?
+        })),
+        ModelInputItem::ToolCallOutput(output) if output.kind() == ToolCallKind::Custom => {
+            Ok(json!({
+                "type": "custom_tool_call_output",
+                "call_id": output.call_id().as_str(),
+                "output": lower_tool_output(output.output()).await?
+            }))
+        }
         ModelInputItem::ToolCall(call) => Ok(json!({
             "type": "function_call",
             "call_id": call.call_id().as_str(),
@@ -426,6 +439,16 @@ async fn lower_input_item(item: &ModelInputItem, request: &ModelRequest) -> Resu
             "unsupported model-input item for OpenAI Responses",
         )),
     }
+}
+
+/// A custom call's raw input, which is stored as a JSON string.
+fn custom_input(call: &ra_core::item::ToolCall) -> Result<&str> {
+    call.arguments().as_str().ok_or_else(|| {
+        Error::caller(format!(
+            "custom tool call `{}` has arguments that are not its raw input string",
+            call.call_id().as_str()
+        ))
+    })
 }
 
 fn lower_reasoning(reasoning: &ra_core::item::Reasoning) -> Value {
@@ -598,6 +621,9 @@ async fn lower_tool_output(payload: &Value) -> Result<Value> {
 struct MergedTools {
     populated: bool,
     function_names: BTreeSet<String>,
+    /// The subset of `function_names` advertised as custom tools, which `tool_choice` names by a
+    /// different type.
+    custom_names: BTreeSet<String>,
 }
 
 fn merge_tools(
@@ -624,8 +650,22 @@ fn merge_tools(
     }
     lowered.reserve(tools.len() + handoffs.len());
 
+    let mut custom_names = BTreeSet::new();
+    for tool in tools.iter().filter(|tool| tool.kind().is_custom()) {
+        validate_function_name(tool.name())?;
+        if !names.insert(tool.name().to_owned()) {
+            return Err(Error::caller(format!(
+                "duplicate OpenAI tool/handoff name `{}`",
+                tool.name()
+            )));
+        }
+        custom_names.insert(tool.name().to_owned());
+        lowered.push(custom_tool(tool));
+    }
+
     let neutral = tools
         .iter()
+        .filter(|tool| !tool.kind().is_custom())
         .map(|tool| {
             (
                 tool.name(),
@@ -659,7 +699,30 @@ fn merge_tools(
     Ok(MergedTools {
         populated,
         function_names: names,
+        custom_names,
     })
+}
+
+/// The reference's `CustomToolParam`: a name, a description, and the format the raw input is
+/// constrained to, when it is.
+fn custom_tool(tool: &ModelToolDefinition) -> Value {
+    let mut lowered = json!({
+        "type": "custom",
+        "name": tool.name(),
+        "description": tool.description().unwrap_or_default(),
+    });
+    match tool.kind().custom_format() {
+        Some(CustomToolFormat::Text) => lowered["format"] = json!({"type": "text"}),
+        Some(CustomToolFormat::Grammar { syntax, definition }) => {
+            lowered["format"] = json!({
+                "type": "grammar",
+                "syntax": syntax.as_str(),
+                "definition": definition,
+            });
+        }
+        _ => {}
+    }
+    lowered
 }
 
 /// Rejects a name the endpoint will reject, while the call site is still visible.
@@ -693,10 +756,8 @@ fn function_tool(name: &str, description: Option<&str>, schema: &Value, strict: 
     tool
 }
 
-fn lower_tool_choice(
-    choice: Option<&ToolChoice>,
-    function_names: &BTreeSet<String>,
-) -> Result<Value> {
+fn lower_tool_choice(choice: Option<&ToolChoice>, tools: &MergedTools) -> Result<Value> {
+    let function_names = &tools.function_names;
     match choice.unwrap_or(&ToolChoice::Auto) {
         ToolChoice::Auto => Ok(Value::String("auto".to_owned())),
         ToolChoice::Required => Ok(Value::String("required".to_owned())),
@@ -707,6 +768,9 @@ fn lower_tool_choice(
                 return Err(Error::caller(format!(
                     "OpenAI tool_choice names unavailable function `{name}`"
                 )));
+            }
+            if tools.custom_names.contains(name) {
+                return Ok(json!({"type": "custom", "name": name}));
             }
             Ok(json!({"type": "function", "name": name}))
         }

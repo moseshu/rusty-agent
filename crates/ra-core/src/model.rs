@@ -25,8 +25,9 @@ pub use protocol::{
     ToolResultCarrier,
 };
 pub use request::{
-    ConversationContinuation, ModelHandoffDefinition, ModelOutputSchema, ModelRequest,
-    ModelToolDefinition, ModelTracing, ProviderConversationId,
+    ConversationContinuation, CustomToolFormat, CustomToolGrammarSyntax, ModelHandoffDefinition,
+    ModelOutputSchema, ModelRequest, ModelToolDefinition, ModelToolKind, ModelTracing,
+    ProviderConversationId, custom_tool_input_schema,
 };
 pub use resolution::{ModelSelector, ResolvedModel};
 pub use retry::{

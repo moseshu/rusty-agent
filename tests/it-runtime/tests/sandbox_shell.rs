@@ -1,21 +1,25 @@
-//! The shell capability run end to end: a sandbox agent given `Shell` works through the real local
-//! backend, from the run's working directory, with the tools the session offers.
+//! The shell and filesystem capabilities run end to end: a sandbox agent given `Shell` and
+//! `Filesystem` works through the real local backend, from the run's working directory, with the
+//! tools the session offers.
 //!
-//! Ported from the shell parts of the reference's `tests/sandbox/test_run_cwd.py`, plus an
-//! interactive round trip the reference covers only below the runner.
+//! Ported from the reference's `tests/sandbox/test_run_cwd.py` (all but its skills case), plus an
+//! interactive round trip the reference covers only below the runner, and a custom `apply_patch`
+//! call carried through an approval.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ra_core::{
     agent::{AgentId, AgentSpec},
     cancel::CancelScope,
+    capability::Capability,
     error::{Error, Result},
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
-        ToolCall,
+        ToolCall, ToolCallKind, ToolCallOutput,
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
@@ -34,6 +38,7 @@ use ra_runtime::{
 };
 use ra_sandbox::unix_local::UnixLocalSandboxClient;
 use ra_tools::sandbox::NeedsApproval;
+use ra_tools::sandbox::filesystem::Filesystem;
 use ra_tools::sandbox::shell::{Shell, ShellToolSet};
 use ra_tools::sandbox::shell_tool::{
     ExecCommandArgs, ExecCommandTool, WriteStdinArgs, WriteStdinTool,
@@ -142,13 +147,47 @@ fn answer(id: &str) -> Step {
 }
 
 fn shell_agent(name: &str, shell: Shell) -> Arc<AgentSpec> {
+    sandbox_agent(name, vec![Arc::new(shell)])
+}
+
+fn sandbox_agent(name: &str, capabilities: Vec<Arc<dyn Capability>>) -> Arc<AgentSpec> {
+    let mut config = SandboxAgentConfig::new();
+    for capability in capabilities {
+        config = config.with_capability(capability);
+    }
     AgentSpec::builder()
         .id(AgentId::new(name))
         .name(name)
         .instructions("do the task")
-        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(shell)))
+        .sandbox(config)
         .build()
         .unwrap()
+}
+
+/// A model turn calling a custom tool with raw `input`.
+fn custom_call(id: &str, name: &str, input: &str) -> Step {
+    let id = id.to_owned();
+    let name = name.to_owned();
+    let input = input.to_owned();
+    Box::new(move |_| {
+        ModelResponse::new(vec![RunItem::new(
+            ItemId::new(&id),
+            RunItemKind::ToolCall(ToolCall::custom(CallId::new(&id), &name, input.clone())),
+        )])
+    })
+}
+
+/// The output answering `call_id` among a run's new items.
+fn tool_output<'a>(items: &'a [RunItem], call_id: &str) -> &'a ToolCallOutput {
+    items
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == call_id => {
+                Some(output)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no output for {call_id}"))
 }
 
 fn request(
@@ -255,16 +294,29 @@ async fn an_approved_command_runs_in_the_resumed_runs_working_directory() {
     session.close().await.unwrap();
 }
 
-// The shell step of `test_concurrent_runs_scope_relative_paths_with_shared_live_session`; its
-// `view_image` and `apply_patch` steps arrive with the filesystem capability.
+// `test_concurrent_runs_scope_relative_paths_with_shared_live_session`
 #[tokio::test]
 async fn concurrent_runs_on_one_session_keep_their_relative_paths_apart() {
     let (_directory, root, session) = live_session().await;
     let tasks = ["task-a", "task-b"];
+    // A PNG and a JPEG signature, so each run's image is recognisably its own.
+    let image = |task: &str| -> (&'static str, Vec<u8>) {
+        if task == "task-a" {
+            (
+                "image/png",
+                [b"\x89PNG\r\n\x1a\n".as_slice(), task.as_bytes()].concat(),
+            )
+        } else {
+            (
+                "image/jpeg",
+                [b"\xff\xd8\xff".as_slice(), task.as_bytes()].concat(),
+            )
+        }
+    };
     for task in tasks {
         let directory = root.join("tasks").join(task);
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("seed.png"), task.as_bytes()).unwrap();
+        std::fs::write(directory.join("seed.png"), image(task).1).unwrap();
     }
 
     // Both runs reach their first model call before either issues its command.
@@ -277,12 +329,25 @@ async fn concurrent_runs_on_one_session_keep_their_relative_paths_apart() {
                     "exec_command",
                     json!({"cmd": "cp seed.png plot.png", "login": false}),
                 ),
+                call(
+                    &format!("{task}_image"),
+                    "view_image",
+                    json!({"path": "plot.png"}),
+                ),
+                custom_call(
+                    &format!("{task}_patch"),
+                    "apply_patch",
+                    &format!("*** Begin Patch\n*** Add File: notes.md\n+{task}\n*** End Patch\n"),
+                ),
                 answer(&format!("{task}_message")),
             ],
             Some(Arc::clone(&rendezvous)),
         );
         let run = Runner::run(request(
-            shell_agent(task, Shell::new()),
+            sandbox_agent(
+                task,
+                vec![Arc::new(Shell::new()), Arc::new(Filesystem::new())],
+            ),
             &model,
             &format!("run-{task}"),
             in_session(&session, &format!("tasks/{task}")),
@@ -297,13 +362,31 @@ async fn concurrent_runs_on_one_session_keep_their_relative_paths_apart() {
         ("task-b", result_b.unwrap(), model_b),
     ] {
         assert_eq!(result.final_text(), "done");
+        let (media_type, bytes) = image(task);
         assert_eq!(
             std::fs::read(root.join("tasks").join(task).join("plot.png")).unwrap(),
-            task.as_bytes()
+            bytes
+        );
+
+        let image_output = tool_output(result.new_items(), &format!("{task}_image"));
+        let block = &image_output.output()["blocks"][0];
+        assert_eq!(block["source"]["data"]["media_type"], media_type, "{block}");
+        assert_eq!(block["source"]["data"]["data"], BASE64.encode(&bytes));
+
+        let patch_output = tool_output(result.new_items(), &format!("{task}_patch"));
+        assert_eq!(patch_output.kind(), ToolCallKind::Custom);
+        assert_eq!(
+            patch_output.output()["blocks"][0]["text"],
+            "Created notes.md"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("tasks").join(task).join("notes.md")).unwrap(),
+            task
         );
         model.assert_complete();
     }
     assert!(!root.join("plot.png").exists());
+    assert!(!root.join("notes.md").exists());
     session.close().await.unwrap();
 }
 
@@ -457,4 +540,80 @@ async fn a_piped_command_is_polled_until_it_finishes() {
     );
     assert!(finished.ends_with("Output:\nend"), "{finished}");
     session.close().await.unwrap();
+}
+
+/// A custom call that waits for approval keeps its kind on the approval and on the output the
+/// resumed run records, so a provider replays both as custom items; approving runs the patch in the
+/// run's working directory, and rejecting answers the call without running it.
+#[tokio::test]
+async fn a_patch_awaiting_approval_resumes_as_a_custom_call() {
+    for approve in [true, false] {
+        let (_directory, root, session) = live_session().await;
+        std::fs::create_dir_all(root.join("tasks/patch")).unwrap();
+        let agent = || {
+            sandbox_agent(
+                "patcher",
+                vec![Arc::new(Filesystem::new().with_configure_tools(
+                    |toolset: &mut ra_tools::sandbox::filesystem::FilesystemToolSet| {
+                        toolset.apply_patch_mut().set_needs_approval(true);
+                    },
+                ))],
+            )
+        };
+        let model = ScriptedModel::new(vec![
+            custom_call(
+                "patch",
+                "apply_patch",
+                "*** Begin Patch\n*** Add File: notes.md\n+approved\n*** End Patch\n",
+            ),
+            answer("patch_message"),
+        ]);
+
+        let first = Runner::run(request(
+            agent(),
+            &model,
+            "run-patch",
+            in_session(&session, "tasks/patch"),
+        ))
+        .await
+        .unwrap();
+        let RunOutcome::Interrupted { items } = first.outcome() else {
+            panic!("expected an approval interruption");
+        };
+        let RunItemKind::ToolApproval(approval) = items[0].kind() else {
+            panic!("expected a tool approval");
+        };
+        assert_eq!(approval.kind(), ToolCallKind::Custom);
+        assert!(!root.join("tasks/patch/notes.md").exists());
+
+        let mut state = first.state().clone();
+        if approve {
+            state.approve(&items[0], false).unwrap();
+        } else {
+            state.reject(&items[0], false).unwrap();
+        }
+        let resumed = Runner::run(
+            request(
+                agent(),
+                &model,
+                "run-patch",
+                in_session(&session, "tasks/patch"),
+            )
+            .with_state(state),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resumed.final_text(), "done");
+        let output = tool_output(resumed.new_items(), "patch");
+        assert_eq!(output.kind(), ToolCallKind::Custom);
+        assert_eq!(root.join("tasks/patch/notes.md").exists(), approve);
+        if approve {
+            assert_eq!(output.output()["blocks"][0]["text"], "Created notes.md");
+        } else {
+            assert!(output.is_error());
+        }
+        model.assert_complete();
+        session.close().await.unwrap();
+    }
 }
