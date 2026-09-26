@@ -70,6 +70,11 @@ rustix = { version = "1", features = ["fs", "process"] }
 # `doctor sandbox` 要一个不可预测名字、0o700、随句柄删除的目录：它拿自己造的目录当靶子，
 # 而可预测的路径在共享 /tmp 上既能被抢先创建，也不能拿去做递归删除。
 tempfile = "3"
+# 沙箱会话的交互终端（unix-local 的 PTY）。子进程要在 fork 与 exec 之间 `setsid`、把终端设为
+# 控制终端、并把 SIGINT/SIGQUIT 复位为默认——上游 `unix_local.py` 的 `_preexec` 就是这三步。
+# 这只能在 `pre_exec` 里做，而 workspace 禁止 `unsafe`，所以交给这个 crate：它的子进程设置与
+# 上游一致，codex 的 `utils/pty` 用的也是它的同一版本。
+portable-pty = "0.9"
 # 工作区归档（`persist_workspace` / `hydrate_workspace`）。上游用 Python 的 `tarfile` 在进程内
 # 读写 tar，所以移植也在进程内做：调用宿主的 `tar` 会把「归档里有什么」交给一个版本和行为都
 # 不由我们决定的外部程序，而成员路径的越界检查正是这一步要守的东西。

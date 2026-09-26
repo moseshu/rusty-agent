@@ -30,7 +30,18 @@ pub enum SandboxErrorDetails {
         /// Requested process identifier.
         session_id: i64,
     },
+    /// Input sent to an interactive process that was started without a terminal.
+    PtyStdinUnavailable {
+        /// The process addressed.
+        session_id: i64,
+    },
 }
+
+/// What a session says when input is sent to a process that has no terminal to receive it.
+///
+/// The reference's wording, kept exactly: its shell tool recognises this failure by its text, and
+/// a caller porting that recognition should find the same text here.
+pub const PTY_STDIN_UNAVAILABLE_MESSAGE: &str = "stdin is not available for this process";
 
 impl SandboxError {
     /// Constructs a non-zero exit error, retaining bytes before lossy message decoding.
@@ -94,6 +105,28 @@ impl SandboxError {
         )
         .with_context("session_id", session_id);
         error.details = Some(Box::new(SandboxErrorDetails::PtySessionNotFound {
+            session_id,
+        }));
+        error
+    }
+
+    /// Constructs the refusal to write to a process that was started without a terminal.
+    ///
+    /// **Not a sandbox error in the reference**, which raises a bare runtime error outside its
+    /// taxonomy. Here a session answers only in [`SandboxError`], so the failure travels as a
+    /// non-retryable transport error — the process exists, but the channel to its input does not —
+    /// and carries [`SandboxErrorDetails::PtyStdinUnavailable`], which is what a caller should
+    /// match rather than the code.
+    #[must_use]
+    pub fn pty_stdin_unavailable(session_id: i64) -> Self {
+        let mut error = Self::new(
+            ErrorCode::ExecTransportError,
+            OpName::Exec,
+            PTY_STDIN_UNAVAILABLE_MESSAGE,
+        )
+        .with_context("session_id", session_id)
+        .with_retryable(Some(false));
+        error.details = Some(Box::new(SandboxErrorDetails::PtyStdinUnavailable {
             session_id,
         }));
         error

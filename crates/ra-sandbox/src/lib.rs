@@ -23,6 +23,7 @@ pub mod listing;
 #[cfg(unix)]
 pub mod materialize;
 pub mod mounts;
+pub mod pty_output;
 pub mod runtime_helpers;
 pub mod shell;
 pub mod snapshot;

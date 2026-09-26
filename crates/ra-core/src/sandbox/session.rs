@@ -367,7 +367,8 @@ pub trait SandboxSession: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ErrorCode::PtySessionNotFound`] when the process is gone or this session never had
-    /// terminals, or the backend's failure to write.
+    /// terminals, [`SandboxError::pty_stdin_unavailable`] when input is sent to a process started
+    /// without a terminal, or the backend's failure to write.
     async fn pty_write(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
         let _ = request;
         Err(self.pty_unsupported())

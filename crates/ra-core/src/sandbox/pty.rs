@@ -4,9 +4,33 @@
 //! produced so far plus a handle, and a later call writes input, waits again, and returns more. The
 //! handle is what ties the two together.
 
+use std::collections::HashSet;
+use std::hash::BuildHasher;
+
 use serde::{Deserialize, Serialize};
 
+use super::session::ShellInvocation;
+use super::token_truncation::formatted_truncate_text_with_token_count;
 use super::types::User;
+
+/// The shortest wait for output a terminal call makes, in milliseconds.
+pub const PTY_YIELD_TIME_MS_MIN: u64 = 250;
+/// The shortest wait a call that sends nothing makes, in milliseconds.
+pub const PTY_EMPTY_YIELD_TIME_MS_MIN: u64 = 5_000;
+/// The longest wait for output a terminal call makes, in milliseconds.
+pub const PTY_YIELD_TIME_MS_MAX: u64 = 30_000;
+
+/// How many interactive processes one session keeps before it ends one to make room.
+pub const PTY_PROCESSES_MAX: usize = 64;
+/// The process count at which a session starts warning that it is approaching the limit.
+pub const PTY_PROCESSES_WARNING: usize = 60;
+/// How many of the most recently used processes are never ended to make room.
+pub const PTY_PROCESSES_PROTECTED_RECENT: usize = 8;
+
+/// The smallest process id a session hands out.
+pub const PTY_PROCESS_ID_MIN: i64 = 1_000;
+/// One past the largest process id a session hands out.
+pub const PTY_PROCESS_ID_MAX_EXCLUSIVE: i64 = 100_000;
 
 /// A running interactive process.
 ///
@@ -84,7 +108,14 @@ pub struct PtyStartRequest {
     /// The command and its arguments.
     pub command: Vec<String>,
     /// How long to wait for the whole command, in seconds.
+    ///
+    /// Carried because the reference's signature carries it; the local backend ignores it, as the
+    /// reference's does, since an interactive process ends when it is told to rather than on a
+    /// clock.
     pub timeout_s: Option<f64>,
+    /// Whether a shell sits between the session and the command. The default is the login shell,
+    /// as for a one-shot command.
+    pub shell: ShellInvocation,
     /// Whether a terminal is allocated, as opposed to plain pipes.
     pub tty: bool,
     /// The account to run as, or the session's default.
@@ -103,6 +134,13 @@ impl PtyStartRequest {
             command: command.into_iter().collect(),
             ..Self::default()
         }
+    }
+
+    /// Puts a different shell, or none, between the session and the command.
+    #[must_use]
+    pub fn with_shell(mut self, shell: ShellInvocation) -> Self {
+        self.shell = shell;
+        self
     }
 
     /// Allocates a terminal for the command.
@@ -185,4 +223,133 @@ impl PtyWriteRequest {
         self.max_output_tokens = Some(max_output_tokens);
         self
     }
+}
+
+/// Holds a requested wait within the bounds every terminal call observes.
+#[must_use]
+pub fn clamp_pty_yield_time_ms(yield_time_ms: u64) -> u64 {
+    yield_time_ms.clamp(PTY_YIELD_TIME_MS_MIN, PTY_YIELD_TIME_MS_MAX)
+}
+
+/// The wait a write makes: clamped, and never shorter than [`PTY_EMPTY_YIELD_TIME_MS_MIN`] when it
+/// sends nothing.
+#[must_use]
+pub fn resolve_pty_write_yield_time_ms(yield_time_ms: u64, input_empty: bool) -> u64 {
+    let normalized = clamp_pty_yield_time_ms(yield_time_ms);
+    if input_empty {
+        normalized.max(PTY_EMPTY_YIELD_TIME_MS_MIN)
+    } else {
+        normalized
+    }
+}
+
+/// Picks an unused process id at random from the session's range.
+///
+/// Random rather than sequential, as the reference's is. The randomness is the version-4
+/// identifier generator's, which this crate already uses, rather than a second source.
+#[must_use]
+pub fn allocate_pty_process_id<S: BuildHasher>(
+    used_process_ids: &HashSet<PtyProcessId, S>,
+) -> PtyProcessId {
+    let span = u128::try_from(PTY_PROCESS_ID_MAX_EXCLUSIVE - PTY_PROCESS_ID_MIN).unwrap_or(1);
+    loop {
+        let offset = uuid::Uuid::new_v4().as_u128() % span;
+        let offset = i64::try_from(offset).unwrap_or_default();
+        let process_id = PtyProcessId(PTY_PROCESS_ID_MIN + offset);
+        if !used_process_ids.contains(&process_id) {
+            return process_id;
+        }
+    }
+}
+
+/// What a session knows about one interactive process when choosing which to end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PtyProcessMeta<T> {
+    process_id: PtyProcessId,
+    last_used: T,
+    exited: bool,
+}
+
+impl<T: Copy> PtyProcessMeta<T> {
+    /// Describes one process: which it is, when it was last used — larger is more recent — and
+    /// whether it has already exited.
+    #[must_use]
+    pub const fn new(process_id: PtyProcessId, last_used: T, exited: bool) -> Self {
+        Self {
+            process_id,
+            last_used,
+            exited,
+        }
+    }
+
+    /// The process.
+    #[must_use]
+    pub const fn process_id(&self) -> PtyProcessId {
+        self.process_id
+    }
+
+    /// When it was last used.
+    #[must_use]
+    pub const fn last_used(&self) -> T {
+        self.last_used
+    }
+
+    /// Whether it has already exited.
+    #[must_use]
+    pub const fn exited(&self) -> bool {
+        self.exited
+    }
+}
+
+/// Chooses which interactive process to end when a session is full.
+///
+/// The [`PTY_PROCESSES_PROTECTED_RECENT`] most recently used are never chosen. Among the rest, the
+/// least recently used one that has already exited goes first, and failing that the least recently
+/// used one still running. `None` only when every process is protected.
+#[must_use]
+pub fn process_id_to_prune_from_meta<T: PartialOrd + Copy>(
+    meta: &[PtyProcessMeta<T>],
+) -> Option<PtyProcessId> {
+    if meta.is_empty() {
+        return None;
+    }
+
+    let mut by_recency = meta.to_vec();
+    by_recency.sort_by(|left, right| {
+        right
+            .last_used
+            .partial_cmp(&left.last_used)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let protected: HashSet<PtyProcessId> = by_recency
+        .iter()
+        .take(PTY_PROCESSES_PROTECTED_RECENT)
+        .map(|entry| entry.process_id)
+        .collect();
+
+    let mut least_recent = meta.to_vec();
+    least_recent.sort_by(|left, right| {
+        left.last_used
+            .partial_cmp(&right.last_used)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    least_recent
+        .iter()
+        .find(|entry| entry.exited && !protected.contains(&entry.process_id))
+        .or_else(|| {
+            least_recent
+                .iter()
+                .find(|entry| !protected.contains(&entry.process_id))
+        })
+        .map(|entry| entry.process_id)
+}
+
+/// Cuts terminal output to `max_output_tokens`, reporting the original size when it was cut.
+#[must_use]
+pub fn truncate_text_by_tokens(
+    text: &str,
+    max_output_tokens: Option<u64>,
+) -> (String, Option<u64>) {
+    formatted_truncate_text_with_token_count(text, max_output_tokens)
 }

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use super::types::ErrorContext;
 
 mod constructors;
-pub use constructors::SandboxErrorDetails;
+pub use constructors::{PTY_STDIN_UNAVAILABLE_MESSAGE, SandboxErrorDetails};
 
 /// The stable, machine-readable identity of a sandbox failure.
 ///

@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, CompressionScheme, Entry, EnvValueResolver, ErrorCode, ExecRequest, ExecResult,
     ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, MaterializedFile, OpName,
-    PosixPath, SandboxArchiveLimits, SandboxConcurrencyLimits, SandboxError, SandboxResult,
-    SandboxSession, SandboxSessionState, SessionResources, SnapshotFingerprint, User,
-    validate_manifest_mount_credential_boundaries,
+    PosixPath, PtyExecUpdate, PtyStartRequest, PtyWriteRequest, SandboxArchiveLimits,
+    SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
+    SessionResources, SnapshotFingerprint, User, validate_manifest_mount_credential_boundaries,
 };
 
 use crate::archive::WorkspaceArchiveExtractor;
@@ -27,6 +27,7 @@ use crate::snapshot::lifecycle::SnapshotLifecycle;
 use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
 use super::exec::ArgumentPaths;
+use super::pty::PtyProcesses;
 use super::{UNIX_LOCAL_BACKEND_ID, archive, exec, files};
 
 /// A local workspace, and the commands run against it.
@@ -59,6 +60,8 @@ pub struct UnixLocalSandboxSession {
     /// The dependency container, pre-stop callbacks and close lock every session holds. Shared by
     /// clones, as the state is: a clone is the same session.
     resources: Arc<SessionResources>,
+    /// The interactive processes this session started. Shared by clones for the same reason.
+    pty: Arc<PtyProcesses>,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxSession {
@@ -87,6 +90,7 @@ impl UnixLocalSandboxSession {
             snapshot_store: Arc::new(BuiltinSnapshotStore),
             mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             resources: Arc::new(SessionResources::new()),
+            pty: Arc::new(PtyProcesses::default()),
         }
     }
 
@@ -438,14 +442,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         &self.resources
     }
 
-    /// Whether this session can allocate a terminal.
-    ///
-    /// **`false`, where the reference says `true`.** The terminal implementation is a separate
-    /// task; until it lands, claiming a terminal would have the tool surface offer an interactive
-    /// write tool backed by nothing. Answering honestly costs an absent capability; answering
-    /// aspirationally costs a tool that fails when a model uses it.
     fn supports_pty(&self) -> bool {
-        false
+        true
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
@@ -461,6 +459,47 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     async fn running(&self) -> SandboxResult<bool> {
         Ok(self.running.load(Ordering::SeqCst))
+    }
+
+    /// Starts a command that keeps running, through the same shaping a one-shot command gets.
+    ///
+    /// The request's timeout is ignored, as the reference's local session ignores it: the process
+    /// runs until it exits or is ended, and the wait for output is what the caller bounds.
+    async fn pty_start(&self, request: PtyStartRequest) -> SandboxResult<PtyExecUpdate> {
+        let (env, cwd) = self.exec_context().await?;
+        let command = exec::prepare_exec_command(&ExecRequest {
+            command: request.command,
+            timeout_s: None,
+            shell: request.shell,
+            user: request.user,
+        });
+        let grants = self.manifest().extra_path_grants;
+        let host = exec::host_command(
+            &command,
+            &env,
+            &cwd,
+            &grants,
+            ArgumentPaths::WorkspaceRelative,
+        )?;
+        self.pty
+            .start(
+                &command,
+                host,
+                &env,
+                request.tty,
+                request.yield_time_s,
+                request.max_output_tokens,
+            )
+            .await
+    }
+
+    async fn pty_write(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        self.pty.write(request).await
+    }
+
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        self.pty.terminate_all().await;
+        Ok(())
     }
 
     async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
@@ -803,7 +842,13 @@ impl SandboxSession for UnixLocalSandboxSession {
     /// The workspace directory is deliberately left alone: deleting it belongs to the client, which
     /// is the only party that knows whether this session created it.
     async fn after_shutdown(&self) -> SandboxResult<()> {
+        self.pty.wait_for_fd_closes().await;
         self.running.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Gives terminals ended before the snapshot a short grace period to finish closing.
+    async fn after_stop(&self) {
+        self.pty.wait_for_fd_closes().await;
     }
 }
