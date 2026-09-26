@@ -28,5 +28,7 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# `exec_command` 的 sandbox 版照上游在每次响应头写一个随机 Chunk ID。
+uuid = { workspace = true }
 # 文件事实进宿主事件通道时，通道拒收要留痕：已经写盘的修改不能因为记不下来就变成没发生。
 tracing = { workspace = true }

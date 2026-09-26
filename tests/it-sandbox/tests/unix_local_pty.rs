@@ -152,7 +152,7 @@ const IGNORED_SIGNAL_ENV: &str = "RA_TEST_PTY_IGNORED_SIGNAL";
 async fn terminal_signals_interrupt_even_when_the_host_ignores_them() {
     let binary = std::env::current_exe().expect("test binary");
     for signal in ["INT", "QUIT"] {
-        let status = std::process::Command::new("sh")
+        let output = std::process::Command::new("sh")
             .args([
                 "-c",
                 &format!("trap '' {signal}; exec \"$0\" \"$@\""),
@@ -164,9 +164,13 @@ async fn terminal_signals_interrupt_even_when_the_host_ignores_them() {
                 "--test-threads=1",
             ])
             .env(IGNORED_SIGNAL_ENV, signal)
-            .status()
+            .output()
             .expect("run under an ignored signal");
-        assert!(status.success(), "SIG{signal}: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "SIG{signal}: {stdout}\n{stderr}");
+        // A filter that matched nothing is reported as success.
+        assert!(stdout.contains("1 passed"), "SIG{signal}: {stdout}");
     }
 }
 

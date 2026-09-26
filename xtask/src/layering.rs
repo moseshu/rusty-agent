@@ -121,8 +121,8 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // and interactive alike — rather than going through `ra-exec`, because the environment policy,
     // resource ceilings and per-command fence that crate applies are this product's, not the
     // ported contract's, and inheriting them would change what a ported session does. Terminal
-    // support kept to that rule and took no edge. The one to `ra-tools` is added when the default
-    // capabilities ship the tools that bind to a session.
+    // support kept to that rule and took no edge. Nor does the shell capability need one: it and its
+    // tools live in `ra-tools` and reach a session only through `ra-core`'s protocol.
     ("ra-sandbox", &["ra-core"]),
     ("ra-session", &["ra-core"]),
     ("ra-mcp", &["ra-core"]),
