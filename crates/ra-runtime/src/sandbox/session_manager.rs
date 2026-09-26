@@ -12,6 +12,10 @@
 //!   reported.
 //! - **A failed cleanup produces no resume state.** Every agent's session is cleaned up even after
 //!   one fails, and only when all of them succeeded is a new resume state written.
+//! - **What handled mount authority says nothing about it.** Preparing a session and cleaning one
+//!   up are the two boundaries the reference guards with `@redact_mount_error_data`: when what the
+//!   call was given carries mount authority, or the failure was already marked as possibly carrying
+//!   some, the failure is replaced by one that keeps only what a caller branches on.
 //!
 //! # Where this differs from the reference
 //!
@@ -30,11 +34,12 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use ra_core::{
     agent::{AgentId, AgentSpec},
-    error::{Error, Result},
+    error::{Error, Result, SandboxErrorKind},
     sandbox::{
         CreateRequest, Entry, Manifest, PosixPath, SandboxAgentConfig, SandboxAgentRunLease,
         SandboxClient, SandboxError, SandboxPathGrant, SandboxResult, SandboxSession,
-        SandboxSessionState, manifest_with_run_as_user, process_manifest, resolve_workspace_path,
+        SandboxSessionState, manifest_has_configured_mount_authority, manifest_with_run_as_user,
+        process_manifest, replace_protected_mount_error, resolve_workspace_path,
         validate_manifest_mount_credential_boundaries,
     },
 };
@@ -72,7 +77,23 @@ impl RunSession {
     }
 
     /// Cleans up an owned session, once. A borrowed one is left alone.
+    ///
+    /// A failure is replaced as [`replace_protected_mount_error`] describes when the session's
+    /// manifest carries mount authority or the failure was marked as possibly carrying some: a
+    /// pre-stop callback, a stop or a delete is free to quote the configuration it worked with.
     async fn cleanup(&mut self) -> SandboxResult<()> {
+        let call_has_authority =
+            manifest_has_configured_mount_authority(self.session.state().manifest());
+        self.cleanup_steps().await.map_err(|error| {
+            if call_has_authority || error.is_data_redacted() {
+                replace_protected_mount_error(&error)
+            } else {
+                error
+            }
+        })
+    }
+
+    async fn cleanup_steps(&mut self) -> SandboxResult<()> {
         if !self.owns_session || self.cleaned {
             return Ok(());
         }
@@ -165,7 +186,42 @@ impl SessionManager {
 
     /// The session `agent` runs against, created, resumed or borrowed the first time it is asked
     /// for, and started if it is not running.
+    ///
+    /// A failure is replaced as [`redact_mount_error`] describes when the configuration the call
+    /// works from carries mount authority.
     pub(crate) async fn ensure_session(
+        &mut self,
+        agent: &AgentSpec,
+        sandbox: &SandboxAgentConfig,
+    ) -> Result<Arc<dyn SandboxSession>> {
+        let call_has_authority = self.call_has_mount_authority(sandbox);
+        self.ensure_session_unredacted(agent, sandbox)
+            .await
+            .map_err(|error| redact_mount_error(error, call_has_authority))
+    }
+
+    /// Whether what a preparation works from carries mount authority.
+    ///
+    /// What the reference's decorator reads off `ensure_session`'s arguments: the run
+    /// configuration's manifest, its explicit state and its live session, and the agent's default
+    /// manifest. The checkpoint is not among them; what it carries was stripped of authority on the
+    /// way in, and what a resume rebinds comes from those same manifests.
+    fn call_has_mount_authority(&self, sandbox: &SandboxAgentConfig) -> bool {
+        self.config
+            .manifest()
+            .into_iter()
+            .chain(sandbox.default_manifest())
+            .any(manifest_has_configured_mount_authority)
+            || self
+                .config
+                .session_state()
+                .is_some_and(|state| manifest_has_configured_mount_authority(state.manifest()))
+            || self.config.session().is_some_and(|session| {
+                manifest_has_configured_mount_authority(session.state().manifest())
+            })
+    }
+
+    async fn ensure_session_unredacted(
         &mut self,
         agent: &AgentSpec,
         sandbox: &SandboxAgentConfig,
@@ -196,6 +252,18 @@ impl SessionManager {
     /// resume state is produced, because a state describing sessions whose cleanup failed would
     /// resume a workspace nobody can vouch for. The run's claims are released either way.
     pub(crate) async fn cleanup(&mut self) -> Result<Option<Value>> {
+        let span = if self.resources.is_empty() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                "sandbox.cleanup_sessions",
+                session_count = self.resources.len()
+            )
+        };
+        self.cleanup_sessions().instrument(span).await
+    }
+
+    async fn cleanup_sessions(&mut self) -> Result<Option<Value>> {
         let mut first_error = None;
         for (_, resources) in &mut self.resources {
             if let Err(error) = resources.cleanup().await {
@@ -516,6 +584,36 @@ fn resume_key(agent: &AgentId) -> String {
 
 fn invalid_envelope() -> Error {
     Error::config("RunState sandbox resume state has an invalid envelope")
+}
+
+/// What the reference says in place of a failure that is not a sandbox failure.
+const PROTECTED_MOUNT_OPERATION_FAILED: &str =
+    "sandbox operation failed while using a protected mount configuration";
+
+/// The failure a preparation lets out, decided as the reference's `@redact_mount_error_data`
+/// decides it.
+///
+/// A sandbox failure is replaced when the call handled mount authority or the failure was already
+/// marked as possibly carrying some; the replacement keeps the code, the operation and the
+/// retryability. Any other failure from a call that handled authority becomes the reference's
+/// generic sentence, since nothing about it says what it may quote. Cancellation passes as it is:
+/// it carries no data, and it is how the run stops — the counterpart of the reference keeping its
+/// process-control exceptions.
+fn redact_mount_error(error: Error, call_has_authority: bool) -> Error {
+    if matches!(error, Error::Cancelled { .. }) {
+        return error;
+    }
+    let sandbox =
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<SandboxError>());
+    match sandbox {
+        Some(sandbox) if call_has_authority || sandbox.is_data_redacted() => {
+            sandbox_error(replace_protected_mount_error(sandbox))
+        }
+        None if call_has_authority => {
+            Error::sandbox(SandboxErrorKind::Setup, PROTECTED_MOUNT_OPERATION_FAILED)
+        }
+        _ => error,
+    }
 }
 
 /// The session state inside one `sessions_by_agent` entry.

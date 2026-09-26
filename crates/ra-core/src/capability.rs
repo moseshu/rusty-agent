@@ -462,18 +462,22 @@ pub trait Capability: Send + Sync + 'static {
 
     /// Changes the manifest a sandbox agent's session is created or resumed with.
     ///
-    /// Called in installation order, each capability receiving what the one before it returned, on
-    /// a copy the host's own manifest is not affected by. Credential exposure the host acknowledged
-    /// on the manifest it was handed survives into whatever this returns, even a manifest built
-    /// from scratch. The default returns it unchanged.
+    /// Called in installation order, each capability editing what the one before it left, on a copy
+    /// the host's own manifest is not affected by. The edit is in place, as on the reference; a
+    /// capability that builds a new manifest assigns it over the one it was handed. Credential
+    /// exposure the host acknowledged on the manifest it was handed survives whatever this leaves,
+    /// even a manifest built from scratch. The default leaves it unchanged.
     ///
     /// # Errors
     ///
-    /// Returns the sandbox failure that refuses the manifest. When the manifest carries mount
-    /// authority, the runtime replaces the failure with one that says what failed and nothing
-    /// else, because the message is free to quote what it was handed.
-    fn process_manifest(&self, manifest: Manifest) -> SandboxResult<Manifest> {
-        Ok(manifest)
+    /// Returns the sandbox failure that refuses the manifest. When the manifest carried mount
+    /// authority — handed in, or added before the failure — the runtime replaces the failure with
+    /// one that says what failed and nothing else, because the message is free to quote what it
+    /// saw. That is why the edit is in place: a manifest handed over by value is lost with the
+    /// failure, and could no longer be asked what the capability had added to it.
+    fn process_manifest(&self, manifest: &mut Manifest) -> SandboxResult<()> {
+        let _ = manifest;
+        Ok(())
     }
 
     /// Binds this capability to the sandbox session a sandbox agent runs against.

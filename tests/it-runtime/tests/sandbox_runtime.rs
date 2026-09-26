@@ -21,22 +21,27 @@ use ra_core::{
     capability::{Capability, CapabilityFamily, SandboxBinding},
     context::RunContext,
     error::{Error, Result},
-    guardrail::{GuardrailFunctionOutput, InputGuardrail},
+    guardrail::{GuardrailFinalOutput, GuardrailFunctionOutput, InputGuardrail, OutputGuardrail},
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
         ToolCall,
     },
+    lifecycle::{
+        AgentEndInput, AgentStartInput, LifecycleHook, LifecycleScope, LlmEndInput, LlmStartInput,
+    },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ModelStreamEvent, ProviderKey, ResolvedModel,
+        ModelStreamEvent, ProviderKey, ResolvedModel, ToolChoice,
     },
     prompt::{PromptSection, PromptSource, ResolvedPrompt, SectionPosition, SectionStability},
     sandbox::{
         AsUser, CreateRequest, DiscriminatedPayload, Entry, ErrorCode, ExecRequest, ExecResult,
-        FileEntry, Manifest, MaterializedFile, OpName, PosixPath, SandboxAgentConfig,
-        SandboxArchiveLimits, SandboxClient, SandboxConcurrencyLimits, SandboxError,
-        SandboxPathGrant, SandboxResult, SandboxSession, SandboxSessionState,
+        FileEntry, Manifest, MaterializedFile, Mount, MountPattern, MountProvider, MountStrategy,
+        OpName, PosixPath, REDACTED_MOUNT_AUTHORITY_KEY, RcloneOptions, S3Mount,
+        SandboxAgentConfig, SandboxArchiveLimits, SandboxClient, SandboxConcurrencyLimits,
+        SandboxError, SandboxPathGrant, SandboxResult, SandboxSession, SandboxSessionState,
         SandboxWorkspaceScope, SessionResources, Snapshot, User, pre_stop_hook,
+        validate_manifest_mount_credential_boundaries,
     },
     state::{RunId, RunState},
     tool::{
@@ -82,9 +87,11 @@ impl Faults {
 
 struct SessionInner {
     label: String,
+    backend: String,
     state: Mutex<SandboxSessionState>,
     resources: SessionResources,
     running: AtomicBool,
+    running_calls: AtomicUsize,
     log: Log,
     faults: Faults,
     /// Directories `test -d` / `test -x` succeed for.
@@ -99,9 +106,11 @@ impl FakeSession {
     fn new(label: &str, state: SandboxSessionState, log: &Log, faults: &Faults) -> Self {
         let session = Self(Arc::new(SessionInner {
             label: label.to_owned(),
+            backend: state.state_type().to_owned(),
             state: Mutex::new(state),
             resources: SessionResources::new(),
             running: AtomicBool::new(false),
+            running_calls: AtomicUsize::new(0),
             log: Arc::clone(log),
             faults: faults.clone(),
             directories: Arc::default(),
@@ -138,7 +147,7 @@ impl FakeSession {
 #[async_trait]
 impl SandboxSession for FakeSession {
     fn backend_id(&self) -> &str {
-        "fake"
+        &self.0.backend
     }
 
     fn state(&self) -> SandboxSessionState {
@@ -160,6 +169,7 @@ impl SandboxSession for FakeSession {
     }
 
     async fn running(&self) -> SandboxResult<bool> {
+        self.0.running_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.0.running.load(Ordering::SeqCst))
     }
 
@@ -209,7 +219,34 @@ impl SandboxSession for FakeSession {
                 .unwrap()
                 .push(path.as_str().to_owned());
         }
+        // Fails once, as a backend whose write broke off would.
+        if self.0.faults.0.lock().unwrap().remove("apply_once") {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                OpName::Start,
+                "delta apply failed",
+            ));
+        }
         Ok(Vec::new())
+    }
+
+    async fn validate_manifest_application(
+        &self,
+        manifest: &Manifest,
+        session_running: bool,
+    ) -> SandboxResult<()> {
+        let _ = session_running;
+        self.0
+            .faults
+            .check("validate_application", OpName::Start)
+            .map_err(|_| {
+                SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    OpName::Start,
+                    "live manifest update rejected",
+                )
+            })?;
+        validate_manifest_mount_credential_boundaries(manifest, Some(&self.0.backend))
     }
 
     async fn start(&self) -> SandboxResult<bool> {
@@ -240,11 +277,14 @@ impl SandboxSession for FakeSession {
 }
 
 struct FakeClient {
+    backend: &'static str,
     log: Log,
     faults: Faults,
     sessions: Mutex<Vec<FakeSession>>,
     created_ids: Mutex<Vec<Uuid>>,
     resumed_ids: Mutex<Vec<Uuid>>,
+    /// Each state handed to `resume`, as the client received it.
+    resumed_states: Mutex<Vec<SandboxSessionState>>,
     create_requests: Mutex<Vec<CreateRequest>>,
     counter: AtomicUsize,
     default_options: bool,
@@ -260,11 +300,13 @@ impl FakeClient {
 
     fn with_log(log: &Log) -> Arc<Self> {
         Arc::new(Self {
+            backend: "fake",
             log: Arc::clone(log),
             faults: Faults::default(),
             sessions: Mutex::default(),
             created_ids: Mutex::default(),
             resumed_ids: Mutex::default(),
+            resumed_states: Mutex::default(),
             create_requests: Mutex::default(),
             counter: AtomicUsize::new(0),
             default_options: true,
@@ -278,6 +320,21 @@ impl FakeClient {
         let mut client = Arc::try_unwrap(client).ok().unwrap();
         client.default_options = false;
         Arc::new(client)
+    }
+
+    /// A client that says it is `backend`, for mounts whose strategy only one backend executes.
+    fn for_backend(backend: &'static str) -> Arc<Self> {
+        let client = Self::new();
+        let mut client = Arc::try_unwrap(client).ok().unwrap();
+        client.backend = backend;
+        Arc::new(client)
+    }
+
+    fn starts(&self) -> usize {
+        self.log()
+            .iter()
+            .filter(|entry| entry.starts_with("start"))
+            .count()
     }
 
     fn log(&self) -> Vec<String> {
@@ -308,7 +365,7 @@ impl FakeClient {
 #[async_trait]
 impl SandboxClient for FakeClient {
     fn backend_id(&self) -> &str {
-        "fake"
+        self.backend
     }
 
     fn supports_default_options(&self) -> bool {
@@ -328,7 +385,7 @@ impl SandboxClient for FakeClient {
         let label = format!("s{index}");
         note(&self.log, format!("create:{label}"));
         let state = SandboxSessionState::new(
-            "fake",
+            self.backend,
             Snapshot::noop(),
             request.manifest.clone().unwrap_or_default(),
         );
@@ -343,6 +400,7 @@ impl SandboxClient for FakeClient {
         let label = format!("s{index}");
         note(&self.log, format!("resume:{label}"));
         self.resumed_ids.lock().unwrap().push(state.session_id());
+        self.resumed_states.lock().unwrap().push(state.clone());
         Ok(Box::new(self.adopt(label, state)))
     }
 
@@ -368,6 +426,7 @@ struct ScriptedModel {
     inputs: Mutex<Vec<Vec<ModelInputItem>>>,
     tools: Mutex<Vec<Vec<String>>>,
     temperatures: Mutex<Vec<Option<f64>>>,
+    tool_choices: Mutex<Vec<Option<ToolChoice>>>,
 }
 
 impl ScriptedModel {
@@ -378,6 +437,7 @@ impl ScriptedModel {
             inputs: Mutex::default(),
             tools: Mutex::default(),
             temperatures: Mutex::default(),
+            tool_choices: Mutex::default(),
         })
     }
 
@@ -402,6 +462,10 @@ impl ScriptedModel {
             .lock()
             .unwrap()
             .push(request.model_settings().temperature());
+        self.tool_choices
+            .lock()
+            .unwrap()
+            .push(request.model_settings().tool_choice().cloned());
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
             return Err(Error::caller("scripted model ran out of responses"));
@@ -524,16 +588,26 @@ fn resume_payload(result: &RunResult) -> Value {
 }
 
 /// A capability assembled from parts, recording what it was bound to.
+#[derive(Clone)]
 struct WorkspaceCapability {
     kind: CapabilityFamily,
     requires: Option<CapabilityFamily>,
     fragment: Option<&'static str>,
     temperature: Option<f64>,
     adds_entry: Option<&'static str>,
+    /// Replaces the manifest's path grants.
+    sets_grants: Option<Vec<SandboxPathGrant>>,
+    /// Mounted at `data`.
+    adds_mount: Option<Entry>,
+    /// Fails with this message, after every edit above.
+    fails: Option<&'static str>,
     tool: bool,
     approval: bool,
     bound: Option<SandboxBinding>,
     bindings: Arc<AtomicUsize>,
+    /// Every binding it was handed, in order.
+    seen: Arc<Mutex<Vec<SandboxBinding>>>,
+    process_calls: Arc<AtomicUsize>,
 }
 
 impl WorkspaceCapability {
@@ -544,10 +618,15 @@ impl WorkspaceCapability {
             fragment: None,
             temperature: None,
             adds_entry: None,
+            sets_grants: None,
+            adds_mount: None,
+            fails: None,
             tool: false,
             approval: false,
             bound: None,
             bindings: Arc::default(),
+            seen: Arc::default(),
+            process_calls: Arc::default(),
         }
     }
 }
@@ -597,26 +676,34 @@ impl Capability for WorkspaceCapability {
         }
     }
 
-    fn process_manifest(&self, manifest: Manifest) -> SandboxResult<Manifest> {
-        Ok(match self.adds_entry {
-            Some(path) => manifest.with_entry(path, Entry::file(b"from capability".to_vec())),
-            None => manifest,
-        })
+    fn process_manifest(&self, manifest: &mut Manifest) -> SandboxResult<()> {
+        self.process_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = self.adds_entry {
+            *manifest =
+                std::mem::take(manifest).with_entry(path, Entry::file(b"from capability".to_vec()));
+        }
+        if let Some(grants) = &self.sets_grants {
+            manifest.extra_path_grants.clone_from(grants);
+        }
+        if let Some(mount) = &self.adds_mount {
+            *manifest = std::mem::take(manifest).with_entry("data", mount.clone());
+        }
+        match self.fails {
+            Some(message) => Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                OpName::Start,
+                message,
+            )),
+            None => Ok(()),
+        }
     }
 
     fn bind_sandbox(&self, binding: &SandboxBinding) -> Result<Option<Arc<dyn Capability>>> {
         self.bindings.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(Arc::new(Self {
-            kind: self.kind.clone(),
-            requires: self.requires.clone(),
-            fragment: self.fragment,
-            temperature: self.temperature,
-            adds_entry: self.adds_entry,
-            tool: self.tool,
-            approval: self.approval,
-            bound: Some(binding.clone()),
-            bindings: Arc::clone(&self.bindings),
-        })))
+        self.seen.lock().unwrap().push(binding.clone());
+        let mut bound = self.clone();
+        bound.bound = Some(binding.clone());
+        Ok(Some(Arc::new(bound)))
     }
 }
 
@@ -670,6 +757,95 @@ impl Tool for TouchTool {
             .map_err(|error| Error::caller(error.to_string()))?;
         Ok(ToolOutput::text(format!("wrote {path}")))
     }
+}
+
+/// Stops the run's first session behind the runner's back, as a backend that lost it would.
+struct Halt {
+    client: Arc<FakeClient>,
+    /// Also takes away the directories the working-directory check succeeds for.
+    forget_directories: bool,
+    origin: ToolOrigin,
+    schema: ToolSchema,
+}
+
+impl Halt {
+    fn tool(client: &Arc<FakeClient>, forget_directories: bool) -> Arc<dyn Tool> {
+        Arc::new(Self {
+            client: Arc::clone(client),
+            forget_directories,
+            origin: ToolOrigin::new("halt").unwrap(),
+            schema: ToolSchema::new(
+                "halt",
+                json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+            )
+            .unwrap(),
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for Halt {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        let session = self.client.session(0);
+        session.0.running.store(false, Ordering::SeqCst);
+        if self.forget_directories {
+            session.0.directories.lock().unwrap().clear();
+        }
+        Ok(ToolOutput::text("halted"))
+    }
+}
+
+/// An S3 mount with its keys, mounted through a Docker volume: authority only the Docker backend
+/// may execute.
+fn docker_s3(secret: &str) -> Entry {
+    Entry::mount(
+        Mount::new(
+            MountProvider::S3(S3Mount {
+                bucket: "example-bucket".to_owned(),
+                access_key_id: Some("example-access-key".to_owned()),
+                secret_access_key: Some(secret.to_owned()),
+                ..S3Mount::default()
+            }),
+            MountStrategy::docker_volume("rclone"),
+        )
+        .unwrap(),
+    )
+}
+
+/// An S3 mount whose keys an rclone helper inside the sandbox would read, with no acknowledgement
+/// from the host that the model may see them.
+fn exposed_s3() -> Entry {
+    Entry::mount(
+        Mount::new(
+            MountProvider::S3(S3Mount {
+                bucket: "example-bucket".to_owned(),
+                access_key_id: Some("example-access-key".to_owned()),
+                secret_access_key: Some("example-secret-key".to_owned()),
+                ..S3Mount::default()
+            }),
+            MountStrategy::in_container(MountPattern::Rclone(RcloneOptions::default())),
+        )
+        .unwrap(),
+    )
+}
+
+/// Everything an error says, its sources included, both as displayed and as debugged.
+fn error_text(error: &Error) -> String {
+    let mut text = format!("{error}\n{error:?}");
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        text.push_str(&format!("\n{current}\n{current:?}"));
+        source = current.source();
+    }
+    text
 }
 
 // -- configuration ------------------------------------------------------------------------------
@@ -2183,6 +2359,10 @@ async fn eventually_logged(client: &FakeClient, entry: &str) -> Vec<String> {
 /// A host that drops the stream while the session is still stopping — longer than the drain grace
 /// the run is given before it is aborted — still gets the session shut down, deleted and its
 /// dependencies closed.
+///
+/// Also `test_runner_streamed_immediate_cancel_skips_waiting_for_sandbox_cleanup`: dropping the
+/// stream is how a host cancels a streamed run at once, and it returns without waiting for the
+/// stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_stream_during_a_slow_stop_still_releases_the_session() {
     let client = FakeClient::new();
@@ -2197,8 +2377,14 @@ async fn dropping_the_stream_during_a_slow_stop_still_releases_the_session() {
             break;
         }
     }
-    // The run has answered and is settling its sandbox; the host walks away.
+    // The run has answered and is settling its sandbox; the host walks away, without waiting.
+    let dropped_at = std::time::Instant::now();
     drop(stream);
+    assert!(
+        dropped_at.elapsed() < std::time::Duration::from_millis(200),
+        "{:?}",
+        dropped_at.elapsed()
+    );
 
     let log = eventually_logged(&client, "close_dependencies:s0").await;
     assert_eq!(
@@ -2291,4 +2477,905 @@ async fn dropping_a_run_mid_call_still_releases_the_session() {
     let log = eventually_logged(&client, "close_dependencies:s0").await;
     assert!(log.contains(&"delete:s0".to_owned()), "{log:?}");
     assert!(log.contains(&"close_dependencies:s0".to_owned()), "{log:?}");
+}
+
+// -- a continued run handing off ----------------------------------------------------------------
+
+/// `test_runner_resumed_handoff_materializes_manifest_for_new_sandbox_agent`: a run continued from
+/// an approval hands off to a sandbox agent that has not run yet, which gets a session of its own,
+/// made from its own manifest, and a prompt describing that one.
+#[tokio::test]
+async fn a_continued_run_prepares_an_agent_it_hands_off_to_from_its_own_manifest() {
+    let workspace = |approval: bool| {
+        let mut capability = WorkspaceCapability::new("workspace");
+        capability.fragment = Some("Workspace");
+        capability.tool = approval;
+        capability.approval = approval;
+        Arc::new(capability) as Arc<dyn Capability>
+    };
+    let worker = AgentSpec::builder()
+        .id(AgentId::new("worker"))
+        .name("Worker")
+        .instructions("work")
+        .sandbox(
+            SandboxAgentConfig::new()
+                .with_default_manifest(Manifest::new().with_root("/worker"))
+                .with_capability(workspace(false)),
+        )
+        .build()
+        .unwrap();
+    let triage = AgentSpec::builder()
+        .id(AgentId::new("triage"))
+        .name("Triage")
+        .instructions("triage")
+        .handoff(HandoffSpec::new(
+            AgentId::new("worker"),
+            transfer_schema("worker"),
+        ))
+        .sandbox(
+            SandboxAgentConfig::new()
+                .with_default_manifest(Manifest::new().with_root("/triage"))
+                .with_capability(workspace(true)),
+        )
+        .build()
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(Arc::clone(&triage))
+        .register(worker)
+        .build()
+        .unwrap();
+
+    let interrupted = Runner::run(request(
+        Arc::clone(&triage),
+        &ScriptedModel::new(vec![tool_call("call-1", "touch")]),
+        RunConfig::new()
+            .with_agent_registry(registry.clone())
+            .with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap();
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state.approve(&items[0], false).unwrap();
+
+    let model = ScriptedModel::new(vec![
+        tool_call("call-2", "transfer_to_worker"),
+        final_answer("m", "done"),
+    ]);
+    let client = FakeClient::new();
+    let resumed = Runner::run(
+        RunRequest::new(
+            AgentBinding::direct(triage),
+            Arc::new(FixedResolver(Arc::clone(&model))),
+            RunId::new("run-sandbox"),
+            CancelScope::root(),
+            Vec::new(),
+        )
+        .with_state(state)
+        .with_config(
+            RunConfig::new()
+                .with_agent_registry(registry)
+                .with_sandbox(with_client(&client)),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.final_text(), "done");
+    // The agent that was interrupted is resumed; the one it handed off to is created.
+    assert_eq!(client.resumed_ids.lock().unwrap().len(), 1);
+    let requests = client.create_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].manifest.as_ref().unwrap().root, "/worker");
+    let instructions = model.instructions(1);
+    assert!(
+        instructions.contains(
+            "# Agent instructions\n\nwork\n\n# Sandbox capability instructions\n\nWorkspace (root \
+             /worker)"
+        ),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("The filesystem layout is:\n\n/worker"),
+        "{instructions}"
+    );
+}
+
+// -- mount authority and host paths on resume ---------------------------------------------------
+
+/// `test_session_manager_rebinds_redacted_external_mount_authority`: mount credentials never reach
+/// the checkpoint, and a continued run takes them back from the manifest it trusts now.
+#[tokio::test]
+async fn mount_credentials_are_rebound_from_the_trusted_manifest_on_resume() {
+    let agent = || {
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_default_manifest(
+                Manifest::new().with_entry("data", docker_s3("example-secret-key")),
+            ),
+        )
+    };
+    let first = Runner::run(request(
+        agent(),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(with_client(&FakeClient::for_backend("docker"))),
+    ))
+    .await
+    .unwrap();
+    let payload = resume_payload(&first);
+    let persisted = payload.to_string();
+    assert!(!persisted.contains("example-access-key"), "{persisted}");
+    assert!(!persisted.contains("example-secret-key"), "{persisted}");
+    assert_eq!(payload["session_state"][REDACTED_MOUNT_AUTHORITY_KEY], true);
+
+    let client = FakeClient::for_backend("docker");
+    let second = Runner::run(
+        request(
+            agent(),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(with_client(&client)),
+        )
+        .with_state(first.state().clone()),
+    )
+    .await
+    .unwrap();
+
+    let resumed = client.resumed_states.lock().unwrap()[0].clone();
+    assert_eq!(
+        resumed.manifest().entries["data"],
+        docker_s3("example-secret-key")
+    );
+    assert!(!resumed.mount_authority_redacted());
+    assert!(resumed.mount_authority_rebound());
+    let persisted = resume_payload(&second).to_string();
+    assert!(!persisted.contains("example-access-key"), "{persisted}");
+    assert!(!persisted.contains("example-secret-key"), "{persisted}");
+}
+
+/// `test_session_manager_rebinds_capability_host_path_grant_once`: a host directory a capability
+/// grants is not persisted, and on resume the capability grants it again — once.
+#[tokio::test]
+async fn a_host_directory_a_capability_grants_is_granted_again_on_resume() {
+    let grant = SandboxPathGrant::new("/mnt/shared-data")
+        .unwrap()
+        .with_host_path("/srv/shared")
+        .unwrap()
+        .read_only(true);
+    let granting = || {
+        let mut capability = WorkspaceCapability::new("grants");
+        capability.sets_grants = Some(vec![grant.clone()]);
+        capability
+    };
+    let agent = |capability: &WorkspaceCapability| {
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new()
+                .with_default_manifest(Manifest::new())
+                .with_capability(Arc::new(capability.clone())),
+        )
+    };
+    let first = Runner::run(request(
+        agent(&granting()),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap();
+    let persisted = resume_payload(&first).to_string();
+    assert!(!persisted.contains("/srv/shared"), "{persisted}");
+
+    let capability = granting();
+    let client = FakeClient::new();
+    Runner::run(
+        request(
+            agent(&capability),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(with_client(&client)),
+        )
+        .with_state(first.state().clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(capability.process_calls.load(Ordering::SeqCst), 1);
+    let resumed = client.resumed_states.lock().unwrap()[0].clone();
+    assert_eq!(resumed.manifest().extra_path_grants, vec![grant]);
+    assert!(resumed.path_grants_require_rebind().is_empty());
+}
+
+/// `test_session_manager_rejects_unmarked_serialized_host_path`: a checkpoint that names a host
+/// directory without saying it has to be rebound is refused before anything is resumed.
+#[tokio::test]
+async fn a_host_directory_the_checkpoint_does_not_mark_for_rebinding_is_refused() {
+    let state = SandboxSessionState::new(
+        "fake",
+        Snapshot::noop(),
+        Manifest::new().with_path_grant(
+            SandboxPathGrant::new("/mnt/shared-data")
+                .unwrap()
+                .with_host_path("/srv/shared")
+                .unwrap(),
+        ),
+    );
+    let raw = state.to_json().unwrap();
+    let mut carried = RunState::start(RunId::new("run-sandbox"));
+    carried
+        .set_sandbox_resume_state(Some(json!({
+            "backend_id": "fake",
+            "current_agent_key": "coder",
+            "current_agent_name": "Coder",
+            "session_state": raw,
+            "sessions_by_agent": {"coder": {"agent_name": "Coder", "session_state": raw}},
+        })))
+        .unwrap();
+
+    let client = FakeClient::new();
+    let error = Runner::run(
+        request(
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(with_client(&client)),
+        )
+        .with_state(carried),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires current trusted host_path"),
+        "{error}"
+    );
+    assert!(client.resumed_ids.lock().unwrap().is_empty());
+}
+
+// -- capabilities changing a session, however it comes about ------------------------------------
+
+/// `test_session_manager_applies_capability_manifest_mutations_with_session_parity`: a session the
+/// host handed in, one resumed from an explicit state and one created all carry the change.
+#[tokio::test]
+async fn a_capability_change_reaches_the_session_however_it_comes_about() {
+    let agent = || {
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+        )
+    };
+
+    let live = live_session(false);
+    Runner::run(request(
+        agent(),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(
+            SandboxRunConfig::new().with_session(Arc::new(live.clone()) as Arc<dyn SandboxSession>),
+        ),
+    ))
+    .await
+    .unwrap();
+    assert!(live.manifest_now().entries.contains_key("notes.md"));
+
+    let client = FakeClient::new();
+    Runner::run(request(
+        agent(),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(with_client(&client).with_session_state(
+            SandboxSessionState::new("fake", Snapshot::noop(), Manifest::new()),
+        )),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        client.resumed_states.lock().unwrap()[0]
+            .manifest()
+            .entries
+            .contains_key("notes.md")
+    );
+    assert!(
+        client
+            .session(0)
+            .manifest_now()
+            .entries
+            .contains_key("notes.md")
+    );
+
+    let client = FakeClient::new();
+    Runner::run(request(
+        agent(),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(with_client(&client).with_manifest(Manifest::new())),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        client.create_requests.lock().unwrap()[0]
+            .manifest
+            .as_ref()
+            .unwrap()
+            .entries
+            .contains_key("notes.md")
+    );
+    assert!(
+        client
+            .session(0)
+            .manifest_now()
+            .entries
+            .contains_key("notes.md")
+    );
+}
+
+/// `test_session_manager_rejects_unsafe_stopped_injected_session_manifest`, with the credentials
+/// already in the session's manifest and with a capability adding them: refused before the session
+/// is asked anything, and left as it was.
+#[tokio::test]
+async fn a_session_the_host_handed_in_refuses_mount_credentials_it_would_expose() {
+    for from_capability in [false, true] {
+        let manifest = if from_capability {
+            workspace_manifest()
+        } else {
+            workspace_manifest().with_entry("data", exposed_s3())
+        };
+        let log = Log::default();
+        let live = FakeSession::new(
+            "live",
+            SandboxSessionState::new("fake", Snapshot::noop(), manifest.clone()),
+            &log,
+            &Faults::default(),
+        );
+        let mut capability = WorkspaceCapability::new("mounts");
+        if from_capability {
+            capability.adds_mount = Some(exposed_s3());
+        }
+
+        let error = Runner::run(request(
+            sandbox_agent(
+                "coder",
+                "Coder",
+                SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+            ),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(
+                SandboxRunConfig::new()
+                    .with_session(Arc::new(live.clone()) as Arc<dyn SandboxSession>),
+            ),
+        ))
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("mount-scoped credentials cannot be exposed"),
+            "{error}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert_eq!(live.0.running_calls.load(Ordering::SeqCst), 0);
+        assert!(live.0.applied.lock().unwrap().is_empty());
+        assert_eq!(live.manifest_now(), manifest);
+    }
+}
+
+/// `test_session_manager_rejects_stopped_injected_session_host_mount_changes`: a capability may not
+/// change which host directory a session the host handed in mounts, even while it is stopped —
+/// neither by pointing the grant elsewhere nor by adding an unmounted grant for the same path.
+#[tokio::test]
+async fn a_session_the_host_handed_in_keeps_the_host_directories_it_mounts() {
+    let mounted = SandboxPathGrant::new("/mnt/shared-data")
+        .unwrap()
+        .with_host_path("/native/old")
+        .unwrap()
+        .read_only(true);
+    let elsewhere = vec![
+        SandboxPathGrant::new("/mnt/shared-data")
+            .unwrap()
+            .with_host_path("/native/new")
+            .unwrap()
+            .read_only(true),
+    ];
+    let mixed_duplicate = vec![
+        SandboxPathGrant::new("/mnt/shared-data").unwrap(),
+        mounted.clone(),
+    ];
+
+    for grants in [elsewhere, mixed_duplicate] {
+        let log = Log::default();
+        let live = FakeSession::new(
+            "live",
+            SandboxSessionState::new(
+                "fake",
+                Snapshot::noop(),
+                workspace_manifest().with_path_grant(mounted.clone()),
+            ),
+            &log,
+            &Faults::default(),
+        );
+        let mut capability = WorkspaceCapability::new("grants");
+        capability.sets_grants = Some(grants);
+
+        let error = Runner::run(request(
+            sandbox_agent(
+                "coder",
+                "Coder",
+                SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+            ),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(
+                SandboxRunConfig::new()
+                    .with_session(Arc::new(live.clone()) as Arc<dyn SandboxSession>),
+            ),
+        ))
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("host-backed `manifest.extra_path_grants`"),
+            "{error}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert_eq!(live.manifest_now().extra_path_grants, vec![mounted.clone()]);
+    }
+}
+
+/// `test_session_manager_validates_running_manifest_update_before_materialization`: a running
+/// session the host handed in is asked whether it takes the change before any of it is written.
+#[tokio::test]
+async fn a_running_session_the_host_handed_in_checks_a_change_before_it_is_written() {
+    let faults = Faults::default();
+    faults.fail("validate_application");
+    let live = FakeSession::new(
+        "live",
+        SandboxSessionState::new("fake", Snapshot::noop(), workspace_manifest()),
+        &Log::default(),
+        &faults,
+    );
+    live.0.running.store(true, Ordering::SeqCst);
+
+    let error = Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+        ),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(
+            SandboxRunConfig::new().with_session(Arc::new(live.clone()) as Arc<dyn SandboxSession>),
+        ),
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("live manifest update rejected"),
+        "{error}"
+    );
+    assert!(live.0.applied.lock().unwrap().is_empty());
+    assert_eq!(live.manifest_now(), workspace_manifest());
+}
+
+/// `test_session_manager_retries_running_injected_session_delta_apply_after_failure`: a write that
+/// broke off leaves the session's manifest as it was, so the next preparation writes the change
+/// again. The reference retries within one run; a failed preparation ends a run here, so the retry
+/// is the next run's.
+#[tokio::test]
+async fn a_change_whose_write_broke_off_is_written_again_next_time() {
+    let faults = Faults::default();
+    faults.fail("apply_once");
+    let live = FakeSession::new(
+        "live",
+        SandboxSessionState::new("fake", Snapshot::noop(), workspace_manifest()),
+        &Log::default(),
+        &faults,
+    );
+    live.0.running.store(true, Ordering::SeqCst);
+    let run = || {
+        Runner::run(request(
+            sandbox_agent(
+                "coder",
+                "Coder",
+                SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+            ),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(
+                SandboxRunConfig::new()
+                    .with_session(Arc::new(live.clone()) as Arc<dyn SandboxSession>),
+            ),
+        ))
+    };
+
+    let error = run().await.unwrap_err();
+    assert!(error.to_string().contains("delta apply failed"), "{error}");
+    assert_eq!(live.manifest_now(), workspace_manifest());
+    assert_eq!(
+        live.0.applied.lock().unwrap().as_slice(),
+        ["/workspace/notes.md"]
+    );
+
+    run().await.unwrap();
+    assert!(live.manifest_now().entries.contains_key("notes.md"));
+    assert_eq!(
+        live.0.applied.lock().unwrap().as_slice(),
+        ["/workspace/notes.md", "/workspace/notes.md"]
+    );
+}
+
+// -- failures while handling mount authority ----------------------------------------------------
+
+/// `test_session_manager_redacts_authority_added_before_capability_failure`: a capability that
+/// added a credentialed mount and then failed is reported without the mount's secret, whatever its
+/// own message said, and nothing is created.
+#[tokio::test]
+async fn a_capability_that_failed_after_adding_credentials_is_reported_without_them() {
+    let secret = "capability-added-mount-secret";
+    let mut capability = WorkspaceCapability::new("mounts");
+    capability.adds_mount = Some(docker_s3(secret));
+    capability.fails = Some("capability failed with capability-added-mount-secret");
+    let client = FakeClient::new();
+
+    let error = Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+        ),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(with_client(&client).with_manifest(Manifest::new())),
+    ))
+    .await
+    .unwrap_err();
+
+    let text = error_text(&error);
+    assert!(!text.contains(secret), "{text}");
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox operation failed while using a protected mount configuration"),
+        "{error}"
+    );
+    assert!(client.log().is_empty(), "{:?}", client.log());
+}
+
+/// The reference's decorator replaces any failure of a preparation whose configuration carries
+/// mount authority, not only sandbox failures: a missing option is reported as a failure and
+/// nothing more. Without the authority, the same refusal keeps its words — see
+/// `a_client_without_default_options_needs_them_for_a_fresh_session`.
+#[tokio::test]
+async fn any_failure_while_handling_mount_credentials_says_only_that_it_failed() {
+    let error = Runner::run(request(
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        &ScriptedModel::answering("done"),
+        RunConfig::new()
+            .with_sandbox(with_client(&FakeClient::requiring_options()).with_manifest(
+                Manifest::new().with_entry("data", docker_s3("example-secret-key")),
+            )),
+    ))
+    .await
+    .unwrap_err();
+
+    let text = error_text(&error);
+    assert!(!text.contains("example-secret-key"), "{text}");
+    assert!(!text.contains("run_config.sandbox.options"), "{text}");
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox operation failed while using a protected mount configuration"),
+        "{error}"
+    );
+}
+
+// -- a cached preparation -----------------------------------------------------------------------
+
+/// `test_prepare_agent_rechecks_session_liveness_before_reusing_cached_agent`: a session that
+/// stopped between turns is started again, and the preparation made against it is reused.
+#[tokio::test]
+async fn a_session_that_stopped_between_turns_is_restarted_and_its_preparation_reused() {
+    let capability = WorkspaceCapability::new("notes");
+    let bindings = Arc::clone(&capability.bindings);
+    let client = FakeClient::new();
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .instructions("do the task")
+        .tool(Halt::tool(&client, false))
+        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(capability)))
+        .build()
+        .unwrap();
+    let model = ScriptedModel::new(vec![tool_call("call-1", "halt"), final_answer("m", "done")]);
+
+    let result = Runner::run(request(
+        agent,
+        &model,
+        RunConfig::new().with_sandbox(with_client(&client)),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(client.starts(), 2, "{:?}", client.log());
+    assert_eq!(bindings.load(Ordering::SeqCst), 1);
+    assert_eq!(model.instructions(1), model.instructions(0));
+}
+
+/// `test_prepare_agent_revalidates_cwd_after_restarting_cached_session`: the working directory is
+/// checked again on a restarted session, and one that went missing refuses the turn.
+#[tokio::test]
+async fn the_working_directory_is_checked_again_on_a_restarted_session() {
+    let client = FakeClient::new();
+    client
+        .directories
+        .lock()
+        .unwrap()
+        .insert("/workspace/pkg".to_owned());
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .instructions("do the task")
+        .tool(Halt::tool(&client, true))
+        .sandbox(
+            SandboxAgentConfig::new()
+                .with_default_manifest(workspace_manifest())
+                .with_run_as(User::new("builder")),
+        )
+        .build()
+        .unwrap();
+
+    let error = Runner::run(request(
+        agent,
+        &ScriptedModel::new(vec![tool_call("call-1", "halt"), final_answer("m", "done")]),
+        RunConfig::new().with_sandbox(with_client(&client).with_cwd("pkg").unwrap()),
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Sandbox working directory `pkg` does not exist or is not accessible"),
+        "{error}"
+    );
+    assert_eq!(client.starts(), 2, "{:?}", client.log());
+    let probes: Vec<String> = client
+        .log()
+        .into_iter()
+        .filter(|entry| entry.starts_with("exec"))
+        .collect();
+    assert_eq!(
+        probes,
+        [
+            "exec[test -d /workspace/pkg]as[builder]:s0",
+            "exec[test -x /workspace/pkg]as[builder]:s0",
+            "exec[test -d /workspace/pkg]as[builder]:s0",
+        ]
+    );
+}
+
+/// `test_prepare_agent_binds_run_as_to_cloned_capabilities`: a capability is bound to the session
+/// and to the user the agent runs as, and the one the agent was declared with stays unbound.
+#[tokio::test]
+async fn capabilities_are_bound_to_the_session_and_the_agents_user() {
+    let installed = Arc::new(WorkspaceCapability::new("notes"));
+    let client = FakeClient::new();
+    Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new()
+                .with_capability(Arc::clone(&installed) as Arc<dyn Capability>)
+                .with_run_as(User::new("sandbox-user")),
+        ),
+        &ScriptedModel::answering("done"),
+        RunConfig::new().with_sandbox(with_client(&client)),
+    ))
+    .await
+    .unwrap();
+
+    assert!(installed.bound.is_none());
+    let seen = installed.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].run_as(), Some(&User::new("sandbox-user")));
+    assert_eq!(
+        seen[0].session().state().session_id(),
+        client.created_ids.lock().unwrap()[0]
+    );
+}
+
+/// `test_runner_reuses_prepared_sandbox_agent_across_turns_for_tool_choice_reset`: a forced tool
+/// choice is released once the sandbox agent used a tool, as for any agent.
+#[tokio::test]
+async fn a_forced_tool_choice_is_released_after_the_sandbox_agent_used_a_tool() {
+    let mut capability = WorkspaceCapability::new("notes");
+    capability.tool = true;
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .instructions("do the task")
+        .model_settings(ModelSettings::new().with_tool_choice(ToolChoice::Required))
+        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(capability)))
+        .build()
+        .unwrap();
+    let model = ScriptedModel::new(vec![
+        tool_call("call-1", "touch"),
+        final_answer("m", "done"),
+    ]);
+
+    let result = Runner::run(request(
+        agent,
+        &model,
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(
+        model.tool_choices.lock().unwrap().as_slice(),
+        [Some(ToolChoice::Required), None]
+    );
+}
+
+// -- the public agent ---------------------------------------------------------------------------
+
+/// Records which agent each lifecycle stage and the output guardrail were told about.
+#[derive(Default)]
+struct AgentWitness(Mutex<Vec<String>>);
+
+impl AgentWitness {
+    fn note(&self, stage: &str, run: &RunContext) {
+        self.0.lock().unwrap().push(format!(
+            "{stage}:{}:{}",
+            run.agent().id().as_str(),
+            run.agent().name()
+        ));
+    }
+
+    fn stages(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LifecycleHook for AgentWitness {
+    fn name(&self) -> &str {
+        "agent-witness"
+    }
+
+    async fn on_agent_start(
+        &self,
+        _scope: LifecycleScope,
+        input: &AgentStartInput<'_>,
+    ) -> Result<()> {
+        self.note("agent_start", input.run());
+        Ok(())
+    }
+
+    async fn on_agent_end(&self, _scope: LifecycleScope, input: &AgentEndInput<'_>) -> Result<()> {
+        self.note("agent_end", input.run());
+        Ok(())
+    }
+
+    async fn on_llm_start(&self, _scope: LifecycleScope, input: &LlmStartInput<'_>) -> Result<()> {
+        self.note("llm_start", input.run());
+        Ok(())
+    }
+
+    async fn on_llm_end(&self, _scope: LifecycleScope, input: &LlmEndInput<'_>) -> Result<()> {
+        self.note("llm_end", input.run());
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl OutputGuardrail for AgentWitness {
+    fn name(&self) -> &str {
+        "agent-witness"
+    }
+
+    async fn check(
+        &self,
+        context: &RunContext,
+        _output: &GuardrailFinalOutput<'_>,
+    ) -> Result<GuardrailFunctionOutput> {
+        self.note("output_guardrail", context);
+        Ok(GuardrailFunctionOutput::pass())
+    }
+}
+
+/// `test_runner_keeps_public_agent_identity_for_hooks_and_streaming`,
+/// `test_runner_uses_public_agent_for_non_streaming_output_guardrails`,
+/// `test_runner_uses_public_agent_for_non_function_tool_outputs` and
+/// `test_runner_streamed_emits_public_agent_for_tool_and_reasoning_events`: hooks, the output
+/// guardrail, the records and the stream all name the agent the user configured. Here what they
+/// are told is a projection of the public agent by construction; the case pins that a sandbox run,
+/// whose turns run a prepared instance, goes through the same projection.
+#[tokio::test]
+async fn every_view_of_a_sandbox_run_names_the_agent_the_user_configured() {
+    use ra_runtime::runner::RunStreamEvent;
+
+    for streamed in [false, true] {
+        let mut capability = WorkspaceCapability::new("notes");
+        capability.tool = true;
+        let witness = Arc::new(AgentWitness::default());
+        let request = request(
+            sandbox_agent(
+                "coder",
+                "Coder",
+                SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+            ),
+            &ScriptedModel::new(vec![
+                tool_call("call-1", "touch"),
+                final_answer("m", "done"),
+            ]),
+            RunConfig::new()
+                .with_sandbox(with_client(&FakeClient::new()))
+                .with_lifecycle_hook(Arc::clone(&witness) as Arc<dyn LifecycleHook>)
+                .with_output_guardrail(Arc::clone(&witness) as Arc<dyn OutputGuardrail>),
+        );
+
+        let mut events = Vec::new();
+        let result = if streamed {
+            let mut stream = Runner::run_streamed(request);
+            while let Some(event) = stream.next_event().await {
+                let finished = matches!(event, RunStreamEvent::Finished(_));
+                events.push(event);
+                if finished {
+                    break;
+                }
+            }
+            stream.finish().await.unwrap()
+        } else {
+            Runner::run(request).await.unwrap()
+        };
+
+        assert_eq!(result.final_text(), "done");
+        let stages = witness.stages();
+        for stage in [
+            "agent_start",
+            "llm_start",
+            "llm_end",
+            "output_guardrail",
+            "agent_end",
+        ] {
+            assert!(
+                stages.contains(&format!("{stage}:coder:Coder")),
+                "{stage}: {stages:?}"
+            );
+        }
+        assert!(
+            stages.iter().all(|stage| stage.ends_with(":coder:Coder")),
+            "{stages:?}"
+        );
+        assert!(!result.new_items().is_empty());
+        for item in result.new_items() {
+            let provenance = item
+                .provenance()
+                .expect("every record says who produced it");
+            assert_eq!(provenance.agent_id().as_str(), "coder");
+        }
+        if streamed {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, RunStreamEvent::Item(_)))
+            );
+            for event in &events {
+                match event {
+                    RunStreamEvent::TurnStarted { agent, .. } => {
+                        assert_eq!(agent.as_str(), "coder");
+                    }
+                    RunStreamEvent::Item(item) => {
+                        let provenance =
+                            item.provenance().expect("a streamed record is attributed");
+                        assert_eq!(provenance.agent_id().as_str(), "coder");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
