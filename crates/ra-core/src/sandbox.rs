@@ -33,6 +33,7 @@ pub mod registry;
 pub mod remote_mount_policy;
 pub mod resources;
 pub mod session;
+pub mod shell;
 pub mod snapshot;
 pub mod state;
 pub mod token_truncation;

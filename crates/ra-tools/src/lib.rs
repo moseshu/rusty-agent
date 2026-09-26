@@ -38,6 +38,11 @@
 //! only address a session `exec_command` started" becomes structural instead of something every
 //! host has to know.
 //!
+//! [`sandbox`] is the other family of entry points: the reference's sandbox tools, bound to a
+//! sandbox session rather than to this host, with the capability that installs them. Two of its
+//! tools share their advertised names with `exec_command` and `write_stdin` above; an agent is given
+//! one pair or the other.
+//!
 //! **Boundary in the other direction**: these are tool *entry points*. The work itself belongs to
 //! the service crates — process execution to [`ra_exec`], MCP transport and lifecycle to
 //! [`ra_mcp`], V4A parsing and hunk application to [`ra_patch`] — and this crate only binds it to a
@@ -60,6 +65,7 @@ pub mod mcp_ns;
 pub mod memory;
 pub mod read_file;
 mod rooted;
+pub mod sandbox;
 mod search;
 mod session_return;
 pub mod skill;
