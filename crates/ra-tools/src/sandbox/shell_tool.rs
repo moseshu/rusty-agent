@@ -33,16 +33,13 @@ use ra_core::{
         ShellInvocation, User, shell::quote,
         token_truncation::formatted_truncate_text_with_token_count,
     },
-    tool::{
-        FuncSchema, Tool, ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolOptions,
-        ToolOrigin, ToolOutput, ToolSchema,
-    },
+    tool::{FuncSchema, Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::NeedsApproval;
+use super::{NeedsApproval, decode, sandbox_tool_options, session_failure};
 
 /// The name `exec_command` is advertised under.
 pub const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
@@ -310,32 +307,6 @@ fn validate_max_output_tokens(tool: &str, max_output_tokens: Option<u64>) -> Res
         ));
     }
     Ok(())
-}
-
-/// Carries a session's failure out of a tool, keeping it as the source.
-fn session_failure(tool: &str, error: SandboxError) -> Error {
-    Error::tool(ToolErrorKind::ExecutionFailed, tool, error.to_string()).with_source(error)
-}
-
-/// Decodes a call's arguments, whether or not the runtime decoded them first.
-fn decode<T: ra_core::tool::ToolInput>(
-    context: &mut ToolContext<'_>,
-    schema: &FuncSchema,
-) -> Result<T> {
-    if let Some(input) = context.take_decoded_input::<T>()? {
-        return Ok(input);
-    }
-    serde_json::from_value(context.arguments().clone()).map_err(|error| {
-        Error::tool(
-            ToolErrorKind::InvalidInput,
-            schema.tool_schema().name(),
-            ToolArgumentDecodeError::Deserialize {
-                input_type: schema.input_type_name(),
-                message: error.to_string(),
-            }
-            .to_string(),
-        )
-    })
 }
 
 /// Joins a one-shot command's two streams, as the reference's `_normalize_output` does.
@@ -688,16 +659,6 @@ impl Tool for ExecCommandTool {
         let args: ExecCommandArgs = decode(&mut context, &self.func_schema)?;
         self.run(&args).await.map(ToolOutput::text)
     }
-}
-
-/// The options both sandbox tools declare.
-///
-/// Parallel, because the reference runs every function call of a turn concurrently; the session is
-/// what serializes anything that has to be.
-fn sandbox_tool_options(needs_approval: &NeedsApproval) -> ToolOptions {
-    ToolOptions::new()
-        .with_approval(needs_approval.policy())
-        .with_concurrency(ToolConcurrency::Parallel)
 }
 
 /// Runs `write_stdin` against a sandbox session.

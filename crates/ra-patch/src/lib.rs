@@ -6,15 +6,26 @@
 //! file permissions, approval, sandboxing, or the coding agent's editing discipline. The fuzzy
 //! matcher is an implementation detail and stays out of the public API.
 //!
+//! Two appliers live here. [`apply_hunks`] with [`parse_patch`] is the coding tools' own, which
+//! refuses ambiguous edits. [`apply_diff()`] is a port of the reference's applier, used by the
+//! sandbox tools, with the operation types of the reference's editor protocol in [`editor`]; the
+//! documentation of [`mod@apply_diff`] says where the two disagree.
+//!
 //! **Stability**: `Evolving`. The V4A format itself is defined upstream; this parser's API may
 //! grow but not shrink.
 
 pub mod apply;
+pub mod apply_diff;
+pub mod editor;
 pub(crate) mod fuzz;
 pub mod parse;
 pub mod render;
 
 pub use apply::{AppliedFileUpdate, CommittedPatchDelta, apply_hunks};
+pub use apply_diff::{ApplyDiffError, ApplyDiffMode, apply_diff};
+pub use editor::{
+    ApplyPatchOperation, ApplyPatchOperationType, ApplyPatchResult, ApplyPatchStatus,
+};
 pub use parse::{
     PatchAction, PatchConflict, PatchHunk, PatchMatchLevel, PatchParseError, PatchPlan, parse_patch,
 };

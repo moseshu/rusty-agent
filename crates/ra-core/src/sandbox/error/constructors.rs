@@ -304,4 +304,89 @@ impl SandboxError {
         .with_context("command", command)
         .with_context("stderr", stderr)
     }
+
+    /// Constructs a refusal of a patch path.
+    #[must_use]
+    pub fn apply_patch_invalid_path(path: &str, reason: ApplyPatchPathReason) -> Self {
+        let message = match reason {
+            ApplyPatchPathReason::Absolute => format!("apply_patch path must be relative: {path}"),
+            ApplyPatchPathReason::EscapeRoot => {
+                format!("apply_patch path must not escape root: {path}")
+            }
+            ApplyPatchPathReason::Empty => "apply_patch path must be non-empty".to_owned(),
+        };
+        Self::new(
+            ErrorCode::ApplyPatchInvalidPath,
+            OpName::ApplyPatch,
+            message,
+        )
+        .with_retryable(Some(false))
+        .with_context("path", path)
+        .with_context("reason", reason.as_str())
+    }
+
+    /// Constructs a failure for a diff that is malformed or does not apply.
+    ///
+    /// `path` is the file it was for, when there is one.
+    #[must_use]
+    pub fn apply_patch_invalid_diff(message: impl Into<String>, path: Option<&str>) -> Self {
+        let error = Self::new(
+            ErrorCode::ApplyPatchInvalidDiff,
+            OpName::ApplyPatch,
+            message,
+        )
+        .with_retryable(Some(false));
+        match path {
+            Some(path) => error.with_context("path", path),
+            None => error,
+        }
+    }
+
+    /// Constructs a failure for a patch that names a file that is not there.
+    #[must_use]
+    pub fn apply_patch_file_not_found(path: &str) -> Self {
+        Self::new(
+            ErrorCode::ApplyPatchFileNotFound,
+            OpName::ApplyPatch,
+            format!("apply_patch missing file: {path}"),
+        )
+        .with_retryable(Some(false))
+        .with_context("path", path)
+    }
+
+    /// Constructs a failure for a patched file that is not UTF-8.
+    #[must_use]
+    pub fn apply_patch_decode_error(path: &str) -> Self {
+        Self::new(
+            ErrorCode::ApplyPatchDecodeError,
+            OpName::ApplyPatch,
+            format!("apply_patch could not decode file: {path}"),
+        )
+        .with_retryable(Some(false))
+        .with_context("path", path)
+    }
+}
+
+/// Why a patch path was refused.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyPatchPathReason {
+    /// It was absolute where a relative path was required.
+    Absolute,
+    /// It leaves the workspace.
+    EscapeRoot,
+    /// It was blank.
+    Empty,
+}
+
+impl ApplyPatchPathReason {
+    /// The reference's name for it, recorded in the failure's context.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absolute => "absolute",
+            Self::EscapeRoot => "escape_root",
+            Self::Empty => "empty",
+        }
+    }
 }

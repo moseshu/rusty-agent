@@ -14,6 +14,8 @@ ra-context = { path = "../../crates/ra-context" }
 ra-runtime = { path = "../../crates/ra-runtime" }
 ra-tools = { path = "../../crates/ra-tools" }
 ra-sandbox = { path = "../../crates/ra-sandbox" }
+ra-patch = { path = "../../crates/ra-patch" }
+base64 = "0.22"
 async-trait = "0.1"
 futures = "0.3"
 insta = { version = "1", features = ["json", "redactions"] }

@@ -69,8 +69,8 @@ pub use environment::{
     UnresolvableEnvValues, builtin_env_value_registry, env_value_kind,
 };
 pub use error::{
-    ErrorCategory, ErrorCode, OpName, PTY_STDIN_UNAVAILABLE_MESSAGE, SandboxError,
-    SandboxErrorDetails,
+    ApplyPatchPathReason, ErrorCategory, ErrorCode, OpName, PTY_STDIN_UNAVAILABLE_MESSAGE,
+    SandboxError, SandboxErrorDetails,
 };
 pub use files::{EntryKind, FileEntry};
 pub use manifest::{
