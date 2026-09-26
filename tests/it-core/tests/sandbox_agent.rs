@@ -54,9 +54,19 @@ enum Edit {
     Rebuild,
     MoveRoot(&'static str),
     Fail,
+    /// Adds a credentialed mount, then fails.
+    AddMountThenFail,
 }
 
 struct Editing(Edit);
+
+fn refusal() -> SandboxError {
+    SandboxError::new(
+        ErrorCode::SandboxConfigInvalid,
+        OpName::Start,
+        "refused while holding example-secret-key",
+    )
+}
 
 #[async_trait]
 impl Capability for Editing {
@@ -64,28 +74,30 @@ impl Capability for Editing {
         CapabilityFamily::new("editing").unwrap()
     }
 
-    fn process_manifest(&self, manifest: Manifest) -> SandboxResult<Manifest> {
+    fn process_manifest(&self, manifest: &mut Manifest) -> SandboxResult<()> {
         match &self.0 {
             Edit::AddFile(path) => {
-                Ok(manifest.with_entry(*path, Entry::file(b"capability".to_vec())))
+                *manifest =
+                    std::mem::take(manifest).with_entry(*path, Entry::file(b"capability".to_vec()));
+                Ok(())
             }
             // Keeps the content and drops everything private, as a manifest built from its fields
             // would.
             Edit::Rebuild => {
                 let mut rebuilt = Manifest::new().with_root(manifest.root.clone());
                 rebuilt.entries = manifest.entries.clone();
-                Ok(rebuilt.with_entry("cap.txt", Entry::file(b"capability".to_vec())))
+                *manifest = rebuilt.with_entry("cap.txt", Entry::file(b"capability".to_vec()));
+                Ok(())
             }
             Edit::MoveRoot(root) => {
-                let mut moved = manifest;
-                moved.root = (*root).to_owned();
-                Ok(moved)
+                manifest.root = (*root).to_owned();
+                Ok(())
             }
-            Edit::Fail => Err(SandboxError::new(
-                ErrorCode::SandboxConfigInvalid,
-                OpName::Start,
-                "refused while holding example-secret-key",
-            )),
+            Edit::Fail => Err(refusal()),
+            Edit::AddMountThenFail => {
+                *manifest = std::mem::take(manifest).with_entry("data", s3(true, false));
+                Err(refusal())
+            }
         }
     }
 }
@@ -242,6 +254,21 @@ fn a_capability_failure_over_mount_authority_is_redacted() {
     assert!(
         plain.to_string().contains("refused while holding"),
         "{plain}"
+    );
+}
+
+/// `test_session_manager_redacts_authority_added_before_capability_failure`, at the step that
+/// decides it: authority the failing capability added itself counts, which is why the capability
+/// edits the manifest in place rather than consuming it.
+#[test]
+fn a_capability_failure_after_adding_mount_authority_is_redacted() {
+    let error =
+        process_manifest(&[editing(Edit::AddMountThenFail)], &Manifest::new(), None).unwrap_err();
+    assert!(error.is_data_redacted());
+    assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
+    assert_eq!(
+        error.message(),
+        "sandbox operation failed while using a protected mount configuration"
     );
 }
 

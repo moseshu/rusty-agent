@@ -15,9 +15,10 @@
 //!
 //! - A capability's context processing is not run for a sandbox agent's turns, and capabilities are
 //!   not told the resolved model name when they adjust sampling settings.
-//! - The reference's memory hooks, the instrumentation wrapper around sessions and the sanitization
-//!   of the checkpoint's sandbox envelope as a whole are not here; each session state in it is
-//!   sanitized by the client that wrote it.
+//! - The reference's memory hooks and the instrumentation wrapper around sessions are not here, so
+//!   a session's own start, stop and shutdown carry no spans of their own. A failure that may quote
+//!   mount authority is replaced where the runtime calls into a session — preparing it, cleaning
+//!   it up — rather than by a wrapper around every session call.
 //! - The runner's cleanup error is logged rather than surfaced, as on the reference, and a
 //!   streamed run's live session is not exposed while the stream is running.
 

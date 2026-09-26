@@ -223,7 +223,8 @@ pub fn manifest_with_run_as_user(manifest: Manifest, user: Option<&User>) -> Man
 /// # Errors
 ///
 /// Returns the provenance refusal, or the first capability's failure — replaced by one that quotes
-/// nothing when the manifest it was handed carried mount authority.
+/// nothing when the manifest carried mount authority, whether the capability was handed it or
+/// added it before failing.
 pub fn process_manifest(
     capabilities: &[Arc<dyn Capability>],
     manifest: &Manifest,
@@ -233,12 +234,12 @@ pub fn process_manifest(
     let mut processed = manifest_with_run_as_user(manifest.clone(), run_as);
     for capability in capabilities {
         let handed = processed.clone();
-        match capability.process_manifest(processed) {
-            Ok(mut returned) => {
-                returned.merge_mount_credential_exposure_policy_from(&handed);
-                processed = returned;
-            }
-            Err(error) if manifest_has_configured_mount_authority(&handed) => {
+        match capability.process_manifest(&mut processed) {
+            Ok(()) => processed.merge_mount_credential_exposure_policy_from(&handed),
+            Err(error)
+                if manifest_has_configured_mount_authority(&handed)
+                    || manifest_has_configured_mount_authority(&processed) =>
+            {
                 return Err(replace_protected_mount_error(&error));
             }
             Err(error) => return Err(error),
