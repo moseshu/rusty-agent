@@ -12,14 +12,63 @@
 //! format and run wherever the session is. Both pairs advertise `exec_command` and `write_stdin`,
 //! so an agent is given one pair or the other, never both — a sandbox agent gets these through
 //! [`shell::Shell`], and a coding agent keeps its own.
+//!
+//! The same holds for [`crate::view_image`] and [`view_image`], and for [`crate::apply_patch`] and
+//! the editor in [`apply_patch`]: the coding versions read and write the host through a confined
+//! filesystem, and these go through the session.
 
+pub mod apply_patch;
 pub mod shell;
 pub mod shell_tool;
+pub mod view_image;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ra_core::{error::Result, tool::ToolApprovalPolicy, tool::ToolContext};
+use ra_core::{
+    error::{Error, Result, ToolErrorKind},
+    sandbox::SandboxError,
+    tool::{
+        FuncSchema, ToolApprovalPolicy, ToolArgumentDecodeError, ToolConcurrency, ToolContext,
+        ToolInput, ToolOptions,
+    },
+};
+
+/// Carries a session's failure out of a tool, keeping it as the source.
+pub(crate) fn session_failure(tool: &str, error: SandboxError) -> Error {
+    Error::tool(ToolErrorKind::ExecutionFailed, tool, error.to_string()).with_source(error)
+}
+
+/// Decodes a call's arguments, whether or not the runtime decoded them first.
+pub(crate) fn decode<T: ToolInput>(
+    context: &mut ToolContext<'_>,
+    schema: &FuncSchema,
+) -> Result<T> {
+    if let Some(input) = context.take_decoded_input::<T>()? {
+        return Ok(input);
+    }
+    serde_json::from_value(context.arguments().clone()).map_err(|error| {
+        Error::tool(
+            ToolErrorKind::InvalidInput,
+            schema.tool_schema().name(),
+            ToolArgumentDecodeError::Deserialize {
+                input_type: schema.input_type_name(),
+                message: error.to_string(),
+            }
+            .to_string(),
+        )
+    })
+}
+
+/// The options every sandbox function tool declares.
+///
+/// Parallel, because the reference runs every function call of a turn concurrently; the session is
+/// what serializes anything that has to be.
+pub(crate) fn sandbox_tool_options(needs_approval: &NeedsApproval) -> ToolOptions {
+    ToolOptions::new()
+        .with_approval(needs_approval.policy())
+        .with_concurrency(ToolConcurrency::Parallel)
+}
 
 /// Decides, per call, whether a sandbox tool's call waits for the host's approval.
 ///

@@ -395,18 +395,19 @@ pub trait SandboxSession: Send + Sync {
 
     // --- the workspace --------------------------------------------------------------------
 
-    /// Validates access and returns the path the backend's file operations use.
+    /// The lexical path policy of the current manifest: its root and its grants.
     ///
-    /// The default applies the manifest's lexical path policy. Backends that resolve filesystem
-    /// links must override this so callers can derive destinations from the same resolved path.
+    /// The reference's `_workspace_path_policy`. Tools use it to re-measure a path from the
+    /// workspace root, or to validate one without consulting the filesystem; it never resolves a
+    /// link, which is what [`Self::validate_path_access`] is for on a backend that can.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error for an invalid root, or the path policy's access refusal.
-    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+    /// Returns a configuration error when the manifest's root is not absolute.
+    fn workspace_path_policy(&self) -> SandboxResult<super::workspace_paths::WorkspacePathPolicy> {
         let state = self.state();
         let manifest = state.manifest();
-        let policy = super::workspace_paths::WorkspacePathPolicy::new(
+        super::workspace_paths::WorkspacePathPolicy::new(
             &manifest.root,
             manifest.extra_path_grants.clone(),
         )
@@ -416,8 +417,20 @@ pub trait SandboxSession: Send + Sync {
                 OpName::Write,
                 error.to_string(),
             )
-        })?;
-        Ok(policy
+        })
+    }
+
+    /// Validates access and returns the path the backend's file operations use.
+    ///
+    /// The default applies the manifest's lexical path policy. Backends that resolve filesystem
+    /// links must override this so callers can derive destinations from the same resolved path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for an invalid root, or the path policy's access refusal.
+    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+        Ok(self
+            .workspace_path_policy()?
             .normalize_sandbox_path(path, for_write)?
             .as_str()
             .to_owned())
