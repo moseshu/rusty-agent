@@ -1,6 +1,6 @@
 //! Anthropic SSE to `ModelStreamEvent` conversion.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use futures::{StreamExt, stream, stream::BoxStream};
 use ra_core::{
@@ -24,6 +24,7 @@ pub(crate) fn events(
     response: reqwest::Response,
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
+    custom_tools: BTreeSet<String>,
     request_id: Option<String>,
     unstarted: ReplaySafety,
 ) -> ModelStream<'static> {
@@ -35,6 +36,7 @@ pub(crate) fn events(
                 .boxed(),
             provider,
             handoffs,
+            custom_tools,
             request_id,
             partial: Vec::new(),
             data: Vec::new(),
@@ -56,6 +58,8 @@ struct Driver {
     bytes: BoxStream<'static, Result<Vec<u8>>>,
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
+    /// Custom tools advertised as functions, whose calls are lifted back to custom calls.
+    custom_tools: BTreeSet<String>,
     request_id: Option<String>,
     partial: Vec<u8>,
     data: Vec<String>,
@@ -207,6 +211,7 @@ impl Driver {
                     &payload,
                     self.request_id.clone(),
                     &self.handoffs,
+                    &self.custom_tools,
                     &self.provider,
                 )?;
                 self.outcome = Outcome::Settled;

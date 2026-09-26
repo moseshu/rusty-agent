@@ -14,10 +14,13 @@
 //! [`shell::Shell`], and a coding agent keeps its own.
 //!
 //! The same holds for [`crate::view_image`] and [`view_image`], and for [`crate::apply_patch`] and
-//! the editor in [`apply_patch`]: the coding versions read and write the host through a confined
-//! filesystem, and these go through the session.
+//! [`apply_patch_tool`]: the coding versions read and write the host through a confined
+//! filesystem, and these go through the session. A sandbox agent gets them through
+//! [`filesystem::Filesystem`]; [`filesystem::default_capabilities`] is the reference's default set.
 
 pub mod apply_patch;
+pub mod apply_patch_tool;
+pub mod filesystem;
 pub mod shell;
 pub mod shell_tool;
 pub mod view_image;

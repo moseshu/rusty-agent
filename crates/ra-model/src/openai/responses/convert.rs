@@ -114,6 +114,7 @@ pub(crate) fn convert_output_item(
         "message" => RunItemKind::Message(convert_message(item)?),
         "reasoning" => RunItemKind::Reasoning(convert_reasoning(item, model)),
         "function_call" => convert_function_call(item, handoffs)?,
+        "custom_tool_call" => convert_custom_tool_call(item)?,
         // Hosted-tool items (web search, file search, hosted MCP, image generation) have no
         // protocol-neutral payload yet. They can only appear when `extra_body.tools` requested
         // them, so the message names the item rather than silently dropping part of the turn.
@@ -229,6 +230,16 @@ fn convert_function_call(item: &Value, handoffs: &[ModelHandoffDefinition]) -> R
             call_id, name, arguments,
         )))
     }
+}
+
+/// Lifts a call to a custom tool, whose input is one raw string rather than JSON arguments.
+fn convert_custom_tool_call(item: &Value) -> Result<RunItemKind> {
+    let call_id = CallId::new(required_str(item, "call_id", "custom_tool_call")?);
+    let name = required_str(item, "name", "custom_tool_call")?;
+    let input = required_str(item, "input", "custom_tool_call")?;
+    Ok(RunItemKind::ToolCall(ToolCall::custom(
+        call_id, name, input,
+    )))
 }
 
 fn convert_usage(value: Option<&Value>) -> Usage {

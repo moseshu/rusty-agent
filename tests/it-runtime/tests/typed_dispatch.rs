@@ -217,3 +217,118 @@ async fn a_projector_can_only_add_to_the_complete_tool_output() {
         ]
     );
 }
+
+/// A tool that always fails with `error`, advertised as a custom tool or as a function.
+struct FailingTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    error: fn() -> ra_core::error::Error,
+}
+
+impl FailingTool {
+    fn new(custom: bool, error: fn() -> ra_core::error::Error) -> Self {
+        let schema = if custom {
+            ToolSchema::custom("patcher", None).expect("custom schema")
+        } else {
+            ToolSchema::loose("patcher", json!({"type": "object"})).expect("schema")
+        };
+        Self {
+            origin: ToolOrigin::new("patcher").expect("origin"),
+            schema,
+            error,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FailingTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> ra_core::error::Result<ToolOutput> {
+        Err((self.error)())
+    }
+}
+
+fn invalid_context() -> ra_core::error::Error {
+    ra_core::error::Error::tool(
+        ra_core::error::ToolErrorKind::ExecutionFailed,
+        "patcher",
+        "Invalid Context 0: missing anchor",
+    )
+}
+
+async fn dispatch_failing(tool: FailingTool, arguments: serde_json::Value) -> ToolDispatch {
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("patcher"))
+        .name("Patcher")
+        .build()
+        .expect("agent builds");
+    dispatch_tool(ToolDispatchRequest::new(
+        Arc::new(tool),
+        CallId::new("call-custom"),
+        arguments,
+        Arc::new(RunContext::new(RunId::new("run-custom-failure"), &agent)),
+        CancelScope::root(),
+        CallHistory::default(),
+        Default::default(),
+    ))
+    .await
+    .expect("a failing call settles as an observation")
+    .into_parts()
+    .0
+}
+
+/// A custom tool that fails shows the model the text it wrote, as the reference's custom-tool runner
+/// reports a tool that raised, so the model can correct its raw input. Any tool, not only
+/// `apply_patch`; and never the framework's rendering of the error.
+#[tokio::test]
+async fn a_failing_custom_tool_shows_the_model_its_own_error_text() {
+    let dispatch =
+        dispatch_failing(FailingTool::new(true, invalid_context), json!("raw input")).await;
+    let ToolDispatch::Observed(observation) = dispatch else {
+        panic!("a custom tool's failure is an observation");
+    };
+    assert_eq!(observation.failure_code(), Some("tool.execution_failed"));
+    assert_eq!(
+        observation.output().output()["blocks"][0]["text"],
+        "Invalid Context 0: missing anchor"
+    );
+    let rendered = observation.output().output().to_string();
+    assert!(!rendered.contains("工具 `"), "{rendered}");
+}
+
+/// Only a tool's own message is used; any other error is reported by its code, since its text is
+/// framework prose.
+#[tokio::test]
+async fn a_custom_tools_framework_error_is_reported_by_its_code() {
+    let dispatch = dispatch_failing(
+        FailingTool::new(true, || {
+            ra_core::error::Error::config("secret framework prose")
+        }),
+        json!("raw input"),
+    )
+    .await;
+    let ToolDispatch::Observed(observation) = dispatch else {
+        panic!("a custom tool's failure is an observation");
+    };
+    assert_eq!(observation.output().output()["blocks"][0]["text"], "config");
+}
+
+/// A function tool keeps the framework's rule: a failure is a code and a tool name, no text.
+#[tokio::test]
+async fn a_failing_function_tool_still_shows_only_its_code() {
+    let dispatch = dispatch_failing(FailingTool::new(false, invalid_context), json!({})).await;
+    let ToolDispatch::Observed(observation) = dispatch else {
+        panic!("a function tool's failure is an observation");
+    };
+    assert_eq!(
+        observation.output().output(),
+        &json!({"error": {"code": "tool.execution_failed", "tool": "patcher"}})
+    );
+}

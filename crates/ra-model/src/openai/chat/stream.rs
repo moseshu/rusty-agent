@@ -30,7 +30,7 @@
 //! response as one recorded request, exactly as the non-streaming path reports it, so a streamed
 //! turn and a non-streamed one produce the same ledger entry for the same call.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
@@ -53,12 +53,20 @@ use crate::openai::{error::behavior_error, sse::SseFrame};
 /// What a provider reports when it withholds a turn without saying anything else.
 const CONTENT_FILTER_REFUSAL: &str = "Response withheld by the provider's content filter.";
 
+/// What a streamed call can name besides an ordinary function.
+pub(crate) struct CallTargets {
+    /// The request's handoffs, resolved by advertised name.
+    pub(crate) handoffs: Vec<ModelHandoffDefinition>,
+    /// Custom tools advertised as functions, whose calls are lifted back to custom calls.
+    pub(crate) custom_tools: BTreeSet<String>,
+}
+
 /// Turns a stream of chat-completion chunks into model stream events.
 pub(crate) fn events(
     codec: ChatCodec,
     frames: impl Stream<Item = Result<SseFrame>> + Send + 'static,
     provider: ProviderKey,
-    handoffs: Vec<ModelHandoffDefinition>,
+    targets: CallTargets,
     buffer_tool_calls: bool,
     request_id: Option<String>,
     unstarted: ReplaySafety,
@@ -67,7 +75,8 @@ pub(crate) fn events(
         frames: frames.boxed(),
         codec,
         provider,
-        handoffs,
+        handoffs: targets.handoffs,
+        custom_tools: targets.custom_tools,
         request_id,
         state: StreamingState::default(),
         layout: OutputLayout::default(),
@@ -307,6 +316,8 @@ struct StreamDriver {
     codec: ChatCodec,
     provider: ProviderKey,
     handoffs: Vec<ModelHandoffDefinition>,
+    /// Custom tools advertised as functions, whose calls are lifted back to custom calls.
+    custom_tools: BTreeSet<String>,
     /// Transport diagnostics from the response headers, which the body never carries.
     request_id: Option<String>,
     state: StreamingState,
@@ -1212,7 +1223,13 @@ impl StreamDriver {
             .get("arguments")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let kind = convert::tool_call_item(CallId::new(call_id), name, arguments, &self.handoffs)?;
+        let kind = convert::tool_call_item(
+            CallId::new(call_id),
+            name,
+            arguments,
+            &self.handoffs,
+            &self.custom_tools,
+        )?;
         self.emit_item(kind, output_index, payload);
         Ok(())
     }

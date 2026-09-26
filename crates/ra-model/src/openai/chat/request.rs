@@ -83,7 +83,7 @@ pub(crate) async fn build_request_body(
         );
     }
 
-    let tools = merge_tools(&mut body, request.tools(), request.handoffs())?;
+    let tools = merge_tools(codec, &mut body, request.tools(), request.handoffs())?;
     apply_tool_choice(&mut body, request, &tools)?;
     apply_parallel_tool_calls(&mut body, codec, request, tools.populated);
     apply_streaming(&mut body, codec, streaming);
@@ -211,6 +211,7 @@ struct MergedTools {
 /// Replacing the array would make the two mutually exclusive; the names are checked across both
 /// sources so a collision fails locally instead of producing an ambiguous call.
 fn merge_tools(
+    codec: &ChatCodec,
     body: &mut Map<String, Value>,
     tools: &[ModelToolDefinition],
     handoffs: &[ModelHandoffDefinition],
@@ -234,15 +235,31 @@ fn merge_tools(
     }
     lowered.reserve(tools.len() + handoffs.len());
 
+    // The reference's converter raises for any tool that is not a function; advertising a custom
+    // tool as one is an extension the caller has to ask for.
+    if let Some(custom) = tools.iter().find(|tool| tool.kind().is_custom())
+        && !codec.options.custom_tools_as_functions()
+    {
+        return Err(crate::custom_tools::unsupported(
+            "the Chat Completions API",
+            custom.name(),
+        ));
+    }
+    let custom_parameters = crate::custom_tools::function_parameters();
+
     let neutral = tools
         .iter()
         .map(|tool| {
-            (
-                tool.name(),
-                tool.description(),
-                tool.input_schema(),
-                tool.strict(),
-            )
+            if tool.kind().is_custom() {
+                (tool.name(), tool.description(), &custom_parameters, false)
+            } else {
+                (
+                    tool.name(),
+                    tool.description(),
+                    tool.input_schema(),
+                    tool.strict(),
+                )
+            }
         })
         .chain(handoffs.iter().map(|handoff| {
             (

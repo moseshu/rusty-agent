@@ -333,8 +333,15 @@ pub(crate) fn remove(path: &Path, recursive: bool) -> Result<(), SandboxError> {
 ///
 /// Returns [`ra_core::sandbox::ErrorCode::WorkspaceReadNotFound`] when the file is not there, and
 /// [`ra_core::sandbox::ErrorCode::WorkspaceArchiveReadError`] for any other failure.
-pub(crate) fn read_file(path: &Path, requested: &str) -> Result<Vec<u8>, SandboxError> {
-    std::fs::read(path).map_err(|error| {
+///
+/// `max_bytes` stops the read after that many bytes from the start, so a caller with a ceiling
+/// never holds more than it asked for, whatever the file's size.
+pub(crate) fn read_file(
+    path: &Path,
+    requested: &str,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, SandboxError> {
+    let failure = |error: std::io::Error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             SandboxError::workspace_read_not_found(requested).with_cause(error)
         } else {
@@ -342,7 +349,15 @@ pub(crate) fn read_file(path: &Path, requested: &str) -> Result<Vec<u8>, Sandbox
                 .with_context("os_error", error.to_string())
                 .with_cause(error)
         }
-    })
+    };
+    let Some(max_bytes) = max_bytes else {
+        return std::fs::read(path).map_err(failure);
+    };
+    let file = std::fs::File::open(path).map_err(failure)?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, max_bytes), &mut data)
+        .map_err(failure)?;
+    Ok(data)
 }
 
 /// Writes a file into the workspace, creating the directories above it.

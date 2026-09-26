@@ -11,7 +11,7 @@ use super::origin::validate_tool_name;
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result, ToolErrorKind},
-    model::ModelToolDefinition,
+    model::{CustomToolFormat, ModelToolDefinition, ModelToolKind, custom_tool_input_schema},
     strict::{canonicalize_json, ensure_strict_json_schema, verify_strict_json_schema},
 };
 
@@ -89,11 +89,34 @@ pub struct ToolSchema {
     input_schema_hash: String,
     #[serde(default = "default_true")]
     strict_json_schema: bool,
+    #[serde(default, skip_serializing_if = "ModelToolKind::is_function")]
+    kind: ModelToolKind,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
 
 impl ToolSchema {
+    /// Creates the schema of a custom tool: one raw string, constrained by `format` when given.
+    ///
+    /// The tool is handed its input as a JSON string, and its input schema says so; that schema is
+    /// not advertised, the custom form is. Custom schemas are never strict, having no JSON object
+    /// for a provider to validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for an invalid name.
+    pub fn custom(name: impl Into<String>, format: Option<CustomToolFormat>) -> Result<Self> {
+        let mut schema = Self::build(name, custom_tool_input_schema(), false)?;
+        schema.kind = ModelToolKind::Custom { format };
+        Ok(schema)
+    }
+
+    /// How the tool takes its input.
+    #[must_use]
+    pub const fn kind(&self) -> &ModelToolKind {
+        &self.kind
+    }
+
     /// Creates a strict schema, rejecting one that does not satisfy the strict-mode invariants.
     ///
     /// Strictness is checked here rather than assumed, because `strict` is also sent to the
@@ -125,6 +148,7 @@ impl ToolSchema {
             input_schema,
             input_schema_hash,
             strict_json_schema: strict,
+            kind: ModelToolKind::Function,
             unknown: Unknown::new(),
         })
     }
@@ -155,8 +179,13 @@ impl ToolSchema {
     /// Projects only model-visible fields across the provider boundary.
     #[must_use]
     pub fn to_model_definition(&self) -> ModelToolDefinition {
-        let definition = ModelToolDefinition::new(self.name.clone(), self.input_schema.clone())
-            .with_strict(self.strict_json_schema);
+        let definition = match &self.kind {
+            ModelToolKind::Custom { format } => {
+                ModelToolDefinition::custom(self.name.clone(), format.clone())
+            }
+            _ => ModelToolDefinition::new(self.name.clone(), self.input_schema.clone())
+                .with_strict(self.strict_json_schema),
+        };
         match &self.description {
             Some(description) => definition.with_description(description.clone()),
             None => definition,
@@ -235,6 +264,8 @@ struct ToolSchemaWire {
     input_schema_hash: Option<String>,
     #[serde(default = "default_true")]
     strict_json_schema: bool,
+    #[serde(default)]
+    kind: ModelToolKind,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -270,6 +301,7 @@ impl<'de> Deserialize<'de> for ToolSchema {
             input_schema,
             input_schema_hash: actual_hash,
             strict_json_schema: wire.strict_json_schema,
+            kind: wire.kind,
             unknown: wire.unknown,
         })
     }

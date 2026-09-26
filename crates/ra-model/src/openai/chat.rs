@@ -57,6 +57,7 @@ pub(crate) const FAKE_ITEM_ID: &str = "__fake_id__";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChatLoweringOptions {
     strict_feature_validation: bool,
+    custom_tools_as_functions: bool,
 }
 
 impl ChatLoweringOptions {
@@ -65,6 +66,7 @@ impl ChatLoweringOptions {
     pub const fn new() -> Self {
         Self {
             strict_feature_validation: true,
+            custom_tools_as_functions: false,
         }
     }
 
@@ -84,6 +86,24 @@ impl ChatLoweringOptions {
     #[must_use]
     pub const fn strict_feature_validation(self) -> bool {
         self.strict_feature_validation
+    }
+
+    /// Chooses whether a custom tool is advertised as a function taking one string `input`.
+    ///
+    /// Off by default, which refuses a custom tool as the reference does: Chat Completions has no
+    /// custom form in the reference's converter. Turning it on is this framework's extension, and
+    /// it drops the tool's grammar — see [`crate::custom_tools`]. It is independent of
+    /// [`Self::with_strict_feature_validation`]: a custom tool is never dropped silently.
+    #[must_use]
+    pub const fn with_custom_tools_as_functions(mut self, enabled: bool) -> Self {
+        self.custom_tools_as_functions = enabled;
+        self
+    }
+
+    /// Whether a custom tool is advertised as a function.
+    #[must_use]
+    pub const fn custom_tools_as_functions(self) -> bool {
+        self.custom_tools_as_functions
     }
 }
 
@@ -392,6 +412,10 @@ impl OpenAiChatModel {
             &payload,
             facts.into_request_id(),
             request.handoffs(),
+            &crate::custom_tools::advertised_as_functions(
+                self.codec.options.custom_tools_as_functions(),
+                &request,
+            ),
             request.model_settings().provider(),
         )
     }
@@ -424,6 +448,10 @@ impl Model for OpenAiChatModel {
         futures_stream::once(async move {
             let provider = request.model_settings().provider().clone();
             let handoffs = request.handoffs().to_vec();
+            let custom_tools = crate::custom_tools::advertised_as_functions(
+                model.codec.options.custom_tools_as_functions(),
+                &request,
+            );
             let unstarted = unstarted_replay_safety(request.continuation());
             match model.send(&request, true).await {
                 Ok(response) if response.status().is_success() => {
@@ -435,7 +463,10 @@ impl Model for OpenAiChatModel {
                             model.codec.clone(),
                             super::sse::frames(response, model.codec.terminator.clone()),
                             provider,
-                            handoffs,
+                            stream::CallTargets {
+                                handoffs,
+                                custom_tools,
+                            },
                             model.buffer_tool_calls,
                             request_id,
                             unstarted,

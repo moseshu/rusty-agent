@@ -7,7 +7,7 @@ use ra_core::{
     error::{Error, Result},
     item::{
         ContentBlock, HandoffCall, ImageBlock, ImageSource, InputItemNormalizer, Message,
-        MessageRole, ModelInputItem, ThinkingBlock,
+        MessageRole, ModelInputItem, ThinkingBlock, ToolCallKind,
     },
     model::{
         ConversationContinuation, Effort, ModelHandoffDefinition, ModelRequest,
@@ -25,6 +25,7 @@ const MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
 pub(crate) async fn build_request_body(
     model: &str,
     request: &ModelRequest,
+    custom_tools_as_functions: bool,
     streaming: bool,
 ) -> Result<Value> {
     reject_unsupported(request)?;
@@ -43,9 +44,14 @@ pub(crate) async fn build_request_body(
     body.insert("max_tokens".to_owned(), json!(max_tokens));
     body.insert(
         "messages".to_owned(),
-        Value::Array(lower_messages(request).await?),
+        Value::Array(lower_messages(request, custom_tools_as_functions).await?),
     );
-    let tools = merge_tools(&mut body, request.tools(), request.handoffs())?;
+    let tools = merge_tools(
+        &mut body,
+        request.tools(),
+        request.handoffs(),
+        custom_tools_as_functions,
+    )?;
     insert_system(&mut body, request, &tools)?;
     apply_tool_choice(
         &mut body,
@@ -127,7 +133,10 @@ fn insert_system(
     Ok(())
 }
 
-async fn lower_messages(request: &ModelRequest) -> Result<Vec<Value>> {
+async fn lower_messages(
+    request: &ModelRequest,
+    custom_tools_as_functions: bool,
+) -> Result<Vec<Value>> {
     let normalized = InputItemNormalizer::new()
         .normalize_model_items(request.input())
         .map_err(|error| {
@@ -144,6 +153,17 @@ async fn lower_messages(request: &ModelRequest) -> Result<Vec<Value>> {
             ModelInputItem::Reasoning(reasoning) => {
                 ensure_tool_results_are_adjacent(&pending_tool_results)?;
                 accumulator.push(ASSISTANT_ROLE, vec![thinking_from_reasoning(reasoning)?]);
+            }
+            ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::Custom => {
+                if !custom_tools_as_functions {
+                    return Err(crate::custom_tools::unsupported(
+                        "Anthropic Messages",
+                        call.name(),
+                    ));
+                }
+                pending_tool_results.insert(call.call_id().clone());
+                let input = crate::custom_tools::function_arguments(call)?;
+                accumulator.push(ASSISTANT_ROLE, vec![json!({"type":"tool_use", "id":call.call_id().as_str(), "name":call.name(), "input":input})]);
             }
             ModelInputItem::ToolCall(call) => {
                 pending_tool_results.insert(call.call_id().clone());
@@ -413,6 +433,7 @@ fn merge_tools(
     body: &mut Map<String, Value>,
     tools: &[ModelToolDefinition],
     handoffs: &[ModelHandoffDefinition],
+    custom_tools_as_functions: bool,
 ) -> Result<Tools> {
     let mut lowered = match body.remove("tools") {
         None | Some(Value::Null) => Vec::new(),
@@ -430,9 +451,25 @@ fn merge_tools(
             }
         }
     }
+    if let Some(custom) = tools.iter().find(|tool| tool.kind().is_custom())
+        && !custom_tools_as_functions
+    {
+        return Err(crate::custom_tools::unsupported(
+            "Anthropic Messages",
+            custom.name(),
+        ));
+    }
+    let custom_parameters = crate::custom_tools::function_parameters();
     for (name, description, schema) in tools
         .iter()
-        .map(|tool| (tool.name(), tool.description(), tool.input_schema()))
+        .map(|tool| {
+            let schema = if tool.kind().is_custom() {
+                &custom_parameters
+            } else {
+                tool.input_schema()
+            };
+            (tool.name(), tool.description(), schema)
+        })
         .chain(handoffs.iter().map(|handoff| {
             (
                 handoff.name(),

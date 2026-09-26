@@ -21,6 +21,7 @@
 pub mod anthropic;
 #[cfg(feature = "compat")]
 pub mod compat;
+pub(crate) mod custom_tools;
 pub mod fallback;
 #[cfg(feature = "openai")]
 pub mod openai;

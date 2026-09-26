@@ -1,27 +1,49 @@
-//! `ra-tools::sandbox::apply_patch`: the workspace editor against an in-memory session.
+//! `ra-tools::sandbox::{apply_patch, apply_patch_tool, filesystem}` against an in-memory session.
 //!
-//! Ported from the reference's `tests/sandbox/test_apply_patch.py`, one test per upstream test in
-//! the upstream order, followed by the editor tests of
-//! `tests/sandbox/capabilities/test_apply_patch_tool.py` — the ones that drive
-//! `SandboxApplyPatchTool.editor` rather than the tool's custom-tool entry.
+//! Ported from the reference's `tests/sandbox/test_apply_patch.py`, then
+//! `tests/sandbox/capabilities/test_apply_patch_tool.py` (its editor tests first, then its
+//! custom-tool tests), `tests/sandbox/capabilities/test_apply_patch_preflight.py` and
+//! `tests/sandbox/capabilities/test_filesystem_capability.py`, each in upstream order.
 //!
 //! The session is the Rust counterpart of the reference's `ApplyPatchSession`: files in a map keyed
 //! by the lexically normalized absolute path, every `mkdir` and `rm` recorded, and the user of every
 //! file operation recorded, as `UserRecordingApplyPatchSession` does. The reference's
 //! `session.apply_patch(...)` is `WorkspaceEditor::new(session).apply_patch(...)` here.
+//!
+//! The reference drives the custom tool through its runner's `CustomToolAction`, which asks for
+//! approval, runs the tool, and turns a raised error into the output text. [`execute`] drives it
+//! through the runtime's own dispatch, which does the same three things.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ra_core::sandbox::{
-    AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, OpName, SandboxError,
-    SandboxResult, SandboxSession, SandboxSessionState, SandboxWorkspaceScope, SessionResources,
-    Snapshot, User,
+use ra_core::cancel::CancelScope;
+use ra_core::{
+    agent::AgentSpec,
+    capability::{Capability, CapabilityFamily, SandboxBinding},
+    context::RunContext,
+    item::{AgentId, CallId},
+    model::{CustomToolFormat, CustomToolGrammarSyntax, ModelToolKind},
+    sandbox::{
+        AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, OpName, SandboxError,
+        SandboxResult, SandboxSession, SandboxSessionState, SandboxWorkspaceScope,
+        SessionResources, Snapshot, User,
+    },
+    state::RunId,
+    tool::{Tool, ToolApprovalPolicy, ToolContext},
 };
 use ra_patch::{ApplyDiffError, ApplyDiffMode, ApplyPatchOperation, ApplyPatchOperationType};
+use ra_runtime::permission::PermissionEngine;
+use ra_runtime::tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool};
 use ra_tools::sandbox::apply_patch::{PatchFormat, WorkspaceEditor, operations_from_json};
-use serde_json::json;
+use ra_tools::sandbox::apply_patch_tool::{
+    APPLY_PATCH_DESCRIPTION, APPLY_PATCH_GRAMMAR, PatchApproval, SandboxApplyPatchTool,
+    parse_apply_patch_input,
+};
+use ra_tools::sandbox::filesystem::{Filesystem, FilesystemToolSet, default_capabilities};
+use ra_tools::sandbox::view_image::ViewImageTool;
+use serde_json::{Value, json};
 
 // ---- the in-memory session -----------------------------------------------------------------
 
@@ -935,5 +957,635 @@ fn json_operations_are_coerced_as_the_reference_coerces_them() {
     assert_eq!(
         refusal(json!("a")),
         "Invalid apply_patch operations payload: str"
+    );
+}
+
+// ---- test_apply_patch_tool.py, the custom tool ---------------------------------------------
+
+fn run_context() -> RunContext {
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("patcher"))
+        .name("patcher")
+        .build()
+        .expect("agent");
+    RunContext::new(RunId::new("run-sandbox-apply-patch"), &agent)
+}
+
+fn patch_tool(session: &Arc<PatchSession>) -> SandboxApplyPatchTool {
+    SandboxApplyPatchTool::new(Arc::clone(session) as Arc<dyn SandboxSession>).expect("tool")
+}
+
+/// How the reference's runner answers one custom call.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The call stopped to ask the host.
+    NeedsApproval,
+    /// The call ran, or failed, and this is what the model reads.
+    Output(String),
+}
+
+/// The reference's `CustomToolAction`, through the runtime's dispatch: ask for approval, run, and
+/// report a failure as its text.
+async fn execute(tool: &SandboxApplyPatchTool, raw_input: &str) -> Outcome {
+    let request = ToolDispatchRequest::new(
+        Arc::new(tool.clone()),
+        CallId::new("call_apply"),
+        Value::String(raw_input.to_owned()),
+        Arc::new(run_context()),
+        CancelScope::root(),
+        CallHistory::default(),
+        PermissionEngine::default(),
+    );
+    let (dispatch, _) = dispatch_tool(request)
+        .await
+        .expect("a custom call settles as a dispatch result")
+        .into_parts();
+    let output = match dispatch {
+        ToolDispatch::AwaitingApproval(_) => return Outcome::NeedsApproval,
+        ToolDispatch::Observed(observation) => observation.into_output(),
+        ToolDispatch::Refused(refusal) => refusal.into_output(),
+        other => panic!("unexpected dispatch {other:?}"),
+    };
+    let text = output.output()["blocks"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a text answer, got {}", output.output()));
+    Outcome::Output(text.to_owned())
+}
+
+fn output(outcome: Outcome) -> String {
+    match outcome {
+        Outcome::Output(text) => text,
+        Outcome::NeedsApproval => panic!("the call stopped for approval"),
+    }
+}
+
+/// The path and move target of each operation an approval check was shown.
+type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// Records the operations an approval check was shown, answering with `answer`.
+fn recording_check(
+    answer: impl Fn(&ApplyPatchOperation) -> bool + Send + Sync + 'static,
+) -> (PatchApproval, Seen) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let check = move |_: &ToolContext<'_>, operation: &ApplyPatchOperation| {
+        record.lock().unwrap().push((
+            operation.path().to_owned(),
+            operation.move_to().map(str::to_owned),
+        ));
+        Ok(answer(operation))
+    };
+    (PatchApproval::check(check), seen)
+}
+
+#[test]
+fn apply_patch_is_a_custom_tool_with_the_references_lark_grammar() {
+    let tool = patch_tool(&PatchSession::new());
+
+    assert_eq!(tool.schema().name(), "apply_patch");
+    let definition = tool.model_definition();
+    assert_eq!(definition.name(), "apply_patch");
+    assert_eq!(
+        definition.kind(),
+        &ModelToolKind::Custom {
+            format: Some(CustomToolFormat::Grammar {
+                syntax: CustomToolGrammarSyntax::Lark,
+                definition: APPLY_PATCH_GRAMMAR.to_owned(),
+            }),
+        }
+    );
+    assert!(!definition.strict());
+}
+
+#[test]
+fn the_grammar_requires_a_diff_after_an_optional_move() {
+    let update_rule = APPLY_PATCH_GRAMMAR
+        .lines()
+        .find(|line| line.starts_with("update_hunk:"))
+        .expect("update rule");
+    assert_eq!(
+        update_rule,
+        r#"update_hunk: "*** Update File: " filename LF change_move? change"#
+    );
+    assert!(
+        APPLY_PATCH_DESCRIPTION
+            .contains(r#"UpdateFile := "*** Update File: " path NEWLINE [ MoveTo ] Hunk { Hunk }"#)
+    );
+}
+
+/// The reference's converter test: what the tool hands the model boundary is its description and
+/// the same grammar. The wire rendering is `it-model`'s custom tool test.
+#[test]
+fn the_model_definition_carries_the_references_description_and_grammar() {
+    let tool = patch_tool(&PatchSession::new());
+    let definition = tool.model_definition();
+
+    let description = definition.description().expect("description");
+    assert!(description.contains("This is a FREEFORM tool"));
+    assert!(description.contains("A full patch can combine several operations"));
+    assert_eq!(description, APPLY_PATCH_DESCRIPTION);
+}
+
+#[tokio::test]
+async fn an_update_without_a_diff_is_refused_at_run_time() {
+    for update_body in ["", "*** Move to: moved.txt\n"] {
+        let tool = patch_tool(&PatchSession::new());
+
+        let text = output(
+            execute(
+                &tool,
+                &format!(
+                    "*** Begin Patch\n*** Update File: notes.txt\n{update_body}*** End Patch\n"
+                ),
+            )
+            .await,
+        );
+
+        assert!(
+            text.contains("Update File patch for notes.txt must include a hunk"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn needs_approval_takes_an_operation_typed_check() {
+    let check = |_: &ToolContext<'_>, operation: &ApplyPatchOperation| {
+        Ok(operation.kind() != ApplyPatchOperationType::CreateFile)
+    };
+    let tool = patch_tool(&PatchSession::new()).with_needs_approval(PatchApproval::check(check));
+
+    assert!(matches!(
+        tool.needs_approval_policy(),
+        PatchApproval::Check(_)
+    ));
+    assert_eq!(tool.options().approval(), ToolApprovalPolicy::Dynamic);
+}
+
+#[tokio::test]
+async fn a_check_set_after_construction_drives_approval() {
+    let mut tool = patch_tool(&PatchSession::new());
+    let check = |_: &ToolContext<'_>, operation: &ApplyPatchOperation| {
+        Ok(operation.kind() == ApplyPatchOperationType::DeleteFile)
+    };
+    tool.set_needs_approval(PatchApproval::check(check));
+
+    let outcome = execute(
+        &tool,
+        "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch\n",
+    )
+    .await;
+
+    assert_eq!(outcome, Outcome::NeedsApproval);
+}
+
+#[tokio::test]
+async fn the_approval_check_sees_canonical_paths() {
+    let cases = [
+        (
+            json!({"type": "create_file", "path": r"sensitive\secret.txt", "diff": "+secret\n"}),
+            ("sensitive/secret.txt".to_owned(), None),
+        ),
+        (
+            json!({
+                "type": "update_file",
+                "path": "notes.txt",
+                "move_to": r"sensitive\secret.txt",
+                "diff": "@@\n-old\n+new\n",
+            }),
+            (
+                "notes.txt".to_owned(),
+                Some("sensitive/secret.txt".to_owned()),
+            ),
+        ),
+    ];
+    for (payload, expected) in cases {
+        let (check, seen) = recording_check(|operation| {
+            operation.path() == "sensitive/secret.txt"
+                || operation.move_to() == Some("sensitive/secret.txt")
+        });
+        let tool = patch_tool(&PatchSession::new()).with_needs_approval(check);
+
+        let outcome = execute(&tool, &payload.to_string()).await;
+
+        assert_eq!(outcome, Outcome::NeedsApproval);
+        assert_eq!(*seen.lock().unwrap(), vec![expected]);
+    }
+}
+
+/// `test_multi_operation_checker_stops_when_approval_resolves` resolves the approval while the
+/// first check is still running and asserts the second check never runs. A call's approval here is
+/// answered only after the turn has stopped, so there is no status to resolve mid-check; what is
+/// left of the behaviour is that checking stops at the first operation that needs approval, and a
+/// patch whose checks all decline runs every operation.
+#[tokio::test]
+async fn checking_stops_at_the_first_operation_that_needs_approval() {
+    let raw_input = "*** Begin Patch\n*** Add File: first.txt\n+first\n*** Add File: second.txt\n+second\n*** End Patch\n";
+
+    let session = PatchSession::new();
+    let (check, seen) = recording_check(|_| true);
+    let tool = patch_tool(&session).with_needs_approval(check);
+    assert_eq!(execute(&tool, raw_input).await, Outcome::NeedsApproval);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(session.files().is_empty());
+
+    let session = PatchSession::new();
+    let (check, seen) = recording_check(|_| false);
+    let tool = patch_tool(&session).with_needs_approval(check);
+    output(execute(&tool, raw_input).await);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(session.file("/workspace/first.txt").unwrap(), b"first");
+    assert_eq!(session.file("/workspace/second.txt").unwrap(), b"second");
+}
+
+#[tokio::test]
+async fn a_malformed_patch_is_a_tool_error_even_when_approval_is_required() {
+    let tool = patch_tool(&PatchSession::new()).with_needs_approval(true);
+
+    let text = output(execute(&tool, "not a valid patch").await);
+
+    assert!(
+        text.contains("apply_patch input must start with '*** Begin Patch'"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn the_approval_check_sees_the_paths_the_run_will_touch_under_a_working_directory() {
+    let session = PatchSession::new();
+    session.put("/workspace/tasks/a/notes.txt", b"old\n");
+    let (check, seen) = recording_check(|_| false);
+    let tool = patch_tool(&session)
+        .with_workspace_scope(SandboxWorkspaceScope::from_cwd(Some("tasks/a")).unwrap())
+        .with_needs_approval(check);
+
+    let text = output(
+        execute(
+            &tool,
+            "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch\n",
+        )
+        .await,
+    );
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            "tasks/a/notes.txt".to_owned(),
+            Some("tasks/a/moved.txt".to_owned())
+        )]
+    );
+    assert_eq!(text, "Updated notes.txt\nMoved notes.txt to moved.txt");
+    assert_eq!(
+        session.file("/workspace/tasks/a/moved.txt").unwrap(),
+        b"new\n"
+    );
+}
+
+#[tokio::test]
+async fn an_absolute_path_in_a_patch_stays_at_the_workspace_root() {
+    let session = PatchSession::new();
+    let tool = patch_tool(&session)
+        .with_workspace_scope(SandboxWorkspaceScope::from_cwd(Some("tasks/a")).unwrap());
+
+    let text = output(
+        execute(
+            &tool,
+            "*** Begin Patch\n*** Add File: /workspace/root.txt\n+root\n*** End Patch\n",
+        )
+        .await,
+    );
+
+    assert_eq!(text, "Created root.txt");
+    assert_eq!(session.file("/workspace/root.txt").unwrap(), b"root");
+    assert_eq!(session.file("/workspace/tasks/a/root.txt"), None);
+}
+
+#[tokio::test]
+async fn a_patch_creates_updates_moves_and_deletes() {
+    let session = PatchSession::new();
+    let tool = patch_tool(&session);
+
+    output(
+        execute(
+            &tool,
+            "*** Begin Patch\n*** Add File: notes.txt\n+hello\n+world\n*** End Patch\n",
+        )
+        .await,
+    );
+    assert_eq!(
+        session.file("/workspace/notes.txt").unwrap(),
+        b"hello\nworld"
+    );
+
+    let text = output(
+        execute(
+            &tool,
+            "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: moved.txt\n@@\n-hello\n+hi\n world\n*** End Patch\n",
+        )
+        .await,
+    );
+    assert!(text.contains("Updated notes.txt"), "{text}");
+    assert!(text.contains("Moved notes.txt to moved.txt"), "{text}");
+    assert_eq!(session.file("/workspace/notes.txt"), None);
+    assert_eq!(session.file("/workspace/moved.txt").unwrap(), b"hi\nworld");
+
+    output(
+        execute(
+            &tool,
+            "*** Begin Patch\n*** Delete File: moved.txt\n*** End Patch\n",
+        )
+        .await,
+    );
+    assert_eq!(session.file("/workspace/moved.txt"), None);
+}
+
+// ---- test_apply_patch_preflight.py ---------------------------------------------------------
+
+#[tokio::test]
+async fn an_invalid_later_path_leaves_the_valid_prefix_unapplied() {
+    let session = PatchSession::new();
+    let tool = patch_tool(&session).with_needs_approval(true);
+
+    let text = output(
+        execute(
+            &tool,
+            "*** Begin Patch\n*** Add File: safe.txt\n+safe\n*** Add File: ../escape.txt\n+escape\n*** End Patch\n",
+        )
+        .await,
+    );
+
+    assert_eq!(text, "apply_patch path must not escape root: ../escape.txt");
+    assert!(session.files().is_empty());
+}
+
+// ---- the patch parser, beyond the reference's tests ----------------------------------------
+
+/// Every refusal the reference's parser raises, in its words.
+#[test]
+fn the_parser_refuses_what_the_reference_refuses() {
+    let refusal = |raw: &str| {
+        parse_apply_patch_input(raw)
+            .unwrap_err()
+            .message()
+            .to_owned()
+    };
+    assert_eq!(
+        refusal("*** Begin Patch\n*** Add File: a\n+a\n"),
+        "apply_patch input must end with '*** End Patch'"
+    );
+    assert_eq!(
+        refusal("*** Begin Patch\n*** End Patch\n"),
+        "apply_patch input must include at least one file operation"
+    );
+    assert_eq!(
+        refusal("*** Begin Patch\n*** Rename File: a\n*** End Patch"),
+        "Invalid apply_patch file operation header: *** Rename File: a"
+    );
+    assert_eq!(
+        refusal("*** Begin Patch\n*** Add File: a\nplain\n*** End Patch"),
+        "Invalid Add File line: plain"
+    );
+    assert_eq!(
+        refusal("*** Begin Patch\n*** Add File: a\n*** End Patch"),
+        "Add File patch for a must include at least one + line"
+    );
+    assert_eq!(
+        refusal("*** Begin Patch\n*** Delete File: a\n-x\n*** End Patch"),
+        "Delete File patch for a must not include a diff"
+    );
+    assert_eq!(
+        refusal("*** Begin Patch\n*** Add File:  \n+a\n*** End Patch"),
+        "Missing path in apply_patch header: *** Add File:  "
+    );
+    assert_eq!(
+        refusal(r#"{"type": "rename", "path": "a"}"#),
+        "Invalid apply_patch operation type: rename"
+    );
+    assert_eq!(
+        refusal(r#"{"path": "a"}"#),
+        "Invalid apply_patch operation type: None"
+    );
+    assert_eq!(
+        refusal(r#"{"type": "create_file", "path": ""}"#),
+        "apply_patch operation is missing a path"
+    );
+    assert_eq!(
+        refusal(r#"{"type": "update_file", "path": "a"}"#),
+        "apply_patch operation update_file is missing a diff"
+    );
+    assert_eq!(
+        refusal(r#"{"type": "delete_file", "path": "a", "move_to": 3}"#),
+        "apply_patch operation move_to must be a string"
+    );
+    assert_eq!(refusal("[1]"), "apply_patch operation must be an object");
+}
+
+/// The envelope splits on every line boundary Python's `splitlines` knows, so a CRLF patch reads
+/// like an LF one; the JSON forms take an operation list, one operation, or a bare operation.
+#[test]
+fn the_parser_reads_every_form_the_reference_reads() {
+    let crlf = parse_apply_patch_input(
+        "*** Begin Patch\r\n*** Update File: a.txt\r\n*** Move to: b.txt\r\n@@\r\n-x\r\n+y\r\n*** End Patch\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crlf,
+        vec![ApplyPatchOperation::update_file("a.txt", "@@\n-x\n+y\n").with_move_to("b.txt")]
+    );
+
+    let expected = vec![ApplyPatchOperation::delete_file("a.txt")];
+    for raw in [
+        r#"  {"operations": [{"type": "delete_file", "path": "a.txt", "diff": "ignored"}]}"#,
+        r#"{"operation": {"type": "delete_file", "path": "a.txt"}}"#,
+        r#"{"type": "delete_file", "path": "a.txt"}"#,
+        r#"[{"type": "delete_file", "path": "a.txt"}]"#,
+    ] {
+        assert_eq!(parse_apply_patch_input(raw).unwrap(), expected, "{raw}");
+    }
+}
+
+// ---- test_filesystem_capability.py ---------------------------------------------------------
+
+fn bound_filesystem(filesystem: &Filesystem, session: &Arc<PatchSession>) -> Filesystem {
+    filesystem.bound(
+        Arc::clone(session) as Arc<dyn SandboxSession>,
+        None,
+        SandboxWorkspaceScope::root(),
+    )
+}
+
+#[test]
+fn an_unbound_filesystem_refuses_to_build_its_tools() {
+    let error = Filesystem::new().try_tools().err().expect("unbound");
+    assert_eq!(
+        error.to_string(),
+        Filesystem::new()
+            .bind(&run_context())
+            .err()
+            .expect("unbound")
+            .to_string()
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Filesystem capability is not bound to a SandboxSession")
+    );
+    assert!(Filesystem::new().tools().is_empty());
+}
+
+#[test]
+fn a_bound_filesystem_offers_view_image_and_apply_patch() {
+    let tools = bound_filesystem(&Filesystem::new(), &PatchSession::new())
+        .try_tools()
+        .expect("tools");
+
+    let names: Vec<&str> = tools.iter().map(|tool| tool.schema().name()).collect();
+    assert_eq!(names, ["view_image", "apply_patch"]);
+    assert!(tools[0].model_definition().kind().is_function());
+    assert!(tools[1].model_definition().kind().is_custom());
+}
+
+#[test]
+fn a_configurator_sets_approval_on_both_tools_after_a_clone() {
+    let configure = |toolset: &mut FilesystemToolSet| {
+        let view_image_check = |context: &ToolContext<'_>| {
+            Ok(context.arguments()["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("sensitive/")))
+        };
+        toolset
+            .view_image_mut()
+            .set_needs_approval(ra_tools::sandbox::NeedsApproval::check(view_image_check));
+        let apply_patch_check = |_: &ToolContext<'_>, operation: &ApplyPatchOperation| {
+            Ok(operation.kind() != ApplyPatchOperationType::CreateFile)
+        };
+        toolset
+            .apply_patch_mut()
+            .set_needs_approval(PatchApproval::check(apply_patch_check));
+    };
+    let filesystem = Filesystem::new().with_configure_tools(configure).clone();
+
+    let toolset = bound_filesystem(&filesystem, &PatchSession::new())
+        .toolset()
+        .expect("tools");
+
+    assert!(matches!(
+        toolset.view_image().needs_approval_policy(),
+        ra_tools::sandbox::NeedsApproval::Check(_)
+    ));
+    assert!(matches!(
+        toolset.apply_patch().needs_approval_policy(),
+        PatchApproval::Check(_)
+    ));
+}
+
+#[test]
+fn a_configurator_can_replace_a_tool() {
+    let configure = |toolset: &mut FilesystemToolSet| {
+        let replacement = ViewImageTool::new(Arc::clone(toolset.view_image().session()))
+            .expect("tool")
+            .with_workspace_scope(toolset.workspace_scope().clone())
+            .with_needs_approval(true);
+        toolset.set_view_image(replacement);
+    };
+
+    let toolset = bound_filesystem(
+        &Filesystem::new().with_configure_tools(configure),
+        &PatchSession::new(),
+    )
+    .toolset()
+    .expect("tools");
+
+    assert!(matches!(
+        toolset.view_image().needs_approval_policy(),
+        ra_tools::sandbox::NeedsApproval::Always
+    ));
+    assert_eq!(toolset.apply_patch().schema().name(), "apply_patch");
+}
+
+#[test]
+fn the_tools_and_the_configurator_see_the_bound_workspace_scope() {
+    let scope = SandboxWorkspaceScope::from_cwd(Some("tasks/a")).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let filesystem = Filesystem::new().with_configure_tools(move |toolset| {
+        record
+            .lock()
+            .unwrap()
+            .push(toolset.workspace_scope().clone());
+    });
+
+    let toolset = filesystem
+        .bound(
+            PatchSession::new() as Arc<dyn SandboxSession>,
+            None,
+            scope.clone(),
+        )
+        .toolset()
+        .expect("tools");
+
+    assert_eq!(*seen.lock().unwrap(), vec![scope.clone()]);
+    assert_eq!(toolset.view_image().workspace_scope(), &scope);
+    assert_eq!(toolset.apply_patch().workspace_scope(), &scope);
+}
+
+#[test]
+fn the_file_tools_act_as_the_bound_user() {
+    let run_as = User::new("sandbox-user");
+    let toolset = Filesystem::new()
+        .bound(
+            PatchSession::new() as Arc<dyn SandboxSession>,
+            Some(run_as.clone()),
+            SandboxWorkspaceScope::root(),
+        )
+        .toolset()
+        .expect("tools");
+
+    assert_eq!(toolset.view_image().user(), Some(&run_as));
+    assert_eq!(toolset.apply_patch().editor().user(), Some(&run_as));
+}
+
+#[tokio::test]
+async fn the_filesystem_adds_no_instructions() {
+    assert!(Filesystem::new().instructions().await.unwrap().is_none());
+}
+
+// ---- the capability, beyond the reference's tests ------------------------------------------
+
+#[test]
+fn binding_to_a_sandbox_session_yields_a_bound_filesystem() {
+    let binding = SandboxBinding::new(
+        PatchSession::new() as Arc<dyn SandboxSession>,
+        Some(User::new("agent")),
+        SandboxWorkspaceScope::from_cwd(Some("tasks/a")).unwrap(),
+        Manifest::new().with_root("/workspace"),
+    );
+    let filesystem = Filesystem::new();
+    assert_eq!(filesystem.kind(), CapabilityFamily::FILESYSTEM);
+
+    let bound = filesystem
+        .bind_sandbox(&binding)
+        .expect("bind")
+        .expect("a bound copy");
+
+    let names: Vec<String> = bound
+        .tools()
+        .iter()
+        .map(|tool| tool.schema().name().to_owned())
+        .collect();
+    assert_eq!(names, ["view_image", "apply_patch"]);
+    assert!(!filesystem.is_bound());
+}
+
+/// The reference's default set is filesystem, shell and compaction; compaction is not here yet.
+#[test]
+fn the_default_capabilities_are_filesystem_and_shell() {
+    let kinds: Vec<CapabilityFamily> = default_capabilities()
+        .iter()
+        .map(|capability| capability.kind())
+        .collect();
+    assert_eq!(
+        kinds,
+        [CapabilityFamily::FILESYSTEM, CapabilityFamily::SHELL]
     );
 }

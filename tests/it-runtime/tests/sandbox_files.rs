@@ -175,3 +175,44 @@ async fn view_image_reads_an_image_from_the_workspace() {
         Some("image path `images/gone.png` was not found")
     );
 }
+
+/// The local backend's bounded read stops at its limit however large the file is: a 1 GiB sparse
+/// file comes back as exactly the bytes asked for, and `view_image` refuses it having read only one
+/// byte past its ceiling.
+#[tokio::test]
+async fn a_huge_file_is_read_only_up_to_the_limit() {
+    let (_directory, root, session) = live_session().await;
+    let huge = root.join("huge.png");
+    let file = std::fs::File::create(&huge).unwrap();
+    file.set_len(1 << 30).unwrap();
+    drop(file);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&huge)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b"\x89PNG\r\n\x1a\n"))
+        .unwrap();
+
+    let limit = u64::try_from(ra_tools::sandbox::view_image::MAX_IMAGE_BYTES).unwrap() + 1;
+    let data = session
+        .read_up_to(huge.to_str().unwrap(), None, limit)
+        .await
+        .unwrap();
+    assert_eq!(u64::try_from(data.len()).unwrap(), limit);
+    assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let tool = ViewImageTool::new(Arc::clone(&session)).unwrap();
+    let output = tool.run(&ViewImageArgs::new("huge.png")).await.unwrap();
+    assert_eq!(
+        output.as_text(),
+        Some(
+            "image path `huge.png` exceeded the allowed size of 10MB; resize or compress the \
+             image and try again"
+        )
+    );
+
+    let missing = session
+        .read_up_to(root.join("gone.png").to_str().unwrap(), None, limit)
+        .await
+        .unwrap_err();
+    assert_eq!(missing.error_code(), ErrorCode::WorkspaceReadNotFound);
+}

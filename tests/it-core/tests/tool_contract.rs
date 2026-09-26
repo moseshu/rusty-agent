@@ -634,3 +634,107 @@ fn test_tool_contract_17() {
 
     assert!(serde_json::from_value::<ToolSchema>(wire).is_err());
 }
+
+// ---- custom tools ----------------------------------------------------------------------------
+
+/// A custom tool's schema describes its raw input as one string, is never strict, and projects to a
+/// custom definition carrying its format; the kind survives a round trip, and a function schema
+/// writes no kind at all, so records from before custom tools read back unchanged.
+#[test]
+fn a_custom_schema_projects_to_a_custom_definition_and_round_trips() {
+    use ra_core::model::{CustomToolFormat, CustomToolGrammarSyntax, ModelToolKind};
+
+    let format = CustomToolFormat::Grammar {
+        syntax: CustomToolGrammarSyntax::Lark,
+        definition: "start: \"x\"".to_owned(),
+    };
+    let schema = ToolSchema::custom("apply_patch", Some(format.clone()))
+        .unwrap()
+        .with_description("Edits files.");
+
+    assert_eq!(schema.input_schema(), &json!({"type": "string"}));
+    assert!(!schema.strict_json_schema());
+    let definition = schema.to_model_definition();
+    assert_eq!(
+        definition.kind(),
+        &ModelToolKind::Custom {
+            format: Some(format.clone())
+        }
+    );
+    assert_eq!(definition.description(), Some("Edits files."));
+    assert!(!definition.strict());
+
+    let written = serde_json::to_value(&schema).unwrap();
+    assert_eq!(
+        written["kind"],
+        json!({"kind": "custom", "format": {"type": "grammar", "syntax": "lark", "definition": "start: \"x\""}})
+    );
+    let read: ToolSchema = serde_json::from_value(written).unwrap();
+    assert_eq!(read, schema);
+
+    let function = ToolSchema::loose("lookup", json!({"type": "object"})).unwrap();
+    assert!(
+        serde_json::to_value(&function)
+            .unwrap()
+            .get("kind")
+            .is_none()
+    );
+    assert!(function.kind().is_function());
+}
+
+/// What a custom entry costs in the tool table is its grammar, not the placeholder string schema.
+#[test]
+fn a_custom_definition_is_measured_by_its_format() {
+    use ra_core::model::{CustomToolFormat, CustomToolGrammarSyntax, ModelToolDefinition};
+
+    let small = ModelToolDefinition::custom("apply_patch", None);
+    let grammar = ModelToolDefinition::custom(
+        "apply_patch",
+        Some(CustomToolFormat::Grammar {
+            syntax: CustomToolGrammarSyntax::Lark,
+            definition: "x".repeat(1000),
+        }),
+    );
+    assert!(grammar.advertised_bytes().unwrap() > small.advertised_bytes().unwrap() + 1000);
+    assert!(grammar.advertised_chars().unwrap() > 1000);
+}
+
+/// A custom call carries its raw input as a JSON string, and the kind is written only for custom
+/// items, so function-call records keep their shape.
+#[test]
+fn call_items_record_their_kind_only_when_custom() {
+    use ra_core::item::{ToolApproval, ToolCall, ToolCallKind, ToolCallOutput};
+
+    let custom = ToolCall::custom(CallId::new("c1"), "apply_patch", "*** Begin Patch");
+    assert_eq!(custom.kind(), ToolCallKind::Custom);
+    assert_eq!(custom.arguments(), &json!("*** Begin Patch"));
+    let written = serde_json::to_value(&custom).unwrap();
+    assert_eq!(written["kind"], "custom");
+    let read: ToolCall = serde_json::from_value(written).unwrap();
+    assert_eq!(read, custom);
+
+    let function = ToolCall::new(CallId::new("c2"), "lookup", json!({}));
+    assert!(
+        serde_json::to_value(&function)
+            .unwrap()
+            .get("kind")
+            .is_none()
+    );
+
+    let output =
+        ToolCallOutput::new(CallId::new("c1"), json!("done")).with_kind(ToolCallKind::Custom);
+    let read: ToolCallOutput =
+        serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
+    assert_eq!(read.kind(), ToolCallKind::Custom);
+
+    let approval = ToolApproval::new(CallId::new("c1"), "apply_patch", json!("patch"))
+        .with_kind(ToolCallKind::Custom);
+    let read: ToolApproval =
+        serde_json::from_value(serde_json::to_value(&approval).unwrap()).unwrap();
+    assert_eq!(read.kind(), ToolCallKind::Custom);
+
+    let legacy: ToolCallOutput =
+        serde_json::from_value(json!({"schema_version": 1, "call_id": "c3", "output": "ok"}))
+            .unwrap();
+    assert_eq!(legacy.kind(), ToolCallKind::Function);
+}
