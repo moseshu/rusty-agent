@@ -35,6 +35,7 @@ pub mod resources;
 pub mod session;
 pub mod snapshot;
 pub mod state;
+pub mod token_truncation;
 pub mod types;
 pub mod workspace_paths;
 
@@ -66,7 +67,10 @@ pub use environment::{
     EnvEntry, EnvMember, EnvValue, EnvValueResolver, Environment, STR_ENV_VALUE_TYPE,
     UnresolvableEnvValues, builtin_env_value_registry, env_value_kind,
 };
-pub use error::{ErrorCategory, ErrorCode, OpName, SandboxError, SandboxErrorDetails};
+pub use error::{
+    ErrorCategory, ErrorCode, OpName, PTY_STDIN_UNAVAILABLE_MESSAGE, SandboxError,
+    SandboxErrorDetails,
+};
 pub use files::{EntryKind, FileEntry};
 pub use manifest::{
     DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, MANIFEST_VERSION, Manifest,
@@ -90,7 +94,13 @@ pub use mount_security::{
     validate_manifest_mount_credential_boundaries, validate_manifest_mount_provenance,
     validate_mount_activation_credential_boundary,
 };
-pub use pty::{PtyExecUpdate, PtyProcessId, PtyStartRequest, PtyWriteRequest};
+pub use pty::{
+    PTY_EMPTY_YIELD_TIME_MS_MIN, PTY_PROCESS_ID_MAX_EXCLUSIVE, PTY_PROCESS_ID_MIN,
+    PTY_PROCESSES_MAX, PTY_PROCESSES_PROTECTED_RECENT, PTY_PROCESSES_WARNING,
+    PTY_YIELD_TIME_MS_MAX, PTY_YIELD_TIME_MS_MIN, PtyExecUpdate, PtyProcessId, PtyProcessMeta,
+    PtyStartRequest, PtyWriteRequest, allocate_pty_process_id, clamp_pty_yield_time_ms,
+    process_id_to_prune_from_meta, resolve_pty_write_yield_time_ms, truncate_text_by_tokens,
+};
 pub use registry::{
     DiscriminatedPayload, RegistryError, RegistryKind, TypeRegistry, client_options_kind,
     session_state_kind, snapshot_kind,

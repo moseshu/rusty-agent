@@ -27,6 +27,8 @@ mod exec;
 #[cfg(unix)]
 mod files;
 #[cfg(unix)]
+mod pty;
+#[cfg(unix)]
 mod session;
 
 #[cfg(unix)]

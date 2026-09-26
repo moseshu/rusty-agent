@@ -117,12 +117,12 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-prompt", &["ra-core"]),
     ("ra-context", &["ra-core"]),
     ("ra-exec", &["ra-core"]),
-    // The sandbox backends. `ra-core` alone today: the local backend spawns its own processes
-    // rather than going through `ra-exec`, because the environment policy, resource ceilings and
-    // per-command fence that crate applies are this product's, not the ported contract's, and
-    // inheriting them would change what a ported session does. The edge to `ra-exec` gets added
-    // when terminal support reuses its process supervision, and the one to `ra-tools` when the
-    // default capabilities ship the tools that bind to a session.
+    // The sandbox backends. `ra-core` alone: the local backend spawns its own processes — one-shot
+    // and interactive alike — rather than going through `ra-exec`, because the environment policy,
+    // resource ceilings and per-command fence that crate applies are this product's, not the
+    // ported contract's, and inheriting them would change what a ported session does. Terminal
+    // support kept to that rule and took no edge. The one to `ra-tools` is added when the default
+    // capabilities ship the tools that bind to a session.
     ("ra-sandbox", &["ra-core"]),
     ("ra-session", &["ra-core"]),
     ("ra-mcp", &["ra-core"]),

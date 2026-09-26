@@ -129,6 +129,51 @@ pub(crate) fn shell_workspace_process_context(
     (PathBuf::from("/"), rewritten)
 }
 
+/// A command shaped for this host: where the process starts, and what it runs.
+pub(crate) struct HostCommand {
+    /// The directory the process is started in.
+    pub(crate) process_cwd: PathBuf,
+    /// The argument vector, program first. Never empty.
+    pub(crate) argv: Vec<String>,
+}
+
+/// Takes a prepared command through steps 2 to 4: relative arguments, the `cd`, and the fence.
+///
+/// Shared by one-shot commands and interactive ones, which the reference runs through the same
+/// three steps in the same order.
+///
+/// # Errors
+///
+/// Returns [`ra_core::sandbox::ErrorCode::ExecTransportError`] when the workspace root cannot be
+/// resolved or there is nothing to run, and the fence's failure to wrap the command.
+pub(crate) fn host_command(
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    extra_path_grants: &[SandboxPathGrant],
+    argument_paths: ArgumentPaths,
+) -> Result<HostCommand, SandboxError> {
+    let workspace_root = resolve_without_strictness(cwd).map_err(|error| {
+        SandboxError::exec_transport(command.to_vec(), Some(&error.to_string()))
+            .with_sandbox_cause(error)
+    })?;
+    let parts = match argument_paths {
+        ArgumentPaths::WorkspaceRelative => {
+            workspace_relative_command_parts(command, &workspace_root)
+        }
+        ArgumentPaths::AsWritten => command.to_vec(),
+    };
+    let (process_cwd, parts) = shell_workspace_process_context(parts, &workspace_root, cwd);
+    let argv = HostConfinement::current().wrap(parts, &workspace_root, env, extra_path_grants)?;
+    if argv.is_empty() {
+        return Err(SandboxError::exec_transport(
+            command.to_vec(),
+            Some("no command to run"),
+        ));
+    }
+    Ok(HostCommand { process_cwd, argv })
+}
+
 /// Runs a prepared command to completion.
 ///
 /// `stdin` is the payload to feed the command, when there is one. Without it the command inherits
@@ -151,21 +196,9 @@ pub(crate) async fn run(
     stdin: Option<Vec<u8>>,
     argument_paths: ArgumentPaths,
 ) -> Result<ExecResult, SandboxError> {
-    let workspace_root = resolve_without_strictness(cwd).map_err(|error| {
-        SandboxError::exec_transport(command.to_vec(), Some(&error.to_string()))
-            .with_sandbox_cause(error)
-    })?;
-    let parts = match argument_paths {
-        ArgumentPaths::WorkspaceRelative => {
-            workspace_relative_command_parts(command, &workspace_root)
-        }
-        ArgumentPaths::AsWritten => command.to_vec(),
-    };
-    let (process_cwd, parts) = shell_workspace_process_context(parts, &workspace_root, cwd);
-    let exec_command =
-        HostConfinement::current().wrap(parts, &workspace_root, env, extra_path_grants)?;
-
-    let Some((program, arguments)) = exec_command.split_first() else {
+    let HostCommand { process_cwd, argv } =
+        host_command(command, env, cwd, extra_path_grants, argument_paths)?;
+    let Some((program, arguments)) = argv.split_first() else {
         return Err(SandboxError::exec_transport(
             command.to_vec(),
             Some("no command to run"),
@@ -231,7 +264,7 @@ pub(crate) async fn run(
 }
 
 /// Reports a command that never produced a result.
-fn transport_failure(command: &[String], error: &std::io::Error) -> SandboxError {
+pub(crate) fn transport_failure(command: &[String], error: &std::io::Error) -> SandboxError {
     SandboxError::exec_transport(command.to_vec(), Some(&error.to_string()))
         .with_context("os_error", error.to_string())
 }
@@ -241,7 +274,7 @@ fn transport_failure(command: &[String], error: &std::io::Error) -> SandboxError
 /// A signalled command reports the negated signal number, which is what the reference's process
 /// object carries and what a caller reading "was this interrupted" looks for. Without it a killed
 /// command would be indistinguishable from one that exited cleanly.
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
     status
@@ -259,7 +292,7 @@ impl Drop for ProcessGroupGuard {
 }
 
 /// Kills everything the command started, by group.
-fn kill_process_group(pid: Option<u32>) {
+pub(crate) fn kill_process_group(pid: Option<u32>) {
     use rustix::process::{Pid, Signal, kill_process_group};
 
     let group = pid
