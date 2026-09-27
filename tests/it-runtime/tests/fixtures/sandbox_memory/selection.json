@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "updated_at": "X",
+  "selected": [
+    {
+      "rollout_id": "new-rollout",
+      "updated_at": "2025-03-02T00:00:00Z",
+      "rollout_path": "sessions/new-rollout.jsonl",
+      "rollout_summary_file": "rollout_summaries/new-rollout_slug.md",
+      "terminal_state": "completed"
+    },
+    {
+      "rollout_id": "kept-rollout",
+      "updated_at": "",
+      "rollout_path": "sessions/kept-rollout.jsonl",
+      "rollout_summary_file": "rollout_summaries/kept-rollout_slug.md",
+      "terminal_state": "failed"
+    },
+    {
+      "rollout_id": "\u00fcn\u00ef",
+      "updated_at": "",
+      "rollout_path": "",
+      "rollout_summary_file": "s.md",
+      "terminal_state": ""
+    }
+  ]
+}

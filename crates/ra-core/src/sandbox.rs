@@ -28,6 +28,7 @@ pub mod files;
 pub mod manifest;
 pub mod manifest_render;
 pub mod materialization;
+pub mod memory;
 pub mod mount_security;
 pub mod pty;
 pub mod registry;
@@ -93,6 +94,11 @@ pub use materialization::{
     ConcurrencyLimitError, DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY,
     DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY, MaterializationResult, MaterializedFile,
     SandboxConcurrencyLimits,
+};
+pub use memory::{
+    DEFAULT_MAX_RAW_MEMORIES_FOR_CONSOLIDATION, DEFAULT_MEMORIES_DIR, DEFAULT_PHASE_ONE_MODEL,
+    DEFAULT_PHASE_TWO_MODEL, DEFAULT_SESSIONS_DIR, MAX_RAW_MEMORIES_FOR_CONSOLIDATION_LIMIT,
+    MemoryGenerateConfig, MemoryLayoutConfig, MemoryModel, MemoryReadConfig,
 };
 pub use mount_security::{
     CREDENTIALLESS_MOUNT_AUTHORITY_KEY, InvalidRawManifest, InvalidRunStateSandbox,

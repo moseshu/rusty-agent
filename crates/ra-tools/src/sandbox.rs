@@ -23,6 +23,7 @@ pub mod apply_patch;
 pub mod apply_patch_tool;
 pub mod compaction;
 pub mod filesystem;
+pub mod memory;
 pub mod shell;
 pub mod shell_tool;
 pub mod skills;

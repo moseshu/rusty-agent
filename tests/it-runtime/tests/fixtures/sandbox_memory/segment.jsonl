@@ -1,0 +1,1 @@
+{"updated_at":"2026-01-01T00:00:00+00:00","rollout_id":"chat-1","input":[{"role":"user","content":"h\u00e9llo \ud83d\ude00"}],"generated_items":[],"terminal_metadata":{"terminal_state":"completed","exception_type":null,"exception_message":null,"has_final_output":true},"final_output":"done"}

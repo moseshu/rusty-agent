@@ -23,6 +23,7 @@
 //!   streamed run's live session is not exposed while the stream is running.
 
 mod config;
+pub mod memory;
 mod preparation;
 mod runtime;
 mod session_manager;
