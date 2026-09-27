@@ -163,6 +163,170 @@ pub async fn ensure_installed(
     ))
 }
 
+/// Where a path really leads inside the sandbox, and whether the session may use it.
+///
+/// Takes the workspace root, the candidate path, `1` or `0` for whether the use is a write, and then
+/// pairs of extra grant root and `1` or `0` for read-only. Resolves every symlink along the
+/// candidate — as the sandbox sees them, which a caller outside it cannot — and prints the resolved
+/// path when it lands under the root or a grant. The exit status says what went wrong otherwise:
+/// `111` for a path that escapes everything, `112` for a symlink loop, `113` for a grant that
+/// resolves to the filesystem root, `114` for a write under a read-only grant, `64` for arguments
+/// that do not parse.
+///
+/// The reference's `RESOLVE_WORKSPACE_PATH_HELPER`, script for script.
+#[must_use]
+pub fn resolve_workspace_path_helper() -> RuntimeHelperScript {
+    RuntimeHelperScript::from_content("resolve-workspace-path", RESOLVE_WORKSPACE_PATH_SCRIPT)
+}
+
+/// The script behind [`resolve_workspace_path_helper`], byte for byte the reference's.
+///
+/// Including the run of spaces in the middle of the read-only `printf`: the reference's source
+/// breaks that line with a backslash inside a Python string, which joins the two halves rather than
+/// continuing a shell line, and the text that reaches the sandbox is the joined one.
+const RESOLVE_WORKSPACE_PATH_SCRIPT: &str = r#"#!/bin/sh
+# RESOLVE_WORKSPACE_REALPATH_V1
+set -eu
+
+root="$1"
+candidate="$2"
+for_write="$3"
+shift 3
+max_symlink_depth=64
+
+case "$for_write" in
+    0|1) ;;
+    *)
+        printf 'for_write must be 0 or 1: %s\n' "$for_write" >&2
+        exit 64
+        ;;
+esac
+
+if [ $(( $# % 2 )) -ne 0 ]; then
+    printf 'extra path grants must be root/read_only pairs\n' >&2
+    exit 64
+fi
+
+resolve_path() {
+    path="$1"
+    depth="${2:-0}"
+    seen="${3:-}"
+    if [ "$path" = "/" ]; then
+        printf '/\n'
+        return 0
+    fi
+
+    if [ "$depth" -ge "$max_symlink_depth" ]; then
+        printf 'symlink resolution depth exceeded: %s\n' "$path" >&2
+        exit 112
+    fi
+
+    if [ -d "$path" ]; then
+        (
+            cd "$path"
+            pwd -P
+        )
+        return 0
+    fi
+
+    parent=${path%/*}
+    base=${path##*/}
+    if [ -z "$parent" ] || [ "$parent" = "$path" ]; then
+        parent="/"
+    fi
+
+    resolved_parent=$(resolve_path "$parent" "$depth" "$seen")
+    candidate_path="$resolved_parent/$base"
+    if [ -L "$candidate_path" ]; then
+        case ":$seen:" in
+            *":$candidate_path:"*)
+                printf 'symlink resolution depth exceeded: %s\n' "$candidate_path" >&2
+                exit 112
+                ;;
+        esac
+        target=$(readlink "$candidate_path")
+        next_depth=$((depth + 1))
+        next_seen="${seen}:$candidate_path"
+        case "$target" in
+            /*) resolve_path "$target" "$next_depth" "$next_seen" ;;
+            *) resolve_path "$resolved_parent/$target" "$next_depth" "$next_seen" ;;
+        esac
+        return 0
+    fi
+
+    printf '%s\n' "$candidate_path"
+}
+
+resolved_candidate=$(resolve_path "$candidate" 0)
+best_grant_root=""
+best_grant_original=""
+best_grant_read_only="0"
+best_grant_len=0
+
+check_root() {
+    allowed_root="$1"
+    resolved_root=$(resolve_path "$allowed_root" 0)
+    case "$resolved_candidate" in
+        "$resolved_root"|"$resolved_root"/*)
+            printf '%s\n' "$resolved_candidate"
+            exit 0
+            ;;
+    esac
+}
+
+reject_root_grant() {
+    allowed_root="$1"
+    resolved_root=$(resolve_path "$allowed_root" 0)
+    if [ "$resolved_root" = "/" ]; then
+        printf 'extra path grant must not resolve to filesystem root: %s\n' "$allowed_root" >&2
+        exit 113
+    fi
+}
+
+consider_extra_grant() {
+    allowed_root="$1"
+    read_only="$2"
+    case "$read_only" in
+        0|1) ;;
+        *)
+            printf 'extra path grant read_only must be 0 or 1: %s\n' "$read_only" >&2
+            exit 64
+            ;;
+    esac
+
+    reject_root_grant "$allowed_root"
+    resolved_root=$(resolve_path "$allowed_root" 0)
+    case "$resolved_candidate" in
+        "$resolved_root"|"$resolved_root"/*)
+            root_len=${#resolved_root}
+            if [ "$root_len" -gt "$best_grant_len" ]; then
+                best_grant_root="$resolved_root"
+                best_grant_original="$allowed_root"
+                best_grant_read_only="$read_only"
+                best_grant_len="$root_len"
+            fi
+            ;;
+    esac
+}
+
+while [ "$#" -gt 0 ]; do
+    consider_extra_grant "$1" "$2"
+    shift 2
+done
+
+check_root "$root"
+if [ -n "$best_grant_root" ]; then
+    if [ "$for_write" = "1" ] && [ "$best_grant_read_only" = "1" ]; then
+        printf 'read-only extra path grant: %s\nresolved path: %s\n'             "$best_grant_original" "$resolved_candidate" >&2
+        exit 114
+    fi
+    printf '%s\n' "$resolved_candidate"
+    exit 0
+fi
+
+printf 'workspace escape: %s\n' "$resolved_candidate" >&2
+exit 111"#;
+
 /// What the workspace currently hashes to, computed from inside the sandbox.
 ///
 /// Takes the workspace root, the fingerprint scheme's name, where to cache the answer, a digest of

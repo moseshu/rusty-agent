@@ -110,7 +110,8 @@ pub use remote_mount_policy::{build_remote_mount_policy_instructions, remote_mou
 pub use resources::{PreStopHook, SessionResources, pre_stop_hook};
 pub use session::{
     AsUser, CreateRequest, ExecRequest, SandboxClient, SandboxResult, SandboxSession,
-    ShellInvocation,
+    ShellInvocation, invalid_state_payload, parse_session_state_for_backend,
+    render_session_state_for_storage,
 };
 pub use snapshot::{
     LOCAL_SNAPSHOT_TYPE, NOOP_SNAPSHOT_TYPE, REMOTE_SNAPSHOT_TYPE, Snapshot, SnapshotFingerprint,

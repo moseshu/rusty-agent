@@ -65,6 +65,8 @@ pub struct SandboxSessionState {
     mount_authority_redacted: bool,
     /// Whether mount authority was rebound from a trusted manifest.
     mount_authority_rebound: bool,
+    /// Adapter-supplied identity fields and UUID name prefix, never read from an untrusted payload.
+    persisted_identity_redaction: Option<(BTreeSet<String>, String)>,
 }
 
 /// Why a persisted session state could not be read.
@@ -190,6 +192,7 @@ impl SandboxSessionState {
             path_grants_require_rebind: Vec::new(),
             mount_authority_redacted: false,
             mount_authority_rebound: false,
+            persisted_identity_redaction: None,
         }
     }
 
@@ -354,6 +357,25 @@ impl SandboxSessionState {
         self.mount_authority_rebound
     }
 
+    /// Configures the adapter's provider identity scrub for every serialization entry point.
+    ///
+    /// This is the value representation of the reference state's provider serializer hook: when
+    /// mount authority is stripped, these provider fields become empty strings, the session id is
+    /// derived with UUID v5 under the URL namespace, and workspace readiness is cleared. Adapters
+    /// install this on construction and deserialization; the policy is never taken from a payload.
+    #[must_use]
+    pub fn with_persisted_identity_redaction(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+        session_id_prefix: impl Into<String>,
+    ) -> Self {
+        self.persisted_identity_redaction = Some((
+            fields.into_iter().map(Into::into).collect(),
+            session_id_prefix.into(),
+        ));
+        self
+    }
+
     /// Renders the state for storage, with no mount authority in it.
     ///
     /// Authority is stripped from the manifest while rendering — not afterwards on the read side,
@@ -374,6 +396,17 @@ impl SandboxSessionState {
             && let Value::Object(fields) = &mut payload
         {
             fields.insert(REDACTED_MOUNT_AUTHORITY_KEY.to_owned(), Value::Bool(true));
+            if let Some((identity_fields, prefix)) = &self.persisted_identity_redaction {
+                for field in identity_fields {
+                    fields.insert(field.clone(), Value::from(""));
+                }
+                let id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!("{prefix}{}", self.session_id).as_bytes(),
+                );
+                fields.insert("session_id".to_owned(), Value::from(id.to_string()));
+                fields.insert("workspace_root_ready".to_owned(), Value::Bool(false));
+            }
         }
         Ok(payload)
     }
@@ -697,6 +730,7 @@ impl SandboxSessionState {
             path_grants_require_rebind: Vec::new(),
             mount_authority_redacted: false,
             mount_authority_rebound: false,
+            persisted_identity_redaction: None,
         })
     }
 }

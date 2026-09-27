@@ -10,8 +10,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 连接真实 Docker daemon 的 `DockerApi` 实现。Docker 后端本身（client、session、容器配置）
+# 不需要它：它们只依赖 `DockerApi` 这个接口，测试用替身实现。
+docker = ["dep:bollard"]
+
 [dependencies]
 ra-core = { workspace = true }
+bollard = { workspace = true, optional = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }

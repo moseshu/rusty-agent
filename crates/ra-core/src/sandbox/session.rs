@@ -1290,17 +1290,7 @@ pub trait SandboxClient: Send + Sync {
         &self,
         state: &SandboxSessionState,
     ) -> SandboxResult<serde_json::Value> {
-        let (persistable, dropped) = state.without_host_path_grants();
-        let mut payload = persistable.to_json()?;
-        if !dropped.is_empty()
-            && let serde_json::Value::Object(fields) = &mut payload
-        {
-            fields.insert(
-                REDACTED_HOST_PATH_GRANT_PATHS_KEY.to_owned(),
-                serde_json::Value::from(dropped.into_iter().collect::<Vec<_>>()),
-            );
-        }
-        Ok(payload)
+        render_session_state_for_storage(state)
     }
 
     /// Reads back a state this backend wrote.
@@ -1319,17 +1309,62 @@ pub trait SandboxClient: Send + Sync {
         snapshots: &TypeRegistry,
         manifests: &ManifestRegistries,
     ) -> SandboxResult<SandboxSessionState> {
-        let invalid = |error: InvalidSessionStatePayload| {
-            SandboxError::new(
-                ErrorCode::SandboxConfigInvalid,
-                OpName::Start,
-                error.to_string(),
-            )
-        };
-        let state = SandboxSessionState::parse(payload, snapshots, manifests).map_err(invalid)?;
-        if state.state_type() != self.backend_id() {
-            return Err(invalid(InvalidSessionStatePayload::Invalid));
-        }
-        Ok(state)
+        parse_session_state_for_backend(self.backend_id(), payload, snapshots, manifests)
     }
+}
+
+/// What [`SandboxClient::serialize_session_state`] does by default, callable on its own.
+///
+/// A trait default cannot be reached from an override, and a backend that has something to add —
+/// the reference's per-state provider identity scrub is one — needs the default rendering first.
+///
+/// # Errors
+///
+/// As [`SandboxClient::serialize_session_state`].
+pub fn render_session_state_for_storage(
+    state: &SandboxSessionState,
+) -> SandboxResult<serde_json::Value> {
+    let (persistable, dropped) = state.without_host_path_grants();
+    let mut payload = persistable.to_json()?;
+    if !dropped.is_empty()
+        && let serde_json::Value::Object(fields) = &mut payload
+    {
+        fields.insert(
+            REDACTED_HOST_PATH_GRANT_PATHS_KEY.to_owned(),
+            serde_json::Value::from(dropped.into_iter().collect::<Vec<_>>()),
+        );
+    }
+    Ok(payload)
+}
+
+/// What [`SandboxClient::deserialize_session_state`] does by default, for the backend named.
+///
+/// # Errors
+///
+/// As [`SandboxClient::deserialize_session_state`].
+pub fn parse_session_state_for_backend(
+    backend_id: &str,
+    payload: serde_json::Value,
+    snapshots: &TypeRegistry,
+    manifests: &ManifestRegistries,
+) -> SandboxResult<SandboxSessionState> {
+    let state =
+        SandboxSessionState::parse(payload, snapshots, manifests).map_err(invalid_state_payload)?;
+    if state.state_type() != backend_id {
+        return Err(invalid_state_payload(InvalidSessionStatePayload::Invalid));
+    }
+    Ok(state)
+}
+
+/// The fixed refusal of a state payload that does not read.
+///
+/// Public so that a backend refusing a payload for a reason of its own — a field only it models —
+/// says exactly what the default says, and quotes nothing either.
+#[must_use]
+pub fn invalid_state_payload(error: InvalidSessionStatePayload) -> SandboxError {
+    SandboxError::new(
+        ErrorCode::SandboxConfigInvalid,
+        OpName::Start,
+        error.to_string(),
+    )
 }

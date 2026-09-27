@@ -18,13 +18,16 @@
 //! that is one step inside it, not the same thing.
 
 pub mod archive;
+pub mod docker;
 pub mod host_paths;
 pub mod listing;
 #[cfg(unix)]
 pub mod materialize;
 pub mod mounts;
 pub mod pty_output;
+pub mod remote;
 pub mod runtime_helpers;
+pub(crate) mod session_scripts;
 pub mod shell;
 pub mod snapshot;
 pub mod tar_utils;

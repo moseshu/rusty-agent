@@ -109,12 +109,17 @@ reqwest = { version = "0.12", features = [
     "stream",
     "rustls-tls",
 ], default-features = false }
+# Docker 沙箱后端（ra-sandbox 的 `docker` 特性）与 daemon 对话的客户端。上游用 docker-py，
+# 这里是 Rust 生态里对应的 Engine API 客户端（Apache-2.0）。`ssl` 让 `DOCKER_HOST` 指向
+# TLS daemon 时也能连上——docker-py 的 `from_env` 支持这一点，上游源码的注释也专门提到
+# 经 TLS 连接的远端 daemon。
+bollard = { version = "0.21", features = ["ssl"] }
 
 # --- 存储与进程 ---
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # --- 杂项 ---
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting"] }
 httpdate = "1"
 rand = "0.9"
