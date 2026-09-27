@@ -327,7 +327,8 @@ fn category_of(item: &ModelInputItem) -> ContextUsageCategory {
         | ModelInputItem::HandoffOutput(_)
         | ModelInputItem::McpApprovalRequest(_)
         | ModelInputItem::McpApprovalResponse(_)
-        | ModelInputItem::Compaction(_) => ContextUsageCategory::Messages,
+        | ModelInputItem::Compaction(_)
+        | ModelInputItem::ProviderCompaction(_) => ContextUsageCategory::Messages,
         _ => ContextUsageCategory::Messages,
     }
 }

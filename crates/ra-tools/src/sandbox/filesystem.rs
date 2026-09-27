@@ -231,11 +231,12 @@ impl Capability for Filesystem {
 
 /// The capabilities a sandbox agent gets when its host names none.
 ///
-/// The reference's `Capabilities.default()` is `[Filesystem(), Shell(), Compaction()]`. The third is
-/// **not included yet**: compaction is shared with the context chapter, and which of the two owns
-/// it is settled with the rest of the cross-chapter capabilities. Until then this is
-/// `[Filesystem, Shell]`, and a host that wants compaction adds it itself.
+/// The reference's `Capabilities.default()`: `[Filesystem(), Shell(), Compaction()]`, in that order.
 #[must_use]
 pub fn default_capabilities() -> Vec<Arc<dyn Capability>> {
-    vec![Arc::new(Filesystem::new()), Arc::new(Shell::new())]
+    vec![
+        Arc::new(Filesystem::new()),
+        Arc::new(Shell::new()),
+        Arc::new(super::compaction::Compaction::new()),
+    ]
 }

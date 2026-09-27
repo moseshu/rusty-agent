@@ -121,6 +121,12 @@ async fn lower_item(
             }));
             Ok(())
         }
+        // The reference's chat converter refuses the item in these words: what it carries is
+        // Responses state, and no Chat Completions request can hand it back.
+        ModelInputItem::ProviderCompaction(_) => Err(Error::caller(
+            "Compaction items are not supported for chat completions. Please use the Responses \
+             API to handle compaction.",
+        )),
         _ => Err(Error::caller(format!(
             "OpenAI Chat Completions has no representation for `{}`",
             item.label()

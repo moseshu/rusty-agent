@@ -12,8 +12,9 @@ use std::{
 
 use ra_core::{
     agent::{AgentId, AgentSpec},
-    capability::SandboxBinding,
+    capability::{Capability, ContextProcessor, SamplingContext, SandboxBinding},
     error::{Error, Result},
+    model::ModelResolver,
     sandbox::{SandboxSession, SandboxWorkspaceScope},
 };
 use serde_json::Value;
@@ -21,6 +22,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 use tracing::{Instrument, warn};
 
 use crate::agent::AgentBinding;
+use crate::capability::CapabilityContextProcessor;
 
 use super::{
     SandboxRunConfig,
@@ -35,6 +37,9 @@ struct PreparedAgent {
     base: Arc<AgentSpec>,
     agent: Arc<AgentSpec>,
     session: Arc<dyn SandboxSession>,
+    /// The capabilities as bound to that session, whose context processing runs on the agent's
+    /// turns.
+    capabilities: Vec<Arc<dyn Capability>>,
 }
 
 struct Inner {
@@ -97,7 +102,16 @@ impl SandboxRuntime {
     /// An ordinary agent comes back unchanged. A sandbox agent comes back prepared against its
     /// session — created, resumed or borrowed the first time, and started when it is not running —
     /// with the cached preparation reused while the session is the same one.
-    pub(crate) async fn prepare_agent(&self, agent: &AgentBinding) -> Result<AgentBinding> {
+    ///
+    /// The capabilities' sampling settings are folded for the model the turn will use, resolved the
+    /// way turn preparation resolves it — `model_override`, else the agent's own model — as the
+    /// reference's `resolve_sandbox_model_name` does.
+    pub(crate) async fn prepare_agent(
+        &self,
+        agent: &AgentBinding,
+        resolver: &dyn ModelResolver,
+        model_override: Option<&str>,
+    ) -> Result<AgentBinding> {
         let public = agent.public();
         self.assert_agent_supported(public)?;
         let (Some(sandbox), Some(inner)) = (public.sandbox(), &self.inner) else {
@@ -122,6 +136,15 @@ impl SandboxRuntime {
                 None => Arc::clone(agent.execution()),
             };
 
+            let selector = resolver
+                .resolve_model(model_override.or(base.model()))?
+                .selector()
+                .clone();
+            let mut sampling = SamplingContext::new().with_provider(selector.provider().clone());
+            if let Some(model) = selector.model() {
+                sampling = sampling.with_model(model);
+            }
+
             let manifest = session.state().manifest().clone();
             let binding = SandboxBinding::new(
                 Arc::clone(&session),
@@ -136,6 +159,7 @@ impl SandboxRuntime {
                 &capabilities,
                 &manifest,
                 &self.workspace_scope,
+                &sampling,
             )
             .await?;
             inner.prepared.insert(
@@ -144,12 +168,44 @@ impl SandboxRuntime {
                     base,
                     agent: Arc::clone(&prepared),
                     session,
+                    capabilities,
                 },
             );
             Ok(AgentBinding::prepared(Arc::clone(public), prepared))
         }
         .instrument(span)
         .await
+    }
+
+    /// The context processors `agent`'s sandbox capabilities contribute to its turns, in
+    /// installation order.
+    ///
+    /// Empty for an ordinary agent, and for a sandbox agent not yet prepared. They run before the
+    /// run's own processors, as the reference processes a sandbox agent's input while preparing it,
+    /// ahead of anything else the turn does to the input.
+    pub(crate) async fn context_processors(
+        &self,
+        agent: &AgentBinding,
+    ) -> Vec<Arc<dyn ContextProcessor>> {
+        let Some(inner) = &self.inner else {
+            return Vec::new();
+        };
+        let inner = inner.lock().await;
+        inner
+            .prepared
+            .get(agent.public().id())
+            .map(|prepared| {
+                prepared
+                    .capabilities
+                    .iter()
+                    .filter(|capability| capability.context_processor().is_some())
+                    .map(|capability| {
+                        Arc::new(CapabilityContextProcessor::new(Arc::clone(capability)))
+                            as Arc<dyn ContextProcessor>
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Cleans up the sessions the run owns and returns what resumes them.

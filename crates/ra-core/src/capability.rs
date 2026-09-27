@@ -85,7 +85,7 @@ use crate::{
     error::{Error, Result},
     hook::{CompactTrigger, HookEvent, UserHookDispatcher},
     item::{Compaction, ItemId, ModelInputItem, ModelResponse, RunItem},
-    model::{ModelOutputSchema, ModelSettings},
+    model::{ModelOutputSchema, ModelSettings, ProviderKey},
     prompt::{PromptSection, PromptSectionName, PromptSource},
     sandbox::{Manifest, SandboxResult, SandboxSession, SandboxWorkspaceScope, User},
     state::{AgentToolUse, RunId, ToolUse},
@@ -432,6 +432,26 @@ pub trait Capability: Send + Sync + 'static {
         settings
     }
 
+    /// As [`Self::sampling_params`], told which model and provider the settings are for.
+    ///
+    /// The reference hands every capability the resolved model name alongside the extra arguments
+    /// it is folding, because what a capability asks for can depend on the model — a compaction
+    /// threshold derived from the model's context window, for one. Here the answer also carries the
+    /// provider registration, since a field only one provider understands goes in that provider's
+    /// own `extra_body` bucket rather than in the neutral settings.
+    ///
+    /// Where the runtime knows the model — preparing a sandbox agent — it calls this; the default
+    /// ignores the context and defers to [`Self::sampling_params`], so a capability that does not
+    /// care implements only that one.
+    fn sampling_params_for(
+        &self,
+        settings: ModelSettings,
+        context: &SamplingContext,
+    ) -> ModelSettings {
+        let _ = context;
+        self.sampling_params(settings)
+    }
+
     /// The context transformation this capability performs, if it performs one.
     ///
     /// An implementation that also implements [`ContextProcessor`] returns `Some(self)`.
@@ -495,6 +515,57 @@ pub trait Capability: Send + Sync + 'static {
     fn bind_sandbox(&self, binding: &SandboxBinding) -> Result<Option<Arc<dyn Capability>>> {
         let _ = binding;
         Ok(None)
+    }
+}
+
+/// The model a capability's sampling settings are folded for.
+///
+/// The reference's `sampling_params` argument carries the resolved model name under `model`; the
+/// provider registration is this framework's addition, needed because provider-specific request
+/// fields are kept per provider (see [`ModelSettings::with_extra_body_value`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamplingContext {
+    model: Option<String>,
+    provider: Option<ProviderKey>,
+}
+
+impl SamplingContext {
+    /// A context that knows neither the model nor the provider.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            model: None,
+            provider: None,
+        }
+    }
+
+    /// Records the resolved, provider-facing model name.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Records the provider registration the request goes to.
+    #[must_use]
+    pub fn with_provider(mut self, provider: ProviderKey) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// The resolved, provider-facing model name, when one was resolved.
+    ///
+    /// `None` when the provider's own default model is used, which the runtime cannot name.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The provider registration the request goes to, when it is known.
+    #[must_use]
+    pub const fn provider(&self) -> Option<&ProviderKey> {
+        self.provider.as_ref()
     }
 }
 

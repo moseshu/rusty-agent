@@ -4,7 +4,8 @@ use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     item::{
         CallId, ContentBlock, HandoffCall, ItemId, Message, MessageRole, ModelResponse,
-        OutputPhase, RawProviderItem, Reasoning, RunItem, RunItemKind, ToolCall,
+        OutputPhase, ProviderCompaction, RawProviderItem, Reasoning, RunItem, RunItemKind,
+        ToolCall,
     },
     model::{ModelHandoffDefinition, ProviderKey},
     usage::{RequestUsage, Usage},
@@ -115,6 +116,7 @@ pub(crate) fn convert_output_item(
         "reasoning" => RunItemKind::Reasoning(convert_reasoning(item, model)),
         "function_call" => convert_function_call(item, handoffs)?,
         "custom_tool_call" => convert_custom_tool_call(item)?,
+        "compaction" => RunItemKind::ProviderCompaction(convert_compaction(item, provider)),
         // Hosted-tool items (web search, file search, hosted MCP, image generation) have no
         // protocol-neutral payload yet. They can only appear when `extra_body.tools` requested
         // them, so the message names the item rather than silently dropping part of the turn.
@@ -126,6 +128,18 @@ pub(crate) fn convert_output_item(
     };
     Ok(RunItem::new(item_id, kind)
         .with_raw_provider_item(RawProviderItem::new(provider.as_str(), item.clone())))
+}
+
+/// Keeps a server-side compaction as the opaque item it is, minus `created_by`.
+///
+/// The reference drops that one field before the item is stored for replay; everything else —
+/// the encrypted content above all — goes back to the server unchanged.
+fn convert_compaction(item: &Value, provider: &ProviderKey) -> ProviderCompaction {
+    let mut payload = item.clone();
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("created_by");
+    }
+    ProviderCompaction::new(provider.as_str(), payload)
 }
 
 fn convert_message(item: &Value) -> Result<Message> {

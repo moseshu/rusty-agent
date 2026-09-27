@@ -16,10 +16,12 @@
 //! The same holds for [`crate::view_image`] and [`view_image`], and for [`crate::apply_patch`] and
 //! [`apply_patch_tool`]: the coding versions read and write the host through a confined
 //! filesystem, and these go through the session. A sandbox agent gets them through
-//! [`filesystem::Filesystem`]; [`filesystem::default_capabilities`] is the reference's default set.
+//! [`filesystem::Filesystem`]; [`filesystem::default_capabilities`] is the reference's default set,
+//! which adds [`compaction::Compaction`].
 
 pub mod apply_patch;
 pub mod apply_patch_tool;
+pub mod compaction;
 pub mod filesystem;
 pub mod shell;
 pub mod shell_tool;

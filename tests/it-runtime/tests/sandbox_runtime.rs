@@ -18,7 +18,10 @@ use futures::{StreamExt, stream};
 use ra_core::{
     agent::{AgentId, AgentInstructions, AgentSpec, HandoffSpec},
     cancel::CancelScope,
-    capability::{Capability, CapabilityFamily, SandboxBinding},
+    capability::{
+        Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
+        ContextProcessorResult, ContextSummarizer, SamplingContext, SandboxBinding,
+    },
     context::RunContext,
     error::{Error, Result},
     guardrail::{GuardrailFinalOutput, GuardrailFunctionOutput, InputGuardrail, OutputGuardrail},
@@ -427,6 +430,8 @@ struct ScriptedModel {
     tools: Mutex<Vec<Vec<String>>>,
     temperatures: Mutex<Vec<Option<f64>>>,
     tool_choices: Mutex<Vec<Option<ToolChoice>>>,
+    /// The resolved provider's `extra_body` bucket of every call.
+    extra_bodies: Mutex<Vec<Value>>,
 }
 
 impl ScriptedModel {
@@ -438,6 +443,7 @@ impl ScriptedModel {
             tools: Mutex::default(),
             temperatures: Mutex::default(),
             tool_choices: Mutex::default(),
+            extra_bodies: Mutex::default(),
         })
     }
 
@@ -466,6 +472,10 @@ impl ScriptedModel {
             .lock()
             .unwrap()
             .push(request.model_settings().tool_choice().cloned());
+        self.extra_bodies
+            .lock()
+            .unwrap()
+            .push(serde_json::to_value(request.model_settings().extra_body()).unwrap());
         let mut script = self.script.lock().unwrap();
         if script.is_empty() {
             return Err(Error::caller("scripted model ran out of responses"));
@@ -3378,4 +3388,247 @@ async fn every_view_of_a_sandbox_run_names_the_agent_the_user_configured() {
             }
         }
     }
+}
+
+// -- compaction and context processing ----------------------------------------------------------
+
+/// `test_runner_applies_compaction_capability_to_input_and_model_settings`: the input the model gets
+/// starts at the last provider compaction, and the request asks the provider to compact at the
+/// configured threshold, in the resolved provider's own bucket.
+#[tokio::test]
+async fn compaction_trims_the_input_and_asks_the_provider_to_compact() {
+    use ra_core::item::ProviderCompaction;
+    use ra_tools::sandbox::compaction::{Compaction, CompactionPolicy};
+
+    let model = ScriptedModel::answering("done");
+    let agent = sandbox_agent(
+        "coder",
+        "Coder",
+        SandboxAgentConfig::new().with_capability(Arc::new(Compaction::with_policy(
+            CompactionPolicy::static_threshold(123),
+        ))),
+    );
+    let input = vec![
+        ModelInputItem::Message(Message::user("old-user")),
+        ModelInputItem::ProviderCompaction(ProviderCompaction::new(
+            "test-provider",
+            json!({"type": "compaction", "summary": "compacted-up-to-here"}),
+        )),
+        ModelInputItem::Message(Message::assistant("recent-assistant", OutputPhase::Final)),
+        ModelInputItem::Message(Message::user("new-user")),
+    ];
+    let request = RunRequest::new(
+        AgentBinding::direct(agent),
+        Arc::new(FixedResolver(Arc::clone(&model))),
+        RunId::new("run-sandbox"),
+        CancelScope::root(),
+        input.clone(),
+    )
+    .with_config(RunConfig::new().with_sandbox(with_client(&FakeClient::new())));
+
+    let result = Runner::run(request).await.unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(model.inputs.lock().unwrap()[0], input[1..].to_vec());
+    assert_eq!(
+        model.extra_bodies.lock().unwrap()[0],
+        json!({"context_management": [{"type": "compaction", "compact_threshold": 123}]})
+    );
+}
+
+/// `test_prepare_sandbox_agent_prepares_default_compaction_policy`: with no policy, the field is
+/// still written, and nothing else — the model name is what the threshold is derived from, not
+/// something sent.
+#[tokio::test]
+async fn default_compaction_writes_the_field_and_not_the_model() {
+    use ra_tools::sandbox::compaction::Compaction;
+
+    let model = ScriptedModel::answering("done");
+    Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capability(Arc::new(Compaction::new())),
+        ),
+        &model,
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap();
+
+    // `canonical-model` is not in the reference's table, so the static default applies.
+    assert_eq!(
+        model.extra_bodies.lock().unwrap()[0],
+        json!({"context_management": [{"type": "compaction", "compact_threshold": 240_000}]})
+    );
+}
+
+/// Records the sampling context it was folded with.
+struct SamplingProbe(Arc<Mutex<Vec<SamplingContext>>>);
+
+#[async_trait]
+impl Capability for SamplingProbe {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new("probe".to_owned()).unwrap()
+    }
+
+    fn sampling_params_for(
+        &self,
+        settings: ModelSettings,
+        context: &SamplingContext,
+    ) -> ModelSettings {
+        self.0.lock().unwrap().push(context.clone());
+        settings
+    }
+}
+
+/// `test_prepare_sandbox_agent_passes_default_model_to_capability_sampling_params`: an agent that
+/// names no model is folded for the model the resolver picks, and for its provider.
+#[tokio::test]
+async fn capabilities_are_folded_for_the_resolved_model_and_provider() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedModel::answering("done");
+    Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capability(Arc::new(SamplingProbe(Arc::clone(&seen)))),
+        ),
+        &model,
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].model(), Some("canonical-model"));
+    assert_eq!(seen[0].provider(), Some(&ProviderKey::new("test-provider")));
+}
+
+/// Appends how many times the instance bound to the session has processed a turn.
+#[derive(Clone, Default)]
+struct CountingProcessor {
+    calls: Option<Arc<AtomicUsize>>,
+}
+
+#[async_trait]
+impl Capability for CountingProcessor {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new("counting".to_owned()).unwrap()
+    }
+
+    fn context_processor(&self) -> Option<&dyn ContextProcessor> {
+        Some(self)
+    }
+
+    fn bind_sandbox(&self, _binding: &SandboxBinding) -> Result<Option<Arc<dyn Capability>>> {
+        // A fresh counter per binding: a turn that rebound would start counting again.
+        Ok(Some(Arc::new(Self {
+            calls: Some(Arc::default()),
+        })))
+    }
+}
+
+#[async_trait]
+impl ContextProcessor for CountingProcessor {
+    async fn process_context(
+        &self,
+        request: ContextProcessorRequest,
+        _summarizer: &dyn ContextSummarizer,
+    ) -> Result<ContextProcessorResult> {
+        let calls = self
+            .calls
+            .as_ref()
+            .ok_or_else(|| Error::caller("processed without being bound"))?;
+        let count = calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut input = request.input().to_vec();
+        input.push(ModelInputItem::Message(Message::user(format!(
+            "process_calls={count}"
+        ))));
+        Ok(ContextProcessorResult::new(input))
+    }
+}
+
+/// `test_prepare_agent_processes_context_with_bound_cached_capabilities`: each turn's input is
+/// processed by the instance bound to the session, the same one on every turn of the run.
+#[tokio::test]
+async fn context_is_processed_by_the_bound_capability_on_every_turn() {
+    let client = FakeClient::new();
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .instructions("do the task")
+        .tool(Halt::tool(&client, false))
+        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(CountingProcessor::default())))
+        .build()
+        .unwrap();
+    let model = ScriptedModel::new(vec![tool_call("call-1", "halt"), final_answer("m", "done")]);
+
+    let result = Runner::run(request(
+        agent,
+        &model,
+        RunConfig::new().with_sandbox(with_client(&client)),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    let first = model.input_text(0);
+    let second = model.input_text(1);
+    assert!(first.ends_with("process_calls=1"), "{first}");
+    assert!(second.ends_with("process_calls=2"), "{second}");
+    assert!(
+        !second.contains("process_calls=1"),
+        "a processor's projection is not written into history: {second}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_trims_caller_managed_continuation_input() {
+    use ra_core::item::ProviderCompaction;
+    use ra_tools::sandbox::compaction::{Compaction, CompactionPolicy};
+
+    let model = ScriptedModel::answering("done");
+    let agent = sandbox_agent(
+        "coder",
+        "Coder",
+        SandboxAgentConfig::new().with_capability(Arc::new(Compaction::with_policy(
+            CompactionPolicy::static_threshold(123),
+        ))),
+    );
+    let input = vec![
+        ModelInputItem::Message(Message::user("old-user")),
+        ModelInputItem::ProviderCompaction(ProviderCompaction::new(
+            "test-provider",
+            json!({"type": "compaction", "summary": "compacted-up-to-here"}),
+        )),
+        ModelInputItem::Message(Message::assistant("recent-assistant", OutputPhase::Final)),
+        ModelInputItem::Message(Message::user("new-user")),
+    ];
+    let mut carried = RunState::start(RunId::new("run-sandbox"));
+    carried
+        .begin_segment(
+            agent.id().clone(),
+            vec![ModelInputItem::Message(Message::user("original"))],
+        )
+        .unwrap();
+    let request = RunRequest::new(
+        AgentBinding::direct(agent),
+        Arc::new(FixedResolver(Arc::clone(&model))),
+        RunId::new("run-sandbox"),
+        CancelScope::root(),
+        input.clone(),
+    )
+    .with_config(RunConfig::new().with_sandbox(with_client(&FakeClient::new())))
+    .with_state(carried);
+
+    let result = Runner::run(request).await.unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(model.inputs.lock().unwrap()[0], input[1..].to_vec());
+    assert_eq!(
+        model.extra_bodies.lock().unwrap()[0],
+        json!({"context_management": [{"type": "compaction", "compact_threshold": 123}]})
+    );
 }

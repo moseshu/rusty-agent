@@ -27,7 +27,9 @@ pub mod phase;
 pub mod reasoning;
 pub mod tool;
 
-pub use compaction::{ArchiveRef, Compaction};
+pub use compaction::{
+    ArchiveRef, Compaction, PROVIDER_COMPACTION_SCHEMA_VERSION, ProviderCompaction,
+};
 pub use content::{
     Base64FileSource, Base64ImageSource, ContentBlock, FileBlock, FileSource, ImageBlock,
     ImageDetail, ImageSource, LocalImageSource, ProviderFileSource, RefusalBlock, TextBlock,
@@ -295,6 +297,8 @@ pub enum RunItemKind {
     McpApprovalResponse(McpApprovalResponse),
     /// Compaction summary.
     Compaction(Compaction),
+    /// Compaction the provider performed, kept as the opaque item it returned.
+    ProviderCompaction(ProviderCompaction),
     /// Tool call awaiting host approval. This variant cannot be projected into model input.
     ToolApproval(ToolApproval),
 }
@@ -314,6 +318,7 @@ impl RunItemKind {
             Self::McpApprovalRequest(_) => "mcp_approval_request",
             Self::McpApprovalResponse(_) => "mcp_approval_response",
             Self::Compaction(_) => "compaction",
+            Self::ProviderCompaction(_) => "provider_compaction",
             Self::ToolApproval(_) => "tool_approval",
         }
     }
@@ -337,7 +342,8 @@ impl RunItemKind {
             | Self::HandoffOutput(_)
             | Self::McpListTools(_)
             | Self::McpApprovalResponse(_)
-            | Self::Compaction(_) => false,
+            | Self::Compaction(_)
+            | Self::ProviderCompaction(_) => false,
         }
     }
 
@@ -363,6 +369,7 @@ impl RunItemKind {
             | Self::McpListTools(_)
             | Self::McpApprovalResponse(_)
             | Self::Compaction(_)
+            | Self::ProviderCompaction(_)
             | Self::ToolApproval(_) => false,
         }
     }
@@ -517,6 +524,9 @@ impl RunItem {
                 Some(ModelInputItem::McpApprovalResponse(item.clone()))
             }
             RunItemKind::Compaction(item) => Some(ModelInputItem::Compaction(item.clone())),
+            RunItemKind::ProviderCompaction(item) => {
+                Some(ModelInputItem::ProviderCompaction(item.clone()))
+            }
             RunItemKind::ToolApproval(_) => None,
         }
     }
@@ -551,6 +561,8 @@ pub enum ModelInputItem {
     McpApprovalResponse(McpApprovalResponse),
     /// Compaction summary.
     Compaction(Compaction),
+    /// Compaction the provider performed, replayed verbatim to the provider that produced it.
+    ProviderCompaction(ProviderCompaction),
 }
 
 impl ModelInputItem {
@@ -568,6 +580,7 @@ impl ModelInputItem {
             Self::McpApprovalRequest(_) => "mcp_approval_request",
             Self::McpApprovalResponse(_) => "mcp_approval_response",
             Self::Compaction(_) => "compaction",
+            Self::ProviderCompaction(_) => "provider_compaction",
         }
     }
 

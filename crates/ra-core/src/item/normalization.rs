@@ -284,7 +284,8 @@ fn dedupe_key(item: &ModelInputItem) -> Option<DedupeKey> {
         )),
         ModelInputItem::Message(_)
         | ModelInputItem::McpListTools(_)
-        | ModelInputItem::Compaction(_) => None,
+        | ModelInputItem::Compaction(_)
+        | ModelInputItem::ProviderCompaction(_) => None,
     }
 }
 

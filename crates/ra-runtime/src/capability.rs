@@ -768,8 +768,15 @@ impl fmt::Debug for AssembledCapabilities {
 /// holds its processors as owned values for the duration of the run. This adapter is the join: it
 /// owns the bound capability and forwards each call to the processor that capability returns, so
 /// the transform stays the capability's own implementation rather than a copy assembly made of it.
-struct CapabilityContextProcessor {
+pub(crate) struct CapabilityContextProcessor {
     capability: Arc<dyn Capability>,
+}
+
+impl CapabilityContextProcessor {
+    /// Forwards to `capability`'s own processor.
+    pub(crate) const fn new(capability: Arc<dyn Capability>) -> Self {
+        Self { capability }
+    }
 }
 
 #[async_trait]

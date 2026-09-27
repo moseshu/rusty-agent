@@ -27,7 +27,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     agent::{AgentInstructions, AgentSpec, ResolvedInstructions},
-    capability::Capability,
+    capability::{Capability, SamplingContext},
     context::RunContext,
     error::{Error, Result},
     prompt::{DynamicPromptHandler, PromptSource, ResolvedPrompt},
@@ -235,6 +235,7 @@ pub(super) async fn prepare_sandbox_agent(
     capabilities: &[Arc<dyn Capability>],
     manifest: &Manifest,
     workspace_scope: &SandboxWorkspaceScope,
+    sampling: &SamplingContext,
 ) -> Result<Arc<AgentSpec>> {
     let available: BTreeSet<_> = capabilities
         .iter()
@@ -262,7 +263,7 @@ pub(super) async fn prepare_sandbox_agent(
     let settings = capabilities
         .iter()
         .fold(base.model_settings().clone(), |settings, capability| {
-            capability.sampling_params(settings)
+            capability.sampling_params_for(settings, sampling)
         });
     let instructions = build_sandbox_instructions(
         sandbox.base_instructions(),

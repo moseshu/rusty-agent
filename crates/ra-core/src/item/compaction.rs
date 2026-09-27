@@ -313,3 +313,65 @@ impl Compaction {
         &self.unknown
     }
 }
+
+/// Current provider-compaction schema version.
+pub const PROVIDER_COMPACTION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// A compaction the provider performed and handed back as an opaque item.
+///
+/// The counterpart of the reference's `CompactionItem`: a model provider that compacts server side
+/// — the `OpenAI` Responses API, asked to through a `context_management` request field — returns an
+/// output item that stands for everything before it, and expects it back verbatim on later
+/// requests. The payload is that item as the provider wrote it, minus the fields the reference
+/// drops before replay, and nothing in this framework reads inside it.
+///
+/// **Not a [`Compaction`].** That type is a portable summary this framework wrote and can hand to
+/// any provider as text; this one is provider state that only the provider it came from can read.
+/// Keeping the two apart is what stops a local compaction engine from treating an encrypted blob as
+/// a summary, and what lets an adapter for another protocol refuse the item instead of sending it
+/// somewhere it means nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCompaction {
+    schema_version: SchemaVersion,
+    provider: String,
+    payload: serde_json::Value,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl ProviderCompaction {
+    /// Records the item `provider` returned.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            schema_version: PROVIDER_COMPACTION_SCHEMA_VERSION,
+            provider: provider.into(),
+            payload,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// The registered provider alias that produced the item.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The item as the provider wrote it, to be replayed verbatim.
+    #[must_use]
+    pub const fn payload(&self) -> &serde_json::Value {
+        &self.payload
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
