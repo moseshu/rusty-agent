@@ -193,6 +193,14 @@ async fn lower_messages(
                     vec![json!({"type":"text", "text":compaction.model_text()})],
                 );
             }
+            // Responses state, as for Chat Completions: nothing in a Messages request can carry
+            // it back, so it is refused rather than dropped or sent as text.
+            ModelInputItem::ProviderCompaction(_) => {
+                return Err(Error::caller(
+                    "Compaction items are not supported for Anthropic Messages. Please use the \
+                     Responses API to handle compaction.",
+                ));
+            }
             item => {
                 return Err(Error::caller(format!(
                     "Anthropic Messages has no representation for `{}`",

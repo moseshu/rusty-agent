@@ -346,3 +346,33 @@ fn replacing_a_tool_output_preserves_the_records_identity_and_metadata() {
         "a field a newer build wrote still travels with the projection"
     );
 }
+
+/// A provider's compaction keeps the item it returned, round-trips through a session record, and
+/// reaches model input as itself rather than as a summary.
+#[test]
+fn a_provider_compaction_is_kept_opaque_from_record_to_model_input() {
+    use ra_core::item::ProviderCompaction;
+
+    let payload = json!({"id": "cmp_1", "type": "compaction", "encrypted_content": "opaque"});
+    let record = item(
+        "cmp_1",
+        RunItemKind::ProviderCompaction(ProviderCompaction::new("openai", payload.clone())),
+    );
+
+    let encoded = serde_json::to_value(&record).expect("serialize");
+    let decoded: RunItem = serde_json::from_value(encoded).expect("deserialize");
+    assert_eq!(decoded, record);
+    assert_eq!(record.kind().label(), "provider_compaction");
+    assert!(!record.kind().is_interruption());
+    assert!(!record.kind().requires_action_binding());
+
+    let Some(ModelInputItem::ProviderCompaction(input)) = record.to_model_input() else {
+        panic!("not projected as itself");
+    };
+    assert_eq!(input.provider(), "openai");
+    assert_eq!(input.payload(), &payload);
+    assert_eq!(
+        ModelInputItem::ProviderCompaction(input).label(),
+        "provider_compaction"
+    );
+}

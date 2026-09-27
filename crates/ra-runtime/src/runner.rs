@@ -1387,7 +1387,11 @@ async fn run_loop_inner(
         // the top of its first turn, as the reference prepares at the top of each loop.
         if !state.pending_interruption_resolutions().is_empty() {
             agent = cancel
-                .run(sandbox.prepare_agent(&agent))
+                .run(sandbox.prepare_agent(
+                    &agent,
+                    context.model_resolver.as_ref(),
+                    context.config.model.as_deref(),
+                ))
                 .await
                 .and_then(|prepared| prepared)?;
         }
@@ -2295,7 +2299,11 @@ async fn run_one_turn(
     // Every turn, as the reference prepares: a transfer of control may have brought a sandbox agent
     // in, and a session that stopped since the last turn is started again.
     *agent = turn_scope
-        .run(context.sandbox.prepare_agent(agent))
+        .run(context.sandbox.prepare_agent(
+            agent,
+            context.model_resolver.as_ref(),
+            config.model.as_deref(),
+        ))
         .await
         .and_then(|prepared| prepared)?;
     // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
@@ -2325,8 +2333,10 @@ async fn run_one_turn(
         preparation = preparation.with_model(model.clone());
     }
     let prepared = prepare_turn(preparation).await?;
+    let sandbox_processors = context.sandbox.context_processors(agent).await;
     let (prepared, context_records, context_responses) = process_context_processors(
         context,
+        &sandbox_processors,
         progress,
         turn_scope,
         prepared,
@@ -2626,30 +2636,39 @@ fn deliver_deferred_prompts(
 /// product-specific retention policy.
 async fn process_context_processors(
     context: &TurnLoopContext<'_>,
+    sandbox_processors: &[Arc<dyn ContextProcessor>],
     progress: &TurnLoopProgress,
     turn_scope: &CancelScope,
     prepared: PreparedTurn,
     turn_input: &TurnInput,
     run: RunContext,
 ) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>)> {
-    let processors = context.config.context_processors();
+    // Sandbox capabilities transform the current input even on caller-managed continuations,
+    // as the reference's prepare_sandbox_input does. Only run-level processors require an
+    // authoritative history decomposition.
+    let decomposition = turn_input
+        .history_span
+        .and_then(|span| span.split(prepared.request().input(), turn_input.base()));
+    let processors: Vec<&Arc<dyn ContextProcessor>> = sandbox_processors
+        .iter()
+        .chain(
+            context
+                .config
+                .context_processors()
+                .iter()
+                .filter(|_| decomposition.is_some()),
+        )
+        .collect();
     if processors.is_empty() {
         return Ok((prepared, Vec::new(), Vec::new()));
     }
-    // Only a request this loop assembled can be split into prefix, history, and tail. A segment
-    // resuming on a caller's own projection is skipped rather than guessed at.
-    let Some(span) = turn_input.history_span else {
-        return Ok((prepared, Vec::new(), Vec::new()));
-    };
-    let Some((prefix, suffix)) = span.split(prepared.request().input(), turn_input.base()) else {
-        return Ok((prepared, Vec::new(), Vec::new()));
-    };
-
     let mut input = prepared.request().input().to_vec();
-    // The records behind the base, which after a transfer of control is less than the run's whole
-    // history. A processor owns what the model is being shown; it is not the place to reintroduce
-    // what the transfer decided the receiving agent may not see.
-    let mut history = turn_input.carried().to_vec();
+    // Without a reconstructible history, expose the caller's input as a prefix, not as records
+    // from the checkpoint that may no longer be part of the caller's projection.
+    let (prefix, suffix, mut history) = match decomposition {
+        Some((prefix, suffix)) => (prefix, suffix, turn_input.carried().to_vec()),
+        None => (input.clone(), Vec::new(), Vec::new()),
+    };
     let mut generated_items: Vec<RunItem> = Vec::new();
     let mut taken_ids: BTreeSet<ItemId> = history.iter().map(|item| item.id().clone()).collect();
     let mut model_responses = Vec::new();

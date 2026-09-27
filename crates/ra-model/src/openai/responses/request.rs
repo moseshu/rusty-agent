@@ -431,6 +431,9 @@ async fn lower_input_item(item: &ModelInputItem, request: &ModelRequest) -> Resu
             "role": MessageRole::User.label(),
             "content": [{"type": "input_text", "text": compaction.model_text()}]
         })),
+        // Replayed exactly as the provider returned it: the item is opaque server state, and the
+        // reference hands it back unchanged.
+        ModelInputItem::ProviderCompaction(compaction) => Ok(compaction.payload().clone()),
         ModelInputItem::McpListTools(_) => Err(Error::caller(format!(
             "OpenAI Responses cannot lower `{}` without provider replay data",
             item.label()

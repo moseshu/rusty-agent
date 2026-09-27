@@ -1577,15 +1577,19 @@ fn binding_to_a_sandbox_session_yields_a_bound_filesystem() {
     assert!(!filesystem.is_bound());
 }
 
-/// The reference's default set is filesystem, shell and compaction; compaction is not here yet.
+/// The reference's `Capabilities.default()`: filesystem, shell and compaction, in that order.
 #[test]
-fn the_default_capabilities_are_filesystem_and_shell() {
+fn the_default_capabilities_are_filesystem_shell_and_compaction() {
     let kinds: Vec<CapabilityFamily> = default_capabilities()
         .iter()
         .map(|capability| capability.kind())
         .collect();
     assert_eq!(
         kinds,
-        [CapabilityFamily::FILESYSTEM, CapabilityFamily::SHELL]
+        [
+            CapabilityFamily::FILESYSTEM,
+            CapabilityFamily::SHELL,
+            CapabilityFamily::COMPACTION
+        ]
     );
 }
