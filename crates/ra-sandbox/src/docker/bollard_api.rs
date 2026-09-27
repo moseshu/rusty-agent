@@ -4,6 +4,11 @@
 //! translated the way `docker-py` translates them: an environment map becomes `KEY=value` strings, a
 //! published port becomes an exposed port plus a binding with an empty host port, a device path
 //! becomes a mapping with `rwm` permissions.
+//!
+//! One call leaves bollard: starting a command that has a terminal. bollard reads a terminal's
+//! output as if it might be framed and can cut it, so that attachment is made over a connection of
+//! this module's own and read raw — see [`super::raw_attach`]. It needs the daemon's address, which
+//! a client built here knows and one handed in has to be told with [`BollardDockerApi::with_host`].
 
 use std::collections::HashMap;
 
@@ -25,11 +30,15 @@ use super::api::{
     ContainerCreateSpec, DockerApi, DockerApiError, DockerMountKind, ExecAttachment,
     ExecCreateRequest, ExecFrame, ExecInspect, ExecStreamKind,
 };
+use super::raw_attach::{DEFAULT_DOCKER_HOST, DaemonEndpoint, start_exec_raw};
 
 /// Talks to a Docker daemon.
 #[derive(Debug, Clone)]
 pub struct BollardDockerApi {
     docker: Docker,
+    /// Where the daemon listens, for terminal attachments; `None` for a client handed in without
+    /// its address.
+    endpoint: Option<DaemonEndpoint>,
 }
 
 impl BollardDockerApi {
@@ -41,15 +50,42 @@ impl BollardDockerApi {
     /// Returns a transport error when the address cannot be used. Nothing is sent to the daemon
     /// yet, so an address that parses but has no daemon behind it fails on first use instead.
     pub fn connect_with_defaults() -> Result<Self, DockerApiError> {
-        Docker::connect_with_defaults()
-            .map(Self::from_client)
+        let host = std::env::var("DOCKER_HOST").unwrap_or_else(|_| DEFAULT_DOCKER_HOST.to_owned());
+        Self::connect_with_host(&host)
+    }
+
+    /// Connects to the daemon at `host`, read as a `DOCKER_HOST` value is.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error when the address cannot be used, as
+    /// [`Self::connect_with_defaults`] does.
+    pub fn connect_with_host(host: &str) -> Result<Self, DockerApiError> {
+        Docker::connect_with_host(host)
+            .map(|docker| Self {
+                docker,
+                endpoint: Some(DaemonEndpoint::from_host(host)),
+            })
             .map_err(|error| DockerApiError::transport(error.to_string()))
     }
 
     /// Wraps a client the host configured itself.
+    ///
+    /// Such a client cannot start a command on a terminal until it is told where the daemon is,
+    /// with [`Self::with_host`]; everything else works as it is.
     #[must_use]
     pub const fn from_client(docker: Docker) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            endpoint: None,
+        }
+    }
+
+    /// Records where the daemon listens, as a `DOCKER_HOST` value, for terminal attachments.
+    #[must_use]
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.endpoint = Some(DaemonEndpoint::from_host(host));
+        self
     }
 
     /// The client underneath.
@@ -284,6 +320,15 @@ impl DockerApi for BollardDockerApi {
     }
 
     async fn exec_start(&self, exec_id: &str, tty: bool) -> Result<ExecAttachment, DockerApiError> {
+        if tty {
+            let endpoint = self.endpoint.as_ref().ok_or_else(|| {
+                DockerApiError::transport(
+                    "attaching to a terminal needs the daemon's address; \
+                     build the client with connect_with_host or give it one with with_host",
+                )
+            })?;
+            return start_exec_raw(endpoint, exec_id).await;
+        }
         let started = self
             .docker
             .start_exec(

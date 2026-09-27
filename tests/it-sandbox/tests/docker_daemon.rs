@@ -3,7 +3,8 @@
 //! The fakes in the other Docker test files pin down what the backend asks the daemon for; these
 //! check that a real daemon answers the way the backend expects — that a container comes up idle,
 //! that commands and files go through `exec`, that the workspace archive survives the trip out and
-//! back in, that a published port resolves, and that a delete leaves nothing behind.
+//! back in, that a published port resolves, that interactive processes take input and are ended,
+//! and that a delete leaves nothing behind.
 //!
 //! **Ignored unless asked for**, because they need a daemon and pull an image: run them with
 //! `cargo test -p it-sandbox --test docker_daemon -- --ignored`. The daemon is found the way
@@ -13,7 +14,8 @@
 use std::sync::Arc;
 
 use ra_core::sandbox::{
-    CreateRequest, Entry, ExecRequest, Manifest, SandboxClient, SandboxSession, ShellInvocation,
+    CreateRequest, Entry, ErrorCode, ExecRequest, Manifest, PtyStartRequest, PtyWriteRequest,
+    SandboxClient, SandboxSession, ShellInvocation, User,
 };
 use ra_sandbox::docker::{
     BollardDockerApi, DEFAULT_PYTHON_SANDBOX_IMAGE, DockerApi, DockerNetworkMode,
@@ -214,5 +216,153 @@ async fn network_mode_none_leaves_the_container_on_no_network() {
         .await
         .expect("exec");
     assert_eq!(text(&interfaces.stdout).trim(), "lo");
+    client.delete(session.as_ref()).await.expect("deleted");
+}
+
+/// Starts `argv` with no shell of the session's own.
+fn direct(argv: &[&str]) -> PtyStartRequest {
+    PtyStartRequest::new(argv.iter().map(|part| (*part).to_owned()))
+        .with_shell(ShellInvocation::None)
+}
+
+/// The command lines of every process in the container, one per line.
+async fn process_command_lines(session: &dyn SandboxSession) -> String {
+    let listing = session
+        .exec(shell(
+            "for f in /proc/[0-9]*/cmdline; do tr '\\000' ' ' < \"$f\"; echo; done 2>/dev/null",
+        ))
+        .await
+        .expect("list processes");
+    text(&listing.stdout)
+}
+
+/// A terminal's output reaches the caller byte for byte — including output that starts with a byte
+/// a frame header would start with — and input written to the terminal reaches the process.
+#[tokio::test]
+#[ignore = "needs a Docker daemon; run with --ignored"]
+async fn a_terminal_process_takes_input_and_its_raw_output_arrives_intact() {
+    let api = daemon();
+    let client = DockerSandboxClient::new(api);
+    let session = client
+        .create(
+            CreateRequest::new()
+                .with_manifest(Manifest::new().with_root("/workspace"))
+                .with_options(DockerSandboxClientOptions::new(image()).to_payload()),
+        )
+        .await
+        .expect("created");
+    session.start().await.expect("started");
+    assert!(session.supports_pty());
+
+    let started = session
+        .pty_start(
+            direct(&[
+                "sh",
+                "-c",
+                r#"printf '\001\000\000\000\000\000\000\005ready'; read line; echo "got $line in $(pwd)"; exit 7"#,
+            ])
+            .with_tty(true)
+            .with_yield_time_s(1.0),
+        )
+        .await
+        .expect("start");
+    let process_id = started.process_id.expect("waiting for input");
+    assert_eq!(started.output, b"\x01\x00\x00\x00\x00\x00\x00\x05ready");
+
+    let mut update = session
+        .pty_write(PtyWriteRequest::new(process_id, "abc\n").with_yield_time_s(2.0))
+        .await
+        .expect("write");
+    let mut output = update.output.clone();
+    while update.exit_code.is_none() {
+        update = session
+            .pty_write(PtyWriteRequest::poll(process_id).with_yield_time_s(5.0))
+            .await
+            .expect("poll");
+        output.extend_from_slice(&update.output);
+    }
+    assert_eq!(update.exit_code, Some(7));
+    assert_eq!(update.process_id, None);
+    let output = text(&output);
+    // The terminal echoes the input, and ends lines with CR LF.
+    assert!(output.contains("abc\r\n"), "{output:?}");
+    assert!(output.contains("got abc in /workspace\r\n"), "{output:?}");
+
+    let forgotten = session
+        .pty_write(PtyWriteRequest::poll(process_id))
+        .await
+        .expect_err("forgotten");
+    assert_eq!(forgotten.error_code(), ErrorCode::PtySessionNotFound);
+    client.delete(session.as_ref()).await.expect("deleted");
+}
+
+/// A process without a terminal delivers both streams, refuses input, and is killed when the
+/// session ends its interactive processes — as another account, whose pid file is its own.
+#[tokio::test]
+#[ignore = "needs a Docker daemon; run with --ignored"]
+async fn a_process_without_a_terminal_as_another_user_is_killed_when_ended() {
+    let api = daemon();
+    let client = DockerSandboxClient::new(api);
+    let session = client
+        .create(
+            CreateRequest::new()
+                .with_manifest(
+                    Manifest::new()
+                        .with_root("/workspace")
+                        .with_user(User::new("sandboxer")),
+                )
+                .with_options(DockerSandboxClientOptions::new(image()).to_payload()),
+        )
+        .await
+        .expect("created");
+    session.start().await.expect("started");
+
+    let started = session
+        .pty_start(
+            direct(&[
+                "sh",
+                "-c",
+                "echo out; echo err >&2; whoami; exec sleep 4242",
+            ])
+            .as_user(User::new("sandboxer"))
+            .with_yield_time_s(1.0),
+        )
+        .await
+        .expect("start");
+    let process_id = started.process_id.expect("still running");
+    let output = text(&started.output);
+    for expected in ["out\n", "err\n", "sandboxer\n"] {
+        assert!(output.contains(expected), "{output:?}");
+    }
+    assert!(
+        process_command_lines(session.as_ref())
+            .await
+            .contains("sleep 4242")
+    );
+
+    let refused = session
+        .pty_write(PtyWriteRequest::new(process_id, "hello"))
+        .await
+        .expect_err("no input");
+    assert_eq!(refused.error_code(), ErrorCode::ExecTransportError);
+
+    session.pty_terminate_all().await.expect("terminate");
+
+    let mut lines = process_command_lines(session.as_ref()).await;
+    for _ in 0..20 {
+        if !lines.contains("sleep 4242") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        lines = process_command_lines(session.as_ref()).await;
+    }
+    assert!(!lines.contains("sleep 4242"), "{lines}");
+    let staged = session
+        .exec(shell(
+            "ls /tmp/sandbox-docker-archive 2>/dev/null | grep -c pty.pid || true",
+        ))
+        .await
+        .expect("ls");
+    assert_eq!(text(&staged.stdout).trim(), "0", "pid files left behind");
     client.delete(session.as_ref()).await.expect("deleted");
 }

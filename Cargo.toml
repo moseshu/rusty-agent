@@ -114,6 +114,17 @@ reqwest = { version = "0.12", features = [
 # TLS daemon 时也能连上——docker-py 的 `from_env` 支持这一点，上游源码的注释也专门提到
 # 经 TLS 连接的远端 daemon。
 bollard = { version = "0.21", features = ["ssl"] }
+# 终端模式的 exec 附着：bollard 0.21 按每次读取的首字节猜测输出是否带帧头，终端输出以 0／1／2
+# 开头时会被误读成帧头；上游（docker-py）对终端读原始 socket。所以终端附着自己开一条连接、发同样的
+# 升级请求并直接读升级后的原始流。这几项都已在 bollard 的依赖树里，不引入新的 crate。
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 
 # --- 存储与进程 ---
 rusqlite = { version = "0.32", features = ["bundled"] }
