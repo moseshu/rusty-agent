@@ -36,6 +36,7 @@ pub mod resources;
 pub mod session;
 pub mod shell;
 pub mod sinks;
+pub mod skills;
 pub mod snapshot;
 pub mod state;
 pub mod token_truncation;
@@ -122,6 +123,10 @@ pub use session::{
     render_session_state_for_storage,
 };
 pub use sinks::{DeliveryMode, EventSink, OnErrorPolicy, SinkError, undecorated_session};
+pub use skills::{
+    LazySkillSource, NO_SKILL_DESCRIPTION, SKILL_MARKDOWN, SkillLoadResult, SkillMetadata,
+    parse_skill_frontmatter,
+};
 pub use snapshot::{
     LOCAL_SNAPSHOT_TYPE, NOOP_SNAPSHOT_TYPE, REMOTE_SNAPSHOT_TYPE, Snapshot, SnapshotFingerprint,
     SnapshotPathError, SnapshotSource, SnapshotSpec, builtin_snapshot_registry, resolve_snapshot,

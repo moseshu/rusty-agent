@@ -2,9 +2,10 @@
 //! `Filesystem` works through the real local backend, from the run's working directory, with the
 //! tools the session offers.
 //!
-//! Ported from the reference's `tests/sandbox/test_run_cwd.py` (all but its skills case), plus an
-//! interactive round trip the reference covers only below the runner, and a custom `apply_patch`
-//! call carried through an approval.
+//! Ported from the reference's `tests/sandbox/test_run_cwd.py`, plus an interactive round trip the
+//! reference covers only below the runner, and a custom `apply_patch` call carried through an
+//! approval. Its skills case runs a shared skill's script from a nested directory of the run's
+//! working directory.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -26,8 +27,8 @@ use ra_core::{
         ResolvedModel,
     },
     sandbox::{
-        CreateRequest, Manifest, SandboxAgentConfig, SandboxClient, SandboxSession,
-        SandboxWorkspaceScope,
+        CreateRequest, Entry, Manifest, SandboxAgentConfig, SandboxClient, SandboxPathGrant,
+        SandboxSession, SandboxWorkspaceScope,
     },
     state::RunId,
 };
@@ -36,6 +37,7 @@ use ra_runtime::{
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
     sandbox::SandboxRunConfig,
 };
+use ra_sandbox::skills::LocalDirLazySkillSource;
 use ra_sandbox::unix_local::UnixLocalSandboxClient;
 use ra_tools::sandbox::NeedsApproval;
 use ra_tools::sandbox::filesystem::Filesystem;
@@ -43,6 +45,7 @@ use ra_tools::sandbox::shell::{Shell, ShellToolSet};
 use ra_tools::sandbox::shell_tool::{
     ExecCommandArgs, ExecCommandTool, WriteStdinArgs, WriteStdinTool,
 };
+use ra_tools::sandbox::skills::{Skill, Skills};
 use serde_json::{Value, json};
 use tokio::sync::Barrier;
 
@@ -53,6 +56,7 @@ type Step = Box<dyn Fn(&[String]) -> ModelResponse + Send + Sync>;
 struct ScriptedModel {
     steps: Mutex<VecDeque<Step>>,
     outputs: Mutex<Vec<String>>,
+    instructions: Mutex<Vec<Option<String>>>,
     rendezvous: Option<Arc<Barrier>>,
 }
 
@@ -65,12 +69,18 @@ impl ScriptedModel {
         Arc::new(Self {
             steps: Mutex::new(steps.into()),
             outputs: Mutex::default(),
+            instructions: Mutex::default(),
             rendezvous,
         })
     }
 
     fn outputs(&self) -> Vec<String> {
         self.outputs.lock().unwrap().clone()
+    }
+
+    /// The system instructions of each call, in order.
+    fn instructions(&self) -> Vec<Option<String>> {
+        self.instructions.lock().unwrap().clone()
     }
 
     fn assert_complete(&self) {
@@ -82,6 +92,10 @@ impl ScriptedModel {
 impl Model for ScriptedModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let first = self.outputs.lock().unwrap().is_empty();
+        self.instructions
+            .lock()
+            .unwrap()
+            .push(request.system_instructions().map(str::to_owned));
         {
             let mut outputs = self.outputs.lock().unwrap();
             outputs.clear();
@@ -387,6 +401,196 @@ async fn concurrent_runs_on_one_session_keep_their_relative_paths_apart() {
     }
     assert!(!root.join("plot.png").exists());
     assert!(!root.join("notes.md").exists());
+    session.close().await.unwrap();
+}
+
+// `test_python_skill_uses_absolute_root_from_nested_workdir`
+#[tokio::test]
+async fn a_shared_skill_s_script_runs_from_a_nested_directory_and_keeps_task_files_local() {
+    let skill_script = "from pathlib import Path\n\
+                        skill_root = Path(__file__).parent.parent\n\
+                        suffix = (skill_root / 'assets' / 'suffix.txt').read_text(encoding='utf-8')\n\
+                        source = Path('input.txt').read_text(encoding='utf-8')\n\
+                        Path('output.txt').write_text(source + suffix, encoding='utf-8')\n";
+    let skills = Skills::builder()
+        .skill(
+            Skill::new(
+                "python-proof",
+                "Proves shared Python skills keep task files local.",
+                "# Python proof\n",
+            )
+            .unwrap()
+            .with_script("prove.py", Entry::file(skill_script))
+            .unwrap()
+            .with_asset("suffix.txt", Entry::file("-from-shared-skill"))
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path())
+        .unwrap()
+        .join("workspace");
+    let mut manifest = Manifest::new().with_root(root.to_string_lossy().into_owned());
+    skills.process_manifest(&mut manifest).unwrap();
+    let session: Arc<dyn SandboxSession> = Arc::from(
+        UnixLocalSandboxClient::new()
+            .create(CreateRequest::new().with_manifest(manifest))
+            .await
+            .unwrap(),
+    );
+    session.start().await.unwrap();
+    session
+        .mkdir("tasks/task-a/nested", true, None)
+        .await
+        .unwrap();
+    session
+        .write("tasks/task-a/nested/input.txt", b"task-a".to_vec(), None)
+        .await
+        .unwrap();
+    let skill_root = format!("{}/.agents/python-proof", root.to_string_lossy());
+    let model = ScriptedModel::new(vec![
+        call(
+            "python_skill",
+            "exec_command",
+            json!({
+                "cmd": format!("python3 '{skill_root}/scripts/prove.py'"),
+                "workdir": "nested",
+                "login": false,
+            }),
+        ),
+        answer("python_skill_message"),
+    ]);
+
+    let result = Runner::run(request(
+        sandbox_agent(
+            "python-skill-task",
+            vec![Arc::new(Shell::new()), Arc::new(skills)],
+        ),
+        &model,
+        "run-python-skill",
+        in_session(&session, "tasks/task-a"),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(
+        session
+            .read("tasks/task-a/nested/output.txt", None)
+            .await
+            .unwrap(),
+        b"task-a-from-shared-skill"
+    );
+    assert_eq!(
+        session
+            .read(".agents/python-proof/scripts/prove.py", None)
+            .await
+            .unwrap(),
+        skill_script.as_bytes()
+    );
+    let instructions = model.instructions()[0]
+        .clone()
+        .expect("system instructions");
+    assert!(
+        instructions.contains(&format!("(file: {skill_root})")),
+        "{instructions}"
+    );
+    assert!(instructions.contains("Treat each listed path as the skill root"));
+    assert!(
+        instructions.contains("Files outside the working directory may be visible to or shared")
+    );
+    model.assert_complete();
+    session.close().await.unwrap();
+}
+
+/// A lazily indexed skill is staged into a real local workspace when the model asks for it, and
+/// is then read from the path the index gave.
+#[tokio::test]
+async fn a_lazy_skill_is_staged_when_the_model_asks_and_read_from_the_indexed_path() {
+    let sources = tempfile::tempdir().unwrap();
+    let source_root = std::fs::canonicalize(sources.path())
+        .unwrap()
+        .join("skills");
+    std::fs::create_dir_all(source_root.join("notes")).unwrap();
+    std::fs::write(
+        source_root.join("notes/SKILL.md"),
+        "---\nname: notes\ndescription: Keeps notes.\n---\nWrite notes in notes.md.\n",
+    )
+    .unwrap();
+    let skills = Skills::builder()
+        .lazy_from(
+            LocalDirLazySkillSource::new(Entry::local_dir(Some(
+                source_root.to_string_lossy().into_owned(),
+            )))
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path())
+        .unwrap()
+        .join("workspace");
+    let mut manifest = Manifest::new()
+        .with_root(root.to_string_lossy().into_owned())
+        .with_path_grant(SandboxPathGrant::new(&source_root.to_string_lossy()).unwrap());
+    skills.process_manifest(&mut manifest).unwrap();
+    let session: Arc<dyn SandboxSession> = Arc::from(
+        UnixLocalSandboxClient::new()
+            .create(CreateRequest::new().with_manifest(manifest))
+            .await
+            .unwrap(),
+    );
+    session.start().await.unwrap();
+    std::fs::create_dir_all(root.join("tasks/task-a")).unwrap();
+    let skill_root = format!("{}/.agents/notes", root.to_string_lossy());
+    let model = ScriptedModel::new(vec![
+        call("load", "load_skill", json!({"skill_name": "notes"})),
+        call(
+            "read",
+            "exec_command",
+            json!({"cmd": format!("cat '{skill_root}/SKILL.md'"), "login": false}),
+        ),
+        answer("done"),
+    ]);
+
+    let result = Runner::run(request(
+        sandbox_agent(
+            "lazy-skill-task",
+            vec![Arc::new(Shell::new()), Arc::new(skills)],
+        ),
+        &model,
+        "run-lazy-skill",
+        in_session(&session, "tasks/task-a"),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    let loaded: Value = serde_json::from_str(
+        tool_output(result.new_items(), "load").output()["blocks"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        loaded,
+        json!({"status": "loaded", "skill_name": "notes", "path": skill_root})
+    );
+    let read = tool_output(result.new_items(), "read").output()["blocks"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(read.contains("Write notes in notes.md."), "{read}");
+    let instructions = model.instructions()[0]
+        .clone()
+        .expect("system instructions");
+    assert!(
+        instructions.contains(&format!("- notes: Keeps notes. (file: {skill_root})")),
+        "{instructions}"
+    );
+    assert!(instructions.contains("### Lazy loading"));
+    model.assert_complete();
     session.close().await.unwrap();
 }
 

@@ -31,6 +31,8 @@ pub mod runtime_helpers;
 pub(crate) mod session_scripts;
 pub mod shell;
 pub mod sinks;
+#[cfg(unix)]
+pub mod skills;
 pub mod snapshot;
 pub mod tar_utils;
 pub mod unix_local;
