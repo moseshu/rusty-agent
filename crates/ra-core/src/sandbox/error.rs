@@ -102,6 +102,15 @@ pub enum ErrorCode {
     SnapshotRestoreError,
     /// A snapshot exists but cannot be restored from.
     SnapshotNotRestorable,
+    /// An event sink configured to raise failed while a session operation was being recorded.
+    ///
+    /// **Not one of the reference's codes.** There, a failing sink raises a plain `RuntimeError`
+    /// out of the operation — outside the sandbox error family, so it has no code at all. Every
+    /// session method here returns [`SandboxError`], so the same failure needs a code to travel in,
+    /// and borrowing one of the reference's would tell a host that the sandbox did something it did
+    /// not. [`ErrorCode::reference_code`] answers `None` for it, which is what an event or a span
+    /// records in the reference's place.
+    EventSinkFailed,
 }
 
 impl ErrorCode {
@@ -142,6 +151,67 @@ impl ErrorCode {
             Self::SnapshotPersistError => "snapshot_persist_error",
             Self::SnapshotRestoreError => "snapshot_restore_error",
             Self::SnapshotNotRestorable => "snapshot_not_restorable",
+            Self::EventSinkFailed => "event_sink_failed",
+        }
+    }
+
+    /// The code as the reference publishes it, or `None` for the one this port added.
+    ///
+    /// What an audit event or a trace span records as the failure's code: the reference records
+    /// none for a failure outside its sandbox error family, and [`Self::EventSinkFailed`] is the
+    /// only such failure that reaches a session caller here.
+    #[must_use]
+    pub const fn reference_code(self) -> Option<Self> {
+        match self {
+            Self::EventSinkFailed => None,
+            other => Some(other),
+        }
+    }
+
+    /// The name of the class the reference raises for this code.
+    ///
+    /// Audit events and trace spans record a failure's type by that name (`error_type`), and a
+    /// consumer written against the reference branches on it. Every reference code is raised by
+    /// exactly one leaf class, so the name follows from the code. Two codes are raised by a class
+    /// that is not a leaf: [`Self::SandboxConfigInvalid`] by the configuration family's base, and
+    /// [`Self::EventSinkFailed`] — this port's code for the reference's plain `RuntimeError`.
+    #[must_use]
+    pub const fn reference_type_name(self) -> &'static str {
+        match self {
+            Self::InvalidManifestPath => "InvalidManifestPathError",
+            Self::InvalidCompressionScheme => "InvalidCompressionSchemeError",
+            Self::ExposedPortUnavailable => "ExposedPortUnavailableError",
+            Self::ExecNonzero => "ExecNonZeroError",
+            Self::ExecTimeout => "ExecTimeoutError",
+            Self::ExecTransportError => "ExecTransportError",
+            Self::PtySessionNotFound => "PtySessionNotFoundError",
+            Self::ApplyPatchInvalidPath => "ApplyPatchPathError",
+            Self::ApplyPatchInvalidDiff => "ApplyPatchDiffError",
+            Self::ApplyPatchFileNotFound => "ApplyPatchFileNotFoundError",
+            Self::ApplyPatchDecodeError => "ApplyPatchDecodeError",
+            Self::WorkspaceReadNotFound => "WorkspaceReadNotFoundError",
+            Self::WorkspaceArchiveReadError => "WorkspaceArchiveReadError",
+            Self::WorkspaceArchiveWriteError => "WorkspaceArchiveWriteError",
+            Self::WorkspaceWriteTypeError => "WorkspaceWriteTypeError",
+            Self::WorkspaceStopError => "WorkspaceStopError",
+            Self::WorkspaceStartError => "WorkspaceStartError",
+            Self::WorkspaceRootNotFound => "WorkspaceRootNotFoundError",
+            Self::LocalFileReadError => "LocalFileReadError",
+            Self::LocalDirReadError => "LocalDirReadError",
+            Self::LocalChecksumError => "LocalChecksumError",
+            Self::GitMissingInImage => "GitMissingInImageError",
+            Self::GitCloneError => "GitCloneError",
+            Self::GitSubpathError => "GitSubpathError",
+            Self::GitCopyError => "GitCopyError",
+            Self::MountMissingTool => "MountToolMissingError",
+            Self::MountFailed => "MountCommandError",
+            Self::MountConfigInvalid => "MountConfigError",
+            Self::SkillsConfigInvalid => "SkillsConfigError",
+            Self::SandboxConfigInvalid => "ConfigurationError",
+            Self::SnapshotPersistError => "SnapshotPersistError",
+            Self::SnapshotRestoreError => "SnapshotRestoreError",
+            Self::SnapshotNotRestorable => "SnapshotNotRestorableError",
+            Self::EventSinkFailed => "RuntimeError",
         }
     }
 
@@ -168,7 +238,8 @@ impl ErrorCode {
             | Self::WorkspaceWriteTypeError
             | Self::WorkspaceStopError
             | Self::WorkspaceStartError
-            | Self::WorkspaceRootNotFound => ErrorCategory::Runtime,
+            | Self::WorkspaceRootNotFound
+            | Self::EventSinkFailed => ErrorCategory::Runtime,
             Self::LocalFileReadError
             | Self::LocalDirReadError
             | Self::LocalChecksumError
@@ -231,7 +302,9 @@ impl ErrorCode {
             | Self::GitCloneError
             | Self::GitCopyError
             | Self::SnapshotPersistError
-            | Self::SnapshotRestoreError => None,
+            | Self::SnapshotRestoreError
+            // Whatever the sink failed on is the sink's to say, and it says nothing here.
+            | Self::EventSinkFailed => None,
         }
     }
 
@@ -463,6 +536,14 @@ impl SandboxError {
     #[must_use]
     pub fn with_cause(mut self, cause: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.cause = Some(Box::new(cause));
+        self
+    }
+
+    /// As [`Self::with_cause`], for a cause that is already boxed — a sink's or a callback's
+    /// failure, whose concrete type the caller never learns.
+    #[must_use]
+    pub fn with_boxed_cause(mut self, cause: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        self.cause = Some(cause);
         self
     }
 

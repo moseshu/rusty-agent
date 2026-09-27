@@ -579,14 +579,12 @@ async fn a_manifest_refused_at_the_credential_boundary_is_refused_before_create(
         .err()
         .expect("a strategy owned by another backend");
 
+    // The boundary's refusal is marked as redacted with a safe message, so `create` lets it out the
+    // way the reference's `@redact_mount_error_data` does: code and message kept, context dropped.
     assert_eq!(error.error_code(), ErrorCode::MountConfigInvalid);
-    assert_eq!(
-        error
-            .context()
-            .get("sandbox_backend")
-            .and_then(serde_json::Value::as_str),
-        Some(UNIX_LOCAL_BACKEND_ID)
-    );
+    assert!(error.is_data_redacted());
+    assert!(error.has_safe_redacted_message());
+    assert!(error.context().is_empty(), "{:?}", error.context());
 }
 
 #[tokio::test]

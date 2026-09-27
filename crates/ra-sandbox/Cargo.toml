@@ -11,6 +11,9 @@ repository.workspace = true
 workspace = true
 
 [features]
+# 把事件 POST 到采集端的 `HttpProxySink`。它的 HTTP 客户端带一套需要 C 编译步骤的 TLS 实现，
+# 其它 sink 和后端都用不到，所以单独开关。
+http-sink = ["dep:reqwest"]
 # 连接真实 Docker daemon 的 `DockerApi` 实现。Docker 后端本身（client、session、容器配置）
 # 不需要它：它们只依赖 `DockerApi` 这个接口，测试用替身实现。
 docker = [
@@ -40,6 +43,9 @@ tokio-rustls = { workspace = true, optional = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
+# `HttpProxySink` 的 POST（`http-sink` 特性）。上游用标准库的 `urlopen`；这里用工作区已有的 HTTP
+# 客户端，不引入新 crate。
+reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }

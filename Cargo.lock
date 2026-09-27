@@ -1604,6 +1604,7 @@ dependencies = [
  "portable-pty",
  "ra-core",
  "regex",
+ "reqwest",
  "rustix",
  "rustls",
  "rustls-native-certs",

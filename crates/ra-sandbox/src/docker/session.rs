@@ -613,8 +613,18 @@ impl DockerSandboxSession {
     /// The applier that puts this session's manifest in its workspace.
     #[cfg(unix)]
     fn applier(&self) -> SandboxResult<crate::materialize::ManifestApplier> {
+        self.applier_through(Arc::new(self.clone()))
+    }
+
+    /// As [`Self::applier`], making its workspace operations through `through` — a decorating
+    /// layer over this session that records them.
+    #[cfg(unix)]
+    fn applier_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+    ) -> SandboxResult<crate::materialize::ManifestApplier> {
         Ok(crate::materialize::ManifestApplier::new(
-            Arc::new(self.clone()),
+            through,
             crate::materialize::manifest_base_dir()?,
         )
         .with_limits(self.resources.concurrency_limits())
@@ -1077,12 +1087,22 @@ impl SandboxSession for DockerSandboxSession {
         &self,
         provision_accounts: bool,
     ) -> SandboxResult<MaterializationResult> {
+        self.apply_manifest_through(Arc::new(self.clone()), provision_accounts)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn apply_manifest_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+        provision_accounts: bool,
+    ) -> SandboxResult<MaterializationResult> {
         let manifest = self.manifest();
         ra_core::sandbox::validate_manifest_mount_credential_boundaries(
             &manifest,
             Some(DOCKER_BACKEND_ID),
         )?;
-        self.applier()?
+        self.applier_through(through)?
             .apply_manifest(&manifest, provision_accounts)
             .await
     }
@@ -1112,6 +1132,17 @@ impl SandboxSession for DockerSandboxSession {
         entries: Vec<(PosixPath, Entry)>,
     ) -> SandboxResult<Vec<MaterializedFile>> {
         self.applier()?.apply_entry_list(&entries).await
+    }
+
+    #[cfg(unix)]
+    async fn apply_manifest_entries_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+        entries: Vec<(PosixPath, Entry)>,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        self.applier_through(through)?
+            .apply_entry_list(&entries)
+            .await
     }
 
     #[cfg(unix)]

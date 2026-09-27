@@ -131,11 +131,15 @@ impl UnixLocalSandboxSession {
     /// Returns [`ErrorCode::SandboxConfigInvalid`] when this process has no readable working
     /// directory, which is what a manifest's relative sources are measured from.
     fn applier(&self) -> SandboxResult<ManifestApplier> {
-        Ok(
-            ManifestApplier::new(Arc::new(self.clone()), manifest_base_dir()?)
-                .with_limits(self.resources.concurrency_limits())
-                .with_mount_lifecycle(Arc::clone(&self.mount_lifecycle)),
-        )
+        self.applier_through(Arc::new(self.clone()))
+    }
+
+    /// As [`Self::applier`], making its workspace operations through `through` — a decorating
+    /// layer over this session that records them.
+    fn applier_through(&self, through: Arc<dyn SandboxSession>) -> SandboxResult<ManifestApplier> {
+        Ok(ManifestApplier::new(through, manifest_base_dir()?)
+            .with_limits(self.resources.concurrency_limits())
+            .with_mount_lifecycle(Arc::clone(&self.mount_lifecycle)))
     }
 
     /// The state as it stands, copied out from under the lock.
@@ -721,6 +725,15 @@ impl SandboxSession for UnixLocalSandboxSession {
         &self,
         provision_accounts: bool,
     ) -> SandboxResult<MaterializationResult> {
+        self.apply_manifest_through(Arc::new(self.clone()), provision_accounts)
+            .await
+    }
+
+    async fn apply_manifest_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+        provision_accounts: bool,
+    ) -> SandboxResult<MaterializationResult> {
         let manifest = self.manifest();
         assert_host_path_grants_unsupported(&manifest)?;
         // The start path has already checked this, but a host may apply a manifest directly, and
@@ -730,7 +743,7 @@ impl SandboxSession for UnixLocalSandboxSession {
         // creating; this backend cannot create one at all, and materializing content that is meant
         // to belong to a missing account would hand it to whoever runs the SDK instead.
         assert_accounts_unsupported(&manifest)?;
-        self.applier()?
+        self.applier_through(through)?
             .apply_manifest(&manifest, provision_accounts)
             .await
     }
@@ -746,6 +759,16 @@ impl SandboxSession for UnixLocalSandboxSession {
         entries: Vec<(PosixPath, Entry)>,
     ) -> SandboxResult<Vec<MaterializedFile>> {
         self.applier()?.apply_entry_list(&entries).await
+    }
+
+    async fn apply_manifest_entries_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+        entries: Vec<(PosixPath, Entry)>,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        self.applier_through(through)?
+            .apply_entry_list(&entries)
+            .await
     }
 
     /// Rebuilds the entries that were deliberately never persisted.

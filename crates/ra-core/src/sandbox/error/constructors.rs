@@ -365,6 +365,17 @@ impl SandboxError {
         .with_retryable(Some(false))
         .with_context("path", path)
     }
+
+    /// Constructs the failure of an event sink that was configured to raise, during `op`.
+    ///
+    /// `message` is what the caller is told, which is the reference's own wording: its
+    /// synchronous delivery reports `sandbox event sink failed: <sink> while handling event <id>`,
+    /// while a sink awaited inline in `async` mode lets its own failure out as it is. What the sink
+    /// failed with travels as the cause either way.
+    #[must_use]
+    pub fn event_sink_failed(op: OpName, message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::EventSinkFailed, op, message)
+    }
 }
 
 /// Why a patch path was refused.
