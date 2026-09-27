@@ -10,6 +10,8 @@
 //! The session does not remove its container. That belongs to the client, which is the only party
 //! that knows whether this session created it.
 
+mod pty;
+
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,9 +20,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, CompressionScheme, ErrorCode, ExecRequest, ExecResult, ExposedPortEndpoint, FileEntry,
-    Manifest, MaterializationResult, OpName, PosixPath, SandboxArchiveLimits, SandboxError,
-    SandboxResult, SandboxSession, SandboxSessionState, SessionResources, ShellInvocation,
-    SnapshotFingerprint, manifest_has_configured_mount_authority, replace_protected_mount_error,
+    Manifest, MaterializationResult, OpName, PosixPath, PtyExecUpdate, PtyStartRequest,
+    PtyWriteRequest, SandboxArchiveLimits, SandboxError, SandboxResult, SandboxSession,
+    SandboxSessionState, SessionResources, ShellInvocation, SnapshotFingerprint,
+    manifest_has_configured_mount_authority, replace_protected_mount_error,
 };
 #[cfg(unix)]
 use ra_core::sandbox::{Entry, MaterializedFile};
@@ -131,6 +134,8 @@ pub struct DockerSandboxSession {
     resources: Arc<SessionResources>,
     cleanup: Arc<DeferredCleanup>,
     cleanup_timeout: Duration,
+    /// The interactive processes this session started.
+    pty: Arc<pty::DockerPtyProcesses>,
 }
 
 impl std::fmt::Debug for DockerSandboxSession {
@@ -167,6 +172,7 @@ impl DockerSandboxSession {
             resources: Arc::new(SessionResources::new()),
             cleanup: Arc::new(DeferredCleanup::default()),
             cleanup_timeout: DEFERRED_CLEANUP_TIMEOUT,
+            pty: Arc::new(pty::DockerPtyProcesses::default()),
         })
     }
 
@@ -692,6 +698,11 @@ impl SandboxSession for DockerSandboxSession {
         true
     }
 
+    /// Commands can be started on a terminal through an attached exec.
+    fn supports_pty(&self) -> bool {
+        true
+    }
+
     /// Runs a command, switching accounts through Docker rather than `sudo`.
     ///
     /// The account is handed to the daemon, which starts the command as that account directly; the
@@ -704,6 +715,24 @@ impl SandboxSession for DockerSandboxSession {
         });
         self.exec_internal_for_user(command, request.timeout_s, user)
             .await
+    }
+
+    /// Starts a command with its streams attached, as the account named, through the daemon.
+    ///
+    /// The request's timeout bounds setting the command up and starting it, not the process, which
+    /// runs until it exits or is ended.
+    async fn pty_start(&self, request: PtyStartRequest) -> SandboxResult<PtyExecUpdate> {
+        self.pty_exec_start(request).await
+    }
+
+    async fn pty_write(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        self.pty_write_stdin(request).await
+    }
+
+    /// Kills every interactive process through its pid file and closes its attachment.
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        self.pty_terminate_all_processes().await;
+        Ok(())
     }
 
     /// Whether the container is running, read fresh from the daemon.

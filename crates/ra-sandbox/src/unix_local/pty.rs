@@ -46,7 +46,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::pty_output::{PtyOutputBuffer, collect_pty_output};
+use crate::pty_output::{PtyOutputBuffer, collect_pty_output, seconds_to_millis};
 
 use super::exec::{self, HostCommand};
 
@@ -397,16 +397,6 @@ fn prune_if_needed(table: &mut PtyTable) -> Option<Arc<PtyEntry>> {
     let process_id = process_id_to_prune_from_meta(&meta)?;
     table.reserved.remove(&process_id);
     table.processes.remove(&process_id)
-}
-
-/// Converts a wait in seconds to milliseconds, truncating as the reference's `int()` does.
-fn seconds_to_millis(seconds: Option<f64>, default_ms: u64) -> u64 {
-    let Some(seconds) = seconds else {
-        return default_ms;
-    };
-    Duration::try_from_secs_f64(seconds).map_or(0, |duration| {
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-    })
 }
 
 /// Starts a command on a new terminal.

@@ -25,6 +25,8 @@ mod api;
 mod bollard_api;
 mod client;
 mod container;
+#[cfg(feature = "docker")]
+mod raw_attach;
 mod session;
 mod stream;
 

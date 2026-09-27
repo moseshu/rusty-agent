@@ -13,11 +13,30 @@ workspace = true
 [features]
 # 连接真实 Docker daemon 的 `DockerApi` 实现。Docker 后端本身（client、session、容器配置）
 # 不需要它：它们只依赖 `DockerApi` 这个接口，测试用替身实现。
-docker = ["dep:bollard"]
+docker = [
+    "dep:bollard",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pki-types",
+    "dep:tokio-rustls",
+    "tokio/net",
+]
 
 [dependencies]
 ra-core = { workspace = true }
 bollard = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }

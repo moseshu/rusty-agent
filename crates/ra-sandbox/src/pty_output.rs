@@ -99,3 +99,15 @@ pub async fn collect_pty_output(
     let (truncated, original_token_count) = truncate_text_by_tokens(&text, max_output_tokens);
     (truncated.into_bytes(), original_token_count)
 }
+
+/// Converts a wait in seconds to milliseconds, truncating as the reference's `int()` does.
+///
+/// `None` is the backend's default; a wait that is negative or not a number is no wait at all.
+pub(crate) fn seconds_to_millis(seconds: Option<f64>, default_ms: u64) -> u64 {
+    let Some(seconds) = seconds else {
+        return default_ms;
+    };
+    Duration::try_from_secs_f64(seconds).map_or(0, |duration| {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    })
+}
