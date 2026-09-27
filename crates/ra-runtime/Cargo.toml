@@ -21,3 +21,5 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+# Sandbox memory names a rollout file it allocates with a random UUID, as the reference does.
+uuid = { workspace = true }
