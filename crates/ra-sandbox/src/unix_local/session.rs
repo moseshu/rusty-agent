@@ -710,16 +710,9 @@ impl SandboxSession for UnixLocalSandboxSession {
         })
     }
 
-    /// Whether accounts named by the manifest still need creating.
-    ///
-    /// Always, because nothing about a local host is preserved between sessions in the way a
-    /// container's user database is. In practice this backend has no accounts to create — a
-    /// manifest that names one is refused — but the answer has to be the truthful one so the
-    /// lifecycle does not skip a step on the strength of a preservation that never happened.
-    fn should_provision_accounts(&self) -> bool {
-        true
-    }
-
+    // Whether accounts still need creating is the protocol's answer: yes, because this backend
+    // never reports its workspace, or therefore its system state, as preserved. In practice it has
+    // no accounts to create — a manifest that names one is refused here.
     async fn provision_accounts(&self) -> SandboxResult<()> {
         assert_accounts_unsupported(&self.manifest())
     }

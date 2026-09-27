@@ -54,6 +54,9 @@ use super::workspace_paths::PosixPath;
 /// What a sandbox operation returns when it can fail.
 pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
 
+/// How long the default workspace probe waits for `test -d`, in seconds.
+const WORKSPACE_ROOT_PROBE_TIMEOUT_S: f64 = 10.0;
+
 /// How a command's arguments reach the shell, when they do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ShellInvocation {
@@ -579,16 +582,30 @@ pub trait SandboxSession: Send + Sync {
         Ok(())
     }
 
-    /// Looks for evidence that a previous workspace survived.
+    /// Looks for evidence that a preserved workspace is still there.
     ///
-    /// **Runs before the workspace is prepared**, which is the whole point: afterwards, a directory
-    /// this session just created is indistinguishable from one a previous session left behind.
+    /// Asked only when the backend reports its workspace preserved and no earlier start has
+    /// recorded the root as ready, and **before the workspace is prepared**, which is the whole
+    /// point: afterwards, a directory this session just created is indistinguishable from one a
+    /// previous session left behind.
+    ///
+    /// The default is the reference's: `test -d <root>` inside the sandbox, with no shell and a
+    /// ten-second limit. A probe that cannot be run, or that fails, answers "not proven" rather than
+    /// failing the start — the cost of an unanswered probe is a full materialization, not the
+    /// session.
     ///
     /// # Errors
     ///
-    /// Returns the backend's failure to probe.
+    /// The default never fails. An override may, and its failure fails the start.
     async fn probe_workspace_root(&self) -> SandboxResult<bool> {
-        Ok(false)
+        let request = ExecRequest::new([
+            "test".to_owned(),
+            "-d".to_owned(),
+            self.state().manifest().root.clone(),
+        ])
+        .with_timeout_s(WORKSPACE_ROOT_PROBE_TIMEOUT_S)
+        .with_shell(ShellInvocation::None);
+        Ok(matches!(self.exec(request).await, Ok(result) if result.ok()))
     }
 
     /// Creates whatever the workspace needs before content goes into it.
@@ -634,9 +651,22 @@ pub trait SandboxSession: Send + Sync {
         Ok(false)
     }
 
+    /// Whether the accounts and groups a previous run created are known to have survived.
+    ///
+    /// Follows [`Self::workspace_state_preserved_on_start`] unless overridden, as the reference's
+    /// setter defaults its system flag to the workspace one: a backend that reconnects to the
+    /// machine it ran on usually gets both back. A backend that keeps the files but not the
+    /// accounts says so here.
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.workspace_state_preserved_on_start()
+    }
+
     /// Whether accounts named by the manifest still need creating on this start.
+    ///
+    /// Unless the system state survived, they do: a restored workspace can carry files owned by
+    /// accounts that no longer exist.
     fn should_provision_accounts(&self) -> bool {
-        false
+        !self.system_state_preserved_on_start()
     }
 
     /// Creates the accounts the manifest names.
@@ -710,8 +740,9 @@ pub trait SandboxSession: Send + Sync {
     /// Records that the workspace root now exists, so a later start can tell a resume from a fresh
     /// one.
     ///
-    /// Called last on a successful start. A backend that persists its state has to write this
-    /// down; one that does not can ignore it and will simply probe again next time.
+    /// Called last on a successful start, and earlier when a probe proves a preserved root. A
+    /// backend that persists its state has to write this down; one that does not can ignore it and
+    /// will simply probe again next time.
     ///
     /// # Errors
     ///
@@ -895,9 +926,17 @@ pub trait SandboxSession: Send + Sync {
 
         // Read before anything is created: once the workspace has been prepared, "the root exists"
         // no longer tells a resume from a fresh start. A state written by a previous run is the
-        // other way to know, and either is enough.
-        let root_ready_at_start =
-            self.state().workspace_root_ready() || self.probe_workspace_root().await?;
+        // other way to know, and either is enough. Only a backend that says its workspace survived
+        // is probed at all; for any other, a directory that happens to be there proves nothing.
+        let mut root_ready_at_start = self.state().workspace_root_ready();
+        if !root_ready_at_start
+            && self.workspace_state_preserved_on_start()
+            && self.probe_workspace_root().await?
+        {
+            // Written down as soon as it is proven, as the reference writes it.
+            self.record_workspace_root_ready().await?;
+            root_ready_at_start = true;
+        }
 
         self.prepare_backend_workspace().await?;
         self.ensure_runtime_helpers().await?;

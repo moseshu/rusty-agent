@@ -34,6 +34,8 @@ struct RecordingSession {
     state: SandboxSessionState,
     calls: Mutex<Vec<Call>>,
     listings: BTreeMap<String, Vec<FileEntry>>,
+    /// Every directory listed, in order.
+    listed: Mutex<Vec<String>>,
 }
 
 impl RecordingSession {
@@ -47,6 +49,7 @@ impl RecordingSession {
             ),
             calls: Mutex::new(Vec::new()),
             listings: BTreeMap::new(),
+            listed: Mutex::new(Vec::new()),
         }
     }
 
@@ -120,6 +123,7 @@ impl SandboxSession for RecordingSession {
     }
 
     async fn ls(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        self.listed.lock().expect("listed").push(path.to_owned());
         self.listings
             .get(path)
             .cloned()
@@ -637,6 +641,20 @@ async fn an_archive_whose_format_cannot_be_read_is_refused(
 
     assert_eq!(error.error_code(), ErrorCode::InvalidCompressionScheme);
     assert_eq!(error.message(), message);
+    // `test_extract_archive_rejects_missing_compression_scheme`: the path as given, and the
+    // extension it named — none at all for a bare name.
+    assert_eq!(
+        error.context().get("path").and_then(|value| value.as_str()),
+        Some(path)
+    );
+    let named = path.rsplit_once('.').map(|(_, suffix)| suffix);
+    assert_eq!(
+        error
+            .context()
+            .get("scheme")
+            .and_then(|value| value.as_str()),
+        named
+    );
     assert!(session.calls().is_empty());
 }
 
@@ -1354,4 +1372,149 @@ async fn a_zip_name_flagged_utf8_that_is_not_utf8_is_refused() {
         Some("unreadable archive")
     );
     assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}
+
+/// The reason and member a refusal names, and what it measured when it was a limit.
+fn refused_with(error: &ra_core::sandbox::SandboxError) -> (Option<&str>, Option<&str>) {
+    (
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("member")
+            .and_then(|value| value.as_str()),
+    )
+}
+
+/// `test_extract.py::test_extract_zip_rejects_member_count_over_limit` and
+/// `…_zip_rejects_extracted_bytes_over_limit`: the member that crossed the limit, the limit and
+/// what it came to, and nothing written but the archive.
+#[tokio::test]
+async fn a_zip_over_its_member_or_byte_limit_names_the_member_that_crossed_it() {
+    let count = SandboxArchiveLimits::new()
+        .with_max_input_bytes(None)
+        .and_then(|limits| limits.with_max_extracted_bytes(None))
+        .and_then(|limits| limits.with_max_members(Some(1)))
+        .expect("limits");
+    let bytes = SandboxArchiveLimits::new()
+        .with_max_input_bytes(None)
+        .and_then(|limits| limits.with_max_extracted_bytes(Some(4)))
+        .and_then(|limits| limits.with_max_members(None))
+        .expect("limits");
+    for (data, limits, member, reason, limit, actual) in [
+        (
+            zip_of(&[("one.txt", b"1"), ("two.txt", b"2")]),
+            count,
+            "two.txt",
+            "archive member count exceeds limit",
+            1,
+            2,
+        ),
+        (
+            zip_of(&[("large.txt", b"12345")]),
+            bytes,
+            "large.txt",
+            "archive extracted size exceeds limit",
+            4,
+            5,
+        ),
+    ] {
+        let session = RecordingSession::new();
+
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract("/workspace/bundle.zip", data, None, Some(limits))
+            .await
+            .expect_err("over the limit");
+
+        assert_eq!(refused_with(&error), (Some(reason), Some(member)));
+        assert_eq!(
+            error
+                .context()
+                .get("limit")
+                .and_then(serde_json::Value::as_u64),
+            Some(limit)
+        );
+        assert_eq!(
+            error
+                .context()
+                .get("actual")
+                .and_then(serde_json::Value::as_u64),
+            Some(actual)
+        );
+        assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+    }
+}
+
+/// `test_extract.py::test_extract_zip_rejects_windows_drive_member_paths` and
+/// `…_zip_rejects_windows_separator_member_paths`, with the reasons they name.
+#[tokio::test]
+async fn a_zip_member_named_for_windows_is_refused_for_the_reason_the_reference_gives() {
+    for (name, reason) in [
+        (r"C:\tmp\evil.txt", "windows drive path"),
+        (r"\evil.txt", "windows path separator"),
+    ] {
+        let session = RecordingSession::new();
+
+        let error = WorkspaceArchiveExtractor::new(&session)
+            .extract(
+                "/workspace/bundle.zip",
+                zip_of(&[(name, b"evil")]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("refused");
+
+        assert_eq!(refused_with(&error), (Some(reason), Some(name)));
+        assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+    }
+}
+
+/// `test_extract.py::test_extract_zip_rejects_symlinked_parent_paths`
+#[tokio::test]
+async fn a_zip_member_landing_under_an_existing_symlink_is_refused() {
+    let session = RecordingSession::new().holding("/workspace", "link", EntryKind::Symlink);
+
+    let error = WorkspaceArchiveExtractor::new(&session)
+        .extract(
+            "/workspace/bundle.zip",
+            zip_of(&[("link/hello.txt", b"hello from zip")]),
+            None,
+            None,
+        )
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        refused_with(&error),
+        (Some("symlink in parent path: link"), Some("link/hello.txt"))
+    );
+    assert_eq!(session.writes(), vec!["/workspace/bundle.zip"]);
+}
+
+/// `test_extract.py::test_extract_tar_reuses_directory_listings_during_symlink_checks`: each
+/// directory on the way is listed once, however many members sit under it.
+#[tokio::test]
+async fn each_directory_is_listed_once_while_checking_for_links() {
+    let session = RecordingSession::new();
+    let data = archive(|builder| {
+        member(builder, "nested/one.txt", tar::EntryType::Regular, b"one");
+        member(builder, "nested/two.txt", tar::EntryType::Regular, b"two");
+    });
+
+    WorkspaceArchiveExtractor::new(&session)
+        .extract("/workspace/bundle.tar", data, None, None)
+        .await
+        .expect("extract");
+
+    assert_eq!(
+        session.written("/workspace/nested/two.txt"),
+        Some(b"two".to_vec())
+    );
+    assert_eq!(
+        *session.listed.lock().expect("listed"),
+        ["/workspace", "/workspace/nested"]
+    );
 }

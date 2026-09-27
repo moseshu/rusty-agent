@@ -27,4 +27,5 @@ pub mod pty_output;
 pub mod runtime_helpers;
 pub mod shell;
 pub mod snapshot;
+pub mod tar_utils;
 pub mod unix_local;
