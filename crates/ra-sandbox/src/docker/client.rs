@@ -12,13 +12,13 @@ use ra_core::sandbox::{
     CreateRequest, Dependencies, EnvValueResolver, ErrorCode, InvalidSessionStatePayload, Manifest,
     ManifestRegistries, OpName, SandboxClient, SandboxConcurrencyLimits, SandboxError,
     SandboxResult, SandboxSession, SandboxSessionState, SnapshotSpec, TypeRegistry,
-    UnresolvableEnvValues, invalid_state_payload, manifest_has_configured_mount_authority,
-    parse_session_state_for_backend, render_session_state_for_storage,
-    replace_protected_mount_error, resolve_snapshot,
+    UnresolvableEnvValues, invalid_state_payload, parse_session_state_for_backend,
+    render_session_state_for_storage, resolve_snapshot,
 };
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::instrumentation::{Instrumentation, InstrumentedSession};
 use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
 use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
@@ -61,11 +61,7 @@ fn daemon_failure(op: OpName, error: DockerApiError) -> SandboxError {
 ///
 /// The reference's `@redact_mount_error_data` on `create`, `resume` and `delete`.
 fn redact_for(manifest: &Manifest, error: SandboxError) -> SandboxError {
-    if error.is_data_redacted() || manifest_has_configured_mount_authority(manifest) {
-        replace_protected_mount_error(&error)
-    } else {
-        error
-    }
+    crate::mounts::redact_for_manifest(manifest, error)
 }
 
 /// What to remove when acquiring a container did not produce a session.
@@ -147,6 +143,7 @@ struct AcquiredSession {
 /// the result. Dropping this wait detaches the task; its discarded result then triggers cleanup.
 async fn deliver_acquired(
     task: tokio::task::JoinHandle<SandboxResult<AcquiredSession>>,
+    instrumentation: Arc<Instrumentation>,
 ) -> SandboxResult<Box<dyn SandboxSession>> {
     let mut acquired = task.await.map_err(|_| {
         SandboxError::new(
@@ -155,10 +152,15 @@ async fn deliver_acquired(
             "docker resource acquisition task did not complete",
         )
     })??;
+    // Wrapped before the acquisition is disarmed: a sink that cannot bind means no session is
+    // handed out, and what was acquired for it is removed rather than left behind.
+    let manifest = acquired.session.state().manifest().clone();
+    let session = InstrumentedSession::new(Arc::new(acquired.session), Some(instrumentation), None)
+        .map_err(|error| redact_for(&manifest, error))?;
     if let Some(cleanup) = &mut acquired.cleanup {
         cleanup.disarm();
     }
-    Ok(Box::new(acquired.session))
+    Ok(Box::new(session))
 }
 
 /// Makes containers, and releases the ones it made.
@@ -169,6 +171,7 @@ pub struct DockerSandboxClient {
     snapshot_store: Arc<dyn SnapshotStore>,
     mount_lifecycle: Arc<dyn MountLifecycle>,
     dependencies: Option<Dependencies>,
+    instrumentation: Arc<Instrumentation>,
 }
 
 impl std::fmt::Debug for DockerSandboxClient {
@@ -189,6 +192,7 @@ impl DockerSandboxClient {
             snapshot_store: Arc::clone(&self.snapshot_store),
             mount_lifecycle: Arc::clone(&self.mount_lifecycle),
             dependencies: self.dependencies.as_ref().map(Dependencies::clone_bindings),
+            instrumentation: Arc::clone(&self.instrumentation),
         }
     }
 
@@ -202,6 +206,7 @@ impl DockerSandboxClient {
             snapshot_store: Arc::new(BuiltinSnapshotStore),
             mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             dependencies: None,
+            instrumentation: Arc::new(Instrumentation::new()),
         }
     }
 
@@ -230,6 +235,16 @@ impl DockerSandboxClient {
     #[must_use]
     pub fn with_dependencies(mut self, dependencies: Dependencies) -> Self {
         self.dependencies = Some(dependencies);
+        self
+    }
+
+    /// Delivers the audit events of every session this client makes through `instrumentation`.
+    ///
+    /// Every session comes back wrapped whether or not this is called, as the reference's do; the
+    /// default instrumentation has no sinks.
+    #[must_use]
+    pub fn with_instrumentation(mut self, instrumentation: Arc<Instrumentation>) -> Self {
+        self.instrumentation = instrumentation;
         self
     }
 
@@ -522,7 +537,8 @@ impl DockerSandboxClient {
             state.assert_path_grants_rebound()?;
             validate_docker_path_grants(state.manifest())?;
             let fields = DockerStateFields::read(&state)?;
-            let configured_authority = manifest_has_configured_mount_authority(state.manifest());
+            let configured_authority =
+                ra_core::sandbox::manifest_has_configured_mount_authority(state.manifest());
             let requires_fresh_resource = state.mount_authority_rebound() || configured_authority;
             let existing = if requires_fresh_resource {
                 None
@@ -609,9 +625,10 @@ impl SandboxClient for DockerSandboxClient {
     /// in a session, including when the caller stops waiting for it.
     async fn create(&self, request: CreateRequest) -> SandboxResult<Box<dyn SandboxSession>> {
         let client = self.for_acquisition();
-        deliver_acquired(tokio::spawn(
-            async move { client.create_owned(request).await },
-        ))
+        deliver_acquired(
+            tokio::spawn(async move { client.create_owned(request).await }),
+            Arc::clone(&self.instrumentation),
+        )
         .await
     }
 
@@ -619,9 +636,10 @@ impl SandboxClient for DockerSandboxClient {
     /// until the caller receives it, even if the caller stops waiting during creation.
     async fn resume(&self, state: SandboxSessionState) -> SandboxResult<Box<dyn SandboxSession>> {
         let client = self.for_acquisition();
-        deliver_acquired(tokio::spawn(
-            async move { client.resume_owned(state).await },
-        ))
+        deliver_acquired(
+            tokio::spawn(async move { client.resume_owned(state).await }),
+            Arc::clone(&self.instrumentation),
+        )
         .await
     }
 

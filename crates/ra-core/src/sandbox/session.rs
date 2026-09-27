@@ -40,7 +40,10 @@ use super::error::{ErrorCode, OpName, SandboxError};
 use super::files::FileEntry;
 use super::manifest::{Manifest, ManifestRegistries, validated_relative_path};
 use super::materialization::{MaterializationResult, MaterializedFile, SandboxConcurrencyLimits};
-use super::mount_security::validate_manifest_mount_credential_boundaries;
+use super::mount_security::{
+    manifest_has_configured_mount_authority, replace_protected_mount_error,
+    validate_manifest_mount_credential_boundaries,
+};
 use super::pty::{PtyExecUpdate, PtyStartRequest, PtyWriteRequest};
 use super::registry::{DiscriminatedPayload, TypeRegistry};
 use super::resources::{PreStopHook, SessionResources};
@@ -145,6 +148,33 @@ pub trait SandboxSession: Send + Sync {
     /// Every session has them, as every session on the reference does; the lifecycle defaults below
     /// are written against them.
     fn resources(&self) -> &SessionResources;
+
+    /// The session this one decorates, when it is a decorating layer.
+    ///
+    /// The instrumented wrapper answers with the backend session it wraps; a backend answers `None`.
+    /// Sinks bind to the answer, so that a sink writing into the workspace does not write through
+    /// the layer that would report its writes back to it.
+    fn inner_session(&self) -> Option<Arc<dyn SandboxSession>> {
+        None
+    }
+
+    /// The failure this session lets out in place of `error`.
+    ///
+    /// The reference's `@redact_mount_error_data` at a session method: when the session's manifest
+    /// carries mount authority, or could, or the failure was already marked as carrying some, the
+    /// failure is replaced by one that keeps only its code, operation and retryability. Otherwise
+    /// it passes through unchanged. The lifecycle defaults below apply it where the reference's base
+    /// class does — start, stop, shutdown, the pre-stop callbacks and close — and the instrumented
+    /// wrapper applies it to the operations it records.
+    fn redact_mount_error(&self, error: SandboxError) -> SandboxError {
+        if error.is_data_redacted()
+            || manifest_has_configured_mount_authority(self.state().manifest())
+        {
+            replace_protected_mount_error(&error)
+        } else {
+            error
+        }
+    }
 
     // --- dependencies and pre-stop callbacks -----------------------------------------------
 
@@ -301,6 +331,26 @@ pub trait SandboxSession: Send + Sync {
             "materializing individual manifest entries is not supported by this sandbox session",
         )
         .with_context("backend", self.backend_id().to_owned()))
+    }
+
+    /// As [`Self::apply_manifest_entries`], with every workspace operation made through `through`.
+    ///
+    /// For a decorating layer that must see the writes and commands materialization makes. The
+    /// reference gets this for free: its wrapper inherits the base class's materialization, which
+    /// then calls back into the wrapper. Here the backend keeps its own checks and hands the
+    /// operations to whichever session it was given. The default ignores `through`, which is right
+    /// for a backend that materializes without calling session methods at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_manifest_entries`].
+    async fn apply_manifest_entries_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+        entries: Vec<(PosixPath, Entry)>,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        let _ = through;
+        self.apply_manifest_entries(entries).await
     }
 
     /// Checks that `manifest` may be applied to this session.
@@ -468,6 +518,27 @@ pub trait SandboxSession: Send + Sync {
     /// Returns [`ErrorCode::WorkspaceReadNotFound`] for a path that is not there, or the backend's
     /// failure to read it.
     async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>>;
+
+    /// Reads a file whose absence, or some other failure, the caller expects and handles.
+    ///
+    /// The reference's `_read_with_expected_span_errors`: the failure is returned exactly as
+    /// [`Self::read`] returns it, and recorded in the audit events as the failure it is, but a trace
+    /// span does not mark it as an error when its code is one of `expected`. A caller probing for an
+    /// optional file would otherwise fill the trace with errors that are not. Only a decorating
+    /// layer that records spans has anything to do here; the default is [`Self::read`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    async fn read_expecting(
+        &self,
+        path: &str,
+        user: AsUser,
+        expected: &[ErrorCode],
+    ) -> SandboxResult<Vec<u8>> {
+        let _ = expected;
+        self.read(path, user).await
+    }
 
     /// Reads at most `max_bytes` from the start of a file.
     ///
@@ -724,6 +795,24 @@ pub trait SandboxSession: Send + Sync {
         Ok(MaterializationResult::new())
     }
 
+    /// As [`Self::apply_manifest`], with every workspace operation made through `through`.
+    ///
+    /// What [`Self::apply_manifest_entries_through`] is to its counterpart: the backend's checks run
+    /// as they always do, and the writes, directories and commands go to `through`, which is how a
+    /// decorating layer sees them. The default ignores `through`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_manifest`].
+    async fn apply_manifest_through(
+        &self,
+        through: Arc<dyn SandboxSession>,
+        provision_accounts: bool,
+    ) -> SandboxResult<MaterializationResult> {
+        let _ = through;
+        self.apply_manifest(provision_accounts).await
+    }
+
     /// Runs after a successful start.
     ///
     /// **Outside the guarded block**: a failure here is not reported as a failed start, and does
@@ -844,7 +933,10 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the first callback failure, on the call that actually ran them.
     async fn run_pre_stop_hooks(&self) -> SandboxResult<()> {
-        self.resources().run_pre_stop_hooks().await
+        self.resources()
+            .run_pre_stop_hooks()
+            .await
+            .map_err(|error| self.redact_mount_error(error))
     }
 
     /// Whether the pre-stop callbacks have ever failed.
@@ -898,22 +990,27 @@ pub trait SandboxSession: Send + Sync {
     /// Returns the first failure from the guarded block, given the backend's wording. The failure
     /// hook has already run by then.
     async fn start(&self) -> SandboxResult<bool> {
-        // Before the guarded block, as the reference has it: a manifest refused at the credential
-        // boundary never started anything, so there is no failed start to clean up after.
-        self.validate_mount_credential_boundaries()?;
-        match self.start_guarded().await {
-            Ok(preserved) => {
-                self.after_start().await?;
-                // Last, and only on success: the root is proven to exist now, and a start that did
-                // not finish has proven nothing.
-                self.record_workspace_root_ready().await?;
-                Ok(preserved)
-            }
-            Err(error) => {
-                self.after_start_failed().await;
-                Err(self.wrap_start_error(error))
+        let outcome = async {
+            // Before the guarded block, as the reference has it: a manifest refused at the
+            // credential boundary never started anything, so there is no failed start to clean up
+            // after.
+            self.validate_mount_credential_boundaries()?;
+            match self.start_guarded().await {
+                Ok(preserved) => {
+                    self.after_start().await?;
+                    // Last, and only on success: the root is proven to exist now, and a start that
+                    // did not finish has proven nothing.
+                    self.record_workspace_root_ready().await?;
+                    Ok(preserved)
+                }
+                Err(error) => {
+                    self.after_start_failed().await;
+                    Err(self.wrap_start_error(error))
+                }
             }
         }
+        .await;
+        outcome.map_err(|error| self.redact_mount_error(error))
     }
 
     /// The part of a start whose failure runs the failure hook.
@@ -998,7 +1095,8 @@ pub trait SandboxSession: Send + Sync {
     async fn stop(&self) -> SandboxResult<()> {
         // Outside the persist-and-settle sequence: a refusal here means nothing was attempted, so
         // there is nothing for the after-stop hook to settle.
-        self.validate_mount_credential_boundaries()?;
+        self.validate_mount_credential_boundaries()
+            .map_err(|error| self.redact_mount_error(error))?;
         let outcome = async {
             self.before_stop().await?;
             self.persist_snapshot().await
@@ -1006,7 +1104,7 @@ pub trait SandboxSession: Send + Sync {
         .await;
 
         self.after_stop().await;
-        outcome.map_err(|error| self.wrap_stop_error(error))
+        outcome.map_err(|error| self.redact_mount_error(self.wrap_stop_error(error)))
     }
 
     /// Tears the session's backend down.
@@ -1018,9 +1116,13 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns the first failure.
     async fn shutdown(&self) -> SandboxResult<()> {
-        self.before_shutdown().await?;
-        self.shutdown_backend().await?;
-        self.after_shutdown().await
+        let outcome = async {
+            self.before_shutdown().await?;
+            self.shutdown_backend().await?;
+            self.after_shutdown().await
+        }
+        .await;
+        outcome.map_err(|error| self.redact_mount_error(error))
     }
 
     /// Makes the session unusable after a mount was detached or reattached with an unknown outcome.
@@ -1059,7 +1161,9 @@ pub trait SandboxSession: Send + Sync {
     /// Returns the first failure recorded, after every step that was still eligible has run.
     async fn close(&self) -> SandboxResult<()> {
         let _closing = self.resources().lock_close().await;
-        self.close_guarded().await
+        self.close_guarded()
+            .await
+            .map_err(|error| self.redact_mount_error(error))
     }
 
     /// The close itself, with the guard already held.

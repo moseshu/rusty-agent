@@ -20,6 +20,7 @@
 pub mod archive;
 pub mod docker;
 pub mod host_paths;
+pub mod instrumentation;
 pub mod listing;
 #[cfg(unix)]
 pub mod materialize;
@@ -29,6 +30,7 @@ pub mod remote;
 pub mod runtime_helpers;
 pub(crate) mod session_scripts;
 pub mod shell;
+pub mod sinks;
 pub mod snapshot;
 pub mod tar_utils;
 pub mod unix_local;

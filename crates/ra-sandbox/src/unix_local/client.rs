@@ -15,7 +15,8 @@ use ra_core::sandbox::{
 };
 use uuid::Uuid;
 
-use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
+use crate::instrumentation::{Instrumentation, InstrumentedSession};
+use crate::mounts::{BuiltinMountLifecycle, MountLifecycle, redact_for_manifest};
 use crate::snapshot::{BuiltinSnapshotStore, SnapshotStore};
 
 use super::session::assert_host_path_grants_unsupported;
@@ -41,6 +42,8 @@ pub struct UnixLocalSandboxClient {
     mount_lifecycle: Arc<dyn MountLifecycle>,
     /// The bindings every session this client makes starts from, or `None` for none.
     dependencies: Option<Dependencies>,
+    /// Where the audit events of every session this client makes are delivered.
+    instrumentation: Arc<Instrumentation>,
 }
 
 impl std::fmt::Debug for UnixLocalSandboxClient {
@@ -76,6 +79,7 @@ impl UnixLocalSandboxClient {
             snapshot_store: Arc::new(BuiltinSnapshotStore),
             mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             dependencies: None,
+            instrumentation: Arc::new(Instrumentation::new()),
         }
     }
 
@@ -106,6 +110,7 @@ impl UnixLocalSandboxClient {
             snapshot_store: Arc::new(BuiltinSnapshotStore),
             mount_lifecycle: Arc::new(BuiltinMountLifecycle),
             dependencies: None,
+            instrumentation: Arc::new(Instrumentation::new()),
         }
     }
 
@@ -148,6 +153,16 @@ impl UnixLocalSandboxClient {
         self
     }
 
+    /// Delivers the audit events of every session this client makes through `instrumentation`.
+    ///
+    /// Every session comes back wrapped whether or not this is called, as the reference's do; the
+    /// default instrumentation has no sinks.
+    #[must_use]
+    pub fn with_instrumentation(mut self, instrumentation: Arc<Instrumentation>) -> Self {
+        self.instrumentation = instrumentation;
+        self
+    }
+
     /// Paces manifest application in every session this client makes.
     ///
     /// Held here for the same reason the environment policy is: it is a decision the process
@@ -165,8 +180,9 @@ impl UnixLocalSandboxClient {
         self.host_environment_allowlist.as_ref()
     }
 
-    /// Builds a session over a state this client already vetted.
-    fn open(&self, state: SandboxSessionState) -> Box<dyn SandboxSession> {
+    /// Builds a session over a state this client already vetted, wrapped in this client's
+    /// instrumentation.
+    fn open(&self, state: SandboxSessionState) -> SandboxResult<Box<dyn SandboxSession>> {
         let session = UnixLocalSandboxSession::new(
             state,
             self.host_environment_allowlist.clone(),
@@ -176,7 +192,12 @@ impl UnixLocalSandboxClient {
         .with_snapshot_store(Arc::clone(&self.snapshot_store))
         .with_mount_lifecycle(Arc::clone(&self.mount_lifecycle));
         session.set_dependencies(self.resolve_dependencies());
-        Box::new(session)
+        let wrapped = InstrumentedSession::new(
+            Arc::new(session),
+            Some(Arc::clone(&self.instrumentation)),
+            None,
+        )?;
+        Ok(Box::new(wrapped))
     }
 
     /// A fresh copy of the configured dependencies for one session, or `None` when there are none.
@@ -224,66 +245,78 @@ impl SandboxClient for UnixLocalSandboxClient {
         true
     }
 
+    /// Makes a workspace and opens a session over it.
+    ///
+    /// A failure is let out as the reference's `@redact_mount_error_data` lets it out: replaced when
+    /// the manifest the call was handed carries mount authority.
     async fn create(&self, request: CreateRequest) -> SandboxResult<Box<dyn SandboxSession>> {
-        self.check_options(request.options.as_ref())?;
-        let options = match &request.options {
-            Some(payload) => UnixLocalSandboxClientOptions::from_payload(payload)?,
-            None => UnixLocalSandboxClientOptions::new(),
-        };
+        let requested_manifest = request.manifest.clone().unwrap_or_default();
+        let outcome: SandboxResult<Box<dyn SandboxSession>> = async {
+            self.check_options(request.options.as_ref())?;
+            let options = match &request.options {
+                Some(payload) => UnixLocalSandboxClientOptions::from_payload(payload)?,
+                None => UnixLocalSandboxClientOptions::new(),
+            };
 
-        let mut manifest = request.manifest.unwrap_or_default();
-        // Checked before anything is created. A configuration this backend cannot honour should
-        // leave nothing behind, and a temporary directory made first would outlive the refusal.
-        //
-        // A manifest that asks for accounts is deliberately *not* refused here. The reference
-        // refuses it when the manifest is materialized, and moving the refusal earlier would make
-        // this client reject a configuration the reference lets a caller hold — the same manifest
-        // can be handed to a container backend that can honour it.
-        assert_host_path_grants_unsupported(&manifest)?;
-        self.validate_manifest_for_create(&manifest)?;
+            let mut manifest = request.manifest.unwrap_or_default();
+            // Checked before anything is created. A configuration this backend cannot honour should
+            // leave nothing behind, and a temporary directory made first would outlive the refusal.
+            //
+            // A manifest that asks for accounts is deliberately *not* refused here. The reference
+            // refuses it when the manifest is materialized, and moving the refusal earlier would make
+            // this client reject a configuration the reference lets a caller hold — the same manifest
+            // can be handed to a container backend that can honour it.
+            assert_host_path_grants_unsupported(&manifest)?;
+            self.validate_manifest_for_create(&manifest)?;
 
-        let mut workspace_root_owned = false;
-        if manifest.root == DEFAULT_MANIFEST_ROOT {
-            // The default root is a path inside a container. On this host it would be a directory
-            // at the filesystem root, shared by every session that ever ran, so a session that was
-            // not told where to work gets a private directory instead.
-            let directory = tempfile::Builder::new()
-                .prefix(DEFAULT_WORKSPACE_PREFIX)
-                .tempdir()
-                .map_err(|error| {
-                    SandboxError::workspace_start(DEFAULT_MANIFEST_ROOT, Some(&error.to_string()))
+            let mut workspace_root_owned = false;
+            if manifest.root == DEFAULT_MANIFEST_ROOT {
+                // The default root is a path inside a container. On this host it would be a directory
+                // at the filesystem root, shared by every session that ever ran, so a session that was
+                // not told where to work gets a private directory instead.
+                let directory = tempfile::Builder::new()
+                    .prefix(DEFAULT_WORKSPACE_PREFIX)
+                    .tempdir()
+                    .map_err(|error| {
+                        SandboxError::workspace_start(
+                            DEFAULT_MANIFEST_ROOT,
+                            Some(&error.to_string()),
+                        )
                         .with_cause(error)
-                })?;
-            manifest.root = directory.keep().to_string_lossy().into_owned();
-            workspace_root_owned = true;
-        }
+                    })?;
+                manifest.root = directory.keep().to_string_lossy().into_owned();
+                workspace_root_owned = true;
+            }
 
-        let session_id = Uuid::new_v4();
-        // A caller that named storage gets it as it stands; one that only said where to put a
-        // snapshot has it named after this session, and one that said nothing gets the snapshot
-        // that stores nothing — under the same id, so that turning storage on later does not
-        // change what the session is called.
-        let snapshot = resolve_snapshot(request.snapshot.as_ref(), &session_id.to_string())
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::SandboxConfigInvalid,
-                    OpName::Start,
-                    error.to_string(),
-                )
-                .with_cause(error)
-            })?;
-        let state = SandboxSessionState::new(UNIX_LOCAL_BACKEND_ID, snapshot, manifest)
-            .with_session_id(session_id)
-            .with_exposed_ports(options.exposed_ports().iter().copied())
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::SandboxConfigInvalid,
-                    OpName::Start,
-                    error.to_string(),
-                )
-            })?
-            .with_field(WORKSPACE_ROOT_OWNED_FIELD, workspace_root_owned);
-        Ok(self.open(state))
+            let session_id = Uuid::new_v4();
+            // A caller that named storage gets it as it stands; one that only said where to put a
+            // snapshot has it named after this session, and one that said nothing gets the snapshot
+            // that stores nothing — under the same id, so that turning storage on later does not
+            // change what the session is called.
+            let snapshot = resolve_snapshot(request.snapshot.as_ref(), &session_id.to_string())
+                .map_err(|error| {
+                    SandboxError::new(
+                        ErrorCode::SandboxConfigInvalid,
+                        OpName::Start,
+                        error.to_string(),
+                    )
+                    .with_cause(error)
+                })?;
+            let state = SandboxSessionState::new(UNIX_LOCAL_BACKEND_ID, snapshot, manifest)
+                .with_session_id(session_id)
+                .with_exposed_ports(options.exposed_ports().iter().copied())
+                .map_err(|error| {
+                    SandboxError::new(
+                        ErrorCode::SandboxConfigInvalid,
+                        OpName::Start,
+                        error.to_string(),
+                    )
+                })?
+                .with_field(WORKSPACE_ROOT_OWNED_FIELD, workspace_root_owned);
+            self.open(state)
+        }
+        .await;
+        outcome.map_err(|error| redact_for_manifest(&requested_manifest, error))
     }
 
     /// Reattaches to the workspace a state describes.
@@ -291,14 +324,19 @@ impl SandboxClient for UnixLocalSandboxClient {
     /// There is nothing to reconnect to — the directory is either still on disk or it is not — so
     /// resuming is opening a session over the same root. A workspace that is gone is recreated
     /// empty by start, and restoring its contents from the state's snapshot is the snapshot
-    /// lifecycle's job rather than this one's.
+    /// lifecycle's job rather than this one's. A failure is redacted as [`Self::create`]'s is, by
+    /// the state's manifest.
     async fn resume(&self, state: SandboxSessionState) -> SandboxResult<Box<dyn SandboxSession>> {
-        Self::assert_own_state(&state, OpName::Start)?;
-        // A state read back from storage may still be missing the authority that was stripped on
-        // the way there; it has to be rebound from a trusted manifest before it can run.
-        state.assert_path_grants_rebound()?;
-        assert_host_path_grants_unsupported(state.manifest())?;
-        Ok(self.open(state))
+        let manifest = state.manifest().clone();
+        let outcome = (|| {
+            Self::assert_own_state(&state, OpName::Start)?;
+            // A state read back from storage may still be missing the authority that was stripped
+            // on the way there; it has to be rebound from a trusted manifest before it can run.
+            state.assert_path_grants_rebound()?;
+            assert_host_path_grants_unsupported(state.manifest())?;
+            self.open(state)
+        })();
+        outcome.map_err(|error| redact_for_manifest(&manifest, error))
     }
 
     /// Removes the workspace directory, when this backend is the one that created it.

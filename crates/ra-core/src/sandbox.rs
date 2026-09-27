@@ -23,6 +23,7 @@ pub mod dependencies;
 pub mod entries;
 pub mod environment;
 pub mod error;
+pub mod events;
 pub mod files;
 pub mod manifest;
 pub mod manifest_render;
@@ -34,6 +35,7 @@ pub mod remote_mount_policy;
 pub mod resources;
 pub mod session;
 pub mod shell;
+pub mod sinks;
 pub mod snapshot;
 pub mod state;
 pub mod token_truncation;
@@ -71,6 +73,12 @@ pub use environment::{
 pub use error::{
     ApplyPatchPathReason, ErrorCategory, ErrorCode, OpName, PTY_STDIN_UNAVAILABLE_MESSAGE,
     SandboxError, SandboxErrorDetails,
+};
+pub use events::{
+    DEFAULT_MAX_STDERR_CHARS, DEFAULT_MAX_STDOUT_CHARS, EventPayloadPolicy, EventPhase,
+    SANDBOX_SESSION_EVENT_VERSION, SandboxSessionEvent, SandboxSessionEventBase,
+    SandboxSessionFinishEvent, SandboxSessionStartEvent, event_to_json_line,
+    format_event_timestamp, parse_event_timestamp, safe_decode, validate_sandbox_session_event,
 };
 pub use files::{EntryKind, FileEntry};
 pub use manifest::{
@@ -113,6 +121,7 @@ pub use session::{
     ShellInvocation, invalid_state_payload, parse_session_state_for_backend,
     render_session_state_for_storage,
 };
+pub use sinks::{DeliveryMode, EventSink, OnErrorPolicy, SinkError, undecorated_session};
 pub use snapshot::{
     LOCAL_SNAPSHOT_TYPE, NOOP_SNAPSHOT_TYPE, REMOTE_SNAPSHOT_TYPE, Snapshot, SnapshotFingerprint,
     SnapshotPathError, SnapshotSource, SnapshotSpec, builtin_snapshot_registry, resolve_snapshot,

@@ -1885,3 +1885,86 @@ async fn cancelling_during_failure_cleanup_does_not_interrupt_removal() {
     .await
     .expect("failure cleanup finished");
 }
+
+struct FailingBindSink;
+
+#[async_trait]
+impl ra_core::sandbox::EventSink for FailingBindSink {
+    fn mode(&self) -> ra_core::sandbox::DeliveryMode {
+        ra_core::sandbox::DeliveryMode::Sync
+    }
+
+    fn on_error(&self) -> ra_core::sandbox::OnErrorPolicy {
+        ra_core::sandbox::OnErrorPolicy::Raise
+    }
+
+    fn bind(&self, _session: Arc<dyn SandboxSession>) -> SandboxResult<()> {
+        Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            ra_core::sandbox::OpName::Start,
+            "binding failed with secret-key",
+        )
+        .with_context("detail", "secret-key")
+        .with_cause(std::io::Error::other("secret-key")))
+    }
+
+    async fn handle(
+        &self,
+        _event: ra_core::sandbox::SandboxSessionEvent,
+    ) -> Result<(), ra_core::sandbox::SinkError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn binding_failures_are_redacted_on_create_and_resume_and_release_acquired_resources() {
+    for resume in [false, true] {
+        for protected in [false, true] {
+            let fake = Arc::new(FakeDocker::new().with_image(IMAGE));
+            let sink: Arc<dyn ra_core::sandbox::EventSink> = Arc::new(FailingBindSink);
+            let instrumentation =
+                Arc::new(ra_sandbox::instrumentation::Instrumentation::with_sinks([
+                    sink,
+                ]));
+            let client = client(&fake).with_instrumentation(instrumentation);
+            let manifest = if protected {
+                credentialed_manifest("secret-key")
+            } else {
+                Manifest::new()
+            };
+            let result = if resume {
+                client
+                    .resume(docker_state(manifest, "missing-container"))
+                    .await
+            } else {
+                client
+                    .create(
+                        CreateRequest::new()
+                            .with_manifest(manifest)
+                            .with_options(options().to_payload()),
+                    )
+                    .await
+            };
+            let error = result.failure("sink binding failed");
+            assert_eq!(error.is_data_redacted(), protected);
+            if protected {
+                assert!(!format!("{error:?}").contains("secret-key"));
+                assert!(error.context().is_empty());
+                assert!(std::error::Error::source(&error).is_none());
+            } else {
+                assert_eq!(error.message(), "binding failed with secret-key");
+                assert!(std::error::Error::source(&error).is_some());
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if !fake.container_removals.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed acquisition is cleaned up");
+        }
+    }
+}

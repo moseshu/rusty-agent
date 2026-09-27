@@ -205,6 +205,37 @@ pub mod field {
     /// MCP server identity.
     pub const MCP_SERVER: &str = "mcp.server";
 
+    // -- sandbox session operations ----------------------------------------
+
+    /// Which backend the session belongs to, valued by its backend id (`unix_local`, `docker`).
+    pub const SANDBOX_BACKEND: &str = "sandbox.backend";
+    /// Which session operation the span covers, valued by the operation's wire name (`exec`,
+    /// `read`, `stop`).
+    pub const SANDBOX_OPERATION: &str = "sandbox.operation";
+    /// The session's id, the same UUID its audit events carry.
+    ///
+    /// The reference's span attribute is the three-part `sandbox.session.id`; this vocabulary keeps
+    /// every name to one dot, so the last two parts are joined.
+    pub const SANDBOX_SESSION_ID: &str = "sandbox.session_id";
+    /// The span id the operation's audit events carry, so a log line and an event can be matched.
+    pub const SANDBOX_AUDIT_SPAN_ID: &str = "sandbox.audit_span_id";
+    /// Whether a liveness check found the session running.
+    pub const SANDBOX_ALIVE: &str = "sandbox.alive";
+    /// A command's exit status.
+    ///
+    /// `process.exit.code` in the reference's spans, joined to one dot as above.
+    pub const PROCESS_EXIT_CODE: &str = "process.exit_code";
+    /// The host port a forwarded port resolved to.
+    pub const SERVER_PORT: &str = "server.port";
+    /// The address a forwarded port resolved to, recorded only when it is a loopback address: any
+    /// other address can name infrastructure the trace should not carry.
+    pub const SERVER_ADDRESS: &str = "server.address";
+    /// A failure's type name, where the failure has one the reference names — a sandbox operation's
+    /// error class, or `ExecNonZeroError` for a command that exited non-zero.
+    pub const ERROR_TYPE: &str = "error.type";
+    /// Whether retrying the failed operation is expected to help, when that is known.
+    pub const ERROR_RETRYABLE: &str = "error.retryable";
+
     /// The complete set. Eval and the gates use it to check that every field name is in the
     /// vocabulary.
     pub const ALL: &[&str] = &[
@@ -243,6 +274,16 @@ pub mod field {
         GUARDRAIL_TRIGGERED,
         GUARDRAIL_BEHAVIOR,
         MCP_SERVER,
+        SANDBOX_BACKEND,
+        SANDBOX_OPERATION,
+        SANDBOX_SESSION_ID,
+        SANDBOX_AUDIT_SPAN_ID,
+        SANDBOX_ALIVE,
+        PROCESS_EXIT_CODE,
+        SERVER_PORT,
+        SERVER_ADDRESS,
+        ERROR_TYPE,
+        ERROR_RETRYABLE,
     ];
 }
 

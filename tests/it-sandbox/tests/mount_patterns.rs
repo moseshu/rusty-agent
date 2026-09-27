@@ -898,6 +898,71 @@ async fn a_failed_mountpoint_command_says_nothing_about_what_it_was_given() {
     }
 }
 
+/// The event half of `test_s3_mountpoint_failure_redacts_credentials_from_errors_and_events`: the
+/// same failure, applied through an instrumented session, leaves nothing sensitive in its events.
+#[tokio::test]
+async fn a_failed_mountpoint_command_puts_nothing_it_was_given_into_the_events() {
+    use std::sync::Arc;
+
+    use ra_core::sandbox::{EventSink, SandboxSessionEvent};
+    use ra_sandbox::instrumentation::{Instrumentation, InstrumentedSession};
+    use ra_sandbox::sinks::CallbackSink;
+
+    let events: Arc<Mutex<Vec<SandboxSessionEvent>>> = Arc::default();
+    let seen = Arc::clone(&events);
+    let sink = CallbackSink::new(move |event, _session| {
+        seen.lock().expect("events").push(event);
+        Ok(())
+    });
+    let session = InstrumentedSession::new(
+        Arc::new(Recorder {
+            failing: Some("mount-s3 "),
+            failing_stderr: "bad credentials: access secret token",
+            ..Recorder::new()
+        }),
+        Some(Arc::new(Instrumentation::with_sinks([
+            Arc::new(sink) as Arc<dyn EventSink>
+        ]))),
+        None,
+    )
+    .expect("wrap");
+
+    let error = apply_pattern(
+        &MountPattern::Mountpoint(MountpointOptions::default()),
+        &session,
+        &PosixPath::new("/workspace/remote"),
+        &MountPatternConfig::Mountpoint(MountpointMountConfig {
+            session_token: Some("token".to_owned()),
+            region: Some("us-east-1".to_owned()),
+            endpoint_url: Some("https://user:inline-endpoint-secret@example.test".to_owned()),
+            read_only: false,
+            ..mountpoint("bucket", "s3_mount")
+        }),
+    )
+    .await
+    .expect_err("the mount command failed");
+    assert_eq!(error.error_code(), ErrorCode::MountFailed);
+
+    let events = events.lock().expect("events").clone();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.op() == OpName::Exec && event.as_finish().is_some_and(|f| !f.ok())),
+        "the failing mount command was recorded"
+    );
+    let serialized: Vec<String> = events
+        .iter()
+        .map(|event| serde_json::to_string(event).expect("json"))
+        .collect();
+    let serialized = serialized.join("\n");
+    for sensitive in ["access", "secret", "token", "inline-endpoint-secret"] {
+        assert!(
+            !serialized.contains(sensitive),
+            "{sensitive} in {serialized}"
+        );
+    }
+}
+
 // --- S3 Files commands -------------------------------------------------------------------------
 
 #[tokio::test]

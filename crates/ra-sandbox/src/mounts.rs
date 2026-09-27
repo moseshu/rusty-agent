@@ -32,7 +32,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use ra_core::sandbox::{
-    ErrorCode, MaterializedFile, Mount, MountStrategy, OpName, PosixPath, SandboxError,
+    ErrorCode, Manifest, MaterializedFile, Mount, MountStrategy, OpName, PosixPath, SandboxError,
     SandboxResult, SandboxSession, manifest_has_configured_mount_authority,
     mount_has_configured_authority, replace_protected_mount_error,
     validate_mount_activation_credential_boundary,
@@ -304,6 +304,18 @@ pub(crate) fn protect<T>(
             error
         }
     })
+}
+
+/// Lets a failure out of a client call, replacing it when `manifest` — the one the call was handed —
+/// carries mount authority, or when the failure was marked redacted where it was raised.
+///
+/// The reference's `@redact_mount_error_data` on a client's `create`, `resume` and `delete`.
+pub(crate) fn redact_for_manifest(manifest: &Manifest, error: SandboxError) -> SandboxError {
+    if error.is_data_redacted() || manifest_has_configured_mount_authority(manifest) {
+        replace_protected_mount_error(&error)
+    } else {
+        error
+    }
 }
 
 /// Checks the credential boundary for a mount about to be attached at `dest`.
