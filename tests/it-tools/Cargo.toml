@@ -14,6 +14,11 @@ ra-core = { path = "../../crates/ra-core" }
 ra-tools = { path = "../../crates/ra-tools" }
 ra-exec = { path = "../../crates/ra-exec" }
 ra-patch = { path = "../../crates/ra-patch" }
+# The skills tests load lazy skills from a host directory, a source that lives with the backends,
+# and read the spans the instrumented session records while probing for a loaded skill.
+ra-sandbox = { path = "../../crates/ra-sandbox" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The custom-tool tests go through the runtime's dispatch, which owns how a failure is reported.
 ra-runtime = { path = "../../crates/ra-runtime" }
 base64 = "0.22"

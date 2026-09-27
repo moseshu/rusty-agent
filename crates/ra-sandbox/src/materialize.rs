@@ -39,13 +39,13 @@ use futures::future::BoxFuture;
 use ra_core::sandbox::{
     Entry, EntryContent, EntryOwner, ExecRequest, ExecResult, Manifest, MaterializationResult,
     MaterializedFile, PosixPath, SandboxConcurrencyLimits, SandboxError, SandboxResult,
-    SandboxSession, ShellInvocation, resolve_workspace_path,
+    SandboxSession, ShellInvocation, User, resolve_workspace_path,
 };
 
-mod errors;
+pub(crate) mod errors;
 mod gather;
 mod git;
-mod local;
+pub(crate) mod local;
 
 use errors::{local_file_read, unsupported_entry};
 use gather::gather_in_order;
@@ -337,7 +337,7 @@ impl ManifestApplier {
                 }
                 EntryContent::LocalFile { src } => self.apply_local_file(src, &dest).await?,
                 EntryContent::LocalDir { src } => {
-                    self.apply_local_dir(src.as_deref(), &dest).await?
+                    self.apply_local_dir(src.as_deref(), &dest, None).await?
                 }
                 EntryContent::GitRepo {
                     host,
@@ -424,26 +424,63 @@ impl ManifestApplier {
         Ok(vec![MaterializedFile::new(dest.clone(), sha256)])
     }
 
+    /// Copies a host directory entry into the workspace as `user`.
+    ///
+    /// The reference's `LocalDir.apply(..., user=...)`, the one entry type it materializes on behalf
+    /// of a user: every directory and file is created as that user, and the entry's own group and
+    /// permissions are applied only when there is none — a user who cannot `chgrp` or `chmod` what
+    /// it was just handed would otherwise fail a copy that succeeded. `user` of `None` is the same
+    /// as materializing the entry as part of a manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ra_core::sandbox::ErrorCode::LocalDirReadError`] for a source that cannot be
+    /// read, a refusal for an entry that is not a host directory, and the session's failure to
+    /// write.
+    pub async fn apply_local_dir_as(
+        &self,
+        entry: &Entry,
+        dest: &PosixPath,
+        user: Option<&User>,
+    ) -> SandboxResult<Vec<MaterializedFile>> {
+        let EntryContent::LocalDir { src } = entry.content() else {
+            return Err(unsupported_entry(
+                entry.entry_type(),
+                "only a host directory is materialized on behalf of a user",
+            ));
+        };
+        let written = self.apply_local_dir(src.as_deref(), dest, user).await?;
+        if user.is_none() {
+            self.apply_metadata(entry, dest).await?;
+        }
+        Ok(written)
+    }
+
     /// Copies one host directory into the workspace, or just creates the directory.
     async fn apply_local_dir(
         &self,
         src: Option<&str>,
         dest: &PosixPath,
+        user: Option<&User>,
     ) -> SandboxResult<Vec<MaterializedFile>> {
         let Some(src) = src else {
-            self.session.mkdir(dest.as_str(), true, None).await?;
+            self.session
+                .mkdir(dest.as_str(), true, user.cloned())
+                .await?;
             return Ok(Vec::new());
         };
 
         let grants = self.session.state().manifest().extra_path_grants.clone();
         let source = LocalSource::new(&self.base_dir, Path::new(src), &grants);
         let src_root = source.resolve_root()?;
-        self.session.mkdir(dest.as_str(), true, None).await?;
+        self.session
+            .mkdir(dest.as_str(), true, user.cloned())
+            .await?;
 
         let children = source.list_files(&src_root)?;
         let tasks = children
             .iter()
-            .map(|child| self.copy_one(&source, &src_root, child, dest))
+            .map(|child| self.copy_one(&source, &src_root, child, dest, user))
             .collect();
         gather_in_order(tasks, self.limits.local_dir_files()).await
     }
@@ -455,14 +492,19 @@ impl ManifestApplier {
         src_root: &Path,
         rel_child: &Path,
         dest_root: &PosixPath,
+        user: Option<&User>,
     ) -> SandboxResult<MaterializedFile> {
         let child_dest = dest_root.join(&rel_child.to_string_lossy());
         let file = source.open_file(src_root, rel_child)?;
         let (bytes, sha256) = local::read_and_hash(file, &src_root.join(rel_child))?;
         if let Some(parent) = parent_path(&child_dest) {
-            self.session.mkdir(parent.as_str(), true, None).await?;
+            self.session
+                .mkdir(parent.as_str(), true, user.cloned())
+                .await?;
         }
-        self.session.write(child_dest.as_str(), bytes, None).await?;
+        self.session
+            .write(child_dest.as_str(), bytes, user.cloned())
+            .await?;
         Ok(MaterializedFile::new(child_dest, sha256))
     }
 

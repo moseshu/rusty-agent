@@ -25,6 +25,7 @@ pub mod compaction;
 pub mod filesystem;
 pub mod shell;
 pub mod shell_tool;
+pub mod skills;
 pub mod view_image;
 
 use std::sync::Arc;

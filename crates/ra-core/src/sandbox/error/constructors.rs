@@ -277,6 +277,17 @@ impl SandboxError {
             .with_retryable(Some(false))
     }
 
+    /// Constructs an invalid skills configuration failure.
+    ///
+    /// The reference's `SkillsConfigError`: raised while the skills capability checks what it was
+    /// given, edits a manifest, renders its index or loads a lazy skill, and always recorded against
+    /// `materialize`, as the reference records it.
+    #[must_use]
+    pub fn skills_config(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::SkillsConfigInvalid, OpName::Materialize, message)
+            .with_retryable(Some(false))
+    }
+
     /// Constructs a failure for a mount whose tool is not installed in the sandbox.
     #[must_use]
     pub fn mount_tool_missing(tool: &str) -> Self {

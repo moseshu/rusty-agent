@@ -308,6 +308,21 @@ impl Entry {
         self
     }
 
+    /// Copies from a different host source, keeping everything else the entry declared.
+    ///
+    /// Ignored by content that is not copied from the host. The reference makes the same change by
+    /// copying the entry with a new `src`, which is how the lazy skills source materializes one
+    /// skill with the permissions and group its configured directory carries.
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        match &mut self.content {
+            EntryContent::LocalFile { src } => *src = source.into(),
+            EntryContent::LocalDir { src } => *src = Some(source.into()),
+            _ => {}
+        }
+        self
+    }
+
     /// Declares one entry inside this directory.
     ///
     /// Ignored by content that is not a directory: a file has nowhere to put a child, and inventing
