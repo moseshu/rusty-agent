@@ -362,7 +362,10 @@ impl SandboxSession for Backend {
 async fn the_workspace_probe_runs_before_the_workspace_is_prepared() {
     // Afterwards a directory this start created is indistinguishable from one a previous session
     // left behind, and every resume decision below reads that answer.
-    let session = Backend::with_answers(Answers::default());
+    let session = Backend::with_answers(Answers {
+        workspace_preserved: true,
+        ..Answers::default()
+    });
 
     session.start().await.expect("start");
 
@@ -382,6 +385,68 @@ async fn the_workspace_probe_runs_before_the_workspace_is_prepared() {
 }
 
 #[tokio::test]
+async fn a_backend_that_kept_nothing_is_not_probed() {
+    // Only a backend that says its workspace survived has anything a probe could prove; for any
+    // other, a directory that happens to be there is not a workspace this session can reuse.
+    let session = Backend::with_answers(Answers {
+        probe_finds_workspace: true,
+        ..Answers::default()
+    });
+
+    session.start().await.expect("start");
+
+    let transcript = session.transcript();
+    assert!(
+        !transcript.contains(&"probe_workspace_root"),
+        "{transcript:?}"
+    );
+    assert!(transcript.contains(&"apply_manifest"), "{transcript:?}");
+}
+
+#[tokio::test]
+async fn a_root_an_earlier_start_recorded_is_not_probed_again() {
+    let session = Backend::with_answers(Answers {
+        workspace_preserved: true,
+        state_root_ready: true,
+        ..Answers::default()
+    });
+
+    session.start().await.expect("start");
+
+    let transcript = session.transcript();
+    assert!(
+        !transcript.contains(&"probe_workspace_root"),
+        "{transcript:?}"
+    );
+    assert!(
+        transcript.contains(&"reapply_ephemeral_manifest"),
+        "{transcript:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_root_the_probe_proves_is_recorded_before_anything_is_prepared() {
+    // Written down as soon as it is proven, as the reference writes it, rather than only when the
+    // whole start has succeeded.
+    let session = Backend::with_answers(Answers {
+        workspace_preserved: true,
+        probe_finds_workspace: true,
+        ..Answers::default()
+    });
+
+    session.start().await.expect("start");
+
+    assert_eq!(
+        &session.transcript()[..3],
+        [
+            "probe_workspace_root",
+            "record_workspace_root_ready",
+            "prepare_backend_workspace"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_fresh_start_materializes_the_whole_manifest() {
     let session = Backend::with_answers(Answers::default());
 
@@ -390,7 +455,6 @@ async fn a_fresh_start_materializes_the_whole_manifest() {
     assert_eq!(
         session.transcript(),
         [
-            "probe_workspace_root",
             "prepare_backend_workspace",
             "ensure_runtime_helpers",
             "snapshot_restorable",

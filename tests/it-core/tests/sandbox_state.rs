@@ -407,6 +407,71 @@ fn host_backed_grant() -> SandboxPathGrant {
         .read_only(true)
 }
 
+/// `test_snapshot.py::test_sandbox_session_state_roundtrip_preserves_custom_snapshot_type`: a
+/// snapshot type the host registered comes back as that type, with the fingerprint beside it.
+#[test]
+fn a_host_snapshot_type_and_its_fingerprint_survive_the_trip_through_a_state() {
+    let mut snapshots = builtin_snapshot_registry();
+    snapshots
+        .register("test-noop", "TestNoopSnapshot")
+        .expect("register");
+    let original = SandboxSessionState::new(
+        "stub",
+        Snapshot::new("test-noop", "custom-snapshot"),
+        Manifest::new(),
+    )
+    .with_snapshot_fingerprint("deadbeef", "workspace_tar_sha256_v1");
+
+    let restored = SandboxSessionState::parse(
+        serde_json::from_str(
+            &serde_json::to_string(&original.to_json().expect("persistable")).expect("render"),
+        )
+        .expect("read"),
+        &snapshots,
+        &ManifestRegistries::builtin(),
+    )
+    .expect("parse");
+
+    assert_eq!(restored.snapshot().snapshot_type(), "test-noop");
+    assert_eq!(restored.snapshot().id(), "custom-snapshot");
+    assert_eq!(
+        restored.snapshot_fingerprint(),
+        Some(("deadbeef", "workspace_tar_sha256_v1"))
+    );
+}
+
+/// `test_snapshot.py::test_remote_snapshot_serializes_through_session_state_without_dependencies`:
+/// a remote snapshot is written as its three fields and nothing about the client it resolves to.
+#[test]
+fn a_remote_snapshot_travels_in_a_state_as_its_key_alone() {
+    let original = SandboxSessionState::new(
+        "stub",
+        Snapshot::remote("snap-123", "tests.remote_snapshot_client"),
+        Manifest::new().with_root("/workspace"),
+    );
+
+    let rendered = original.to_json().expect("persistable");
+    assert_eq!(
+        rendered["snapshot"],
+        json!({
+            "type": "remote",
+            "id": "snap-123",
+            "client_dependency_key": "tests.remote_snapshot_client",
+        })
+    );
+
+    let restored = parse(rendered).expect("parse");
+    assert_eq!(restored.snapshot().id(), "snap-123");
+    assert_eq!(
+        restored.snapshot().remote_client_dependency_key(),
+        Some("tests.remote_snapshot_client")
+    );
+    assert_eq!(
+        restored.snapshot(),
+        &Snapshot::remote("snap-123", "tests.remote_snapshot_client")
+    );
+}
+
 #[test]
 fn parse_rejects_invalid_payloads() {
     assert_eq!(

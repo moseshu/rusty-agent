@@ -309,3 +309,65 @@ async fn an_archive_path_outside_the_workspace_is_refused_before_anything_is_wri
         error.message()
     );
 }
+
+/// A limit on members only, the others off.
+fn members_only(max_members: Option<usize>) -> ra_core::sandbox::SandboxArchiveLimits {
+    ra_core::sandbox::SandboxArchiveLimits::new()
+        .with_max_input_bytes(None)
+        .and_then(|limits| limits.with_max_extracted_bytes(None))
+        .and_then(|limits| limits.with_max_members(max_members))
+        .expect("limits")
+}
+
+/// `test_extract_uses_session_default_archive_limits`,
+/// `test_extract_archive_limits_per_call_override_session_default` and
+/// `test_extract_archive_limits_object_with_all_none_overrides_session_default`: the session's limits
+/// apply to a call that names none, and a call that names its own — even ones that limit nothing —
+/// replaces them rather than being combined with them.
+#[tokio::test]
+async fn the_sessions_limits_apply_unless_the_call_names_its_own() {
+    let workspace = tempfile::tempdir().expect("temp");
+    let session = UnixLocalSandboxClient::new()
+        .create(CreateRequest::new().with_manifest(manifest_at(workspace.path())))
+        .await
+        .expect("create");
+    session.set_archive_limits(Some(members_only(Some(1))));
+    session.start().await.expect("start");
+
+    let error = session
+        .extract("default/bundle.tar", bundle(), None, None)
+        .await
+        .expect_err("the session allows one member");
+    let context = |key: &str| error.context().get(key).cloned();
+    assert_eq!(
+        context("reason"),
+        Some(serde_json::json!("archive member count exceeds limit"))
+    );
+    assert_eq!(context("limit"), Some(serde_json::json!(1)));
+    assert_eq!(context("actual"), Some(serde_json::json!(2)));
+
+    session
+        .extract(
+            "wider/bundle.tar",
+            bundle(),
+            None,
+            Some(members_only(Some(3))),
+        )
+        .await
+        .expect("the call allows three");
+    session
+        .extract(
+            "unlimited/bundle.tar",
+            bundle(),
+            None,
+            Some(members_only(None)),
+        )
+        .await
+        .expect("the call allows any number");
+    for directory in ["wider", "unlimited"] {
+        assert_eq!(
+            std::fs::read(workspace.path().join(directory).join("README.md")).expect("read"),
+            b"# bundle"
+        );
+    }
+}

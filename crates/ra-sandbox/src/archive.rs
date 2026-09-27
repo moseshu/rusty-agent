@@ -27,6 +27,8 @@ use ra_core::sandbox::{
 };
 use zip::read::HasZipMetadata;
 
+use crate::tar_utils::windows_drive;
+
 /// Unpacks archives into one session's workspace.
 pub struct WorkspaceArchiveExtractor<'a> {
     session: &'a dyn SandboxSession,
@@ -752,15 +754,6 @@ impl From<tar::EntryType> for MemberKind {
             Self::Other
         }
     }
-}
-
-/// Whether a member name starts with a Windows drive, which names a filesystem of its own.
-pub(crate) fn windows_drive(name: &str) -> bool {
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
-        && characters.next() == Some(':')
 }
 
 /// The metadata used to validate one original central-directory record.

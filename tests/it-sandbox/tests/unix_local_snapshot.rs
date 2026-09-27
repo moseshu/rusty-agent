@@ -141,12 +141,14 @@ async fn a_stop_stores_the_workspace_whether_or_not_it_could_hash_it() {
             assert_eq!(version, SNAPSHOT_FINGERPRINT_VERSION);
         }
         None => {
+            // A write, not only a `mkdir -p`: other tests install the helper from outside the
+            // fence, and creating a directory that already exists writes nothing.
             let helper_root_writable = session
                 .exec(
                     ExecRequest::new(vec![
                         "sh".to_owned(),
                         "-c".to_owned(),
-                        "mkdir -p /tmp/rusty-agent/bin".to_owned(),
+                        "mkdir -p /tmp/rusty-agent/bin && probe=$(mktemp /tmp/rusty-agent/bin/.probe.XXXXXX) && rm -f \"$probe\"".to_owned(),
                     ])
                     .with_shell(ShellInvocation::None),
                 )
