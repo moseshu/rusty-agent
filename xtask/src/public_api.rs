@@ -39,6 +39,56 @@ const TRACKED: &[&str] = &[
     "ra-tools",
 ];
 
+/// Accepts the current items the `fragments` name into their crates' baselines, and nothing else.
+///
+/// The reviewed alternative to `--bless`, which accepts every pending change at once: see
+/// [`xtask::baseline_policy`]. A crate with no baseline yet is left alone — accepting a few of its
+/// items would turn the rest of its surface into pending additions nobody asked to review — and a
+/// fragment that names nothing to reconcile fails the command.
+pub(crate) fn accept(fragments: &[String]) -> Outcome {
+    let fragments: Vec<&str> = fragments.iter().map(String::as_str).collect();
+    let mut changed = Vec::new();
+    let mut report = Vec::new();
+    let mut violations = Vec::new();
+    for name in TRACKED {
+        let Some(baseline) = api::read_baseline(name) else {
+            continue;
+        };
+        let items = match api::snapshot(name) {
+            Ok(items) => items,
+            Err(err) => {
+                violations.push(format!("{name}：{err}"));
+                continue;
+            }
+        };
+        let accepted = xtask::baseline_policy::accept(&baseline, &items, &fragments);
+        if accepted.added.is_empty() && accepted.removed.is_empty() {
+            continue;
+        }
+        if let Err(err) = api::write_baseline(name, &accepted.baseline) {
+            violations.push(format!("{name}：写基线失败 {err}"));
+            continue;
+        }
+        for item in &accepted.added {
+            report.push(format!("{name} + {item}"));
+        }
+        for item in &accepted.removed {
+            report.push(format!("{name} - {item}"));
+        }
+        changed.extend(accepted.added);
+        changed.extend(accepted.removed);
+    }
+    for fragment in xtask::baseline_policy::unused_fragments(&fragments, &changed) {
+        violations.push(format!(
+            "`{fragment}` 没有匹配到任何待定的公开项（有基线的 crate 中）——拼写或已接受？"
+        ));
+    }
+    for line in &report {
+        println!("  {line}");
+    }
+    Outcome::from_violations(violations, format!("已接受 {} 项", report.len()))
+}
+
 /// Runs the gate. When `bless` is true it rewrites the baseline instead of reconciling.
 pub(crate) fn run(bless: bool) -> Outcome {
     // The extension-safety and stability-grade halves would still run against the source alone, but
