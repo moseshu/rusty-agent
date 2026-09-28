@@ -2,7 +2,8 @@
 //!
 //! Ported from the reference's `sandbox/runtime.py`. One of these exists per run. It holds the
 //! session manager and a cache of prepared agents, so a sandbox agent is assembled once per session
-//! rather than once per turn.
+//! rather than once per turn, and it records the run for sandbox memory when the agent it last
+//! prepared generates memory.
 
 use std::{
     collections::BTreeMap,
@@ -14,8 +15,9 @@ use ra_core::{
     agent::{AgentId, AgentSpec},
     capability::{Capability, ContextProcessor, SamplingContext, SandboxBinding},
     error::{Error, Result},
+    item::{ModelInputItem, RunItem},
     model::ModelResolver,
-    sandbox::{SandboxSession, SandboxWorkspaceScope},
+    sandbox::{SandboxMemory, SandboxSession, SandboxWorkspaceScope},
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, oneshot, watch};
@@ -23,9 +25,14 @@ use tracing::{Instrument, warn};
 
 use crate::agent::AgentBinding;
 use crate::capability::CapabilityContextProcessor;
+use crate::runner::RunResult;
 
 use super::{
     SandboxRunConfig,
+    memory::{
+        manager::{SandboxMemoryGenerationManager, get_or_create_memory_generation_manager},
+        rollouts::{build_rollout_payload, terminal_metadata_for_error},
+    },
     preparation::{bind_capabilities, prepare_sandbox_agent, validate_workspace_scope},
     session_manager::SessionManager,
 };
@@ -45,6 +52,14 @@ struct PreparedAgent {
 struct Inner {
     manager: SessionManager,
     prepared: BTreeMap<AgentId, PreparedAgent>,
+    /// The session of the agent prepared last, the reference's `current_session`.
+    current_session: Option<Arc<dyn SandboxSession>>,
+}
+
+/// What a failed run got through, for sandbox memory.
+struct FailedSegment {
+    input: Vec<ModelInputItem>,
+    items: Vec<RunItem>,
 }
 
 /// Sandbox execution for one run.
@@ -55,12 +70,29 @@ pub(crate) struct SandboxRuntime {
     inner: Option<Mutex<Inner>>,
     /// Set once cleanup has started; turns `true` when it has finished.
     cleanup_done: StdMutex<Option<watch::Receiver<bool>>>,
+    /// Resolves the models of sandbox memory's own runs.
+    model_resolver: Arc<dyn ModelResolver>,
+    /// The rollout this run's segment is recorded under; `None` without a sandbox configuration.
+    rollout_id: Option<String>,
+    /// The memory capability of the agent prepared last, the reference's
+    /// `_active_memory_capability`.
+    active_memory: StdMutex<Option<SandboxMemory>>,
+    /// Set by the runner when the run fails after its turns started.
+    failed_segment: StdMutex<Option<FailedSegment>>,
 }
 
 impl SandboxRuntime {
     /// Sandbox execution for a run configured with `config`, continued from `resumed` if the run's
     /// checkpoint carried a resume payload.
-    pub(crate) fn new(config: Option<SandboxRunConfig>, resumed: Option<Value>) -> Self {
+    ///
+    /// `model_resolver` resolves the models sandbox memory runs with, and `rollout_id` names the
+    /// rollout the run is recorded under.
+    pub(crate) fn new(
+        config: Option<SandboxRunConfig>,
+        resumed: Option<Value>,
+        model_resolver: Arc<dyn ModelResolver>,
+        rollout_id: Option<String>,
+    ) -> Self {
         let workspace_scope = SandboxWorkspaceScope::from_cwd(
             config
                 .as_ref()
@@ -76,9 +108,14 @@ impl SandboxRuntime {
                 Mutex::new(Inner {
                     manager: SessionManager::new(config, resumed),
                     prepared: BTreeMap::new(),
+                    current_session: None,
                 })
             }),
             cleanup_done: StdMutex::new(None),
+            model_resolver,
+            rollout_id,
+            active_memory: StdMutex::new(None),
+            failed_segment: StdMutex::new(None),
         }
     }
 
@@ -114,6 +151,14 @@ impl SandboxRuntime {
     ) -> Result<AgentBinding> {
         let public = agent.public();
         self.assert_agent_supported(public)?;
+        // For every agent, a sandbox agent or not: a handoff to an agent without memory stops the
+        // run being recorded, and one to an agent with memory starts it.
+        *lock(&self.active_memory) = public.sandbox().and_then(|sandbox| {
+            sandbox
+                .capabilities()
+                .iter()
+                .find_map(|capability| capability.sandbox_memory())
+        });
         let (Some(sandbox), Some(inner)) = (public.sandbox(), &self.inner) else {
             return Ok(agent.clone());
         };
@@ -122,6 +167,7 @@ impl SandboxRuntime {
             let mut inner = inner.lock().await;
             inner.manager.acquire_agent(public, sandbox)?;
             let session = inner.manager.ensure_session(public, sandbox).await?;
+            inner.current_session = Some(Arc::clone(&session));
             validate_workspace_scope(session.as_ref(), &self.workspace_scope, sandbox.run_as())
                 .await?;
 
@@ -208,6 +254,74 @@ impl SandboxRuntime {
             .unwrap_or_default()
     }
 
+    /// Records the segment a failed run got through, for [`Self::enqueue_memory_failure`].
+    pub(crate) fn record_failed_segment(&self, input: &[ModelInputItem], items: &[RunItem]) {
+        *lock(&self.failed_segment) = Some(FailedSegment {
+            input: input.to_vec(),
+            items: items.to_vec(),
+        });
+    }
+
+    /// Records a finished run as a segment of its rollout, when the agent prepared last generates
+    /// memory.
+    ///
+    /// The reference's `enqueue_memory_result`, with the run's input as the segment's input.
+    pub(crate) async fn enqueue_memory_result(&self, result: &RunResult) -> Result<()> {
+        let (Some(manager), Some(rollout_id)) =
+            (self.memory_generation_manager().await?, &self.rollout_id)
+        else {
+            return Ok(());
+        };
+        manager.enqueue_result(result, None, rollout_id).await
+    }
+
+    /// Records a failed run as a segment of its rollout, when the agent prepared last generates
+    /// memory: the records it got through, and how it failed.
+    ///
+    /// The reference's `enqueue_memory_payload` as its runner calls it for an exception. A run that
+    /// failed before its turns started has no records, and approvals a failed turn was waiting on
+    /// are not recorded.
+    pub(crate) async fn enqueue_memory_failure(&self, error: &Error) -> Result<()> {
+        let (Some(manager), Some(rollout_id)) =
+            (self.memory_generation_manager().await?, &self.rollout_id)
+        else {
+            return Ok(());
+        };
+        let segment = lock(&self.failed_segment).take();
+        let (input, items) = segment.map_or_else(
+            || (Vec::new(), Vec::new()),
+            |segment| (segment.input, segment.items),
+        );
+        let payload = build_rollout_payload(
+            &input,
+            &items,
+            None,
+            &[],
+            terminal_metadata_for_error(error),
+        );
+        manager.enqueue_rollout_payload(payload, rollout_id).await
+    }
+
+    /// The generation manager of the current session and the active memory, if that memory
+    /// generates.
+    async fn memory_generation_manager(
+        &self,
+    ) -> Result<Option<Arc<SandboxMemoryGenerationManager>>> {
+        let Some(memory) = lock(&self.active_memory)
+            .clone()
+            .filter(|memory| memory.generate().is_some())
+        else {
+            return Ok(None);
+        };
+        let Some(inner) = &self.inner else {
+            return Ok(None);
+        };
+        let Some(session) = inner.lock().await.current_session.clone() else {
+            return Ok(None);
+        };
+        get_or_create_memory_generation_manager(&session, &memory, &self.model_resolver).map(Some)
+    }
+
     /// Cleans up the sessions the run owns and returns what resumes them.
     ///
     /// `Ok(None)` for a run whose sandbox configuration borrowed its session. Not called for a run
@@ -289,6 +403,7 @@ impl SandboxRuntime {
             None => inner.manager.cleanup().await,
         };
         inner.prepared.clear();
+        inner.current_session = None;
         result
     }
 }

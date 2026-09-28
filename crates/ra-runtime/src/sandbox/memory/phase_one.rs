@@ -1,19 +1,29 @@
 //! Phase one: extracting one rollout into a raw memory and a rollout summary.
 //!
-//! A port of the pure half of the reference's `sandbox/memory/phase_one.py` and
-//! `sandbox/memory/interface.py`: the structured output the extraction model returns, the prompt it
-//! is given, and the checks on what it returns. Running the extraction belongs with the generation
-//! manager.
+//! A port of the reference's `sandbox/memory/phase_one.py` and `sandbox/memory/interface.py`: the
+//! structured output the extraction model returns, the prompt it is given, the checks on what it
+//! returns, and the extraction run itself.
 
 use ra_core::{
     error::{Error, Result},
-    sandbox::token_truncation::{TruncationPolicy, truncate_text},
+    output::OutputSchema,
+    sandbox::{
+        MemoryGenerateConfig,
+        token_truncation::{TruncationPolicy, truncate_text},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::agents::{MemoryRunConfig, PhaseAgent};
 use super::json::{dumps_indented_tight, python_repr, python_strip};
-use super::prompts::render_rollout_extraction_user_prompt;
+use super::prompts::{render_rollout_extraction_prompt, render_rollout_extraction_user_prompt};
+
+/// The extraction agent's name.
+pub const PHASE_ONE_AGENT_NAME: &str = "sandbox-memory-phase-one";
+
+/// The turn cap an extraction runs under: the reference leaves it at its runner's default.
+pub const PHASE_ONE_MAX_TURNS: u32 = 10;
 
 /// The most tokens of a rollout phase one's prompt carries.
 pub const PHASE_ONE_ROLLOUT_TOKEN_LIMIT: i64 = 150_000;
@@ -241,4 +251,47 @@ pub fn validate_rollout_artifacts(artifacts: &RolloutExtractionArtifacts) -> Res
         ));
     }
     Ok(true)
+}
+
+/// Runs the extraction agent on `prompt` and reads its structured output.
+///
+/// The reference's `run_phase_one`: the agent's instructions are the extraction prompt with the
+/// developer's guidance, and its output is [`RolloutExtractionArtifacts`] under the strict schema.
+/// Only a run that concluded on its own is read; an error handler's closeout is not the agent's
+/// answer.
+///
+/// # Errors
+///
+/// Returns the extraction run's failure, a configuration error naming how it stopped when it did
+/// not conclude, and one when it delivered no answer or one that is not the artifacts.
+pub async fn run_phase_one(
+    config: &MemoryGenerateConfig,
+    prompt: String,
+    run: &MemoryRunConfig,
+) -> Result<RolloutExtractionArtifacts> {
+    let result = run
+        .run(
+            PhaseAgent {
+                name: PHASE_ONE_AGENT_NAME,
+                instructions: Some(render_rollout_extraction_prompt(config.extra_prompt())),
+                model: config.phase_one_model(),
+                model_settings: config.phase_one_model_settings(),
+                output_schema: Some(OutputSchema::json_schema(
+                    ROLLOUT_EXTRACTION_ARTIFACTS_NAME,
+                    rollout_extraction_artifacts_json_schema(),
+                )),
+                max_turns: Some(PHASE_ONE_MAX_TURNS),
+            },
+            prompt,
+        )
+        .await?;
+    let Some(message) = result.final_message() else {
+        return Err(Error::config(
+            "Phase 1 did not return rollout extraction artifacts.",
+        ));
+    };
+    serde_json::from_str(&message.text_content()).map_err(|error| {
+        Error::config("Phase 1 returned output that is not rollout extraction artifacts.")
+            .with_source(error)
+    })
 }

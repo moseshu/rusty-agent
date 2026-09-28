@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use super::json::{dumps_indented, python_strip, utc_isoformat};
+use super::json::{dumps_indented, python_strip, python_truthy_str, utc_isoformat};
 
 /// One raw memory as consolidation selects it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -104,17 +104,7 @@ impl PhaseTwoSelectionItem {
 
 /// `str(value or "").strip()` for a JSON value.
 fn python_str_or_empty(value: Option<&Value>) -> String {
-    let text = match value {
-        None | Some(Value::Null | Value::Bool(false)) => String::new(),
-        Some(Value::Bool(true)) => "True".to_owned(),
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Number(number)) if number.as_f64() == Some(0.0) => String::new(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Array(items)) if items.is_empty() => String::new(),
-        Some(Value::Object(fields)) if fields.is_empty() => String::new(),
-        Some(other) => other.to_string(),
-    };
-    python_strip(&text).to_owned()
+    python_strip(&value.and_then(python_truthy_str).unwrap_or_default()).to_owned()
 }
 
 /// What one consolidation is given, and how it differs from the last successful one.

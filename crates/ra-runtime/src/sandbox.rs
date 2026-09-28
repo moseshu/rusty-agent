@@ -6,7 +6,9 @@
 //! the [`SandboxRunConfig`] on its run configuration. Before each of a sandbox agent's turns the
 //! runner prepares it — creating, resuming or borrowing its session, binding its capabilities to
 //! that session, and assembling the prompt that describes the workspace — and when the run ends it
-//! cleans up the sessions it owns and records what resumes them in the run's checkpoint.
+//! cleans up the sessions it owns and records what resumes them in the run's checkpoint. When the
+//! agent it prepared last carries a generating memory capability, the run is also recorded for
+//! [`memory`] generation before that cleanup.
 //!
 //! **Boundary**: this module names sandbox clients and sessions only through the protocol in
 //! `ra-core`. No backend lives here; a host constructs one from a service crate and hands it in.
@@ -15,10 +17,10 @@
 //!
 //! - A capability's context processing is not run for a sandbox agent's turns, and capabilities are
 //!   not told the resolved model name when they adjust sampling settings.
-//! - The reference's memory hooks and the instrumentation wrapper around sessions are not here, so
-//!   a session's own start, stop and shutdown carry no spans of their own. A failure that may quote
-//!   mount authority is replaced where the runtime calls into a session — preparing it, cleaning
-//!   it up — rather than by a wrapper around every session call.
+//! - The instrumentation wrapper around sessions is not here, so a session's own start, stop and
+//!   shutdown carry no spans of their own. A failure that may quote mount authority is replaced
+//!   where the runtime calls into a session — preparing it, cleaning it up — rather than by a
+//!   wrapper around every session call.
 //! - The runner's cleanup error is logged rather than surfaced, as on the reference, and a
 //!   streamed run's live session is not exposed while the stream is running.
 

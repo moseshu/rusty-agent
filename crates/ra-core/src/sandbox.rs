@@ -98,7 +98,7 @@ pub use materialization::{
 pub use memory::{
     DEFAULT_MAX_RAW_MEMORIES_FOR_CONSOLIDATION, DEFAULT_MEMORIES_DIR, DEFAULT_PHASE_ONE_MODEL,
     DEFAULT_PHASE_TWO_MODEL, DEFAULT_SESSIONS_DIR, MAX_RAW_MEMORIES_FOR_CONSOLIDATION_LIMIT,
-    MemoryGenerateConfig, MemoryLayoutConfig, MemoryModel, MemoryReadConfig,
+    MemoryGenerateConfig, MemoryLayoutConfig, MemoryModel, MemoryReadConfig, SandboxMemory,
 };
 pub use mount_security::{
     CREDENTIALLESS_MOUNT_AUTHORITY_KEY, InvalidRawManifest, InvalidRunStateSandbox,

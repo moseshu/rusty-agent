@@ -87,7 +87,9 @@ use crate::{
     item::{Compaction, ItemId, ModelInputItem, ModelResponse, RunItem},
     model::{ModelOutputSchema, ModelSettings, ProviderKey},
     prompt::{PromptSection, PromptSectionName, PromptSource},
-    sandbox::{Manifest, SandboxResult, SandboxSession, SandboxWorkspaceScope, User},
+    sandbox::{
+        Manifest, SandboxMemory, SandboxResult, SandboxSession, SandboxWorkspaceScope, User,
+    },
     state::{AgentToolUse, RunId, ToolUse},
     tool::{Tool, ToolLookupKey},
     usage::Usage,
@@ -515,6 +517,16 @@ pub trait Capability: Send + Sync + 'static {
     fn bind_sandbox(&self, binding: &SandboxBinding) -> Result<Option<Arc<dyn Capability>>> {
         let _ = binding;
         Ok(None)
+    }
+
+    /// The sandbox memory this capability configures, when it is the sandbox memory capability.
+    ///
+    /// The reference's runtime finds that capability on a sandbox agent by its class and reads its
+    /// layout and generation configuration from it. The runtime here cannot name a capability's
+    /// type, so the capability answers this instead. Every other capability answers `None`, the
+    /// default.
+    fn sandbox_memory(&self) -> Option<SandboxMemory> {
+        None
     }
 }
 

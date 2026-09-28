@@ -32,6 +32,7 @@ use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
+use crate::capability::Capability;
 use crate::error::{Error, Result};
 use crate::model::{Effort, Model, ModelSettings};
 use crate::sandbox::PosixPath;
@@ -456,5 +457,73 @@ impl<'de> Deserialize<'de> for MemoryGenerateConfig {
                 .or(defaults.phase_two_model_settings),
             extra_prompt: fields.extra_prompt,
         })
+    }
+}
+
+/// What the sandbox memory capability tells the runtime about the memory it configures.
+///
+/// The reference's runtime reads the `Memory` capability it finds on a sandbox agent directly; here
+/// the capability hands this over through
+/// [`Capability::sandbox_memory`]. Besides the layout and generation configuration it carries the
+/// capabilities the extraction and consolidation agents run with: the reference builds those
+/// agents as sandbox agents, which get its default capability set, and that set lives with the
+/// capabilities rather than with the runtime that runs them.
+#[derive(Clone)]
+pub struct SandboxMemory {
+    layout: MemoryLayoutConfig,
+    generate: Option<MemoryGenerateConfig>,
+    phase_capabilities: Vec<Arc<dyn Capability>>,
+}
+
+impl SandboxMemory {
+    /// Memory kept where `layout` says, generated as `generate` says or not at all when `None`,
+    /// with extraction and consolidation running on `phase_capabilities`.
+    #[must_use]
+    pub fn new(
+        layout: MemoryLayoutConfig,
+        generate: Option<MemoryGenerateConfig>,
+        phase_capabilities: Vec<Arc<dyn Capability>>,
+    ) -> Self {
+        Self {
+            layout,
+            generate,
+            phase_capabilities,
+        }
+    }
+
+    /// Where memory files are kept.
+    #[must_use]
+    pub const fn layout(&self) -> &MemoryLayoutConfig {
+        &self.layout
+    }
+
+    /// How memory is generated, or `None` when it is not.
+    #[must_use]
+    pub const fn generate(&self) -> Option<&MemoryGenerateConfig> {
+        self.generate.as_ref()
+    }
+
+    /// The capabilities the extraction and consolidation agents run with.
+    #[must_use]
+    pub fn phase_capabilities(&self) -> &[Arc<dyn Capability>] {
+        &self.phase_capabilities
+    }
+}
+
+impl fmt::Debug for SandboxMemory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxMemory")
+            .field("layout", &self.layout)
+            .field("generate", &self.generate)
+            .field(
+                "phase_capabilities",
+                &self
+                    .phase_capabilities
+                    .iter()
+                    .map(|capability| capability.kind())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
