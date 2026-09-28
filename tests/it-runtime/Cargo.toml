@@ -13,7 +13,9 @@ ra-core = { path = "../../crates/ra-core" }
 ra-context = { path = "../../crates/ra-context" }
 ra-runtime = { path = "../../crates/ra-runtime" }
 ra-tools = { path = "../../crates/ra-tools" }
-ra-sandbox = { path = "../../crates/ra-sandbox" }
+# `docker` for the parity suite, which drives the runner against a real daemon as well as the local
+# backend.
+ra-sandbox = { path = "../../crates/ra-sandbox", features = ["docker"] }
 ra-patch = { path = "../../crates/ra-patch" }
 base64 = "0.22"
 async-trait = "0.1"

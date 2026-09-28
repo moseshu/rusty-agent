@@ -60,10 +60,18 @@ jobs:
           sudo apt-get install -y bubblewrap python3
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+      # sandbox-parity 门禁在真实 Docker daemon 上跑同一组场景。镜像在这里先拉好：
+      # 仓库源不可用时应当在这一步失败，而不是混进后端行为的结果里。
+      - name: Pull the Docker sandbox image
+        run: docker pull python:3.14-slim
+
       # 只有 FAIL 让这一步变红；被测对象尚未存在的几条报 SKIP 并在汇总里计数，
-      # 每次 CI 输出都会提醒还欠几条。
+      # 每次 CI 输出都会提醒还欠几条。sandbox-parity 在这里两个后端都必须真跑：
+      # 缺 daemon 或镜像即 FAIL，不能退成本地那样的 SKIP。
       - name: 九条门禁
         run: cargo xtask all
+        env:
+          RA_SANDBOX_PARITY_REQUIRE: unix_local,docker
 
   deny:
     name: 依赖审计
