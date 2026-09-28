@@ -1114,30 +1114,18 @@ impl Capability for Skills {
     description = "Load a single lazily configured skill into the sandbox so its SKILL.md, scripts, \
                    references, and assets can be read from the workspace."
 )]
-pub struct LoadSkillArgs {
+pub(crate) struct LoadSkillArgs {
     // Undocumented on purpose: the reference's schema gives the field no description.
     skill_name: String,
 }
 
-impl LoadSkillArgs {
-    /// Loads the skill named `skill_name`.
-    #[must_use]
-    pub fn new(skill_name: impl Into<String>) -> Self {
-        Self {
-            skill_name: skill_name.into(),
-        }
-    }
-
-    /// The skill asked for.
-    #[must_use]
-    pub fn skill_name(&self) -> &str {
-        &self.skill_name
-    }
-}
-
 /// Runs `load_skill` for a bound skills capability.
+///
+/// Private, as the reference's `_LoadSkillTool` is: a host reaches it through [`Skills`], and the
+/// tool's name and description are public as [`LOAD_SKILL_TOOL_NAME`] and
+/// [`LOAD_SKILL_DESCRIPTION`].
 #[derive(Clone)]
-pub struct LoadSkillTool {
+pub(crate) struct LoadSkillTool {
     origin: ToolOrigin,
     func_schema: FuncSchema,
     skills: Arc<Skills>,
@@ -1161,7 +1149,7 @@ impl LoadSkillTool {
     ///
     /// Returns a configuration error if the schema cannot be built, which is a defect here rather
     /// than a condition a caller can cause.
-    pub fn new(skills: Arc<Skills>) -> Result<Self> {
+    pub(crate) fn new(skills: Arc<Skills>) -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(LOAD_SKILL_TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<LoadSkillArgs>(LOAD_SKILL_TOOL_NAME)?,
@@ -1170,18 +1158,12 @@ impl LoadSkillTool {
         })
     }
 
-    /// The capability skills are loaded through.
-    #[must_use]
-    pub const fn skills(&self) -> &Arc<Skills> {
-        &self.skills
-    }
-
     /// Runs one call, answering with what the source reported, as a JSON object.
     ///
     /// # Errors
     ///
     /// Returns a failure carrying what [`Skills::load_skill`] failed with as its source.
-    pub async fn run(&self, args: &LoadSkillArgs) -> Result<ToolOutput> {
+    async fn run(&self, args: &LoadSkillArgs) -> Result<ToolOutput> {
         let result = self
             .skills
             .load_skill(&args.skill_name)
