@@ -15,6 +15,12 @@
 //! over by the memory capability in `ra-tools` through
 //! [`Capability::sandbox_memory`](ra_core::capability::Capability::sandbox_memory).
 //!
+//! **Stability**: `Internal`, as the reference's package is: its `__init__` exports nothing, and
+//! a host turns memory on through the memory capability, not through anything here. The module is
+//! public, and `#[doc(hidden)]`, only because tests live in a separate workspace; it appears in the
+//! public-API baseline so its churn stays visible in review, and carries **no compatibility
+//! promise**.
+//!
 //! # Deviations from the reference
 //!
 //! - **Written JSON is typed.** The reference takes a rollout segment as JSON text and

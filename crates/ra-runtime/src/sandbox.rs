@@ -8,7 +8,7 @@
 //! that session, and assembling the prompt that describes the workspace — and when the run ends it
 //! cleans up the sessions it owns and records what resumes them in the run's checkpoint. When the
 //! agent it prepared last carries a generating memory capability, the run is also recorded for
-//! [`memory`] generation before that cleanup.
+//! memory generation, in the internal `memory` module, before that cleanup.
 //!
 //! **Boundary**: this module names sandbox clients and sessions only through the protocol in
 //! `ra-core`. No backend lives here; a host constructs one from a service crate and hands it in.
@@ -25,6 +25,9 @@
 //!   stream runs; nothing here carries it, since nothing public reads it.
 
 mod config;
+// `Internal`, as `turn` is: public only so the separate test workspace can reach it. See the
+// module's own documentation.
+#[doc(hidden)]
 pub mod memory;
 mod preparation;
 mod runtime;
