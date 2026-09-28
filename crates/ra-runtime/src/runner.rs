@@ -417,6 +417,10 @@ impl RunConfig {
     /// A missing dependency, two capabilities claiming one family, or a capability requiring its
     /// own family fails the run before its first model call. Mutually dependent capabilities are
     /// accepted when every required family is installed.
+    ///
+    /// A sandbox agent's own capabilities may not claim a family installed here: the built-in
+    /// sandbox capabilities share family names with the host-side ones while meaning something
+    /// else, so the run fails before that agent's session is created.
     pub fn with_capability(mut self, capability: Arc<dyn Capability>) -> Self {
         self.capabilities.push(capability);
         self
@@ -1951,6 +1955,7 @@ fn sandbox_runtime(request: &RunRequest) -> Arc<SandboxRuntime> {
     Arc::new(SandboxRuntime::new(
         request.config.sandbox().cloned(),
         request.state.sandbox_resume_state().cloned(),
+        request.config.capabilities(),
         Arc::clone(&request.model_resolver),
         rollout_id,
     ))

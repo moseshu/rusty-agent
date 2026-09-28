@@ -18,6 +18,14 @@
 //! filesystem, and these go through the session. A sandbox agent gets them through
 //! [`filesystem::Filesystem`]; [`filesystem::default_capabilities`] is the reference's default set,
 //! which adds [`compaction::Compaction`].
+//!
+//! The capabilities share names with the coding ones too. [`shell::Shell`],
+//! [`filesystem::Filesystem`], [`compaction::Compaction`], [`memory::Memory`] and [`skills::Skills`]
+//! claim the families `shell`, `filesystem`, `compaction`, `memory` and `skills`, which
+//! [`crate::capability`] and `ra-context` also claim for host-side capabilities of different
+//! meaning. Both halves of that are enforced rather than left to the host: an agent cannot
+//! advertise one tool name twice, and a run that installs a family for every agent cannot run a
+//! sandbox agent that installs the same family itself.
 
 pub mod apply_patch;
 pub mod apply_patch_tool;

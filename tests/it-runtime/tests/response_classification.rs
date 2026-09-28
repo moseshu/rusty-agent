@@ -11,7 +11,7 @@ use ra_core::{
     error::{Error, Result},
     item::{
         CallId, HandoffCall, ItemId, McpApprovalRequest, Message, ModelResponse, OutputPhase,
-        RunItem, RunItemKind, ToolCall,
+        RunItem, RunItemKind, ToolCall, ToolCallKind,
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
@@ -515,6 +515,61 @@ fn test_response_classification_11() {
             .map(ModelToolDefinition::name)
             .collect::<Vec<_>>(),
         ["search"]
+    );
+}
+
+/// A call binds to the advertised tool of its name whatever form it arrived in, and keeps its own
+/// form for the answer.
+///
+/// The reference routes by call type instead: a `function_call` looks only among function tools and
+/// a `custom_tool_call` only among custom tools, and one that finds nothing there ends the run. Here
+/// one flat name namespace holds both — a turn cannot advertise one name twice, whatever the kinds —
+/// so the name alone finds the tool. That is what the Chat and Anthropic custom-tool lowering relies
+/// on: a function-form call to `apply_patch` whose arguments are not `{"input": ...}` stays a
+/// function call, reaches the patch tool, and the tool reports the malformed input to the model.
+#[test]
+fn a_call_binds_by_name_whatever_its_form_and_keeps_its_form() {
+    let apply_patch: Arc<dyn Tool> = Arc::new(StubTool {
+        origin: ToolOrigin::new("apply_patch").unwrap(),
+        schema: ToolSchema::custom("apply_patch", None).unwrap(),
+        options: ToolOptions::new(),
+        enabled: true,
+        advertised_as: None,
+    });
+    let surface =
+        TurnActionSurface::new(vec![apply_patch, tool("exec_command")], Vec::new()).unwrap();
+    let response = ModelResponse::new(vec![
+        tool_call("call-item-1", "call-1", "apply_patch"),
+        item(
+            "call-item-2",
+            RunItemKind::ToolCall(ToolCall::custom(
+                CallId::new("call-2"),
+                "exec_command",
+                "ls",
+            )),
+        ),
+    ]);
+
+    let processed = process_model_response(&response, &surface).unwrap();
+
+    assert!(processed.tools_not_found().is_empty());
+    let bound: Vec<_> = processed
+        .functions()
+        .iter()
+        .map(|run| {
+            (
+                run.call().name().to_owned(),
+                run.call().kind(),
+                run.tool().model_definition().kind().is_custom(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        bound,
+        [
+            ("apply_patch".to_owned(), ToolCallKind::Function, true),
+            ("exec_command".to_owned(), ToolCallKind::Custom, false),
+        ]
     );
 }
 

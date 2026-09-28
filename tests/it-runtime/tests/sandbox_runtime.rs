@@ -1557,6 +1557,153 @@ async fn a_capability_missing_its_dependency_is_refused() {
     );
 }
 
+/// A family the run installs for every agent cannot be installed again on a sandbox agent. The
+/// run-level and the sandbox capability of one family are two different capabilities under one
+/// name, so the run is refused before a session exists, on both entry points, naming every shared
+/// family and only those.
+#[tokio::test]
+async fn a_family_the_run_installs_cannot_be_installed_again_on_a_sandbox_agent() {
+    for streamed in [false, true] {
+        let client = FakeClient::new();
+        let run = request(
+            sandbox_agent(
+                "coder",
+                "Coder",
+                SandboxAgentConfig::new()
+                    .with_capability(Arc::new(WorkspaceCapability::new("shell")))
+                    .with_capability(Arc::new(WorkspaceCapability::new("filesystem")))
+                    .with_capability(Arc::new(WorkspaceCapability::new("todo"))),
+            ),
+            &ScriptedModel::answering("done"),
+            RunConfig::new()
+                .with_sandbox(with_client(&client))
+                .with_capability(Arc::new(WorkspaceCapability::new("filesystem")))
+                .with_capability(Arc::new(WorkspaceCapability::new("shell")))
+                .with_capability(Arc::new(WorkspaceCapability::new("web"))),
+        );
+        let error = if streamed {
+            Runner::run_streamed(run).finish().await.unwrap_err()
+        } else {
+            Runner::run(run).await.unwrap_err()
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "sandbox agent `coder` installs capability families `filesystem`, `shell` that \
+                 the run also installs for every agent"
+            ),
+            "{message}"
+        );
+        assert!(
+            !message.contains("`todo`") && !message.contains("`web`"),
+            "{message}"
+        );
+        assert!(client.log().is_empty(), "{:?}", client.log());
+    }
+}
+
+/// The pairing the refusal exists for, with the real capabilities: local compaction installed for
+/// the run, and a sandbox agent with the default set, whose third member is the provider-side
+/// `Compaction`. Without the sandbox's own compaction the same run goes through.
+#[tokio::test]
+async fn local_compaction_for_the_run_and_the_default_sandbox_set_are_refused_together() {
+    use ra_context::compaction::CompactionCapability;
+    use ra_tools::sandbox::{
+        filesystem::{Filesystem, default_capabilities},
+        shell::Shell,
+    };
+
+    let client = FakeClient::new();
+    let error = Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capabilities(default_capabilities()),
+        ),
+        &ScriptedModel::answering("done"),
+        RunConfig::new()
+            .with_sandbox(with_client(&client))
+            .with_capability(Arc::new(CompactionCapability::default())),
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("installs capability families `compaction` that the run also installs"),
+        "{error}"
+    );
+    assert!(client.log().is_empty(), "{:?}", client.log());
+
+    let result = Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new()
+                .with_capability(Arc::new(Filesystem::new()))
+                .with_capability(Arc::new(Shell::new())),
+        ),
+        &ScriptedModel::answering("done"),
+        RunConfig::new()
+            .with_sandbox(with_client(&FakeClient::new()))
+            .with_capability(Arc::new(CompactionCapability::default())),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(result.final_text(), "done");
+}
+
+/// Run-level context processing runs on a handoff target's turns too, so a sandbox agent reached by
+/// a handoff is held to the same rule, at the turn it would take over and before its session exists.
+#[tokio::test]
+async fn a_handoff_into_a_sandbox_agent_sharing_a_run_family_is_refused() {
+    let model = ScriptedModel::new(vec![
+        tool_call("call-1", "transfer_to_coder"),
+        final_answer("msg-2", "done"),
+    ]);
+    let coder = sandbox_agent(
+        "coder",
+        "Coder",
+        SandboxAgentConfig::new().with_capability(Arc::new(WorkspaceCapability::new("compaction"))),
+    );
+    let planner = AgentSpec::builder()
+        .id(AgentId::new("planner"))
+        .name("Planner")
+        .handoff(HandoffSpec::new(
+            AgentId::new("coder"),
+            transfer_schema("coder"),
+        ))
+        .build()
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(Arc::clone(&planner))
+        .register(coder)
+        .build()
+        .unwrap();
+    let client = FakeClient::new();
+
+    let error = Runner::run(request(
+        planner,
+        &model,
+        RunConfig::new()
+            .with_agent_registry(registry)
+            .with_sandbox(with_client(&client))
+            .with_capability(Arc::new(WorkspaceCapability::new("compaction"))),
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox agent `coder` installs capability families `compaction`"),
+        "{error}"
+    );
+    assert_eq!(model.inputs.lock().unwrap().len(), 1);
+    assert!(client.log().is_empty(), "{:?}", client.log());
+}
+
 /// `test_prepare_agent_binds_and_validates_run_workspace_scope` and
 /// `test_prepare_agent_rejects_inaccessible_run_workspace_scope`: the working directory is checked
 /// on the session, as the agent's user, and described to the model.

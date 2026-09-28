@@ -57,10 +57,17 @@
 //! one is the arrangement where the memory root is just another path in the workspace, and that is
 //! also the arrangement where nothing structural keeps an agent inside it.
 //!
-//! So this framework still has no dependency edge in its built-in set. The validation machinery is
-//! not thereby unused — a third-party capability declares against these families — but the first
-//! built-in edge is still ahead, and inventing one to exercise the mechanism would be the
-//! `apply_patch` -> `filesystem` mistake with a different pair of names.
+//! So the set in this module still has no dependency edge. The validation machinery is not thereby
+//! unused — a third-party capability declares against these families — but inventing an edge here
+//! to exercise the mechanism would be the `apply_patch` -> `filesystem` mistake with a different
+//! pair of names.
+//!
+//! The sandbox set in [`crate::sandbox`] does have one, because it is a port and the reference's
+//! sandbox `Memory` declares `filesystem` and `shell` (only `shell` when memory is read without live
+//! updates). Those are the sandbox capabilities of that name, bound to a session, not the ones
+//! here: the two sets share family names without sharing their meaning. One agent therefore
+//! installs a family from one set or the other, and the runtime refuses a sandbox agent whose own
+//! capabilities claim a family the run already installs for every agent.
 //!
 //! # Why the prompt text is here, beside the tools rather than in a product crate
 //!
