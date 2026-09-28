@@ -9,6 +9,7 @@
 //! cargo xtask no-inline-tests    # no test code under crates/
 //! cargo xtask feature-matrix     # per crate, all features off / on
 //! cargo xtask test -p it-core    # runs the separate test workspace, args pass through
+//! cargo xtask sandbox-parity     # the runner scenarios on every sandbox backend
 //! ```
 
 mod api;
@@ -19,6 +20,7 @@ mod inline_tests;
 mod layering;
 mod prompt_dump;
 mod public_api;
+mod sandbox_parity;
 mod schema_stability;
 mod source;
 mod tests_workspace;
@@ -79,6 +81,14 @@ enum Task {
     Layering,
     /// Per crate, checks that all features off and all features on both compile.
     FeatureMatrix,
+    /// Runs the same runner-level scenarios on every built-in sandbox backend. A backend whose
+    /// prerequisites are missing is skipped and counted, unless it is required.
+    SandboxParity {
+        /// Backends that may not be skipped, comma-separated (`unix_local,docker`, or `all`).
+        /// Defaults to `RA_SANDBOX_PARITY_REQUIRE`.
+        #[arg(long)]
+        require: Option<String>,
+    },
 }
 
 /// The gate list. Its order is the execution order of `all`: **fast before slow**, with static
@@ -93,6 +103,7 @@ fn all_gates() -> Vec<(&'static str, Outcome)> {
         ("token-budget", token_budget::run()),
         ("feature-matrix", feature_matrix::run()),
         ("test", tests_workspace::run(&[])),
+        ("sandbox-parity", sandbox_parity::run(None)),
     ]
 }
 
@@ -107,6 +118,9 @@ fn main() -> std::process::ExitCode {
         Task::TokenBudget => vec![("token-budget", token_budget::run())],
         Task::FeatureMatrix => vec![("feature-matrix", feature_matrix::run())],
         Task::Test { args } => vec![("test", tests_workspace::run(&args))],
+        Task::SandboxParity { require } => {
+            vec![("sandbox-parity", sandbox_parity::run(require.as_deref()))]
+        }
     };
 
     report(&outcomes)
