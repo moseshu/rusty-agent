@@ -147,6 +147,6 @@ pub use types::{
 };
 pub use workspace_paths::{
     CwdError, InvalidWorkspaceRoot, PathGrantError, PosixPath, SandboxPathGrant,
-    SandboxWorkspaceScope, ScopePathError, WorkspacePathPolicy, normalize_sandbox_cwd,
+    SandboxWorkspaceScope, ScopePathError, SessionPath, WorkspacePathPolicy, normalize_sandbox_cwd,
     windows_absolute_path,
 };

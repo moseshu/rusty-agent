@@ -23,7 +23,7 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use ra_core::sandbox::{
-    ErrorCode, OpName, PathGrantError, PosixPath, SandboxError, SandboxPathGrant,
+    ErrorCode, OpName, PathGrantError, PosixPath, SandboxError, SandboxPathGrant, SessionPath,
     WorkspacePathPolicy, windows_absolute_path,
 };
 
@@ -277,7 +277,12 @@ impl HostWorkspacePaths {
             // Lexical first: a relative path has to land inside the workspace as written, before
             // any symlink gets a say. Skipping this would let `../../etc/passwd` be judged on where
             // it resolved to rather than on the fact that it climbed out.
-            let absolute = self.policy.absolute_workspace_path(path)?;
+            //
+            // Read as written, as the reference reads the path object it built: a backslash is
+            // part of a name here, as it is to the host filesystem this resolves against.
+            let absolute = self
+                .policy
+                .absolute_workspace_path(SessionPath::Posix(&PosixPath::new(path)))?;
             resolve_without_strictness(Path::new(absolute.as_str()))?
         };
 
@@ -315,7 +320,7 @@ impl HostWorkspacePaths {
 /// handles both, and a path refused for the same reason should not read differently depending on
 /// which half of the check caught it.
 fn invalid_manifest_path(path: &str, absolute: bool) -> SandboxError {
-    let rendered = PosixPath::coerce(path);
+    let rendered = PosixPath::new(path);
     let reason = if absolute { "absolute" } else { "escape_root" };
     let message = if absolute {
         format!("manifest path must be relative: {rendered}")

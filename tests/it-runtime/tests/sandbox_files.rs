@@ -194,7 +194,7 @@ async fn a_huge_file_is_read_only_up_to_the_limit() {
 
     let limit = u64::try_from(ra_tools::sandbox::view_image::MAX_IMAGE_BYTES).unwrap() + 1;
     let data = session
-        .read_up_to(huge.to_str().unwrap(), None, limit)
+        .read_up_to((huge.to_str().unwrap()).into(), None, limit)
         .await
         .unwrap();
     assert_eq!(u64::try_from(data.len()).unwrap(), limit);
@@ -211,7 +211,11 @@ async fn a_huge_file_is_read_only_up_to_the_limit() {
     );
 
     let missing = session
-        .read_up_to(root.join("gone.png").to_str().unwrap(), None, limit)
+        .read_up_to(
+            (root.join("gone.png").to_str().unwrap()).into(),
+            None,
+            limit,
+        )
         .await
         .unwrap_err();
     assert_eq!(missing.error_code(), ErrorCode::WorkspaceReadNotFound);

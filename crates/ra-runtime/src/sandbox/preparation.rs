@@ -33,7 +33,8 @@ use ra_core::{
     prompt::{DynamicPromptHandler, PromptSource, ResolvedPrompt},
     sandbox::{
         ExecRequest, Manifest, PosixPath, SandboxAgentConfig, SandboxSession,
-        SandboxWorkspaceScope, ShellInvocation, User, build_remote_mount_policy_instructions,
+        SandboxWorkspaceScope, SessionPath, ShellInvocation, User,
+        build_remote_mount_policy_instructions,
     },
 };
 
@@ -298,13 +299,18 @@ pub(super) async fn validate_workspace_scope(
     let Some(cwd) = scope.cwd() else {
         return Ok(());
     };
+    let anchored = scope.anchor(".");
     let resolved = session
-        .validate_path_access(&scope.anchor("."), false)
+        .validate_path_access(SessionPath::Text(&anchored), false)
         .await
         .map_err(sandbox_error)?;
     for flag in ["-d", "-x"] {
-        let mut request = ExecRequest::new(["test".to_owned(), flag.to_owned(), resolved.clone()])
-            .with_shell(ShellInvocation::None);
+        let mut request = ExecRequest::new([
+            "test".to_owned(),
+            flag.to_owned(),
+            resolved.as_str().to_owned(),
+        ])
+        .with_shell(ShellInvocation::None);
         if let Some(user) = run_as {
             request = request.as_user(user.clone());
         }

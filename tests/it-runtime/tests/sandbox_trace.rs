@@ -33,8 +33,8 @@ use ra_core::{
     sandbox::{
         AsUser, CreateRequest, Entry, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest,
         Mount, MountProvider, MountStrategy, OpName, S3Mount, SandboxAgentConfig, SandboxClient,
-        SandboxError, SandboxResult, SandboxSession, SandboxSessionState, SessionResources,
-        Snapshot, pre_stop_hook,
+        SandboxError, SandboxResult, SandboxSession, SandboxSessionState, SessionPath,
+        SessionResources, Snapshot, pre_stop_hook,
     },
     state::RunId,
 };
@@ -229,23 +229,38 @@ impl SandboxSession for FakeSession {
         Ok(self.running.load(Ordering::SeqCst))
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn read(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
         Ok(Vec::new())
     }
 
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 

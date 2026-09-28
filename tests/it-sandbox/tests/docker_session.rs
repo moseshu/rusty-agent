@@ -16,12 +16,13 @@ use docker_fake::{
 };
 use ra_core::sandbox::{
     AzureBlobMount, Entry, ErrorCode, ExecRequest, Manifest, Mount, MountPattern, MountProvider,
-    MountStrategy, MountpointOptions, S3Mount, SandboxPathGrant, SandboxSession, ShellInvocation,
-    User,
+    MountStrategy, MountpointOptions, PosixPath, S3Mount, SandboxPathGrant, SandboxSession,
+    SessionPath, ShellInvocation, User,
 };
 use ra_sandbox::docker::{
     DockerSandboxSession, ExecRunOutput, LENGTH_FRAMED_STDIN_SCRIPT, manifest_requires_fuse,
 };
+use ra_sandbox::materialize::ManifestApplier;
 use serde_json::json;
 
 fn workspace_manifest() -> Manifest {
@@ -254,7 +255,7 @@ async fn persist_workspace_leaves_out_paths_registered_at_runtime() {
     std::fs::write(logs.join("events.jsonl"), "skip").expect("write");
     let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
     session
-        .register_persist_workspace_skip_path("logs/events.jsonl")
+        .register_persist_workspace_skip_path("logs/events.jsonl".into())
         .expect("register");
 
     let names = archive_member_names(&session.persist_workspace().await.expect("persist"));
@@ -336,12 +337,12 @@ async fn read_and_write_refuse_paths_outside_the_workspace_root() {
     let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
     let read = session
-        .read("../secret.txt", None)
+        .read("../secret.txt".into(), None)
         .await
         .expect_err("refused");
     assert!(read.message().contains("must not escape root"), "{read}");
     let write = session
-        .write("../secret.txt", b"nope".to_vec(), None)
+        .write("../secret.txt".into(), b"nope".to_vec(), None)
         .await
         .expect_err("refused");
     assert!(write.message().contains("must not escape root"), "{write}");
@@ -355,7 +356,7 @@ async fn read_returns_the_file_bytes_without_the_archive_api() {
     std::fs::write(workspace.join("hello.bin"), b"hello\x00world").expect("write");
     let (fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
-    let data = session.read("hello.bin", None).await.expect("read");
+    let data = session.read("hello.bin".into(), None).await.expect("read");
 
     assert_eq!(data, b"hello\x00world");
     assert!(fake.archive_calls.lock().expect("calls").is_empty());
@@ -368,7 +369,7 @@ async fn read_of_a_missing_path_is_not_found() {
     let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
     let error = session
-        .read("missing.txt", None)
+        .read("missing.txt".into(), None)
         .await
         .expect_err("missing");
 
@@ -382,7 +383,7 @@ async fn read_of_an_existing_unreadable_path_is_an_archive_error() {
     let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
     let error = session
-        .read("directory", None)
+        .read("directory".into(), None)
         .await
         .expect_err("unreadable");
 
@@ -397,7 +398,7 @@ async fn read_with_an_undecided_probe_is_an_archive_error() {
     *fake.read_probe_exit_code.lock().expect("probe") = Some(2);
 
     let error = session
-        .read("inaccessible/missing.txt", None)
+        .read("inaccessible/missing.txt".into(), None)
         .await
         .expect_err("undecided");
 
@@ -411,7 +412,7 @@ async fn read_probe_runs_as_the_requested_user() {
     let (fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
     let error = session
-        .read("missing.txt", Some(User::new("sandbox-user")))
+        .read("missing.txt".into(), Some(User::new("sandbox-user")))
         .await
         .expect_err("missing");
 
@@ -433,11 +434,11 @@ async fn path_validation_keeps_a_safe_leaf_symlink_as_written() {
     let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
     let normalized = session
-        .validate_path_access("link.txt", false)
+        .validate_path_access("link.txt".into(), false)
         .await
         .expect("inside the workspace");
 
-    assert_eq!(normalized, "/workspace/link.txt");
+    assert_eq!(normalized.as_str(), "/workspace/link.txt");
 }
 
 #[tokio::test]
@@ -457,7 +458,10 @@ async fn read_uses_the_sandbox_side_of_a_split_path_grant() {
     );
     let (_fake, session) = host_backed_session(&container, manifest);
 
-    let data = session.read("/tmp/result.txt", None).await.expect("read");
+    let data = session
+        .read("/tmp/result.txt".into(), None)
+        .await
+        .expect("read");
 
     assert_eq!(data, b"scratch output");
 }
@@ -475,7 +479,7 @@ async fn write_refuses_a_read_only_extra_path_grant() {
     let (_fake, session) = host_backed_session(tmp.path(), manifest);
 
     let error = session
-        .write("/tmp/result.txt", b"scratch output".to_vec(), None)
+        .write("/tmp/result.txt".into(), b"scratch output".to_vec(), None)
         .await
         .expect_err("read-only");
 
@@ -509,7 +513,11 @@ async fn write_refuses_a_workspace_symlink_into_a_read_only_grant() {
     let (_fake, session) = host_backed_session(tmp.path(), manifest);
 
     let error = session
-        .write("tmp-link/result.txt", b"scratch output".to_vec(), None)
+        .write(
+            "tmp-link/result.txt".into(),
+            b"scratch output".to_vec(),
+            None,
+        )
         .await
         .expect_err("read-only");
 
@@ -547,7 +555,7 @@ async fn write_refuses_a_workspace_symlink_into_a_nested_read_only_grant() {
 
     let error = session
         .write(
-            "tmp-link/protected/result.txt",
+            "tmp-link/protected/result.txt".into(),
             b"scratch output".to_vec(),
             None,
         )
@@ -575,7 +583,10 @@ async fn rm_unlinks_a_safe_leaf_symlink_rather_than_its_target() {
         .expect("symlink");
     let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
-    session.rm("link.txt", false, None).await.expect("rm");
+    session
+        .rm("link.txt".into(), false, None)
+        .await
+        .expect("rm");
 
     assert_eq!(
         std::fs::read_to_string(workspace.join("target.txt")).expect("read"),
@@ -600,26 +611,26 @@ async fn file_operations_refuse_a_symlink_that_escapes_the_workspace() {
     };
     escaped(
         session
-            .read("link/secret.txt", None)
+            .read("link/secret.txt".into(), None)
             .await
             .expect_err("read"),
     );
     escaped(
         session
-            .write("link/secret.txt", b"overwrite".to_vec(), None)
+            .write("link/secret.txt".into(), b"overwrite".to_vec(), None)
             .await
             .expect_err("write"),
     );
-    escaped(session.ls("link", None).await.expect_err("ls"));
+    escaped(session.ls("link".into(), None).await.expect_err("ls"));
     escaped(
         session
-            .mkdir("link/newdir", true, None)
+            .mkdir("link/newdir".into(), true, None)
             .await
             .expect_err("mkdir"),
     );
     escaped(
         session
-            .rm("link/secret.txt", false, None)
+            .rm("link/secret.txt".into(), false, None)
             .await
             .expect_err("rm"),
     );
@@ -632,7 +643,7 @@ async fn write_streams_through_a_staging_file_and_lands_in_place() {
     let (fake, session) = host_backed_session(tmp.path(), workspace_manifest());
 
     session
-        .write("nested/out.txt", b"payload".to_vec(), None)
+        .write("nested/out.txt".into(), b"payload".to_vec(), None)
         .await
         .expect("write");
 
@@ -646,6 +657,79 @@ async fn write_streams_through_a_staging_file_and_lands_in_place() {
     assert_eq!(attached[0].request.workdir(), None);
 }
 
+/// Text reads a backslash as a separator and a path keeps it, as the reference's remote session
+/// reads a `str` and a `Path`: the path lands as one file whose name holds the backslash.
+#[tokio::test]
+async fn a_path_keeps_its_backslash_where_text_reads_a_separator() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    std::fs::create_dir_all(tmp.path().join("workspace")).expect("mkdir");
+    let (_fake, session) = host_backed_session(tmp.path(), workspace_manifest());
+    let typed = PosixPath::new("notes\\draft.txt");
+
+    assert_eq!(
+        session
+            .validate_path_access(SessionPath::Posix(&typed), true)
+            .await
+            .expect("path")
+            .as_str(),
+        "/workspace/notes\\draft.txt"
+    );
+    assert_eq!(
+        session
+            .validate_path_access("notes\\draft.txt".into(), true)
+            .await
+            .expect("text")
+            .as_str(),
+        "/workspace/notes/draft.txt"
+    );
+
+    session
+        .write(SessionPath::Posix(&typed), b"typed".to_vec(), None)
+        .await
+        .expect("write the path");
+    session
+        .write("notes\\draft.txt".into(), b"text".to_vec(), None)
+        .await
+        .expect("write the text");
+
+    let workspace = tmp.path().join("workspace");
+    assert_eq!(
+        std::fs::read(workspace.join("notes\\draft.txt")).expect("one file"),
+        b"typed"
+    );
+    assert_eq!(
+        std::fs::read(workspace.join("notes/draft.txt")).expect("a nested file"),
+        b"text"
+    );
+}
+
+/// What materialization writes is a path, as the reference's `dest / child` is: a host file whose
+/// name holds a backslash arrives as one file, on a backend that would read the same characters as
+/// text as a separator.
+#[tokio::test]
+async fn a_copied_host_file_with_a_backslash_in_its_name_arrives_as_one_file() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    std::fs::create_dir_all(tmp.path().join("workspace")).expect("mkdir");
+    let sources = tempfile::tempdir().expect("sources");
+    std::fs::create_dir_all(sources.path().join("assets")).expect("mkdir");
+    std::fs::write(sources.path().join("assets/a\\b.txt"), b"one file").expect("write");
+    let manifest =
+        workspace_manifest().with_entry("public", Entry::local_dir(Some("assets".to_owned())));
+    let (_fake, session) = host_backed_session(tmp.path(), manifest.clone());
+
+    ManifestApplier::new(Arc::new(session), sources.path().to_path_buf())
+        .apply_manifest(&manifest, false)
+        .await
+        .expect("materialize");
+
+    let public = tmp.path().join("workspace/public");
+    assert_eq!(
+        std::fs::read(public.join("a\\b.txt")).expect("one file"),
+        b"one file"
+    );
+    assert!(!public.join("a").exists());
+}
+
 #[tokio::test]
 async fn write_as_another_user_is_done_by_that_user() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -654,7 +738,7 @@ async fn write_as_another_user_is_done_by_that_user() {
 
     session
         .write(
-            "deep/dir/out.txt",
+            "deep/dir/out.txt".into(),
             b"payload".to_vec(),
             Some(User::new("sandbox-user")),
         )

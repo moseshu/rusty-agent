@@ -16,9 +16,9 @@ use ra_core::{
     item::{AgentId, ModelResponse},
     model::{Effort, Model, ModelRequest, ModelSettings},
     sandbox::{
-        CreateRequest, ExecRequest, Manifest, MemoryGenerateConfig, MemoryLayoutConfig,
-        MemoryModel, MemoryReadConfig, SandboxClient, SandboxSession, SandboxWorkspaceScope,
-        ShellInvocation,
+        CreateRequest, Manifest, MemoryGenerateConfig, MemoryLayoutConfig, MemoryModel,
+        MemoryReadConfig, PosixPath, SandboxClient, SandboxSession, SandboxWorkspaceScope,
+        SessionPath,
     },
     state::RunId,
 };
@@ -53,11 +53,16 @@ fn read_only_generation_off() -> Memory {
     Memory::builder().generate(None).build().unwrap()
 }
 
+/// Writes the summary as the reference's tests do, through `Path(memories_dir)`.
 async fn write_summary(session: &Arc<dyn SandboxSession>, memories_dir: &str, summary: &[u8]) {
-    session.mkdir(memories_dir, true, None).await.unwrap();
+    let directory = PosixPath::new(memories_dir);
+    session
+        .mkdir(SessionPath::Posix(&directory), true, None)
+        .await
+        .unwrap();
     session
         .write(
-            &format!("{memories_dir}/memory_summary.md"),
+            SessionPath::Posix(&directory.join("memory_summary.md")),
             summary.to_vec(),
             None,
         )
@@ -102,7 +107,6 @@ async fn without_a_summary_there_are_no_memory_instructions() {
 #[rstest::rstest]
 #[case::absolute("/memory", "memories_dir must be relative")]
 #[case::escaping("../memory", "memories_dir must not escape root")]
-#[case::escaping_with_a_backslash("..\\memory", "memories_dir must not escape root")]
 #[case::empty("", "memories_dir must be non-empty")]
 #[case::dot(".", "memories_dir must be non-empty")]
 fn an_invalid_memories_dir_is_refused(#[case] memories_dir: &str, #[case] expected: &str) {
@@ -118,7 +122,6 @@ fn an_invalid_memories_dir_is_refused(#[case] memories_dir: &str, #[case] expect
 #[rstest::rstest]
 #[case::absolute("/sessions", "sessions_dir must be relative")]
 #[case::escaping("../sessions", "sessions_dir must not escape root")]
-#[case::escaping_with_a_backslash("..\\sessions", "sessions_dir must not escape root")]
 #[case::empty("", "sessions_dir must be non-empty")]
 #[case::dot(".", "sessions_dir must be non-empty")]
 fn an_invalid_sessions_dir_is_refused(#[case] sessions_dir: &str, #[case] expected: &str) {
@@ -329,11 +332,10 @@ async fn with_a_run_working_directory_memory_paths_are_absolute() {
     session.close().await.unwrap();
 }
 
-/// The reference keeps the configured spelling when there is no working directory. A backslash
-/// is the one exception: the session reads it as a separator, so the prompt does too, and the
-/// directory it names is the one the summary was read from.
+/// The reference keeps the configured spelling when there is no working directory, and on a POSIX
+/// host that spelling is the directory the summary was read from, a backslash included.
 #[rstest::rstest]
-#[case::backslash("team\\memory", "team/memory")]
+#[case::backslash("team\\memory", "team\\memory")]
 #[case::doubled_separator("team//memory", "team//memory")]
 #[tokio::test]
 async fn without_a_working_directory_the_layout_is_shown_as_configured(
@@ -357,10 +359,10 @@ async fn without_a_working_directory_the_layout_is_shown_as_configured(
     session.close().await.unwrap();
 }
 
-/// The reference's typed path keeps a backslash as part of the name; here the session reads it as
-/// a separator, and the absolute path the prompt names is the file that was read.
+/// The reference's typed path keeps a backslash as part of the name, and so does the session here:
+/// the absolute path the prompt names is the file that was read, a directory called `team\\memory`.
 #[tokio::test]
-async fn with_a_working_directory_the_layout_is_the_directory_the_session_resolves() {
+async fn with_a_working_directory_the_layout_is_a_typed_path() {
     let (_directory, root, session) = live_session().await;
     write_summary(&session, "team\\memory", b"summary entry").await;
     let capability = Memory::builder()
@@ -373,26 +375,28 @@ async fn with_a_working_directory_the_layout_is_the_directory_the_session_resolv
 
     let text = instructions(&capability, &session).await.unwrap();
 
-    let summary_path = root.join("team/memory/memory_summary.md");
-    assert!(summary_path.is_file());
-    assert!(text.contains(&format!(
-        "{}/memory_summary.md",
-        root.join("team/memory").display()
-    )));
-    assert!(text.contains(&format!("{}/MEMORY.md", root.join("team/memory").display())));
-    assert!(!text.contains('\\'));
-    let shown = session
-        .exec(
-            ExecRequest::new([
-                "cat".to_owned(),
-                summary_path.to_string_lossy().into_owned(),
-            ])
-            .with_shell(ShellInvocation::None),
-        )
-        .await
-        .unwrap();
-    assert_eq!(shown.stdout, b"summary entry");
+    let memory_dir = root.join("team\\memory");
+    assert!(memory_dir.join("memory_summary.md").is_file());
+    assert!(!root.join("team").exists());
+    assert!(text.contains(&format!("{}/memory_summary.md", memory_dir.display())));
+    assert!(text.contains(&format!("{}/MEMORY.md", memory_dir.display())));
     session.close().await.unwrap();
+}
+
+/// A backslash does not make a layout directory climb out: `..\\memory` is one name, as the
+/// reference's `Path` parts read it.
+#[test]
+fn a_backslash_is_part_of_a_layout_directory_name() {
+    for layout in [
+        MemoryLayoutConfig::new().with_memories_dir("..\\memory"),
+        MemoryLayoutConfig::new().with_sessions_dir("..\\sessions"),
+    ] {
+        Memory::builder()
+            .layout(layout)
+            .generate(None)
+            .build()
+            .unwrap();
+    }
 }
 
 // ---- beyond the reference's tests -----------------------------------------------------------

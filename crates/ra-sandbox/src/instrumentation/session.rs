@@ -52,7 +52,7 @@ use ra_core::sandbox::{
     PosixPath, PreStopHook, PtyExecUpdate, PtyStartRequest, PtyWriteRequest, SandboxArchiveLimits,
     SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionEvent,
     SandboxSessionEventBase, SandboxSessionFinishEvent, SandboxSessionStartEvent,
-    SandboxSessionState, SessionResources, ShellInvocation, SnapshotFingerprint,
+    SandboxSessionState, SessionPath, SessionResources, ShellInvocation, SnapshotFingerprint,
     WorkspacePathPolicy,
 };
 use ra_core::trace::{SpanKind, SpanOutcome, record_outcome};
@@ -505,7 +505,10 @@ impl SandboxSession for InstrumentedSession {
         self.inner.register_pre_stop_hook(hook);
     }
 
-    fn register_persist_workspace_skip_path(&self, path: &str) -> SandboxResult<PosixPath> {
+    fn register_persist_workspace_skip_path(
+        &self,
+        path: SessionPath<'_>,
+    ) -> SandboxResult<PosixPath> {
         self.inner.register_persist_workspace_skip_path(path)
     }
 
@@ -635,33 +638,37 @@ impl SandboxSession for InstrumentedSession {
         self.inner.workspace_path_policy()
     }
 
-    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+    async fn validate_path_access(
+        &self,
+        path: SessionPath<'_>,
+        for_write: bool,
+    ) -> SandboxResult<PosixPath> {
         self.inner.validate_path_access(path, for_write).await
     }
 
-    async fn ls(&self, path: &str, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         self.inner.ls(path, user).await
     }
 
-    async fn rm(&self, path: &str, recursive: bool, user: AsUser) -> SandboxResult<()> {
+    async fn rm(&self, path: SessionPath<'_>, recursive: bool, user: AsUser) -> SandboxResult<()> {
         self.inner.rm(path, recursive, user).await
     }
 
-    async fn mkdir(&self, path: &str, parents: bool, user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(&self, path: SessionPath<'_>, parents: bool, user: AsUser) -> SandboxResult<()> {
         self.inner.mkdir(path, parents, user).await
     }
 
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>> {
         self.read_expecting(path, user, &[]).await
     }
 
     async fn read_expecting(
         &self,
-        path: &str,
+        path: SessionPath<'_>,
         user: AsUser,
         expected: &[ErrorCode],
     ) -> SandboxResult<Vec<u8>> {
-        let start_data = path_start_data(path, user.as_ref());
+        let start_data = path_start_data(path.as_str(), user.as_ref());
         self.annotate(
             OpName::Read,
             start_data,
@@ -672,8 +679,13 @@ impl SandboxSession for InstrumentedSession {
         .await
     }
 
-    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
-        let start_data = path_start_data(path, user.as_ref());
+    async fn read_up_to(
+        &self,
+        path: SessionPath<'_>,
+        user: AsUser,
+        max_bytes: u64,
+    ) -> SandboxResult<Vec<u8>> {
+        let start_data = path_start_data(path.as_str(), user.as_ref());
         self.annotate(
             OpName::Read,
             start_data,
@@ -684,8 +696,8 @@ impl SandboxSession for InstrumentedSession {
         .await
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
-        let mut start_data = path_start_data(path, user.as_ref());
+    async fn write(&self, path: SessionPath<'_>, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+        let mut start_data = path_start_data(path.as_str(), user.as_ref());
         start_data.insert("bytes".to_owned(), json!(data.len()));
         self.annotate(
             OpName::Write,
@@ -699,7 +711,7 @@ impl SandboxSession for InstrumentedSession {
 
     async fn extract(
         &self,
-        path: &str,
+        path: SessionPath<'_>,
         data: Vec<u8>,
         scheme: Option<CompressionScheme>,
         limits: Option<SandboxArchiveLimits>,
@@ -836,7 +848,7 @@ impl SandboxSession for InstrumentedSession {
         self.inner.restore_snapshot().await
     }
 
-    async fn remove_workspace_entry_on_resume(&self, path: &str) -> SandboxResult<()> {
+    async fn remove_workspace_entry_on_resume(&self, path: SessionPath<'_>) -> SandboxResult<()> {
         self.inner.remove_workspace_entry_on_resume(path).await
     }
 

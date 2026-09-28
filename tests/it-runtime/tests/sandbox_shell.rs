@@ -441,11 +441,15 @@ async fn a_shared_skill_s_script_runs_from_a_nested_directory_and_keeps_task_fil
     );
     session.start().await.unwrap();
     session
-        .mkdir("tasks/task-a/nested", true, None)
+        .mkdir("tasks/task-a/nested".into(), true, None)
         .await
         .unwrap();
     session
-        .write("tasks/task-a/nested/input.txt", b"task-a".to_vec(), None)
+        .write(
+            "tasks/task-a/nested/input.txt".into(),
+            b"task-a".to_vec(),
+            None,
+        )
         .await
         .unwrap();
     let skill_root = format!("{}/.agents/python-proof", root.to_string_lossy());
@@ -477,14 +481,14 @@ async fn a_shared_skill_s_script_runs_from_a_nested_directory_and_keeps_task_fil
     assert_eq!(result.final_text(), "done");
     assert_eq!(
         session
-            .read("tasks/task-a/nested/output.txt", None)
+            .read("tasks/task-a/nested/output.txt".into(), None)
             .await
             .unwrap(),
         b"task-a-from-shared-skill"
     );
     assert_eq!(
         session
-            .read(".agents/python-proof/scripts/prove.py", None)
+            .read(".agents/python-proof/scripts/prove.py".into(), None)
             .await
             .unwrap(),
         skill_script.as_bytes()

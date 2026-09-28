@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, OpName, SandboxError,
-    SandboxResult, SandboxSession, SandboxSessionState, SessionResources, Snapshot,
+    SandboxResult, SandboxSession, SandboxSessionState, SessionPath, SessionResources, Snapshot,
 };
 
 /// The backend id the memory session reports.
@@ -119,27 +119,45 @@ impl SandboxSession for MemorySession {
         Ok(self.running.load(Ordering::SeqCst))
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn rm(&self, path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         lock(&self.files).remove(path);
         Ok(())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         lock(&self.files)
             .get(path)
             .cloned()
             .ok_or_else(|| SandboxError::workspace_read_not_found(path))
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        path: SessionPath<'_>,
+        data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         lock(&self.files).insert(path.to_owned(), data);
         Ok(())
     }

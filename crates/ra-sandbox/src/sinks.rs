@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use ra_core::sandbox::{
-    DeliveryMode, ErrorCode, EventPayloadPolicy, EventSink, OnErrorPolicy, OpName, SandboxResult,
-    SandboxSession, SandboxSessionEvent, SinkError, event_to_json_line, undecorated_session,
+    DeliveryMode, ErrorCode, EventPayloadPolicy, EventSink, OnErrorPolicy, OpName, PosixPath,
+    SandboxResult, SandboxSession, SandboxSessionEvent, SessionPath, SinkError, event_to_json_line,
+    undecorated_session,
 };
 
 #[cfg(feature = "http-sink")]
@@ -483,8 +484,11 @@ impl EventSink for WorkspaceJsonlSink {
         let session = undecorated_session(session);
         let relpath =
             expand_workspace_relpath(&self.workspace_relpath, session.state().session_id());
+        // A path, as the reference renders its template into one: a backslash stays in the name.
         if self.ephemeral {
-            session.register_persist_workspace_skip_path(&relpath)?;
+            session.register_persist_workspace_skip_path(SessionPath::Posix(&PosixPath::new(
+                relpath.as_str(),
+            )))?;
         }
         *lock(&self.bound) = Some((session, relpath));
         Ok(())
@@ -509,13 +513,16 @@ impl EventSink for WorkspaceJsonlSink {
             return Ok(());
         }
 
-        let mut contents = match session.read(&relpath, None).await {
+        let path = PosixPath::new(relpath.as_str());
+        let mut contents = match session.read(SessionPath::Posix(&path), None).await {
             Ok(existing) => existing,
             Err(error) if error.error_code() == ErrorCode::WorkspaceReadNotFound => Vec::new(),
             Err(error) => return Err(Box::new(error)),
         };
         contents.extend_from_slice(&outbox.buffer);
-        session.write(&relpath, contents, None).await?;
+        session
+            .write(SessionPath::Posix(&path), contents, None)
+            .await?;
         outbox.buffer.clear();
         Ok(())
     }

@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, Dependencies, Entry, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry,
     Manifest, Mount, MountPattern, MountProvider, MountStrategy, MountpointOptions, Permissions,
-    S3Mount, SandboxError, SandboxResult, SandboxSession, SandboxSessionState, SessionResources,
-    Snapshot, SnapshotFingerprint,
+    S3Mount, SandboxError, SandboxResult, SandboxSession, SandboxSessionState, SessionPath,
+    SessionResources, Snapshot, SnapshotFingerprint,
 };
 use ra_sandbox::runtime_helpers::workspace_fingerprint_helper;
 use ra_sandbox::snapshot::SnapshotStore;
@@ -174,17 +174,25 @@ impl SandboxSession for RecordingSession {
         Ok(true)
     }
 
-    async fn ls(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        let path = path.as_str();
         self.calls
             .lock()
             .expect("calls")
             .push(Call::Ls(path.to_owned()));
-        self.listings.get(path).cloned().ok_or_else(|| {
-            SandboxError::workspace_read_not_found(path)
-        })
+        self.listings
+            .get(path)
+            .cloned()
+            .ok_or_else(|| SandboxError::workspace_read_not_found(path))
     }
 
-    async fn rm(&self, path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.calls
             .lock()
             .expect("calls")
@@ -192,15 +200,26 @@ impl SandboxSession for RecordingSession {
         Ok(())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         Err(SandboxError::workspace_read_not_found(path))
     }
 
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
@@ -303,7 +322,10 @@ fn entry(path: &str, kind: EntryKind) -> FileEntry {
 
 #[tokio::test]
 async fn persisting_stores_the_archive_and_records_what_it_hashed_to() {
-    let session = RecordingSession::new(Snapshot::local("snap-1", "/snapshots").expect("named"), manifest());
+    let session = RecordingSession::new(
+        Snapshot::local("snap-1", "/snapshots").expect("named"),
+        manifest(),
+    );
     let store = RecordingStore::new();
 
     SnapshotLifecycle::new(&session, &store)
@@ -326,7 +348,10 @@ async fn persisting_stores_the_archive_and_records_what_it_hashed_to() {
         .into_iter()
         .filter(|call| matches!(call, Call::Exec(_) | Call::PersistWorkspace))
         .collect();
-    assert!(matches!(order.last(), Some(Call::PersistWorkspace)), "{order:?}");
+    assert!(
+        matches!(order.last(), Some(Call::PersistWorkspace)),
+        "{order:?}"
+    );
 }
 
 #[tokio::test]
@@ -582,7 +607,11 @@ async fn the_hashing_command_names_the_workspace_the_scheme_and_what_to_leave_ou
     let run = session
         .commands()
         .into_iter()
-        .find(|command| command.first().is_some_and(|program| *program == *helper.install_path()))
+        .find(|command| {
+            command
+                .first()
+                .is_some_and(|program| *program == *helper.install_path())
+        })
         .expect("the helper ran");
     assert_eq!(
         run,
@@ -618,7 +647,7 @@ fn what_is_left_out_of_a_hash_is_what_is_left_out_of_the_archive() {
     // What the session created at runtime and excluded from its archives is excluded from the hash
     // for the same reason.
     session
-        .register_persist_workspace_skip_path(".sandbox-rclone-config/session")
+        .register_persist_workspace_skip_path(".sandbox-rclone-config/session".into())
         .expect("outside every mount");
 
     let skipped: Vec<String> = fingerprint_skip_relpaths(&session)

@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use ra_core::sandbox::{
-    CreateRequest, EntryKind, ErrorCode, Manifest, SandboxClient, SandboxPathGrant, SandboxSession,
+    CreateRequest, EntryKind, ErrorCode, Manifest, PosixPath, SandboxClient, SandboxPathGrant,
+    SandboxSession, SessionPath,
 };
 use ra_sandbox::unix_local::UnixLocalSandboxClient;
 
@@ -34,7 +35,7 @@ async fn a_file_written_through_the_session_is_read_back_through_it() {
     let (_temp, root, session) = fixture(Vec::new()).await;
 
     session
-        .write("notes/today.md", b"first line".to_vec(), None)
+        .write("notes/today.md".into(), b"first line".to_vec(), None)
         .await
         .expect("write");
 
@@ -42,16 +43,54 @@ async fn a_file_written_through_the_session_is_read_back_through_it() {
     // to walk the tree first.
     assert!(root.join("notes").is_dir());
     assert_eq!(
-        session.read("notes/today.md", None).await.expect("read"),
+        session
+            .read("notes/today.md".into(), None)
+            .await
+            .expect("read"),
         b"first line"
     );
+}
+
+/// This backend resolves against the host directory and reads text and paths alike as written,
+/// as the reference's symlink-resolving policy builds its native path without converting any
+/// separator: a backslash is part of a file name in either form.
+#[tokio::test]
+async fn text_and_paths_both_keep_a_backslash_in_a_name() {
+    let (_temp, root, session) = fixture(Vec::new()).await;
+    let typed = PosixPath::new("notes\\draft.txt");
+    let expected = format!("{}/notes\\draft.txt", root.display());
+
+    for path in [
+        SessionPath::Text("notes\\draft.txt"),
+        SessionPath::Posix(&typed),
+    ] {
+        assert_eq!(
+            session
+                .validate_path_access(path, true)
+                .await
+                .expect("inside the workspace")
+                .as_str(),
+            expected,
+            "{path}"
+        );
+    }
+    session
+        .write(SessionPath::Posix(&typed), b"draft".to_vec(), None)
+        .await
+        .expect("write");
+
+    assert_eq!(
+        std::fs::read(root.join("notes\\draft.txt")).expect("one file"),
+        b"draft"
+    );
+    assert!(!root.join("notes").exists());
 }
 
 #[tokio::test]
 async fn reading_a_file_that_is_not_there_says_so() {
     let (_temp, _root, session) = fixture(Vec::new()).await;
     let error = session
-        .read("missing.md", None)
+        .read("missing.md".into(), None)
         .await
         .expect_err("a file nobody wrote");
 
@@ -73,7 +112,7 @@ async fn a_listing_reports_what_each_entry_is() {
     std::fs::create_dir(root.join("directory")).expect("directory");
     std::os::unix::fs::symlink(root.join("file.txt"), root.join("link")).expect("link");
 
-    let mut listed = session.ls(".", None).await.expect("ls");
+    let mut listed = session.ls(".".into(), None).await.expect("ls");
     listed.sort_by(|left, right| left.path.cmp(&right.path));
     let described: Vec<(String, EntryKind, u64)> = listed
         .into_iter()
@@ -107,11 +146,11 @@ async fn a_directory_is_created_with_its_parents_only_when_asked() {
     let (_temp, root, session) = fixture(Vec::new()).await;
 
     session
-        .mkdir("deep/nested", false, None)
+        .mkdir("deep/nested".into(), false, None)
         .await
         .expect_err("a directory whose parent is not there");
     session
-        .mkdir("deep/nested", true, None)
+        .mkdir("deep/nested".into(), true, None)
         .await
         .expect("with parents");
     assert!(root.join("deep/nested").is_dir());
@@ -119,7 +158,7 @@ async fn a_directory_is_created_with_its_parents_only_when_asked() {
     // Creating one that already exists is success, so materializing the same manifest twice does
     // not fail the second time.
     session
-        .mkdir("deep/nested", false, None)
+        .mkdir("deep/nested".into(), false, None)
         .await
         .expect("an existing directory");
 }
@@ -129,14 +168,14 @@ async fn removing_something_that_is_not_there_depends_on_whether_it_was_a_sweep(
     let (_temp, _root, session) = fixture(Vec::new()).await;
 
     let error = session
-        .rm("missing.txt", false, None)
+        .rm("missing.txt".into(), false, None)
         .await
         .expect_err("a named file that is not there");
     assert_eq!(error.error_code(), ErrorCode::ExecNonzero);
 
     // A recursive removal asked for the path to be gone, and it is.
     session
-        .rm("missing.txt", true, None)
+        .rm("missing.txt".into(), true, None)
         .await
         .expect("a sweep of nothing");
 }
@@ -150,17 +189,23 @@ async fn a_directory_needs_a_sweep_and_a_link_is_followed_to_what_it_names() {
     std::os::unix::fs::symlink(root.join("target.txt"), root.join("alias")).expect("link");
 
     session
-        .rm("tree", false, None)
+        .rm("tree".into(), false, None)
         .await
         .expect_err("a directory with contents");
-    session.rm("tree", true, None).await.expect("a sweep");
+    session
+        .rm("tree".into(), true, None)
+        .await
+        .expect("a sweep");
     assert!(!root.join("tree").exists());
 
     // A local path is resolved all the way to its leaf before anything happens to it, so removing
     // a link removes what the link names and leaves the link dangling. This is worth stating
     // outright because the session protocol's remote form deliberately does the opposite: there the
     // resolved path is only checked for containment and the operation still lands on the link.
-    session.rm("alias", false, None).await.expect("the link");
+    session
+        .rm("alias".into(), false, None)
+        .await
+        .expect("the link");
     assert!(!root.join("target.txt").exists());
     assert!(root.join("alias").symlink_metadata().is_ok());
 }
@@ -177,11 +222,14 @@ async fn a_path_outside_the_workspace_is_refused_by_every_operation() {
     let (_temp, _root, session) = fixture(Vec::new()).await;
 
     for error in [
-        session.read(&target, None).await.err(),
-        session.write(&target, b"x".to_vec(), None).await.err(),
-        session.rm(&target, false, None).await.err(),
-        session.mkdir(&target, false, None).await.err(),
-        session.ls(&target, None).await.err(),
+        session.read((&target).into(), None).await.err(),
+        session
+            .write((&target).into(), b"x".to_vec(), None)
+            .await
+            .err(),
+        session.rm((&target).into(), false, None).await.err(),
+        session.mkdir((&target).into(), false, None).await.err(),
+        session.ls((&target).into(), None).await.err(),
     ] {
         assert_eq!(
             error.expect("a path outside the workspace").error_code(),
@@ -209,12 +257,12 @@ async fn a_read_only_grant_can_be_read_and_not_written() {
         .to_string_lossy()
         .into_owned();
     assert_eq!(
-        session.read(&shared, None).await.expect("read"),
+        session.read((&shared).into(), None).await.expect("read"),
         b"reference"
     );
 
     let error = session
-        .write(&shared, b"overwritten".to_vec(), None)
+        .write((&shared).into(), b"overwritten".to_vec(), None)
         .await
         .expect_err("a write through a read-only grant");
     assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
@@ -243,12 +291,12 @@ async fn a_long_symlink_chain_cannot_read_or_write_outside_the_workspace() {
         root.join("link0").to_string_lossy().into_owned(),
     ] {
         let read_error = session
-            .read(&requested, None)
+            .read((&requested).into(), None)
             .await
             .expect_err("external read");
         assert_eq!(read_error.error_code(), ErrorCode::InvalidManifestPath);
         let write_error = session
-            .write(&requested, b"overwritten".to_vec(), None)
+            .write((&requested).into(), b"overwritten".to_vec(), None)
             .await
             .expect_err("external write");
         assert_eq!(write_error.error_code(), ErrorCode::InvalidManifestPath);
@@ -275,16 +323,16 @@ async fn a_path_that_climbs_out_is_refused_as_escaping_the_root_by_every_operati
     let (_temp, _root, session) = fixture(Vec::new()).await;
 
     for message in [
-        refused_path(session.read("../secret.txt", None).await.err()),
+        refused_path(session.read("../secret.txt".into(), None).await.err()),
         refused_path(
             session
-                .write("../secret.txt", b"nope".to_vec(), None)
+                .write("../secret.txt".into(), b"nope".to_vec(), None)
                 .await
                 .err(),
         ),
-        refused_path(session.ls("../outside", None).await.err()),
-        refused_path(session.mkdir("../outside", true, None).await.err()),
-        refused_path(session.rm("../outside", false, None).await.err()),
+        refused_path(session.ls("../outside".into(), None).await.err()),
+        refused_path(session.mkdir("../outside".into(), true, None).await.err()),
+        refused_path(session.rm("../outside".into(), false, None).await.err()),
     ] {
         assert!(message.contains("must not escape root"), "{message}");
     }
@@ -297,9 +345,9 @@ async fn a_symlink_out_of_the_workspace_is_refused_as_escaping_the_root() {
     std::os::unix::fs::symlink(outside.path(), root.join("link")).expect("link");
 
     for message in [
-        refused_path(session.mkdir("link/nested", true, None).await.err()),
-        refused_path(session.ls("link", None).await.err()),
-        refused_path(session.rm("link/file.txt", false, None).await.err()),
+        refused_path(session.mkdir("link/nested".into(), true, None).await.err()),
+        refused_path(session.ls("link".into(), None).await.err()),
+        refused_path(session.rm("link/file.txt".into(), false, None).await.err()),
     ] {
         assert!(message.contains("must not escape root"), "{message}");
     }
@@ -318,12 +366,12 @@ async fn a_writable_grant_outside_the_workspace_can_be_written_and_read_back() {
         .into_owned();
 
     session
-        .write(&result, b"scratch output".to_vec(), None)
+        .write((&result).into(), b"scratch output".to_vec(), None)
         .await
         .expect("write");
 
     assert_eq!(
-        session.read(&result, None).await.expect("read"),
+        session.read((&result).into(), None).await.expect("read"),
         b"scratch output"
     );
 }
@@ -342,7 +390,7 @@ async fn a_write_under_a_read_only_grant_names_the_grant_that_refused_it() {
         .into_owned();
 
     let error = session
-        .write(&result, b"scratch output".to_vec(), None)
+        .write((&result).into(), b"scratch output".to_vec(), None)
         .await
         .expect_err("read-only");
 

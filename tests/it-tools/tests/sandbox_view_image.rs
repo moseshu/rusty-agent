@@ -21,7 +21,7 @@ use ra_core::{
     sandbox::{
         AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, OpName, SandboxError,
         SandboxPathGrant, SandboxResult, SandboxSession, SandboxSessionState,
-        SandboxWorkspaceScope, SessionResources, Snapshot, User,
+        SandboxWorkspaceScope, SessionPath, SessionResources, Snapshot, User,
     },
     state::RunId,
     tool::{Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolOutput, ToolOutputBlock},
@@ -122,31 +122,53 @@ impl SandboxSession for ScriptedSession {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Err(not_scripted())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Err(not_scripted())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Err(not_scripted())
     }
 
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         self.limits.lock().unwrap().push(None);
         self.answer(path, user)
     }
 
-    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
+    async fn read_up_to(
+        &self,
+        path: SessionPath<'_>,
+        user: AsUser,
+        max_bytes: u64,
+    ) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         self.limits.lock().unwrap().push(Some(max_bytes));
         let mut data = self.answer(path, user)?;
         data.truncate(usize::try_from(max_bytes).unwrap());
         Ok(data)
     }
 
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Err(not_scripted())
     }
 

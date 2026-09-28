@@ -27,7 +27,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{ImageBlock, ImageSource},
-    sandbox::{ErrorCode, PosixPath, SandboxSession, SandboxWorkspaceScope, User},
+    sandbox::{ErrorCode, PosixPath, SandboxSession, SandboxWorkspaceScope, SessionPath, User},
     tool::{
         FuncSchema, Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolOutputBlock,
         ToolSchema,
@@ -281,7 +281,7 @@ impl ViewImageTool {
         let payload = match self
             .session
             .read_up_to(
-                resolved_path.as_str(),
+                SessionPath::Posix(&resolved_path),
                 self.user.clone(),
                 u64::try_from(MAX_IMAGE_BYTES + 1).unwrap_or(u64::MAX),
             )

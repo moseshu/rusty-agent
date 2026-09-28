@@ -20,8 +20,8 @@ use ra_core::sandbox::{
     FileEntry, GcsMount, Manifest, ManifestRegistries, Mount, MountConfigError, MountPattern,
     MountProvider, MountStrategy, PosixPath, REDACTED_MOUNT_AUTHORITY_KEY, RcloneOptions,
     S3FilesMount, S3FilesOptions, S3Mount, SandboxClient, SandboxError, SandboxPathGrant,
-    SandboxResult, SandboxSession, SandboxSessionState, SessionResources, ShellInvocation,
-    SnapshotSpec, TypeRegistry, builtin_snapshot_registry, client_options_kind,
+    SandboxResult, SandboxSession, SandboxSessionState, SessionPath, SessionResources,
+    ShellInvocation, SnapshotSpec, TypeRegistry, builtin_snapshot_registry, client_options_kind,
 };
 use ra_sandbox::docker::{
     ContainerCreateSpec, DOCKER_BACKEND_ID, DockerApiError, DockerDriverConfig, DockerMount,
@@ -1025,19 +1025,34 @@ impl SandboxSession for FailingShutdown {
     async fn running(&self) -> SandboxResult<bool> {
         Ok(false)
     }
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         unimplemented!("not reached")
     }
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         unimplemented!("not reached")
     }
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         unimplemented!("not reached")
     }
-    async fn read(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
         unimplemented!("not reached")
     }
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         unimplemented!("not reached")
     }
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {

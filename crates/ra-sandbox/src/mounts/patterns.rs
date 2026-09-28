@@ -19,7 +19,7 @@
 
 use ra_core::sandbox::{
     ExecRequest, ExecResult, FuseCacheType, FuseOptions, MountPattern, PosixPath, RcloneMode,
-    RcloneOptions, SandboxError, SandboxResult, SandboxSession, ShellInvocation,
+    RcloneOptions, SandboxError, SandboxResult, SandboxSession, SessionPath, ShellInvocation,
     url_carries_inline_authority,
 };
 use std::fmt::Write as _;
@@ -142,9 +142,8 @@ async fn sh(session: &dyn SandboxSession, script: String) -> SandboxResult<ExecR
 /// Where a workspace path lands for this session's commands.
 async fn normalize(session: &dyn SandboxSession, path: &PosixPath) -> SandboxResult<PosixPath> {
     session
-        .validate_path_access(path.as_str(), false)
+        .validate_path_access(SessionPath::Posix(path), false)
         .await
-        .map(PosixPath::new)
 }
 
 /// Creates a directory, and its parents.
@@ -154,7 +153,7 @@ async fn mkdir(session: &dyn SandboxSession, path: &PosixPath) -> SandboxResult<
     } else {
         normalize(session, path).await?
     };
-    session.mkdir(target.as_str(), true, None).await
+    session.mkdir(SessionPath::Posix(&target), true, None).await
 }
 
 /// Writes generated configuration or credentials readable by their owner only.
@@ -164,7 +163,9 @@ async fn write_sensitive(
     payload: Vec<u8>,
 ) -> SandboxResult<()> {
     let target = normalize(session, path).await?;
-    session.write(target.as_str(), payload, None).await?;
+    session
+        .write(SessionPath::Posix(&target), payload, None)
+        .await?;
     let command = vec![
         "chmod".to_owned(),
         "0600".to_owned(),
@@ -271,7 +272,7 @@ async fn read_text_if_present(session: &dyn SandboxSession, path: &PosixPath) ->
         return String::new();
     };
     session
-        .read(target.as_str(), None)
+        .read(SessionPath::Posix(&target), None)
         .await
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
@@ -339,7 +340,7 @@ async fn apply_mountpoint(
         let stderr = config_dir.join(&format!("{command_hash}.stderr"));
 
         mkdir(session, &config_dir).await?;
-        session.register_persist_workspace_skip_path(config_dir.as_str())?;
+        session.register_persist_workspace_skip_path(SessionPath::Posix(&config_dir))?;
         write_sensitive(session, &env_path, render_shell_exports(&environment)).await?;
 
         let env_target = normalize(session, &env_path).await?;
@@ -493,8 +494,8 @@ async fn apply_fuse(
     mkdir(session, path).await?;
     mkdir(session, &cache_dir).await?;
     mkdir(session, &config_dir).await?;
-    session.register_persist_workspace_skip_path(cache_dir.as_str())?;
-    session.register_persist_workspace_skip_path(config_dir.as_str())?;
+    session.register_persist_workspace_skip_path(SessionPath::Posix(&cache_dir))?;
+    session.register_persist_workspace_skip_path(SessionPath::Posix(&config_dir))?;
     let command_config_path = normalize(session, &config_path).await?;
 
     let yaml = blobfuse_yaml(options, config, &command_cache_dir);
@@ -736,7 +737,7 @@ async fn apply_rclone(
     let config_path = config_dir.join(&format!("{}.conf", config.remote_name));
     mkdir(session, path).await?;
     mkdir(session, &config_dir).await?;
-    session.register_persist_workspace_skip_path(config_dir.as_str())?;
+    session.register_persist_workspace_skip_path(SessionPath::Posix(&config_dir))?;
     write_sensitive(session, &config_path, config_text.clone().into_bytes()).await?;
     let command_config_path = normalize(session, &config_path).await?;
 

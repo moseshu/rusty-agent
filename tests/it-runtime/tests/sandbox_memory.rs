@@ -526,14 +526,9 @@ async fn segments_are_appended_to_one_rollout_file_or_a_fresh_one() {
 
 #[tokio::test]
 async fn rollout_file_names_and_directories_are_checked() {
-    let (_directory, _root, session) = live_session().await;
+    let (_directory, root, session) = live_session().await;
 
-    for file_name in [
-        "nested/chat.jsonl",
-        "nested\\chat.jsonl",
-        "chat.json",
-        "/chat.jsonl",
-    ] {
+    for file_name in ["nested/chat.jsonl", "chat.json", "/chat.jsonl"] {
         let error = write_rollout(&session, &json!({}), "sessions", Some(file_name))
             .await
             .unwrap_err();
@@ -550,7 +545,6 @@ async fn rollout_file_names_and_directories_are_checked() {
             "rollouts_path must be relative to the sandbox workspace root",
         ),
         ("../sessions", "rollouts_path must not escape root"),
-        ("..\\sessions", "rollouts_path must not escape root"),
         (".", "rollouts_path must be non-empty"),
     ] {
         let error = write_rollout(&session, &json!({}), path, None)
@@ -558,6 +552,23 @@ async fn rollout_file_names_and_directories_are_checked() {
             .unwrap_err();
         assert!(error.to_string().contains(message), "{path}: {error}");
     }
+
+    // A backslash is part of a name, as in the reference's `Path(...)`: `nested\\chat.jsonl` is one
+    // file name, and `..\\sessions` one directory inside the workspace.
+    let written = write_rollout(
+        &session,
+        &json!({}),
+        "..\\sessions",
+        Some("nested\\chat.jsonl"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written, PosixPath::new("..\\sessions/nested\\chat.jsonl"));
+    assert!(
+        root.join("..\\sessions")
+            .join("nested\\chat.jsonl")
+            .is_file()
+    );
     session.close().await.unwrap();
 }
 
@@ -597,7 +608,7 @@ async fn a_segment_that_is_not_json_is_refused_and_nothing_is_written() {
 }
 
 #[tokio::test]
-async fn a_backslash_in_the_layout_is_the_directory_the_files_land_in() {
+async fn a_backslash_in_the_layout_is_part_of_the_directory_name() {
     let (_directory, root, session) = live_session().await;
     let layout = MemoryLayoutConfig::new()
         .with_memories_dir("team\\memory")
@@ -614,11 +625,12 @@ async fn a_backslash_in_the_layout_is_the_directory_the_files_land_in() {
     .await
     .unwrap();
 
-    assert_eq!(storage.memories_dir(), PosixPath::new("team/memory"));
-    assert_eq!(storage.sessions_dir(), PosixPath::new("team/sessions"));
-    assert!(root.join("team/memory/MEMORY.md").is_file());
-    assert!(root.join("team/memory/raw_memories").is_dir());
-    assert_eq!(written, PosixPath::new("team/sessions/chat-1.jsonl"));
+    assert_eq!(storage.memories_dir(), PosixPath::new("team\\memory"));
+    assert_eq!(storage.sessions_dir(), PosixPath::new("team\\sessions"));
+    assert!(root.join("team\\memory/MEMORY.md").is_file());
+    assert!(root.join("team\\memory/raw_memories").is_dir());
+    assert!(!root.join("team").exists());
+    assert_eq!(written, PosixPath::new("team\\sessions/chat-1.jsonl"));
     assert!(root.join(written.as_str()).is_file());
     session.close().await.unwrap();
 }

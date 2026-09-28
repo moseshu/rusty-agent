@@ -18,7 +18,7 @@ use ra_core::sandbox::{
     ExecRequest, ExecResult, FileEntry, Manifest, MaterializationResult, Mount, MountPattern,
     MountProvider, MountStrategy, OpName, Permissions, PtyProcessId, PtyStartRequest,
     PtyWriteRequest, RcloneOptions, S3Mount, SandboxClient, SandboxError, SandboxResult,
-    SandboxSession, SandboxSessionState, SessionResources, Snapshot,
+    SandboxSession, SandboxSessionState, SessionPath, SessionResources, Snapshot,
 };
 
 /// Which hook a backend was asked for, in the order it was asked.
@@ -139,7 +139,7 @@ impl SandboxSession for Backend {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         self.note("ls");
         Ok(vec![
             FileEntry::new("/workspace/README.md", Permissions::from_mode(0o644))
@@ -148,22 +148,37 @@ impl SandboxSession for Backend {
         ])
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         self.note("rm");
         Ok(())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         self.note("mkdir");
         Ok(())
     }
 
-    async fn read(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
         self.note("read");
         Ok(b"contents".to_vec())
     }
 
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         self.note("write");
         Ok(())
     }
@@ -794,24 +809,30 @@ async fn the_workspace_operations_are_reachable_through_the_protocol() {
     // Reachable through `dyn`, which is how a host holds one.
     let session: Box<dyn SandboxSession> = Box::new(Backend::with_answers(Answers::default()));
 
-    let listing = session.ls("/workspace", None).await.expect("ls");
+    let listing = session.ls("/workspace".into(), None).await.expect("ls");
     assert_eq!(listing.len(), 1);
     assert_eq!(listing[0].kind, EntryKind::File);
     assert!(!listing[0].is_dir());
 
     assert_eq!(
-        session.read("/workspace/a", None).await.expect("read"),
+        session
+            .read("/workspace/a".into(), None)
+            .await
+            .expect("read"),
         b"contents"
     );
     session
-        .write("/workspace/a", b"x".to_vec(), None)
+        .write("/workspace/a".into(), b"x".to_vec(), None)
         .await
         .expect("write");
     session
-        .mkdir("/workspace/d", true, None)
+        .mkdir("/workspace/d".into(), true, None)
         .await
         .expect("mkdir");
-    session.rm("/workspace/d", true, None).await.expect("rm");
+    session
+        .rm("/workspace/d".into(), true, None)
+        .await
+        .expect("rm");
 
     let archive = session.persist_workspace().await.expect("persist");
     session.hydrate_workspace(archive).await.expect("hydrate");

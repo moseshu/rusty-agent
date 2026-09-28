@@ -29,8 +29,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ra_core::sandbox::{
     Entry, EntryContent, ErrorCode, LazySkillSource, NO_SKILL_DESCRIPTION, PosixPath,
-    SKILL_MARKDOWN, SandboxError, SandboxPathGrant, SandboxResult, SandboxSession, SkillLoadResult,
-    SkillMetadata, User, parse_skill_frontmatter,
+    SKILL_MARKDOWN, SandboxError, SandboxPathGrant, SandboxResult, SandboxSession, SessionPath,
+    SkillLoadResult, SkillMetadata, User, parse_skill_frontmatter,
 };
 
 use crate::materialize::errors::local_dir_read;
@@ -202,7 +202,7 @@ impl LazySkillSource for LocalDirLazySkillSource {
         // A probe: the skill is usually not there yet, and a trace should not call that an error.
         match session
             .read_expecting(
-                skill_md.as_str(),
+                SessionPath::Posix(&skill_md),
                 user.cloned(),
                 &[ErrorCode::WorkspaceReadNotFound],
             )

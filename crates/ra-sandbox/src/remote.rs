@@ -16,7 +16,7 @@
 
 use ra_core::sandbox::{
     AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, OpName, PosixPath, SandboxError,
-    SandboxResult, SandboxSession, ShellInvocation,
+    SandboxResult, SandboxSession, SessionPath, ShellInvocation,
 };
 
 use crate::listing::parse_ls_la;
@@ -90,13 +90,13 @@ pub fn prepare_exec_command(request: &ExecRequest) -> Vec<String> {
 /// [`ErrorCode::ExecNonzero`] for any other failure, including one to install the resolver.
 pub async fn validate_remote_path_access(
     session: &dyn SandboxSession,
-    path: &str,
+    path: SessionPath<'_>,
     for_write: bool,
-) -> SandboxResult<String> {
+) -> SandboxResult<PosixPath> {
     let policy = session.workspace_path_policy()?;
     let root = policy.sandbox_root().as_str().to_owned();
     let workspace_path = policy.normalize_sandbox_path(path, for_write)?;
-    let original_path = PosixPath::coerce(path);
+    let original_path = path.to_posix();
     let helper = resolve_workspace_path_helper();
     ensure_installed(session, &helper).await?;
 
@@ -145,7 +145,7 @@ pub async fn validate_remote_path_access(
     if result.ok() {
         let resolved = String::from_utf8_lossy(&result.stdout);
         if !resolved.trim().is_empty() {
-            return Ok(workspace_path.as_str().to_owned());
+            return Ok(workspace_path);
         }
         return Err(SandboxError::exec_transport(reported_command(), None)
             .with_context("reason", "empty_stdout")
@@ -261,10 +261,10 @@ pub async fn read_error_from_exec(
 /// Returns the path validation's refusal, or [`ErrorCode::ExecNonzero`] when `ls` fails.
 pub async fn ls(
     session: &dyn SandboxSession,
-    path: &str,
+    path: SessionPath<'_>,
     user: AsUser,
 ) -> SandboxResult<Vec<FileEntry>> {
-    let path = session.validate_path_access(path, false).await?;
+    let path = String::from(session.validate_path_access(path, false).await?);
     let command = vec![
         "ls".to_owned(),
         "-la".to_owned(),
@@ -285,11 +285,11 @@ pub async fn ls(
 /// Returns the path validation's refusal, or [`ErrorCode::ExecNonzero`] when `rm` fails.
 pub async fn rm(
     session: &dyn SandboxSession,
-    path: &str,
+    path: SessionPath<'_>,
     recursive: bool,
     user: AsUser,
 ) -> SandboxResult<()> {
-    let path = session.validate_path_access(path, true).await?;
+    let path = String::from(session.validate_path_access(path, true).await?);
     let mut command = vec!["rm".to_owned()];
     if recursive {
         command.push("-rf".to_owned());
@@ -310,11 +310,11 @@ pub async fn rm(
 /// Returns the path validation's refusal, or [`ErrorCode::ExecNonzero`] when `mkdir` fails.
 pub async fn mkdir(
     session: &dyn SandboxSession,
-    path: &str,
+    path: SessionPath<'_>,
     parents: bool,
     user: AsUser,
 ) -> SandboxResult<()> {
-    let path = session.validate_path_access(path, true).await?;
+    let path = String::from(session.validate_path_access(path, true).await?);
     let mut command = vec!["mkdir".to_owned()];
     if parents {
         command.push("-p".to_owned());

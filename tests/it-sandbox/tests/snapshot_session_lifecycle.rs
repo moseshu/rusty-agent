@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, Dependencies, Entry, ExecRequest, ExecResult, FileEntry, Manifest,
     MaterializationResult, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    SessionResources, Snapshot, SnapshotFingerprint, User,
+    SessionPath, SessionResources, Snapshot, SnapshotFingerprint, User,
 };
 use ra_sandbox::snapshot::lifecycle::{
     SNAPSHOT_FINGERPRINT_VERSION, SnapshotLifecycle, parse_fingerprint_record,
@@ -226,26 +226,46 @@ impl SandboxSession for TrackingSession {
 
     /// Counted as the workspace being cleared for a restore, which is the only thing that lists
     /// the root here; answering "not there" keeps the clear from removing anything real.
-    async fn ls(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        let path = path.as_str();
         if path == self.state().manifest().root {
             self.clear_calls.fetch_add(1, Ordering::SeqCst);
         }
         Err(SandboxError::workspace_read_not_found(path))
     }
 
-    async fn rm(&self, path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         panic!("rm({path}) should not be called in this test")
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         panic!("mkdir({path}) should not be called in this test")
     }
 
-    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         panic!("read({path}) should not be called in this test")
     }
 
-    async fn write(&self, path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         panic!("write({path}) should not be called in this test")
     }
 

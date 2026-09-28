@@ -39,7 +39,7 @@ use futures::future::BoxFuture;
 use ra_core::sandbox::{
     Entry, EntryContent, EntryOwner, ExecRequest, ExecResult, Manifest, MaterializationResult,
     MaterializedFile, PosixPath, SandboxConcurrencyLimits, SandboxError, SandboxResult,
-    SandboxSession, ShellInvocation, User, resolve_workspace_path,
+    SandboxSession, SessionPath, ShellInvocation, User, resolve_workspace_path,
 };
 
 pub(crate) mod errors;
@@ -141,7 +141,9 @@ impl ManifestApplier {
         provision_accounts: bool,
     ) -> SandboxResult<MaterializationResult> {
         let root = PosixPath::coerce(&manifest.root);
-        self.session.mkdir(root.as_str(), true, None).await?;
+        self.session
+            .mkdir(SessionPath::Posix(&root), true, None)
+            .await?;
 
         if provision_accounts {
             self.provision_accounts(manifest).await?;
@@ -167,7 +169,9 @@ impl ManifestApplier {
         manifest: &Manifest,
     ) -> SandboxResult<MaterializationResult> {
         let root = PosixPath::coerce(&manifest.root);
-        self.session.mkdir(root.as_str(), true, None).await?;
+        self.session
+            .mkdir(SessionPath::Posix(&root), true, None)
+            .await?;
 
         let mut queued = Vec::new();
         for (declared, entry) in ephemeral_entries(manifest)? {
@@ -317,7 +321,9 @@ impl ManifestApplier {
         async move {
             let written = match entry.content() {
                 EntryContent::Dir { children } => {
-                    self.session.mkdir(dest.as_str(), true, None).await?;
+                    self.session
+                        .mkdir(SessionPath::Posix(&dest), true, None)
+                        .await?;
                     self.apply_metadata(entry, &dest).await?;
                     return self
                         .apply_entry_batch(
@@ -331,7 +337,7 @@ impl ManifestApplier {
                 }
                 EntryContent::File { content } => {
                     self.session
-                        .write(dest.as_str(), content.clone(), None)
+                        .write(SessionPath::Posix(&dest), content.clone(), None)
                         .await?;
                     Vec::new()
                 }
@@ -418,9 +424,13 @@ impl ManifestApplier {
         let (bytes, sha256) = local::read_and_hash(file, &src_root.join(name))?;
 
         if let Some(parent) = parent_path(dest) {
-            self.session.mkdir(parent.as_str(), true, None).await?;
+            self.session
+                .mkdir(SessionPath::Posix(&parent), true, None)
+                .await?;
         }
-        self.session.write(dest.as_str(), bytes, None).await?;
+        self.session
+            .write(SessionPath::Posix(dest), bytes, None)
+            .await?;
         Ok(vec![MaterializedFile::new(dest.clone(), sha256)])
     }
 
@@ -465,7 +475,7 @@ impl ManifestApplier {
     ) -> SandboxResult<Vec<MaterializedFile>> {
         let Some(src) = src else {
             self.session
-                .mkdir(dest.as_str(), true, user.cloned())
+                .mkdir(SessionPath::Posix(dest), true, user.cloned())
                 .await?;
             return Ok(Vec::new());
         };
@@ -474,7 +484,7 @@ impl ManifestApplier {
         let source = LocalSource::new(&self.base_dir, Path::new(src), &grants);
         let src_root = source.resolve_root()?;
         self.session
-            .mkdir(dest.as_str(), true, user.cloned())
+            .mkdir(SessionPath::Posix(dest), true, user.cloned())
             .await?;
 
         let children = source.list_files(&src_root)?;
@@ -499,11 +509,11 @@ impl ManifestApplier {
         let (bytes, sha256) = local::read_and_hash(file, &src_root.join(rel_child))?;
         if let Some(parent) = parent_path(&child_dest) {
             self.session
-                .mkdir(parent.as_str(), true, user.cloned())
+                .mkdir(SessionPath::Posix(&parent), true, user.cloned())
                 .await?;
         }
         self.session
-            .write(child_dest.as_str(), bytes, user.cloned())
+            .write(SessionPath::Posix(&child_dest), bytes, user.cloned())
             .await?;
         Ok(MaterializedFile::new(child_dest, sha256))
     }

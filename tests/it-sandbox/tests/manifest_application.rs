@@ -16,7 +16,8 @@ use ra_core::sandbox::{
     AsUser, Entry, EntryOwner, ErrorCode, ExecRequest, ExecResult, FileEntry, FileMode, Group,
     Manifest, Mount, MountPattern, MountProvider, MountStrategy, MountpointOptions,
     NOOP_SNAPSHOT_TYPE, Permissions, S3Mount, SandboxConcurrencyLimits, SandboxError,
-    SandboxResult, SandboxSession, SandboxSessionState, SessionResources, Snapshot, User,
+    SandboxResult, SandboxSession, SandboxSessionState, SessionPath, SessionResources, Snapshot,
+    User,
 };
 use ra_sandbox::materialize::ManifestApplier;
 
@@ -178,20 +179,32 @@ impl SandboxSession for RecordingSession {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.record(Call::Mkdir(path.to_owned()));
         Ok(())
     }
 
-    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         self.written
             .lock()
             .expect("written")
@@ -200,7 +213,13 @@ impl SandboxSession for RecordingSession {
             .ok_or_else(|| SandboxError::workspace_read_not_found(path))
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        path: SessionPath<'_>,
+        data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         let _active = ActiveOperation(&self.in_flight);
         self.peak_in_flight.fetch_max(now, Ordering::SeqCst);

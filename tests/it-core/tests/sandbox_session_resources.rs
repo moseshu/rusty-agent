@@ -13,7 +13,8 @@ use ra_core::sandbox::{
     AsUser, CloseDependency, Dependencies, DependencyValue, Entry, ErrorCode, ExecRequest,
     ExecResult, FactoryOptions, FileEntry, GcsMount, Manifest, Mount, MountPattern, MountProvider,
     MountStrategy, MountpointOptions, OpName, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, SessionResources, Snapshot, dependency_factory, pre_stop_hook,
+    SandboxSessionState, SessionPath, SessionResources, Snapshot, dependency_factory,
+    pre_stop_hook,
 };
 
 type Transcript = Arc<Mutex<Vec<String>>>;
@@ -99,23 +100,38 @@ impl SandboxSession for Plain {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn read(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
         Ok(Vec::new())
     }
 
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
@@ -336,7 +352,7 @@ fn a_runtime_skip_path_may_not_overlap_where_a_mount_attaches() {
         let session = mounted_at(mount_path);
 
         let error = session
-            .register_persist_workspace_skip_path(skip_path)
+            .register_persist_workspace_skip_path(skip_path.into())
             .expect_err("overlaps the mount");
 
         assert_eq!(
@@ -366,7 +382,7 @@ fn a_runtime_skip_path_beside_a_mount_is_recorded_and_left_out_of_snapshots() {
     let session = mounted_at("data");
 
     let registered = session
-        .register_persist_workspace_skip_path("logs/events.jsonl")
+        .register_persist_workspace_skip_path("logs/events.jsonl".into())
         .expect("does not overlap");
 
     assert_eq!(registered.as_str(), "logs/events.jsonl");
@@ -391,7 +407,7 @@ fn a_runtime_skip_path_names_somewhere_inside_the_workspace() {
         ("C:/x", "absolute"),
     ] {
         let error = session
-            .register_persist_workspace_skip_path(path)
+            .register_persist_workspace_skip_path(path.into())
             .expect_err("not a workspace-relative path");
         assert_eq!(error.error_code(), ErrorCode::InvalidManifestPath, "{path}");
         assert_eq!(
@@ -403,7 +419,7 @@ fn a_runtime_skip_path_names_somewhere_inside_the_workspace() {
     // The root itself is not a concrete path: excluding it would exclude everything.
     for path in ["", "."] {
         let error = session
-            .register_persist_workspace_skip_path(path)
+            .register_persist_workspace_skip_path(path.into())
             .expect_err("the workspace root");
         assert_eq!(
             error.error_code(),

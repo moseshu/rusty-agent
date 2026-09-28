@@ -30,7 +30,7 @@ use ra_core::{
     sandbox::{
         ErrorCode, ExecRequest, PosixPath, PtyExecUpdate, PtyProcessId, PtyStartRequest,
         PtyWriteRequest, SandboxError, SandboxErrorDetails, SandboxSession, SandboxWorkspaceScope,
-        ShellInvocation, User, shell::quote,
+        SessionPath, ShellInvocation, User, shell::quote,
         token_truncation::formatted_truncate_text_with_token_count,
     },
     tool::{FuncSchema, Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
@@ -416,9 +416,9 @@ pub async fn resolve_workdir_command(
     };
     let anchored = workspace_scope.anchor(PosixPath::coerce(workdir).as_str());
     let resolved = session
-        .validate_path_access(PosixPath::coerce(&anchored).as_str(), false)
+        .validate_path_access(SessionPath::Posix(&PosixPath::coerce(&anchored)), false)
         .await?;
-    Ok(format!("cd {} && {command}", quote(&resolved)))
+    Ok(format!("cd {} && {command}", quote(resolved.as_str())))
 }
 
 /// Runs `exec_command` against a sandbox session.

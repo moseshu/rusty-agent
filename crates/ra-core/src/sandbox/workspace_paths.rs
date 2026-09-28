@@ -208,6 +208,77 @@ impl From<PosixPath> for String {
     }
 }
 
+/// A path handed to a sandbox session: text, or a path already in POSIX form.
+///
+/// The reference's session methods take `Path | str`, and the two are not the same input. Its
+/// `coerce_posix_path` turns a backslash in a string into a separator, and keeps a path object as
+/// it is — on the POSIX hosts it runs sandboxes from, `team\memory` held as a path is one directory
+/// whose name contains a backslash. The reference's own callers nearly always hand the session a
+/// path object, built from configuration or from names the filesystem reported, so what they name
+/// is what gets touched; a host passing a string gets the string reading.
+///
+/// [`Text`](Self::Text) is the string and [`Posix`](Self::Posix) the path object, and both convert
+/// from what they wrap, so a caller writes `path.into()`. Converting text is the only difference:
+/// Windows drive syntax is refused in either, as it is on the reference.
+///
+/// A backend that resolves paths against a real host directory reads either variant as written,
+/// as the reference's symlink-resolving policy builds a native path from either without converting
+/// anything.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPath<'a> {
+    /// Text, whose backslashes are separators.
+    Text(&'a str),
+    /// A path in POSIX form, whose backslashes are part of the names they appear in.
+    Posix(&'a PosixPath),
+}
+
+impl<'a> SessionPath<'a> {
+    /// The path as it was written.
+    #[must_use]
+    pub fn as_str(&self) -> &'a str {
+        match self {
+            Self::Text(text) => text,
+            Self::Posix(path) => path.as_str(),
+        }
+    }
+
+    /// The path in POSIX form: text with its backslashes converted, a path as it is.
+    ///
+    /// The reference's `coerce_posix_path`.
+    #[must_use]
+    pub fn to_posix(&self) -> PosixPath {
+        match self {
+            Self::Text(text) => PosixPath::coerce(text),
+            Self::Posix(path) => (*path).clone(),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for SessionPath<'a> {
+    fn from(text: &'a str) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl<'a> From<&'a String> for SessionPath<'a> {
+    fn from(text: &'a String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl<'a> From<&'a PosixPath> for SessionPath<'a> {
+    fn from(path: &'a PosixPath) -> Self {
+        Self::Posix(path)
+    }
+}
+
+impl std::fmt::Display for SessionPath<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Tidies a path's spelling the way the reference's path type does when it is handed a string.
 ///
 /// Repeated separators collapse, a bare `.` drops out, and a trailing separator goes. Exactly two
@@ -434,21 +505,25 @@ impl SandboxWorkspaceScope {
     ///
     /// # Errors
     ///
-    /// Returns [`ScopePathError`] for a path that is empty, absolute, written with backslashes or
-    /// containing a parent segment, and for a workspace root that is not POSIX absolute.
-    pub fn model_resource_path(
+    /// Returns [`ScopePathError`] for a path that is empty, absolute, text written with
+    /// backslashes, or containing a parent segment, and for a workspace root that is not POSIX
+    /// absolute. As on the reference, only text is refused for a backslash: a
+    /// [`SessionPath::Posix`] keeps it as part of a name.
+    pub fn model_resource_path<'a, 'b>(
         &self,
-        workspace_root: &str,
-        workspace_relative_path: &str,
+        workspace_root: impl Into<SessionPath<'a>>,
+        workspace_relative_path: impl Into<SessionPath<'b>>,
     ) -> Result<PosixPath, ScopePathError> {
-        if workspace_relative_path.contains('\\') {
+        let workspace_root = workspace_root.into();
+        let workspace_relative_path = workspace_relative_path.into();
+        if matches!(workspace_relative_path, SessionPath::Text(text) if text.contains('\\')) {
             return Err(ScopePathError::ResourceSeparators);
         }
-        if windows_absolute_path(workspace_relative_path).is_some() {
+        if windows_absolute_path(workspace_relative_path.as_str()).is_some() {
             return Err(ScopePathError::ResourceNotRelative);
         }
 
-        let relative = PosixPath::coerce(workspace_relative_path);
+        let relative = workspace_relative_path.to_posix();
         if relative.is_absolute() || relative.parts().contains(&"..") {
             return Err(ScopePathError::ResourceNotRelative);
         }
@@ -461,12 +536,12 @@ impl SandboxWorkspaceScope {
             return Ok(normalized);
         };
 
-        let root = if let Some(windows_root) = windows_absolute_path(workspace_root) {
+        let root = if let Some(windows_root) = windows_absolute_path(workspace_root.as_str()) {
             PosixPath::new(windows_root)
-        } else if workspace_root.contains('\\') {
+        } else if matches!(workspace_root, SessionPath::Text(text) if text.contains('\\')) {
             return Err(ScopePathError::RootNotPosixAbsolute);
         } else {
-            let root = PosixPath::coerce(workspace_root);
+            let root = workspace_root.to_posix();
             if !root.is_absolute() {
                 return Err(ScopePathError::RootNotPosixAbsolute);
             }
@@ -838,11 +913,15 @@ impl WorkspacePathPolicy {
     ///
     /// Returns a [`SandboxError`] with [`ErrorCode::InvalidManifestPath`] for a path that is absolute
     /// outside the root, or that climbs out of it.
-    pub fn absolute_workspace_path(&self, path: &str) -> Result<PosixPath, SandboxError> {
-        if let Some(windows_path) = windows_absolute_path(path) {
+    pub fn absolute_workspace_path<'a>(
+        &self,
+        path: impl Into<SessionPath<'a>>,
+    ) -> Result<PosixPath, SandboxError> {
+        let path = path.into();
+        if let Some(windows_path) = windows_absolute_path(path.as_str()) {
             return Err(invalid_manifest_path(&PosixPath::new(windows_path)));
         }
-        self.absolute_workspace_posix_path(&PosixPath::coerce(path))
+        self.absolute_workspace_posix_path(&path.to_posix())
     }
 
     /// Re-measures a path from the workspace root.
@@ -853,11 +932,15 @@ impl WorkspacePathPolicy {
     /// # Errors
     ///
     /// As [`Self::absolute_workspace_path`].
-    pub fn relative_path(&self, path: &str) -> Result<PosixPath, SandboxError> {
-        if let Some(windows_path) = windows_absolute_path(path) {
+    pub fn relative_path<'a>(
+        &self,
+        path: impl Into<SessionPath<'a>>,
+    ) -> Result<PosixPath, SandboxError> {
+        let path = path.into();
+        if let Some(windows_path) = windows_absolute_path(path.as_str()) {
             return Err(invalid_manifest_path(&PosixPath::new(windows_path)));
         }
-        let absolute = self.absolute_workspace_posix_path(&PosixPath::coerce(path))?;
+        let absolute = self.absolute_workspace_posix_path(&path.to_posix())?;
         Ok(absolute
             .relative_to(&self.root)
             .unwrap_or_else(|| PosixPath::new(".")))
@@ -870,15 +953,16 @@ impl WorkspacePathPolicy {
     /// Returns [`ErrorCode::InvalidManifestPath`] for a path that is neither inside the workspace nor
     /// inside a grant, and [`ErrorCode::WorkspaceArchiveWriteError`] when `for_write` is set and the
     /// matching grant is read-only.
-    pub fn normalize_sandbox_path(
+    pub fn normalize_sandbox_path<'a>(
         &self,
-        path: &str,
+        path: impl Into<SessionPath<'a>>,
         for_write: bool,
     ) -> Result<PosixPath, SandboxError> {
-        if let Some(windows_path) = windows_absolute_path(path) {
+        let path = path.into();
+        if let Some(windows_path) = windows_absolute_path(path.as_str()) {
             return Err(invalid_manifest_path(&PosixPath::new(windows_path)));
         }
-        let original = PosixPath::coerce(path);
+        let original = path.to_posix();
         let (resolved, grant) = self.sandbox_path_and_grant(&original)?;
         if for_write
             && let Some(grant) = grant

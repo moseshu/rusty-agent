@@ -22,7 +22,7 @@ use ra_core::{
     sandbox::{
         AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, PtyExecUpdate,
         PtyProcessId, PtyStartRequest, PtyWriteRequest, SandboxError, SandboxPathGrant,
-        SandboxResult, SandboxSession, SandboxSessionState, SandboxWorkspaceScope,
+        SandboxResult, SandboxSession, SandboxSessionState, SandboxWorkspaceScope, SessionPath,
         SessionResources, ShellInvocation, Snapshot, User,
     },
     state::RunId,
@@ -155,23 +155,38 @@ impl SandboxSession for ScriptedSession {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Err(not_scripted())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Err(not_scripted())
     }
 
-    async fn mkdir(&self, _path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        _path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Err(not_scripted())
     }
 
-    async fn read(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
         Err(not_scripted())
     }
 
-    async fn write(&self, _path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        _path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Err(not_scripted())
     }
 

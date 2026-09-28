@@ -8,7 +8,10 @@
 
 use std::path::PathBuf;
 
-use ra_core::sandbox::{CreateRequest, Entry, ErrorCode, Manifest, SandboxClient, SandboxSession};
+use ra_core::sandbox::{
+    CreateRequest, Entry, ErrorCode, Manifest, PosixPath, SandboxClient, SandboxSession,
+    SessionPath,
+};
 use ra_sandbox::unix_local::UnixLocalSandboxClient;
 
 /// A session over a symlink-free workspace. Not started: these operations do not need it, and a
@@ -154,7 +157,7 @@ async fn what_the_session_excluded_at_runtime_is_not_written_out() {
     .expect("config file");
     std::fs::write(root.join("keep.txt"), b"durable").expect("keep");
     session
-        .register_persist_workspace_skip_path(".sandbox-rclone-config")
+        .register_persist_workspace_skip_path(".sandbox-rclone-config".into())
         .expect("inside the workspace");
 
     let archive = session.persist_workspace().await.expect("persist");
@@ -178,6 +181,50 @@ async fn what_the_session_excluded_at_runtime_is_not_written_out() {
         !names
             .iter()
             .any(|name| name.starts_with(".sandbox-rclone-config")),
+        "{names:?}"
+    );
+}
+
+/// A skip path registered as a path keeps its backslash, and so does the name the directory
+/// reports, as the reference's `should_skip_tar_member` reads both through `Path(...).parts`: the
+/// file is left out, and a sibling whose name also holds a backslash is kept under that name.
+#[tokio::test]
+async fn a_skip_path_with_a_backslash_in_a_name_leaves_that_file_out() {
+    let (_temp, _root, session) = fixture(Manifest::new()).await;
+    let skipped = PosixPath::new("logs\\events.jsonl");
+    let kept = PosixPath::new("logs\\kept.jsonl");
+    for path in [&skipped, &kept] {
+        session
+            .write(SessionPath::Posix(path), b"line\n".to_vec(), None)
+            .await
+            .expect("write");
+    }
+    session
+        .register_persist_workspace_skip_path(SessionPath::Posix(&skipped))
+        .expect("inside the workspace");
+
+    let archive = session.persist_workspace().await.expect("persist");
+    let names: Vec<String> = tar::Archive::new(archive.as_slice())
+        .entries()
+        .expect("entries")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .path()
+                .expect("path")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+    assert!(
+        !names.iter().any(|name| name.contains("events.jsonl")),
+        "{names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name.trim_start_matches("./") == "logs\\kept.jsonl"),
         "{names:?}"
     );
 }

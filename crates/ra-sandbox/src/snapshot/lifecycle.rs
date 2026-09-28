@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use futures::future::BoxFuture;
 use ra_core::sandbox::{
     ErrorCode, ExecRequest, Manifest, OpName, PosixPath, SandboxError, SandboxResult,
-    SandboxSession, SandboxSessionState, ShellInvocation, SnapshotFingerprint,
+    SandboxSession, SandboxSessionState, SessionPath, ShellInvocation, SnapshotFingerprint,
 };
 use sha2::{Digest, Sha256};
 
@@ -274,7 +274,7 @@ impl<'a> SnapshotLifecycle<'a> {
         skip: BTreeSet<PosixPath>,
     ) -> BoxFuture<'_, SandboxResult<()>> {
         Box::pin(async move {
-            let entries = match self.session.ls(directory.as_str(), None).await {
+            let entries = match self.session.ls(SessionPath::Posix(&directory), None).await {
                 Ok(entries) => entries,
                 // A directory that is not there, or cannot be listed, is treated as empty: the
                 // restore that follows creates what it needs, and refusing here would fail a resume
@@ -289,7 +289,7 @@ impl<'a> SnapshotLifecycle<'a> {
                 // reason about, and is removed rather than kept.
                 let Some(relative) = child.relative_to(&root) else {
                     self.session
-                        .remove_workspace_entry_on_resume(child.as_str())
+                        .remove_workspace_entry_on_resume(SessionPath::Posix(&child))
                         .await?;
                     continue;
                 };
@@ -308,14 +308,14 @@ impl<'a> SnapshotLifecycle<'a> {
                             .await?;
                     } else {
                         self.session
-                            .remove_workspace_entry_on_resume(child.as_str())
+                            .remove_workspace_entry_on_resume(SessionPath::Posix(&child))
                             .await?;
                     }
                     continue;
                 }
 
                 self.session
-                    .remove_workspace_entry_on_resume(child.as_str())
+                    .remove_workspace_entry_on_resume(SessionPath::Posix(&child))
                     .await?;
             }
             Ok(())

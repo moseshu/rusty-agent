@@ -10,7 +10,7 @@
 
 use ra_core::sandbox::{
     CwdError, ErrorCode, PathGrantError, PosixPath, SandboxPathGrant, SandboxWorkspaceScope,
-    ScopePathError, WorkspacePathPolicy, normalize_sandbox_cwd, windows_absolute_path,
+    ScopePathError, SessionPath, WorkspacePathPolicy, normalize_sandbox_cwd, windows_absolute_path,
 };
 use serde_json::json;
 
@@ -682,4 +682,107 @@ fn a_session_resource_must_be_a_non_empty_workspace_relative_posix_path() {
             "{root}"
         );
     }
+}
+
+// ---- text and paths ----------------------------------------------------------------------------
+
+/// Text reads a backslash as a separator and a path keeps it, as the reference's
+/// `coerce_posix_path` reads a `str` and a `Path`; on the POSIX hosts it runs sandboxes from, a
+/// backslash in a path object is part of the name it appears in.
+#[test]
+fn text_reads_a_backslash_as_a_separator_and_a_path_keeps_it() {
+    let policy = policy("/workspace");
+    let typed = PosixPath::new("pkg\\file.py");
+
+    assert_eq!(
+        policy
+            .normalize_sandbox_path("pkg\\file.py", false)
+            .expect("text")
+            .as_str(),
+        "/workspace/pkg/file.py"
+    );
+    assert_eq!(
+        policy
+            .normalize_sandbox_path(&typed, false)
+            .expect("path")
+            .as_str(),
+        "/workspace/pkg\\file.py"
+    );
+    assert_eq!(
+        policy
+            .absolute_workspace_path(&typed)
+            .expect("path")
+            .as_str(),
+        "/workspace/pkg\\file.py"
+    );
+    assert_eq!(
+        policy.relative_path(&typed).expect("path").as_str(),
+        "pkg\\file.py"
+    );
+    assert_eq!(
+        SessionPath::from("pkg\\file.py").to_posix(),
+        PosixPath::new("pkg/file.py")
+    );
+    assert_eq!(SessionPath::from(&typed).to_posix(), typed);
+}
+
+/// A backslash that is part of a name cannot climb out of the workspace; the same characters as text
+/// can.
+#[test]
+fn a_backslash_in_a_path_is_not_a_parent_segment() {
+    let policy = policy("/workspace");
+
+    assert_eq!(
+        policy
+            .normalize_sandbox_path(&PosixPath::new("..\\notes"), false)
+            .expect("one name")
+            .as_str(),
+        "/workspace/..\\notes"
+    );
+    let error = policy
+        .normalize_sandbox_path("..\\notes", false)
+        .unwrap_err();
+    assert_eq!(error.error_code(), ErrorCode::InvalidManifestPath);
+}
+
+/// Windows drive syntax is refused whichever form it arrives in, as on the reference.
+#[test]
+fn a_drive_path_is_refused_as_text_and_as_a_path() {
+    let policy = policy("/workspace");
+    for written in ["C:\\tmp\\secret.txt", "C:/tmp/secret.txt"] {
+        let typed = PosixPath::new(written);
+        for path in [SessionPath::Text(written), SessionPath::Posix(&typed)] {
+            let error = policy.normalize_sandbox_path(path, false).unwrap_err();
+            assert_eq!(error.error_code(), ErrorCode::InvalidManifestPath, "{path}");
+        }
+    }
+}
+
+/// Only text is refused for a backslash in a session resource: a path keeps it as part of a name,
+/// as the reference's `model_resource_path` refuses only a `str` containing one.
+#[test]
+fn a_session_resource_given_as_a_path_keeps_its_backslash() {
+    let scope = SandboxWorkspaceScope::from_cwd(Some("tasks/a")).expect("valid cwd");
+    let typed = PosixPath::new("team\\memory");
+
+    assert_eq!(
+        scope
+            .model_resource_path("/workspace", &typed)
+            .expect("path")
+            .as_str(),
+        "/workspace/team\\memory"
+    );
+    assert_eq!(
+        SandboxWorkspaceScope::root()
+            .model_resource_path("/workspace", &typed)
+            .expect("path")
+            .as_str(),
+        "team\\memory"
+    );
+    assert_eq!(
+        scope
+            .model_resource_path("/workspace", "team\\memory")
+            .unwrap_err(),
+        ScopePathError::ResourceSeparators
+    );
 }

@@ -62,8 +62,8 @@ use ra_core::{
     sandbox::{
         Entry, EntryContent, ErrorCode, LazySkillSource, Manifest, NO_SKILL_DESCRIPTION, OpName,
         PosixPath, SKILL_MARKDOWN, SandboxError, SandboxResult, SandboxSession,
-        SandboxWorkspaceScope, SkillLoadResult, SkillMetadata, User, parse_skill_frontmatter,
-        windows_absolute_path,
+        SandboxWorkspaceScope, SessionPath, SkillLoadResult, SkillMetadata, User,
+        parse_skill_frontmatter, windows_absolute_path,
     },
     tool::{FuncSchema, Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
@@ -813,7 +813,10 @@ impl Skills {
             return Vec::new();
         };
         let skills_root = PosixPath::coerce(&manifest.root).join(&self.skills_path);
-        let Ok(entries) = session.ls(skills_root.as_str(), self.run_as.clone()).await else {
+        let Ok(entries) = session
+            .ls(SessionPath::Posix(&skills_root), self.run_as.clone())
+            .await
+        else {
             return Vec::new();
         };
 
@@ -828,7 +831,10 @@ impl Skills {
                 continue;
             };
             let skill_md = skill_dir.join(SKILL_MARKDOWN);
-            let Ok(markdown) = session.read(skill_md.as_str(), self.run_as.clone()).await else {
+            let Ok(markdown) = session
+                .read(SessionPath::Posix(&skill_md), self.run_as.clone())
+                .await
+            else {
                 continue;
             };
             let mut frontmatter = parse_skill_frontmatter(&String::from_utf8_lossy(&markdown));

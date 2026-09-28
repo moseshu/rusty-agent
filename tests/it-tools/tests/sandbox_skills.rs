@@ -28,8 +28,8 @@ use ra_core::{
         AsUser, Entry, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry, FileMode, Group,
         LazySkillSource, Manifest, NO_SKILL_DESCRIPTION, Permissions, SandboxError,
         SandboxPathGrant, SandboxResult, SandboxSession, SandboxSessionState,
-        SandboxWorkspaceScope, SessionResources, SkillLoadResult, SkillMetadata, Snapshot, User,
-        parse_skill_frontmatter,
+        SandboxWorkspaceScope, SessionPath, SessionResources, SkillLoadResult, SkillMetadata,
+        Snapshot, User, parse_skill_frontmatter,
     },
     state::RunId,
     tool::{ToolApprovalPolicy, ToolConcurrency, ToolContext},
@@ -139,7 +139,8 @@ impl SandboxSession for HostSession {
         Ok(true)
     }
 
-    async fn ls(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        let path = path.as_str();
         let directory = self.host_path(path)?;
         let listing =
             std::fs::read_dir(&directory).map_err(|error| io_failure(&directory, &error))?;
@@ -158,11 +159,22 @@ impl SandboxSession for HostSession {
             .collect())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         panic!("the skills capability never removes anything");
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool, user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        path: SessionPath<'_>,
+        _parents: bool,
+        user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.record
             .lock()
             .unwrap()
@@ -172,7 +184,8 @@ impl SandboxSession for HostSession {
         std::fs::create_dir_all(&directory).map_err(|error| io_failure(&directory, &error))
     }
 
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         self.record
             .lock()
             .unwrap()
@@ -187,7 +200,8 @@ impl SandboxSession for HostSession {
         std::fs::read(&file).map_err(|error| io_failure(&file, &error))
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+    async fn write(&self, path: SessionPath<'_>, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         self.record
             .lock()
             .unwrap()
@@ -853,7 +867,7 @@ async fn load_skill_stages_exactly_the_skill_asked_for() {
     let capability = capability.bound_to(session.clone());
 
     let missing = session
-        .read(".agents/dynamic-skill/SKILL.md", None)
+        .read(".agents/dynamic-skill/SKILL.md".into(), None)
         .await
         .unwrap_err();
     assert_eq!(missing.error_code(), ErrorCode::WorkspaceReadNotFound);
@@ -1112,7 +1126,7 @@ async fn a_skill_already_in_the_workspace_is_reported_as_already_loaded() {
     let capability = lazy_skills(lazy_local_dir(&source)).bound_to(session.clone());
     session
         .write(
-            ".agents/dynamic-skill/SKILL.md",
+            ".agents/dynamic-skill/SKILL.md".into(),
             b"# already loaded\n".to_vec(),
             None,
         )

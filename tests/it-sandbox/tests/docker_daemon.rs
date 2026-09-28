@@ -61,20 +61,23 @@ async fn a_container_session_runs_commands_moves_files_and_is_deleted() {
     let pwd = session.exec(shell("pwd")).await.expect("pwd");
     assert_eq!(text(&pwd.stdout).trim(), "/workspace");
     assert_eq!(
-        text(&session.read("hello.txt", None).await.expect("read")),
+        text(&session.read("hello.txt".into(), None).await.expect("read")),
         "hello from the manifest\n"
     );
 
     let binary = (0_u8..=255).cycle().take(300_000).collect::<Vec<_>>();
     session
-        .write("nested/data.bin", binary.clone(), None)
+        .write("nested/data.bin".into(), binary.clone(), None)
         .await
         .expect("write");
     assert_eq!(
-        session.read("nested/data.bin", None).await.expect("read"),
+        session
+            .read("nested/data.bin".into(), None)
+            .await
+            .expect("read"),
         binary
     );
-    let listing = session.ls("nested", None).await.expect("ls");
+    let listing = session.ls("nested".into(), None).await.expect("ls");
     assert!(
         listing
             .iter()
@@ -82,7 +85,7 @@ async fn a_container_session_runs_commands_moves_files_and_is_deleted() {
     );
 
     let missing = session
-        .read("missing.txt", None)
+        .read("missing.txt".into(), None)
         .await
         .expect_err("missing");
     assert_eq!(
@@ -90,7 +93,7 @@ async fn a_container_session_runs_commands_moves_files_and_is_deleted() {
         ra_core::sandbox::ErrorCode::WorkspaceReadNotFound
     );
     let escape = session
-        .read("../etc/passwd", None)
+        .read("../etc/passwd".into(), None)
         .await
         .expect_err("escape");
     assert_eq!(
@@ -114,10 +117,13 @@ async fn a_container_session_runs_commands_moves_files_and_is_deleted() {
     assert_eq!(text(&stderr.stderr), "err\n");
 
     let archive = session.persist_workspace().await.expect("persist");
-    session.rm("nested", true, None).await.expect("rm");
+    session.rm("nested".into(), true, None).await.expect("rm");
     session.hydrate_workspace(archive).await.expect("hydrate");
     assert_eq!(
-        session.read("nested/data.bin", None).await.expect("read"),
+        session
+            .read("nested/data.bin".into(), None)
+            .await
+            .expect("read"),
         binary
     );
 
@@ -148,7 +154,7 @@ async fn a_resumed_session_reconnects_to_its_running_container() {
         .expect("created");
     session.start().await.expect("started");
     session
-        .write("marker.txt", b"still here".to_vec(), None)
+        .write("marker.txt".into(), b"still here".to_vec(), None)
         .await
         .expect("write");
 
@@ -164,7 +170,7 @@ async fn a_resumed_session_reconnects_to_its_running_container() {
             .container_id()
     );
     assert_eq!(
-        resumed.read("marker.txt", None).await.expect("read"),
+        resumed.read("marker.txt".into(), None).await.expect("read"),
         b"still here"
     );
     client.delete(resumed.as_ref()).await.expect("deleted");
