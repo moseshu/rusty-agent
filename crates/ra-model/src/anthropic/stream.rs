@@ -100,7 +100,7 @@ impl Driver {
                 return Some(event);
             }
             if let Some(frame) = self.ready.pop_front() {
-                match frame.and_then(|frame| self.decode(frame)) {
+                match frame.and_then(|frame| self.decode(&frame)) {
                     Ok(events) => self.pending.extend(events.into_iter().map(Ok)),
                     // Whatever is still buffered describes a turn that will not arrive, so the
                     // first failure is the last event rather than a note in the middle.
@@ -173,14 +173,14 @@ impl Driver {
             }));
     }
 
-    fn decode(&mut self, frame: Value) -> Result<Vec<ModelStreamEvent>> {
+    fn decode(&mut self, frame: &Value) -> Result<Vec<ModelStreamEvent>> {
         let event_type = frame
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| convert::behavior_error("Anthropic stream event has no type"))?
             .to_owned();
         if event_type == "error" {
-            return Err(self.stream_error(&frame));
+            return Err(self.stream_error(frame));
         }
         let mut events = vec![ModelStreamEvent::RawResponse(RawResponseEvent::new(
             self.provider.clone(),
@@ -192,7 +192,7 @@ impl Driver {
             // `Value` that is not an object panics. The shape is therefore established once, here,
             // rather than re-checked at each of the writes that assume it.
             "message_start" => {
-                self.message = Some(object(&frame, "message", "message_start")?);
+                self.message = Some(object(frame, "message", "message_start")?);
             }
             "content_block_start" => {
                 let index = frame.get("index").and_then(Value::as_u64).ok_or_else(|| {
@@ -200,11 +200,11 @@ impl Driver {
                 })?;
                 self.blocks.insert(
                     index,
-                    object(&frame, "content_block", "content_block_start")?,
+                    object(frame, "content_block", "content_block_start")?,
                 );
             }
-            "content_block_delta" => self.apply_delta(&frame)?,
-            "message_delta" => self.apply_message_delta(&frame),
+            "content_block_delta" => self.apply_delta(frame)?,
+            "message_delta" => self.apply_message_delta(frame),
             "message_stop" => {
                 let payload = self.assembled()?;
                 let response = convert::convert_response(

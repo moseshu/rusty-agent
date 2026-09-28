@@ -44,7 +44,10 @@ impl AnthropicAuth {
     /// Replaces the API base URL. A trailing slash is ignored.
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into().trim_end_matches('/').to_owned();
+        base_url
+            .into()
+            .trim_end_matches('/')
+            .clone_into(&mut self.base_url);
         self
     }
     /// Replaces the API key.

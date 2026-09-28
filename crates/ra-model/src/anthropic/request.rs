@@ -52,7 +52,7 @@ pub(crate) async fn build_request_body(
         request.handoffs(),
         custom_tools_as_functions,
     )?;
-    insert_system(&mut body, request, &tools)?;
+    insert_system(&mut body, request);
     apply_tool_choice(
         &mut body,
         request.model_settings().tool_choice(),
@@ -110,13 +110,11 @@ fn reject_unsupported(request: &ModelRequest) -> Result<()> {
     Ok(())
 }
 
-fn insert_system(
-    body: &mut Map<String, Value>,
-    request: &ModelRequest,
-    tools: &Tools,
-) -> Result<()> {
+/// Adds the system prompt, marked cacheable when it and the tools already merged into `body` are
+/// long enough to be worth a breakpoint.
+fn insert_system(body: &mut Map<String, Value>, request: &ModelRequest) {
     let Some(instructions) = request.system_instructions() else {
-        return Ok(());
+        return;
     };
     let mut block = json!({"type": "text", "text": instructions});
     let tool_tokens = body
@@ -128,9 +126,7 @@ fn insert_system(
     {
         block["cache_control"] = json!({"type": "ephemeral"});
     }
-    let _ = tools;
     body.insert("system".to_owned(), Value::Array(vec![block]));
-    Ok(())
 }
 
 async fn lower_messages(
@@ -241,15 +237,14 @@ struct MessageAccumulator {
 }
 impl MessageAccumulator {
     fn push(&mut self, role: &str, blocks: Vec<Value>) {
-        if let Some(last) = self
+        if let Some(content) = self
             .messages
             .last_mut()
             .filter(|last| last.get("role").and_then(Value::as_str) == Some(role))
+            .and_then(|last| last.get_mut("content"))
+            .and_then(Value::as_array_mut)
         {
-            last["content"]
-                .as_array_mut()
-                .expect("constructed content array")
-                .extend(blocks);
+            content.extend(blocks);
         } else {
             self.messages.push(json!({"role": role, "content": blocks}));
         }
@@ -257,24 +252,19 @@ impl MessageAccumulator {
 
     /// Adds a result as the first block of a user turn, or alongside its sibling results.
     fn push_tool_result(&mut self, block: Value) {
-        let can_extend = self.messages.last().is_some_and(|last| {
-            last.get("role").and_then(Value::as_str) == Some("user")
-                && last
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks.iter().all(|block| {
-                            block.get("type").and_then(Value::as_str) == Some("tool_result")
-                        })
-                    })
-        });
-        if can_extend {
-            self.messages
-                .last_mut()
-                .and_then(|message| message.get_mut("content"))
-                .and_then(Value::as_array_mut)
-                .expect("constructed tool-result content array")
-                .push(block);
+        if let Some(results) = self
+            .messages
+            .last_mut()
+            .filter(|last| last.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|last| last.get_mut("content"))
+            .and_then(Value::as_array_mut)
+            .filter(|blocks| {
+                blocks.iter().all(|existing| {
+                    existing.get("type").and_then(Value::as_str) == Some("tool_result")
+                })
+            })
+        {
+            results.push(block);
         } else {
             self.messages
                 .push(json!({"role": "user", "content": [block]}));
