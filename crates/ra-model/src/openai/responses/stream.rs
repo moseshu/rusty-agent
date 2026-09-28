@@ -174,11 +174,11 @@ impl StreamDriver {
         // A failure frame is the provider stating an outcome, and it is the only place that outcome
         // appears: the body simply ends afterwards, which the check for a missing terminal frame
         // would report as a dropped connection instead of as the refusal or the truncation it was.
-        match event_type.as_str() {
-            "response.failed" | "response.incomplete" => return Err(failure(frame)),
-            "error" => return Err(stream_error(frame)),
-            _ => {}
-        }
+        let terminal_failure = match event_type.as_str() {
+            "response.failed" | "response.incomplete" => Some(failure(&event_type, frame)),
+            "error" | "response.error" => Some(stream_error(&event_type, frame)),
+            _ => None,
+        };
 
         self.pending
             .push_back(Ok(ModelStreamEvent::RawResponse(RawResponseEvent::new(
@@ -186,6 +186,15 @@ impl StreamDriver {
                 event_type.clone(),
                 frame.clone(),
             ))));
+
+        // As on the reference, the failure frame itself reaches the consumer first and the error
+        // follows it; nothing after it is read, so transport teardown cannot replace the
+        // provider's own account of what went wrong.
+        if let Some(error) = terminal_failure {
+            self.pending.push_back(Err(error));
+            self.finished = true;
+            return Ok(());
+        }
 
         match event_type.as_str() {
             CREATED => {
@@ -253,35 +262,75 @@ impl StreamDriver {
     }
 }
 
-/// Reads the outcome out of a terminal failure frame.
-fn failure(frame: &Value) -> Error {
-    let reason = frame
-        .pointer("/response/incomplete_details/reason")
-        .and_then(Value::as_str);
-    match reason {
-        Some("max_output_tokens") => Error::provider(
-            ProviderErrorKind::ContextOverflow,
-            "OpenAI response stopped at max_output_tokens",
-        ),
-        Some("content_filter") => Error::provider(
-            ProviderErrorKind::Refusal,
-            "OpenAI response stopped on a content filter",
-        ),
-        _ => {
-            let message = frame
-                .pointer("/response/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("OpenAI response stream reported a failed response");
-            behavior_error(message.to_owned())
+/// Reads the outcome out of a `response.failed` or `response.incomplete` frame.
+///
+/// The message is the reference's `format_response_terminal_failure`: the event, then the
+/// response's `status`, `error` and `incomplete_details` when present. Those two objects are shown
+/// as compact JSON where the reference shows its SDK's representation of them.
+///
+/// The reference reports every such frame as a model behaviour error. A truncation and a content
+/// filter are classified here instead, as the non-streaming path classifies the same statuses, so
+/// a caller can tell them from a malformed response.
+fn failure(event_type: &str, frame: &Value) -> Error {
+    let response = frame.get("response");
+    let field = |name: &str| response.and_then(|response| response.get(name));
+    let mut details = Vec::new();
+    if let Some(status) = field("status")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        details.push(format!("status={status}"));
+    }
+    for name in ["error", "incomplete_details"] {
+        if let Some(value) = field(name).filter(|value| !value.is_null()) {
+            details.push(format!("{name}={value}"));
         }
     }
+    let message = terminal_message(event_type, &details);
+    let kind = match field("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("max_output_tokens") => ProviderErrorKind::ContextOverflow,
+        Some("content_filter") => ProviderErrorKind::Refusal,
+        _ => return behavior_error(message),
+    };
+    Error::provider(kind, message)
 }
 
-/// Reads a mid-stream error frame, which reports a call that will produce nothing further.
-fn stream_error(frame: &Value) -> Error {
-    let message = frame
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("OpenAI response stream reported an error");
-    behavior_error(message.to_owned())
+/// Reads an `error` or `response.error` frame, which reports a call that will produce nothing
+/// further.
+///
+/// The message is the reference's `format_response_error_event`: `code`, `message` and `param`
+/// when present. They sit at the top of an `error` frame and inside an `error` object on a
+/// `response.error` frame, so both places are read, the top first.
+fn stream_error(event_type: &str, frame: &Value) -> Error {
+    let nested = frame.get("error").filter(|value| value.is_object());
+    let field = |name: &str| {
+        frame
+            .get(name)
+            .filter(|value| !value.is_null())
+            .or_else(|| nested.and_then(|error| error.get(name)))
+            .filter(|value| !value.is_null() && value.as_str() != Some(""))
+    };
+    let details: Vec<String> = ["code", "message", "param"]
+        .into_iter()
+        .filter_map(|name| {
+            field(name).map(|value| match value.as_str() {
+                Some(text) => format!("{name}={text}"),
+                None => format!("{name}={value}"),
+            })
+        })
+        .collect();
+    behavior_error(terminal_message(event_type, &details))
+}
+
+/// The reference's wording for a stream that ended on a failure event.
+fn terminal_message(event_type: &str, details: &[String]) -> String {
+    let message = format!("Responses stream ended with terminal event `{event_type}`.");
+    if details.is_empty() {
+        message
+    } else {
+        format!("{message} {}.", details.join("; "))
+    }
 }
