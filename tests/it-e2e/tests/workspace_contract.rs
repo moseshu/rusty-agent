@@ -107,7 +107,7 @@ fn test_workspace_contract_04() {
         .map(|name| host_of(name))
         .chain(std::iter::once(CROSS_CRATE_HOST.to_owned()))
     {
-        for file in rust_files(&tests.join(host).join("tests")) {
+        for file in test_targets(&tests.join(host).join("tests")) {
             sources += 1;
             let text = read(&file);
             assert!(
@@ -169,6 +169,31 @@ fn has_test_attribute(text: &str) -> bool {
                 .is_some_and(|tail| tail.starts_with(']') || tail.starts_with('('))
         })
     })
+}
+
+/// The test targets Cargo discovers in a `tests/` directory: every `*.rs` file directly in it, and
+/// `main.rs` of each directory directly under it. Deeper files are modules a target includes —
+/// helpers under `support/` — and hold no test of their own by design.
+fn test_targets(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut targets: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter_map(|path| {
+            if path.is_dir() {
+                let main = path.join("main.rs");
+                main.is_file().then_some(main)
+            } else {
+                path.extension()
+                    .is_some_and(|extension| extension == "rs")
+                    .then_some(path)
+            }
+        })
+        .collect();
+    targets.sort();
+    targets
 }
 
 fn rust_files(root: &Path) -> Vec<PathBuf> {

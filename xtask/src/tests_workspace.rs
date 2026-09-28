@@ -174,10 +174,10 @@ fn validate_layout(manifest: &Path) -> Vec<String> {
     let mut test_files = 0_usize;
     let mut test_cases = 0_usize;
     for host in &hosts {
-        // Only Cargo's external test slot counts: `src/` is an empty lib and `fixtures/` holds
-        // compile-time negative fixtures, and neither should read as "a test file with no
-        // assertions".
-        for file in source::rust_files(&tests_root.join(host).join("tests")) {
+        // Only Cargo's test targets count: `src/` is an empty lib, `fixtures/` holds compile-time
+        // negative fixtures, and `tests/support/` holds helpers the targets include, and none of
+        // them should read as "a test file with no assertions".
+        for file in source::test_targets(&tests_root.join(host).join("tests")) {
             test_files += 1;
             let text = std::fs::read_to_string(&file).unwrap_or_default();
             let count = text.lines().filter(|line| is_test_attribute(line)).count();
