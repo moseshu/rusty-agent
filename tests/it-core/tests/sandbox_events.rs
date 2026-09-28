@@ -228,6 +228,12 @@ fn a_timestamp_reads_back_from_either_offset_form_or_epoch_seconds() {
     );
     assert!(parse_event_timestamp(&json!("yesterday")).is_err());
     assert!(parse_event_timestamp(&json!("2026-13-01T00:00:00Z")).is_err());
+    // Year 1 is the first a `datetime` holds; year 0 is refused, as the reference refuses it.
+    assert_eq!(
+        format_event_timestamp(parse_event_timestamp(&json!("0001-01-01T00:00:00Z")).unwrap()),
+        "0001-01-01T00:00:00Z"
+    );
+    assert!(parse_event_timestamp(&json!("0000-01-01T00:00:00Z")).is_err());
 }
 
 // --- parsing --------------------------------------------------------------------------------------
@@ -335,11 +341,95 @@ fn a_reference_code_is_its_own_reference_code_and_names_its_class() {
 
 #[test]
 fn out_of_range_numeric_timestamps_are_parse_errors() {
-    for seconds in [1e100, 1e19, -1.0] {
+    // After 9999 or before 0001, in either unit; the reference refuses each of these.
+    for seconds in [
+        1e100,
+        -1e100,
+        1e19,
+        253_402_300_800_000.0,
+        -62_135_596_801_000.0,
+    ] {
         assert!(parse_event_timestamp(&json!(seconds)).is_err());
         let mut payload = serde_json::to_value(finish_with_output(b"", b"")).unwrap();
         payload["ts"] = json!(seconds);
         assert!(validate_sandbox_session_event(payload).is_err());
+    }
+}
+
+/// An event holds its time at the precision it writes, so a time read from a clock with
+/// nanoseconds — Linux's — still reads back equal from the event's own serialized form.
+#[test]
+fn an_event_keeps_its_time_to_whole_microseconds_and_reads_back_equal() {
+    let precise = UNIX_EPOCH + Duration::new(1_790_586_137, 504_975_054);
+    let base =
+        SandboxSessionEventBase::new(Uuid::new_v4(), 1, OpName::Start, "audit").with_ts(precise);
+    assert_eq!(
+        base.ts(),
+        UNIX_EPOCH + Duration::new(1_790_586_137, 504_975_000)
+    );
+
+    let event: SandboxSessionEvent = SandboxSessionStartEvent::from_base(base).into();
+    let read_back = validate_sandbox_session_event(serde_json::to_value(&event).unwrap()).unwrap();
+    assert_eq!(read_back, event);
+
+    // Before the epoch too: kept toward the past, and written and read back unchanged.
+    let early = UNIX_EPOCH - Duration::new(1, 499_999_999);
+    let base =
+        SandboxSessionEventBase::new(Uuid::new_v4(), 1, OpName::Start, "audit").with_ts(early);
+    assert_eq!(
+        format_event_timestamp(base.ts()),
+        "1969-12-31T23:59:58.500000Z"
+    );
+    let event: SandboxSessionEvent = SandboxSessionStartEvent::from_base(base).into();
+    let read_back = validate_sandbox_session_event(serde_json::to_value(&event).unwrap()).unwrap();
+    assert_eq!(read_back, event);
+}
+
+/// Every value here was read by the reference's event model (pydantic 2.12.3, pydantic-core
+/// 2.41.4) and written back with its `model_dump_json`; this is what it wrote.
+#[test]
+fn numeric_timestamps_are_read_as_the_reference_reads_them() {
+    let cases: [(Value, &str); 24] = [
+        // Fractions round to the nearest microsecond, carrying into the second.
+        (json!(1.000_000_9), "1970-01-01T00:00:01.000001Z"),
+        (json!(1.999_999_9), "1970-01-01T00:00:02Z"),
+        (json!(1.000_000_5), "1970-01-01T00:00:01.000001Z"),
+        (json!(1.000_001_5), "1970-01-01T00:00:01.000001Z"),
+        (json!(1.000_002_5), "1970-01-01T00:00:01.000002Z"),
+        (json!(1.000_000_4), "1970-01-01T00:00:01Z"),
+        (json!(2.5e-7), "1970-01-01T00:00:00Z"),
+        // Before the epoch, a number's fraction is added to its floor.
+        (json!(-1), "1969-12-31T23:59:59Z"),
+        (json!(-1.0), "1969-12-31T23:59:59Z"),
+        (json!(-1.5), "1969-12-31T23:59:58.500000Z"),
+        (json!(-4e-7), "1969-12-31T23:59:59Z"),
+        (json!(-6e-7), "1969-12-31T23:59:59.000001Z"),
+        (json!(-1.999_999_9), "1969-12-31T23:59:59Z"),
+        // Above 2e10 in magnitude, milliseconds.
+        (json!(2e10), "2603-10-11T11:33:20Z"),
+        (json!(2.000_000_1e10), "1970-08-20T11:33:21Z"),
+        (json!(20_000_000_000.5), "2603-10-11T11:33:20.000500Z"),
+        (json!(20_000_000_001.000_5), "1970-08-20T11:33:20.001000Z"),
+        (
+            json!(1_790_586_137_504.975_1),
+            "2026-09-28T09:02:17.504975Z",
+        ),
+        (json!(25_000_000_000_i64), "1970-10-17T08:26:40Z"),
+        (json!(1e11), "1973-03-03T09:46:40Z"),
+        (json!(-2e10), "1336-03-23T12:26:40Z"),
+        (json!(-2.000_000_1e10), "1969-05-14T12:26:39Z"),
+        // The ends of the range.
+        (json!(253_402_300_799_999.0), "9999-12-31T23:59:59.999000Z"),
+        (json!(-62_135_596_800_000.0), "0001-01-01T00:00:00Z"),
+    ];
+    for (input, written) in cases {
+        let time = parse_event_timestamp(&input).unwrap_or_else(|error| panic!("{input}: {error}"));
+        assert_eq!(format_event_timestamp(time), written, "{input}");
+        assert_eq!(
+            parse_event_timestamp(&json!(written)).unwrap(),
+            time,
+            "{written}"
+        );
     }
 }
 

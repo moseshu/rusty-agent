@@ -193,7 +193,7 @@ pub struct SandboxSessionEventBase {
     #[serde(default = "Uuid::new_v4")]
     event_id: Uuid,
     #[serde(
-        default = "SystemTime::now",
+        default = "event_now",
         serialize_with = "serialize_timestamp",
         deserialize_with = "deserialize_timestamp"
     )]
@@ -221,7 +221,7 @@ impl SandboxSessionEventBase {
         Self {
             version: SANDBOX_SESSION_EVENT_VERSION,
             event_id: Uuid::new_v4(),
-            ts: SystemTime::now(),
+            ts: event_now(),
             session_id,
             seq,
             op,
@@ -254,10 +254,10 @@ impl SandboxSessionEventBase {
         self
     }
 
-    /// Replaces when the record was made.
+    /// Replaces when the record was made, kept to whole microseconds as the record writes it.
     #[must_use]
-    pub const fn with_ts(mut self, ts: SystemTime) -> Self {
-        self.ts = ts;
+    pub fn with_ts(mut self, ts: SystemTime) -> Self {
+        self.ts = at_event_precision(ts);
         self
     }
 
@@ -780,15 +780,77 @@ fn write_ascii_string(text: &str, out: &mut String) {
 
 // --- timestamps ----------------------------------------------------------------------------------
 
+/// Above this magnitude a numeric timestamp counts milliseconds rather than seconds, as the
+/// reference's `datetime` validation reads it.
+const MS_WATERSHED: i64 = 20_000_000_000;
+
+/// [`MS_WATERSHED`] as a float, for the comparison the reference makes on a float timestamp; exact.
+const MS_WATERSHED_F64: f64 = 20_000_000_000.0;
+
+/// The first second of 0001-01-01, the earliest time the reference's `datetime` holds.
+const FIRST_SECOND: i64 = -62_135_596_800;
+
+/// The last second of 9999-12-31, the latest time the reference reads from a timestamp.
+const LAST_SECOND: i64 = 253_402_300_799;
+
+/// A time as whole seconds from the epoch, rounded toward the past, and the microseconds after them.
+fn to_parts(time: SystemTime) -> (i64, u32) {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => (
+            i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+            after.subsec_micros(),
+        ),
+        Err(error) => {
+            let before = error.duration();
+            let seconds = i64::try_from(before.as_secs()).map_or(i64::MIN, |seconds| -seconds);
+            // Rounded toward the past, so a time a nanosecond before a microsecond boundary keeps
+            // the earlier microsecond, as it does after the epoch.
+            let nanos = before.subsec_nanos();
+            if nanos == 0 {
+                (seconds, 0)
+            } else {
+                (
+                    seconds.saturating_sub(1),
+                    (1_000_000_000 - nanos).div_euclid(1_000),
+                )
+            }
+        }
+    }
+}
+
+/// The time `seconds` from the epoch plus `micros`, if the platform's clock type can hold it.
+fn from_parts(seconds: i64, micros: u32) -> Option<SystemTime> {
+    let whole = if seconds >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(seconds.unsigned_abs()))?
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs()))?
+    };
+    whole.checked_add(Duration::from_micros(u64::from(micros)))
+}
+
+/// A time at the precision an event keeps: whole microseconds, the precision of the reference's
+/// `datetime` field.
+///
+/// Every time an event holds goes through here, so that what it holds is exactly what it writes.
+/// Without this an event made on a host whose clock reads nanoseconds — Linux, not macOS — would
+/// not compare equal to itself read back from its own serialized form.
+fn at_event_precision(time: SystemTime) -> SystemTime {
+    let (seconds, micros) = to_parts(time);
+    from_parts(seconds, micros).unwrap_or(time)
+}
+
+/// The current time, at the precision an event keeps.
+fn event_now() -> SystemTime {
+    at_event_precision(SystemTime::now())
+}
+
 /// Writes a time as the reference writes a UTC time: `YYYY-MM-DDTHH:MM:SS`, then `.ffffff` when
-/// there are microseconds, then `Z`. Times before the epoch are written as the epoch.
+/// there are microseconds, then `Z`.
 #[must_use]
 pub fn format_event_timestamp(time: SystemTime) -> String {
-    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = since_epoch.as_secs();
-    let micros = since_epoch.subsec_micros();
-    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
-    let of_day = seconds % 86_400;
+    let (seconds, micros) = to_parts(time);
+    let days = seconds.div_euclid(86_400);
+    let of_day = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     let mut out = format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
@@ -804,7 +866,13 @@ pub fn format_event_timestamp(time: SystemTime) -> String {
 }
 
 /// Reads a time written as RFC 3339 — a `Z` or a numeric offset, any number of fractional digits
-/// down to microseconds — or as seconds since the epoch.
+/// down to microseconds — or as a Unix timestamp.
+///
+/// A timestamp is read as the reference's `datetime` field reads one: seconds, or milliseconds
+/// when its magnitude is above 2e10; a fraction rounded to the nearest microsecond; negative values
+/// before the epoch; and nothing before 0001-01-01 or after 9999-12-31. The rounding has the
+/// reference's quirks — the fraction's unit follows the number's magnitude while the whole part's
+/// follows the floored integer, and a negative number adds its fraction to its floor.
 ///
 /// # Errors
 ///
@@ -812,21 +880,54 @@ pub fn format_event_timestamp(time: SystemTime) -> String {
 pub fn parse_event_timestamp(value: &Value) -> Result<SystemTime, String> {
     match value {
         Value::Number(number) => {
-            let seconds = number
-                .as_f64()
-                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                .ok_or_else(|| format!("invalid timestamp {number}"))?;
-            let duration = Duration::try_from_secs_f64(seconds)
-                .map_err(|_| format!("invalid timestamp {number}"))?;
-            UNIX_EPOCH
-                .checked_add(duration)
-                .ok_or_else(|| format!("invalid timestamp {number}"))
+            parse_numeric_timestamp(number).ok_or_else(|| format!("invalid timestamp {number}"))
         }
         Value::String(text) => {
             parse_rfc3339(text).ok_or_else(|| format!("invalid timestamp {text:?}"))
         }
         other => Err(format!("invalid timestamp {other}")),
     }
+}
+
+/// The reference's `speedate` `DateTime::from_float_with_config` and
+/// `from_timestamp_with_config`, with the unit inferred.
+fn parse_numeric_timestamp(number: &serde_json::Number) -> Option<SystemTime> {
+    let (timestamp, fraction_micros) = if let Some(integer) = number.as_i64() {
+        (integer, 0)
+    } else if number.is_u64() {
+        // Beyond `i64`, and so beyond 9999 in either unit.
+        return None;
+    } else {
+        let float = number.as_f64().filter(|float| float.is_finite())?;
+        let fraction = if float.abs() <= MS_WATERSHED_F64 {
+            float.fract().abs() * 1_000_000.0
+        } else {
+            float.fract().abs() * 1_000.0
+        };
+        // Saturating, as the reference's own conversion is; a saturated value is then out of
+        // range either way.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let converted = (float.floor() as i64, fraction.round() as u32);
+        converted
+    };
+
+    let (mut seconds, extra_micros) = if timestamp.checked_abs()? <= MS_WATERSHED {
+        (timestamp, 0)
+    } else {
+        (
+            timestamp.div_euclid(1_000),
+            u32::try_from(timestamp.rem_euclid(1_000) * 1_000).ok()?,
+        )
+    };
+    let mut micros = fraction_micros.checked_add(extra_micros)?;
+    if micros >= 1_000_000 {
+        seconds = seconds.checked_add(i64::from(micros / 1_000_000))?;
+        micros %= 1_000_000;
+    }
+    if !(FIRST_SECOND..=LAST_SECOND).contains(&seconds) {
+        return None;
+    }
+    from_parts(seconds, micros)
 }
 
 fn parse_rfc3339(text: &str) -> Option<SystemTime> {
@@ -895,9 +996,11 @@ fn parse_rfc3339(text: &str) -> Option<SystemTime> {
 
     let days = days_from_civil(year, month, day);
     let total = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_seconds;
-    let total = u64::try_from(total).ok()?;
-    let micros = u64::try_from(micros).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(total) + Duration::from_micros(micros))
+    // Year 0 is a date the reference's `datetime` cannot hold.
+    if year < 1 {
+        return None;
+    }
+    from_parts(total, u32::try_from(micros).ok()?)
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
