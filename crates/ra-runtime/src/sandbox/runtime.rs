@@ -6,14 +6,14 @@
 //! prepared generates memory.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError},
 };
 
 use ra_core::{
     agent::{AgentId, AgentSpec},
-    capability::{Capability, ContextProcessor, SamplingContext, SandboxBinding},
+    capability::{Capability, CapabilityFamily, ContextProcessor, SamplingContext, SandboxBinding},
     error::{Error, Result},
     item::{ModelInputItem, RunItem},
     model::ModelResolver,
@@ -65,6 +65,9 @@ struct FailedSegment {
 /// Sandbox execution for one run.
 pub(crate) struct SandboxRuntime {
     workspace_scope: SandboxWorkspaceScope,
+    /// The families of the capabilities the run installs for every agent, which a sandbox agent's
+    /// own capabilities must not claim again.
+    run_capability_families: BTreeSet<CapabilityFamily>,
     /// `None` when the run has no sandbox configuration, which is a run that refuses sandbox
     /// agents rather than one that ignores them.
     inner: Option<Mutex<Inner>>,
@@ -85,11 +88,13 @@ impl SandboxRuntime {
     /// Sandbox execution for a run configured with `config`, continued from `resumed` if the run's
     /// checkpoint carried a resume payload.
     ///
-    /// `model_resolver` resolves the models sandbox memory runs with, and `rollout_id` names the
-    /// rollout the run is recorded under.
+    /// `run_capabilities` are the capabilities the run installs for every agent, `model_resolver`
+    /// resolves the models sandbox memory runs with, and `rollout_id` names the rollout the run is
+    /// recorded under.
     pub(crate) fn new(
         config: Option<SandboxRunConfig>,
         resumed: Option<Value>,
+        run_capabilities: &[Arc<dyn Capability>],
         model_resolver: Arc<dyn ModelResolver>,
         rollout_id: Option<String>,
     ) -> Self {
@@ -104,6 +109,10 @@ impl SandboxRuntime {
         .unwrap_or_default();
         Self {
             workspace_scope,
+            run_capability_families: run_capabilities
+                .iter()
+                .map(|capability| capability.kind())
+                .collect(),
             inner: config.map(|config| {
                 Mutex::new(Inner {
                     manager: SessionManager::new(config, resumed),
@@ -124,12 +133,49 @@ impl SandboxRuntime {
         self.inner.is_some()
     }
 
-    /// Refuses a sandbox agent in a run that has no sandbox configuration.
+    /// Refuses a sandbox agent in a run that has no sandbox configuration, and one whose own
+    /// capabilities claim a family the run already installs for every agent.
+    ///
+    /// The second refusal has no counterpart in the reference, which installs capabilities only on
+    /// a sandbox agent. Here a run can also install them for every agent, and the built-in set for
+    /// that route shares its family names with the sandbox set while meaning something else: the
+    /// run-level `shell` and `filesystem` act on the host's workspace, the sandbox ones on the
+    /// session's; the run-level `memory` reads a store, the sandbox one the session's files; the
+    /// run-level `compaction` summarizes locally, the sandbox one asks the provider. Installed
+    /// together, one agent would hold two meanings under one name, so the run is refused before a
+    /// session exists rather than left to whichever tool the model happens to call. The check
+    /// covers every sandbox agent the run prepares, a handoff target included: run-level tools and
+    /// prompt text reach the starting agent only, but run-level context processing runs on every
+    /// turn.
     pub(crate) fn assert_agent_supported(&self, agent: &AgentSpec) -> Result<()> {
-        if agent.sandbox().is_some() && !self.enabled() {
+        let Some(sandbox) = agent.sandbox() else {
+            return Ok(());
+        };
+        if !self.enabled() {
             return Err(Error::config(
                 "SandboxAgent execution requires `RunConfig(sandbox=...)`",
             ));
+        }
+        let shared: BTreeSet<CapabilityFamily> = sandbox
+            .capabilities()
+            .iter()
+            .map(|capability| capability.kind())
+            .filter(|family| self.run_capability_families.contains(family))
+            .collect();
+        if !shared.is_empty() {
+            let families = shared
+                .iter()
+                .map(|family| format!("`{family}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::config(format!(
+                "sandbox agent `{}` installs capability families {families} that the run also \
+                 installs for every agent; a run-level capability and a sandbox capability of one \
+                 family are two different capabilities under one name, so the agent would hold \
+                 both meanings at once. Install each family in one place: remove it from the \
+                 run's capabilities or from the sandbox agent's",
+                agent.id()
+            )));
         }
         Ok(())
     }
