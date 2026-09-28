@@ -274,7 +274,7 @@ fn worker(id: &str, capabilities: Vec<Arc<dyn Capability>>) -> Arc<AgentSpec> {
         .id(AgentId::new(id))
         .name(id)
         .instructions("Worker.")
-        .sandbox(SandboxAgentConfig::new().with_capabilities(capabilities))
+        .sandbox(SandboxAgentConfig::empty().with_capabilities(capabilities))
         .build()
         .unwrap()
 }
@@ -1119,7 +1119,7 @@ async fn an_interrupted_run_reaches_phase_one_as_interrupted() {
         .name("worker")
         .instructions("Worker.")
         .tool(ApprovalTool::new())
-        .sandbox(SandboxAgentConfig::new().with_capability(memory))
+        .sandbox(SandboxAgentConfig::empty().with_capability(memory))
         .build()
         .unwrap();
     let model = ScriptedModel::new(vec![vec![item(
@@ -1209,7 +1209,7 @@ async fn phase_models_given_as_instances_need_no_default_model() {
         .name("worker")
         .instructions("Worker.")
         .model("worker-model")
-        .sandbox(SandboxAgentConfig::new().with_capability(memory))
+        .sandbox(SandboxAgentConfig::empty().with_capability(memory))
         .build()
         .unwrap();
     let resolver = Arc::new(NamedOnlyResolver {

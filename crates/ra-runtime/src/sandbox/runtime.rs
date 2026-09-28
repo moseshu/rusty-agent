@@ -17,7 +17,7 @@ use ra_core::{
     error::{Error, Result},
     item::{ModelInputItem, RunItem},
     model::ModelResolver,
-    sandbox::{SandboxMemory, SandboxSession, SandboxWorkspaceScope},
+    sandbox::{SandboxAgentConfig, SandboxMemory, SandboxSession, SandboxWorkspaceScope},
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, oneshot, watch};
@@ -28,7 +28,7 @@ use crate::capability::CapabilityContextProcessor;
 use crate::runner::RunResult;
 
 use super::{
-    SandboxRunConfig,
+    DefaultCapabilities, SandboxRunConfig,
     memory::{
         manager::{SandboxMemoryGenerationManager, get_or_create_memory_generation_manager},
         rollouts::{build_rollout_payload, terminal_metadata_for_error},
@@ -82,6 +82,11 @@ pub(crate) struct SandboxRuntime {
     active_memory: StdMutex<Option<SandboxMemory>>,
     /// Set by the runner when the run fails after its turns started.
     failed_segment: StdMutex<Option<FailedSegment>>,
+    /// What makes the capabilities of a sandbox agent that names none, if the run supplies it.
+    default_capabilities: Option<DefaultCapabilities>,
+    /// Each sandbox agent's configuration with its capabilities settled, made once per agent so
+    /// that every check, manifest edit and binding in the run sees the same instances.
+    resolved: StdMutex<BTreeMap<AgentId, Arc<SandboxAgentConfig>>>,
 }
 
 impl SandboxRuntime {
@@ -107,6 +112,9 @@ impl SandboxRuntime {
         // The configuration normalized its working directory when it was set, so a second
         // normalization of the same value cannot refuse it.
         .unwrap_or_default();
+        let default_capabilities = config
+            .as_ref()
+            .and_then(|config| config.default_capabilities().cloned());
         Self {
             workspace_scope,
             run_capability_families: run_capabilities
@@ -125,7 +133,43 @@ impl SandboxRuntime {
             rollout_id,
             active_memory: StdMutex::new(None),
             failed_segment: StdMutex::new(None),
+            default_capabilities,
+            resolved: StdMutex::new(BTreeMap::new()),
         }
+    }
+
+    /// `agent`'s sandbox configuration with its capabilities settled, or `None` for an agent that
+    /// is not a sandbox agent.
+    ///
+    /// Capabilities the agent named are its own. Unspecified ones are the default set the run
+    /// supplies, made once for this agent; a run that supplies none refuses the agent, because the
+    /// reference would have given it tools this run cannot.
+    fn resolved_sandbox(&self, agent: &AgentSpec) -> Result<Option<Arc<SandboxAgentConfig>>> {
+        let Some(sandbox) = agent.sandbox() else {
+            return Ok(None);
+        };
+        let mut resolved = lock(&self.resolved);
+        if let Some(config) = resolved.get(agent.id()) {
+            return Ok(Some(Arc::clone(config)));
+        }
+        let config = if sandbox.capabilities_specified() {
+            sandbox.resolve_capabilities(Vec::new)
+        } else if let Some(defaults) = &self.default_capabilities {
+            sandbox.resolve_capabilities(|| defaults())
+        } else {
+            return Err(Error::config(format!(
+                "sandbox agent `{}` names no capabilities, so it gets the default set, and the \
+                 run supplies none: pass the default set with \
+                 `SandboxRunConfig::with_default_capabilities` (the reference's is \
+                 `ra_tools::sandbox::default_capabilities`), build the agent from \
+                 `ra_tools::sandbox::sandbox_agent_config()`, or give it \
+                 `SandboxAgentConfig::empty()` for none",
+                agent.id()
+            )));
+        };
+        let config = Arc::new(config);
+        resolved.insert(agent.id().clone(), Arc::clone(&config));
+        Ok(Some(config))
     }
 
     /// Whether the run has a sandbox configuration.
@@ -148,14 +192,17 @@ impl SandboxRuntime {
     /// prompt text reach the starting agent only, but run-level context processing runs on every
     /// turn.
     pub(crate) fn assert_agent_supported(&self, agent: &AgentSpec) -> Result<()> {
-        let Some(sandbox) = agent.sandbox() else {
+        if agent.sandbox().is_none() {
             return Ok(());
-        };
+        }
         if !self.enabled() {
             return Err(Error::config(
                 "SandboxAgent execution requires `RunConfig(sandbox=...)`",
             ));
         }
+        let Some(sandbox) = self.resolved_sandbox(agent)? else {
+            return Ok(());
+        };
         let shared: BTreeSet<CapabilityFamily> = sandbox
             .capabilities()
             .iter()
@@ -199,13 +246,14 @@ impl SandboxRuntime {
         self.assert_agent_supported(public)?;
         // For every agent, a sandbox agent or not: a handoff to an agent without memory stops the
         // run being recorded, and one to an agent with memory starts it.
-        *lock(&self.active_memory) = public.sandbox().and_then(|sandbox| {
+        let settled = self.resolved_sandbox(public)?;
+        *lock(&self.active_memory) = settled.as_ref().and_then(|sandbox| {
             sandbox
                 .capabilities()
                 .iter()
                 .find_map(|capability| capability.sandbox_memory())
         });
-        let (Some(sandbox), Some(inner)) = (public.sandbox(), &self.inner) else {
+        let (Some(sandbox), Some(inner)) = (settled.as_deref(), &self.inner) else {
             return Ok(agent.clone());
         };
         let span = tracing::info_span!("sandbox.prepare_agent", agent.name = %public.name());

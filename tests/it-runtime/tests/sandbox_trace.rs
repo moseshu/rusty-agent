@@ -410,7 +410,7 @@ async fn run(manifest: Manifest, fault: CleanupFault) -> Vec<String> {
         .id(AgentId::new("coder"))
         .name("Coder")
         .instructions("do the task")
-        .sandbox(SandboxAgentConfig::new().with_default_manifest(manifest))
+        .sandbox(SandboxAgentConfig::empty().with_default_manifest(manifest))
         .build()
         .unwrap();
     let client = Arc::new(FakeClient {

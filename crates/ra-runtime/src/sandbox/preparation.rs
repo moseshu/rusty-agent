@@ -30,6 +30,7 @@ use ra_core::{
     capability::{Capability, SamplingContext},
     context::RunContext,
     error::{Error, Result},
+    model::ModelSettings,
     prompt::{DynamicPromptHandler, PromptSource, ResolvedPrompt},
     sandbox::{
         ExecRequest, Manifest, PosixPath, SandboxAgentConfig, SandboxSession,
@@ -38,7 +39,59 @@ use ra_core::{
     },
 };
 
+use serde_json::Value;
+
 use super::sandbox_error;
+
+/// Folds one capability's sampling parameters onto the settings before it.
+///
+/// The reference merges what each capability returns into what came before with `deep_merge`: an
+/// object set by both is merged key by key, anything else is replaced, and nothing set earlier is
+/// removed. Here a capability is handed the typed settings and returns them, so the typed fields
+/// already behave that way; the provider request-body buckets are free-form JSON, and are
+/// deep-merged onto the buckets before the capability, so that two capabilities writing inside the
+/// same object both keep what they wrote.
+fn fold_sampling_params(
+    settings: ModelSettings,
+    capability: &dyn Capability,
+    sampling: &SamplingContext,
+) -> ModelSettings {
+    let before = settings.extra_body().clone();
+    let mut after = capability.sampling_params_for(settings, sampling);
+    let written = after.extra_body().clone();
+    let providers: BTreeSet<_> = before.keys().chain(written.keys()).cloned().collect();
+    for provider in providers {
+        let mut merged = before.get(&provider).cloned().unwrap_or_default();
+        for (key, value) in written.get(&provider).cloned().unwrap_or_default() {
+            match merged.get_mut(&key) {
+                Some(existing) => deep_merge(existing, value),
+                None => {
+                    merged.insert(key, value);
+                }
+            }
+        }
+        after = after.with_extra_body(provider, merged);
+    }
+    after
+}
+
+/// The reference's `util/deep_merge.py`: objects merge key by key, recursively; any other value
+/// replaces what was there.
+fn deep_merge(target: &mut Value, incoming: Value) {
+    match (target, incoming) {
+        (Value::Object(target), Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                match target.get_mut(&key) {
+                    Some(existing) => deep_merge(existing, value),
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, incoming) => *target = incoming,
+    }
+}
 
 /// The base sandbox prompt an agent gets unless it replaces it.
 ///
@@ -264,7 +317,7 @@ pub(super) async fn prepare_sandbox_agent(
     let settings = capabilities
         .iter()
         .fold(base.model_settings().clone(), |settings, capability| {
-            capability.sampling_params_for(settings, sampling)
+            fold_sampling_params(settings, capability.as_ref(), sampling)
         });
     let instructions = build_sandbox_instructions(
         sandbox.base_instructions(),

@@ -132,6 +132,60 @@ fn a_sandbox_agent_carries_its_configuration_through_a_rebuild() {
     assert!(ordinary.sandbox().is_none());
 }
 
+/// The reference's `SandboxAgent` default: capabilities nobody named stand for the default set,
+/// naming any replaces it, and naming none means none. The configuration keeps those apart, and
+/// settling it asks for the default only when nothing was named.
+#[test]
+fn unnamed_capabilities_stand_for_the_default_and_naming_any_replaces_it() {
+    let default_made = std::cell::Cell::new(0);
+    let defaults = || {
+        default_made.set(default_made.get() + 1);
+        vec![editing(Edit::Fail), editing(Edit::Fail)]
+    };
+
+    let unnamed = SandboxAgentConfig::new();
+    assert!(!unnamed.capabilities_specified());
+    assert!(unnamed.capabilities().is_empty());
+    let settled = unnamed.resolve_capabilities(defaults);
+    assert!(settled.capabilities_specified());
+    assert_eq!(settled.capabilities().len(), 2);
+    assert_eq!(default_made.get(), 1);
+
+    for named in [
+        SandboxAgentConfig::empty(),
+        SandboxAgentConfig::new().with_capabilities(Vec::new()),
+        SandboxAgentConfig::new().with_capability(editing(Edit::Fail)),
+    ] {
+        assert!(named.capabilities_specified());
+        let count = named.capabilities().len();
+        assert_eq!(
+            named.resolve_capabilities(defaults).capabilities().len(),
+            count
+        );
+    }
+    assert_eq!(
+        default_made.get(),
+        1,
+        "the default is not made for a named set"
+    );
+    assert!(
+        SandboxAgentConfig::default()
+            .resolve_capabilities(Vec::new)
+            .capabilities_specified()
+    );
+}
+
+/// A settled copy is the same agent for the purpose of the one-run-at-a-time claim.
+#[test]
+fn a_settled_configuration_shares_the_claim_of_the_one_it_came_from() {
+    let sandbox = SandboxAgentConfig::new();
+    let settled = sandbox.resolve_capabilities(Vec::new);
+    let lease = settled.acquire_run("Coder").unwrap();
+    assert!(sandbox.acquire_run("Coder").is_err());
+    drop(lease);
+    assert!(sandbox.acquire_run("Coder").is_ok());
+}
+
 /// The reference's `_sandbox_concurrency_guard`: one run at a time, released when the run ends.
 #[test]
 fn a_sandbox_agent_is_claimed_by_one_run_at_a_time() {

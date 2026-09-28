@@ -32,32 +32,52 @@ use super::types::User;
 
 /// What makes an agent a sandbox agent.
 ///
-/// # The default capabilities are not here
+/// # The default capabilities
 ///
-/// The reference gives every sandbox agent a filesystem, a shell and compaction unless told
-/// otherwise. Those are implementations with tools and IO, which this crate does not hold, so a
-/// configuration built here starts with none; the assembly layer that owns them supplies the
-/// default set.
+/// The reference gives every sandbox agent a filesystem, a shell and compaction unless it names its
+/// own. Those are implementations with tools and IO, which this crate does not hold, so a
+/// configuration here tells apart the two cases the reference's default makes: capabilities left
+/// **unspecified** ([`Self::new`], [`Self::default`]), which stand for the default set, and
+/// capabilities **named** — [`Self::with_capability`], [`Self::with_capabilities`], or none at all
+/// with [`Self::empty`].
+///
+/// The run fills in an unspecified set from the default its configuration supplies, and refuses an
+/// agent whose set is unspecified when the run supplies none, before any session is made: an agent
+/// that silently ran without the tools the reference would have given it is the failure this
+/// avoids.
 #[must_use]
 pub struct SandboxAgentConfig {
     default_manifest: Option<Manifest>,
     base_instructions: Option<AgentInstructions>,
-    capabilities: Vec<Arc<dyn Capability>>,
+    /// `None` when unspecified, which stands for the default set.
+    capabilities: Option<Vec<Arc<dyn Capability>>>,
     run_as: Option<User>,
     /// Runs currently using this configuration, which the reference allows to be at most one.
     active_runs: Arc<AtomicUsize>,
 }
 
 impl SandboxAgentConfig {
-    /// A sandbox agent with no manifest of its own, the default base prompt, no capabilities and
-    /// the session's own user.
+    /// A sandbox agent with no manifest of its own, the default base prompt, the default
+    /// capabilities and the session's own user — the reference's `SandboxAgent` with nothing named.
+    ///
+    /// The capabilities are left unspecified: the run installs the default set its configuration
+    /// supplies, and refuses the agent when it supplies none.
     pub fn new() -> Self {
         Self {
             default_manifest: None,
             base_instructions: None,
-            capabilities: Vec::new(),
+            capabilities: None,
             run_as: None,
             active_runs: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// As [`Self::new`], but with no capabilities at all rather than the default ones — the
+    /// reference's `capabilities=[]`.
+    pub fn empty() -> Self {
+        Self {
+            capabilities: Some(Vec::new()),
+            ..Self::new()
         }
     }
 
@@ -77,17 +97,28 @@ impl SandboxAgentConfig {
     }
 
     /// Installs one capability, after those already installed.
+    ///
+    /// On a configuration whose capabilities were unspecified this names them, and the default set
+    /// no longer applies: as on the reference, naming capabilities replaces the default rather than
+    /// adding to it.
     pub fn with_capability(mut self, capability: Arc<dyn Capability>) -> Self {
-        self.capabilities.push(capability);
+        self.capabilities
+            .get_or_insert_with(Vec::new)
+            .push(capability);
         self
     }
 
     /// Installs several capabilities, in order, after those already installed.
+    ///
+    /// Like [`Self::with_capability`], this names the capabilities, even when `capabilities` is
+    /// empty.
     pub fn with_capabilities(
         mut self,
         capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
     ) -> Self {
-        self.capabilities.extend(capabilities);
+        self.capabilities
+            .get_or_insert_with(Vec::new)
+            .extend(capabilities);
         self
     }
 
@@ -109,10 +140,36 @@ impl SandboxAgentConfig {
         self.base_instructions.as_ref()
     }
 
-    /// The installed capabilities, in installation order.
+    /// The named capabilities, in installation order; empty when they are unspecified.
+    ///
+    /// What a run installs is [`Self::resolve_capabilities`]'s answer, not this one: an unspecified
+    /// set stands for the default.
     #[must_use]
     pub fn capabilities(&self) -> &[Arc<dyn Capability>] {
-        &self.capabilities
+        self.capabilities.as_deref().unwrap_or_default()
+    }
+
+    /// Whether the capabilities were named — possibly as none — rather than left to the default.
+    #[must_use]
+    pub const fn capabilities_specified(&self) -> bool {
+        self.capabilities.is_some()
+    }
+
+    /// This configuration with its capabilities settled: the named ones, or, when they were left
+    /// unspecified, what `defaults` produces.
+    ///
+    /// The copy shares this configuration's run claim, so claiming either claims both.
+    pub fn resolve_capabilities(
+        &self,
+        defaults: impl FnOnce() -> Vec<Arc<dyn Capability>>,
+    ) -> Self {
+        Self {
+            default_manifest: self.default_manifest.clone(),
+            base_instructions: self.base_instructions.clone(),
+            capabilities: Some(self.capabilities.clone().unwrap_or_else(defaults)),
+            run_as: self.run_as.clone(),
+            active_runs: Arc::clone(&self.active_runs),
+        }
     }
 
     /// Who model-facing sandbox tools run as, or `None` for the session's own user.
@@ -160,11 +217,12 @@ impl fmt::Debug for SandboxAgentConfig {
             .field("base_instructions", &self.base_instructions)
             .field(
                 "capabilities",
-                &self
-                    .capabilities
-                    .iter()
-                    .map(|capability| capability.kind())
-                    .collect::<Vec<_>>(),
+                &self.capabilities.as_ref().map(|capabilities| {
+                    capabilities
+                        .iter()
+                        .map(|capability| capability.kind())
+                        .collect::<Vec<_>>()
+                }),
             )
             .field("run_as", &self.run_as)
             .finish_non_exhaustive()
