@@ -29,6 +29,9 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # bzip2 自己的许可证（BSD 式、宽松）。经由 libbz2-rs-sys（纯 Rust 移植）进来，
+    # ra-sandbox 解 bzip2 压缩的归档要用它（R8-P7）。2026-09-29 由维护者明确允许。
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
 
