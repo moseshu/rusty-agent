@@ -926,6 +926,85 @@ async fn a_failure_frame_is_classified_rather_than_read_as_a_dropped_connection(
     assert_eq!(error.code(), expected);
 }
 
+/// Every terminal failure event reaches the raw channel before the error it causes, as on the
+/// reference, and the error carries the reference's diagnostics. Nothing after the terminal event
+/// is read.
+///
+/// `error` carries its fields at the top; `response.error` nests them under `error`.
+#[rstest]
+#[case::incomplete(
+    json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "resp_123",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}
+        }
+    }),
+    "Responses stream ended with terminal event `response.incomplete`. status=incomplete; \
+     incomplete_details={\"reason\":\"max_output_tokens\"}."
+)]
+#[case::failed(
+    json!({
+        "type": "response.failed",
+        "response": {
+            "id": "resp_123",
+            "status": "failed",
+            "error": {"code": "server_error", "message": "boom"}
+        }
+    }),
+    "Responses stream ended with terminal event `response.failed`. status=failed; \
+     error={\"code\":\"server_error\",\"message\":\"boom\"}."
+)]
+#[case::error(
+    json!({
+        "type": "error",
+        "code": "server_error",
+        "message": "synthetic provider failure",
+        "param": null,
+        "sequence_number": 1
+    }),
+    "Responses stream ended with terminal event `error`. code=server_error; \
+     message=synthetic provider failure."
+)]
+#[case::response_error(
+    json!({
+        "type": "response.error",
+        "error": {"code": "invalid_request_error", "message": "bad request", "param": null},
+        "sequence_number": 1
+    }),
+    "Responses stream ended with terminal event `response.error`. code=invalid_request_error; \
+     message=bad request."
+)]
+#[tokio::test]
+async fn a_terminal_failure_event_is_forwarded_raw_before_its_error(
+    #[case] terminal: Value,
+    #[case] expected: &str,
+) {
+    let server = MockServer::start().await;
+    let created = json!({"type": "response.created", "response": {"id": "resp_123"}});
+    let after = json!({"type": "response.output_text.delta", "delta": "never read"});
+    let events = streamed_events(&server, &[created, terminal.clone(), after]).await;
+
+    assert_eq!(events.len(), 3, "{events:?}");
+    let raw: Vec<_> = events[..2]
+        .iter()
+        .map(|event| match event {
+            Ok(ModelStreamEvent::RawResponse(raw)) => (raw.event_type().to_owned(), raw.payload()),
+            other => panic!("expected a raw event, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(raw[0].0, "response.created");
+    assert_eq!(raw[1].0, terminal["type"].as_str().unwrap());
+    assert_eq!(raw[1].1, &terminal);
+
+    let error = events[2]
+        .as_ref()
+        .expect_err("the error follows the raw event");
+    // The framework's display prefixes the error's category; the provider's account is the rest.
+    assert!(error.to_string().ends_with(expected), "{error}");
+}
+
 /// An endpoint that ignores `stream=true` answers with one document and no events at all.
 #[tokio::test]
 async fn an_endpoint_that_ignores_the_stream_flag_is_reported_as_such() {
