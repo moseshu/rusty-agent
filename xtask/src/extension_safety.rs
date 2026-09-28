@@ -36,18 +36,47 @@ use crate::source;
 /// `SummarySlot` is a fixed external format, not an open classification. A tenth slot would make
 /// an existing compaction summary no longer conform to its own durable format, so consumers must
 /// be able to match all nine slots and a format change has to be deliberate and breaking.
-const EXHAUSTIVE_ALLOWED: &[&str] = &["NextStep", "ResolvedInstructions", "SummarySlot"];
+///
+/// `SandboxErrorDetails` is here for a different reason from the rest: it shipped exhaustive in
+/// the `v0.1.0` tag of `ra-core`, which is `Stable`, so adding `#[non_exhaustive]` now would break
+/// a downstream exhaustive `match` outside a major version. It should become non-exhaustive at the
+/// next major version, with a migration note, and leave this list then.
+///
+/// `ShellInvocation` is the reference's `shell: bool | list[str]`, a closed union every sandbox
+/// backend `match`es to shape the command it runs. A `_` arm would run a new kind of invocation
+/// through whichever shaping the arm picked, so a new variant has to stop every backend at compile
+/// time until it says how to run it.
+///
+/// `FileMode` names the reference's fixed `FileMode` values, the octal digits of one permission
+/// triplet. The set is POSIX's, not an open classification, and code that turns a mode into bits
+/// must be able to cover all of it.
+const EXHAUSTIVE_ALLOWED: &[&str] = &[
+    "NextStep",
+    "ResolvedInstructions",
+    "SummarySlot",
+    "ShellInvocation",
+    "FileMode",
+    "SandboxErrorDetails",
+];
 
 /// Structs allowed to have public fields, by the file they are declared in and their name.
 ///
-/// The bar is narrow on purpose: a **configuration record carried over field for field from an
-/// upstream model**, where the repository's porting rule already fixes the shape and a builder would
-/// be this implementation inventing a surface the reference does not have. Everything else uses a
-/// constructor or a builder, and the rest of the crate's public structs still do.
+/// The bar is narrow on purpose: a **record carried over field for field from an upstream model**,
+/// whether it configures something or reports a result, where the repository's porting rule already
+/// fixes the shape and a builder would be this implementation inventing a surface the reference
+/// does not have. A type this port introduced itself, such as a request that bundles a reference
+/// method's keyword arguments, does not qualify and uses a constructor or a builder, as the rest of
+/// the crate's public structs do.
+///
+/// The last group below is the one exception to that bar, and it is about compatibility rather
+/// than shape: types this port introduced that already shipped with public fields in the `v0.1.0`
+/// tag. Making their fields private breaks every caller that builds or reads them literally, which
+/// the stability policy allows only in a major version with a migration note, so they keep their
+/// fields until then and leave the list at that release.
 ///
 /// Scoped by path so the exemption cannot spread to a same-named type elsewhere, and listed one by
-/// one so adding an eleventh is a decision somebody makes rather than a module-wide pass. Each entry
-/// names the upstream type it mirrors.
+/// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
+/// names the upstream type it mirrors, or the release it shipped in.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
     // Mount provider records: `sandbox/entries/mounts/providers/*.py`. Each is the provider's own
     // field list — bucket, container, credentials, endpoints — and a manifest written against the
@@ -81,6 +110,56 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/ra-core/src/sandbox/entries/mounts.rs",
         "S3FilesOptions",
+    ),
+    // The manifest: `sandbox/manifest.py` `Manifest`. It is written by hand and read back from
+    // serialized state, and its fields are the reference's.
+    ("crates/ra-core/src/sandbox/manifest.rs", "Manifest"),
+    // Accounts, permissions and results: `sandbox/types.py` `User`, `Group`, `Permissions`,
+    // `ExecResult` and `ExposedPortEndpoint`.
+    ("crates/ra-core/src/sandbox/types.rs", "User"),
+    ("crates/ra-core/src/sandbox/types.rs", "Group"),
+    ("crates/ra-core/src/sandbox/types.rs", "Permissions"),
+    ("crates/ra-core/src/sandbox/types.rs", "ExecResult"),
+    ("crates/ra-core/src/sandbox/types.rs", "ExposedPortEndpoint"),
+    // A directory listing entry: `sandbox/files.py` `FileEntry`.
+    ("crates/ra-core/src/sandbox/files.rs", "FileEntry"),
+    // Interactive output: `sandbox/session/pty_types.py` `PtyExecUpdate`.
+    ("crates/ra-core/src/sandbox/pty.rs", "PtyExecUpdate"),
+    // Resolved mount tool configurations: `sandbox/entries/mounts/patterns.py`
+    // `FuseMountConfig`, `MountpointMountConfig`, `RcloneMountConfig` and `S3FilesMountConfig`.
+    ("crates/ra-sandbox/src/mounts/config.rs", "FuseMountConfig"),
+    (
+        "crates/ra-sandbox/src/mounts/config.rs",
+        "MountpointMountConfig",
+    ),
+    (
+        "crates/ra-sandbox/src/mounts/config.rs",
+        "RcloneMountConfig",
+    ),
+    (
+        "crates/ra-sandbox/src/mounts/config.rs",
+        "S3FilesMountConfig",
+    ),
+    // The reference's `build_docker_volume_driver_config` returns the fixed tuple
+    // `(driver, options, read_only)`; this names its three positions and adds nothing.
+    (
+        "crates/ra-sandbox/src/mounts/config.rs",
+        "DockerVolumeDriverConfig",
+    ),
+    // Shipped with public fields in `v0.1.0`; private at the next major version. The four requests
+    // bundle a reference method's keyword arguments and have builders for every field except
+    // `PtyStartRequest`'s timeout, so the migration is that one builder, read accessors, and private
+    // fields. `ra-core` is `Stable`; `ra-sandbox` is
+    // `Evolving`, whose minor releases may add but not remove.
+    ("crates/ra-core/src/sandbox/session.rs", "ExecRequest"),
+    ("crates/ra-core/src/sandbox/session.rs", "CreateRequest"),
+    ("crates/ra-core/src/sandbox/pty.rs", "PtyProcessId"),
+    ("crates/ra-core/src/sandbox/pty.rs", "PtyStartRequest"),
+    ("crates/ra-core/src/sandbox/pty.rs", "PtyWriteRequest"),
+    ("crates/ra-core/src/sandbox/types.rs", "UnsupportedScheme"),
+    (
+        "crates/ra-sandbox/src/mounts/transition.rs",
+        "EphemeralMountRemoval",
     ),
 ];
 
