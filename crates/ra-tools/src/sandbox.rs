@@ -16,8 +16,10 @@
 //! The same holds for [`crate::view_image`] and [`view_image`], and for [`crate::apply_patch`] and
 //! [`apply_patch_tool`]: the coding versions read and write the host through a confined
 //! filesystem, and these go through the session. A sandbox agent gets them through
-//! [`filesystem::Filesystem`]; [`filesystem::default_capabilities`] is the reference's default set,
-//! which adds [`compaction::Compaction`].
+//! [`filesystem::Filesystem`]; [`default_capabilities`] is the reference's default set, which adds
+//! [`compaction::Compaction`]. A run hands it to every sandbox agent that names no capabilities with
+//! `SandboxRunConfig::with_default_capabilities`, and [`sandbox_agent_config`] names it on one
+//! agent instead.
 //!
 //! The capabilities share names with the coding ones too. [`shell::Shell`],
 //! [`filesystem::Filesystem`], [`compaction::Compaction`], [`memory::Memory`] and [`skills::Skills`]
@@ -37,17 +39,36 @@ pub mod shell_tool;
 pub mod skills;
 pub mod view_image;
 
+pub use filesystem::default_capabilities;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    sandbox::SandboxError,
+    sandbox::{SandboxAgentConfig, SandboxError},
     tool::{
         FuncSchema, ToolApprovalPolicy, ToolArgumentDecodeError, ToolConcurrency, ToolContext,
         ToolInput, ToolOptions,
     },
 };
+
+/// A sandbox agent's configuration with the reference's default capabilities named on it.
+///
+/// The reference's `SandboxAgent` gives every sandbox agent `Capabilities.default()` —
+/// [`filesystem::Filesystem`], [`shell::Shell`] and [`compaction::Compaction`], in that order —
+/// unless the agent names its own. [`SandboxAgentConfig::new`] leaves the capabilities unspecified
+/// and lets the run fill them in from
+/// `SandboxRunConfig::with_default_capabilities(default_capabilities)`; this names the same set on
+/// the agent instead, for a run that supplies no default. The rest of the builder applies to it as
+/// usual.
+///
+/// To replace the defaults rather than use them — the reference's `capabilities=[...]` — install
+/// exactly the capabilities wanted on [`SandboxAgentConfig::new`], or none with
+/// [`SandboxAgentConfig::empty`].
+pub fn sandbox_agent_config() -> SandboxAgentConfig {
+    SandboxAgentConfig::new().with_capabilities(filesystem::default_capabilities())
+}
 
 /// Carries a session's failure out of a tool, keeping it as the source.
 pub(crate) fn session_failure(tool: &str, error: SandboxError) -> Error {

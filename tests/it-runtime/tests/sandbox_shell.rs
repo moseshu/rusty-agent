@@ -58,6 +58,8 @@ struct ScriptedModel {
     outputs: Mutex<Vec<String>>,
     instructions: Mutex<Vec<Option<String>>>,
     rendezvous: Option<Arc<Barrier>>,
+    /// The names of the tools each call offered, in order.
+    tools: Mutex<Vec<Vec<String>>>,
 }
 
 impl ScriptedModel {
@@ -71,6 +73,7 @@ impl ScriptedModel {
             outputs: Mutex::default(),
             instructions: Mutex::default(),
             rendezvous,
+            tools: Mutex::default(),
         })
     }
 
@@ -96,6 +99,13 @@ impl Model for ScriptedModel {
             .lock()
             .unwrap()
             .push(request.system_instructions().map(str::to_owned));
+        self.tools.lock().unwrap().push(
+            request
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect(),
+        );
         {
             let mut outputs = self.outputs.lock().unwrap();
             outputs.clear();
@@ -165,7 +175,7 @@ fn shell_agent(name: &str, shell: Shell) -> Arc<AgentSpec> {
 }
 
 fn sandbox_agent(name: &str, capabilities: Vec<Arc<dyn Capability>>) -> Arc<AgentSpec> {
-    let mut config = SandboxAgentConfig::new();
+    let mut config = SandboxAgentConfig::empty();
     for capability in capabilities {
         config = config.with_capability(capability);
     }
@@ -823,5 +833,63 @@ async fn a_patch_awaiting_approval_resumes_as_a_custom_call() {
         }
         model.assert_complete();
         session.close().await.unwrap();
+    }
+}
+
+/// The reference's default path, both ways it is spelled here: an agent that names no
+/// capabilities in a run that supplies the default set, and an agent built with the set named on
+/// it. Either way it gets the default tools and runs them against a real local session the run
+/// creates, as a reference agent with only `SandboxRunConfig(client=...)` does.
+#[tokio::test]
+async fn an_agent_with_the_default_capabilities_runs_the_default_tools() {
+    let manifest =
+        || Manifest::new().with_entry("notes.txt", Entry::file(b"from the manifest".to_vec()));
+    let local = || {
+        SandboxRunConfig::new()
+            .with_client(Arc::new(UnixLocalSandboxClient::new()) as Arc<dyn SandboxClient>)
+    };
+    let cases = [
+        (
+            SandboxAgentConfig::new().with_default_manifest(manifest()),
+            local().with_default_capabilities(ra_tools::sandbox::default_capabilities),
+        ),
+        (
+            ra_tools::sandbox::sandbox_agent_config().with_default_manifest(manifest()),
+            local(),
+        ),
+    ];
+    for (sandbox, run) in cases {
+        let agent = AgentSpec::builder()
+            .id(AgentId::new("coder"))
+            .name("coder")
+            .instructions("do the task")
+            .sandbox(sandbox)
+            .build()
+            .unwrap();
+        let model = ScriptedModel::new(vec![
+            call("call-1", "exec_command", json!({"cmd": "cat notes.txt"})),
+            answer("m"),
+        ]);
+
+        let result = Runner::run(request(
+            agent,
+            &model,
+            "run-defaults",
+            RunConfig::new().with_sandbox(run),
+        ))
+        .await
+        .unwrap();
+
+        let offered = model.tools.lock().unwrap()[0].clone();
+        for tool in ["view_image", "apply_patch", "exec_command", "write_stdin"] {
+            assert!(offered.iter().any(|name| name == tool), "{offered:?}");
+        }
+        let output = tool_output(result.new_items(), "call-1");
+        assert!(
+            output.output().to_string().contains("from the manifest"),
+            "{:?}",
+            output.output()
+        );
+        model.assert_complete();
     }
 }

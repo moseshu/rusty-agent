@@ -885,7 +885,7 @@ fn error_text(error: &Error) -> String {
 async fn a_sandbox_agent_without_sandbox_configuration_is_refused() {
     let model = ScriptedModel::answering("done");
     let error = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &model,
         RunConfig::new(),
     ))
@@ -908,7 +908,7 @@ async fn a_handoff_into_a_sandbox_agent_without_configuration_is_refused() {
         tool_call("call-1", "transfer_to_coder"),
         final_answer("msg-2", "done"),
     ]);
-    let coder = sandbox_agent("coder", "Coder", SandboxAgentConfig::new());
+    let coder = sandbox_agent("coder", "Coder", SandboxAgentConfig::empty());
     let planner = AgentSpec::builder()
         .id(AgentId::new("planner"))
         .name("Planner")
@@ -944,7 +944,7 @@ async fn a_handoff_into_a_sandbox_agent_without_configuration_is_refused() {
 async fn a_client_without_default_options_needs_them_for_a_fresh_session() {
     let client = FakeClient::requiring_options();
     let error = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -959,7 +959,7 @@ async fn a_client_without_default_options_needs_them_for_a_fresh_session() {
 
     let client = FakeClient::requiring_options();
     let result = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new()
             .with_sandbox(with_client(&client).with_options(DiscriminatedPayload::new("fake"))),
@@ -969,7 +969,7 @@ async fn a_client_without_default_options_needs_them_for_a_fresh_session() {
     assert_eq!(result.final_text(), "done");
 
     let error = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
             with_client(&FakeClient::new()).with_options(DiscriminatedPayload::new("docker")),
@@ -989,7 +989,7 @@ async fn a_client_without_default_options_needs_them_for_a_fresh_session() {
 #[tokio::test]
 async fn a_configuration_with_neither_client_nor_session_is_refused() {
     let error = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(SandboxRunConfig::new()),
     ))
@@ -1016,7 +1016,7 @@ async fn the_run_configurations_limits_reach_the_session_and_archive_limits_defa
         .unwrap();
     let archive = SandboxArchiveLimits::default();
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
             with_client(&client)
@@ -1032,7 +1032,7 @@ async fn the_run_configurations_limits_reach_the_session_and_archive_limits_defa
 
     let client = FakeClient::new();
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -1054,7 +1054,7 @@ async fn a_fresh_session_takes_the_configured_manifest_ahead_of_the_agents_defau
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_default_manifest(Manifest::new().with_root("/agent")),
+            SandboxAgentConfig::empty().with_default_manifest(Manifest::new().with_root("/agent")),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new()
@@ -1083,7 +1083,7 @@ async fn the_run_as_user_is_added_to_a_created_manifest_even_without_one_declare
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_run_as(User::new("builder")),
+            SandboxAgentConfig::empty().with_run_as(User::new("builder")),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
@@ -1104,7 +1104,7 @@ async fn the_run_as_user_is_added_to_a_created_manifest_even_without_one_declare
 async fn a_session_the_run_created_is_cleaned_up_in_order() {
     let client = FakeClient::new();
     let result = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -1140,7 +1140,7 @@ async fn a_session_the_run_created_is_cleaned_up_in_order() {
 async fn a_streamed_run_cleans_up_the_session_it_created() {
     let client = FakeClient::new();
     let stream = Runner::run_streamed(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ));
@@ -1169,7 +1169,7 @@ async fn a_session_the_host_handed_in_is_never_stopped_or_deleted() {
 
     let result = Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(
                 SandboxRunConfig::new()
@@ -1199,7 +1199,7 @@ async fn a_running_session_the_host_handed_in_is_not_started_again() {
     session.0.running.store(true, Ordering::SeqCst);
 
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::new(vec![
             tool_call("call-1", "missing"),
             final_answer("m", "done"),
@@ -1230,7 +1230,7 @@ async fn a_failed_cleanup_leaves_the_result_standing_without_resume_state() {
         .unwrap();
     let result = Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(with_client(&client)),
         )
@@ -1244,7 +1244,7 @@ async fn a_failed_cleanup_leaves_the_result_standing_without_resume_state() {
     let client = FakeClient::new();
     client.faults.fail("shutdown");
     let result = Runner::run_streamed(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -1262,7 +1262,7 @@ async fn cleanup_attempts_every_step_after_a_failure() {
     let client = FakeClient::new();
     client.faults.fail("stop");
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -1281,7 +1281,7 @@ async fn cleanup_attempts_every_step_after_a_failure() {
     let client = FakeClient::new();
     client.faults.fail("pre_stop");
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -1303,7 +1303,7 @@ async fn cleanup_attempts_every_step_after_a_failure() {
 async fn a_failed_run_still_cleans_up_its_session() {
     let client = FakeClient::new();
     let error = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::new(Vec::new()),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -1349,7 +1349,7 @@ async fn a_tripped_blocking_input_guardrail_creates_no_session() {
             sandbox_agent(
                 "coder",
                 "Coder",
-                SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+                SandboxAgentConfig::empty().with_capability(adding_capability("notes.md")),
             ),
             &ScriptedModel::answering("done"),
             RunConfig::new()
@@ -1369,7 +1369,7 @@ async fn a_tripped_blocking_input_guardrail_creates_no_session() {
             .with_sandbox(with_client(&client))
             .with_input_guardrail(Arc::new(Refuse));
         let request = request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             config,
         );
@@ -1386,7 +1386,7 @@ async fn a_tripped_blocking_input_guardrail_creates_no_session() {
 /// `test_runner_rejects_concurrent_reuse_of_same_sandbox_agent`
 #[tokio::test]
 async fn one_sandbox_agent_cannot_serve_two_runs_at_once() {
-    let agent = sandbox_agent("coder", "Coder", SandboxAgentConfig::new());
+    let agent = sandbox_agent("coder", "Coder", SandboxAgentConfig::empty());
     let sandbox = agent.sandbox().unwrap();
     let held = sandbox.acquire_run("Coder").unwrap();
 
@@ -1435,7 +1435,7 @@ async fn the_prepared_prompt_orders_base_agent_capability_and_filesystem_section
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(workspace_manifest())
                 .with_capability(Arc::new(capability)),
         ),
@@ -1470,7 +1470,7 @@ async fn base_instructions_replace_the_default_prompt() {
         .id(AgentId::new("coder"))
         .name("Coder")
         .sandbox(
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_base_instructions(AgentInstructions::static_text("Custom base.")),
         )
         .build()
@@ -1509,7 +1509,7 @@ async fn generated_agent_instructions_sit_below_the_default_prompt() {
                 ))
             }
         })
-        .sandbox(SandboxAgentConfig::new())
+        .sandbox(SandboxAgentConfig::empty())
         .build()
         .unwrap();
     Runner::run(request(
@@ -1541,7 +1541,7 @@ async fn capability_settings_fold_in_installation_order() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_capability(Arc::new(first))
                 .with_capability(Arc::new(second)),
         ),
@@ -1562,7 +1562,7 @@ async fn a_capability_missing_its_dependency_is_refused() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(Arc::new(memory)),
+            SandboxAgentConfig::empty().with_capability(Arc::new(memory)),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
@@ -1589,7 +1589,7 @@ async fn a_family_the_run_installs_cannot_be_installed_again_on_a_sandbox_agent(
             sandbox_agent(
                 "coder",
                 "Coder",
-                SandboxAgentConfig::new()
+                SandboxAgentConfig::empty()
                     .with_capability(Arc::new(WorkspaceCapability::new("shell")))
                     .with_capability(Arc::new(WorkspaceCapability::new("filesystem")))
                     .with_capability(Arc::new(WorkspaceCapability::new("todo"))),
@@ -1639,7 +1639,7 @@ async fn local_compaction_for_the_run_and_the_default_sandbox_set_are_refused_to
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capabilities(default_capabilities()),
+            SandboxAgentConfig::empty().with_capabilities(default_capabilities()),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new()
@@ -1660,7 +1660,7 @@ async fn local_compaction_for_the_run_and_the_default_sandbox_set_are_refused_to
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_capability(Arc::new(Filesystem::new()))
                 .with_capability(Arc::new(Shell::new())),
         ),
@@ -1685,7 +1685,8 @@ async fn a_handoff_into_a_sandbox_agent_sharing_a_run_family_is_refused() {
     let coder = sandbox_agent(
         "coder",
         "Coder",
-        SandboxAgentConfig::new().with_capability(Arc::new(WorkspaceCapability::new("compaction"))),
+        SandboxAgentConfig::empty()
+            .with_capability(Arc::new(WorkspaceCapability::new("compaction"))),
     );
     let planner = AgentSpec::builder()
         .id(AgentId::new("planner"))
@@ -1740,7 +1741,7 @@ async fn the_working_directory_is_checked_as_the_agents_user_and_described() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(workspace_manifest())
                 .with_run_as(User::new("builder")),
         ),
@@ -1771,7 +1772,7 @@ async fn the_working_directory_is_checked_as_the_agents_user_and_described() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_default_manifest(workspace_manifest()),
+            SandboxAgentConfig::empty().with_default_manifest(workspace_manifest()),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client).with_cwd("missing").unwrap()),
@@ -1803,7 +1804,7 @@ fn planner_and_reviewer(
             AgentId::new("planner"),
             transfer_schema("planner"),
         ))
-        .sandbox(SandboxAgentConfig::new())
+        .sandbox(SandboxAgentConfig::empty())
         .build()
         .unwrap();
     let planner = AgentSpec::builder()
@@ -1831,7 +1832,8 @@ fn planner_and_reviewer(
 #[tokio::test]
 async fn each_agent_across_a_handoff_is_resumed_from_its_own_entry() {
     let client = FakeClient::new();
-    let (planner, reviewer, registry) = planner_and_reviewer(SandboxAgentConfig::new(), "Reviewer");
+    let (planner, reviewer, registry) =
+        planner_and_reviewer(SandboxAgentConfig::empty(), "Reviewer");
     let first = Runner::run(request(
         Arc::clone(&planner),
         &ScriptedModel::new(vec![
@@ -1904,7 +1906,7 @@ async fn each_agent_across_a_handoff_is_resumed_from_its_own_entry() {
 #[tokio::test]
 async fn agents_sharing_a_name_keep_separate_resume_entries() {
     let client = FakeClient::new();
-    let (planner, _, registry) = planner_and_reviewer(SandboxAgentConfig::new(), "Planner");
+    let (planner, _, registry) = planner_and_reviewer(SandboxAgentConfig::empty(), "Planner");
     let result = Runner::run(request(
         planner,
         &ScriptedModel::new(vec![
@@ -1934,7 +1936,8 @@ async fn agents_sharing_a_name_keep_separate_resume_entries() {
 #[tokio::test]
 async fn an_entry_for_an_agent_that_did_not_run_is_carried_forward() {
     let client = FakeClient::new();
-    let (planner, reviewer, registry) = planner_and_reviewer(SandboxAgentConfig::new(), "Reviewer");
+    let (planner, reviewer, registry) =
+        planner_and_reviewer(SandboxAgentConfig::empty(), "Reviewer");
     let first = Runner::run(request(
         Arc::clone(&planner),
         &ScriptedModel::new(vec![
@@ -2008,7 +2011,7 @@ async fn resume_sources_are_chosen_in_the_reference_order() {
     // No checkpoint: the explicit state is resumed.
     let client = FakeClient::new();
     let first = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client).with_session_state(explicit.clone())),
     ))
@@ -2021,7 +2024,7 @@ async fn resume_sources_are_chosen_in_the_reference_order() {
     let client = FakeClient::new();
     Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new()
                 .with_sandbox(with_client(&client).with_session_state(other_explicit.clone())),
@@ -2040,7 +2043,7 @@ async fn resume_sources_are_chosen_in_the_reference_order() {
     let client = FakeClient::new();
     Runner::run(
         request(
-            sandbox_agent("other", "Other", SandboxAgentConfig::new()),
+            sandbox_agent("other", "Other", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new()
                 .with_sandbox(with_client(&client).with_session_state(other_explicit.clone())),
@@ -2065,7 +2068,7 @@ async fn resume_sources_are_chosen_in_the_reference_order() {
     );
     Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(
                 with_client(&client)
@@ -2089,7 +2092,7 @@ async fn a_checkpoint_from_another_backend_is_refused() {
         .unwrap();
     let error = Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
         )
@@ -2116,7 +2119,7 @@ async fn a_resumed_session_takes_its_host_path_grants_from_the_trusted_manifest(
     let trusted = workspace_manifest().with_path_grant(grant.clone());
     let client = FakeClient::new();
     let first = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client).with_manifest(trusted.clone())),
     ))
@@ -2128,7 +2131,7 @@ async fn a_resumed_session_takes_its_host_path_grants_from_the_trusted_manifest(
     // Without a trusted manifest the resume is refused.
     let error = Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
         )
@@ -2142,7 +2145,7 @@ async fn a_resumed_session_takes_its_host_path_grants_from_the_trusted_manifest(
     let client = FakeClient::new();
     Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(with_client(&client).with_manifest(trusted)),
         )
@@ -2184,7 +2187,7 @@ async fn a_capability_adds_entries_to_a_running_session_the_host_handed_in() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+            SandboxAgentConfig::empty().with_capability(adding_capability("notes.md")),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
@@ -2211,7 +2214,7 @@ async fn a_stopped_session_the_host_handed_in_takes_the_change_through_its_manif
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+            SandboxAgentConfig::empty().with_capability(adding_capability("notes.md")),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
@@ -2235,7 +2238,7 @@ async fn a_running_session_the_host_handed_in_refuses_new_accounts() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_run_as(User::new("builder")),
+            SandboxAgentConfig::empty().with_run_as(User::new("builder")),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
@@ -2258,7 +2261,7 @@ async fn a_running_session_the_host_handed_in_refuses_new_accounts() {
 async fn an_unchanged_running_session_is_not_touched() {
     let session = live_session(true);
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
             SandboxRunConfig::new()
@@ -2353,7 +2356,7 @@ async fn an_approved_call_runs_on_the_resumed_sessions_tool() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(workspace_manifest())
                 .with_capability(Arc::new(capability)),
         )
@@ -2416,7 +2419,7 @@ async fn a_remote_mount_adds_its_policy_to_the_prompt() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_default_manifest(
+            SandboxAgentConfig::empty().with_default_manifest(
                 workspace_manifest().with_entry("data", Entry::mount(mount)),
             ),
         ),
@@ -2445,7 +2448,7 @@ async fn a_resumed_state_is_processed_like_a_fresh_manifest() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_capability(adding_capability("notes.md"))
                 .with_run_as(User::new("builder")),
         ),
@@ -2469,7 +2472,7 @@ async fn an_owned_session_is_started_even_when_the_backend_reports_it_running() 
     let client = FakeClient::new();
     client.report_running.store(true, Ordering::SeqCst);
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::new(vec![
             tool_call("call-1", "missing"),
             final_answer("m", "done"),
@@ -2494,7 +2497,7 @@ async fn the_snapshot_is_the_configured_one_else_the_clients_default_else_nothin
 
     let client = FakeClient::new();
     Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client).with_snapshot_spec(SnapshotSpec::Noop)),
     ))
@@ -2508,7 +2511,7 @@ async fn the_snapshot_is_the_configured_one_else_the_clients_default_else_nothin
     let client = FakeClient::new();
     client.faults.fail("default_snapshot");
     let result = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ))
@@ -2545,7 +2548,7 @@ async fn dropping_the_stream_during_a_slow_stop_still_releases_the_session() {
     let client = FakeClient::new();
     client.faults.fail("slow_stop");
     let mut stream = Runner::run_streamed(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client)),
     ));
@@ -2610,7 +2613,7 @@ impl ModelResolver for HungResolver {
 fn hung_request(client: &Arc<FakeClient>) -> (RunRequest, Arc<AtomicBool>) {
     let called = Arc::new(AtomicBool::new(false));
     let request = RunRequest::new(
-        AgentBinding::direct(sandbox_agent("coder", "Coder", SandboxAgentConfig::new())),
+        AgentBinding::direct(sandbox_agent("coder", "Coder", SandboxAgentConfig::empty())),
         Arc::new(HungResolver(Arc::new(Hung(Arc::clone(&called))))),
         RunId::new("run-sandbox"),
         CancelScope::root(),
@@ -2675,7 +2678,7 @@ async fn a_continued_run_prepares_an_agent_it_hands_off_to_from_its_own_manifest
         .name("Worker")
         .instructions("work")
         .sandbox(
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(Manifest::new().with_root("/worker"))
                 .with_capability(workspace(false)),
         )
@@ -2690,7 +2693,7 @@ async fn a_continued_run_prepares_an_agent_it_hands_off_to_from_its_own_manifest
             transfer_schema("worker"),
         ))
         .sandbox(
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(Manifest::new().with_root("/triage"))
                 .with_capability(workspace(true)),
         )
@@ -2770,7 +2773,7 @@ async fn mount_credentials_are_rebound_from_the_trusted_manifest_on_resume() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_default_manifest(
+            SandboxAgentConfig::empty().with_default_manifest(
                 Manifest::new().with_entry("data", docker_s3("example-secret-key")),
             ),
         )
@@ -2830,7 +2833,7 @@ async fn a_host_directory_a_capability_grants_is_granted_again_on_resume() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(Manifest::new())
                 .with_capability(Arc::new(capability.clone())),
         )
@@ -2893,7 +2896,7 @@ async fn a_host_directory_the_checkpoint_does_not_mark_for_rebinding_is_refused(
     let client = FakeClient::new();
     let error = Runner::run(
         request(
-            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(with_client(&client)),
         )
@@ -2921,7 +2924,7 @@ async fn a_capability_change_reaches_the_session_however_it_comes_about() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+            SandboxAgentConfig::empty().with_capability(adding_capability("notes.md")),
         )
     };
 
@@ -3013,7 +3016,7 @@ async fn a_session_the_host_handed_in_refuses_mount_credentials_it_would_expose(
             sandbox_agent(
                 "coder",
                 "Coder",
-                SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+                SandboxAgentConfig::empty().with_capability(Arc::new(capability)),
             ),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(
@@ -3078,7 +3081,7 @@ async fn a_session_the_host_handed_in_keeps_the_host_directories_it_mounts() {
             sandbox_agent(
                 "coder",
                 "Coder",
-                SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+                SandboxAgentConfig::empty().with_capability(Arc::new(capability)),
             ),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(
@@ -3118,7 +3121,7 @@ async fn a_running_session_the_host_handed_in_checks_a_change_before_it_is_writt
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+            SandboxAgentConfig::empty().with_capability(adding_capability("notes.md")),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(
@@ -3156,7 +3159,7 @@ async fn a_change_whose_write_broke_off_is_written_again_next_time() {
             sandbox_agent(
                 "coder",
                 "Coder",
-                SandboxAgentConfig::new().with_capability(adding_capability("notes.md")),
+                SandboxAgentConfig::empty().with_capability(adding_capability("notes.md")),
             ),
             &ScriptedModel::answering("done"),
             RunConfig::new().with_sandbox(
@@ -3199,7 +3202,7 @@ async fn a_capability_that_failed_after_adding_credentials_is_reported_without_t
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+            SandboxAgentConfig::empty().with_capability(Arc::new(capability)),
         ),
         &ScriptedModel::answering("done"),
         RunConfig::new().with_sandbox(with_client(&client).with_manifest(Manifest::new())),
@@ -3225,7 +3228,7 @@ async fn a_capability_that_failed_after_adding_credentials_is_reported_without_t
 #[tokio::test]
 async fn any_failure_while_handling_mount_credentials_says_only_that_it_failed() {
     let error = Runner::run(request(
-        sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
         &ScriptedModel::answering("done"),
         RunConfig::new()
             .with_sandbox(with_client(&FakeClient::requiring_options()).with_manifest(
@@ -3260,7 +3263,7 @@ async fn a_session_that_stopped_between_turns_is_restarted_and_its_preparation_r
         .name("Coder")
         .instructions("do the task")
         .tool(Halt::tool(&client, false))
-        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(capability)))
+        .sandbox(SandboxAgentConfig::empty().with_capability(Arc::new(capability)))
         .build()
         .unwrap();
     let model = ScriptedModel::new(vec![tool_call("call-1", "halt"), final_answer("m", "done")]);
@@ -3295,7 +3298,7 @@ async fn the_working_directory_is_checked_again_on_a_restarted_session() {
         .instructions("do the task")
         .tool(Halt::tool(&client, true))
         .sandbox(
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(workspace_manifest())
                 .with_run_as(User::new("builder")),
         )
@@ -3342,7 +3345,7 @@ async fn capabilities_are_bound_to_the_session_and_the_agents_user() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_capability(Arc::clone(&installed) as Arc<dyn Capability>)
                 .with_run_as(User::new("sandbox-user")),
         ),
@@ -3373,7 +3376,7 @@ async fn a_forced_tool_choice_is_released_after_the_sandbox_agent_used_a_tool() 
         .name("Coder")
         .instructions("do the task")
         .model_settings(ModelSettings::new().with_tool_choice(ToolChoice::Required))
-        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(capability)))
+        .sandbox(SandboxAgentConfig::empty().with_capability(Arc::new(capability)))
         .build()
         .unwrap();
     let model = ScriptedModel::new(vec![
@@ -3482,7 +3485,7 @@ async fn every_view_of_a_sandbox_run_names_the_agent_the_user_configured() {
             sandbox_agent(
                 "coder",
                 "Coder",
-                SandboxAgentConfig::new().with_capability(Arc::new(capability)),
+                SandboxAgentConfig::empty().with_capability(Arc::new(capability)),
             ),
             &ScriptedModel::new(vec![
                 tool_call("call-1", "touch"),
@@ -3571,7 +3574,7 @@ async fn compaction_trims_the_input_and_asks_the_provider_to_compact() {
     let agent = sandbox_agent(
         "coder",
         "Coder",
-        SandboxAgentConfig::new().with_capability(Arc::new(Compaction::with_policy(
+        SandboxAgentConfig::empty().with_capability(Arc::new(Compaction::with_policy(
             CompactionPolicy::static_threshold(123),
         ))),
     );
@@ -3615,7 +3618,7 @@ async fn default_compaction_writes_the_field_and_not_the_model() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(Arc::new(Compaction::new())),
+            SandboxAgentConfig::empty().with_capability(Arc::new(Compaction::new())),
         ),
         &model,
         RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
@@ -3659,7 +3662,7 @@ async fn capabilities_are_folded_for_the_resolved_model_and_provider() {
         sandbox_agent(
             "coder",
             "Coder",
-            SandboxAgentConfig::new().with_capability(Arc::new(SamplingProbe(Arc::clone(&seen)))),
+            SandboxAgentConfig::empty().with_capability(Arc::new(SamplingProbe(Arc::clone(&seen)))),
         ),
         &model,
         RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
@@ -3727,7 +3730,9 @@ async fn context_is_processed_by_the_bound_capability_on_every_turn() {
         .name("Coder")
         .instructions("do the task")
         .tool(Halt::tool(&client, false))
-        .sandbox(SandboxAgentConfig::new().with_capability(Arc::new(CountingProcessor::default())))
+        .sandbox(
+            SandboxAgentConfig::empty().with_capability(Arc::new(CountingProcessor::default())),
+        )
         .build()
         .unwrap();
     let model = ScriptedModel::new(vec![tool_call("call-1", "halt"), final_answer("m", "done")]);
@@ -3760,7 +3765,7 @@ async fn compaction_trims_caller_managed_continuation_input() {
     let agent = sandbox_agent(
         "coder",
         "Coder",
-        SandboxAgentConfig::new().with_capability(Arc::new(Compaction::with_policy(
+        SandboxAgentConfig::empty().with_capability(Arc::new(Compaction::with_policy(
             CompactionPolicy::static_threshold(123),
         ))),
     );
@@ -3798,4 +3803,180 @@ async fn compaction_trims_caller_managed_continuation_input() {
         model.extra_bodies.lock().unwrap()[0],
         json!({"context_management": [{"type": "compaction", "compact_threshold": 123}]})
     );
+}
+
+/// Writes one key inside the `options` object of the provider's request body.
+struct NestedBodyWriter {
+    family: &'static str,
+    key: &'static str,
+}
+
+impl Capability for NestedBodyWriter {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new(self.family.to_owned()).unwrap()
+    }
+
+    fn sampling_params_for(
+        &self,
+        settings: ModelSettings,
+        context: &SamplingContext,
+    ) -> ModelSettings {
+        let provider = context.provider().cloned().expect("a provider");
+        settings.with_extra_body_value(provider, "options", json!({ self.key: true }))
+    }
+}
+
+/// The reference folds every capability's sampling parameters with `deep_merge`: two capabilities
+/// that each set a key inside the same object both keep it, rather than the later replacing the
+/// object the earlier one wrote.
+#[tokio::test]
+async fn capability_sampling_objects_are_deep_merged_in_order() {
+    let model = ScriptedModel::answering("done");
+    Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::empty()
+                .with_capability(Arc::new(NestedBodyWriter {
+                    family: "first_writer",
+                    key: "first",
+                }))
+                .with_capability(Arc::new(NestedBodyWriter {
+                    family: "second_writer",
+                    key: "second",
+                })),
+        ),
+        &model,
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap();
+
+    let bodies = model.extra_bodies.lock().unwrap();
+    assert_eq!(
+        bodies[0]["options"],
+        json!({"first": true, "second": true}),
+        "{bodies:?}"
+    );
+}
+
+// -- the default capabilities -------------------------------------------------------------------
+
+/// A capability offering `touch`, as a run's default set.
+fn touching_default() -> Vec<Arc<dyn Capability>> {
+    let mut capability = WorkspaceCapability::new("workspace");
+    capability.tool = true;
+    vec![Arc::new(capability)]
+}
+
+/// The reference's `SandboxAgent` gives an agent that names no capabilities the default set. The
+/// defaults are not made here, so a run that supplies none refuses such an agent — plainly, and
+/// before a session exists — rather than running it without the tools the reference would have
+/// given it.
+#[tokio::test]
+async fn an_agent_naming_no_capabilities_is_refused_when_the_run_supplies_no_default() {
+    for streamed in [false, true] {
+        let client = FakeClient::new();
+        let request = request(
+            sandbox_agent("coder", "Coder", SandboxAgentConfig::new()),
+            &ScriptedModel::answering("done"),
+            RunConfig::new().with_sandbox(with_client(&client)),
+        );
+        let error = if streamed {
+            Runner::run_streamed(request).finish().await.unwrap_err()
+        } else {
+            Runner::run(request).await.unwrap_err()
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("SandboxRunConfig::with_default_capabilities"),
+            "{error}"
+        );
+        assert!(client.log().is_empty(), "{:?}", client.log());
+    }
+}
+
+/// With a default supplied, an agent that names no capabilities gets it — made once for that
+/// agent, however many turns the agent takes.
+#[tokio::test]
+async fn an_agent_naming_no_capabilities_gets_the_runs_default_set() {
+    let made = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&made);
+    let model = ScriptedModel::new(vec![
+        tool_call("call-1", "touch"),
+        final_answer("m", "done"),
+    ]);
+
+    let result = Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_default_manifest(workspace_manifest()),
+        ),
+        &model,
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new()).with_default_capabilities(
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                touching_default()
+            },
+        )),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    let offered = model.tools.lock().unwrap().clone();
+    assert_eq!(offered, [["touch"], ["touch"]]);
+    assert_eq!(made.load(Ordering::SeqCst), 1);
+}
+
+/// Naming capabilities replaces the default, as `capabilities=[...]` does on the reference, and
+/// naming none — `capabilities=[]` — means none: the default is never made for such an agent.
+#[tokio::test]
+async fn named_capabilities_or_none_are_not_replaced_by_the_default() {
+    let made = Arc::new(AtomicUsize::new(0));
+    let config = || {
+        let counter = Arc::clone(&made);
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new()).with_default_capabilities(
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                touching_default()
+            },
+        ))
+    };
+
+    let empty_model = ScriptedModel::answering("done");
+    Runner::run(request(
+        sandbox_agent("coder", "Coder", SandboxAgentConfig::empty()),
+        &empty_model,
+        config(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(empty_model.tools.lock().unwrap()[0], Vec::<String>::new());
+
+    let named = WorkspaceCapability::new("own");
+    let bindings = Arc::clone(&named.bindings);
+    let named_model = ScriptedModel::answering("done");
+    Runner::run(request(
+        sandbox_agent(
+            "coder",
+            "Coder",
+            SandboxAgentConfig::new().with_capability(Arc::new(named)),
+        ),
+        &named_model,
+        config(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        bindings.load(Ordering::SeqCst),
+        1,
+        "the named capability was bound"
+    );
+    assert_eq!(named_model.tools.lock().unwrap()[0], Vec::<String>::new());
+    assert_eq!(made.load(Ordering::SeqCst), 0, "the default was never made");
 }

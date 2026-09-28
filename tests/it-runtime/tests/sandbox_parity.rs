@@ -894,7 +894,7 @@ fn agent(id: &'static str, manifest: Manifest, handoffs: &[&str]) -> Arc<AgentSp
     }
     builder
         .sandbox(
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(manifest)
                 .with_capability(Probe::unbound(id)),
         )

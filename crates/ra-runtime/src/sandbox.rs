@@ -13,16 +13,16 @@
 //! **Boundary**: this module names sandbox clients and sessions only through the protocol in
 //! `ra-core`. No backend lives here; a host constructs one from a service crate and hands it in.
 //!
-//! # What this module does not do yet
+//! # Where this differs from the reference
 //!
-//! - A capability's context processing is not run for a sandbox agent's turns, and capabilities are
-//!   not told the resolved model name when they adjust sampling settings.
-//! - The instrumentation wrapper around sessions is not here, so a session's own start, stop and
-//!   shutdown carry no spans of their own. A failure that may quote mount authority is replaced
-//!   where the runtime calls into a session — preparing it, cleaning it up — rather than by a
-//!   wrapper around every session call.
-//! - The runner's cleanup error is logged rather than surfaced, as on the reference, and a
-//!   streamed run's live session is not exposed while the stream is running.
+//! - The instrumentation wrapper around sessions lives with the backends, in the service crate:
+//!   the built-in clients hand back sessions already wrapped, as the reference's do, and a host's
+//!   own client decides for itself. This module still replaces a failure that may quote mount
+//!   authority where it calls into a session — preparing it, cleaning it up — so a session that
+//!   arrives unwrapped is covered at those points too.
+//! - The runner's cleanup error is logged rather than surfaced, as on the reference. The
+//!   reference also parks the live session on a streamed result in a private attribute while the
+//!   stream runs; nothing here carries it, since nothing public reads it.
 
 mod config;
 pub mod memory;
@@ -35,7 +35,7 @@ use ra_core::{
     sandbox::SandboxError,
 };
 
-pub use config::SandboxRunConfig;
+pub use config::{DefaultCapabilities, SandboxRunConfig};
 pub use preparation::{DEFAULT_SANDBOX_INSTRUCTIONS, filesystem_instructions};
 pub(crate) use runtime::SandboxRuntime;
 

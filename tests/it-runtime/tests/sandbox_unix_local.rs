@@ -193,7 +193,7 @@ fn agent(roots: &Arc<Mutex<Vec<String>>>) -> Arc<AgentSpec> {
         .name("Coder")
         .instructions("work in the workspace")
         .sandbox(
-            SandboxAgentConfig::new()
+            SandboxAgentConfig::empty()
                 .with_default_manifest(
                     Manifest::new().with_entry("README.md", Entry::file(b"hello".to_vec())),
                 )
@@ -381,7 +381,7 @@ async fn a_run_as_user_is_refused_by_the_local_backend() {
     let agent = AgentSpec::builder()
         .id(AgentId::new("coder"))
         .name("Coder")
-        .sandbox(SandboxAgentConfig::new().with_run_as(ra_core::sandbox::User::new("builder")))
+        .sandbox(SandboxAgentConfig::empty().with_run_as(ra_core::sandbox::User::new("builder")))
         .build()
         .unwrap();
     let error = Runner::run(
@@ -885,7 +885,7 @@ async fn a_run_paused_for_approval_resumes_with_the_workspace_it_left() {
             .name("sandbox")
             .instructions("Use the sandbox lifecycle tools.")
             .sandbox(
-                SandboxAgentConfig::new()
+                SandboxAgentConfig::empty()
                     .with_default_manifest(manifest.clone())
                     .with_capability(Arc::new(LifecycleProbe { binding: None })),
             )

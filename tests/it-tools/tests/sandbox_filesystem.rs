@@ -1581,6 +1581,33 @@ fn binding_to_a_sandbox_session_yields_a_bound_filesystem() {
     assert!(!filesystem.is_bound());
 }
 
+/// The reference's default set, named on one agent: what a run that supplies no default of its own
+/// needs its sandbox agents built from.
+#[test]
+fn a_sandbox_agent_configuration_starts_with_the_default_capabilities() {
+    let kinds = |config: &ra_core::sandbox::SandboxAgentConfig| -> Vec<CapabilityFamily> {
+        config
+            .capabilities()
+            .iter()
+            .map(|capability| capability.kind())
+            .collect()
+    };
+
+    let config = ra_tools::sandbox::sandbox_agent_config();
+    assert_eq!(
+        kinds(&config),
+        [
+            CapabilityFamily::FILESYSTEM,
+            CapabilityFamily::SHELL,
+            CapabilityFamily::COMPACTION
+        ]
+    );
+    assert!(config.run_as().is_none());
+    assert!(config.capabilities_specified());
+    // The configuration in `ra-core` leaves them unspecified, for the run to fill in.
+    assert!(!ra_core::sandbox::SandboxAgentConfig::new().capabilities_specified());
+}
+
 /// The reference's `Capabilities.default()`: filesystem, shell and compaction, in that order.
 #[test]
 fn the_default_capabilities_are_filesystem_shell_and_compaction() {

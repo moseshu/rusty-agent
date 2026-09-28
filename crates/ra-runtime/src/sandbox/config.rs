@@ -2,6 +2,7 @@
 
 use std::{fmt, sync::Arc};
 
+use ra_core::capability::Capability;
 use ra_core::sandbox::{
     CwdError, DiscriminatedPayload, Manifest, ManifestRegistries, PosixPath, SandboxArchiveLimits,
     SandboxClient, SandboxConcurrencyLimits, SandboxSession, SandboxSessionState, Snapshot,
@@ -33,6 +34,13 @@ use ra_core::sandbox::{
 /// assembles its registries explicitly, so this carries the ones checkpointed states are read
 /// with — the built-in families by default.
 ///
+/// # The default capabilities
+///
+/// A sandbox agent that names no capabilities gets the reference's default set, and the set is
+/// made by the assembly layer that owns the implementations, not by this crate. A run hands it in
+/// with [`Self::with_default_capabilities`] — `ra_tools::sandbox::default_capabilities` is the
+/// reference's set — and a run that hands in none refuses such an agent before any session exists.
+///
 /// # Where a fresh session's snapshot goes
 ///
 /// [`Self::with_snapshot`] or [`Self::with_snapshot_spec`] when set. Otherwise the client's
@@ -54,7 +62,11 @@ pub struct SandboxRunConfig {
     cwd: Option<PosixPath>,
     snapshot_registry: Arc<TypeRegistry>,
     manifest_registries: Arc<ManifestRegistries>,
+    default_capabilities: Option<DefaultCapabilities>,
 }
+
+/// Makes the capabilities a sandbox agent gets when it names none, fresh for each agent.
+pub type DefaultCapabilities = Arc<dyn Fn() -> Vec<Arc<dyn Capability>> + Send + Sync>;
 
 impl Default for SandboxRunConfig {
     fn default() -> Self {
@@ -80,6 +92,7 @@ impl SandboxRunConfig {
             cwd: None,
             snapshot_registry: Arc::new(builtin_snapshot_registry()),
             manifest_registries: Arc::new(ManifestRegistries::builtin()),
+            default_capabilities: None,
         }
     }
 
@@ -169,6 +182,26 @@ impl SandboxRunConfig {
         self.snapshot_registry = Arc::new(snapshots);
         self.manifest_registries = Arc::new(manifests);
         self
+    }
+
+    /// Gives every sandbox agent that names no capabilities the set `defaults` makes — the
+    /// reference's `Capabilities.default()` when `defaults` is
+    /// `ra_tools::sandbox::default_capabilities`.
+    ///
+    /// Called once for each such agent the run prepares, so no two agents share an instance. An
+    /// agent that names its capabilities, even as none, is not affected.
+    pub fn with_default_capabilities(
+        mut self,
+        defaults: impl Fn() -> Vec<Arc<dyn Capability>> + Send + Sync + 'static,
+    ) -> Self {
+        self.default_capabilities = Some(Arc::new(defaults));
+        self
+    }
+
+    /// What makes the capabilities of an agent that names none, if the run supplies it.
+    #[must_use]
+    pub fn default_capabilities(&self) -> Option<&DefaultCapabilities> {
+        self.default_capabilities.as_ref()
     }
 
     /// The client that creates and resumes sessions.
@@ -273,6 +306,7 @@ impl fmt::Debug for SandboxRunConfig {
             .field("concurrency_limits", &self.concurrency_limits)
             .field("archive_limits", &self.archive_limits)
             .field("cwd", &self.cwd)
+            .field("default_capabilities", &self.default_capabilities.is_some())
             .finish_non_exhaustive()
     }
 }
