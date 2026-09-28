@@ -18,7 +18,7 @@ use ra_core::sandbox::{
     AsUser, DiscriminatedPayload, Entry, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest,
     MaterializedFile, Mount, MountPattern, MountProvider, MountStrategy, MountpointOptions, OpName,
     PosixPath, S3Mount, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    SessionResources, Snapshot,
+    SessionPath, SessionResources, Snapshot,
 };
 use ra_sandbox::materialize::ManifestApplier;
 use ra_sandbox::mounts::{
@@ -141,15 +141,26 @@ impl SandboxSession for Session {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.writes
             .lock()
             .expect("writes")
@@ -157,11 +168,17 @@ impl SandboxSession for Session {
         Ok(())
     }
 
-    async fn read(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
         Ok(Vec::new())
     }
 
-    async fn write(&self, path: &str, _data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        path: SessionPath<'_>,
+        _data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.writes.lock().expect("writes").push(path.to_owned());
         push(&self.events, format!("write:{path}"));
         Ok(())

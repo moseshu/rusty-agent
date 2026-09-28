@@ -16,8 +16,8 @@ use ra_core::sandbox::{
     AsUser, AzureBlobMount, BoxMount, ErrorCode, ExecRequest, ExecResult, FileEntry, FuseCacheType,
     FuseOptions, GcsMount, Manifest, Mount, MountPattern, MountProvider, MountStrategy,
     MountpointOptions, OpName, PosixPath, R2Mount, RcloneMode, RcloneOptions, S3FilesMount,
-    S3FilesOptions, S3Mount, SandboxResult, SandboxSession, SandboxSessionState, SessionResources,
-    ShellInvocation, Snapshot,
+    S3FilesOptions, S3Mount, SandboxResult, SandboxSession, SandboxSessionState, SessionPath,
+    SessionResources, ShellInvocation, Snapshot,
 };
 use ra_sandbox::mounts::config::{
     FuseMountConfig, MountpointMountConfig, RcloneMountConfig, S3FilesMountConfig,
@@ -136,27 +136,45 @@ impl SandboxSession for Recorder {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.mkdirs.lock().expect("mkdirs").push(path.to_owned());
         Ok(())
     }
 
-    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         self.file_text
             .clone()
             .map(String::into_bytes)
             .ok_or_else(|| ra_core::sandbox::SandboxError::workspace_read_not_found(path))
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        path: SessionPath<'_>,
+        data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.writes
             .lock()
             .expect("writes")

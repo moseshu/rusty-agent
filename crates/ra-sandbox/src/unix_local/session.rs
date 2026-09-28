@@ -15,7 +15,8 @@ use ra_core::sandbox::{
     ExposedPortEndpoint, FileEntry, Manifest, MaterializationResult, MaterializedFile, OpName,
     PosixPath, PtyExecUpdate, PtyStartRequest, PtyWriteRequest, SandboxArchiveLimits,
     SandboxConcurrencyLimits, SandboxError, SandboxResult, SandboxSession, SandboxSessionState,
-    SessionResources, SnapshotFingerprint, User, validate_manifest_mount_credential_boundaries,
+    SessionPath, SessionResources, SnapshotFingerprint, User,
+    validate_manifest_mount_credential_boundaries,
 };
 
 use crate::archive::WorkspaceArchiveExtractor;
@@ -525,9 +526,15 @@ impl SandboxSession for UnixLocalSandboxSession {
         Ok(())
     }
 
-    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
-        let normalized = self.normalize_path(path, for_write)?;
-        normalized.to_str().map(str::to_owned).ok_or_else(|| {
+    async fn validate_path_access(
+        &self,
+        path: SessionPath<'_>,
+        for_write: bool,
+    ) -> SandboxResult<PosixPath> {
+        // Either form is read as written: this backend resolves against a real directory, as the
+        // reference's symlink-resolving policy does, and that policy converts no separators.
+        let normalized = self.normalize_path(path.as_str(), for_write)?;
+        normalized.to_str().map(PosixPath::new).ok_or_else(|| {
             SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,
                 OpName::Write,
@@ -536,7 +543,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         })
     }
 
-    async fn ls(&self, path: &str, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        let path = path.as_str();
         let normalized = self.normalize_path(path, false)?;
         let Some(user) = user else {
             return files::list_directory(&normalized);
@@ -564,7 +572,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         ))
     }
 
-    async fn rm(&self, path: &str, recursive: bool, user: AsUser) -> SandboxResult<()> {
+    async fn rm(&self, path: SessionPath<'_>, recursive: bool, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         let normalized = self.normalize_path(path, true)?;
         if let Some(user) = user {
             let arguments = vec![
@@ -586,7 +595,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         files::remove(&normalized, recursive)
     }
 
-    async fn mkdir(&self, path: &str, parents: bool, user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(&self, path: SessionPath<'_>, parents: bool, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         let normalized = self.normalize_path(path, true)?;
         if let Some(user) = user {
             let arguments = vec![
@@ -608,17 +618,25 @@ impl SandboxSession for UnixLocalSandboxSession {
         files::make_directory(&normalized, parents)
     }
 
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         let normalized = self.readable_path(path, user).await?;
         files::read_file(&normalized, path, None)
     }
 
-    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
+    async fn read_up_to(
+        &self,
+        path: SessionPath<'_>,
+        user: AsUser,
+        max_bytes: u64,
+    ) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         let normalized = self.readable_path(path, user).await?;
         files::read_file(&normalized, path, Some(max_bytes))
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+    async fn write(&self, path: SessionPath<'_>, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         let normalized = self.normalize_path(path, true)?;
         let Some(user) = user else {
             return files::write_file(&normalized, &data);
@@ -681,7 +699,7 @@ impl SandboxSession for UnixLocalSandboxSession {
     /// ordinary write gets, applied to input that chose its own paths.
     async fn extract(
         &self,
-        path: &str,
+        path: SessionPath<'_>,
         data: Vec<u8>,
         scheme: Option<CompressionScheme>,
         limits: Option<SandboxArchiveLimits>,
@@ -794,7 +812,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         self.snapshots().restore_on_resume().await
     }
 
-    async fn remove_workspace_entry_on_resume(&self, path: &str) -> SandboxResult<()> {
+    async fn remove_workspace_entry_on_resume(&self, path: SessionPath<'_>) -> SandboxResult<()> {
+        let path = path.as_str();
         let entry = std::path::Path::new(path);
         let name = entry.file_name().ok_or_else(|| {
             SandboxError::workspace_archive_write(path)

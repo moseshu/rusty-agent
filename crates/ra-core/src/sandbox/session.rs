@@ -52,7 +52,7 @@ use super::state::{
     InvalidSessionStatePayload, REDACTED_HOST_PATH_GRANT_PATHS_KEY, SandboxSessionState,
 };
 use super::types::{ExecResult, ExposedPortEndpoint, User};
-use super::workspace_paths::PosixPath;
+use super::workspace_paths::{PosixPath, SessionPath};
 
 /// What a sandbox operation returns when it can fail.
 pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
@@ -213,7 +213,10 @@ pub trait SandboxSession: Send + Sync {
     /// and [`ErrorCode::MountConfigInvalid`] for one that overlaps where a mount attaches: excluding
     /// a mount's path, or a directory containing one, would change what the mount's own exclusion
     /// already decides.
-    fn register_persist_workspace_skip_path(&self, path: &str) -> SandboxResult<PosixPath> {
+    fn register_persist_workspace_skip_path(
+        &self,
+        path: SessionPath<'_>,
+    ) -> SandboxResult<PosixPath> {
         let relative = validated_relative_path(path)?;
         if relative.parts().is_empty() {
             return Err(SandboxError::new(
@@ -478,15 +481,19 @@ pub trait SandboxSession: Send + Sync {
     /// The default applies the manifest's lexical path policy. Backends that resolve filesystem
     /// links must override this so callers can derive destinations from the same resolved path.
     ///
+    /// The answer is a path rather than text, as the reference's is: handed back to this session
+    /// it names what was validated, where text would have its backslashes read again as separators.
+    ///
     /// # Errors
     ///
     /// Returns a configuration error for an invalid root, or the path policy's access refusal.
-    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
-        Ok(self
-            .workspace_path_policy()?
-            .normalize_sandbox_path(path, for_write)?
-            .as_str()
-            .to_owned())
+    async fn validate_path_access(
+        &self,
+        path: SessionPath<'_>,
+        for_write: bool,
+    ) -> SandboxResult<PosixPath> {
+        self.workspace_path_policy()?
+            .normalize_sandbox_path(path, for_write)
     }
 
     /// Lists a directory.
@@ -495,21 +502,21 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns [`ErrorCode::WorkspaceReadNotFound`] for a path that is not there, or the backend's
     /// failure to read it.
-    async fn ls(&self, path: &str, user: AsUser) -> SandboxResult<Vec<FileEntry>>;
+    async fn ls(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<FileEntry>>;
 
     /// Removes a path, optionally with everything under it.
     ///
     /// # Errors
     ///
     /// Returns the backend's failure to remove it.
-    async fn rm(&self, path: &str, recursive: bool, user: AsUser) -> SandboxResult<()>;
+    async fn rm(&self, path: SessionPath<'_>, recursive: bool, user: AsUser) -> SandboxResult<()>;
 
     /// Creates a directory, optionally creating its parents.
     ///
     /// # Errors
     ///
     /// Returns the backend's failure to create it.
-    async fn mkdir(&self, path: &str, parents: bool, user: AsUser) -> SandboxResult<()>;
+    async fn mkdir(&self, path: SessionPath<'_>, parents: bool, user: AsUser) -> SandboxResult<()>;
 
     /// Reads a file out of the workspace.
     ///
@@ -517,7 +524,7 @@ pub trait SandboxSession: Send + Sync {
     ///
     /// Returns [`ErrorCode::WorkspaceReadNotFound`] for a path that is not there, or the backend's
     /// failure to read it.
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>>;
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>>;
 
     /// Reads a file whose absence, or some other failure, the caller expects and handles.
     ///
@@ -532,7 +539,7 @@ pub trait SandboxSession: Send + Sync {
     /// As [`Self::read`].
     async fn read_expecting(
         &self,
-        path: &str,
+        path: SessionPath<'_>,
         user: AsUser,
         expected: &[ErrorCode],
     ) -> SandboxResult<Vec<u8>> {
@@ -553,7 +560,12 @@ pub trait SandboxSession: Send + Sync {
     /// # Errors
     ///
     /// As [`Self::read`].
-    async fn read_up_to(&self, path: &str, user: AsUser, max_bytes: u64) -> SandboxResult<Vec<u8>> {
+    async fn read_up_to(
+        &self,
+        path: SessionPath<'_>,
+        user: AsUser,
+        max_bytes: u64,
+    ) -> SandboxResult<Vec<u8>> {
         let mut data = self.read(path, user).await?;
         data.truncate(usize::try_from(max_bytes).unwrap_or(usize::MAX));
         Ok(data)
@@ -564,7 +576,7 @@ pub trait SandboxSession: Send + Sync {
     /// # Errors
     ///
     /// Returns the backend's failure to write it.
-    async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()>;
+    async fn write(&self, path: SessionPath<'_>, data: Vec<u8>, user: AsUser) -> SandboxResult<()>;
 
     /// Writes an archive into the workspace and unpacks it beside itself.
     ///
@@ -582,7 +594,7 @@ pub trait SandboxSession: Send + Sync {
     /// backend's own failure to write.
     async fn extract(
         &self,
-        path: &str,
+        path: SessionPath<'_>,
         data: Vec<u8>,
         scheme: Option<CompressionScheme>,
         limits: Option<SandboxArchiveLimits>,
@@ -766,7 +778,7 @@ pub trait SandboxSession: Send + Sync {
     /// # Errors
     ///
     /// Returns the backend's failure to validate or remove the entry.
-    async fn remove_workspace_entry_on_resume(&self, path: &str) -> SandboxResult<()> {
+    async fn remove_workspace_entry_on_resume(&self, path: SessionPath<'_>) -> SandboxResult<()> {
         self.rm(path, true, None).await
     }
 

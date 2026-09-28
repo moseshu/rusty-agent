@@ -10,7 +10,7 @@ use ra_core::{
     error::{Error, Result},
     finish::FinishReason,
     item::{MessageRole, ModelInputItem, RunItem, RunItemKind},
-    sandbox::{ErrorCode, PosixPath, SandboxSession},
+    sandbox::{ErrorCode, PosixPath, SandboxSession, SessionPath},
 };
 use serde::{Deserialize, Serialize};
 
@@ -187,7 +187,7 @@ async fn read_existing_bytes(
     session: &Arc<dyn SandboxSession>,
     path: &PosixPath,
 ) -> Result<Option<Vec<u8>>> {
-    match session.read(path.as_str(), None).await {
+    match session.read(SessionPath::Posix(path), None).await {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.error_code() == ErrorCode::WorkspaceReadNotFound => Ok(None),
         Err(error) => Err(sandbox_error(error)),
@@ -203,9 +203,9 @@ async fn read_existing_bytes(
 /// itself, so the order of its fields is the one it serializes in. A segment that cannot be
 /// written as JSON is refused before anything is written.
 ///
-/// `rollouts_path` and `file_name` are read as the session reads text, with a backslash as a
-/// separator, so they are checked as the path the file will actually land at, and the path
-/// answered is that one.
+/// `rollouts_path` and `file_name` are read as paths, as the reference's `Path(...)` reads them: a
+/// backslash is part of a name, so `nested\chat.jsonl` is one file name, and the session is handed
+/// the path that was checked.
 ///
 /// # Errors
 ///
@@ -218,12 +218,12 @@ pub async fn write_rollout<T: Serialize + ?Sized>(
     rollouts_path: &str,
     file_name: Option<&str>,
 ) -> Result<PosixPath> {
-    let rollouts_dir = PosixPath::coerce(rollouts_path);
+    let rollouts_dir = PosixPath::new(rollouts_path);
     validate_relative_path("rollouts_path", &rollouts_dir)?;
     let line = dump_rollout_json(rollout_contents)?;
 
     let destination = if let Some(file_name) = file_name {
-        let requested = PosixPath::coerce(file_name.trim());
+        let requested = PosixPath::new(file_name.trim());
         let single_name = requested.parts().len() == 1 && !requested.is_absolute();
         // Case-sensitive, as the reference's `endswith` is.
         #[allow(clippy::case_sensitive_file_extension_comparisons)]
@@ -250,7 +250,7 @@ pub async fn write_rollout<T: Serialize + ?Sized>(
 
     let parent = destination.join("..").normalized();
     session
-        .mkdir(parent.as_str(), true, None)
+        .mkdir(SessionPath::Posix(&parent), true, None)
         .await
         .map_err(sandbox_error)?;
     let mut contents = read_existing_bytes(session, &destination)
@@ -258,7 +258,7 @@ pub async fn write_rollout<T: Serialize + ?Sized>(
         .unwrap_or_default();
     contents.extend_from_slice(line.as_bytes());
     session
-        .write(destination.as_str(), contents, None)
+        .write(SessionPath::Posix(&destination), contents, None)
         .await
         .map_err(sandbox_error)?;
     Ok(destination)

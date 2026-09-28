@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use ra_core::sandbox::{
     AsUser, CompressionScheme, EntryKind, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest,
     Permissions, SandboxArchiveLimits, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, SessionResources, Snapshot,
+    SandboxSessionState, SessionPath, SessionResources, Snapshot,
 };
 use ra_sandbox::archive::WorkspaceArchiveExtractor;
 use rstest::rstest;
@@ -122,7 +122,8 @@ impl SandboxSession for RecordingSession {
         Ok(true)
     }
 
-    async fn ls(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+        let path = path.as_str();
         self.listed.lock().expect("listed").push(path.to_owned());
         self.listings
             .get(path)
@@ -130,11 +131,22 @@ impl SandboxSession for RecordingSession {
             .ok_or_else(|| SandboxError::workspace_read_not_found(path))
     }
 
-    async fn rm(&self, _path: &str, _recursive: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn rm(
+        &self,
+        _path: SessionPath<'_>,
+        _recursive: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
         Ok(())
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool, _user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(
+        &self,
+        path: SessionPath<'_>,
+        _parents: bool,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.calls
             .lock()
             .expect("calls")
@@ -142,11 +154,18 @@ impl SandboxSession for RecordingSession {
         Ok(())
     }
 
-    async fn read(&self, path: &str, _user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         Err(SandboxError::workspace_read_not_found(path))
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, _user: AsUser) -> SandboxResult<()> {
+    async fn write(
+        &self,
+        path: SessionPath<'_>,
+        data: Vec<u8>,
+        _user: AsUser,
+    ) -> SandboxResult<()> {
+        let path = path.as_str();
         self.calls
             .lock()
             .expect("calls")
@@ -207,7 +226,12 @@ fn link_member(
 fn bundle() -> Vec<u8> {
     archive(|builder| {
         member(builder, "src/", tar::EntryType::Directory, b"");
-        member(builder, "src/main.rs", tar::EntryType::Regular, b"fn main() {}");
+        member(
+            builder,
+            "src/main.rs",
+            tar::EntryType::Regular,
+            b"fn main() {}",
+        );
         member(builder, "README.md", tar::EntryType::Regular, b"# bundle");
     })
 }
@@ -218,7 +242,7 @@ async fn an_archive_is_written_where_it_was_asked_and_unpacked_beside_itself() {
     let data = bundle();
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data.clone(), None, None)
+        .extract(ARCHIVE_PATH.into(), data.clone(), None, None)
         .await
         .expect("extract");
 
@@ -237,7 +261,11 @@ async fn an_archive_is_written_where_it_was_asked_and_unpacked_beside_itself() {
         Some(b"fn main() {}".to_vec())
     );
     // A directory member is created, and so is the parent of every file written.
-    assert!(session.mkdirs().contains(&"/workspace/incoming/src".to_owned()));
+    assert!(
+        session
+            .mkdirs()
+            .contains(&"/workspace/incoming/src".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -248,11 +276,16 @@ async fn members_named_from_the_archive_root_land_without_the_prefix() {
     let data = archive(|builder| {
         member(builder, "./", tar::EntryType::Directory, b"");
         member(builder, "./src/", tar::EntryType::Directory, b"");
-        member(builder, "./src/main.rs", tar::EntryType::Regular, b"fn main() {}");
+        member(
+            builder,
+            "./src/main.rs",
+            tar::EntryType::Regular,
+            b"fn main() {}",
+        );
     });
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect("extract");
 
@@ -277,21 +310,21 @@ async fn members_named_from_the_archive_root_land_without_the_prefix() {
 #[case("c:/windows", "windows drive path")]
 #[case("nested\\escape", "windows path separator")]
 #[tokio::test]
-async fn a_member_that_names_somewhere_else_is_refused(
-    #[case] name: &str,
-    #[case] reason: &str,
-) {
+async fn a_member_that_names_somewhere_else_is_refused(#[case] name: &str, #[case] reason: &str) {
     let session = RecordingSession::new();
     let data = archive(|builder| member(builder, name, tar::EntryType::Regular, b"payload"));
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
 
     assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some(reason)
     );
     // The archive landed, because that is what the caller asked for; nothing was unpacked from it.
@@ -309,12 +342,15 @@ async fn links_are_refused_in_both_directions() {
         let data = archive(|builder| link_member(builder, "link", entry_type, "/etc/passwd"));
 
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract(ARCHIVE_PATH, data, None, None)
+            .extract(ARCHIVE_PATH.into(), data, None, None)
             .await
             .expect_err("refused");
 
         assert_eq!(
-            error.context().get("reason").and_then(|value| value.as_str()),
+            error
+                .context()
+                .get("reason")
+                .and_then(|value| value.as_str()),
             Some(reason)
         );
     }
@@ -326,12 +362,15 @@ async fn a_member_that_is_neither_a_file_nor_a_directory_is_refused() {
     let data = archive(|builder| member(builder, "pipe", tar::EntryType::Fifo, b""));
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("unsupported member type")
     );
 }
@@ -349,12 +388,15 @@ async fn the_archives_own_root_may_only_be_a_directory(
     let data = archive(|builder| member(builder, ".", entry_type, b""));
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some(reason)
     );
 }
@@ -368,7 +410,7 @@ async fn the_archives_own_root_directory_is_skipped_rather_than_written() {
     });
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect("extract");
 
@@ -390,12 +432,15 @@ async fn the_same_path_twice_is_refused_unless_both_are_directories() {
     });
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("duplicate archive path: notes.md")
     );
 
@@ -406,7 +451,7 @@ async fn the_same_path_twice_is_refused_unless_both_are_directories() {
         member(builder, "src/", tar::EntryType::Directory, b"");
     });
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect("extract");
 }
@@ -420,15 +465,21 @@ async fn a_path_that_descends_through_a_file_is_refused_from_either_side() {
         member(builder, "src/main.rs", tar::EntryType::Regular, b"under it");
     });
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("archive path descends through non-directory: src")
     );
     assert_eq!(
-        error.context().get("member").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("member")
+            .and_then(|value| value.as_str()),
         Some("src/main.rs")
     );
 
@@ -440,15 +491,21 @@ async fn a_path_that_descends_through_a_file_is_refused_from_either_side() {
         member(builder, "src", tar::EntryType::Regular, b"a file");
     });
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("archive path descends through non-directory: src")
     );
     assert_eq!(
-        error.context().get("member").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("member")
+            .and_then(|value| value.as_str()),
         Some("src/main.rs")
     );
 }
@@ -457,18 +514,22 @@ async fn a_path_that_descends_through_a_file_is_refused_from_either_side() {
 async fn a_member_landing_under_an_existing_symlink_is_refused() {
     // The workspace already holds `incoming/data` as a link. Writing `data/secret` through it would
     // land wherever the link points, which is not this workspace's decision to make.
-    let session = RecordingSession::new().holding("/workspace/incoming", "data", EntryKind::Symlink);
+    let session =
+        RecordingSession::new().holding("/workspace/incoming", "data", EntryKind::Symlink);
     let data = archive(|builder| {
         member(builder, "data/secret", tar::EntryType::Regular, b"payload");
     });
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("symlink in parent path: data")
     );
     assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
@@ -483,7 +544,7 @@ async fn an_existing_directory_of_the_same_name_is_not_a_symlink() {
     });
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect("extract");
 
@@ -502,16 +563,22 @@ async fn an_archive_larger_than_the_caller_allows_is_refused_before_it_is_read()
         .expect("limit");
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, bundle(), None, Some(limits))
+        .extract(ARCHIVE_PATH.into(), bundle(), None, Some(limits))
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("archive input size exceeds limit")
     );
     assert_eq!(
-        error.context().get("limit").and_then(serde_json::Value::as_u64),
+        error
+            .context()
+            .get("limit")
+            .and_then(serde_json::Value::as_u64),
         Some(16)
     );
     // Not even the archive itself: it is bigger than this caller agreed to accept.
@@ -526,16 +593,22 @@ async fn an_archive_with_more_members_than_the_caller_allows_is_refused() {
         .expect("limit");
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, bundle(), None, Some(limits))
+        .extract(ARCHIVE_PATH.into(), bundle(), None, Some(limits))
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("archive member count exceeds limit")
     );
     assert_eq!(
-        error.context().get("actual").and_then(serde_json::Value::as_u64),
+        error
+            .context()
+            .get("actual")
+            .and_then(serde_json::Value::as_u64),
         Some(3)
     );
     assert_eq!(session.writes(), vec![ARCHIVE_PATH.to_owned()]);
@@ -551,16 +624,22 @@ async fn an_archive_that_would_unpack_to_more_than_the_caller_allows_is_refused(
         .expect("limit");
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, bundle(), None, Some(limits))
+        .extract(ARCHIVE_PATH.into(), bundle(), None, Some(limits))
         .await
         .expect_err("refused");
 
     assert_eq!(
-        error.context().get("reason").and_then(|value| value.as_str()),
+        error
+            .context()
+            .get("reason")
+            .and_then(|value| value.as_str()),
         Some("archive extracted size exceeds limit")
     );
     assert_eq!(
-        error.context().get("limit").and_then(serde_json::Value::as_u64),
+        error
+            .context()
+            .get("limit")
+            .and_then(serde_json::Value::as_u64),
         Some(8)
     );
 }
@@ -572,7 +651,7 @@ async fn a_caller_who_sets_no_limits_gets_none() {
     let session = RecordingSession::new();
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, bundle(), None, None)
+        .extract(ARCHIVE_PATH.into(), bundle(), None, None)
         .await
         .expect("extract");
 
@@ -615,9 +694,8 @@ fn the_format_comes_from_the_name_unless_the_caller_says_otherwise(
     #[case] given: Option<CompressionScheme>,
     #[case] expected: &str,
 ) {
-    let scheme = given.or_else(|| {
-        CompressionScheme::from_file_name(path.rsplit('/').next().expect("a name"))
-    });
+    let scheme = given
+        .or_else(|| CompressionScheme::from_file_name(path.rsplit('/').next().expect("a name")));
     assert_eq!(scheme.map(CompressionScheme::as_str), Some(expected));
 }
 
@@ -626,7 +704,10 @@ fn the_format_comes_from_the_name_unless_the_caller_says_otherwise(
 #[case("/workspace/bundle", "could not determine compression scheme")]
 // `archive.tar.gz` names `gz`, which is a format this does not unpack — the reference reads only
 // the last extension too.
-#[case("/workspace/bundle.tar.gz", "compression scheme must be one of 'zip' 'tar'")]
+#[case(
+    "/workspace/bundle.tar.gz",
+    "compression scheme must be one of 'zip' 'tar'"
+)]
 #[tokio::test]
 async fn an_archive_whose_format_cannot_be_read_is_refused(
     #[case] path: &str,
@@ -635,7 +716,7 @@ async fn an_archive_whose_format_cannot_be_read_is_refused(
     let session = RecordingSession::new();
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(path, bundle(), None, None)
+        .extract(path.into(), bundle(), None, None)
         .await
         .expect_err("refused");
 
@@ -662,15 +743,20 @@ async fn an_archive_whose_format_cannot_be_read_is_refused(
 async fn a_zip_archive_is_unpacked_beside_itself() {
     let session = RecordingSession::new();
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    writer.start_file("src/main.rs", zip::write::SimpleFileOptions::default()).expect("member");
+    writer
+        .start_file("src/main.rs", zip::write::SimpleFileOptions::default())
+        .expect("member");
     std::io::Write::write_all(&mut writer, b"fn main() {}").expect("body");
     let data = writer.finish().expect("archive").into_inner();
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data.clone(), None, None)
+        .extract("/workspace/bundle.zip".into(), data.clone(), None, None)
         .await
         .expect("extract");
     assert_eq!(session.written("/workspace/bundle.zip"), Some(data));
-    assert_eq!(session.written("/workspace/src/main.rs"), Some(b"fn main() {}".to_vec()));
+    assert_eq!(
+        session.written("/workspace/src/main.rs"),
+        Some(b"fn main() {}".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -689,7 +775,7 @@ async fn compressed_tar_formats_are_unpacked() {
     for data in [gzip, bzip, xz] {
         let session = RecordingSession::new();
         WorkspaceArchiveExtractor::new(&session)
-            .extract(ARCHIVE_PATH, data, None, None)
+            .extract(ARCHIVE_PATH.into(), data, None, None)
             .await
             .expect("extract");
         assert_eq!(
@@ -714,7 +800,7 @@ async fn zip_rejects_unsafe_paths_before_writing_members() {
         std::io::Write::write_all(&mut writer, b"bad").expect("body");
         let data = writer.finish().expect("archive").into_inner();
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, None)
+            .extract("/workspace/bundle.zip".into(), data, None, None)
             .await
             .expect_err("unsafe member");
         assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
@@ -735,7 +821,7 @@ async fn zip_checks_declared_size_before_writing_members() {
         .with_max_extracted_bytes(Some(4))
         .expect("limit");
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, Some(limits))
+        .extract("/workspace/bundle.zip".into(), data, None, Some(limits))
         .await
         .expect_err("oversize");
     assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
@@ -766,7 +852,7 @@ async fn a_compressed_tar_over_the_extracted_size_limit_is_refused_before_writin
         .expect("limit");
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, Some(limits))
+        .extract(ARCHIVE_PATH.into(), data, None, Some(limits))
         .await
         .expect_err("oversize");
 
@@ -783,7 +869,7 @@ async fn a_compressed_tar_is_decoded_only_as_far_as_its_members_reach() {
     data.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef]);
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data, None, None)
+        .extract(ARCHIVE_PATH.into(), data, None, None)
         .await
         .expect("extract");
 
@@ -829,7 +915,7 @@ async fn a_zip_member_larger_than_its_header_declares_is_refused() {
             .expect("limit");
 
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, Some(limits))
+            .extract("/workspace/bundle.zip".into(), data, None, Some(limits))
             .await
             .expect_err("size mismatch");
 
@@ -880,7 +966,7 @@ async fn a_zip_link_member_is_refused_whichever_system_made_it(#[case] made_by: 
     let data = zip_with_attributes("link", made_by, ZIP_SYMLINK_ATTRIBUTES);
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect_err("link member");
 
@@ -901,7 +987,7 @@ async fn a_zip_member_that_is_a_link_and_a_climb_is_refused_as_the_climb() {
     let data = zip_with_attributes("../escape", ZIP_MADE_BY_UNIX, ZIP_SYMLINK_ATTRIBUTES);
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect_err("unsafe member");
 
@@ -940,7 +1026,7 @@ async fn a_zip_path_given_twice_is_refused_unless_both_are_directories() {
         let data = zip_of(&[(first, b""), (second, b"")]);
 
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, None)
+            .extract("/workspace/bundle.zip".into(), data, None, None)
             .await
             .expect_err("refused");
 
@@ -959,7 +1045,7 @@ async fn a_zip_path_given_twice_is_refused_unless_both_are_directories() {
     let session = RecordingSession::new();
     let data = zip_of(&[("src/", b""), ("src/./", b"")]);
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect("extract");
     assert!(session.mkdirs().contains(&"/workspace/src".to_owned()));
@@ -976,7 +1062,7 @@ async fn a_zip_path_that_descends_through_a_file_is_refused_from_either_side() {
         let data = zip_of(&members);
 
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, None)
+            .extract("/workspace/bundle.zip".into(), data, None, None)
             .await
             .expect_err("refused");
 
@@ -1028,7 +1114,7 @@ async fn a_zip_naming_one_file_twice_is_refused_rather_than_unpacked_as_the_last
     );
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect_err("refused");
 
@@ -1045,7 +1131,7 @@ async fn a_zip_naming_one_file_twice_is_refused_rather_than_unpacked_as_the_last
     let session = RecordingSession::new();
     let data = zip_renaming(&[("src/", b""), ("srd/", b"")], "srd/", "src/");
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect("extract");
     assert!(session.mkdirs().contains(&"/workspace/src".to_owned()));
@@ -1060,7 +1146,12 @@ async fn repeated_zip_directories_still_count_towards_member_limits() {
             .with_max_members(Some(limit))
             .expect("limit");
         let result = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data.clone(), None, Some(limits))
+            .extract(
+                "/workspace/bundle.zip".into(),
+                data.clone(),
+                None,
+                Some(limits),
+            )
             .await;
         if limit == 1 {
             let error = result.expect_err("two entries exceed the member limit");
@@ -1091,7 +1182,7 @@ async fn a_link_hidden_by_a_repeated_zip_directory_is_refused() {
         data[first + 38..first + 42].copy_from_slice(&ZIP_SYMLINK_ATTRIBUTES.to_le_bytes());
         let session = RecordingSession::new();
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, None)
+            .extract("/workspace/bundle.zip".into(), data, None, None)
             .await
             .expect_err("hidden link");
         assert_eq!(
@@ -1116,7 +1207,12 @@ async fn repeated_zip_directories_still_count_all_declared_bytes() {
             .with_max_extracted_bytes(Some(limit))
             .expect("limit");
         let result = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data.clone(), None, Some(limits))
+            .extract(
+                "/workspace/bundle.zip".into(),
+                data.clone(),
+                None,
+                Some(limits),
+            )
             .await;
         if limit == 6 {
             let error = result.expect_err("all original directory sizes count");
@@ -1170,7 +1266,12 @@ async fn a_collapsed_zip64_directory_uses_its_extended_size() {
             .with_max_extracted_bytes(Some(limit))
             .expect("limit");
         let result = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data.clone(), None, Some(limits))
+            .extract(
+                "/workspace/bundle.zip".into(),
+                data.clone(),
+                None,
+                Some(limits),
+            )
             .await;
         if limit == 4 {
             let error = result.expect_err("hidden ZIP64 size exceeds limit");
@@ -1206,7 +1307,12 @@ async fn collapsed_zip_names_use_cp437_when_utf8_is_not_flagged() {
         .with_max_members(Some(1))
         .expect("limit");
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data.clone(), None, Some(limits))
+        .extract(
+            "/workspace/bundle.zip".into(),
+            data.clone(),
+            None,
+            Some(limits),
+        )
         .await
         .expect_err("two entries");
     assert_eq!(
@@ -1214,7 +1320,7 @@ async fn collapsed_zip_names_use_cp437_when_utf8_is_not_flagged() {
         Some("\u{e9}/")
     );
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect("valid CP437 names");
     assert!(session.mkdirs().contains(&"/workspace/\u{e9}".to_owned()));
@@ -1235,7 +1341,7 @@ async fn collapsed_zip_root_entries_are_ignored_before_type_and_limit_checks() {
         .expect("size limit");
     let session = RecordingSession::new();
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, Some(limits))
+        .extract("/workspace/bundle.zip".into(), data, None, Some(limits))
         .await
         .expect("root entries skipped");
     assert!(session.mkdirs().is_empty());
@@ -1258,7 +1364,7 @@ async fn a_tar_split_across_concatenated_xz_streams_is_refused() {
     }
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data.clone(), None, None)
+        .extract(ARCHIVE_PATH.into(), data.clone(), None, None)
         .await
         .expect_err("the first xz stream contains an incomplete tar");
 
@@ -1279,7 +1385,7 @@ async fn a_tar_split_across_concatenated_gzip_members_is_refused() {
     data.extend(gzip(tail));
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract(ARCHIVE_PATH, data.clone(), None, None)
+        .extract(ARCHIVE_PATH.into(), data.clone(), None, None)
         .await
         .expect_err("the first gzip member contains an incomplete tar");
 
@@ -1316,7 +1422,7 @@ async fn a_zip_name_ends_at_its_first_nul_as_the_reference_reads_it() {
     let data = zip_with_raw_bytes(&[("notes.md", b"body")], &[(b"notes.md", b"note\0.md")]);
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect("extract");
 
@@ -1337,7 +1443,7 @@ async fn zip_names_that_differ_only_after_a_nul_are_the_same_path() {
     );
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect_err("refused");
 
@@ -1359,7 +1465,7 @@ async fn a_zip_name_flagged_utf8_that_is_not_utf8_is_refused() {
     let data = zip_with_raw_bytes(&[("\u{e9}.txt", b"body")], &[(b"\xc3\xa9", b"\xc3\x28")]);
 
     let error = WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.zip", data, None, None)
+        .extract("/workspace/bundle.zip".into(), data, None, None)
         .await
         .expect_err("refused");
 
@@ -1424,7 +1530,7 @@ async fn a_zip_over_its_member_or_byte_limit_names_the_member_that_crossed_it() 
         let session = RecordingSession::new();
 
         let error = WorkspaceArchiveExtractor::new(&session)
-            .extract("/workspace/bundle.zip", data, None, Some(limits))
+            .extract("/workspace/bundle.zip".into(), data, None, Some(limits))
             .await
             .expect_err("over the limit");
 
@@ -1459,7 +1565,7 @@ async fn a_zip_member_named_for_windows_is_refused_for_the_reason_the_reference_
 
         let error = WorkspaceArchiveExtractor::new(&session)
             .extract(
-                "/workspace/bundle.zip",
+                "/workspace/bundle.zip".into(),
                 zip_of(&[(name, b"evil")]),
                 None,
                 None,
@@ -1479,7 +1585,7 @@ async fn a_zip_member_landing_under_an_existing_symlink_is_refused() {
 
     let error = WorkspaceArchiveExtractor::new(&session)
         .extract(
-            "/workspace/bundle.zip",
+            "/workspace/bundle.zip".into(),
             zip_of(&[("link/hello.txt", b"hello from zip")]),
             None,
             None,
@@ -1505,7 +1611,7 @@ async fn each_directory_is_listed_once_while_checking_for_links() {
     });
 
     WorkspaceArchiveExtractor::new(&session)
-        .extract("/workspace/bundle.tar", data, None, None)
+        .extract("/workspace/bundle.tar".into(), data, None, None)
         .await
         .expect("extract");
 

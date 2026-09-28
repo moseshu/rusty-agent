@@ -168,12 +168,16 @@ impl Tool for SessionTool {
         let session = self.binding.session();
         let outcome = if self.origin.name() == "write_note" {
             session
-                .write("notes/note.txt", b"written in the first run".to_vec(), None)
+                .write(
+                    "notes/note.txt".into(),
+                    b"written in the first run".to_vec(),
+                    None,
+                )
                 .await
                 .map(|()| "written".to_owned())
         } else {
             session
-                .read("notes/note.txt", None)
+                .read("notes/note.txt".into(), None)
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         };
@@ -596,7 +600,11 @@ impl ProbeTool {
             }
             "write_runtime_note" => {
                 session
-                    .write("runtime_note.txt", b"runtime note v1\n".to_vec(), None)
+                    .write(
+                        "runtime_note.txt".into(),
+                        b"runtime note v1\n".to_vec(),
+                        None,
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok("wrote runtime_note.txt".to_owned())
@@ -652,7 +660,12 @@ impl ProbeTool {
                     .append_data(&mut header, "archive_dir/hello.txt", &payload[..])
                     .unwrap();
                 session
-                    .extract("bundle.tar", builder.into_inner().unwrap(), None, None)
+                    .extract(
+                        "bundle.tar".into(),
+                        builder.into_inner().unwrap(),
+                        None,
+                        None,
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 expect_text(session, "archive_dir/hello.txt", "hello from tar archive\n").await?;
@@ -706,7 +719,7 @@ impl ProbeTool {
                 Ok("restored lifecycle state verified".to_owned())
             }
             "read_runtime_note" => session
-                .read("runtime_note.txt", None)
+                .read("runtime_note.txt".into(), None)
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .map_err(|error| error.to_string()),
@@ -750,7 +763,7 @@ async fn expect_text(
     expected: &str,
 ) -> std::result::Result<(), String> {
     let bytes = session
-        .read(path, None)
+        .read(path.into(), None)
         .await
         .map_err(|error| format!("{path}: {error}"))?;
     let actual = String::from_utf8_lossy(&bytes);
@@ -765,7 +778,7 @@ async fn expect_missing(
     session: &dyn ra_core::sandbox::SandboxSession,
     path: &str,
 ) -> std::result::Result<(), String> {
-    match session.read(path, None).await {
+    match session.read(path.into(), None).await {
         Err(error) if error.error_code() == ra_core::sandbox::ErrorCode::WorkspaceReadNotFound => {
             Ok(())
         }
@@ -779,8 +792,10 @@ async fn expect_blocked(
     path: &str,
 ) -> std::result::Result<(), String> {
     use ra_core::sandbox::ErrorCode;
-    let read = session.read(path, None).await.map(|_| ());
-    let write = session.write(path, b"outside write\n".to_vec(), None).await;
+    let read = session.read(path.into(), None).await.map(|_| ());
+    let write = session
+        .write(path.into(), b"outside write\n".to_vec(), None)
+        .await;
     let patch = ra_tools::sandbox::apply_patch::WorkspaceEditor::new(session)
         .apply_patch(&[ra_patch::ApplyPatchOperation::create_file(
             path,
@@ -812,7 +827,7 @@ async fn workspace_tree(
     let mut pending = vec![".".to_owned()];
     while let Some(directory) = pending.pop() {
         for entry in session
-            .ls(&directory, None)
+            .ls((&directory).into(), None)
             .await
             .map_err(|error| format!("{directory}: {error}"))?
         {

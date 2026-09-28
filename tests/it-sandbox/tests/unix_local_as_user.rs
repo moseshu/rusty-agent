@@ -123,7 +123,7 @@ async fn mkdir_as_another_account_asks_as_that_account_and_then_creates_it_local
 
     fixture
         .session
-        .mkdir("nested", false, account("sandbox-user"))
+        .mkdir("nested".into(), false, account("sandbox-user"))
         .await
         .expect("mkdir");
 
@@ -146,7 +146,7 @@ async fn rm_as_another_account_asks_as_that_account_and_then_removes_it_locally(
 
     fixture
         .session
-        .rm("stale.txt", false, account("sandbox-user"))
+        .rm("stale.txt".into(), false, account("sandbox-user"))
         .await
         .expect("rm");
 
@@ -168,7 +168,7 @@ async fn an_operation_the_account_may_not_perform_is_refused_before_it_happens()
     // the one refusal the check script can be made to give without a second account.
     let error = fixture
         .session
-        .rm("missing.txt", false, account("sandbox-user"))
+        .rm("missing.txt".into(), false, account("sandbox-user"))
         .await
         .expect_err("refused by the check");
     assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
@@ -190,7 +190,7 @@ async fn a_readable_file_is_read_after_one_check() {
 
     let content = fixture
         .session
-        .read("notes.md", account("sandbox-user"))
+        .read("notes.md".into(), account("sandbox-user"))
         .await
         .expect("read");
 
@@ -207,7 +207,7 @@ async fn a_missing_file_is_told_apart_from_an_unreadable_one_by_probing_as_the_a
 
     let error = fixture
         .session
-        .read("missing.txt", account("sandbox-user"))
+        .read("missing.txt".into(), account("sandbox-user"))
         .await
         .expect_err("missing");
 
@@ -257,7 +257,7 @@ async fn a_file_that_is_there_but_unreadable_is_a_read_failure_not_a_missing_fil
 
     let error = fixture
         .session
-        .read("locked.txt", account("sandbox-user"))
+        .read("locked.txt".into(), account("sandbox-user"))
         .await
         .expect_err("unreadable");
 
@@ -278,7 +278,7 @@ async fn an_account_that_cannot_be_switched_to_is_a_read_failure_without_a_probe
 
     let error = fixture
         .session
-        .read("notes.md", account("broken"))
+        .read("notes.md".into(), account("broken"))
         .await
         .expect_err("the account switch failed");
 
@@ -302,7 +302,11 @@ async fn a_write_as_another_account_is_performed_by_that_account() {
 
     fixture
         .session
-        .write("out/data.txt", b"payload".to_vec(), account("sandbox-user"))
+        .write(
+            "out/data.txt".into(),
+            b"payload".to_vec(),
+            account("sandbox-user"),
+        )
         .await
         .expect("write");
 
@@ -334,7 +338,7 @@ async fn a_listing_as_another_account_is_that_accounts_ls() {
 
     let entries = fixture
         .session
-        .ls("", account("sandbox-user"))
+        .ls("".into(), account("sandbox-user"))
         .await
         .expect("ls");
 

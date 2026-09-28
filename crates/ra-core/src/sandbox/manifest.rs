@@ -41,7 +41,9 @@ use super::manifest_render::{MAX_MANIFEST_DESCRIPTION_CHARS, render_manifest_des
 use super::mount_security::{Provenance, manifest_mount_provenance};
 use super::registry::{RegistryError, TypeRegistry};
 use super::types::{Group, User};
-use super::workspace_paths::{PathGrantError, PosixPath, SandboxPathGrant, windows_absolute_path};
+use super::workspace_paths::{
+    PathGrantError, PosixPath, SandboxPathGrant, SessionPath, windows_absolute_path,
+};
 
 /// The registries a manifest is read through.
 ///
@@ -853,8 +855,11 @@ fn resolve_within_root(
 ///
 /// The same rules a declared entry path is held to, for paths that arrive from elsewhere — a
 /// session registering something it created at runtime.
-pub(crate) fn validated_relative_path(path: &str) -> Result<PosixPath, SandboxError> {
-    let path = coerce_entry_path(path)?;
+pub(crate) fn validated_relative_path(path: SessionPath<'_>) -> Result<PosixPath, SandboxError> {
+    if let Some(windows_path) = windows_absolute_path(path.as_str()) {
+        return Err(invalid_entry_path(&windows_path, "absolute"));
+    }
+    let path = path.to_posix();
     validate_entry_path(&path)?;
     Ok(path)
 }

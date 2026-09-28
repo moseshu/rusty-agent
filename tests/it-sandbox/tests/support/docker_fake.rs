@@ -301,6 +301,8 @@ impl FakeDocker {
                 }
             }
             ["sh", "-lc", script] if script.starts_with("pkill ") => ok(Vec::new()),
+            // Materialization applies each entry's mode; the host directory already has one.
+            ["chmod", _, path] if self.host_path(path).exists() => ok(Vec::new()),
             _ => panic!("unexpected command: {cmd:?}"),
         }
     }

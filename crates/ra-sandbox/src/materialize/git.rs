@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 
 use ra_core::sandbox::{
-    ExecRequest, ExecResult, PosixPath, SandboxError, SandboxResult, SandboxSession,
+    ExecRequest, ExecResult, PosixPath, SandboxError, SandboxResult, SandboxSession, SessionPath,
     ShellInvocation,
 };
 use uuid::Uuid;
@@ -180,7 +180,7 @@ impl GitCheckout<'_> {
             || temporary.to_owned(),
             |subpath| format!("{temporary}/{}", subpath.as_str()),
         );
-        session.mkdir(dest.as_str(), true, None).await?;
+        session.mkdir(SessionPath::Posix(dest), true, None).await?;
         let copy = exec_direct(
             session,
             vec![

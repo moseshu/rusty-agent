@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 
 use ra_core::sandbox::{
     CompressionScheme, EntryKind, ErrorCode, OpName, PosixPath, SandboxArchiveLimits, SandboxError,
-    SandboxResult, SandboxSession, file_name_suffix,
+    SandboxResult, SandboxSession, SessionPath, file_name_suffix,
 };
 use zip::read::HasZipMetadata;
 
@@ -60,7 +60,7 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
     /// malformed, that would write outside the workspace, or that exceeds one of `limits`.
     pub async fn extract(
         &mut self,
-        path: &str,
+        path: SessionPath<'_>,
         data: Vec<u8>,
         scheme: Option<CompressionScheme>,
         limits: Option<SandboxArchiveLimits>,
@@ -70,11 +70,18 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         self.listings.clear();
         let scheme = match scheme {
             Some(scheme) => scheme,
-            None => Self::infer_scheme(path)?,
+            None => Self::infer_scheme(path.as_str())?,
         };
         // Infer the format from the caller's name, but place members beside the backend-resolved
         // archive. A leaf symlink can put the archive in a different directory.
-        let normalized_path = self.session.validate_path_access(path, true).await?;
+        //
+        // The reference reads text as a path object before anything else, so a backslash in the
+        // name is part of it whichever form the caller used.
+        let requested = PosixPath::new(path.as_str());
+        let normalized_path = self
+            .session
+            .validate_path_access(SessionPath::Posix(&requested), true)
+            .await?;
         let path = normalized_path.as_str();
 
         if let Some(limit) = limits.and_then(SandboxArchiveLimits::max_input_bytes)
@@ -88,7 +95,9 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         // The archive itself lands first, as the reference writes it: it is what the caller handed
         // over, and a caller whose archive is then refused still has the bytes to look at.
         let destination_root = parent_of(path);
-        self.session.write(path, data.clone(), None).await?;
+        self.session
+            .write(SessionPath::Posix(&normalized_path), data.clone(), None)
+            .await?;
 
         // Its members are read through to the end before any of them is written, so a refusal
         // leaves the workspace holding the archive and nothing unpacked from it. Only the headers
@@ -568,18 +577,32 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             let destination = join(destination_root, &member.relative);
 
             if member.is_directory {
-                self.session.mkdir(&destination, true, None).await?;
+                self.session
+                    .mkdir(
+                        SessionPath::Posix(&PosixPath::new(&destination)),
+                        true,
+                        None,
+                    )
+                    .await?;
                 self.record(destination_root, &member.relative, EntryKind::Directory);
                 continue;
             }
 
             let parent = parent_of(&destination);
-            self.session.mkdir(&parent, true, None).await?;
+            self.session
+                .mkdir(SessionPath::Posix(&PosixPath::new(&parent)), true, None)
+                .await?;
             if let Some(relative_parent) = parent_relative(&member.relative) {
                 self.record(destination_root, &relative_parent, EntryKind::Directory);
             }
             let bytes = content(&member)?;
-            self.session.write(&destination, bytes, None).await?;
+            self.session
+                .write(
+                    SessionPath::Posix(&PosixPath::new(&destination)),
+                    bytes,
+                    None,
+                )
+                .await?;
             self.record(destination_root, &member.relative, EntryKind::File);
         }
         Ok(())
@@ -625,7 +648,11 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
     /// What a directory holds, read once and remembered.
     async fn child_kind(&mut self, directory: &str, child: &str) -> Option<EntryKind> {
         if !self.listings.contains_key(directory) {
-            let listed = match self.session.ls(directory, None).await {
+            let listed = match self
+                .session
+                .ls(SessionPath::Posix(&PosixPath::new(directory)), None)
+                .await
+            {
                 Ok(entries) => entries
                     .into_iter()
                     .map(|entry| {

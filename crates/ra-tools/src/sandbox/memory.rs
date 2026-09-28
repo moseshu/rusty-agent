@@ -45,7 +45,7 @@ use ra_core::{
     prompt::{PromptSection, SectionPosition, SectionStability},
     sandbox::{
         ErrorCode, Manifest, MemoryGenerateConfig, MemoryLayoutConfig, MemoryReadConfig, PosixPath,
-        SandboxMemory, SandboxSession, SandboxWorkspaceScope, User,
+        SandboxMemory, SandboxSession, SandboxWorkspaceScope, SessionPath, User,
         token_truncation::{TruncationPolicy, truncate_text},
     },
 };
@@ -328,7 +328,7 @@ impl Memory {
         let memory_dir = self.layout.memories_path();
         let summary_path = memory_dir.join(MEMORY_SUMMARY_FILE);
         let payload = match session
-            .read(summary_path.as_str(), self.run_as.clone())
+            .read(SessionPath::Posix(&summary_path), self.run_as.clone())
             .await
         {
             Ok(payload) => payload,
@@ -350,14 +350,14 @@ impl Memory {
             return Ok(None);
         }
 
-        // The prompt names the directory the summary was just read from. Without a working
-        // directory the reference keeps the configured spelling; only the separators are
-        // translated here, as the session translated them for the read.
+        // Without a working directory the prompt keeps the configured spelling, as the
+        // reference's does; that spelling names the directory the summary was read from, since
+        // the session was handed it as a path.
         let model_memory_dir = if self.workspace_scope.cwd().is_none() {
-            self.layout.memories_dir().replace('\\', "/")
+            self.layout.memories_dir().to_owned()
         } else {
             self.workspace_scope
-                .model_resource_path(&manifest.root, memory_dir.as_str())
+                .model_resource_path(&manifest.root, &memory_dir)
                 .map_err(|error| Error::config(error.to_string()))?
                 .into()
         };

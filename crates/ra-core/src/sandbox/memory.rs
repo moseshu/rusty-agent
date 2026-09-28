@@ -16,14 +16,6 @@
 //! - **Model instances are shared with `Arc`.** Cloning keeps their identity, as the reference
 //!   does. Named models serialize as strings; serializing an in-memory model instance fails
 //!   explicitly because a live model cannot be reconstructed from JSON.
-//! - **A backslash in a layout directory is a separator.** The reference holds the directories as
-//!   `Path`, so on a POSIX host `team\memory` names one directory with a backslash in its name, and
-//!   its session addresses it that way because a typed path skips separator translation. Session
-//!   paths here are text, and the session reads a backslash in text as a separator, as the
-//!   reference's `coerce_posix_path` does for a string. [`MemoryLayoutConfig::memories_path`] and
-//!   [`MemoryLayoutConfig::sessions_path`] read the directories that same way, and everything that
-//!   touches memory files goes through them, so the files, the storage and the prompt name one
-//!   directory.
 //! - **Model settings are the framework's own.** The reference's default `Reasoning(effort=
 //!   "medium")` is [`ModelSettings::with_effort`] with [`Effort::Medium`]. A dictionary of settings
 //!   is read through the settings' own deserializer rather than coerced by a helper.
@@ -108,18 +100,20 @@ impl MemoryLayoutConfig {
         &self.sessions_dir
     }
 
-    /// The directory consolidated memory files live in, as the session resolves it: a backslash
-    /// is a separator.
+    /// The directory consolidated memory files live in, as a path.
+    ///
+    /// The reference's `Path(memories_dir)`: a backslash is part of a name, as it is on the POSIX
+    /// hosts the reference runs sandboxes from, so `team\memory` is one directory. Handed to a
+    /// session as [`SessionPath::Posix`](crate::sandbox::SessionPath::Posix) it stays one.
     #[must_use]
     pub fn memories_path(&self) -> PosixPath {
-        PosixPath::coerce(&self.memories_dir)
+        PosixPath::new(self.memories_dir.as_str())
     }
 
-    /// The directory per-rollout JSONL files live in, as the session resolves it: a backslash is a
-    /// separator.
+    /// The directory per-rollout JSONL files live in, as a path; see [`Self::memories_path`].
     #[must_use]
     pub fn sessions_path(&self) -> PosixPath {
-        PosixPath::coerce(&self.sessions_dir)
+        PosixPath::new(self.sessions_dir.as_str())
     }
 }
 

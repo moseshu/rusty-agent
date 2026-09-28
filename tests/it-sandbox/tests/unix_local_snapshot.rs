@@ -41,7 +41,11 @@ async fn a_workspace_comes_back_from_what_its_stop_stored() {
         .expect("create");
     session.start().await.expect("start");
     session
-        .write("notes.md", b"the first session's work".to_vec(), None)
+        .write(
+            "notes.md".into(),
+            b"the first session's work".to_vec(),
+            None,
+        )
         .await
         .expect("write");
 
@@ -68,7 +72,7 @@ async fn a_workspace_comes_back_from_what_its_stop_stored() {
     resumed.start().await.expect("start");
 
     assert_eq!(
-        resumed.read("notes.md", None).await.expect("read"),
+        resumed.read("notes.md".into(), None).await.expect("read"),
         b"the first session's work".to_vec()
     );
     // The workspace is emptied before the archive is extracted: a file the archive does not mention
@@ -88,7 +92,7 @@ async fn a_session_that_stores_nothing_leaves_its_workspace_where_it_is() {
     session.start().await.expect("start");
     session
         .write(
-            "notes.md",
+            "notes.md".into(),
             b"kept by the filesystem, not by a snapshot".to_vec(),
             None,
         )
@@ -181,7 +185,7 @@ async fn restoring_removes_stray_links_without_touching_their_targets() {
         .expect("create");
     session.start().await.expect("start");
     session
-        .write("notes", b"stored".to_vec(), None)
+        .write("notes".into(), b"stored".to_vec(), None)
         .await
         .expect("write");
     session.stop().await.expect("stop");
@@ -205,7 +209,7 @@ async fn restoring_removes_stray_links_without_touching_their_targets() {
         b"untouched"
     );
     assert_eq!(
-        resumed.read("notes", None).await.expect("restored"),
+        resumed.read("notes".into(), None).await.expect("restored"),
         b"stored"
     );
 }

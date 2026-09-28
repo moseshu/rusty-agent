@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 use ra_core::sandbox::{
     AzureBlobMount, BoxMount, BoxSubType, ErrorCode, GcsMount, Mount, MountPattern, MountProvider,
     MountStrategy, PosixPath, R2Mount, RcloneOptions, S3FilesMount, S3Mount, SandboxError,
-    SandboxResult, SandboxSession,
+    SandboxResult, SandboxSession, SessionPath,
 };
 
 /// Matches any section header line.
@@ -448,13 +448,15 @@ async fn read_rclone_config_text(
                 .with_context("type", mount_type),
         );
     };
-    let declared = PosixPath::coerce(config_file_path);
+    // A path, as the reference's `config_file_path: Path` field holds it: a backslash is part of
+    // the name. Only the manifest root is read as text.
+    let declared = PosixPath::new(config_file_path.as_str());
     let path = if declared.is_absolute() {
         declared
     } else {
         PosixPath::coerce(&session.state().manifest().root).join(declared.as_str())
     };
-    let bytes = match session.read(path.as_str(), None).await {
+    let bytes = match session.read(SessionPath::Posix(&path), None).await {
         Ok(bytes) => bytes,
         Err(error) if error.error_code() == ErrorCode::WorkspaceReadNotFound => return Err(error),
         Err(error) => {

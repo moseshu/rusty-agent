@@ -27,7 +27,7 @@ use ra_core::{
     model::{CustomToolFormat, CustomToolGrammarSyntax, ModelToolKind},
     sandbox::{
         AsUser, ErrorCode, ExecRequest, ExecResult, FileEntry, Manifest, OpName, SandboxError,
-        SandboxResult, SandboxSession, SandboxSessionState, SandboxWorkspaceScope,
+        SandboxResult, SandboxSession, SandboxSessionState, SandboxWorkspaceScope, SessionPath,
         SessionResources, Snapshot, User,
     },
     state::RunId,
@@ -151,11 +151,12 @@ impl SandboxSession for PatchSession {
         Ok(true)
     }
 
-    async fn ls(&self, _path: &str, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, _path: SessionPath<'_>, _user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         Err(not_scripted())
     }
 
-    async fn rm(&self, path: &str, recursive: bool, user: AsUser) -> SandboxResult<()> {
+    async fn rm(&self, path: SessionPath<'_>, recursive: bool, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         let normalized = self.normalize(path)?;
         let mut record = self.record.lock().unwrap();
         record.rm_users.push(user_name(&user));
@@ -164,7 +165,8 @@ impl SandboxSession for PatchSession {
         Ok(())
     }
 
-    async fn mkdir(&self, path: &str, parents: bool, user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(&self, path: SessionPath<'_>, parents: bool, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         let normalized = self.normalize(path)?;
         let mut record = self.record.lock().unwrap();
         record.mkdir_users.push(user_name(&user));
@@ -172,7 +174,8 @@ impl SandboxSession for PatchSession {
         Ok(())
     }
 
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>> {
+        let path = path.as_str();
         let normalized = self.normalize(path)?;
         let mut record = self.record.lock().unwrap();
         record.read_users.push(user_name(&user));
@@ -185,7 +188,8 @@ impl SandboxSession for PatchSession {
         }
     }
 
-    async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+    async fn write(&self, path: SessionPath<'_>, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+        let path = path.as_str();
         let normalized = self.normalize(path)?;
         let mut record = self.record.lock().unwrap();
         record.write_users.push(user_name(&user));

@@ -90,8 +90,18 @@ fn append_children(
 }
 
 /// Whether a workspace-relative path is one the manifest asked not to persist.
+///
+/// The path is rendered from the names the directory reported, joined with `/` and otherwise as
+/// they are: a backslash is part of a file name, as the reference's `should_skip_tar_member` reads
+/// it through `Path(...).parts`, and a skip path registered as a path keeps it too.
 fn is_skipped(relative: &Path, skip: &BTreeSet<PosixPath>) -> bool {
-    let rendered = PosixPath::coerce(&relative.to_string_lossy());
+    let rendered = PosixPath::new(
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    );
     skip.iter().any(|prefix| rendered.is_under(prefix))
 }
 

@@ -30,7 +30,7 @@
 
 use ra_core::sandbox::{
     ApplyPatchPathReason, ErrorCode, PosixPath, SandboxError, SandboxResult, SandboxSession,
-    SandboxWorkspaceScope, User, windows_absolute_path,
+    SandboxWorkspaceScope, SessionPath, User, windows_absolute_path,
 };
 use ra_patch::{
     ApplyDiffError, ApplyDiffMode, ApplyPatchOperation, ApplyPatchOperationType, ApplyPatchResult,
@@ -178,13 +178,13 @@ impl<'a> WorkspaceEditor<'a> {
         let (relative_path, display_path) = self.resolve_path(operation.path())?;
         let destination = self
             .session
-            .validate_path_access(relative_path.as_str(), false)
+            .validate_path_access(SessionPath::Posix(&relative_path), false)
             .await?;
 
         if operation.kind() == ApplyPatchOperationType::DeleteFile {
             self.ensure_exists(&destination, &display_path).await?;
             self.session
-                .rm(&destination, false, self.user.clone())
+                .rm(SessionPath::Posix(&destination), false, self.user.clone())
                 .await?;
             return Ok(ApplyPatchResult::output(format!("Deleted {display_path}")));
         }
@@ -211,7 +211,7 @@ impl<'a> WorkspaceEditor<'a> {
                 };
                 PosixPath::coerce(named).to_string()
             } else {
-                PosixPath::new(destination.as_str()).to_string()
+                destination.to_string()
             };
             let original = self
                 .read_text(&destination, operation.path(), &decode_path)
@@ -228,12 +228,12 @@ impl<'a> WorkspaceEditor<'a> {
             let (moved_relative_path, moved_display_path) = self.resolve_path(move_to)?;
             let moved_destination = self
                 .session
-                .validate_path_access(moved_relative_path.as_str(), false)
+                .validate_path_access(SessionPath::Posix(&moved_relative_path), false)
                 .await?;
             self.write_text(&moved_destination, &updated).await?;
             if moved_destination != destination {
                 self.session
-                    .rm(&destination, false, self.user.clone())
+                    .rm(SessionPath::Posix(&destination), false, self.user.clone())
                     .await?;
             }
             return Ok(ApplyPatchResult::output(format!(
@@ -314,8 +314,16 @@ impl<'a> WorkspaceEditor<'a> {
             })
     }
 
-    async fn ensure_exists(&self, destination: &str, display_path: &str) -> SandboxResult<()> {
-        match self.session.read(destination, self.user.clone()).await {
+    async fn ensure_exists(
+        &self,
+        destination: &PosixPath,
+        display_path: &str,
+    ) -> SandboxResult<()> {
+        match self
+            .session
+            .read(SessionPath::Posix(destination), self.user.clone())
+            .await
+        {
             Ok(_) => Ok(()),
             Err(error) => Err(not_found_or(error, display_path)),
         }
@@ -323,25 +331,30 @@ impl<'a> WorkspaceEditor<'a> {
 
     async fn read_text(
         &self,
-        destination: &str,
+        destination: &PosixPath,
         operation_path: &str,
         decode_path: &str,
     ) -> SandboxResult<String> {
         let payload = self
             .session
-            .read(destination, self.user.clone())
+            .read(SessionPath::Posix(destination), self.user.clone())
             .await
             .map_err(|error| not_found_or(error, operation_path))?;
         String::from_utf8(payload)
             .map_err(|error| SandboxError::apply_patch_decode_error(decode_path).with_cause(error))
     }
 
-    async fn write_text(&self, destination: &str, text: &str) -> SandboxResult<()> {
+    async fn write_text(&self, destination: &PosixPath, text: &str) -> SandboxResult<()> {
+        let parent = PosixPath::new(parent(destination.as_str()));
         self.session
-            .mkdir(&parent(destination), true, self.user.clone())
+            .mkdir(SessionPath::Posix(&parent), true, self.user.clone())
             .await?;
         self.session
-            .write(destination, text.as_bytes().to_vec(), self.user.clone())
+            .write(
+                SessionPath::Posix(destination),
+                text.as_bytes().to_vec(),
+                self.user.clone(),
+            )
             .await
     }
 }

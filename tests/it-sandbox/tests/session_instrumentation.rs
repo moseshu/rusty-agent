@@ -182,7 +182,7 @@ async fn a_write_s_length_is_left_out_when_the_policy_says_so() {
 
     session.start().await.expect("start");
     session
-        .write("x.txt", b"hello".to_vec(), None)
+        .write("x.txt".into(), b"hello".to_vec(), None)
         .await
         .expect("write");
     session.close().await.expect("close");
@@ -332,7 +332,10 @@ async fn the_workspace_outbox_is_written_into_the_workspace_and_persisted_with_i
     session.close().await.expect("close");
 
     let inner = session.inner_session().expect("wrapped");
-    let outbox = inner.read(&relpath, None).await.expect("read the outbox");
+    let outbox = inner
+        .read((&relpath).into(), None)
+        .await
+        .expect("read the outbox");
     assert!(outbox_ops(&outbox).iter().any(|op| op == "exec"));
 
     let members = tar_members(&snapshots.path().join(format!("{session_id}.tar")));
@@ -368,7 +371,7 @@ async fn the_workspace_outbox_path_expands_the_session_id_templates() {
     let outbox = session
         .inner_session()
         .expect("wrapped")
-        .read(&expected, None)
+        .read((&expected).into(), None)
         .await
         .expect("read the outbox");
     assert!(outbox_ops(&outbox).iter().any(|op| op == "exec"));
@@ -401,7 +404,7 @@ async fn the_workspace_outbox_appends_to_what_is_already_there() {
     inner.start().await.expect("start");
     let relpath = format!("logs/events-{}.jsonl", inner.state().session_id());
     inner
-        .write(&relpath, b"{\"old\":true}\n".to_vec(), None)
+        .write((&relpath).into(), b"{\"old\":true}\n".to_vec(), None)
         .await
         .expect("write");
     let sink = WorkspaceJsonlSink::new()
@@ -528,7 +531,13 @@ async fn an_ephemeral_workspace_outbox_is_left_out_of_the_snapshot() {
     session.start().await.expect("start");
     session.exec(command("echo hi")).await.expect("exec");
     let inner = session.inner_session().expect("wrapped");
-    assert!(!inner.read(&relpath, None).await.expect("outbox").is_empty());
+    assert!(
+        !inner
+            .read((&relpath).into(), None)
+            .await
+            .expect("outbox")
+            .is_empty()
+    );
     // The manifest is not changed to exclude it: the exclusion is the session's.
     let state = session.state();
     let logs = &state.manifest().entries["logs"];
@@ -578,7 +587,13 @@ async fn a_batching_workspace_outbox_still_writes_before_the_snapshot() {
     session.close().await.expect("close");
 
     let inner = session.inner_session().expect("wrapped");
-    assert!(!inner.read(&relpath, None).await.expect("outbox").is_empty());
+    assert!(
+        !inner
+            .read((&relpath).into(), None)
+            .await
+            .expect("outbox")
+            .is_empty()
+    );
     let members = tar_members(&snapshots.path().join(format!("{session_id}.tar")));
     assert!(
         members.iter().any(|name| name.ends_with(&relpath)),
@@ -787,7 +802,7 @@ async fn a_failure_s_retryability_reaches_the_event_and_the_span() {
 
     session.start().await.expect("start");
     let error = session
-        .read("missing.txt", None)
+        .read("missing.txt".into(), None)
         .await
         .expect_err("missing");
     assert_eq!(error.error_code(), ErrorCode::WorkspaceReadNotFound);
@@ -824,11 +839,11 @@ async fn an_expected_failure_is_not_a_span_error_and_is_still_an_audited_failure
 
     let (expected, ordinary) = tokio::join!(
         session.read_expecting(
-            "expected-missing.txt",
+            "expected-missing.txt".into(),
             None,
             &[ErrorCode::WorkspaceReadNotFound]
         ),
-        session.read("ordinary-missing.txt", None),
+        session.read("ordinary-missing.txt".into(), None),
     );
     assert_eq!(
         expected.expect_err("missing").error_code(),
@@ -896,7 +911,7 @@ async fn a_sink_failing_on_an_expected_failure_still_marks_the_span() {
 
     let error = session
         .read_expecting(
-            "expected-missing.txt",
+            "expected-missing.txt".into(),
             None,
             &[ErrorCode::WorkspaceReadNotFound],
         )
@@ -996,11 +1011,11 @@ async fn every_recorded_operation_gets_a_span_in_the_order_it_ran() {
     session.start().await.expect("start");
     assert!(session.running().await.expect("running"));
     session
-        .write("notes.txt", written.clone(), None)
+        .write("notes.txt".into(), written.clone(), None)
         .await
         .expect("write");
     assert_eq!(
-        session.read("notes.txt", None).await.expect("read"),
+        session.read("notes.txt".into(), None).await.expect("read"),
         written
     );
     let endpoint = session.resolve_exposed_port(8765).await.expect("port");

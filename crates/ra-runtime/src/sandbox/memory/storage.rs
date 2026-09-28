@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use futures::future::try_join_all;
 use ra_core::sandbox::{
     ErrorCode, ExecRequest, MemoryLayoutConfig, PosixPath, SandboxError, SandboxResult,
-    SandboxSession, ShellInvocation,
+    SandboxSession, SessionPath, ShellInvocation,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -232,11 +232,10 @@ impl SandboxMemoryStorage {
             memories_dir.join("rollout_summaries"),
             memories_dir.join("skills"),
         ];
-        try_join_all(
-            directories
-                .iter()
-                .map(|directory| self.session.mkdir(directory.as_str(), true, None)),
-        )
+        try_join_all(directories.iter().map(|directory| {
+            self.session
+                .mkdir(SessionPath::Posix(directory), true, None)
+        }))
         .await?;
         self.ensure_text_file(&memories_dir.join("MEMORY.md"))
             .await?;
@@ -253,7 +252,7 @@ impl SandboxMemoryStorage {
         let absolute = self
             .session
             .workspace_path_policy()?
-            .normalize_sandbox_path(path.as_str(), false)?;
+            .normalize_sandbox_path(path, false)?;
         let exists = self
             .session
             .exec(
@@ -264,7 +263,9 @@ impl SandboxMemoryStorage {
         if exists.ok() {
             return Ok(());
         }
-        self.session.write(path.as_str(), Vec::new(), None).await
+        self.session
+            .write(SessionPath::Posix(path), Vec::new(), None)
+            .await
     }
 
     /// Reads a file as text, replacing what is not UTF-8.
@@ -273,7 +274,7 @@ impl SandboxMemoryStorage {
     ///
     /// Returns the session's failure, [`ErrorCode::WorkspaceReadNotFound`] for a missing file.
     pub async fn read_text(&self, path: &PosixPath) -> SandboxResult<String> {
-        let payload = self.session.read(path.as_str(), None).await?;
+        let payload = self.session.read(SessionPath::Posix(path), None).await?;
         Ok(String::from_utf8_lossy(&payload).into_owned())
     }
 
@@ -284,7 +285,7 @@ impl SandboxMemoryStorage {
     /// Returns the session's failure.
     pub async fn write_text(&self, path: &PosixPath, text: &str) -> SandboxResult<()> {
         self.session
-            .write(path.as_str(), text.as_bytes().to_vec(), None)
+            .write(SessionPath::Posix(path), text.as_bytes().to_vec(), None)
             .await
     }
 
@@ -414,7 +415,11 @@ impl SandboxMemoryStorage {
     /// cannot be listed has none.
     async fn list_current_selection_items(&self) -> SandboxResult<Vec<PhaseTwoSelectionItem>> {
         let raw_memories_dir = self.raw_memories_dir();
-        let Ok(entries) = self.session.ls(raw_memories_dir.as_str(), None).await else {
+        let Ok(entries) = self
+            .session
+            .ls(SessionPath::Posix(&raw_memories_dir), None)
+            .await
+        else {
             return Ok(Vec::new());
         };
 

@@ -22,7 +22,7 @@ use ra_core::sandbox::{
     AsUser, CompressionScheme, ErrorCode, ExecRequest, ExecResult, ExposedPortEndpoint, FileEntry,
     Manifest, MaterializationResult, OpName, PosixPath, PtyExecUpdate, PtyStartRequest,
     PtyWriteRequest, SandboxArchiveLimits, SandboxError, SandboxResult, SandboxSession,
-    SandboxSessionState, SessionResources, ShellInvocation, SnapshotFingerprint,
+    SandboxSessionState, SessionPath, SessionResources, ShellInvocation, SnapshotFingerprint,
     manifest_has_configured_mount_authority, replace_protected_mount_error,
 };
 #[cfg(unix)]
@@ -523,7 +523,10 @@ impl DockerSandboxSession {
         skip: &'a BTreeSet<String>,
     ) -> futures::future::BoxFuture<'a, SandboxResult<()>> {
         Box::pin(async move {
-            for entry in self.ls(&source, None).await? {
+            for entry in self
+                .ls(SessionPath::Posix(&PosixPath::new(&source)), None)
+                .await?
+            {
                 let name = entry.path.rsplit('/').next().unwrap_or_default().to_owned();
                 let child_relative = if relative.is_empty() {
                     name.clone()
@@ -777,25 +780,29 @@ impl SandboxSession for DockerSandboxSession {
             == "running")
     }
 
-    async fn validate_path_access(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+    async fn validate_path_access(
+        &self,
+        path: SessionPath<'_>,
+        for_write: bool,
+    ) -> SandboxResult<PosixPath> {
         remote::validate_remote_path_access(self, path, for_write).await
     }
 
-    async fn ls(&self, path: &str, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
+    async fn ls(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<FileEntry>> {
         remote::ls(self, path, user).await
     }
 
-    async fn rm(&self, path: &str, recursive: bool, user: AsUser) -> SandboxResult<()> {
+    async fn rm(&self, path: SessionPath<'_>, recursive: bool, user: AsUser) -> SandboxResult<()> {
         remote::rm(self, path, recursive, user).await
     }
 
-    async fn mkdir(&self, path: &str, parents: bool, user: AsUser) -> SandboxResult<()> {
+    async fn mkdir(&self, path: SessionPath<'_>, parents: bool, user: AsUser) -> SandboxResult<()> {
         remote::mkdir(self, path, parents, user).await
     }
 
     /// Reads a file with `cat`, inside the container, as the account named.
-    async fn read(&self, path: &str, user: AsUser) -> SandboxResult<Vec<u8>> {
-        let workspace_path = self.validate_path_access(path, false).await?;
+    async fn read(&self, path: SessionPath<'_>, user: AsUser) -> SandboxResult<Vec<u8>> {
+        let workspace_path = String::from(self.validate_path_access(path, false).await?);
         let command = vec!["cat".to_owned(), "--".to_owned(), workspace_path.clone()];
         let mut request = no_shell(command.clone());
         if let Some(user) = user.clone() {
@@ -805,7 +812,7 @@ impl SandboxSession for DockerSandboxSession {
         if !result.ok() {
             return Err(remote::read_error_from_exec(
                 self,
-                path,
+                path.as_str(),
                 &workspace_path,
                 command,
                 &result,
@@ -821,8 +828,9 @@ impl SandboxSession for DockerSandboxSession {
     /// As another account, the account writes it itself, creating the parent directories. Otherwise
     /// the bytes go to a staging file first and are copied into place by a process inside the
     /// container, which sees the mounts the daemon's archive upload would not.
-    async fn write(&self, path: &str, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
-        let path = self.validate_path_access(path, true).await?;
+    async fn write(&self, path: SessionPath<'_>, data: Vec<u8>, user: AsUser) -> SandboxResult<()> {
+        let validated = self.validate_path_access(path, true).await?;
+        let path = validated.as_str().to_owned();
         let container_id = self.container_id();
 
         if let Some(user) = user {
@@ -843,20 +851,18 @@ impl SandboxSession for DockerSandboxSession {
             .await;
         }
 
-        let parent = PosixPath::coerce(&path)
-            .as_str()
-            .rsplit_once('/')
-            .map_or_else(
-                || "/".to_owned(),
-                |(parent, _)| {
-                    if parent.is_empty() {
-                        "/".to_owned()
-                    } else {
-                        parent.to_owned()
-                    }
-                },
-            );
-        self.mkdir(&parent, true, None).await?;
+        let parent = path.rsplit_once('/').map_or_else(
+            || "/".to_owned(),
+            |(parent, _)| {
+                if parent.is_empty() {
+                    "/".to_owned()
+                } else {
+                    parent.to_owned()
+                }
+            },
+        );
+        self.mkdir(SessionPath::Posix(&PosixPath::new(&parent)), true, None)
+            .await?;
 
         let name = path.rsplit('/').next().unwrap_or("file");
         let staging_path = Self::archive_stage_path(name);
@@ -988,7 +994,7 @@ impl SandboxSession for DockerSandboxSession {
     /// own `mkdir` and `write`.
     async fn extract(
         &self,
-        path: &str,
+        path: SessionPath<'_>,
         data: Vec<u8>,
         scheme: Option<CompressionScheme>,
         limits: Option<SandboxArchiveLimits>,
