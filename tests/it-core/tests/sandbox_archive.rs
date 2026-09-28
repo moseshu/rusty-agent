@@ -42,7 +42,11 @@ fn a_ceiling_can_be_turned_off_but_not_set_to_zero() {
             .with_max_extracted_bytes(Some(0))
             .is_err()
     );
-    assert!(SandboxArchiveLimits::new().with_max_members(Some(0)).is_err());
+    assert!(
+        SandboxArchiveLimits::new()
+            .with_max_members(Some(0))
+            .is_err()
+    );
 
     let relaxed = SandboxArchiveLimits::new()
         .with_max_input_bytes(None)
