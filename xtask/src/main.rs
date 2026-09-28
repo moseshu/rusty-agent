@@ -75,6 +75,10 @@ enum Task {
         /// API so the diff lands in review.
         #[arg(long)]
         bless: bool,
+        /// Accepts only the pending items containing this text into their baselines, leaving every
+        /// other pending change reported. Repeat for several.
+        #[arg(long, conflicts_with = "bless")]
+        accept: Vec<String>,
     },
     /// The four dependency-direction rules: kernel, reusable pieces, and product may not depend
     /// upward.
@@ -112,7 +116,14 @@ fn main() -> std::process::ExitCode {
         Task::All => all_gates(),
         Task::Layering => vec![("layering", layering::run())],
         Task::NoInlineTests => vec![("no-inline-tests", inline_tests::run())],
-        Task::PublicApi { bless } => vec![("public-api", public_api::run(bless))],
+        Task::PublicApi { bless, accept } => {
+            let outcome = if accept.is_empty() {
+                public_api::run(bless)
+            } else {
+                public_api::accept(&accept)
+            };
+            vec![("public-api", outcome)]
+        }
         Task::SchemaStability { bless } => vec![("schema-stability", schema_stability::run(bless))],
         Task::PromptDump { bless } => vec![("prompt-dump", prompt_dump::run(bless))],
         Task::TokenBudget => vec![("token-budget", token_budget::run())],
