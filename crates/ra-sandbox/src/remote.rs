@@ -19,7 +19,7 @@ use ra_core::sandbox::{
     SandboxResult, SandboxSession, SessionPath, ShellInvocation,
 };
 
-use crate::listing::parse_ls_la;
+use crate::listing::{try_parse_ls_la, unreadable_listing};
 use crate::runtime_helpers::{ensure_installed, resolve_workspace_path_helper};
 use crate::session_scripts::{READ_PATH_PROBE_SCRIPT, READ_PATH_PROBE_TIMEOUT_S, diagnostic_text};
 use crate::shell;
@@ -275,7 +275,8 @@ pub async fn ls(
     if !result.ok() {
         return Err(SandboxError::exec_nonzero(result, command));
     }
-    Ok(parse_ls_la(&String::from_utf8_lossy(&result.stdout), &path))
+    try_parse_ls_la(&String::from_utf8_lossy(&result.stdout), &path)
+        .map_err(|error| unreadable_listing(error, &path))
 }
 
 /// Removes a path with `rm`, run inside the sandbox; `-rf` when recursive.

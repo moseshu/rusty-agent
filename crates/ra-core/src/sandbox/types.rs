@@ -270,21 +270,21 @@ impl Permissions {
 
 /// Parses one `rwx`-style triplet, accepting the special-bit letters for its position.
 fn parse_triplet(triplet: &[char], special: (char, char)) -> Result<u32, PermissionsParseError> {
-    let rendered: String = triplet.iter().collect();
-    let invalid = || PermissionsParseError::Triplet {
-        input: rendered.clone(),
-    };
+    let input: String = triplet.iter().collect();
+    if triplet.len() != 3 {
+        return Err(PermissionsParseError::Triplet { input });
+    }
 
     let mut mask = 0;
     match triplet[0] {
         'r' => mask |= FileMode::Read.bits(),
         '-' => {}
-        _ => return Err(invalid()),
+        _ => return Err(PermissionsParseError::ReadFlag { input }),
     }
     match triplet[1] {
         'w' => mask |= FileMode::Write.bits(),
         '-' => {}
-        _ => return Err(invalid()),
+        _ => return Err(PermissionsParseError::WriteFlag { input }),
     }
 
     let (exec_with_special, special_without_exec) = special;
@@ -292,7 +292,7 @@ fn parse_triplet(triplet: &[char], special: (char, char)) -> Result<u32, Permiss
     if exec_flag == 'x' || exec_flag == exec_with_special {
         mask |= FileMode::Exec.bits();
     } else if exec_flag != '-' && exec_flag != special_without_exec {
-        return Err(invalid());
+        return Err(PermissionsParseError::ExecFlag { input });
     }
 
     Ok(mask)
@@ -352,9 +352,28 @@ pub enum PermissionsParseError {
         /// The field as given.
         input: String,
     },
-    /// One triplet carried a character that is not valid in its position.
+    /// A triplet was not three characters long.
     #[error("invalid permissions triplet: {input:?}")]
     Triplet {
+        /// The triplet as given.
+        input: String,
+    },
+    /// A triplet's read position held something other than `r` or `-`.
+    #[error("invalid read flag: {input:?}")]
+    ReadFlag {
+        /// The triplet as given.
+        input: String,
+    },
+    /// A triplet's write position held something other than `w` or `-`.
+    #[error("invalid write flag: {input:?}")]
+    WriteFlag {
+        /// The triplet as given.
+        input: String,
+    },
+    /// A triplet's execute position held a letter not valid there — including a special-bit
+    /// letter that belongs to another triplet, such as `t` for the owner.
+    #[error("invalid exec flag: {input:?}")]
+    ExecFlag {
         /// The triplet as given.
         input: String,
     },

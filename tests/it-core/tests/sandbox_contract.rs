@@ -690,3 +690,33 @@ fn workspace_error_constructors_keep_reference_fields() {
         None
     );
 }
+
+/// The two codes this port adds for failures the reference raises outside its sandbox error family
+/// report no reference code, name the reference's plain class, and never collide with a reference
+/// code's wire string.
+#[test]
+fn this_ports_own_codes_stand_apart_from_the_references() {
+    for (code, wire, class, retryable) in [
+        (
+            ErrorCode::EventSinkFailed,
+            "event_sink_failed",
+            "RuntimeError",
+            None,
+        ),
+        (
+            ErrorCode::ListingUnreadable,
+            "listing_unreadable",
+            "ValueError",
+            Some(false),
+        ),
+    ] {
+        assert_eq!(code.as_str(), wire);
+        assert_eq!(code.reference_code(), None, "{wire}");
+        assert_eq!(code.reference_type_name(), class, "{wire}");
+        assert_eq!(code.default_retryable(), retryable, "{wire}");
+        assert!(
+            ALL_CODES.iter().all(|reference| reference.as_str() != wire),
+            "{wire}"
+        );
+    }
+}

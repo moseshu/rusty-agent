@@ -5,33 +5,78 @@
 //! comes back. That is the reference's approach, and the parsing has to cope with the two `ls`
 //! implementations a sandbox image might carry.
 
-use ra_core::sandbox::{EntryKind, FileEntry, Permissions};
+use ra_core::sandbox::{
+    EntryKind, ErrorCode, FileEntry, OpName, Permissions, PermissionsParseError, SandboxError,
+};
 
-/// Reads the output of `ls -la` into entries.
+/// Reads the output of `ls -la` into entries, as the reference's `parse_ls_la` does.
 ///
-/// Lines that are not entries — the `total` header, blanks, anything too short to be a row — are
-/// skipped rather than reported: this is output from a command, not a wire format, and a parser
+/// Lines that are not entries — the `total` header, blanks, anything too short to be a row, a size
+/// that is not a number — are skipped rather than reported, as the reference skips them: a parser
 /// that failed on an unfamiliar line would break a listing over a locale banner. `.` and `..` are
 /// dropped because they are not contents.
 ///
+/// A row whose mode field does not read is different: it is an entry, and the reference fails the
+/// listing on it rather than leaving the entry out, so that a caller never mistakes a directory it
+/// could not read for one that holds less. The sessions in this crate list through this function.
+///
 /// `base` is the directory that was listed, and relative names are re-attached to it so every entry
 /// carries a path a caller can use.
+///
+/// # Errors
+///
+/// Returns the mode field's parse failure for the first row whose mode does not read.
+pub fn try_parse_ls_la(output: &str, base: &str) -> Result<Vec<FileEntry>, PermissionsParseError> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        if let Some(entry) = parse_entry(line, base)? {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// Reads the output of `ls -la` into entries, leaving out every row that does not read.
+///
+/// Kept, with its signature and behaviour unchanged, for callers written before
+/// [`try_parse_ls_la`] existed: it leaves out a row whose mode field does not read, where the
+/// reference fails the listing. New callers want [`try_parse_ls_la`].
+#[deprecated(
+    note = "leaves out rows whose mode does not read, which the reference refuses; use `try_parse_ls_la`"
+)]
 #[must_use]
 pub fn parse_ls_la(output: &str, base: &str) -> Vec<FileEntry> {
     output
         .lines()
-        .filter_map(|line| parse_entry(line, base))
+        .filter_map(|line| parse_entry(line, base).ok().flatten())
         .collect()
 }
 
+/// A listing that did not read, as the failure of the command that produced it.
+///
+/// The reference lets the parser's `ValueError` out of `ls` as it is. Here every session failure is
+/// a [`SandboxError`], and this one carries [`ErrorCode::ListingUnreadable`], this port's code for
+/// that `ValueError`: the command succeeded, and what it printed could not be read, which is
+/// neither a transport failure nor something another try would change. The parser's message is
+/// kept and the parse failure is the cause.
+pub(crate) fn unreadable_listing(error: PermissionsParseError, path: &str) -> SandboxError {
+    SandboxError::new(
+        ErrorCode::ListingUnreadable,
+        OpName::Exec,
+        error.to_string(),
+    )
+    .with_context("path", path.to_owned())
+    .with_cause(error)
+}
+
 /// Reads one row, or decides it is not one.
-fn parse_entry(line: &str, base: &str) -> Option<FileEntry> {
+fn parse_entry(line: &str, base: &str) -> Result<Option<FileEntry>, PermissionsParseError> {
     if line.is_empty() || line.starts_with("total") {
-        return None;
+        return Ok(None);
     }
     let parts = split_whitespace(line, 8);
     if parts.len() < 9 {
-        return None;
+        return Ok(None);
     }
 
     let raw_mode = parts[0];
@@ -51,14 +96,17 @@ fn parse_entry(line: &str, base: &str) -> Option<FileEntry> {
         if parts[4].ends_with(',') {
             let shifted = split_whitespace(line, 9);
             if shifted.len() < 10 {
-                return None;
+                return Ok(None);
             }
             (0, shifted[9].to_owned())
         } else {
             (0, parts[8].to_owned())
         }
     } else {
-        (parts[4].parse::<u64>().ok()?, parts[8].to_owned())
+        let Ok(size) = parts[4].parse::<u64>() else {
+            return Ok(None);
+        };
+        (size, parts[8].to_owned())
     };
 
     // Only the rwx bits and directory-ness are modelled, so a symlink or a device has its type
@@ -76,7 +124,7 @@ fn parse_entry(line: &str, base: &str) -> Option<FileEntry> {
         name
     };
     if name == "." || name == ".." {
-        return None;
+        return Ok(None);
     }
 
     let path = if name.starts_with('/') {
@@ -87,12 +135,12 @@ fn parse_entry(line: &str, base: &str) -> Option<FileEntry> {
         format!("{}/{name}", base.trim_end_matches('/'))
     };
 
-    Some(
-        FileEntry::new(path, Permissions::from_str_mode(&mode).ok()?)
+    Ok(Some(
+        FileEntry::new(path, Permissions::from_str_mode(&mode)?)
             .with_ownership(owner, group)
             .with_size(size)
             .with_kind(kind),
-    )
+    ))
 }
 
 /// Splits on runs of whitespace, keeping the remainder whole after `limit` splits.

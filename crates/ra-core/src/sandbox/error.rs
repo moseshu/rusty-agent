@@ -111,6 +111,13 @@ pub enum ErrorCode {
     /// not. [`ErrorCode::reference_code`] answers `None` for it, which is what an event or a span
     /// records in the reference's place.
     EventSinkFailed,
+    /// A command that lists a directory succeeded, and what it printed could not be read.
+    ///
+    /// **Not one of the reference's codes.** There, `ls` lets the listing parser's plain
+    /// `ValueError` out — outside the sandbox error family, as with [`Self::EventSinkFailed`]. A
+    /// transport error would say the command did not get through, which is not what happened, so
+    /// this failure has a code of its own. It is deterministic: the same output fails the same way.
+    ListingUnreadable,
 }
 
 impl ErrorCode {
@@ -152,18 +159,19 @@ impl ErrorCode {
             Self::SnapshotRestoreError => "snapshot_restore_error",
             Self::SnapshotNotRestorable => "snapshot_not_restorable",
             Self::EventSinkFailed => "event_sink_failed",
+            Self::ListingUnreadable => "listing_unreadable",
         }
     }
 
-    /// The code as the reference publishes it, or `None` for the one this port added.
+    /// The code as the reference publishes it, or `None` for the ones this port added.
     ///
     /// What an audit event or a trace span records as the failure's code: the reference records
-    /// none for a failure outside its sandbox error family, and [`Self::EventSinkFailed`] is the
-    /// only such failure that reaches a session caller here.
+    /// none for a failure outside its sandbox error family, and [`Self::EventSinkFailed`] and
+    /// [`Self::ListingUnreadable`] are the failures of that kind that reach a session caller here.
     #[must_use]
     pub const fn reference_code(self) -> Option<Self> {
         match self {
-            Self::EventSinkFailed => None,
+            Self::EventSinkFailed | Self::ListingUnreadable => None,
             other => Some(other),
         }
     }
@@ -172,9 +180,10 @@ impl ErrorCode {
     ///
     /// Audit events and trace spans record a failure's type by that name (`error_type`), and a
     /// consumer written against the reference branches on it. Every reference code is raised by
-    /// exactly one leaf class, so the name follows from the code. Two codes are raised by a class
-    /// that is not a leaf: [`Self::SandboxConfigInvalid`] by the configuration family's base, and
-    /// [`Self::EventSinkFailed`] — this port's code for the reference's plain `RuntimeError`.
+    /// exactly one leaf class, so the name follows from the code. Three codes are raised by a class
+    /// that is not a leaf: [`Self::SandboxConfigInvalid`] by the configuration family's base,
+    /// [`Self::EventSinkFailed`] — this port's code for the reference's plain `RuntimeError` — and
+    /// [`Self::ListingUnreadable`], this port's code for its plain `ValueError`.
     #[must_use]
     pub const fn reference_type_name(self) -> &'static str {
         match self {
@@ -212,6 +221,7 @@ impl ErrorCode {
             Self::SnapshotRestoreError => "SnapshotRestoreError",
             Self::SnapshotNotRestorable => "SnapshotNotRestorableError",
             Self::EventSinkFailed => "RuntimeError",
+            Self::ListingUnreadable => "ValueError",
         }
     }
 
@@ -239,7 +249,8 @@ impl ErrorCode {
             | Self::WorkspaceStopError
             | Self::WorkspaceStartError
             | Self::WorkspaceRootNotFound
-            | Self::EventSinkFailed => ErrorCategory::Runtime,
+            | Self::EventSinkFailed
+            | Self::ListingUnreadable => ErrorCategory::Runtime,
             Self::LocalFileReadError
             | Self::LocalDirReadError
             | Self::LocalChecksumError
@@ -290,7 +301,8 @@ impl ErrorCode {
             | Self::MountFailed
             | Self::SkillsConfigInvalid
             | Self::SandboxConfigInvalid
-            | Self::SnapshotNotRestorable => Some(false),
+            | Self::SnapshotNotRestorable
+            | Self::ListingUnreadable => Some(false),
             // Broad enough to cover both a transient fault and a permanent one. The raiser is the
             // only party that can tell them apart, so an unqualified instance stays unclassified.
             Self::ExposedPortUnavailable

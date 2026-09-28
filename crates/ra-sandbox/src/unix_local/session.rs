@@ -21,7 +21,7 @@ use ra_core::sandbox::{
 
 use crate::archive::WorkspaceArchiveExtractor;
 use crate::host_paths::HostWorkspacePaths;
-use crate::listing::parse_ls_la;
+use crate::listing::{try_parse_ls_la, unreadable_listing};
 use crate::materialize::{ManifestApplier, manifest_base_dir};
 use crate::mounts::{BuiltinMountLifecycle, MountLifecycle};
 use crate::snapshot::lifecycle::SnapshotLifecycle;
@@ -566,10 +566,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         if !result.ok() {
             return Err(SandboxError::exec_nonzero(result, command));
         }
-        Ok(parse_ls_la(
-            &String::from_utf8_lossy(&result.stdout),
-            &rendered,
-        ))
+        try_parse_ls_la(&String::from_utf8_lossy(&result.stdout), &rendered)
+            .map_err(|error| unreadable_listing(error, &rendered))
     }
 
     async fn rm(&self, path: SessionPath<'_>, recursive: bool, user: AsUser) -> SandboxResult<()> {
