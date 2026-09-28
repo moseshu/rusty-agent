@@ -32,6 +32,8 @@ pub struct MemorySession {
     pub shutdown_calls: AtomicUsize,
     pub close_dependency_calls: AtomicUsize,
     pub exec_calls: AtomicUsize,
+    /// Every command it was asked to run, in order.
+    pub exec_requests: Mutex<Vec<ExecRequest>>,
 }
 
 impl MemorySession {
@@ -52,6 +54,7 @@ impl MemorySession {
             shutdown_calls: AtomicUsize::new(0),
             close_dependency_calls: AtomicUsize::new(0),
             exec_calls: AtomicUsize::new(0),
+            exec_requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -110,8 +113,9 @@ impl SandboxSession for MemorySession {
         &self.resources
     }
 
-    async fn exec(&self, _request: ExecRequest) -> SandboxResult<ExecResult> {
+    async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
         self.exec_calls.fetch_add(1, Ordering::SeqCst);
+        lock(&self.exec_requests).push(request);
         Ok(lock(&self.exec_result).clone())
     }
 

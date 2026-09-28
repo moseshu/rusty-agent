@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ra_sandbox::runtime_helpers::workspace_fingerprint_helper;
+use ra_sandbox::runtime_helpers::{
+    RuntimeHelperScript, resolve_workspace_path_helper, workspace_fingerprint_helper,
+};
 use ra_sandbox::snapshot::lifecycle::{SNAPSHOT_FINGERPRINT_VERSION, parse_fingerprint_record};
 
 /// Runs the installer with a destination of this test's choosing.
@@ -18,7 +20,12 @@ use ra_sandbox::snapshot::lifecycle::{SNAPSHOT_FINGERPRINT_VERSION, parse_finger
 /// The installed path is an argument rather than something the script decides, which is what lets
 /// this check the installer without writing to the directory a real session would use.
 fn install(destination: &Path) -> std::process::Output {
-    let command = workspace_fingerprint_helper().install_command();
+    install_helper(&workspace_fingerprint_helper(), destination)
+}
+
+/// Runs `helper`'s installer with a destination of this test's choosing.
+fn install_helper(helper: &RuntimeHelperScript, destination: &Path) -> std::process::Output {
+    let command = helper.install_command();
     let (program, arguments) = command.split_first().expect("a command");
     // The installed path is the script's last argument, which it reads as `$1`.
     let mut arguments: Vec<String> = arguments.to_vec();
@@ -307,4 +314,223 @@ fn failed_archive_or_hash_commands_never_publish_a_fingerprint() {
             }
         }
     }
+}
+
+// --- the reference's `test_runtime_helpers.py` ----------------------------------------------------
+
+/// `test_runtime_helper_from_content_uses_posix_install_path`: a POSIX path under the helper root,
+/// named after the helper and its content.
+///
+/// The root is this framework's `/tmp/rusty-agent/bin` rather than the reference's
+/// `/tmp/openai-agents/bin` (a recorded choice, §3.30 of the R8-P0 checklist): the directory names
+/// the product that installs into it, and nothing reads it but the commands built from it.
+#[test]
+fn a_helper_installs_under_the_helper_root_named_by_its_content() {
+    let helper = RuntimeHelperScript::from_content("test-helper", "#!/bin/sh\nprintf 'ok\\n'");
+    let name = helper
+        .install_path()
+        .strip_prefix("/tmp/rusty-agent/bin/test-helper-")
+        .unwrap_or_else(|| panic!("{}", helper.install_path()));
+    assert_eq!(name.len(), 12, "{name}");
+    assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+    assert_ne!(
+        RuntimeHelperScript::from_content("test-helper", "#!/bin/sh\n").install_path(),
+        helper.install_path(),
+        "a different script installs under a different name"
+    );
+}
+
+/// `test_workspace_fingerprint_helper_treats_exclusions_as_literal`: an exclusion is a path, not a
+/// pattern, so `cache[1]` leaves out that directory and not `cache1`.
+#[test]
+fn an_exclusion_is_a_literal_path_not_a_pattern() {
+    let directory = tempfile::tempdir().expect("temp");
+    let helper = directory.path().join("workspace-fingerprint");
+    assert!(install(&helper).status.success());
+    let root = directory.path().join("workspace");
+    std::fs::create_dir_all(root.join("cache[1]")).expect("excluded");
+    std::fs::create_dir_all(root.join("cache1")).expect("durable");
+    std::fs::write(root.join("cache[1]/remote.txt"), "remote-one").expect("write");
+    std::fs::write(root.join("cache1/durable.txt"), "durable-one").expect("write");
+    let cache = directory.path().join("fingerprint.json");
+    let answer = || {
+        let output = fingerprint(&helper, &root, &cache, "manifest-digest", &["cache[1]"]);
+        assert!(output.status.success(), "{output:?}");
+        parse_fingerprint_record(&output.stdout)
+            .expect("a record")
+            .fingerprint()
+            .to_owned()
+    };
+
+    let first = answer();
+    std::fs::write(root.join("cache[1]/remote.txt"), "remote-two").expect("write");
+    assert_eq!(answer(), first);
+    std::fs::write(root.join("cache1/durable.txt"), "durable-two").expect("write");
+    assert_ne!(answer(), first);
+}
+
+/// A workspace, a directory beside it, and a link from inside the workspace to that directory, all
+/// under a resolved temporary directory; and the resolve helper installed there.
+struct Resolve {
+    _directory: tempfile::TempDir,
+    top: PathBuf,
+    helper: PathBuf,
+    workspace: PathBuf,
+}
+
+impl Resolve {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().expect("temp");
+        let top = std::fs::canonicalize(directory.path()).expect("resolve");
+        let helper = top.join("resolve-workspace-path");
+        let installed = install_helper(&resolve_workspace_path_helper(), &helper);
+        assert!(installed.status.success(), "{installed:?}");
+        let workspace = top.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        Self {
+            _directory: directory,
+            top,
+            helper,
+            workspace,
+        }
+    }
+
+    /// `tmp/result.txt` beside the workspace, and `workspace/tmp-link` pointing at `tmp`; with
+    /// `protected`, the file sits in `tmp/protected` instead.
+    fn linked_scratch(&self, protected: bool) -> PathBuf {
+        let extra = self.top.join("tmp");
+        let holder = if protected {
+            extra.join("protected")
+        } else {
+            extra.clone()
+        };
+        std::fs::create_dir_all(&holder).expect("extra root");
+        std::fs::write(holder.join("result.txt"), "scratch output").expect("write");
+        std::os::unix::fs::symlink(&extra, self.workspace.join("tmp-link")).expect("link");
+        holder.join("result.txt")
+    }
+
+    fn run(&self, arguments: &[&str]) -> (i32, String, String) {
+        let output = Command::new("sh")
+            .arg(&self.helper)
+            .arg(&self.workspace)
+            .args(arguments)
+            .output()
+            .expect("the helper ran");
+        (
+            output.status.code().expect("an exit code"),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    fn path(&self, relative: &str) -> String {
+        self.top.join(relative).to_string_lossy().into_owned()
+    }
+}
+
+/// `test_resolve_workspace_path_helper_allows_extra_root_symlink_target`.
+#[test]
+fn a_link_into_a_granted_root_resolves_to_its_target() {
+    let resolve = Resolve::new();
+    let target = resolve.linked_scratch(false);
+
+    let answer = resolve.run(&[
+        &resolve.path("workspace/tmp-link/result.txt"),
+        "0",
+        &resolve.path("tmp"),
+        "0",
+    ]);
+
+    assert_eq!(
+        answer,
+        (0, format!("{}\n", target.display()), String::new())
+    );
+}
+
+/// `test_resolve_workspace_path_helper_rejects_extra_root_when_not_allowed`.
+#[test]
+fn a_link_out_of_the_workspace_without_a_grant_is_an_escape() {
+    let resolve = Resolve::new();
+    let target = resolve.linked_scratch(false);
+
+    let answer = resolve.run(&[&resolve.path("workspace/tmp-link/result.txt"), "0"]);
+
+    assert_eq!(
+        answer,
+        (
+            111,
+            String::new(),
+            format!("workspace escape: {}\n", target.display())
+        )
+    );
+}
+
+/// `test_resolve_workspace_path_helper_rejects_extra_root_symlink_to_root`.
+#[test]
+fn a_grant_that_resolves_to_the_filesystem_root_is_refused() {
+    let resolve = Resolve::new();
+    let root_alias = resolve.path("root-alias");
+    std::os::unix::fs::symlink("/", &root_alias).expect("link");
+
+    let answer = resolve.run(&["/etc/passwd", "0", &root_alias, "0"]);
+
+    assert_eq!(
+        answer,
+        (
+            113,
+            String::new(),
+            format!("extra path grant must not resolve to filesystem root: {root_alias}\n")
+        )
+    );
+}
+
+/// `test_resolve_workspace_path_helper_rejects_nested_read_only_extra_grant_on_write`.
+#[test]
+fn a_write_into_a_nested_read_only_grant_is_refused() {
+    let resolve = Resolve::new();
+    let target = resolve.linked_scratch(true);
+    let protected = resolve.path("tmp/protected");
+
+    let answer = resolve.run(&[
+        &resolve.path("workspace/tmp-link/protected/result.txt"),
+        "1",
+        &resolve.path("tmp"),
+        "0",
+        &protected,
+        "1",
+    ]);
+
+    assert_eq!(
+        answer,
+        (
+            114,
+            String::new(),
+            format!(
+                "read-only extra path grant: {protected}\nresolved path: {}\n",
+                target.display()
+            )
+        )
+    );
+}
+
+/// `test_resolve_workspace_path_helper_allows_nested_read_only_extra_grant_on_read`.
+#[test]
+fn a_read_from_a_nested_read_only_grant_is_allowed() {
+    let resolve = Resolve::new();
+    let target = resolve.linked_scratch(true);
+
+    let answer = resolve.run(&[
+        &resolve.path("workspace/tmp-link/protected/result.txt"),
+        "0",
+        &resolve.path("tmp"),
+        "0",
+        &resolve.path("tmp/protected"),
+        "1",
+    ]);
+
+    assert_eq!(
+        answer,
+        (0, format!("{}\n", target.display()), String::new())
+    );
 }
