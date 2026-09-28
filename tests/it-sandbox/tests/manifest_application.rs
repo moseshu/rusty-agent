@@ -459,6 +459,8 @@ async fn overlapping_entries_are_applied_in_declaration_order_rather_than_togeth
     );
 }
 
+/// `test_materialization.py::test_gather_in_order_limits_concurrency_and_preserves_order`, the limit
+/// half, through the applier that is the only caller of `gather_in_order` here.
 #[tokio::test]
 async fn a_batch_runs_no_more_entries_at_once_than_it_was_allowed() {
     let mut manifest = manifest();
@@ -484,6 +486,33 @@ async fn a_batch_runs_no_more_entries_at_once_than_it_was_allowed() {
     );
 }
 
+/// `test_materialization.py::test_gather_in_order_rejects_invalid_concurrency`, and the reference's
+/// `SandboxConcurrencyLimits.validate`: a limit of zero is refused where the limits are built — the
+/// only place a number enters here — with the reference's message for the field that was zero.
+#[test]
+fn a_zero_limit_is_refused_where_the_limits_are_built() {
+    let entries = SandboxConcurrencyLimits::new()
+        .with_manifest_entries(Some(0))
+        .expect_err("zero entries at once");
+    assert_eq!(
+        entries.to_string(),
+        "concurrency_limits.manifest_entries must be at least 1"
+    );
+    let files = SandboxConcurrencyLimits::new()
+        .with_local_dir_files(Some(0))
+        .expect_err("zero files at once");
+    assert_eq!(
+        files.to_string(),
+        "concurrency_limits.local_dir_files must be at least 1"
+    );
+    assert!(
+        SandboxConcurrencyLimits::new()
+            .with_manifest_entries(Some(1))
+            .and_then(|limits| limits.with_local_dir_files(None))
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn an_unlimited_batch_really_does_run_everything_at_once() {
     let mut manifest = manifest();
@@ -504,6 +533,8 @@ async fn an_unlimited_batch_really_does_run_everything_at_once() {
     assert_eq!(session.peak_in_flight.load(Ordering::SeqCst), 4);
 }
 
+/// `test_materialization.py::test_gather_in_order_limits_concurrency_and_preserves_order`, the order
+/// half.
 #[tokio::test]
 async fn a_receipt_lists_files_in_entry_order_however_the_writes_interleaved() {
     let mut manifest = manifest();
