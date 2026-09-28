@@ -59,6 +59,33 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The test targets Cargo discovers in a `tests/` directory, in lexical order: every `*.rs` file
+/// directly in it, and `main.rs` of each directory directly under it.
+///
+/// Anything deeper is not a target but a module one includes — shared helpers under `support/`,
+/// reached with `#[path]` — and a helper holds no test of its own by design.
+pub(crate) fn test_targets(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut targets: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter_map(|path| {
+            if path.is_dir() {
+                let main = path.join("main.rs");
+                main.is_file().then_some(main)
+            } else {
+                path.extension()
+                    .is_some_and(|ext| ext == "rs")
+                    .then_some(path)
+            }
+        })
+        .collect();
+    targets.sort();
+    targets
+}
+
 /// Every crate name under `crates/`, in lexical order.
 pub(crate) fn crate_names() -> Vec<String> {
     let mut names = Vec::new();
