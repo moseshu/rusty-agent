@@ -1110,3 +1110,37 @@ async fn a_permanent_daemon_failure_while_persisting_is_not_retried() {
     assert_eq!(error.retryable(), Some(false));
     assert_eq!(fake.archive_calls.lock().expect("calls").len(), 1);
 }
+
+/// `test_parse_ls_la_rejects_special_permission_bits_in_wrong_position`, through a session: a row
+/// whose mode does not read fails the listing, as the reference's `ls` lets the parser's error out,
+/// rather than leaving the entry out of an answer that would then look complete.
+#[tokio::test]
+async fn a_listing_row_whose_mode_does_not_read_fails_the_listing() {
+    let (fake, session) = command_session(true);
+    fake.on_exec(|request| {
+        let listing = request.cmd().first().is_some_and(|program| program == "ls");
+        let stdout = if listing {
+            b"-rw-r--r-- 1 root root 1 Jan 1 00:00 fine.txt\n-rwTr--r-- 1 root root 1 Jan 1 00:00 odd\n"
+                .to_vec()
+        } else {
+            // What the path resolver prints for a path it accepts: the path, resolved.
+            format!("{}\n", request.cmd().get(2).map_or("", String::as_str)).into_bytes()
+        };
+        Ok(ExecRunOutput::new(stdout, Vec::new(), Some(0)))
+    });
+
+    let error = session
+        .ls("docs".into(), None)
+        .await
+        .expect_err("the listing does not read");
+
+    // The command got through and succeeded; its output did not read. That is neither a transport
+    // failure nor one that another try would change, and it is recorded as the reference records
+    // its parser's `ValueError`: no reference code, that type name.
+    assert_eq!(error.error_code(), ErrorCode::ListingUnreadable);
+    assert_eq!(error.retryable(), Some(false));
+    assert_eq!(error.error_code().reference_code(), None);
+    assert_eq!(error.error_code().reference_type_name(), "ValueError");
+    assert!(error.message().starts_with("invalid exec flag"), "{error}");
+    assert_eq!(error.context()["path"], "/workspace/docs");
+}
