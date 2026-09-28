@@ -173,13 +173,18 @@ impl SandboxConcurrencyLimits {
 }
 
 /// A concurrency limit that would stop work rather than pace it.
+///
+/// The messages are those of the reference's `SandboxConcurrencyLimits.validate`, the type this one
+/// ports. The reference checks again further down — `max_entry_concurrency` in manifest
+/// application, `max_concurrency` in `gather_in_order` — but here nothing below this type accepts a
+/// bare number, so a zero is only ever refused here, and says which field was zero.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ConcurrencyLimitError {
     /// The manifest entry limit was zero.
-    #[error("max_entry_concurrency must be at least 1")]
+    #[error("concurrency_limits.manifest_entries must be at least 1")]
     ManifestEntries,
     /// The copied-directory file limit was zero.
-    #[error("max_concurrency must be at least 1")]
+    #[error("concurrency_limits.local_dir_files must be at least 1")]
     LocalDirFiles,
 }
