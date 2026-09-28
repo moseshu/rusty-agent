@@ -10,11 +10,11 @@
 use ra_core::{
     item::{CallId, Message, ModelInputItem, RunItemKind, ToolCall, ToolCallKind, ToolCallOutput},
     model::{
-        CustomToolFormat, CustomToolGrammarSyntax, Model, ModelRequest, ModelSettings,
-        ModelToolDefinition, ProviderKey, ToolChoice,
+        CustomToolFormat, CustomToolGrammarSyntax, Model, ModelProvider, ModelRequest,
+        ModelSettings, ModelToolDefinition, ProviderKey, ToolChoice,
     },
 };
-use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel};
+use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel, AnthropicMessagesProvider};
 use ra_model::openai::{
     auth::OpenAiAuth,
     chat::{ChatLoweringOptions, OpenAiChatModel},
@@ -309,7 +309,18 @@ async fn chat_advertises_custom_tools_as_functions_when_asked() {
 
 // ---- Anthropic Messages --------------------------------------------------------------------
 
+fn anthropic_auth(server: &MockServer) -> AnthropicAuth {
+    AnthropicAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri()))
+}
+
 async fn anthropic_model(server: &MockServer, as_functions: bool) -> AnthropicMessagesModel {
+    mount_anthropic_patch_call(server).await;
+    AnthropicMessagesModel::new("claude-test", anthropic_auth(server))
+        .expect("model")
+        .with_custom_tools_as_functions(as_functions)
+}
+
+async fn mount_anthropic_patch_call(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -324,12 +335,6 @@ async fn anthropic_model(server: &MockServer, as_functions: bool) -> AnthropicMe
         })))
         .mount(server)
         .await;
-    AnthropicMessagesModel::new(
-        "claude-test",
-        AnthropicAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
-    )
-    .expect("model")
-    .with_custom_tools_as_functions(as_functions)
 }
 
 fn anthropic_request(input: Vec<ModelInputItem>) -> ModelRequest {
@@ -367,6 +372,40 @@ async fn anthropic_refuses_a_custom_tool_and_a_custom_call_by_default() {
         "{error}"
     );
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// The provider's setting reaches every model it makes, so a run that resolves its model through
+/// the provider behaves as one built directly.
+#[tokio::test]
+async fn the_anthropic_provider_hands_its_setting_to_the_models_it_makes() {
+    let server = MockServer::start().await;
+    mount_anthropic_patch_call(&server).await;
+    let request = || {
+        anthropic_request(vec![ModelInputItem::Message(Message::user("hi"))])
+            .with_tools(vec![grammar_tool()])
+    };
+
+    let refusing = AnthropicMessagesProvider::new(anthropic_auth(&server), "claude-test")
+        .expect("provider")
+        .get_model(None)
+        .expect("model");
+    let error = refusing.get_response(request()).await.expect_err("refused");
+    assert!(
+        error
+            .to_string()
+            .contains("custom tool `apply_patch` is not supported with Anthropic Messages"),
+        "{error}"
+    );
+
+    let advertising = AnthropicMessagesProvider::new(anthropic_auth(&server), "claude-test")
+        .expect("provider")
+        .with_custom_tools_as_functions(true)
+        .get_model(Some("claude-test"))
+        .expect("model");
+    let response = advertising.get_response(request()).await.expect("response");
+    let call = only_call(response.output());
+    assert_eq!(call.kind(), ToolCallKind::Custom);
+    assert_eq!(call.arguments(), &json!(PATCH));
 }
 
 #[tokio::test]
