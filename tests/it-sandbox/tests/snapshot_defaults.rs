@@ -58,7 +58,11 @@ fn a_posix_host_keeps_snapshots_in_its_state_directory(
 fn a_mac_keeps_them_in_application_support() {
     // Read from the platform, not from the environment: `XDG_STATE_HOME` set on a Mac does not
     // move them.
-    let host = host("/home", &[("XDG_STATE_HOME", "/state")], HostPlatform::MacOs);
+    let host = host(
+        "/home",
+        &[("XDG_STATE_HOME", "/state")],
+        HostPlatform::MacOs,
+    );
 
     assert_eq!(
         default_local_snapshot_base_dir(&host),
@@ -116,10 +120,16 @@ fn cleanup_takes_old_archives_and_leaves_everything_else() {
     for (path, body) in [(&stale, "stale"), (&fresh, "fresh"), (&other, "keep")] {
         std::fs::write(path, body).expect("write");
     }
-    set_modified(&stale, now - DEFAULT_LOCAL_SNAPSHOT_TTL - Duration::from_secs(60));
+    set_modified(
+        &stale,
+        now - DEFAULT_LOCAL_SNAPSHOT_TTL - Duration::from_secs(60),
+    );
     set_modified(&fresh, now - Duration::from_secs(60));
     // Old, and still not this directory's business: only `.tar` is the SDK's to delete.
-    set_modified(&other, now - DEFAULT_LOCAL_SNAPSHOT_TTL - Duration::from_secs(60));
+    set_modified(
+        &other,
+        now - DEFAULT_LOCAL_SNAPSHOT_TTL - Duration::from_secs(60),
+    );
 
     cleanup_stale_default_local_snapshots(directory.path(), now, DEFAULT_LOCAL_SNAPSHOT_TTL);
 
@@ -213,5 +223,9 @@ fn set_modified(path: &Path, modified: SystemTime) {
 fn mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
 }

@@ -59,7 +59,9 @@ fn a_field_reader_answers_only_for_the_kind_it_belongs_to() {
     assert_eq!(remote.local_base_path(), None);
     assert_eq!(Snapshot::noop().remote_client_dependency_key(), None);
     assert_eq!(
-        Snapshot::local("snap-1", "/tmp/snapshots").expect("named").remote_client_dependency_key(),
+        Snapshot::local("snap-1", "/tmp/snapshots")
+            .expect("named")
+            .remote_client_dependency_key(),
         None
     );
 }
@@ -88,7 +90,13 @@ fn stored_snapshots_that_name_no_storage_are_refused() {
     assert!(Snapshot::parse(&registry, &json!({"type": "noop", "id": "snap-1"})).is_ok());
     // Present and a string is the whole requirement, as it is on the reference's model. An empty
     // directory means the process's own working directory there, and it means that here too.
-    assert!(Snapshot::parse(&registry, &json!({"type": "local", "id": "s", "base_path": ""})).is_ok());
+    assert!(
+        Snapshot::parse(
+            &registry,
+            &json!({"type": "local", "id": "s", "base_path": ""})
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -103,7 +111,10 @@ fn a_snapshot_survives_the_trip_through_a_session_state() {
     let rendered = state.to_json().expect("persistable");
     let snapshot = Snapshot::parse(&registry, &rendered["snapshot"]).expect("restore");
 
-    assert_eq!(snapshot, Snapshot::local("snap-1", "/tmp/snapshots").expect("named"));
+    assert_eq!(
+        snapshot,
+        Snapshot::local("snap-1", "/tmp/snapshots").expect("named")
+    );
 
     let payload: DiscriminatedPayload = serde_json::from_value(rendered).expect("payload");
     let back =
@@ -200,7 +211,10 @@ fn a_snapshot_handed_in_keeps_the_id_it_came_with() {
     let stored = Snapshot::local("last-weeks-run", "/tmp/snapshots").expect("named");
     let source = SnapshotSource::Snapshot(stored.clone());
 
-    assert_eq!(resolve_snapshot(Some(&source), "snap-1").expect("named"), stored);
+    assert_eq!(
+        resolve_snapshot(Some(&source), "snap-1").expect("named"),
+        stored
+    );
 }
 
 #[test]

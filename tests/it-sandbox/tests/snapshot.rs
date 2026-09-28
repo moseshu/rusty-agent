@@ -222,7 +222,10 @@ async fn an_id_that_is_not_one_path_segment_is_refused(#[case] id: &str) {
     }
 
     // Refused before anything is written: the point of the check is that the path was never used.
-    assert_eq!(std::fs::read_dir(directory.path()).expect("list").count(), 0);
+    assert_eq!(
+        std::fs::read_dir(directory.path()).expect("list").count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -294,10 +297,7 @@ async fn a_local_snapshot_with_no_directory_names_nothing_to_open() {
     // Not reachable through `Snapshot::local`, and refused when parsing stored state — but a
     // payload assembled in process can still say `local` and stop there.
     let snapshot = Snapshot::new("local", "snap-1");
-    let error = Store
-        .restore(&snapshot)
-        .await
-        .expect_err("refused");
+    let error = Store.restore(&snapshot).await.expect_err("refused");
 
     assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
 }
@@ -317,7 +317,10 @@ async fn storage_this_build_cannot_reach_is_refused_rather_than_ignored() {
     ] {
         assert_eq!(error.error_code(), ErrorCode::SandboxConfigInvalid);
         assert_eq!(
-            error.context().get("snapshot_type").and_then(|v| v.as_str()),
+            error
+                .context()
+                .get("snapshot_type")
+                .and_then(|v| v.as_str()),
             Some(snapshot.snapshot_type())
         );
     }
