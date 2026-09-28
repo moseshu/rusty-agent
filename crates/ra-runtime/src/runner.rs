@@ -79,6 +79,7 @@ use ra_core::{
 use tokio::sync::mpsc;
 use tracing::{Instrument, info_span, warn};
 
+mod grouping;
 pub mod result;
 pub mod stream;
 
@@ -156,6 +157,7 @@ pub struct RunConfig {
     user_hooks: UserHooks,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
     sandbox: Option<SandboxRunConfig>,
+    group_id: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -193,6 +195,7 @@ impl RunConfig {
             user_hooks: UserHooks::default(),
             lifecycle_hooks: Vec::new(),
             sandbox: None,
+            group_id: None,
         }
     }
 
@@ -209,6 +212,23 @@ impl RunConfig {
     #[must_use]
     pub const fn sandbox(&self) -> Option<&SandboxRunConfig> {
         self.sandbox.as_ref()
+    }
+
+    /// Links this run with others the host considers one conversation or process — a chat
+    /// thread's id, for instance.
+    ///
+    /// The reference's `RunConfig.group_id`. Sandbox memory appends the runs of one group to one
+    /// rollout; a run with no group, and no conversation or session to take one from, is a
+    /// rollout of its own.
+    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
+    }
+
+    /// The group this run belongs to, as the host named it.
+    #[must_use]
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
     }
 
     /// Sets the turn cap. Zero is rejected when the run starts rather than silently meaning
@@ -704,6 +724,7 @@ impl std::fmt::Debug for RunConfig {
             )
             .field("permission", &self.permission)
             .field("sandbox", &self.sandbox)
+            .field("group_id", &self.group_id)
             .field(
                 "input_guardrails",
                 &self
@@ -1423,9 +1444,15 @@ async fn run_loop_inner(
             }
         }
         Err(error) => {
-            record_progress_usage(span, progress.segment_responses(&state));
-            record_terminal_error(span, &error, &cancel);
-            return Err(error);
+            return Err(terminal_failure(
+                span,
+                sandbox,
+                &input_base,
+                &progress,
+                &state,
+                error,
+                &cancel,
+            ));
         }
     };
 
@@ -1440,9 +1467,15 @@ async fn run_loop_inner(
         match deliver_budget_closeout(&context, &agent, &mut progress, &mut state).await {
             Ok(message) => message,
             Err(error) => {
-                record_progress_usage(span, progress.segment_responses(&state));
-                record_terminal_error(span, &error, &closeout_cancel);
-                return Err(error);
+                return Err(terminal_failure(
+                    span,
+                    sandbox,
+                    &input_base,
+                    &progress,
+                    &state,
+                    error,
+                    &closeout_cancel,
+                ));
             }
         };
 
@@ -1473,9 +1506,15 @@ async fn run_loop_inner(
         if let Err(error) =
             lifecycle_dispatch::agent_end(&lifecycle, &ending, &closeout_cancel).await
         {
-            record_progress_usage(span, progress.segment_responses(&state));
-            record_terminal_error(span, &error, &closeout_cancel);
-            return Err(error);
+            return Err(terminal_failure(
+                span,
+                sandbox,
+                &input_base,
+                &progress,
+                &state,
+                error,
+                &closeout_cancel,
+            ));
         }
     }
 
@@ -1534,15 +1573,27 @@ async fn run_loop_inner(
                     let error = error.with_guardrail_evidence(GuardrailEvidence::Output(
                         state.output_guardrail_results().to_vec(),
                     ));
-                    record_progress_usage(span, progress.segment_responses(&state));
-                    record_terminal_error(span, &error, &cancel);
-                    return Err(error);
+                    return Err(terminal_failure(
+                        span,
+                        sandbox,
+                        &input_base,
+                        &progress,
+                        &state,
+                        error,
+                        &cancel,
+                    ));
                 }
             }
             Err(error) => {
-                record_progress_usage(span, progress.segment_responses(&state));
-                record_terminal_error(span, &error, &cancel);
-                return Err(error);
+                return Err(terminal_failure(
+                    span,
+                    sandbox,
+                    &input_base,
+                    &progress,
+                    &state,
+                    error,
+                    &cancel,
+                ));
             }
         }
     }
@@ -1840,6 +1891,24 @@ fn segment_input_base(
 }
 
 /// Copies the checkpoint records created by one segment for its result.
+/// Ends a run that failed after its turns started: records what the span reports for a failure,
+/// and hands sandbox memory the segment as far as it got, so the failure is remembered with the
+/// records that led to it.
+fn terminal_failure(
+    span: &tracing::Span,
+    sandbox: &SandboxRuntime,
+    input_base: &[ModelInputItem],
+    progress: &TurnLoopProgress,
+    state: &RunState,
+    error: Error,
+    scope: &CancelScope,
+) -> Error {
+    record_progress_usage(span, progress.segment_responses(state));
+    record_terminal_error(span, &error, scope);
+    sandbox.record_failed_segment(input_base, progress.segment_items(state));
+    error
+}
+
 fn segment_records(
     progress: &TurnLoopProgress,
     state: &RunState,
@@ -1869,10 +1938,21 @@ impl Drop for ReleaseSandboxOnDrop {
 }
 
 /// The sandbox half of one run, built from the request before the loop consumes it.
+///
+/// A sandboxed run is also given the rollout its sandbox memory is recorded under: the run's
+/// group, as the reference's `_sandbox_memory_rollout_id` resolves it. A run here has no
+/// server-side conversation or SDK session to take one from, so it is the host's group id, or a
+/// rollout of the run's own.
 fn sandbox_runtime(request: &RunRequest) -> Arc<SandboxRuntime> {
+    let rollout_id = request
+        .config
+        .sandbox()
+        .map(|_| grouping::resolve_run_grouping_id(None, None, request.config.group_id()));
     Arc::new(SandboxRuntime::new(
         request.config.sandbox().cloned(),
         request.state.sandbox_resume_state().cloned(),
+        Arc::clone(&request.model_resolver),
+        rollout_id,
     ))
 }
 
@@ -1883,12 +1963,23 @@ fn sandbox_runtime(request: &RunRequest) -> Arc<SandboxRuntime> {
 /// its sandbox did not go cleanly. The result then carries no resume state, since one describing
 /// sessions whose cleanup failed would resume a workspace nobody can vouch for. A run with no
 /// sandbox configuration keeps whatever resume state it was continued with.
+///
+/// Before cleanup the run is recorded for sandbox memory — the finished run, or the segment a
+/// failed one got through — and a failure to record it is logged in the same way.
 async fn settle_sandbox(
     sandbox: &Arc<SandboxRuntime>,
     result: Result<RunResult>,
 ) -> Result<RunResult> {
     if !sandbox.enabled() {
         return result;
+    }
+    // Before cleanup, whose pre-stop callbacks are what extract and consolidate the segments.
+    let enqueued = match &result {
+        Ok(result) => sandbox.enqueue_memory_result(result).await,
+        Err(error) => sandbox.enqueue_memory_failure(error).await,
+    };
+    if let Err(error) = enqueued {
+        warn!(error = %error, "Failed to enqueue sandbox memory after run");
     }
     let cleanup = sandbox.cleanup().await;
     if let Err(error) = &cleanup {

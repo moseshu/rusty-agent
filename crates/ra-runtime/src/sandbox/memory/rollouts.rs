@@ -1,18 +1,21 @@
 //! Rollout files: one JSONL file per rollout, one line per run segment.
 //!
-//! A port of the file half of the reference's `sandbox/memory/rollouts.py`, and of the rollout id
-//! rules in `sandbox/memory/manager.py`. Building a segment from a run's result belongs with the
-//! runner hooks that call it.
+//! A port of the reference's `sandbox/memory/rollouts.py` — the rollout files, and the segment a
+//! run's result becomes — and of the rollout id rules in `sandbox/memory/manager.py`.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use ra_core::{
     error::{Error, Result},
+    finish::FinishReason,
+    item::{MessageRole, ModelInputItem, RunItem, RunItemKind},
     sandbox::{ErrorCode, PosixPath, SandboxSession},
 };
 use serde::{Deserialize, Serialize};
 
-use super::json::dumps_compact;
+use super::json::{dumps_compact, utc_isoformat};
+use crate::runner::{RunOutcome, RunResult};
 use crate::sandbox::sandbox_error;
 
 /// How a run segment ended.
@@ -259,4 +262,190 @@ pub async fn write_rollout<T: Serialize + ?Sized>(
         .await
         .map_err(sandbox_error)?;
     Ok(destination)
+}
+
+/// How a finished run's segment ended.
+///
+/// The reference's `terminal_metadata_for_result`. A run that delivered an answer completed and one
+/// waiting on approvals was interrupted. The reference reports its other endings as exceptions;
+/// here a run can also stop softly with a result, and the reason it stopped says which of the
+/// reference's states it is: the turn cap, a cancellation, a tripped guardrail, and otherwise a
+/// failure.
+#[must_use]
+pub fn terminal_metadata_for_result(result: &RunResult) -> RolloutTerminalMetadata {
+    let reason = result.outcome().finish_reason();
+    if result.final_message().is_some() || reason.is_some_and(FinishReason::is_complete) {
+        return RolloutTerminalMetadata::new(RolloutTerminalState::Completed, true);
+    }
+    if matches!(result.outcome(), RunOutcome::Interrupted { .. }) {
+        return RolloutTerminalMetadata::new(RolloutTerminalState::Interrupted, false);
+    }
+    let state = match reason {
+        Some(FinishReason::MaxTurns) => RolloutTerminalState::MaxTurnsExceeded,
+        Some(FinishReason::Cancelled) => RolloutTerminalState::Cancelled,
+        Some(FinishReason::GuardrailTripped) => RolloutTerminalState::GuardrailTripped,
+        _ => RolloutTerminalState::Failed,
+    };
+    RolloutTerminalMetadata::new(state, false)
+}
+
+/// How a run that failed ended.
+///
+/// The reference's `terminal_metadata_for_exception`, which classifies by the exception's class
+/// name; here the error's variant says the same, and its stable code stands in for the name.
+#[must_use]
+pub fn terminal_metadata_for_error(error: &Error) -> RolloutTerminalMetadata {
+    let state = match error {
+        Error::Budget {
+            kind: ra_core::error::BudgetKind::MaxTurns,
+            ..
+        } => RolloutTerminalState::MaxTurnsExceeded,
+        Error::Guardrail { .. } => RolloutTerminalState::GuardrailTripped,
+        Error::Cancelled { .. } => RolloutTerminalState::Cancelled,
+        _ => RolloutTerminalState::Failed,
+    };
+    RolloutTerminalMetadata::new(state, false).with_exception(error.code(), error.to_string())
+}
+
+/// Whether an item is kept in a rollout segment.
+///
+/// The reference's `_should_include_memory_item`: conversation messages, tool calls and their
+/// outputs, and MCP approvals are kept; instructions, reasoning, compaction and tool listings are
+/// not. A handoff is a tool call and its output on the reference, and is kept with them.
+fn is_memory_item(item: &ModelInputItem) -> bool {
+    match item {
+        ModelInputItem::Message(message) => message.role() != MessageRole::System,
+        ModelInputItem::ToolCall(_)
+        | ModelInputItem::ToolCallOutput(_)
+        | ModelInputItem::HandoffCall(_)
+        | ModelInputItem::HandoffOutput(_)
+        | ModelInputItem::McpApprovalRequest(_)
+        | ModelInputItem::McpApprovalResponse(_) => true,
+        _ => false,
+    }
+}
+
+/// One run segment as its rollout line records it.
+///
+/// The reference builds this as a dictionary; its fields are written in the reference's order,
+/// with `rollout_id` second once the generation manager has set it, `interruptions` only when there
+/// are some, and `final_output` only when the run delivered one. Items are written in the
+/// framework's own item form.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RolloutPayload {
+    updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout_id: Option<String>,
+    input: Vec<ModelInputItem>,
+    generated_items: Vec<ModelInputItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interruptions: Vec<RunItemKind>,
+    terminal_metadata: RolloutTerminalMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_output: Option<String>,
+}
+
+impl RolloutPayload {
+    /// The same segment, recorded under `rollout_id`.
+    #[must_use]
+    pub fn with_rollout_id(mut self, rollout_id: impl Into<String>) -> Self {
+        self.rollout_id = Some(rollout_id.into());
+        self
+    }
+
+    /// When the segment was recorded, as the reference's `isoformat` writes it.
+    #[must_use]
+    pub fn updated_at(&self) -> &str {
+        &self.updated_at
+    }
+
+    /// The rollout the segment is recorded under, once one is set.
+    #[must_use]
+    pub fn rollout_id(&self) -> Option<&str> {
+        self.rollout_id.as_deref()
+    }
+
+    /// The run's input, without what memory does not keep.
+    #[must_use]
+    pub fn input(&self) -> &[ModelInputItem] {
+        &self.input
+    }
+
+    /// What the run produced, without what memory does not keep.
+    #[must_use]
+    pub fn generated_items(&self) -> &[ModelInputItem] {
+        &self.generated_items
+    }
+
+    /// The approvals the run stopped for.
+    #[must_use]
+    pub fn interruptions(&self) -> &[RunItemKind] {
+        &self.interruptions
+    }
+
+    /// How the run ended.
+    #[must_use]
+    pub const fn terminal_metadata(&self) -> &RolloutTerminalMetadata {
+        &self.terminal_metadata
+    }
+
+    /// The text the run delivered, if it delivered any.
+    #[must_use]
+    pub fn final_output(&self) -> Option<&str> {
+        self.final_output.as_deref()
+    }
+}
+
+/// A run segment for memory: its input and generated items without what memory does not keep, the
+/// approvals it stopped for, how it ended and what it delivered.
+///
+/// The reference's `build_rollout_payload`, stamped with the current time.
+#[must_use]
+pub fn build_rollout_payload(
+    input: &[ModelInputItem],
+    new_items: &[RunItem],
+    final_output: Option<String>,
+    interruptions: &[RunItem],
+    terminal_metadata: RolloutTerminalMetadata,
+) -> RolloutPayload {
+    RolloutPayload {
+        updated_at: utc_isoformat(SystemTime::now()),
+        rollout_id: None,
+        input: input
+            .iter()
+            .filter(|item| is_memory_item(item))
+            .cloned()
+            .collect(),
+        generated_items: new_items
+            .iter()
+            .filter_map(RunItem::to_model_input)
+            .filter(is_memory_item)
+            .collect(),
+        interruptions: interruptions
+            .iter()
+            .map(|item| item.kind().clone())
+            .collect(),
+        terminal_metadata,
+        final_output,
+    }
+}
+
+/// The segment a finished run becomes, with `input_override` as its input when given and the
+/// input the run started from otherwise.
+///
+/// The reference's `build_rollout_payload_from_result`.
+#[must_use]
+pub fn build_rollout_payload_from_result(
+    result: &RunResult,
+    input_override: Option<&[ModelInputItem]>,
+) -> RolloutPayload {
+    build_rollout_payload(
+        input_override.unwrap_or_else(|| result.original_input()),
+        result.new_items(),
+        result
+            .final_message()
+            .map(ra_core::item::Message::text_content),
+        result.outcome().interruptions(),
+        terminal_metadata_for_result(result),
+    )
 }

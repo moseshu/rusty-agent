@@ -9,7 +9,10 @@
 //! dependencies: reading needs `shell`, and live updates need `filesystem` as well.
 //!
 //! Generating memory — appending run segments and extracting and consolidating them when the
-//! session closes — is configured here, by [`Memory::generate`], and run by the runtime.
+//! session closes — is configured here, by [`Memory::generate`], and run by the runtime, which
+//! reads the configuration through [`Capability::sandbox_memory`]. The extraction and
+//! consolidation agents run with [`super::filesystem::default_capabilities`], the capabilities the
+//! reference's sandbox agents get by default.
 //!
 //! # Not the memory store
 //!
@@ -42,7 +45,7 @@ use ra_core::{
     prompt::{PromptSection, SectionPosition, SectionStability},
     sandbox::{
         ErrorCode, Manifest, MemoryGenerateConfig, MemoryLayoutConfig, MemoryReadConfig, PosixPath,
-        SandboxSession, SandboxWorkspaceScope, User,
+        SandboxMemory, SandboxSession, SandboxWorkspaceScope, User,
         token_truncation::{TruncationPolicy, truncate_text},
     },
 };
@@ -407,6 +410,14 @@ impl Capability for Memory {
             return Err(Error::config(UNBOUND));
         }
         Ok(None)
+    }
+
+    fn sandbox_memory(&self) -> Option<SandboxMemory> {
+        Some(SandboxMemory::new(
+            self.layout.clone(),
+            self.generate.clone(),
+            super::filesystem::default_capabilities(),
+        ))
     }
 
     fn bind_sandbox(&self, binding: &SandboxBinding) -> Result<Option<Arc<dyn Capability>>> {

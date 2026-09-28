@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use ra_core::sandbox::events::format_event_timestamp;
 use serde::Serialize;
+use serde_json::Value;
 use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
 
 /// Writes a run of characters that needs no escape of JSON's own, escaping what is not ASCII.
@@ -180,9 +181,32 @@ pub(crate) fn python_repr(text: &str) -> String {
     out
 }
 
+/// Python's `str(value)` for a JSON value that is truthy, or `None` for one that is not — the
+/// reference's `str(value or default)` with the default left to the caller.
+pub(crate) fn python_truthy_str(value: &Value) -> Option<String> {
+    match value {
+        Value::Null | Value::Bool(false) => None,
+        Value::Bool(true) => Some("True".to_owned()),
+        Value::String(text) if text.is_empty() => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) if number.as_f64() == Some(0.0) => None,
+        Value::Number(number) => Some(number.to_string()),
+        Value::Array(items) if items.is_empty() => None,
+        Value::Object(fields) if fields.is_empty() => None,
+        other => Some(other.to_string()),
+    }
+}
+
 /// Python's `str.strip()`: Unicode whitespace and the four information separators.
 pub(crate) fn python_strip(text: &str) -> &str {
     text.trim_matches(|character: char| {
+        character.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&character)
+    })
+}
+
+/// Python's `str.rstrip()`, the trailing half of [`python_strip`].
+pub(crate) fn python_rstrip(text: &str) -> &str {
+    text.trim_end_matches(|character: char| {
         character.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&character)
     })
 }
