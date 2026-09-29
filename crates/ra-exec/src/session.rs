@@ -70,6 +70,19 @@ const STREAM_CHUNK_BYTES: usize = 4096;
 /// process itself.
 const CAPACITY_WAIT_SLACK: Duration = Duration::from_millis(500);
 
+/// How long a group this executor killed may take to disappear before its exit counts as
+/// unconfirmed.
+///
+/// Killing the group kills the leader's children with it, but a child whose parent died first
+/// stays in the group as a zombie until whoever adopted it reaps it. That is usually init, a moment
+/// later. Probing once, right after the leader is reaped, loses that race — on a system whose `sh`
+/// forks the command instead of replacing itself with it, most of the time — and would hold back
+/// every cancelled run's scratch directory for recovery it does not need.
+const REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// How often [`REAP_GRACE`] probes the group.
+const REAP_POLL: Duration = Duration::from_millis(10);
+
 /// The lifecycle state of a process execution session.
 ///
 /// Transitions follow an audited single-direction state machine. Once a session reaches a terminal
@@ -1778,10 +1791,18 @@ async fn supervise(
     // Reaping the shell and draining its pipes do not prove that its descendants exited.
     // Do not kill legitimate background work or wait indefinitely for it. Instead preserve the
     // scratch directory and require host recovery if the group still exists or cannot be probed.
-    // Check after drain so short-lived descendants have had time to finish. Never clear a prior
-    // recovery mark by polling a bare PID later: it may have been reused by then.
+    // Check after drain so short-lived descendants have had time to finish. A group this executor
+    // killed is given `REAP_GRACE` for its dying members to be reaped; a command that exited on its
+    // own reaped its children itself, so it is probed once, as before, and a legitimate background
+    // job it left behind is not waited for. Never clear a prior recovery mark by polling a bare PID
+    // later: it may have been reused by then.
+    let grace = if termination_requested {
+        REAP_GRACE
+    } else {
+        Duration::ZERO
+    };
     if let Some(usage) = &context.temp_dir_use
-        && !tracked_exit_confirmed(context.pid)
+        && !tracked_exit_confirmed_within(context.pid, grace).await
     {
         usage.require_recovery();
         tracing::warn!(session_id = %context.session_id,
@@ -2086,6 +2107,22 @@ fn tracked_exit_confirmed(pid: Option<u32>) -> bool {
         return false;
     };
     matches!(test_kill_process_group(group), Err(rustix::io::Errno::SRCH))
+}
+
+/// As [`tracked_exit_confirmed`], probing again every [`REAP_POLL`] until `grace` has passed.
+///
+/// A zero `grace` probes exactly once.
+async fn tracked_exit_confirmed_within(pid: Option<u32>, grace: Duration) -> bool {
+    let deadline = TokioInstant::now() + grace;
+    loop {
+        if tracked_exit_confirmed(pid) {
+            return true;
+        }
+        if TokioInstant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(REAP_POLL).await;
+    }
 }
 
 /// Off Unix there is no process group to outlive the child, because none was created: `spawn_child`
