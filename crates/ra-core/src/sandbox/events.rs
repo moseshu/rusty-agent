@@ -685,6 +685,10 @@ pub fn validate_sandbox_session_event(
 ///
 /// The limit is on decoded characters rather than bytes, as the reference's is, and a cut is
 /// marked with `…`.
+///
+/// `Internal`, as the reference's `_safe_decode` is: public and `#[doc(hidden)]` only so the
+/// separate test workspace can reach it, with no compatibility promise.
+#[doc(hidden)]
 #[must_use]
 pub fn safe_decode(bytes: &[u8], max_chars: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -874,9 +878,14 @@ pub fn format_event_timestamp(time: SystemTime) -> String {
 /// reference's quirks — the fraction's unit follows the number's magnitude while the whole part's
 /// follows the floored integer, and a negative number adds its fraction to its floor.
 ///
+/// `Internal`: the event deserializer's reading of its `ts` field, which the reference does inside
+/// its model's field validation. Public and `#[doc(hidden)]` only so the separate test workspace can
+/// reach it, with no compatibility promise.
+///
 /// # Errors
 ///
 /// Returns a description of what did not parse.
+#[doc(hidden)]
 pub fn parse_event_timestamp(value: &Value) -> Result<SystemTime, String> {
     match value {
         Value::Number(number) => {
