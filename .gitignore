@@ -25,6 +25,9 @@ target
 /tests/target/
 /tests/*/target/
 /tests/Cargo.lock
+# 编译期边界 fixture 的锁文件由 it-e2e/crate_boundaries 在运行时从 tests/Cargo.lock 复制生成，
+# 与它一样不进版本库：进了版本库就会和每台机器现场解析的 tests/Cargo.lock 漂移，离线检查因缺包失败。
+/tests/it-e2e/fixtures/*/Cargo.lock
 /tests/test-gemini/
 # 抓取第三方系统提示词的调研产物，不进公开仓库。
 /tests/extracted_prompts.json
