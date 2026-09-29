@@ -1,6 +1,6 @@
 //! The runtime policy that decides whether a failed model call is worth another attempt.
 //!
-//! Provider adapters report facts through [`RetryAdvice`](super::RetryAdvice); this module keeps
+//! Provider adapters report facts through [`RetryAdvice`]; this module keeps
 //! the application decision separate from those facts. In particular, a retry policy can choose
 //! a narrower class of transient failures than an adapter recognizes, but it cannot bypass the
 //! runtime's attempt cap, cancellation, or a stream event that was already published.

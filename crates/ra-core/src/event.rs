@@ -208,7 +208,7 @@ impl HostEvent {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if sequence number allocation fails.
+    /// Returns [`Error`](crate::error::Error) if sequence number allocation fails.
     pub fn allocate(
         allocator: &EventSeqAllocator,
         agent_id: AgentId,
@@ -329,7 +329,7 @@ impl HostEventEmitter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if sequence allocation is exhausted.
+    /// Returns [`Error`](crate::error::Error) if sequence allocation is exhausted.
     pub fn emit(&self, body: impl Into<HostEventBody>) -> Result<u64> {
         let envelope = HostEvent::allocate(&self.allocator, self.agent_id.clone(), body.into())?;
         let seq = envelope.seq();
@@ -341,7 +341,7 @@ impl HostEventEmitter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if sequence allocation is exhausted.
+    /// Returns [`Error`](crate::error::Error) if sequence allocation is exhausted.
     pub fn emit_exec(&self, event: ExecEvent) -> Result<u64> {
         self.emit(HostEventBody::Exec(event))
     }
@@ -350,7 +350,7 @@ impl HostEventEmitter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if sequence allocation is exhausted.
+    /// Returns [`Error`](crate::error::Error) if sequence allocation is exhausted.
     pub fn emit_file(&self, event: FileEvent) -> Result<u64> {
         self.emit(HostEventBody::File(event))
     }
@@ -359,7 +359,7 @@ impl HostEventEmitter {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if sequence allocation is exhausted.
+    /// Returns [`Error`](crate::error::Error) if sequence allocation is exhausted.
     pub fn emit_agent(&self, event: AgentEvent) -> Result<u64> {
         self.emit(HostEventBody::Agent(event))
     }

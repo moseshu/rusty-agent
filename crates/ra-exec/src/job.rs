@@ -1,7 +1,7 @@
 //! Background job lifecycle plus `wait{until: output|done|timeout|match}`.
 //!
 //! A background job is a view of one execution session, not a second process owner. The
-//! [`ProcessManager`](crate::session::ProcessManager) that started the command remains solely
+//! [`ProcessManager`] that started the command remains solely
 //! responsible for its child, process group, capture buffers, deadlines, and termination. This
 //! module adds the consumer-side lifecycle contract: inspect a job, wait for new output, wait for
 //! it to finish, wait for a bounded interval, or stop when retained output contains a literal

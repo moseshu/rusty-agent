@@ -225,7 +225,7 @@ impl ModelResponse {
 
     /// Sets usage for this call.
     ///
-    /// A [`RequestUsage`](crate::usage::RequestUsage) converts, which is what an adapter reporting
+    /// A [`RequestUsage`] converts, which is what an adapter reporting
     /// one provider request passes: the conversion records it as one request rather than as bare
     /// totals with nothing behind them.
     #[must_use]

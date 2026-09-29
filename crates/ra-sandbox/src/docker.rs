@@ -17,7 +17,7 @@
 //! # The daemon is behind an interface
 //!
 //! The client is handed a [`DockerApi`], as the reference's is handed a `docker-py` client. The
-//! implementation that talks to a daemon, [`BollardDockerApi`], is behind this crate's `docker`
+//! implementation that talks to a daemon, `BollardDockerApi`, is behind this crate's `docker`
 //! feature; tests hand in fakes, as the reference's do.
 
 mod api;

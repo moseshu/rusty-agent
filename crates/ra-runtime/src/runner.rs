@@ -2,10 +2,10 @@
 //!
 //! # One loop, not two
 //!
-//! Both entry points call [`run_loop`]. The streaming one differs by exactly one thing — it is
-//! handed a channel to announce into — and that is the whole of the difference the reference
-//! implementation spreads across two code paths. Two loops drift: the streamed one grows a fix the
-//! other never gets, and the bug reproduces only when the host happens to subscribe.
+//! Both entry points call the private `run_loop`. The streaming one differs by exactly one thing
+//! — it is handed a channel to announce into — and that is the whole of the difference the
+//! reference implementation spreads across two code paths. Two loops drift: the streamed one grows
+//! a fix the other never gets, and the bug reproduces only when the host happens to subscribe.
 //!
 //! # What one turn is
 //!
@@ -21,10 +21,10 @@
 //! # Deliberately absent
 //!
 //! **Budget policy beyond the shared value types.** Turns, tokens, and a wall-clock deadline are
-//! enforced here through [`BudgetLimit`](ra_core::budget::BudgetLimit); spend is not a dimension,
-//! because pricing is the host's. Provider refusal fallback and structured-output validation remain
-//! at their provider and output-contract seams; when either produces a terminal [`Error`], they use
-//! the same [`RunErrorHandler`] contract.
+//! enforced here through [`BudgetLimit`]; spend is not a dimension, because pricing is the host's.
+//! Provider refusal fallback and structured-output validation remain at their provider and
+//! output-contract seams; when either produces a terminal [`Error`], they use the same
+//! [`RunErrorHandler`] contract.
 //!
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
@@ -412,7 +412,7 @@ impl RunConfig {
     /// that executes, its settings fold onto that instance's settings layer, and its context
     /// transform is appended to the processors installed above. Installation order is the assembly
     /// order; dependencies check presence without reordering capabilities — see
-    /// [`CapabilityPlan`](crate::capability::CapabilityPlan) for the whole rule.
+    /// [`CapabilityPlan`] for the whole rule.
     ///
     /// A missing dependency, two capabilities claiming one family, or a capability requiring its
     /// own family fails the run before its first model call. Mutually dependent capabilities are

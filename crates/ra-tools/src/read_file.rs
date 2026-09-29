@@ -9,7 +9,7 @@
 //! surface from Claude Code and the execution surface from Codex.
 //!
 //! This is the first real consumer of R2-3's
-//! [`ObservationMetadata`](ra_core::tool::ObservationMetadata): the window and the ceiling are
+//! [`ObservationMetadata`]: the window and the ceiling are
 //! recorded as typed truncations for the host, and rendered into a leading sentence for the model
 //! only at the provider boundary.
 //!

@@ -77,7 +77,8 @@ impl AnthropicMessagesProvider {
     /// Chooses whether a custom tool is advertised as a function taking one string `input`.
     ///
     /// Off by default: Messages has no custom tool form, so one is refused. Turning it on is this
-    /// framework's extension and drops the tool's grammar — see [`crate::custom_tools`].
+    /// framework's extension and drops the tool's grammar — see the private `custom_tools`
+    /// module.
     #[must_use]
     pub const fn with_custom_tools_as_functions(mut self, enabled: bool) -> Self {
         self.custom_tools_as_functions = enabled;
@@ -168,7 +169,8 @@ impl AnthropicMessagesModel {
     /// Chooses whether a custom tool is advertised as a function taking one string `input`.
     ///
     /// Off by default: Messages has no custom tool form, so one is refused. Turning it on is this
-    /// framework's extension and drops the tool's grammar — see [`crate::custom_tools`].
+    /// framework's extension and drops the tool's grammar — see the private `custom_tools`
+    /// module.
     #[must_use]
     pub const fn with_custom_tools_as_functions(mut self, enabled: bool) -> Self {
         self.custom_tools_as_functions = enabled;

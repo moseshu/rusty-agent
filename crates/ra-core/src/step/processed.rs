@@ -9,12 +9,12 @@
 //!
 //! The reference implementation splits those out because each is a distinct provider payload with
 //! its own execution path. This framework has exactly one local execution contract —
-//! [`Tool`] plus [`ToolLookupKey`] dispatch — and a shell or patch tool is an ordinary
-//! implementation of it living in a product crate. A category per product tool would put product
-//! vocabulary in the kernel and put `if name == "shell"` back in the runner, which is the
-//! text-driven control flow this framework forbids. The categories below are the ones that make
-//! settlement *behave* differently: run it, transfer control, ask a human, or answer a call that
-//! bound to nothing.
+//! [`Tool`] plus [`ToolLookupKey`](crate::tool::ToolLookupKey) dispatch — and a shell or patch
+//! tool is an ordinary implementation of it living in a product crate. A category per product tool
+//! would put product vocabulary in the kernel and put `if name == "shell"` back in the runner,
+//! which is the text-driven control flow this framework forbids. The categories below are the ones
+//! that make settlement *behave* differently: run it, transfer control, ask a human, or answer a
+//! call that bound to nothing.
 //!
 //! # Two things this type deliberately derives instead of storing
 //!
@@ -270,9 +270,10 @@ impl ToolNotFound {
 /// whose record is missing from `new_items` is a call the session never learns about.
 ///
 /// This type is deliberately **not** serializable. It holds `Arc<dyn Tool>`, and a resolved tool
-/// object is not state — a future resume path persists [`ToolLookupKey`]s and rebinds them
-/// against the live registry on resume, which is the only way a restored run can refuse to call a
-/// tool that no longer exists instead of silently calling a different one.
+/// object is not state — a future resume path persists
+/// [`ToolLookupKey`](crate::tool::ToolLookupKey)s and rebinds them against the live registry on
+/// resume, which is the only way a restored run can refuse to call a tool that no longer exists
+/// instead of silently calling a different one.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct ProcessedResponse {
