@@ -44,8 +44,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # 默认 features 只编译一部分代码：anthropic、docker、http-sink 等可选 feature 后面的
+      # 代码，上一步一行都没检查到（anthropic 模块曾因此攒下 5 条 clippy 错误）。
+      - name: Clippy（全部 features）
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: 编译
         run: cargo check --workspace --all-targets
+
+      # 文档链接：解析不到、指向私有项（没有页面）、多余的显式目标都算错误。两种配置都要跑：
+      # 可选 feature 后面的文档只在全开时生成，而指向可选 feature 里某一项的链接只在默认配置下
+      # 才解析失败。
+      - name: 文档（默认与全部 features）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --workspace --no-deps
+          cargo doc --workspace --all-features --no-deps
 
   gates:
     name: xtask 九条门禁
