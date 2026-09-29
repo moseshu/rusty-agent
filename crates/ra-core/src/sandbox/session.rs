@@ -78,14 +78,10 @@ pub enum ShellInvocation {
 /// What a caller is asking a session to run.
 #[derive(Debug, Clone, Default)]
 pub struct ExecRequest {
-    /// The command and its arguments.
-    pub command: Vec<String>,
-    /// How long to wait before giving up, in seconds.
-    pub timeout_s: Option<f64>,
-    /// Whether a shell sits between the session and the command.
-    pub shell: ShellInvocation,
-    /// The account to run as, or the session's default.
-    pub user: Option<User>,
+    command: Vec<String>,
+    timeout_s: Option<f64>,
+    shell: ShellInvocation,
+    user: Option<User>,
 }
 
 impl ExecRequest {
@@ -96,6 +92,30 @@ impl ExecRequest {
             command: command.into_iter().collect(),
             ..Self::default()
         }
+    }
+
+    /// The command and its arguments.
+    #[must_use]
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    /// How long to wait before giving up, in seconds.
+    #[must_use]
+    pub const fn timeout_s(&self) -> Option<f64> {
+        self.timeout_s
+    }
+
+    /// Whether a shell sits between the session and the command.
+    #[must_use]
+    pub const fn shell(&self) -> &ShellInvocation {
+        &self.shell
+    }
+
+    /// The account to run as, or the session's default.
+    #[must_use]
+    pub const fn user(&self) -> Option<&User> {
+        self.user.as_ref()
     }
 
     /// Gives up after `timeout_s` seconds.
@@ -116,6 +136,14 @@ impl ExecRequest {
     #[must_use]
     pub fn as_user(mut self, user: User) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    /// Runs as the session's default account, for a backend that switches accounts some other way
+    /// than through the command.
+    #[must_use]
+    pub fn without_user(mut self) -> Self {
+        self.user = None;
         self
     }
 }
@@ -1221,20 +1249,9 @@ pub trait SandboxSession: Send + Sync {
 /// How a client was asked to make a session.
 #[derive(Debug, Clone, Default)]
 pub struct CreateRequest {
-    /// What to start the workspace from and persist back to, or nothing.
-    ///
-    /// Either a snapshot that already names stored content, or a spec saying where to put one; the
-    /// client settles it with [`resolve_snapshot`](super::snapshot::resolve_snapshot) once it has
-    /// chosen the session's id.
-    pub snapshot: Option<SnapshotSource>,
-    /// What the workspace should contain.
-    pub manifest: Option<Manifest>,
-    /// The backend's own settings: an image, a template, an endpoint.
-    ///
-    /// Carried as a routed payload rather than a concrete type, for the reason the registry exists:
-    /// a third-party backend's options are its own, and a closed set here would shut it out. A
-    /// client checks the discriminator names its own backend before reading anything.
-    pub options: Option<DiscriminatedPayload>,
+    snapshot: Option<SnapshotSource>,
+    manifest: Option<Manifest>,
+    options: Option<DiscriminatedPayload>,
 }
 
 impl CreateRequest {
@@ -1242,6 +1259,39 @@ impl CreateRequest {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// What to start the workspace from and persist back to, or nothing.
+    ///
+    /// Either a snapshot that already names stored content, or a spec saying where to put one; the
+    /// client settles it with [`resolve_snapshot`](super::snapshot::resolve_snapshot) once it has
+    /// chosen the session's id.
+    #[must_use]
+    pub const fn snapshot(&self) -> Option<&SnapshotSource> {
+        self.snapshot.as_ref()
+    }
+
+    /// What the workspace should contain.
+    #[must_use]
+    pub const fn manifest(&self) -> Option<&Manifest> {
+        self.manifest.as_ref()
+    }
+
+    /// The backend's own settings: an image, a template, an endpoint.
+    ///
+    /// Carried as a routed payload rather than a concrete type, for the reason the registry exists:
+    /// a third-party backend's options are its own, and a closed set here would shut it out. A
+    /// client checks the discriminator names its own backend before reading anything.
+    #[must_use]
+    pub const fn options(&self) -> Option<&DiscriminatedPayload> {
+        self.options.as_ref()
+    }
+
+    /// Starts from, or stores to, whatever `source` names, for a caller that already resolved it.
+    #[must_use]
+    pub fn with_snapshot_source(mut self, source: SnapshotSource) -> Self {
+        self.snapshot = Some(source);
+        self
     }
 
     /// Starts the workspace from `snapshot`, which already names stored content.

@@ -5,6 +5,7 @@ use crate::sandbox::ExecResult;
 
 /// Failure-specific data that cannot be recovered from a diagnostic message.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SandboxErrorDetails {
     /// A completed command and its original, possibly non-UTF-8 output.
     ExecNonZero {

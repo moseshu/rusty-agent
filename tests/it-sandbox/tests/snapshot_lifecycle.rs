@@ -153,8 +153,8 @@ impl SandboxSession for RecordingSession {
         self.calls
             .lock()
             .expect("calls")
-            .push(Call::Exec(request.command.clone()));
-        let program = request.command.first().cloned().unwrap_or_default();
+            .push(Call::Exec(request.command().to_vec()));
+        let program = request.command().first().cloned().unwrap_or_default();
 
         if program == "sh" {
             // Installing the helper.

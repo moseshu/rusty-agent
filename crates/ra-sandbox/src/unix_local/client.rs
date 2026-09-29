@@ -250,15 +250,15 @@ impl SandboxClient for UnixLocalSandboxClient {
     /// A failure is let out as the reference's `@redact_mount_error_data` lets it out: replaced when
     /// the manifest the call was handed carries mount authority.
     async fn create(&self, request: CreateRequest) -> SandboxResult<Box<dyn SandboxSession>> {
-        let requested_manifest = request.manifest.clone().unwrap_or_default();
+        let requested_manifest = request.manifest().cloned().unwrap_or_default();
         let outcome: SandboxResult<Box<dyn SandboxSession>> = async {
-            self.check_options(request.options.as_ref())?;
-            let options = match &request.options {
+            self.check_options(request.options())?;
+            let options = match request.options() {
                 Some(payload) => UnixLocalSandboxClientOptions::from_payload(payload)?,
                 None => UnixLocalSandboxClientOptions::new(),
             };
 
-            let mut manifest = request.manifest.unwrap_or_default();
+            let mut manifest = requested_manifest.clone();
             // Checked before anything is created. A configuration this backend cannot honour should
             // leave nothing behind, and a temporary directory made first would outlive the refusal.
             //
@@ -293,8 +293,8 @@ impl SandboxClient for UnixLocalSandboxClient {
             // snapshot has it named after this session, and one that said nothing gets the snapshot
             // that stores nothing — under the same id, so that turning storage on later does not
             // change what the session is called.
-            let snapshot = resolve_snapshot(request.snapshot.as_ref(), &session_id.to_string())
-                .map_err(|error| {
+            let snapshot =
+                resolve_snapshot(request.snapshot(), &session_id.to_string()).map_err(|error| {
                     SandboxError::new(
                         ErrorCode::SandboxConfigInvalid,
                         OpName::Start,

@@ -162,10 +162,10 @@ impl SandboxSession for FakeSession {
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
-        let user = request.user.as_ref().map_or("-", |user| user.name.as_str());
-        self.step(&format!("exec[{}]as[{user}]", request.command.join(" ")));
+        let user = request.user().map_or("-", |user| user.name.as_str());
+        self.step(&format!("exec[{}]as[{user}]", request.command().join(" ")));
         let exists = request
-            .command
+            .command()
             .last()
             .is_some_and(|path| self.0.directories.lock().unwrap().contains(path));
         Ok(ExecResult::new(Vec::new(), Vec::new(), i32::from(!exists)))
@@ -406,7 +406,7 @@ impl SandboxClient for FakeClient {
         let state = SandboxSessionState::new(
             self.backend,
             Snapshot::noop(),
-            request.manifest.clone().unwrap_or_default(),
+            request.manifest().cloned().unwrap_or_default(),
         );
         self.created_ids.lock().unwrap().push(state.session_id());
         self.create_requests.lock().unwrap().push(request);
@@ -1064,10 +1064,10 @@ async fn a_fresh_session_takes_the_configured_manifest_ahead_of_the_agents_defau
     .unwrap();
 
     let requests = client.create_requests.lock().unwrap();
-    assert_eq!(requests[0].manifest.as_ref().unwrap().root, "/run");
+    assert_eq!(requests[0].manifest().unwrap().root, "/run");
     assert_eq!(
-        requests[0].snapshot,
-        Some(ra_core::sandbox::SnapshotSource::Spec(
+        requests[0].snapshot(),
+        Some(&ra_core::sandbox::SnapshotSource::Spec(
             ra_core::sandbox::SnapshotSpec::Local {
                 base_path: "/snapshots/default".into()
             }
@@ -1092,7 +1092,7 @@ async fn the_run_as_user_is_added_to_a_created_manifest_even_without_one_declare
     .unwrap();
 
     let requests = client.create_requests.lock().unwrap();
-    let manifest = requests[0].manifest.as_ref().unwrap();
+    let manifest = requests[0].manifest().unwrap();
     assert_eq!(manifest.users, vec![User::new("builder")]);
 }
 
@@ -2504,8 +2504,8 @@ async fn the_snapshot_is_the_configured_one_else_the_clients_default_else_nothin
     .await
     .unwrap();
     assert_eq!(
-        client.create_requests.lock().unwrap()[0].snapshot,
-        Some(SnapshotSource::Spec(SnapshotSpec::Noop))
+        client.create_requests.lock().unwrap()[0].snapshot(),
+        Some(&SnapshotSource::Spec(SnapshotSpec::Noop))
     );
 
     let client = FakeClient::new();
@@ -2519,8 +2519,8 @@ async fn the_snapshot_is_the_configured_one_else_the_clients_default_else_nothin
     .unwrap();
     assert_eq!(result.final_text(), "done");
     assert_eq!(
-        client.create_requests.lock().unwrap()[0].snapshot,
-        Some(SnapshotSource::Spec(SnapshotSpec::Noop))
+        client.create_requests.lock().unwrap()[0].snapshot(),
+        Some(&SnapshotSource::Spec(SnapshotSpec::Noop))
     );
 }
 
@@ -2748,7 +2748,7 @@ async fn a_continued_run_prepares_an_agent_it_hands_off_to_from_its_own_manifest
     assert_eq!(client.resumed_ids.lock().unwrap().len(), 1);
     let requests = client.create_requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].manifest.as_ref().unwrap().root, "/worker");
+    assert_eq!(requests[0].manifest().unwrap().root, "/worker");
     let instructions = model.instructions(1);
     assert!(
         instructions.contains(
@@ -2974,7 +2974,7 @@ async fn a_capability_change_reaches_the_session_however_it_comes_about() {
     .unwrap();
     assert!(
         client.create_requests.lock().unwrap()[0]
-            .manifest
+            .manifest()
             .as_ref()
             .unwrap()
             .entries

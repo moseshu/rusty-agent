@@ -415,21 +415,21 @@ fn user_value(user: Option<&ra_core::sandbox::User>) -> Value {
 }
 
 fn exec_start_data(request: &ExecRequest) -> Map<String, Value> {
-    let shell = match &request.shell {
+    let shell = match request.shell() {
         ShellInvocation::Login => Value::Bool(true),
         ShellInvocation::None => Value::Bool(false),
         ShellInvocation::Prefix(prefix) => json!(prefix),
     };
     let mut data = Map::new();
-    data.insert("command".to_owned(), json!(request.command));
+    data.insert("command".to_owned(), json!(request.command()));
     data.insert(
         "timeout_s".to_owned(),
         request
-            .timeout_s
+            .timeout_s()
             .map_or(Value::Null, |timeout| json!(timeout)),
     );
     data.insert("shell".to_owned(), shell);
-    data.insert("user".to_owned(), user_value(request.user.as_ref()));
+    data.insert("user".to_owned(), user_value(request.user()));
     data
 }
 

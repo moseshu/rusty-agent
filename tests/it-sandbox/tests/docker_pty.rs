@@ -204,7 +204,7 @@ async fn any_other_write_failure_is_reported() {
         .expect_err("a failed write");
 
     assert_eq!(error.error_code(), ErrorCode::ExecTransportError);
-    assert_eq!(error.context()["session_id"], process_id.0);
+    assert_eq!(error.context()["session_id"], process_id.get());
     session.pty_terminate_all().await.expect("terminate");
 }
 
@@ -267,8 +267,10 @@ async fn a_start_that_outlasts_its_timeout_kills_through_the_pid_file(#[case] de
     *fake.delayed.lock().unwrap() = Some(delayed);
     let session = ready_session(&fake);
 
-    let mut request = direct(&["python3"]).with_tty(true).with_yield_time_s(0.01);
-    request.timeout_s = Some(0.01);
+    let request = direct(&["python3"])
+        .with_tty(true)
+        .with_yield_time_s(0.01)
+        .with_timeout_s(0.01);
     let error = session.pty_start(request).await.expect_err("timed out");
 
     assert_eq!(error.error_code(), ErrorCode::ExecTimeout);

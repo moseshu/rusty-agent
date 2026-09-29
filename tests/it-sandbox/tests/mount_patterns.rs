@@ -112,10 +112,10 @@ impl SandboxSession for Recorder {
             .lock()
             .expect("requests")
             .push(request.clone());
-        let script = request.command.join(" ");
-        let command = match request.shell {
+        let script = request.command().join(" ");
+        let command = match request.shell() {
             ShellInvocation::Login => vec!["sh".to_owned(), "-lc".to_owned(), script.clone()],
-            ShellInvocation::None => request.command,
+            ShellInvocation::None => request.command().to_vec(),
             ShellInvocation::Prefix(_) => panic!("unexpected custom shell"),
         };
         self.commands.lock().expect("commands").push(command);
@@ -1601,7 +1601,7 @@ async fn tool_probes_allow_the_local_backend_to_select_a_non_login_shell() {
         .expect("apply");
         let requests = session.requests.lock().expect("requests");
         let probe = &requests[0];
-        assert!(matches!(probe.shell, ShellInvocation::Login));
+        assert!(matches!(probe.shell(), ShellInvocation::Login));
         assert_eq!(
             ra_sandbox::unix_local::prepare_exec_command(probe),
             vec![

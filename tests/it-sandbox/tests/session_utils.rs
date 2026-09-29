@@ -178,12 +178,12 @@ async fn a_refused_read_is_classified_by_a_probe_run_as_the_same_account() {
         let requests = session.exec_requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 1);
         let probe = &requests[0];
-        assert_eq!(probe.command[..2], ["sh", "-c"]);
-        assert!(probe.command[2].starts_with("# READ_PATH_PROBE_V3\n"));
-        assert_eq!(probe.command[3..], ["sh", "/workspace/target.txt"]);
-        assert_eq!(probe.shell, ShellInvocation::None);
-        assert_eq!(probe.user, Some(User::new("sandbox-user")));
-        assert_eq!(probe.timeout_s, Some(10.0));
+        assert_eq!(probe.command()[..2], ["sh", "-c"]);
+        assert!(probe.command()[2].starts_with("# READ_PATH_PROBE_V3\n"));
+        assert_eq!(probe.command()[3..], ["sh", "/workspace/target.txt"]);
+        assert_eq!(probe.shell(), &ShellInvocation::None);
+        assert_eq!(probe.user().cloned(), Some(User::new("sandbox-user")));
+        assert_eq!(probe.timeout_s(), Some(10.0));
         assert_eq!(error.context()["existence_probe_exit_code"], probe_exit);
     }
 }
@@ -249,7 +249,7 @@ async fn probe_script() -> String {
     )
     .await;
     let requests = session.exec_requests.lock().expect("requests").clone();
-    requests[0].command[2].clone()
+    requests[0].command()[2].clone()
 }
 
 /// Runs the probe on `path` with `sh`, as the session does, and answers its exit status.

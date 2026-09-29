@@ -417,8 +417,8 @@ impl DockerSandboxClient {
             .start_container(&container_id)
             .await
             .map_err(|error| daemon_failure(OpName::Start, error))?;
-        let snapshot = resolve_snapshot(request.snapshot.as_ref(), &session_id.to_string())
-            .map_err(|error| {
+        let snapshot =
+            resolve_snapshot(request.snapshot(), &session_id.to_string()).map_err(|error| {
                 SandboxError::new(
                     ErrorCode::SandboxConfigInvalid,
                     OpName::Start,
@@ -484,8 +484,8 @@ impl DockerSandboxClient {
 
 impl DockerSandboxClient {
     async fn create_owned(&self, request: CreateRequest) -> SandboxResult<AcquiredSession> {
-        self.check_options(request.options.as_ref())?;
-        let options = match &request.options {
+        self.check_options(request.options())?;
+        let options = match request.options() {
             Some(payload) => DockerSandboxClientOptions::from_payload(payload)?,
             None => {
                 return Err(SandboxError::new(
@@ -495,7 +495,7 @@ impl DockerSandboxClient {
                 ));
             }
         };
-        let manifest = request.manifest.clone().unwrap_or_default();
+        let manifest = request.manifest().cloned().unwrap_or_default();
         let outcome = async {
             self.validate_manifest_for_create(&manifest)?;
             validate_docker_path_grants(&manifest)?;

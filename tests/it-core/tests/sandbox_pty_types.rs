@@ -13,7 +13,7 @@ use ra_core::sandbox::{
 };
 
 fn meta(process_id: i64, last_used: f64, exited: bool) -> PtyProcessMeta<f64> {
-    PtyProcessMeta::new(PtyProcessId(process_id), last_used, exited)
+    PtyProcessMeta::new(PtyProcessId::new(process_id), last_used, exited)
 }
 
 // `test_clamp_pty_yield_time_ms_enforces_minimum`
@@ -38,7 +38,10 @@ fn a_write_that_sends_nothing_waits_longer() {
 // `test_allocate_pty_process_id_avoids_used_ids`
 #[test]
 fn an_allocated_id_is_never_one_in_use() {
-    let used: HashSet<PtyProcessId> = [1000, 1001, 1002].into_iter().map(PtyProcessId).collect();
+    let used: HashSet<PtyProcessId> = [1000, 1001, 1002]
+        .into_iter()
+        .map(PtyProcessId::new)
+        .collect();
     let allocated = allocate_pty_process_id(&used);
     assert!(!used.contains(&allocated));
 }
@@ -54,7 +57,7 @@ fn pruning_prefers_an_exited_process_outside_the_protected_recent_set() {
 
     assert_eq!(
         process_id_to_prune_from_meta(&entries),
-        Some(PtyProcessId(2001))
+        Some(PtyProcessId::new(2001))
     );
 }
 
@@ -74,7 +77,7 @@ fn a_wait_above_the_maximum_is_lowered_to_it() {
 fn allocated_ids_stay_in_range() {
     let used = HashSet::new();
     for _ in 0..1_000 {
-        let PtyProcessId(id) = allocate_pty_process_id(&used);
+        let id = allocate_pty_process_id(&used).get();
         assert!((PTY_PROCESS_ID_MIN..PTY_PROCESS_ID_MAX_EXCLUSIVE).contains(&id));
     }
 }
@@ -89,7 +92,7 @@ fn pruning_falls_back_to_the_least_recent_running_process() {
 
     assert_eq!(
         process_id_to_prune_from_meta(&entries),
-        Some(PtyProcessId(2002))
+        Some(PtyProcessId::new(2002))
     );
 }
 
@@ -106,11 +109,11 @@ fn nothing_is_pruned_when_every_process_is_protected() {
 #[test]
 fn a_start_request_defaults_to_the_login_shell() {
     let request = PtyStartRequest::new(["pwd".to_owned()]);
-    assert_eq!(request.shell, ShellInvocation::Login);
-    assert!(!request.tty);
+    assert_eq!(request.shell(), &ShellInvocation::Login);
+    assert!(!request.tty());
 
     let request = request.with_shell(ShellInvocation::None);
-    assert_eq!(request.shell, ShellInvocation::None);
+    assert_eq!(request.shell(), &ShellInvocation::None);
 }
 
 /// Writing to a process started without a terminal: the reference's exact words, a transport

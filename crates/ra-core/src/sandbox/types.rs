@@ -502,8 +502,15 @@ impl ExposedPortEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("scheme must be either 'http' or 'ws', got {scheme:?}")]
 pub struct UnsupportedScheme {
+    scheme: String,
+}
+
+impl UnsupportedScheme {
     /// The scheme as given.
-    pub scheme: String,
+    #[must_use]
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
 }
 
 /// Structured metadata attached to a sandbox error.

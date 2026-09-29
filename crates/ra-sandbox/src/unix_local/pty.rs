@@ -218,7 +218,7 @@ impl PtyProcesses {
 
     /// Sends input to a registered process, or only waits when there is none, and collects output.
     pub(crate) async fn write(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
-        let process_id = request.process_id;
+        let process_id = request.process_id();
         let entry = self
             .table
             .lock()
@@ -226,22 +226,22 @@ impl PtyProcesses {
             .processes
             .get(&process_id)
             .cloned()
-            .ok_or_else(|| SandboxError::pty_session_not_found(process_id.0))?;
+            .ok_or_else(|| SandboxError::pty_session_not_found(process_id.get()))?;
 
-        if !request.chars.is_empty() {
+        if !request.chars().is_empty() {
             if !entry.tty {
-                return Err(SandboxError::pty_stdin_unavailable(process_id.0));
+                return Err(SandboxError::pty_stdin_unavailable(process_id.get()));
             }
-            write_to_terminal(&entry, process_id, request.chars.clone().into_bytes()).await?;
+            write_to_terminal(&entry, process_id, request.chars().as_bytes().to_vec()).await?;
             tokio::time::sleep(WRITE_SETTLE).await;
         }
 
-        let wait_ms = seconds_to_millis(request.yield_time_s, DEFAULT_WRITE_YIELD_TIME_MS);
+        let wait_ms = seconds_to_millis(request.yield_time_s(), DEFAULT_WRITE_YIELD_TIME_MS);
         let (output, original_token_count) = collect_pty_output(
             &entry.output,
             || entry.output_closed.load(Ordering::SeqCst),
-            resolve_pty_write_yield_time_ms(wait_ms, request.chars.is_empty()),
-            request.max_output_tokens,
+            resolve_pty_write_yield_time_ms(wait_ms, request.chars().is_empty()),
+            request.max_output_tokens(),
         )
         .await;
         entry.touch();
@@ -601,16 +601,16 @@ async fn write_to_terminal(
     .await
     .map_err(|error| {
         SandboxError::exec_transport(Vec::new(), Some(&error.to_string()))
-            .with_context("session_id", process_id.0)
+            .with_context("session_id", process_id.get())
     })?;
 
     match written {
-        None => Err(SandboxError::pty_stdin_unavailable(process_id.0)),
+        None => Err(SandboxError::pty_stdin_unavailable(process_id.get())),
         Some(Ok(())) => Ok(()),
         Some(Err(error)) if terminal_is_going_away(&error) => Ok(()),
         Some(Err(error)) => Err(
             SandboxError::exec_transport(Vec::new(), Some(&error.to_string()))
-                .with_context("session_id", process_id.0)
+                .with_context("session_id", process_id.get())
                 .with_context("os_error", error.to_string()),
         ),
     }

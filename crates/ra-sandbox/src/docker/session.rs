@@ -721,12 +721,9 @@ impl SandboxSession for DockerSandboxSession {
     /// The account is handed to the daemon, which starts the command as that account directly; the
     /// image does not need `sudo` for a caller to name one.
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
-        let user = request.user.as_ref().map(|user| user.name.clone());
-        let command = remote::prepare_exec_command(&ExecRequest {
-            user: None,
-            ..request.clone()
-        });
-        self.exec_internal_for_user(command, request.timeout_s, user)
+        let user = request.user().map(|user| user.name.clone());
+        let command = remote::prepare_exec_command(&request.clone().without_user());
+        self.exec_internal_for_user(command, request.timeout_s(), user)
             .await
     }
 

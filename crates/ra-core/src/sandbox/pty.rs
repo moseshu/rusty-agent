@@ -38,7 +38,21 @@ pub const PTY_PROCESS_ID_MAX_EXCLUSIVE: i64 = 100_000;
 /// session*, and a session that reused a pid it did not own would address someone else's work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PtyProcessId(pub i64);
+pub struct PtyProcessId(i64);
+
+impl PtyProcessId {
+    /// Wraps a process id a session handed out.
+    #[must_use]
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    /// The number the session and the model address this process by.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
 
 impl std::fmt::Display for PtyProcessId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,25 +119,13 @@ impl PtyExecUpdate {
 /// What a caller is asking a session to start interactively.
 #[derive(Debug, Clone, Default)]
 pub struct PtyStartRequest {
-    /// The command and its arguments.
-    pub command: Vec<String>,
-    /// How long to wait for the whole command, in seconds.
-    ///
-    /// Carried because the reference's signature carries it; the local backend ignores it, as the
-    /// reference's does, since an interactive process ends when it is told to rather than on a
-    /// clock.
-    pub timeout_s: Option<f64>,
-    /// Whether a shell sits between the session and the command. The default is the login shell,
-    /// as for a one-shot command.
-    pub shell: ShellInvocation,
-    /// Whether a terminal is allocated, as opposed to plain pipes.
-    pub tty: bool,
-    /// The account to run as, or the session's default.
-    pub user: Option<User>,
-    /// How long to wait for output before giving the turn back, in seconds.
-    pub yield_time_s: Option<f64>,
-    /// The ceiling on returned output, in tokens.
-    pub max_output_tokens: Option<u64>,
+    command: Vec<String>,
+    timeout_s: Option<f64>,
+    shell: ShellInvocation,
+    tty: bool,
+    user: Option<User>,
+    yield_time_s: Option<f64>,
+    max_output_tokens: Option<u64>,
 }
 
 impl PtyStartRequest {
@@ -134,6 +136,60 @@ impl PtyStartRequest {
             command: command.into_iter().collect(),
             ..Self::default()
         }
+    }
+
+    /// The command and its arguments.
+    #[must_use]
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    /// How long to wait for the whole command, in seconds.
+    ///
+    /// Carried because the reference's signature carries it; the local backend ignores it, as the
+    /// reference's does, since an interactive process ends when it is told to rather than on a
+    /// clock.
+    #[must_use]
+    pub const fn timeout_s(&self) -> Option<f64> {
+        self.timeout_s
+    }
+
+    /// Whether a shell sits between the session and the command. The default is the login shell,
+    /// as for a one-shot command.
+    #[must_use]
+    pub const fn shell(&self) -> &ShellInvocation {
+        &self.shell
+    }
+
+    /// Whether a terminal is allocated, as opposed to plain pipes.
+    #[must_use]
+    pub const fn tty(&self) -> bool {
+        self.tty
+    }
+
+    /// The account to run as, or the session's default.
+    #[must_use]
+    pub const fn user(&self) -> Option<&User> {
+        self.user.as_ref()
+    }
+
+    /// How long to wait for output before giving the turn back, in seconds.
+    #[must_use]
+    pub const fn yield_time_s(&self) -> Option<f64> {
+        self.yield_time_s
+    }
+
+    /// The ceiling on returned output, in tokens.
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
+    }
+
+    /// Gives up on the whole command after `timeout_s` seconds, on a backend that bounds it.
+    #[must_use]
+    pub const fn with_timeout_s(mut self, timeout_s: f64) -> Self {
+        self.timeout_s = Some(timeout_s);
+        self
     }
 
     /// Puts a different shell, or none, between the session and the command.
@@ -175,16 +231,10 @@ impl PtyStartRequest {
 /// What a caller is sending to a running interactive process.
 #[derive(Debug, Clone)]
 pub struct PtyWriteRequest {
-    /// The process to write to.
-    pub process_id: PtyProcessId,
-    /// The characters to send, which may be empty.
-    ///
-    /// Empty is not a no-op: it is how a caller waits for more output without sending anything.
-    pub chars: String,
-    /// How long to wait for output before giving the turn back, in seconds.
-    pub yield_time_s: Option<f64>,
-    /// The ceiling on returned output, in tokens.
-    pub max_output_tokens: Option<u64>,
+    process_id: PtyProcessId,
+    chars: String,
+    yield_time_s: Option<f64>,
+    max_output_tokens: Option<u64>,
 }
 
 impl PtyWriteRequest {
@@ -208,6 +258,32 @@ impl PtyWriteRequest {
             yield_time_s: None,
             max_output_tokens: None,
         }
+    }
+
+    /// The process to write to.
+    #[must_use]
+    pub const fn process_id(&self) -> PtyProcessId {
+        self.process_id
+    }
+
+    /// The characters to send, which may be empty.
+    ///
+    /// Empty is not a no-op: it is how a caller waits for more output without sending anything.
+    #[must_use]
+    pub fn chars(&self) -> &str {
+        &self.chars
+    }
+
+    /// How long to wait for output before giving the turn back, in seconds.
+    #[must_use]
+    pub const fn yield_time_s(&self) -> Option<f64> {
+        self.yield_time_s
+    }
+
+    /// The ceiling on returned output, in tokens.
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
     }
 
     /// Gives the turn back after `yield_time_s` seconds.

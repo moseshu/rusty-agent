@@ -246,15 +246,13 @@ impl DockerSandboxSession {
         &self,
         request: PtyStartRequest,
     ) -> SandboxResult<PtyExecUpdate> {
-        let original = request.command.clone();
-        let user = request.user.as_ref().map(|user| user.name.clone());
-        let command = remote::prepare_exec_command(&ExecRequest {
-            command: request.command,
-            timeout_s: None,
-            shell: request.shell,
-            user: None,
-        });
-        self.recover_workspace_root_ready(request.timeout_s).await;
+        let original = request.command().to_vec();
+        let user = request.user().map(|user| user.name.clone());
+        let command = remote::prepare_exec_command(
+            &ExecRequest::new(request.command().iter().cloned())
+                .with_shell(request.shell().clone()),
+        );
+        self.recover_workspace_root_ready(request.timeout_s()).await;
         let workdir = self
             .workspace_root_ready
             .load(Ordering::SeqCst)
@@ -270,8 +268,8 @@ impl DockerSandboxSession {
                 command,
                 workdir,
                 user,
-                request.tty,
-                request.timeout_s,
+                request.tty(),
+                request.timeout_s(),
                 &pid_path,
             )
             .await;
@@ -279,7 +277,7 @@ impl DockerSandboxSession {
             Ok(entry) => entry,
             Err(StartFailure::TimedOut) => {
                 self.kill_pty_pid_path(&pid_path).await;
-                return Err(SandboxError::exec_timeout(original, request.timeout_s));
+                return Err(SandboxError::exec_timeout(original, request.timeout_s()));
             }
             Err(failure) => {
                 // Every other failure is a transport error the caller may retry, with what went
@@ -294,7 +292,7 @@ impl DockerSandboxSession {
             }
         };
         unregistered.entry = Some(Arc::clone(&entry));
-        if !request.tty {
+        if !request.tty() {
             // Unlike the reference's synchronous half-close, this can yield. The acquired process
             // must already be guarded so cancellation ends it before it has a public process id.
             let (reply, done) = oneshot::channel();
@@ -322,12 +320,12 @@ impl DockerSandboxSession {
             );
         }
 
-        let wait_ms = seconds_to_millis(request.yield_time_s, DEFAULT_START_YIELD_TIME_MS);
+        let wait_ms = seconds_to_millis(request.yield_time_s(), DEFAULT_START_YIELD_TIME_MS);
         let (output, original_token_count) = collect_pty_output(
             &entry.output,
             || entry.output_closed(),
             clamp_pty_yield_time_ms(wait_ms),
-            request.max_output_tokens,
+            request.max_output_tokens(),
         )
         .await;
         Ok(self
@@ -397,7 +395,7 @@ impl DockerSandboxSession {
         &self,
         request: PtyWriteRequest,
     ) -> SandboxResult<PtyExecUpdate> {
-        let process_id = request.process_id;
+        let process_id = request.process_id();
         let entry = self
             .pty
             .table
@@ -406,22 +404,22 @@ impl DockerSandboxSession {
             .processes
             .get(&process_id)
             .cloned()
-            .ok_or_else(|| SandboxError::pty_session_not_found(process_id.0))?;
+            .ok_or_else(|| SandboxError::pty_session_not_found(process_id.get()))?;
 
-        if !request.chars.is_empty() {
+        if !request.chars().is_empty() {
             if !entry.tty {
-                return Err(SandboxError::pty_stdin_unavailable(process_id.0));
+                return Err(SandboxError::pty_stdin_unavailable(process_id.get()));
             }
-            write_to_process(&entry, process_id, request.chars.as_bytes()).await?;
+            write_to_process(&entry, process_id, request.chars().as_bytes()).await?;
             tokio::time::sleep(WRITE_SETTLE).await;
         }
 
-        let wait_ms = seconds_to_millis(request.yield_time_s, DEFAULT_WRITE_YIELD_TIME_MS);
+        let wait_ms = seconds_to_millis(request.yield_time_s(), DEFAULT_WRITE_YIELD_TIME_MS);
         let (output, original_token_count) = collect_pty_output(
             &entry.output,
             || entry.output_closed(),
-            resolve_pty_write_yield_time_ms(wait_ms, request.chars.is_empty()),
-            request.max_output_tokens,
+            resolve_pty_write_yield_time_ms(wait_ms, request.chars().is_empty()),
+            request.max_output_tokens(),
         )
         .await;
         entry.touch();
@@ -665,7 +663,7 @@ async fn write_to_process(
         Ok(()) => Ok(()),
         Err(error) if connection_is_going_away(&error) => Ok(()),
         Err(error) => Err(SandboxError::exec_transport(Vec::new(), None)
-            .with_context("session_id", process_id.0)
+            .with_context("session_id", process_id.get())
             .with_context("os_error", error.to_string())
             .with_cause(error)),
     }
