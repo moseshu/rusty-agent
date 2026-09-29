@@ -45,8 +45,22 @@ fn cargo_check_fixture(name: &str) -> std::process::Output {
     let tests_root = manifest_dir
         .parent()
         .expect("it-e2e must live directly under tests/");
-    let manifest = manifest_dir.join("fixtures").join(name).join("Cargo.toml");
+    let fixture_dir = manifest_dir.join("fixtures").join(name);
+    let manifest = fixture_dir.join("Cargo.toml");
     let target_dir: PathBuf = tests_root.join("target").join("boundary-fixtures");
+
+    // The check runs offline, so every package the fixture resolves to must already be downloaded.
+    // Seeding its lockfile from this workspace's pins it to exactly the versions just built here;
+    // Cargo drops the entries the fixture does not use. Without that, an offline resolution picks
+    // the newest version the local index knows of, which need not have been downloaded — or may be
+    // yanked — and a lockfile kept in the repository drifts from this workspace's, which is not.
+    let workspace_lock = tests_root.join("Cargo.lock");
+    std::fs::copy(&workspace_lock, fixture_dir.join("Cargo.lock")).unwrap_or_else(|error| {
+        panic!(
+            "failed to seed the lockfile of fixture `{name}` from {}: {error}",
+            workspace_lock.display()
+        )
+    });
 
     Command::new(env!("CARGO"))
         .args(["check", "--quiet", "--offline", "--manifest-path"])
