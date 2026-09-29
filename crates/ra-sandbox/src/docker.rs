@@ -40,11 +40,16 @@ pub use api::{
 #[cfg(feature = "docker")]
 pub use bollard_api::BollardDockerApi;
 pub use client::DockerSandboxClient;
+// `Internal`: helpers the reference keeps private (`_docker_volume_name`, `_manifest_requires_fuse`
+// and the rest), public only so the separate test workspace can reach them, with no compatibility
+// promise.
+#[doc(hidden)]
 pub use container::{
     docker_volume_name, docker_volume_names_for_manifest, manifest_requires_fuse,
     manifest_requires_sys_admin, parse_repository_tag,
 };
 pub use session::DockerSandboxSession;
+#[doc(hidden)]
 pub use stream::LENGTH_FRAMED_STDIN_SCRIPT;
 
 use ra_core::sandbox::{
