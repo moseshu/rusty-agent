@@ -39,8 +39,9 @@ use crate::source;
 ///
 /// `SandboxErrorDetails` is here for a different reason from the rest: it shipped exhaustive in
 /// the `v0.1.0` tag of `ra-core`, which is `Stable`, so adding `#[non_exhaustive]` now would break
-/// a downstream exhaustive `match` outside a major version. It should become non-exhaustive at the
-/// next major version, with a migration note, and leave this list then.
+/// a downstream exhaustive `match` outside a major version. It should become non-exhaustive in a
+/// later major version, with a migration note, and leave this list then; `0.2.0` breaks other
+/// signatures but did not take this change.
 ///
 /// `ShellInvocation` is the reference's `shell: bool | list[str]`, a closed union every sandbox
 /// backend `match`es to shape the command it runs. A `_` arm would run a new kind of invocation
@@ -72,7 +73,8 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// than shape: types this port introduced that already shipped with public fields in the `v0.1.0`
 /// tag. Making their fields private breaks every caller that builds or reads them literally, which
 /// the stability policy allows only in a major version with a migration note, so they keep their
-/// fields until then and leave the list at that release.
+/// fields until a major version takes the change and leave the list at that release. `0.2.0` is a
+/// major version for other reasons and did not take it.
 ///
 /// Scoped by path so the exemption cannot spread to a same-named type elsewhere, and listed one by
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
@@ -146,7 +148,7 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-sandbox/src/mounts/config.rs",
         "DockerVolumeDriverConfig",
     ),
-    // Shipped with public fields in `v0.1.0`; private at the next major version. The four requests
+    // Shipped with public fields in `v0.1.0`; private in a later major version. The four requests
     // bundle a reference method's keyword arguments and have builders for every field except
     // `PtyStartRequest`'s timeout, so the migration is that one builder, read accessors, and private
     // fields. `ra-core` is `Stable`; `ra-sandbox` is
