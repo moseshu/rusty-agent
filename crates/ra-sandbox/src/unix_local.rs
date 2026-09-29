@@ -59,6 +59,10 @@ pub(crate) const WORKSPACE_ROOT_OWNED_FIELD: &str = "workspace_root_owned";
 /// Locale, certificates, the search path, and the two colour switches — enough for a command to
 /// behave like the host's own, and nothing that names a credential. A host that wants a different
 /// set passes its own; this is only the answer when it does not say.
+///
+/// `Internal`, as the reference's `_HOST_ENVIRONMENT_ALLOWLIST` is, and hidden from the
+/// documentation. It shipped public, so it becomes crate-private only in a major version.
+#[doc(hidden)]
 pub const HOST_ENVIRONMENT_ALLOWLIST: [&str; 20] = [
     "PATH",
     "LANG",

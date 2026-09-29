@@ -107,6 +107,10 @@ const FILESYSTEM_TREE_DEPTH: usize = 3;
 /// # Errors
 ///
 /// Returns the manifest's failure to describe itself.
+///
+/// `Internal`, as the reference's `_filesystem_instructions` is: public, and hidden from the
+/// documentation, only so the separate test workspace can reach it.
+#[doc(hidden)]
 pub fn filesystem_instructions(
     manifest: &Manifest,
     workspace_scope: &SandboxWorkspaceScope,

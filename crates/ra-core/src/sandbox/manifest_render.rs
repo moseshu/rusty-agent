@@ -240,6 +240,10 @@ fn collect(
 }
 
 /// Cuts a description to `max_chars`, saying that it was cut.
+///
+/// `Internal`, as the reference's `_truncate_manifest_description` is: public, and hidden from the
+/// documentation, only so the separate test workspace can reach it.
+#[doc(hidden)]
 #[must_use]
 pub fn truncate_manifest_description(description: &str, max_chars: Option<usize>) -> String {
     let Some(max_chars) = max_chars else {
