@@ -474,7 +474,7 @@ impl SandboxSession for UnixLocalSandboxSession {
         let command = exec::prepare_exec_command(&request);
         self.run_prepared(
             &command,
-            request.timeout_s,
+            request.timeout_s(),
             None,
             ArgumentPaths::WorkspaceRelative,
         )
@@ -491,12 +491,12 @@ impl SandboxSession for UnixLocalSandboxSession {
     /// runs until it exits or is ended, and the wait for output is what the caller bounds.
     async fn pty_start(&self, request: PtyStartRequest) -> SandboxResult<PtyExecUpdate> {
         let (env, cwd) = self.exec_context().await?;
-        let command = exec::prepare_exec_command(&ExecRequest {
-            command: request.command,
-            timeout_s: None,
-            shell: request.shell,
-            user: request.user,
-        });
+        let mut exec_request =
+            ExecRequest::new(request.command().iter().cloned()).with_shell(request.shell().clone());
+        if let Some(user) = request.user() {
+            exec_request = exec_request.as_user(user.clone());
+        }
+        let command = exec::prepare_exec_command(&exec_request);
         let grants = self.manifest().extra_path_grants;
         let host = exec::host_command(
             &command,
@@ -510,9 +510,9 @@ impl SandboxSession for UnixLocalSandboxSession {
                 &command,
                 host,
                 &env,
-                request.tty,
-                request.yield_time_s,
-                request.max_output_tokens,
+                request.tty(),
+                request.yield_time_s(),
+                request.max_output_tokens(),
             )
             .await
     }

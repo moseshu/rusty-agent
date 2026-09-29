@@ -33,7 +33,7 @@ use super::confine::HostConfinement;
 /// for a request naming another account cannot be found that way without a second account.
 #[must_use]
 pub fn prepare_exec_command(request: &ExecRequest) -> Vec<String> {
-    let prefix: Option<Vec<String>> = match &request.shell {
+    let prefix: Option<Vec<String>> = match request.shell() {
         ShellInvocation::None => None,
         ShellInvocation::Login => Some(vec!["sh".to_owned(), "-c".to_owned()]),
         // An empty prefix is no shell at all, which is how the reference reads an empty list.
@@ -42,20 +42,20 @@ pub fn prepare_exec_command(request: &ExecRequest) -> Vec<String> {
     };
 
     let mut command = match prefix {
-        None => request.command.clone(),
+        None => request.command().to_vec(),
         Some(mut prefix) => {
             // A single argument is already a command line; several are quoted back into one.
-            let joined = if request.command.len() == 1 {
-                request.command[0].clone()
+            let joined = if request.command().len() == 1 {
+                request.command()[0].clone()
             } else {
-                shell::join(request.command.iter().map(String::as_str))
+                shell::join(request.command().iter().map(String::as_str))
             };
             prefix.push(joined);
             prefix
         }
     };
 
-    if let Some(user) = &request.user {
+    if let Some(user) = request.user() {
         let mut elevated = vec![
             "sudo".to_owned(),
             "-u".to_owned(),

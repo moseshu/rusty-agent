@@ -505,11 +505,14 @@ impl SessionManager {
             _ => {}
         }
 
-        let request = CreateRequest {
-            snapshot: Some(self.config.resolve_snapshot(client.as_ref())),
-            manifest,
-            options,
-        };
+        let mut request = CreateRequest::new()
+            .with_snapshot_source(self.config.resolve_snapshot(client.as_ref()));
+        if let Some(manifest) = manifest {
+            request = request.with_manifest(manifest);
+        }
+        if let Some(options) = options {
+            request = request.with_options(options);
+        }
         let session = client
             .create(request)
             .instrument(tracing::info_span!(

@@ -125,7 +125,7 @@ impl SandboxSession for ScriptedSession {
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
-        let rendered = request.command.join(" ");
+        let rendered = request.command().join(" ");
         match self.next(Call::Exec(request)) {
             Answer::Exec(result) => result,
             Answer::ExecEcho => Ok(ExecResult::new(
@@ -209,7 +209,7 @@ fn exec_session(result: SandboxResult<ExecResult>) -> Arc<ScriptedSession> {
 }
 
 fn running(process_id: i64) -> PtyExecUpdate {
-    PtyExecUpdate::running(PtyProcessId(process_id), Vec::new())
+    PtyExecUpdate::running(PtyProcessId::new(process_id), Vec::new())
 }
 
 fn transport_error(retry_safe: Option<bool>, tty: bool) -> SandboxError {
@@ -510,9 +510,9 @@ async fn exec_command_reports_in_the_references_format() {
     .expect("output");
 
     let calls = exec_calls(&scripted);
-    assert_eq!(calls[0].command, ["pwd"]);
-    assert_eq!(calls[0].timeout_s, Some(1.5));
-    assert_eq!(calls[0].shell, ShellInvocation::Login);
+    assert_eq!(calls[0].command(), ["pwd"]);
+    assert_eq!(calls[0].timeout_s(), Some(1.5));
+    assert_eq!(calls[0].shell(), &ShellInvocation::Login);
     assert_eq!(
         after_stamp(&output),
         "Process exited with code 7\nOutput:\nstdout: pwd\nstderr: pwd"
@@ -537,8 +537,8 @@ async fn exec_command_runs_as_the_bound_user_from_the_bound_directory() {
         .expect("output");
 
     let calls = exec_calls(&scripted);
-    assert_eq!(calls[0].command, ["cd /workspace/tasks/a && pwd"]);
-    assert_eq!(calls[0].user, Some(User::new("sandbox-user")));
+    assert_eq!(calls[0].command(), ["cd /workspace/tasks/a && pwd"]);
+    assert_eq!(calls[0].user().cloned(), Some(User::new("sandbox-user")));
     scripted.assert_complete();
 }
 
@@ -584,11 +584,11 @@ async fn exec_command_changes_into_the_workdir_and_uses_the_named_shell() {
     .expect("output");
 
     let calls = exec_calls(&scripted);
-    assert_eq!(calls[0].command, ["cd /workspace/src/project && pwd"]);
-    assert_eq!(calls[0].timeout_s, Some(10.0));
+    assert_eq!(calls[0].command(), ["cd /workspace/src/project && pwd"]);
+    assert_eq!(calls[0].timeout_s(), Some(10.0));
     assert_eq!(
-        calls[0].shell,
-        ShellInvocation::Prefix(vec!["/bin/bash".to_owned(), "-c".to_owned()])
+        calls[0].shell(),
+        &ShellInvocation::Prefix(vec!["/bin/bash".to_owned(), "-c".to_owned()])
     );
     assert_eq!(
         after_stamp(&output),
@@ -617,7 +617,7 @@ async fn a_blank_workdir_means_the_turns_working_directory() {
             .expect("output");
 
         assert_eq!(
-            exec_calls(&scripted)[0].command,
+            exec_calls(&scripted)[0].command(),
             ["cd /workspace/tasks/a && pwd"],
             "{workdir:?}"
         );
@@ -641,7 +641,7 @@ async fn a_relative_workdir_is_measured_from_the_turns_working_directory() {
     .expect("output");
 
     assert_eq!(
-        exec_calls(&scripted)[0].command,
+        exec_calls(&scripted)[0].command(),
         ["cd /workspace/tasks/a/src/project && pwd"]
     );
 }
@@ -663,7 +663,7 @@ async fn backslashes_in_a_workdir_are_read_as_separators() {
     .expect("output");
 
     assert_eq!(
-        exec_calls(&scripted)[0].command,
+        exec_calls(&scripted)[0].command(),
         ["cd /workspace/tasks/a/src/project && pwd"]
     );
 }
@@ -701,11 +701,11 @@ async fn a_workdir_under_a_path_grant_is_allowed() {
     .expect("output");
 
     let calls = exec_calls(&scripted);
-    assert_eq!(calls[0].command, ["cd /mnt/shared-data && pwd"]);
-    assert_eq!(calls[0].timeout_s, Some(10.0));
+    assert_eq!(calls[0].command(), ["cd /mnt/shared-data && pwd"]);
+    assert_eq!(calls[0].timeout_s(), Some(10.0));
     assert_eq!(
-        calls[0].shell,
-        ShellInvocation::Prefix(vec!["/bin/bash".to_owned(), "-c".to_owned()])
+        calls[0].shell(),
+        &ShellInvocation::Prefix(vec!["/bin/bash".to_owned(), "-c".to_owned()])
     );
     assert_eq!(
         after_stamp(&output),
@@ -736,9 +736,9 @@ async fn exec_command_starts_interactively_where_the_session_offers_terminals() 
     .expect("output");
 
     let starts = pty_starts(&scripted);
-    assert_eq!(starts[0].command, ["cd /workspace/tasks/a && pwd"]);
-    assert_eq!(starts[0].yield_time_s, Some(0.0));
-    assert!(starts[0].tty);
+    assert_eq!(starts[0].command(), ["cd /workspace/tasks/a && pwd"]);
+    assert_eq!(starts[0].yield_time_s(), Some(0.0));
+    assert!(starts[0].tty());
     assert_eq!(
         after_stamp(&output),
         "Process running with session ID 1337\nOutput:\n"
@@ -770,7 +770,7 @@ async fn an_interactive_start_runs_as_the_bound_user() {
     .expect("output");
 
     assert_eq!(
-        pty_starts(&scripted)[0].user,
+        pty_starts(&scripted)[0].user().cloned(),
         Some(User::new("sandbox-user"))
     );
 }
@@ -827,10 +827,10 @@ async fn a_retry_safe_transport_failure_falls_back_to_a_one_shot_command() {
     );
     let calls = scripted.calls();
     assert!(
-        matches!(&calls[0], Call::PtyStart(request) if request.command == ["cd /workspace/tasks/a && pwd"])
+        matches!(&calls[0], Call::PtyStart(request) if request.command() == ["cd /workspace/tasks/a && pwd"])
     );
     assert!(
-        matches!(&calls[1], Call::Exec(request) if request.command == ["cd /workspace/tasks/a && pwd"])
+        matches!(&calls[1], Call::Exec(request) if request.command() == ["cd /workspace/tasks/a && pwd"])
     );
 }
 
@@ -972,9 +972,9 @@ async fn write_stdin_reports_a_process_that_finished() {
     let Call::PtyWrite(request) = &calls[0] else {
         panic!("expected a write");
     };
-    assert_eq!(request.process_id, PtyProcessId(1337));
-    assert_eq!(request.chars, "hello");
-    assert_eq!(request.yield_time_s, Some(0.25));
+    assert_eq!(request.process_id(), PtyProcessId::new(1337));
+    assert_eq!(request.chars(), "hello");
+    assert_eq!(request.yield_time_s(), Some(0.25));
 }
 
 // `test_write_stdin_tool_rejects_non_pty_sessions`
@@ -1156,10 +1156,10 @@ async fn omitted_arguments_take_the_references_defaults() {
         .expect("output");
 
     let start = &pty_starts(&scripted)[0];
-    assert_eq!(start.shell, ShellInvocation::Login);
-    assert!(!start.tty);
-    assert_eq!(start.yield_time_s, Some(10.0));
-    assert_eq!(start.max_output_tokens, None);
+    assert_eq!(start.shell(), &ShellInvocation::Login);
+    assert!(!start.tty());
+    assert_eq!(start.yield_time_s(), Some(10.0));
+    assert_eq!(start.max_output_tokens(), None);
 }
 
 /// The two bounds the schema states are enforced when the call runs.

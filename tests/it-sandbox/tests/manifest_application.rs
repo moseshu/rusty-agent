@@ -136,8 +136,8 @@ impl SandboxSession for RecordingSession {
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
-        self.record(Call::Exec(request.command.clone()));
-        let program = request.command.first().cloned().unwrap_or_default();
+        self.record(Call::Exec(request.command().to_vec()));
+        let program = request.command().first().cloned().unwrap_or_default();
         if program == "git" && self.blocked_git {
             self.git_active.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveOperation(&self.git_active);

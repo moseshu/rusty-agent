@@ -202,7 +202,7 @@ impl SandboxSession for TrackingSession {
 
     /// Runs the command on this machine, as the reference's tracking sessions do.
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
-        let command = request.command.clone();
+        let command = request.command().to_vec();
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new(&command[0])
                 .args(&command[1..])
@@ -211,7 +211,7 @@ impl SandboxSession for TrackingSession {
         .await
         .expect("join")
         .map_err(|error| {
-            SandboxError::exec_transport(request.command.clone(), Some(&error.to_string()))
+            SandboxError::exec_transport(request.command().to_vec(), Some(&error.to_string()))
         })?;
         Ok(ExecResult::new(
             output.stdout,

@@ -850,7 +850,7 @@ async fn a_session_without_a_terminal_refuses_to_start_one() {
     assert_eq!(error.error_code(), ErrorCode::PtySessionNotFound);
 
     let error = session
-        .pty_write(PtyWriteRequest::new(PtyProcessId(7), "q"))
+        .pty_write(PtyWriteRequest::new(PtyProcessId::new(7), "q"))
         .await
         .expect_err("refuse");
     assert_eq!(error.error_code(), ErrorCode::PtySessionNotFound);
@@ -919,7 +919,7 @@ impl SandboxClient for StubClient {
     }
 
     async fn create(&self, request: CreateRequest) -> SandboxResult<Box<dyn SandboxSession>> {
-        self.check_options(request.options.as_ref())?;
+        self.check_options(request.options())?;
         Ok(Box::new(Backend::with_answers(Answers::default())))
     }
 

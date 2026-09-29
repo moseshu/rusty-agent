@@ -61,7 +61,7 @@ async fn assert_forgotten(session: &dyn SandboxSession, process_id: PtyProcessId
     assert_eq!(
         error.details(),
         Some(&SandboxErrorDetails::PtySessionNotFound {
-            session_id: process_id.0
+            session_id: process_id.get()
         })
     );
 }
@@ -102,7 +102,7 @@ async fn a_terminal_process_takes_input_and_is_forgotten_once_it_exits() {
     );
 
     assert_forgotten(session.as_ref(), process_id).await;
-    assert_forgotten(session.as_ref(), PtyProcessId(999_999)).await;
+    assert_forgotten(session.as_ref(), PtyProcessId::new(999_999)).await;
 
     session.close().await.expect("close");
 }
@@ -252,7 +252,7 @@ async fn a_process_without_a_terminal_refuses_input_and_can_still_be_polled() {
     assert_eq!(
         error.details(),
         Some(&SandboxErrorDetails::PtyStdinUnavailable {
-            session_id: process_id.0
+            session_id: process_id.get()
         })
     );
 

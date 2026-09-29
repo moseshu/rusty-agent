@@ -133,7 +133,7 @@ impl SandboxSession for Session {
         self.commands
             .lock()
             .expect("commands")
-            .push(request.command);
+            .push(request.command().to_vec());
         Ok(ExecResult::new(Vec::new(), Vec::new(), 0))
     }
 

@@ -326,7 +326,7 @@ impl SandboxClient for FakeClient {
             state: Mutex::new(SandboxSessionState::new(
                 "docker",
                 Snapshot::noop(),
-                request.manifest.unwrap_or_default(),
+                request.manifest().cloned().unwrap_or_default(),
             )),
             resources: SessionResources::new(),
             running: AtomicBool::new(false),

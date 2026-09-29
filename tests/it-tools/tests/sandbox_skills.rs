@@ -131,7 +131,7 @@ impl SandboxSession for HostSession {
             .lock()
             .unwrap()
             .commands
-            .push(request.command.clone());
+            .push(request.command().to_vec());
         Ok(ExecResult::new(Vec::new(), Vec::new(), 0))
     }
 

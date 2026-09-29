@@ -585,7 +585,9 @@ impl ExecCommandTool {
             .with_shell(shell.clone())
             .with_tty(args.tty)
             .with_yield_time_s(yield_time.as_secs_f64());
-        request.user.clone_from(&self.user);
+        if let Some(user) = &self.user {
+            request = request.as_user(user.clone());
+        }
         if let Some(max_output_tokens) = args.max_output_tokens {
             request = request.with_max_output_tokens(max_output_tokens);
         }
@@ -605,7 +607,9 @@ impl ExecCommandTool {
         let mut request = ExecRequest::new([wrapped.to_owned()])
             .with_timeout_s(timeout.as_secs_f64())
             .with_shell(shell.clone());
-        request.user.clone_from(&self.user);
+        if let Some(user) = &self.user {
+            request = request.as_user(user.clone());
+        }
         let result = self.session.exec(request).await?;
         let output = normalize_output(&result.stdout, &result.stderr);
         let (output, original_token_count) =
@@ -741,8 +745,9 @@ impl WriteStdinTool {
         validate_max_output_tokens(WRITE_STDIN_TOOL_NAME, args.max_output_tokens)?;
 
         let start = Instant::now();
-        let mut request = PtyWriteRequest::new(PtyProcessId(args.session_id), args.chars.clone())
-            .with_yield_time_s(Duration::from_millis(args.yield_time_ms).as_secs_f64());
+        let mut request =
+            PtyWriteRequest::new(PtyProcessId::new(args.session_id), args.chars.clone())
+                .with_yield_time_s(Duration::from_millis(args.yield_time_ms).as_secs_f64());
         if let Some(max_output_tokens) = args.max_output_tokens {
             request = request.with_max_output_tokens(max_output_tokens);
         }

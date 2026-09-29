@@ -84,21 +84,21 @@ impl ArchiveErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EphemeralMountRemoval {
     /// The path a transition failure is reported against.
-    pub error_path: String,
+    error_path: String,
     /// What a transition failure is reported as.
-    pub error_kind: ArchiveErrorKind,
+    error_kind: ArchiveErrorKind,
     /// Where a remount failure records the operation's own failure, when there was one.
     ///
     /// The remount failure is what is returned, because it is what leaves the workspace in an
     /// unknown state; the operation's failure is kept under this key so it is not lost. Only a
     /// workspace IO failure is recorded, and only its message.
-    pub operation_error_context_key: Option<String>,
+    operation_error_context_key: Option<String>,
     /// Whether mounts are put back after the operation succeeds.
     ///
     /// `false` is for an operation that is about to replace the session, where reattaching to a
     /// workspace that is being thrown away would be wasted work. Mounts are always put back after a
     /// failure.
-    pub restore_on_success: bool,
+    restore_on_success: bool,
 }
 
 impl EphemeralMountRemoval {
@@ -140,9 +140,10 @@ impl EphemeralMountRemoval {
 /// # Errors
 ///
 /// In order of precedence: a remount failure (with the session terminated, and the operation's own
-/// failure recorded as [`EphemeralMountRemoval::operation_error_context_key`] says), a teardown
-/// failure, then the operation's own failure. A transition failure is reported as
-/// [`EphemeralMountRemoval::error_kind`] with the strategy's failure as its cause; the session is
+/// failure recorded under the key given to
+/// [`EphemeralMountRemoval::recording_operation_error_as`]), a teardown failure, then the
+/// operation's own failure. A transition failure is reported as the kind given to
+/// [`EphemeralMountRemoval::new`] with the strategy's failure as its cause; the session is
 /// marked `terminal_cleanup_failed` when terminating it failed too.
 ///
 /// # Panics
