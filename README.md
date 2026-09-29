@@ -6,7 +6,9 @@ An agent framework written in Rust, plus the reference products built with it.
 > context management (budgeting, compaction, tool-output trimming) are in place,
 > alongside the crate boundaries, error and cancellation model, logging, configuration,
 > separate test workspace, and extension-safety contracts.
-> The public API is `0.1.x` and carries no stability guarantee.
+> The public API is `0.2.x`. Each crate's documentation states whether its surface is
+> `Stable`, `Evolving`, or `Internal`; a `Stable` surface changes incompatibly only in a new
+> `0.x` version, with migration notes.
 
 ## What this is
 
@@ -84,6 +86,40 @@ Shared services  ra-model · ra-prompt · ra-context · ra-session · ra-exec ·
 Dependencies flow one way, enforced in CI: the kernel does not depend on reusable
 components or products, reusable components do not depend on products, and products
 have zero dependencies on each other.
+
+## Installation
+
+The crates are not published to crates.io. Depend on the ones you need from this repository
+at a release tag:
+
+```toml
+[dependencies]
+ra-core = { git = "https://github.com/moseshu/rusty-agent", tag = "v0.2.0" }
+ra-runtime = { git = "https://github.com/moseshu/rusty-agent", tag = "v0.2.0" }
+```
+
+`ra-core` holds the types and contracts and `ra-runtime` runs the agent loop. Together they
+are enough for an agent with your own model and tools, as
+[`examples/minimal_agent`](examples/minimal_agent) shows. Add more crates from the same tag
+as you need them:
+
+| Crate | Adds | Features |
+| --- | --- | --- |
+| `ra-model` | Model providers: OpenAI Responses and Chat, Anthropic Messages, OpenAI-compatible endpoints | `openai` (default), `anthropic`, `compat` |
+| `ra-tools` | Reusable tools, and the sandbox capabilities: filesystem, shell, skills, memory, compaction | — |
+| `ra-sandbox` | Sandbox backends: unix-local and Docker | `docker` connects to a real Docker daemon; `http-sink` posts session events over HTTP |
+
+Take every crate from the same tag. Crates from two tags are two copies of `ra-core`, and
+their types do not interoperate. The crates declare Rust 1.88 as their minimum supported
+version.
+
+### Upgrading from v0.1.0
+
+0.2.0 changes the public API. Session I/O takes `SessionPath` in place of `&str`, and several
+sandbox request types are built through constructors and read through accessors instead of
+public fields. Section 13.6 of the
+[R8-P0 checklist](Docs/R8-P0_上游沙箱契约与差异清单.md) (in Chinese) lists each change and
+how to adapt.
 
 ## Building
 
