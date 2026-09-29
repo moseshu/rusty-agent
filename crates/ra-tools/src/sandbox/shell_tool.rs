@@ -381,6 +381,10 @@ impl Response {
 /// shell in the protocol and `sh -c` on the local backend. No shell named and no login is `sh -c`.
 /// A named shell gets `-lc` or `-c`. The host's own login shell is never consulted, whatever the
 /// argument's description says.
+///
+/// `Internal`, as the reference's `_resolve_shell` is: public, and hidden from the documentation,
+/// only so the separate test workspace can reach it.
+#[doc(hidden)]
 #[must_use]
 pub fn resolve_shell(shell: Option<&str>, login: bool) -> ShellInvocation {
     match shell {
@@ -403,6 +407,10 @@ pub fn resolve_shell(shell: Option<&str>, login: bool) -> ShellInvocation {
 /// # Errors
 ///
 /// Returns the session's refusal of the directory.
+///
+/// `Internal`, as the reference's `_resolve_workdir_command` is: public, and hidden from the
+/// documentation, only so the separate test workspace can reach it.
+#[doc(hidden)]
 pub async fn resolve_workdir_command(
     session: &dyn SandboxSession,
     workspace_scope: &SandboxWorkspaceScope,

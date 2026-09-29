@@ -835,6 +835,10 @@ pub(crate) fn manifest_mount_provenance(manifest: &Manifest) -> Result<(), Prove
 /// # Errors
 ///
 /// Returns [`ErrorCode::MountConfigInvalid`] naming which of the two it was.
+///
+/// `Internal`, as the reference's `_validate_manifest_mount_provenance` is, and hidden from the
+/// documentation. It shipped public, so it becomes crate-private only in a major version.
+#[doc(hidden)]
 pub fn validate_manifest_mount_provenance(manifest: &Manifest) -> Result<(), SandboxError> {
     manifest_mount_provenance(manifest).map_err(validation_error)
 }

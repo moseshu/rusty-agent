@@ -92,6 +92,10 @@ impl ViewImageArgs {
 ///
 /// `path` is consulted only for a file whose bytes are not recognised: a `.svg` or `.svgz` name
 /// still makes it SVG.
+///
+/// `Internal`, as the reference's `_detect_image_mime_type` is: public, and hidden from the
+/// documentation, only so the separate test workspace can reach it.
+#[doc(hidden)]
 #[must_use]
 pub fn detect_image_mime_type(path: &str, payload: &[u8]) -> Option<&'static str> {
     if payload.starts_with(b"\x89PNG\r\n\x1a\n") {

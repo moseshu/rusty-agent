@@ -200,6 +200,10 @@ type ParseResult<T> = std::result::Result<T, PatchParseError>;
 /// # Errors
 ///
 /// Returns the reference's message for input that is neither.
+///
+/// `Internal`, as the reference's `_parse_apply_patch_input` is: public, and hidden from the
+/// documentation, only so the separate test workspace can reach it.
+#[doc(hidden)]
 pub fn parse_apply_patch_input(raw_input: &str) -> ParseResult<Vec<ApplyPatchOperation>> {
     let stripped = raw_input.trim_start_matches(is_py_space);
     if stripped.starts_with('{') || stripped.starts_with('[') {
@@ -735,9 +739,12 @@ impl SandboxApplyPatchTool {
 
     /// Splits raw input into operations.
     ///
+    /// Input that starts, after leading whitespace, with `{` or `[` is read as JSON operations;
+    /// anything else is read as a patch envelope.
+    ///
     /// # Errors
     ///
-    /// As [`parse_apply_patch_input`].
+    /// Returns the reference's message for input that is neither.
     pub fn parse_custom_input(&self, raw_input: &str) -> ParseResult<Vec<ApplyPatchOperation>> {
         parse_apply_patch_input(raw_input)
     }
