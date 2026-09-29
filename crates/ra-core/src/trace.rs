@@ -69,10 +69,11 @@ use crate::error::{Error, Recoverability};
 ///
 /// # A name means the same thing everywhere, a *scale* does not
 ///
-/// The usage and duration fields appear on more than one [`super::SpanKind`], and what they count
+/// The usage and duration fields appear on more than one [`SpanKind`], and what they count
 /// differs by kind: a `generation` reports one request, the `turn` above it reports that request
 /// plus its retries, and the `agent` above that reports the whole run. **So aggregation has to
-/// group by [`SPAN_KIND`] first** — summing [`USAGE_INPUT_TOKENS`] across every span in a trace
+/// group by [`SPAN_KIND`](crate::trace::field::SPAN_KIND) first** — summing
+/// [`USAGE_INPUT_TOKENS`](crate::trace::field::USAGE_INPUT_TOKENS) across every span in a trace
 /// counts the same tokens once per level and produces a number that is simply wrong.
 ///
 /// The alternative, a separate `usage.total_*` set for the enclosing spans, was not taken: it

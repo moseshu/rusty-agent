@@ -260,9 +260,9 @@ impl ToolObservation {
 
 /// What the run's records already say about a call, projected by the batch.
 ///
-/// The two counters are separate because they answer separate questions — see
-/// [`circuit`](crate::circuit). Passing them as one value keeps a call site from transposing two
-/// bare integers whose meanings are unrelated.
+/// The two counters are separate because they answer separate questions — see the private
+/// `circuit` module. Passing them as one value keeps a call site from transposing two bare integers
+/// whose meanings are unrelated.
 #[must_use]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

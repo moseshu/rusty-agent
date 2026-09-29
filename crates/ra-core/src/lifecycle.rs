@@ -25,7 +25,7 @@
 //! `on_start` and `on_agent_end` / `on_end`, which describe the same moment from the two sides.
 //!
 //! So there is **one trait here and two installation sites**. A hook attached to an
-//! [`AgentSpec`](crate::agent::AgentSpec) is told what happens while that agent is the one running,
+//! [`AgentSpec`] is told what happens while that agent is the one running,
 //! and stops being told anything the moment control transfers away; a hook installed on the run is
 //! told about every agent in it. Declaring the same seven moments twice would be seven chances for
 //! the two lists to drift, and the first one to drift would be the one a host wrote its code

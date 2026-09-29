@@ -92,7 +92,7 @@ impl ChatLoweringOptions {
     ///
     /// Off by default, which refuses a custom tool as the reference does: Chat Completions has no
     /// custom form in the reference's converter. Turning it on is this framework's extension, and
-    /// it drops the tool's grammar — see [`crate::custom_tools`]. It is independent of
+    /// it drops the tool's grammar — see the private `custom_tools` module. It is independent of
     /// [`Self::with_strict_feature_validation`]: a custom tool is never dropped silently.
     #[must_use]
     pub const fn with_custom_tools_as_functions(mut self, enabled: bool) -> Self {

@@ -198,7 +198,8 @@ fn open_host(workspace: &Path) -> Result<CodingHost> {
 ///
 /// # Errors
 ///
-/// Propagates the failures described on [`PromptDumpRequest::build`].
+/// Returns an error for an unknown role name, a workspace that cannot be opened, and any prompt
+/// assembly failure underneath.
 pub async fn render_prompt_dump(request: &PromptDumpRequest) -> Result<String> {
     Ok(request.build().await?.render_text())
 }
@@ -207,7 +208,8 @@ pub async fn render_prompt_dump(request: &PromptDumpRequest) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Propagates the failures described on [`PromptDumpRequest::build`], and serialization failures.
+/// Returns an error for an unknown role name, a workspace that cannot be opened, any prompt
+/// assembly failure underneath, and a serialization failure.
 pub async fn render_prompt_dump_json(request: &PromptDumpRequest) -> Result<String> {
     request.build().await?.to_json()
 }
@@ -218,8 +220,8 @@ pub async fn render_prompt_dump_json(request: &PromptDumpRequest) -> Result<Stri
 ///
 /// # Errors
 ///
-/// Returns an error if the baseline is not a prompt dump in JSON form, plus the failures described
-/// on [`PromptDumpRequest::build`].
+/// Returns an error if the baseline is not a prompt dump in JSON form, for an unknown role name, a
+/// workspace that cannot be opened, and any prompt assembly failure underneath.
 pub async fn compare_prompt_dump(
     request: &PromptDumpRequest,
     baseline_json: &str,

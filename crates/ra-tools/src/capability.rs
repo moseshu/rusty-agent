@@ -24,9 +24,9 @@
 //! | --- | --- |
 //! | `shell`, `filesystem`, `apply_patch`, `search`, `view_image` | a [`Workspace`] |
 //! | `todo` | nothing |
-//! | `memory` | a [`MemoryStore`](ra_core::memory::MemoryStore) |
-//! | `web` | a [`WebAccess`](ra_core::web::WebAccess) |
-//! | `skills` | a [`SkillCatalog`](ra_core::skill::SkillCatalog) |
+//! | `memory` | a [`MemoryStore`] |
+//! | `web` | a [`WebAccess`] |
+//! | `skills` | a [`SkillCatalog`] |
 //!
 //! A host without a web backend therefore has no `web` family, and that is the correct outcome: an
 //! entry advertised over a backend that does not exist is one the model will call and be refused
@@ -52,7 +52,7 @@
 //! filesystem — which is true of the arrangement where memory contributes prompt text and the model
 //! reads the store with `read_file` or a shell command. [`MemoryCapability`] takes the other branch
 //! and brings its own three entries, so the store is reached through a
-//! [`MemoryStore`](ra_core::memory::MemoryStore) that no other family is involved in. The edge
+//! [`MemoryStore`] that no other family is involved in. The edge
 //! disappears because the dependency did, not because it was overlooked: the arrangement that has
 //! one is the arrangement where the memory root is just another path in the workspace, and that is
 //! also the arrangement where nothing structural keeps an agent inside it.

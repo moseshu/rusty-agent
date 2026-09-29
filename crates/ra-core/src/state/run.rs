@@ -555,10 +555,10 @@ impl PendingControlRequest {
 ///
 /// # Reading one written by an older build
 ///
-/// Deserialization goes through [`RunStateRecord`], which exists so that spend recorded under an
-/// earlier layout still counts. That is the whole of the migration, and it is on the way in rather
-/// than at a call site, because a resumed run that has to remember to migrate is a resumed run that
-/// silently gets its allowance back the day someone forgets.
+/// Deserialization goes through the private `RunStateRecord`, which exists so that spend recorded
+/// under an earlier layout still counts. That is the whole of the migration, and it is on the way
+/// in rather than at a call site, because a resumed run that has to remember to migrate is a
+/// resumed run that silently gets its allowance back the day someone forgets.
 ///
 /// # Why the latch fields stay separate bools
 ///

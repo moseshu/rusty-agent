@@ -598,9 +598,8 @@ impl RunResult {
 
     /// The message that delivered the run, if it produced one.
     ///
-    /// Structural: the assistant message settlement put on
-    /// [`OutputPhase::Final`](ra_core::item::OutputPhase::Final) (R3-10). It does not parse the
-    /// text, which is R1-16's structured-output contract.
+    /// Structural: the assistant message settlement put on [`OutputPhase::Final`] (R3-10). It does
+    /// not parse the text, which is R1-16's structured-output contract.
     ///
     /// **`None` is a real answer, not just "the model said nothing".** A run that stopped for an
     /// approval has not delivered anything yet, and neither has one that hit
@@ -621,9 +620,8 @@ impl RunResult {
     /// reports those verdicts rather than the empty set the resuming segment produced.
     ///
     /// **A tripped verdict is in here**, and so is every sibling that finished before it. The
-    /// refusal ends the run through [`Error::Guardrail`](ra_core::error::Error::Guardrail), but the
-    /// evidence it was argued from is recorded first — a refusal nobody can audit is worse than
-    /// none.
+    /// refusal ends the run through [`Error::Guardrail`], but the evidence it was argued from is
+    /// recorded first — a refusal nobody can audit is worse than none.
     #[must_use]
     pub fn input_guardrail_results(&self) -> &[InputGuardrailResult] {
         self.state.input_guardrail_results()
@@ -657,10 +655,11 @@ impl RunResult {
     ///
     /// **It reads that one field and nothing else.** The temptation this method exists to remove is
     /// the other implementation — walking [`Self::new_items`] for the record settlement stamped
-    /// [`OutputPhase::Final`] on. That walk is already done once, in [`Self::new`], and a second
-    /// copy would be a second definition of "which record was the delivery" for the two of them to
-    /// disagree about: a closeout from a [`RunErrorHandler`] replaces the field without touching
-    /// the items, so the two answers differ on exactly the runs a host most wants to render.
+    /// [`OutputPhase::Final`] on. That walk is already done once, in the private `RunResult::new`,
+    /// and a second copy would be a second definition of "which record was the delivery" for the
+    /// two of them to disagree about: a closeout from a [`RunErrorHandler`] replaces the field
+    /// without touching the items, so the two answers differ on exactly the runs a host most wants
+    /// to render.
     ///
     /// Empty is meaningful in the same way [`Self::final_message`]'s `None` is: a run that stopped
     /// for an approval or ran out of turns delivered nothing. A host that wants to show *something*

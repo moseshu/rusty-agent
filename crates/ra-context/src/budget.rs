@@ -1,19 +1,19 @@
 //! Byte and token ceilings for tool results.
 //!
-//! The complete [`ToolOutput`](ra_core::tool::ToolOutput) remains in the session record.  This
-//! module only adds a bounded [`ModelExcerpt`](ra_core::tool::ModelExcerpt) when a result would
+//! The complete [`ToolOutput`] remains in the session record.  This
+//! module only adds a bounded [`ModelExcerpt`] when a result would
 //! exceed the configured model-input allowance.  The runtime reaches it through the core
-//! [`ToolOutputProjector`](ra_core::tool::ToolOutputProjector) port, so `ra-runtime` never learns
+//! [`ToolOutputProjector`] port, so `ra-runtime` never learns
 //! about a concrete context policy.
 //!
 //! # One measure, used twice
 //!
 //! The ceiling that admits a result and the ceiling that sizes its excerpt are the **same
-//! measurement**, taken by [`measure`] over the final model-visible blocks. An earlier shape gated
-//! on the serialized JSON of the block list and then trimmed the raw text against those numbers;
-//! the two differ by the `{"type":"text","text":…}` framing and one escape per control character,
-//! so the excerpt it produced could still exceed the ceiling that had just rejected the result. A
-//! projector whose output fails its own admission check has no invariant left to test.
+//! measurement**, taken by the private `measure` over the final model-visible blocks. An earlier
+//! shape gated on the serialized JSON of the block list and then trimmed the raw text against those
+//! numbers; the two differ by the `{"type":"text","text":…}` framing and one escape per control
+//! character, so the excerpt it produced could still exceed the ceiling that had just rejected the
+//! result. A projector whose output fails its own admission check has no invariant left to test.
 //!
 //! Text is measured by its own bytes and by the shared prompt estimator; an opaque image or file is
 //! measured by its serialized payload, because that is what it costs a provider and there is no

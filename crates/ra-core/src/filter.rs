@@ -284,7 +284,7 @@ impl ContextFilterReport {
     }
 
     /// The same change in estimated tokens, on the shared
-    /// [`estimate`](crate::item::estimate) basis, and signed like [`Self::chars_saved`].
+    /// [`estimate`] basis, and signed like [`Self::chars_saved`].
     ///
     /// Estimated rather than counted: a provider's tokenizer is the only thing that can answer this
     /// exactly, and it is not reachable from a provider-neutral projection. The value is comparable

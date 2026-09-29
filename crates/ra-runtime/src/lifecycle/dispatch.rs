@@ -20,8 +20,9 @@
 //! # Never awaited bare
 //!
 //! A lifecycle hook is third-party `async` code the host installed, so every moment runs inside the
-//! caller's [`CancelScope`]. A hook that ignored a stop signal would otherwise keep the run alive
-//! after the user asked it to stop, with nothing else still running to blame for it.
+//! caller's [`CancelScope`](ra_core::cancel::CancelScope). A hook that ignored a stop signal would
+//! otherwise keep the run alive after the user asked it to stop, with nothing else still running to
+//! blame for it.
 
 use std::time::Instant;
 

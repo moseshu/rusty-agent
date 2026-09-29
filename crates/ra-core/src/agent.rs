@@ -3,7 +3,7 @@
 //! [`AgentSpec`] contains reusable configuration only. Run configuration, session state,
 //! credentials, resolved provider objects, and execution-agent bindings belong to higher layers.
 //! The type intentionally has no mutating methods and does not implement [`Clone`]: callers share
-//! the value as an [`Arc`](std::sync::Arc), while intentional variants go through
+//! the value as an [`Arc`], while intentional variants go through
 //! [`AgentSpec::to_builder`].
 //!
 //! Several agent concerns have dedicated later milestones. Dynamic prompts and output schemas have

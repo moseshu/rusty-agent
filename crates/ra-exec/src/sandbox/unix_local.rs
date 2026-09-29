@@ -66,7 +66,7 @@ pub enum EnvInherit {
     /// "hand over every API key in the shell that launched us".
     #[default]
     All,
-    /// Start from [`CORE_ENV_VARS`] only.
+    /// Start from the private `CORE_ENV_VARS` only.
     Core,
     /// Start from nothing.
     ///

@@ -24,8 +24,8 @@
 //! One rule from the reference is **not** here: a manifest supplied as a *mapping* — rather than as
 //! a `Manifest` the caller constructed — may not declare path grants at all, because a grant is
 //! authority and a mapping is configuration. That check belongs where a run configuration coerces
-//! its manifest argument, and lands with the task that ports the run configuration. [`Self::parse`]
-//! matches the reference's model-level read, which does accept them.
+//! its manifest argument, and lands with the task that ports the run configuration.
+//! [`Manifest::parse`] matches the reference's model-level read, which does accept them.
 
 use std::collections::{BTreeMap, BTreeSet};
 

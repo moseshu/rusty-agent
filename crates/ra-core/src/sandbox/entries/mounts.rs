@@ -18,8 +18,8 @@
 //!
 //! Mounts are runtime-attached external filesystems, not durable workspace state. A snapshot that
 //! carried one would be recording somebody else's storage as if it were the workspace's, so
-//! [`Entry::mount`] fixes `ephemeral` at true and the manifest excludes mount targets from what it
-//! persists.
+//! [`Entry::mount`](crate::sandbox::entries::Entry::mount) fixes `ephemeral` at true and the
+//! manifest excludes mount targets from what it persists.
 //!
 //! # Permissions are not honoured, and that is the reference's decision
 //!

@@ -105,11 +105,11 @@ impl ContextUsage {
 
     /// Estimates usage from the provider-neutral serialized item representation.
     ///
-    /// Pricing lives in [`crate::estimate`], which documents what a character is charged for and
-    /// why. This measures items only: system instructions and the request-time tool, handoff, and
-    /// output-schema definitions are not part of the history a compaction trigger reasons about,
-    /// because compaction cannot shrink them. A host that wants the complete request instead —
-    /// definitions included — should read
+    /// Pricing lives in the private `estimate` module, which documents what a character is charged
+    /// for and why. This measures items only: system instructions and the request-time tool,
+    /// handoff, and output-schema definitions are not part of the history a compaction trigger
+    /// reasons about, because compaction cannot shrink them. A host that wants the complete request
+    /// instead — definitions included — should read
     /// [`ContextUsageBreakdown`](crate::usage::ContextUsageBreakdown), which reports this same
     /// measurement alongside the categories it splits into.
     ///
@@ -839,9 +839,9 @@ impl CompactedModelInput {
 ///
 /// **The projection is structurally self-sufficient.** Retention selects by position, which on its
 /// own can split a call from its result or strand a reasoning item; the compacted set is therefore
-/// widened until no such shape survives (see [`close_structural_dependencies`]). A caller may still
-/// run [`InputItemNormalizer`](ra_core::item::InputItemNormalizer) afterwards, but does not have to
-/// in order to get input a provider adapter will accept.
+/// widened until no such shape survives (see the private `close_structural_dependencies`). A caller
+/// may still run [`InputItemNormalizer`](ra_core::item::InputItemNormalizer) afterwards, but does
+/// not have to in order to get input a provider adapter will accept.
 ///
 /// **One summary cannot preserve chronology around an anchor.** Replaced records both before and
 /// after a retained anchor collapse into a single item placed ahead of it, so content that

@@ -274,8 +274,8 @@ impl RunTempDir {
     /// Whether this directory is held back for a host to verify before it can be removed.
     ///
     /// Set when the executor could not establish that everything it was tracking had exited. It is
-    /// sticky — see [`TempDirUse::require_recovery`] — so a host reports and acts on it rather than
-    /// waiting for it to clear.
+    /// sticky — see the private `TempDirUse::require_recovery` — so a host reports and acts on
+    /// it rather than waiting for it to clear.
     #[must_use]
     pub fn recovery_required(&self) -> bool {
         self.state
