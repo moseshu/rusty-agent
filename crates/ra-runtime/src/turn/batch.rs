@@ -810,9 +810,11 @@ fn spawn_dispatch_task(
     function_span: tracing::Span,
 ) -> Id {
     let task_span = function_span.clone();
+    // Carried across the spawn for the reason the span is: a task-local does not follow it, and a
+    // nested agent dispatched from here would otherwise find no parent run.
     dispatches
         .spawn(
-            async move {
+            crate::agent::tool::parent::carry(async move {
                 let started = Instant::now();
                 // 1. Acquire batch concurrency slot permit before entering third-party code.
                 // This bounds peak concurrent needs_approval(), resource_claims(), and call()
@@ -839,7 +841,7 @@ fn spawn_dispatch_task(
                     tool,
                     result,
                 }
-            }
+            })
             .instrument(task_span),
         )
         .id()

@@ -35,6 +35,8 @@
 
 use std::{any::Any, fmt, sync::Arc};
 
+use serde_json::Value;
+
 use crate::{
     agent::AgentSpec,
     budget::BudgetSnapshot,
@@ -102,6 +104,7 @@ pub struct RunContext {
     usage_totals: Usage,
     pending_control_requests: Vec<PendingControlRequest>,
     event_seq_allocator: Option<EventSeqAllocator>,
+    tool_input: Option<Arc<Value>>,
 }
 
 impl RunContext {
@@ -121,6 +124,7 @@ impl RunContext {
             usage_totals: Usage::default(),
             pending_control_requests: Vec::new(),
             event_seq_allocator: None,
+            tool_input: None,
         }
     }
 
@@ -166,6 +170,13 @@ impl RunContext {
     #[must_use]
     pub fn with_event_seq_allocator(mut self, allocator: EventSeqAllocator) -> Self {
         self.event_seq_allocator = Some(allocator);
+        self
+    }
+
+    /// Attaches the structured arguments this run was started from as an agent tool.
+    #[must_use]
+    pub fn with_tool_input(mut self, tool_input: Arc<Value>) -> Self {
+        self.tool_input = Some(tool_input);
         self
     }
 
@@ -229,6 +240,17 @@ impl RunContext {
         self.event_seq_allocator.as_ref()
     }
 
+    /// The structured arguments of the agent-tool call that started this run.
+    ///
+    /// Present only for a nested run whose tool declared a parameter type, a schema to show, or an
+    /// input builder — the cases where the nested agent's input is a rendering of the arguments
+    /// rather than the arguments themselves, so code inside the run can still read them as data. A
+    /// top-level run, and a nested run called with the default `{"input": ...}` object, have none.
+    #[must_use]
+    pub fn tool_input(&self) -> Option<&Value> {
+        self.tool_input.as_deref()
+    }
+
     /// Constructs a [`HostEventEmitter`] using this run's sequence allocator and agent identity.
     #[must_use]
     pub fn event_emitter(&self, sink: Arc<dyn HostEventSink>) -> Option<HostEventEmitter> {
@@ -250,6 +272,7 @@ impl fmt::Debug for RunContext {
             .field("run_id", &self.run_id)
             .field("agent_id", self.agent_id())
             .field("has_app_context", &self.app.is_some())
+            .field("has_tool_input", &self.tool_input.is_some())
             .field("budget", &self.budget)
             .field(
                 "pending_control_requests",

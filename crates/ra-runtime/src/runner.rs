@@ -86,14 +86,14 @@ pub mod stream;
 pub use crate::turn::prepare::ActionSurfaceBudget;
 
 pub use result::{
-    ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
-    RunOutcome, RunResult, TurnRecord,
+    AgentToolInvocation, ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput,
+    RunErrorHandlerResult, RunOutcome, RunResult, TurnRecord,
 };
 use result::{TurnRecordOwner, aggregate_usage, find_final_message};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
-    agent::{AgentBinding, AgentRegistry},
+    agent::{AgentBinding, AgentRegistry, tool::ParentRun},
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     hook::{UserHookRegistration, UserHooks},
@@ -797,6 +797,7 @@ pub struct RunRequest {
     state: RunState,
     services: ToolServices,
     event_seqs: EventSeqAllocator,
+    tool_input: Option<Arc<serde_json::Value>>,
 }
 
 impl RunRequest {
@@ -830,7 +831,14 @@ impl RunRequest {
             state,
             services: ToolServices::new(),
             event_seqs,
+            tool_input: None,
         }
+    }
+
+    /// Records the structured arguments of the agent-tool call this run answers.
+    pub(crate) fn with_tool_input(mut self, tool_input: serde_json::Value) -> Self {
+        self.tool_input = Some(Arc::new(tool_input));
+        self
     }
 
     /// Sets the run-level configuration.
@@ -998,6 +1006,8 @@ struct TurnLoopContext<'a> {
     model_resolver: &'a Arc<dyn ModelResolver>,
     run_id: &'a RunId,
     app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
+    /// Structured agent-tool arguments this run answers, projected into every live context.
+    tool_input: Option<&'a Arc<serde_json::Value>>,
     services: &'a ToolServices,
     cancel: &'a CancelScope,
     closeout_cancel: &'a CancelScope,
@@ -1102,7 +1112,20 @@ async fn run_loop(
         .then(|| InterruptNotice::new(&request));
     // Settled after the loop, whichever way it ended: the sessions the run owns are cleaned up on
     // a failed or cancelled run exactly as on a finished one.
-    let result = run_loop_inner(request, events, &agent_span, &sandbox)
+    // Installed around the loop so a tool this run dispatches can start a nested run from it; see
+    // `agent::tool::parent` for why this is a task-local rather than a field of the tool context.
+    let parent = ParentRun::new(
+        Arc::clone(&request.model_resolver),
+        request.config.clone(),
+        request.app_context.clone(),
+    );
+    let result = parent
+        .scope(Box::pin(run_loop_inner(
+            request,
+            events,
+            &agent_span,
+            &sandbox,
+        )))
         .instrument(agent_span.clone())
         .await;
     let result = settle_sandbox(&sandbox, result)
@@ -1144,6 +1167,9 @@ impl InterruptNotice {
             .with_event_seq_allocator(request.event_seqs.clone());
         if let Some(app_context) = &request.app_context {
             run = run.with_app_context(Arc::clone(app_context));
+        }
+        if let Some(tool_input) = &request.tool_input {
+            run = run.with_tool_input(Arc::clone(tool_input));
         }
         Self {
             hooks: request.config.user_hooks().clone(),
@@ -1192,6 +1218,7 @@ async fn run_loop_inner(
         mut state,
         services,
         event_seqs,
+        tool_input,
     } = request;
 
     if let Err(error) =
@@ -1278,6 +1305,7 @@ async fn run_loop_inner(
             &agent,
             &run_id,
             app_context.as_ref(),
+            tool_input.as_ref(),
             &state,
             &event_seqs,
         );
@@ -1341,6 +1369,7 @@ async fn run_loop_inner(
         model_resolver: &model_resolver,
         run_id: &run_id,
         app_context: app_context.as_ref(),
+        tool_input: tool_input.as_ref(),
         services: &services,
         cancel: &cancel,
         closeout_cancel: &closeout_cancel,
@@ -1646,6 +1675,7 @@ async fn assemble_capabilities(
     agent: &AgentBinding,
     run_id: &RunId,
     app_context: Option<&Arc<dyn Any + Send + Sync>>,
+    tool_input: Option<&Arc<serde_json::Value>>,
     state: &RunState,
     event_seqs: &EventSeqAllocator,
 ) -> Result<(
@@ -1662,6 +1692,9 @@ async fn assemble_capabilities(
         .with_event_seq_allocator(event_seqs.clone());
     if let Some(app_context) = app_context {
         context = context.with_app_context(Arc::clone(app_context));
+    }
+    if let Some(tool_input) = tool_input {
+        context = context.with_tool_input(Arc::clone(tool_input));
     }
 
     let assembled = plan.assemble(&context).await?;
@@ -1812,6 +1845,9 @@ async fn execute_approved_call(
         .with_event_seq_allocator(context.event_seqs.clone());
     if let Some(app_context) = context.app_context {
         run = run.with_app_context(Arc::clone(app_context));
+    }
+    if let Some(tool_input) = context.tool_input {
+        run = run.with_tool_input(Arc::clone(tool_input));
     }
 
     // The streak already counts this call: settlement recorded the attempt before it interrupted,
@@ -3135,15 +3171,18 @@ fn live_context(
     agent: &AgentBinding,
     state: &RunState,
 ) -> RunContext {
-    let run = RunContext::new(context.run_id.clone(), agent.public())
+    let mut run = RunContext::new(context.run_id.clone(), agent.public())
         .with_budget(state.budget().clone())
         .with_usage_totals(state.usage_totals().clone())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(context.event_seqs.clone());
-    match context.app_context {
-        Some(app_context) => run.with_app_context(Arc::clone(app_context)),
-        None => run,
+    if let Some(app_context) = context.app_context {
+        run = run.with_app_context(Arc::clone(app_context));
     }
+    if let Some(tool_input) = context.tool_input {
+        run = run.with_tool_input(Arc::clone(tool_input));
+    }
+    run
 }
 
 struct ModelCallAttempt<'a> {

@@ -845,7 +845,9 @@ async fn invoke(
     name: &str,
 ) -> Result<ToolOutput> {
     let started = Instant::now();
-    let call = tool.call(context);
+    // Scoped to this call so an agent tool can start its nested run under the call's own
+    // cancellation scope; see `agent::tool::parent`.
+    let call = crate::agent::tool::parent::within_call(cancel, tool.call(context));
     let result = match options.timeout() {
         None => cancel.run(call).await.and_then(|result| result),
         Some(limit) => cancel
@@ -892,6 +894,11 @@ pub(crate) async fn shape_failure(
     // let the loop continue past the very thing that asked it to stop, and the run would keep
     // spending after the user interrupted it.
     if error.is_cancelled() {
+        return Err(error);
+    }
+    // Nor is a question a nested agent is waiting on. Shown to the model as a failure, the approval
+    // would never reach the host that owes the answer, and the parent would carry on without it.
+    if crate::agent::tool::is_nested_interruption(&error) {
         return Err(error);
     }
 

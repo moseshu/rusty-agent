@@ -17,6 +17,9 @@ ra-tools = { path = "../../crates/ra-tools" }
 # backend.
 ra-sandbox = { path = "../../crates/ra-sandbox", features = ["docker"] }
 ra-patch = { path = "../../crates/ra-patch" }
+# Typed agent-tool parameters need a derived `ToolInput`.
+ra-macros = { path = "../../crates/ra-macros" }
+schemars = "0.8"
 base64 = "0.22"
 async-trait = "0.1"
 futures = "0.3"
