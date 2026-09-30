@@ -35,13 +35,6 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# ring 的 LICENSE 是 ISC / MIT / OpenSSL 三段拼接，不是标准 SPDX 表达式，
-# 需要显式澄清；它经由 rustls 进来，是 TLS 栈的必需件。
-[[licenses.clarify]]
-crate = "ring"
-expression = "ISC AND MIT AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0e_ed23 }]
-
 [bans]
 # 重复版本只警告：传递依赖的版本收敛不在我们控制之内，报错会让 CI 长期红着，
 # 而长期红着的门禁等于没有门禁。

@@ -149,8 +149,11 @@ distinguishes "not confined" from "could not be checked" in its output.
 
 ## Acknowledgements
 
-This project draws conceptual inspiration from the
-[OpenAI Agents SDK for Python](https://github.com/openai/openai-agents-python).
+The provider-neutral contracts follow the
+[OpenAI Agents SDK for Python](https://github.com/openai/openai-agents-python), and much of the
+sandbox subsystem is ported from it: its modules are translated to Rust and its model-facing
+prompts are carried verbatim. That SDK is MIT-licensed; its notice and the list of what was taken
+from it are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 
