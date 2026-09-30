@@ -94,8 +94,8 @@ at a release tag:
 
 ```toml
 [dependencies]
-ra-core = { git = "https://github.com/moseshu/rusty-agent", tag = "v0.2.0" }
-ra-runtime = { git = "https://github.com/moseshu/rusty-agent", tag = "v0.2.0" }
+ra-core = { git = "https://github.com/moseshu/rusty-agent", tag = "v0.2.1" }
+ra-runtime = { git = "https://github.com/moseshu/rusty-agent", tag = "v0.2.1" }
 ```
 
 `ra-core` holds the types and contracts and `ra-runtime` runs the agent loop. Together they
