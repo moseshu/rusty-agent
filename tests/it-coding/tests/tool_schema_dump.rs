@@ -51,6 +51,19 @@ fn snapshot_path() -> PathBuf {
         .join(SNAPSHOT)
 }
 
+/// Whether this checkout carries recorded baselines at all.
+///
+/// `api/` is not committed, so a fresh checkout — CI's among them — has nothing to compare
+/// against, and the xtask gates that read the same files report SKIP for it rather than failing.
+/// These tests follow the same rule: with the directory absent they still render, say so and
+/// stop; with the directory present and a file missing they fail, because that is a baseline
+/// nobody blessed.
+fn baselines_present() -> bool {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../api")
+        .is_dir()
+}
+
 fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
     let settings = ModelSettings::new().with_max_tokens(256);
     ModelSettings::new().resolve(
@@ -245,6 +258,11 @@ async fn test_tool_schema_dump_01() {
     let path = snapshot_path();
     if std::env::var_os("BLESS_TOOL_SCHEMA_DUMP").is_some() {
         std::fs::write(&path, rendered).expect("snapshot must be writable");
+        return;
+    }
+
+    if !baselines_present() {
+        eprintln!("skipped the comparison: this checkout has no api/ baselines");
         return;
     }
 

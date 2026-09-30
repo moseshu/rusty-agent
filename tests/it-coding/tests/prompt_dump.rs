@@ -72,6 +72,19 @@ fn capability_assembly_snapshot_path() -> PathBuf {
         .join("capability-assembly.txt")
 }
 
+/// Whether this checkout carries recorded baselines at all.
+///
+/// `api/` is not committed, so a fresh checkout — CI's among them — has nothing to compare
+/// against, and the xtask gates that read the same files report SKIP for it rather than failing.
+/// These tests follow the same rule: with the directory absent they still render, say so and
+/// stop; with the directory present and a file missing they fail, because that is a baseline
+/// nobody blessed.
+fn baselines_present() -> bool {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../api")
+        .is_dir()
+}
+
 /// The tools the product's host-backed builder actually installs.
 ///
 /// The temporary workspace is dropped on the way out: what the surface reads is the advertised
@@ -168,6 +181,11 @@ async fn test_stable_prefix_matches_the_committed_snapshot() {
         return;
     }
 
+    if !baselines_present() {
+        eprintln!("skipped the comparison: this checkout has no api/ baselines");
+        return;
+    }
+
     let baseline = std::fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!(
             "missing prompt dump snapshot at {}: {err}. Run with BLESS_PROMPT_DUMP=1 to create it",
@@ -213,6 +231,11 @@ async fn test_the_capability_assembly_matches_the_committed_record() {
         let _writing = lock_snapshots();
         refuse_bless_without_revision_bump(&rendered_tool_surface());
         std::fs::write(&path, &rendered).expect("assembly record must be writable");
+        return;
+    }
+
+    if !baselines_present() {
+        eprintln!("skipped the comparison: this checkout has no api/ baselines");
         return;
     }
 
@@ -573,6 +596,11 @@ fn test_tool_surface_matches_the_committed_snapshot_and_requires_a_revision_bump
         let _writing = lock_snapshots();
         refuse_bless_without_revision_bump(&rendered);
         std::fs::write(&path, rendered).expect("tool-surface snapshot must be writable");
+        return;
+    }
+
+    if !baselines_present() {
+        eprintln!("skipped the comparison: this checkout has no api/ baselines");
         return;
     }
 
