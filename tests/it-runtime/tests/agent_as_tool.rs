@@ -10,8 +10,9 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use ra_core::{
-    agent::{AgentId, AgentSpec, ToolUseBehavior},
+    agent::{AgentId, AgentSpec, HandoffSpec, ToolUseBehavior},
     cancel::{CancelReason, CancelScope},
     context::{RunAgent, RunContext},
     error::{Error, Result},
@@ -27,8 +28,8 @@ use ra_core::{
     },
     lifecycle::{LifecycleHook, LifecycleScope, ToolEndInput, ToolStartInput},
     model::{
-        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
-        ResolvedModel,
+        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
+        ModelStreamEvent, ProviderKey, RawResponseEvent, ResolvedModel,
     },
     state::{RunId, RunState},
     tool::{
@@ -39,15 +40,15 @@ use ra_core::{
 use ra_macros::ToolInput;
 use ra_runtime::{
     agent::{
-        AgentBinding,
+        AgentBinding, AgentRegistry,
         tool::{
             AgentAsTool, AgentTool, AgentToolErrorFunction, AgentToolOutputExtractor,
-            STRUCTURED_INPUT_PREAMBLE, StructuredToolInputBuilder,
-            StructuredToolInputBuilderOptions, StructuredToolInputResult,
-            transform_string_function_style,
+            AgentToolStreamEvent, AgentToolStreamHandler, STRUCTURED_INPUT_PREAMBLE,
+            StructuredToolInputBuilder, StructuredToolInputBuilderOptions,
+            StructuredToolInputResult, transform_string_function_style,
         },
     },
-    runner::{RunConfig, RunOutcome, RunRequest, RunResult, Runner},
+    runner::{RunConfig, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1907,4 +1908,791 @@ fn zero_max_turns_is_rejected_at_build() {
         .build()
         .unwrap_err();
     assert!(matches!(error, Error::Config { .. }), "{error:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streaming the nested run (`on_stream`)
+// ---------------------------------------------------------------------------------------------
+
+type Forwarded = Arc<Mutex<Vec<AgentToolStreamEvent>>>;
+
+fn event_label(event: &RunStreamEvent) -> &'static str {
+    match event {
+        RunStreamEvent::TurnStarted { .. } => "turn_started",
+        RunStreamEvent::RawResponse(_) => "raw_response",
+        RunStreamEvent::Item(_) => "item",
+        RunStreamEvent::FinalMessage(_) => "final_message",
+        RunStreamEvent::Finished(_) => "finished",
+        _ => "other",
+    }
+}
+
+fn labels(events: &[AgentToolStreamEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|event| event_label(event.event()))
+        .collect()
+}
+
+/// A synchronous handler that records every event.
+fn recording() -> (Arc<dyn AgentToolStreamHandler>, Forwarded) {
+    let seen: Forwarded = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let handler = move |event: AgentToolStreamEvent| -> Result<()> {
+        sink.lock().unwrap().push(event);
+        Ok(())
+    };
+    (Arc::new(handler), seen)
+}
+
+/// An asynchronous handler that holds its first event until released, recording what it handled.
+struct GatedHandler {
+    release: Arc<tokio::sync::Notify>,
+    first_seen: Arc<tokio::sync::Notify>,
+    handled: Forwarded,
+    dropped: Arc<AtomicBool>,
+    /// Never releases the first event.
+    forever: bool,
+}
+
+impl GatedHandler {
+    fn new(forever: bool) -> Arc<Self> {
+        Arc::new(Self {
+            release: Arc::new(tokio::sync::Notify::new()),
+            first_seen: Arc::new(tokio::sync::Notify::new()),
+            handled: Arc::new(Mutex::new(Vec::new())),
+            dropped: Arc::new(AtomicBool::new(false)),
+            forever,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentToolStreamHandler for GatedHandler {
+    async fn on_event(&self, event: AgentToolStreamEvent) -> Result<()> {
+        let first = self.handled.lock().unwrap().is_empty();
+        if first {
+            let _guard = SetOnDrop(Arc::clone(&self.dropped));
+            self.first_seen.notify_one();
+            if self.forever {
+                std::future::pending::<()>().await;
+            }
+            self.release.notified().await;
+        }
+        self.handled.lock().unwrap().push(event);
+        Ok(())
+    }
+}
+
+/// A model that streams provider deltas, then either answers or never finishes.
+struct DeltaModel {
+    deltas: usize,
+    then: Option<ModelResponse>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl DeltaModel {
+    fn new(deltas: usize, then: Option<ModelResponse>) -> Arc<Self> {
+        Arc::new(Self {
+            deltas,
+            then,
+            stopped: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+#[async_trait]
+impl Model for DeltaModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller("the delta model only streams"))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        let deltas = (0..self.deltas).map(|index| {
+            Ok(ModelStreamEvent::RawResponse(RawResponseEvent::new(
+                ProviderKey::new("test-provider"),
+                "response.output_text.delta",
+                json!({"index": index}),
+            )))
+        });
+        let stopped = Arc::clone(&self.stopped);
+        let then = self.then.clone();
+        let tail = futures::stream::once(async move {
+            let _guard = SetOnDrop(stopped);
+            match then {
+                Some(response) => Ok(ModelStreamEvent::Completed(Box::new(response))),
+                None => std::future::pending().await,
+            }
+        });
+        Box::pin(futures::stream::iter(deltas).chain(tail))
+    }
+}
+
+/// Resolves the model named `deltas` to a [`DeltaModel`] and everything else to the script.
+struct DeltaResolver {
+    scripted: Arc<ScriptedResolver>,
+    deltas: Arc<DeltaModel>,
+}
+
+impl ModelResolver for DeltaResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        if model_name != Some("deltas") {
+            return self.scripted.resolve_model(model_name);
+        }
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some("delta-model".to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.deltas) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+fn delta_agent() -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("streamer"))
+        .name("Streamer")
+        .instructions("stream")
+        .model("deltas")
+        .build()
+        .unwrap()
+}
+
+/// A parent that calls the delta agent's tool, with partial messages so the deltas are forwarded.
+fn delta_request(
+    tool: AgentTool,
+    scripted: &Arc<ScriptedResolver>,
+    deltas: &Arc<DeltaModel>,
+    cancel: CancelScope,
+) -> RunRequest {
+    RunRequest::new(
+        AgentBinding::direct(orchestrator(tool)),
+        Arc::new(DeltaResolver {
+            scripted: Arc::clone(scripted),
+            deltas: Arc::clone(deltas),
+        }) as Arc<dyn ModelResolver>,
+        RunId::new("run-parent"),
+        cancel,
+        vec![ModelInputItem::Message(Message::user("please delegate"))],
+    )
+    .with_config(RunConfig::new().with_partial_messages(true))
+}
+
+#[tokio::test]
+async fn on_stream_receives_every_nested_event_with_its_agent_and_call() {
+    let (handler, seen) = recording();
+    let tool = agent("researcher", "Researcher", "research things")
+        .as_tool()
+        .tool_name("research")
+        .on_stream(handler)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-9", "research", json!({"input": "ownership"})),
+        final_message("n-1", "nested answer"),
+        final_message("p-2", "done"),
+    ]);
+    let result = Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+
+    // Streaming changes nothing about the call's output.
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[2].input),
+        ["nested answer"]
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(labels(&seen), ["turn_started", "item", "finished"]);
+    for event in seen.iter() {
+        assert_eq!(event.agent().as_str(), "researcher");
+        assert_eq!(event.tool_call().tool_name(), "research");
+        assert_eq!(event.tool_call().tool_call_id(), &CallId::new("call-9"));
+        assert_eq!(
+            event.tool_call().tool_arguments(),
+            &json!({"input": "ownership"})
+        );
+    }
+    let RunStreamEvent::Item(item) = seen[1].event() else {
+        panic!("the nested message is forwarded as a record");
+    };
+    assert_eq!(item.id().as_str(), "n-1");
+}
+
+#[tokio::test]
+async fn the_forwarded_agent_follows_a_handoff_inside_the_nested_run() {
+    let reviewer = agent("reviewer", "Reviewer", "review");
+    let planner = AgentSpec::builder()
+        .id(AgentId::new("planner"))
+        .name("Planner")
+        .instructions("plan")
+        .handoff(HandoffSpec::new(
+            AgentId::new("reviewer"),
+            ToolSchema::new(
+                "transfer_to_reviewer",
+                json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+            )
+            .unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let (handler, seen) = recording();
+    let tool = planner.as_tool().on_stream(handler).build().unwrap();
+    let parent = orchestrator(tool);
+    let registry = AgentRegistry::builder()
+        .register(Arc::clone(&parent))
+        .register(planner)
+        .register(reviewer)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "planner", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "transfer_to_reviewer", json!({})),
+        final_message("n-2", "reviewed"),
+        final_message("p-2", "done"),
+    ]);
+    let result = Runner::run(
+        request(parent, &resolver).with_config(RunConfig::new().with_agent_registry(registry)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(tool_output_texts(&resolver.calls()[3].input), ["reviewed"]);
+
+    let seen = seen.lock().unwrap();
+    let agents = seen
+        .iter()
+        .map(|event| {
+            (
+                event_label(event.event()),
+                event.agent().as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_reviewer_turn = agents
+        .iter()
+        .position(|(label, agent)| *label == "turn_started" && agent == "reviewer")
+        .expect("the handoff starts a turn under the reviewer");
+    assert!(
+        agents[..first_reviewer_turn]
+            .iter()
+            .all(|(_, agent)| agent == "planner")
+    );
+    assert!(
+        agents[first_reviewer_turn..]
+            .iter()
+            .all(|(_, agent)| agent == "reviewer")
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_extractor_sees_the_invocation() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (handler, forwarded) = recording();
+    let tool = agent("summarizer", "Summarizer", "summarize")
+        .as_tool()
+        .custom_output_extractor(Arc::new(CapturingExtractor {
+            seen: Arc::clone(&seen),
+        }))
+        .on_stream(handler)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-7", "summarizer", json!({"input": "long text"})),
+        final_message("n-1", "short"),
+        final_message("p-2", "done"),
+    ]);
+    Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(seen.lock().unwrap()[0].1, CallId::new("call-7"));
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[2].input),
+        ["extracted: short"]
+    );
+    assert!(!forwarded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_slow_handler_does_not_hold_the_nested_run_back() {
+    let handler = GatedHandler::new(false);
+    let tool = agent("nested", "Nested", "n")
+        .as_tool()
+        .on_stream(Arc::clone(&handler) as Arc<dyn AgentToolStreamHandler>)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        final_message("n-1", "nested answer"),
+        final_message("p-2", "done"),
+    ]);
+    let run = tokio::spawn(Runner::run(request(orchestrator(tool), &resolver)));
+    tokio::time::timeout(Duration::from_secs(5), handler.first_seen.notified())
+        .await
+        .expect("the first event reached the handler");
+    // The nested run reaches its answer while the handler still holds the first event...
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while resolver.calls().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the nested model was called");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // ...but the call does not return before its events have been handled.
+    assert!(!run.is_finished());
+    assert_eq!(resolver.calls().len(), 2);
+
+    handler.release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the parent finished")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(
+        labels(&handler.handled.lock().unwrap()),
+        ["turn_started", "item", "finished"]
+    );
+}
+
+struct FailingHandler {
+    calls: Arc<Mutex<u32>>,
+    error: fn() -> Error,
+}
+
+#[async_trait]
+impl AgentToolStreamHandler for FailingHandler {
+    async fn on_event(&self, _event: AgentToolStreamEvent) -> Result<()> {
+        *self.calls.lock().unwrap() += 1;
+        Err((self.error)())
+    }
+}
+
+#[tokio::test]
+async fn a_failing_handler_does_not_fail_the_call() {
+    let calls = Arc::new(Mutex::new(0));
+    let tool = agent("nested", "Nested", "n")
+        .as_tool()
+        .on_stream(Arc::new(FailingHandler {
+            calls: Arc::clone(&calls),
+            error: || Error::caller("SECRET_AGENT_STREAM_PAYLOAD"),
+        }))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        final_message("n-1", "nested answer"),
+        final_message("p-2", "done"),
+    ]);
+    let result = Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[2].input),
+        ["nested answer"]
+    );
+    // Forwarding carries on after a failure: every event was offered.
+    assert_eq!(*calls.lock().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn a_nested_failure_is_raised_only_after_its_events_are_handled() {
+    let handler = GatedHandler::new(false);
+    let tool = agent("nested", "Nested", "n")
+        .as_tool()
+        .propagate_failures()
+        .on_stream(Arc::clone(&handler) as Arc<dyn AgentToolStreamHandler>)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::with_steps(vec![
+        Some(tool_call("p-1", "call-1", "nested", json!({"input": "x"}))),
+        None,
+    ]);
+    let run = tokio::spawn(Runner::run(request(orchestrator(tool), &resolver)));
+    tokio::time::timeout(Duration::from_secs(5), handler.first_seen.notified())
+        .await
+        .expect("the first event reached the handler");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while resolver.calls().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the nested model call failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!run.is_finished(), "the failure waits for the handler");
+    assert!(!handler.dropped.load(Ordering::SeqCst));
+
+    handler.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the parent finished")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("scripted model call failed"),
+        "{error}"
+    );
+    assert_eq!(labels(&handler.handled.lock().unwrap()), ["turn_started"]);
+}
+
+#[tokio::test]
+async fn cancelling_the_parent_does_not_wait_for_the_handler() {
+    let handler = GatedHandler::new(true);
+    let tool = agent("nested", "Nested", "n")
+        .as_tool()
+        .on_stream(Arc::clone(&handler) as Arc<dyn AgentToolStreamHandler>)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        final_message("n-1", "nested answer"),
+    ]);
+    let root = CancelScope::root();
+    let run = tokio::spawn(Runner::run(RunRequest::new(
+        AgentBinding::direct(orchestrator(tool)),
+        Arc::clone(&resolver) as Arc<dyn ModelResolver>,
+        RunId::new("run-parent"),
+        root.clone(),
+        vec![ModelInputItem::Message(Message::user("go"))],
+    )));
+    tokio::time::timeout(Duration::from_secs(5), handler.first_seen.notified())
+        .await
+        .expect("the first event reached the handler");
+    root.cancel(CancelReason::UserInterrupt);
+    let error = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the parent stopped without the handler finishing")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is_cancelled(), "{error:?}");
+    assert!(handler.dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_handler_that_reports_cancellation_stops_the_nested_run() {
+    let calls = Arc::new(Mutex::new(0));
+    let tool = delta_agent()
+        .as_tool()
+        .on_stream(Arc::new(FailingHandler {
+            calls: Arc::clone(&calls),
+            error: || Error::cancelled("handler_stop"),
+        }))
+        .build()
+        .unwrap();
+    let scripted = ScriptedResolver::new(vec![tool_call(
+        "p-1",
+        "call-1",
+        "streamer",
+        json!({"input": "x"}),
+    )]);
+    let deltas = DeltaModel::new(3, None);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        Runner::run(delta_request(tool, &scripted, &deltas, CancelScope::root())),
+    )
+    .await
+    .expect("the call stopped")
+    .unwrap_err();
+    assert!(error.is_cancelled(), "{error:?}");
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert!(
+        deltas.stopped.load(Ordering::SeqCst),
+        "the nested model call was stopped"
+    );
+}
+
+struct PanickingHandler;
+
+#[async_trait]
+impl AgentToolStreamHandler for PanickingHandler {
+    async fn on_event(&self, _event: AgentToolStreamEvent) -> Result<()> {
+        panic!("the stream handler panicked");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_handler_fails_the_call_and_stops_the_nested_run() {
+    let tool = delta_agent()
+        .as_tool()
+        .on_stream(Arc::new(PanickingHandler))
+        .build()
+        .unwrap();
+    let scripted = ScriptedResolver::new(vec![tool_call(
+        "p-1",
+        "call-1",
+        "streamer",
+        json!({"input": "x"}),
+    )]);
+    let deltas = DeltaModel::new(3, None);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::spawn(Runner::run(delta_request(
+            tool,
+            &scripted,
+            &deltas,
+            CancelScope::root(),
+        ))),
+    )
+    .await
+    .expect("the call did not hang");
+    assert!(
+        !matches!(outcome, Ok(Ok(_))),
+        "a panicking handler cannot let the call succeed"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !deltas.stopped.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the nested model call was stopped");
+}
+
+#[test]
+fn a_zero_stream_backlog_limit_is_rejected_at_build() {
+    let error = agent("nested", "Nested", "n")
+        .as_tool()
+        .on_stream_max_pending_events(Some(0))
+        .build()
+        .unwrap_err();
+    assert!(matches!(error, Error::Config { .. }), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("on_stream_max_pending_events must be a positive integer"),
+        "{error}"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OverflowPolicy {
+    Propagate,
+    Custom,
+    Default,
+}
+
+struct RecordingErrorFunction {
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentToolErrorFunction for RecordingErrorFunction {
+    async fn error_message(&self, _context: &ToolContext<'_>, error: &Error) -> Result<String> {
+        self.errors.lock().unwrap().push(error.to_string());
+        Ok("stream callback overloaded".to_owned())
+    }
+}
+
+async fn check_backlog_overflow(limit: Option<usize>, policy: OverflowPolicy) {
+    let expected_limit =
+        limit.unwrap_or(ra_runtime::agent::tool::DEFAULT_ON_STREAM_MAX_PENDING_EVENTS);
+    let handler = GatedHandler::new(true);
+    let extracted = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = delta_agent()
+        .as_tool()
+        .on_stream(Arc::clone(&handler) as Arc<dyn AgentToolStreamHandler>)
+        .custom_output_extractor(Arc::new(CapturingExtractor {
+            seen: Arc::clone(&extracted),
+        }));
+    if let Some(limit) = limit {
+        builder = builder.on_stream_max_pending_events(Some(limit));
+    }
+    builder = match policy {
+        OverflowPolicy::Propagate => builder.propagate_failures(),
+        OverflowPolicy::Custom => {
+            builder.failure_error_function(Arc::new(RecordingErrorFunction {
+                errors: Arc::clone(&errors),
+            }))
+        }
+        OverflowPolicy::Default => builder,
+    };
+    let scripted = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "streamer", json!({"input": "x"})),
+        final_message("p-2", "recovered"),
+    ]);
+    // The first event occupies the handler; one more than the limit then waits behind it.
+    let deltas = DeltaModel::new(expected_limit + 1, None);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        Runner::run(delta_request(
+            builder.build().unwrap(),
+            &scripted,
+            &deltas,
+            CancelScope::root(),
+        )),
+    )
+    .await
+    .expect("the overflow ended the call");
+
+    let needle = format!("on_stream_max_pending_events={expected_limit}");
+    match policy {
+        OverflowPolicy::Propagate => {
+            let error = outcome.unwrap_err();
+            assert!(matches!(error, Error::Caller { .. }), "{error:?}");
+            assert!(error.to_string().contains(&needle), "{error}");
+        }
+        OverflowPolicy::Custom => {
+            assert_eq!(outcome.unwrap().final_text(), "recovered");
+            let errors = errors.lock().unwrap();
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains(&needle), "{errors:?}");
+            assert_eq!(
+                tool_output_texts(&scripted.calls()[1].input),
+                ["stream callback overloaded"]
+            );
+        }
+        OverflowPolicy::Default => {
+            assert_eq!(outcome.unwrap().final_text(), "recovered");
+            let outputs = tool_output_texts(&scripted.calls()[1].input);
+            assert_eq!(outputs.len(), 1);
+            assert!(
+                !outputs[0].contains("response.output_text.delta"),
+                "{outputs:?}"
+            );
+        }
+    }
+    // The handler was abandoned, the nested run was stopped by the call itself — well inside the
+    // drain grace a run left to the stream's own cleanup would get — and no output was extracted
+    // from a run that did not conclude.
+    assert!(
+        started.elapsed() < ra_core::cancel::DRAIN_GRACE / 2,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(handler.dropped.load(Ordering::SeqCst));
+    assert!(deltas.stopped.load(Ordering::SeqCst));
+    assert!(extracted.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_stream_backlog_overflow_stops_the_nested_run_and_fails_the_call() {
+    check_backlog_overflow(None, OverflowPolicy::Propagate).await;
+    check_backlog_overflow(Some(2), OverflowPolicy::Custom).await;
+    check_backlog_overflow(Some(2), OverflowPolicy::Default).await;
+}
+
+#[tokio::test]
+async fn the_backlog_limit_counts_waiting_events_and_all_of_them_are_delivered() {
+    // turn_started, then five deltas, then the nested answer as a record, then finished.
+    let total = 8;
+    for (limit, overflows) in [
+        (Some(total - 1), false),
+        (Some(total - 2), true),
+        (None, false),
+    ] {
+        let handler = GatedHandler::new(false);
+        let tool = delta_agent()
+            .as_tool()
+            .propagate_failures()
+            .on_stream(Arc::clone(&handler) as Arc<dyn AgentToolStreamHandler>)
+            .on_stream_max_pending_events(limit)
+            .build()
+            .unwrap();
+        let scripted = ScriptedResolver::new(vec![
+            tool_call("p-1", "call-1", "streamer", json!({"input": "x"})),
+            final_message("p-2", "done"),
+        ]);
+        let deltas = DeltaModel::new(5, Some(final_message("n-1", "complete")));
+        let run = tokio::spawn(Runner::run(delta_request(
+            tool,
+            &scripted,
+            &deltas,
+            CancelScope::root(),
+        )));
+        tokio::time::timeout(Duration::from_secs(5), handler.first_seen.notified())
+            .await
+            .expect("the first event reached the handler");
+        // Give the nested run time to finish and fill the backlog behind the held event.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handler.release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the parent finished")
+            .unwrap();
+        if overflows {
+            let error = outcome.unwrap_err();
+            assert!(
+                error.to_string().contains("on_stream_max_pending_events=6"),
+                "{error}"
+            );
+            continue;
+        }
+        assert_eq!(outcome.unwrap().final_text(), "done", "{limit:?}");
+        assert_eq!(tool_output_texts(&scripted.calls()[1].input), ["complete"]);
+        let handled = handler.handled.lock().unwrap();
+        assert_eq!(handled.len(), total, "{limit:?}");
+        assert_eq!(labels(&handled)[0], "turn_started");
+        assert_eq!(labels(&handled)[1..6], ["raw_response"; 5]);
+        assert_eq!(labels(&handled)[6..], ["item", "finished"]);
+    }
+}
+
+#[tokio::test]
+async fn a_ready_handler_drains_a_burst_under_a_limit_of_one() {
+    let (handler, seen) = recording();
+    let tool = delta_agent()
+        .as_tool()
+        .propagate_failures()
+        .on_stream(handler)
+        .on_stream_max_pending_events(Some(1))
+        .build()
+        .unwrap();
+    let scripted = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "streamer", json!({"input": "x"})),
+        final_message("p-2", "done"),
+    ]);
+    let deltas = DeltaModel::new(50, Some(final_message("n-1", "complete")));
+    let result = Runner::run(delta_request(tool, &scripted, &deltas, CancelScope::root()))
+        .await
+        .unwrap();
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(seen.lock().unwrap().len(), 53);
+}
+
+#[tokio::test]
+async fn a_streamed_nested_run_still_pauses_for_approval_and_resumes() {
+    let (nested, guarded_calls) = guarded_nested();
+    let (handler, seen) = recording();
+    let parent = orchestrator(nested.as_tool().on_stream(handler).build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        final_message("n-2", "nested done"),
+        final_message("p-2", "done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let items = interruptions(&first);
+    assert_eq!(items.len(), 1);
+    assert_eq!(asked_tool(&items[0]), "guarded");
+    assert_eq!(first.state().nested_runs().len(), 1);
+    let paused = labels(&seen.lock().unwrap());
+    assert_eq!(paused.first(), Some(&"turn_started"));
+    assert_eq!(paused.last(), Some(&"finished"));
+
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+    assert_eq!(resumed.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[3].input),
+        ["nested done"]
+    );
+    // The resumed segment is forwarded too, after what the paused one emitted.
+    let all = seen.lock().unwrap();
+    assert!(all.len() > paused.len());
+    assert_eq!(labels(&all[paused.len()..]).last(), Some(&"finished"));
+    assert!(all.iter().all(|event| event.agent().as_str() == "nested"));
 }

@@ -970,7 +970,16 @@ impl Runner {
     /// cleanup of the sessions it owns: after aborting a run that did not stop in time, the reaper
     /// waits for that cleanup — or starts it, if the run never got that far.
     #[must_use]
-    pub fn run_streamed(mut request: RunRequest) -> RunStream {
+    pub fn run_streamed(request: RunRequest) -> RunStream {
+        Self::run_streamed_in(request, tracing::Span::none())
+    }
+
+    /// [`Self::run_streamed`], with the background run's spans nested under `span`.
+    ///
+    /// A spawned task does not inherit the spawner's span. A nested agent run streamed from inside
+    /// a tool call passes the call's span, so its spans sit where they would had it been awaited
+    /// through [`Self::run`].
+    pub(crate) fn run_streamed_in(mut request: RunRequest, span: tracing::Span) -> RunStream {
         let (sender, receiver) = mpsc::unbounded_channel();
         // The run gets its own child scope so dropping the stream cancels this run without
         // touching the caller's scope, while a cancellation from above still propagates down.
@@ -979,8 +988,10 @@ impl Runner {
         let guard = scope.cancel_on_drop(CancelReason::UserInterrupt);
         let sandbox = sandbox_runtime(&request);
         let supervised = sandbox.enabled().then(|| Arc::clone(&sandbox));
-        let task =
-            tokio::spawn(async move { Box::pin(run_loop(request, Some(sender), sandbox)).await });
+        let task = tokio::spawn(
+            async move { Box::pin(run_loop(request, Some(sender), sandbox)).await }
+                .instrument(span),
+        );
         RunStream::new(receiver, task, guard, supervised)
     }
 }

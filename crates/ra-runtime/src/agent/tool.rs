@@ -42,9 +42,15 @@
 //! tool returns an error carrying the nested run's checkpoint, and dispatch turns that one error
 //! into a paused call rather than a failure.
 //!
+//! # Streaming the nested run
+//!
+//! A tool given a stream handler runs the nested agent streamed and hands the handler every event
+//! the nested run emits, through a bounded backlog that keeps a slow handler from holding the run
+//! back; see `stream`. Which events there are is the nested run's own configuration: provider
+//! deltas, for one, are only among them when that configuration asks for partial messages.
+//!
 //! # Not yet here
 //!
-//! - **Streaming the nested run's events** (`on_stream`).
 //! - **Accruing nested usage on the parent.** The nested run's usage stays on its own result.
 //! - **`previous_response_id`, `conversation_id` and `session`.** The first two are conversation
 //!   state a provider keeps server-side, which this runner has no counterpart for; a nested session
@@ -52,6 +58,7 @@
 
 mod input;
 pub(crate) mod parent;
+mod stream;
 
 use std::{fmt, sync::Arc};
 
@@ -78,6 +85,10 @@ pub use input::{
     default_tool_input_builder, is_agent_tool_input, resolve_agent_tool_input,
 };
 pub(crate) use parent::ParentRun;
+use stream::StreamForwarding;
+pub use stream::{
+    AgentToolStreamEvent, AgentToolStreamHandler, DEFAULT_ON_STREAM_MAX_PENDING_EVENTS,
+};
 
 use super::AgentBinding;
 use crate::runner::{
@@ -221,6 +232,8 @@ pub struct AgentToolBuilder {
     parameters: Option<fn(&str) -> Result<TypedParameters>>,
     input_builder: Option<Arc<dyn StructuredToolInputBuilder>>,
     include_input_schema: bool,
+    on_stream: Option<Arc<dyn AgentToolStreamHandler>>,
+    on_stream_max_pending_events: Option<usize>,
     options: ToolOptions,
 }
 
@@ -323,6 +336,23 @@ impl AgentToolBuilder {
         self
     }
 
+    /// Receives the nested run's events as it runs; the nested agent then runs streamed.
+    pub fn on_stream(mut self, handler: Arc<dyn AgentToolStreamHandler>) -> Self {
+        self.on_stream = Some(handler);
+        self
+    }
+
+    /// Caps the events waiting for the stream handler, not counting the one being handled.
+    ///
+    /// Defaults to [`DEFAULT_ON_STREAM_MAX_PENDING_EVENTS`]; `None` allows any backlog. When the
+    /// backlog stays full after the handler has had a chance to catch up, the nested run and the
+    /// handler are stopped and the call fails through the tool's failure handling. This bounds the
+    /// number of pending events, not their size. Without [`Self::on_stream`] it has no effect.
+    pub const fn on_stream_max_pending_events(mut self, limit: Option<usize>) -> Self {
+        self.on_stream_max_pending_events = limit;
+        self
+    }
+
     /// Sets the remaining tool policies — exposure, concurrency, timeout, guardrails, permission
     /// scope.
     ///
@@ -341,6 +371,11 @@ impl AgentToolBuilder {
         if self.max_turns == Some(0) {
             return Err(Error::config(format!(
                 "agent tool `{name}` sets max_turns to zero"
+            )));
+        }
+        if self.on_stream_max_pending_events == Some(0) {
+            return Err(Error::config(format!(
+                "agent tool `{name}`: on_stream_max_pending_events must be a positive integer or None"
             )));
         }
 
@@ -400,6 +435,9 @@ impl AgentToolBuilder {
             error_function: self.error_function,
             run_config: self.run_config,
             max_turns: self.max_turns,
+            stream: self
+                .on_stream
+                .map(|handler| StreamForwarding::new(handler, self.on_stream_max_pending_events)),
         };
         tool.validate()?;
         Ok(tool)
@@ -422,6 +460,7 @@ pub struct AgentTool {
     error_function: Option<Arc<dyn AgentToolErrorFunction>>,
     run_config: Option<RunConfig>,
     max_turns: Option<u32>,
+    stream: Option<StreamForwarding>,
 }
 
 impl AgentTool {
@@ -443,6 +482,8 @@ impl AgentTool {
             parameters: None,
             input_builder: None,
             include_input_schema: false,
+            on_stream: None,
+            on_stream_max_pending_events: Some(DEFAULT_ON_STREAM_MAX_PENDING_EVENTS),
             options: ToolOptions::default(),
         }
     }
@@ -508,11 +549,18 @@ impl AgentTool {
             Some(state) => (state.run_id().clone(), Vec::new()),
             None => (RunId::generate(), input),
         };
+        // The agent a resumed run continues with may be one the nested run handed off to.
+        let starting_agent = resume
+            .as_ref()
+            .and_then(RunState::current_agent)
+            .unwrap_or_else(|| self.agent.id())
+            .clone();
+        let scope = call_scope.child(ScopeKind::Run);
         let mut request = RunRequest::new(
             AgentBinding::direct(Arc::clone(&self.agent)),
             Arc::clone(parent.model_resolver()),
             run_id,
-            call_scope.child(ScopeKind::Run),
+            scope.clone(),
             input,
         )
         .with_config(config)
@@ -530,12 +578,24 @@ impl AgentTool {
             request = request.with_tool_input(params);
         }
 
-        let mut result = Box::pin(Runner::run(request)).await?;
-        result.set_agent_tool_invocation(AgentToolInvocation::new(
+        let invocation = AgentToolInvocation::new(
             name.to_owned(),
             context.call_id().clone(),
             context.arguments().clone(),
-        ));
+        );
+        let mut result = match &self.stream {
+            Some(stream) => {
+                Box::pin(stream.run(
+                    request,
+                    &scope,
+                    starting_agent,
+                    Arc::new(invocation.clone()),
+                ))
+                .await?
+            }
+            None => Box::pin(Runner::run(request)).await?,
+        };
+        result.set_agent_tool_invocation(invocation);
         Ok(result)
     }
 
@@ -705,6 +765,7 @@ impl fmt::Debug for AgentTool {
             .field("capture_tool_input", &self.capture_tool_input)
             .field("inherits_run_config", &self.run_config.is_none())
             .field("max_turns", &self.max_turns)
+            .field("stream", &self.stream)
             .finish_non_exhaustive()
     }
 }
