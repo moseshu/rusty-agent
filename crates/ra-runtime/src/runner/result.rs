@@ -30,14 +30,57 @@ use ra_core::{
         ToolOutputGuardrailResult,
     },
     item::{
-        AgentId, InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse,
+        AgentId, CallId, InputItemNormalizer, Message, MessageRole, ModelInputItem, ModelResponse,
         OutputPhase, RunItem, RunItemKind,
     },
     state::{RunState, ToolUseTracker},
     step::NextStep,
     usage::Usage,
 };
+use serde_json::Value;
 use std::{ops::Range, sync::Arc};
+
+/// Immutable metadata about the agent-tool call a nested run answered.
+// The field names are the reference's `AgentToolInvocation` fields.
+#[allow(clippy::struct_field_names)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentToolInvocation {
+    tool_name: String,
+    tool_call_id: CallId,
+    tool_arguments: Value,
+}
+
+impl AgentToolInvocation {
+    pub(crate) fn new(tool_name: String, tool_call_id: CallId, tool_arguments: Value) -> Self {
+        Self {
+            tool_name,
+            tool_call_id,
+            tool_arguments,
+        }
+    }
+
+    /// The tool name the model called.
+    #[must_use]
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    /// The call this nested run answered.
+    #[must_use]
+    pub const fn tool_call_id(&self) -> &CallId {
+        &self.tool_call_id
+    }
+
+    /// The parsed arguments the model sent.
+    ///
+    /// The reference exposes the raw JSON string; arguments reach a tool here already parsed, so
+    /// this is that value rather than a re-serialization of it.
+    #[must_use]
+    pub const fn tool_arguments(&self) -> &Value {
+        &self.tool_arguments
+    }
+}
 
 /// Read-only facts supplied to a terminal error handler.
 ///
@@ -439,6 +482,7 @@ pub struct RunResult {
     turns: u32,
     state: RunState,
     final_message: Option<Message>,
+    agent_tool_invocation: Option<AgentToolInvocation>,
 }
 
 impl RunResult {
@@ -468,7 +512,22 @@ impl RunResult {
             turns,
             state,
             final_message,
+            agent_tool_invocation: None,
         }
+    }
+
+    /// Marks this result as the nested run of an agent-tool call.
+    pub(crate) fn set_agent_tool_invocation(&mut self, invocation: AgentToolInvocation) {
+        self.agent_tool_invocation = Some(invocation);
+    }
+
+    /// The agent-tool call this run answered, or `None` for a run that was not started by one.
+    ///
+    /// Set for the result an [`AgentTool`](crate::agent::tool::AgentTool) hands its output
+    /// extractor, so the extractor can tell which call it is shaping an answer for.
+    #[must_use]
+    pub const fn agent_tool_invocation(&self) -> Option<&AgentToolInvocation> {
+        self.agent_tool_invocation.as_ref()
     }
 
     /// Records what resumes the run's sandbox sessions, once they have been cleaned up.

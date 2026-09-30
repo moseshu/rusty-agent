@@ -29,8 +29,10 @@
 //! What the type does guarantee is that a prepared instance cannot reach the framework *without* a
 //! public agent named beside it.
 //!
-//! `as_tool` — the sub-agent shape, where a whole run becomes one tool call — is R12-2's and lands
-//! in this module beside the binding, since a nested run needs both identities too.
+//! [`tool`] holds `as_tool` — the sub-agent shape, where a whole run becomes one tool call — beside
+//! the binding, since a nested run needs both identities too.
+
+pub mod tool;
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
