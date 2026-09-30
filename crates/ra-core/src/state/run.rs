@@ -40,11 +40,12 @@ use crate::{
     permission::{PermissionDecision, PermissionRule},
     sandbox::{builtin_entry_registry, sanitize_run_state_sandbox_mount_authority},
     state::{ToolFailureTracker, ToolOutputReferenceTracker, ToolUseTracker},
+    tool::{ToolLookupKey, ToolOrigin},
     usage::Usage,
 };
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(5);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(6);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -71,10 +72,16 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          hands the receiving agent the transcript the transfer withheld.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(5),
         "Persisted what resumes each sandbox agent's session. An older runtime carries it as an \
          unknown field and starts every sandbox agent on a fresh workspace, losing the one the \
          paused run was working in.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the agent-tool runs paused on an approval, each with its own checkpoint, and \
+         routed answers to them. An older runtime neither asks for those approvals nor resumes \
+         the calls waiting on them, and continues with a tool call that has no output.",
     ),
 ];
 
@@ -244,6 +251,22 @@ impl EventSeqAllocator {
 }
 
 /// Reference to a nested child run spawned as a tool execution.
+///
+/// A parent records one for each agent-tool call whose nested run stopped to ask the host
+/// something, and drops it once that call has an output. It is the reference's registry entry for
+/// an interrupted `Agent.as_tool()` run, keyed the way the reference keys it — by the tool call
+/// within the parent's scope — and serialized with the parent the way the reference serializes the
+/// nested run's state onto the parent's pending function call.
+///
+/// # Why it carries the child's whole checkpoint
+///
+/// A host persists one value: the parent's [`RunState`]. The nested run's approvals are answered
+/// through that value and its resume starts from it, so the child's state has to be inside it —
+/// a pointer to some other store would make a parent checkpoint that cannot resume on its own.
+///
+/// The routing identity and the arguments are what the parent re-dispatches when it resumes. The
+/// call's record is in the parent's history too, but a call ID is only unique within one
+/// response, and finding the call by it would be a guess the day a model reuses one.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NestedRunRef {
@@ -251,6 +274,12 @@ pub struct NestedRunRef {
     call_id: CallId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lookup_key: Option<Box<ToolLookupKey>>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<Box<RunState>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -263,7 +292,31 @@ impl NestedRunRef {
             scope_id: scope_id.into(),
             call_id,
             signature: None,
+            lookup_key: None,
+            arguments: serde_json::Value::Null,
+            state: None,
             unknown: Unknown::new(),
+        }
+    }
+
+    /// Records the paused nested run behind one agent-tool call.
+    ///
+    /// `scope_id` is the parent run's ID: the reference scopes its registry per run state so two
+    /// independently restored copies never read each other's entries, and here the entry travels
+    /// inside the parent's state, which makes the parent's identity that scope.
+    #[must_use]
+    pub fn interrupted(
+        scope_id: impl Into<String>,
+        tool: &ToolOrigin,
+        call_id: CallId,
+        arguments: serde_json::Value,
+        state: RunState,
+    ) -> Self {
+        Self {
+            lookup_key: Some(Box::new(tool.lookup_key().clone())),
+            arguments,
+            state: Some(Box::new(state)),
+            ..Self::new(scope_id, call_id)
         }
     }
 
@@ -290,6 +343,30 @@ impl NestedRunRef {
     #[must_use]
     pub fn signature(&self) -> Option<&str> {
         self.signature.as_deref()
+    }
+
+    /// Exact routing key of the agent tool the parent re-dispatches on resume.
+    #[must_use]
+    pub fn lookup_key(&self) -> Option<&ToolLookupKey> {
+        self.lookup_key.as_deref()
+    }
+
+    /// Arguments of the parent's call, which the resumed call is dispatched with again.
+    #[must_use]
+    pub const fn arguments(&self) -> &serde_json::Value {
+        &self.arguments
+    }
+
+    /// Checkpoint of the paused nested run, when this reference records one.
+    #[must_use]
+    pub fn state(&self) -> Option<&RunState> {
+        self.state.as_deref()
+    }
+
+    /// Takes the paused nested run's checkpoint out.
+    #[must_use]
+    pub fn into_state(self) -> Option<RunState> {
+        self.state.map(|state| *state)
     }
 
     /// Unknown fields retained during deserialization.
@@ -840,6 +917,7 @@ impl TryFrom<RunStateRecord> for RunState {
             &pending_interruption_resolutions,
             &pending_interruptions,
         )?;
+        validate_nested_runs(&nested_runs, &run_id)?;
 
         Ok(Self {
             schema_version,
@@ -1110,7 +1188,10 @@ impl RunState {
         self
     }
 
-    /// Nested child runs spawned during this run.
+    /// Agent-tool runs paused on an approval, each waiting to be continued when this run resumes.
+    ///
+    /// Only paused runs are recorded, as in the reference: a nested run that finished has already
+    /// become its call's output, and nothing about it is left to resume.
     #[must_use]
     pub fn nested_runs(&self) -> &[NestedRunRef] {
         &self.nested_runs
@@ -1387,17 +1468,49 @@ impl RunState {
         &self.pending_interruptions
     }
 
-    /// The authoritative records [`Self::pending_interruptions`] names.
+    /// Every record the host still has to answer: the ones [`Self::pending_interruptions`] names,
+    /// then those of each paused agent-tool run in [`Self::nested_runs`], depth first.
+    ///
+    /// The nested ones are the reference's `get_interruptions()` for a run whose agent tool
+    /// stopped on an approval: the question is the nested run's, but the host is asked through
+    /// the parent, and answers it through [`Self::approve`] or [`Self::reject`] on the parent.
     pub fn pending_interruption_items(&self) -> impl Iterator<Item = &RunItem> {
-        self.pending_interruptions.iter().filter_map(|id| {
+        let mut items = Vec::new();
+        self.collect_pending_interruption_items(&mut items);
+        items.into_iter()
+    }
+
+    fn collect_pending_interruption_items<'a>(&'a self, items: &mut Vec<&'a RunItem>) {
+        items.extend(self.pending_interruptions.iter().filter_map(|id| {
             self.generated_items
                 .iter()
                 .find(|generated| generated.id() == id)
-        })
+        }));
+        for state in self.nested_runs.iter().filter_map(NestedRunRef::state) {
+            state.collect_pending_interruption_items(items);
+        }
     }
 
     /// Answers a pending tool approval and retains that answer for resume.
+    ///
+    /// An approval raised inside a paused agent-tool run is answered on that run's own state, as
+    /// the reference routes it: an `always` answer there becomes a rule of the nested run, and
+    /// never one of this run.
     pub fn approve(&mut self, item: &RunItem, always: bool) -> Result<()> {
+        let owner = self.interruption_owner(item)?;
+        self.owner_mut(&owner).approve_own(item, always)
+    }
+
+    /// Rejects a pending tool approval and retains that answer for resume.
+    ///
+    /// Routed to the run that raised the approval, as [`Self::approve`] is.
+    pub fn reject(&mut self, item: &RunItem, always: bool) -> Result<()> {
+        let owner = self.interruption_owner(item)?;
+        self.owner_mut(&owner)
+            .answer_interruption(item, InterruptionResolution::Reject { always })
+    }
+
+    fn approve_own(&mut self, item: &RunItem, always: bool) -> Result<()> {
         let approval = self.authoritative_tool_approval(item)?;
         if approval.lookup_key().is_none() {
             return Err(Error::caller(format!(
@@ -1408,9 +1521,146 @@ impl RunState {
         self.answer_interruption(item, InterruptionResolution::Approve { always })
     }
 
-    /// Rejects a pending tool approval and retains that answer for resume.
-    pub fn reject(&mut self, item: &RunItem, always: bool) -> Result<()> {
-        self.answer_interruption(item, InterruptionResolution::Reject { always })
+    /// Finds the run — this one, or a paused agent-tool run inside it — that is waiting on `item`.
+    ///
+    /// Returned as a path of indexes into [`Self::nested_runs`], empty for this run. An item no run
+    /// is waiting on resolves to this run, whose own answer then reports it as not pending.
+    ///
+    /// Record IDs derive from call IDs, and a nested run's calls are numbered by another model
+    /// call than this run's, so the same ID can be pending in two places. The record the host was
+    /// shown settles that when it can — the two copies name different producers — and when it
+    /// cannot, the answer is refused rather than applied to whichever came first, as the reference
+    /// fails closed on an ambiguous approval identity.
+    fn interruption_owner(&self, item: &RunItem) -> Result<Vec<usize>> {
+        let mut owners = Vec::new();
+        self.collect_interruption_owners(item.id(), &mut Vec::new(), &mut owners);
+        if owners.len() > 1 {
+            owners.retain(|path| {
+                self.owner(path)
+                    .generated_items
+                    .iter()
+                    .any(|stored| stored == item)
+            });
+            if owners.len() != 1 {
+                return Err(Error::caller(format!(
+                    "cannot apply an answer to `{}`: more than one pending approval in this run and                      its nested agent-tool runs has that identity; use unique call IDs",
+                    item.id()
+                )));
+            }
+        }
+        Ok(owners.pop().unwrap_or_default())
+    }
+
+    fn collect_interruption_owners(
+        &self,
+        id: &ItemId,
+        path: &mut Vec<usize>,
+        owners: &mut Vec<Vec<usize>>,
+    ) {
+        if self
+            .pending_interruptions
+            .iter()
+            .any(|pending| pending == id)
+        {
+            owners.push(path.clone());
+        }
+        for (index, nested) in self.nested_runs.iter().enumerate() {
+            if let Some(state) = nested.state() {
+                path.push(index);
+                state.collect_interruption_owners(id, path, owners);
+                path.pop();
+            }
+        }
+    }
+
+    fn owner(&self, path: &[usize]) -> &Self {
+        path.iter().fold(self, |state, index| {
+            state.nested_runs[*index]
+                .state
+                .as_deref()
+                .unwrap_or_else(|| unreachable!("owner paths only pass through recorded states"))
+        })
+    }
+
+    fn owner_mut(&mut self, path: &[usize]) -> &mut Self {
+        path.iter().fold(self, |state, index| {
+            state.nested_runs[*index]
+                .state
+                .as_deref_mut()
+                .unwrap_or_else(|| unreachable!("owner paths only pass through recorded states"))
+        })
+    }
+
+    /// The records in [`Self::pending_interruption_items`] that have no answer yet.
+    ///
+    /// What a resumed run asks again: the reference re-asks only the approvals still unanswered,
+    /// and an answer already given stays with the run that owns it until that run continues.
+    pub fn unanswered_interruption_items(&self) -> impl Iterator<Item = &RunItem> {
+        let mut items = Vec::new();
+        self.collect_unanswered_interruption_items(&mut items);
+        items.into_iter()
+    }
+
+    fn collect_unanswered_interruption_items<'a>(&'a self, items: &mut Vec<&'a RunItem>) {
+        items.extend(
+            self.pending_interruptions
+                .iter()
+                .filter(|id| {
+                    !self
+                        .pending_interruption_resolutions
+                        .iter()
+                        .any(|entry| entry.item_id == **id)
+                })
+                .filter_map(|id| {
+                    self.generated_items
+                        .iter()
+                        .find(|generated| generated.id() == id)
+                }),
+        );
+        for state in self.nested_runs.iter().filter_map(NestedRunRef::state) {
+            state.collect_unanswered_interruption_items(items);
+        }
+    }
+
+    /// Whether any record this run or a paused agent-tool run inside it waits on has no answer.
+    ///
+    /// Answered records stay pending until their outputs are settled. This reports only records
+    /// that still need a host decision, including those in deeper nested runs.
+    #[must_use]
+    pub fn has_unanswered_interruptions(&self) -> bool {
+        self.pending_interruptions.iter().any(|id| {
+            !self
+                .pending_interruption_resolutions
+                .iter()
+                .any(|entry| entry.item_id == *id)
+        }) || self
+            .nested_runs
+            .iter()
+            .filter_map(NestedRunRef::state)
+            .any(Self::has_unanswered_interruptions)
+    }
+
+    /// Records the agent-tool runs the settled turn left paused on an approval.
+    ///
+    /// Replaces whatever was recorded before: a turn settles on one interruption, and the nested
+    /// runs of an earlier one were continued — and so dropped — before it started.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error for a reference that could not be resumed from this state: one
+    /// without a checkpoint, a routing key or anything pending, one whose checkpoint names a
+    /// different parent, or two references for the same call.
+    #[doc(hidden)]
+    pub fn set_nested_runs(&mut self, nested_runs: Vec<NestedRunRef>) -> Result<()> {
+        validate_nested_runs(&nested_runs, &self.run_id)?;
+        self.nested_runs = nested_runs;
+        Ok(())
+    }
+
+    /// Takes the paused agent-tool runs out so each can be continued.
+    #[doc(hidden)]
+    pub fn take_nested_runs(&mut self) -> Vec<NestedRunRef> {
+        std::mem::take(&mut self.nested_runs)
     }
 
     /// Answers the awaiting records without removing them before their result is recorded.
@@ -1654,16 +1904,8 @@ impl RunState {
     /// would send the caller's input on top of a history it had already replaced.
     #[doc(hidden)]
     pub fn begin_segment(&mut self, agent: AgentId, input: Vec<ModelInputItem>) -> Result<()> {
-        if self.pending_interruptions.iter().any(|id| {
-            !self
-                .pending_interruption_resolutions
-                .iter()
-                .any(|entry| entry.item_id == *id)
-        }) {
-            return Err(Error::caller(
-                "run state has unanswered interruptions; resolve them before resuming",
-            ));
-        }
+        // Resume may settle only some approvals. The runner returns the remaining questions
+        // before another model call; entering a segment must not prevent that settlement.
         match &self.current_agent {
             Some(current) if current != &agent => Err(Error::caller(format!(
                 "run state expects current agent `{current}`, not `{agent}`"
@@ -1840,6 +2082,44 @@ fn serialize_sandbox_envelope<S: serde::Serializer>(
 /// produce the same value, and a rule enforced on only one of them is a rule a restart walks
 /// around: an ID naming nothing leaves the run permanently unresumable, and one naming an ordinary
 /// message leaves it waiting for an answer to a question nobody was asked.
+/// A paused agent-tool run this state can resume: its own checkpoint under this run, the key
+/// that routes the call again, something still pending, and one reference per call.
+///
+/// A reference without a checkpoint is the persistent identity alone, which is all this slot held
+/// before paused runs were recorded; it has nothing to resume and is let through as it always was.
+fn validate_nested_runs(nested_runs: &[NestedRunRef], run_id: &RunId) -> Result<()> {
+    let mut calls = std::collections::BTreeSet::new();
+    for nested in nested_runs {
+        let call_id = nested.call_id();
+        let Some(state) = nested.state() else {
+            continue;
+        };
+        if !calls.insert(call_id) {
+            return Err(Error::caller(format!(
+                "run state records two paused agent-tool runs for call `{call_id}`"
+            )));
+        }
+        if nested.lookup_key().is_none() {
+            return Err(Error::caller(format!(
+                "paused agent-tool run for call `{call_id}` has no tool routing identity to resume \
+                 through"
+            )));
+        }
+        if state.parent_run_id() != Some(run_id) {
+            return Err(Error::caller(format!(
+                "paused agent-tool run for call `{call_id}` belongs to another parent run than \
+                 `{run_id}`"
+            )));
+        }
+        if state.pending_interruption_items().next().is_none() {
+            return Err(Error::caller(format!(
+                "paused agent-tool run for call `{call_id}` is not waiting on anything"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_pending_interruptions(ids: &[ItemId], generated: &[RunItem]) -> Result<()> {
     for id in ids {
         let Some(item) = generated.iter().find(|generated| generated.id() == id) else {

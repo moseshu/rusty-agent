@@ -11,10 +11,16 @@
 //! Nothing outside this crate can read it. A tool invoked directly — not through the runner's
 //! dispatch — finds no parent here, which [`super::AgentTool`] reports as a caller error rather
 //! than guessing a model provider.
+//!
+//! The narrowing also carries, for a call the parent is resuming, the checkpoint of the nested run
+//! that call paused on. The reference finds that state in its registry by tool-call identity; here
+//! the parent's own state holds it, and the runner hands it to exactly the call it belongs to. A
+//! nested run installs its own environment around its loop, so the checkpoint never reaches a call
+//! the nested run makes in turn.
 
 use std::{any::Any, future::Future, sync::Arc};
 
-use ra_core::{cancel::CancelScope, model::ModelResolver};
+use ra_core::{cancel::CancelScope, model::ModelResolver, state::RunState};
 
 use crate::runner::RunConfig;
 
@@ -27,6 +33,7 @@ tokio::task_local! {
 pub(crate) struct ParentRun {
     run: Arc<ParentRunEnvironment>,
     call_scope: Option<CancelScope>,
+    resume: Option<Arc<RunState>>,
 }
 
 struct ParentRunEnvironment {
@@ -49,6 +56,7 @@ impl ParentRun {
                 app_context,
             }),
             call_scope: None,
+            resume: None,
         }
     }
 
@@ -62,10 +70,16 @@ impl ParentRun {
         CURRENT.scope(self, future).await
     }
 
-    /// Narrows the environment to one tool call's cancellation scope.
+    /// Narrows the environment to one tool call: its cancellation scope, and the paused nested run
+    /// it continues, if it is being resumed.
     #[must_use]
-    pub(crate) fn for_call(mut self, call_scope: CancelScope) -> Self {
+    pub(crate) fn for_call(
+        mut self,
+        call_scope: CancelScope,
+        resume: Option<Arc<RunState>>,
+    ) -> Self {
         self.call_scope = Some(call_scope);
+        self.resume = resume;
         self
     }
 
@@ -84,6 +98,11 @@ impl ParentRun {
     /// The scope of the tool call being executed; absent outside a dispatched call.
     pub(crate) const fn call_scope(&self) -> Option<&CancelScope> {
         self.call_scope.as_ref()
+    }
+
+    /// The paused nested run the call being executed continues; absent for a fresh call.
+    pub(crate) fn nested_resume(&self) -> Option<&RunState> {
+        self.resume.as_deref()
     }
 }
 
@@ -104,10 +123,19 @@ where
     }
 }
 
-/// Runs a tool invocation narrowed to its own call scope, when it belongs to a run.
-pub(crate) async fn within_call<F: Future>(call_scope: &CancelScope, future: F) -> F::Output {
+/// Runs a tool invocation narrowed to its own call, when it belongs to a run.
+pub(crate) async fn within_call<F: Future>(
+    call_scope: &CancelScope,
+    resume: Option<Arc<RunState>>,
+    future: F,
+) -> F::Output {
     match ParentRun::current() {
-        Some(parent) => parent.for_call(call_scope.clone()).scope(future).await,
+        Some(parent) => {
+            parent
+                .for_call(call_scope.clone(), resume)
+                .scope(future)
+                .await
+        }
         None => future.await,
     }
 }

@@ -107,8 +107,9 @@ impl ToolUseResult {
 /// failed or unapproved call into a successful terminal run.
 ///
 /// `nested_run` is a persistent identity, not a live child runtime result. `ra-core` cannot own
-/// that runtime object without reversing the crate dependency; the nested-agent implementation
-/// will populate and resolve the reference through the parent run's bounded registry.
+/// that runtime object without reversing the crate dependency, so an agent tool whose nested run
+/// stopped on an approval is represented by the nested run's checkpoint instead — the value the
+/// parent records in its own state and resumes the call from.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct FunctionToolResult {
@@ -169,6 +170,36 @@ impl FunctionToolResult {
         })
     }
 
+    /// Creates the result of an agent-tool call whose nested run stopped on an approval.
+    ///
+    /// Following the reference, the call has no output and no run item yet — its answer is owed
+    /// once the nested run can continue — and the nested run's pending approvals are this call's
+    /// interruptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error when `nested_run` records no paused checkpoint, or one that is not
+    /// waiting on anything.
+    pub fn nested_interruption(tool: ToolOrigin, nested_run: NestedRunRef) -> Result<Self> {
+        let interruptions: Vec<RunItem> = nested_run
+            .state()
+            .map(|state| state.pending_interruption_items().cloned().collect())
+            .unwrap_or_default();
+        if interruptions.is_empty() {
+            return Err(Error::caller(
+                "a nested agent-tool interruption requires a paused nested run with pending \
+                 approvals",
+            ));
+        }
+        Ok(Self {
+            tool,
+            output: None,
+            run_item: None,
+            interruptions,
+            nested_run: Some(nested_run),
+        })
+    }
+
     /// Stable identity of the tool that was dispatched.
     #[must_use]
     pub const fn tool(&self) -> &ToolOrigin {
@@ -181,14 +212,18 @@ impl FunctionToolResult {
         self.output.as_ref()
     }
 
-    /// ID of the call this result answers when either its output or its normalized item has one.
+    /// ID of the call this result answers, from its output, its normalized item, or the nested run
+    /// it is waiting on.
     #[must_use]
     pub const fn call_id(&self) -> Option<&CallId> {
         match self.output.as_ref() {
             Some(output) => Some(output.call_id()),
             None => match self.run_item.as_ref() {
                 Some(item) => item.call_id(),
-                None => None,
+                None => match self.nested_run.as_ref() {
+                    Some(nested) => Some(nested.call_id()),
+                    None => None,
+                },
             },
         }
     }
@@ -205,9 +240,11 @@ impl FunctionToolResult {
         &self.interruptions
     }
 
-    /// Persistent child-run identity for an agent-as-tool invocation.
+    /// The paused nested run of an agent-tool call that stopped on an approval.
     ///
-    /// It remains empty until nested-agent execution is available.
+    /// Empty for every other result, including an agent-tool call whose nested run finished: as in
+    /// the reference, only an interrupted nested run is kept, because only it has anything left to
+    /// resume.
     #[must_use]
     pub const fn nested_run(&self) -> Option<&NestedRunRef> {
         self.nested_run.as_ref()

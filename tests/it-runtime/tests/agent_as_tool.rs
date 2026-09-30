@@ -15,18 +15,25 @@ use ra_core::{
     cancel::{CancelReason, CancelScope},
     context::{RunAgent, RunContext},
     error::{Error, Result},
-    guardrail::{GuardrailFinalOutput, GuardrailFunctionOutput, OutputGuardrail},
+    finish::FinishReason,
+    guardrail::{
+        GuardrailFinalOutput, GuardrailFunctionOutput, OutputGuardrail,
+        ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData,
+        ToolOutputGuardrail, ToolOutputGuardrailData,
+    },
     item::{
         CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolCall,
     },
+    lifecycle::{LifecycleHook, LifecycleScope, ToolEndInput, ToolStartInput},
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
         ResolvedModel,
     },
-    state::RunId,
+    state::{RunId, RunState},
     tool::{
-        Tool, ToolApprovalPolicy, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        Tool, ToolApprovalPolicy, ToolContext, ToolGuardrailId, ToolOptions, ToolOrigin,
+        ToolOutput, ToolSchema,
     },
 };
 use ra_macros::ToolInput;
@@ -968,10 +975,20 @@ async fn needs_approval_interrupts_before_the_nested_run_starts() {
     assert_eq!(resolver.calls().len(), 1);
 }
 
-#[tokio::test]
-async fn a_nested_approval_fails_the_parent_turn_instead_of_reaching_the_model() {
-    let mut guarded = ProbeTool::new("guarded", "never");
-    guarded.options = ToolOptions::default().with_approval(ToolApprovalPolicy::Always);
+// ---------------------------------------------------------------------------------------------
+// Approvals inside the nested run (the reference's nested approval bubbling and mirroring)
+// ---------------------------------------------------------------------------------------------
+
+fn gated_probe(name: &str, output: &str) -> ProbeTool {
+    let mut probe = ProbeTool::new(name, output);
+    probe.options = ToolOptions::default().with_approval(ToolApprovalPolicy::Always);
+    probe
+}
+
+/// A nested agent whose one tool always asks for approval, and the log of that tool's calls.
+fn guarded_nested() -> (Arc<AgentSpec>, SeenToolInput) {
+    let guarded = gated_probe("guarded", "guarded output");
+    let calls = Arc::clone(&guarded.seen_tool_input);
     let nested = AgentSpec::builder()
         .id(AgentId::new("nested"))
         .name("Nested")
@@ -979,18 +996,850 @@ async fn a_nested_approval_fails_the_parent_turn_instead_of_reaching_the_model()
         .tool(Arc::new(guarded))
         .build()
         .unwrap();
-    // Model-visible failure handling is the default, and it must still not swallow the question.
-    let tool = nested.as_tool().build().unwrap();
+    (nested, calls)
+}
+
+fn resume(parent: Arc<AgentSpec>, resolver: &Arc<ScriptedResolver>, state: RunState) -> RunRequest {
+    RunRequest::new(
+        AgentBinding::direct(parent),
+        Arc::clone(resolver) as Arc<dyn ModelResolver>,
+        RunId::new("run-parent"),
+        CancelScope::root(),
+        Vec::new(),
+    )
+    .with_state(state)
+}
+
+fn interruptions(result: &RunResult) -> Vec<RunItem> {
+    let RunOutcome::Interrupted { items } = result.outcome() else {
+        panic!("expected an interruption, got {:?}", result.outcome());
+    };
+    items.clone()
+}
+
+fn asked_tool(item: &RunItem) -> &str {
+    let RunItemKind::ToolApproval(approval) = item.kind() else {
+        panic!("expected an approval, got {item:?}");
+    };
+    approval.tool_name()
+}
+
+fn approve_all(result: &RunResult, always: bool) -> RunState {
+    let mut state = result.state().clone();
+    for item in interruptions(result) {
+        state.approve(&item, always).unwrap();
+    }
+    state
+}
+
+fn two_calls(first: &str, second: &str) -> ModelResponse {
+    ModelResponse::new(vec![
+        item(
+            "p-1a",
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new(first),
+                "nested",
+                json!({"input": "x"}),
+            )),
+        ),
+        item(
+            "p-1b",
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new(second),
+                "nested",
+                json!({"input": "y"}),
+            )),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn nested_approvals_are_asked_through_the_parent_and_resume_once_answered() {
+    let (nested, guarded_calls) = guarded_nested();
+    // Model-visible failure handling is the default, and it must not swallow the question.
+    let parent = orchestrator(nested.as_tool().build().unwrap());
     let resolver = ScriptedResolver::new(vec![
         tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
         tool_call("n-1", "n-call-1", "guarded", json!({})),
-        final_message("p-2", "must not be reached"),
+        final_message("n-2", "nested done"),
+        final_message("p-2", "done"),
     ]);
-    let error = Runner::run(request(orchestrator(tool), &resolver))
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("approval"), "{error}");
+        .unwrap();
+    let items = interruptions(&first);
+    assert_eq!(items.len(), 1);
+    assert_eq!(asked_tool(&items[0]), "guarded");
     assert_eq!(resolver.calls().len(), 2);
+    assert!(guarded_calls.lock().unwrap().is_empty());
+    // The call waits for its nested run: it has no output yet, so nothing reaches the model.
+    assert!(
+        !first
+            .new_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(_)))
+    );
+    let state = first.state();
+    assert!(state.pending_interruptions().is_empty());
+    assert_eq!(
+        state
+            .pending_interruption_items()
+            .cloned()
+            .collect::<Vec<_>>(),
+        items
+    );
+    let [paused] = state.nested_runs() else {
+        panic!("one paused nested run is kept with the parent");
+    };
+    assert_eq!(paused.call_id(), &CallId::new("call-1"));
+    assert_eq!(paused.scope_id(), "run-parent");
+    assert_eq!(paused.arguments(), &json!({"input": "x"}));
+
+    let mut state = state.clone();
+    state.approve(&items[0], true).unwrap();
+    assert!(
+        state.permission_rules().is_empty(),
+        "an always answer to a nested question is the nested run's rule"
+    );
+    let resumed = Runner::run(resume(parent, &resolver, state)).await.unwrap();
+
+    assert!(
+        matches!(resumed.outcome(), RunOutcome::Completed { .. }),
+        "{:?}",
+        resumed.outcome()
+    );
+    assert_eq!(resumed.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    assert!(resumed.state().nested_runs().is_empty());
+    let calls = resolver.calls();
+    assert_eq!(calls.len(), 4);
+    // The nested run continued its own history instead of starting over.
+    assert_eq!(tool_output_texts(&calls[2].input), ["guarded output"]);
+    assert_eq!(tool_output_texts(&calls[3].input), ["nested done"]);
+}
+
+#[tokio::test]
+async fn an_agent_tool_that_needs_approval_still_surfaces_its_nested_approval() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().needs_approval(true).build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        final_message("n-2", "hola"),
+        final_message("p-2", "done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(asked_tool(&interruptions(&first)[0]), "nested");
+
+    let second = Runner::run(resume(
+        Arc::clone(&parent),
+        &resolver,
+        approve_all(&first, true),
+    ))
+    .await
+    .unwrap();
+    let items = interruptions(&second);
+    assert_eq!(asked_tool(&items[0]), "guarded");
+    assert_eq!(
+        second.turns(),
+        0,
+        "the parent model has nothing new to read"
+    );
+    assert_eq!(resolver.calls().len(), 2);
+    assert!(guarded_calls.lock().unwrap().is_empty());
+
+    let last = Runner::run(resume(parent, &resolver, approve_all(&second, true)))
+        .await
+        .unwrap();
+    assert_eq!(last.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_rejected_nested_approval_resumes_the_nested_run_with_the_refusal() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        final_message("n-2", "rejected, so no"),
+        final_message("p-2", "done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let mut state = first.state().clone();
+    state.reject(&interruptions(&first)[0], false).unwrap();
+    let resumed = Runner::run(resume(parent, &resolver, state)).await.unwrap();
+
+    assert_eq!(resumed.final_text(), "done");
+    assert!(guarded_calls.lock().unwrap().is_empty());
+    let calls = resolver.calls();
+    let [refusal] = tool_output_texts(&calls[2].input).try_into().unwrap();
+    assert!(refusal.contains("approval_rejected"), "{refusal}");
+    assert_eq!(tool_output_texts(&calls[3].input), ["rejected, so no"]);
+}
+
+/// Ported from the reference's `test_parent_approval_does_not_authorize_independent_nested_run`,
+/// whose resume without an answer is interrupted again on the same question.
+#[tokio::test]
+async fn an_unanswered_nested_approval_is_asked_again_without_a_model_call() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        final_message("n-2", "nested done"),
+        final_message("p-2", "done"),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+
+    let again = Runner::run(resume(
+        Arc::clone(&parent),
+        &resolver,
+        first.state().clone(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(interruptions(&again), interruptions(&first));
+    assert_eq!(again.turns(), 0);
+    assert_eq!(resolver.calls().len(), 2);
+    assert!(guarded_calls.lock().unwrap().is_empty());
+
+    let last = Runner::run(resume(parent, &resolver, approve_all(&again, false)))
+        .await
+        .unwrap();
+    assert_eq!(last.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+}
+
+/// The paused nested run's questions, found through the call that started it.
+fn questions_of(state: &RunState, call_id: &str) -> Vec<RunItem> {
+    state
+        .nested_runs()
+        .iter()
+        .find(|nested| nested.call_id() == &CallId::new(call_id))
+        .and_then(|nested| nested.state())
+        .expect("the call has a paused nested run")
+        .pending_interruption_items()
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn only_the_nested_runs_that_have_their_answers_continue() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        two_calls("call-a", "call-b"),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        tool_call("n-2", "n-call-2", "guarded", json!({})),
+        final_message("n-3", "nested done"),
+        final_message("n-4", "nested done"),
+        final_message("p-2", "done"),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let mut state = first.state().clone();
+    let answered = questions_of(&state, "call-a");
+    let waiting = questions_of(&state, "call-b");
+    state.approve(&answered[0], false).unwrap();
+
+    let second = Runner::run(resume(Arc::clone(&parent), &resolver, state))
+        .await
+        .unwrap();
+    assert_eq!(interruptions(&second), waiting);
+    assert_eq!(
+        second.turns(),
+        0,
+        "the parent model waits for call-b's output"
+    );
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    let [still_paused] = second.state().nested_runs() else {
+        panic!("only call-b is still paused");
+    };
+    assert_eq!(still_paused.call_id(), &CallId::new("call-b"));
+    assert!(second.state().generated_items().iter().any(|item| matches!(
+        item.kind(),
+        RunItemKind::ToolCallOutput(output) if output.call_id() == &CallId::new("call-a")
+    )));
+
+    let last = Runner::run(resume(parent, &resolver, approve_all(&second, false)))
+        .await
+        .unwrap();
+    assert_eq!(last.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[5].input),
+        ["nested done", "nested done"]
+    );
+}
+
+#[tokio::test]
+async fn a_partly_answered_nested_run_waits_for_the_rest_and_asks_only_what_is_unanswered() {
+    for reject_first in [false, true] {
+        for deep in [false, true] {
+            check_partial_nested_resume(reject_first, deep).await;
+        }
+    }
+}
+
+async fn check_partial_nested_resume(reject_first: bool, deep: bool) {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = if deep {
+        let middle = AgentSpec::builder()
+            .id(AgentId::new("middle"))
+            .name("Middle")
+            .instructions("delegate")
+            .tool(Arc::new(nested.as_tool().build().unwrap()))
+            .build()
+            .unwrap();
+        orchestrator(middle.as_tool().build().unwrap())
+    } else {
+        orchestrator(nested.as_tool().build().unwrap())
+    };
+    let both = ModelResponse::new(vec![
+        item(
+            "n-1a",
+            RunItemKind::ToolCall(ToolCall::new(CallId::new("n-a"), "guarded", json!({}))),
+        ),
+        item(
+            "n-1b",
+            RunItemKind::ToolCall(ToolCall::new(CallId::new("n-b"), "guarded", json!({}))),
+        ),
+    ]);
+    let mut script = Vec::new();
+    if deep {
+        script.push(tool_call(
+            "root-1",
+            "root-call",
+            "middle",
+            json!({"input": "x"}),
+        ));
+    }
+    script.extend([
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        both,
+        final_message("n-2", "nested done"),
+    ]);
+    if deep {
+        script.push(final_message("middle-2", "middle done"));
+    }
+    script.push(final_message("p-2", "done"));
+    let resolver = ScriptedResolver::new(script);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let asked = interruptions(&first);
+    assert_eq!(asked.len(), 2);
+    let mut state: RunState =
+        serde_json::from_str(&serde_json::to_string(first.state()).unwrap()).unwrap();
+    if reject_first {
+        state.reject(&asked[0], false).unwrap();
+    } else {
+        state.approve(&asked[0], false).unwrap();
+    }
+
+    let second = Runner::run(resume(Arc::clone(&parent), &resolver, state))
+        .await
+        .unwrap();
+    // As the upstream run behaves: only the unanswered question is asked again, and nothing the
+    // nested run asked about has run. An approval waits with the paused run; a rejection outranks
+    // the open question, so the nested run is continued far enough to settle the refusal.
+    assert_eq!(interruptions(&second), vec![asked[1].clone()]);
+    assert!(guarded_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        resolver.calls().len(),
+        2 + usize::from(deep),
+        "no model call while an approval remains"
+    );
+    let mut owner = second.state();
+    while let [paused] = owner.nested_runs() {
+        owner = paused.state().unwrap();
+    }
+    let refused = owner.generated_items().iter().any(|item| {
+        matches!(
+            item.kind(),
+            RunItemKind::ToolCallOutput(output)
+                if output.call_id() == &CallId::new("n-a")
+                    && output.output().to_string().contains("approval_rejected")
+        )
+    });
+    if reject_first {
+        assert!(
+            owner.pending_interruption_resolutions().is_empty(),
+            "the rejection is settled at once"
+        );
+        assert!(refused, "the refusal is in the nested run's history");
+    } else {
+        assert_eq!(
+            owner.pending_interruption_resolutions().len(),
+            1,
+            "the approval waits with the paused run"
+        );
+        assert!(!refused);
+    }
+    assert!(owner.has_unanswered_interruptions());
+
+    let mut state: RunState =
+        serde_json::from_str(&serde_json::to_string(second.state()).unwrap()).unwrap();
+    state.approve(&asked[1], false).unwrap();
+    let last = Runner::run(resume(parent, &resolver, state)).await.unwrap();
+    assert_eq!(last.final_text(), "done");
+    assert_eq!(
+        guarded_calls.lock().unwrap().len(),
+        1 + usize::from(!reject_first)
+    );
+    let calls = resolver.calls();
+    let nested_outputs = tool_output_texts(&calls[2 + usize::from(deep)].input);
+    assert_eq!(nested_outputs.len(), 2, "each call has exactly one output");
+    if reject_first {
+        assert!(nested_outputs[0].contains("approval_rejected"));
+    }
+}
+
+/// Records the tool outputs each delivery it checks carries.
+#[derive(Default)]
+struct DeliveredOutputs(Mutex<Vec<Vec<String>>>);
+
+struct RecordingGuardrail(Arc<DeliveredOutputs>);
+
+#[async_trait]
+impl OutputGuardrail for RecordingGuardrail {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    async fn check(
+        &self,
+        _context: &RunContext,
+        output: &GuardrailFinalOutput<'_>,
+    ) -> Result<GuardrailFunctionOutput> {
+        self.0.0.lock().unwrap().push(
+            output
+                .tool_outputs()
+                .iter()
+                .map(|output| output.output().to_string())
+                .collect(),
+        );
+        Ok(GuardrailFunctionOutput::pass())
+    }
+}
+
+#[tokio::test]
+async fn an_approved_call_ends_the_resumed_run_under_the_stop_policy() {
+    let gated = gated_probe("write", "written");
+    let calls = Arc::clone(&gated.seen_tool_input);
+    let delivered = Arc::new(DeliveredOutputs::default());
+    let parent = AgentSpec::builder()
+        .id(AgentId::new("orchestrator"))
+        .name("Orchestrator")
+        .instructions("orchestrate")
+        .tool(Arc::new(gated))
+        .tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
+        .output_guardrail(Arc::new(RecordingGuardrail(Arc::clone(&delivered))))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![tool_call("p-1", "call-1", "write", json!({}))]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.outcome().finish_reason(),
+        Some(FinishReason::ToolStop)
+    );
+    assert_eq!(resolver.calls().len(), 1, "no model call after the stop");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let checked = delivered.0.lock().unwrap().clone();
+    let [outputs] = checked.as_slice() else {
+        panic!("the delivery is checked once, got {checked:?}");
+    };
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].contains("written"), "{outputs:?}");
+}
+
+#[tokio::test]
+async fn a_continued_agent_tool_ends_the_resumed_run_under_the_stop_policy() {
+    let (nested, guarded_calls) = guarded_nested();
+    let delivered = Arc::new(DeliveredOutputs::default());
+    let parent = AgentSpec::builder()
+        .id(AgentId::new("orchestrator"))
+        .name("Orchestrator")
+        .instructions("orchestrate")
+        .tool(Arc::new(nested.as_tool().build().unwrap()))
+        .tool_use_behavior(ToolUseBehavior::StopAtTools {
+            names: ["nested".to_owned()].into_iter().collect(),
+        })
+        .output_guardrail(Arc::new(RecordingGuardrail(Arc::clone(&delivered))))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        final_message("n-2", "nested done"),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.outcome().finish_reason(),
+        Some(FinishReason::ToolStop)
+    );
+    assert_eq!(
+        resolver.calls().len(),
+        3,
+        "the parent model is not asked again"
+    );
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    let checked = delivered.0.lock().unwrap().clone();
+    let [outputs] = checked.as_slice() else {
+        panic!("the delivery is checked once, got {checked:?}");
+    };
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].contains("nested done"), "{outputs:?}");
+}
+
+#[tokio::test]
+async fn a_nested_run_that_pauses_again_is_asked_before_the_parent_model() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        tool_call("n-2", "n-call-2", "guarded", json!({})),
+        final_message("n-3", "nested done"),
+        final_message("p-2", "done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let second = Runner::run(resume(
+        Arc::clone(&parent),
+        &resolver,
+        approve_all(&first, false),
+    ))
+    .await
+    .unwrap();
+    let items = interruptions(&second);
+    let RunItemKind::ToolApproval(approval) = items[0].kind() else {
+        panic!("expected an approval");
+    };
+    assert_eq!(approval.call_id(), &CallId::new("n-call-2"));
+    assert_eq!(second.turns(), 0);
+    assert_eq!(resolver.calls().len(), 3);
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+
+    let last = Runner::run(resume(parent, &resolver, approve_all(&second, false)))
+        .await
+        .unwrap();
+    assert_eq!(last.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_parent_approval_does_not_authorize_the_nested_run() {
+    let parent_sensitive = gated_probe("sensitive", "outer");
+    let parent_calls = Arc::clone(&parent_sensitive.seen_tool_input);
+    let nested_sensitive = gated_probe("sensitive", "inner");
+    let nested_calls = Arc::clone(&nested_sensitive.seen_tool_input);
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("nested"))
+        .name("Nested")
+        .instructions("n")
+        .tool(Arc::new(nested_sensitive))
+        .build()
+        .unwrap();
+    let parent = AgentSpec::builder()
+        .id(AgentId::new("orchestrator"))
+        .name("Orchestrator")
+        .instructions("orchestrate")
+        .tool(Arc::new(parent_sensitive))
+        .tool(Arc::new(nested.as_tool().build().unwrap()))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "shared", "sensitive", json!({})),
+        tool_call("p-2", "outer-nested", "nested", json!({"input": "x"})),
+        tool_call("n-1", "shared", "sensitive", json!({})),
+        final_message("n-2", "inner done"),
+        final_message("p-3", "done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let second = Runner::run(resume(
+        Arc::clone(&parent),
+        &resolver,
+        approve_all(&first, true),
+    ))
+    .await
+    .unwrap();
+    let items = interruptions(&second);
+    assert_eq!(asked_tool(&items[0]), "sensitive");
+    assert_eq!(parent_calls.lock().unwrap().len(), 1);
+    assert!(
+        nested_calls.lock().unwrap().is_empty(),
+        "the parent's always rule must not answer the nested run's question"
+    );
+
+    let last = Runner::run(resume(parent, &resolver, approve_all(&second, false)))
+        .await
+        .unwrap();
+    assert_eq!(last.final_text(), "done");
+    assert_eq!(nested_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_nested_call_id_may_repeat_the_parents() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "shared", "nested", json!({"input": "x"})),
+        tool_call("n-1", "shared", "guarded", json!({})),
+        final_message("n-2", "inner done"),
+        final_message("p-2", "outer done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(interruptions(&first).len(), 1);
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+
+    assert_eq!(resumed.final_text(), "outer done");
+    assert!(resumed.outcome().interruptions().is_empty());
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[3].input),
+        ["inner done"]
+    );
+}
+
+#[tokio::test]
+async fn parallel_agent_tool_calls_pause_and_resume_independently() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        two_calls("call-a", "call-b"),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        tool_call("n-2", "n-call-2", "guarded", json!({})),
+        final_message("n-3", "nested done"),
+        final_message("n-4", "nested done"),
+        final_message("p-2", "done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(interruptions(&first).len(), 2);
+    assert_eq!(first.state().nested_runs().len(), 2);
+
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+    assert_eq!(resumed.final_text(), "done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[5].input),
+        ["nested done", "nested done"]
+    );
+}
+
+#[tokio::test]
+async fn identical_nested_approvals_in_two_calls_are_refused_rather_than_guessed() {
+    let (nested, guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        two_calls("call-a", "call-b"),
+        tool_call("n-1", "dup", "guarded", json!({})),
+        tool_call("n-1", "dup", "guarded", json!({})),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let items = interruptions(&first);
+    assert_eq!(items.len(), 2);
+    let error = first.state().clone().approve(&items[0], false).unwrap_err();
+    assert!(error.to_string().contains("unique call IDs"), "{error}");
+    assert!(guarded_calls.lock().unwrap().is_empty());
+}
+
+/// Counts what happens around the `delegate` call: its checks, its narration, and its extractor.
+#[derive(Default)]
+struct OuterCallbacks {
+    events: Mutex<Vec<&'static str>>,
+}
+
+impl OuterCallbacks {
+    fn push(&self, event: &'static str) {
+        self.events.lock().unwrap().push(event);
+    }
+
+    fn count(&self, event: &str) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| **seen == event)
+            .count()
+    }
+}
+
+struct CountingHook(Arc<OuterCallbacks>);
+
+#[async_trait]
+impl LifecycleHook for CountingHook {
+    fn name(&self) -> &str {
+        "counting"
+    }
+
+    async fn on_tool_start(
+        &self,
+        _scope: LifecycleScope,
+        input: &ToolStartInput<'_>,
+    ) -> Result<()> {
+        if input.origin().qualified_name() == "delegate" {
+            self.0.push("start");
+        }
+        Ok(())
+    }
+
+    async fn on_tool_end(&self, _scope: LifecycleScope, input: &ToolEndInput<'_>) -> Result<()> {
+        if input.origin().qualified_name() == "delegate" {
+            self.0.push("end");
+        }
+        Ok(())
+    }
+}
+
+struct CountingCheck {
+    id: ToolGuardrailId,
+    callbacks: Arc<OuterCallbacks>,
+}
+
+#[async_trait]
+impl ToolInputGuardrail for CountingCheck {
+    fn id(&self) -> &ToolGuardrailId {
+        &self.id
+    }
+
+    async fn check(
+        &self,
+        _data: &ToolInputGuardrailData<'_>,
+    ) -> Result<ToolGuardrailFunctionOutput> {
+        self.callbacks.push("input_guardrail");
+        Ok(ToolGuardrailFunctionOutput::allow())
+    }
+}
+
+#[async_trait]
+impl ToolOutputGuardrail for CountingCheck {
+    fn id(&self) -> &ToolGuardrailId {
+        &self.id
+    }
+
+    async fn check(
+        &self,
+        _data: &ToolOutputGuardrailData<'_>,
+    ) -> Result<ToolGuardrailFunctionOutput> {
+        self.callbacks.push("output_guardrail");
+        Ok(ToolGuardrailFunctionOutput::allow())
+    }
+}
+
+/// Ported from the reference's `test_nested_agent_tool_continuation_runs_outer_callbacks_once`.
+#[tokio::test]
+async fn a_serialized_nested_pause_resumes_and_runs_the_outer_callbacks_once() {
+    let callbacks = Arc::new(OuterCallbacks::default());
+    let (nested, guarded_calls) = guarded_nested();
+    let extractor_callbacks = Arc::clone(&callbacks);
+    let input_id = ToolGuardrailId::new("track_input").unwrap();
+    let output_id = ToolGuardrailId::new("track_output").unwrap();
+    let tool = nested
+        .as_tool()
+        .tool_name("delegate")
+        .custom_output_extractor(Arc::new(move |result: &RunResult| {
+            extractor_callbacks.push("custom_output");
+            Ok(result.final_text())
+        }))
+        .options(
+            ToolOptions::default()
+                .with_input_guardrail(input_id.clone())
+                .with_output_guardrail(output_id.clone()),
+        )
+        .build()
+        .unwrap();
+    let parent = orchestrator(tool);
+    let config = RunConfig::new()
+        .with_lifecycle_hook(Arc::new(CountingHook(Arc::clone(&callbacks))))
+        .with_tool_input_guardrail(Arc::new(CountingCheck {
+            id: input_id,
+            callbacks: Arc::clone(&callbacks),
+        }))
+        .with_tool_output_guardrails([Arc::new(CountingCheck {
+            id: output_id,
+            callbacks: Arc::clone(&callbacks),
+        }) as Arc<dyn ToolOutputGuardrail>]);
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "outer-call", "delegate", json!({"input": "hello"})),
+        tool_call("n-1", "inner-call", "guarded", json!({})),
+        final_message("n-2", "nested done"),
+        final_message("p-2", "outer done"),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver).with_config(config.clone()))
+        .await
+        .unwrap();
+    assert_eq!(interruptions(&first).len(), 1);
+    assert_eq!(callbacks.count("input_guardrail"), 1);
+    assert_eq!(callbacks.count("start"), 1);
+    assert_eq!(callbacks.count("output_guardrail"), 0);
+    assert_eq!(callbacks.count("custom_output"), 0);
+    assert_eq!(callbacks.count("end"), 0);
+
+    let mut state: RunState =
+        serde_json::from_str(&serde_json::to_string(first.state()).unwrap()).unwrap();
+    let asked = state
+        .pending_interruption_items()
+        .cloned()
+        .collect::<Vec<_>>();
+    state.approve(&asked[0], false).unwrap();
+    let last = Runner::run(resume(parent, &resolver, state).with_config(config))
+        .await
+        .unwrap();
+
+    assert_eq!(last.final_text(), "outer done");
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    for event in [
+        "input_guardrail",
+        "start",
+        "output_guardrail",
+        "custom_output",
+        "end",
+    ] {
+        assert_eq!(callbacks.count(event), 1, "{event}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

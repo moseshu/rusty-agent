@@ -49,6 +49,7 @@ use ra_core::{
     item::{CallId, ToolApproval, ToolCallKind, ToolCallOutput},
     lifecycle::{ToolEndInput, ToolStartInput},
     permission::PermissionDecision,
+    state::{NestedRunRef, RunState},
     tool::{
         Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
         ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior,
@@ -170,6 +171,12 @@ pub enum ToolDispatch {
     Refused(ToolRefusal),
     /// A host has to decide before the tool may run.
     AwaitingApproval(ToolApproval),
+    /// An agent tool ran, and the nested run it started stopped to ask the host something.
+    ///
+    /// Neither an output nor a failure: the call is answered once the nested run can continue, and
+    /// the reference leaves it without an output until then. Boxed because it carries the nested
+    /// run's whole checkpoint, and every other variant is a single record.
+    AwaitingNestedApproval(Box<NestedRunRef>),
 }
 
 /// What the model is told when the chain declines to run a call.
@@ -310,6 +317,7 @@ pub struct ToolDispatchRequest {
     user_hooks: UserHooks,
     lifecycle: LifecycleHooks,
     approval_granted: bool,
+    nested_resume: Option<Arc<RunState>>,
 }
 
 impl ToolDispatchRequest {
@@ -345,6 +353,7 @@ impl ToolDispatchRequest {
             user_hooks: UserHooks::default(),
             lifecycle: LifecycleHooks::new(),
             approval_granted: false,
+            nested_resume: None,
         }
     }
 
@@ -392,6 +401,18 @@ impl ToolDispatchRequest {
     #[doc(hidden)]
     pub const fn with_approval_granted(mut self) -> Self {
         self.approval_granted = true;
+        self
+    }
+
+    /// Marks a call as the continuation of an agent-tool call whose nested run paused on an
+    /// approval, and hands that nested run's checkpoint to the tool.
+    ///
+    /// The call was admitted, checked and announced when it first started, and the reference
+    /// resumes it without going through any of that again: the repeat and permission stages, the
+    /// input guardrails and the tool-start narration are skipped. Its result is checked and
+    /// announced as any call's is, once, when it finally has one.
+    pub(crate) fn with_nested_resume(mut self, state: RunState) -> Self {
+        self.nested_resume = Some(Arc::new(state));
         self
     }
 
@@ -530,13 +551,18 @@ async fn run_chain(
     // run. Both breakers live behind one insertion point rather than being bolted onto whichever
     // call site notices the repetition first, and they refuse the way this stage chain refuses:
     // with an observation the model can react to.
-    if let Some(reason) = circuit::admit(&options, request.history, &name) {
+    //
+    // Stages 2 to 4 decide whether the call may start, and a continuation already started: it
+    // passed all three the first time, before its nested run paused.
+    let continuation = request.nested_resume.is_some();
+    if !continuation && let Some(reason) = circuit::admit(&options, request.history, &name) {
         return Ok(refused(&request.call_id, &name, &reason));
     }
 
     // 3. Permission policy and approval, before anything runs.
-    if let Some(answer) =
-        admit_permission(request, &options, &name, &input_guardrails, records).await?
+    if !continuation
+        && let Some(answer) =
+            admit_permission(request, &options, &name, &input_guardrails, records).await?
     {
         return Ok(answer);
     }
@@ -544,7 +570,9 @@ async fn run_chain(
     // 4. Input guardrail, on the arguments the tool is about to be handed. A refusal here means the
     // tool runs zero times, which is the whole reason this boundary exists rather than only the one
     // after the call.
-    if let Some(refusal) = check_input_guardrails(request, &input_guardrails, records).await? {
+    if !continuation
+        && let Some(refusal) = check_input_guardrails(request, &input_guardrails, records).await?
+    {
         return Ok(refusal);
     }
 
@@ -597,12 +625,17 @@ async fn run_chain(
     // a host counting invocations would be counting decisions. It sits below the admission gate
     // too, so the pair brackets execution rather than execution plus queueing — the waiting already
     // has its own field.
-    lifecycle_dispatch::tool_start(
-        &request.lifecycle,
-        &lifecycle_call(request),
-        &request.cancel,
-    )
-    .await?;
+    //
+    // A continuation was announced when it first started, and its end is announced once, below,
+    // when it has a result.
+    if !continuation {
+        lifecycle_dispatch::tool_start(
+            &request.lifecycle,
+            &lifecycle_call(request),
+            &request.cancel,
+        )
+        .await?;
+    }
 
     // 7. Invoke tool.
     let outcome = invoke(
@@ -611,11 +644,29 @@ async fn run_chain(
         &options,
         &request.cancel,
         &name,
+        request.nested_resume.clone(),
     )
     .await;
 
     // Release fine-grained resource locks immediately upon invoke completion.
     drop(permits);
+
+    // An agent tool whose nested run paused has not settled: nothing is announced, checked or
+    // rendered for it until it has, which is the reference skipping output guardrails and
+    // `on_tool_end` for a call with nested interruptions.
+    if let Err(error) = &outcome
+        && let Some(state) = crate::agent::tool::nested_interruption(error)
+    {
+        return Ok(ToolDispatch::AwaitingNestedApproval(Box::new(
+            NestedRunRef::interrupted(
+                request.run.run_id().as_str(),
+                tool.origin(),
+                request.call_id.clone(),
+                request.arguments.clone(),
+                state.clone(),
+            ),
+        )));
+    }
 
     announce_invocation_end(request, &outcome).await?;
 
@@ -843,11 +894,12 @@ async fn invoke(
     options: &ToolOptions,
     cancel: &CancelScope,
     name: &str,
+    nested_resume: Option<Arc<RunState>>,
 ) -> Result<ToolOutput> {
     let started = Instant::now();
     // Scoped to this call so an agent tool can start its nested run under the call's own
-    // cancellation scope; see `agent::tool::parent`.
-    let call = crate::agent::tool::parent::within_call(cancel, tool.call(context));
+    // cancellation scope — or continue the one it paused on; see `agent::tool::parent`.
+    let call = crate::agent::tool::parent::within_call(cancel, nested_resume, tool.call(context));
     let result = match options.timeout() {
         None => cancel.run(call).await.and_then(|result| result),
         Some(limit) => cancel
@@ -896,9 +948,10 @@ pub(crate) async fn shape_failure(
     if error.is_cancelled() {
         return Err(error);
     }
-    // Nor is a question a nested agent is waiting on. Shown to the model as a failure, the approval
-    // would never reach the host that owes the answer, and the parent would carry on without it.
-    if crate::agent::tool::is_nested_interruption(&error) {
+    // Nor is a question a nested agent is waiting on. The invocation site turns it into a paused
+    // call before it gets here; reaching this point would mean a stage that runs no tool raised it,
+    // and shown to the model as a failure, the approval would never reach the host that owes it.
+    if crate::agent::tool::nested_interruption(&error).is_some() {
         return Err(error);
     }
 

@@ -26,13 +26,24 @@
 //! runner makes it available for the duration of the dispatched call (see `parent`). A tool called
 //! directly, outside a runner, has no parent to inherit from and fails as a caller error.
 //!
+//! # Approvals inside the nested run
+//!
+//! A nested run that stops to ask the host something does not fail the call and is never shown to
+//! the calling model. As in the reference, the call is left without an output, the nested run's
+//! approvals are asked as the parent's, and the paused nested run is kept with the parent — in its
+//! [`RunState`](ra_core::state::RunState), keyed by the call — until the host has answered them.
+//! The answers are applied to the nested run's own state, so an `always` answer is a rule of that
+//! nested run and nothing else. When the parent resumes it dispatches the call again, and this tool
+//! continues the paused nested run from its checkpoint instead of starting a new one; the parent's
+//! own checks and tool-start narration ran when the call first started and are not repeated.
+//!
+//! How the paused run leaves the tool is a Rust adaptation. The reference records it in a registry
+//! the tool and the runner share; here [`Tool::call`] can only return an output or an error, so the
+//! tool returns an error carrying the nested run's checkpoint, and dispatch turns that one error
+//! into a paused call rather than a failure.
+//!
 //! # Not yet here
 //!
-//! - **Approvals raised inside the nested run.** The reference records the interrupted nested run
-//!   by tool-call identity, surfaces its approvals as the parent's interruptions, and mirrors the
-//!   host's decision back on resume. Until that lands, a nested interruption fails the parent's
-//!   turn — it is never shown to the model as a tool failure, which would bury a question the host
-//!   owes an answer to.
 //! - **Streaming the nested run's events** (`on_stream`).
 //! - **Accruing nested usage on the parent.** The nested run's usage stays on its own result.
 //! - **`previous_response_id`, `conversation_id` and `session`.** The first two are conversation
@@ -52,7 +63,7 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
     item::{MessageRole, RunItemKind},
-    state::RunId,
+    state::{RunId, RunState},
     tool::{
         FuncSchema, Tool, ToolApprovalPolicy, ToolAvailability, ToolContext, ToolFailureHandling,
         ToolInput, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
@@ -489,19 +500,32 @@ impl AgentTool {
             .clone()
             .unwrap_or_else(|| parent.config().clone())
             .with_max_turns(self.max_turns.unwrap_or(DEFAULT_MAX_TURNS));
+        // A resumed call continues the nested run it paused on, from that run's checkpoint and
+        // with its history, as the reference passes the saved state where a fresh call passes
+        // input. Its parent was recorded when it first started.
+        let resume = parent.nested_resume().cloned();
+        let (run_id, input) = match &resume {
+            Some(state) => (state.run_id().clone(), Vec::new()),
+            None => (RunId::generate(), input),
+        };
         let mut request = RunRequest::new(
             AgentBinding::direct(Arc::clone(&self.agent)),
             Arc::clone(parent.model_resolver()),
-            RunId::generate(),
+            run_id,
             call_scope.child(ScopeKind::Run),
             input,
         )
         .with_config(config)
-        .with_parent_run_id(context.run().run_id().clone())?
         .with_services(context.services().clone());
+        request = match resume {
+            Some(state) => request.with_state(state),
+            None => request.with_parent_run_id(context.run().run_id().clone())?,
+        };
         if let Some(app_context) = parent.app_context() {
             request = request.with_app_context(Arc::clone(app_context));
         }
+        // Derived again on resume from the call's arguments, which the parent dispatches unchanged,
+        // rather than kept in the checkpoint — the reference sets it on every invocation the same way.
         if self.capture_tool_input {
             request = request.with_tool_input(params);
         }
@@ -519,10 +543,11 @@ impl AgentTool {
         let name = self.origin.qualified_name();
         if !result.outcome().interruptions().is_empty() {
             return Err(Error::caller(format!(
-                "agent tool `{name}`: the nested agent stopped to ask for approval, and approvals \
-                 raised inside an agent tool are not supported yet"
+                "agent tool `{name}`: the nested agent stopped to ask for approval"
             ))
-            .with_source(NestedInterruption));
+            .with_source(NestedInterruption {
+                state: Box::new(result.state().clone()),
+            }));
         }
         // The reference raises when a nested run runs out of turns; this runner ends such a run
         // softly instead, so the stop is turned back into the failure the calling model is shown.
@@ -684,9 +709,15 @@ impl fmt::Debug for AgentTool {
     }
 }
 
-/// Marks the error a nested interruption raises, so dispatch never renders it for the model.
+/// Carries a nested run that stopped on an approval out of [`Tool::call`].
+///
+/// An error is the only way out of `call` that is not an output, and an output is exactly what the
+/// call must not produce yet. Dispatch recognises this source and turns the error into a paused
+/// call, so no failure handling — model-visible or propagated — ever sees it.
 #[derive(Debug)]
-struct NestedInterruption;
+struct NestedInterruption {
+    state: Box<RunState>,
+}
 
 impl fmt::Display for NestedInterruption {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -696,7 +727,9 @@ impl fmt::Display for NestedInterruption {
 
 impl std::error::Error for NestedInterruption {}
 
-/// Whether `error` reports a nested agent that stopped for approval.
-pub(crate) fn is_nested_interruption(error: &Error) -> bool {
-    std::error::Error::source(error).is_some_and(<dyn std::error::Error>::is::<NestedInterruption>)
+/// The paused nested run `error` carries, when it reports a nested agent that stopped for approval.
+pub(crate) fn nested_interruption(error: &Error) -> Option<&RunState> {
+    std::error::Error::source(error)
+        .and_then(<dyn std::error::Error>::downcast_ref::<NestedInterruption>)
+        .map(|interruption| interruption.state.as_ref())
 }

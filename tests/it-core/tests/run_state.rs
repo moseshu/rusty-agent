@@ -662,9 +662,9 @@ fn ids(items: &[RunItem]) -> Vec<&str> {
     items.iter().map(|item| item.id().as_str()).collect()
 }
 
-/// Unanswered questions block the next segment, and clearing them is what unblocks it.
+/// Entering a segment preserves unanswered questions for the runner to return.
 #[test]
-fn test_run_state_blocks_a_segment_while_interruptions_are_unanswered() {
+fn test_run_state_preserves_unanswered_interruptions_across_segments() {
     let agent = AgentId::new("coder");
     let approval = approval_item("approval-1", "call-1");
     let mut state = RunState::start(RunId::new("run-blocked"));
@@ -676,10 +676,16 @@ fn test_run_state_blocks_a_segment_while_interruptions_are_unanswered() {
         .set_pending_interruptions(std::slice::from_ref(&approval))
         .expect("stored approval must be a generated interruption");
 
-    let error = state
+    state
         .begin_segment(agent.clone(), Vec::new())
-        .expect_err("a run waiting on an approval must not issue another model call");
-    assert!(error.to_string().contains("unanswered interruptions"));
+        .expect("a segment can settle partial answers before returning remaining approvals");
+    assert_eq!(
+        state
+            .pending_interruption_items()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![approval]
+    );
 
     state
         .set_pending_interruptions(&[])
@@ -980,4 +986,170 @@ fn test_run_state_migrates_pre_ledger_token_spend_into_the_usage_ledger() {
     assert_eq!(continued.tokens_used(), 12_600);
     assert_eq!(continued.usage_totals().requests(), 1);
     assert_eq!(continued.usage_totals().input_tokens(), 500);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Agent-tool runs paused on an approval
+// -------------------------------------------------------------------------------------------------
+
+fn paused_child(parent: &str, approval: &RunItem) -> RunState {
+    let mut child = RunState::start(RunId::new("run-child"));
+    child
+        .assign_parent_run_id(RunId::new(parent))
+        .expect("a fresh child accepts its parent");
+    child
+        .begin_segment(AgentId::new("nested"), Vec::new())
+        .expect("first segment must initialize the history");
+    child.record_generated_items([approval.clone()]);
+    child
+        .set_pending_interruptions(std::slice::from_ref(approval))
+        .expect("stored approval must be a generated interruption");
+    child
+}
+
+fn paused_ref(parent: &str, approval: &RunItem) -> NestedRunRef {
+    NestedRunRef::interrupted(
+        parent,
+        &ToolOrigin::new("nested").unwrap(),
+        CallId::new("outer-1"),
+        json!({"input": "x"}),
+        paused_child(parent, approval),
+    )
+}
+
+fn parent_state() -> RunState {
+    let mut parent = RunState::start(RunId::new("run-parent"));
+    parent
+        .begin_segment(AgentId::new("orchestrator"), Vec::new())
+        .expect("first segment must initialize the history");
+    parent
+}
+
+#[test]
+fn test_nested_approvals_are_asked_answered_and_checkpointed_through_the_parent() {
+    let approval = approval_item("n-approval", "inner-1");
+    let mut parent = parent_state();
+    parent
+        .set_nested_runs(vec![paused_ref("run-parent", &approval)])
+        .expect("a paused child of this run is recorded");
+
+    assert!(parent.pending_interruptions().is_empty());
+    assert_eq!(
+        parent.pending_interruption_items().collect::<Vec<_>>(),
+        [&approval],
+        "the nested run's question is asked through the parent"
+    );
+    assert!(parent.has_unanswered_interruptions());
+    parent
+        .clone()
+        .begin_segment(AgentId::new("orchestrator"), Vec::new())
+        .expect("a nested question does not block the resume; the runner asks it again");
+
+    parent
+        .approve(&approval, true)
+        .expect("the answer is routed to the nested run");
+    assert!(parent.pending_interruption_resolutions().is_empty());
+    assert!(!parent.has_unanswered_interruptions());
+    assert!(
+        parent.permission_rules().is_empty(),
+        "an always answer is a rule of the nested run only"
+    );
+    let child = parent.nested_runs()[0].state().expect("checkpoint is kept");
+    assert_eq!(child.pending_interruption_resolutions().len(), 1);
+    assert_eq!(child.permission_rules().len(), 1);
+
+    let restored: RunState =
+        serde_json::from_str(&serde_json::to_string(&parent).expect("state must serialize"))
+            .expect("a paused child round-trips with its parent");
+    assert_eq!(restored, parent);
+    assert_eq!(
+        restored.nested_runs()[0].lookup_key(),
+        Some(ToolOrigin::new("nested").unwrap().lookup_key())
+    );
+    assert_eq!(
+        restored.nested_runs()[0].arguments(),
+        &json!({"input": "x"})
+    );
+    restored
+        .clone()
+        .begin_segment(AgentId::new("orchestrator"), Vec::new())
+        .expect("an answered nested approval lets the parent resume");
+}
+
+#[test]
+fn test_a_paused_child_of_another_run_is_refused() {
+    let approval = approval_item("n-approval", "inner-1");
+    let mut parent = parent_state();
+    let error = parent
+        .set_nested_runs(vec![paused_ref("someone-else", &approval)])
+        .expect_err("a child of another run cannot be resumed from this one");
+    assert!(error.to_string().contains("another parent"), "{error}");
+
+    parent
+        .set_nested_runs(vec![paused_ref("run-parent", &approval)])
+        .expect("a paused child of this run is recorded");
+    let mut stored = serde_json::to_value(&parent).expect("state must serialize");
+    stored["nested_runs"][0]["state"]["parent_run_id"] = json!("someone-else");
+    let error = serde_json::from_value::<RunState>(stored)
+        .expect_err("a checkpoint whose child names another parent is refused");
+    assert!(error.to_string().contains("another parent"), "{error}");
+
+    let error = parent
+        .clone()
+        .set_nested_runs(vec![
+            paused_ref("run-parent", &approval),
+            paused_ref("run-parent", &approval),
+        ])
+        .expect_err("one call cannot have two paused runs");
+    assert!(error.to_string().contains("two paused"), "{error}");
+}
+
+#[test]
+fn test_a_shared_approval_identity_is_routed_by_record_or_refused() {
+    let own = approval_item("approval-1", "call-1");
+    let nested = RunItem::new(
+        ItemId::new("approval-1"),
+        RunItemKind::ToolApproval(
+            ToolApproval::new(CallId::new("call-1"), "exec_command", json!({"cmd": "ls"}))
+                .with_tool_origin(&ToolOrigin::new("exec_command").unwrap()),
+        ),
+    );
+    let mut parent = parent_state();
+    parent.record_generated_items([own.clone()]);
+    parent
+        .set_pending_interruptions(std::slice::from_ref(&own))
+        .expect("own approval is pending");
+    parent
+        .set_nested_runs(vec![paused_ref("run-parent", &nested)])
+        .expect("a paused child of this run is recorded");
+
+    parent
+        .reject(&nested, false)
+        .expect("the record the host holds tells the two apart");
+    assert!(parent.pending_interruption_resolutions().is_empty());
+    assert_eq!(
+        parent.nested_runs()[0]
+            .state()
+            .unwrap()
+            .pending_interruption_resolutions()
+            .len(),
+        1
+    );
+    parent
+        .approve(&own, false)
+        .expect("and the parent's own record");
+    assert_eq!(parent.pending_interruption_resolutions().len(), 1);
+
+    let mut ambiguous = parent_state();
+    ambiguous.record_generated_items([own.clone()]);
+    ambiguous
+        .set_pending_interruptions(std::slice::from_ref(&own))
+        .expect("own approval is pending");
+    ambiguous
+        .set_nested_runs(vec![paused_ref("run-parent", &own)])
+        .expect("a paused child of this run is recorded");
+    let error = ambiguous
+        .approve(&own, false)
+        .expect_err("two identical pending records cannot be told apart");
+    assert!(error.to_string().contains("unique call IDs"), "{error}");
 }

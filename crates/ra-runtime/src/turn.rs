@@ -274,7 +274,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     // still the pre-settlement copy of one of them. Re-pointing it now is what makes this one
     // settled turn internally consistent: every consumer of `next_step` sees the same record the
     // session stores, instead of each having to know to go look it up.
-    let next_step = rebind_interruption(next_step, &items)?;
+    let next_step = rebind_interruption(next_step, &items, execution.nested_interruptions())?;
 
     // 5. Project, and only on the turn that transfers control. Everything above produced the
     // authoritative records; this decides how much of them the *next* agent is shown. The two
@@ -296,6 +296,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         // settlement, and the loop records them beside everything else the turn returned.
         .tool_input_guardrail_results(execution.tool_input_guardrail_results().to_vec())
         .tool_output_guardrail_results(execution.tool_output_guardrail_results().to_vec())
+        .function_results(execution.function_results().to_vec())
         .processed_response(processed)
         .next_step(next_step)
         .build()

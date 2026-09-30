@@ -11,7 +11,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use ra_core::{
-    agent::{AgentSpec, ToolUseBehavior},
+    agent::{AgentSpec, ToolUseBehavior, ToolUseResult},
     cancel::CancelScope,
     error::{Error, Result},
     finish::FinishReason,
@@ -28,8 +28,14 @@ pub async fn resolve_next_step(
     tool_use_behavior: &ToolUseBehavior,
     cancel: &CancelScope,
 ) -> Result<NextStep> {
+    // The run's own questions first, then those its agent tools' nested runs stopped on, each run's
+    // in model order. The reference interleaves the two by call; keeping this run's records together
+    // is what lets settlement re-point them at the stored copies without having to tell a nested
+    // record that reuses one of their IDs apart from them by position.
     if execution.has_interruptions() {
-        return NextStep::interruption(execution.interruptions().to_vec());
+        let mut items = execution.interruptions().to_vec();
+        items.extend_from_slice(execution.nested_interruptions());
+        return NextStep::interruption(items);
     }
 
     // The first transfer in model order, which is the one `execute_actions` performed and wrote a
@@ -41,7 +47,9 @@ pub async fn resolve_next_step(
         });
     }
 
-    if check_for_final_output_from_tools(execution, tool_use_behavior, cancel).await? {
+    if check_for_final_output_from_tools(execution.tool_results(), tool_use_behavior, cancel)
+        .await?
+    {
         return Ok(NextStep::FinalOutput {
             reason: FinishReason::ToolStop,
         });
@@ -70,7 +78,9 @@ pub async fn resolve_next_step(
 /// only be choosing between one value and itself.
 ///
 /// The decision reads [`TurnExecution::tool_results`], not `new_items`: what a policy is allowed to
-/// promote is decided where the batch settles, not by re-inspecting records here.
+/// promote is decided where the batch settles, not by re-inspecting records here. A resumed run
+/// asks the same question of the calls it settles before its next model call, as the reference
+/// finalizes from the tool results of an interrupted turn it resolves.
 ///
 /// Whether the policy is one this runtime understands is checked **before** the results are looked
 /// at. [`ToolUseBehavior`] is `#[non_exhaustive]` and lives in another crate, so a catch-all is
@@ -79,12 +89,11 @@ pub async fn resolve_next_step(
 /// [`execute_actions`](super::batch::execute_actions) exists to prevent. That arm is unreachable
 /// from the test workspace for the same `#[non_exhaustive]` reason: no variant outside this list
 /// exists to construct yet.
-async fn check_for_final_output_from_tools(
-    execution: &TurnExecution,
+pub(crate) async fn check_for_final_output_from_tools(
+    tool_results: &[ToolUseResult],
     tool_use_behavior: &ToolUseBehavior,
     cancel: &CancelScope,
 ) -> Result<bool> {
-    let tool_results = execution.tool_results();
     match tool_use_behavior {
         ToolUseBehavior::RunLlmAgain => Ok(false),
         ToolUseBehavior::StopOnFirstTool => Ok(!tool_results.is_empty()),
@@ -168,7 +177,15 @@ pub fn step_items(
 /// [`step_items`] is the union of those two. It answers rather than unwraps because that
 /// containment is an invariant of another module, and a silent `expect` here would report the
 /// breakage as a panic in the runner rather than as a settlement that named the item it lost.
-pub(super) fn rebind_interruption(next_step: NextStep, items: &[RunItem]) -> Result<NextStep> {
+///
+/// A nested run's question is passed through as it is. It is not one of this turn's records — it
+/// is the nested run's own stored copy, answered there — and it is recognised as the whole record,
+/// not by ID, because a nested run numbers its calls independently of this one.
+pub(super) fn rebind_interruption(
+    next_step: NextStep,
+    items: &[RunItem],
+    nested: &[RunItem],
+) -> Result<NextStep> {
     match next_step {
         NextStep::Interruption { items: pending } => {
             let stored: BTreeMap<&ItemId, &RunItem> =
@@ -176,6 +193,9 @@ pub(super) fn rebind_interruption(next_step: NextStep, items: &[RunItem]) -> Res
             let pending = pending
                 .iter()
                 .map(|item| {
+                    if nested.contains(item) {
+                        return Ok(item.clone());
+                    }
                     stored.get(item.id()).copied().cloned().ok_or_else(|| {
                         Error::caller(format!(
                             "pending decision `{}` is missing from the records this turn stores; \

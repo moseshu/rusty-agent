@@ -3212,15 +3212,15 @@ async fn stopping_for_pending_approval_is_an_outcome_not_an_error() {
     assert!(result.final_message().is_none());
 
     let resume_model = ScriptedModel::new(Vec::new());
-    let error = Runner::run(resume_request(
+    let resumed = Runner::run(resume_request(
         Vec::new(),
         &resume_model,
         &cancel,
         result.state().clone(),
     ))
     .await
-    .expect_err("an unanswered checkpoint must not issue another model call");
-    assert!(error.to_string().contains("unanswered interruptions"));
+    .expect("an unanswered checkpoint returns its pending questions");
+    assert_eq!(resumed.outcome().interruptions(), items);
     assert_eq!(resume_model.calls.load(Ordering::SeqCst), 0);
 }
 

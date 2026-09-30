@@ -29,11 +29,11 @@
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
 
-use std::{any::Any, collections::BTreeSet, future::Future, sync::Arc, time::Instant};
+use std::{any::Any, collections::BTreeSet, future::Future, ops::Range, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use ra_core::{
-    agent::{AgentSpec, HandoffInputData, HandoffInputFilter},
+    agent::{AgentSpec, HandoffInputData, HandoffInputFilter, ToolUseResult},
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
     capability::{
@@ -54,8 +54,8 @@ use ra_core::{
     },
     hook::{HookDecision, HookEvent, HookEventName, StopHookData},
     item::{
-        ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
-        RunItemKind, ToolApproval, ToolCallOutput,
+        CallId, ItemId, ItemProvenance, Message, MessageRole, ModelInputItem, ModelResponse,
+        OutputPhase, RunItem, RunItemKind, ToolApproval, ToolCallOutput,
     },
     lifecycle::{
         AgentEndInput, AgentStartInput, HandoffInput, LifecycleHook, LlmEndInput, LlmStartInput,
@@ -68,11 +68,11 @@ use ra_core::{
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
     state::{
-        EventSeqAllocator, HandoffProjection, InterruptionResolution, RunId, RunState, ToolOutcome,
-        ToolUse,
+        EventSeqAllocator, HandoffProjection, InterruptionResolution, NestedRunRef, RunId,
+        RunState, ToolOutcome, ToolUse,
     },
     step::NextStep,
-    tool::{ToolOutputReferenceExtractor, ToolServices},
+    tool::{ToolLookupKey, ToolOutputReferenceExtractor, ToolServices},
     trace::SpanKind,
     usage::{RequestUsage, Usage},
 };
@@ -99,9 +99,7 @@ use crate::{
     hook::{UserHookRegistration, UserHooks},
     lifecycle::{LifecycleHooks, dispatch as lifecycle_dispatch},
     permission::PermissionEngine,
-    tool::dispatch::{
-        CallHistory, ToolDispatch, ToolDispatchRequest, ToolGuardrailRecords, dispatch_tool,
-    },
+    tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     tool::guardrail::ToolGuardrails,
     turn::{
         TurnSettlementRequest,
@@ -110,6 +108,7 @@ use crate::{
             PreparedTurn, ToolNameCollisionPolicy, TurnActionSurface, TurnPreparationRequest,
             prepare_turn,
         },
+        resolve::check_for_final_output_from_tools,
         settle_turn,
     },
 };
@@ -1045,6 +1044,11 @@ struct TurnLoopProgress {
     /// segment has already recorded a second time.
     reference_turn_base: u64,
     budget_stop: Option<BudgetKind>,
+    /// The records a resumed segment settled before its first turn, when those settled the run.
+    ///
+    /// A resume that concludes on the stop policy has no turn of its own to read the delivery from,
+    /// and these are what that delivery consists of.
+    resumed_conclusion: Option<Range<usize>>,
 }
 
 impl TurnLoopProgress {
@@ -1354,6 +1358,7 @@ async fn run_loop_inner(
             .last_completed_turn()
             .unwrap_or(0),
         budget_stop: None,
+        resumed_conclusion: None,
     };
     let permission = config.permission().clone().with_rules(
         config
@@ -1439,7 +1444,7 @@ async fn run_loop_inner(
         // the prepared agent carries. After the blocking checks either way, so a tripped one stops
         // the run before a sandbox is created, started or changed. Every other run is prepared at
         // the top of its first turn, as the reference prepares at the top of each loop.
-        if !state.pending_interruption_resolutions().is_empty() {
+        if !state.pending_interruption_resolutions().is_empty() || !state.nested_runs().is_empty() {
             agent = cancel
                 .run(sandbox.prepare_agent(
                     &agent,
@@ -1449,7 +1454,26 @@ async fn run_loop_inner(
                 .await
                 .and_then(|prepared| prepared)?;
         }
-        resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await?;
+        // Settled like the turn it finishes: a call still waiting on a nested run's question is asked
+        // again straight away — the model has nothing new to read until that call has an output —
+        // and results the stop policy promotes end the run as they would have ended that turn,
+        // through the same stop hook, delivery and output checks.
+        let resumed_from = progress.segment_items(&state).len();
+        match resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await? {
+            ResumeStage::Interrupted(items) => return Ok(RunOutcome::Interrupted { items }),
+            ResumeStage::Concluded(reason) => {
+                progress.resumed_conclusion =
+                    Some(resumed_from..progress.segment_items(&state).len());
+                let outcome = RunOutcome::Completed { reason };
+                if !continue_from_stop_hook(&context, &agent, &mut state, &mut progress, &outcome)
+                    .await?
+                {
+                    return Ok(outcome);
+                }
+                progress.resumed_conclusion = None;
+            }
+            ResumeStage::Continue => {}
+        }
         // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn, and
         // the caller composing runs should not hold all of it inline.
         Box::pin(run_turns(
@@ -1711,13 +1735,28 @@ async fn assemble_capabilities(
 /// The approval record remains in history as the control-plane question; this stage appends the
 /// paired tool output (or rejection) and only then clears its pending ID. That ordering makes a
 /// checkpoint taken between the click and the tool invocation resumable instead of losing work.
+///
+/// A paused agent-tool call continues from its checkpoint once every question its nested run — and
+/// any run nested in that — asked has an answer, or as soon as one of them was rejected. Otherwise
+/// it stays paused with the answers it has, and nothing it asked about runs: the reference judges a
+/// nested run with an unanswered approval and no rejection as pending and leaves it alone. A
+/// rejection outranks that, so the refusal is settled into the nested run's history while the
+/// questions still open stay open. Only the unanswered questions, of this run and of the paused
+/// runs, are asked again before another model call.
+///
+/// What the stage ends on is decided the way a turn's is: a paused call is asked about first, and
+/// otherwise the results the calls produced go to the stop policy, as the reference finalizes
+/// from the tool results of the interrupted turn it resolves.
 async fn resolve_interrupted_turn(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     state: &mut RunState,
     lifecycle: &LifecycleHooks,
-) -> Result<()> {
+) -> Result<ResumeStage> {
     let answers = state.pending_interruption_resolutions().to_vec();
+    let continued = state.take_nested_runs();
+    let mut paused = Vec::new();
+    let mut tool_results = Vec::new();
     // Filed once for the whole stage rather than once per answer, because these are the tail of a
     // single interrupted turn. `ToolFailureTracker::record_turn` fingerprints the ordered turn it
     // is given to recognise a re-settle, so splitting one turn into several one-outcome calls
@@ -1742,51 +1781,30 @@ async fn resolve_interrupted_turn(
         };
         let provenance = item.provenance().cloned();
         let approval = approval.clone();
-        let (output, outcome, guardrails) = match answer.resolution() {
-            InterruptionResolution::Reject { .. } => {
-                let output = ToolCallOutput::new(
-                    approval.call_id().clone(),
-                    serde_json::json!({"code": "approval_rejected", "tool": approval.tool_name()}),
-                )
-                .with_error(true)
-                .with_kind(approval.kind());
-                // Filed as a refusal, the same as a call the permission stage declines below: both
-                // are "the runtime answered without running the tool", which is what
-                // `ToolOutcome::refused` names. Recording nothing instead would leave an earlier
-                // failure streak standing behind a call that never ran, so the next genuine
-                // attempt would be judged on evidence this one did not produce. An approval
-                // written before routing identities were stored has nothing to file it under.
-                let outcome = approval.lookup_key().map(|key| {
-                    ToolOutcome::refused(
-                        ToolUse::Tool(key.clone()),
-                        approval.call_id().clone(),
-                        approval.arguments(),
-                        output.output(),
-                    )
-                });
-                (output, outcome, ToolGuardrailRecords::default())
-            }
+        let (output, outcome) = match answer.resolution() {
+            InterruptionResolution::Reject { .. } => rejection(&approval),
             InterruptionResolution::Approve { .. } => {
-                let (output, outcome, guardrails) = execute_approved_call(
-                    context,
-                    agent,
-                    state,
-                    lifecycle,
-                    &approval,
-                    answer.item_id(),
-                )
-                .await?;
-                (output, Some(outcome), guardrails)
+                match run_approved_call(context, agent, state, lifecycle, &approval).await? {
+                    ResumedOutcome::Settled {
+                        output,
+                        outcome,
+                        tool_result,
+                    } => {
+                        tool_results.extend(tool_result);
+                        (output, Some(outcome))
+                    }
+                    // The host's answer is spent — the call ran — and what the call owes now is the
+                    // nested run's to settle, so the approval is cleared without an output.
+                    ResumedOutcome::Paused(nested) => {
+                        paused.push(*nested);
+                        state.settle_interruption_resolution(answer.item_id())?;
+                        continue;
+                    }
+                }
             }
             _ => return Err(Error::caller("unsupported interruption resolution")),
         };
         outcomes.extend(outcome);
-        // The post-approval check the contract requires is inside the dispatch above; what is left
-        // here is filing what it decided, so a run resumed in a second process leaves the same
-        // evidence a run that never paused would have.
-        let (input_verdicts, output_verdicts) = guardrails.into_parts();
-        state.record_tool_input_guardrail_results(input_verdicts);
-        state.record_tool_output_guardrail_results(output_verdicts);
         let mut output_item = RunItem::new(
             ItemId::new(format!("{}.output", approval.call_id())),
             RunItemKind::ToolCallOutput(output.with_kind(approval.kind())),
@@ -1798,32 +1816,262 @@ async fn resolve_interrupted_turn(
         state.record_generated_items([output_item]);
         state.settle_interruption_resolution(answer.item_id())?;
     }
+    for nested in continued {
+        if nested
+            .state()
+            .is_some_and(|state| nested_answer_status(state) == NestedAnswers::Pending)
+        {
+            paused.push(nested);
+            continue;
+        }
+        let (output, outcome) =
+            match continue_paused_run(context, agent, state, lifecycle, nested).await? {
+                ResumedOutcome::Settled {
+                    output,
+                    outcome,
+                    tool_result,
+                } => {
+                    tool_results.extend(tool_result);
+                    (output, outcome)
+                }
+                ResumedOutcome::Paused(nested) => {
+                    paused.push(*nested);
+                    continue;
+                }
+            };
+        outcomes.push(outcome);
+        // Attributed as the batch attributes the output of a call it settles: to the public agent
+        // that made the call, which is the agent this checkpoint resumes.
+        let output_item = RunItem::new(
+            ItemId::new(format!("{}.output", output.call_id())),
+            RunItemKind::ToolCallOutput(output),
+        )
+        .with_provenance(
+            ItemProvenance::new(agent.public_id().clone()).with_agent_name(agent.public().name()),
+        );
+        emit(context.events, RunStreamEvent::Item(output_item.clone()));
+        state.record_generated_items([output_item]);
+    }
     if !outcomes.is_empty() {
         let (_, failure) = state.trackers_mut();
         failure.record_turn(agent.public_id(), outcomes);
     }
-    Ok(())
+    end_resume_stage(context, agent, state, paused, &tool_results).await
 }
 
-/// Runs one call the host approved before the checkpoint was taken.
+/// Where the host's answers leave a paused agent-tool run, judged over its whole nested tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedAnswers {
+    /// Something was rejected. The run continues so the refusal is settled into its history, and
+    /// whatever is still unanswered is asked again from there.
+    Rejected,
+    /// Nothing was rejected and something is unanswered: the run stays paused with what it has.
+    Pending,
+    /// Every question has an answer.
+    Approved,
+}
+
+/// The reference's `_nested_interruptions_status`: a rejection anywhere outranks an unanswered
+/// question, which outranks approval.
+fn nested_answer_status(state: &RunState) -> NestedAnswers {
+    if has_rejection(state) {
+        NestedAnswers::Rejected
+    } else if state.has_unanswered_interruptions() {
+        NestedAnswers::Pending
+    } else {
+        NestedAnswers::Approved
+    }
+}
+
+fn has_rejection(state: &RunState) -> bool {
+    state
+        .pending_interruption_resolutions()
+        .iter()
+        .any(|answer| matches!(answer.resolution(), InterruptionResolution::Reject { .. }))
+        || state
+            .nested_runs()
+            .iter()
+            .filter_map(NestedRunRef::state)
+            .any(has_rejection)
+}
+
+/// Decides what the resume stage ends on, in the order a turn's settlement does.
+async fn end_resume_stage(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+    paused: Vec<NestedRunRef>,
+    tool_results: &[ToolUseResult],
+) -> Result<ResumeStage> {
+    state.set_nested_runs(paused)?;
+    let items: Vec<_> = state.unanswered_interruption_items().cloned().collect();
+    if !items.is_empty() {
+        return Ok(ResumeStage::Interrupted(items));
+    }
+    let concluded = check_for_final_output_from_tools(
+        tool_results,
+        agent.public().tool_use_behavior(),
+        context.cancel,
+    )
+    .await?;
+    Ok(if concluded {
+        ResumeStage::Concluded(FinishReason::ToolStop)
+    } else {
+        ResumeStage::Continue
+    })
+}
+
+/// What settling an interrupted turn on resume decided.
+enum ResumeStage {
+    /// Nothing concluded: the run asks the model for its next response.
+    Continue,
+    /// A call still waits on a nested run's questions, which the run asks again.
+    Interrupted(Vec<RunItem>),
+    /// The stop policy promoted a result settled here to the run's answer.
+    Concluded(FinishReason),
+}
+
+/// The answer a rejected approval puts in history, and how the call is filed.
+fn rejection(approval: &ToolApproval) -> (ToolCallOutput, Option<ToolOutcome>) {
+    let output = ToolCallOutput::new(
+        approval.call_id().clone(),
+        serde_json::json!({"code": "approval_rejected", "tool": approval.tool_name()}),
+    )
+    .with_error(true)
+    .with_kind(approval.kind());
+    // Filed as a refusal, the same as a call the permission stage declines: both are "the runtime
+    // answered without running the tool", which is what `ToolOutcome::refused` names. Recording
+    // nothing instead would leave an earlier failure streak standing behind a call that never ran,
+    // so the next genuine attempt would be judged on evidence this one did not produce. An approval
+    // written before routing identities were stored has nothing to file it under.
+    let outcome = approval.lookup_key().map(|key| {
+        ToolOutcome::refused(
+            ToolUse::Tool(key.clone()),
+            approval.call_id().clone(),
+            approval.arguments(),
+            output.output(),
+        )
+    });
+    (output, outcome)
+}
+
+/// Runs a call the host approved before the checkpoint was taken.
+async fn run_approved_call(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+    lifecycle: &LifecycleHooks,
+    approval: &ToolApproval,
+) -> Result<ResumedOutcome> {
+    let key = approval.lookup_key().ok_or_else(|| {
+        Error::caller(format!(
+            "approval for call `{}` cannot resume because it has no serialized tool lookup key",
+            approval.call_id()
+        ))
+    })?;
+    execute_resumed_call(
+        context,
+        agent,
+        state,
+        lifecycle,
+        ResumedCall {
+            key,
+            call_id: approval.call_id(),
+            arguments: approval.arguments(),
+            nested: None,
+        },
+    )
+    .await
+}
+
+/// Dispatches an agent-tool call again to continue the nested run it paused on.
+async fn continue_paused_run(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+    lifecycle: &LifecycleHooks,
+    nested: NestedRunRef,
+) -> Result<ResumedOutcome> {
+    let key = nested.lookup_key().cloned().ok_or_else(|| {
+        Error::caller(format!(
+            "paused agent-tool run for call `{}` has no tool routing identity",
+            nested.call_id()
+        ))
+    })?;
+    let call_id = nested.call_id().clone();
+    let arguments = nested.arguments().clone();
+    let checkpoint = nested.into_state().ok_or_else(|| {
+        Error::caller(format!(
+            "paused agent-tool run for call `{call_id}` carries no checkpoint to continue"
+        ))
+    })?;
+    execute_resumed_call(
+        context,
+        agent,
+        state,
+        lifecycle,
+        ResumedCall {
+            key: &key,
+            call_id: &call_id,
+            arguments: &arguments,
+            nested: Some(checkpoint),
+        },
+    )
+    .await
+}
+
+/// One call a resumed run dispatches again before its next model call.
+struct ResumedCall<'a> {
+    key: &'a ToolLookupKey,
+    call_id: &'a CallId,
+    arguments: &'a serde_json::Value,
+    /// The paused nested run the call continues; `None` for a call the host approved.
+    nested: Option<RunState>,
+}
+
+/// How a call dispatched on resume ended.
 ///
-/// The identity handed to the breaker is rebuilt from the approval's lookup key rather than asked
+/// Short-lived — each is matched as soon as it is returned — so the settled variant stays inline
+/// rather than boxed for the size of a value that never sits in a collection.
+#[allow(clippy::large_enum_variant)]
+enum ResumedOutcome {
+    /// It has an output, and the record of how it went.
+    Settled {
+        output: ToolCallOutput,
+        outcome: ToolOutcome,
+        /// What the stop policy reads, present when the call produced a usable result — the same
+        /// rule the batch applies, so a resumed call can end the run exactly when a call settled
+        /// in its turn could have.
+        tool_result: Option<ToolUseResult>,
+    },
+    /// Its nested run stopped on a question again.
+    Paused(Box<NestedRunRef>),
+}
+
+/// Runs one call the host approved before the checkpoint was taken, or continues one whose nested
+/// run paused.
+///
+/// The identity handed to the breaker is rebuilt from the recorded lookup key rather than asked
 /// of a bound action, which is safe only because the tool below is *selected* by that same key:
 /// the two cannot drift the way [`ProcessedResponse`](ra_core::step::ProcessedResponse) warns
 /// about, because one is the search term for the other.
-async fn execute_approved_call(
+///
+/// What the checks around the call decided is filed on `state` here. The post-approval check the
+/// contract requires is inside the dispatch, and filing it lets a run resumed in a second process
+/// leave the same evidence a run that never paused would have.
+async fn execute_resumed_call(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
-    state: &RunState,
+    state: &mut RunState,
     lifecycle: &LifecycleHooks,
-    approval: &ToolApproval,
-    item_id: &ItemId,
-) -> Result<(ToolCallOutput, ToolOutcome, ToolGuardrailRecords)> {
-    let key = approval.lookup_key().ok_or_else(|| {
-        Error::caller(format!(
-            "approval `{item_id}` cannot resume because it has no serialized tool lookup key"
-        ))
-    })?;
+    call: ResumedCall<'_>,
+) -> Result<ResumedOutcome> {
+    let ResumedCall {
+        key,
+        call_id,
+        arguments,
+        nested,
+    } = call;
     // The execution instance's tools, because that is what runs: a capability contributes tools
     // to it alone, and a call the host approved on one of those must still find it on resume.
     let tool = agent
@@ -1833,7 +2081,7 @@ async fn execute_approved_call(
         .find(|tool| tool.origin().lookup_key() == key)
         .ok_or_else(|| {
             Error::caller(format!(
-                "approval `{item_id}` names lookup key `{key:?}`, which the resumed agent no \
+                "resumed call `{call_id}` names lookup key `{key:?}`, which the resumed agent no \
                  longer provides"
             ))
         })?;
@@ -1860,53 +2108,60 @@ async fn execute_approved_call(
             .tool_failure()
             .no_progress_streak(agent.public_id(), &identity),
     );
-    let dispatch = dispatch_tool(
-        ToolDispatchRequest::new(
-            Arc::clone(tool),
-            approval.call_id().clone(),
-            approval.arguments().clone(),
-            Arc::new(run),
-            context.cancel.child(ScopeKind::Tool),
-            history,
-            context.permission.clone(),
-        )
-        .with_services(context.services.clone())
-        .with_tool_guardrails(context.tool_guardrails.clone())
-        .with_user_hooks(context.config.user_hooks().clone())
-        .with_lifecycle_hooks(lifecycle.clone())
-        .with_approval_granted(),
+    let request = ToolDispatchRequest::new(
+        Arc::clone(tool),
+        call_id.clone(),
+        arguments.clone(),
+        Arc::new(run),
+        context.cancel.child(ScopeKind::Tool),
+        history,
+        context.permission.clone(),
     )
-    .await?;
+    .with_services(context.services.clone())
+    .with_tool_guardrails(context.tool_guardrails.clone())
+    .with_user_hooks(context.config.user_hooks().clone())
+    .with_lifecycle_hooks(lifecycle.clone());
+    let request = match nested {
+        Some(checkpoint) => request.with_nested_resume(checkpoint),
+        None => request.with_approval_granted(),
+    };
+    let (dispatch, guardrails) = dispatch_tool(request).await?.into_parts();
+    let (input_verdicts, output_verdicts) = guardrails.into_parts();
+    state.record_tool_input_guardrail_results(input_verdicts);
+    state.record_tool_output_guardrail_results(output_verdicts);
 
-    let call_id = approval.call_id().clone();
-    let (dispatch, guardrails) = dispatch.into_parts();
+    let call_id = call_id.clone();
     match dispatch {
         ToolDispatch::Observed(observation) => {
             let failure_code = observation.failure_code();
             let output = observation.output().clone();
             let outcome = match failure_code {
-                Some(code) => ToolOutcome::failed(
-                    identity,
-                    call_id,
-                    approval.arguments(),
-                    output.output(),
-                    code,
-                ),
-                None => {
-                    ToolOutcome::succeeded(identity, call_id, approval.arguments(), output.output())
+                Some(code) => {
+                    ToolOutcome::failed(identity, call_id, arguments, output.output(), code)
                 }
+                None => ToolOutcome::succeeded(identity, call_id, arguments, output.output()),
             };
-            Ok((output, outcome, guardrails))
+            let tool_result = (!output.is_error())
+                .then(|| ToolUseResult::new(tool.origin().clone(), output.clone()));
+            Ok(ResumedOutcome::Settled {
+                output,
+                outcome,
+                tool_result,
+            })
         }
         ToolDispatch::Refused(refusal) => {
             let output = refusal.into_output();
-            let outcome =
-                ToolOutcome::refused(identity, call_id, approval.arguments(), output.output());
-            Ok((output, outcome, guardrails))
+            let outcome = ToolOutcome::refused(identity, call_id, arguments, output.output());
+            Ok(ResumedOutcome::Settled {
+                output,
+                outcome,
+                tool_result: None,
+            })
         }
         ToolDispatch::AwaitingApproval(_) => Err(Error::caller(
             "an approved tool call requested approval again",
         )),
+        ToolDispatch::AwaitingNestedApproval(nested) => Ok(ResumedOutcome::Paused(nested)),
     }
 }
 
@@ -2649,10 +2904,27 @@ async fn run_one_turn(
         // it stores before handing the decision over, so this outcome and the stream carry one copy
         // of each question rather than two that disagree about who produced it.
         NextStep::Interruption { items } => {
-            // The checkpoint keeps their IDs, which resolve against the records recorded just
-            // above. Settlement guarantees they are among them, so a failure here is this loop
-            // breaking its own contract rather than anything the host did.
-            state.set_pending_interruptions(items)?;
+            // The checkpoint keeps the IDs of this run's own questions, which resolve against the
+            // records recorded just above. Settlement guarantees they are among them, so a failure
+            // here is this loop breaking its own contract rather than anything the host did.
+            //
+            // A nested run's questions are not this run's records. The checkpoint keeps the paused
+            // nested runs instead, and each question is answered — and read back — through the run
+            // that raised it.
+            let nested: Vec<&RunItem> = settled.nested_interruptions().collect();
+            let own: Vec<RunItem> = items
+                .iter()
+                .filter(|item| !nested.contains(item))
+                .cloned()
+                .collect();
+            state.set_pending_interruptions(&own)?;
+            state.set_nested_runs(
+                settled
+                    .function_results()
+                    .iter()
+                    .filter_map(|result| result.nested_run().cloned())
+                    .collect(),
+            )?;
             Ok(Some(RunOutcome::Interrupted {
                 items: items.clone(),
             }))
@@ -3102,11 +3374,13 @@ fn concluding_turn_tool_outputs(
     state: &RunState,
     progress: &TurnLoopProgress,
 ) -> Vec<ToolCallOutput> {
-    let Some(record) = progress.turn_records.last() else {
-        return Vec::new();
+    // A resume that concluded before its first turn delivers what it settled.
+    let range = match (progress.turn_records.last(), &progress.resumed_conclusion) {
+        (Some(record), _) => record.item_range().clone(),
+        (None, Some(range)) => range.clone(),
+        (None, None) => return Vec::new(),
     };
     let items = progress.segment_items(state);
-    let range = record.item_range().clone();
     items
         .get(range)
         .unwrap_or_default()
