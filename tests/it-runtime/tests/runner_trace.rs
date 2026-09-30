@@ -56,7 +56,10 @@ use ra_core::{
     usage::{RequestUsage, Usage},
 };
 use ra_runtime::{
-    agent::AgentBinding,
+    agent::{
+        AgentBinding,
+        tool::{AgentAsTool, AgentToolStreamEvent},
+    },
     hook::UserHookRegistration,
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
 };
@@ -895,5 +898,59 @@ async fn a_refused_call_names_the_boundary_that_refused_it() {
         assert_eq!(function.field("outcome"), Some("error"), "{function:?}");
         assert_eq!(function.field("error.code"), Some(expected), "{function:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "{expected}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_nested_agent_run_nests_under_its_call_whether_or_not_it_streams() {
+    for streamed in [false, true] {
+        let nested = AgentSpec::builder()
+            .id(AgentId::new("nested"))
+            .name("Nested")
+            .instructions("answer")
+            .build()
+            .unwrap();
+        let mut builder = nested.as_tool();
+        if streamed {
+            let ignore = |_event: AgentToolStreamEvent| -> Result<()> { Ok(()) };
+            builder = builder.on_stream(Arc::new(ignore));
+        }
+        let model = ScriptedModel::new(vec![
+            ModelResponse::new(vec![item(
+                "call-item-1",
+                RunItemKind::ToolCall(ToolCall::new(
+                    CallId::new("call-1"),
+                    "nested",
+                    json!({ "input": "x" }),
+                )),
+            )]),
+            ModelResponse::new(vec![message("msg-1", "nested answer")]),
+            ModelResponse::new(vec![message("msg-2", "done")]),
+        ]);
+        let cancel = CancelScope::root();
+        let (spans, _text, guard) = capture();
+
+        Runner::run(request(
+            vec![Arc::new(builder.build().unwrap())],
+            &model,
+            &cancel,
+        ))
+        .await
+        .unwrap();
+        drop(guard);
+
+        // The nested run's cost belongs to the call that started it, so its root span has to sit
+        // under that call's span — also when it runs on a task of its own to be streamed.
+        let agents = spans.of_kind("agent");
+        assert_eq!(agents.len(), 2, "{agents:?}");
+        let nested = agents
+            .iter()
+            .find(|span| span.field("agent.name") == Some("Nested"))
+            .unwrap_or_else(|| panic!("no nested agent span: {agents:?}"));
+        assert_eq!(
+            nested.parent.as_deref(),
+            Some("function"),
+            "streamed: {streamed}"
+        );
     }
 }
