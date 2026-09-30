@@ -36,6 +36,7 @@ use super::{
     phase::{delivery_index, is_assistant_message, phase_at},
 };
 use crate::{
+    agent::FunctionToolResult,
     error::{Error, Result},
     guardrail::{ToolInputGuardrailResult, ToolOutputGuardrailResult},
     item::{ItemId, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
@@ -55,6 +56,7 @@ pub struct SingleStepResult {
     nested_history_owned_items: Vec<ItemId>,
     tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
     tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
+    function_results: Vec<FunctionToolResult>,
     processed_response: ProcessedResponse,
     next_step: NextStep,
 }
@@ -124,6 +126,25 @@ impl SingleStepResult {
         &self.tool_output_guardrail_results
     }
 
+    /// How each function-tool call this turn dispatched ended, in model order.
+    ///
+    /// Carries what the stored items cannot: an agent-tool call whose nested run stopped on an
+    /// approval has no item in this turn at all, and its paused run and the questions it raised
+    /// are here and nowhere else.
+    #[must_use]
+    pub fn function_results(&self) -> &[FunctionToolResult] {
+        &self.function_results
+    }
+
+    /// Approvals raised inside the nested runs of this turn's agent-tool calls, in model order.
+    ///
+    /// Each belongs to a paused nested run, not to this run's history, so none of them is among
+    /// [`Self::session_step_items`]; they are asked through [`NextStep::Interruption`] beside the
+    /// turn's own.
+    pub fn nested_interruptions(&self) -> impl Iterator<Item = &RunItem> {
+        nested_interruptions(&self.function_results)
+    }
+
     /// This turn's classification, kept because resuming an interruption needs the bound actions
     /// that produced it rather than a fresh guess at what the model meant.
     #[must_use]
@@ -161,6 +182,7 @@ pub struct SingleStepResultBuilder {
     nested_history_owned_items: Vec<ItemId>,
     tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
     tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
+    function_results: Vec<FunctionToolResult>,
     processed_response: Option<ProcessedResponse>,
     next_step: Option<NextStep>,
 }
@@ -222,6 +244,12 @@ impl SingleStepResultBuilder {
         self
     }
 
+    /// Sets how each dispatched function-tool call ended.
+    pub fn function_results(mut self, results: Vec<FunctionToolResult>) -> Self {
+        self.function_results = results;
+        self
+    }
+
     /// Sets this turn's classification.
     pub fn processed_response(mut self, processed: ProcessedResponse) -> Self {
         self.processed_response = Some(processed);
@@ -261,7 +289,12 @@ impl SingleStepResultBuilder {
         check_carried_items(&new_items, &pre_items, &session_items)?;
         check_session_items_are_new(&session_items, &pre_items)?;
         check_nested_ownership(&self.nested_history_owned_items, &session_items)?;
-        check_next_step(&next_step, &processed_response, &session_items)?;
+        check_next_step(
+            &next_step,
+            &processed_response,
+            &session_items,
+            &self.function_results,
+        )?;
         check_resolved_output_phases(&next_step, &session_step_items)?;
 
         Ok(SingleStepResult {
@@ -273,6 +306,7 @@ impl SingleStepResultBuilder {
             nested_history_owned_items: self.nested_history_owned_items,
             tool_input_guardrail_results: self.tool_input_guardrail_results,
             tool_output_guardrail_results: self.tool_output_guardrail_results,
+            function_results: self.function_results,
             processed_response,
             next_step,
         })
@@ -474,6 +508,7 @@ fn check_next_step(
     next_step: &NextStep,
     processed_response: &ProcessedResponse,
     session_items: &ItemsById<'_>,
+    function_results: &[FunctionToolResult],
 ) -> Result<()> {
     match next_step {
         NextStep::RunAgain | NextStep::Handoff { .. } if processed_response.has_interruptions() => {
@@ -482,8 +517,16 @@ fn check_next_step(
                  continues the loop",
             ))
         }
+        NextStep::RunAgain | NextStep::Handoff { .. }
+            if nested_interruptions(function_results).next().is_some() =>
+        {
+            Err(Error::caller(
+                "an agent tool's nested run is waiting on an approval, so the turn cannot settle to \
+                 a state that continues the loop",
+            ))
+        }
         NextStep::Interruption { items } => {
-            check_interruption(items, processed_response, session_items)
+            check_interruption(items, processed_response, session_items, function_results)
         }
         NextStep::RunAgain | NextStep::Handoff { .. } | NextStep::FinalOutput { .. } => Ok(()),
     }
@@ -522,10 +565,18 @@ fn check_resolved_output_phases(next_step: &NextStep, session_items: &[RunItem])
     Ok(())
 }
 
+fn nested_interruptions(results: &[FunctionToolResult]) -> impl Iterator<Item = &RunItem> {
+    results
+        .iter()
+        .filter(|result| result.nested_run().is_some())
+        .flat_map(FunctionToolResult::interruptions)
+}
+
 fn check_interruption(
     items: &[RunItem],
     processed_response: &ProcessedResponse,
     session_items: &ItemsById<'_>,
+    function_results: &[FunctionToolResult],
 ) -> Result<()> {
     if items.is_empty() {
         return Err(Error::caller(
@@ -547,6 +598,13 @@ fn check_interruption(
                 item.kind().label()
             )));
         }
+        // A nested run's question is answered through the paused run that raised it, which is
+        // where resume reads it from; it is not one of this turn's records. Matched as the whole
+        // record, before the lookup by ID, because a nested run numbers its calls independently and
+        // may reuse an ID this turn also stored.
+        if nested_interruptions(function_results).any(|nested| nested == item) {
+            continue;
+        }
         let Some(stored) = session_items.get(item.id()) else {
             return Err(Error::caller(format!(
                 "interruption item `{}` is not among the stored items; resume reads the session, \
@@ -555,6 +613,17 @@ fn check_interruption(
             )));
         };
         check_stored_payload(item, stored, "an interruption item")?;
+    }
+
+    // The same for the nested runs' questions: a turn that paused on some of them and not others
+    // would record a paused run nobody is asked to resume.
+    for pending in nested_interruptions(function_results) {
+        if !items.contains(pending) {
+            return Err(Error::caller(format!(
+                "a nested agent run is waiting on `{}` but the interruption does not ask about it",
+                pending.id()
+            )));
+        }
     }
 
     // Every pending decision the response raised has to be among the questions asked. Stopping the

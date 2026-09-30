@@ -92,6 +92,7 @@ const UNBOUND_ORDER: usize = usize::MAX;
 pub struct TurnExecution {
     new_items: Vec<RunItem>,
     interruptions: Vec<RunItem>,
+    nested_interruptions: Vec<RunItem>,
     function_results: Vec<FunctionToolResult>,
     tool_results: Vec<ToolUseResult>,
     outcomes: Vec<ToolOutcome>,
@@ -150,16 +151,28 @@ impl TurnExecution {
         &self.new_items
     }
 
-    /// Decisions the host owes before the run continues, response-level ones first.
+    /// Decisions the host owes this run before it continues, response-level ones first.
+    ///
+    /// Every one is a record this turn stores. The questions raised inside agent tools' nested runs
+    /// are owed too, but they belong to those runs; see [`Self::nested_interruptions`].
     #[must_use]
     pub fn interruptions(&self) -> &[RunItem] {
         &self.interruptions
     }
 
-    /// Whether the run has to stop and ask.
+    /// Approvals the nested runs of this turn's agent-tool calls stopped on, in model order.
+    ///
+    /// Kept apart from [`Self::interruptions`] because none of them is a record of this run: each
+    /// is answered on the paused nested run that raised it.
+    #[must_use]
+    pub fn nested_interruptions(&self) -> &[RunItem] {
+        &self.nested_interruptions
+    }
+
+    /// Whether the run has to stop and ask, about its own calls or a nested run's.
     #[must_use]
     pub fn has_interruptions(&self) -> bool {
-        !self.interruptions.is_empty()
+        !self.interruptions.is_empty() || !self.nested_interruptions.is_empty()
     }
 
     /// Complete results for every function call that reached a terminal dispatch decision, in
@@ -173,10 +186,8 @@ impl TurnExecution {
     /// fabricating one would make its recorded identity look executable. Its error output remains
     /// in [`Self::new_items`], paired to the model's call as required.
     ///
-    /// The runner does not yet carry these values through [`ra_core::step::SingleStepResult`]. It
-    /// preserves the corresponding items and interruptions through its established result paths;
-    /// promotion of the complete per-call values waits for nested-agent execution, which is their
-    /// first runner-level consumer.
+    /// Carried out through [`ra_core::step::SingleStepResult::function_results`], because an
+    /// agent-tool call whose nested run paused is represented here and by no stored record.
     #[must_use]
     pub fn function_results(&self) -> &[FunctionToolResult] {
         &self.function_results
@@ -867,8 +878,9 @@ fn record_function_outcome(
         }
         // Suspended, not finished: the handler never ran, so `tool.execution_ms` is absent and the
         // duration is the wait for a decision. Recorded as `ok` because nothing failed — a report
-        // of tool latency has to filter on the execution field being present, not assume it.
-        Ok(ToolDispatch::AwaitingApproval(_)) => {
+        // of tool latency has to filter on the execution field being present, not assume it. An
+        // agent tool whose nested run paused is suspended the same way, only after running.
+        Ok(ToolDispatch::AwaitingApproval(_) | ToolDispatch::AwaitingNestedApproval(_)) => {
             ra_core::trace::record_outcome(span, ra_core::trace::SpanOutcome::Ok);
         }
         // The tool's own scope, so a tool that timed itself out is attributed to `tool` and one
@@ -1266,6 +1278,15 @@ fn settle_dispatches(
                 execution.interruptions.push(item.clone());
                 execution.new_items.push(item);
             }
+            // No item and no outcome record, as for a call awaiting its own approval: the call has
+            // not produced anything yet, and it is filed when the resumed call does.
+            ToolDispatch::AwaitingNestedApproval(nested) => {
+                let result = FunctionToolResult::nested_interruption(completed.tool, *nested)?;
+                execution
+                    .nested_interruptions
+                    .extend(result.interruptions().iter().cloned());
+                execution.function_results.push(result);
+            }
         }
     }
     Ok(())
@@ -1310,10 +1331,10 @@ fn execute_handoffs(
     execution: &mut TurnExecution,
 ) {
     let mut handoffs = processed.handoffs().iter();
-    let taken = if execution.interruptions.is_empty() {
-        handoffs.next()
-    } else {
+    let taken = if execution.has_interruptions() {
         None
+    } else {
+        handoffs.next()
     };
 
     if let Some(handoff) = taken {
