@@ -186,7 +186,7 @@ impl<'a> WorkspaceEditor<'a> {
             self.session
                 .rm(SessionPath::Posix(&destination), false, self.user.clone())
                 .await?;
-            return Ok(ApplyPatchResult::output(format!("Deleted {display_path}")));
+            return Ok(ApplyPatchResult::default().with_output(format!("Deleted {display_path}")));
         }
 
         let Some(diff) = operation.diff() else {
@@ -222,7 +222,9 @@ impl<'a> WorkspaceEditor<'a> {
 
             let Some(move_to) = operation.move_to() else {
                 self.write_text(&destination, &updated).await?;
-                return Ok(ApplyPatchResult::output(format!("Updated {display_path}")));
+                return Ok(
+                    ApplyPatchResult::default().with_output(format!("Updated {display_path}"))
+                );
             };
 
             let (moved_relative_path, moved_display_path) = self.resolve_path(move_to)?;
@@ -236,7 +238,7 @@ impl<'a> WorkspaceEditor<'a> {
                     .rm(SessionPath::Posix(&destination), false, self.user.clone())
                     .await?;
             }
-            return Ok(ApplyPatchResult::output(format!(
+            return Ok(ApplyPatchResult::default().with_output(format!(
                 "Updated {display_path}\nMoved {display_path} to {moved_display_path}"
             )));
         }
@@ -245,7 +247,7 @@ impl<'a> WorkspaceEditor<'a> {
             .apply_diff("", diff, ApplyDiffMode::Create)
             .map_err(|error| invalid_diff(error, operation.path()))?;
         self.write_text(&destination, &created).await?;
-        Ok(ApplyPatchResult::output(format!("Created {display_path}")))
+        Ok(ApplyPatchResult::default().with_output(format!("Created {display_path}")))
     }
 
     /// The operation with its paths in the canonical form of the workspace's path policy.

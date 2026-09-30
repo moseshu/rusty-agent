@@ -143,12 +143,20 @@ pub struct ApplyPatchResult {
 
 impl ApplyPatchResult {
     /// A result with `output` and no status.
+    #[deprecated(
+        note = "build it as `ApplyPatchResult::default().with_output(..)`, as the reference's \
+                `ApplyPatchResult(output=..)` does; `output` becomes the reader in 0.3.0"
+    )]
     #[must_use]
     pub fn output(output: impl Into<String>) -> Self {
-        Self {
-            status: None,
-            output: Some(output.into()),
-        }
+        Self::default().with_output(output)
+    }
+
+    /// Sets what the editor said it did.
+    #[must_use]
+    pub fn with_output(mut self, output: impl Into<String>) -> Self {
+        self.output = Some(output.into());
+        self
     }
 
     /// Sets the status.
@@ -165,6 +173,9 @@ impl ApplyPatchResult {
     }
 
     /// What the editor said it did.
+    ///
+    /// The reference names this field `output`. The name is held by the deprecated constructor
+    /// until 0.3.0, which removes that constructor and names this reader `output`.
     #[must_use]
     pub fn output_text(&self) -> Option<&str> {
         self.output.as_deref()
