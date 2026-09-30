@@ -96,7 +96,8 @@ fn deep_merge(target: &mut Value, incoming: Value) {
 /// The base sandbox prompt an agent gets unless it replaces it.
 ///
 /// The reference's `sandbox/instructions/prompt.md` (MIT), carried verbatim: it is what the model
-/// reads, and a paraphrase would be a different instruction.
+/// reads, and a paraphrase would be a different instruction. The license is in the repository's
+/// `THIRD_PARTY_NOTICES.md`.
 pub const DEFAULT_SANDBOX_INSTRUCTIONS: &str = include_str!("prompt.md");
 
 /// How deep the workspace tree in the filesystem section goes.

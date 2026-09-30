@@ -3,7 +3,8 @@
 //! A port of the generation half of the reference's `sandbox/memory/prompts.py`. The templates are
 //! the reference's (MIT), carried verbatim: they are what the extraction and consolidation models
 //! read, and a paraphrase would be a different instruction. The read prompt lives with the memory
-//! capability in `ra-tools`.
+//! capability in `ra-tools`. The license and the list of copied files are in the repository's
+//! `THIRD_PARTY_NOTICES.md`.
 
 use super::json::python_strip;
 use super::storage::PhaseTwoInputSelection;

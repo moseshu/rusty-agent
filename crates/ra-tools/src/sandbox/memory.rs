@@ -56,7 +56,8 @@ pub const MEMORY_SUMMARY_MAX_TOKENS: i64 = 15_000;
 /// The file the instructions embed, under the memories directory.
 pub const MEMORY_SUMMARY_FILE: &str = "memory_summary.md";
 
-/// The reference's `memory_read_prompt.md` (MIT), carried verbatim.
+/// The reference's `memory_read_prompt.md` (MIT), carried verbatim. The license is in the
+/// repository's `THIRD_PARTY_NOTICES.md`.
 pub const MEMORY_READ_PROMPT_TEMPLATE: &str = include_str!("memory_read_prompt.md");
 
 /// What the prompt says when live updates are off, verbatim from the reference.
