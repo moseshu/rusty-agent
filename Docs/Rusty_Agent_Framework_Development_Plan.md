@@ -11,6 +11,24 @@
 经验依据：**两处可读源码**——`/Users/moses/workspace/custom-app/openai-agents-python`（框架契约）与 `/Users/moses/workspace/custom-app/codex`（产品机制）。**2026-09-09 起不再引用 AgentForge 作为设计论据**：R7 的审计证明，以它的治理思路为前提长出过一整套无收益证据的内建纪律家族。凡曾挂在它名下的第三方实测数字（缓存命中率、工具计数等），要用必须先回到上面两处源码或第一手日志重新核实。
 配套文档：[项目结构与模块划分](Rusty_Agent_Project_Structure.md) · [代码地图](Code_Map.md)（任务号 ↔ 代码位置 ↔ 实现状态） · [模型协议层设计](Model_Protocol_Design_Responses_and_Chat.md) · [取消契约](Cancellation_Contract.md)
 
+### 参考优先级、移植记录与偏差状态
+
+| 分类 | 权威来源 | 写入 `rusty-agent` 的规则 |
+| --- | --- | --- |
+| provider-neutral 框架契约 | `openai-agents-python` 的实现与测试 | `ra-core` / 通用 runner 先移植其公开形状、字段含义、默认值、merge 顺序、生命周期和错误语义。Rust 所需的所有权、异步和持久化改写不能改变这些可观察语义。 |
+| 通用运行机制 | Codex 可见源码 | 可提取进 runtime、工具服务或可复用件，如进程监管、取消、工具调度、权限和子 agent 生命周期；不得把 Codex 的 coding prompt、账户机制或产品策略带进框架默认值。与上一行重叠时，框架契约优先。 |
+| Rusty 通用扩展 | 本项目自己的明确决定 | 必须是可选配置、adapter 或单独的扩展点；不能以“更严格”或“更安全”为由取代已存在的上游默认行为。记录具体动机和使用者。 |
+| `ra-coding` 等产品策略 | 产品需求与产品实测 | 工具组合、工具数、schema 或输出预算、提示词、危险动作判定和产品验收只由产品 profile 决定；不进入 `ra-core` 或通用 runtime 的默认契约。 |
+
+每个已实现或新立项的框架能力都要留一条可审计的移植记录：**来源文件和测试、Rust 落点、分类（直接移植／必要 Rust 改写／通用扩展／产品策略）、任何可观察偏差及原因、验证证据**。`DONE` 只表示该项已有实现和基础验证；只有没有未决契约偏差时，才可表述为“与上游框架契约对齐”。
+
+**当前未决框架契约偏差**：
+
+| ID | 上游契约 | 当前形态 | 必须收口的方向 | 验证 |
+| --- | --- | --- | --- | --- |
+| D-001 | `ModelSettings.resolve()` 对已设置字段按后层覆盖，不以“更严格”为默认 merge 规则。 | R1-2b 目前把 `max_tokens` 与 `timeout` 合并为取更严格值。功能已实现，但这不是上游默认，也不能作为 `ra-core` 的替代契约。 | 核心 resolve 改回后层显式值覆盖；模型的硬上限在模型能力／adapter 校验处拒绝；run 的 deadline 或产品限制由显式、可选的 policy 收紧。 | 覆盖四层顺序和显式零值的上游对齐用例；另测模型上限校验与 opt-in 限制策略。 |
+| D-002 | 上游的通用层提供工具级 `needs_approval` / approval callback 与待决调用恢复；Codex 的 `PermissionProfile` 是 coding 产品运行时的一部分。二者都没有把固定的 coding 模式词表当作通用 agent core。 | R6 将 `AcceptEdits`、`Plan` 和 `Read` / `Edit` / `Execute` 写进 `ra-core::PermissionMode` / `PermissionScope`。通用审批与中断恢复已实现，但这些固定词汇会把其他产品的权限模型压成 coding 形状。 | core 保留 allow / deny / ask、工具级审批 port、待决记录和恢复；具体模式、作用域映射、命令判定和默认策略由 `ra-coding` 或其他产品 profile 提供。R8 的路径授权、挂载凭据和 sandbox authority 仍是通用沙箱机制，不随之下放。 | 用一个没有文件编辑语义的产品工具验证同一 approval / resume port；`ra-coding` 另验证其模式和作用域映射。 |
+
 > **2026-08-11 验证状态裁决**：不实现 `VerificationLedger`、`TaskLedgerProjection` 或产品级 `ReadRevisionSnapshot` 表。当前 run 的 `Session` / 工具事件历史已经是「改了什么、跑了什么、结果如何」的唯一事实来源；模型上下文、final 成型和离线 eval 都从这条历史按需投影，不能再复制出一份验证真相。AgentForge 的相关机制未证明默认收益且成本 gate 未过，Codex 可见源码也未出现等价账本。改后验证保留为 prompt 提醒与 final 诚实披露，不成为 runtime 硬 gate 或自动续跑理由；只有未来 A/B 同时证明降低 false completion 且不增加成本时，才可重新立项评估。
 
 ---
@@ -42,6 +60,8 @@
 | `BLOCKED` | 被依赖、设计或外部条件阻塞 |
 | `DONE` | 已完成并通过基础验证 |
 | `DEFERRED` | 暂缓，不影响当前阶段目标 |
+
+`DONE` 不覆盖上表的未决框架契约偏差；偏差仍打开时，状态描述必须同时写明其 ID 和收口条件。
 
 ---
 
@@ -106,7 +126,7 @@
 | `ra-mcp` | 服务 | MCP client（stdio/SSE/HTTP）+ 进程内工具服务器 | ra-core |
 | `ra-protocol` | 服务 | 控制协议帧、stdio/WebSocket transport、app-server | ra-core, ra-session |
 | `ra-eval` | 服务 | eval / replay / trace 断言 / 回归 fixture / 成本与纪律报告 | ra-core, ra-runtime, **ra-model**, ra-protocol |
-| **`ra-tools`**（新增，R2-12） | 可复用件 | 与业务无关的通用工具入口：exec_command / write_stdin / read_file / grep / glob / view_image / web_search / web_fetch / ask_user / update_plan / skill / tool_search / **apply_patch** / `agent.*` / `mcp.*`。**等于 R2-8 的 15 个 advertise 入口全集** | ra-core, ra-exec, ra-mcp, ra-patch |
+| **`ra-tools`**（新增，R2-12） | 可复用件 | 与业务无关的通用工具入口：exec_command / write_stdin / read_file / grep / glob / view_image / web_search / web_fetch / ask_user / update_plan / skill / tool_search / **apply_patch** / `agent.*` / `mcp.*`。`ra-coding` 当前 profile 从中选择 15 个 advertise 入口；其他产品按自己的 profile 选择。 | ra-core, ra-exec, ra-mcp, ra-patch |
 | **`ra-flow`**（新增，R17） | 可复用件 | 编排与图引擎：WorkState reducer、Node/Edge/Scheduler、图 checkpoint、plan-execute 与 multi-agent 预置拓扑 | ra-core, ra-runtime |
 | `ra-patch` | 可复用件 | V4A apply_patch 解析、fuzz 匹配、应用与 diff 渲染 | — |
 | `ra-coding` | **参考产品 A** | 用框架写出的编码 agent：提示词内容、编码纪律、危险动作事实、改后验证提醒与 final 诚实披露、coding profile。**不拥有任何工具**——含 `apply_patch` 在内的每个入口都来自 `ra-tools`，这个 crate 只决定装哪些、各自拿到什么 capability、提示词怎么讲 | ra-core, ra-runtime, ra-tools, ra-prompt, ra-patch |
@@ -326,7 +346,7 @@
 | --- | --- | --- | --- |
 | R1-1 | 项模型 `RunItem` / `ModelResponse` | **DONE** | 落地为两层强类型：`RunItem` 是 session 权威记录，保存稳定 `ItemId`、`ItemProvenance`、隔离的 `RawProviderItem` 与 `SessionData`；`ModelInputItem` 是显式发送投影，剥离这些元数据并在类型上排除 `ToolApproval`，不靠 adapter 临时记得过滤。覆盖 `Message` / `Reasoning` / `ToolCall` / `ToolCallOutput` / `Handoff*` / `McpListTools` / `McpApproval*` / `Compaction` / `ToolApproval` 共 11 种 payload；call/output 统一用 `CallId` 配对，reasoning 同时保留归一化字段与完整 `provider_data` 回放真相，`ModelResponse` 保存 output / usage / response_id / request_id 并提供 `to_input_items()`。所有持久结构带 schema version、私有字段构造器与未知字段回写；9 条契约测试在 `tests/it-core/tests/item_model.rs`。R1-2 的图片 / thinking / tool-use 等多模态 `ContentBlock` 仍未展开，本项只放了 Message 必需的文本块。 |
 | R1-2 | 内容块与多模态 | **DONE** | `ContentBlock::{Text, Thinking, Image, ToolUse, ToolResult, ServerToolUse, ServerToolResult}` 已落地；thinking 保留回放签名，client/server tool block 统一用 `CallId` 配对，server tool 名保持开放字符串，结果内容保留协议中立 JSON。图片通过 `ImageSource::{Base64, LocalPath}` 强类型区分，`ra-core` 只保存路径、不做 I/O。所有 payload 均带 schema version 与未知字段回写，7 条契约测试覆盖七变体往返、两类图片、配对、开放 server tool、文本投影、双层降级读取及三态缺省语义。 |
-| R1-2b | **`ModelSettings` 与四层 resolve 语义** | **DONE** | 协议中立字段、`ThinkingConfig` / `Effort` / `ToolChoice`、retry/backoff 配置与 `ResolvedModelSettings` 已落地。`provider_defaults.resolve(provider_key, agent, model, run)` 不修改原层：普通字段后层 `Some` 胜出，`max_tokens` / `timeout` 取全层最严格值，metadata / headers / query / retry 合并，`extra_body` 按 `ProviderKey` 选桶后四层递归合并。trace-safe 投影从类型入口排除 body / headers / query。8 条契约测试覆盖四层快照、显式零值、严格约束、深合并、provider 切换隔离、trace 脱敏、retry falsey 值和兼容回写。 |
+| R1-2b | **`ModelSettings` 与四层 resolve 语义** | **DONE（D-001 未收口）** | 协议中立字段、`ThinkingConfig` / `Effort` / `ToolChoice`、retry/backoff 配置与 `ResolvedModelSettings` 已落地。`provider_defaults.resolve(provider_key, agent, model, run)` 不修改原层：普通字段后层 `Some` 胜出，metadata / headers / query / retry 合并，`extra_body` 按 `ProviderKey` 选桶后四层递归合并。当前 `max_tokens` / `timeout` 仍取全层最严格值，见 D-001；在移回上游覆盖语义前，不能把该行为称为框架契约对齐。trace-safe 投影从类型入口排除 body / headers / query。 |
 | R1-3 | `Model` / `ModelProvider` trait | **DONE** | `Model` 已落地为对象安全的非流式/流式双入口：`get_response(ModelRequest)` 返回归一化 `ModelResponse`，`stream_response(ModelRequest)` 返回 `BoxStream<Result<StreamEvent>>`；`get_retry_advice` 与异步 `close` 都有默认实现，第三方最小 required 集只有两个调用方法。`ModelProvider::get_model(Option<&str>) -> Arc<dyn Model>` 支持 provider 默认模型与实例缓存，异步 `close` 默认 no-op。`ModelRequest` 私有字段覆盖 `system_instructions`、协议中立 input、`ResolvedModelSettings`、模型侧 tool / output-schema / handoff 投影、tracing 与服务端续接；`ConversationContinuation` 把 `previous_response_id` / `conversation_id` 做成互斥枚举而不是两个可同时为真的 Option。请求刻意不可序列化，避免 resolved headers / query / body 误入 trace 或持久态。`StreamEvent` 这里只冻结 raw / run-item / agent-update 信封，delta 聚合与终态 backfill 仍属 R1-7；`RetryAdvice` 这里只冻结 provider evidence 外壳，规范化错误与最终策略仍属 R1-9/R1-9b。7 条契约测试覆盖完整参数面、续接互斥、tracing 三态、trait-object 双入口、默认 retry/close、raw stream 信封的未知字段降级回写，以及**模型事件通道不含 run 级事实**。<br>**事件分层修正**：初版 `StreamEvent` 含 `AgentUpdated`，等于允许 provider adapter 发布「公开 agent 变了」——adapter 既不知道 agent 也不知道 handoff，是类型允许的无效状态；参考实现同样是两条通道（`Model.stream_response` 只发 provider 事件，消费者联合另加 run 级变体）。改名为 `ModelStreamEvent` 并收窄为 `{RawResponse, RunItem}`，`AgentUpdatedStreamEvent` 删除，run 通道由 `ra-runtime` 在 R1-7/R13 包一层。<br>`RunItemStreamEvent::name` 暂留开放字符串并写明理由：词表由 runner 映射步骤项产生（R1-7/R3-1），现在闭合等于照参考实现猜。<br>**两处刻意缺席已写进类型文档**：可复用 prompt 对象属 Responses 专有，走 `extra_body`；`prompt_cache_key` 是会话生命周期的运行期值，`extra_body` 那个静态桶不对，R1-13 落地时应作为 `ModelRequest` 新字段（`#[non_exhaustive]` 保证不破坏）。<br>**2026-08-28 裁定：`stream_response` 改为带默认实现，`get_response` 成为唯一必填方法。** 起因是 R3-4b 之后每次模型调用都走 `stream_response`（`call_model` 写明「so every call streams」，`partial_messages` 只决定旁白是否离开 runtime），而 trait 把两个方法并列为必填，第三方据此以为非流式 run 会走 `get_response`——`examples/minimal_agent` 第一版正是这么写的，跑起来直接报错。<br>**没有删 `get_response`，因为它不是死代码**：`tests/it-model` 有 60+ 处调用它，那是三个 adapter 非流式wire path 的契约测试，删掉等于把那套测试连根拔了。真正死掉的是「运行时会调它」这个预期。<br>**默认方向选择 `stream_response` 兜底而不是反过来**，理由是两个退化默认的代价不对称：由 `get_response` 合成一条单 `Completed` 的流，损失的只是 R3-4b 的重叠执行（性能属性，不是行为），而且 `get_response` 借此重新变成 loop 间接走到的原语；反过来把 `stream_response` 设为必填，则是让每个 mock、测试替身和示例都去写 `BoxStream` 管道，换不到任何东西——真 adapter 两种情况下都会自己实现。仓库里 19 处 `impl Model for` 只有 3 处是真 adapter，其余全是前一类。<br>**连带改的三处**：`examples/minimal_agent` 删掉手写流式实现与 `futures` 依赖（这是这次改动的人体工学证据）；`turn/prepare.rs` 引用 `Model::get_response` 的过期注释改指 `stream_response`；`it-core` 的 `test_model_contract_05` 里那个 `MinimalModel` 原本用 `stream::empty()`，在 R3-4b 之后是一个 loop 根本驱动不了的模型（流不以 `Completed` 结束就没产生 turn），现在删掉该方法走默认。新增 `test_model_contract_default_stream_yields_one_completed` 钉住默认流恰好是一个 `Completed`。 |
 | R1-3a | Provider 注册与模型名前缀解析 | **DONE** | `ra-model::provider` 已落地不可变 `ProviderRegistry`：builder 一次性校验 canonical `ProviderKey`、prefix alias、模型 alias、默认 provider、unknown-prefix target 与 `extra_body` 桶身份；`ModelSelector{provider,model,protocol}` 始终返回 canonical provider key 和 provider-facing 模型名。显式注册优先，未知前缀可 fail-fast 或用 `UnknownPrefixPolicy::ForwardTo` 把**完整原字符串**交给 compat；`openai` / `gemini` / `anthropic` / `grok` 没有任何内建分支，是否特殊完全取决于注册项。`ProviderFactory` 在不进入 `Debug` 的闭包/实现里持有 endpoint、凭据、headers 与 client 构造；同一个 `ProviderRegistration` 还持有 protocol、模型别名、provider/model 两层 settings 和静态 `extra_body`，R1-6b 的 `ProviderQuirks` 已在模块文档中明确要求原位加入，不另建 vendor 表。provider 实例按 canonical key 懒加载缓存；统一 `close` 去重共享实例、即使一个失败仍排空其余 provider、幂等并永久封闭 registry。`ResolvedModel::resolve_settings` 把注册层与模型层接回四层 merge，因此 Anthropic 可在注册层补出必填 `max_tokens`、再受模型上限钳制。9 条 `it-model` 契约测试覆盖显式优先/完整转交、零厂商分支、默认 provider、模型别名与 Anthropic 兜底、懒加载缓存、`ModelProvider` trait、close 语义、fail-fast 与注册冲突。 |
 | R1-4 | OpenAI Responses provider | **DONE** | `ra-model::openai::responses` 已落地可真实调用的 `OpenAiResponsesProvider` / `OpenAiResponsesModel`：共享 `reqwest` client、默认模型与实例缓存，`OpenAiAuth` 支持 API key / base URL / organization / project / 默认头且 Debug 脱敏。请求 lowering 把 `reasoning.encrypted_content` 合并进 include；稳定前缀走顶层 `instructions`，动态 system message 保持 input 尾部；支持 previous response / conversation 互斥续接、文本与 base64/本地图片、reasoning replay、function tool / handoff、structured output、effort、metadata、transport extras，工具存在时默认 `tool_choice=auto` 与 `parallel_tool_calls=true`。发送前复用 R1-17 normalizer。完成态 lifting 保留 response/request id、usage/cached/reasoning token、message phase、refusal、reasoning 完整 provider data、tool/handoff call 与隔离的 raw provider item；HTTP/transport/非法模型输出映射到通用错误分类，失败响应的 `x-request-id` 进错误文本。`stream_response` 在 R1-7 前明确只做完成态适配，不伪装 token SSE。13 条 mock HTTP 契约测试覆盖请求形状、双 continuation、store 推导、handoff 回放、压缩历史、hosted tool 合并、截断响应、鉴权与脱敏、本地图片、reasoning/tool replay、usage、错误映射及完成态事件。<br>**四处初版设计冲突已修正**：① `store` 原为无条件 `false`，与它同时支持的 `previous_response_id` 互斥——未存储的响应下一轮必然找不到（计划 R9-14 早写明这条禁忌）。改为**由续接模式推导**：无续接 `false`（Codex 式全量回传），有续接 `true`；`extra_body.store` 显式值优先，唯一硬拒的是 `previous_response_id` + `store=false`。② `HandoffCall` 只存 `target_agent`，回放要反查「当前请求是否还广播该 handoff」——而控制权转移后目标 agent 正好不再广播它，整条历史从此发不出去。`HandoffCall` 增加 `tool_name`（lifting 时从 wire 记录），反查降为 fallback。③ `Compaction` 原被判成「无 provider replay data 不可 lowering」，等于 R5 一压缩就发不出去；它的 `summary` 本就是协议中立的，现在落成一条 user 消息，措辞归产出它的压缩步骤。④ extra_body 合并策略自相矛盾（`include` 取并集，`reasoning` / `tools` 整体覆盖）：`effort` 现在按 key 合进 `reasoning`（不再连带清掉只能走 extra_body 的 `summary` / `context` / `mode`），hosted tool 与中立工具合并且跨来源查重，`tool_choice` / `parallel_tool_calls` 只在中立层未设时兜底。<br>**另修**：`status` 之前完全没读，`incomplete` 的半截消息会当成 final answer 交给 runner——现按 `incomplete_details.reason` 映射成 `ContextOverflow` / `Refusal`，`cancelled` 与未完成态一并拒绝（`ModelResponse` 至今没有承载部分结果的字段——原写"等 R1-8"，但 R1-8 的题域是 usage 账本、已按此完成，这条留白目前无人认领，见 R1-8 行末）。<br>**真实端点实测**（`tests/it-model/tests/openai_responses_live.rs`，默认 `#[ignore]`，环境变量驱动，离线 CI 不受影响）：对 bianxie.ai 中转的 `gpt-5.5` 打通两条路径——单轮往返，以及**「reasoning + tool call → 原样回放 → 拿到 final message」**。实测结论：① 该中转**接受并透传** `include: reasoning.encrypted_content`，reasoning 项带 `id` 与 `encrypted_content` 回来，回放不报 `reasoning item without its required following item`；② `phase: final_answer` 是真实回传字段，不是本地臆造；③ `x-request-id` 有值但是中转自生成的 UUID，不是 `OpenAI` 的 `req_` 形态——R1-9 归一化错误时不能假设它能在 `OpenAI` 侧检索；④ 短 prompt 下 `cached_tokens` 恒为 0，缓存透传能力待 ≥1024 token 的长前缀再验（R1-8/R1-13）。<br>**已知留白**：`include: reasoning.encrypted_content` 仍无条件下发——按请求内容推导会打断推理模型的第一轮（replay 材料正是那轮首发），正确的门控是模型能力轴，见 R1-3a / R1-13；hosted tool 的输出项没有中立 item 类型，回来会明确报错而不是静默丢半个 turn。 |
@@ -351,7 +371,7 @@
 ### R1-2b `ModelSettings` 字段面与 resolve 语义
 
 > 基线：`openai-agents-python/src/agents/model_settings.py`（390 行，22 个字段）。
-> **可以大量照抄，但有三处必须改**——它是为「包一层 OpenAI Python SDK」设计的，而 rusty-agent 自己拼 JSON body，且四条协议路径平级。
+> **先照抄可观察的 resolve 契约，再做表示改写。** Rusty 自己拼 JSON body、且四条协议路径平级，允许改变 provider extras 的表示；不允许把这当成改变后层覆盖语义的理由。
 
 #### 1. 字段分类
 
@@ -426,13 +446,13 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 | 3 | 模型名解析出的默认 | 该模型的 `max_tokens` 上限与能力 |
 | 4 | `run_config` 覆盖 | 本次 run 临时调参 |
 
-后层赢。产出 `ResolvedModelSettings`，**不修改任何一层的原对象**。
+目标契约是后层赢。产出 `ResolvedModelSettings`，**不修改任何一层的原对象**；当前 `max_tokens` / `timeout` 的例外见 D-001，尚未达成这一条。
 
 | 类别 | 字段 | 是否 openai 行为 |
 | --- | --- | --- |
 | `Override`（后层直接盖） | `temperature` / `top_p` / `frequency_penalty` / `presence_penalty` / `tool_choice` / `parallel_tool_calls` | ✅ 照抄 |
 | `Merge`（合并不替换） | `extra_body` / `extra_headers` / `extra_query` / `metadata` / `retry` | ⚠️ **部分是我们的修正**——openai 只合并 `extra_args` 与 `retry`，`extra_body` 是整体替换。两者并成一个之后统一按合并处理，顺手消掉这个不一致 |
-| `TakeStricter`（取更严格的） | `max_tokens` 不得超过模型上限、`timeout` 取更短 | ❌ **我们的增强，不是 openai 行为**。他们所有字段都是纯覆盖。理由：模型上限是硬事实，`run_config` 设个超上限的值只会换来 400 |
+| D-001：`TakeStricter`（当前待迁移） | `max_tokens` 取更小值、`timeout` 取更短 | ❌ **不是 openai 行为，不能保留为框架默认。** 模型上限是 provider／模型能力事实，应在 resolved settings 之后由 adapter 或能力校验拒绝；run deadline 与产品限制可显式收紧，但不得重写通用 settings 的 merge 结果。 |
 
 **最容易错的一条**：必须区分「未设置」与「显式设成默认值」——用 `Option<T>` 而不是拿默认值填充。`temperature: Some(0.0)` 是用户的决定，`None` 才允许下层填。混同之后要么下层永远盖不了，要么用户显式设的 `0.0` 被悄悄改掉，两种都极难排查。
 
@@ -442,7 +462,7 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 - `extra_body` 与 `Quirks` 同住 provider 注册项（R1-3a），不拆两处。
 - **验收**：四层 fixture 的 resolve 快照测试，外加五条断言——
   1. 未设置字段可被下层填充，显式设置不被覆盖；
-  2. `max_tokens` 取更严格值；
+  2. `max_tokens` 与 `timeout` 和其他普通字段一样由后层显式值覆盖；模型上限校验与显式收紧 policy 分别测试，不能借 merge 测试替代；
   3. `extra_body` 四层深合并（provider 注册项 → agent → model → run_config）；
   4. **切 provider 后，前一个 provider 的 `extra_body` 桶不被下发**——这条直接对应 §2 那个 bug，必须有 vLLM→OpenRouter 之类的用例；
   5. `extra_body` 不出现在 trace 与 `RunState` 的可移植字段中。
@@ -568,6 +588,8 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 ## R2 工具体系
 
+R2 的通用职责是定义工具身份、schema、注册、发现、可见性、调度和结果契约；它不规定某个 agent 必须装哪些工具或每轮可见多少工具。`ra-coding` 的工具集合与字节预算是该产品 profile 对这些通用机制的第一次验证，不是框架默认值。
+
 ### R2 开发顺序
 
 | 顺序 | 任务 | 状态 | 说明 |
@@ -678,7 +700,7 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 | 项目 | 处理 |
 | --- | --- |
-| 40+ 工具的宽工具面 | 不做；硬上限 24（CC 量级），默认 14-16（Codex 量级）。AF 的 43-44 是反面教材 |
+| 把 14–16 个入口或 ≤20 KB 变成框架上限 | 不做；这些是 `ra-coding` profile 的当前预算。框架只提供 `ToolProfile`、选择、发现和可配置的 surface budget，其他产品自行决定入口数与字节限额。 |
 | 把 read/list/search/grep 各拆一个工具 | 不做；长尾能力收进 `exec_command`，只保留有独立价值的（read_file 的窗口预算、grep 的结构化统计） |
 | 同时暴露 Codex 与 Claude Code 两套工具名 | 不做；一次请求只暴露一个 profile 的命名（AF `Codex_ClaudeCode_工具能力兼容开发方案` 的结论） |
 | 工具描述靠外部文档 | 不做；模型只读 schema |
@@ -688,7 +710,7 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 | 能力 | 标准 |
 | --- | --- |
-| 数量达标 | 默认 profile 工具数 ∈ [14,16]，`full` ≤ 24；总 schema ≤ 20 KB |
+| `ra-coding` 数量达标 | `ra-coding` 默认 profile 工具数 ∈ [14,16]，`full` ≤ 24；总 schema ≤ 20 KB。其他 profile 只验证自己的显式预算。 |
 | 字节稳定 | 同配置连续渲染 100 次 schema 字节全同（CI 断言） |
 | 身份无歧义 | 两个 MCP server 提供同名 `search` 工具时，调用与 RunState 恢复都能正确路由 |
 | 观察可自纠 | 截断/空结果/超大输出场景下，工具结果里能看到原因与下一步建议 |
@@ -749,7 +771,9 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 ## R4 Prompt 装配与缓存治理
 
-> **本阶段的目标是把缓存命中率做到与两个参考同档。** **注意：下面这组数字曾挂在 AgentForge 的分析文档名下，2026-09-09 起不作为论据**——要用必须先回到 `codex-rs` 源码或第一手 provider 日志重新核实。机制本身（稳定前缀、缓存断点、动态段位置约束、Anthropic 侧 `cache_control` 分块）与数字无关，照做。
+R4 分为两个层次：`ra-prompt` / 通用 runtime 提供 `PromptSection`、稳定与易变内容的隔离、动态 instruction 投影、缓存计划和请求校验；`ra-coding` 决定具体角色、稳定前缀正文、工具文案、输出格式和其 cache budget。前者应参考 `openai-agents-python` 的 instructions / dynamic instructions 契约，并从 Codex 提取装配与缓存机制；后者只能作为 Coding 产品的可测 profile，不能被其他产品继承为框架默认 prompt。
+
+> **`ra-coding` 的目标是把缓存命中率做到与两个参考产品的同档。** 这是一项产品基准，不是框架目标。**注意：下面这组数字曾挂在 AgentForge 的分析文档名下，2026-09-09 起不作为论据**——要用必须先回到 `codex-rs` 源码或第一手 provider 日志重新核实。机制本身（稳定前缀、缓存断点、动态段位置约束、Anthropic 侧 `cache_control` 分块）与数字无关，照做。
 
 ### R4 开发顺序
 
@@ -834,6 +858,8 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 
 ## R6 权限、审批与中断恢复
 
+R6 的通用移植面是工具级 `needs_approval`、宿主 approval callback、`Allow` / `Deny` / `Ask` 决策、待决项持久化以及中断后的恢复；这些都可以由不具文件编辑能力的产品复用。`AcceptEdits`、`Plan`、`Read` / `Edit` / `Execute`、命令前缀和危险动作分类则是 `ra-coding` 的 policy vocabulary：Codex 的 `PermissionProfile` 可以说明其产品实现方式，不能使这些固定名称成为框架 core 的默认语义。该边界已登记为 D-002；R8 的路径授权、挂载凭据和 sandbox authority 仍是通用沙箱机制。
+
 ### R6 开发顺序
 
 | 顺序 | 任务 | 状态 | 说明 |
@@ -850,6 +876,8 @@ extra_body: BTreeMap<ProviderKey, JsonMap>,
 | R6-8b | **四级自动审批分类** | TODO | 照 CC 的 Auto Mode Classifier 分四级，**关键判据是"用户意图能否解除"**：`allow`（自动批准）/ `soft_deny`（破坏性、不可逆；**除非有明确用户意图授权，否则拦**）/ `hard_deny`（安全边界；**用户意图也解除不了，无条件拦**）/ `environment`（用户环境上下文，不是动作，只喂给判定器）。`soft_deny` 与 `hard_deny` 的分界不是"多危险"，而是**用户说了能不能算数**——这条区分比四个标签本身更重要。CC 用 LLM 分类器判定；**rusty-agent 先用确定性规则（命令 AST + 路径 + 影响面）覆盖 `hard_deny` 与 `allow` 两端，中间灰区才可选调用分类器**，避免把每次审批都变成一次模型往返 |
 | R6-9 | 配置矛盾预警 | TODO | 对齐 claude 的 `CanUseToolShadowedWarning`：`allowed_tools` 整工具放行或 `BypassPermissions` 时，审批回调永不触发 → 连接时主动告警 |
 | R6-10 | 沙箱与审批的边界声明 | TODO | 借鉴 Codex：把沙箱模式与审批策略作为**独立的高权限提示通道**（`developer` 角色或等价物）声明给模型，明写"越界命令会被拒绝" |
+
+> **D-002 收口条件**：R6-1 与 R6-2 的现有实现和测试可以证明 coding policy 能工作，但不能证明其固定词表适合通用框架。完成收口前，`PermissionMode` / `PermissionScope` 及由它们直接推导的默认规则仍标为“已实现、存在框架偏差”；核心只保留通用的审批和恢复契约，产品 profile 负责模式、scope、命令判定和默认策略。
 
 ### R6 非目标
 
@@ -2203,7 +2231,7 @@ reasoning → ACTION(exec) ACTION(exec) ACTION(exec) → observation×3 → reas
 - [x] **`examples/minimal_agent`：不依赖 `ra-coding` 的最小自定义 agent（框架通用性的唯一硬证据）**：只依赖 `ra-core` + `ra-runtime`，自带 `Tool` / `Model` / `ModelResolver`，离线跑完两轮。**约束由 `xtask` 的 `ALLOWED_INTERNAL_DEPS` 钉死**（`&["ra-core", "ra-runtime"]`），加第三个内部依赖即 FAIL 并点名，已反证。落地时暴露两件事，均已处理：`Model::get_response` 在 runtime 已无调用点（已裁定——`stream_response` 改带默认实现，见 R1-3）、最终文本无出口（已补 `RunResult::final_text()`）
 - [x] R1-1 项模型 `RunItem` / `ModelResponse`
 - [x] R1-2 内容块与多模态（七种 `ContentBlock` + base64 / 本地路径图片）
-- [x] **R1-2b `ModelSettings` 与四层 resolve 语义（四层不可变 resolve + per-provider `extra_body` 深合并）**
+- [x] **R1-2b `ModelSettings` 与四层 resolve 语义（四层不可变 resolve + per-provider `extra_body` 深合并；D-001 待收口）**
 - [x] R1-3 `Model` / `ModelProvider` trait
 - [x] R1-3a Provider 注册与模型名前缀解析
 - [x] R1-5b `ApiProtocol` 能力矩阵（协议差异显式建模）
