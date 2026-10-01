@@ -72,16 +72,33 @@
 //! `agent_max_depth`: the version of Codex these tools port does not check depth, and its first
 //! version does.
 //!
+//! # Activity on the host timeline
+//!
+//! As in Codex, what happens to a spawned agent is recorded on the timeline of the agent that
+//! caused it, as an [`AgentEvent::SubAgentActivity`] host event in the sink of that agent's run.
+//! The collaboration tools record that they started, contacted or interrupted an agent; the tree
+//! records that a run completed, on the run whose spawn or follow-up started it — Codex's parent
+//! turn. That run may have ended by then; the event is still its own, numbered in its sequence.
+//! So that a continuation of the run from its checkpoint cannot reissue that number, the tree
+//! keeps the sequence of every run that has named itself an origin, and a run continued in the tree
+//! — bound to an agent, or an agent-tool run inside it — draws from that same sequence, raised past
+//! its own checkpoint and log. A run continued outside the tree relies on its checkpoint alone,
+//! which covers only what was numbered before the checkpoint was taken. A run started by mail from
+//! several runs, or from none, records no completion, as Codex's does not without a single parent
+//! turn. A run that errors, is interrupted or is shut down records none either: its parent learns
+//! of it from the `FINAL_ANSWER` mail alone.
+//!
 //! # What this does not port
 //!
 //! - **Per-spawn model and reasoning-effort overrides**, agent nicknames, and role descriptions.
 //! - **Persistence and resume of the tree.** A spawned agent lives as long as its [`AgentControl`].
-//! - **Host events.**
+//!   Neither the activity events nor an agent's history are written anywhere by the tree; storing
+//!   a spawned agent's transcript on its own is for the session layer.
 
 mod budget;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -102,10 +119,11 @@ use ra_core::{
     },
     cancel::{CancelReason, CancelScope, ScopeKind},
     error::{Error, Result},
+    event::{AgentEvent, HostEventEmitter, SubAgentActivityEvent, SubAgentActivityKind},
     finish::FinishReason,
     item::{InputItemNormalizer, ModelInputItem, NormalizedInput, RunItem},
     model::ModelResolver,
-    state::{RunId, RunState},
+    state::{EventSeqAllocator, RunId, RunState},
     tool::ToolServices,
 };
 use tokio::{
@@ -162,6 +180,7 @@ impl AgentControl {
             max_depth: AtomicUsize::new(usize::MAX),
             rollout_budget: OnceLock::new(),
             paused_activity: watch::Sender::new(0),
+            event_seqs: Mutex::new(HashMap::new()),
         });
         Self { tree }
     }
@@ -447,6 +466,11 @@ impl AgentHandle {
         self.tree.upgrade().ok_or(AgentControlError::Unavailable)
     }
 
+    /// The tree this handle's agent belongs to.
+    pub(crate) fn tree_ref(&self) -> AgentTreeRef {
+        AgentTreeRef(self.tree.clone())
+    }
+
     /// The rollout budget of this agent's tree, if it has one and is still alive.
     pub(crate) fn rollout_budget(&self) -> Option<Arc<RolloutBudget>> {
         self.tree.upgrade()?.rollout_budget.get().map(Arc::clone)
@@ -509,6 +533,10 @@ impl AgentHandle {
             self.node.status.send_replace(AgentStatus::Shutdown);
             return;
         }
+        // Recorded before the status is published, so a host woken by the status finds it.
+        if let (AgentStatus::Completed(_), Ok(result)) = (&status, result) {
+            self.record_completion(result.state().run_id());
+        }
         self.node.status.send_replace(status.clone());
         let (Some(tree), Some(parent)) = (tree, self.node.path.parent()) else {
             return;
@@ -518,6 +546,47 @@ impl AgentHandle {
             completion_message(&parent, &self.node.path, &status),
         ) {
             parent_node.mailbox.push(message);
+        }
+    }
+
+    /// Records on the timeline of the run that started this agent's current run that the run
+    /// completed, as Codex's `notify_parent_of_terminal_turn` does for a turn with a parent turn.
+    /// A run started by mail from more than one run, or by none, records nothing.
+    fn record_completion(&self, run_id: &RunId) {
+        let Some(child) = &self.node.child else {
+            return;
+        };
+        let Some(origin) = lock(&child.state).run_origin.clone() else {
+            return;
+        };
+        let event = SubAgentActivityEvent::new(
+            format!("subagent-completed-{run_id}"),
+            self.node.path.clone(),
+            SubAgentActivityKind::Completed,
+        );
+        if let Err(error) = origin.emit_agent(AgentEvent::SubAgentActivity(event)) {
+            tracing::warn!(
+                agent = %self.node.path,
+                %error,
+                "a sub-agent completion could not be recorded on the host event channel"
+            );
+        }
+    }
+}
+
+/// The tree a run executes in, for a run not bound to one of its agents — a nested agent-tool run
+/// started inside it — as well as for one that is.
+#[derive(Clone)]
+pub(crate) struct AgentTreeRef(Weak<Tree>);
+
+impl AgentTreeRef {
+    /// The host event sequence a run starting with `allocator` must draw from, so that a run
+    /// continued from its checkpoint shares one sequence with the completions an earlier segment
+    /// of it asked to be told about.
+    pub(crate) fn adopt_event_seqs(&self, allocator: EventSeqAllocator) -> EventSeqAllocator {
+        match self.0.upgrade() {
+            Some(tree) => tree.adopt_event_seqs(allocator),
+            None => allocator,
         }
     }
 }
@@ -603,6 +672,7 @@ impl AgentControlPort for AgentHandle {
                 history,
                 current_run: None,
                 paused: None,
+                run_origin: None,
             }),
             idle: watch::Sender::new(true),
         };
@@ -629,12 +699,15 @@ impl AgentControlPort for AgentHandle {
             }
             agents.insert(path.clone(), Arc::clone(&node));
         }
-        node.mailbox.push(InterAgentCommunication::from_agent(
-            self.node.path.clone(),
-            path.clone(),
-            request.message(),
-            MessageDeliveryMode::TriggerTurn,
-        ));
+        node.mailbox.push_from(
+            InterAgentCommunication::from_agent(
+                self.node.path.clone(),
+                path.clone(),
+                request.message(),
+                MessageDeliveryMode::TriggerTurn,
+            ),
+            tree.origin_of(&parent),
+        );
         tree.ensure_running(&node);
         Ok(node.snapshot())
     }
@@ -666,12 +739,21 @@ impl AgentControlPort for AgentHandle {
                 max_threads: tree.limiter.max_threads,
             });
         }
-        node.mailbox.push(InterAgentCommunication::from_agent(
-            self.node.path.clone(),
-            node.path.clone(),
-            &message,
-            mode,
-        ));
+        // Only a follow-up names the run that asked for it, as only Codex's trigger-turn mail
+        // carries a parent turn.
+        let origin = (mode == MessageDeliveryMode::TriggerTurn)
+            .then(ParentRun::current)
+            .flatten()
+            .and_then(|parent| tree.origin_of(&parent));
+        node.mailbox.push_from(
+            InterAgentCommunication::from_agent(
+                self.node.path.clone(),
+                node.path.clone(),
+                &message,
+                mode,
+            ),
+            origin,
+        );
         if mode == MessageDeliveryMode::TriggerTurn {
             tree.ensure_running(&node);
         }
@@ -775,9 +857,47 @@ struct Tree {
     rollout_budget: OnceLock<Arc<RolloutBudget>>,
     /// Ticks whenever an agent's run pauses for approval.
     paused_activity: watch::Sender<u64>,
+    /// The host event sequence of every run that has named itself as the origin of another run,
+    /// which records that run's completion from it later. Kept for the tree's lifetime: the run
+    /// may be continued at any time, and its continuation must draw from the same sequence.
+    event_seqs: Mutex<HashMap<RunId, EventSeqAllocator>>,
 }
 
 impl Tree {
+    /// The authoritative sequence of `allocator`'s run, registering `allocator` as that sequence
+    /// when the run has none yet.
+    fn share_event_seqs(&self, allocator: &EventSeqAllocator) -> EventSeqAllocator {
+        let mut seqs = lock(&self.event_seqs);
+        let shared = seqs
+            .entry(allocator.run_id().clone())
+            .or_insert_with(|| allocator.clone());
+        shared.advance_past(allocator);
+        shared.clone()
+    }
+
+    /// The sequence a run starting with `allocator` draws from: the registered one, raised past
+    /// `allocator`, when an earlier segment of the run registered it; otherwise `allocator` itself.
+    fn adopt_event_seqs(&self, allocator: EventSeqAllocator) -> EventSeqAllocator {
+        match lock(&self.event_seqs).get(allocator.run_id()) {
+            Some(shared) => {
+                shared.advance_past(&allocator);
+                shared.clone()
+            }
+            None => allocator,
+        }
+    }
+
+    /// An emitter attributed to `parent` — its run and the agent of its current turn — drawing
+    /// from the run's authoritative sequence, when the run has an event sink.
+    fn origin_of(&self, parent: &ParentRun) -> Option<HostEventEmitter> {
+        let sink = parent.services().event_sink()?;
+        Some(HostEventEmitter::new(
+            parent.current_agent().id().clone(),
+            self.share_event_seqs(parent.event_seqs()),
+            Arc::clone(sink),
+        ))
+    }
+
     fn node(&self, path: &AgentPath) -> Option<Arc<AgentNode>> {
         lock(&self.agents).get(path).map(Arc::clone)
     }
@@ -947,11 +1067,14 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
         let handle = AgentHandle::new(&strong, Arc::clone(&node));
         drop(strong);
 
-        let mut input = lock(&child.state).history.clone();
+        let (mail, origin) = node.mailbox.take_for_run();
+        let mut input = {
+            let mut state = lock(&child.state);
+            state.run_origin = origin;
+            state.history.clone()
+        };
         input.extend(
-            node.mailbox
-                .take_all()
-                .iter()
+            mail.iter()
                 .map(|mail| ModelInputItem::Message(mail.to_message())),
         );
         let history = run_to_end(&tree, child, &handle, &scope, input).await;
@@ -1207,6 +1330,9 @@ struct ChildState {
     current_run: Option<CancelScope>,
     /// The run's checkpoint while it waits for the host to answer an approval.
     paused: Option<PausedRun>,
+    /// The run whose spawn or follow-up started the current run, whose timeline records the run's
+    /// completion.
+    run_origin: Option<HostEventEmitter>,
 }
 
 struct PausedRun {
@@ -1216,8 +1342,15 @@ struct PausedRun {
 
 /// An agent's pending mail, with a counter that ticks on every delivery for waiters.
 struct Mailbox {
-    queue: Mutex<VecDeque<InterAgentCommunication>>,
+    queue: Mutex<VecDeque<Mail>>,
     activity: watch::Sender<u64>,
+}
+
+/// One message waiting in a mailbox, with the run that sent it when that run asked for a run of
+/// the recipient: Codex's pending mail and the turn start options it was sent with.
+struct Mail {
+    communication: InterAgentCommunication,
+    origin: Option<HostEventEmitter>,
 }
 
 impl Mailbox {
@@ -1229,13 +1362,44 @@ impl Mailbox {
     }
 
     fn push(&self, mail: InterAgentCommunication) {
-        lock(&self.queue).push_back(mail);
+        self.push_from(mail, None);
+    }
+
+    fn push_from(&self, communication: InterAgentCommunication, origin: Option<HostEventEmitter>) {
+        lock(&self.queue).push_back(Mail {
+            communication,
+            origin,
+        });
         self.activity
             .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     fn take_all(&self) -> Vec<InterAgentCommunication> {
-        lock(&self.queue).drain(..).collect()
+        lock(&self.queue)
+            .drain(..)
+            .map(|mail| mail.communication)
+            .collect()
+    }
+
+    /// Takes the mail a new run starts on, and the run that asked for it.
+    ///
+    /// As Codex's `drain_mailbox_input_items` keeps a parent turn only when every trigger-turn mail
+    /// names the same one, the origin is kept only when every trigger mail came from the same run.
+    fn take_for_run(&self) -> (Vec<InterAgentCommunication>, Option<HostEventEmitter>) {
+        let mail: Vec<Mail> = lock(&self.queue).drain(..).collect();
+        let origin = mail
+            .iter()
+            .filter(|mail| mail.communication.trigger_turn())
+            .map(|mail| mail.origin.as_ref())
+            .reduce(|expected, candidate| {
+                expected.filter(|expected| {
+                    candidate.is_some_and(|candidate| candidate.run_id() == expected.run_id())
+                })
+            })
+            .flatten()
+            .cloned();
+        let communications = mail.into_iter().map(|mail| mail.communication).collect();
+        (communications, origin)
     }
 
     fn has_pending(&self) -> bool {
@@ -1245,7 +1409,7 @@ impl Mailbox {
     fn has_trigger(&self) -> bool {
         lock(&self.queue)
             .iter()
-            .any(InterAgentCommunication::trigger_turn)
+            .any(|mail| mail.communication.trigger_turn())
     }
 
     async fn wait(&self, timeout: Duration) -> WaitOutcome {

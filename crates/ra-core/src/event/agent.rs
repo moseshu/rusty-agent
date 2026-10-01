@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
+    agent::control::AgentPath,
     compat::{SchemaVersion, Unknown},
     item::AgentId,
     state::RunId,
@@ -455,6 +456,170 @@ impl AgentClosedEvent {
     }
 }
 
+/// What happened to a spawned agent, as the timeline of the agent that caused it shows it.
+///
+/// Ported from Codex's `SubAgentActivityKind`. Like [`AgentStatus`], it is a label a host renders
+/// and nothing in the framework routes on, so a name this build has no variant for is kept as
+/// [`Self::Custom`] rather than failing the event around it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubAgentActivityKind {
+    /// The agent was spawned.
+    Started,
+    /// The agent was sent a message or given a follow-up task.
+    Interacted,
+    /// The agent's current run was interrupted.
+    Interrupted,
+    /// A run the acting agent started on the agent completed.
+    Completed,
+    /// A kind this build has no variant for, kept verbatim.
+    Custom(Cow<'static, str>),
+}
+
+impl SubAgentActivityKind {
+    /// The kind named `name`, as the variant this build has for it or as [`Self::Custom`].
+    #[must_use]
+    pub fn custom(name: impl Into<Cow<'static, str>>) -> Self {
+        let name = name.into();
+        Self::known(&name).unwrap_or(Self::Custom(name))
+    }
+
+    /// The name of this kind, byte-identical to its serialized form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Started => "started",
+            Self::Interacted => "interacted",
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+            Self::Custom(name) => name,
+        }
+    }
+
+    fn known(name: &str) -> Option<Self> {
+        match name {
+            "started" => Some(Self::Started),
+            "interacted" => Some(Self::Interacted),
+            "interrupted" => Some(Self::Interrupted),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+}
+
+impl From<&str> for SubAgentActivityKind {
+    fn from(name: &str) -> Self {
+        Self::known(name).unwrap_or_else(|| Self::Custom(Cow::Owned(name.to_owned())))
+    }
+}
+
+impl From<String> for SubAgentActivityKind {
+    fn from(name: String) -> Self {
+        match Self::known(&name) {
+            Some(known) => known,
+            None => Self::Custom(Cow::Owned(name)),
+        }
+    }
+}
+
+impl fmt::Display for SubAgentActivityKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for SubAgentActivityKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SubAgentActivityKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self::from(String::deserialize(deserializer)?))
+    }
+}
+
+/// One step of a spawned agent's life, recorded on the timeline of the agent that caused it.
+///
+/// Ported from Codex's `SubAgentActivityItem`. The envelope's run and agent are the acting side:
+/// the run whose tool call spawned, messaged or interrupted the agent, or, for
+/// [`SubAgentActivityKind::Completed`], the run whose spawn or follow-up started the run that
+/// completed. [`Self::id`] is the tool call's id, or `subagent-completed-<run id>` naming the run
+/// that completed.
+///
+/// # Deviations from Codex
+///
+/// - The kind is serialized as `activity`: `kind` is already the tag that names the variant of
+///   [`AgentEvent`].
+/// - There is no thread id. A path names one live agent; a path freed by a close can be spawned
+///   again, and the later life begins with its own [`SubAgentActivityKind::Started`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubAgentActivityEvent {
+    #[serde(default = "default_schema_version")]
+    schema_version: SchemaVersion,
+    id: String,
+    agent_path: AgentPath,
+    activity: SubAgentActivityKind,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl SubAgentActivityEvent {
+    /// Creates an activity of `agent_path`.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        agent_path: AgentPath,
+        activity: SubAgentActivityKind,
+    ) -> Self {
+        Self {
+            schema_version: AGENT_EVENT_SCHEMA_VERSION,
+            id: id.into(),
+            agent_path,
+            activity,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// The tool call that caused the activity, or `subagent-completed-<run id>` for a completion.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The agent the activity happened to.
+    #[must_use]
+    pub const fn agent_path(&self) -> &AgentPath {
+        &self.agent_path
+    }
+
+    /// What happened.
+    #[must_use]
+    pub const fn activity(&self) -> &SubAgentActivityKind {
+        &self.activity
+    }
+
+    /// Schema version of this event payload.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Unknown fields preserved during forward-compatible deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
 /// The family of multi-agent orchestration events.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,6 +639,8 @@ pub enum AgentEvent {
     Completed(AgentCompletedEvent),
     /// Agent resource closed.
     Closed(AgentClosedEvent),
+    /// A spawned agent was started, contacted, interrupted or completed a run.
+    SubAgentActivity(SubAgentActivityEvent),
     /// Forward-compatible unknown agent event kind.
     Unknown(serde_json::Value),
 }
@@ -491,6 +658,7 @@ impl Serialize for AgentEvent {
             StatusChanged(&'a AgentStatusChangedEvent),
             Completed(&'a AgentCompletedEvent),
             Closed(&'a AgentClosedEvent),
+            SubAgentActivity(&'a SubAgentActivityEvent),
         }
 
         match self {
@@ -499,6 +667,7 @@ impl Serialize for AgentEvent {
             Self::StatusChanged(e) => Known::StatusChanged(e).serialize(serializer),
             Self::Completed(e) => Known::Completed(e).serialize(serializer),
             Self::Closed(e) => Known::Closed(e).serialize(serializer),
+            Self::SubAgentActivity(e) => Known::SubAgentActivity(e).serialize(serializer),
             Self::Unknown(val) => val.serialize(serializer),
         }
     }
@@ -533,6 +702,11 @@ impl<'de> Deserialize<'de> for AgentEvent {
             Some(serde_json::Value::String(ref s)) if s == "closed" => serde_json::from_value(val)
                 .map(Self::Closed)
                 .map_err(serde::de::Error::custom),
+            Some(serde_json::Value::String(ref s)) if s == "sub_agent_activity" => {
+                serde_json::from_value(val)
+                    .map(Self::SubAgentActivity)
+                    .map_err(serde::de::Error::custom)
+            }
             other => {
                 if let Some(kv) = other
                     && let Some(map) = val.as_object_mut()

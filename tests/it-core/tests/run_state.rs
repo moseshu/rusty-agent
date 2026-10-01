@@ -849,6 +849,38 @@ fn test_run_state_snapshot_event_seq_rejects_a_foreign_allocator() {
 }
 
 #[test]
+fn an_allocator_advanced_past_another_shares_nothing_already_issued_and_never_moves_back() {
+    let earlier = RunState::start(RunId::new("run-joined"))
+        .with_next_host_event_seq(3)
+        .restore_event_seq_allocator(None);
+    let restored = RunState::start(RunId::new("run-joined"))
+        .with_next_host_event_seq(1)
+        .restore_event_seq_allocator(Some(9));
+
+    earlier.advance_past(&restored);
+    assert_eq!(earlier.current_next(), 10);
+    // A clone draws from the same counter, so the two hand out one sequence between them.
+    let shared = earlier.clone();
+    assert_eq!(shared.allocate().unwrap(), 10);
+    assert_eq!(earlier.allocate().unwrap(), 11);
+
+    let behind = RunState::start(RunId::new("run-joined")).restore_event_seq_allocator(None);
+    earlier.advance_past(&behind);
+    assert_eq!(earlier.current_next(), 12);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "event sequence allocators of different runs")]
+fn an_allocator_is_not_advanced_past_another_runs() {
+    let mine = RunState::start(RunId::new("run-mine")).restore_event_seq_allocator(None);
+    let theirs = RunState::start(RunId::new("run-theirs"))
+        .with_next_host_event_seq(50)
+        .restore_event_seq_allocator(None);
+    mine.advance_past(&theirs);
+}
+
+#[test]
 fn test_run_state_next_event_seq_never_regresses() {
     let state = RunState::start(RunId::new("run-monotonic-bound"))
         .with_next_host_event_seq(100)

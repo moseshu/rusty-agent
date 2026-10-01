@@ -584,6 +584,7 @@ impl AgentTool {
         )
         .with_config(config)
         .with_services(context.services().clone())
+        .with_agent_tree(parent.agent_tree().cloned())
         // Every call the nested run pays for is billed on the parent as well, as the reference
         // shares one usage object between them. Inheriting the parent's configuration inherits its
         // token ceiling, which is then measured against the spend it is shared with.
