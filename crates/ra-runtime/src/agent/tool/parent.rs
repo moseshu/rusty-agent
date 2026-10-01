@@ -18,9 +18,20 @@
 //! nested run installs its own environment around its loop, so the checkpoint never reaches a call
 //! the nested run makes in turn.
 
-use std::{any::Any, future::Future, sync::Arc};
+use std::{
+    any::Any,
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+};
 
-use ra_core::{cancel::CancelScope, model::ModelResolver, state::RunState};
+use ra_core::{
+    agent::AgentSpec,
+    cancel::CancelScope,
+    item::ModelInputItem,
+    model::ModelResolver,
+    state::{RunId, RunState},
+    tool::ToolServices,
+};
 
 use crate::runner::RunConfig;
 
@@ -40,20 +51,44 @@ struct ParentRunEnvironment {
     model_resolver: Arc<dyn ModelResolver>,
     config: RunConfig,
     app_context: Option<Arc<dyn Any + Send + Sync>>,
+    run_id: RunId,
+    services: ToolServices,
+    /// The agent running the current turn and the history that turn's request was built from.
+    /// The loop replaces it every turn, so a handoff is reflected from the turn it takes effect.
+    turn: Mutex<TurnView>,
+}
+
+#[derive(Clone)]
+struct TurnView {
+    agent: Arc<AgentSpec>,
+    history: Arc<Vec<ModelInputItem>>,
 }
 
 impl ParentRun {
     /// Captures a run's environment before its loop consumes the request.
+    ///
+    /// `agent` is the agent the run starts with, until the loop reports the agent of each turn;
+    /// `services` are the ports the run was given. An agent spawned into the background from this
+    /// run starts from both.
     pub(crate) fn new(
         model_resolver: Arc<dyn ModelResolver>,
         config: RunConfig,
         app_context: Option<Arc<dyn Any + Send + Sync>>,
+        run_id: RunId,
+        agent: Arc<AgentSpec>,
+        services: ToolServices,
     ) -> Self {
         Self {
             run: Arc::new(ParentRunEnvironment {
                 model_resolver,
                 config,
                 app_context,
+                run_id,
+                services,
+                turn: Mutex::new(TurnView {
+                    agent,
+                    history: Arc::new(Vec::new()),
+                }),
             }),
             call_scope: None,
             resume: None,
@@ -93,6 +128,40 @@ impl ParentRun {
 
     pub(crate) fn app_context(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
         self.run.app_context.as_ref()
+    }
+
+    pub(crate) fn run_id(&self) -> &RunId {
+        &self.run.run_id
+    }
+
+    /// Records the agent running this turn and the history its request was built from.
+    pub(crate) fn enter_turn(&self, agent: &Arc<AgentSpec>, history: Vec<ModelInputItem>) {
+        *self.run.turn.lock().unwrap_or_else(PoisonError::into_inner) = TurnView {
+            agent: Arc::clone(agent),
+            history: Arc::new(history),
+        };
+    }
+
+    /// The agent running the current turn.
+    pub(crate) fn current_agent(&self) -> Arc<AgentSpec> {
+        Arc::clone(&self.turn_view().agent)
+    }
+
+    /// The history the current turn's request was built from.
+    pub(crate) fn current_history(&self) -> Arc<Vec<ModelInputItem>> {
+        self.turn_view().history
+    }
+
+    fn turn_view(&self) -> TurnView {
+        self.run
+            .turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn services(&self) -> &ToolServices {
+        &self.run.services
     }
 
     /// The scope of the tool call being executed; absent outside a dispatched call.

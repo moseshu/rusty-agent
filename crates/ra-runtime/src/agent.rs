@@ -32,6 +32,7 @@
 //! [`tool`] holds `as_tool` — the sub-agent shape, where a whole run becomes one tool call — beside
 //! the binding, since a nested run needs both identities too.
 
+pub mod control;
 pub mod tool;
 
 use std::{collections::BTreeMap, fmt, sync::Arc};

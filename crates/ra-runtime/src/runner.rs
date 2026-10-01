@@ -93,7 +93,7 @@ use result::{TurnRecordOwner, aggregate_usage, find_final_message};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
-    agent::{AgentBinding, AgentRegistry, tool::ParentRun},
+    agent::{AgentBinding, AgentRegistry, control::AgentHandle, tool::ParentRun},
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     hook::{UserHookRegistration, UserHooks},
@@ -797,6 +797,7 @@ pub struct RunRequest {
     services: ToolServices,
     event_seqs: EventSeqAllocator,
     tool_input: Option<Arc<serde_json::Value>>,
+    agent_handle: Option<AgentHandle>,
 }
 
 impl RunRequest {
@@ -831,6 +832,7 @@ impl RunRequest {
             services: ToolServices::new(),
             event_seqs,
             tool_input: None,
+            agent_handle: None,
         }
     }
 
@@ -870,6 +872,19 @@ impl RunRequest {
     /// as its own parameter would change four signatures and every third-party tool.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Runs this request as the agent `handle` names in its agent tree.
+    ///
+    /// The run's tools reach the tree through [`ToolServices::agent_control`], acting as that
+    /// agent, whatever services [`Self::with_services`] installed. Mail sent to the agent is
+    /// delivered into the run at model-call boundaries — from the second model call on when the
+    /// request carries new input, so that input is answered first, as Codex drains pending input.
+    /// The run marks the agent running when it starts and records how it ended; a spawned agent's
+    /// run then reports its result to its parent.
+    pub fn with_agent_control(mut self, handle: AgentHandle) -> Self {
+        self.agent_handle = Some(handle);
         self
     }
 
@@ -1030,6 +1045,10 @@ struct TurnLoopContext<'a> {
     deferred_prompts: &'a [DeferredPrompt],
     /// Prepares sandbox agents before their turns.
     sandbox: &'a SandboxRuntime,
+    /// The agent-tree mailbox this run delivers at model-call boundaries.
+    agent_mail: Option<&'a AgentHandle>,
+    /// Whether the first model call of this segment already takes pending mail.
+    deliver_mail_first: bool,
 }
 
 /// What the loop produces, whichever way it ends.
@@ -1133,7 +1152,14 @@ async fn run_loop(
         Arc::clone(&request.model_resolver),
         request.config.clone(),
         request.app_context.clone(),
+        request.run_id.clone(),
+        Arc::clone(request.agent.public()),
+        request.services.clone(),
     );
+    let agent_handle = request.agent_handle.clone();
+    if let Some(handle) = &agent_handle {
+        handle.run_started(request.agent.public_id());
+    }
     let result = parent
         .scope(Box::pin(run_loop_inner(
             request,
@@ -1146,6 +1172,9 @@ async fn run_loop(
     let result = settle_sandbox(&sandbox, result)
         .instrument(agent_span.clone())
         .await;
+    if let Some(handle) = &agent_handle {
+        handle.run_finished(&result);
+    }
     if let Some(interrupt) = interrupt
         && result
             .as_ref()
@@ -1234,7 +1263,15 @@ async fn run_loop_inner(
         services,
         event_seqs,
         tool_input,
+        agent_handle,
     } = request;
+    let services = match &agent_handle {
+        Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
+        None => services,
+    };
+    // Codex drains pending input before the first model call only when the turn brought none of
+    // its own, so new input is answered before anything that was waiting.
+    let deliver_mail_first = requested_input.is_empty();
 
     if let Err(error) =
         validate_config(&config).and_then(|()| sandbox.assert_agent_supported(agent.public()))
@@ -1396,6 +1433,8 @@ async fn run_loop_inner(
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
         sandbox,
+        agent_mail: agent_handle.as_ref(),
+        deliver_mail_first,
     };
     // The stage runs once per run, on the segment that opens it. A continuation does not repeat
     // the caller's opening input, so a check written against that input has nothing new to look
@@ -2707,12 +2746,27 @@ async fn run_one_turn(
     // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
+    deliver_agent_mail(context, state, progress, turn_scope);
     let reminder = budget_reminder(state, config.budget());
     // What this turn's request is built from: the base the run continues on, and the records
     // appended since. The two ways of decomposing that are equivalent until a transfer of control
     // narrows the base — after which only the state knows what the receiving agent may see.
     let turn_input = TurnInput::resolve(context, state, progress)?;
     let input = next_input(turn_input.base(), turn_input.carried(), reminder);
+    // What an agent spawned during this turn starts from: the agent running it, and the history
+    // its request is built from. Only a run that takes part in an agent tree pays for the copy.
+    if context.services.agent_control().is_some()
+        && let Some(parent) = ParentRun::current()
+    {
+        let mut history = turn_input.base().to_vec();
+        history.extend(
+            turn_input
+                .carried()
+                .iter()
+                .filter_map(RunItem::to_model_input),
+        );
+        parent.enter_turn(agent.public(), history);
+    }
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
         agent,
@@ -3038,6 +3092,47 @@ fn deliver_deferred_prompts(
     if items.is_empty() {
         return;
     }
+    for item in &items {
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+    }
+    state.record_generated_items(items);
+}
+
+/// Records the mail waiting for this run's agent as input to the model call about to be made.
+///
+/// Mail that arrives while the model is answering waits for the next call; a run whose answer
+/// concludes it leaves that mail queued for the agent's next run, as Codex defers mailbox delivery
+/// once a turn has produced its final answer. A turn already cancelled takes nothing, so an
+/// interrupt never swallows a follow-up into a run that is stopping.
+fn deliver_agent_mail(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    progress: &TurnLoopProgress,
+    turn_scope: &CancelScope,
+) {
+    let Some(handle) = context.agent_mail else {
+        return;
+    };
+    if (progress.turns <= 1 && !context.deliver_mail_first) || turn_scope.is_cancelled() {
+        return;
+    }
+    let mail = handle.take_mail();
+    if mail.is_empty() {
+        return;
+    }
+    // Numbered by the whole run's turn, like the other records the loop writes itself, so a
+    // resumed segment does not collide with what an earlier one recorded.
+    let turn = progress.reference_turn();
+    let items: Vec<RunItem> = mail
+        .iter()
+        .enumerate()
+        .map(|(index, mail)| {
+            RunItem::new(
+                ItemId::new(format!("agent-message-{turn}-{index}")),
+                RunItemKind::Message(mail.to_message()),
+            )
+        })
+        .collect();
     for item in &items {
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
