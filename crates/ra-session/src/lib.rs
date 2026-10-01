@@ -22,8 +22,10 @@ pub mod store;
 pub use memory::InMemorySession;
 pub use ra_core::session::{Session, SessionId};
 pub use rollout::{
-    ChildAnchorKind, ROLLOUT_SCHEMA_VERSION, RolloutCheckpoint, RolloutChildAnchor,
-    RolloutFileRecorder, RolloutModelUsage, RolloutPayload, RolloutReader, RolloutRecord,
-    RolloutSessionMeta, RolloutSidecar, RolloutSummary, RolloutTurnContext, RolloutWriter,
-    UnifiedReplayItem, graft_child_transcripts, is_persisted_rollout_item,
+    ChildAnchorKind, ROLLOUT_SCHEMA_VERSION, ReconstructedRun, RolloutCheckpoint,
+    RolloutChildAnchor, RolloutFileRecorder, RolloutModelUsage, RolloutPayload, RolloutReader,
+    RolloutReconstruction, RolloutRecord, RolloutSessionMeta, RolloutSidecar, RolloutSummary,
+    RolloutTurnContext, RolloutWriter, UnifiedReplayItem, graft_child_transcripts,
+    is_persisted_rollout_item, reconstruct_history, truncate_rollout_after_run,
+    truncate_rollout_before_run,
 };

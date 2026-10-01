@@ -1278,9 +1278,12 @@ async fn run_loop(
 /// recorder as well as to the sink the host installed. Returns the recorder, if there is one.
 fn start_recording(request: &mut RunRequest) -> Option<Arc<dyn RolloutRecorder>> {
     let rollout = request.rollout.clone()?;
-    let mut started =
-        RolloutRunStarted::new(request.run_id.clone(), request.agent.public_id().clone())
-            .with_input(request.input.clone());
+    let started = RolloutRunStarted::new(request.run_id.clone(), request.agent.public_id().clone());
+    let mut started = if input_is_continuation_base(&request.state, &request.input) {
+        started.with_continuation_base(request.input.clone())
+    } else {
+        started.with_input(request.input.clone())
+    };
     if let Some(parent) = request.state.parent_run_id() {
         started = started.with_parent_run_id(parent.clone());
     }
@@ -2428,6 +2431,14 @@ async fn execute_resumed_call(
         )),
         ToolDispatch::AwaitingNestedApproval(nested) => Ok(ResumedOutcome::Paused(nested)),
     }
+}
+
+/// Whether a segment runs on the input its caller supplied in place of its checkpoint's history.
+///
+/// Read from the state before the segment begins. A continuation given input of its own runs on
+/// that input, as [`segment_input_base`] selects it, so the input already holds the run's history.
+fn input_is_continuation_base(state: &RunState, input: &[ModelInputItem]) -> bool {
+    state.current_agent().is_some() && !input.is_empty()
 }
 
 /// Selects the input base for one segment after its state accepted the agent identity.

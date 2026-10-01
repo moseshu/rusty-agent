@@ -20,3 +20,7 @@ insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 serde_json = "1"
+
+# 仅供 `rollout_recorder_write_failures.rs`：用文件大小上限（RLIMIT_FSIZE）在已打开的文件上制造写入失败。
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
