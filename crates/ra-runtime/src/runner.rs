@@ -882,7 +882,9 @@ impl RunRequest {
     /// delivered into the run at model-call boundaries — from the second model call on when the
     /// request carries new input, so that input is answered first, as Codex drains pending input.
     /// The run marks the agent running when it starts and records how it ended; a spawned agent's
-    /// run then reports its result to its parent.
+    /// run then reports its result to its parent. In a tree built
+    /// [`with_close_descendants_on_cancel`](crate::agent::control::AgentControl::with_close_descendants_on_cancel),
+    /// a cancelled run also closes the agents below its agent before it returns.
     pub fn with_agent_control(mut self, handle: AgentHandle) -> Self {
         self.agent_handle = Some(handle);
         self
@@ -1173,7 +1175,7 @@ async fn run_loop(
         .instrument(agent_span.clone())
         .await;
     if let Some(handle) = &agent_handle {
-        handle.run_finished(&result);
+        handle.run_ended(&result).await;
     }
     if let Some(interrupt) = interrupt
         && result
