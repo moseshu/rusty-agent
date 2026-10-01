@@ -531,6 +531,7 @@ async fn a_run_paused_for_approval_ends_interrupted_and_its_continuation_starts_
         panic!("the continuation records its start");
     };
     assert!(restarted.input().is_empty());
+    assert!(!restarted.input_is_continuation_base());
 }
 
 #[tokio::test]
@@ -1162,5 +1163,208 @@ async fn items_streamed_by_an_attempt_that_is_retried_are_never_recorded() {
             .any(|label| label.contains("This attempt will fail.")),
         "{:?}",
         labels(&recorder)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rebuilt from the file
+// ---------------------------------------------------------------------------------------------
+
+/// Runs one streamed request to its end and returns its result, or the error it ended with.
+async fn run_streamed(request: RunRequest) -> Result<ra_runtime::runner::RunResult> {
+    let mut stream = Runner::run_streamed(request);
+    while stream.next_event().await.is_some() {}
+    stream.finish().await
+}
+
+#[tokio::test]
+async fn a_session_rebuilt_from_its_rollout_file_is_what_its_runs_continue_from() {
+    use ra_core::item::MessageRole;
+    use ra_runtime::runner::ContinuationInput;
+
+    let dir = std::env::temp_dir()
+        .join("rusty_agent_tests")
+        .join("rollout_recording_rebuilt");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let writer = ra_session::RolloutWriter::create_for_session(
+        &dir,
+        ra_core::session::SessionId::new("session-1"),
+    )
+    .await
+    .unwrap();
+    let path = writer.path().to_path_buf();
+    let recorder: Arc<dyn RolloutRecorder> =
+        Arc::new(ra_session::RolloutFileRecorder::spawn(writer));
+
+    // The first run's message arrives without a phase: it is recorded before its call's tool
+    // starts, and recorded again under its id once settlement gives it one.
+    let unphased = RunItem::new(
+        ItemId::new("l-0"),
+        RunItemKind::Message(Message::text(MessageRole::Assistant, "Touching the notes.")),
+    );
+    let touch = call_item("l-1", "l-1-call", "touch");
+    let rewrite = call_item("r-1", "r-1-call", "rewrite");
+    let model = Arc::new(StreamScriptModel(Mutex::new(VecDeque::from(vec![
+        vec![
+            narrated(&unphased),
+            narrated(&touch),
+            completed(ModelResponse::new(vec![unphased.clone(), touch.clone()])),
+        ],
+        vec![completed(final_message("l-2", "done"))],
+        // The second run reuses an item id of the first: ids are only unique within a run.
+        vec![completed(final_message("l-2", "again"))],
+        vec![narrated(&rewrite), StreamStep::Hang],
+    ]))));
+    let reported = Arc::new(Notify::new());
+    let lead = agent(
+        "lead",
+        vec![
+            Arc::new(TouchTool::new()),
+            Arc::new(BlockingTouchTool::new(&reported)),
+        ],
+    );
+    let request = |run: &str, text: &str, cancel: CancelScope| {
+        RunRequest::new(
+            AgentBinding::direct(Arc::clone(&lead)),
+            Arc::new(FixedResolver(Arc::clone(&model) as Arc<dyn Model>)) as Arc<dyn ModelResolver>,
+            RunId::new(run),
+            cancel,
+            vec![ModelInputItem::Message(Message::user(text))],
+        )
+        .with_rollout_recorder(Arc::clone(&recorder))
+    };
+
+    let first = run_streamed(request("run-1", "do it", CancelScope::root()))
+        .await
+        .unwrap();
+    let second = run_streamed(request("run-2", "and again", CancelScope::root()))
+        .await
+        .unwrap();
+    let cancel = CancelScope::root();
+    let canceller = tokio::spawn(cancel_once_reported(cancel.clone(), Arc::clone(&reported)));
+    assert!(
+        run_streamed(request("run-3", "rewrite them", cancel))
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    canceller.await.unwrap();
+
+    let after_first = first.continuation_input(ContinuationInput::PreserveAll);
+    let mut after_second = after_first.clone();
+    after_second.extend(second.continuation_input(ContinuationInput::PreserveAll));
+    let mut after_third = after_second.clone();
+    after_third.push(ModelInputItem::Message(Message::user("rewrite them")));
+    after_third.extend(rewrite.to_model_input());
+
+    let records = ra_session::RolloutReader::open(&path)
+        .read_all()
+        .await
+        .unwrap();
+    let rebuilt = ra_session::reconstruct_history(&records).unwrap();
+    assert_eq!(rebuilt.history(), after_third);
+    let last = rebuilt.last_run().unwrap();
+    assert_eq!(last.run_id(), &RunId::new("run-3"));
+    assert_eq!(last.end().unwrap().end(), RolloutRunEnd::Cancelled);
+    assert_eq!(
+        rebuilt.turn_context().unwrap().model(),
+        Some("canonical-model")
+    );
+
+    let through_second =
+        ra_session::truncate_rollout_after_run(records.clone(), &RunId::new("run-2")).unwrap();
+    assert_eq!(
+        ra_session::reconstruct_history(&through_second)
+            .unwrap()
+            .history(),
+        after_second
+    );
+    let before_second =
+        ra_session::truncate_rollout_before_run(records, &RunId::new("run-2")).unwrap();
+    assert_eq!(
+        ra_session::reconstruct_history(&before_second)
+            .unwrap()
+            .history(),
+        after_first
+    );
+}
+
+#[tokio::test]
+async fn a_run_continued_on_its_callers_projection_is_rebuilt_without_repeating_it() {
+    use ra_runtime::runner::ContinuationInput;
+
+    let dir = std::env::temp_dir()
+        .join("rusty_agent_tests")
+        .join("rollout_recording_continued");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let writer = ra_session::RolloutWriter::create_for_session(
+        &dir,
+        ra_core::session::SessionId::new("session-1"),
+    )
+    .await
+    .unwrap();
+    let path = writer.path().to_path_buf();
+    let recorder: Arc<dyn RolloutRecorder> =
+        Arc::new(ra_session::RolloutFileRecorder::spawn(writer));
+    let scripts = Arc::new(Scripts::default());
+    scripts.push("lead", Step::Respond(final_message("l-1", "answer 1")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "answer 2")));
+    let lead = agent("lead", Vec::new());
+    let request = |input: Vec<ModelInputItem>| {
+        RunRequest::new(
+            AgentBinding::direct(Arc::clone(&lead)),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new("run-1"),
+            CancelScope::root(),
+            input,
+        )
+        .with_rollout_recorder(Arc::clone(&recorder))
+    };
+
+    let first = Runner::run(request(vec![ModelInputItem::Message(Message::user(
+        "user 1",
+    ))]))
+    .await
+    .unwrap();
+    // The documented way to add a turn to a checkpointed run: its projection, then the new message.
+    let mut input = first.continuation_input(ContinuationInput::default());
+    input.push(ModelInputItem::Message(Message::user("user 2")));
+    let second = Runner::run(request(input).with_state(first.state().clone()))
+        .await
+        .unwrap();
+    assert_eq!(second.final_text(), "answer 2");
+
+    let records = ra_session::RolloutReader::open(&path)
+        .read_all()
+        .await
+        .unwrap();
+    let starts: Vec<bool> = records
+        .iter()
+        .filter_map(|record| match record.payload().unwrap() {
+            ra_session::RolloutPayload::RunStarted(started) => {
+                Some(started.input_is_continuation_base())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, vec![false, true]);
+
+    let answer = |id: &str, text: &str| final_message(id, text).output()[0].to_model_input();
+    let expected: Vec<ModelInputItem> = [
+        Some(ModelInputItem::Message(Message::user("user 1"))),
+        answer("l-1", "answer 1"),
+        Some(ModelInputItem::Message(Message::user("user 2"))),
+        answer("l-2", "answer 2"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let rebuilt = ra_session::reconstruct_history(&records).unwrap();
+    assert_eq!(rebuilt.history(), expected);
+    assert_eq!(
+        rebuilt.history(),
+        second.continuation_input(ContinuationInput::PreserveAll)
     );
 }

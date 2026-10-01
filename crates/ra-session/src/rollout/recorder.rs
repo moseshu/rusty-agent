@@ -14,9 +14,12 @@
 //! through [`RolloutWriter::open`], which repairs a torn last line and resumes the sequence from
 //! what is on disk.
 //!
-//! An item whose write failed after it reached the file — the flush failed, not the write — is
-//! written again on retry and so appears twice, as in Codex; each copy is a complete record, and a
-//! reader that keys records by their item id sees one.
+//! A write can also fail after its record reached the file: the writer cannot tell how much of the
+//! line the system took, and poisons itself. Codex writes such a record again on retry, so it
+//! appears twice. Here the recorder remembers the sequence number the record was written under,
+//! and once the file is reopened — which repairs or seals the line — looks for it: a record that
+//! landed is not written again. A duplicated run start would otherwise repeat its input in the
+//! rebuilt history, and a duplicated usage record would bill a model call twice.
 
 use std::{
     collections::VecDeque,
@@ -26,7 +29,7 @@ use std::{
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, SessionErrorKind},
-    event::{FileEvent, HostEventBody},
+    event::{EventTimestamp, FileEvent, HostEventBody},
     session::{
         SessionId,
         rollout::{RolloutItem, RolloutRecorder},
@@ -34,7 +37,10 @@ use ra_core::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use super::writer::{RolloutPayload, RolloutWriter};
+use super::{
+    reader::RolloutReader,
+    writer::{RolloutPayload, RolloutRecord, RolloutWriter},
+};
 
 /// Whether `item` belongs in a rollout file.
 ///
@@ -84,6 +90,7 @@ impl RolloutFileRecorder {
             session_id: writer.session_id().clone(),
             writer: Some(writer),
             pending: VecDeque::new(),
+            unconfirmed: None,
             last_logged_error: None,
         };
         Self::start(state)
@@ -104,6 +111,7 @@ impl RolloutFileRecorder {
             session_id,
             writer: None,
             pending: VecDeque::new(),
+            unconfirmed: None,
             last_logged_error: None,
         })
     }
@@ -150,6 +158,9 @@ struct WriterState {
     writer: Option<RolloutWriter>,
     /// Recorded and not yet written, oldest first.
     pending: VecDeque<RolloutPayload>,
+    /// The sequence number the front of the queue was written under when that write failed with
+    /// its outcome unknown, until the reopened file says whether it landed.
+    unconfirmed: Option<u64>,
     last_logged_error: Option<String>,
 }
 
@@ -180,18 +191,67 @@ impl WriterState {
 
     async fn write_once(&mut self, sync: bool) -> Result<()> {
         if self.writer.is_none() {
-            self.writer = Some(open(&self.path, &self.session_id).await?);
+            let writer = open(&self.path, &self.session_id).await?;
+            self.settle_unconfirmed(&writer).await?;
+            self.writer = Some(writer);
         }
         let Some(writer) = self.writer.as_mut() else {
             return Err(stopped());
         };
-        while let Some(payload) = self.pending.front() {
-            writer.append(payload.clone()).await?;
+        while let Some(payload) = self.pending.front().cloned() {
+            let timeline_seq = writer.next_timeline_seq();
+            let was_poisoned = writer.is_poisoned();
+            if let Err(error) = writer.append(payload).await {
+                // Poisoned by this append: its bytes may be on disk, in part or in full.
+                if !was_poisoned && writer.is_poisoned() {
+                    self.unconfirmed = Some(timeline_seq);
+                }
+                return Err(error);
+            }
             self.pending.pop_front();
         }
         if sync {
             writer.flush().await?;
         }
+        Ok(())
+    }
+
+    /// Takes the front of the queue off if the write whose outcome was unknown landed after all.
+    ///
+    /// Called once the file has been reopened, which truncates a torn line and seals one that is
+    /// complete but for its newline, so a record found under the sequence number it was written
+    /// under, with its type and payload, is the one that write produced. Anything else at that
+    /// number — nothing, or a checkpoint that took it — means it did not land.
+    ///
+    /// The file is only read when the reopened writer resumed past that number, which is the only
+    /// way anything can sit there. Otherwise nothing landed, and nothing is read: a path that is not
+    /// a regular file, such as a device that reports no length and never ends, is not scanned.
+    async fn settle_unconfirmed(&mut self, reopened: &RolloutWriter) -> Result<()> {
+        let Some(timeline_seq) = self.unconfirmed else {
+            return Ok(());
+        };
+        if reopened.next_timeline_seq() > timeline_seq
+            && let Some(payload) = self.pending.front()
+        {
+            let expected = RolloutRecord::new(
+                timeline_seq,
+                EventTimestamp::from_millis(0),
+                payload.clone(),
+            )?;
+            let landed = RolloutReader::open(&self.path)
+                .read_all()
+                .await?
+                .iter()
+                .any(|record| {
+                    record.timeline_seq() == timeline_seq
+                        && record.type_name() == expected.type_name()
+                        && record.payload_value() == expected.payload_value()
+                });
+            if landed {
+                self.pending.pop_front();
+            }
+        }
+        self.unconfirmed = None;
         Ok(())
     }
 

@@ -18,7 +18,10 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom},
 };
 
-use super::writer::{ChildAnchorKind, RolloutCheckpoint, RolloutPayload, RolloutRecord};
+use super::{
+    reconstruction::RolloutReconstruction,
+    writer::{ChildAnchorKind, RolloutCheckpoint, RolloutPayload, RolloutRecord},
+};
 
 /// Reconstructed summary of a rollout file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +168,16 @@ impl RolloutReader {
     pub async fn read_all(&self) -> Result<Vec<RolloutRecord>> {
         let (records, _, _) = self.read_records_internal(0).await?;
         Ok(records.into_iter().map(|(_, record)| record).collect())
+    }
+
+    /// Reads the file and rebuilds the session's history from it; see
+    /// [`reconstruct_history`](super::reconstruct_history).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if reading fails, or if a record of a kind this build knows cannot be read.
+    pub async fn reconstruct_history(&self) -> Result<RolloutReconstruction> {
+        super::reconstruct_history(&self.read_all().await?)
     }
 
     /// Scans the rollout file and produces a summary including sequence bounds, usage totals,

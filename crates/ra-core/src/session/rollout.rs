@@ -72,7 +72,8 @@ pub enum RolloutItem {
 /// A run or a segment of it started: Codex's `TurnStarted` with the user input of the turn.
 ///
 /// A segment that continues a run from its checkpoint records its own start under the same run id,
-/// with whatever new input it was given.
+/// with whatever new input it was given — or, when the caller supplied the input that segment runs
+/// on in place of the checkpoint's history, with that input marked as the continuation base.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RolloutRunStarted {
@@ -84,6 +85,8 @@ pub struct RolloutRunStarted {
     parent_run_id: Option<RunId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     input: Vec<ModelInputItem>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    continuation_base: bool,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -98,6 +101,7 @@ impl RolloutRunStarted {
             agent_id,
             parent_run_id: None,
             input: Vec::new(),
+            continuation_base: false,
             unknown: Unknown::new(),
         }
     }
@@ -113,6 +117,20 @@ impl RolloutRunStarted {
     #[must_use]
     pub fn with_input(mut self, input: Vec<ModelInputItem>) -> Self {
         self.input = input;
+        self.continuation_base = false;
+        self
+    }
+
+    /// Sets the input a continuing segment runs on in place of what its run recorded so far.
+    ///
+    /// A caller that continues a run from its checkpoint and supplies input makes that input the
+    /// base of the segment's model calls: it already holds the run's history, projected as the
+    /// caller chose, followed by whatever the caller added. Recording it as new input would count
+    /// that history twice.
+    #[must_use]
+    pub fn with_continuation_base(mut self, input: Vec<ModelInputItem>) -> Self {
+        self.input = input;
+        self.continuation_base = true;
         self
     }
 
@@ -134,10 +152,18 @@ impl RolloutRunStarted {
         self.parent_run_id.as_ref()
     }
 
-    /// The new input the run or segment started on.
+    /// The input the run or segment started on: new input, or the continuation base when
+    /// [`Self::input_is_continuation_base`] says so.
     #[must_use]
     pub fn input(&self) -> &[ModelInputItem] {
         &self.input
+    }
+
+    /// Whether [`Self::input`] replaces the history the run recorded before this segment rather
+    /// than adding to it; see [`Self::with_continuation_base`].
+    #[must_use]
+    pub const fn input_is_continuation_base(&self) -> bool {
+        self.continuation_base
     }
 
     /// Schema version of the record.
