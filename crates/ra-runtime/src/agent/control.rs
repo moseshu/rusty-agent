@@ -46,6 +46,19 @@
 //! from the caller's history projected as Codex forks it (see
 //! [`fork_history`](ra_core::agent::control::fork_history)), followed by its task.
 //!
+//! # Closing
+//!
+//! [`AgentControl::close`] shuts an agent down together with every live agent below it, as Codex's
+//! `close_agent` and `shutdown_agent_tree` do: the descendants are found first, then the agent and
+//! each descendant in turn is stopped — its run cancelled and waited for — and removed from the
+//! tree, so it is no longer listed and its path can be spawned again. The whole subtree is marked
+//! closed before the first one stops, so nothing can be spawned into it or started in it meanwhile.
+//!
+//! Cancelling a run does not close anything by default: Codex leaves an interrupted agent's
+//! children running, and so does this tree. A host that wants a cancelled run to take its spawned
+//! agents with it opts in with [`AgentControl::with_close_descendants_on_cancel`]; a run bound to an
+//! agent that ends cancelled then closes every live agent below that agent before it returns.
+//!
 //! # What this does not port
 //!
 //! - **Per-spawn model and reasoning-effort overrides**, agent nicknames, and role descriptions.
@@ -124,9 +137,25 @@ impl AgentControl {
             agents: Mutex::new(BTreeMap::from([(AgentPath::root(), root)])),
             tasks: Mutex::new(Vec::new()),
             shut_down: AtomicBool::new(false),
+            close_descendants_on_cancel: AtomicBool::new(false),
             paused_activity: watch::Sender::new(0),
         });
         Self { tree }
+    }
+
+    /// Sets whether a cancelled run closes the agents below the agent it is bound to.
+    ///
+    /// Off by default, as in Codex, where interrupting an agent leaves its children running. When
+    /// on, a run bound to an agent in this tree that ends cancelled — the host's root run, or a
+    /// spawned agent's run stopped by an interrupt — closes every live agent below that agent, as
+    /// [`Self::close`] does, before it returns. The agent itself stays: only its run was cancelled.
+    /// The setting belongs to the tree, so it applies through every clone of this control.
+    #[must_use]
+    pub fn with_close_descendants_on_cancel(self, enabled: bool) -> Self {
+        self.tree
+            .close_descendants_on_cancel
+            .store(enabled, Ordering::Release);
+        self
     }
 
     /// The root agent's view of the tree, for the runs the host starts.
@@ -232,6 +261,27 @@ impl AgentControl {
             .resume
             .send(state)
             .map_err(|_| AgentControlError::Unavailable)
+    }
+
+    /// Closes the agent at `path` and every live agent below it, and returns the status the agent
+    /// had before it was closed.
+    ///
+    /// Each agent's run is cancelled and waited for — a run paused for approval ends — and the
+    /// agent is removed from the tree: it is no longer listed, messages to it are refused as to an
+    /// unknown agent, and a later spawn may reuse its path. A closed agent reports nothing to its
+    /// parent. Closing the root closes every spawned agent and keeps the root, whose runs belong to
+    /// the host; the tree goes on accepting spawns.
+    ///
+    /// # Errors
+    ///
+    /// Refuses when the tree has no agent at `path`.
+    pub async fn close(&self, path: &AgentPath) -> Result<AgentStatus, AgentControlError> {
+        let node = self.tree.node(path).ok_or_else(|| {
+            AgentControlError::Unsupported(format!("live agent path `{path}` not found"))
+        })?;
+        let previous = node.status();
+        drop(self.tree.close_subtree(&node, true).await);
+        Ok(previous)
     }
 
     /// Stops every spawned agent: cancels their runs, waits for them to end, and marks each
@@ -346,6 +396,28 @@ impl AgentHandle {
         self.node.status.send_replace(AgentStatus::Running);
     }
 
+    /// Records how a run bound to this agent ended, as [`Self::run_finished`] does, and when the
+    /// run was cancelled in a tree that asks for it, closes the agents below this one.
+    pub(crate) async fn run_ended(&self, result: &Result<RunResult>) {
+        self.run_finished(result);
+        if !result
+            .as_ref()
+            .is_err_and(ra_core::error::Error::is_cancelled)
+        {
+            return;
+        }
+        let Some(tree) = self.tree.upgrade() else {
+            return;
+        };
+        // A closing agent's subtree is already being closed, and a shutdown stops everything.
+        if tree.close_descendants_on_cancel.load(Ordering::Acquire)
+            && !tree.shut_down.load(Ordering::Acquire)
+            && !self.node.is_closed()
+        {
+            drop(tree.close_subtree(&self.node, false).await);
+        }
+    }
+
     /// Records how a run bound to this agent ended and, for a spawned agent, reports it to the
     /// parent.
     pub(crate) fn run_finished(&self, result: &Result<RunResult>) {
@@ -353,7 +425,8 @@ impl AgentHandle {
         let tree = self.tree.upgrade();
         let shutting_down = tree
             .as_ref()
-            .is_none_or(|tree| tree.shut_down.load(Ordering::Acquire));
+            .is_none_or(|tree| tree.shut_down.load(Ordering::Acquire))
+            || self.node.is_closed();
         if shutting_down && !self.node.path.is_root() {
             self.node.status.send_replace(AgentStatus::Shutdown);
             return;
@@ -390,6 +463,12 @@ impl AgentControlPort for AgentHandle {
         let tree = self.tree()?;
         if tree.shut_down.load(Ordering::Acquire) {
             return Err(AgentControlError::Unavailable);
+        }
+        if self.node.is_closed() {
+            return Err(closed_error(&self.node.path));
+        }
+        if self.node.is_closing_subtree() {
+            return Err(closing_error(&self.node.path));
         }
         let parent = ParentRun::current().ok_or_else(|| {
             AgentControlError::Unsupported(
@@ -442,6 +521,7 @@ impl AgentControlPort for AgentHandle {
                 current_run: None,
                 paused: None,
             }),
+            idle: watch::Sender::new(true),
         };
         let node = Arc::new(AgentNode::new(
             path.clone(),
@@ -450,6 +530,15 @@ impl AgentControlPort for AgentHandle {
         ));
         {
             let mut agents = lock(&tree.agents);
+            // Checked again under the lock a close marks its subtree under, so a spawn racing a
+            // close cannot leave a child below an agent that is going away, or add one to a
+            // subtree being emptied.
+            if self.node.is_closed() {
+                return Err(closed_error(&self.node.path));
+            }
+            if self.node.is_closing_subtree() {
+                return Err(closing_error(&self.node.path));
+            }
             if agents.contains_key(&path) {
                 return Err(AgentControlError::Unsupported(format!(
                     "agent path `{path}` already exists"
@@ -480,11 +569,11 @@ impl AgentControlPort for AgentHandle {
                 "Follow-up tasks can't target the root agent".to_owned(),
             ));
         }
-        if node.status() == AgentStatus::Shutdown || tree.shut_down.load(Ordering::Acquire) {
-            return Err(AgentControlError::Unsupported(format!(
-                "agent `{}` is closed",
-                node.path
-            )));
+        if node.status() == AgentStatus::Shutdown
+            || node.is_closed()
+            || tree.shut_down.load(Ordering::Acquire)
+        {
+            return Err(closed_error(&node.path));
         }
         if mode == MessageDeliveryMode::TriggerTurn
             && !node.is_running()
@@ -548,6 +637,16 @@ impl AgentControlPort for AgentHandle {
     }
 }
 
+fn closed_error(path: &AgentPath) -> AgentControlError {
+    AgentControlError::Unsupported(format!("agent `{path}` is closed"))
+}
+
+fn closing_error(path: &AgentPath) -> AgentControlError {
+    AgentControlError::Unsupported(format!(
+        "the agents below `{path}` are being closed; spawn again once that is done"
+    ))
+}
+
 /// The status a run's result leaves its agent in.
 fn terminal_status(result: &Result<RunResult>) -> AgentStatus {
     match result {
@@ -580,6 +679,8 @@ struct Tree {
     agents: Mutex<BTreeMap<AgentPath, Arc<AgentNode>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     shut_down: AtomicBool,
+    /// Whether a cancelled run closes the agents below the agent it is bound to.
+    close_descendants_on_cancel: AtomicBool,
     /// Ticks whenever an agent's run pauses for approval.
     paused_activity: watch::Sender<u64>,
 }
@@ -611,6 +712,91 @@ impl Tree {
             .collect()
     }
 
+    /// Closes the live agents below `node`, and `node` itself when `including_node` is set and it is
+    /// not the root, and returns a receiver that resolves once the close is finished.
+    ///
+    /// Ported from Codex's `shutdown_agent_tree`: the descendants are collected before anything
+    /// stops, then the agent and each descendant in depth-first order, children by path, is
+    /// waited for and removed. Two things differ from Codex, both so that a close cannot be left
+    /// half done:
+    ///
+    /// - Everything that stops a close from being outgrown or abandoned happens here, before the
+    ///   first wait: every target is marked closed and has its run cancelled, and `node` refuses
+    ///   spawns until the close is finished. The marking happens under the lock spawns take, so
+    ///   the subtree cannot grow while it is being taken down — not even below the root, which
+    ///   stays open.
+    /// - The waiting and removal run as a task of the tree rather than in the caller, so a caller
+    ///   that stops waiting — a timeout, a `select!` — does not leave closed agents behind.
+    ///   [`AgentControl::shutdown`] waits for that task like any other.
+    fn close_subtree(
+        self: &Arc<Self>,
+        node: &Arc<AgentNode>,
+        including_node: bool,
+    ) -> oneshot::Receiver<()> {
+        let (doomed, closing) = {
+            let agents = lock(&self.agents);
+            let mut doomed: Vec<Arc<AgentNode>> = agents
+                .values()
+                .filter(|other| other.path.starts_with(&node.path))
+                .filter(|other| !other.path.is_root())
+                .filter(|other| including_node || other.path != node.path)
+                .map(Arc::clone)
+                .collect();
+            // Segment-wise order is a depth-first walk that visits siblings by name, which is the
+            // order Codex's walk produces; plain string order would put `a-b` before `a/b`.
+            doomed.sort_by(|left, right| {
+                left.path
+                    .as_str()
+                    .split('/')
+                    .cmp(right.path.as_str().split('/'))
+            });
+            for agent in &doomed {
+                agent.closed.store(true, Ordering::Release);
+            }
+            (doomed, ClosingSubtree::new(Arc::clone(node)))
+        };
+        for agent in &doomed {
+            if let Some(child) = &agent.child {
+                child.scope.cancel(CancelReason::Shutdown);
+            }
+        }
+        let tree = Arc::clone(self);
+        let (done, finished) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            for agent in doomed {
+                tree.stop(&agent).await;
+            }
+            drop(closing);
+            // Nobody may be waiting any more; the close is done either way.
+            let _ = done.send(());
+        });
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+        finished
+    }
+
+    /// Waits for a closed agent's cancelled run to end, and removes the agent from the tree.
+    async fn stop(&self, node: &Arc<AgentNode>) {
+        if let Some(child) = &node.child {
+            // Passing the state lock pairs with the check in `ensure_running`: any run claimed
+            // before the agent was marked closed has cleared `idle` by now, and none is claimed
+            // after.
+            drop(lock(&child.state));
+            let mut idle = child.idle.subscribe();
+            // The sender lives in the node held here, so the wait cannot fail.
+            drop(idle.wait_for(|idle| *idle).await);
+        }
+        node.status.send_replace(AgentStatus::Shutdown);
+        let mut agents = lock(&self.agents);
+        if agents
+            .get(&node.path)
+            .is_some_and(|current| Arc::ptr_eq(current, node))
+        {
+            agents.remove(&node.path);
+        }
+    }
+
     /// Starts a run on `node` if it is idle and its mailbox asks for one.
     fn ensure_running(self: &Arc<Self>, node: &Arc<AgentNode>) {
         let Some(child) = &node.child else {
@@ -621,11 +807,15 @@ impl Tree {
         }
         let scope = {
             let mut state = lock(&child.state);
-            if state.current_run.is_some() || !node.mailbox.has_trigger() {
+            // Checked under the state lock too, which a close takes before it waits for the agent
+            // to go idle: a run claimed before the close marked the agent is waited for, and none
+            // is claimed after.
+            if state.current_run.is_some() || node.is_closed() || !node.mailbox.has_trigger() {
                 return;
             }
             let scope = child.scope.child(ScopeKind::Run);
             state.current_run = Some(scope.clone());
+            child.idle.send_replace(false);
             scope
         };
         let task = tokio::spawn(drive(Arc::downgrade(self), Arc::clone(node), scope));
@@ -652,6 +842,8 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
     };
     loop {
         let Some(strong) = tree.upgrade() else {
+            lock(&child.state).current_run = None;
+            child.idle.send_replace(true);
             break;
         };
         let guard = strong.limiter.admit();
@@ -673,8 +865,9 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
         let shut_down = tree
             .upgrade()
             .is_none_or(|tree| tree.shut_down.load(Ordering::Acquire));
-        if shut_down || !node.mailbox.has_trigger() {
+        if shut_down || node.is_closed() || !node.mailbox.has_trigger() {
             state.current_run = None;
+            child.idle.send_replace(true);
             break;
         }
         scope = child.scope.child(ScopeKind::Run);
@@ -727,7 +920,7 @@ async fn run_to_end(
         lock(&child.state).paused = None;
         let Some(state) = answered else {
             if let Err(error) = scope.ensure_not_cancelled() {
-                handle.run_finished(&Err(error));
+                handle.run_ended(&Err(error)).await;
             }
             return history;
         };
@@ -824,6 +1017,10 @@ struct AgentNode {
     agent_id: Mutex<Option<AgentId>>,
     status: watch::Sender<AgentStatus>,
     mailbox: Mailbox,
+    /// Set once the agent is being closed; it then starts no run and accepts nothing more.
+    closed: AtomicBool,
+    /// How many closes of the agents below this one are in progress; it spawns nothing meanwhile.
+    closing_subtree: AtomicUsize,
     /// Absent for the root, whose runs the host starts.
     child: Option<ChildRuntime>,
 }
@@ -835,12 +1032,22 @@ impl AgentNode {
             agent_id: Mutex::new(agent_id),
             status: watch::Sender::new(AgentStatus::PendingInit),
             mailbox: Mailbox::new(),
+            closed: AtomicBool::new(false),
+            closing_subtree: AtomicUsize::new(0),
             child,
         }
     }
 
     fn status(&self) -> AgentStatus {
         self.status.borrow().clone()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn is_closing_subtree(&self) -> bool {
+        self.closing_subtree.load(Ordering::Acquire) > 0
     }
 
     fn is_running(&self) -> bool {
@@ -855,6 +1062,22 @@ impl AgentNode {
             lock(&self.agent_id).clone(),
             self.status(),
         )
+    }
+}
+
+/// Holds an agent's subtree closed to new spawns for as long as a close of it is in progress.
+struct ClosingSubtree(Arc<AgentNode>);
+
+impl ClosingSubtree {
+    fn new(node: Arc<AgentNode>) -> Self {
+        node.closing_subtree.fetch_add(1, Ordering::AcqRel);
+        Self(node)
+    }
+}
+
+impl Drop for ClosingSubtree {
+    fn drop(&mut self) {
+        self.0.closing_subtree.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -873,6 +1096,9 @@ struct ChildRuntime {
     /// Parent of the agent's run scopes, below the tree's.
     scope: CancelScope,
     state: Mutex<ChildState>,
+    /// Whether no driver is running the agent: cleared when a run is claimed, set when the
+    /// driver hands its last run back. A close waits on it.
+    idle: watch::Sender<bool>,
 }
 
 struct ChildState {

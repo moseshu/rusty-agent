@@ -13,13 +13,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use ra_core::{
     agent::{
         AgentId, AgentSpec, HandoffSpec,
         control::{
             AgentControlPort, AgentPath, AgentStatus, InterAgentCommunication, MessageDeliveryMode,
-            SpawnAgentForkMode, completion_message, fork_history,
+            SpawnAgentForkMode, SpawnAgentRequest, completion_message, fork_history,
         },
     },
     cancel::CancelScope,
@@ -1465,6 +1465,475 @@ async fn a_paused_run_is_resumed_only_from_its_own_checkpoint_and_ends_on_interr
         .resume(&worker_path(), paused.state().clone())
         .unwrap_err();
     assert_eq!(late.to_string(), "agent `/root/worker` has no paused run");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Closing and cancellation
+// ---------------------------------------------------------------------------------------------
+
+/// Kills and reaps a real process when dropped, as a tool that owns its process must.
+struct OwnedProcess(std::process::Child);
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A tool that starts a long-running process, records its pid, and holds it until the call is
+/// dropped.
+struct HoldProcessTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    pids: Arc<Mutex<Vec<u32>>>,
+}
+
+impl HoldProcessTool {
+    fn new() -> Self {
+        Self {
+            origin: ToolOrigin::new("hold_process").unwrap(),
+            schema: ToolSchema::new(
+                "hold_process",
+                json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+            )
+            .unwrap(),
+            pids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for HoldProcessTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::default()
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| Error::caller(error.to_string()))?;
+        self.pids.lock().unwrap().push(child.id());
+        let _process = OwnedProcess(child);
+        std::future::pending().await
+    }
+}
+
+fn is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+async fn eventually(mut condition: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn helper_path() -> AgentPath {
+    worker_path().join("helper").unwrap()
+}
+
+fn spawn_call(id: &str, task_name: &str, agent_type: &str, message: &str) -> ModelResponse {
+    tool_call(
+        id,
+        &format!("{id}-call"),
+        "spawn_agent",
+        json!({"task_name": task_name, "message": message, "agent_type": agent_type}),
+    )
+}
+
+fn helper_agent(extra: Vec<Arc<dyn Tool>>) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("helper"))
+        .name("Helper")
+        .instructions("helper")
+        .tools(extra)
+        .build()
+        .unwrap()
+}
+
+/// A root run whose registry declares a worker and the helper the worker spawns below itself.
+fn tree_request(
+    scripts: &Arc<Scripts>,
+    control: &AgentControl,
+    cancel: CancelScope,
+    tools: &[Arc<dyn Tool>],
+) -> RunRequest {
+    let registry = AgentRegistry::builder()
+        .register(worker_agent(tools.to_vec()))
+        .register(helper_agent(tools.to_vec()))
+        .build()
+        .unwrap();
+    RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(Arc::clone(scripts))) as Arc<dyn ModelResolver>,
+        RunId::generate(),
+        cancel,
+        vec![ModelInputItem::Message(Message::user("do the work"))],
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root())
+}
+
+fn paths(control: &AgentControl) -> Vec<String> {
+    control
+        .agents()
+        .iter()
+        .map(|agent| agent.agent_path().to_string())
+        .collect()
+}
+
+/// Scripts a worker that spawns a helper, and both then hold a process each.
+fn script_holding_tree(scripts: &Scripts) {
+    scripts.push(
+        "worker",
+        Step::Respond(spawn_call("w-1", "helper", "helper", "help")),
+    );
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-2", "w-2-call", "hold_process", json!({}))),
+    );
+    scripts.push(
+        "helper",
+        Step::Respond(tool_call("h-1", "h-1-call", "hold_process", json!({}))),
+    );
+}
+
+#[tokio::test]
+async fn close_shuts_down_an_agent_and_its_live_descendants() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let hold = HoldProcessTool::new();
+    let pids = Arc::clone(&hold.pids);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(hold)];
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    script_holding_tree(&scripts);
+    Runner::run(tree_request(
+        &scripts,
+        &control,
+        CancelScope::root(),
+        &tools,
+    ))
+    .await
+    .unwrap();
+    eventually(|| pids.lock().unwrap().len() == 2, "both processes started").await;
+
+    let previous = tokio::time::timeout(Duration::from_secs(10), control.close(&worker_path()))
+        .await
+        .expect("close drains in time")
+        .unwrap();
+    assert_eq!(previous, AgentStatus::Running);
+    // Checked at once: close returns only after each agent's run has ended.
+    let started = pids.lock().unwrap().clone();
+    assert!(started.iter().all(|pid| !is_alive(*pid)), "{started:?}");
+    assert_eq!(control.status(&worker_path()), None);
+    assert_eq!(control.status(&helper_path()), None);
+    assert_eq!(paths(&control), ["/root"]);
+    let error = control
+        .root()
+        .send(
+            "worker",
+            "hello".to_owned(),
+            MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "live agent path `/root/worker` not found"
+    );
+    // A closed agent reports nothing to its parent.
+    assert!(!control.root().has_pending_mail());
+}
+
+#[tokio::test]
+async fn closing_a_descendant_and_then_the_root_frees_the_paths_for_new_spawns() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(spawn_call("w-1", "helper", "helper", "help")),
+    );
+    scripts.push("worker", Step::Hang);
+    scripts.push("helper", Step::Hang);
+    Runner::run(tree_request(&scripts, &control, CancelScope::root(), &[]))
+        .await
+        .unwrap();
+    eventually_status(&control, &helper_path(), |status| {
+        *status == AgentStatus::Running
+    })
+    .await;
+
+    control.close(&helper_path()).await.unwrap();
+    assert_eq!(paths(&control), ["/root", "/root/worker"]);
+    assert_eq!(control.status(&worker_path()), Some(AgentStatus::Running));
+
+    control.close(&AgentPath::root()).await.unwrap();
+    assert_eq!(paths(&control), ["/root"]);
+
+    // The root stays and the tree keeps accepting spawns, at the path just freed.
+    scripts.push("lead", Step::Respond(spawn_worker("l-3", "again")));
+    scripts.push("lead", Step::Respond(final_message("l-4", "spawned again")));
+    scripts.push("worker", Step::Respond(final_message("w-2", "second life")));
+    Runner::run(tree_request(&scripts, &control, CancelScope::root(), &[]))
+        .await
+        .unwrap();
+    let status = eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    assert_eq!(
+        status,
+        AgentStatus::Completed(Some("second life".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn close_reports_the_previous_status_and_refuses_an_unknown_agent() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "done")));
+    Runner::run(tree_request(&scripts, &control, CancelScope::root(), &[]))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    assert_eq!(
+        control.close(&worker_path()).await.unwrap(),
+        AgentStatus::Completed(Some("done".to_owned()))
+    );
+    assert_eq!(
+        control.close(&worker_path()).await.unwrap_err().to_string(),
+        "live agent path `/root/worker` not found"
+    );
+}
+
+#[tokio::test]
+async fn a_close_the_caller_stops_waiting_for_still_stops_every_agent() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let hold = HoldProcessTool::new();
+    let pids = Arc::clone(&hold.pids);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(hold)];
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    script_holding_tree(&scripts);
+    Runner::run(tree_request(
+        &scripts,
+        &control,
+        CancelScope::root(),
+        &tools,
+    ))
+    .await
+    .unwrap();
+    eventually(|| pids.lock().unwrap().len() == 2, "both processes started").await;
+
+    // Polled once, then dropped while it waits for the first agent to stop.
+    let abandoned = control.close(&worker_path()).now_or_never();
+    assert!(abandoned.is_none(), "the close was still waiting");
+
+    eventually(|| paths(&control) == ["/root"], "the close finished").await;
+    let started = pids.lock().unwrap().clone();
+    eventually(
+        || started.iter().all(|pid| !is_alive(*pid)),
+        "both processes are gone",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spawns_below_an_agent_are_refused_while_its_subtree_is_being_closed() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Hang);
+    Runner::run(tree_request(&scripts, &control, CancelScope::root(), &[]))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Running
+    })
+    .await;
+
+    let abandoned = control.close(&AgentPath::root()).now_or_never();
+    assert!(abandoned.is_none(), "the close was still waiting");
+    let error = control
+        .root()
+        .spawn(SpawnAgentRequest::new("new_worker", "late"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "the agents below `/root` are being closed; spawn again once that is done"
+    );
+
+    eventually(|| paths(&control) == ["/root"], "the close finished").await;
+    // Admission is back once the close is done; outside a runner the spawn now fails for that
+    // reason instead.
+    let error = control
+        .root()
+        .spawn(SpawnAgentRequest::new("new_worker", "late"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "agents can only be spawned by an agent running under a runner"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_root_run_leaves_spawned_agents_running_by_default() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let hold = HoldProcessTool::new();
+    let pids = Arc::clone(&hold.pids);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(hold)];
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Hang);
+    script_holding_tree(&scripts);
+    let cancel = CancelScope::root();
+    let run = tokio::spawn(Runner::run(tree_request(
+        &scripts,
+        &control,
+        cancel.clone(),
+        &tools,
+    )));
+    eventually(|| pids.lock().unwrap().len() == 2, "both processes started").await;
+
+    cancel.cancel(ra_core::cancel::CancelReason::UserInterrupt);
+    let error = run.await.unwrap().unwrap_err();
+    assert!(error.is_cancelled(), "{error:?}");
+    assert_eq!(
+        paths(&control),
+        ["/root", "/root/worker", "/root/worker/helper"]
+    );
+    assert_eq!(control.status(&worker_path()), Some(AgentStatus::Running));
+    let started = pids.lock().unwrap().clone();
+    assert!(started.iter().all(|pid| is_alive(*pid)));
+
+    tokio::time::timeout(Duration::from_secs(10), control.shutdown())
+        .await
+        .expect("shutdown drains in time");
+    assert!(started.iter().all(|pid| !is_alive(*pid)));
+}
+
+#[tokio::test]
+async fn a_cancelled_root_run_closes_every_agent_and_its_processes_before_returning_when_asked() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new().with_close_descendants_on_cancel(true);
+    let hold = HoldProcessTool::new();
+    let pids = Arc::clone(&hold.pids);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(hold)];
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Hang);
+    script_holding_tree(&scripts);
+    let cancel = CancelScope::root();
+    let run = tokio::spawn(Runner::run(tree_request(
+        &scripts,
+        &control,
+        cancel.clone(),
+        &tools,
+    )));
+    eventually(|| pids.lock().unwrap().len() == 2, "both processes started").await;
+
+    cancel.cancel(ra_core::cancel::CancelReason::UserInterrupt);
+    let error = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the run returns in time")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is_cancelled(), "{error:?}");
+    // Checked at once: the run returns only after the agents below it have stopped, down to the
+    // grandchild and the processes their tools held.
+    assert_eq!(paths(&control), ["/root"]);
+    let started = pids.lock().unwrap().clone();
+    assert!(started.iter().all(|pid| !is_alive(*pid)), "{started:?}");
+    assert_eq!(
+        control.status(&AgentPath::root()),
+        Some(AgentStatus::Interrupted)
+    );
+}
+
+#[tokio::test]
+async fn an_interrupted_agent_closes_the_agents_below_it_and_stays_when_asked() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new().with_close_descendants_on_cancel(true);
+    let hold = HoldProcessTool::new();
+    let pids = Arc::clone(&hold.pids);
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(hold)];
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    script_holding_tree(&scripts);
+    Runner::run(tree_request(
+        &scripts,
+        &control,
+        CancelScope::root(),
+        &tools,
+    ))
+    .await
+    .unwrap();
+    eventually(|| pids.lock().unwrap().len() == 2, "both processes started").await;
+
+    control.root().interrupt("worker").await.unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Interrupted
+    })
+    .await;
+    eventually(
+        || control.status(&helper_path()).is_none(),
+        "the helper is closed",
+    )
+    .await;
+    assert_eq!(paths(&control), ["/root", "/root/worker"]);
+    let started = pids.lock().unwrap().clone();
+    eventually(
+        || started.iter().all(|pid| !is_alive(*pid)),
+        "both processes are gone",
+    )
+    .await;
+
+    // The interrupted agent itself is still there and takes a follow-up.
+    scripts.push("worker", Step::Respond(final_message("w-3", "resumed")));
+    control
+        .root()
+        .send(
+            "worker",
+            "carry on".to_owned(),
+            MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    let status = eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    assert_eq!(status, AgentStatus::Completed(Some("resumed".to_owned())));
 }
 
 // ---------------------------------------------------------------------------------------------
