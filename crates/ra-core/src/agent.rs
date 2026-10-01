@@ -31,6 +31,7 @@ use crate::{
 };
 use async_trait::async_trait;
 
+pub mod control;
 mod handoff;
 
 pub use crate::item::AgentId;

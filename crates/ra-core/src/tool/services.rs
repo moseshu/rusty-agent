@@ -25,7 +25,10 @@
 use core::fmt;
 use std::sync::Arc;
 
-use crate::{event::HostEventSink, state::WorkStateHandle, tool::ToolOutputProjector};
+use crate::{
+    agent::control::AgentControlPort, event::HostEventSink, state::WorkStateHandle,
+    tool::ToolOutputProjector,
+};
 
 /// Framework-owned ports handed to a tool, each behind its own accessor.
 ///
@@ -39,6 +42,7 @@ pub struct ToolServices {
     work_state: Option<Arc<dyn WorkStateHandle>>,
     event_sink: Option<Arc<dyn HostEventSink>>,
     output_projector: Option<Arc<dyn ToolOutputProjector>>,
+    agent_control: Option<Arc<dyn AgentControlPort>>,
 }
 
 impl ToolServices {
@@ -48,6 +52,7 @@ impl ToolServices {
             work_state: None,
             event_sink: None,
             output_projector: None,
+            agent_control: None,
         }
     }
 
@@ -79,6 +84,12 @@ impl ToolServices {
         self
     }
 
+    /// Installs the multi-agent control plane, bound to the agent this run is.
+    pub fn with_agent_control(mut self, agent_control: Arc<dyn AgentControlPort>) -> Self {
+        self.agent_control = Some(agent_control);
+        self
+    }
+
     /// The task state spanning this run, when the host attached one.
     ///
     /// `None` is not a failure: a run belongs to a task only when something above it says so. A
@@ -102,6 +113,17 @@ impl ToolServices {
     }
 }
 
+impl ToolServices {
+    /// The multi-agent control plane as this run's agent sees it, when the host enabled one.
+    ///
+    /// `None` means the run takes no part in an agent tree; the collaboration tools answer the
+    /// model that they are not enabled.
+    #[must_use]
+    pub fn agent_control(&self) -> Option<&Arc<dyn AgentControlPort>> {
+        self.agent_control.as_ref()
+    }
+}
+
 impl fmt::Debug for ToolServices {
     /// Reports which ports are installed, never what they hold.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -110,6 +132,7 @@ impl fmt::Debug for ToolServices {
             .field("work_state", &self.work_state.is_some())
             .field("event_sink", &self.event_sink.is_some())
             .field("output_projector", &self.output_projector.is_some())
+            .field("agent_control", &self.agent_control.is_some())
             .finish_non_exhaustive()
     }
 }
