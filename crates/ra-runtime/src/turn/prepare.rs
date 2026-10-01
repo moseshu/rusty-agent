@@ -32,7 +32,7 @@ use ra_core::{
     },
     prompt::{CachePlan, PromptProvenance},
     state::ToolUseTracker,
-    tool::{Tool, ToolAvailability},
+    tool::{Tool, ToolAvailability, ToolServices},
 };
 
 use crate::agent::{AgentBinding, AgentRegistry};
@@ -147,6 +147,7 @@ pub struct TurnPreparationRequest<'a> {
     collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
     agent_registry: Option<&'a AgentRegistry>,
+    services: &'a ToolServices,
 }
 
 impl<'a> TurnPreparationRequest<'a> {
@@ -190,6 +191,7 @@ impl<'a> TurnPreparationRequest<'a> {
             collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
             agent_registry: None,
+            services: ToolServices::none(),
         }
     }
 
@@ -237,6 +239,15 @@ impl<'a> TurnPreparationRequest<'a> {
     /// has nothing to configure.
     pub const fn with_agent_registry(mut self, agent_registry: &'a AgentRegistry) -> Self {
         self.agent_registry = Some(agent_registry);
+        self
+    }
+
+    /// Supplies the framework ports this turn's tools are given.
+    ///
+    /// A tool whose availability depends on one of its ports reads them through
+    /// [`Tool::is_enabled_with_services`]; without this call it sees none installed.
+    pub const fn with_services(mut self, services: &'a ToolServices) -> Self {
+        self.services = services;
         self
     }
 }
@@ -708,7 +719,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let agent = request.agent.execution();
 
     // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
-    let tools = resolve_enabled_tools(agent, request.run, request.cancel).await?;
+    let tools = resolve_enabled_tools(agent, request.run, request.services, request.cancel).await?;
 
     // 2. Resolve enabled handoffs after tools, binding each to the agent that would receive it.
     // Sealing the two into one surface here — not lazily at settlement — is what applies the
@@ -827,6 +838,7 @@ struct EnabledTools {
 async fn resolve_enabled_tools(
     agent: &AgentSpec,
     context: &RunContext,
+    services: &ToolServices,
     cancel: &CancelScope,
 ) -> Result<EnabledTools> {
     let decisions = cancel
@@ -834,7 +846,7 @@ async fn resolve_enabled_tools(
             match tool.options().availability() {
                 ToolAvailability::Enabled => Ok(true),
                 ToolAvailability::Disabled => Ok(false),
-                ToolAvailability::Dynamic => tool.is_enabled(context).await,
+                ToolAvailability::Dynamic => tool.is_enabled_with_services(context, services).await,
                 _ => Err(Error::caller(format!(
                     "tool `{}` uses an unsupported availability policy",
                     tool.origin().qualified_name()

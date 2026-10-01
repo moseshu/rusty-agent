@@ -109,6 +109,20 @@ pub trait Tool: Send + Sync + 'static {
         }
     }
 
+    /// Evaluates dynamic availability with the framework ports the run was given.
+    ///
+    /// For a tool whose availability depends on one of its own ports — the ones [`Tool::call`]
+    /// would receive through [`ToolContext::services`] — rather than on the run alone. The runner
+    /// asks this method; the default answers [`Tool::is_enabled`], so a tool overrides one or the
+    /// other.
+    async fn is_enabled_with_services(
+        &self,
+        context: &RunContext,
+        _services: &ToolServices,
+    ) -> Result<bool> {
+        self.is_enabled(context).await
+    }
+
     /// Evaluates whether this call requires host approval.
     async fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
         match self.options().approval() {

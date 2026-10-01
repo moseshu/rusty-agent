@@ -59,17 +59,32 @@
 //! agents with it opts in with [`AgentControl::with_close_descendants_on_cancel`]; a run bound to an
 //! agent that ends cancelled then closes every live agent below that agent before it returns.
 //!
+//! # Budget and depth
+//!
+//! As in Codex, a spawned agent's spend stays its own: it is not added to the ledger of the run
+//! that spawned it, whose result reports that run's calls. What the tree shares is an optional
+//! token budget, Codex's rollout budget ([`AgentControl::with_rollout_budget`]): every run in the
+//! tree is charged against it, each agent is told what is left as its runs start, and every run
+//! stops once it is used up. An agent-tool run is different — it is part of the call that started
+//! it, and its spend is that run's too (see [`crate::agent::tool`]).
+//!
+//! The tree has no depth limit unless given one with [`AgentControl::with_max_depth`], Codex's
+//! `agent_max_depth`: the version of Codex these tools port does not check depth, and its first
+//! version does.
+//!
 //! # What this does not port
 //!
 //! - **Per-spawn model and reasoning-effort overrides**, agent nicknames, and role descriptions.
 //! - **Persistence and resume of the tree.** A spawned agent lives as long as its [`AgentControl`].
-//! - **Host events and usage accrual to the parent**, which belong to the event and budget work.
+//! - **Host events.**
+
+mod budget;
 
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -86,7 +101,7 @@ use ra_core::{
         },
     },
     cancel::{CancelReason, CancelScope, ScopeKind},
-    error::Result,
+    error::{Error, Result},
     finish::FinishReason,
     item::{InputItemNormalizer, ModelInputItem, NormalizedInput, RunItem},
     model::ModelResolver,
@@ -98,6 +113,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub use budget::RolloutBudgetConfig;
+pub(crate) use budget::{RolloutBudget, RolloutBudgetReminder};
+
 use super::{AgentBinding, tool::ParentRun};
 use crate::runner::{
     ContinuationInput, RunConfig, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
@@ -105,6 +123,9 @@ use crate::runner::{
 
 /// Codex's default ceiling on concurrently running spawned agents in one tree.
 pub const DEFAULT_MAX_CONCURRENT_THREADS: usize = 4;
+
+/// Codex's refusal of a spawn past the depth limit.
+const DEPTH_LIMIT_REACHED: &str = "Agent depth limit reached. Solve the task yourself.";
 
 /// The control plane of one agent tree.
 ///
@@ -138,9 +159,50 @@ impl AgentControl {
             tasks: Mutex::new(Vec::new()),
             shut_down: AtomicBool::new(false),
             close_descendants_on_cancel: AtomicBool::new(false),
+            max_depth: AtomicUsize::new(usize::MAX),
+            rollout_budget: OnceLock::new(),
             paused_activity: watch::Sender::new(0),
         });
         Self { tree }
+    }
+
+    /// Limits how deep the tree may grow: an agent spawned by the root is at depth 1, and no agent
+    /// may spawn one deeper than `max_depth`.
+    ///
+    /// Codex's `agent_max_depth`, which its first multi-agent version enforces and the version
+    /// these tools port does not: without this call the tree has no depth limit, as in that
+    /// version. An agent at the limit is refused every spawn with Codex's message, and the
+    /// collaboration tools are not offered to its runs at all, as Codex hides them. Zero keeps
+    /// the root from spawning. The setting belongs to the tree, so it applies through every clone
+    /// of this control.
+    #[must_use]
+    pub fn with_max_depth(self, max_depth: usize) -> Self {
+        self.tree.max_depth.store(max_depth, Ordering::Release);
+        self
+    }
+
+    /// Gives the tree a shared token budget, Codex's rollout budget.
+    ///
+    /// Every run in the tree — the host's runs bound to the root, every spawned agent's runs, and
+    /// the agent-tool runs any of them start — is charged for each model call in weighted tokens,
+    /// and each agent is told what is left when its runs start: the whole budget the first time,
+    /// and again whenever the remainder has fallen past another of the configured thresholds.
+    /// Once the charges reach the limit, each run in the tree ends after its next response with
+    /// [`FinishReason::BudgetExhausted`] — the response that spent the budget included, whose answer
+    /// is then kept in history but not delivered. Off by default, as in Codex; see
+    /// [`RolloutBudgetConfig`] for how calls are charged and where this differs from Codex.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a configuration Codex refuses — a zero limit, a reminder at zero or at or above the
+    /// limit, a negative or non-finite weight — and a second budget for the same tree.
+    pub fn with_rollout_budget(self, config: RolloutBudgetConfig) -> Result<Self> {
+        config.validate()?;
+        self.tree
+            .rollout_budget
+            .set(Arc::new(RolloutBudget::new(config)))
+            .map_err(|_| Error::config("the agent tree already has a rollout budget"))?;
+        Ok(self)
     }
 
     /// Sets whether a cancelled run closes the agents below the agent it is bound to.
@@ -385,6 +447,22 @@ impl AgentHandle {
         self.tree.upgrade().ok_or(AgentControlError::Unavailable)
     }
 
+    /// The rollout budget of this agent's tree, if it has one and is still alive.
+    pub(crate) fn rollout_budget(&self) -> Option<Arc<RolloutBudget>> {
+        self.tree.upgrade()?.rollout_budget.get().map(Arc::clone)
+    }
+
+    /// The reminder of the tree's remaining budget this agent is owed, if any.
+    pub(crate) fn pending_budget_reminder(&self) -> Option<RolloutBudgetReminder> {
+        self.rollout_budget()?
+            .pending_reminder(*lock(&self.node.budget_reminder_delivered))
+    }
+
+    /// Records that `reminder` is in this agent's history.
+    pub(crate) fn mark_budget_reminder_delivered(&self, reminder: RolloutBudgetReminder) {
+        *lock(&self.node.budget_reminder_delivered) = Some(reminder.reminder_index);
+    }
+
     /// Takes the mail a run bound to this agent delivers at a model-call boundary.
     pub(crate) fn take_mail(&self) -> Vec<InterAgentCommunication> {
         self.node.mailbox.take_all()
@@ -469,6 +547,11 @@ impl AgentControlPort for AgentHandle {
         }
         if self.node.is_closing_subtree() {
             return Err(closing_error(&self.node.path));
+        }
+        if tree.spawn_depth_exceeded(&self.node.path) {
+            return Err(AgentControlError::Unsupported(
+                DEPTH_LIMIT_REACHED.to_owned(),
+            ));
         }
         let parent = ParentRun::current().ok_or_else(|| {
             AgentControlError::Unsupported(
@@ -635,6 +718,12 @@ impl AgentControlPort for AgentHandle {
     async fn wait_for_mailbox(&self, timeout: Duration) -> WaitOutcome {
         self.node.mailbox.wait(timeout).await
     }
+
+    fn spawn_depth_exceeded(&self) -> bool {
+        self.tree
+            .upgrade()
+            .is_some_and(|tree| tree.spawn_depth_exceeded(&self.node.path))
+    }
 }
 
 fn closed_error(path: &AgentPath) -> AgentControlError {
@@ -681,6 +770,9 @@ struct Tree {
     shut_down: AtomicBool,
     /// Whether a cancelled run closes the agents below the agent it is bound to.
     close_descendants_on_cancel: AtomicBool,
+    /// The deepest an agent may be; `usize::MAX` when the tree has no limit.
+    max_depth: AtomicUsize,
+    rollout_budget: OnceLock<Arc<RolloutBudget>>,
     /// Ticks whenever an agent's run pauses for approval.
     paused_activity: watch::Sender<u64>,
 }
@@ -688,6 +780,11 @@ struct Tree {
 impl Tree {
     fn node(&self, path: &AgentPath) -> Option<Arc<AgentNode>> {
         lock(&self.agents).get(path).map(Arc::clone)
+    }
+
+    /// Codex's `exceeds_thread_spawn_depth_limit` for an agent `caller` would spawn.
+    fn spawn_depth_exceeded(&self, caller: &AgentPath) -> bool {
+        depth(caller).saturating_add(1) > self.max_depth.load(Ordering::Acquire)
     }
 
     fn resolve(
@@ -1023,6 +1120,8 @@ struct AgentNode {
     closing_subtree: AtomicUsize,
     /// Absent for the root, whose runs the host starts.
     child: Option<ChildRuntime>,
+    /// How many thresholds of the tree's rollout budget the agent has been told about.
+    budget_reminder_delivered: Mutex<Option<usize>>,
 }
 
 impl AgentNode {
@@ -1035,6 +1134,7 @@ impl AgentNode {
             closed: AtomicBool::new(false),
             closing_subtree: AtomicUsize::new(0),
             child,
+            budget_reminder_delivered: Mutex::new(None),
         }
     }
 
@@ -1189,6 +1289,11 @@ impl Drop for ExecutionGuard {
     fn drop(&mut self) {
         self.limiter.active.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// How far below the root `path` is: the root is at 0 and an agent it spawns at 1.
+fn depth(path: &AgentPath) -> usize {
+    std::iter::successors(path.parent(), AgentPath::parent).count()
 }
 
 /// Locks a mutex whose holders never panic while holding it; a poisoned one is still consistent.

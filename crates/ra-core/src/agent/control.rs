@@ -713,4 +713,13 @@ pub trait AgentControlPort: Send + Sync {
     /// Waits until the caller's mailbox has something, or `timeout` elapses. Returns at once when
     /// mail is already pending. The mail itself reaches the caller's model at its next model call.
     async fn wait_for_mailbox(&self, timeout: Duration) -> WaitOutcome;
+
+    /// Whether an agent the caller spawned would be deeper than the tree allows.
+    ///
+    /// Codex's `exceeds_thread_spawn_depth_limit` for the caller's next spawn. A caller for which
+    /// this holds is refused every spawn, and Codex does not offer it the collaboration tools at
+    /// all. The default answers `false`: a tree with no depth limit.
+    fn spawn_depth_exceeded(&self) -> bool {
+        false
+    }
 }

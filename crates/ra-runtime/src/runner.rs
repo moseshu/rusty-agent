@@ -113,7 +113,7 @@ use crate::{
     },
 };
 
-use crate::budget::budget_reminder;
+use crate::budget::{NestedSpend, RunSpend, budget_reminder, exhausted_budget_kind};
 use crate::sandbox::{SandboxRunConfig, SandboxRuntime};
 
 /// Default turn cap.
@@ -798,6 +798,7 @@ pub struct RunRequest {
     event_seqs: EventSeqAllocator,
     tool_input: Option<Arc<serde_json::Value>>,
     agent_handle: Option<AgentHandle>,
+    nested_spend: Option<NestedSpend>,
 }
 
 impl RunRequest {
@@ -833,12 +834,19 @@ impl RunRequest {
             event_seqs,
             tool_input: None,
             agent_handle: None,
+            nested_spend: None,
         }
     }
 
     /// Records the structured arguments of the agent-tool call this run answers.
     pub(crate) fn with_tool_input(mut self, tool_input: serde_json::Value) -> Self {
         self.tool_input = Some(Arc::new(tool_input));
+        self
+    }
+
+    /// Bills this run's model calls to the run whose agent-tool call started it as well.
+    pub(crate) fn with_nested_spend(mut self, nested_spend: NestedSpend) -> Self {
+        self.nested_spend = Some(nested_spend);
         self
     }
 
@@ -1047,10 +1055,15 @@ struct TurnLoopContext<'a> {
     deferred_prompts: &'a [DeferredPrompt],
     /// Prepares sandbox agents before their turns.
     sandbox: &'a SandboxRuntime,
-    /// The agent-tree mailbox this run delivers at model-call boundaries.
+    /// The agent this run is bound to in its tree: the mailbox it delivers at model-call
+    /// boundaries, and the budget reminders it is owed.
     agent_mail: Option<&'a AgentHandle>,
     /// Whether the first model call of this segment already takes pending mail.
     deliver_mail_first: bool,
+    /// What the run has spent, as the runs it starts and its token ceiling see it.
+    spend: &'a RunSpend,
+    /// Whether this segment continues a turn that stopped for approval rather than starting one.
+    continues_turn: bool,
 }
 
 /// What the loop produces, whichever way it ends.
@@ -1081,6 +1094,8 @@ struct TurnLoopProgress {
     /// A resume that concludes on the stop policy has no turn of its own to read the delivery from,
     /// and these are what that delivery consists of.
     resumed_conclusion: Option<Range<usize>>,
+    /// What the agent-tool runs this segment started spent, as moved into the run's ledger.
+    nested_usage: Usage,
 }
 
 impl TurnLoopProgress {
@@ -1148,6 +1163,15 @@ async fn run_loop(
         .then(|| InterruptNotice::new(&request));
     // Settled after the loop, whichever way it ended: the sessions the run owns are cleaned up on
     // a failed or cancelled run exactly as on a finished one.
+    //
+    // What this run has spent as the runs it starts see it; see `RunSpend`. A run bound to an
+    // agent tree with a rollout budget charges it here, once for every call its ledger receives.
+    let agent_handle = request.agent_handle.clone();
+    let spend = RunSpend::new(
+        request.state.usage_totals(),
+        request.nested_spend.clone(),
+        agent_handle.as_ref().and_then(AgentHandle::rollout_budget),
+    );
     // Installed around the loop so a tool this run dispatches can start a nested run from it; see
     // `agent::tool::parent` for why this is a task-local rather than a field of the tool context.
     let parent = ParentRun::new(
@@ -1157,8 +1181,8 @@ async fn run_loop(
         request.run_id.clone(),
         Arc::clone(request.agent.public()),
         request.services.clone(),
+        Arc::clone(&spend),
     );
-    let agent_handle = request.agent_handle.clone();
     if let Some(handle) = &agent_handle {
         handle.run_started(request.agent.public_id());
     }
@@ -1168,6 +1192,7 @@ async fn run_loop(
             events,
             &agent_span,
             &sandbox,
+            &spend,
         )))
         .instrument(agent_span.clone())
         .await;
@@ -1252,6 +1277,7 @@ async fn run_loop_inner(
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
     span: &tracing::Span,
     sandbox: &SandboxRuntime,
+    spend: &RunSpend,
 ) -> Result<RunResult> {
     let RunRequest {
         mut agent,
@@ -1266,6 +1292,7 @@ async fn run_loop_inner(
         event_seqs,
         tool_input,
         agent_handle,
+        nested_spend: _,
     } = request;
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
@@ -1326,6 +1353,10 @@ async fn run_loop_inner(
     // An explicit input remains the caller's continuation base. An empty resumed request chooses
     // the checkpoint projection, so hosts that persist only state do not have to rebuild it.
     let resuming = state.current_agent().is_some();
+    // A segment that answers questions the last one stopped on finishes that turn rather than
+    // starting a new one, which is what the agent tree's budget reminder is keyed to.
+    let continues_turn =
+        !state.pending_interruptions().is_empty() || !state.nested_runs().is_empty();
     if let Err(error) = state.begin_segment(agent.public_id().clone(), requested_input.clone()) {
         ra_core::trace::record_error(span, &error);
         return Err(error);
@@ -1409,6 +1440,7 @@ async fn run_loop_inner(
             .unwrap_or(0),
         budget_stop: None,
         resumed_conclusion: None,
+        nested_usage: Usage::default(),
     };
     let permission = config.permission().clone().with_rules(
         config
@@ -1437,6 +1469,8 @@ async fn run_loop_inner(
         sandbox,
         agent_mail: agent_handle.as_ref(),
         deliver_mail_first,
+        spend,
+        continues_turn,
     };
     // The stage runs once per run, on the segment that opens it. A continuation does not repeat
     // the caller's opening input, so a check written against that input has nothing new to look
@@ -1511,7 +1545,19 @@ async fn run_loop_inner(
         // and results the stop policy promotes end the run as they would have ended that turn,
         // through the same stop hook, delivery and output checks.
         let resumed_from = progress.segment_items(&state).len();
-        match resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await? {
+        let resumed = resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await?;
+        // The turn this segment finishes was settled on a spent shared budget, or the budget was
+        // spent while it waited: as at the end of a turn, it ends the run once its answers are in.
+        if continues_turn
+            && !matches!(resumed, ResumeStage::Interrupted(_))
+            && spend.rollout_budget_exhausted()
+        {
+            progress.budget_stop = Some(BudgetKind::Tokens);
+            return Ok(RunOutcome::Completed {
+                reason: FinishReason::BudgetExhausted,
+            });
+        }
+        match resumed {
             ResumeStage::Interrupted(items) => return Ok(RunOutcome::Interrupted { items }),
             ResumeStage::Concluded(reason) => {
                 progress.resumed_conclusion =
@@ -1539,6 +1585,12 @@ async fn run_loop_inner(
         .await
     }
     .await;
+
+    // Whatever the loop's agent-tool calls spent before it stopped belongs in the ledger the result,
+    // the checkpoint and an error handler read, whichever way it stopped — including a stage that
+    // failed after a nested run had already been paid for. Nothing inside the loop reads the ledger
+    // for spend: the budget checks and the code the loop runs read the live spend instead.
+    absorb_nested_spend(spend, &mut state, &mut progress);
 
     // The one place an expired wall clock is read back as a budget stop. Everything under the run
     // scope reports expiry the same way any other cancellation is reported, which is what lets the
@@ -1590,8 +1642,15 @@ async fn run_loop_inner(
 
     // Resolve delivery once for both output checks and the result. A blocked candidate stays in
     // history, but its turn no longer has a final-output decision.
-    let final_message =
-        final_message.or_else(|| concluding_turn_message(&state, &progress).cloned());
+    //
+    // Only a run that concluded delivers its concluding turn's answer: a turn that answered on a
+    // spent shared budget keeps the answer in history, and the run ends without handing it over.
+    let final_message = final_message.or_else(|| {
+        outcome
+            .finish_reason()
+            .filter(|reason| reason.is_complete())
+            .and_then(|_| concluding_turn_message(&state, &progress).cloned())
+    });
 
     // The closing half of the agent bracket, and ahead of the output guardrails: an observer is
     // told the answer the agent produced, not the one a check may go on to refuse. Only a run that
@@ -1726,6 +1785,7 @@ async fn run_loop_inner(
         progress.turns,
         state,
         final_message,
+        progress.nested_usage,
     );
     if let Some(sink) = &config.memory_usage_sink {
         crate::memory::report_final_citations(&result, sink, &run_id).await;
@@ -2140,7 +2200,7 @@ async fn execute_resumed_call(
 
     let mut run = RunContext::new(context.run_id.clone(), agent.public())
         .with_budget(state.budget().clone())
-        .with_usage_totals(state.usage_totals().clone())
+        .with_usage_totals(context.spend.shared_usage())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(context.event_seqs.clone());
     if let Some(app_context) = context.app_context {
@@ -2346,8 +2406,12 @@ async fn settle_sandbox(
 /// These are the same field names a `generation` uses one level down, and the scale is the
 /// difference: this is the whole run, that is one request. Reports group by `span.kind` before
 /// summing — see the note in `ra_core::trace::field`.
+///
+/// The run's own model calls only: an agent-tool run it started records its calls on its own span,
+/// one level down, and counting them here as well would count them twice in any report that sums
+/// agent spans.
 fn record_run_outcome(span: &tracing::Span, result: &RunResult) {
-    record_usage(span, &result.usage());
+    record_usage(span, &aggregate_usage(result.model_responses()));
     if let Some(reason) = result.outcome().finish_reason() {
         span.record(ra_core::trace::field::FINISH_REASON, reason.code());
     }
@@ -2425,7 +2489,7 @@ async fn run_turns(
         // exhausted its turns — the reason a host reacts to is different for each.
         context.cancel.ensure_not_cancelled()?;
 
-        if let Some(kind) = state.exhausted_budget_kind(config.budget()) {
+        if let Some(kind) = exhausted_budget_kind(state, config.budget(), context.spend) {
             progress.budget_stop = Some(kind);
             break RunOutcome::Completed {
                 reason: FinishReason::from_budget_kind(kind),
@@ -2749,7 +2813,8 @@ async fn run_one_turn(
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
     deliver_agent_mail(context, state, progress, turn_scope);
-    let reminder = budget_reminder(state, config.budget());
+    deliver_rollout_budget_reminder(context, state, progress);
+    let reminder = budget_reminder(context.spend, config.budget());
     // What this turn's request is built from: the base the run continues on, and the records
     // appended since. The two ways of decomposing that are equivalent until a transfer of control
     // narrows the base — after which only the state knows what the receiving agent may see.
@@ -2782,7 +2847,8 @@ async fn run_one_turn(
     .with_tracing(config.tracing)
     .with_tool_name_collision_policy(config.tool_name_collision_policy())
     .with_action_surface_budget(config.action_surface_budget())
-    .with_agent_registry(config.agent_registry());
+    .with_agent_registry(config.agent_registry())
+    .with_services(context.services);
     if let Some(model) = &config.model {
         preparation = preparation.with_model(model.clone());
     }
@@ -2811,7 +2877,7 @@ async fn run_one_turn(
             total.accumulate(response.usage())
         });
     if context_usage.requests() > 0 {
-        state.record_usage(&context_usage);
+        record_spend(context, state, &context_usage);
     }
     for response in context_responses {
         state.record_model_response(response);
@@ -2876,7 +2942,7 @@ async fn run_one_turn(
     // call ran. The copy is what that costs, next to the history copy this turn already makes for
     // settlement.
     record_usage(turn_span, response.usage());
-    state.record_usage(response.usage());
+    record_spend(context, state, response.usage());
     state.record_model_response(response.clone());
 
     // After the spend has been recorded, so a callback reads the run's totals with the call it is
@@ -2964,7 +3030,7 @@ async fn run_one_turn(
 
     // No `_` arm, deliberately. R3-1 made this the one place control flow converges, and a
     // fifth state has to be answered here rather than fall through to "keep going".
-    match settled.next_step() {
+    let decided: Result<Option<RunOutcome>> = match settled.next_step() {
         NextStep::RunAgain => Ok(None),
         NextStep::FinalOutput { reason } => Ok(Some(RunOutcome::Completed { reason: *reason })),
         // The items are the session's own records: settlement re-points a pending decision at what
@@ -3052,7 +3118,22 @@ async fn run_one_turn(
             }
             Ok(None)
         }
+    };
+    let decided = decided?;
+    // Codex fails the request whose usage leaves the tree's shared budget spent — and, once it is
+    // spent, every later one — after the response is recorded and the tool calls it issued have
+    // run. So a turn settled on a spent budget ends the run here whatever it decided: an answer is
+    // kept in history but not delivered, and no further model call is made. A turn that stopped
+    // for approval still pauses; the segment that settles the answers ends the run instead.
+    if !matches!(decided, Some(RunOutcome::Interrupted { .. }))
+        && context.spend.rollout_budget_exhausted()
+    {
+        progress.budget_stop = Some(BudgetKind::Tokens);
+        return Ok(Some(RunOutcome::Completed {
+            reason: FinishReason::BudgetExhausted,
+        }));
     }
+    Ok(decided)
 }
 
 /// Delivers every deferred capability fragment this turn has earned into authoritative history.
@@ -3139,6 +3220,55 @@ fn deliver_agent_mail(
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
     state.record_generated_items(items);
+}
+
+/// Writes the agent tree's budget reminder into history, when the agent is owed one.
+///
+/// Once per turn of the agent's, at its first model call, as Codex records it when a turn starts:
+/// a segment that only finishes a turn stopped for approval is not given one. Acknowledged after
+/// it is recorded, so a run that stops before then is reminded next time.
+fn deliver_rollout_budget_reminder(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    progress: &TurnLoopProgress,
+) {
+    let Some(handle) = context.agent_mail else {
+        return;
+    };
+    if progress.turns > 1 || context.continues_turn {
+        return;
+    }
+    let Some(reminder) = handle.pending_budget_reminder() else {
+        return;
+    };
+    let item = RunItem::new(
+        ItemId::new(format!("rollout-budget-{}", progress.reference_turn())),
+        RunItemKind::Message(Message::user(reminder.text())),
+    );
+    emit(context.events, RunStreamEvent::Item(item.clone()));
+    state.record_generated_items([item]);
+    handle.mark_budget_reminder_delivered(reminder);
+}
+
+/// Records a model call this run paid for, in its ledger and in the spend the runs it started and
+/// its agent tree read.
+fn record_spend(context: &TurnLoopContext<'_>, state: &mut RunState, usage: &Usage) {
+    state.record_usage(usage);
+    context.spend.record_own(usage);
+}
+
+/// Moves what this run's agent-tool calls have spent into its ledger.
+///
+/// The reference's nested run adds to the parent's usage directly; here it reaches this run's
+/// [`RunSpend`] as it goes — which is what the budget checks and the run's live context read — and
+/// the loop moves it into the ledger once, when the loop ends, whichever way it ended.
+fn absorb_nested_spend(spend: &RunSpend, state: &mut RunState, progress: &mut TurnLoopProgress) {
+    let nested = spend.take_nested();
+    if nested.requests() == 0 && nested.total_tokens() == 0 {
+        return;
+    }
+    state.record_usage(&nested);
+    progress.nested_usage = progress.nested_usage.accumulate(&nested);
 }
 
 /// Runs every installed context processor and rebuilds the ordinary request from its projection.
@@ -3545,9 +3675,11 @@ fn record_tool_output_references(
 /// - **The public agent, never the execution instance.** A dynamic availability check, a tool and
 ///   later a guard all report and branch on the agent the user configured; a prepared clone that
 ///   reached them would make a run describe something nobody wrote down.
-/// - **The spend counters as copies taken from [`RunState`], not handles into it.** The context is
-///   a read view; the state stays the one thing that accumulates and the one thing a checkpoint
-///   carries.
+/// - **The spend counters as copies, not handles.** The context is a read view; the state stays the
+///   one thing that accumulates and the one thing a checkpoint carries. The usage is the one the
+///   run shares with its agent-tool chain (see `RunSpend::shared_usage`), as the reference hands a
+///   nested run its parent's own usage object; a run no agent-tool call started reads its own
+///   ledger, with what its agent-tool calls have spent so far.
 fn live_context(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
@@ -3555,7 +3687,7 @@ fn live_context(
 ) -> RunContext {
     let mut run = RunContext::new(context.run_id.clone(), agent.public())
         .with_budget(state.budget().clone())
-        .with_usage_totals(state.usage_totals().clone())
+        .with_usage_totals(context.spend.shared_usage())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(context.event_seqs.clone());
     if let Some(app_context) = context.app_context {

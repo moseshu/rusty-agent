@@ -20,6 +20,8 @@
 //!   omitted rather than sent as `null`.
 //! - The tools are offered under their bare names; Codex's optional `collaboration` namespace is a
 //!   product setting.
+//! - In a tree given a depth limit, an agent at the limit is not offered the tools, as Codex's first
+//!   multi-agent version hides them; the version these tools port has no depth limit.
 
 use std::{fmt, time::Duration};
 
@@ -32,11 +34,12 @@ use ra_core::{
             SpawnAgentForkMode, SpawnAgentRequest, WaitOutcome,
         },
     },
+    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     permission::PermissionScope,
     tool::{
-        DecodedToolInput, FuncSchema, Tool, ToolContext, ToolFailureHandling, ToolInput,
-        ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        DecodedToolInput, FuncSchema, Tool, ToolAvailability, ToolContext, ToolFailureHandling,
+        ToolInput, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
     },
 };
 use ra_macros::ToolInput;
@@ -344,7 +347,9 @@ impl CollaborationTool {
             origin: ToolOrigin::new(name)?,
             func_schema,
             schema,
+            // Dynamic so a run whose agent is at the tree's depth limit is not offered the tools.
             options: ToolOptions::new()
+                .with_availability(ToolAvailability::Dynamic)
                 .with_failure_handling(ToolFailureHandling::Custom)
                 .with_permission_scope(scope),
             wait,
@@ -588,6 +593,23 @@ impl Tool for CollaborationTool {
 
     fn options(&self) -> ToolOptions {
         self.options.clone()
+    }
+
+    /// Hidden from an agent that may spawn nothing more, as Codex's first multi-agent version
+    /// leaves the collaboration tools out once the next spawn would exceed the depth limit. A run
+    /// with no control plane still sees them, and is told collaboration is not enabled.
+    async fn is_enabled(&self, _context: &RunContext) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn is_enabled_with_services(
+        &self,
+        _context: &RunContext,
+        services: &ToolServices,
+    ) -> Result<bool> {
+        Ok(services
+            .agent_control()
+            .is_none_or(|port| !port.spawn_depth_exceeded()))
     }
 
     async fn handle_failure(

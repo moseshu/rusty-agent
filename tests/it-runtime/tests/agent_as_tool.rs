@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use ra_core::{
     agent::{AgentId, AgentSpec, HandoffSpec, ToolUseBehavior},
-    cancel::{CancelReason, CancelScope},
+    cancel::{CancelReason, CancelScope, Deadline},
     context::{RunAgent, RunContext},
     error::{Error, Result},
     finish::FinishReason,
@@ -22,11 +22,12 @@ use ra_core::{
         ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData,
         ToolOutputGuardrail, ToolOutputGuardrailData,
     },
+    hook::{HookDecision, HookEvent, HookEventName, UserHook, UserHookContext},
     item::{
         CallId, ItemId, Message, MessageRole, ModelInputItem, ModelResponse, OutputPhase, RunItem,
         RunItemKind, ToolCall,
     },
-    lifecycle::{LifecycleHook, LifecycleScope, ToolEndInput, ToolStartInput},
+    lifecycle::{LifecycleHook, LifecycleScope, LlmStartInput, ToolEndInput, ToolStartInput},
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelStreamEvent, ProviderKey, RawResponseEvent, ResolvedModel,
@@ -36,6 +37,7 @@ use ra_core::{
         Tool, ToolApprovalPolicy, ToolContext, ToolGuardrailId, ToolOptions, ToolOrigin,
         ToolOutput, ToolSchema,
     },
+    usage::{RequestUsage, Usage},
 };
 use ra_macros::ToolInput;
 use ra_runtime::{
@@ -48,6 +50,7 @@ use ra_runtime::{
             StructuredToolInputResult, transform_string_function_style,
         },
     },
+    hook::UserHookRegistration,
     runner::{RunConfig, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner},
 };
 use schemars::JsonSchema;
@@ -2695,4 +2698,568 @@ async fn a_streamed_nested_run_still_pauses_for_approval_and_resumes() {
     assert!(all.len() > paused.len());
     assert_eq!(labels(&all[paused.len()..]).last(), Some(&"finished"));
     assert!(all.iter().all(|event| event.agent().as_str() == "nested"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Usage and budget
+// ---------------------------------------------------------------------------------------------
+
+fn billed(response: ModelResponse, input_tokens: u64, output_tokens: u64) -> ModelResponse {
+    response.with_usage(Usage::from_request(RequestUsage::new(
+        input_tokens,
+        output_tokens,
+    )))
+}
+
+/// Requests, input tokens and output tokens of one ledger.
+fn spent(usage: &Usage) -> (u64, u64, u64) {
+    (
+        usage.requests(),
+        usage.input_tokens(),
+        usage.output_tokens(),
+    )
+}
+
+/// Records the usage of each nested result it is handed.
+struct UsageExtractor {
+    seen: Arc<Mutex<Vec<Usage>>>,
+}
+
+#[async_trait]
+impl AgentToolOutputExtractor for UsageExtractor {
+    async fn extract(&self, result: &RunResult) -> Result<String> {
+        self.seen.lock().unwrap().push(result.usage());
+        Ok(result.final_text())
+    }
+}
+
+fn stepping_nested() -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("stepper"))
+        .name("Stepper")
+        .instructions("step")
+        .tool(Arc::new(ProbeTool::new("step", "stepped")))
+        .build()
+        .unwrap()
+}
+
+fn texts_of(input: &[ModelInputItem]) -> String {
+    message_texts(input).join("\n")
+}
+
+#[tokio::test]
+async fn nested_usage_is_billed_on_the_parent_ledger_and_result() {
+    let nested_usage = Arc::new(Mutex::new(Vec::new()));
+    let tool = agent("nested", "Nested", "n")
+        .as_tool()
+        .custom_output_extractor(Arc::new(UsageExtractor {
+            seen: Arc::clone(&nested_usage),
+        }))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            2,
+        ),
+        billed(final_message("n-1", "nested answer"), 100, 20),
+        billed(final_message("p-2", "done"), 30, 3),
+    ]);
+    let result = Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    // The reference shares one usage object, so the parent's totals include the nested call.
+    assert_eq!(spent(&result.usage()), (3, 140, 25));
+    assert_eq!(spent(result.state().usage_totals()), (3, 140, 25));
+    assert_eq!(result.usage().request_usage_entries().len(), 3);
+    // The parent's own calls are still only its own.
+    assert_eq!(result.model_responses().len(), 2);
+    // The nested result reports its own call and nothing of the parent's.
+    let nested_usage = nested_usage.lock().unwrap();
+    assert_eq!(nested_usage.len(), 1);
+    assert_eq!(spent(&nested_usage[0]), (1, 100, 20));
+}
+
+#[tokio::test]
+async fn a_failed_nested_run_is_still_billed_on_the_parent() {
+    let tool = stepping_nested().as_tool().build().unwrap();
+    let resolver = ScriptedResolver::with_steps(vec![
+        Some(billed(
+            tool_call("p-1", "call-1", "stepper", json!({"input": "x"})),
+            10,
+            2,
+        )),
+        Some(billed(
+            tool_call("n-1", "n-call-1", "step", json!({})),
+            50,
+            5,
+        )),
+        // The nested run's second call fails, which fails the agent-tool call.
+        None,
+        Some(billed(final_message("p-2", "recovered"), 10, 2)),
+    ]);
+    let result = Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_text(), "recovered");
+    assert_eq!(spent(&result.usage()), (3, 70, 9));
+    assert_eq!(spent(result.state().usage_totals()), (3, 70, 9));
+}
+
+#[tokio::test]
+async fn a_nested_run_paused_for_approval_is_billed_before_and_after_the_pause() {
+    let (nested, _guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            1,
+        ),
+        billed(tool_call("n-1", "n-call-1", "guarded", json!({})), 20, 2),
+        billed(final_message("n-2", "nested done"), 40, 4),
+        billed(final_message("p-2", "done"), 80, 8),
+    ]);
+
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(interruptions(&first).len(), 1);
+    // What the nested run spent before it stopped is the parent's spend too, in the checkpoint.
+    assert_eq!(spent(&first.usage()), (2, 30, 3));
+    assert_eq!(spent(first.state().usage_totals()), (2, 30, 3));
+
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+    assert_eq!(resumed.final_text(), "done");
+    // The resumed segment reports what it spent, the continued nested call included; the
+    // ledger covers the whole run.
+    assert_eq!(spent(&resumed.usage()), (2, 120, 12));
+    assert_eq!(spent(resumed.state().usage_totals()), (4, 150, 15));
+}
+
+#[tokio::test]
+async fn a_nested_run_under_the_parent_config_is_held_to_the_parent_token_ceiling() {
+    let tool = stepping_nested().as_tool().build().unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "stepper", json!({"input": "x"})),
+            60,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "step", json!({})), 50, 0),
+        // Neither is reached: the shared spend is past the ceiling after the nested call.
+        final_message("n-2", "nested done"),
+        final_message("p-2", "done"),
+    ]);
+    let result = Runner::run(
+        request(orchestrator(tool), &resolver).with_config(RunConfig::new().with_max_tokens(100)),
+    )
+    .await
+    .unwrap();
+
+    let calls = resolver.calls();
+    assert_eq!(calls.len(), 2);
+    // The nested run reads what is left of the parent's ceiling, not a fresh allowance.
+    assert!(
+        texts_of(&calls[1].input).contains("Task token budget: 40 tokens remain"),
+        "{:?}",
+        message_texts(&calls[1].input)
+    );
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    assert_eq!(result.state().tokens_used(), 110);
+}
+
+#[tokio::test]
+async fn a_nested_run_with_its_own_config_has_its_own_ceiling_and_still_bills_the_parent() {
+    let tool = stepping_nested()
+        .as_tool()
+        .run_config(RunConfig::new().with_max_tokens(1_000))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "stepper", json!({"input": "x"})),
+            60,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "step", json!({})), 50, 0),
+        billed(final_message("n-2", "nested done"), 10, 0),
+        final_message("p-2", "done"),
+    ]);
+    let result = Runner::run(
+        request(orchestrator(tool), &resolver).with_config(RunConfig::new().with_max_tokens(100)),
+    )
+    .await
+    .unwrap();
+
+    let calls = resolver.calls();
+    // The nested run measures its own ceiling against its own spend, and finishes.
+    assert_eq!(calls.len(), 3);
+    assert!(
+        texts_of(&calls[2].input).contains("Task token budget: 950 tokens remain"),
+        "{:?}",
+        message_texts(&calls[2].input)
+    );
+    // Its spend is still the parent's, which is now past the parent's ceiling.
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    assert_eq!(result.state().tokens_used(), 120);
+}
+
+#[tokio::test]
+async fn a_nested_run_inside_a_nested_run_is_billed_up_the_whole_chain() {
+    let inner = agent("inner", "Inner", "i").as_tool().build().unwrap();
+    let middle = AgentSpec::builder()
+        .id(AgentId::new("middle"))
+        .name("Middle")
+        .instructions("m")
+        .tool(Arc::new(inner))
+        .build()
+        .unwrap();
+    let middle_usage = Arc::new(Mutex::new(Vec::new()));
+    let tool = middle
+        .as_tool()
+        .custom_output_extractor(Arc::new(UsageExtractor {
+            seen: Arc::clone(&middle_usage),
+        }))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "middle", json!({"input": "x"})),
+            1,
+            0,
+        ),
+        billed(
+            tool_call("m-1", "m-call-1", "inner", json!({"input": "y"})),
+            10,
+            0,
+        ),
+        billed(final_message("i-1", "inner answer"), 100, 0),
+        billed(final_message("m-2", "middle answer"), 1_000, 0),
+        billed(final_message("p-2", "done"), 10_000, 0),
+    ]);
+    let result = Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(result.state().tokens_used(), 11_111);
+    assert_eq!(result.usage().requests(), 5);
+    // The middle run's result covers itself and the run it started, not the parent.
+    assert_eq!(middle_usage.lock().unwrap()[0].total_tokens(), 1_110);
+}
+
+/// Records the run's token spend each time a stop hook is asked.
+struct SpendAtStop(Arc<Mutex<Vec<u64>>>);
+
+#[async_trait]
+impl UserHook for SpendAtStop {
+    fn name(&self) -> &str {
+        "spend at stop"
+    }
+
+    async fn call(
+        &self,
+        context: &UserHookContext<'_>,
+        _event: &HookEvent<'_>,
+    ) -> Result<HookDecision> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(context.run().usage_totals().total_tokens());
+        Ok(HookDecision::Continue)
+    }
+}
+
+fn stopping_at(nested: AgentTool) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("orchestrator"))
+        .name("Orchestrator")
+        .instructions("orchestrate")
+        .tool(Arc::new(nested))
+        .tool_use_behavior(ToolUseBehavior::StopAtTools {
+            names: ["nested".to_owned()].into_iter().collect(),
+        })
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_turn_that_settles_an_agent_tool_call_reads_its_spend() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let parent = stopping_at(agent("nested", "Nested", "n").as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            0,
+        ),
+        billed(final_message("n-1", "nested answer"), 100, 0),
+    ]);
+    let hook = Arc::new(SpendAtStop(Arc::clone(&seen)));
+    let result = Runner::run(request(parent, &resolver).with_config(
+        RunConfig::new().with_user_hook(UserHookRegistration::new(HookEventName::Stop, hook)),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::ToolStop)
+    );
+    // Asked straight after the turn that ran the nested call, with that call's spend in the ledger.
+    assert_eq!(*seen.lock().unwrap(), [110]);
+}
+
+#[tokio::test]
+async fn a_resume_that_ends_on_a_continued_agent_tool_bills_what_it_spent() {
+    let (nested, _guarded_calls) = guarded_nested();
+    let parent = stopping_at(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "guarded", json!({})), 20, 0),
+        billed(final_message("n-2", "nested done"), 40, 0),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let resumed = Runner::run(resume(parent, &resolver, approve_all(&first, false)))
+        .await
+        .unwrap();
+
+    // The resumed segment ends on the stop policy without another turn, and still bills the call
+    // the continued nested run made.
+    assert_eq!(
+        resumed.outcome().finish_reason(),
+        Some(FinishReason::ToolStop)
+    );
+    assert_eq!(spent(&resumed.usage()), (1, 40, 0));
+    assert_eq!(resumed.state().tokens_used(), 70);
+}
+
+/// Records the orchestrator's token spend as each of its model calls starts.
+struct SpendAtLlmStart(Arc<Mutex<Vec<u64>>>);
+
+#[async_trait]
+impl LifecycleHook for SpendAtLlmStart {
+    fn name(&self) -> &str {
+        "spend at llm start"
+    }
+
+    async fn on_llm_start(&self, _scope: LifecycleScope, input: &LlmStartInput<'_>) -> Result<()> {
+        if input.run().agent_id().as_str() == "orchestrator" {
+            self.0
+                .lock()
+                .unwrap()
+                .push(input.run().usage_totals().total_tokens());
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_first_turn_after_a_resume_reads_what_the_continued_nested_run_spent() {
+    let (nested, _guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "guarded", json!({})), 20, 0),
+        billed(final_message("n-2", "nested done"), 40, 0),
+        final_message("p-2", "done"),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let resumed = Runner::run(
+        resume(parent, &resolver, approve_all(&first, false)).with_config(
+            RunConfig::new().with_lifecycle_hook(Arc::new(SpendAtLlmStart(Arc::clone(&seen)))),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.final_text(), "done");
+    assert_eq!(*seen.lock().unwrap(), [70]);
+}
+
+#[tokio::test]
+async fn a_nested_run_stopped_by_the_parent_deadline_is_still_billed() {
+    let mut hang = ProbeTool::new("hang", "never");
+    hang.hang = true;
+    let started = Arc::clone(&hang.started);
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("nested"))
+        .name("Nested")
+        .instructions("n")
+        .tool(Arc::new(hang))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "hang", json!({})), 50, 0),
+    ]);
+    let run = tokio::spawn(Runner::run(
+        request(orchestrator(nested.as_tool().build().unwrap()), &resolver).with_config(
+            RunConfig::new().with_deadline(Deadline::after(Duration::from_millis(200))),
+        ),
+    ));
+    started.notified().await;
+    let result = run.await.unwrap().unwrap();
+
+    // The deadline stopped the turn mid-call; the nested call it had paid for is still the run's.
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    assert_eq!(spent(&result.usage()), (2, 60, 0));
+    assert_eq!(result.state().tokens_used(), 60);
+}
+
+/// Records the run usage an agent's code reads as each of that agent's model calls starts.
+struct UsageAtLlmStart {
+    agent: &'static str,
+    seen: Arc<Mutex<Vec<u64>>>,
+}
+
+#[async_trait]
+impl LifecycleHook for UsageAtLlmStart {
+    fn name(&self) -> &str {
+        "usage at llm start"
+    }
+
+    async fn on_llm_start(&self, _scope: LifecycleScope, input: &LlmStartInput<'_>) -> Result<()> {
+        if input.run().agent_id().as_str() == self.agent {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(input.run().usage_totals().total_tokens());
+        }
+        Ok(())
+    }
+}
+
+fn usage_probe(agent: &'static str) -> (Arc<UsageAtLlmStart>, Arc<Mutex<Vec<u64>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    (
+        Arc::new(UsageAtLlmStart {
+            agent,
+            seen: Arc::clone(&seen),
+        }),
+        seen,
+    )
+}
+
+fn shared_usage_script() -> Arc<ScriptedResolver> {
+    ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "stepper", json!({"input": "x"})),
+            10,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "step", json!({})), 100, 0),
+        billed(final_message("n-2", "nested done"), 1_000, 0),
+        final_message("p-2", "done"),
+    ])
+}
+
+#[tokio::test]
+async fn code_in_a_nested_run_reads_the_usage_it_shares_with_the_parent() {
+    // The reference hands the nested run the parent's own usage object
+    // (`test_agent_as_tool.py` asserts `nested_context.usage is run_context.usage`).
+    let (nested_probe, nested_seen) = usage_probe("stepper");
+    let (parent_probe, parent_seen) = usage_probe("orchestrator");
+    let resolver = shared_usage_script();
+    let result = Runner::run(
+        request(
+            orchestrator(stepping_nested().as_tool().build().unwrap()),
+            &resolver,
+        )
+        .with_config(
+            RunConfig::new()
+                .with_lifecycle_hook(nested_probe)
+                .with_lifecycle_hook(parent_probe),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    // The parent's spend first, then the nested run's own calls on top of it.
+    assert_eq!(*nested_seen.lock().unwrap(), [10, 110]);
+    assert_eq!(*parent_seen.lock().unwrap(), [0, 1_110]);
+    // Each run's own record still holds only what it spent.
+    assert_eq!(result.state().tokens_used(), 1_110);
+}
+
+#[tokio::test]
+async fn a_nested_run_under_its_own_config_still_reads_the_shared_usage() {
+    let (nested_probe, nested_seen) = usage_probe("stepper");
+    let tool = stepping_nested()
+        .as_tool()
+        .run_config(RunConfig::new().with_lifecycle_hook(nested_probe))
+        .build()
+        .unwrap();
+    let resolver = shared_usage_script();
+    Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+
+    // The reference shares the usage object whatever configuration the nested run is given.
+    assert_eq!(*nested_seen.lock().unwrap(), [10, 110]);
+}
+
+#[tokio::test]
+async fn a_resumed_nested_run_reads_the_usage_of_the_parent_that_resumed_it() {
+    // The reference's `test_agent_as_tool_cached_resume_rebinds_usage_to_outer_context`.
+    let (nested, _guarded_calls) = guarded_nested();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        billed(
+            tool_call("p-1", "call-1", "nested", json!({"input": "x"})),
+            10,
+            0,
+        ),
+        billed(tool_call("n-1", "n-call-1", "guarded", json!({})), 20, 0),
+        billed(final_message("n-2", "nested done"), 40, 0),
+        final_message("p-2", "done"),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    let (nested_probe, nested_seen) = usage_probe("nested");
+    let resumed = Runner::run(
+        resume(parent, &resolver, approve_all(&first, false))
+            .with_config(RunConfig::new().with_lifecycle_hook(nested_probe)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.final_text(), "done");
+    // The continued nested call reads the resumed parent's whole spend, its own earlier call in it.
+    assert_eq!(*nested_seen.lock().unwrap(), [30]);
 }

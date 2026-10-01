@@ -49,9 +49,27 @@
 //! back; see `stream`. Which events there are is the nested run's own configuration: provider
 //! deltas, for one, are only among them when that configuration asks for partial messages.
 //!
+//! # Usage and budget
+//!
+//! As in the reference, every model call the nested run pays for is billed on the parent too: it
+//! reaches the parent's usage ledger and the parent's result whether the nested run finishes,
+//! fails, is cancelled, or pauses for approval and continues later. The reference does this by
+//! handing the nested run the parent's own usage object; here the parent's ledger belongs to its
+//! loop, so the nested run forwards each call as it records it and the parent's loop moves what
+//! arrived into its ledger (see `crate::budget::RunSpend`). The nested run's own ledger, result and
+//! checkpoint still hold only its own calls; what the code running in it reads as the run's usage
+//! is the shared total, as the reference's shared object is — the outermost run's, every nested
+//! call included, again after a paused nested run resumes.
+//!
+//! A nested run under the parent's configuration inherits the parent's token ceiling, and measures
+//! it against the spend that ceiling covers: the parent's, and that of every agent-tool run started
+//! beside this one — what reading the reference's shared usage object would show. A tool given its
+//! own configuration gives the nested run its own ceiling, measured against its own spend. The
+//! wall clock needs no such sharing: the nested run's scope is below the parent's, so the parent's
+//! deadline stops it either way.
+//!
 //! # Not yet here
 //!
-//! - **Accruing nested usage on the parent.** The nested run's usage stays on its own result.
 //! - **`previous_response_id`, `conversation_id` and `session`.** The first two are conversation
 //!   state a provider keeps server-side, which this runner has no counterpart for; a nested session
 //!   belongs with the transcript-storage work.
@@ -91,8 +109,9 @@ pub use stream::{
 };
 
 use super::AgentBinding;
-use crate::runner::{
-    AgentToolInvocation, DEFAULT_MAX_TURNS, RunConfig, RunRequest, RunResult, Runner,
+use crate::{
+    budget::NestedSpend,
+    runner::{AgentToolInvocation, DEFAULT_MAX_TURNS, RunConfig, RunRequest, RunResult, Runner},
 };
 
 /// Extracts the tool output from a finished nested run.
@@ -564,7 +583,14 @@ impl AgentTool {
             input,
         )
         .with_config(config)
-        .with_services(context.services().clone());
+        .with_services(context.services().clone())
+        // Every call the nested run pays for is billed on the parent as well, as the reference
+        // shares one usage object between them. Inheriting the parent's configuration inherits its
+        // token ceiling, which is then measured against the spend it is shared with.
+        .with_nested_spend(NestedSpend::new(
+            Arc::clone(parent.spend()),
+            self.run_config.is_none(),
+        ));
         request = match resume {
             Some(state) => request.with_state(state),
             None => request.with_parent_run_id(context.run().run_id().clone())?,
