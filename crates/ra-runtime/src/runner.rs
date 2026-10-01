@@ -42,6 +42,7 @@ use ra_core::{
     },
     context::RunContext,
     error::{BudgetKind, Error, ProviderErrorKind, Result},
+    event::{HostEvent, HostEventSink},
     filter::{
         ContextFilter, ContextFilterChain, ContextFilterReport, ContextFilterRequest,
         ModelInputData,
@@ -67,6 +68,10 @@ use ra_core::{
     },
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
+    session::rollout::{
+        RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
+        RolloutRunStarted, RolloutTurnContext,
+    },
     state::{
         EventSeqAllocator, HandoffProjection, InterruptionResolution, NestedRunRef, RunId,
         RunState, ToolOutcome, ToolUse,
@@ -805,6 +810,7 @@ pub struct RunRequest {
     /// The agent tree an unbound run executes in: a nested agent-tool run started inside it.
     agent_tree: Option<AgentTreeRef>,
     nested_spend: Option<NestedSpend>,
+    rollout: Option<Arc<dyn RolloutRecorder>>,
 }
 
 impl RunRequest {
@@ -841,6 +847,7 @@ impl RunRequest {
             tool_input: None,
             agent_handle: None,
             agent_tree: None,
+            rollout: None,
             nested_spend: None,
         }
     }
@@ -848,6 +855,23 @@ impl RunRequest {
     /// Records the structured arguments of the agent-tool call this run answers.
     pub(crate) fn with_tool_input(mut self, tool_input: serde_json::Value) -> Self {
         self.tool_input = Some(Arc::new(tool_input));
+        self
+    }
+
+    /// Records this run into a session rollout through `recorder`.
+    ///
+    /// The run records that it started and on what new input, the context of its first model call,
+    /// every session record it produces, every host event attributed to it, the usage of every
+    /// model call it pays for, and how it ended; it then waits for the recorder to flush, and logs
+    /// rather than fails if that does not succeed. These are Codex's turn records: its turn is a
+    /// run here.
+    ///
+    /// Only this run is recorded. A nested agent-tool run and a spawned agent are not given the
+    /// recorder, and their events, though they reach the same event sink, are not recorded with
+    /// this run's. Events are recorded whether or not [`Self::with_services`] installed an event
+    /// sink; one that was installed receives them as before.
+    pub fn with_rollout_recorder(mut self, recorder: Arc<dyn RolloutRecorder>) -> Self {
+        self.rollout = Some(recorder);
         self
     }
 
@@ -1063,7 +1087,7 @@ struct TurnLoopContext<'a> {
     config: &'a RunConfig,
     permission: &'a PermissionEngine,
     tool_guardrails: &'a ToolGuardrails,
-    events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
+    events: RunEvents<'a>,
     event_seqs: &'a EventSeqAllocator,
     /// Capability fragments resolved at assembly and still waiting for the signal that earns them.
     deferred_prompts: &'a [DeferredPrompt],
@@ -1110,6 +1134,8 @@ struct TurnLoopProgress {
     resumed_conclusion: Option<Range<usize>>,
     /// What the agent-tool runs this segment started spent, as moved into the run's ledger.
     nested_usage: Usage,
+    /// Whether this segment has recorded its turn context in the run's rollout.
+    turn_context_recorded: bool,
 }
 
 impl TurnLoopProgress {
@@ -1155,6 +1181,8 @@ async fn run_loop(
     if let Some(tree) = &agent_tree {
         request.event_seqs = tree.adopt_event_seqs(request.event_seqs.clone());
     }
+    let rollout = start_recording(&mut request);
+    let rollout_run_id = request.run_id.clone();
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
     // is what the turn spans underneath carry, each recording the agent that ran it; a span that
@@ -1229,6 +1257,9 @@ async fn run_loop(
     if let Some(handle) = &agent_handle {
         handle.run_ended(&result).await;
     }
+    if let Some(rollout) = &rollout {
+        record_run_end(rollout.as_ref(), &rollout_run_id, &result).await;
+    }
     if let Some(interrupt) = interrupt
         && result
             .as_ref()
@@ -1241,6 +1272,82 @@ async fn run_loop(
         duration_ms(started.elapsed()),
     );
     result
+}
+
+/// Records that a run given a rollout recorder started, and routes the run's host events to the
+/// recorder as well as to the sink the host installed. Returns the recorder, if there is one.
+fn start_recording(request: &mut RunRequest) -> Option<Arc<dyn RolloutRecorder>> {
+    let rollout = request.rollout.clone()?;
+    let mut started =
+        RolloutRunStarted::new(request.run_id.clone(), request.agent.public_id().clone())
+            .with_input(request.input.clone());
+    if let Some(parent) = request.state.parent_run_id() {
+        started = started.with_parent_run_id(parent.clone());
+    }
+    rollout.record(RolloutItem::RunStarted(started));
+    request.services = request
+        .services
+        .clone()
+        .with_event_sink(Arc::new(RecordingSink {
+            run_id: request.run_id.clone(),
+            recorder: Arc::clone(&rollout),
+            inner: request.services.event_sink().cloned(),
+        }));
+    Some(rollout)
+}
+
+/// The event sink of a run that is recorded: every event reaches the sink the host installed, and
+/// those attributed to the run are recorded as well.
+///
+/// The sink is handed on with the run's services — to its tools, to the nested runs its agent-tool
+/// calls start, and to the agents it spawns — so it filters by run rather than recording whatever
+/// passes through: a nested run or a spawned agent is not part of this run's rollout, while an
+/// event recorded for this run after it returned, such as the completion of an agent it spawned, is.
+struct RecordingSink {
+    run_id: RunId,
+    recorder: Arc<dyn RolloutRecorder>,
+    inner: Option<Arc<dyn HostEventSink>>,
+}
+
+impl HostEventSink for RecordingSink {
+    fn emit(&self, event: HostEvent) {
+        if *event.run_id() == self.run_id {
+            self.recorder.record(RolloutItem::Event(event.clone()));
+        }
+        if let Some(inner) = &self.inner {
+            inner.emit(event);
+        }
+    }
+}
+
+/// Records how a recorded run ended and waits for the recorder to write it all.
+///
+/// A recorder that cannot is logged rather than turned into a failure of the run: the run's work
+/// and its result do not depend on the log, as Codex's turn does not fail on a rollout flush.
+async fn record_run_end(rollout: &dyn RolloutRecorder, run_id: &RunId, result: &Result<RunResult>) {
+    let ended = match result {
+        Ok(result) => match result.outcome() {
+            RunOutcome::Interrupted { .. } => {
+                RolloutRunEnded::new(run_id.clone(), RolloutRunEnd::Interrupted)
+            }
+            outcome => {
+                let ended = RolloutRunEnded::new(run_id.clone(), RolloutRunEnd::Completed);
+                match outcome.finish_reason() {
+                    Some(reason) => ended.with_finish_reason(reason),
+                    None => ended,
+                }
+            }
+        },
+        Err(error) if error.is_cancelled() => {
+            RolloutRunEnded::new(run_id.clone(), RolloutRunEnd::Cancelled)
+        }
+        Err(error) => RolloutRunEnded::new(run_id.clone(), RolloutRunEnd::Failed)
+            .with_error(error.to_string()),
+    };
+    rollout.record(RolloutItem::RunEnded(ended));
+    if let Err(error) = rollout.flush().await {
+        warn!(run_id = %run_id, %error, "the run's rollout could not be flushed");
+    }
 }
 
 /// What it takes to tell a host that its run was cancelled, held across the loop that consumed it.
@@ -1321,6 +1428,7 @@ async fn run_loop_inner(
         agent_handle,
         agent_tree: _,
         nested_spend: _,
+        rollout,
     } = request;
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
@@ -1469,6 +1577,7 @@ async fn run_loop_inner(
         budget_stop: None,
         resumed_conclusion: None,
         nested_usage: Usage::default(),
+        turn_context_recorded: false,
     };
     let permission = config.permission().clone().with_rules(
         config
@@ -1491,7 +1600,10 @@ async fn run_loop_inner(
         config: &config,
         permission: &permission,
         tool_guardrails: &tool_guardrails,
-        events: events.as_ref(),
+        events: RunEvents {
+            stream: events.as_ref(),
+            rollout: rollout.as_deref(),
+        },
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
         sandbox,
@@ -1618,7 +1730,14 @@ async fn run_loop_inner(
     // the checkpoint and an error handler read, whichever way it stopped — including a stage that
     // failed after a nested run had already been paid for. Nothing inside the loop reads the ledger
     // for spend: the budget checks and the code the loop runs read the live spend instead.
-    absorb_nested_spend(spend, &mut state, &mut progress);
+    let nested = absorb_nested_spend(spend, &mut state, &mut progress);
+    // Agent-tool calls are billed to this run, so the rollout's usage records add up to its ledger.
+    if let (Some(rollout), Some(nested)) = (rollout.as_deref(), nested) {
+        rollout.record(RolloutItem::ModelUsage(RolloutModelUsage::new(
+            run_id.clone(),
+            nested,
+        )));
+    }
 
     // The one place an expired wall clock is read back as a budget stop. Everything under the run
     // scope reports expiry the same way any other cancellation is reported, which is what lets the
@@ -1819,7 +1938,13 @@ async fn run_loop_inner(
         crate::memory::report_final_citations(&result, sink, &run_id).await;
     }
     record_run_outcome(span, &result);
-    emit(events.as_ref(), RunStreamEvent::Finished(outcome));
+    emit(
+        RunEvents {
+            stream: events.as_ref(),
+            rollout: None,
+        },
+        RunStreamEvent::Finished(outcome),
+    );
     Ok(result)
 }
 
@@ -2905,7 +3030,7 @@ async fn run_one_turn(
             total.accumulate(response.usage())
         });
     if context_usage.requests() > 0 {
-        record_spend(context, state, &context_usage);
+        record_spend(context, state, &context_usage, None, progress);
     }
     for response in context_responses {
         state.record_model_response(response);
@@ -2943,6 +3068,17 @@ async fn run_one_turn(
     // The model identity outlives the request it came from: `into_call` consumes the preparation,
     // and the closing half of this bracket has to name the same model the opening half did.
     let selector = prepared.selector().clone();
+    if let Some(rollout) = context.events.rollout
+        && !progress.turn_context_recorded
+    {
+        progress.turn_context_recorded = true;
+        rollout.record(RolloutItem::TurnContext(turn_context(
+            context.run_id,
+            progress,
+            &selector,
+            prepared.request().model_settings().effort(),
+        )));
+    }
     // Announced once for the whole logical call rather than once per physical request. Retries and
     // a provider fallback happen inside it, and are already on the generation spans underneath; a
     // callback per attempt would make a host counting model calls count retries, and would leave
@@ -2954,8 +3090,15 @@ async fn run_one_turn(
             .with_services(context.services);
         lifecycle_dispatch::llm_start(lifecycle, &calling, turn_scope).await?;
     }
-    let (surface, response, streamed_dispatches) =
-        call_model(turn_scope, prepared, context, streaming_dispatch).await?;
+    let mut early = EarlyRecords::new(context.events.rollout, agent.public());
+    let (surface, response, streamed_dispatches) = call_model(
+        turn_scope,
+        prepared,
+        context,
+        streaming_dispatch,
+        &mut early,
+    )
+    .await?;
     state.record_memory_exposures(memory_exposures);
 
     // Both facts about a completed call are recorded here, before settlement, and the stop
@@ -2970,7 +3113,7 @@ async fn run_one_turn(
     // call ran. The copy is what that costs, next to the history copy this turn already makes for
     // settlement.
     record_usage(turn_span, response.usage());
-    record_spend(context, state, response.usage());
+    record_spend(context, state, response.usage(), selector.model(), progress);
     state.record_model_response(response.clone());
 
     // After the spend has been recorded, so a callback reads the run's totals with the call it is
@@ -3021,6 +3164,8 @@ async fn run_one_turn(
         Some(filter) => settlement.with_handoff_input_filter(Arc::clone(filter)),
         None => settlement,
     };
+    // Settlement runs the calls that did not start during the stream; their records go first.
+    early.record_before_settlement(&response);
     let settled = settle_turn(settlement).await?;
 
     // Recorded straight after settlement, alongside the items: these are decisions this turn's
@@ -3038,7 +3183,12 @@ async fn run_one_turn(
     )?;
 
     for item in settled.session_step_items() {
-        emit(context.events, RunStreamEvent::Item(item.clone()));
+        let events = if early.recorded(item) {
+            context.events.stream_only()
+        } else {
+            context.events
+        };
+        emit(events, RunStreamEvent::Item(item.clone()));
     }
     // The range is relative to the segment, because that is what `RunResult::turn_items` indexes.
     state.record_generated_items(settled.session_step_items().iter().cloned());
@@ -3280,9 +3430,44 @@ fn deliver_rollout_budget_reminder(
 
 /// Records a model call this run paid for, in its ledger and in the spend the runs it started and
 /// its agent tree read.
-fn record_spend(context: &TurnLoopContext<'_>, state: &mut RunState, usage: &Usage) {
+fn record_spend(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    usage: &Usage,
+    model: Option<&str>,
+    progress: &TurnLoopProgress,
+) {
     state.record_usage(usage);
     context.spend.record_own(usage);
+    if let Some(rollout) = context.events.rollout {
+        let mut record = RolloutModelUsage::new(context.run_id.clone(), usage.clone());
+        if let Ok(turn) = u32::try_from(progress.reference_turn()) {
+            record = record.with_turn_index(turn);
+        }
+        if let Some(model) = model {
+            record = record.with_model(model);
+        }
+        rollout.record(RolloutItem::ModelUsage(record));
+    }
+}
+
+/// The context a recorded run's first model call in a segment runs in: Codex's turn context, with
+/// the model and effort the call resolved to.
+fn turn_context(
+    run_id: &RunId,
+    progress: &TurnLoopProgress,
+    selector: &ra_core::model::ModelSelector,
+    effort: Option<ra_core::model::Effort>,
+) -> RolloutTurnContext {
+    let turn = u32::try_from(progress.reference_turn()).unwrap_or(u32::MAX);
+    let mut context = RolloutTurnContext::new(run_id.clone(), turn);
+    if let Some(model) = selector.model() {
+        context = context.with_model(model);
+    }
+    if let Some(effort) = effort {
+        context = context.with_effort(effort.to_string());
+    }
+    context
 }
 
 /// Moves what this run's agent-tool calls have spent into its ledger.
@@ -3290,13 +3475,18 @@ fn record_spend(context: &TurnLoopContext<'_>, state: &mut RunState, usage: &Usa
 /// The reference's nested run adds to the parent's usage directly; here it reaches this run's
 /// [`RunSpend`] as it goes — which is what the budget checks and the run's live context read — and
 /// the loop moves it into the ledger once, when the loop ends, whichever way it ended.
-fn absorb_nested_spend(spend: &RunSpend, state: &mut RunState, progress: &mut TurnLoopProgress) {
+fn absorb_nested_spend(
+    spend: &RunSpend,
+    state: &mut RunState,
+    progress: &mut TurnLoopProgress,
+) -> Option<Usage> {
     let nested = spend.take_nested();
     if nested.requests() == 0 && nested.total_tokens() == 0 {
-        return;
+        return None;
     }
     state.record_usage(&nested);
     progress.nested_usage = progress.nested_usage.accumulate(&nested);
+    Some(nested)
 }
 
 /// Runs every installed context processor and rebuilds the ordinary request from its projection.
@@ -3832,6 +4022,7 @@ async fn call_model(
     prepared: PreparedTurn,
     context: &TurnLoopContext<'_>,
     streaming_dispatch: StreamedDispatchInput,
+    early: &mut EarlyRecords<'_>,
 ) -> Result<(TurnActionSurface, ModelResponse, StreamedFunctionDispatches)> {
     let model = Arc::clone(prepared.model());
     let selector = prepared.selector().clone();
@@ -3850,7 +4041,7 @@ async fn call_model(
     let narration = context
         .config
         .partial_messages
-        .then_some(context.events)
+        .then_some(context.events.stream)
         .flatten();
     let retry_settings = model_request.model_settings().retry().cloned();
     let max_retries = retry_settings
@@ -3877,6 +4068,7 @@ async fn call_model(
             model_request.clone(),
             &surface,
             &mut consumed,
+            early,
         )
         .await;
         match response {
@@ -3929,7 +4121,10 @@ async fn call_model_attempt(
     model_request: ModelRequest,
     surface: &TurnActionSurface,
     consumed: &mut CallConsumption,
+    early: &mut EarlyRecords<'_>,
 ) -> Result<(ModelResponse, StreamedFunctionDispatches)> {
+    // A retried attempt starts over: what the failed one streamed was never acted on.
+    early.discard_pending();
     let model_name = attempt.selector.model().unwrap_or("<provider_default>");
     let generation_span = info_span!(
         "generation",
@@ -3971,6 +4166,7 @@ async fn call_model_attempt(
         attempt.turn_scope,
         attempt.streaming_dispatch.start(),
         consumed,
+        early,
     )
     .instrument(generation_span.clone())
     .await;
@@ -4106,6 +4302,7 @@ fn prepend_failed_attempts(usage: &Usage, failed_attempts: u32) -> Usage {
 /// delivered. Rebuilding the turn from the deltas instead would mean re-deriving all three from a
 /// provider-shaped vocabulary that carries no stability promise, once per protocol — and reporting
 /// a turn the provider never said it finished.
+#[allow(clippy::too_many_arguments)]
 async fn stream_model_call(
     model: &Arc<dyn Model>,
     request: ModelRequest,
@@ -4114,6 +4311,7 @@ async fn stream_model_call(
     cancel: &CancelScope,
     mut dispatches: StreamedFunctionDispatches,
     consumed: &mut CallConsumption,
+    early: &mut EarlyRecords<'_>,
 ) -> Result<(ModelResponse, StreamedFunctionDispatches)> {
     // `CancelScope::run` cannot wrap this call: the dispatcher below owns spawned tasks that have
     // to be drained rather than dropped when the scope fires. Its entry checkpoint is taken here
@@ -4129,6 +4327,7 @@ async fn stream_model_call(
         cancel,
         &mut dispatches,
         consumed,
+        early,
     )
     .await;
     match settled {
@@ -4155,6 +4354,7 @@ async fn stream_model_call(
 ///
 /// Split from [`stream_model_call`] so that every failure exit reaches the one place that drains
 /// early tool work, rather than repeating the teardown at each `return`.
+#[allow(clippy::too_many_arguments)]
 async fn read_model_stream(
     model: &Arc<dyn Model>,
     request: ModelRequest,
@@ -4163,6 +4363,7 @@ async fn read_model_stream(
     cancel: &CancelScope,
     dispatches: &mut StreamedFunctionDispatches,
     consumed: &mut CallConsumption,
+    early: &mut EarlyRecords<'_>,
 ) -> Result<ModelResponse> {
     let mut stream = model.stream_response(request);
     let mut settled: Option<ModelResponse> = None;
@@ -4197,11 +4398,15 @@ async fn read_model_stream(
                 if events.is_some() {
                     consumed.published = true;
                 }
-                emit(events, RunStreamEvent::RawResponse(raw));
+                // Narration only: it is not a session record, so it never reaches the rollout.
+                if let Some(sender) = events {
+                    let _ = sender.send(RunStreamEvent::RawResponse(raw));
+                }
             }
             ModelStreamEvent::Completed(response) => settled = Some(*response),
             ModelStreamEvent::RunItem(item) => {
-                start_streamed_call(item.item(), surface, dispatches, consumed)?;
+                early.completed(item.item());
+                start_streamed_call(item.item(), surface, dispatches, consumed, early)?;
             }
             // Every other model event is the adapter's own view of items this run publishes itself.
             _ => {}
@@ -4223,6 +4428,7 @@ fn start_streamed_call(
     surface: &TurnActionSurface,
     dispatches: &mut StreamedFunctionDispatches,
     consumed: &mut CallConsumption,
+    early: &mut EarlyRecords<'_>,
 ) -> Result<()> {
     if !matches!(item.kind(), RunItemKind::ToolCall(_)) {
         return Ok(());
@@ -4240,6 +4446,10 @@ fn start_streamed_call(
     let Some(action) = processed.functions().first() else {
         return Ok(());
     };
+    // Recorded before the tool exists, so nothing it reports can precede the call it answers.
+    if !dispatches.defers(action)? {
+        early.record_pending();
+    }
     if dispatches.start(action)? == StreamedStart::Started {
         consumed.dispatched = true;
     }
@@ -4434,8 +4644,115 @@ fn next_input(
 ///
 /// A dropped receiver is not a run failure. The host stopping listening is handled by cancelling
 /// the run when the stream drops, which is a decision about the run rather than about one send.
-fn emit(events: Option<&mpsc::UnboundedSender<RunStreamEvent>>, event: RunStreamEvent) {
-    if let Some(sender) = events {
+/// Where what a run produces goes as it happens: the stream subscriber, if there is one, and the
+/// rollout recorder, if the run was given one.
+#[derive(Clone, Copy)]
+struct RunEvents<'a> {
+    stream: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
+    rollout: Option<&'a dyn RolloutRecorder>,
+}
+
+impl RunEvents<'_> {
+    /// The same subscriber, without the rollout: for a record the rollout already holds.
+    const fn stream_only(self) -> Self {
+        Self {
+            rollout: None,
+            ..self
+        }
+    }
+}
+
+/// The records of a turn a recorded run writes before the turn settles.
+///
+/// Codex persists each completed item of a response before it runs the call it carries, so a turn
+/// interrupted while its tools run still has the call every reported effect answers. Here a turn's
+/// records are written when it settles, and settlement is exactly what an interruption skips. So
+/// when a call is about to start — from the stream, or in settlement — every completed item of the
+/// response up to it is recorded first, in response order and attributed as settlement attributes
+/// it. Settlement then records only what is new: an item already recorded as it settles is not
+/// recorded again, and one settlement changed (an assistant message's output phase is decided
+/// there) is recorded again under its id, superseding the earlier copy.
+///
+/// Nothing is recorded early from an attempt that may still be retried: items wait here until a
+/// tool starts from one — which is what closes a call to replay — or until the response is final.
+struct EarlyRecords<'a> {
+    rollout: Option<&'a dyn RolloutRecorder>,
+    public: &'a AgentSpec,
+    /// Completed stream items of the current attempt not recorded yet, in order.
+    pending: Vec<RunItem>,
+    /// What this turn recorded early, by id.
+    recorded: std::collections::HashMap<ItemId, RunItem>,
+}
+
+impl<'a> EarlyRecords<'a> {
+    fn new(rollout: Option<&'a dyn RolloutRecorder>, public: &'a AgentSpec) -> Self {
+        Self {
+            rollout,
+            public,
+            pending: Vec::new(),
+            recorded: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Notes a completed stream item, to be recorded once a call starts.
+    fn completed(&mut self, item: &RunItem) {
+        if self.rollout.is_some() {
+            self.pending.push(item.clone());
+        }
+    }
+
+    /// Forgets the items of an attempt that is being replaced.
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Records the completed stream items not recorded yet, ahead of a call that starts now.
+    fn record_pending(&mut self) {
+        for item in std::mem::take(&mut self.pending) {
+            self.record(item);
+        }
+    }
+
+    /// Records the final response's items not recorded yet, when settlement is about to run calls.
+    fn record_before_settlement(&mut self, response: &ModelResponse) {
+        self.pending.clear();
+        if self.rollout.is_none()
+            || !response
+                .output()
+                .iter()
+                .any(|item| matches!(item.kind(), RunItemKind::ToolCall(_)))
+        {
+            return;
+        }
+        for item in response.output() {
+            if !self.recorded.contains_key(item.id()) {
+                self.record(item.clone());
+            }
+        }
+    }
+
+    fn record(&mut self, item: RunItem) {
+        let Some(rollout) = self.rollout else {
+            return;
+        };
+        let item = crate::turn::resolve::attribute(item, self.public);
+        rollout.record(RolloutItem::Item(item.clone()));
+        self.recorded.insert(item.id().clone(), item);
+    }
+
+    /// Whether `item`, as settled, is already in the rollout exactly as it is.
+    fn recorded(&self, item: &RunItem) -> bool {
+        self.recorded.get(item.id()) == Some(item)
+    }
+}
+
+/// Sends `event` to the subscriber and records each session record it carries in the rollout, so
+/// the rollout holds exactly the records the stream reports, in the same order.
+fn emit(events: RunEvents<'_>, event: RunStreamEvent) {
+    if let (Some(rollout), RunStreamEvent::Item(item)) = (events.rollout, &event) {
+        rollout.record(RolloutItem::Item(item.clone()));
+    }
+    if let Some(sender) = events.stream {
         let _ = sender.send(event);
     }
 }

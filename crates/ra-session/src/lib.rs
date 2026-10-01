@@ -23,7 +23,7 @@ pub use memory::InMemorySession;
 pub use ra_core::session::{Session, SessionId};
 pub use rollout::{
     ChildAnchorKind, ROLLOUT_SCHEMA_VERSION, RolloutCheckpoint, RolloutChildAnchor,
-    RolloutModelUsage, RolloutPayload, RolloutReader, RolloutRecord, RolloutSessionMeta,
-    RolloutSidecar, RolloutSummary, RolloutTurnContext, RolloutWriter, UnifiedReplayItem,
-    graft_child_transcripts,
+    RolloutFileRecorder, RolloutModelUsage, RolloutPayload, RolloutReader, RolloutRecord,
+    RolloutSessionMeta, RolloutSidecar, RolloutSummary, RolloutTurnContext, RolloutWriter,
+    UnifiedReplayItem, graft_child_transcripts, is_persisted_rollout_item,
 };

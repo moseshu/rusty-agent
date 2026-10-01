@@ -12,7 +12,10 @@ use ra_core::{
     error::{Error, Result, SessionErrorKind},
     event::{AgentOperationId, EventTimestamp, HostEvent},
     item::{AgentId, CallId, RunItem},
-    session::SessionId,
+    session::{
+        SessionId,
+        rollout::{RolloutItem, RolloutRunEnded, RolloutRunStarted},
+    },
     state::RunId,
     usage::Usage,
 };
@@ -23,6 +26,10 @@ use tokio::{
 };
 
 use super::reader::{RolloutReader, RolloutSummary};
+
+// Defined beside the session port so the runner can record them without depending on storage;
+// re-exported here, where they were first defined.
+pub use ra_core::session::rollout::{RolloutModelUsage, RolloutTurnContext};
 
 /// Current schema version for rollout envelopes and records.
 pub const ROLLOUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
@@ -366,222 +373,6 @@ impl RolloutSessionMeta {
     }
 }
 
-/// Execution and configuration context captured at the start of a turn.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutTurnContext {
-    #[serde(default = "default_rollout_schema_version")]
-    schema_version: SchemaVersion,
-    run_id: RunId,
-    turn_index: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    approval_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sandbox_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    effort: Option<String>,
-    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
-    unknown: Unknown,
-}
-
-impl RolloutTurnContext {
-    /// Creates a new turn context record.
-    #[must_use]
-    pub fn new(run_id: RunId, turn_index: u32) -> Self {
-        Self {
-            schema_version: ROLLOUT_SCHEMA_VERSION,
-            run_id,
-            turn_index,
-            cwd: None,
-            approval_policy: None,
-            sandbox_policy: None,
-            model: None,
-            effort: None,
-            unknown: Unknown::new(),
-        }
-    }
-
-    /// Sets the working directory.
-    #[must_use]
-    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    /// Sets the approval policy name.
-    #[must_use]
-    pub fn with_approval_policy(mut self, policy: impl Into<String>) -> Self {
-        self.approval_policy = Some(policy.into());
-        self
-    }
-
-    /// Sets the sandbox policy name.
-    #[must_use]
-    pub fn with_sandbox_policy(mut self, policy: impl Into<String>) -> Self {
-        self.sandbox_policy = Some(policy.into());
-        self
-    }
-
-    /// Sets the active model identifier.
-    #[must_use]
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
-        self
-    }
-
-    /// Sets the effort level.
-    #[must_use]
-    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
-        self.effort = Some(effort.into());
-        self
-    }
-
-    /// Active run identifier.
-    #[must_use]
-    pub const fn run_id(&self) -> &RunId {
-        &self.run_id
-    }
-
-    /// Zero-based turn index.
-    #[must_use]
-    pub const fn turn_index(&self) -> u32 {
-        self.turn_index
-    }
-
-    /// Working directory.
-    #[must_use]
-    pub fn cwd(&self) -> Option<&str> {
-        self.cwd.as_deref()
-    }
-
-    /// Approval policy name.
-    #[must_use]
-    pub fn approval_policy(&self) -> Option<&str> {
-        self.approval_policy.as_deref()
-    }
-
-    /// Sandbox policy name.
-    #[must_use]
-    pub fn sandbox_policy(&self) -> Option<&str> {
-        self.sandbox_policy.as_deref()
-    }
-
-    /// Model name.
-    #[must_use]
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-
-    /// Effort level string.
-    #[must_use]
-    pub fn effort(&self) -> Option<&str> {
-        self.effort.as_deref()
-    }
-
-    /// Schema version of the record.
-    #[must_use]
-    pub const fn schema_version(&self) -> SchemaVersion {
-        self.schema_version
-    }
-
-    /// Unknown fields retained during deserialization.
-    #[must_use]
-    pub const fn unknown(&self) -> &Unknown {
-        &self.unknown
-    }
-}
-
-/// Unprunable model usage record written upon each model completion settlement.
-///
-/// This is the reconciliation baseline for every total derived from it. Items are compacted and
-/// pruned, and a run's checkpointed totals therefore cannot be checked against the responses still
-/// present in its state; they can be checked against these records, which are never removed. The
-/// per-request entries inside [`Self::usage`] are the finest granularity that survives, which is
-/// what makes a cache hit rate computable for one call rather than only for a whole session.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutModelUsage {
-    #[serde(default = "default_rollout_schema_version")]
-    schema_version: SchemaVersion,
-    run_id: RunId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    turn_index: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    usage: Usage,
-    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
-    unknown: Unknown,
-}
-
-impl RolloutModelUsage {
-    /// Creates a model usage record.
-    #[must_use]
-    pub fn new(run_id: RunId, usage: Usage) -> Self {
-        Self {
-            schema_version: ROLLOUT_SCHEMA_VERSION,
-            run_id,
-            turn_index: None,
-            model: None,
-            usage,
-            unknown: Unknown::new(),
-        }
-    }
-
-    /// Sets the turn index.
-    #[must_use]
-    pub const fn with_turn_index(mut self, turn_index: u32) -> Self {
-        self.turn_index = Some(turn_index);
-        self
-    }
-
-    /// Sets the model identifier.
-    #[must_use]
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
-        self
-    }
-
-    /// Active run identifier.
-    #[must_use]
-    pub const fn run_id(&self) -> &RunId {
-        &self.run_id
-    }
-
-    /// Turn index, if known.
-    #[must_use]
-    pub const fn turn_index(&self) -> Option<u32> {
-        self.turn_index
-    }
-
-    /// Model identifier, if known.
-    #[must_use]
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-
-    /// Token usage details.
-    #[must_use]
-    pub const fn usage(&self) -> &Usage {
-        &self.usage
-    }
-
-    /// Schema version of the record.
-    #[must_use]
-    pub const fn schema_version(&self) -> SchemaVersion {
-        self.schema_version
-    }
-
-    /// Unknown fields retained during deserialization.
-    #[must_use]
-    pub const fn unknown(&self) -> &Unknown {
-        &self.unknown
-    }
-}
-
 /// Aggregates over every record preceding this one, written into the log itself.
 ///
 /// This is what makes resume able to skip a full scan. The same summary kept beside the log
@@ -686,6 +477,10 @@ pub enum RolloutPayload {
     ChildAnchor(RolloutChildAnchor),
     /// Aggregates over the preceding records, letting resume skip them.
     Checkpoint(RolloutCheckpoint),
+    /// A run, or a segment continuing it, started.
+    RunStarted(RolloutRunStarted),
+    /// A run, or its latest segment, ended.
+    RunEnded(RolloutRunEnded),
     /// Forward-compatible unknown payload.
     Unknown {
         /// Type name identifier.
@@ -734,6 +529,36 @@ impl From<RolloutChildAnchor> for RolloutPayload {
 impl From<RolloutCheckpoint> for RolloutPayload {
     fn from(c: RolloutCheckpoint) -> Self {
         Self::Checkpoint(c)
+    }
+}
+
+impl From<RolloutRunStarted> for RolloutPayload {
+    fn from(started: RolloutRunStarted) -> Self {
+        Self::RunStarted(started)
+    }
+}
+
+impl From<RolloutRunEnded> for RolloutPayload {
+    fn from(ended: RolloutRunEnded) -> Self {
+        Self::RunEnded(ended)
+    }
+}
+
+impl From<RolloutItem> for RolloutPayload {
+    fn from(item: RolloutItem) -> Self {
+        match item {
+            RolloutItem::RunStarted(started) => Self::RunStarted(started),
+            RolloutItem::TurnContext(context) => Self::TurnContext(context),
+            RolloutItem::Item(item) => Self::Item(item),
+            RolloutItem::Event(event) => Self::Event(event),
+            RolloutItem::ModelUsage(usage) => Self::ModelUsage(usage),
+            RolloutItem::RunEnded(ended) => Self::RunEnded(ended),
+            // A kind this build cannot name has no payload to be written as.
+            other => Self::Unknown {
+                type_name: "unknown_rollout_item".to_owned(),
+                data: serde_json::Value::String(format!("{other:?}")),
+            },
+        }
     }
 }
 
@@ -820,6 +645,24 @@ impl RolloutRecord {
                     Error::session(
                         SessionErrorKind::Corrupted,
                         format!("failed to serialize checkpoint: {e}"),
+                    )
+                })?,
+            ),
+            RolloutPayload::RunStarted(started) => (
+                "run_started".to_string(),
+                serde_json::to_value(started).map_err(|e| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        format!("failed to serialize run_started: {e}"),
+                    )
+                })?,
+            ),
+            RolloutPayload::RunEnded(ended) => (
+                "run_ended".to_string(),
+                serde_json::to_value(ended).map_err(|e| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        format!("failed to serialize run_ended: {e}"),
                     )
                 })?,
             ),
@@ -933,6 +776,24 @@ impl RolloutRecord {
                     Error::session(
                         SessionErrorKind::Corrupted,
                         format!("corrupted checkpoint payload: {e}"),
+                    )
+                    .with_source(e)
+                }),
+            "run_started" => serde_json::from_value::<RolloutRunStarted>(self.payload.clone())
+                .map(RolloutPayload::RunStarted)
+                .map_err(|e| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        format!("corrupted run_started payload: {e}"),
+                    )
+                    .with_source(e)
+                }),
+            "run_ended" => serde_json::from_value::<RolloutRunEnded>(self.payload.clone())
+                .map(RolloutPayload::RunEnded)
+                .map_err(|e| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        format!("corrupted run_ended payload: {e}"),
                     )
                     .with_source(e)
                 }),

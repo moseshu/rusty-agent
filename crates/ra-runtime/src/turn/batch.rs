@@ -548,16 +548,10 @@ impl StreamedFunctionDispatches {
     /// The no-progress streak needs no such treatment: outcomes are filed at the end of the
     /// *previous* turn, so both paths read the same number.
     pub(crate) fn start(&mut self, action: &ToolRunFunction) -> Result<StreamedStart> {
-        let call_id = action.call_id().clone();
-        if self.started.contains_key(&call_id) {
-            return Err(Error::provider(
-                ra_core::error::ProviderErrorKind::Behavior,
-                format!("the model stream emitted function call `{call_id}` more than once"),
-            ));
-        }
-        if action.tool().options().max_repeat_streak().is_some() {
+        if self.defers(action)? {
             return Ok(StreamedStart::Deferred);
         }
+        let call_id = action.call_id().clone();
         let identity = action.identity();
         let history = CallHistory::new(
             self.tool_use.repeat_streak(&self.agent_id, &identity),
@@ -602,6 +596,23 @@ impl StreamedFunctionDispatches {
             },
         );
         Ok(StreamedStart::Started)
+    }
+
+    /// Whether [`Self::start`] would leave `action` to the terminal response rather than start it,
+    /// decided before anything is spawned so a caller can act on the answer first.
+    ///
+    /// # Errors
+    ///
+    /// The model stream emitted the same call more than once.
+    pub(crate) fn defers(&self, action: &ToolRunFunction) -> Result<bool> {
+        let call_id = action.call_id();
+        if self.started.contains_key(call_id) {
+            return Err(Error::provider(
+                ra_core::error::ProviderErrorKind::Behavior,
+                format!("the model stream emitted function call `{call_id}` more than once"),
+            ));
+        }
+        Ok(action.tool().options().max_repeat_streak().is_some())
     }
 
     /// Cancels and reaps early work when the stream cannot yield a terminal response.

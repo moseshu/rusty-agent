@@ -221,7 +221,7 @@ pub(super) fn rebind_interruption(
 /// Only fills what is empty. A record that already names a producer got it from something that
 /// knew better — R12's nested runs will attribute their own items to the sub-agent — and
 /// overwriting that would re-label a sub-agent's work as the parent's.
-fn attribute(item: RunItem, public: &AgentSpec) -> RunItem {
+pub(crate) fn attribute(item: RunItem, public: &AgentSpec) -> RunItem {
     if item.provenance().is_some() {
         return item;
     }
