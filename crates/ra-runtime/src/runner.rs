@@ -93,7 +93,11 @@ use result::{TurnRecordOwner, aggregate_usage, find_final_message};
 pub use stream::{RunStream, RunStreamEvent};
 
 use crate::{
-    agent::{AgentBinding, AgentRegistry, control::AgentHandle, tool::ParentRun},
+    agent::{
+        AgentBinding, AgentRegistry,
+        control::{AgentHandle, AgentTreeRef},
+        tool::ParentRun,
+    },
     capability::{CapabilityPlan, DeferredPrompt},
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     hook::{UserHookRegistration, UserHooks},
@@ -798,6 +802,8 @@ pub struct RunRequest {
     event_seqs: EventSeqAllocator,
     tool_input: Option<Arc<serde_json::Value>>,
     agent_handle: Option<AgentHandle>,
+    /// The agent tree an unbound run executes in: a nested agent-tool run started inside it.
+    agent_tree: Option<AgentTreeRef>,
     nested_spend: Option<NestedSpend>,
 }
 
@@ -834,6 +840,7 @@ impl RunRequest {
             event_seqs,
             tool_input: None,
             agent_handle: None,
+            agent_tree: None,
             nested_spend: None,
         }
     }
@@ -841,6 +848,13 @@ impl RunRequest {
     /// Records the structured arguments of the agent-tool call this run answers.
     pub(crate) fn with_tool_input(mut self, tool_input: serde_json::Value) -> Self {
         self.tool_input = Some(Arc::new(tool_input));
+        self
+    }
+
+    /// Runs this request inside `tree` without binding it to an agent there, as a nested
+    /// agent-tool run inherits the tree of the run that started it.
+    pub(crate) fn with_agent_tree(mut self, tree: Option<AgentTreeRef>) -> Self {
+        self.agent_tree = tree;
         self
     }
 
@@ -1126,10 +1140,21 @@ impl TurnLoopProgress {
 ///
 /// `events` is the only difference between them.
 async fn run_loop(
-    request: RunRequest,
+    mut request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
     sandbox: Arc<SandboxRuntime>,
 ) -> Result<RunResult> {
+    // Before anything copies the allocator: in an agent tree, a run continued from its checkpoint
+    // draws from the sequence an earlier segment of it registered there, which a completion it
+    // asked to be told about may still be drawing from.
+    let agent_tree = request
+        .agent_handle
+        .as_ref()
+        .map(AgentHandle::tree_ref)
+        .or_else(|| request.agent_tree.clone());
+    if let Some(tree) = &agent_tree {
+        request.event_seqs = tree.adopt_event_seqs(request.event_seqs.clone());
+    }
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
     // is what the turn spans underneath carry, each recording the agent that ran it; a span that
@@ -1181,6 +1206,8 @@ async fn run_loop(
         request.run_id.clone(),
         Arc::clone(request.agent.public()),
         request.services.clone(),
+        request.event_seqs.clone(),
+        agent_tree,
         Arc::clone(&spend),
     );
     if let Some(handle) = &agent_handle {
@@ -1292,6 +1319,7 @@ async fn run_loop_inner(
         event_seqs,
         tool_input,
         agent_handle,
+        agent_tree: _,
         nested_spend: _,
     } = request;
     let services = match &agent_handle {

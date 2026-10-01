@@ -9,7 +9,7 @@ use std::{
 };
 
 use ra_core::{
-    agent::AgentSpec,
+    agent::{AgentSpec, control::AgentPath},
     compat::SchemaVersion,
     context::RunContext,
     event::{
@@ -18,7 +18,8 @@ use ra_core::{
         NoopHostEventSink,
         agent::{
             AgentClosedEvent, AgentCompletedEvent, AgentMessageSentEvent, AgentOperationId,
-            AgentSpawnedEvent, AgentStatus, AgentStatusChangedEvent,
+            AgentSpawnedEvent, AgentStatus, AgentStatusChangedEvent, SubAgentActivityEvent,
+            SubAgentActivityKind,
         },
         exec::{
             EXEC_EVENT_SCHEMA_VERSION, ExecEvictedEvent, ExecEvictionReason, ExecExitedEvent,
@@ -252,6 +253,11 @@ fn test_all_agent_events_serde_roundtrip_equality() {
         )),
         AgentEvent::Completed(AgentCompletedEvent::new("success")),
         AgentEvent::Closed(AgentClosedEvent::new("completed")),
+        AgentEvent::SubAgentActivity(SubAgentActivityEvent::new(
+            "call-7",
+            AgentPath::root().join("worker").unwrap(),
+            SubAgentActivityKind::Started,
+        )),
     ];
 
     for variant in agent_variants {
@@ -278,6 +284,9 @@ fn test_all_agent_events_serde_roundtrip_equality() {
             HostEventBody::Agent(AgentEvent::StatusChanged(e)) => assert!(e.unknown().is_empty()),
             HostEventBody::Agent(AgentEvent::Completed(e)) => assert!(e.unknown().is_empty()),
             HostEventBody::Agent(AgentEvent::Closed(e)) => assert!(e.unknown().is_empty()),
+            HostEventBody::Agent(AgentEvent::SubAgentActivity(e)) => {
+                assert!(e.unknown().is_empty());
+            }
             _ => panic!("unexpected event body"),
         }
     }
@@ -741,6 +750,79 @@ fn test_unknown_agent_status_keeps_the_whole_envelope() {
         _ => panic!("expected a typed StatusChanged event, not an Unknown fallback"),
     }
 
+    assert_eq!(
+        serde_json::to_value(&event).expect("must serialize"),
+        payload
+    );
+}
+
+#[test]
+fn sub_agent_activity_has_codex_fields_under_the_family_tag() {
+    let worker = AgentPath::root().join("worker").unwrap();
+    for (kind, name) in [
+        (SubAgentActivityKind::Started, "started"),
+        (SubAgentActivityKind::Interacted, "interacted"),
+        (SubAgentActivityKind::Interrupted, "interrupted"),
+        (SubAgentActivityKind::Completed, "completed"),
+    ] {
+        let event = AgentEvent::SubAgentActivity(SubAgentActivityEvent::new(
+            "call-1",
+            worker.clone(),
+            kind,
+        ));
+        let wire = serde_json::to_value(&event).expect("must serialize");
+        assert_eq!(
+            wire,
+            json!({
+                "kind": "sub_agent_activity",
+                "schema_version": 1,
+                "id": "call-1",
+                "agent_path": "/root/worker",
+                "activity": name
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentEvent>(wire).expect("must deserialize"),
+            event
+        );
+    }
+}
+
+#[test]
+fn an_unknown_sub_agent_activity_kind_keeps_the_whole_envelope() {
+    let payload = json!({
+        "schema_version": 1,
+        "seq": 53,
+        "run_id": "run-label-3",
+        "agent_id": "orchestrator",
+        "at": 1700000000000_u64,
+        "body": {
+            "family": "agent",
+            "data": {
+                "schema_version": 1,
+                "kind": "sub_agent_activity",
+                "id": "call-9",
+                "agent_path": "/root/worker",
+                "activity": "resumed",
+                "nickname": "Ada"
+            }
+        }
+    });
+
+    let event: HostEvent =
+        serde_json::from_value(payload.clone()).expect("unknown kind must not fail the envelope");
+
+    match event.body() {
+        HostEventBody::Agent(AgentEvent::SubAgentActivity(activity)) => {
+            assert_eq!(
+                activity.activity(),
+                &SubAgentActivityKind::custom("resumed")
+            );
+            assert_eq!(activity.agent_path().as_str(), "/root/worker");
+            assert!(!activity.unknown().is_empty());
+        }
+        _ => panic!("expected a typed SubAgentActivity event, not an Unknown fallback"),
+    }
     assert_eq!(
         serde_json::to_value(&event).expect("must serialize"),
         payload

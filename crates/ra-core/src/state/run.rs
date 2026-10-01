@@ -225,6 +225,27 @@ impl EventSeqAllocator {
         self.next.load(Ordering::Relaxed)
     }
 
+    /// Raises this allocator's bound to at least `other`'s, atomically.
+    ///
+    /// For two allocators of one run that must become one: a run continued from its checkpoint
+    /// while an earlier segment's allocator is still in use elsewhere. The earlier one is kept and
+    /// raised past everything the restored one promises not to reissue, and the continuation then
+    /// draws from it, so the two can never hand out the same number. The bound only moves forward.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if the allocators belong to different runs; release builds leave this
+    /// allocator unchanged, since one run's numbers say nothing about another's.
+    pub fn advance_past(&self, other: &Self) {
+        debug_assert_eq!(
+            self.run_id, other.run_id,
+            "event sequence allocators of different runs"
+        );
+        if self.run_id == other.run_id {
+            self.next.fetch_max(other.current_next(), Ordering::Relaxed);
+        }
+    }
+
     /// Initializes a restored allocator from a checkpointed next sequence and an optional persisted
     /// maximum sequence.
     ///

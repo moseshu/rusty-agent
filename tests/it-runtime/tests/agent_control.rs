@@ -24,6 +24,7 @@ use ra_core::{
     },
     cancel::CancelScope,
     error::{Error, Result},
+    event::{AgentEvent, HostEventBody, InMemoryHostEventSink, SubAgentActivityKind},
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
@@ -36,6 +37,7 @@ use ra_core::{
     state::{RunId, RunState},
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        ToolServices,
     },
     usage::{RequestUsage, Usage},
 };
@@ -2575,4 +2577,948 @@ fn completion_messages_report_terminal_statuses_only() {
             .content(),
         FINAL_ANSWER
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Activity on the host timeline
+// ---------------------------------------------------------------------------------------------
+
+/// One recorded activity: the run and agent whose timeline holds it, its id, the agent it
+/// happened to, and what happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Activity {
+    run: String,
+    agent: String,
+    id: String,
+    path: String,
+    kind: SubAgentActivityKind,
+}
+
+fn activities(sink: &InMemoryHostEventSink) -> Vec<Activity> {
+    sink.events()
+        .iter()
+        .filter_map(|event| match event.body() {
+            HostEventBody::Agent(AgentEvent::SubAgentActivity(activity)) => Some(Activity {
+                run: event.run_id().to_string(),
+                agent: event.agent_id().to_string(),
+                id: activity.id().to_owned(),
+                path: activity.agent_path().to_string(),
+                kind: activity.activity().clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn activity(run: &str, agent: &str, id: &str, path: &str, kind: SubAgentActivityKind) -> Activity {
+    Activity {
+        run: run.to_owned(),
+        agent: agent.to_owned(),
+        id: id.to_owned(),
+        path: path.to_owned(),
+        kind,
+    }
+}
+
+/// A parent's `wait_agent` that lets a child answer only once the parent's request is built, so
+/// the answer arrives during the wait instead of being delivered at that model call.
+fn wait_releasing(id: &str, child: &Arc<Notify>) -> Step {
+    let child = Arc::clone(child);
+    Step::After(
+        Box::pin(async move { child.notify_one() }),
+        tool_call(
+            id,
+            &format!("{id}-call"),
+            "wait_agent",
+            json!({"timeout_ms": 10_000}),
+        ),
+    )
+}
+
+/// A child's final answer, given once `gate` is released.
+fn final_after(gate: &Arc<Notify>, id: &str, text: &str) -> Step {
+    let gate = Arc::clone(gate);
+    Step::After(
+        Box::pin(async move { gate.notified().await }),
+        final_message(id, text),
+    )
+}
+
+fn with_sink(request: RunRequest, sink: &InMemoryHostEventSink) -> RunRequest {
+    request.with_services(ToolServices::new().with_event_sink(Arc::new(sink.clone())))
+}
+
+/// Replaces the generated run id in a completion's id, which a test cannot know in advance.
+fn completion_ids_checked(mut recorded: Vec<Activity>) -> Vec<Activity> {
+    for activity in &mut recorded {
+        if activity.kind == SubAgentActivityKind::Completed {
+            let run = activity
+                .id
+                .strip_prefix("subagent-completed-")
+                .expect("a completion is keyed by the run that completed");
+            assert!(!run.is_empty());
+            activity.id = "subagent-completed-*".to_owned();
+        }
+    }
+    recorded
+}
+
+#[tokio::test]
+async fn spawns_messages_and_completed_runs_are_recorded_on_the_callers_timeline() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let worker_turn = Arc::new(Notify::new());
+
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_worker("l-1", "count the files")),
+    );
+    scripts.push("lead", wait_releasing("l-2", &worker_turn));
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-3",
+            "l-3-call",
+            "send_message",
+            json!({"target": "worker", "message": "Include hidden files."}),
+        )),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-4",
+            "l-4-call",
+            "followup_task",
+            json!({"target": "worker", "message": "Count again."}),
+        )),
+    );
+    scripts.push("lead", wait_releasing("l-5", &worker_turn));
+    scripts.push("lead", Step::Respond(final_message("l-6", "done")));
+    scripts.push("worker", final_after(&worker_turn, "w-1", "42 files"));
+    scripts.push("worker", final_after(&worker_turn, "w-2", "45 files"));
+
+    let request = with_sink(
+        root_request(&scripts, &control, worker_agent(Vec::new())),
+        &sink,
+    );
+    assert_eq!(Runner::run(request).await.unwrap().final_text(), "done");
+
+    let recorded = activities(&sink);
+    let completions: Vec<&str> = recorded
+        .iter()
+        .filter(|activity| activity.kind == SubAgentActivityKind::Completed)
+        .map(|activity| activity.id.as_str())
+        .collect();
+    assert_eq!(completions.len(), 2);
+    assert_ne!(
+        completions[0], completions[1],
+        "each run is its own completion"
+    );
+    let worker = "/root/worker";
+    assert_eq!(
+        completion_ids_checked(recorded),
+        vec![
+            activity(
+                "run-root",
+                "lead",
+                "l-1-call",
+                worker,
+                SubAgentActivityKind::Started
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "subagent-completed-*",
+                worker,
+                SubAgentActivityKind::Completed
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "l-3-call",
+                worker,
+                SubAgentActivityKind::Interacted
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "l-4-call",
+                worker,
+                SubAgentActivityKind::Interacted
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "subagent-completed-*",
+                worker,
+                SubAgentActivityKind::Completed
+            ),
+        ]
+    );
+    // One sequence for the run, whoever recorded the event: the tools or the tree.
+    let seqs: Vec<u64> = sink
+        .events()
+        .iter()
+        .filter(|event| event.run_id().as_str() == "run-root")
+        .map(ra_core::event::HostEvent::seq)
+        .collect();
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+}
+
+#[tokio::test]
+async fn an_interrupt_is_recorded_and_runs_that_do_not_complete_record_no_completion() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let slow = GateTool::new();
+    let tool_started = Arc::clone(&slow.started);
+
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "index the repo")));
+    scripts.push(
+        "lead",
+        Step::After(
+            Box::pin(async move { tool_started.notified().await }),
+            tool_call(
+                "l-2",
+                "l-2-call",
+                "interrupt_agent",
+                json!({"target": "worker"}),
+            ),
+        ),
+    );
+    let watch = control.clone();
+    scripts.push(
+        "lead",
+        Step::After(
+            Box::pin(async move {
+                drop(
+                    watch
+                        .wait_for_status(&worker_path(), |status| {
+                            *status == AgentStatus::Interrupted
+                        })
+                        .await,
+                );
+            }),
+            tool_call(
+                "l-3",
+                "l-3-call",
+                "followup_task",
+                json!({"target": "worker", "message": "Try again."}),
+            ),
+        ),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-4", "gave up")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "slow_task", json!({}))),
+    );
+    // The follow-up's run finds no response scripted and fails.
+
+    let request = with_sink(
+        root_request(&scripts, &control, worker_agent(vec![Arc::new(slow)])),
+        &sink,
+    );
+    assert_eq!(Runner::run(request).await.unwrap().final_text(), "gave up");
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Errored(_))
+    })
+    .await;
+
+    let worker = "/root/worker";
+    assert_eq!(
+        activities(&sink),
+        vec![
+            activity(
+                "run-root",
+                "lead",
+                "l-1-call",
+                worker,
+                SubAgentActivityKind::Started
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "l-2-call",
+                worker,
+                SubAgentActivityKind::Interrupted
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "l-3-call",
+                worker,
+                SubAgentActivityKind::Interacted
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_run_started_by_another_agent_records_its_completion_on_that_agents_timeline() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let worker_turn = Arc::new(Notify::new());
+    let helper = AgentSpec::builder()
+        .id(AgentId::new("helper"))
+        .name("Helper")
+        .instructions("helper")
+        .tools(collaboration())
+        .build()
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(worker_agent(Vec::new()))
+        .register(helper)
+        .build()
+        .unwrap();
+
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_worker("l-1", "draft the notes")),
+    );
+    scripts.push("lead", wait_releasing("l-2", &worker_turn));
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_call(
+            "l-3",
+            "helper",
+            "helper",
+            "Have the worker add a summary.",
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-4", "delegated")));
+    scripts.push("worker", final_after(&worker_turn, "w-1", "notes drafted"));
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-2", "summary added")),
+    );
+    scripts.push(
+        "helper",
+        Step::Respond(tool_call(
+            "h-1",
+            "h-1-call",
+            "followup_task",
+            json!({"target": "/root/worker", "message": "Add a summary."}),
+        )),
+    );
+    scripts.push("helper", Step::Respond(final_message("h-2", "asked")));
+
+    let request = RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+        RunId::new("run-root"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("do the work"))],
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root());
+    let request = with_sink(request, &sink);
+    assert_eq!(
+        Runner::run(request).await.unwrap().final_text(),
+        "delegated"
+    );
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("summary added".to_owned()))
+    })
+    .await;
+    let helper_path = AgentPath::root().join("helper").unwrap();
+    eventually_status(&control, &helper_path, |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    let recorded = completion_ids_checked(activities(&sink));
+    let (lead, helper): (Vec<_>, Vec<_>) = recorded
+        .into_iter()
+        .partition(|activity| activity.agent == "lead");
+    let worker = "/root/worker";
+    assert_eq!(
+        lead,
+        vec![
+            activity(
+                "run-root",
+                "lead",
+                "l-1-call",
+                worker,
+                SubAgentActivityKind::Started
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "subagent-completed-*",
+                worker,
+                SubAgentActivityKind::Completed
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "l-3-call",
+                "/root/helper",
+                SubAgentActivityKind::Started
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "subagent-completed-*",
+                "/root/helper",
+                SubAgentActivityKind::Completed
+            ),
+        ]
+    );
+    // The worker's second run was asked for by the helper, so the helper's run records it, though
+    // the worker's final answer still goes to its parent.
+    assert_eq!(helper.len(), 2, "{helper:?}");
+    assert!(helper.iter().all(|activity| activity.agent == "helper"
+        && activity.run == helper[0].run
+        && activity.run != "run-root"
+        && activity.path == worker));
+    assert_eq!(
+        helper
+            .iter()
+            .map(|activity| (activity.id.as_str(), activity.kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("h-1-call", SubAgentActivityKind::Interacted),
+            ("subagent-completed-*", SubAgentActivityKind::Completed),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_run_started_by_follow_ups_from_two_runs_records_no_completion() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let slow = GateTool::new();
+    let tool_started = Arc::clone(&slow.started);
+    let worker_turn = Arc::new(Notify::new());
+    let worker = worker_agent(vec![Arc::new(slow)]);
+
+    // The first root run spawns the worker and, while the worker sits in a tool call, asks it for
+    // more; the follow-up waits in the mailbox for the worker's next model call.
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "index the repo")));
+    scripts.push(
+        "lead",
+        Step::After(
+            Box::pin(async move { tool_started.notified().await }),
+            tool_call(
+                "l-2",
+                "l-2-call",
+                "followup_task",
+                json!({"target": "worker", "message": "List the crates."}),
+            ),
+        ),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("l-3", "first run done")),
+    );
+    // A second root run asks again and interrupts the worker, which then starts a new run on both
+    // follow-ups — mail from two different runs.
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-4",
+            "l-4-call",
+            "followup_task",
+            json!({"target": "worker", "message": "List the tests."}),
+        )),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-5",
+            "l-5-call",
+            "interrupt_agent",
+            json!({"target": "worker"}),
+        )),
+    );
+    scripts.push("lead", wait_releasing("l-6", &worker_turn));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("l-7", "second run done")),
+    );
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "slow_task", json!({}))),
+    );
+    scripts.push(
+        "worker",
+        final_after(&worker_turn, "w-2", "crates and tests"),
+    );
+
+    let first = with_sink(root_request(&scripts, &control, Arc::clone(&worker)), &sink);
+    assert_eq!(
+        Runner::run(first).await.unwrap().final_text(),
+        "first run done"
+    );
+    let registry = AgentRegistry::builder().register(worker).build().unwrap();
+    let second = RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+        RunId::new("run-root-2"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("keep going"))],
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root());
+    let second = with_sink(second, &sink);
+    assert_eq!(
+        Runner::run(second).await.unwrap().final_text(),
+        "second run done"
+    );
+    assert_eq!(
+        control.status(&worker_path()),
+        Some(AgentStatus::Completed(Some("crates and tests".to_owned())))
+    );
+    let last_worker_input = texts(scripts.inputs("worker").last().unwrap());
+    assert!(
+        last_worker_input
+            .iter()
+            .any(|text| text.ends_with("List the crates."))
+    );
+    assert!(
+        last_worker_input
+            .iter()
+            .any(|text| text.ends_with("List the tests."))
+    );
+
+    let worker = "/root/worker";
+    assert_eq!(
+        activities(&sink),
+        vec![
+            activity(
+                "run-root",
+                "lead",
+                "l-1-call",
+                worker,
+                SubAgentActivityKind::Started
+            ),
+            activity(
+                "run-root",
+                "lead",
+                "l-2-call",
+                worker,
+                SubAgentActivityKind::Interacted
+            ),
+            activity(
+                "run-root-2",
+                "lead",
+                "l-4-call",
+                worker,
+                SubAgentActivityKind::Interacted
+            ),
+            activity(
+                "run-root-2",
+                "lead",
+                "l-5-call",
+                worker,
+                SubAgentActivityKind::Interrupted
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_run_paused_for_approval_records_its_completion_only_once_it_completes() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "deploy", json!({}))),
+    );
+    let request = root_request(
+        &scripts,
+        &control,
+        worker_agent(vec![Arc::new(GuardedTool::new())]),
+    );
+    Runner::run(with_sink(request, &sink)).await.unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the worker pauses for approval");
+
+    // Waiting for an approval is not the end of the run.
+    let worker = "/root/worker";
+    let started = activity(
+        "run-root",
+        "lead",
+        "l-1-call",
+        worker,
+        SubAgentActivityKind::Started,
+    );
+    assert_eq!(activities(&sink), vec![started.clone()]);
+
+    let mut state = paused.state().clone();
+    let run_id = state.run_id().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    scripts.push("worker", Step::Respond(final_message("w-2", "deployed")));
+    control.resume(&worker_path(), state).unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    // The run that paused is the run that completed, recorded once on the spawning run.
+    assert_eq!(
+        activities(&sink),
+        vec![
+            started,
+            activity(
+                "run-root",
+                "lead",
+                &format!("subagent-completed-{run_id}"),
+                worker,
+                SubAgentActivityKind::Completed,
+            ),
+        ]
+    );
+}
+
+/// The sequence numbers of the events recorded for `run`, in the order the sink received them.
+fn seqs_of(sink: &InMemoryHostEventSink, run: &str) -> Vec<u64> {
+    sink.events()
+        .iter()
+        .filter(|event| event.run_id().as_str() == run)
+        .map(ra_core::event::HostEvent::seq)
+        .collect()
+}
+
+fn assert_unique_and_rising(seqs: &[u64]) {
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "sequence numbers must be unique and rising: {seqs:?}"
+    );
+}
+
+/// Continues the root run `state` belongs to, bound to `control`'s root, with `input`.
+fn continue_root(
+    scripts: &Arc<Scripts>,
+    control: &AgentControl,
+    state: RunState,
+    input: &str,
+    sink: &InMemoryHostEventSink,
+) -> RunRequest {
+    let input = if input.is_empty() {
+        Vec::new()
+    } else {
+        vec![ModelInputItem::Message(Message::user(input))]
+    };
+    let request = RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(Arc::clone(scripts))) as Arc<dyn ModelResolver>,
+        state.run_id().clone(),
+        CancelScope::root(),
+        input,
+    )
+    .with_state(state)
+    .with_config(
+        RunConfig::new().with_agent_registry(
+            AgentRegistry::builder()
+                .register(worker_agent(Vec::new()))
+                .build()
+                .unwrap(),
+        ),
+    )
+    .with_agent_control(control.root());
+    with_sink(request, sink)
+}
+
+#[tokio::test]
+async fn a_run_continued_from_its_checkpoint_shares_a_sequence_with_a_completion_recorded_after_it_returned()
+ {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let worker_turn = Arc::new(Notify::new());
+
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_worker("l-1", "count the files")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", final_after(&worker_turn, "w-1", "42 files"));
+    let first = Runner::run(with_sink(
+        root_request(&scripts, &control, worker_agent(Vec::new())),
+        &sink,
+    ))
+    .await
+    .unwrap();
+    // The worker completes after the root run returned; the completion is still the root run's.
+    worker_turn.notify_one();
+    eventually(
+        || {
+            activities(&sink)
+                .iter()
+                .any(|activity| activity.kind == SubAgentActivityKind::Completed)
+        },
+        "the worker's completion is recorded",
+    )
+    .await;
+
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-3",
+            "l-3-call",
+            "send_message",
+            json!({"target": "worker", "message": "Thanks."}),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-4", "noted")));
+    let second = continue_root(&scripts, &control, first.state().clone(), "thank it", &sink);
+    assert_eq!(Runner::run(second).await.unwrap().final_text(), "noted");
+
+    assert_eq!(
+        completion_ids_checked(activities(&sink))
+            .into_iter()
+            .map(|activity| (activity.run, activity.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("run-root".to_owned(), SubAgentActivityKind::Started),
+            ("run-root".to_owned(), SubAgentActivityKind::Completed),
+            ("run-root".to_owned(), SubAgentActivityKind::Interacted),
+        ]
+    );
+    assert_unique_and_rising(&seqs_of(&sink, "run-root"));
+}
+
+#[tokio::test]
+async fn a_completion_recorded_during_a_continued_run_is_covered_by_its_checkpoint() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let worker_turn = Arc::new(Notify::new());
+
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_worker("l-1", "count the files")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", final_after(&worker_turn, "w-1", "42 files"));
+    let first = Runner::run(with_sink(
+        root_request(&scripts, &control, worker_agent(Vec::new())),
+        &sink,
+    ))
+    .await
+    .unwrap();
+
+    // The continued run lets the worker finish and waits for its answer, so the completion is
+    // recorded while both the continuation and the earlier segment's origin hold the sequence.
+    scripts.push("lead", wait_releasing("l-3", &worker_turn));
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-4",
+            "l-4-call",
+            "send_message",
+            json!({"target": "worker", "message": "Thanks."}),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-5", "noted")));
+    let second = Runner::run(continue_root(
+        &scripts,
+        &control,
+        first.state().clone(),
+        "wait for it",
+        &sink,
+    ))
+    .await
+    .unwrap();
+    let seqs = seqs_of(&sink, "run-root");
+    assert_eq!(seqs.len(), 3, "started, completed, interacted");
+    assert_unique_and_rising(&seqs);
+
+    // Continued once more under a tree that never saw the run, the checkpoint alone has to keep
+    // the run clear of every number already issued — including the completion's.
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_call("l-6", "auditor", "worker", "audit")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-7", "audited")));
+    scripts.push("worker", Step::Respond(final_message("w-2", "clean")));
+    let elsewhere = AgentControl::new();
+    let third = continue_root(&scripts, &elsewhere, second.state().clone(), "audit", &sink);
+    assert_eq!(Runner::run(third).await.unwrap().final_text(), "audited");
+    let seqs = seqs_of(&sink, "run-root");
+    assert!(seqs.len() > 3);
+    assert_unique_and_rising(&seqs);
+    elsewhere.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_nested_agent_tool_run_continued_after_approval_shares_a_sequence_with_its_completions() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let worker_turn = Arc::new(Notify::new());
+    let mut nested_tools = collaboration();
+    nested_tools.push(Arc::new(GuardedTool::new()));
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("nested"))
+        .name("Nested")
+        .instructions("nested")
+        .tools(nested_tools)
+        .build()
+        .unwrap();
+    let lead = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .instructions("lead")
+        .tool(Arc::new(nested.as_tool().build().unwrap()))
+        .build()
+        .unwrap();
+    let config = RunConfig::new().with_agent_registry(
+        AgentRegistry::builder()
+            .register(worker_agent(Vec::new()))
+            .build()
+            .unwrap(),
+    );
+    let request = |run_id: RunId, input: Vec<ModelInputItem>| {
+        with_sink(
+            RunRequest::new(
+                AgentBinding::direct(Arc::clone(&lead)),
+                Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+                run_id,
+                CancelScope::root(),
+                input,
+            )
+            .with_config(config.clone())
+            .with_agent_control(control.root()),
+            &sink,
+        )
+    };
+
+    // The nested run spawns a worker, then stops to ask for approval; the worker completes once
+    // the paused run has returned, on the nested run's timeline.
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-1",
+            "l-1-call",
+            "nested",
+            json!({"input": "ship"}),
+        )),
+    );
+    scripts.push(
+        "nested",
+        Step::Respond(spawn_call("n-1", "worker", "worker", "prepare the release")),
+    );
+    scripts.push(
+        "nested",
+        Step::Respond(tool_call("n-2", "n-2-call", "deploy", json!({}))),
+    );
+    scripts.push("worker", final_after(&worker_turn, "w-1", "prepared"));
+    let first = Runner::run(request(
+        RunId::new("run-root"),
+        vec![ModelInputItem::Message(Message::user("release"))],
+    ))
+    .await
+    .unwrap();
+    assert!(!first.outcome().interruptions().is_empty());
+    worker_turn.notify_one();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let nested_run = activities(&sink)
+        .into_iter()
+        .find(|activity| activity.kind == SubAgentActivityKind::Completed)
+        .expect("the completion is recorded")
+        .run;
+    assert_ne!(nested_run, "run-root");
+
+    // Approved and continued, the nested run messages the worker from its new segment.
+    let mut state = first.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    scripts.push(
+        "nested",
+        Step::Respond(tool_call(
+            "n-3",
+            "n-3-call",
+            "send_message",
+            json!({"target": "worker", "message": "Deployed."}),
+        )),
+    );
+    scripts.push("nested", Step::Respond(final_message("n-4", "shipped")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "released")));
+    let second = Runner::run(request(RunId::new("run-root"), Vec::new()).with_state(state))
+        .await
+        .unwrap();
+    assert_eq!(second.final_text(), "released");
+
+    assert_eq!(
+        activities(&sink)
+            .into_iter()
+            .filter(|activity| activity.run == nested_run)
+            .map(|activity| activity.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            SubAgentActivityKind::Started,
+            SubAgentActivityKind::Completed,
+            SubAgentActivityKind::Interacted,
+        ]
+    );
+    assert_unique_and_rising(&seqs_of(&sink, &nested_run));
+}
+
+#[tokio::test]
+async fn a_continuation_resumed_past_a_persisted_log_raises_the_shared_sequence() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    let worker_turn = Arc::new(Notify::new());
+
+    scripts.push(
+        "lead",
+        Step::Respond(spawn_worker("l-1", "count the files")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", final_after(&worker_turn, "w-1", "42 files"));
+    let first = Runner::run(with_sink(
+        root_request(&scripts, &control, worker_agent(Vec::new())),
+        &sink,
+    ))
+    .await
+    .unwrap();
+    worker_turn.notify_one();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    // The host's log says the run already wrote number 40; the continuation and the sequence the
+    // tree holds for the run both have to move past it.
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-3",
+            "l-3-call",
+            "send_message",
+            json!({"target": "worker", "message": "Thanks."}),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-4", "noted")));
+    let second = RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+        RunId::new("run-root"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("thank it"))],
+    )
+    .with_state_and_persisted_max_seq(first.state().clone(), Some(40))
+    .with_agent_control(control.root());
+    assert_eq!(
+        Runner::run(with_sink(second, &sink))
+            .await
+            .unwrap()
+            .final_text(),
+        "noted"
+    );
+    assert_eq!(seqs_of(&sink, "run-root"), vec![0, 1, 41]);
 }

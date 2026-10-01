@@ -29,11 +29,11 @@ use ra_core::{
     cancel::CancelScope,
     item::ModelInputItem,
     model::ModelResolver,
-    state::{RunId, RunState},
+    state::{EventSeqAllocator, RunId, RunState},
     tool::ToolServices,
 };
 
-use crate::{budget::RunSpend, runner::RunConfig};
+use crate::{agent::control::AgentTreeRef, budget::RunSpend, runner::RunConfig};
 
 tokio::task_local! {
     static CURRENT: ParentRun;
@@ -53,6 +53,9 @@ struct ParentRunEnvironment {
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     run_id: RunId,
     services: ToolServices,
+    /// The run's host event sequence, which events the control plane records for it draw from.
+    event_seqs: EventSeqAllocator,
+    agent_tree: Option<AgentTreeRef>,
     /// What the run has spent, which a nested run it starts bills its own calls to as well.
     spend: Arc<RunSpend>,
     /// The agent running the current turn and the history that turn's request was built from.
@@ -71,7 +74,9 @@ impl ParentRun {
     ///
     /// `agent` is the agent the run starts with, until the loop reports the agent of each turn;
     /// `services` are the ports the run was given. An agent spawned into the background from this
-    /// run starts from both. `spend` is the run's live spend.
+    /// run starts from both. `event_seqs` is the run's host event sequence, `agent_tree` the agent
+    /// tree it executes in, and `spend` its live spend.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model_resolver: Arc<dyn ModelResolver>,
         config: RunConfig,
@@ -79,6 +84,8 @@ impl ParentRun {
         run_id: RunId,
         agent: Arc<AgentSpec>,
         services: ToolServices,
+        event_seqs: EventSeqAllocator,
+        agent_tree: Option<AgentTreeRef>,
         spend: Arc<RunSpend>,
     ) -> Self {
         Self {
@@ -88,6 +95,8 @@ impl ParentRun {
                 app_context,
                 run_id,
                 services,
+                event_seqs,
+                agent_tree,
                 spend,
                 turn: Mutex::new(TurnView {
                     agent,
@@ -166,6 +175,16 @@ impl ParentRun {
 
     pub(crate) fn services(&self) -> &ToolServices {
         &self.run.services
+    }
+
+    /// The run's host event sequence.
+    pub(crate) fn event_seqs(&self) -> &EventSeqAllocator {
+        &self.run.event_seqs
+    }
+
+    /// The agent tree the run executes in, if any, which a nested run it starts executes in too.
+    pub(crate) fn agent_tree(&self) -> Option<&AgentTreeRef> {
+        self.run.agent_tree.as_ref()
     }
 
     /// What the run has spent, as a nested run it starts sees it.

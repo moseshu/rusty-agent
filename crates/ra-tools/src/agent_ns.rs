@@ -12,6 +12,11 @@
 //! redirect the child with `followup_task` or `send_message` — delivered at the child's next model
 //! call — stop its current run with `interrupt_agent`, or carry on without it.
 //!
+//! A successful `spawn_agent`, `send_message`, `followup_task` or `interrupt_agent` records a
+//! [`SubAgentActivityEvent`] on the caller's host timeline, keyed by the call's id, as Codex's
+//! handlers emit a sub-agent activity item; the completion of a run they started is recorded by
+//! the runtime.
+//!
 //! # Deviations from Codex
 //!
 //! - `spawn_agent` takes no `model` or `reasoning_effort`; Codex also hides those behind
@@ -30,12 +35,13 @@ use ra_core::{
     agent::{
         AgentId,
         control::{
-            AgentControlError, AgentControlPort, AgentStatus, LiveAgent, MessageDeliveryMode,
-            SpawnAgentForkMode, SpawnAgentRequest, WaitOutcome,
+            AgentControlError, AgentControlPort, AgentPath, AgentStatus, LiveAgent,
+            MessageDeliveryMode, SpawnAgentForkMode, SpawnAgentRequest, WaitOutcome,
         },
     },
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
+    event::{AgentEvent, SubAgentActivityEvent, SubAgentActivityKind},
     permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, Tool, ToolAvailability, ToolContext, ToolFailureHandling,
@@ -431,6 +437,7 @@ impl CollaborationTool {
                     .spawn(request)
                     .await
                     .map_err(|error| self.spawn_error(&error))?;
+                record_activity(context, agent.agent_path(), SubAgentActivityKind::Started);
                 json_output(&json!({ "task_name": agent.agent_path() }))
             }
             CollaborationKind::SendMessage | CollaborationKind::FollowupTask => {
@@ -446,9 +453,11 @@ impl CollaborationTool {
                     )
                 };
                 let message = self.message_content(message)?;
-                port.send(&target, message, mode)
+                let receiver = port
+                    .send(&target, message, mode)
                     .await
                     .map_err(|error| self.agent_error(&error))?;
+                record_activity(context, &receiver, SubAgentActivityKind::Interacted);
                 Ok(ToolOutput::text(String::new()))
             }
             CollaborationKind::InterruptAgent => {
@@ -457,6 +466,10 @@ impl CollaborationTool {
                     .interrupt(&input.target)
                     .await
                     .map_err(|error| self.agent_error(&error))?;
+                // The port resolved the same reference against the caller to find the agent.
+                if let Ok(receiver) = port.caller().resolve(&input.target) {
+                    record_activity(context, &receiver, SubAgentActivityKind::Interrupted);
+                }
                 json_output(&InterruptAgentResult { previous_status })
             }
             CollaborationKind::WaitAgent => {
@@ -489,6 +502,26 @@ impl CollaborationTool {
                 })
             }
         }
+    }
+}
+
+/// Records an activity of `agent` on the caller's timeline, keyed by this call, as Codex's
+/// `emit_sub_agent_activity` does once the operation has succeeded.
+///
+/// A host that installed no event sink records nothing; a sequence that cannot be allocated is
+/// logged rather than failing a call whose operation has already happened.
+fn record_activity(context: &ToolContext<'_>, agent: &AgentPath, activity: SubAgentActivityKind) {
+    let Some(emitter) = context.event_emitter() else {
+        return;
+    };
+    let event = SubAgentActivityEvent::new(context.call_id().as_str(), agent.clone(), activity);
+    if let Err(error) = emitter.emit_agent(AgentEvent::SubAgentActivity(event)) {
+        tracing::warn!(
+            agent = %agent,
+            call_id = %context.call_id(),
+            %error,
+            "a sub-agent activity could not be recorded on the host event channel"
+        );
     }
 }
 

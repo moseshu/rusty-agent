@@ -29,7 +29,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::{
-    agent::{AgentEvent, AgentOperationId},
+    agent::{AgentEvent, AgentOperationId, SubAgentActivityEvent, SubAgentActivityKind},
     exec::ExecEvent,
     file::FileEvent,
     sink::{FnHostEventSink, HostEventSink, InMemoryHostEventSink, NoopHostEventSink},
