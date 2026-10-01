@@ -220,9 +220,12 @@ impl RunContext {
 
     /// Tokens the run has spent so far, per request and in total.
     ///
-    /// The same ledger [`RunState::usage_totals`](crate::state::RunState::usage_totals) owns, as of
-    /// the stage that built this context — including the call that has just been paid for, so a
-    /// tool reads spend that already includes the turn it is running under.
+    /// The ledger [`RunState::usage_totals`](crate::state::RunState::usage_totals) owns, as of the
+    /// stage that built this context — including the call that has just been paid for, so a tool
+    /// reads spend that already includes the turn it is running under — together with what the
+    /// agent-tool runs this run started have spent so far. A nested agent-tool run reports the
+    /// usage it shares with the run that started it instead, as the reference hands it that run's
+    /// own usage object: the outermost run's total, every nested call included.
     #[must_use]
     pub const fn usage_totals(&self) -> &Usage {
         &self.usage_totals

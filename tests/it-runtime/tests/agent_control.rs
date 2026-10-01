@@ -24,6 +24,7 @@ use ra_core::{
     },
     cancel::CancelScope,
     error::{Error, Result},
+    finish::FinishReason,
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
         ToolCall,
@@ -36,13 +37,15 @@ use ra_core::{
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
+    usage::{RequestUsage, Usage},
 };
 use ra_runtime::{
     agent::{
         AgentBinding, AgentRegistry,
-        control::{AgentControl, PausedAgentRun},
+        control::{AgentControl, PausedAgentRun, RolloutBudgetConfig},
+        tool::AgentAsTool,
     },
-    runner::{RunConfig, RunRequest, Runner},
+    runner::{ContinuationInput, RunConfig, RunRequest, Runner},
 };
 use ra_tools::agent_ns::{WaitAgentTimeoutOptions, collaboration_tools_with};
 use serde_json::{Value, json};
@@ -67,6 +70,8 @@ enum Step {
 struct Scripts {
     steps: Mutex<HashMap<String, VecDeque<Step>>>,
     calls: Mutex<Vec<(String, Vec<ModelInputItem>)>>,
+    /// The tool names each call advertised, per agent.
+    tools: Mutex<Vec<(String, Vec<String>)>>,
 }
 
 impl Scripts {
@@ -77,6 +82,16 @@ impl Scripts {
             .entry(agent.to_owned())
             .or_default()
             .push_back(step);
+    }
+
+    fn tools(&self, agent: &str) -> Vec<Vec<String>> {
+        self.tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key == agent)
+            .map(|(_, tools)| tools.clone())
+            .collect()
     }
 
     fn inputs(&self, agent: &str) -> Vec<Vec<ModelInputItem>> {
@@ -118,6 +133,14 @@ impl Model for ScriptedModel {
             .lock()
             .unwrap()
             .push((agent.clone(), request.input().to_vec()));
+        self.0.tools.lock().unwrap().push((
+            agent.clone(),
+            request
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect(),
+        ));
         let step = self
             .0
             .steps
@@ -1934,6 +1957,543 @@ async fn an_interrupted_agent_closes_the_agents_below_it_and_stays_when_asked() 
     })
     .await;
     assert_eq!(status, AgentStatus::Completed(Some("resumed".to_owned())));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rollout budget
+// ---------------------------------------------------------------------------------------------
+
+fn billed(response: ModelResponse, usage: RequestUsage) -> ModelResponse {
+    response.with_usage(Usage::from_request(usage))
+}
+
+fn rollout_budget() -> RolloutBudgetConfig {
+    RolloutBudgetConfig::new(100, vec![75, 50, 25])
+}
+
+fn rollout_budget_message(remaining_tokens: u64) -> String {
+    format!(
+        "<rollout_budget>\nYou have {remaining_tokens} weighted tokens left in the shared session token budget.\n</rollout_budget>"
+    )
+}
+
+fn rollout_budget_texts(input: &[ModelInputItem]) -> Vec<String> {
+    texts(input)
+        .into_iter()
+        .filter(|text| text.starts_with("<rollout_budget>"))
+        .collect()
+}
+
+/// A request continuing `previous` with a new user message, as a host's next turn does.
+fn next_turn(
+    scripts: &Arc<Scripts>,
+    control: &AgentControl,
+    previous: &ra_runtime::runner::RunResult,
+    message: &str,
+) -> RunRequest {
+    let mut input = previous.continuation_input(ContinuationInput::Normalized);
+    input.push(ModelInputItem::Message(Message::user(message)));
+    let registry = AgentRegistry::builder()
+        .register(worker_agent(Vec::new()))
+        .build()
+        .unwrap();
+    RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(Arc::clone(scripts))) as Arc<dyn ModelResolver>,
+        RunId::generate(),
+        CancelScope::root(),
+        input,
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root())
+}
+
+#[tokio::test]
+async fn each_run_is_reminded_of_the_weighted_budget_left_at_its_start() {
+    // Codex's `adds_weighted_initial_and_threshold_reminders`, weighted-usage case.
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(
+            rollout_budget()
+                .with_sampling_token_weight(2.0)
+                .with_prefill_token_weight(0.5),
+        )
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            final_message("l-1", "first answer"),
+            RequestUsage::new(60, 15).with_cached_input_tokens(40),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2", "second answer")));
+
+    let first = Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    Runner::run(next_turn(&scripts, &control, &first, "second turn"))
+        .await
+        .unwrap();
+
+    let lead = scripts.inputs("lead");
+    assert_eq!(
+        rollout_budget_texts(&lead[0]),
+        vec![rollout_budget_message(100)]
+    );
+    // 15 output tokens at 2 and 20 uncached input tokens at 0.5 leave 60, past the 75 threshold.
+    // The first reminder stays in history; the new one follows the new input.
+    assert_eq!(
+        rollout_budget_texts(&lead[1]),
+        vec![rollout_budget_message(100), rollout_budget_message(60)]
+    );
+    assert_eq!(texts(&lead[1]).last().unwrap(), &rollout_budget_message(60));
+}
+
+#[tokio::test]
+async fn a_run_is_not_reminded_again_until_another_threshold_is_crossed() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(rollout_budget())
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            final_message("l-1", "first answer"),
+            RequestUsage::new(10, 0),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2", "second answer")));
+
+    let first = Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    Runner::run(next_turn(&scripts, &control, &first, "second turn"))
+        .await
+        .unwrap();
+
+    // 90 left is above every threshold, so the second run brings nothing new.
+    assert_eq!(
+        rollout_budget_texts(&scripts.inputs("lead")[1]),
+        vec![rollout_budget_message(100)]
+    );
+}
+
+#[tokio::test]
+async fn subagent_usage_draws_from_the_shared_budget() {
+    // Codex's `subagent_usage_draws_from_the_shared_budget`.
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(rollout_budget())
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            spawn_worker("l-1", "consume child budget"),
+            RequestUsage::new(10, 0),
+        )),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            final_message("l-2", "spawned"),
+            RequestUsage::new(10, 0),
+        )),
+    );
+    scripts.push(
+        "worker",
+        Step::Respond(billed(
+            final_message("w-1", "consumed"),
+            RequestUsage::new(30, 0),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-3", "reported")));
+
+    let first = Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    Runner::run(next_turn(
+        &scripts,
+        &control,
+        &first,
+        "report the shared budget",
+    ))
+    .await
+    .unwrap();
+
+    // The child forks the root's reminder with the conversation, as Codex keeps it in a fork, and
+    // is told what is left itself when its run starts.
+    let worker = rollout_budget_texts(&scripts.inputs("worker")[0]);
+    assert_eq!(worker.len(), 2);
+    assert_eq!(worker[0], rollout_budget_message(100));
+    let lead = scripts.inputs("lead");
+    assert_eq!(
+        rollout_budget_texts(&lead[2]).last(),
+        Some(&rollout_budget_message(50))
+    );
+    // A spawned agent's spend is the tree's, not the spawning run's: the root's ledger holds only
+    // its own calls, as Codex keeps each thread's usage to itself.
+    assert_eq!(first.state().tokens_used(), 20);
+}
+
+#[tokio::test]
+async fn a_final_answer_that_spends_the_budget_is_kept_but_not_delivered() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(RolloutBudgetConfig::new(30, Vec::new()))
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            final_message("l-1", "the answer"),
+            RequestUsage::new(30, 0),
+        )),
+    );
+
+    let result = Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+
+    // Codex fails the request whose usage spent the budget: the answer is recorded, not delivered.
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    assert!(result.final_message().is_none());
+    assert!(result.new_items().iter().any(|item| matches!(
+        item.kind(),
+        RunItemKind::Message(message) if message.text_content() == "the answer"
+    )));
+}
+
+#[tokio::test]
+async fn an_exhausted_budget_fails_the_current_run_and_every_later_one_after_its_request() {
+    // Codex's `exhausted_budget_fails_current_and_later_turns`.
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(RolloutBudgetConfig::new(30, vec![20, 10]))
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            tool_call("l-1", "l-1-call", "list_agents", json!({})),
+            RequestUsage::new(30, 0),
+        )),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            final_message("l-2", "too late"),
+            RequestUsage::new(1, 0),
+        )),
+    );
+
+    let first = Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    // The call the spending response issued still ran, as Codex drains in-flight tool calls.
+    assert!(
+        first
+            .new_items()
+            .iter()
+            .any(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(_)))
+    );
+    assert_eq!(scripts.inputs("lead").len(), 1);
+
+    // A later run still makes its request, and fails after it.
+    let second = Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    assert!(second.final_message().is_none());
+    assert_eq!(scripts.inputs("lead").len(), 2);
+}
+
+#[tokio::test]
+async fn a_turn_paused_on_a_spent_budget_ends_once_its_answers_are_settled() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(RolloutBudgetConfig::new(30, Vec::new()))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(billed(
+            tool_call("w-1", "w-1-call", "deploy", json!({})),
+            RequestUsage::new(30, 0),
+        )),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-2", "unreachable")));
+    Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(vec![Arc::new(GuardedTool::new())]),
+    ))
+    .await
+    .unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the turn still pauses for its approval");
+
+    let mut state = paused.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    control.resume(&worker_path(), state).unwrap();
+    let status = eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Errored(_))
+    })
+    .await;
+
+    assert_eq!(
+        status,
+        AgentStatus::Errored("the agent stopped before concluding (budget_exhausted)".to_owned())
+    );
+    // The approved call ran; the model was not asked again.
+    assert_eq!(scripts.inputs("worker").len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_tool_run_inside_the_tree_is_charged_and_stopped_by_its_budget() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(RolloutBudgetConfig::new(30, Vec::new()))
+        .unwrap();
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("nested"))
+        .name("Nested")
+        .instructions("nested")
+        .tool(Arc::new(QuickTool::new()))
+        .build()
+        .unwrap();
+    let lead = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .instructions("lead")
+        .tool(Arc::new(nested.as_tool().build().unwrap()))
+        .build()
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            tool_call("l-1", "l-1-call", "nested", json!({"input": "look"})),
+            RequestUsage::new(10, 0),
+        )),
+    );
+    scripts.push(
+        "nested",
+        Step::Respond(billed(
+            tool_call("n-1", "n-1-call", "quick_look", json!({})),
+            RequestUsage::new(25, 0),
+        )),
+    );
+    scripts.push("nested", Step::Respond(final_message("n-2", "unreachable")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "unreachable")));
+
+    let result = Runner::run(
+        RunRequest::new(
+            AgentBinding::direct(lead),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("do the work"))],
+        )
+        .with_agent_control(control.root()),
+    )
+    .await
+    .unwrap();
+
+    // The nested call reached the tree's budget through the run that started it, and the nested
+    // run stopped on it before calling again; so did the root.
+    assert_eq!(scripts.inputs("nested").len(), 1);
+    assert_eq!(scripts.inputs("lead").len(), 1);
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::BudgetExhausted)
+    );
+    // An agent-tool run is not an agent of the tree and is told nothing about its budget.
+    assert!(rollout_budget_texts(&scripts.inputs("nested")[0]).is_empty());
+}
+
+#[tokio::test]
+async fn a_run_continued_after_approval_is_not_reminded_again() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_budget(rollout_budget())
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    // Past the 75 threshold, which a run starting now would be told about.
+    scripts.push(
+        "worker",
+        Step::Respond(billed(
+            tool_call("w-1", "w-1-call", "deploy", json!({})),
+            RequestUsage::new(30, 0),
+        )),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-2", "deployed")));
+    Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(vec![Arc::new(GuardedTool::new())]),
+    ))
+    .await
+    .unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the worker pauses for approval");
+
+    let mut state = paused.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    control.resume(&worker_path(), state).unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    // Answering an approval finishes the turn it stopped; Codex reminds at the start of a turn.
+    let worker = scripts.inputs("worker");
+    assert_eq!(worker.len(), 2);
+    assert_eq!(
+        rollout_budget_texts(&worker[1]),
+        rollout_budget_texts(&worker[0])
+    );
+}
+
+#[test]
+fn rollout_budget_configuration_is_checked_like_codex() {
+    for (config, message) in [
+        (
+            RolloutBudgetConfig::new(0, Vec::new()),
+            "rollout budget `limit_tokens` must be positive",
+        ),
+        (
+            RolloutBudgetConfig::new(100, vec![0]),
+            "rollout budget `reminder_at_remaining_tokens` must contain only positive values below `limit_tokens`",
+        ),
+        (
+            RolloutBudgetConfig::new(100, vec![100]),
+            "rollout budget `reminder_at_remaining_tokens` must contain only positive values below `limit_tokens`",
+        ),
+        (
+            RolloutBudgetConfig::new(100, Vec::new()).with_sampling_token_weight(-1.0),
+            "rollout budget `sampling_token_weight` must be finite and non-negative",
+        ),
+        (
+            RolloutBudgetConfig::new(100, Vec::new()).with_prefill_token_weight(f64::NAN),
+            "rollout budget `prefill_token_weight` must be finite and non-negative",
+        ),
+    ] {
+        let error = AgentControl::new().with_rollout_budget(config).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+    let error = AgentControl::new()
+        .with_rollout_budget(rollout_budget())
+        .unwrap()
+        .with_rollout_budget(rollout_budget())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("already has a rollout budget"),
+        "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Depth limit
+// ---------------------------------------------------------------------------------------------
+
+const DEPTH_LIMIT_REACHED: &str = "Agent depth limit reached. Solve the task yourself.";
+
+fn offers_spawn(tools: &[String]) -> bool {
+    tools.iter().any(|tool| tool == "spawn_agent")
+}
+
+#[tokio::test]
+async fn an_agent_at_the_depth_limit_is_not_offered_the_tools_and_cannot_spawn() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new().with_max_depth(1);
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "work")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "worked")));
+
+    Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(vec![Arc::new(QuickTool::new())]),
+    ))
+    .await
+    .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    assert!(offers_spawn(&scripts.tools("lead")[0]));
+    // Codex hides every collaboration tool from an agent that may spawn nothing; the rest stay.
+    assert_eq!(scripts.tools("worker")[0], vec!["quick_look".to_owned()]);
+    let worker = control.handle(&worker_path()).unwrap();
+    assert!(worker.spawn_depth_exceeded());
+    assert!(!control.root().spawn_depth_exceeded());
+    let refusal = worker
+        .spawn(SpawnAgentRequest::new("helper", "help"))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.to_string(), DEPTH_LIMIT_REACHED);
+}
+
+#[tokio::test]
+async fn a_zero_depth_limit_keeps_the_root_from_spawning() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new().with_max_depth(0);
+    scripts.push("lead", Step::Respond(final_message("l-1", "alone")));
+
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+
+    assert!(scripts.tools("lead")[0].is_empty());
+    let refusal = control
+        .root()
+        .spawn(SpawnAgentRequest::new("worker", "work"))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.to_string(), DEPTH_LIMIT_REACHED);
+}
+
+#[tokio::test]
+async fn without_a_depth_limit_every_agent_is_offered_the_tools() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "work")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "worked")));
+
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    assert!(offers_spawn(&scripts.tools("worker")[0]));
+    assert!(
+        !control
+            .handle(&worker_path())
+            .unwrap()
+            .spawn_depth_exceeded()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

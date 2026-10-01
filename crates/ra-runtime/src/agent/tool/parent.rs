@@ -33,7 +33,7 @@ use ra_core::{
     tool::ToolServices,
 };
 
-use crate::runner::RunConfig;
+use crate::{budget::RunSpend, runner::RunConfig};
 
 tokio::task_local! {
     static CURRENT: ParentRun;
@@ -53,6 +53,8 @@ struct ParentRunEnvironment {
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     run_id: RunId,
     services: ToolServices,
+    /// What the run has spent, which a nested run it starts bills its own calls to as well.
+    spend: Arc<RunSpend>,
     /// The agent running the current turn and the history that turn's request was built from.
     /// The loop replaces it every turn, so a handoff is reflected from the turn it takes effect.
     turn: Mutex<TurnView>,
@@ -69,7 +71,7 @@ impl ParentRun {
     ///
     /// `agent` is the agent the run starts with, until the loop reports the agent of each turn;
     /// `services` are the ports the run was given. An agent spawned into the background from this
-    /// run starts from both.
+    /// run starts from both. `spend` is the run's live spend.
     pub(crate) fn new(
         model_resolver: Arc<dyn ModelResolver>,
         config: RunConfig,
@@ -77,6 +79,7 @@ impl ParentRun {
         run_id: RunId,
         agent: Arc<AgentSpec>,
         services: ToolServices,
+        spend: Arc<RunSpend>,
     ) -> Self {
         Self {
             run: Arc::new(ParentRunEnvironment {
@@ -85,6 +88,7 @@ impl ParentRun {
                 app_context,
                 run_id,
                 services,
+                spend,
                 turn: Mutex::new(TurnView {
                     agent,
                     history: Arc::new(Vec::new()),
@@ -162,6 +166,11 @@ impl ParentRun {
 
     pub(crate) fn services(&self) -> &ToolServices {
         &self.run.services
+    }
+
+    /// What the run has spent, as a nested run it starts sees it.
+    pub(crate) fn spend(&self) -> &Arc<RunSpend> {
+        &self.run.spend
     }
 
     /// The scope of the tool call being executed; absent outside a dispatched call.

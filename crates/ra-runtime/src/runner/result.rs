@@ -483,6 +483,8 @@ pub struct RunResult {
     state: RunState,
     final_message: Option<Message>,
     agent_tool_invocation: Option<AgentToolInvocation>,
+    /// What the agent-tool runs this segment started spent.
+    nested_usage: Usage,
 }
 
 impl RunResult {
@@ -500,6 +502,7 @@ impl RunResult {
         turns: u32,
         state: RunState,
         final_message: Option<Message>,
+        nested_usage: Usage,
     ) -> Self {
         Self {
             outcome,
@@ -513,6 +516,7 @@ impl RunResult {
             state,
             final_message,
             agent_tool_invocation: None,
+            nested_usage,
         }
     }
 
@@ -639,9 +643,16 @@ impl RunResult {
 
     /// Token usage across every call **this segment** made, per request and in total.
     ///
-    /// Summed from [`Self::model_responses`] rather than accumulated into a field: a stored total
-    /// is a second source of truth that a dropped or retried response can put out of step with the
-    /// calls it claims to summarise.
+    /// The run's own calls are summed from [`Self::model_responses`] rather than accumulated into a
+    /// field: a stored total is a second source of truth that a dropped or retried response can put
+    /// out of step with the calls it claims to summarise.
+    ///
+    /// # Agent-tool runs are included
+    ///
+    /// The calls of every agent-tool run this segment's tool calls started are in here too, as the
+    /// reference bills a nested run on its parent's usage — whether the nested run finished, failed
+    /// or was cancelled. Those calls are not among [`Self::model_responses`], which lists this
+    /// run's own; the nested run's own result reports them as its own.
     ///
     /// # This is not the same number as the run's ledger
     ///
@@ -652,7 +663,7 @@ impl RunResult {
     /// this one as the run's total would under-report every continuation.
     #[must_use]
     pub fn usage(&self) -> Usage {
-        aggregate_usage(&self.model_responses)
+        aggregate_usage(&self.model_responses).accumulate(&self.nested_usage)
     }
 
     /// The message that delivered the run, if it produced one.
