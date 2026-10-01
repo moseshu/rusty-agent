@@ -2,9 +2,11 @@
 
 pub mod pairing;
 pub mod reader;
+pub mod recorder;
 pub mod writer;
 
 pub use reader::{RolloutReader, RolloutSummary, UnifiedReplayItem, graft_child_transcripts};
+pub use recorder::{RolloutFileRecorder, is_persisted_rollout_item};
 pub use writer::{
     ChildAnchorKind, ROLLOUT_SCHEMA_VERSION, RolloutCheckpoint, RolloutChildAnchor,
     RolloutModelUsage, RolloutPayload, RolloutRecord, RolloutSessionMeta, RolloutSidecar,

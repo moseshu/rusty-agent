@@ -7,6 +7,7 @@
 
 pub mod id;
 pub mod port;
+pub mod rollout;
 
 pub use id::SessionId;
 pub use port::Session;
