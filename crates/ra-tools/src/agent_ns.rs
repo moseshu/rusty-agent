@@ -437,7 +437,12 @@ impl CollaborationTool {
                     .spawn(request)
                     .await
                     .map_err(|error| self.spawn_error(&error))?;
-                record_activity(context, agent.agent_path(), SubAgentActivityKind::Started);
+                record_activity(
+                    context,
+                    port,
+                    agent.agent_path(),
+                    SubAgentActivityKind::Started,
+                );
                 json_output(&json!({ "task_name": agent.agent_path() }))
             }
             CollaborationKind::SendMessage | CollaborationKind::FollowupTask => {
@@ -457,7 +462,7 @@ impl CollaborationTool {
                     .send(&target, message, mode)
                     .await
                     .map_err(|error| self.agent_error(&error))?;
-                record_activity(context, &receiver, SubAgentActivityKind::Interacted);
+                record_activity(context, port, &receiver, SubAgentActivityKind::Interacted);
                 Ok(ToolOutput::text(String::new()))
             }
             CollaborationKind::InterruptAgent => {
@@ -468,7 +473,7 @@ impl CollaborationTool {
                     .map_err(|error| self.agent_error(&error))?;
                 // The port resolved the same reference against the caller to find the agent.
                 if let Ok(receiver) = port.caller().resolve(&input.target) {
-                    record_activity(context, &receiver, SubAgentActivityKind::Interrupted);
+                    record_activity(context, port, &receiver, SubAgentActivityKind::Interrupted);
                 }
                 json_output(&InterruptAgentResult { previous_status })
             }
@@ -505,16 +510,25 @@ impl CollaborationTool {
     }
 }
 
-/// Records an activity of `agent` on the caller's timeline, keyed by this call, as Codex's
-/// `emit_sub_agent_activity` does once the operation has succeeded.
+/// Records an activity of `agent` on the caller's timeline, keyed by this call and naming the
+/// agent's session when `port` knows it, as Codex's `emit_sub_agent_activity` does with the agent's
+/// thread id once the operation has succeeded.
 ///
 /// A host that installed no event sink records nothing; a sequence that cannot be allocated is
 /// logged rather than failing a call whose operation has already happened.
-fn record_activity(context: &ToolContext<'_>, agent: &AgentPath, activity: SubAgentActivityKind) {
+fn record_activity(
+    context: &ToolContext<'_>,
+    port: &dyn AgentControlPort,
+    agent: &AgentPath,
+    activity: SubAgentActivityKind,
+) {
     let Some(emitter) = context.event_emitter() else {
         return;
     };
-    let event = SubAgentActivityEvent::new(context.call_id().as_str(), agent.clone(), activity);
+    let mut event = SubAgentActivityEvent::new(context.call_id().as_str(), agent.clone(), activity);
+    if let Some(session_id) = port.agent_session_id(agent) {
+        event = event.with_agent_session_id(session_id);
+    }
     if let Err(error) = emitter.emit_agent(AgentEvent::SubAgentActivity(event)) {
         tracing::warn!(
             agent = %agent,

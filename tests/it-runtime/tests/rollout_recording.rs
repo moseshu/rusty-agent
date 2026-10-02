@@ -15,13 +15,14 @@ use ra_core::{
     cancel::{CancelReason, CancelScope},
     error::{Error, ProviderErrorKind, Result},
     event::{
-        AgentEvent, HostEventBody, InMemoryHostEventSink,
+        AgentEvent, HostEventBody, HostEventSink, InMemoryHostEventSink,
         file::{FileChangeKind, FileChangedEvent, FileEvent, FileReadEvent},
     },
     finish::FinishReason,
+    hook::{HookDecision, HookEvent, HookEventName, UserHook, UserHookContext},
     item::{
-        CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
-        ToolCall,
+        CallId, InputItemNormalizer, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase,
+        RunItem, RunItemKind, ToolCall,
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest,
@@ -29,7 +30,12 @@ use ra_core::{
         NetworkErrorRetryPolicy, NormalizedProviderError, ProviderKey, ReplaySafety, ResolvedModel,
         RetryAdvice, RetryBackoffSettings,
     },
-    session::rollout::{RolloutItem, RolloutRecorder, RolloutRunEnd},
+    session::{
+        SessionId,
+        rollout::{
+            RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutThreadSpawn, RolloutThreadStore,
+        },
+    },
     state::RunId,
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
@@ -39,6 +45,7 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::{AgentBinding, AgentRegistry, control::AgentControl, tool::AgentAsTool},
+    hook::UserHookRegistration,
     runner::{RunConfig, RunRequest, RunStreamEvent, Runner},
 };
 use ra_tools::agent_ns::{WaitAgentTimeoutOptions, collaboration_tools_with};
@@ -58,6 +65,8 @@ enum Step {
 #[derive(Default)]
 struct Scripts {
     steps: Mutex<HashMap<String, VecDeque<Step>>>,
+    /// The input of every request each agent's model was sent, in order.
+    requests: Mutex<HashMap<String, Vec<Vec<ModelInputItem>>>>,
 }
 
 impl Scripts {
@@ -68,6 +77,15 @@ impl Scripts {
             .entry(agent.to_owned())
             .or_default()
             .push_back(step);
+    }
+
+    fn requests(&self, agent: &str) -> Vec<Vec<ModelInputItem>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -94,6 +112,13 @@ struct ScriptedModel(Arc<Scripts>);
 impl Model for ScriptedModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let agent = request.system_instructions().unwrap_or_default().to_owned();
+        self.0
+            .requests
+            .lock()
+            .unwrap()
+            .entry(agent.clone())
+            .or_default()
+            .push(request.input().to_vec());
         let step = self
             .0
             .steps
@@ -1367,4 +1392,895 @@ async fn a_run_continued_on_its_callers_projection_is_rebuilt_without_repeating_
         rebuilt.history(),
         second.continuation_input(ContinuationInput::PreserveAll)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A spawned agent records into a rollout of its own
+// ---------------------------------------------------------------------------------------------
+
+/// Gives every spawned agent's thread a recorder of its own, and keeps what it was told.
+#[derive(Default)]
+struct MemoryThreadStore {
+    threads: Mutex<Vec<(SessionId, RolloutThreadSpawn, Arc<MemoryRecorder>)>>,
+    refuse: bool,
+}
+
+impl MemoryThreadStore {
+    fn refusing() -> Self {
+        Self {
+            refuse: true,
+            ..Self::default()
+        }
+    }
+
+    fn threads(&self) -> Vec<(SessionId, RolloutThreadSpawn, Arc<MemoryRecorder>)> {
+        self.threads.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RolloutThreadStore for MemoryThreadStore {
+    async fn create_thread(
+        &self,
+        session_id: &SessionId,
+        spawn: &RolloutThreadSpawn,
+    ) -> Result<Arc<dyn RolloutRecorder>> {
+        if self.refuse {
+            return Err(Error::caller("the disk is full"));
+        }
+        let recorder = Arc::new(MemoryRecorder::default());
+        self.threads.lock().unwrap().push((
+            session_id.clone(),
+            spawn.clone(),
+            Arc::clone(&recorder),
+        ));
+        Ok(recorder)
+    }
+}
+
+/// On the first sub-agent completion it sees, notes what the spawned agents' rollouts held then.
+struct CompletionWitness {
+    store: Arc<MemoryThreadStore>,
+    seen: Mutex<Option<Vec<Vec<String>>>>,
+}
+
+impl HostEventSink for CompletionWitness {
+    fn emit(&self, event: ra_core::event::HostEvent) {
+        if let HostEventBody::Agent(AgentEvent::SubAgentActivity(activity)) = event.body()
+            && activity.activity().as_str() == "completed"
+        {
+            let mut seen = self.seen.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some(
+                    self.store
+                        .threads()
+                        .iter()
+                        .map(|(_, _, recorder)| labels(recorder))
+                        .collect(),
+                );
+            }
+        }
+    }
+}
+
+fn collaboration_tools() -> Vec<Arc<dyn Tool>> {
+    collaboration_tools_with(WaitAgentTimeoutOptions::new().with_bounds(2_000, 0, 60_000))
+        .unwrap()
+        .into_iter()
+        .map(|tool| Arc::new(tool) as Arc<dyn Tool>)
+        .collect()
+}
+
+fn spawn_call(id: &str, task_name: &str, agent_type: &str) -> ModelResponse {
+    tool_call(
+        id,
+        &format!("{id}-call"),
+        "spawn_agent",
+        json!({"task_name": task_name, "message": format!("do the {task_name} work"), "agent_type": agent_type}),
+    )
+}
+
+fn followup_call(id: &str, target: &str, message: &str) -> ModelResponse {
+    tool_call(
+        id,
+        &format!("{id}-call"),
+        "followup_task",
+        json!({"target": target, "message": message}),
+    )
+}
+
+/// The sub-agent activity a rollout recorded: what happened, to which agent, and its session.
+fn activities(recorder: &MemoryRecorder) -> Vec<(String, AgentPath, Option<SessionId>)> {
+    recorder
+        .items()
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::Event(event) => match event.body() {
+                HostEventBody::Agent(AgentEvent::SubAgentActivity(activity)) => Some((
+                    activity.activity().to_string(),
+                    activity.agent_path().clone(),
+                    activity.agent_session_id().cloned(),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn started_inputs(records: &[ra_session::RolloutRecord]) -> Vec<Vec<ModelInputItem>> {
+    records
+        .iter()
+        .filter_map(|record| match record.payload().unwrap() {
+            ra_session::RolloutPayload::RunStarted(started) => Some(started.input().to_vec()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn normalized(items: &[ModelInputItem]) -> Vec<ModelInputItem> {
+    InputItemNormalizer::new()
+        .normalize_model_items(items)
+        .unwrap()
+        .into_items()
+}
+
+async fn rollout_records(path: &std::path::Path) -> Vec<ra_session::RolloutRecord> {
+    ra_session::RolloutReader::open(path)
+        .read_all()
+        .await
+        .unwrap()
+}
+
+/// Waits until the rollout at `path` has recorded the end of `runs` runs.
+async fn wait_for_ended_runs(path: &std::path::Path, runs: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ended = rollout_records(path)
+            .await
+            .iter()
+            .filter(|record| record.type_name() == "run_ended")
+            .count();
+        if ended >= runs {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {runs} runs to end in {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("rusty_agent_tests").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn a_spawned_agent_records_its_runs_into_a_rollout_of_its_own_tied_to_its_parent() {
+    let scripts = Arc::new(Scripts::default());
+    let recorder = Arc::new(MemoryRecorder::default());
+    let store = Arc::new(MemoryThreadStore::default());
+    let root_session = SessionId::new("session-root");
+    let control = AgentControl::new()
+        .with_rollout_store(
+            Arc::clone(&store) as Arc<dyn RolloutThreadStore>,
+            root_session.clone(),
+        )
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", vec![Arc::new(TouchTool::new())]))
+        .build()
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "touch", json!({}))),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-2", "touched")));
+    let witness = Arc::new(CompletionWitness {
+        store: Arc::clone(&store),
+        seen: Mutex::new(None),
+    });
+
+    let run = request(
+        &scripts,
+        agent("lead", collaboration_tools()),
+        "run-1",
+        &recorder,
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_services(
+        ToolServices::new().with_event_sink(Arc::clone(&witness) as Arc<dyn HostEventSink>),
+    )
+    .with_agent_control(control.root());
+    Runner::run(run).await.unwrap();
+    let worker = AgentPath::root().join("worker").unwrap();
+    eventually(
+        || {
+            activities(&recorder)
+                .iter()
+                .any(|(activity, _, _)| activity == "completed")
+        },
+        "the worker's completion is recorded on the lead's timeline",
+    )
+    .await;
+
+    let threads = store.threads();
+    assert_eq!(threads.len(), 1, "one rollout for the one spawned agent");
+    let (session, spawn, child) = &threads[0];
+    assert_eq!(spawn.root_session_id(), &root_session);
+    assert_eq!(spawn.parent_session_id(), &root_session);
+    assert_eq!(spawn.depth(), 1);
+    assert_eq!(spawn.agent_path(), &worker);
+    assert_eq!(spawn.agent_type(), Some(&AgentId::new("worker")));
+
+    // The worker's run is in its own rollout, whole, and ends there before its parent hears.
+    let recorded = labels(child);
+    let RolloutItem::RunStarted(started) = &child.items()[0] else {
+        panic!("the worker's rollout starts with its run");
+    };
+    let worker_run = started.run_id().clone();
+    assert_eq!(started.parent_run_id(), Some(&RunId::new("run-1")));
+    assert!(recorded.contains(&"item tool_call touch".to_owned()));
+    assert!(recorded.contains(&format!("event file_changed {worker_run}")));
+    assert_eq!(
+        recorded.last().unwrap(),
+        &format!("run_ended {worker_run} Completed")
+    );
+    assert!(child.flushes() >= 1);
+    // Its end was written before its parent was told it completed.
+    let seen = witness.seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        seen[0].last(),
+        Some(&format!("run_ended {worker_run} Completed"))
+    );
+    // And none of it is in the lead's.
+    assert!(
+        !labels(&recorder)
+            .iter()
+            .any(|label| label.contains(worker_run.as_str()))
+    );
+
+    // The lead's timeline names the worker's session, as the tree lists it.
+    assert_eq!(
+        activities(&recorder),
+        vec![
+            ("started".to_owned(), worker.clone(), Some(session.clone())),
+            (
+                "completed".to_owned(),
+                worker.clone(),
+                Some(session.clone())
+            ),
+        ]
+    );
+    let agents = control.agents();
+    assert_eq!(agents[0].session_id(), Some(&root_session));
+    assert_eq!(agents[1].session_id(), Some(session));
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn each_run_of_a_spawned_agent_records_only_what_its_rollout_does_not_hold_yet() {
+    let dir = temp_dir("rollout_recording_subagent_followups");
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(&dir));
+    let root_session = SessionId::new("session-root");
+    let control = AgentControl::new()
+        .with_rollout_store(
+            Arc::clone(&store) as Arc<dyn RolloutThreadStore>,
+            root_session.clone(),
+        )
+        .unwrap();
+    let scripts = Arc::new(Scripts::default());
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", vec![Arc::new(TouchTool::new())]))
+        .build()
+        .unwrap();
+    let lead = agent("lead", collaboration_tools());
+    let root_recorder = Arc::new(MemoryRecorder::default());
+    let root_run = |run: &str| {
+        RunRequest::new(
+            AgentBinding::direct(Arc::clone(&lead)),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new(run),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user(format!(
+                "{run} task"
+            )))],
+        )
+        .with_config(RunConfig::new().with_agent_registry(registry.clone()))
+        .with_agent_control(control.root())
+        .with_rollout_recorder(Arc::clone(&root_recorder) as Arc<dyn RolloutRecorder>)
+    };
+
+    // Forked with the lead's history on its first run, then two follow-ups, one of them with a
+    // tool call.
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "one")));
+    Runner::run(root_run("run-1")).await.unwrap();
+    let worker_session = control.agents()[1].session_id().cloned().unwrap();
+    let path = store.rollout_path(&worker_session).unwrap();
+    wait_for_ended_runs(&path, 1).await;
+
+    scripts.push(
+        "lead",
+        Step::Respond(followup_call("l-3", "worker", "second task")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-4", "followed up")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-2", "w-2-call", "touch", json!({}))),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-3", "two")));
+    Runner::run(root_run("run-2")).await.unwrap();
+    wait_for_ended_runs(&path, 2).await;
+
+    scripts.push(
+        "lead",
+        Step::Respond(followup_call("l-5", "worker", "third task")),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("l-6", "followed up again")),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-4", "three")));
+    Runner::run(root_run("run-3")).await.unwrap();
+    wait_for_ended_runs(&path, 3).await;
+
+    // One request for the first run, two for the second, one for the third.
+    let requests = scripts.requests("worker");
+    assert_eq!(requests.len(), 4);
+    let records = rollout_records(&path).await;
+    let inputs = started_inputs(&records);
+    assert_eq!(inputs.len(), 3);
+    // The first run records all it started on: the history it was forked with and its task.
+    assert_eq!(inputs[0], requests[0]);
+    assert!(inputs[0].len() > 1, "the worker was forked with history");
+    let parents: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record.payload().unwrap() {
+            ra_session::RolloutPayload::RunStarted(started) => {
+                Some(started.parent_run_id().cloned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        parents,
+        vec![
+            Some(RunId::new("run-1")),
+            Some(RunId::new("run-2")),
+            Some(RunId::new("run-3"))
+        ]
+    );
+    // Each later run records only its mail; the rest is the agent's history, recorded already.
+    assert_eq!(inputs[1], vec![requests[1].last().unwrap().clone()]);
+    assert_eq!(inputs[2], vec![requests[3].last().unwrap().clone()]);
+
+    // So the rollout rebuilds the history the agent runs on, once.
+    let rebuilt = ra_session::reconstruct_history(&records).unwrap();
+    let mut expected = requests[3].clone();
+    expected.extend(final_message("w-4", "three").output()[0].to_model_input());
+    assert_eq!(normalized(rebuilt.history()), normalized(&expected));
+
+    // The follow-ups on the lead's timeline name the session the spawn did.
+    let worker = AgentPath::root().join("worker").unwrap();
+    let named: Vec<(String, Option<SessionId>)> = activities(&root_recorder)
+        .into_iter()
+        .filter(|(_, path, _)| path == &worker)
+        .map(|(activity, _, session)| (activity, session))
+        .collect();
+    assert_eq!(
+        named
+            .iter()
+            .filter(|(activity, _)| activity == "interacted")
+            .count(),
+        2,
+        "{named:?}"
+    );
+    assert!(
+        named
+            .iter()
+            .all(|(_, session)| session.as_ref() == Some(&worker_session)),
+        "{named:?}"
+    );
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_spawned_agents_run_stopped_while_it_waits_for_approval_is_recorded_cancelled() {
+    let scripts = Arc::new(Scripts::default());
+    let recorder = Arc::new(MemoryRecorder::default());
+    let store = Arc::new(MemoryThreadStore::default());
+    let control = AgentControl::new()
+        .with_rollout_store(
+            Arc::clone(&store) as Arc<dyn RolloutThreadStore>,
+            SessionId::new("session-root"),
+        )
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", vec![Arc::new(GuardedTool::new())]))
+        .build()
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "deploy", json!({}))),
+    );
+
+    let run = request(
+        &scripts,
+        agent("lead", collaboration_tools()),
+        "run-1",
+        &recorder,
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root());
+    Runner::run(run).await.unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .unwrap();
+    let worker_run = paused.state().run_id().clone();
+    control.close(paused.path()).await.unwrap();
+
+    let (_, _, child) = &store.threads()[0];
+    let recorded = labels(child);
+    let ends: Vec<&String> = recorded
+        .iter()
+        .filter(|label| label.starts_with("run_ended"))
+        .collect();
+    assert_eq!(
+        ends,
+        vec![
+            &format!("run_ended {worker_run} Interrupted"),
+            &format!("run_ended {worker_run} Cancelled"),
+        ],
+        "the segment paused, then the run was cancelled while it waited"
+    );
+    assert_eq!(recorded.last(), ends.last().copied());
+    assert!(child.flushes() >= 2, "the cancellation was flushed");
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_spawn_whose_rollout_cannot_be_created_fails_and_leaves_no_agent() {
+    let scripts = Arc::new(Scripts::default());
+    let recorder = Arc::new(MemoryRecorder::default());
+    let control = AgentControl::new()
+        .with_rollout_store(
+            Arc::new(MemoryThreadStore::refusing()),
+            SessionId::new("session-root"),
+        )
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", Vec::new()))
+        .build()
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("l-2", "could not spawn")),
+    );
+
+    let run = request(
+        &scripts,
+        agent("lead", collaboration_tools()),
+        "run-1",
+        &recorder,
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root());
+    Runner::run(run).await.unwrap();
+
+    assert_eq!(control.agents().len(), 1, "only the root");
+    assert!(activities(&recorder).is_empty());
+    // The model is told why.
+    let lead_requests = scripts.requests("lead");
+    let told = serde_json::to_string(lead_requests.last().unwrap()).unwrap();
+    assert!(told.contains("could not be created"), "{told}");
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_a_store_a_spawned_agent_still_has_a_session_naming_its_life() {
+    let scripts = Arc::new(Scripts::default());
+    let recorder = Arc::new(MemoryRecorder::default());
+    let control = AgentControl::new();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", Vec::new()))
+        .build()
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "done")));
+
+    let run = request(
+        &scripts,
+        agent("lead", collaboration_tools()),
+        "run-1",
+        &recorder,
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root());
+    Runner::run(run).await.unwrap();
+    let worker = AgentPath::root().join("worker").unwrap();
+    let agents = control.agents();
+    assert_eq!(
+        agents[0].session_id(),
+        None,
+        "the tree was not told the root's"
+    );
+    let session = agents[1]
+        .session_id()
+        .cloned()
+        .expect("a spawned agent has one");
+    assert_eq!(
+        activities(&recorder)[0],
+        ("started".to_owned(), worker, Some(session))
+    );
+    control.shutdown().await;
+}
+
+#[test]
+fn a_tree_takes_one_rollout_store() {
+    let control = AgentControl::new()
+        .with_rollout_store(
+            Arc::new(MemoryThreadStore::default()),
+            SessionId::new("session-root"),
+        )
+        .unwrap();
+    assert!(
+        control
+            .with_rollout_store(
+                Arc::new(MemoryThreadStore::default()),
+                SessionId::new("session-other"),
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn spawned_agents_rollout_files_name_the_session_they_were_spawned_from() {
+    let dir = temp_dir("rollout_recording_subagent_tree");
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(&dir));
+    let root_session = SessionId::new("session-root");
+    let control = AgentControl::new()
+        .with_rollout_store(
+            Arc::clone(&store) as Arc<dyn RolloutThreadStore>,
+            root_session.clone(),
+        )
+        .unwrap();
+    let root_path = store.rollout_path(&root_session).unwrap();
+    let root_recorder: Arc<dyn RolloutRecorder> =
+        Arc::new(ra_session::RolloutFileRecorder::create_with_session_meta(
+            &root_path,
+            ra_session::RolloutSessionMeta::new(root_session.clone()),
+        ));
+    let scripts = Arc::new(Scripts::default());
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", collaboration_tools()))
+        .register(agent("helper", Vec::new()))
+        .build()
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(spawn_call("w-1", "helper", "helper")),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-2", "delegated")));
+    scripts.push("helper", Step::Respond(final_message("h-1", "helped")));
+
+    Runner::run(
+        RunRequest::new(
+            AgentBinding::direct(agent("lead", collaboration_tools())),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new("run-1"),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("do it"))],
+        )
+        .with_config(RunConfig::new().with_agent_registry(registry))
+        .with_agent_control(control.root())
+        .with_rollout_recorder(root_recorder),
+    )
+    .await
+    .unwrap();
+    let helper = AgentPath::root()
+        .join("worker")
+        .unwrap()
+        .join("helper")
+        .unwrap();
+    let helper_session = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(agent) = control
+                .agents()
+                .into_iter()
+                .find(|agent| agent.agent_path() == &helper)
+            {
+                break agent.session_id().cloned().unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper is spawned"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let helper_path = store.rollout_path(&helper_session).unwrap();
+    wait_for_ended_runs(&helper_path, 1).await;
+
+    // The root's rollout is a root's: it was spawned from nothing.
+    let root_meta = ra_session::RolloutReader::open(&root_path)
+        .session_meta()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root_meta.session_id(), &root_session);
+    assert!(root_meta.thread_spawn().is_none());
+
+    // Its one child is the worker, whose own child is the helper, both in the root's tree.
+    let children = store.children(&root_session).await.unwrap();
+    assert_eq!(children.len(), 1);
+    let (worker_reader, worker_meta) = &children[0];
+    let worker_session = worker_meta.session_id().clone();
+    let worker_spawn = worker_meta.thread_spawn().unwrap();
+    assert_eq!(
+        worker_spawn.agent_path(),
+        &AgentPath::root().join("worker").unwrap()
+    );
+    assert_eq!(worker_spawn.depth(), 1);
+    assert_eq!(worker_spawn.root_session_id(), &root_session);
+    assert_eq!(worker_meta.parent_session_id(), Some(&root_session));
+
+    let grandchildren = store.children(&worker_session).await.unwrap();
+    assert_eq!(grandchildren.len(), 1);
+    let (_, helper_meta) = &grandchildren[0];
+    assert_eq!(helper_meta.session_id(), &helper_session);
+    let helper_spawn = helper_meta.thread_spawn().unwrap();
+    assert_eq!(helper_spawn.agent_path(), &helper);
+    assert_eq!(helper_spawn.depth(), 2);
+    assert_eq!(helper_spawn.root_session_id(), &root_session);
+    assert_eq!(helper_spawn.parent_session_id(), &worker_session);
+    assert!(store.children(&helper_session).await.unwrap().is_empty());
+
+    // Each parent's timeline names the session of the agent it started.
+    let started_session = |records: &[ra_session::RolloutRecord]| {
+        records
+            .iter()
+            .find_map(|record| match record.payload().unwrap() {
+                ra_session::RolloutPayload::Event(event) => match event.body() {
+                    HostEventBody::Agent(AgentEvent::SubAgentActivity(activity))
+                        if activity.activity().as_str() == "started" =>
+                    {
+                        activity.agent_session_id().cloned()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+    };
+    assert_eq!(
+        started_session(&rollout_records(&root_path).await),
+        Some(worker_session.clone())
+    );
+    assert_eq!(
+        started_session(&worker_reader.read_all().await.unwrap()),
+        Some(helper_session)
+    );
+    // Every rollout starts with its session's metadata.
+    for path in [&root_path, worker_reader.path(), &helper_path] {
+        assert_eq!(rollout_records(path).await[0].type_name(), "session_meta");
+    }
+    control.shutdown().await;
+}
+
+/// Notes the name of every hook event it is given.
+#[derive(Default)]
+struct HookNames(Mutex<Vec<HookEventName>>);
+
+#[async_trait]
+impl UserHook for HookNames {
+    fn name(&self) -> &str {
+        "hook names"
+    }
+
+    async fn call(
+        &self,
+        _context: &UserHookContext<'_>,
+        event: &HookEvent<'_>,
+    ) -> Result<HookDecision> {
+        self.0.lock().unwrap().push(event.name());
+        Ok(HookDecision::default())
+    }
+}
+
+#[tokio::test]
+async fn trigger_mail_sets_run_parents_and_mail_naming_no_run_falls_back_to_the_spawning_run() {
+    use ra_core::agent::control::AgentControlPort;
+
+    let scripts = Arc::new(Scripts::default());
+    let hooks = Arc::new(HookNames::default());
+    let store = Arc::new(MemoryThreadStore::default());
+    let control = AgentControl::new()
+        .with_rollout_store(store.clone(), SessionId::new("session-root"))
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", vec![Arc::new(GuardedTool::new())]))
+        .build()
+        .unwrap();
+    let root_run = |run: &str| {
+        RunRequest::new(
+            AgentBinding::direct(agent("lead", collaboration_tools())),
+            Arc::new(ScriptedResolver(scripts.clone())),
+            RunId::new(run),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("work"))],
+        )
+        .with_config(
+            RunConfig::new()
+                .with_agent_registry(registry.clone())
+                .with_user_hook(UserHookRegistration::new(
+                    HookEventName::Stop,
+                    Arc::clone(&hooks) as Arc<dyn UserHook>,
+                ))
+                .with_user_hook(UserHookRegistration::new(
+                    HookEventName::SubagentStop,
+                    Arc::clone(&hooks) as Arc<dyn UserHook>,
+                )),
+        )
+        .with_agent_control(control.root())
+    };
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-call", "deploy", json!({}))),
+    );
+    Runner::run(root_run("spawn-run")).await.unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.state().parent_run_id(),
+        Some(&RunId::new("spawn-run"))
+    );
+
+    scripts.push(
+        "lead",
+        Step::Respond(followup_call("l-3", "worker", "also tag")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-4", "sent")));
+    Runner::run(root_run("mail-during-pause")).await.unwrap();
+    let mut state = paused.state().clone();
+    let pending = state.pending_interruption_items().next().unwrap().clone();
+    state.approve(&pending, false).unwrap();
+    scripts.push("worker", Step::Respond(final_message("w-2", "done")));
+    control.resume(paused.path(), state).unwrap();
+    let child = store.threads()[0].2.clone();
+    eventually(|| child.items().iter().filter(|item| matches!(item, RolloutItem::RunEnded(end) if end.end() == RolloutRunEnd::Completed)).count() == 1, "the resumed worker completed").await;
+
+    // With no running sender, host-triggered mail names no run: the run that spawned the agent is
+    // its run's parent, so that run is still a sub-agent's.
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-3", "host task done")),
+    );
+    control
+        .root()
+        .send(
+            "worker",
+            "host task".to_owned(),
+            ra_core::agent::control::MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    eventually(|| child.items().iter().filter(|item| matches!(item, RolloutItem::RunEnded(end) if end.end() == RolloutRunEnd::Completed)).count() == 2, "the host task completed").await;
+    scripts.push(
+        "lead",
+        Step::Respond(followup_call("l-5", "worker", "another task")),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-6", "sent")));
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-4", "follow-up done")),
+    );
+    Runner::run(root_run("later-followup")).await.unwrap();
+    eventually(
+        || child.items().iter().filter(|item| matches!(item, RolloutItem::RunEnded(end) if end.end() == RolloutRunEnd::Completed)).count() == 3,
+        "the later follow-up completed",
+    ).await;
+    let starts: Vec<_> = child
+        .items()
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::RunStarted(start) => Some(start),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 4);
+    assert_eq!(starts[0].run_id(), starts[1].run_id());
+    assert_eq!(starts[0].parent_run_id(), Some(&RunId::new("spawn-run")));
+    assert_eq!(starts[1].parent_run_id(), Some(&RunId::new("spawn-run")));
+    assert_eq!(starts[2].parent_run_id(), Some(&RunId::new("spawn-run")));
+    assert_eq!(
+        starts[3].parent_run_id(),
+        Some(&RunId::new("later-followup"))
+    );
+    // Each of the worker's three runs ended as a sub-agent's, and each of the lead's as a root's.
+    let names = hooks.0.lock().unwrap().clone();
+    let count = |name: HookEventName| names.iter().filter(|seen| **seen == name).count();
+    assert_eq!(count(HookEventName::SubagentStop), 3, "{names:?}");
+    assert_eq!(count(HookEventName::Stop), 3, "{names:?}");
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn trigger_mail_from_different_runs_falls_back_to_the_spawning_run() {
+    use ra_core::agent::control::AgentControlPort;
+
+    let scripts = Arc::new(Scripts::default());
+    let store = Arc::new(MemoryThreadStore::default());
+    let control = AgentControl::new()
+        .with_rollout_store(store.clone(), SessionId::new("session-root"))
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", Vec::new()))
+        .build()
+        .unwrap();
+    let root_run = |run: &str| {
+        RunRequest::new(
+            AgentBinding::direct(agent("lead", collaboration_tools())),
+            Arc::new(ScriptedResolver(scripts.clone())),
+            RunId::new(run),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("work"))],
+        )
+        .with_config(RunConfig::new().with_agent_registry(registry.clone()))
+        .with_agent_control(control.root())
+    };
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push("worker", Step::Hang);
+    Runner::run(root_run("spawn-run")).await.unwrap();
+    eventually(
+        || scripts.requests("worker").len() == 1,
+        "the worker waits in its model call",
+    )
+    .await;
+    for (run, call) in [("followup-1", "l-3"), ("followup-2", "l-5")] {
+        scripts.push("lead", Step::Respond(followup_call(call, "worker", run)));
+        scripts.push(
+            "lead",
+            Step::Respond(final_message(&format!("{call}-done"), "sent")),
+        );
+        Runner::run(root_run(run)).await.unwrap();
+    }
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-2", "both tasks done")),
+    );
+    control.root().interrupt("worker").await.unwrap();
+    let child = store.threads()[0].2.clone();
+    eventually(|| child.items().iter().any(|item| matches!(item, RolloutItem::RunEnded(end) if end.end() == RolloutRunEnd::Completed)), "the combined follow-ups completed").await;
+    let parents: Vec<_> = child
+        .items()
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::RunStarted(start) => Some(start.parent_run_id().cloned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        parents,
+        vec![Some(RunId::new("spawn-run")), Some(RunId::new("spawn-run"))]
+    );
+    control.shutdown().await;
 }

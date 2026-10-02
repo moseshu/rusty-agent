@@ -934,3 +934,36 @@ fn test_file_events_round_trip_and_degrade_like_every_other_family() {
         labelled
     );
 }
+
+#[test]
+fn sub_agent_activity_names_the_agents_session_as_codex_names_its_thread() {
+    let event = AgentEvent::SubAgentActivity(
+        SubAgentActivityEvent::new(
+            "call-1",
+            AgentPath::root().join("worker").unwrap(),
+            SubAgentActivityKind::Completed,
+        )
+        .with_agent_session_id(ra_core::session::SessionId::new("sess-worker")),
+    );
+    let wire = serde_json::to_value(&event).expect("must serialize");
+    assert_eq!(
+        wire,
+        json!({
+            "kind": "sub_agent_activity",
+            "schema_version": 1,
+            "id": "call-1",
+            "agent_path": "/root/worker",
+            "agent_session_id": "sess-worker",
+            "activity": "completed"
+        })
+    );
+    let restored: AgentEvent = serde_json::from_value(wire).expect("must deserialize");
+    assert_eq!(restored, event);
+    let AgentEvent::SubAgentActivity(activity) = restored else {
+        panic!("expected a sub-agent activity");
+    };
+    assert_eq!(
+        activity.agent_session_id().map(|id| id.as_str()),
+        Some("sess-worker")
+    );
+}

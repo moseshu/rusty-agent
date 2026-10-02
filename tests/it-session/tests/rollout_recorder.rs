@@ -16,14 +16,15 @@ use ra_core::{
         SessionId,
         rollout::{
             RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
-            RolloutRunStarted, RolloutTurnContext,
+            RolloutRunStarted, RolloutThreadSpawn, RolloutThreadStore, RolloutTurnContext,
         },
     },
     state::{EventSeqAllocator, RunId, RunState},
     usage::{RequestUsage, Usage},
 };
 use ra_session::{
-    RolloutFileRecorder, RolloutPayload, RolloutReader, RolloutWriter, is_persisted_rollout_item,
+    RolloutFileRecorder, RolloutPayload, RolloutReader, RolloutSessionMeta, RolloutThreadDirectory,
+    RolloutWriter, is_persisted_rollout_item,
 };
 use serde_json::json;
 
@@ -434,4 +435,231 @@ async fn a_write_that_fails_on_an_open_file_keeps_its_record_for_the_reopened_on
     recorder.flush().await.unwrap();
     let records = RolloutReader::open(&path).read_all().await.unwrap();
     assert_eq!(message_texts(&records), vec!["kept"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The threads of an agent tree
+// ---------------------------------------------------------------------------------------------
+
+fn thread_spawn(parent: &str, depth: u32, path: &AgentPath) -> RolloutThreadSpawn {
+    RolloutThreadSpawn::new(
+        SessionId::new("session-root"),
+        SessionId::new(parent),
+        depth,
+        path.clone(),
+    )
+}
+
+#[tokio::test]
+async fn session_metadata_is_written_first_into_a_new_rollout_and_not_into_an_existing_one() {
+    let dir = temp_test_dir("session_meta_first");
+    let path = dir.join("rollout-session-1.jsonl");
+    let meta = || RolloutSessionMeta::new(SessionId::new("session-1")).with_cwd("/work");
+
+    let recorder = RolloutFileRecorder::create_with_session_meta(&path, meta());
+    recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+        RunId::new("run-1"),
+        AgentId::new("lead"),
+    )));
+    recorder.flush().await.unwrap();
+    drop(recorder);
+    // Reopened, as a resumed session is: its metadata is already there.
+    let recorder = RolloutFileRecorder::create_with_session_meta(&path, meta());
+    recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+        RunId::new("run-2"),
+        AgentId::new("lead"),
+    )));
+    recorder.flush().await.unwrap();
+
+    let records = RolloutReader::open(&path).read_all().await.unwrap();
+    let types: Vec<&str> = records.iter().map(|record| record.type_name()).collect();
+    assert_eq!(types, vec!["session_meta", "run_started", "run_started"]);
+    let read = RolloutReader::open(&path)
+        .session_meta()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.session_id(), &SessionId::new("session-1"));
+    assert_eq!(read.cwd(), Some("/work"));
+    assert!(read.thread_spawn().is_none());
+}
+
+#[tokio::test]
+async fn session_metadata_that_could_not_be_written_yet_is_still_written_first() {
+    let (path, blocker) = blocked_path("session_meta_after_failure");
+    let recorder = RolloutFileRecorder::create_with_session_meta(
+        &path,
+        RolloutSessionMeta::new(SessionId::new("session-1")),
+    );
+    recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+        RunId::new("run-1"),
+        AgentId::new("lead"),
+    )));
+    assert!(recorder.flush().await.is_err());
+    std::fs::remove_file(&blocker).unwrap();
+    recorder.flush().await.unwrap();
+
+    let types: Vec<String> = RolloutReader::open(&path)
+        .read_all()
+        .await
+        .unwrap()
+        .iter()
+        .map(|record| record.type_name().to_owned())
+        .collect();
+    assert_eq!(types, vec!["session_meta", "run_started"]);
+}
+
+#[tokio::test]
+async fn only_a_complete_first_record_of_session_metadata_is_read_as_one() {
+    let dir = temp_test_dir("session_meta_reads");
+    let read = |name: &str| {
+        let path = dir.join(name);
+        async move { RolloutReader::open(path).session_meta().await }
+    };
+    assert_eq!(read("missing.jsonl").await.unwrap(), None);
+
+    std::fs::write(dir.join("empty.jsonl"), "").unwrap();
+    assert_eq!(read("empty.jsonl").await.unwrap(), None);
+
+    let mut writer = RolloutWriter::open(dir.join("no-meta.jsonl"), SessionId::new("s"))
+        .await
+        .unwrap();
+    writer.append_item(message("m-1", "hi")).await.unwrap();
+    drop(writer);
+    assert_eq!(read("no-meta.jsonl").await.unwrap(), None);
+
+    // A first line still being written is not read as anything yet.
+    std::fs::write(dir.join("torn.jsonl"), "{\"timeline_seq\":0,").unwrap();
+    assert_eq!(read("torn.jsonl").await.unwrap(), None);
+    // One that is complete and unreadable is corrupt.
+    std::fs::write(dir.join("corrupt.jsonl"), "not json\n").unwrap();
+    assert!(read("corrupt.jsonl").await.is_err());
+}
+
+#[test]
+fn a_spawned_threads_metadata_says_where_it_was_spawned_from_on_the_wire() {
+    let worker = AgentPath::root().join("worker").unwrap();
+    let meta = RolloutSessionMeta::new(SessionId::new("sess-worker"))
+        .with_created_at(ra_core::event::EventTimestamp::from_millis(7))
+        .with_thread_spawn(
+            thread_spawn("session-root", 1, &worker).with_agent_type(AgentId::new("explorer")),
+        );
+    let wire = serde_json::to_value(&meta).unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "schema_version": 1,
+            "session_id": "sess-worker",
+            "created_at": 7,
+            "thread_spawn": {
+                "schema_version": 1,
+                "root_session_id": "session-root",
+                "parent_session_id": "session-root",
+                "depth": 1,
+                "agent_path": "/root/worker",
+                "agent_type": "explorer"
+            }
+        })
+    );
+    let restored: RolloutSessionMeta = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, meta);
+    assert_eq!(
+        restored.parent_session_id(),
+        Some(&SessionId::new("session-root"))
+    );
+    // A root's metadata, as earlier builds wrote it, names no parent.
+    let root: RolloutSessionMeta =
+        serde_json::from_value(json!({"schema_version": 1, "session_id": "session-root"})).unwrap();
+    assert_eq!(root.parent_session_id(), None);
+}
+
+#[tokio::test]
+async fn a_thread_directory_creates_each_threads_rollout_and_lists_a_sessions_direct_children() {
+    let dir = temp_test_dir("thread_directory");
+    let store = RolloutThreadDirectory::new(dir.join("threads"));
+    assert!(
+        store
+            .children(&SessionId::new("session-root"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a directory not created yet holds no children"
+    );
+    let worker = AgentPath::root().join("worker").unwrap();
+    let helper = worker.join("helper").unwrap();
+    let other = AgentPath::root().join("other").unwrap();
+    for (session, spawn) in [
+        ("sess-1-worker", thread_spawn("session-root", 1, &worker)),
+        ("sess-2-helper", thread_spawn("sess-1-worker", 2, &helper)),
+        ("sess-3-other", thread_spawn("session-root", 1, &other)),
+    ] {
+        let recorder = store
+            .create_thread(&SessionId::new(session), &spawn)
+            .await
+            .unwrap();
+        recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+            RunId::new(format!("run-{session}")),
+            AgentId::new("agent"),
+        )));
+        recorder.flush().await.unwrap();
+    }
+    // Not listed: a thread whose first record is not written yet, a rollout that does not start
+    // with metadata, one whose first record is corrupt, and files that are not rollouts.
+    let _unwritten = store
+        .create_thread(
+            &SessionId::new("sess-4-unwritten"),
+            &thread_spawn("session-root", 1, &AgentPath::root().join("late").unwrap()),
+        )
+        .await
+        .unwrap();
+    std::fs::write(store.path().join("rollout-sess-5.jsonl"), "not json\n").unwrap();
+    let mut no_meta = RolloutWriter::open(
+        store.path().join("rollout-sess-6.jsonl"),
+        SessionId::new("sess-6"),
+    )
+    .await
+    .unwrap();
+    no_meta.append_item(message("m-1", "hi")).await.unwrap();
+    std::fs::write(store.path().join("notes.txt"), "hello\n").unwrap();
+    std::fs::create_dir(store.path().join("rollout-dir.jsonl")).unwrap();
+
+    let listed = |parent: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .children(&SessionId::new(parent))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(reader, meta)| {
+                    assert_eq!(
+                        reader.path(),
+                        store.rollout_path(meta.session_id()).unwrap()
+                    );
+                    meta.session_id().as_str().to_owned()
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        listed("session-root").await,
+        vec!["sess-1-worker", "sess-3-other"]
+    );
+    assert_eq!(listed("sess-1-worker").await, vec!["sess-2-helper"]);
+    assert!(listed("sess-2-helper").await.is_empty());
+
+    let meta = RolloutReader::open(
+        store
+            .rollout_path(&SessionId::new("sess-2-helper"))
+            .unwrap(),
+    )
+    .session_meta()
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        meta.thread_spawn(),
+        Some(&thread_spawn("sess-1-worker", 2, &helper))
+    );
+    assert!(store.rollout_path(&SessionId::new("../escape")).is_err());
 }

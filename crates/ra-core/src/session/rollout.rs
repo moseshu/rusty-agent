@@ -11,11 +11,21 @@
 //! this framework's run, so these are Codex's `TurnStarted` with the user message, its
 //! `TurnContextItem`, its response items, its event messages, its token usage records and its
 //! `TurnComplete` / `TurnAborted`.
+//!
+//! An agent spawned in an agent tree is a thread of its own, as in Codex, and records into a
+//! rollout of its own. The tree creates that rollout through a [`RolloutThreadStore`], describing
+//! the thread with a [`RolloutThreadSpawn`]: which session it was spawned from, at what depth and
+//! path, and which session the tree's root is. That is Codex's `ThreadSpawn` session source, and
+//! it is how a child's rollout is tied to its parent's.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::SessionId;
 use crate::{
+    agent::control::AgentPath,
     compat::{SchemaVersion, Unknown},
     error::Result,
     event::HostEvent,
@@ -49,6 +59,117 @@ pub trait RolloutRecorder: Send + Sync + 'static {
     ///
     /// Returns an error if writing any item recorded so far failed.
     async fn flush(&self) -> Result<()>;
+}
+
+/// Creates the rollouts of the agents an agent tree spawns.
+///
+/// Codex's `ThreadStore::create_thread` for a thread whose source is a thread spawn. The tree calls
+/// it once for each agent it spawns, before the agent's first run, and every run of the agent then
+/// records through the recorder it returns — the agent's whole life, across follow-ups and
+/// approvals, in one rollout. Closing the agent and spawning its path again creates another.
+#[async_trait]
+pub trait RolloutThreadStore: Send + Sync + 'static {
+    /// Creates the rollout of `session_id`, the thread of an agent spawned as `spawn` describes,
+    /// and returns the recorder its runs record through.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rollout cannot be created. The spawn then fails, as Codex's does
+    /// when it cannot create the thread.
+    async fn create_thread(
+        &self,
+        session_id: &SessionId,
+        spawn: &RolloutThreadSpawn,
+    ) -> Result<Arc<dyn RolloutRecorder>>;
+}
+
+/// Where a spawned agent's thread comes from: Codex's `SubAgentSource::ThreadSpawn`, with the
+/// session ids its `SessionMeta` carries beside it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutThreadSpawn {
+    #[serde(default = "default_schema_version")]
+    schema_version: SchemaVersion,
+    root_session_id: SessionId,
+    parent_session_id: SessionId,
+    depth: u32,
+    agent_path: AgentPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_type: Option<AgentId>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl RolloutThreadSpawn {
+    /// Describes an agent at `agent_path`, `depth` below the root, spawned by the agent whose
+    /// session is `parent_session_id`, in the tree whose root's session is `root_session_id`.
+    #[must_use]
+    pub fn new(
+        root_session_id: SessionId,
+        parent_session_id: SessionId,
+        depth: u32,
+        agent_path: AgentPath,
+    ) -> Self {
+        Self {
+            schema_version: ROLLOUT_ITEM_SCHEMA_VERSION,
+            root_session_id,
+            parent_session_id,
+            depth,
+            agent_path,
+            agent_type: None,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Sets the registered agent the spawn asked for: Codex's `agent_role`.
+    #[must_use]
+    pub fn with_agent_type(mut self, agent_type: AgentId) -> Self {
+        self.agent_type = Some(agent_type);
+        self
+    }
+
+    /// The session of the tree's root, shared by every thread in the tree: Codex's `session_id`.
+    #[must_use]
+    pub const fn root_session_id(&self) -> &SessionId {
+        &self.root_session_id
+    }
+
+    /// The session of the agent that spawned this one: Codex's `parent_thread_id`.
+    #[must_use]
+    pub const fn parent_session_id(&self) -> &SessionId {
+        &self.parent_session_id
+    }
+
+    /// How far below the root the agent is; one for an agent the root spawned.
+    #[must_use]
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// The agent's path in the tree.
+    #[must_use]
+    pub const fn agent_path(&self) -> &AgentPath {
+        &self.agent_path
+    }
+
+    /// The registered agent the spawn asked for, if it named one; otherwise the agent runs the
+    /// declaration of the agent that spawned it.
+    #[must_use]
+    pub const fn agent_type(&self) -> Option<&AgentId> {
+        self.agent_type.as_ref()
+    }
+
+    /// Schema version of the record.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
 }
 
 /// One thing a run records.

@@ -88,12 +88,26 @@
 //! turn. A run that errors, is interrupted or is shut down records none either: its parent learns
 //! of it from the `FINAL_ANSWER` mail alone.
 //!
+//! # Rollouts
+//!
+//! As in Codex, a spawned agent is a thread of its own: it is given a session at spawn, which its
+//! [`LiveAgent`] and the activity on its parent's timeline name, and a tree given a store with
+//! [`AgentControl::with_rollout_store`] creates the agent a rollout under that session. Its session
+//! metadata says where it came from — the session it was spawned from, the root's, its depth, its
+//! path and the agent type asked for — as Codex's `ThreadSpawn` source does. Every run of the agent
+//! records into it, so the rollout holds the agent's whole life and rebuilds the history the agent
+//! continues from. Codex records a turn's new input against the history its thread already holds;
+//! here a run starts on the agent's history followed by its mail, and records only the part the
+//! rollout does not hold yet — the history it was forked with, on its first run, and its mail. A
+//! run waiting for approval when it is interrupted or shut down is recorded as cancelled, as Codex
+//! aborts the turn. The root's runs are the host's, which records them into the root's session.
+//!
 //! # What this does not port
 //!
 //! - **Per-spawn model and reasoning-effort overrides**, agent nicknames, and role descriptions.
-//! - **Persistence and resume of the tree.** A spawned agent lives as long as its [`AgentControl`].
-//!   Neither the activity events nor an agent's history are written anywhere by the tree; storing
-//!   a spawned agent's transcript on its own is for the session layer.
+//! - **Resume of the tree.** A spawned agent lives as long as its [`AgentControl`]. Its rollout
+//!   holds what it takes to rebuild its history, but the tree does not reopen agents from their
+//!   rollouts, nor keep Codex's separate store of open and closed spawn edges that its resume reads.
 
 mod budget;
 
@@ -123,6 +137,13 @@ use ra_core::{
     finish::FinishReason,
     item::{InputItemNormalizer, ModelInputItem, NormalizedInput, RunItem},
     model::ModelResolver,
+    session::{
+        SessionId,
+        rollout::{
+            RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded, RolloutThreadSpawn,
+            RolloutThreadStore,
+        },
+    },
     state::{EventSeqAllocator, RunId, RunState},
     tool::ToolServices,
 };
@@ -179,6 +200,7 @@ impl AgentControl {
             close_descendants_on_cancel: AtomicBool::new(false),
             max_depth: AtomicUsize::new(usize::MAX),
             rollout_budget: OnceLock::new(),
+            rollout_store: OnceLock::new(),
             paused_activity: watch::Sender::new(0),
             event_seqs: Mutex::new(HashMap::new()),
         });
@@ -221,6 +243,41 @@ impl AgentControl {
             .rollout_budget
             .set(Arc::new(RolloutBudget::new(config)))
             .map_err(|_| Error::config("the agent tree already has a rollout budget"))?;
+        Ok(self)
+    }
+
+    /// Records every agent the tree spawns into a rollout of its own, created through `store`; the
+    /// root's runs are those of session `root_session_id`.
+    ///
+    /// Codex's threads: a spawned agent is a thread with its own rollout, whose session metadata
+    /// names the thread it was spawned from, the tree's root and the agent's depth and path (see
+    /// [`RolloutThreadSpawn`]). Each spawned agent is given a session of its own whether or not the
+    /// tree has a store — [`LiveAgent::session_id`](ra_core::agent::control::LiveAgent::session_id)
+    /// and the activity on its parent's timeline name it — and with one, the agent's rollout is
+    /// created as it is spawned, and every run of the agent records into it as a run given
+    /// [`RunRequest::with_rollout_recorder`] does: across follow-ups and pauses for approval, for
+    /// as long as the agent lives. A run records only what is new to the agent's thread: the
+    /// history it starts on came from the agent's earlier runs and is already there. A store that
+    /// cannot create the rollout fails the spawn.
+    ///
+    /// The root's runs are the host's: it records them itself, with
+    /// [`RunRequest::with_rollout_recorder`], into the rollout of `root_session_id`. Off by
+    /// default; Codex always records its threads.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a second store for the same tree.
+    pub fn with_rollout_store(
+        self,
+        store: Arc<dyn RolloutThreadStore>,
+        root_session_id: SessionId,
+    ) -> Result<Self> {
+        self.tree
+            .rollout_store
+            .set(store)
+            .map_err(|_| Error::config("the agent tree already has a rollout store"))?;
+        // Only ever set here, behind the store, so it cannot already hold another session.
+        let _ = self.tree.root.session_id.set(root_session_id);
         Ok(self)
     }
 
@@ -559,11 +616,14 @@ impl AgentHandle {
         let Some(origin) = lock(&child.state).run_origin.clone() else {
             return;
         };
-        let event = SubAgentActivityEvent::new(
+        let mut event = SubAgentActivityEvent::new(
             format!("subagent-completed-{run_id}"),
             self.node.path.clone(),
             SubAgentActivityKind::Completed,
         );
+        if let Some(session_id) = self.node.session_id.get() {
+            event = event.with_agent_session_id(session_id.clone());
+        }
         if let Err(error) = origin.emit_agent(AgentEvent::SubAgentActivity(event)) {
             tracing::warn!(
                 agent = %self.node.path,
@@ -656,6 +716,12 @@ impl AgentControlPort for AgentHandle {
                 max_threads: tree.limiter.max_threads,
             });
         }
+        if lock(&tree.agents).contains_key(&path) {
+            return Err(path_taken(&path));
+        }
+        let session_id = SessionId::generate();
+        let rollout =
+            create_rollout(&tree, &self.node, &session_id, &path, request.agent_type()).await?;
 
         let environment = ChildEnvironment {
             agent: Arc::clone(&agent),
@@ -663,24 +729,20 @@ impl AgentControlPort for AgentHandle {
             config: parent.config().clone(),
             app_context: parent.app_context().map(Arc::clone),
             services: parent.services().clone(),
-            parent_run_id: parent.run_id().clone(),
+            spawned_by: parent.run_id().clone(),
+            rollout,
         };
-        let child = ChildRuntime {
+        let child = ChildRuntime::new(
             environment,
-            scope: tree.cancel.child(ScopeKind::custom("agent")),
-            state: Mutex::new(ChildState {
-                history,
-                current_run: None,
-                paused: None,
-                run_origin: None,
-            }),
-            idle: watch::Sender::new(true),
-        };
+            tree.cancel.child(ScopeKind::custom("agent")),
+            history,
+        );
         let node = Arc::new(AgentNode::new(
             path.clone(),
             Some(agent.id().clone()),
             Some(child),
         ));
+        let _ = node.session_id.set(session_id);
         {
             let mut agents = lock(&tree.agents);
             // Checked again under the lock a close marks its subtree under, so a spawn racing a
@@ -693,9 +755,7 @@ impl AgentControlPort for AgentHandle {
                 return Err(closing_error(&self.node.path));
             }
             if agents.contains_key(&path) {
-                return Err(AgentControlError::Unsupported(format!(
-                    "agent path `{path}` already exists"
-                )));
+                return Err(path_taken(&path));
             }
             agents.insert(path.clone(), Arc::clone(&node));
         }
@@ -706,6 +766,7 @@ impl AgentControlPort for AgentHandle {
                 request.message(),
                 MessageDeliveryMode::TriggerTurn,
             ),
+            Some(parent.run_id().clone()),
             tree.origin_of(&parent),
         );
         tree.ensure_running(&node);
@@ -741,10 +802,11 @@ impl AgentControlPort for AgentHandle {
         }
         // Only a follow-up names the run that asked for it, as only Codex's trigger-turn mail
         // carries a parent turn.
-        let origin = (mode == MessageDeliveryMode::TriggerTurn)
+        let parent = (mode == MessageDeliveryMode::TriggerTurn)
             .then(ParentRun::current)
-            .flatten()
-            .and_then(|parent| tree.origin_of(&parent));
+            .flatten();
+        let parent_run_id = parent.as_ref().map(|parent| parent.run_id().clone());
+        let origin = parent.as_ref().and_then(|parent| tree.origin_of(parent));
         node.mailbox.push_from(
             InterAgentCommunication::from_agent(
                 self.node.path.clone(),
@@ -752,6 +814,7 @@ impl AgentControlPort for AgentHandle {
                 &message,
                 mode,
             ),
+            parent_run_id,
             origin,
         );
         if mode == MessageDeliveryMode::TriggerTurn {
@@ -801,11 +864,56 @@ impl AgentControlPort for AgentHandle {
         self.node.mailbox.wait(timeout).await
     }
 
+    fn agent_session_id(&self, path: &AgentPath) -> Option<SessionId> {
+        self.tree.upgrade()?.node(path)?.session_id.get().cloned()
+    }
+
     fn spawn_depth_exceeded(&self) -> bool {
         self.tree
             .upgrade()
             .is_some_and(|tree| tree.spawn_depth_exceeded(&self.node.path))
     }
+}
+
+fn path_taken(path: &AgentPath) -> AgentControlError {
+    AgentControlError::Unsupported(format!("agent path `{path}` already exists"))
+}
+
+/// Creates the rollout of the agent being spawned at `path` by `caller`, when the tree has a store
+/// for them, as Codex creates a spawned thread with its `ThreadSpawn` source.
+async fn create_rollout(
+    tree: &Tree,
+    caller: &AgentNode,
+    session_id: &SessionId,
+    path: &AgentPath,
+    agent_type: Option<&AgentId>,
+) -> Result<Option<Arc<dyn RolloutRecorder>>, AgentControlError> {
+    let Some(store) = tree.rollout_store.get() else {
+        return Ok(None);
+    };
+    let (Some(root_session_id), Some(parent_session_id)) =
+        (tree.root.session_id.get(), caller.session_id.get())
+    else {
+        return Err(AgentControlError::Unavailable);
+    };
+    let mut spawn = RolloutThreadSpawn::new(
+        root_session_id.clone(),
+        parent_session_id.clone(),
+        u32::try_from(depth(path)).unwrap_or(u32::MAX),
+        path.clone(),
+    );
+    if let Some(agent_type) = agent_type {
+        spawn = spawn.with_agent_type(agent_type.clone());
+    }
+    store
+        .create_thread(session_id, &spawn)
+        .await
+        .map(Some)
+        .map_err(|error| {
+            AgentControlError::Unsupported(format!(
+                "the rollout of agent `{path}` could not be created: {error}"
+            ))
+        })
 }
 
 fn closed_error(path: &AgentPath) -> AgentControlError {
@@ -855,6 +963,8 @@ struct Tree {
     /// The deepest an agent may be; `usize::MAX` when the tree has no limit.
     max_depth: AtomicUsize,
     rollout_budget: OnceLock<Arc<RolloutBudget>>,
+    /// Where the spawned agents' rollouts are created, once the host has given the tree a store.
+    rollout_store: OnceLock<Arc<dyn RolloutThreadStore>>,
     /// Ticks whenever an agent's run pauses for approval.
     paused_activity: watch::Sender<u64>,
     /// The host event sequence of every run that has named itself as the origin of another run,
@@ -1067,20 +1177,34 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
         let handle = AgentHandle::new(&strong, Arc::clone(&node));
         drop(strong);
 
-        let (mail, origin) = node.mailbox.take_for_run();
-        let mut input = {
+        let (mail, parent_run_id, origin) = node.mailbox.take_for_run();
+        let (mut input, recorded) = {
             let mut state = lock(&child.state);
             state.run_origin = origin;
-            state.history.clone()
+            (state.history.clone(), state.recorded)
         };
         input.extend(
             mail.iter()
                 .map(|mail| ModelInputItem::Message(mail.to_message())),
         );
-        let history = run_to_end(&tree, child, &handle, &scope, input).await;
+        let (history, started) = run_to_end(
+            &tree,
+            child,
+            &handle,
+            &scope,
+            input,
+            recorded,
+            parent_run_id,
+        )
+        .await;
         drop(guard);
 
         let mut state = lock(&child.state);
+        // A run that started recorded its whole input, and its history follows from what it
+        // recorded; one that never started recorded nothing, and its input is still to be.
+        if started {
+            state.recorded = history.len();
+        }
         state.history = history;
         let shut_down = tree
             .upgrade()
@@ -1096,7 +1220,7 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
 }
 
 /// Runs one run of an agent to its end — across any number of pauses for approval — and returns
-/// the agent's history after it.
+/// the agent's history after it, and whether the run started at all.
 ///
 /// A run that stops to ask for approval is kept as it is: its checkpoint waits here, with the run's
 /// scope and execution slot still held, until the host answers through [`AgentControl::resume`] and
@@ -1108,9 +1232,15 @@ async fn run_to_end(
     handle: &AgentHandle,
     scope: &CancelScope,
     input: Vec<ModelInputItem>,
-) -> Vec<ModelInputItem> {
+    recorded: usize,
+    parent_run_id: Option<RunId>,
+) -> (Vec<ModelInputItem>, bool) {
     let mut fallback = input.clone();
-    let mut start = RunStart::Fresh(input);
+    let mut start = RunStart::Fresh {
+        input,
+        recorded,
+        parent_run_id,
+    };
     loop {
         let (state, history) = match run_once(
             &child.environment,
@@ -1121,9 +1251,11 @@ async fn run_to_end(
         )
         .await
         {
-            RunEnd::Finished(history) => return history,
+            RunEnd::NotStarted(history) => return (history, false),
+            RunEnd::Finished(history) => return (history, true),
             RunEnd::Paused { state, history } => (state, history),
         };
+        let run_id = state.run_id().clone();
         let (resume, answered) = oneshot::channel();
         lock(&child.state).paused = Some(PausedRun {
             state: *state,
@@ -1140,23 +1272,46 @@ async fn run_to_end(
         lock(&child.state).paused = None;
         let Some(state) = answered else {
             if let Err(error) = scope.ensure_not_cancelled() {
+                // The run ends here rather than in the runner, whose last segment ended paused: as
+                // Codex aborts a turn that is waiting for approval, it ends cancelled.
+                if let Some(rollout) = &child.environment.rollout {
+                    record_cancelled(rollout.as_ref(), run_id).await;
+                }
                 handle.run_ended(&Err(error)).await;
             }
-            return history;
+            return (history, true);
         };
         fallback = history;
         start = RunStart::Resume(Box::new(state));
     }
 }
 
-/// How a run starts: on new input, or from a checkpoint the host has answered.
+/// Records that a run waiting for approval was cancelled, and waits for the rollout to write it.
+async fn record_cancelled(rollout: &dyn RolloutRecorder, run_id: RunId) {
+    rollout.record(RolloutItem::RunEnded(RolloutRunEnded::new(
+        run_id.clone(),
+        RolloutRunEnd::Cancelled,
+    )));
+    if let Err(error) = rollout.flush().await {
+        tracing::warn!(run_id = %run_id, %error, "the agent's rollout could not be flushed");
+    }
+}
+
+/// How a run starts: on the agent's history and its mail, of which the agent's rollout already
+/// holds the first `recorded` items, or from a checkpoint the host has answered.
 enum RunStart {
-    Fresh(Vec<ModelInputItem>),
+    Fresh {
+        input: Vec<ModelInputItem>,
+        recorded: usize,
+        /// The run every trigger mail it starts on came from, if they agree on one.
+        parent_run_id: Option<RunId>,
+    },
     Resume(Box<RunState>),
 }
 
-/// How a run ended: done with the agent's new history, or paused for approval.
+/// How a run ended: done with the agent's new history, paused for approval, or never started.
 enum RunEnd {
+    NotStarted(Vec<ModelInputItem>),
     Finished(Vec<ModelInputItem>),
     Paused {
         state: Box<RunState>,
@@ -1174,14 +1329,27 @@ async fn run_once(
     fallback: Vec<ModelInputItem>,
 ) -> RunEnd {
     let request = match start {
-        RunStart::Fresh(input) => RunRequest::new(
-            AgentBinding::direct(Arc::clone(&environment.agent)),
-            Arc::clone(&environment.model_resolver),
-            RunId::generate(),
-            scope,
+        RunStart::Fresh {
             input,
-        )
-        .with_parent_run_id(environment.parent_run_id.clone()),
+            recorded,
+            parent_run_id,
+        } => {
+            let request = RunRequest::new(
+                AgentBinding::direct(Arc::clone(&environment.agent)),
+                Arc::clone(&environment.model_resolver),
+                RunId::generate(),
+                scope,
+                input,
+            )
+            .with_recorded_input(recorded);
+            // Every run of a spawned agent has a parent, which makes it a sub-agent run to its
+            // hooks: Codex runs `SubagentStop` for every turn of a spawned thread, whether or not
+            // the turn has a parent turn. The run whose trigger mail started this one is that
+            // parent; when the mail names no single run — the host sent it, or several runs did —
+            // the run that spawned the agent is.
+            request
+                .with_parent_run_id(parent_run_id.unwrap_or_else(|| environment.spawned_by.clone()))
+        }
         // The checkpoint carries the parent and the history; empty input projects it.
         RunStart::Resume(state) => Ok(RunRequest::new(
             AgentBinding::direct(Arc::clone(&environment.agent)),
@@ -1199,11 +1367,14 @@ async fn run_once(
             .with_agent_control(handle),
         Err(error) => {
             handle.run_finished(&Err(error));
-            return RunEnd::Finished(fallback);
+            return RunEnd::NotStarted(fallback);
         }
     };
     if let Some(app_context) = &environment.app_context {
         request = request.with_app_context(Arc::clone(app_context));
+    }
+    if let Some(rollout) = &environment.rollout {
+        request = request.with_rollout_recorder(Arc::clone(rollout));
     }
 
     let mut stream = Runner::run_streamed(request);
@@ -1234,6 +1405,8 @@ fn partial_history(mut input: Vec<ModelInputItem>, produced: &[RunItem]) -> Vec<
 
 struct AgentNode {
     path: AgentPath,
+    /// The session of the agent's own rollout; the root's once the tree is given a store.
+    session_id: OnceLock<SessionId>,
     agent_id: Mutex<Option<AgentId>>,
     status: watch::Sender<AgentStatus>,
     mailbox: Mailbox,
@@ -1251,6 +1424,7 @@ impl AgentNode {
     fn new(path: AgentPath, agent_id: Option<AgentId>, child: Option<ChildRuntime>) -> Self {
         Self {
             path,
+            session_id: OnceLock::new(),
             agent_id: Mutex::new(agent_id),
             status: watch::Sender::new(AgentStatus::PendingInit),
             mailbox: Mailbox::new(),
@@ -1280,11 +1454,15 @@ impl AgentNode {
     }
 
     fn snapshot(&self) -> LiveAgent {
-        LiveAgent::new(
+        let agent = LiveAgent::new(
             self.path.clone(),
             lock(&self.agent_id).clone(),
             self.status(),
-        )
+        );
+        match self.session_id.get() {
+            Some(session_id) => agent.with_session_id(session_id.clone()),
+            None => agent,
+        }
     }
 }
 
@@ -1311,7 +1489,10 @@ struct ChildEnvironment {
     config: RunConfig,
     app_context: Option<Arc<dyn std::any::Any + Send + Sync>>,
     services: ToolServices,
-    parent_run_id: RunId,
+    /// The run that spawned the agent: the parent of a run whose trigger mail names no single run.
+    spawned_by: RunId,
+    /// The agent's own rollout, when the tree records its agents.
+    rollout: Option<Arc<dyn RolloutRecorder>>,
 }
 
 struct ChildRuntime {
@@ -1324,8 +1505,33 @@ struct ChildRuntime {
     idle: watch::Sender<bool>,
 }
 
+impl ChildRuntime {
+    /// An agent about to start its first run on `history`, none of which its rollout holds yet.
+    fn new(
+        environment: ChildEnvironment,
+        scope: CancelScope,
+        history: Vec<ModelInputItem>,
+    ) -> Self {
+        Self {
+            environment,
+            scope,
+            state: Mutex::new(ChildState {
+                history,
+                recorded: 0,
+                current_run: None,
+                paused: None,
+                run_origin: None,
+            }),
+            idle: watch::Sender::new(true),
+        }
+    }
+}
+
 struct ChildState {
     history: Vec<ModelInputItem>,
+    /// How many leading items of `history` the agent's rollout holds: none of the history it was
+    /// forked with, and all of it once a run has started on it.
+    recorded: usize,
     /// The scope of the run in progress, or of the one about to start.
     current_run: Option<CancelScope>,
     /// The run's checkpoint while it waits for the host to answer an approval.
@@ -1350,6 +1556,7 @@ struct Mailbox {
 /// the recipient: Codex's pending mail and the turn start options it was sent with.
 struct Mail {
     communication: InterAgentCommunication,
+    parent_run_id: Option<RunId>,
     origin: Option<HostEventEmitter>,
 }
 
@@ -1362,12 +1569,18 @@ impl Mailbox {
     }
 
     fn push(&self, mail: InterAgentCommunication) {
-        self.push_from(mail, None);
+        self.push_from(mail, None, None);
     }
 
-    fn push_from(&self, communication: InterAgentCommunication, origin: Option<HostEventEmitter>) {
+    fn push_from(
+        &self,
+        communication: InterAgentCommunication,
+        parent_run_id: Option<RunId>,
+        origin: Option<HostEventEmitter>,
+    ) {
         lock(&self.queue).push_back(Mail {
             communication,
+            parent_run_id,
             origin,
         });
         self.activity
@@ -1385,8 +1598,22 @@ impl Mailbox {
     ///
     /// As Codex's `drain_mailbox_input_items` keeps a parent turn only when every trigger-turn mail
     /// names the same one, the origin is kept only when every trigger mail came from the same run.
-    fn take_for_run(&self) -> (Vec<InterAgentCommunication>, Option<HostEventEmitter>) {
+    fn take_for_run(
+        &self,
+    ) -> (
+        Vec<InterAgentCommunication>,
+        Option<RunId>,
+        Option<HostEventEmitter>,
+    ) {
         let mail: Vec<Mail> = lock(&self.queue).drain(..).collect();
+        // Run identity is retained even when the sender has no event sink.
+        let parent_run_id = mail
+            .iter()
+            .filter(|mail| mail.communication.trigger_turn())
+            .map(|mail| mail.parent_run_id.as_ref())
+            .reduce(|expected, candidate| expected.filter(|expected| candidate == Some(expected)))
+            .flatten()
+            .cloned();
         let origin = mail
             .iter()
             .filter(|mail| mail.communication.trigger_turn())
@@ -1399,7 +1626,7 @@ impl Mailbox {
             .flatten()
             .cloned();
         let communications = mail.into_iter().map(|mail| mail.communication).collect();
-        (communications, origin)
+        (communications, parent_run_id, origin)
     }
 
     fn has_pending(&self) -> bool {

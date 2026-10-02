@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     reader::RolloutReader,
-    writer::{RolloutPayload, RolloutRecord, RolloutWriter},
+    writer::{RolloutPayload, RolloutRecord, RolloutSessionMeta, RolloutWriter},
 };
 
 /// Whether `item` belongs in a rollout file.
@@ -89,6 +89,7 @@ impl RolloutFileRecorder {
             path: writer.path().to_path_buf(),
             session_id: writer.session_id().clone(),
             writer: Some(writer),
+            session_meta: None,
             pending: VecDeque::new(),
             unconfirmed: None,
             last_logged_error: None,
@@ -110,6 +111,27 @@ impl RolloutFileRecorder {
             path: path.into(),
             session_id,
             writer: None,
+            session_meta: None,
+            pending: VecDeque::new(),
+            unconfirmed: None,
+            last_logged_error: None,
+        })
+    }
+
+    /// As [`Self::create`], for the session `meta` describes, which is written as the file's first
+    /// record when the file is opened and holds none yet — as Codex writes `SessionMeta` first when
+    /// it creates a rollout, and not again when it resumes one.
+    ///
+    /// # Panics
+    ///
+    /// If called outside a Tokio runtime, which the writer task needs.
+    #[must_use]
+    pub fn create_with_session_meta(path: impl Into<PathBuf>, meta: RolloutSessionMeta) -> Self {
+        Self::start(WriterState {
+            path: path.into(),
+            session_id: meta.session_id().clone(),
+            writer: None,
+            session_meta: Some(meta),
             pending: VecDeque::new(),
             unconfirmed: None,
             last_logged_error: None,
@@ -156,6 +178,9 @@ struct WriterState {
     session_id: SessionId,
     /// The open file, or `None` before the first write and after a failure.
     writer: Option<RolloutWriter>,
+    /// The session's metadata, until the file is first opened: it is then queued ahead of
+    /// everything else if the file holds no record yet.
+    session_meta: Option<RolloutSessionMeta>,
     /// Recorded and not yet written, oldest first.
     pending: VecDeque<RolloutPayload>,
     /// The sequence number the front of the queue was written under when that write failed with
@@ -193,6 +218,11 @@ impl WriterState {
         if self.writer.is_none() {
             let writer = open(&self.path, &self.session_id).await?;
             self.settle_unconfirmed(&writer).await?;
+            if let Some(meta) = self.session_meta.take()
+                && writer.next_timeline_seq() == 0
+            {
+                self.pending.push_front(RolloutPayload::SessionMeta(meta));
+            }
             self.writer = Some(writer);
         }
         let Some(writer) = self.writer.as_mut() else {

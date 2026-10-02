@@ -14,7 +14,7 @@ use ra_core::{
     item::{AgentId, CallId, RunItem},
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRunEnded, RolloutRunStarted},
+        rollout::{RolloutItem, RolloutRunEnded, RolloutRunStarted, RolloutThreadSpawn},
     },
     state::RunId,
     usage::Usage,
@@ -252,7 +252,10 @@ impl RolloutChildAnchor {
     }
 }
 
-/// Metadata recorded at session creation.
+/// Metadata recorded at session creation: Codex's `SessionMeta`.
+///
+/// The rollout of an agent spawned in an agent tree also says where it came from, as Codex's does
+/// with its `ThreadSpawn` source: see [`Self::thread_spawn`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutSessionMeta {
@@ -269,6 +272,8 @@ pub struct RolloutSessionMeta {
     model_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<EventTimestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_spawn: Option<RolloutThreadSpawn>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -285,8 +290,16 @@ impl RolloutSessionMeta {
             originator: None,
             model_provider: None,
             created_at: Some(EventTimestamp::now()),
+            thread_spawn: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records that the session is the thread of a spawned agent, and where it was spawned from.
+    #[must_use]
+    pub fn with_thread_spawn(mut self, spawn: RolloutThreadSpawn) -> Self {
+        self.thread_spawn = Some(spawn);
+        self
     }
 
     /// Sets the working directory.
@@ -358,6 +371,21 @@ impl RolloutSessionMeta {
     #[must_use]
     pub const fn created_at(&self) -> Option<EventTimestamp> {
         self.created_at
+    }
+
+    /// Where the session's agent was spawned from, for the thread of a spawned agent; `None` for
+    /// a root session.
+    #[must_use]
+    pub const fn thread_spawn(&self) -> Option<&RolloutThreadSpawn> {
+        self.thread_spawn.as_ref()
+    }
+
+    /// The session the agent was spawned from: Codex's `parent_thread_id`.
+    #[must_use]
+    pub fn parent_session_id(&self) -> Option<&SessionId> {
+        self.thread_spawn
+            .as_ref()
+            .map(RolloutThreadSpawn::parent_session_id)
     }
 
     /// Schema version of the record.
@@ -457,6 +485,21 @@ impl RolloutCheckpoint {
     pub const fn unknown(&self) -> &Unknown {
         &self.unknown
     }
+}
+
+/// The rollout of `session_id` in `base_dir`: `rollout-<session_id>.jsonl`.
+///
+/// # Errors
+///
+/// Returns [`Error`] if `session_id` holds characters that would leave `base_dir`.
+pub(crate) fn session_rollout_path(base_dir: &Path, session_id: &SessionId) -> Result<PathBuf> {
+    let id_str = session_id.as_str();
+    if id_str.contains('/') || id_str.contains('\\') || id_str.contains("..") {
+        return Err(Error::caller(format!(
+            "invalid characters in session_id for rollout filename: {id_str}"
+        )));
+    }
+    Ok(base_dir.join(format!("rollout-{id_str}.jsonl")))
 }
 
 /// Payload variants carried within a rollout line.
@@ -1409,15 +1452,7 @@ impl RolloutWriter {
         base_dir: impl AsRef<Path>,
         session_id: SessionId,
     ) -> Result<Self> {
-        let id_str = session_id.as_str();
-        if id_str.contains('/') || id_str.contains('\\') || id_str.contains("..") {
-            return Err(Error::caller(format!(
-                "invalid characters in session_id for rollout filename: {id_str}"
-            )));
-        }
-
-        let filename = format!("rollout-{id_str}.jsonl");
-        let path = base_dir.as_ref().join(filename);
+        let path = session_rollout_path(base_dir.as_ref(), &session_id)?;
         Self::open(path, session_id).await
     }
 
