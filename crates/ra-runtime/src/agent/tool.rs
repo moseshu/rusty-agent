@@ -31,7 +31,7 @@
 //! A nested run that stops to ask the host something does not fail the call and is never shown to
 //! the calling model. As in the reference, the call is left without an output, the nested run's
 //! approvals are asked as the parent's, and the paused nested run is kept with the parent — in its
-//! [`RunState`](ra_core::state::RunState), keyed by the call — until the host has answered them.
+//! [`RunState`], keyed by the call — until the host has answered them.
 //! The answers are applied to the nested run's own state, so an `always` answer is a rule of that
 //! nested run and nothing else. When the parent resumes it dispatches the call again, and this tool
 //! continues the paused nested run from its checkpoint instead of starting a new one; the parent's

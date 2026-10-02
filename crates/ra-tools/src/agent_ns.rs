@@ -3,7 +3,7 @@
 //! Ported from Codex's `MultiAgentV2` tool surface (`core/src/tools/handlers/multi_agents_v2*` and
 //! `multi_agents_spec.rs`): the same six names, arguments, descriptions, outputs and model-facing
 //! refusals. Each is a thin projection of the [`AgentControlPort`] the run was given through
-//! [`ToolServices`](ra_core::tool::ToolServices); the tree, its mailboxes and the background runs
+//! [`ToolServices`]; the tree, its mailboxes and the background runs
 //! live in the runtime. A run that takes part in no agent tree gets a model-visible answer that
 //! collaboration is not enabled, not a failed turn.
 //!

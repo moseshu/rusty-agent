@@ -44,7 +44,7 @@
 //! A spawned agent runs the declaration of the agent running the caller's current turn — after a
 //! handoff, the agent handed to — or the registered declaration named by `agent_type`. It starts
 //! from the caller's history projected as Codex forks it (see
-//! [`fork_history`](ra_core::agent::control::fork_history)), followed by its task.
+//! [`fork_history`]), followed by its task.
 //!
 //! # Closing
 //!
