@@ -20,7 +20,9 @@ use tokio::{
 
 use super::{
     reconstruction::RolloutReconstruction,
-    writer::{ChildAnchorKind, RolloutCheckpoint, RolloutPayload, RolloutRecord},
+    writer::{
+        ChildAnchorKind, RolloutCheckpoint, RolloutPayload, RolloutRecord, RolloutSessionMeta,
+    },
 };
 
 /// Reconstructed summary of a rollout file.
@@ -168,6 +170,60 @@ impl RolloutReader {
     pub async fn read_all(&self) -> Result<Vec<RolloutRecord>> {
         let (records, _, _) = self.read_records_internal(0).await?;
         Ok(records.into_iter().map(|(_, record)| record).collect())
+    }
+
+    /// Reads the session's metadata from the file's first record, as Codex reads a rollout's head
+    /// to list it, without reading the rest.
+    ///
+    /// Returns `None` for a file that does not exist, holds no complete record yet, or does not
+    /// start with session metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if reading fails, or if the first record is complete but not a valid
+    /// record envelope or not readable session metadata.
+    pub async fn session_meta(&self) -> Result<Option<RolloutSessionMeta>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let file = File::open(&self.path).await.map_err(|e| {
+            Error::session(
+                SessionErrorKind::Io,
+                format!("failed to open rollout file for reading: {e}"),
+            )
+            .with_source(e)
+        })?;
+        let mut line = Vec::new();
+        BufReader::new(file)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|e| {
+                Error::session(
+                    SessionErrorKind::Io,
+                    format!("failed to read line from rollout file: {e}"),
+                )
+                .with_source(e)
+            })?;
+        // A first line still being written is not a record yet.
+        if line.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        let record = std::str::from_utf8(&line)
+            .ok()
+            .and_then(|line| serde_json::from_str::<RolloutRecord>(line.trim()).ok())
+            .ok_or_else(|| {
+                Error::session(
+                    SessionErrorKind::Corrupted,
+                    "corrupted rollout record at line 1",
+                )
+            })?;
+        if record.type_name() != "session_meta" {
+            return Ok(None);
+        }
+        match record.payload()? {
+            RolloutPayload::SessionMeta(meta) => Ok(Some(meta)),
+            _ => Ok(None),
+        }
     }
 
     /// Reads the file and rebuilds the session's history from it; see

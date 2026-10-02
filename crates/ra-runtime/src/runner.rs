@@ -811,6 +811,8 @@ pub struct RunRequest {
     agent_tree: Option<AgentTreeRef>,
     nested_spend: Option<NestedSpend>,
     rollout: Option<Arc<dyn RolloutRecorder>>,
+    /// How many leading items of `input` the rollout already holds.
+    recorded_input: usize,
 }
 
 impl RunRequest {
@@ -849,6 +851,7 @@ impl RunRequest {
             agent_tree: None,
             rollout: None,
             nested_spend: None,
+            recorded_input: 0,
         }
     }
 
@@ -868,10 +871,20 @@ impl RunRequest {
     ///
     /// Only this run is recorded. A nested agent-tool run and a spawned agent are not given the
     /// recorder, and their events, though they reach the same event sink, are not recorded with
-    /// this run's. Events are recorded whether or not [`Self::with_services`] installed an event
+    /// this run's; a spawned agent records into a rollout of its own when its tree has a store for
+    /// them (see [`AgentControl::with_rollout_store`](crate::agent::control::AgentControl::with_rollout_store)). Events are recorded whether or not [`Self::with_services`] installed an event
     /// sink; one that was installed receives them as before.
     pub fn with_rollout_recorder(mut self, recorder: Arc<dyn RolloutRecorder>) -> Self {
         self.rollout = Some(recorder);
+        self
+    }
+
+    /// Records only the input after its first `count` items as new: the rollout already holds the
+    /// rest. A spawned agent's run starts on the agent's history followed by its mail, and the
+    /// history is in the agent's rollout from its earlier runs, as Codex's thread holds its history
+    /// and records only a turn's new input.
+    pub(crate) const fn with_recorded_input(mut self, count: usize) -> Self {
+        self.recorded_input = count;
         self
     }
 
@@ -1254,11 +1267,13 @@ async fn run_loop(
     let result = settle_sandbox(&sandbox, result)
         .instrument(agent_span.clone())
         .await;
-    if let Some(handle) = &agent_handle {
-        handle.run_ended(&result).await;
-    }
+    // Written before the agent's status is published, so whoever that wakes — the host, or a
+    // parent waiting on the agent — finds the run's end in its rollout.
     if let Some(rollout) = &rollout {
         record_run_end(rollout.as_ref(), &rollout_run_id, &result).await;
+    }
+    if let Some(handle) = &agent_handle {
+        handle.run_ended(&result).await;
     }
     if let Some(interrupt) = interrupt
         && result
@@ -1282,7 +1297,8 @@ fn start_recording(request: &mut RunRequest) -> Option<Arc<dyn RolloutRecorder>>
     let mut started = if input_is_continuation_base(&request.state, &request.input) {
         started.with_continuation_base(request.input.clone())
     } else {
-        started.with_input(request.input.clone())
+        let recorded = request.recorded_input.min(request.input.len());
+        started.with_input(request.input[recorded..].to_vec())
     };
     if let Some(parent) = request.state.parent_run_id() {
         started = started.with_parent_run_id(parent.clone());
@@ -1432,6 +1448,7 @@ async fn run_loop_inner(
         agent_tree: _,
         nested_spend: _,
         rollout,
+        recorded_input: _,
     } = request;
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),

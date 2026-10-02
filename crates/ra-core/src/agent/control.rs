@@ -20,7 +20,10 @@ use std::{fmt, ops::Deref, str::FromStr, time::Duration};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::item::{AgentId, Message, MessageRole, ModelInputItem, OutputPhase};
+use crate::{
+    item::{AgentId, Message, MessageRole, ModelInputItem, OutputPhase},
+    session::SessionId,
+};
 
 /// Canonical path of an agent in its tree: `/root` for the root, `/root/<name>/...` below it.
 ///
@@ -430,6 +433,7 @@ pub struct LiveAgent {
     agent_path: AgentPath,
     agent_id: Option<AgentId>,
     status: AgentStatus,
+    session_id: Option<SessionId>,
 }
 
 impl LiveAgent {
@@ -444,7 +448,15 @@ impl LiveAgent {
             agent_path,
             agent_id,
             status,
+            session_id: None,
         }
+    }
+
+    /// Sets the session of the agent's own rollout: the id of Codex's thread.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
     }
 
     /// Canonical path.
@@ -463,6 +475,14 @@ impl LiveAgent {
     #[must_use]
     pub const fn status(&self) -> &AgentStatus {
         &self.status
+    }
+
+    /// The session of the agent's own rollout, which names this life of the agent: a path freed by
+    /// a close can be spawned again, with a session of its own. Unknown for a root whose tree was
+    /// not told its session.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
     }
 }
 
@@ -721,5 +741,14 @@ pub trait AgentControlPort: Send + Sync {
     /// all. The default answers `false`: a tree with no depth limit.
     fn spawn_depth_exceeded(&self) -> bool {
         false
+    }
+
+    /// The session of the live agent at `path`, if the tree has one there and knows it.
+    ///
+    /// What Codex's collaboration handlers record as the agent's thread id once an operation on it
+    /// has succeeded. The default knows none.
+    fn agent_session_id(&self, path: &AgentPath) -> Option<SessionId> {
+        let _ = path;
+        None
     }
 }

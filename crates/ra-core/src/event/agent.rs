@@ -9,6 +9,7 @@ use crate::{
     agent::control::AgentPath,
     compat::{SchemaVersion, Unknown},
     item::AgentId,
+    session::SessionId,
     state::RunId,
 };
 
@@ -558,8 +559,8 @@ impl<'de> Deserialize<'de> for SubAgentActivityKind {
 ///
 /// - The kind is serialized as `activity`: `kind` is already the tag that names the variant of
 ///   [`AgentEvent`].
-/// - There is no thread id. A path names one live agent; a path freed by a close can be spawned
-///   again, and the later life begins with its own [`SubAgentActivityKind::Started`].
+/// - Codex's `agent_thread_id` is [`Self::agent_session_id`], the session of the agent's own
+///   rollout. It is optional, for the activity of an agent whose control plane did not report one.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubAgentActivityEvent {
@@ -567,6 +568,8 @@ pub struct SubAgentActivityEvent {
     schema_version: SchemaVersion,
     id: String,
     agent_path: AgentPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_session_id: Option<SessionId>,
     activity: SubAgentActivityKind,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
@@ -584,9 +587,17 @@ impl SubAgentActivityEvent {
             schema_version: AGENT_EVENT_SCHEMA_VERSION,
             id: id.into(),
             agent_path,
+            agent_session_id: None,
             activity,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Sets the session of the agent's own rollout: Codex's `agent_thread_id`.
+    #[must_use]
+    pub fn with_agent_session_id(mut self, session_id: SessionId) -> Self {
+        self.agent_session_id = Some(session_id);
+        self
     }
 
     /// The tool call that caused the activity, or `subagent-completed-<run id>` for a completion.
@@ -599,6 +610,13 @@ impl SubAgentActivityEvent {
     #[must_use]
     pub const fn agent_path(&self) -> &AgentPath {
         &self.agent_path
+    }
+
+    /// The session of the agent's own rollout, which names this agent's life: a path freed by a
+    /// close can be spawned again, and the later life has a session of its own.
+    #[must_use]
+    pub const fn agent_session_id(&self) -> Option<&SessionId> {
+        self.agent_session_id.as_ref()
     }
 
     /// What happened.
