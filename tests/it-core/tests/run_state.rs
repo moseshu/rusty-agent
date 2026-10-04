@@ -83,7 +83,7 @@ fn test_run_state_02() {
 #[test]
 fn test_run_state_03() {
     let stored = r#"{
-        "schema_version": 7,
+        "schema_version": 8,
         "run_id": "run-future",
         "next_host_event_seq": 12,
         "future_policy": { "enabled": true }
@@ -97,7 +97,7 @@ fn test_run_state_03() {
     let state = state.with_tool_use(carried.tool_use().clone());
 
     assert_eq!(state.tool_use().repeat_streak(&agent, &identity), 1);
-    assert_eq!(state.schema_version(), SchemaVersion::new(7));
+    assert_eq!(state.schema_version(), SchemaVersion::new(8));
     let written = serde_json::to_value(&state).expect("run state must serialize");
     assert_eq!(written["future_policy"]["enabled"], true);
     assert_eq!(written["run_id"], "run-future");
@@ -107,7 +107,7 @@ fn test_run_state_03() {
 #[test]
 fn test_run_state_04() {
     let stored = r#"{
-        "schema_version": 7,
+        "schema_version": 8,
         "run_id": "run-future-04",
         "next_host_event_seq": 3,
         "future_policy": { "enabled": true }
@@ -115,7 +115,7 @@ fn test_run_state_04() {
     let state: RunState = serde_json::from_str(stored).expect("newer state must remain readable");
     let written = serde_json::to_value(&state).expect("run state must serialize");
 
-    assert_eq!(state.schema_version(), SchemaVersion::new(7));
+    assert_eq!(state.schema_version(), SchemaVersion::new(8));
     assert_eq!(state.run_id().as_str(), "run-future-04");
     assert_eq!(state.next_host_event_seq(), 3);
     assert_eq!(state.tool_use().agents().count(), 0);
@@ -1184,4 +1184,90 @@ fn test_a_shared_approval_identity_is_routed_by_record_or_refused() {
         .approve(&own, false)
         .expect_err("two identical pending records cannot be told apart");
     assert!(error.to_string().contains("unique call IDs"), "{error}");
+}
+
+/// What a run owes its session is one index into its records, carried by the checkpoint. A run
+/// never bound to a session carries none and writes nothing for it, and one bound only when it
+/// resumes owes nothing it generated before.
+#[test]
+fn test_run_state_session_persistence_count_binds_advances_and_roundtrips() {
+    let mut state = RunState::start(RunId::new("run-session-count"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items([commentary_item("message-1", "looking")]);
+    assert_eq!(state.session_persisted_item_count(), None);
+    let unbound = serde_json::to_value(&state).expect("state must serialize");
+    assert!(unbound.get("session_persisted_item_count").is_none());
+
+    state.bind_session_persistence();
+    assert_eq!(
+        state.session_persisted_item_count(),
+        Some(1),
+        "a run bound late owes its session nothing it generated before"
+    );
+    state.bind_session_persistence();
+    assert_eq!(state.session_persisted_item_count(), Some(1));
+
+    state.record_generated_items([commentary_item("message-2", "found it")]);
+    state
+        .mark_session_persisted(2)
+        .expect("the count may move to the end of the history");
+    assert!(
+        state.mark_session_persisted(1).is_err(),
+        "a count moving backwards would append records twice"
+    );
+    assert!(
+        state.mark_session_persisted(3).is_err(),
+        "a count past the end would skip records the session never received"
+    );
+
+    let restored: RunState =
+        serde_json::from_value(serde_json::to_value(&state).expect("state must serialize"))
+            .expect("state must deserialize");
+    assert_eq!(restored.session_persisted_item_count(), Some(2));
+}
+
+#[test]
+fn test_run_state_rejects_session_count_past_its_history() {
+    let stored = json!({
+        "run_id": "run-session-overrun",
+        "next_host_event_seq": 0,
+        "starting_agent": "coder",
+        "current_agent": "coder",
+        "generated_items": [serde_json::to_value(commentary_item("message-1", "hi")).unwrap()],
+        "session_persisted_item_count": 2
+    });
+    let error = serde_json::from_value::<RunState>(stored)
+        .expect_err("a checkpoint claiming more session records than it holds must be refused");
+    assert!(error.to_string().contains("session was given 2 records"));
+}
+
+#[test]
+fn pending_session_writes_and_terminal_failures_survive_a_checkpoint() {
+    use ra_core::{item::InputItemDigest, session::SessionId, state::PendingSessionWrite};
+    let mut state = RunState::start(RunId::new("pending-write"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .unwrap();
+    state.bind_session_persistence();
+    let item = commentary_item("m1", "done");
+    state.record_generated_items([item.clone()]);
+    let mut pending = PendingSessionWrite::new(SessionId::new("session"), vec![item.clone()], 1);
+    pending.set_before(vec![InputItemDigest::compute_session_item(&item).unwrap()]);
+    state.begin_session_write(pending).unwrap();
+    state.mark_terminal_unrecoverable();
+    let restored: RunState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(restored, state);
+    assert!(restored.terminal_unrecoverable());
+    assert!(restored.pending_session_write().is_some());
+    let mut malformed = serde_json::to_value(&state).unwrap();
+    malformed["pending_session_write"]["persisted_count"] = json!(2);
+    assert!(serde_json::from_value::<RunState>(malformed).is_err());
+    let mut malformed = serde_json::to_value(&state).unwrap();
+    malformed["pending_session_write"]["before"] = json!(["invalid digest"]);
+    assert!(serde_json::from_value::<RunState>(malformed).is_err());
+    let mut malformed = serde_json::to_value(&state).unwrap();
+    malformed["pending_session_write"]["items"] = json!([]);
+    assert!(serde_json::from_value::<RunState>(malformed).is_err());
 }

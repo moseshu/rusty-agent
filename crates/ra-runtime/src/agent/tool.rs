@@ -70,9 +70,9 @@
 //!
 //! # Not yet here
 //!
-//! - **`previous_response_id`, `conversation_id` and `session`.** The first two are conversation
-//!   state a provider keeps server-side, which this runner has no counterpart for; a nested session
-//!   belongs with the transcript-storage work.
+//! - **`previous_response_id` and `conversation_id`.** These are provider-managed conversation
+//!   state, which this runner has no counterpart for. A tool's explicit Session is passed to both
+//!   fresh and resumed nested runs; it is independent of its parent's Session.
 
 mod input;
 pub(crate) mod parent;
@@ -88,6 +88,7 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
     item::{MessageRole, RunItemKind},
+    session::Session,
     state::{RunId, RunState},
     tool::{
         FuncSchema, Tool, ToolApprovalPolicy, ToolAvailability, ToolContext, ToolFailureHandling,
@@ -243,6 +244,7 @@ pub struct AgentToolBuilder {
     enabled: Option<bool>,
     enablement: Option<Arc<dyn AgentToolEnablement>>,
     run_config: Option<RunConfig>,
+    session: Option<Arc<dyn Session>>,
     max_turns: Option<u32>,
     propagate_failures: bool,
     error_function: Option<Arc<dyn AgentToolErrorFunction>>,
@@ -292,6 +294,15 @@ impl AgentToolBuilder {
     /// Runs the nested agent under this configuration instead of the parent's.
     pub fn run_config(mut self, config: RunConfig) -> Self {
         self.run_config = Some(config);
+        self
+    }
+
+    /// Gives this agent tool its own conversation Session, including on approval resume.
+    ///
+    /// The reference's `as_tool(session=...)`. It is explicitly selected for the child and never
+    /// inherited from the parent; repeated calls read and append the child's history.
+    pub fn session(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -453,6 +464,7 @@ impl AgentToolBuilder {
             approval: self.approval,
             error_function: self.error_function,
             run_config: self.run_config,
+            session: self.session,
             max_turns: self.max_turns,
             stream: self
                 .on_stream
@@ -478,6 +490,7 @@ pub struct AgentTool {
     approval: Option<Arc<dyn AgentToolApproval>>,
     error_function: Option<Arc<dyn AgentToolErrorFunction>>,
     run_config: Option<RunConfig>,
+    session: Option<Arc<dyn Session>>,
     max_turns: Option<u32>,
     stream: Option<StreamForwarding>,
 }
@@ -493,6 +506,7 @@ impl AgentTool {
             enabled: None,
             enablement: None,
             run_config: None,
+            session: None,
             max_turns: None,
             propagate_failures: false,
             error_function: None,
@@ -592,6 +606,9 @@ impl AgentTool {
             Arc::clone(parent.spend()),
             self.run_config.is_none(),
         ));
+        if let Some(session) = &self.session {
+            request = request.with_session(Arc::clone(session));
+        }
         request = match resume {
             Some(state) => request.with_state(state),
             None => request.with_parent_run_id(context.run().run_id().clone())?,
@@ -791,6 +808,7 @@ impl fmt::Debug for AgentTool {
             .field("structured", &self.typed.is_some())
             .field("capture_tool_input", &self.capture_tool_input)
             .field("inherits_run_config", &self.run_config.is_none())
+            .field("has_session", &self.session.is_some())
             .field("max_turns", &self.max_turns)
             .field("stream", &self.stream)
             .finish_non_exhaustive()

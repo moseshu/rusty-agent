@@ -35,17 +35,69 @@ use crate::{
         ToolOutputGuardrailResult,
     },
     item::{
-        AgentId, CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind, ToolApproval,
+        AgentId, CallId, InputItemDigest, ItemId, ModelInputItem, ModelResponse, RunItem,
+        RunItemKind, ToolApproval,
     },
     permission::{PermissionDecision, PermissionRule},
     sandbox::{builtin_entry_registry, sanitize_run_state_sandbox_mount_authority},
+    session::SessionId,
     state::{ToolFailureTracker, ToolOutputReferenceTracker, ToolUseTracker},
     tool::{ToolLookupKey, ToolOrigin},
     usage::Usage,
 };
 
+/// A Session append retained until its acknowledgement or exact tail reconciliation.
+///
+/// Ported from the reference's `pending_session_write`. The application supplies the original
+/// backend and serializes access; Session has no distributed compare-and-swap contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingSessionWrite {
+    session_id: SessionId,
+    items: Vec<RunItem>,
+    before: Option<Vec<InputItemDigest>>,
+    persisted_count: usize,
+}
+
+impl PendingSessionWrite {
+    /// Captures a batch before any fallible Session operation.
+    #[must_use]
+    pub fn new(session_id: SessionId, items: Vec<RunItem>, persisted_count: usize) -> Self {
+        Self {
+            session_id,
+            items,
+            before: None,
+            persisted_count,
+        }
+    }
+    /// The original Session's identity.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    /// The detached batch owed to the Session.
+    #[must_use]
+    pub fn items(&self) -> &[RunItem] {
+        &self.items
+    }
+    /// Tail digests captured before starting the append; None means no append started.
+    #[must_use]
+    pub fn before(&self) -> Option<&[InputItemDigest]> {
+        self.before.as_deref()
+    }
+    /// The generated-history cursor after the batch settles.
+    #[must_use]
+    pub const fn persisted_count(&self) -> usize {
+        self.persisted_count
+    }
+    /// Records the tail immediately before starting the append.
+    #[doc(hidden)]
+    pub fn set_before(&mut self, before: Vec<InputItemDigest>) {
+        self.before = Some(before);
+    }
+}
+
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(6);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(7);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -78,10 +130,15 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          paused run was working in.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(6),
         "Persisted the agent-tool runs paused on an approval, each with its own checkpoint, and \
          routed answers to them. An older runtime neither asks for those approvals nor resumes \
          the calls waiting on them, and continues with a tool call that has no output.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the Session append cursor, pending batches and terminal write failures. An \
+         older runtime cannot reconcile an uncertain append or prevent replaying terminal work.",
     ),
 ];
 
@@ -733,6 +790,12 @@ pub struct RunState {
     input_history_is_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_projection: Option<HandoffProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_persisted_item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_session_write: Option<PendingSessionWrite>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    terminal_unrecoverable: bool,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -833,6 +896,12 @@ struct RunStateRecord {
     #[serde(default)]
     handoff_projection: Option<HandoffProjection>,
     #[serde(default)]
+    session_persisted_item_count: Option<usize>,
+    #[serde(default)]
+    pending_session_write: Option<PendingSessionWrite>,
+    #[serde(default)]
+    terminal_unrecoverable: bool,
+    #[serde(default)]
     sandbox: Option<serde_json::Value>,
     #[serde(flatten, default)]
     unknown: Unknown,
@@ -880,6 +949,9 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            session_persisted_item_count,
+            pending_session_write,
+            terminal_unrecoverable,
             sandbox,
             unknown,
         } = record;
@@ -939,6 +1011,24 @@ impl TryFrom<RunStateRecord> for RunState {
             &pending_interruptions,
         )?;
         validate_nested_runs(&nested_runs, &run_id)?;
+        // A count past the end would make the next append skip records the session never received,
+        // and nothing afterwards could tell which ones.
+        if let Some(count) = session_persisted_item_count
+            && count > generated_items.len()
+        {
+            return Err(Error::caller(format!(
+                "run state says its session was given {count} records, but it holds only {}",
+                generated_items.len()
+            )));
+        }
+
+        if let Some(pending) = &pending_session_write {
+            validate_pending_session_write(
+                pending,
+                generated_items.len(),
+                session_persisted_item_count,
+            )?;
+        }
 
         Ok(Self {
             schema_version,
@@ -974,6 +1064,9 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            session_persisted_item_count,
+            pending_session_write,
+            terminal_unrecoverable,
             sandbox,
             unknown,
         })
@@ -1019,6 +1112,9 @@ impl RunState {
             permission_rules: Vec::new(),
             input_history_is_complete: true,
             handoff_projection: None,
+            session_persisted_item_count: None,
+            pending_session_write: None,
+            terminal_unrecoverable: false,
             sandbox: None,
             unknown: Unknown::new(),
         }
@@ -1463,6 +1559,114 @@ impl RunState {
     #[must_use]
     pub const fn handoff_projection(&self) -> Option<&HandoffProjection> {
         self.handoff_projection.as_ref()
+    }
+
+    /// How many leading [`Self::generated_items`] have been settled with the run's session, or
+    /// `None` when no segment of this run was bound to one.
+    ///
+    /// The reference's `current_turn_persisted_item_count`, kept for the whole run rather than for
+    /// one turn: the records are append-only, so a single index says what a continuation still
+    /// owes the session, and a resumed or streamed segment appends from it instead of appending
+    /// again what an earlier segment already wrote. Records before it are not necessarily all in
+    /// the session — approval records never go there, and a run bound to a session only when it
+    /// resumed owes nothing generated before that.
+    #[must_use]
+    pub const fn session_persisted_item_count(&self) -> Option<usize> {
+        self.session_persisted_item_count
+    }
+
+    /// Binds this run's history to a session: records generated from here on are owed to it.
+    ///
+    /// A run already bound keeps its count. A run binding now — a fresh run, or one first resumed
+    /// with a session — owes nothing it generated before.
+    #[doc(hidden)]
+    pub fn bind_session_persistence(&mut self) {
+        if self.session_persisted_item_count.is_none() {
+            self.session_persisted_item_count = Some(self.generated_items.len());
+        }
+    }
+
+    /// Records that the session has been given every record before `count`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a caller error for a count that moves backwards or past the end of the history;
+    /// either would make a later append repeat or skip records.
+    #[doc(hidden)]
+    pub fn mark_session_persisted(&mut self, count: usize) -> Result<()> {
+        let current = self.session_persisted_item_count.unwrap_or(0);
+        if count < current || count > self.generated_items.len() {
+            return Err(Error::caller(format!(
+                "cannot move the session persistence count from {current} to {count} over a \
+                 history of {} records",
+                self.generated_items.len()
+            )));
+        }
+        self.session_persisted_item_count = Some(count);
+        Ok(())
+    }
+
+    /// The append that must settle before further model or tool work.
+    #[must_use]
+    pub const fn pending_session_write(&self) -> Option<&PendingSessionWrite> {
+        self.pending_session_write.as_ref()
+    }
+
+    /// Mutable access for the runtime to capture the pre-append tail.
+    #[doc(hidden)]
+    pub fn pending_session_write_mut(&mut self) -> Option<&mut PendingSessionWrite> {
+        self.pending_session_write.as_mut()
+    }
+
+    /// Starts an append without replacing an unresolved batch.
+    #[doc(hidden)]
+    pub fn begin_session_write(&mut self, pending: PendingSessionWrite) -> Result<()> {
+        if self.pending_session_write.is_some() {
+            return Err(Error::caller(
+                "resolve the pending Session write before saving another batch",
+            ));
+        }
+        validate_pending_session_write(
+            &pending,
+            self.generated_items.len(),
+            self.session_persisted_item_count,
+        )?;
+        self.pending_session_write = Some(pending);
+        Ok(())
+    }
+
+    /// Acknowledges the batch and moves its cursor together.
+    #[doc(hidden)]
+    pub fn finish_session_write(&mut self) -> Result<()> {
+        if let Some(pending) = &self.pending_session_write {
+            self.mark_session_persisted(pending.persisted_count)?;
+        }
+        self.pending_session_write = None;
+        Ok(())
+    }
+
+    /// Whether this run or a nested agent-tool run retains an uncertain or terminal Session write.
+    #[must_use]
+    pub fn has_session_write_checkpoint(&self) -> bool {
+        self.pending_session_write.is_some()
+            || self.terminal_unrecoverable
+            || self
+                .nested_runs
+                .iter()
+                .filter_map(NestedRunRef::state)
+                .any(Self::has_session_write_checkpoint)
+    }
+
+    /// Whether a terminal output's failed append made this run unsafe to resume.
+    #[must_use]
+    pub const fn terminal_unrecoverable(&self) -> bool {
+        self.terminal_unrecoverable
+    }
+
+    /// Prevents replaying completed terminal work after its Session append failed.
+    #[doc(hidden)]
+    pub fn mark_terminal_unrecoverable(&mut self) {
+        self.terminal_unrecoverable = true;
     }
 
     /// Completed model responses across every segment of this run.
@@ -2132,11 +2336,39 @@ fn validate_nested_runs(nested_runs: &[NestedRunRef], run_id: &RunId) -> Result<
                  `{run_id}`"
             )));
         }
-        if state.pending_interruption_items().next().is_none() {
+        if state.pending_interruption_items().next().is_none()
+            && !state.has_session_write_checkpoint()
+        {
             return Err(Error::caller(format!(
                 "paused agent-tool run for call `{call_id}` is not waiting on anything"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Checks a retained Session batch against the history it was cut from.
+///
+/// A batch is owed model-input records, settles to a count inside this history that does not move
+/// backwards, and carries only well-formed tail digests: a checkpoint violating any of these would
+/// make the next reconciliation append, skip, or compare the wrong records.
+fn validate_pending_session_write(
+    pending: &PendingSessionWrite,
+    history_len: usize,
+    persisted_count: Option<usize>,
+) -> Result<()> {
+    if pending.items.is_empty()
+        || pending.items.iter().any(|item| !item.is_model_input())
+        || pending.persisted_count > history_len
+        || persisted_count.is_none_or(|count| pending.persisted_count < count)
+        || pending.before.as_ref().is_some_and(|before| {
+            before.iter().any(|digest| {
+                digest.as_str().len() != 64
+                    || !digest.as_str().bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+    {
+        return Err(Error::caller("invalid pending Session write checkpoint"));
     }
     Ok(())
 }

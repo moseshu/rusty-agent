@@ -42,7 +42,7 @@ use crate::permission::PermissionEngine;
 use crate::tool::guardrail::ToolGuardrails;
 use batch::{
     DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY, StreamedFunctionDispatches, TurnExecutionRequest,
-    execute_actions,
+    TurnRecovery, execute_actions,
 };
 use prepare::TurnActionSurface;
 use process::process_model_response;
@@ -76,6 +76,7 @@ pub struct TurnSettlementRequest<'a> {
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
     handoff_input_filter: Option<Arc<dyn HandoffInputFilter>>,
+    recovery: Option<&'a mut TurnRecovery>,
 }
 
 impl<'a> TurnSettlementRequest<'a> {
@@ -122,6 +123,7 @@ impl<'a> TurnSettlementRequest<'a> {
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
             handoff_input_filter: None,
+            recovery: None,
         }
     }
 
@@ -181,6 +183,11 @@ impl<'a> TurnSettlementRequest<'a> {
         self.handoff_input_filter = Some(filter);
         self
     }
+
+    pub(crate) fn with_recovery(mut self, recovery: &'a mut TurnRecovery) -> Self {
+        self.recovery = Some(recovery);
+        self
+    }
 }
 
 /// Settles one turn in the only permitted stage order.
@@ -229,7 +236,8 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     .with_tool_guardrails(request.guardrails.clone())
     .with_user_hooks(request.user_hooks.clone())
     .with_lifecycle_hooks(request.lifecycle.clone())
-    .with_max_function_tool_concurrency(request.max_function_tool_concurrency);
+    .with_max_function_tool_concurrency(request.max_function_tool_concurrency)
+    .with_recovery(request.recovery.take());
     let execution_request = match request.streamed_dispatches.take() {
         Some(streamed_dispatches) => {
             execution_request.with_streamed_dispatches(streamed_dispatches)

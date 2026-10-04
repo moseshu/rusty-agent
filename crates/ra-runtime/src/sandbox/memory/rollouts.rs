@@ -295,6 +295,10 @@ pub fn terminal_metadata_for_result(result: &RunResult) -> RolloutTerminalMetada
 /// name; here the error's variant says the same, and its stable code stands in for the name.
 #[must_use]
 pub fn terminal_metadata_for_error(error: &Error) -> RolloutTerminalMetadata {
+    // A retained checkpoint does not change how the run ended: classify the original error.
+    if let Error::Run { error, .. } = error {
+        return terminal_metadata_for_error(error);
+    }
     let state = match error {
         Error::Budget {
             kind: ra_core::error::BudgetKind::MaxTurns,

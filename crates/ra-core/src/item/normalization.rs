@@ -33,6 +33,16 @@ impl InputItemDigest {
         Ok(Self(format!("{digest:x}")))
     }
 
+    /// Fingerprints an authoritative Session record, including its identity and metadata.
+    ///
+    /// Session stores retain [`RunItem`]s, including control records that have no model projection.
+    /// Exact append reconciliation must compare that stored representation rather than requiring
+    /// every history record to be model input.
+    pub fn compute_session_item(item: &RunItem) -> Result<Self, serde_json::Error> {
+        let encoded = serde_json::to_vec(item)?;
+        Ok(Self(format!("{:x}", Sha256::digest(encoded))))
+    }
+
     /// Lowercase hexadecimal representation.
     #[must_use]
     pub fn as_str(&self) -> &str {

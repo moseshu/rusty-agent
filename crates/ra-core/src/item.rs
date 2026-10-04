@@ -532,6 +532,25 @@ impl RunItem {
     }
 }
 
+impl From<ModelInputItem> for RunItemKind {
+    /// The record kind a model input item is stored as: the same payload under the same name.
+    fn from(item: ModelInputItem) -> Self {
+        match item {
+            ModelInputItem::Message(item) => Self::Message(item),
+            ModelInputItem::Reasoning(item) => Self::Reasoning(item),
+            ModelInputItem::ToolCall(item) => Self::ToolCall(item),
+            ModelInputItem::ToolCallOutput(item) => Self::ToolCallOutput(item),
+            ModelInputItem::HandoffCall(item) => Self::HandoffCall(item),
+            ModelInputItem::HandoffOutput(item) => Self::HandoffOutput(item),
+            ModelInputItem::McpListTools(item) => Self::McpListTools(item),
+            ModelInputItem::McpApprovalRequest(item) => Self::McpApprovalRequest(item),
+            ModelInputItem::McpApprovalResponse(item) => Self::McpApprovalResponse(item),
+            ModelInputItem::Compaction(item) => Self::Compaction(item),
+            ModelInputItem::ProviderCompaction(item) => Self::ProviderCompaction(item),
+        }
+    }
+}
+
 /// A provider-neutral input item that may be sent to a model.
 ///
 /// This type intentionally carries no `ItemId`, provenance, raw provider payload, or session data;

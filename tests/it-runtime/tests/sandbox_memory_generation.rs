@@ -29,7 +29,7 @@ use ra_core::{
         CreateRequest, Manifest, MemoryGenerateConfig, MemoryLayoutConfig, SandboxAgentConfig,
         SandboxClient, SandboxMemory, SandboxSession,
     },
-    state::RunId,
+    state::{RunId, RunState},
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
@@ -472,6 +472,12 @@ fn a_failed_run_is_classified_by_its_error() {
         assert_eq!(metadata["exception_type"], error.code());
         assert_eq!(metadata["exception_message"], error.to_string());
         assert_eq!(metadata["has_final_output"], false);
+
+        // A failed Session write returns the run's checkpoint with its error; how the run ended
+        // is still the original error's.
+        let retained = error.with_run_state(RunState::start(RunId::new("run-retained")));
+        let wrapped = serde_json::to_value(terminal_metadata_for_error(&retained)).unwrap();
+        assert_eq!(wrapped, metadata, "{retained}");
     }
 }
 

@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ra_core::session::{SessionSettings, resolve_session_limit};
 use ra_core::{
     error::Result,
     item::{
@@ -475,4 +476,58 @@ async fn test_session_implementation_interchangeability() {
         session.clear().await.unwrap();
         assert!(session.get_items(None).await.unwrap().is_empty());
     }
+}
+
+/// The reference's `SessionSettings.resolve`: an override's set values win, its unset ones keep
+/// the base's, and no override keeps the base as it is.
+#[test]
+fn test_session_settings_resolve_overlays_only_set_values() {
+    let base = SessionSettings::new().with_limit(10);
+    assert_eq!(base.resolve(None), base);
+    assert_eq!(base.resolve(Some(&SessionSettings::new())), base);
+    assert_eq!(
+        base.resolve(Some(&SessionSettings::new().with_limit(3)))
+            .limit(),
+        Some(3)
+    );
+    assert_eq!(
+        SessionSettings::default()
+            .resolve(Some(&SessionSettings::new().with_limit(0)))
+            .limit(),
+        Some(0)
+    );
+    assert_eq!(resolve_session_limit(Some(2), Some(&base)), Some(2));
+    assert_eq!(resolve_session_limit(None, Some(&base)), Some(10));
+    assert_eq!(resolve_session_limit(None, None), None);
+}
+
+/// The reference's `test_get_items_uses_session_settings_limit` and
+/// `test_get_items_explicit_limit_overrides_session_settings`: a read without a limit uses the
+/// session's own, and an explicit one replaces it.
+#[tokio::test]
+async fn test_in_memory_session_reads_with_its_settings_limit_unless_given_one() {
+    let session = InMemorySession::new_with_items("sess-settings", sample_items())
+        .with_session_settings(SessionSettings::new().with_limit(2));
+    assert_eq!(
+        session.session_settings().and_then(SessionSettings::limit),
+        Some(2)
+    );
+
+    let default_read = session.get_items(None).await.unwrap();
+    assert_eq!(
+        default_read.as_slice(),
+        &sample_items()[sample_items().len() - 2..]
+    );
+    let explicit_read = session.get_items(Some(4)).await.unwrap();
+    assert_eq!(
+        explicit_read.as_slice(),
+        &sample_items()[sample_items().len() - 4..]
+    );
+
+    assert!(
+        InMemorySession::new("sess-plain")
+            .session_settings()
+            .is_none(),
+        "a session sets nothing unless given settings"
+    );
 }
