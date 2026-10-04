@@ -17,6 +17,8 @@ pub mod memory;
 pub mod mutate;
 pub mod resume;
 pub mod rollout;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod store;
 
 pub use memory::InMemorySession;
@@ -29,3 +31,5 @@ pub use rollout::{
     graft_child_transcripts, is_persisted_rollout_item, reconstruct_history,
     truncate_rollout_after_run, truncate_rollout_before_run,
 };
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteSession, SqliteSessionBuilder};

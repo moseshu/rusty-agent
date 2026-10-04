@@ -1,0 +1,19 @@
+[package]
+name = "it-session-sqlite"
+description = "ra-session 的 SQLite 后端集成测试。不随主 workspace 发布。"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# 与 it-session 分开：那边对 ra-session 关掉了 `sqlite` feature，以便「无需 SQLite 也能实现与
+# 消费 Session port」这条验收在依赖图里可查；SQLite 后端的测试只能放在打开 feature 的这里。
+[dev-dependencies]
+ra-core = { path = "../../crates/ra-core" }
+ra-session = { path = "../../crates/ra-session" }
+# 与 ra-session 用同一版本：测试要绕开会话、直接改库来制造坏行与失败的写入。
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde_json = "1"
