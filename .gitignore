@@ -43,6 +43,7 @@ target
 /Docs/*
 !/Docs/Rusty_Agent_Framework_Development_Plan.md
 !/Docs/R8-P0_上游沙箱契约与差异清单.md
+!/Docs/R9-14_Responses_Compaction_Session.md
 
 # 门禁基线与快照（不上传 GitHub）——本地产物，`cargo xtask <gate> --bless` 生成。
 # 注意代价：它们是 `public-api` / `schema-stability` / `prompt-dump` 三条门禁的对账对象，
