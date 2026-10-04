@@ -31,7 +31,7 @@
 //!   caller's cancellation. A dropped Rust future cannot wait, so the delete runs on its own task
 //!   and holds the session's conversation lock until it settles; the next operation waits for it.
 
-mod items;
+pub(crate) mod items;
 
 use std::{
     collections::BTreeMap,
@@ -209,6 +209,10 @@ impl fmt::Debug for OpenAiConversationsSession {
 
 #[async_trait]
 impl Session for OpenAiConversationsSession {
+    fn manages_server_history(&self) -> bool {
+        true
+    }
+
     fn session_id(&self) -> &SessionId {
         &self.session_id
     }

@@ -1215,6 +1215,8 @@ struct TurnLoopProgress {
     resumed_conclusion: Option<Range<usize>>,
     /// What the agent-tool runs this segment started spent, as moved into the run's ledger.
     nested_usage: Usage,
+    /// Billed session compactions, which do not produce ordinary model responses.
+    session_compaction_usage: std::sync::Mutex<Usage>,
     /// Whether this segment has recorded its turn context in the run's rollout.
     turn_context_recorded: bool,
 }
@@ -1628,7 +1630,19 @@ async fn run_loop_inner(
                 .await
                 .and_then(|plan| plan);
             match plan {
-                Ok(plan) => plan.into_parts(),
+                Ok(plan) => {
+                    if session.compaction().is_some() {
+                        state.set_session_compaction(
+                            ra_core::session::SessionCompactionContext::new(
+                                plan.generation(),
+                                Vec::new(),
+                                None,
+                                None,
+                            ),
+                        );
+                    }
+                    plan.into_parts()
+                }
                 Err(error) => {
                     record_terminal_error(span, &error, &cancel);
                     return Err(error);
@@ -1709,6 +1723,7 @@ async fn run_loop_inner(
         budget_stop: None,
         resumed_conclusion: None,
         nested_usage: Usage::default(),
+        session_compaction_usage: std::sync::Mutex::new(Usage::default()),
         turn_context_recorded: false,
     };
     let permission = config.permission().clone().with_rules(
@@ -1769,8 +1784,13 @@ async fn run_loop_inner(
     // was still thinking is the same budget stop it would have been one line later.
     let stepped = async {
         state.snapshot_event_seq(&event_seqs);
-        session_persistence::resume_pending_session_write(context.session, &mut state, &cancel)
-            .await?;
+        session_persistence::resume_pending_session_write(
+            context.session,
+            &mut state,
+            &cancel,
+            &|usage| record_session_compaction_spend(&context, &progress, usage),
+        )
+        .await?;
         // Before anything that can stop the run, the input checks included: the reference appends
         // a run's input before its first turn, so a tripped check still leaves the question asked
         // in the session.
@@ -1784,6 +1804,7 @@ async fn run_loop_inner(
                 session_input,
                 count,
                 &cancel,
+                &|usage| record_session_compaction_spend(&context, &progress, usage),
             )
             .await?;
         }
@@ -1865,7 +1886,13 @@ async fn run_loop_inner(
             ResumeStage::Continue => {
                 if let Some(session) = context.session {
                     state.snapshot_event_seq(&event_seqs);
-                    session_persistence::save_session_items(session, &mut state, &cancel).await?;
+                    session_persistence::save_session_items(
+                        session,
+                        &mut state,
+                        &cancel,
+                        &|usage| record_session_compaction_spend(&context, &progress, usage),
+                    )
+                    .await?;
                 }
             }
         }
@@ -2069,8 +2096,13 @@ async fn run_loop_inner(
                 let _cleanup_deadline = arm_deadline(&cleanup);
                 let error = match context.session {
                     Some(session) => {
-                        match session_persistence::save_session_items(session, &mut state, &cleanup)
-                            .await
+                        match session_persistence::save_session_items(
+                            session,
+                            &mut state,
+                            &cleanup,
+                            &|usage| record_session_compaction_spend(&context, &progress, usage),
+                        )
+                        .await
                         {
                             Ok(()) => error,
                             Err(write_error) => {
@@ -2112,7 +2144,10 @@ async fn run_loop_inner(
         let _cleanup_deadline = cleanup.as_ref().map(arm_deadline);
         let write_scope = cleanup.as_ref().unwrap_or(&cancel);
         if let Err(error) =
-            session_persistence::save_session_items(session, &mut state, write_scope).await
+            session_persistence::save_session_items(session, &mut state, write_scope, &|usage| {
+                record_session_compaction_spend(&context, &progress, usage);
+            })
+            .await
         {
             if outcome
                 .finish_reason()
@@ -2152,6 +2187,10 @@ async fn run_loop_inner(
         state,
         final_message,
         progress.nested_usage,
+        progress
+            .session_compaction_usage
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     if let Some(sink) = &config.memory_usage_sink {
         crate::memory::report_final_citations(&result, sink, &run_id).await;
@@ -3023,7 +3062,10 @@ async fn run_turns(
             && let Some(session) = context.session
         {
             state.snapshot_event_seq(context.event_seqs);
-            session_persistence::save_session_items(session, state, context.cancel).await?;
+            session_persistence::save_session_items(session, state, context.cancel, &|usage| {
+                record_session_compaction_spend(context, progress, usage);
+            })
+            .await?;
         }
         if let Some(outcome) = step
             && !continue_from_stop_hook(context, agent, state, progress, &outcome).await?
@@ -3388,6 +3430,33 @@ async fn run_one_turn(
             .with_services(context.services);
         lifecycle_dispatch::llm_start(lifecycle, &calling, turn_scope).await?;
     }
+    let mut compaction_evidence = state.session_compaction().cloned().unwrap_or_default();
+    compaction_evidence.reset_exchange();
+    let compaction = context
+        .session
+        .and_then(ra_core::session::Session::compaction);
+    let mut compaction_response_stored = None;
+    if let Some(compaction) = compaction {
+        state.set_session_compaction(compaction_evidence.clone());
+        compaction_response_stored = compaction.response_stored(prepared.request());
+        // Evidence is best-effort, as in the reference: an item that cannot be fingerprinted is
+        // omitted, so stored history covering it cannot match and automatic compaction is
+        // skipped. The optional compaction path must never fail the model turn itself.
+        match turn_scope
+            .run(compaction.model_request_digests(prepared.request()))
+            .await?
+        {
+            Ok(digests) => {
+                for digest in digests {
+                    compaction_evidence.push_model_item_digest(digest);
+                }
+            }
+            Err(error) => tracing::warn!(
+                error.code = error.code(),
+                "Session compaction evidence omitted a model request that could not be fingerprinted"
+            ),
+        }
+    }
     let mut early = EarlyRecords::new(context.events.rollout, agent.public());
     let (surface, response, streamed_dispatches) = call_model(
         turn_scope,
@@ -3413,6 +3482,22 @@ async fn run_one_turn(
     record_usage(turn_span, response.usage());
     record_spend(context, state, response.usage(), selector.model(), progress);
     state.record_model_response(response.clone());
+    if let Some(compaction) = compaction {
+        for item in response.output().iter().filter_map(RunItem::to_model_input) {
+            match turn_scope.run(compaction.model_item_digest(&item)).await? {
+                Ok(digest) => compaction_evidence.push_model_item_digest(digest),
+                Err(error) => tracing::warn!(
+                    error.code = error.code(),
+                    "Session compaction evidence omitted a response item that could not be fingerprinted"
+                ),
+            }
+        }
+        compaction_evidence.set_response(
+            response.response_id().map(str::to_owned),
+            compaction_response_stored,
+        );
+        state.set_session_compaction(compaction_evidence);
+    }
 
     // After the spend has been recorded, so a callback reads the run's totals with the call it is
     // being told about already in them. A call that produced no response never reaches here: it did
@@ -3757,6 +3842,31 @@ fn deliver_rollout_budget_reminder(
     emit(context.events, RunStreamEvent::Item(item.clone()));
     state.record_generated_items([item]);
     handle.mark_budget_reminder_delivered(reminder);
+}
+
+/// Settles adapter compaction usage into the live shared budget and rollout channel.
+fn record_session_compaction_spend(
+    context: &TurnLoopContext<'_>,
+    progress: &TurnLoopProgress,
+    usage: &Usage,
+) {
+    if usage.requests() == 0 {
+        return;
+    }
+    let mut accumulated = progress
+        .session_compaction_usage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *accumulated = accumulated.accumulate(usage);
+    drop(accumulated);
+    context.spend.record_own(usage);
+    if let Some(rollout) = context.events.rollout {
+        let mut record = RolloutModelUsage::new(context.run_id.clone(), usage.clone());
+        if let Ok(turn) = u32::try_from(progress.reference_turn()) {
+            record = record.with_turn_index(turn);
+        }
+        rollout.record(RolloutItem::ModelUsage(record));
+    }
 }
 
 /// Records a model call this run paid for, in its ledger and in the spend the runs it started and

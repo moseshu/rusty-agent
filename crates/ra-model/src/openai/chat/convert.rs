@@ -224,6 +224,7 @@ async fn lower_input_block(block: &ContentBlock, role: MessageRole) -> Result<Va
         ContentBlock::Image(image) if matches!(role, MessageRole::User) => {
             lower_image_part(image).await
         }
+        ContentBlock::File(file) if matches!(role, MessageRole::User) => lower_file_part(file),
         ContentBlock::Image(_) => Err(Error::caller(
             "OpenAI Chat Completions accepts an image only in a user message",
         )),

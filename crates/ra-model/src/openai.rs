@@ -10,6 +10,7 @@ use reqwest::{
 
 pub mod auth;
 pub mod chat;
+pub mod compaction;
 pub(crate) mod content;
 pub mod conversations;
 pub(crate) mod error;

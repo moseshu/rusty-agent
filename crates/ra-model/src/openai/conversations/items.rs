@@ -142,9 +142,18 @@ fn is_unpersistable(value: &Value) -> bool {
 /// The record's identity is the item's conversation id, and the stored item itself is kept as
 /// the record's raw provider copy. A kind with no provider-neutral counterpart — a hosted tool's
 /// call, for one — is an error rather than a silent gap in the history.
-pub(super) fn lift_conversation_item(item: &Value, provider: &ProviderKey) -> Result<RunItem> {
-    let item_type = required_str(item, "type", "conversation item")?;
+pub(crate) fn lift_conversation_item(item: &Value, provider: &ProviderKey) -> Result<RunItem> {
     let id = required_str(item, "id", "conversation item")?;
+    lift_history_item(item, provider, ItemId::new(id))
+}
+
+/// Lifts a Responses history item with a separate local identity when the wire omits one.
+pub(crate) fn lift_history_item(
+    item: &Value,
+    provider: &ProviderKey,
+    id: ItemId,
+) -> Result<RunItem> {
+    let item_type = required_str(item, "type", "conversation item")?;
     let kind = match item_type {
         "message" => RunItemKind::Message(lift_message(item)?),
         "reasoning" => RunItemKind::Reasoning(lift_reasoning(item)),
@@ -165,7 +174,7 @@ pub(super) fn lift_conversation_item(item: &Value, provider: &ProviderKey) -> Re
             )));
         }
     };
-    Ok(RunItem::new(ItemId::new(id), kind)
+    Ok(RunItem::new(id, kind)
         .with_raw_provider_item(RawProviderItem::new(provider.as_str(), item.clone())))
 }
 
@@ -216,6 +225,7 @@ fn lift_content(part: &Value) -> Result<ContentBlock> {
             part, "refusal", "refusal",
         )?)),
         "input_image" => Ok(ContentBlock::Image(lift_image(part)?)),
+        "input_file" => Ok(ContentBlock::File(lift_file(part)?)),
         other => Err(behavior_error(format!(
             "unsupported OpenAI conversation message content `{other}`"
         ))),
@@ -321,7 +331,31 @@ fn lift_file(part: &Value) -> Result<FileBlock> {
             "OpenAI conversation input_file carries no file_data, file_url or file_id",
         ));
     };
-    Ok(FileBlock::new(source))
+    let file = FileBlock::new(source);
+    // Replay metadata belongs to this adapter. Carry it in the record's extension envelope,
+    // rather than adding Responses-only detail or filename fields to the neutral file source.
+    let metadata: serde_json::Map<String, Value> = ["filename", "detail"]
+        .into_iter()
+        .filter_map(|key| {
+            if key == "filename" && matches!(file.source(), FileSource::Base64(_)) {
+                return None;
+            }
+            part.get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| (key.to_owned(), Value::String(value.to_owned())))
+        })
+        .collect();
+    if metadata.is_empty() {
+        return Ok(file);
+    }
+    let mut encoded = serde_json::to_value(file).map_err(|error| {
+        behavior_error("File replay metadata could not be serialized").with_source(error)
+    })?;
+    encoded["openai"] = Value::Object(metadata);
+    serde_json::from_value(encoded).map_err(|error| {
+        behavior_error("File replay metadata could not be stored").with_source(error)
+    })
 }
 
 fn lift_mcp_request(item: &Value) -> Result<McpApprovalRequest> {

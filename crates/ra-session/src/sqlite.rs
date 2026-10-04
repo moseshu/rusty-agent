@@ -23,8 +23,8 @@
 //! - **Cancellation.** The reference waits for a mutation's outcome before re-raising a caller's
 //!   cancellation. A dropped Rust future cannot wait, so the statement runs to completion on the
 //!   blocking pool and its outcome is not reported to anyone; it is never left half applied.
-//! - The private compaction snapshot the reference offers its compaction session is not ported
-//!   with this store.
+//! - Bounded compaction snapshots compare raw row identities and contents in an immediate
+//!   transaction before atomically replacing a suffix, as in the reference.
 
 use std::{
     collections::HashMap,
@@ -40,7 +40,10 @@ use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, SessionErrorKind},
     item::RunItem,
-    session::{Session, SessionId, SessionSettings, resolve_session_limit},
+    session::{
+        CompactionSnapshot, CompactionSnapshotReplacement, Session, SessionId, SessionSettings,
+        resolve_session_limit,
+    },
 };
 use rusqlite::{Connection, ErrorCode, OpenFlags, params, types::ValueRef};
 
@@ -280,6 +283,31 @@ impl Session for SqliteSession {
         self.session_settings.as_ref()
     }
 
+    async fn get_compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        if limit == 0 {
+            return Ok(None);
+        }
+        let rows = self.run(move |inner| inner.snapshot_rows(limit)).await?;
+        let mut items = Vec::with_capacity(rows.0.len());
+        for (_, data) in &rows.0 {
+            let rusqlite::types::Value::Text(data) = data else {
+                return Ok(None);
+            };
+            let Ok(item) = serde_json::from_str::<RunItem>(data) else {
+                return Ok(None);
+            };
+            items.push(item);
+        }
+        Ok(Some(CompactionSnapshot::new(
+            items,
+            rows.1,
+            Arc::new(SqliteSnapshot {
+                inner: Arc::clone(&self.inner),
+                rows: rows.0,
+            }),
+        )))
+    }
+
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<RunItem>> {
         let limit = resolve_session_limit(limit, self.session_settings.as_ref());
         self.run(move |inner| inner.get_items(limit)).await
@@ -303,6 +331,84 @@ impl Session for SqliteSession {
     async fn clear(&self) -> Result<()> {
         self.run(Inner::clear).await
     }
+}
+
+type SnapshotRows = Vec<(i64, rusqlite::types::Value)>;
+
+struct SqliteSnapshot {
+    inner: Arc<Inner>,
+    rows: SnapshotRows,
+}
+
+#[async_trait]
+impl CompactionSnapshotReplacement for SqliteSnapshot {
+    async fn replace_suffix(&self, start: usize, items: Vec<RunItem>) -> Result<bool> {
+        let expected = self.rows.get(start..).unwrap_or_default().to_vec();
+        if expected.is_empty() {
+            return Ok(false);
+        }
+        let output = items.iter().map(encode_item).collect::<Result<Vec<_>>>()?;
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            inner.with_transaction_kind("BEGIN IMMEDIATE", |connection| {
+                let current = query_snapshot_rows(
+                    connection,
+                    &inner.sql.select_snapshot,
+                    &inner.session_id,
+                    expected.len(),
+                )?;
+                if current != expected {
+                    return Ok(false);
+                }
+                connection
+                    .execute(
+                        &inner.sql.delete_suffix,
+                        params![inner.session_id, expected[0].0],
+                    )
+                    .map_err(sqlite_error)?;
+                connection
+                    .execute(&inner.sql.ensure_session, params![inner.session_id])
+                    .map_err(sqlite_error)?;
+                for row in output {
+                    connection
+                        .execute(&inner.sql.insert_item, params![inner.session_id, row])
+                        .map_err(sqlite_error)?;
+                }
+                connection
+                    .execute(&inner.sql.touch_session, params![inner.session_id])
+                    .map_err(sqlite_error)?;
+                Ok(true)
+            })
+        })
+        .await
+        .map_err(|error| {
+            Error::session(
+                SessionErrorKind::Io,
+                "SQLite compaction replacement task failed",
+            )
+            .with_source(error)
+        })?
+    }
+}
+
+fn query_snapshot_rows(
+    connection: &Connection,
+    sql: &str,
+    session_id: &str,
+    limit: usize,
+) -> Result<SnapshotRows> {
+    let mut statement = connection.prepare_cached(sql).map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(
+            params![session_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = rows
+        .collect::<rusqlite::Result<SnapshotRows>>()
+        .map_err(sqlite_error)?;
+    rows.reverse();
+    Ok(rows)
 }
 
 /// The part of a session its blocking operations share.
@@ -348,11 +454,19 @@ impl Inner {
     /// write lock for the sessions that come after: a file connection is reopened by the next
     /// operation, and losing the in-memory one closes the session.
     fn with_transaction<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.with_transaction_kind("BEGIN", operation)
+    }
+
+    fn with_transaction_kind<T>(
+        &self,
+        begin: &str,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         let _guard = lock_ignoring_poison(&self.lock);
         let mut state = lock_ignoring_poison(&self.state);
         let connection = self.connection(&mut state)?;
 
-        connection.execute_batch("BEGIN").map_err(sqlite_error)?;
+        connection.execute_batch(begin).map_err(sqlite_error)?;
         let outcome = operation(connection).and_then(|value| {
             connection.execute_batch("COMMIT").map_err(sqlite_error)?;
             Ok(value)
@@ -396,6 +510,30 @@ impl Inner {
         }
     }
 
+    fn snapshot_rows(&self, limit: usize) -> Result<(SnapshotRows, bool)> {
+        self.with_connection(|connection| {
+            let rows = query_snapshot_rows(
+                connection,
+                &self.sql.select_snapshot,
+                &self.session_id,
+                limit,
+            )?;
+            let complete = if rows.len() < limit || rows.is_empty() {
+                true
+            } else {
+                let count: i64 = connection
+                    .query_row(
+                        &self.sql.count_before,
+                        params![self.session_id, rows[0].0],
+                        |row| row.get(0),
+                    )
+                    .map_err(sqlite_error)?;
+                count == 0
+            };
+            Ok((rows, complete))
+        })
+    }
+
     fn get_items(&self, limit: Option<usize>) -> Result<Vec<RunItem>> {
         let sql = &self.sql;
         self.with_connection(|connection| {
@@ -411,8 +549,11 @@ impl Inner {
             let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
             let mut window = limit_sql;
             loop {
-                let mut rows =
-                    query_rows(connection, &sql.select_newest, params![self.session_id, window])?;
+                let mut rows = query_rows(
+                    connection,
+                    &sql.select_newest,
+                    params![self.session_id, window],
+                )?;
                 let fetched = rows.len();
                 rows.reverse();
                 let mut items = decode_rows(rows)?;
@@ -541,6 +682,9 @@ struct Statements {
     touch_session: String,
     select_all: String,
     select_newest: String,
+    select_snapshot: String,
+    count_before: String,
+    delete_suffix: String,
     pop_newest: String,
     delete_items: String,
     delete_session: String,
@@ -586,6 +730,13 @@ impl Statements {
                 "SELECT message_data FROM {messages} WHERE session_id = ?1 \
                  ORDER BY id DESC LIMIT ?2"
             ),
+            select_snapshot: format!(
+                "SELECT id, message_data FROM {messages} WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2"
+            ),
+            count_before: format!(
+                "SELECT COUNT(*) FROM {messages} WHERE session_id = ?1 AND id < ?2"
+            ),
+            delete_suffix: format!("DELETE FROM {messages} WHERE session_id = ?1 AND id >= ?2"),
             pop_newest: format!(
                 "DELETE FROM {messages} WHERE id = (
                     SELECT id FROM {messages} WHERE session_id = ?1 ORDER BY id DESC LIMIT 1

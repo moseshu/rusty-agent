@@ -328,7 +328,7 @@ fn insert_optional_number(body: &mut Map<String, Value>, name: &str, value: Opti
     }
 }
 
-async fn lower_input(request: &ModelRequest) -> Result<Vec<Value>> {
+pub(crate) async fn lower_input(request: &ModelRequest) -> Result<Vec<Value>> {
     let normalized = InputItemNormalizer::new()
         .normalize_model_items(request.input())
         .map_err(|error| {
@@ -533,6 +533,10 @@ async fn lower_content(block: &ContentBlock, role: MessageRole) -> Result<Value>
             }
             lower_image(image).await
         }
+        ContentBlock::File(file) if !matches!(role, MessageRole::Assistant) => lower_file(file),
+        ContentBlock::File(_) => Err(Error::caller(
+            "OpenAI Responses assistant history cannot contain a file block",
+        )),
         ContentBlock::Refusal(refusal) if matches!(role, MessageRole::Assistant) => {
             Ok(json!({"type": "refusal", "refusal": refusal.refusal()}))
         }
@@ -568,7 +572,7 @@ async fn lower_image(image: &ImageBlock) -> Result<Value> {
 
 /// Lowers one file block to an `input_file` part.
 fn lower_file(file: &FileBlock) -> Result<Value> {
-    match file.source() {
+    let mut part = match file.source() {
         FileSource::Base64(source) => {
             let mut part = json!({"type": "input_file", "file_data": source.data()});
             if let Some(filename) = source.filename() {
@@ -583,7 +587,19 @@ fn lower_file(file: &FileBlock) -> Result<Value> {
         _ => Err(Error::caller(
             "unsupported file source for OpenAI Responses",
         )),
+    }?;
+    if let Some(metadata) = file.unknown().get("openai") {
+        for key in ["filename", "detail"] {
+            if let Some(value) = metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                part[key] = Value::String(value.to_owned());
+            }
+        }
     }
+    Ok(part)
 }
 
 /// Lowers a tool result's stored payload into what `function_call_output.output` accepts.

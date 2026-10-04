@@ -40,6 +40,7 @@ use ra_core::{
 pub struct SessionInputPlan {
     prepared_for_model: Vec<ModelInputItem>,
     append_for_turn: Vec<RunItem>,
+    generation: Option<u64>,
 }
 
 impl SessionInputPlan {
@@ -53,6 +54,12 @@ impl SessionInputPlan {
     #[must_use]
     pub fn append_for_turn(&self) -> &[RunItem] {
         &self.append_for_turn
+    }
+
+    /// Mutation ownership captured atomically with the initial history read.
+    #[must_use]
+    pub const fn generation(&self) -> Option<u64> {
+        self.generation
     }
 
     /// Both halves, by value.
@@ -90,7 +97,7 @@ pub async fn prepare_input_with_session(
         .copied()
         .unwrap_or_default()
         .resolve(settings);
-    let history = session.get_items(resolved.limit()).await?;
+    let (history, generation) = session.get_items_with_generation(resolved.limit()).await?;
     let new_input = new_input_items(run_id, input, &history);
 
     let (combined, history_positions, output_pruning, appended) = match callback {
@@ -120,6 +127,7 @@ pub async fn prepare_input_with_session(
     Ok(SessionInputPlan {
         prepared_for_model: prepared,
         append_for_turn: appended,
+        generation,
     })
 }
 
@@ -138,6 +146,7 @@ pub(crate) async fn save_session_items(
     session: &dyn Session,
     state: &mut RunState,
     cancel: &CancelScope,
+    on_usage: &(dyn Fn(&ra_core::usage::Usage) + Send + Sync),
 ) -> Result<()> {
     let Some(start) = state.session_persisted_item_count() else {
         return Ok(());
@@ -151,7 +160,7 @@ pub(crate) async fn save_session_items(
     if items.is_empty() {
         return state.mark_session_persisted(end);
     }
-    append_session_items(session, state, items, end, cancel).await
+    append_session_items(session, state, items, end, cancel, on_usage).await
 }
 
 /// Captures a batch before reading or writing the backend, so any failure retains the work.
@@ -161,6 +170,7 @@ pub(crate) async fn append_session_items(
     items: Vec<RunItem>,
     persisted_count: usize,
     cancel: &CancelScope,
+    on_usage: &(dyn Fn(&ra_core::usage::Usage) + Send + Sync),
 ) -> Result<()> {
     if state.pending_session_write().is_some() {
         return Err(Error::caller(
@@ -176,7 +186,7 @@ pub(crate) async fn append_session_items(
         items,
         persisted_count,
     ))?;
-    resume_pending_session_write(Some(session), state, cancel).await
+    resume_pending_session_write(Some(session), state, cancel, on_usage).await
 }
 
 /// Settles an uncertain append before allowing any further model or tool work.
@@ -189,6 +199,7 @@ pub(crate) async fn resume_pending_session_write(
     session: Option<&dyn Session>,
     state: &mut RunState,
     cancel: &CancelScope,
+    on_usage: &(dyn Fn(&ra_core::usage::Usage) + Send + Sync),
 ) -> Result<()> {
     let Some(pending) = state.pending_session_write().cloned() else {
         return Ok(());
@@ -217,8 +228,8 @@ pub(crate) async fn resume_pending_session_write(
         Some(before) => {
             let mut expected = before.to_vec();
             expected.extend(cancel.run(item_digests(pending.items(), session)).await??);
-            let tail = cancel
-                .run(session.get_items(Some(expected.len())))
+            let (tail, generation) = cancel
+                .run(session.get_items_with_generation(Some(expected.len())))
                 .await??;
             let observed = cancel.run(item_digests(&tail, session)).await??;
             let committed = observed == expected;
@@ -227,20 +238,63 @@ pub(crate) async fn resume_pending_session_write(
             } else {
                 observed.ends_with(before)
             };
-            if committed == unchanged {
+            if (pending.append_acknowledged() && !committed)
+                || (!pending.append_acknowledged() && committed == unchanged)
+            {
                 return Err(Error::caller(
                     "cannot reconcile the pending Session write: history changed or is ambiguous; repair the original Session before resuming and do not rerun the completed tool",
                 ));
             }
-            !committed
+            if let Some(mut context) = state.session_compaction().cloned() {
+                context.set_generation(generation);
+                state.set_session_compaction(context);
+            }
+            !pending.append_acknowledged() && !committed
         }
     };
     if append {
-        cancel
-            .run(session.add_items(pending.items().to_vec()))
+        let generation = cancel
+            .run(
+                session.add_items_with_generation(
+                    pending.items().to_vec(),
+                    state
+                        .session_compaction()
+                        .and_then(ra_core::session::SessionCompactionContext::generation),
+                ),
+            )
             .await??;
+        if let Some(mut context) = state.session_compaction().cloned() {
+            context.set_generation(generation);
+            state.set_session_compaction(context);
+        }
     }
-    state.finish_session_write()
+    state
+        .pending_session_write_mut()
+        .ok_or_else(|| {
+            Error::caller("pending Session write disappeared before post-write compaction")
+        })?
+        .acknowledge_append();
+    state.mark_session_persisted(pending.persisted_count())?;
+    if let Some(compaction) = session.compaction()
+        && let Some(context) = state.session_compaction().cloned()
+        && context.response_id().is_some()
+    {
+        let local_outputs = pending.items().iter().any(|item| {
+            matches!(
+                item.kind(),
+                RunItemKind::ToolCallOutput(_) | RunItemKind::HandoffOutput(_)
+            )
+        });
+        // The adapter observes cancellation until replacement begins, then drains settlement.
+        // Usage belongs to the ledger even if output normalization or replacement fails.
+        let outcome = compaction.after_turn(&context, local_outputs, cancel).await;
+        let (usage, result) = outcome.into_parts();
+        state.record_usage(&usage);
+        on_usage(&usage);
+        result?;
+    }
+    state.finish_session_write()?;
+    cancel.ensure_not_cancelled()
 }
 
 /// Fingerprints the backend's storage projection rather than the richer run record.
