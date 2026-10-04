@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use ra_core::{
     error::Result,
     item::RunItem,
-    session::{Session, SessionId},
+    session::{Session, SessionId, SessionSettings, resolve_session_limit},
 };
 
 /// An in-memory, thread-safe implementation of [`Session`].
@@ -19,6 +19,7 @@ use ra_core::{
 #[derive(Debug)]
 pub struct InMemorySession {
     session_id: SessionId,
+    session_settings: Option<SessionSettings>,
     items: RwLock<Vec<RunItem>>,
 }
 
@@ -28,6 +29,7 @@ impl InMemorySession {
     pub fn new(session_id: impl Into<SessionId>) -> Self {
         Self {
             session_id: session_id.into(),
+            session_settings: None,
             items: RwLock::new(Vec::new()),
         }
     }
@@ -37,8 +39,16 @@ impl InMemorySession {
     pub fn new_with_items(session_id: impl Into<SessionId>, items: Vec<RunItem>) -> Self {
         Self {
             session_id: session_id.into(),
+            session_settings: None,
             items: RwLock::new(items),
         }
+    }
+
+    /// Gives the session default settings: a read without an explicit limit uses theirs.
+    #[must_use]
+    pub const fn with_session_settings(mut self, settings: SessionSettings) -> Self {
+        self.session_settings = Some(settings);
+        self
     }
 }
 
@@ -48,10 +58,14 @@ impl Session for InMemorySession {
         &self.session_id
     }
 
+    fn session_settings(&self) -> Option<&SessionSettings> {
+        self.session_settings.as_ref()
+    }
+
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<RunItem>> {
         let guard = self.items.read().unwrap_or_else(PoisonError::into_inner);
 
-        let items = match limit {
+        let items = match resolve_session_limit(limit, self.session_settings.as_ref()) {
             None => guard.clone(),
             Some(n) if n >= guard.len() => guard.clone(),
             Some(n) => guard[guard.len() - n..].to_vec(),

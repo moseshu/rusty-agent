@@ -50,7 +50,7 @@ use ra_core::{
     item::{
         AgentId, CallId, HandoffOutput, ItemId, RunItem, RunItemKind, ToolCallKind, ToolCallOutput,
     },
-    state::{ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
+    state::{NestedRunRef, ToolFailureTracker, ToolOutcome, ToolUse, ToolUseTracker},
     step::{ProcessedResponse, ToolRunFunction},
     tool::{ResourceClaim, ResourceId, ToolConcurrency, ToolOrigin, ToolServices},
     trace::SpanKind,
@@ -100,6 +100,13 @@ pub struct TurnExecution {
     tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
 }
 
+/// Completed sibling work and child checkpoints retained when persistence ends a batch.
+#[derive(Default)]
+pub(crate) struct TurnRecovery {
+    pub(crate) execution: TurnExecution,
+    pub(crate) nested_runs: Vec<NestedRunRef>,
+}
+
 /// One completed task, retained until the whole batch is known to be safe to settle.
 struct CompletedDispatch {
     order: usize,
@@ -142,6 +149,7 @@ struct RankedFailure {
 struct CollectedDispatches {
     completed: Vec<CompletedDispatch>,
     failure: Option<RankedFailure>,
+    nested_runs: Vec<(usize, NestedRunRef)>,
 }
 
 impl TurnExecution {
@@ -248,6 +256,7 @@ pub struct TurnExecutionRequest<'a> {
     user_hooks: UserHooks,
     lifecycle: LifecycleHooks,
     streamed_dispatches: Option<StreamedFunctionDispatches>,
+    recovery: Option<&'a mut TurnRecovery>,
 }
 
 impl<'a> TurnExecutionRequest<'a> {
@@ -275,6 +284,7 @@ impl<'a> TurnExecutionRequest<'a> {
             user_hooks: UserHooks::default(),
             lifecycle: LifecycleHooks::new(),
             streamed_dispatches: None,
+            recovery: None,
         }
     }
 
@@ -317,6 +327,11 @@ impl<'a> TurnExecutionRequest<'a> {
         streamed_dispatches: StreamedFunctionDispatches,
     ) -> Self {
         self.streamed_dispatches = Some(streamed_dispatches);
+        self
+    }
+
+    pub(crate) fn with_recovery(mut self, recovery: Option<&'a mut TurnRecovery>) -> Self {
+        self.recovery = recovery;
         self
     }
 }
@@ -376,13 +391,33 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
         return Err(error);
     }
 
-    let collected = collect_dispatches(
+    let mut collected = collect_dispatches(
         &mut dispatches,
         &mut task_orders,
         &tool_scopes,
         request.cancel,
     )
     .await;
+
+    if !collected.nested_runs.is_empty() {
+        collected.nested_runs.sort_by_key(|(order, _)| *order);
+        let nested_runs = std::mem::take(&mut collected.nested_runs)
+            .into_iter()
+            .map(|(_, nested)| nested)
+            .collect();
+        let failure = collected.failure.take();
+        settle_dispatches(collected, processed, &mut execution)?;
+        if let Some(recovery) = request.recovery {
+            recovery.execution = execution;
+            recovery.nested_runs = nested_runs;
+        }
+        // Preserve the cancellation outcome while retaining the completed work it interrupted.
+        request.cancel.ensure_not_cancelled()?;
+        return Err(failure.map_or_else(
+            || Error::caller("a child checkpoint requires the batch failure that produced it"),
+            |failure| failure.error,
+        ));
+    }
 
     // Not redundant with the entry check: collection awaits, and a cancellation that arrives while
     // the last dispatch is completing can lose that race and leave the scope cancelled here.
@@ -1033,6 +1068,11 @@ fn record_task_result(
             } else {
                 debug_assert_eq!(recorded_order, Some(task.order));
             }
+            if let Err(error) = &task.result
+                && let Some(nested) = error.nested_run()
+            {
+                collected.nested_runs.push((task.order, nested.clone()));
+            }
             match task.result {
                 Ok(outcome) => {
                     let (dispatch, guardrails) = outcome.into_parts();
@@ -1109,6 +1149,10 @@ impl RankedFailure {
 
 /// The failure arbitration table. Higher priority wins; equal classes retain model order.
 fn failure_priority(error: &Error) -> FailurePriority {
+    // A retained checkpoint does not change what failed: rank the original error.
+    if let Error::Run { error, .. } = error {
+        return failure_priority(error);
+    }
     if error.is_cancelled() {
         return FailurePriority::Cancelled;
     }

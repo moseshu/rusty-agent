@@ -283,6 +283,23 @@ impl GuardrailStage {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A failed run's original error and the state retained before returning it.
+    ///
+    /// The reference mutates the caller's `RunState` in place. Rust runs consume their state, so
+    /// failures at a Session write return it here instead. Display, classification and guardrail
+    /// evidence delegate to the original error; callers resume using [`Self::run_state`].
+    #[error("{error}")]
+    #[non_exhaustive]
+    Run {
+        /// The original failure, unchanged.
+        #[source]
+        error: Box<Error>,
+        /// The checkpoint at the failed boundary.
+        state: Box<crate::state::RunState>,
+        /// The agent-tool call whose nested checkpoint must be retained by its parent.
+        nested_run: Option<Box<crate::state::NestedRunRef>>,
+    },
+
     /// Configuration error: missing, invalid, or conflicting sources.
     #[error("配置错误：{message}")]
     #[non_exhaustive]
@@ -410,6 +427,54 @@ pub enum Error {
 }
 
 impl Error {
+    /// Retains a run checkpoint without changing the original error's classification or message.
+    #[must_use]
+    pub fn with_run_state(self, state: crate::state::RunState) -> Self {
+        Self::Run {
+            error: Box::new(self),
+            state: Box::new(state),
+            nested_run: None,
+        }
+    }
+
+    /// The checkpoint retained by a failed Session operation, if any.
+    #[must_use]
+    pub fn run_state(&self) -> Option<&crate::state::RunState> {
+        match self {
+            Self::Run { state, .. } => Some(state),
+            _ => None,
+        }
+    }
+
+    /// The retained checkpoint, for recording cleanup before the error leaves the runtime.
+    #[doc(hidden)]
+    pub fn run_state_mut(&mut self) -> Option<&mut crate::state::RunState> {
+        match self {
+            Self::Run { state, .. } => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Retains routing for a failed agent-tool run, without rendering its failure as an output.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_nested_run(mut self, nested: crate::state::NestedRunRef) -> Self {
+        if let Self::Run { nested_run, .. } = &mut self {
+            *nested_run = Some(Box::new(nested));
+        }
+        self
+    }
+
+    /// The agent-tool checkpoint its parent must retain before returning this failure.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn nested_run(&self) -> Option<&crate::state::NestedRunRef> {
+        match self {
+            Self::Run { nested_run, .. } => nested_run.as_deref(),
+            _ => None,
+        }
+    }
+
     // -- constructors (the variants are non_exhaustive, so this is the only way in) --------
 
     /// Creates a [configuration error](Error::Config).
@@ -515,6 +580,18 @@ impl Error {
         mut self,
         collected: crate::guardrail::GuardrailEvidence,
     ) -> Self {
+        if let Self::Run {
+            error,
+            state,
+            nested_run,
+        } = self
+        {
+            return Self::Run {
+                error: Box::new(error.with_guardrail_evidence(collected)),
+                state,
+                nested_run,
+            };
+        }
         if let Self::Guardrail { evidence, .. } = &mut self {
             *evidence = Some(Box::new(collected));
         }
@@ -525,6 +602,7 @@ impl Error {
     #[must_use]
     pub fn guardrail_evidence(&self) -> Option<&crate::guardrail::GuardrailEvidence> {
         match self {
+            Self::Run { error, .. } => error.guardrail_evidence(),
             Self::Guardrail { evidence, .. } => evidence.as_deref(),
             _ => None,
         }
@@ -551,7 +629,20 @@ impl Error {
     /// reads back; prefixing it with prose would turn the reason into free text.
     #[must_use]
     pub fn with_context(mut self, context: impl fmt::Display) -> Self {
+        if let Self::Run {
+            error,
+            state,
+            nested_run,
+        } = self
+        {
+            return Self::Run {
+                error: Box::new(error.with_context(context)),
+                state,
+                nested_run,
+            };
+        }
         match &mut self {
+            Self::Run { .. } => unreachable!("run errors were delegated above"),
             Self::Config { message, .. }
             | Self::Caller { message, .. }
             | Self::Provider { message, .. }
@@ -570,7 +661,20 @@ impl Error {
     /// (`Budget`, `Guardrail`, `Cancelled`) is a no-op.
     #[must_use]
     pub fn with_source(mut self, src: impl Into<BoxError>) -> Self {
+        if let Self::Run {
+            error,
+            state,
+            nested_run,
+        } = self
+        {
+            return Self::Run {
+                error: Box::new(error.with_source(src)),
+                state,
+                nested_run,
+            };
+        }
         match &mut self {
+            Self::Run { .. } => unreachable!("run errors were delegated above"),
             Self::Config { source, .. }
             | Self::Caller { source, .. }
             | Self::Provider { source, .. }
@@ -597,6 +701,7 @@ impl Error {
     #[must_use]
     pub const fn recoverability(&self) -> Recoverability {
         match self {
+            Self::Run { error, .. } => error.recoverability(),
             Self::Cancelled { .. } => Recoverability::Cancelled,
 
             // A caller defect: retrying never helps.
@@ -687,6 +792,7 @@ impl Error {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::Run { error, .. } => error.code(),
             Self::Config { .. } => "config",
             Self::Caller { .. } => "caller",
             Self::Cancelled { .. } => "cancelled",
@@ -753,6 +859,7 @@ impl Error {
     #[must_use]
     pub fn user_message(&self) -> String {
         match self {
+            Self::Run { error, .. } => error.user_message(),
             Self::Config { message, .. } => {
                 format!("配置有问题：{message}。请检查配置文件与环境变量。")
             }

@@ -668,6 +668,25 @@ async fn run_chain(
         )));
     }
 
+    // A failed Session append retains completed child work. It must leave through the parent
+    // checkpoint rather than become a model-visible tool failure that invites another execution.
+    let outcome = match outcome {
+        Err(error) => {
+            if let Some(state) = error.run_state() {
+                let nested = NestedRunRef::interrupted(
+                    request.run.run_id().as_str(),
+                    tool.origin(),
+                    request.call_id.clone(),
+                    request.arguments.clone(),
+                    state.clone(),
+                );
+                return Err(error.with_nested_run(nested));
+            }
+            Err(error)
+        }
+        outcome => outcome,
+    };
+
     announce_invocation_end(request, &outcome).await?;
 
     let output = match outcome {

@@ -68,9 +68,12 @@ use ra_core::{
     },
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
-    session::rollout::{
-        RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
-        RolloutRunStarted, RolloutTurnContext,
+    session::{
+        Session, SessionInputCallback, SessionSettings,
+        rollout::{
+            RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
+            RolloutRunStarted, RolloutTurnContext,
+        },
     },
     state::{
         EventSeqAllocator, HandoffProjection, InterruptionResolution, NestedRunRef, RunId,
@@ -86,6 +89,8 @@ use tracing::{Instrument, info_span, warn};
 
 mod grouping;
 pub mod result;
+#[doc(hidden)]
+pub mod session_persistence;
 pub mod stream;
 
 pub use crate::turn::prepare::ActionSurfaceBudget;
@@ -166,6 +171,8 @@ pub struct RunConfig {
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
     sandbox: Option<SandboxRunConfig>,
     group_id: Option<String>,
+    session_input_callback: Option<Arc<dyn SessionInputCallback>>,
+    session_settings: Option<SessionSettings>,
 }
 
 impl Default for RunConfig {
@@ -204,7 +211,38 @@ impl RunConfig {
             lifecycle_hooks: Vec::new(),
             sandbox: None,
             group_id: None,
+            session_input_callback: None,
+            session_settings: None,
         }
+    }
+
+    /// Sets how a run with a session merges the session's history with its new input.
+    ///
+    /// Without one, the run starts from the history followed by the new input. Whatever the
+    /// callback returns, the session is appended to only with the new turn's items; see
+    /// [`SessionInputCallback`]. A run without a session ignores it.
+    pub fn with_session_input_callback(mut self, callback: Arc<dyn SessionInputCallback>) -> Self {
+        self.session_input_callback = Some(callback);
+        self
+    }
+
+    /// The callback set by [`Self::with_session_input_callback`], if any.
+    #[must_use]
+    pub fn session_input_callback(&self) -> Option<&Arc<dyn SessionInputCallback>> {
+        self.session_input_callback.as_ref()
+    }
+
+    /// Overrides the session's own settings for this run: values set here win, and values left
+    /// unset keep the session's.
+    pub const fn with_session_settings(mut self, settings: SessionSettings) -> Self {
+        self.session_settings = Some(settings);
+        self
+    }
+
+    /// The session settings this run overrides, if any.
+    #[must_use]
+    pub const fn session_settings(&self) -> Option<&SessionSettings> {
+        self.session_settings.as_ref()
     }
 
     /// Configures how this run reaches the sandboxes its sandbox agents run in.
@@ -738,6 +776,11 @@ impl std::fmt::Debug for RunConfig {
             .field("sandbox", &self.sandbox)
             .field("group_id", &self.group_id)
             .field(
+                "has_session_input_callback",
+                &self.session_input_callback.is_some(),
+            )
+            .field("session_settings", &self.session_settings)
+            .field(
                 "input_guardrails",
                 &self
                     .input_guardrails
@@ -813,6 +856,7 @@ pub struct RunRequest {
     rollout: Option<Arc<dyn RolloutRecorder>>,
     /// How many leading items of `input` the rollout already holds.
     recorded_input: usize,
+    session: Option<Arc<dyn Session>>,
 }
 
 impl RunRequest {
@@ -852,6 +896,7 @@ impl RunRequest {
             rollout: None,
             nested_spend: None,
             recorded_input: 0,
+            session: None,
         }
     }
 
@@ -876,6 +921,27 @@ impl RunRequest {
     /// sink; one that was installed receives them as before.
     pub fn with_rollout_recorder(mut self, recorder: Arc<dyn RolloutRecorder>) -> Self {
         self.rollout = Some(recorder);
+        self
+    }
+
+    /// Reads this run's history from `session` and appends what the run adds to it.
+    ///
+    /// The reference's `session` argument. A fresh run starts from the session's history followed
+    /// by its input — or whatever [`RunConfig::with_session_input_callback`] makes of the two —
+    /// and the session is given the new input before the first model call and the run's records as
+    /// each turn settles. A final answer is appended once the output guardrails have passed it, and
+    /// a run whose input guardrail tripped appends its input and nothing else.
+    ///
+    /// A run continued from its checkpoint takes its history from the checkpoint and appends only
+    /// what it has not appended yet, so the same session must be passed again; it must carry no
+    /// input of its own, since the session already holds the conversation that input would be a
+    /// projection of.
+    ///
+    /// If persistence fails, continue from [`Error::run_state`] rather than an earlier checkpoint.
+    /// It retains completed tool work and reconciles uncertain appends before continuing. The host
+    /// must serialize access to the original backend, including other copies of that checkpoint.
+    pub fn with_session(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -1115,6 +1181,8 @@ struct TurnLoopContext<'a> {
     spend: &'a RunSpend,
     /// Whether this segment continues a turn that stopped for approval rather than starting one.
     continues_turn: bool,
+    /// The session the run's history is read from and appended to.
+    session: Option<&'a dyn Session>,
 }
 
 /// What the loop produces, whichever way it ends.
@@ -1449,6 +1517,7 @@ async fn run_loop_inner(
         nested_spend: _,
         rollout,
         recorded_input: _,
+        session,
     } = request;
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
@@ -1508,20 +1577,12 @@ async fn run_loop_inner(
 
     // An explicit input remains the caller's continuation base. An empty resumed request chooses
     // the checkpoint projection, so hosts that persist only state do not have to rebuild it.
-    let resuming = state.current_agent().is_some();
-    // A segment that answers questions the last one stopped on finishes that turn rather than
-    // starting a new one, which is what the agent tree's budget reminder is keyed to.
-    let continues_turn =
-        !state.pending_interruptions().is_empty() || !state.nested_runs().is_empty();
-    if let Err(error) = state.begin_segment(agent.public_id().clone(), requested_input.clone()) {
-        ra_core::trace::record_error(span, &error);
-        return Err(error);
+    if state.terminal_unrecoverable() {
+        return Err(Error::caller(
+            "this run completed terminal work whose Session append failed and cannot be resumed",
+        )
+        .with_run_state(state));
     }
-    // Read from the state that owns it rather than re-derived from this segment's arguments.
-    // `begin_segment` above is what decides it, it survives a checkpoint, and a second encoding
-    // here would have to be kept true by hand across resume paths that never meet.
-    let authoritative_history_complete = state.input_history_is_complete();
-    let input_base = segment_input_base(&state, resuming, requested_input);
     // The run gets its own scope, so either its configured deadline or an inherited caller
     // deadline stops this run without cancelling the caller's tree. An armed timer turns the
     // effective deadline — pure data in `ra-core` — into a real cancellation. Every descendant
@@ -1536,6 +1597,57 @@ async fn run_loop_inner(
     };
     let _deadline = arm_deadline(&cancel);
 
+    let resuming = state.current_agent().is_some();
+    // A segment that answers questions the last one stopped on finishes that turn rather than
+    // starting a new one, which is what the agent tree's budget reminder is keyed to.
+    let continues_turn =
+        !state.pending_interruptions().is_empty() || !state.nested_runs().is_empty();
+    // A fresh run with a session starts from the session's history and owes the session its new
+    // input. A continuation takes its history from the checkpoint, as the reference's resumed
+    // state does, and owes nothing for input.
+    let (requested_input, session_input) = match session.as_deref() {
+        None => (requested_input, Vec::new()),
+        Some(_) if resuming && !requested_input.is_empty() => {
+            let error = Error::caller(
+                "a run continued from its checkpoint with a session takes its history from the \
+                 checkpoint and the session; pass no input, and start a new run for a new turn",
+            );
+            ra_core::trace::record_error(span, &error);
+            return Err(error);
+        }
+        Some(_) if resuming => (requested_input, Vec::new()),
+        Some(session) => {
+            let plan = cancel
+                .run(session_persistence::prepare_input_with_session(
+                    &run_id,
+                    &requested_input,
+                    session,
+                    config.session_input_callback().map(AsRef::as_ref),
+                    config.session_settings(),
+                ))
+                .await
+                .and_then(|plan| plan);
+            match plan {
+                Ok(plan) => plan.into_parts(),
+                Err(error) => {
+                    record_terminal_error(span, &error, &cancel);
+                    return Err(error);
+                }
+            }
+        }
+    };
+    if let Err(error) = state.begin_segment(agent.public_id().clone(), requested_input.clone()) {
+        ra_core::trace::record_error(span, &error);
+        return Err(error);
+    }
+    if session.is_some() {
+        state.bind_session_persistence();
+    }
+    // Read from the state that owns it rather than re-derived from this segment's arguments.
+    // `begin_segment` above is what decides it, it survives a checkpoint, and a second encoding
+    // here would have to be kept true by hand across resume paths that never meet.
+    let authoritative_history_complete = state.input_history_is_complete();
+    let input_base = segment_input_base(&state, resuming, requested_input);
     let mut deferred_prompts: Vec<DeferredPrompt> = Vec::new();
     // Under the run scope rather than ahead of it: a capability resolves its prompt fragment with
     // third-party asynchronous code, and a run whose assembly reads a slow source is one the
@@ -1631,6 +1743,7 @@ async fn run_loop_inner(
         deliver_mail_first,
         spend,
         continues_turn,
+        session: session.as_deref(),
     };
     // The stage runs once per run, on the segment that opens it. A continuation does not repeat
     // the caller's opening input, so a check written against that input has nothing new to look
@@ -1655,6 +1768,25 @@ async fn run_loop_inner(
     // rather than three copies to keep in step — a deadline that expired while a blocking check
     // was still thinking is the same budget stop it would have been one line later.
     let stepped = async {
+        state.snapshot_event_seq(&event_seqs);
+        session_persistence::resume_pending_session_write(context.session, &mut state, &cancel)
+            .await?;
+        // Before anything that can stop the run, the input checks included: the reference appends
+        // a run's input before its first turn, so a tripped check still leaves the question asked
+        // in the session.
+        if let Some(session) = context.session
+            && !session_input.is_empty()
+        {
+            let count = state.session_persisted_item_count().unwrap_or(0);
+            session_persistence::append_session_items(
+                session,
+                &mut state,
+                session_input,
+                count,
+                &cancel,
+            )
+            .await?;
+        }
         if !state.subagent_started()
             && let Some(parent) = state.parent_run_id().cloned()
         {
@@ -1730,7 +1862,12 @@ async fn run_loop_inner(
                 }
                 progress.resumed_conclusion = None;
             }
-            ResumeStage::Continue => {}
+            ResumeStage::Continue => {
+                if let Some(session) = context.session {
+                    state.snapshot_event_seq(&event_seqs);
+                    session_persistence::save_session_items(session, &mut state, &cancel).await?;
+                }
+            }
         }
         // Boxed for the reason `Runner::run` boxes the loop: this future carries a whole turn, and
         // the caller composing runs should not hold all of it inline.
@@ -1765,7 +1902,10 @@ async fn run_loop_inner(
     // four `?` inside — is why exactly one kind of stop can be a soft one.
     let outcome = match stepped {
         Ok(outcome) => outcome,
-        Err(error) if is_wall_clock_expiry(&error, &cancel, budget_deadline) => {
+        Err(error)
+            if !state.has_session_write_checkpoint()
+                && is_wall_clock_expiry(&error, &cancel, budget_deadline) =>
+        {
             progress.budget_stop = Some(BudgetKind::WallClock);
             RunOutcome::Completed {
                 reason: FinishReason::BudgetExhausted,
@@ -1919,7 +2059,28 @@ async fn run_loop_inner(
                     ));
                 }
             }
+            // A check that failed, or was cancelled, refused nothing: the answer stays in the
+            // session as the reference keeps it. Failing to store it outranks the check's error,
+            // as it does there, because it is the one that loses history.
             Err(error) => {
+                state.snapshot_event_seq(&event_seqs);
+                let cleanup = CancelScope::root()
+                    .with_deadline(Deadline::after(ra_core::cancel::DRAIN_GRACE));
+                let _cleanup_deadline = arm_deadline(&cleanup);
+                let error = match context.session {
+                    Some(session) => {
+                        match session_persistence::save_session_items(session, &mut state, &cleanup)
+                            .await
+                        {
+                            Ok(()) => error,
+                            Err(write_error) => {
+                                state.mark_terminal_unrecoverable();
+                                write_error
+                            }
+                        }
+                    }
+                    None => error,
+                };
                 return Err(terminal_failure(
                     span,
                     sandbox,
@@ -1930,6 +2091,44 @@ async fn run_loop_inner(
                     &cancel,
                 ));
             }
+        }
+    }
+
+    // What the run settled since the last turn that continued: the final answer once nothing
+    // refused it, a closeout, the turn a budget ended, or the turn that stopped for approval — the
+    // last one unless the answers to it may become an output guardrail's to refuse, in which case
+    // the resumed run appends it with them once it is cleared.
+    state.snapshot_event_seq(&event_seqs);
+    if let Some(session) = context.session
+        && !defers_interrupted_session_items(&outcome, agent.public(), &config)
+    {
+        // Ordinary writes share the run's cancellation and configured deadline. Only a soft
+        // wall-clock stop needs a fresh, bounded scope to flush the records it already produced.
+        let cleanup = (progress.budget_stop == Some(BudgetKind::WallClock)).then(|| {
+            closeout_cancel
+                .child(ScopeKind::Run)
+                .with_deadline(Deadline::after(ra_core::cancel::DRAIN_GRACE))
+        });
+        let _cleanup_deadline = cleanup.as_ref().map(arm_deadline);
+        let write_scope = cleanup.as_ref().unwrap_or(&cancel);
+        if let Err(error) =
+            session_persistence::save_session_items(session, &mut state, write_scope).await
+        {
+            if outcome
+                .finish_reason()
+                .is_some_and(FinishReason::is_complete)
+            {
+                state.mark_terminal_unrecoverable();
+            }
+            return Err(terminal_failure(
+                span,
+                sandbox,
+                &input_base,
+                &progress,
+                &state,
+                error,
+                write_scope,
+            ));
         }
     }
 
@@ -2032,6 +2231,9 @@ async fn assemble_capabilities(
 /// What the stage ends on is decided the way a turn's is: a paused call is asked about first, and
 /// otherwise the results the calls produced go to the stop policy, as the reference finalizes
 /// from the tool results of the interrupted turn it resolves.
+// Keep both settlement loops together so their failure exits restore the remaining children
+// before returning the parent's checkpoint.
+#[allow(clippy::too_many_lines)]
 async fn resolve_interrupted_turn(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
@@ -2069,7 +2271,21 @@ async fn resolve_interrupted_turn(
         let (output, outcome) = match answer.resolution() {
             InterruptionResolution::Reject { .. } => rejection(&approval),
             InterruptionResolution::Approve { .. } => {
-                match run_approved_call(context, agent, state, lifecycle, &approval).await? {
+                let resumed =
+                    match run_approved_call(context, agent, state, lifecycle, &approval).await {
+                        Ok(resumed) => resumed,
+                        Err(error) => {
+                            if let Some(nested) = error.nested_run() {
+                                paused.push(nested.clone());
+                                state.settle_interruption_resolution(answer.item_id())?;
+                                paused.extend(continued);
+                                state.set_nested_runs(paused)?;
+                                state.snapshot_event_seq(context.event_seqs);
+                            }
+                            return Err(error);
+                        }
+                    };
+                match resumed {
                     ResumedOutcome::Settled {
                         output,
                         outcome,
@@ -2101,7 +2317,8 @@ async fn resolve_interrupted_turn(
         state.record_generated_items([output_item]);
         state.settle_interruption_resolution(answer.item_id())?;
     }
-    for nested in continued {
+    let mut continued = continued.into_iter();
+    while let Some(nested) = continued.next() {
         if nested
             .state()
             .is_some_and(|state| nested_answer_status(state) == NestedAnswers::Pending)
@@ -2109,21 +2326,31 @@ async fn resolve_interrupted_turn(
             paused.push(nested);
             continue;
         }
-        let (output, outcome) =
-            match continue_paused_run(context, agent, state, lifecycle, nested).await? {
-                ResumedOutcome::Settled {
-                    output,
-                    outcome,
-                    tool_result,
-                } => {
-                    tool_results.extend(tool_result);
-                    (output, outcome)
-                }
-                ResumedOutcome::Paused(nested) => {
-                    paused.push(*nested);
-                    continue;
-                }
-            };
+        let saved = nested.clone();
+        let resumed = match continue_paused_run(context, agent, state, lifecycle, nested).await {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                paused.push(error.nested_run().cloned().unwrap_or(saved));
+                paused.extend(continued);
+                state.set_nested_runs(paused)?;
+                state.snapshot_event_seq(context.event_seqs);
+                return Err(error);
+            }
+        };
+        let (output, outcome) = match resumed {
+            ResumedOutcome::Settled {
+                output,
+                outcome,
+                tool_result,
+            } => {
+                tool_results.extend(tool_result);
+                (output, outcome)
+            }
+            ResumedOutcome::Paused(nested) => {
+                paused.push(*nested);
+                continue;
+            }
+        };
         outcomes.push(outcome);
         // Attributed as the batch attributes the output of a call it settles: to the public agent
         // that made the call, which is the agent this checkpoint resumes.
@@ -2494,7 +2721,11 @@ fn terminal_failure(
     record_progress_usage(span, progress.segment_responses(state));
     record_terminal_error(span, &error, scope);
     sandbox.record_failed_segment(input_base, progress.segment_items(state));
-    error
+    if state.has_session_write_checkpoint() {
+        error.with_run_state(state.clone())
+    } else {
+        error
+    }
 }
 
 fn segment_records(
@@ -2529,13 +2760,16 @@ impl Drop for ReleaseSandboxOnDrop {
 ///
 /// A sandboxed run is also given the rollout its sandbox memory is recorded under: the run's
 /// group, as the reference's `_sandbox_memory_rollout_id` resolves it. A run here has no
-/// server-side conversation or SDK session to take one from, so it is the host's group id, or a
-/// rollout of the run's own.
+/// server-side conversation to take one from, so it is the run's session, the host's group id, or
+/// a rollout of the run's own.
 fn sandbox_runtime(request: &RunRequest) -> Arc<SandboxRuntime> {
-    let rollout_id = request
-        .config
-        .sandbox()
-        .map(|_| grouping::resolve_run_grouping_id(None, None, request.config.group_id()));
+    let rollout_id = request.config.sandbox().map(|_| {
+        grouping::resolve_run_grouping_id(
+            None,
+            request.session.as_deref(),
+            request.config.group_id(),
+        )
+    });
     Arc::new(SandboxRuntime::new(
         request.config.sandbox().cloned(),
         request.state.sandbox_resume_state().cloned(),
@@ -2573,6 +2807,13 @@ async fn settle_sandbox(
     let cleanup = sandbox.cleanup().await;
     if let Err(error) = &cleanup {
         warn!(error = %error, "failed to clean up sandbox resources after run");
+    }
+    let mut result = result;
+    if let Err(error) = &mut result
+        && let Some(state) = error.run_state_mut()
+        && let Err(error) = state.set_sandbox_resume_state(cleanup.as_ref().ok().cloned().flatten())
+    {
+        warn!(error = %error, "failed to record sandbox cleanup in a failed run checkpoint");
     }
     result.map(|mut result| {
         if let Err(error) = result.set_sandbox_resume_state(cleanup.unwrap_or(None)) {
@@ -2774,7 +3015,17 @@ async fn run_turns(
         // The one thing that can overrule a conclusion is a stop hook asking for more work, and
         // it is asked here rather than inside the turn because the question is about the run's
         // delivery: a turn does not know whether its own answer is the one being handed over.
-        if let Some(outcome) = step?
+        let step = step?;
+        // A turn that continues is appended as soon as its input checks have cleared it, as the
+        // reference saves each turn that runs again or hands off. A turn that ended the run is
+        // appended after delivery has been decided, by the loop's caller.
+        if step.is_none()
+            && let Some(session) = context.session
+        {
+            state.snapshot_event_seq(context.event_seqs);
+            session_persistence::save_session_items(session, state, context.cancel).await?;
+        }
+        if let Some(outcome) = step
             && !continue_from_stop_hook(context, agent, state, progress, &outcome).await?
         {
             break outcome;
@@ -2782,6 +3033,25 @@ async fn run_turns(
         state.snapshot_event_seq(context.event_seqs);
     };
     Ok(outcome)
+}
+
+/// Whether a run that stopped for approval leaves that turn's records out of its session for now.
+///
+/// The reference's `_should_defer_interrupted_session_items`. When output guardrails are installed
+/// and a tool result can end the run, the approved call's output may become the final answer —
+/// and an answer an output guardrail refuses must not already be in the session. The resumed run
+/// appends the whole turn once that is decided.
+fn defers_interrupted_session_items(
+    outcome: &RunOutcome,
+    agent: &AgentSpec,
+    config: &RunConfig,
+) -> bool {
+    matches!(outcome, RunOutcome::Interrupted { .. })
+        && (!agent.output_guardrails().is_empty() || !config.output_guardrails().is_empty())
+        && !matches!(
+            agent.tool_use_behavior(),
+            ra_core::agent::ToolUseBehavior::RunLlmAgain
+        )
 }
 
 /// Checks the candidate delivery after input checks have passed and before output guardrails.
@@ -3169,6 +3439,7 @@ async fn run_one_turn(
     // A tool the stream already started holds the earlier one instead, for the reason given on
     // [`StreamedDispatchInput`]: its response had not been paid for when it was handed over.
     let settlement_context = Arc::new(live_context(context, agent, state));
+    let mut recovery = crate::turn::batch::TurnRecovery::default();
     let (tool_use, tool_failure) = state.trackers_mut();
     let settlement = TurnSettlementRequest::new(
         agent,
@@ -3187,14 +3458,46 @@ async fn run_one_turn(
     .with_user_hooks(context.config.user_hooks().clone())
     .with_lifecycle_hooks(lifecycle.clone())
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
-    .with_streamed_dispatches(streamed_dispatches);
+    .with_streamed_dispatches(streamed_dispatches)
+    .with_recovery(&mut recovery);
     let settlement = match config.handoff_input_filter() {
         Some(filter) => settlement.with_handoff_input_filter(Arc::clone(filter)),
         None => settlement,
     };
     // Settlement runs the calls that did not start during the stream; their records go first.
     early.record_before_settlement(&response);
-    let settled = settle_turn(settlement).await?;
+    let settled = match settle_turn(settlement).await {
+        Ok(settled) => settled,
+        Err(error) => {
+            if !recovery.nested_runs.is_empty() {
+                // Retain paid-for calls, completed siblings and every failed child's routing.
+                // This mirrors the reference's tool-output committer on a failed batch.
+                state.record_generated_items(response.output().iter().cloned());
+                state.record_generated_items(recovery.execution.new_items().iter().cloned());
+                state.set_pending_interruptions(recovery.execution.interruptions())?;
+                recovery.nested_runs.extend(
+                    recovery
+                        .execution
+                        .function_results()
+                        .iter()
+                        .filter_map(|result| result.nested_run().cloned()),
+                );
+                state.set_nested_runs(recovery.nested_runs)?;
+                state.record_tool_input_guardrail_results(
+                    recovery.execution.tool_input_guardrail_results().to_vec(),
+                );
+                state.record_tool_output_guardrail_results(
+                    recovery.execution.tool_output_guardrail_results().to_vec(),
+                );
+                state
+                    .trackers_mut()
+                    .1
+                    .record_turn(agent.public_id(), recovery.execution.outcomes().to_vec());
+                state.snapshot_event_seq(context.event_seqs);
+            }
+            return Err(error);
+        }
+    };
 
     // Recorded straight after settlement, alongside the items: these are decisions this turn's
     // calls produced, and a checkpoint taken from here on has to carry the evidence for what the

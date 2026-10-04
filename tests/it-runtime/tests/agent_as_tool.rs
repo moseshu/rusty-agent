@@ -3263,3 +3263,104 @@ async fn a_resumed_nested_run_reads_the_usage_of_the_parent_that_resumed_it() {
     // The continued nested call reads the resumed parent's whole spend, its own earlier call in it.
     assert_eq!(*nested_seen.lock().unwrap(), [30]);
 }
+
+#[tokio::test]
+async fn an_agent_tools_session_keeps_its_history_across_calls() {
+    for streamed in [false, true] {
+        let child_session = Arc::new(ra_session::InMemorySession::new("child"));
+        let parent_session = Arc::new(ra_session::InMemorySession::new("parent"));
+        let nested = agent("nested", "Nested", "help");
+        let mut builder = nested.as_tool().session(child_session.clone());
+        if streamed {
+            builder = builder.on_stream(Arc::new(|_: AgentToolStreamEvent| Ok(())));
+        }
+        let parent = orchestrator(builder.build().unwrap());
+        let resolver = ScriptedResolver::new(vec![
+            tool_call("p1", "outer1", "nested", json!({"input": "first question"})),
+            final_message("n1", "first answer"),
+            tool_call(
+                "p2",
+                "outer2",
+                "nested",
+                json!({"input": "second question"}),
+            ),
+            final_message("n2", "second answer"),
+            final_message("p3", "parent answer"),
+        ]);
+        let result = Runner::run(request(parent, &resolver).with_session(parent_session.clone()))
+            .await
+            .unwrap();
+        assert_eq!(result.final_text(), "parent answer");
+        let calls = resolver.calls();
+        assert_eq!(message_texts(&calls[1].input), ["first question"]);
+        assert_eq!(
+            message_texts(&calls[3].input),
+            ["first question", "first answer", "second question"]
+        );
+        use ra_core::session::Session;
+        let child = child_session.get_items(None).await.unwrap();
+        let parent = parent_session.get_items(None).await.unwrap();
+        let child_input: Vec<_> = child.iter().filter_map(RunItem::to_model_input).collect();
+        let parent_input: Vec<_> = parent.iter().filter_map(RunItem::to_model_input).collect();
+        assert_eq!(
+            message_texts(&child_input),
+            [
+                "first question",
+                "first answer",
+                "second question",
+                "second answer"
+            ]
+        );
+        assert_eq!(
+            message_texts(&parent_input),
+            ["please delegate", "parent answer"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_agent_tools_session_is_preserved_through_nested_approval_resume() {
+    for streamed in [false, true] {
+        let child_session = Arc::new(ra_session::InMemorySession::new("approved-child"));
+        let (nested, guarded_calls) = guarded_nested();
+        let mut builder = nested.as_tool().session(child_session.clone());
+        if streamed {
+            builder = builder.on_stream(Arc::new(|_: AgentToolStreamEvent| Ok(())));
+        }
+        let parent = orchestrator(builder.build().unwrap());
+        let resolver = ScriptedResolver::new(vec![
+            tool_call("p1", "outer1", "nested", json!({"input": "do work"})),
+            tool_call("n1", "inner1", "guarded", json!({})),
+            final_message("n2", "child done"),
+            final_message("p2", "parent done"),
+        ]);
+        let first = Runner::run(request(parent.clone(), &resolver))
+            .await
+            .unwrap();
+        use ra_core::session::Session;
+        assert_eq!(child_session.get_items(None).await.unwrap().len(), 2);
+        let result = Runner::run(resume(parent, &resolver, approve_all(&first, true)))
+            .await
+            .unwrap();
+        assert_eq!(result.final_text(), "parent done");
+        assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+        let items = child_session.get_items(None).await.unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            message_texts(
+                &items
+                    .iter()
+                    .filter_map(RunItem::to_model_input)
+                    .collect::<Vec<_>>()
+            ),
+            ["do work", "child done"]
+        );
+    }
+}

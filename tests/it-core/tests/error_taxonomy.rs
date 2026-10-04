@@ -397,3 +397,33 @@ fn test_error_taxonomy_18() {
     assert_eq!(Recoverability::Fatal.to_string(), "fatal");
     assert_eq!(Recoverability::Cancelled.to_string(), "cancelled");
 }
+
+#[test]
+fn a_run_checkpoint_preserves_error_classification_and_source() {
+    use ra_core::state::{RunId, RunState};
+    let error = Error::session(SessionErrorKind::Io, "append failed")
+        .with_source(std::io::Error::other("lost reply"));
+    let message = error.to_string();
+    let user_message = error.user_message();
+    let error = error.with_run_state(RunState::start(RunId::new("failed-run")));
+    assert_eq!(error.to_string(), message);
+    assert_eq!(error.user_message(), user_message);
+    assert_eq!(error.code(), "session.io");
+    assert!(error.is_retryable());
+    assert_eq!(error.run_state().unwrap().run_id().as_str(), "failed-run");
+    let original = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<Box<Error>>()
+        .unwrap()
+        .as_ref();
+    assert!(
+        std::error::Error::source(original)
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .is_some()
+    );
+    let error = Error::cancelled("user_interrupt")
+        .with_run_state(RunState::start(RunId::new("cancelled-run")));
+    assert!(error.is_cancelled());
+    assert_eq!(error.code(), "cancelled");
+}
