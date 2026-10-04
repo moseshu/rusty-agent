@@ -18,6 +18,7 @@ anthropic = ["dep:reqwest", "dep:base64"]
 compat = ["openai"]
 
 [dependencies]
+uuid.workspace = true
 ra-core = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true, optional = true }

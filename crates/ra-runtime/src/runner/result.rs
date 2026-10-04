@@ -485,6 +485,8 @@ pub struct RunResult {
     agent_tool_invocation: Option<AgentToolInvocation>,
     /// What the agent-tool runs this segment started spent.
     nested_usage: Usage,
+    /// Billed session compactions settled by this segment.
+    session_compaction_usage: Usage,
 }
 
 impl RunResult {
@@ -503,6 +505,7 @@ impl RunResult {
         state: RunState,
         final_message: Option<Message>,
         nested_usage: Usage,
+        session_compaction_usage: Usage,
     ) -> Self {
         Self {
             outcome,
@@ -517,6 +520,7 @@ impl RunResult {
             final_message,
             agent_tool_invocation: None,
             nested_usage,
+            session_compaction_usage,
         }
     }
 
@@ -647,6 +651,9 @@ impl RunResult {
     /// field: a stored total is a second source of truth that a dropped or retried response can put
     /// out of step with the calls it claims to summarise.
     ///
+    /// Provider session compactions are also included. Their billed usage is settled separately
+    /// because the compact endpoint returns history replacement rather than a model response.
+    ///
     /// # Agent-tool runs are included
     ///
     /// The calls of every agent-tool run this segment's tool calls started are in here too, as the
@@ -663,7 +670,9 @@ impl RunResult {
     /// this one as the run's total would under-report every continuation.
     #[must_use]
     pub fn usage(&self) -> Usage {
-        aggregate_usage(&self.model_responses).accumulate(&self.nested_usage)
+        aggregate_usage(&self.model_responses)
+            .accumulate(&self.nested_usage)
+            .accumulate(&self.session_compaction_usage)
     }
 
     /// The message that delivered the run, if it produced one.

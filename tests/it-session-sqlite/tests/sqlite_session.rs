@@ -522,3 +522,129 @@ async fn test_sqlite_session_custom_table_names_are_single_quoted_identifiers() 
     );
     assert_eq!(default_tables, 0);
 }
+
+#[tokio::test]
+async fn compaction_snapshot_replaces_bounded_suffix_and_retains_prefix() {
+    let session = SqliteSession::builder("snapshot")
+        .session_settings(SessionSettings::new().with_limit(1))
+        .open()
+        .unwrap();
+    let original = vec![
+        user("old", "old"),
+        user("middle", "middle"),
+        user("tail", "tail"),
+    ];
+    session.add_items(original.clone()).await.unwrap();
+    let snapshot = session.get_compaction_snapshot(2).await.unwrap().unwrap();
+    assert!(!snapshot.complete());
+    assert_eq!(snapshot.items(), &original[1..]);
+    assert!(
+        snapshot
+            .replace_suffix(1, vec![user("replacement", "replacement")])
+            .await
+            .unwrap()
+    );
+    let mut expected = original[..2].to_vec();
+    expected.push(user("replacement", "replacement"));
+    assert_eq!(session.get_items(Some(100)).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn compaction_snapshot_reports_exact_complete_window_and_empty_history() {
+    let session = SqliteSession::open_in_memory("snapshot").unwrap();
+    assert!(session.get_compaction_snapshot(0).await.unwrap().is_none());
+    let empty = session.get_compaction_snapshot(1).await.unwrap().unwrap();
+    assert!(empty.complete());
+    assert!(empty.items().is_empty());
+    assert!(
+        !empty
+            .replace_suffix(0, vec![user("unused", "unused")])
+            .await
+            .unwrap()
+    );
+    session
+        .add_items(vec![user("one", "one"), user("two", "two")])
+        .await
+        .unwrap();
+    assert!(
+        session
+            .get_compaction_snapshot(2)
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+    );
+    assert!(
+        !session
+            .get_compaction_snapshot(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+    );
+}
+
+#[tokio::test]
+async fn compaction_snapshot_rejects_changed_rows_even_when_content_is_identical() {
+    let dir = temp_test_dir("snapshot_row_identity");
+    let db = dir.join("session.db");
+    let session = SqliteSession::open("snapshot", &db).unwrap();
+    let original = vec![user("same", "same")];
+    session.add_items(original.clone()).await.unwrap();
+    let snapshot = session.get_compaction_snapshot(10).await.unwrap().unwrap();
+    let another = SqliteSession::open("snapshot", &db).unwrap();
+    another.clear().await.unwrap();
+    another.add_items(original.clone()).await.unwrap();
+    assert!(
+        !snapshot
+            .replace_suffix(0, vec![user("replacement", "replacement")])
+            .await
+            .unwrap()
+    );
+    assert_eq!(session.get_items(None).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn compaction_snapshot_transaction_rolls_back_failed_insert() {
+    let dir = temp_test_dir("snapshot_failed_insert");
+    let db = dir.join("session.db");
+    let session = SqliteSession::open("snapshot", &db).unwrap();
+    let original = vec![user("prefix", "prefix"), user("tail", "tail")];
+    session.add_items(original.clone()).await.unwrap();
+    let snapshot = session.get_compaction_snapshot(2).await.unwrap().unwrap();
+    probe(&db).execute_batch("CREATE TRIGGER reject_compaction BEFORE INSERT ON agent_messages WHEN NEW.message_data LIKE '%replacement%' BEGIN SELECT RAISE(ABORT, 'reject compacted row'); END;").unwrap();
+    assert!(
+        snapshot
+            .replace_suffix(1, vec![user("replacement", "replacement")])
+            .await
+            .is_err()
+    );
+    assert_eq!(session.get_items(None).await.unwrap(), original);
+    assert!(write_lock_is_free(&db));
+    probe(&db)
+        .execute_batch("DROP TRIGGER reject_compaction")
+        .unwrap();
+    session
+        .add_items(vec![user("later", "later")])
+        .await
+        .unwrap();
+    assert_eq!(session.get_items(None).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn compaction_snapshot_does_not_authorize_unreadable_rows() {
+    let dir = temp_test_dir("snapshot_corrupt");
+    let db = dir.join("session.db");
+    let session = SqliteSession::open("snapshot", &db).unwrap();
+    session
+        .add_items(vec![user("prefix", "prefix")])
+        .await
+        .unwrap();
+    insert_raw_row(&db, "snapshot", "not JSON");
+    assert!(session.get_compaction_snapshot(10).await.unwrap().is_none());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM agent_messages"), 2);
+    session.clear().await.unwrap();
+    insert_raw_row(&db, "snapshot", MALFORMED_ITEM_JSON[0]);
+    assert!(session.get_compaction_snapshot(10).await.unwrap().is_none());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM agent_messages"), 1);
+}

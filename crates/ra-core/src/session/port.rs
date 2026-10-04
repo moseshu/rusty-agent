@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use crate::{
     error::{Error, Result},
     item::{InputItemDigest, ModelInputItem, RunItem},
-    session::{SessionId, SessionSettings},
+    session::{CompactionSnapshot, SessionCompaction, SessionId, SessionSettings},
 };
 
 /// The asynchronous contract for managing authoritative conversation session history.
@@ -85,6 +85,39 @@ pub trait Session: Send + Sync + 'static {
     /// is independent of the identity policy used to reconcile an append.
     fn matches_reconstructed_history_item(&self, _item: &RunItem) -> bool {
         true
+    }
+
+    /// Optional post-turn compaction; ordinary sessions need not implement it.
+    fn compaction(&self) -> Option<&dyn SessionCompaction> {
+        None
+    }
+
+    /// Whether history is managed by a provider rather than replaceable locally.
+    fn manages_server_history(&self) -> bool {
+        false
+    }
+
+    /// Reads history and its exact wrapper generation under one mutation boundary.
+    async fn get_items_with_generation(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<(Vec<RunItem>, Option<u64>)> {
+        Ok((self.get_items(limit).await?, None))
+    }
+
+    /// Appends a batch, retaining automatic-compaction ownership only if its read stayed current.
+    async fn add_items_with_generation(
+        &self,
+        items: Vec<RunItem>,
+        _expected: Option<u64>,
+    ) -> Result<Option<u64>> {
+        self.add_items(items).await?;
+        Ok(None)
+    }
+
+    /// Optional bounded snapshot with backend-owned atomic suffix replacement.
+    async fn get_compaction_snapshot(&self, _limit: usize) -> Result<Option<CompactionSnapshot>> {
+        Ok(None)
     }
 
     /// Retrieves items from the session history.

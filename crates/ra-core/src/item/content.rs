@@ -54,6 +54,8 @@ pub enum ContentBlock {
     Thinking(ThinkingBlock),
     /// An image supplied inline or through a local path.
     Image(ImageBlock),
+    /// A file supplied inline or through a provider reference.
+    File(FileBlock),
     /// A refusal to produce the requested output.
     Refusal(RefusalBlock),
 }
@@ -89,6 +91,12 @@ impl ContentBlock {
         Self::image(ImageSource::local_path(path))
     }
 
+    /// Creates a message file block using the same source contract as tool-result files.
+    #[must_use]
+    pub fn file(source: FileSource) -> Self {
+        Self::File(FileBlock::new(source))
+    }
+
     /// Creates a refusal block.
     #[must_use]
     pub fn refusal(refusal: impl Into<String>) -> Self {
@@ -103,6 +111,7 @@ impl ContentBlock {
             Self::Thinking(_) => "thinking",
             Self::Image(_) => "image",
             Self::Refusal(_) => "refusal",
+            Self::File(_) => "file",
         }
     }
 
@@ -133,6 +142,16 @@ impl ContentBlock {
         match self {
             Self::Image(block) => Some(block),
             _ => None,
+        }
+    }
+
+    /// Returns the file block when this message carries a file.
+    #[must_use]
+    pub const fn as_file(&self) -> Option<&FileBlock> {
+        if let Self::File(block) = self {
+            Some(block)
+        } else {
+            None
         }
     }
 
@@ -619,9 +638,8 @@ impl Base64FileSource {
 
 /// A file content block.
 ///
-/// Deliberately **not** a [`ContentBlock`] variant yet: whether a message may carry a file is the
-/// model-protocol layer's contract to change, and adding the variant later costs nothing because
-/// that enum is `#[non_exhaustive]`. Tool results are the only producer today.
+/// Shared by message content and tool outputs. Providers decide which message roles and file
+/// source kinds their protocols accept; the source itself remains inert provider-neutral data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileBlock {
     schema_version: SchemaVersion,

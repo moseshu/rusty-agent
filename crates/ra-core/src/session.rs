@@ -6,12 +6,17 @@
 //! It is identified by an opaque [`SessionId`].
 
 pub mod callback;
+pub mod compaction;
 pub mod id;
 pub mod port;
 pub mod rollout;
 pub mod settings;
 
 pub use callback::SessionInputCallback;
+pub use compaction::{
+    CompactionSnapshot, CompactionSnapshotReplacement, SessionCompaction, SessionCompactionContext,
+    SessionCompactionOutcome,
+};
 pub use id::SessionId;
 pub use port::Session;
 pub use settings::{SessionSettings, resolve_session_limit};

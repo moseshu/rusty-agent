@@ -40,7 +40,7 @@ use crate::{
     },
     permission::{PermissionDecision, PermissionRule},
     sandbox::{builtin_entry_registry, sanitize_run_state_sandbox_mount_authority},
-    session::SessionId,
+    session::{SessionCompactionContext, SessionId},
     state::{ToolFailureTracker, ToolOutputReferenceTracker, ToolUseTracker},
     tool::{ToolLookupKey, ToolOrigin},
     usage::Usage,
@@ -56,6 +56,8 @@ pub struct PendingSessionWrite {
     items: Vec<RunItem>,
     before: Option<Vec<InputItemDigest>>,
     persisted_count: usize,
+    #[serde(default)]
+    append_acknowledged: bool,
 }
 
 impl PendingSessionWrite {
@@ -67,6 +69,7 @@ impl PendingSessionWrite {
             items,
             before: None,
             persisted_count,
+            append_acknowledged: false,
         }
     }
     /// The original Session's identity.
@@ -89,6 +92,18 @@ impl PendingSessionWrite {
     pub const fn persisted_count(&self) -> usize {
         self.persisted_count
     }
+    /// Whether the append settled and only post-write compaction remains.
+    #[must_use]
+    pub const fn append_acknowledged(&self) -> bool {
+        self.append_acknowledged
+    }
+
+    /// Retains append settlement across a failed post-write compaction.
+    #[doc(hidden)]
+    pub fn acknowledge_append(&mut self) {
+        self.append_acknowledged = true;
+    }
+
     /// Records the tail immediately before starting the append.
     #[doc(hidden)]
     pub fn set_before(&mut self, before: Vec<InputItemDigest>) {
@@ -97,7 +112,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(7);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(8);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -136,9 +151,13 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          the calls waiting on them, and continues with a tool call that has no output.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(7),
         "Persisted the Session append cursor, pending batches and terminal write failures. An \
          older runtime cannot reconcile an uncertain append or prevent replaying terminal work.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted automatic session compaction exchange evidence and append acknowledgement.",
     ),
 ];
 
@@ -794,6 +813,8 @@ pub struct RunState {
     session_persisted_item_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_session_write: Option<PendingSessionWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_compaction: Option<SessionCompactionContext>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     terminal_unrecoverable: bool,
     #[serde(
@@ -899,6 +920,8 @@ struct RunStateRecord {
     session_persisted_item_count: Option<usize>,
     #[serde(default)]
     pending_session_write: Option<PendingSessionWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_compaction: Option<SessionCompactionContext>,
     #[serde(default)]
     terminal_unrecoverable: bool,
     #[serde(default)]
@@ -951,6 +974,7 @@ impl TryFrom<RunStateRecord> for RunState {
             handoff_projection,
             session_persisted_item_count,
             pending_session_write,
+            session_compaction,
             terminal_unrecoverable,
             sandbox,
             unknown,
@@ -1022,6 +1046,16 @@ impl TryFrom<RunStateRecord> for RunState {
             )));
         }
 
+        if let Some(context) = &session_compaction
+            && context.model_exchange().iter().any(|digest| {
+                digest.as_str().len() != 64
+                    || !digest.as_str().bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(Error::caller(
+                "invalid session compaction exchange checkpoint",
+            ));
+        }
         if let Some(pending) = &pending_session_write {
             validate_pending_session_write(
                 pending,
@@ -1066,6 +1100,7 @@ impl TryFrom<RunStateRecord> for RunState {
             handoff_projection,
             session_persisted_item_count,
             pending_session_write,
+            session_compaction,
             terminal_unrecoverable,
             sandbox,
             unknown,
@@ -1114,6 +1149,7 @@ impl RunState {
             handoff_projection: None,
             session_persisted_item_count: None,
             pending_session_write: None,
+            session_compaction: None,
             terminal_unrecoverable: false,
             sandbox: None,
             unknown: Unknown::new(),
@@ -1604,6 +1640,18 @@ impl RunState {
         }
         self.session_persisted_item_count = Some(count);
         Ok(())
+    }
+
+    /// The latest successful model exchange and session mutation ownership.
+    #[must_use]
+    pub const fn session_compaction(&self) -> Option<&SessionCompactionContext> {
+        self.session_compaction.as_ref()
+    }
+
+    /// Updates compaction evidence without retaining plaintext model requests.
+    #[doc(hidden)]
+    pub fn set_session_compaction(&mut self, context: SessionCompactionContext) {
+        self.session_compaction = Some(context);
     }
 
     /// The append that must settle before further model or tool work.
@@ -2357,7 +2405,8 @@ fn validate_pending_session_write(
     history_len: usize,
     persisted_count: Option<usize>,
 ) -> Result<()> {
-    if pending.items.is_empty()
+    if (pending.append_acknowledged && pending.before.is_none())
+        || pending.items.is_empty()
         || pending.items.iter().any(|item| !item.is_model_input())
         || pending.persisted_count > history_len
         || persisted_count.is_none_or(|count| pending.persisted_count < count)

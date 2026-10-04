@@ -83,7 +83,7 @@ fn test_run_state_02() {
 #[test]
 fn test_run_state_03() {
     let stored = r#"{
-        "schema_version": 8,
+        "schema_version": 9,
         "run_id": "run-future",
         "next_host_event_seq": 12,
         "future_policy": { "enabled": true }
@@ -97,7 +97,7 @@ fn test_run_state_03() {
     let state = state.with_tool_use(carried.tool_use().clone());
 
     assert_eq!(state.tool_use().repeat_streak(&agent, &identity), 1);
-    assert_eq!(state.schema_version(), SchemaVersion::new(8));
+    assert_eq!(state.schema_version(), SchemaVersion::new(9));
     let written = serde_json::to_value(&state).expect("run state must serialize");
     assert_eq!(written["future_policy"]["enabled"], true);
     assert_eq!(written["run_id"], "run-future");
@@ -107,7 +107,7 @@ fn test_run_state_03() {
 #[test]
 fn test_run_state_04() {
     let stored = r#"{
-        "schema_version": 8,
+        "schema_version": 9,
         "run_id": "run-future-04",
         "next_host_event_seq": 3,
         "future_policy": { "enabled": true }
@@ -115,7 +115,7 @@ fn test_run_state_04() {
     let state: RunState = serde_json::from_str(stored).expect("newer state must remain readable");
     let written = serde_json::to_value(&state).expect("run state must serialize");
 
-    assert_eq!(state.schema_version(), SchemaVersion::new(8));
+    assert_eq!(state.schema_version(), SchemaVersion::new(9));
     assert_eq!(state.run_id().as_str(), "run-future-04");
     assert_eq!(state.next_host_event_seq(), 3);
     assert_eq!(state.tool_use().agents().count(), 0);
@@ -1270,4 +1270,52 @@ fn pending_session_writes_and_terminal_failures_survive_a_checkpoint() {
     let mut malformed = serde_json::to_value(&state).unwrap();
     malformed["pending_session_write"]["items"] = json!([]);
     assert!(serde_json::from_value::<RunState>(malformed).is_err());
+}
+
+#[test]
+fn session_compaction_exchange_and_append_acknowledgement_survive_checkpoint_without_generation() {
+    use ra_core::{
+        item::InputItemDigest,
+        session::{SessionCompactionContext, SessionId},
+        state::PendingSessionWrite,
+    };
+    let mut state = RunState::start(RunId::new("compaction-checkpoint"));
+    state
+        .begin_segment(AgentId::new("worker"), Vec::new())
+        .unwrap();
+    state.bind_session_persistence();
+    let item = commentary_item("message", "done");
+    state.record_generated_items(vec![item.clone()]);
+    let digest = InputItemDigest::compute(&item.to_model_input().unwrap()).unwrap();
+    state.set_session_compaction(SessionCompactionContext::new(
+        Some(3),
+        vec![digest.clone()],
+        Some("resp-final".into()),
+        Some(false),
+    ));
+    let mut pending = PendingSessionWrite::new(SessionId::new("session"), vec![item], 1);
+    pending.set_before(vec![digest]);
+    pending.acknowledge_append();
+    state.begin_session_write(pending).unwrap();
+    let wire = serde_json::to_value(&state).unwrap();
+    assert!(wire["session_compaction"].get("generation").is_none());
+    let restored: RunState = serde_json::from_value(wire.clone()).unwrap();
+    // Exchange evidence survives; wrapper ownership is process-local and must be re-established.
+    let restored_context = restored.session_compaction().unwrap();
+    assert_eq!(restored_context.generation(), None);
+    let mut expected = state.session_compaction().unwrap().clone();
+    expected.set_generation(None);
+    assert_eq!(restored_context, &expected);
+    assert!(
+        restored
+            .pending_session_write()
+            .unwrap()
+            .append_acknowledged()
+    );
+    let mut invalid = wire.clone();
+    invalid["session_compaction"]["model_exchange"] = serde_json::json!(["not-a-digest"]);
+    assert!(serde_json::from_value::<RunState>(invalid).is_err());
+    let mut invalid = wire;
+    invalid["pending_session_write"]["before"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<RunState>(invalid).is_err());
 }

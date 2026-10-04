@@ -259,7 +259,7 @@ pub(crate) fn convert_custom_tool_call(item: &Value) -> Result<RunItemKind> {
     )))
 }
 
-fn convert_usage(value: Option<&Value>) -> Usage {
+pub(crate) fn convert_usage(value: Option<&Value>) -> Usage {
     let input = value
         .and_then(|usage| usage.get("input_tokens"))
         .and_then(Value::as_u64)

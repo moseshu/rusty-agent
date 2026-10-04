@@ -66,6 +66,12 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
 /// names the upstream type it mirrors.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
+    // The exact optional keyword record from `memory/session.py`,
+    // `OpenAIResponsesCompactionArgs`; provider mode remains in its adapter.
+    (
+        "crates/ra-model/src/openai/compaction.rs",
+        "OpenAiResponsesCompactionArgs",
+    ),
     // Mount provider records: `sandbox/entries/mounts/providers/*.py`. Each is the provider's own
     // field list — bucket, container, credentials, endpoints — and a manifest written against the
     // reference has to read back here field for field.
