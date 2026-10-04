@@ -336,12 +336,16 @@ async fn lower_input(request: &ModelRequest) -> Result<Vec<Value>> {
         })?;
     let mut input = Vec::with_capacity(normalized.entries().len());
     for entry in normalized.entries() {
-        input.push(lower_input_item(entry.item(), request).await?);
+        input.push(lower_input_item(entry.item(), request.handoffs()).await?);
     }
     Ok(input)
 }
 
-async fn lower_input_item(item: &ModelInputItem, request: &ModelRequest) -> Result<Value> {
+/// Lowers one input item. `handoffs` names a handoff call that carries no tool name of its own.
+pub(crate) async fn lower_input_item(
+    item: &ModelInputItem,
+    handoffs: &[ModelHandoffDefinition],
+) -> Result<Value> {
     match item {
         ModelInputItem::Message(message) => lower_message(message).await,
         ModelInputItem::Reasoning(reasoning) => Ok(lower_reasoning(reasoning)),
@@ -377,8 +381,7 @@ async fn lower_input_item(item: &ModelInputItem, request: &ModelRequest) -> Resu
             let name = call
                 .tool_name()
                 .or_else(|| {
-                    request
-                        .handoffs()
+                    handoffs
                         .iter()
                         .find(|handoff| handoff.target_agent() == call.target_agent())
                         .map(ModelHandoffDefinition::name)

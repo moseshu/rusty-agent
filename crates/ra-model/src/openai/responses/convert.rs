@@ -134,7 +134,7 @@ pub(crate) fn convert_output_item(
 ///
 /// The reference drops that one field before the item is stored for replay; everything else —
 /// the encrypted content above all — goes back to the server unchanged.
-fn convert_compaction(item: &Value, provider: &ProviderKey) -> ProviderCompaction {
+pub(crate) fn convert_compaction(item: &Value, provider: &ProviderKey) -> ProviderCompaction {
     let mut payload = item.clone();
     if let Some(fields) = payload.as_object_mut() {
         fields.remove("created_by");
@@ -214,7 +214,7 @@ fn convert_reasoning(item: &Value, model: &str) -> Reasoning {
     reasoning
 }
 
-fn text_segments(value: Option<&Value>) -> Vec<String> {
+pub(crate) fn text_segments(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
         .into_iter()
@@ -223,7 +223,10 @@ fn text_segments(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-fn convert_function_call(item: &Value, handoffs: &[ModelHandoffDefinition]) -> Result<RunItemKind> {
+pub(crate) fn convert_function_call(
+    item: &Value,
+    handoffs: &[ModelHandoffDefinition],
+) -> Result<RunItemKind> {
     let call_id = CallId::new(required_str(item, "call_id", "function_call")?);
     let name = required_str(item, "name", "function_call")?;
     let arguments_text = required_str(item, "arguments", "function_call")?;
@@ -247,7 +250,7 @@ fn convert_function_call(item: &Value, handoffs: &[ModelHandoffDefinition]) -> R
 }
 
 /// Lifts a call to a custom tool, whose input is one raw string rather than JSON arguments.
-fn convert_custom_tool_call(item: &Value) -> Result<RunItemKind> {
+pub(crate) fn convert_custom_tool_call(item: &Value) -> Result<RunItemKind> {
     let call_id = CallId::new(required_str(item, "call_id", "custom_tool_call")?);
     let name = required_str(item, "name", "custom_tool_call")?;
     let input = required_str(item, "input", "custom_tool_call")?;
@@ -289,7 +292,7 @@ fn convert_usage(value: Option<&Value>) -> Usage {
     )
 }
 
-fn required_str<'a>(value: &'a Value, key: &str, owner: &str) -> Result<&'a str> {
+pub(crate) fn required_str<'a>(value: &'a Value, key: &str, owner: &str) -> Result<&'a str> {
     value
         .get(key)
         .and_then(Value::as_str)
