@@ -16,8 +16,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    error::Result,
-    item::RunItem,
+    error::{Error, Result},
+    item::{InputItemDigest, ModelInputItem, RunItem},
     session::{SessionId, SessionSettings},
 };
 
@@ -34,6 +34,57 @@ pub trait Session: Send + Sync + 'static {
     /// The reference's `session_settings` attribute. `None`, the default, sets nothing.
     fn session_settings(&self) -> Option<&SessionSettings> {
         None
+    }
+
+    /// Whether the backend stores items under identities of its own, so that an item read back
+    /// cannot be recognized by the [`RunItem`] identity and envelope it was added with.
+    ///
+    /// The reference's `_ignore_ids_for_matching`, which it applies to its provider-managed
+    /// conversation session. `true` compares the model input without item identities; `false`,
+    /// the default, compares stored records exactly. This does not change callback matching.
+    fn ignore_ids_for_matching(&self) -> bool {
+        false
+    }
+
+    /// Selects the items this backend can persist, preserving their order.
+    ///
+    /// The default keeps every item. A backend may omit records its storage contract cannot
+    /// retain; the runtime still counts those records as processed, but excludes them from the
+    /// pending append. This is the reference's pre-append filtering, dispatched through the
+    /// backend because the runtime cannot depend on provider implementations.
+    fn prepare_items_for_persistence(&self, items: Vec<RunItem>) -> Vec<RunItem> {
+        items
+    }
+
+    /// Fingerprints one item as this backend stores it, for pending-append reconciliation.
+    ///
+    /// The default follows [`Self::ignore_ids_for_matching`]. Backends that transform content
+    /// must apply the same storage projection to a pending item and an item read back. The
+    /// reference fingerprints wire items; this dispatch is necessary because Rust sessions
+    /// exchange typed run records while provider lowering lives outside the runtime.
+    async fn item_digest_for_persistence(&self, item: &RunItem) -> Result<InputItemDigest> {
+        let digest = match item
+            .to_model_input()
+            .filter(|_| self.ignore_ids_for_matching())
+        {
+            Some(ModelInputItem::Reasoning(reasoning)) => {
+                InputItemDigest::compute(&ModelInputItem::Reasoning(reasoning.without_id()))
+            }
+            Some(input) => InputItemDigest::compute(&input),
+            None => InputItemDigest::compute_session_item(item),
+        };
+        digest.map_err(|error| {
+            Error::caller("Session item could not be fingerprinted").with_source(error)
+        })
+    }
+
+    /// Whether a callback's reconstructed item may match stored history by content alone.
+    ///
+    /// The default permits matching every kind. A backend whose history carries identities
+    /// absent from the model projection may require identity for selected kinds instead. This
+    /// is independent of the identity policy used to reconcile an append.
+    fn matches_reconstructed_history_item(&self, _item: &RunItem) -> bool {
+        true
     }
 
     /// Retrieves items from the session history.

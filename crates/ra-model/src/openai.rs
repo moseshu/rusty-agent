@@ -11,6 +11,7 @@ use reqwest::{
 pub mod auth;
 pub mod chat;
 pub(crate) mod content;
+pub mod conversations;
 pub(crate) mod error;
 pub mod responses;
 pub(crate) mod sse;

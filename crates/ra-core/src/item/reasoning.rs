@@ -82,7 +82,7 @@ impl Reasoning {
     }
 
     /// Removes only the provider item ID while retaining every replay-bearing field.
-    pub(super) fn without_id(mut self) -> Self {
+    pub(crate) fn without_id(mut self) -> Self {
         self.id = None;
         self
     }

@@ -28,9 +28,16 @@ pub struct InputItemDigest(String);
 impl InputItemDigest {
     /// Computes a deterministic SHA-256 digest of an input item.
     pub fn compute(item: &ModelInputItem) -> Result<Self, serde_json::Error> {
+        Self::compute_serialized(item)
+    }
+
+    /// Fingerprints a backend's serialized storage projection.
+    ///
+    /// Adapters use this when their stored representation differs from the neutral input item.
+    /// The caller must apply the same projection to pending items and items read back.
+    pub fn compute_serialized<T: Serialize + ?Sized>(item: &T) -> Result<Self, serde_json::Error> {
         let encoded = serde_json::to_vec(item)?;
-        let digest = Sha256::digest(encoded);
-        Ok(Self(format!("{digest:x}")))
+        Ok(Self(format!("{:x}", Sha256::digest(encoded))))
     }
 
     /// Fingerprints an authoritative Session record, including its identity and metadata.
@@ -39,8 +46,7 @@ impl InputItemDigest {
     /// Exact append reconciliation must compare that stored representation rather than requiring
     /// every history record to be model input.
     pub fn compute_session_item(item: &RunItem) -> Result<Self, serde_json::Error> {
-        let encoded = serde_json::to_vec(item)?;
-        Ok(Self(format!("{:x}", Sha256::digest(encoded))))
+        Self::compute_serialized(item)
     }
 
     /// Lowercase hexadecimal representation.

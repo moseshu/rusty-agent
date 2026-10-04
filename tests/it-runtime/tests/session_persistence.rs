@@ -207,6 +207,7 @@ struct CountingSession {
     inner: InMemorySession,
     appends: Mutex<Vec<usize>>,
     fail_appends: bool,
+    ignore_ids: bool,
 }
 
 impl CountingSession {
@@ -215,6 +216,7 @@ impl CountingSession {
             inner: InMemorySession::new(id),
             appends: Mutex::new(Vec::new()),
             fail_appends: false,
+            ignore_ids: false,
         })
     }
 
@@ -223,6 +225,7 @@ impl CountingSession {
             inner: InMemorySession::new(id),
             appends: Mutex::new(Vec::new()),
             fail_appends: true,
+            ignore_ids: false,
         })
     }
 
@@ -235,6 +238,10 @@ impl CountingSession {
 impl Session for CountingSession {
     fn session_id(&self) -> &SessionId {
         self.inner.session_id()
+    }
+
+    fn ignore_ids_for_matching(&self) -> bool {
+        self.ignore_ids
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<RunItem>> {
@@ -2016,5 +2023,42 @@ async fn a_child_session_failure_retains_completed_sibling_outputs() {
             "tool_call_output:outer-1",
             "assistant:parent done"
         ]
+    );
+}
+
+#[tokio::test]
+async fn ignoring_append_identities_does_not_change_generic_callback_matching() {
+    let session = CountingSession {
+        inner: InMemorySession::new_with_items(
+            "remote",
+            vec![RunItem::new(
+                ItemId::new("old-id"),
+                RunItemKind::Message(Message::user("history")),
+            )],
+        ),
+        appends: Mutex::new(Vec::new()),
+        fail_appends: false,
+        ignore_ids: true,
+    };
+    let callback = |history: &mut Vec<RunItem>, new_input: &mut Vec<RunItem>| {
+        Ok(vec![
+            RunItem::new(ItemId::new("rebuilt"), history[0].kind().clone()),
+            new_input[0].clone(),
+        ])
+    };
+    let plan = prepare_input_with_session(
+        &RunId::new("run"),
+        &[user("new")],
+        &session,
+        Some(&callback),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.prepared_for_model(), &[user("history"), user("new")]);
+    assert_eq!(plan.append_for_turn().len(), 1);
+    assert_eq!(
+        plan.append_for_turn()[0].to_model_input(),
+        Some(user("new"))
     );
 }

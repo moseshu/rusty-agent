@@ -16,8 +16,11 @@
 //! - **Approval records are not appended.** The reference's session stores only model input, and
 //!   its approval placeholders never reach it; this session could hold them, but a history read
 //!   back would only filter them out again, and a resumed run answers them from its checkpoint.
-//! - **Provider conversation sessions are not here.** The reference strips server item ids for its
-//!   `OpenAIConversationsSession` in this module; that belongs to a provider session's own policy.
+//! - **Provider conversation sessions keep their own wire policy.** The reference strips server
+//!   item ids and drops reasoning it cannot store here, for its `OpenAIConversationsSession`; this
+//!   session is handed [`RunItem`]s and lowers them itself, so that policy lives with the session.
+//!   The runtime dispatches filtering, storage fingerprints and reconstructed-history matching
+//!   through neutral Session methods because provider implementations cannot live here.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -100,7 +103,7 @@ pub async fn prepare_input_with_session(
         }
         Some(callback) => {
             let (combined, history_positions, appended) =
-                combine_with_callback(callback, history, new_input).await?;
+                combine_with_callback(callback, history, new_input, session).await?;
             (combined, history_positions, None, appended)
         }
     };
@@ -159,6 +162,15 @@ pub(crate) async fn append_session_items(
     persisted_count: usize,
     cancel: &CancelScope,
 ) -> Result<()> {
+    if state.pending_session_write().is_some() {
+        return Err(Error::caller(
+            "resolve the pending Session write before saving another batch",
+        ));
+    }
+    let items = session.prepare_items_for_persistence(items);
+    if items.is_empty() {
+        return state.mark_session_persisted(persisted_count);
+    }
     state.begin_session_write(PendingSessionWrite::new(
         session.session_id().clone(),
         items,
@@ -193,7 +205,7 @@ pub(crate) async fn resume_pending_session_write(
             let tail = cancel
                 .run(session.get_items(Some(pending.items().len() + 1)))
                 .await??;
-            let before = item_digests(&tail)?;
+            let before = cancel.run(item_digests(&tail, session)).await??;
             state
                 .pending_session_write_mut()
                 .ok_or_else(|| {
@@ -204,11 +216,11 @@ pub(crate) async fn resume_pending_session_write(
         }
         Some(before) => {
             let mut expected = before.to_vec();
-            expected.extend(item_digests(pending.items())?);
+            expected.extend(cancel.run(item_digests(pending.items(), session)).await??);
             let tail = cancel
                 .run(session.get_items(Some(expected.len())))
                 .await??;
-            let observed = item_digests(&tail)?;
+            let observed = cancel.run(item_digests(&tail, session)).await??;
             let committed = observed == expected;
             let unchanged = if before.is_empty() {
                 observed.is_empty()
@@ -231,15 +243,13 @@ pub(crate) async fn resume_pending_session_write(
     state.finish_session_write()
 }
 
-fn item_digests(items: &[RunItem]) -> Result<Vec<InputItemDigest>> {
-    items
-        .iter()
-        .map(|item| {
-            InputItemDigest::compute_session_item(item).map_err(|error| {
-                Error::caller("Session item could not be fingerprinted").with_source(error)
-            })
-        })
-        .collect()
+/// Fingerprints the backend's storage projection rather than the richer run record.
+async fn item_digests(items: &[RunItem], session: &dyn Session) -> Result<Vec<InputItemDigest>> {
+    let mut digests = Vec::with_capacity(items.len());
+    for item in items {
+        digests.push(session.item_digest_for_persistence(item).await?);
+    }
+    Ok(digests)
 }
 
 /// Gives each item of a run's new input an identity no history item has.
@@ -278,10 +288,14 @@ fn new_input_items(run_id: &RunId, input: &[ModelInputItem], history: &[RunItem]
 /// one matched to an unconsumed history item by identity is history; any other item whose identity
 /// was handed in as history is history; then an item equal to a history item not yet matched is
 /// history, one equal to a new-input item not yet matched is new, and anything left is new.
+///
+/// The backend decides which reconstructed items may match history by content, independently
+/// of the identity policy it uses for append reconciliation.
 async fn combine_with_callback(
     callback: &dyn SessionInputCallback,
     history: Vec<RunItem>,
     new_input: Vec<RunItem>,
+    session: &dyn Session,
 ) -> Result<(Vec<RunItem>, BTreeSet<usize>, Vec<RunItem>)> {
     let original_history_ids: HashSet<ItemId> =
         history.iter().map(|item| item.id().clone()).collect();
@@ -295,7 +309,12 @@ async fn combine_with_callback(
     // belonging to that list.
     let mut history_refs = reference_map(&history_for_callback);
     let mut new_refs = reference_map(&new_for_callback);
-    let mut history_counts = frequency_map(&history_for_callback);
+    let matching_history: Vec<RunItem> = history_for_callback
+        .iter()
+        .filter(|item| session.matches_reconstructed_history_item(item))
+        .cloned()
+        .collect();
+    let mut history_counts = frequency_map(&matching_history);
     let mut new_counts = frequency_map(&new_for_callback);
 
     let mut history_positions = BTreeSet::new();
