@@ -115,7 +115,7 @@ impl RolloutFileRecorder {
     /// If called outside a Tokio runtime, which the writer task needs.
     #[must_use]
     pub fn create(path: impl Into<PathBuf>, session_id: SessionId) -> Self {
-        Self::deferred(path.into(), session_id, None, None)
+        Self::deferred(path.into(), session_id, None, Vec::new(), None)
     }
 
     /// As [`Self::create`], for the session `meta` describes, which is written as the file's first
@@ -127,7 +127,13 @@ impl RolloutFileRecorder {
     /// If called outside a Tokio runtime, which the writer task needs.
     #[must_use]
     pub fn create_with_session_meta(path: impl Into<PathBuf>, meta: RolloutSessionMeta) -> Self {
-        Self::deferred(path.into(), meta.session_id().clone(), Some(meta), None)
+        Self::deferred(
+            path.into(),
+            meta.session_id().clone(),
+            Some(meta),
+            Vec::new(),
+            None,
+        )
     }
 
     pub(crate) fn create_with_ownership(
@@ -135,13 +141,26 @@ impl RolloutFileRecorder {
         meta: RolloutSessionMeta,
         ownership: Arc<WriterLockGuard>,
     ) -> Self {
-        Self::deferred(path, meta.session_id().clone(), Some(meta), Some(ownership))
+        Self::create_with_history(path, meta, Vec::new(), ownership)
+    }
+
+    /// As [`Self::create_with_ownership`], with `history` queued to be written right after the
+    /// session metadata, as Codex's session appends a forked history before anything else.
+    pub(crate) fn create_with_history(
+        path: PathBuf,
+        meta: RolloutSessionMeta,
+        history: Vec<RolloutPayload>,
+        ownership: Arc<WriterLockGuard>,
+    ) -> Self {
+        let session_id = meta.session_id().clone();
+        Self::deferred(path, session_id, Some(meta), history, Some(ownership))
     }
 
     fn deferred(
         path: PathBuf,
         session_id: SessionId,
         session_meta: Option<RolloutSessionMeta>,
+        history: Vec<RolloutPayload>,
         ownership: Option<Arc<WriterLockGuard>>,
     ) -> Self {
         Self::start(WriterState {
@@ -151,7 +170,7 @@ impl RolloutFileRecorder {
             session_meta,
             ownership,
             deferred_creation: true,
-            pending: VecDeque::new(),
+            pending: history.into(),
             unconfirmed: None,
             last_logged_error: None,
         })

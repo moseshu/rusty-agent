@@ -7,8 +7,9 @@
 //! reading that metadata, as Codex lists a thread's children by filtering its rollouts' metadata
 //! on the parent thread.
 //!
-//! The directory is also where a thread is resumed from and read back, as Codex's local store
-//! reopens and reads a thread's rollout: it is a [`ThreadStore`].
+//! The directory is also where a root thread or a fork is created, and where a thread is resumed
+//! from and read back, as Codex's local store creates, reopens and reads a thread's rollout: it is
+//! a [`ThreadStore`].
 
 use std::{
     path::{Path, PathBuf},
@@ -31,8 +32,8 @@ use super::{
     writer_lock::WriterLockCoordinator,
 };
 use crate::store::{
-    LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams, StoredThread,
-    StoredThreadHistory, ThreadStore,
+    CreateThreadParams, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
+    StoredThread, StoredThreadHistory, ThreadStore, initial_payloads, thread_exists,
 };
 
 /// A directory holding the rollouts of the threads an agent tree spawns, and usually its root's.
@@ -172,6 +173,39 @@ impl RolloutThreadStore for RolloutThreadDirectory {
 
 #[async_trait]
 impl ThreadStore for RolloutThreadDirectory {
+    /// Takes the thread's writer lock at once, as the spawn form does, then refuses a session
+    /// whose rollout is already here, and queues the history behind the session metadata; the
+    /// file is created when something is persisted. Holding the lock while checking keeps a second
+    /// creator from passing the same check before the file exists.
+    async fn create_thread_with(
+        &self,
+        params: &CreateThreadParams,
+    ) -> Result<Arc<dyn RolloutRecorder>> {
+        let history = initial_payloads(params.history())?;
+        let path = self.rollout_path(params.session_id())?;
+        let ownership = self.writer_locks.acquire(params.session_id())?;
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(_) => return Err(thread_exists(params.session_id())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::session(
+                    SessionErrorKind::Io,
+                    format!(
+                        "failed to look up the rollout of session `{}`: {error}",
+                        params.session_id()
+                    ),
+                )
+                .with_source(error));
+            }
+        }
+        Ok(Arc::new(RolloutFileRecorder::create_with_history(
+            path,
+            params.meta().clone(),
+            history,
+            ownership,
+        )))
+    }
+
     /// Reopens the thread's rollout file at once, as Codex's local store reopens its live writer
     /// on resume, so a live writer still holding it is reported here rather than at the first
     /// record. Reopening repairs a torn last line and continues the sequence where the file ends.

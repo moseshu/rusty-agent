@@ -14,6 +14,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
+use ra_core::session::InterruptedTurnHistoryMarker;
 use ra_core::{
     agent::{
         AgentId, AgentSpec, HandoffSpec,
@@ -657,8 +658,11 @@ async fn an_interrupted_child_keeps_its_settled_turns_and_resumes_on_a_follow_up
         &format!("{FINAL_ANSWER}12 modules indexed")
     );
 
-    // The second run carries the first one's settled turn and the follow-up. The turn that was in
-    // flight at the interrupt was never recorded, so its call does not reach the next request.
+    // The second run carries the first one's settled turn, the marker Codex records where a turn
+    // was interrupted — in an agent tree, its developer form — and the follow-up. The turn that
+    // was in flight at the interrupt was never recorded, so its call does not reach the next
+    // request.
+    let marker = InterruptedTurnHistoryMarker::Developer.message().unwrap();
     let worker = scripts.inputs("worker");
     assert_eq!(worker.len(), 3);
     assert_eq!(
@@ -668,9 +672,11 @@ async fn an_interrupted_child_keeps_its_settled_turns_and_resumes_on_a_follow_up
             format!("{NEW_TASK}index the repo"),
             "Looking around first.".to_owned(),
             "12 modules".to_owned(),
+            marker.text_content(),
             format!("{NEW_TASK}Summarize what you saw."),
         ]
     );
+    assert!(worker[2].contains(&ModelInputItem::Message(marker)));
     let calls: Vec<&str> = worker[2]
         .iter()
         .filter_map(|item| match item {

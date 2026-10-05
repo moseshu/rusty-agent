@@ -31,7 +31,7 @@ use ra_core::{
         RetryAdvice, RetryBackoffSettings,
     },
     session::{
-        SessionId,
+        InterruptedTurnHistoryMarker, SessionId,
         rollout::{
             RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutThreadSpawn, RolloutThreadStore,
         },
@@ -344,6 +344,14 @@ fn label(item: &RolloutItem) -> String {
     }
 }
 
+/// The label of the interrupted-run marker a cancelled run outside an agent tree records.
+fn marker_label() -> String {
+    let marker = InterruptedTurnHistoryMarker::ContextualUser
+        .message()
+        .unwrap();
+    format!("item message {}", marker.text_content())
+}
+
 fn labels(recorder: &MemoryRecorder) -> Vec<String> {
     recorder.items().iter().map(label).collect()
 }
@@ -597,6 +605,74 @@ async fn cancelled_and_failed_runs_record_how_they_ended() {
     let failed = ended(&recorder);
     assert_eq!(failed.end(), RolloutRunEnd::Failed);
     assert_eq!(failed.error(), Some(error.to_string().as_str()));
+}
+
+#[tokio::test]
+async fn only_an_interrupted_run_records_the_marker_and_it_can_be_turned_off() {
+    async fn cancelled(reason: CancelReason, config: RunConfig) -> (Vec<String>, Vec<RunItem>) {
+        let scripts = Arc::new(Scripts::default());
+        let recorder = Arc::new(MemoryRecorder::default());
+        scripts.push("lead", Step::Hang);
+        let cancel = CancelScope::root();
+        let run = RunRequest::new(
+            AgentBinding::direct(agent("lead", Vec::new())),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new("run-1"),
+            cancel.clone(),
+            vec![ModelInputItem::Message(Message::user("do it"))],
+        )
+        .with_config(config)
+        .with_rollout_recorder(Arc::clone(&recorder) as Arc<dyn RolloutRecorder>);
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel(reason);
+        });
+        let mut stream = Runner::run_streamed(run);
+        let mut streamed = Vec::new();
+        while let Some(event) = stream.next_event().await {
+            if let RunStreamEvent::Item(item) = event {
+                streamed.push(item);
+            }
+        }
+        assert!(stream.finish().await.unwrap_err().is_cancelled());
+        canceller.await.unwrap();
+        (labels(&recorder), streamed)
+    }
+
+    // An interrupt, and a shutdown, which Codex aborts the same way: the marker is the last record
+    // before the end, and the stream reports it too.
+    for reason in [CancelReason::UserInterrupt, CancelReason::Shutdown] {
+        let (recorded, streamed) = cancelled(reason, RunConfig::new()).await;
+        assert_eq!(
+            recorded[recorded.len() - 2..],
+            [marker_label(), "run_ended run-1 Cancelled".to_owned()]
+        );
+        assert_eq!(
+            streamed,
+            vec![InterruptedTurnHistoryMarker::ContextualUser.item().unwrap()]
+        );
+    }
+
+    // Turned off, as Codex's `agents.interrupt_message = false` does.
+    let (recorded, streamed) = cancelled(
+        CancelReason::UserInterrupt,
+        RunConfig::new().with_interrupt_message(false),
+    )
+    .await;
+    assert!(!recorded.contains(&marker_label()));
+    assert!(streamed.is_empty());
+
+    // Superseded is Codex's `Replaced`, a deadline its `BudgetLimited`: neither records a marker.
+    for reason in [
+        CancelReason::Superseded,
+        CancelReason::Deadline,
+        CancelReason::Timeout,
+    ] {
+        let (recorded, streamed) = cancelled(reason.clone(), RunConfig::new()).await;
+        assert!(!recorded.contains(&marker_label()), "{reason:?}");
+        assert!(streamed.is_empty(), "{reason:?}");
+        assert_eq!(recorded.last().unwrap(), "run_ended run-1 Cancelled");
+    }
 }
 
 #[tokio::test]
@@ -1032,6 +1108,7 @@ async fn a_run_cancelled_while_a_settlement_started_tool_runs_keeps_the_call_its
             "item message Rewriting the notes.",
             "item tool_call rewrite",
             "event file_changed run-1",
+            marker_label().as_str(),
             "run_ended run-1 Cancelled",
         ]
     );
@@ -1087,6 +1164,7 @@ async fn a_run_cancelled_while_a_stream_started_tool_runs_keeps_the_call_its_eff
             "item message Rewriting the notes.",
             "item tool_call rewrite",
             "event file_changed run-1",
+            marker_label().as_str(),
             "run_ended run-1 Cancelled",
         ]
     );
@@ -1282,6 +1360,12 @@ async fn a_session_rebuilt_from_its_rollout_file_is_what_its_runs_continue_from(
     let mut after_third = after_second.clone();
     after_third.push(ModelInputItem::Message(Message::user("rewrite them")));
     after_third.extend(rewrite.to_model_input());
+    // The marker a cancelled run leaves, as Codex's interrupt does.
+    after_third.extend(
+        InterruptedTurnHistoryMarker::ContextualUser
+            .item()
+            .and_then(|item| item.to_model_input()),
+    );
 
     let records = ra_session::RolloutReader::open(&path)
         .read_all()
@@ -1845,6 +1929,13 @@ async fn a_spawned_agents_run_stopped_while_it_waits_for_approval_is_recorded_ca
         "the segment paused, then the run was cancelled while it waited"
     );
     assert_eq!(recorded.last(), ends.last().copied());
+    // Closing shuts the agent down, which Codex aborts as an interrupt: the developer form of the
+    // marker, an agent tree's, comes right before the end.
+    let marker = InterruptedTurnHistoryMarker::Developer.message().unwrap();
+    assert_eq!(
+        recorded[recorded.len() - 2],
+        format!("item message {}", marker.text_content())
+    );
     assert!(child.flushes() >= 2, "the cancellation was flushed");
     control.shutdown().await;
 }
@@ -2377,4 +2468,102 @@ async fn a_thread_resumed_from_its_rollout_continues_where_it_left_off() {
         reconstruct_history(&records).unwrap().history(),
         second.continuation_input(ContinuationInput::PreserveAll)
     );
+}
+
+#[tokio::test]
+async fn a_thread_forked_before_a_user_message_runs_on_the_history_before_it() {
+    use ra_runtime::runner::ContinuationInput;
+    use ra_session::{
+        ForkSnapshot, ForkThreadParams, ForkedThread, RolloutFileRecorder, RolloutPayload,
+        RolloutSessionMeta, RolloutThreadDirectory, reconstruct_history,
+    };
+
+    let directory = RolloutThreadDirectory::new(temp_dir("rollout_recording_forked"));
+    let source = SessionId::new("session-1");
+    let source_path = directory.rollout_path(&source).unwrap();
+    let scripts = Arc::new(Scripts::default());
+    scripts.push("lead", Step::Respond(final_message("m-1", "done")));
+    scripts.push("lead", Step::Respond(final_message("m-1", "again")));
+    scripts.push("lead", Step::Respond(final_message("m-1", "instead")));
+    let lead = agent("lead", Vec::new());
+    let start = |run: &str, input: Vec<ModelInputItem>| {
+        RunRequest::new(
+            AgentBinding::direct(Arc::clone(&lead)),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new(run),
+            CancelScope::root(),
+            input,
+        )
+    };
+
+    // The source thread runs twice, then lets go of its rollout.
+    let recorder: Arc<dyn RolloutRecorder> =
+        Arc::new(RolloutFileRecorder::create_with_session_meta(
+            &source_path,
+            RolloutSessionMeta::new(source.clone()),
+        ));
+    let first = run_streamed(
+        start(
+            "run-1",
+            vec![ModelInputItem::Message(Message::user("do it"))],
+        )
+        .with_rollout_recorder(Arc::clone(&recorder)),
+    )
+    .await
+    .unwrap();
+    let mut input = first.continuation_input(ContinuationInput::PreserveAll);
+    let after_first = input.clone();
+    input.push(ModelInputItem::Message(Message::user("and again")));
+    run_streamed(
+        start("run-2", input.clone())
+            .with_rollout_recorder(Arc::clone(&recorder))
+            .with_recorded_input(after_first.len()),
+    )
+    .await
+    .unwrap();
+    recorder.shutdown().await.unwrap();
+    let source_records = rollout_records(&source_path).await;
+
+    // Forked before the second user message, the new thread starts from the first run alone.
+    let forked = ForkedThread::fork(
+        &directory,
+        &source,
+        &ForkThreadParams::new(ForkSnapshot::TruncateBeforeNthUserMessage(1))
+            .with_session_meta(RolloutSessionMeta::new(SessionId::new("session-2"))),
+    )
+    .await
+    .unwrap();
+    let history = forked.reconstruction().history().to_vec();
+    assert_eq!(history, after_first);
+
+    let mut input = history.clone();
+    input.push(ModelInputItem::Message(Message::user("do it differently")));
+    let third = run_streamed(
+        start("run-3", input.clone())
+            .with_rollout_recorder(Arc::clone(forked.recorder()))
+            .with_recorded_input(history.len()),
+    )
+    .await
+    .unwrap();
+    forked.recorder().shutdown().await.unwrap();
+
+    assert_eq!(scripts.requests("lead")[2], normalized(&input));
+    let fork_path = directory.rollout_path(forked.session_id()).unwrap();
+    let records = rollout_records(&fork_path).await;
+    let RolloutPayload::SessionMeta(meta) = records[0].payload().unwrap() else {
+        panic!("a rollout opens with its session metadata");
+    };
+    assert_eq!(meta.forked_from_id(), Some(&source));
+    assert_eq!(
+        started_inputs(&records),
+        vec![
+            vec![ModelInputItem::Message(Message::user("do it"))],
+            vec![ModelInputItem::Message(Message::user("do it differently"))],
+        ]
+    );
+    assert_eq!(
+        reconstruct_history(&records).unwrap().history(),
+        third.continuation_input(ContinuationInput::PreserveAll)
+    );
+    assert_eq!(rollout_records(&source_path).await, source_records);
 }

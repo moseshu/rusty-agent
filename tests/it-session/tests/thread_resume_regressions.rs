@@ -16,9 +16,9 @@ use ra_core::{
     state::RunId,
 };
 use ra_session::{
-    InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
-    ResumedThread, RolloutFileRecorder, RolloutReader, RolloutSessionMeta, RolloutThreadDirectory,
-    StoredThread, StoredThreadHistory, ThreadStore,
+    CreateThreadParams, InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams,
+    ResumeThreadParams, ResumedThread, RolloutFileRecorder, RolloutReader, RolloutSessionMeta,
+    RolloutThreadDirectory, StoredThread, StoredThreadHistory, ThreadStore,
 };
 
 fn directory(name: &str) -> RolloutThreadDirectory {
@@ -242,6 +242,13 @@ impl RolloutThreadStore for ResumeProbe {
 
 #[async_trait]
 impl ThreadStore for ResumeProbe {
+    async fn create_thread_with(
+        &self,
+        params: &CreateThreadParams,
+    ) -> Result<Arc<dyn RolloutRecorder>> {
+        self.directory.create_thread_with(params).await
+    }
+
     async fn resume_thread(&self, params: &ResumeThreadParams) -> Result<Arc<dyn RolloutRecorder>> {
         if let Some(writer) = &self.final_writer {
             record(writer.as_ref(), "last-run", "last input");

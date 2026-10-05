@@ -23,7 +23,9 @@
 //!
 //! An interrupt cancels the agent's current run. The turns the run had settled before it stopped
 //! stay in the agent's history — the run is streamed so they are known even though a cancelled run
-//! returns no result — and the agent is then idle and can be given a follow-up.
+//! returns no result — followed, as in Codex, by a marker telling the model the run was interrupted
+//! on purpose, unless [`RunConfig::with_interrupt_message`] turns it off. The agent is then idle and
+//! can be given a follow-up.
 //!
 //! This keeps less than Codex does. Codex keeps what the interrupted turn had already streamed;
 //! this runner records a turn only when it settles, so the turn in flight at the interrupt — the
@@ -138,7 +140,8 @@ use ra_core::{
     item::{InputItemNormalizer, ModelInputItem, NormalizedInput, RunItem},
     model::ModelResolver,
     session::{
-        SessionId,
+        InterruptedTurnHistoryMarker, SessionId,
+        interrupt::is_interrupt,
         rollout::{
             RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded, RolloutThreadSpawn,
             RolloutThreadStore,
@@ -1271,11 +1274,27 @@ async fn run_to_end(
         };
         lock(&child.state).paused = None;
         let Some(state) = answered else {
+            let mut history = history;
             if let Err(error) = scope.ensure_not_cancelled() {
                 // The run ends here rather than in the runner, whose last segment ended paused: as
-                // Codex aborts a turn that is waiting for approval, it ends cancelled.
+                // Codex aborts a turn that is waiting for approval, it ends cancelled, after the
+                // marker its interrupt records.
+                let marker = scope
+                    .reason()
+                    .is_some_and(|reason| is_interrupt(&reason))
+                    .then(|| {
+                        InterruptedTurnHistoryMarker::from_settings(
+                            child.environment.config.interrupt_message(),
+                            true,
+                        )
+                        .item()
+                    })
+                    .flatten();
+                if let Some(input) = marker.as_ref().and_then(RunItem::to_model_input) {
+                    history.push(input);
+                }
                 if let Some(rollout) = &child.environment.rollout {
-                    record_cancelled(rollout.as_ref(), run_id).await;
+                    record_cancelled(rollout.as_ref(), run_id, marker).await;
                 }
                 handle.run_ended(&Err(error)).await;
             }
@@ -1286,8 +1305,12 @@ async fn run_to_end(
     }
 }
 
-/// Records that a run waiting for approval was cancelled, and waits for the rollout to write it.
-async fn record_cancelled(rollout: &dyn RolloutRecorder, run_id: RunId) {
+/// Records that a run waiting for approval was cancelled, after its interrupted-run marker if it
+/// has one, and waits for the rollout to write it.
+async fn record_cancelled(rollout: &dyn RolloutRecorder, run_id: RunId, marker: Option<RunItem>) {
+    if let Some(marker) = marker {
+        rollout.record(RolloutItem::Item(marker));
+    }
     rollout.record(RolloutItem::RunEnded(RolloutRunEnded::new(
         run_id.clone(),
         RolloutRunEnd::Cancelled,

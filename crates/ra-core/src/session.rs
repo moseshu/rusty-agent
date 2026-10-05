@@ -8,6 +8,7 @@
 pub mod callback;
 pub mod compaction;
 pub mod id;
+pub mod interrupt;
 pub mod port;
 pub mod rollout;
 pub mod settings;
@@ -18,5 +19,6 @@ pub use compaction::{
     SessionCompactionOutcome,
 };
 pub use id::SessionId;
+pub use interrupt::InterruptedTurnHistoryMarker;
 pub use port::Session;
 pub use settings::{SessionSettings, resolve_session_limit};

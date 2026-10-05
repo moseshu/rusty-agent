@@ -16,8 +16,9 @@ use ra_core::{
 };
 
 use super::{
-    LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams, StoredThread,
-    StoredThreadHistory, ThreadStore, first_session_meta,
+    CreateThreadParams, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
+    StoredThread, StoredThreadHistory, ThreadStore, first_session_meta, initial_payloads,
+    thread_exists,
 };
 use crate::rollout::{
     RolloutPayload, RolloutRecord, RolloutSessionMeta, recorder::is_persisted_rollout_item,
@@ -91,6 +92,28 @@ impl RolloutThreadStore for InMemoryThreadStore {
 
 #[async_trait]
 impl ThreadStore for InMemoryThreadStore {
+    async fn create_thread_with(
+        &self,
+        params: &CreateThreadParams,
+    ) -> Result<Arc<dyn RolloutRecorder>> {
+        let mut payloads = vec![RolloutPayload::SessionMeta(params.meta().clone())];
+        payloads.extend(initial_payloads(params.history())?);
+        let created = (0..)
+            .zip(payloads)
+            .map(|(timeline_seq, payload)| {
+                RolloutRecord::new(timeline_seq, EventTimestamp::now(), payload)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        {
+            let mut threads = self.threads();
+            if threads.contains_key(params.session_id()) {
+                return Err(thread_exists(params.session_id()));
+            }
+            threads.insert(params.session_id().clone(), created);
+        }
+        Ok(self.recorder(params.session_id()))
+    }
+
     async fn resume_thread(&self, params: &ResumeThreadParams) -> Result<Arc<dyn RolloutRecorder>> {
         {
             let mut threads = self.threads();
