@@ -1,6 +1,6 @@
 //! # `ra-session`
 //!
-//! The dual-channel rollout event log, `SessionStore`, resume, fork, checkpoint.
+//! The dual-channel rollout event log, the thread store, resume, fork, checkpoint.
 //!
 //! **Boundary**: it stores and replays session events that are already defined. It runs no model
 //! or tool, interprets no product semantics, and does not expose a concrete local storage layout
@@ -23,6 +23,7 @@ pub mod store;
 
 pub use memory::InMemorySession;
 pub use ra_core::session::{Session, SessionId};
+pub use resume::ResumedThread;
 pub use rollout::{
     ChildAnchorKind, ROLLOUT_SCHEMA_VERSION, ReconstructedRun, RolloutCheckpoint,
     RolloutChildAnchor, RolloutFileRecorder, RolloutModelUsage, RolloutPayload, RolloutReader,
@@ -33,3 +34,7 @@ pub use rollout::{
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteSession, SqliteSessionBuilder};
+pub use store::{
+    InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
+    StoredThread, StoredThreadHistory, ThreadStore,
+};

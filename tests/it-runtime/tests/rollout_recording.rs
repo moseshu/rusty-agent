@@ -2284,3 +2284,97 @@ async fn trigger_mail_from_different_runs_falls_back_to_the_spawning_run() {
     );
     control.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_thread_resumed_from_its_rollout_continues_where_it_left_off() {
+    use ra_runtime::runner::ContinuationInput;
+    use ra_session::{
+        ResumeThreadParams, ResumedThread, RolloutFileRecorder, RolloutSessionMeta,
+        RolloutThreadDirectory, reconstruct_history,
+    };
+
+    let directory = RolloutThreadDirectory::new(temp_dir("rollout_recording_resumed"));
+    let session_id = SessionId::new("session-1");
+    let path = directory.rollout_path(&session_id).unwrap();
+    let scripts = Arc::new(Scripts::default());
+    scripts.push("lead", Step::Respond(final_message("m-1", "done")));
+    // Item ids are only unique within a run, so the second run may reuse one.
+    scripts.push("lead", Step::Respond(final_message("m-1", "again")));
+    let lead = agent("lead", Vec::new());
+    let start = |run: &str, input: Vec<ModelInputItem>| {
+        RunRequest::new(
+            AgentBinding::direct(Arc::clone(&lead)),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new(run),
+            CancelScope::root(),
+            input,
+        )
+    };
+
+    // The thread's first life ends with its writer shut down, as a process does before it exits.
+    let recorder: Arc<dyn RolloutRecorder> =
+        Arc::new(RolloutFileRecorder::create_with_session_meta(
+            &path,
+            RolloutSessionMeta::new(session_id.clone()),
+        ));
+    let first = run_streamed(
+        start(
+            "run-1",
+            vec![ModelInputItem::Message(Message::user("do it"))],
+        )
+        .with_rollout_recorder(Arc::clone(&recorder)),
+    )
+    .await
+    .unwrap();
+    recorder.shutdown().await.unwrap();
+
+    let resumed = ResumedThread::resume(&directory, &ResumeThreadParams::new(session_id.clone()))
+        .await
+        .unwrap();
+    let last = resumed.reconstruction().last_run().unwrap();
+    assert_eq!(last.run_id(), &RunId::new("run-1"));
+    assert_eq!(last.end().unwrap().end(), RolloutRunEnd::Completed);
+    let history = resumed.reconstruction().history().to_vec();
+    assert_eq!(
+        history,
+        first.continuation_input(ContinuationInput::PreserveAll)
+    );
+
+    // The next run starts on the history and records only what is new to the thread.
+    let mut input = history.clone();
+    input.push(ModelInputItem::Message(Message::user("and again")));
+    let second = run_streamed(
+        start("run-2", input.clone())
+            .with_rollout_recorder(Arc::clone(resumed.recorder()))
+            .with_recorded_input(history.len()),
+    )
+    .await
+    .unwrap();
+    resumed.recorder().shutdown().await.unwrap();
+
+    assert_eq!(scripts.requests("lead")[1], normalized(&input));
+    let records = rollout_records(&path).await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.type_name() == "session_meta")
+            .count(),
+        1
+    );
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[0].timeline_seq() < pair[1].timeline_seq())
+    );
+    assert_eq!(
+        started_inputs(&records),
+        vec![
+            vec![ModelInputItem::Message(Message::user("do it"))],
+            vec![ModelInputItem::Message(Message::user("and again"))],
+        ]
+    );
+    assert_eq!(
+        reconstruct_history(&records).unwrap().history(),
+        second.continuation_input(ContinuationInput::PreserveAll)
+    );
+}

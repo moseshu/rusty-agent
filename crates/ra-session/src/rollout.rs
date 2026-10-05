@@ -7,6 +7,7 @@ pub mod recorder;
 pub mod threads;
 pub mod truncation;
 pub mod writer;
+mod writer_lock;
 
 pub use reader::{RolloutReader, RolloutSummary, UnifiedReplayItem, graft_child_transcripts};
 pub use reconstruction::{ReconstructedRun, RolloutReconstruction, reconstruct_history};

@@ -5,6 +5,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use ra_core::{
@@ -26,6 +27,7 @@ use tokio::{
 };
 
 use super::reader::{RolloutReader, RolloutSummary};
+use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 // Defined beside the session port so the runner can record them without depending on storage;
 // re-exported here, where they were first defined.
@@ -1013,6 +1015,7 @@ pub struct RolloutWriter {
     path: PathBuf,
     sidecar_path: PathBuf,
     file: File,
+    ownership: Arc<WriterLockGuard>,
     next_timeline_seq: u64,
     persisted_run_max_seq: HashMap<RunId, u64>,
     usage_totals: Usage,
@@ -1258,12 +1261,31 @@ impl RolloutWriter {
     /// build looks like from here, and deleting it would be exactly the silent downgrade data
     /// loss that [`Unknown`] retention exists to prevent.
     ///
+    /// The writer also owns the session's thread for as long as it lives, as Codex's writer lock
+    /// does: a lock file named after the session in a `thread-writer-locks` directory beside the
+    /// rollout, held across processes. A second writer for the same session is refused while it
+    /// is held.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error`] if directory creation, file opening, or recovery fails. A failure to
-    /// write the sidecar is not one of them; see [`RolloutWriter::sidecar_is_stale`].
+    /// Returns [`Error`] if another writer owns the session's thread, or if directory creation,
+    /// file opening, or recovery fails. A failure to write the sidecar is not one of them; see
+    /// [`RolloutWriter::sidecar_is_stale`].
     pub async fn open(path: impl Into<PathBuf>, session_id: SessionId) -> Result<Self> {
         let path = path.into();
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let ownership = Arc::new(WriterLockCoordinator::new(directory)).acquire(&session_id)?;
+        Self::open_with_ownership(path, session_id, ownership).await
+    }
+
+    pub(crate) async fn open_with_ownership(
+        path: PathBuf,
+        session_id: SessionId,
+        ownership: Arc<WriterLockGuard>,
+    ) -> Result<Self> {
         let sidecar_path = sidecar_path_for(&path);
 
         if let Some(parent) = path.parent() {
@@ -1320,6 +1342,7 @@ impl RolloutWriter {
             path,
             sidecar_path,
             file,
+            ownership,
             next_timeline_seq: recovered.next_timeline_seq,
             persisted_run_max_seq: recovered.persisted_run_max_seq,
             usage_totals: recovered.usage_totals,
@@ -1755,6 +1778,16 @@ impl RolloutWriter {
         }
         self.refresh_sidecar().await;
         Ok(())
+    }
+
+    /// Closes the file once any operation still in flight on it has completed, releasing its lock
+    /// by the time this returns. Dropping the writer closes it too, but without waiting.
+    pub(crate) async fn close(self) {
+        drop(self.file.into_std().await);
+    }
+
+    pub(crate) fn ownership(&self) -> Arc<WriterLockGuard> {
+        Arc::clone(&self.ownership)
     }
 
     /// Whether an earlier write left the commit outcome unknown, disabling further appends.

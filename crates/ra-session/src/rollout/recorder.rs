@@ -24,6 +24,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -40,6 +41,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::{
     reader::RolloutReader,
     writer::{RolloutPayload, RolloutRecord, RolloutSessionMeta, RolloutWriter},
+    writer_lock::WriterLockGuard,
 };
 
 /// Whether `item` belongs in a rollout file.
@@ -66,12 +68,16 @@ pub fn is_persisted_rollout_item(item: &RolloutItem) -> bool {
 enum Command {
     Record(Box<RolloutPayload>),
     Flush(oneshot::Sender<Result<()>>),
+    Persist(oneshot::Sender<Result<()>>),
+    Shutdown(oneshot::Sender<Result<()>>),
+    Discard(oneshot::Sender<()>),
 }
 
 /// A [`RolloutRecorder`] that writes to a rollout file on a task of its own.
 ///
 /// Clones share the task. Dropping every handle lets the task make a last attempt at what is still
-/// queued and close the file.
+/// queued and close the file; [`RolloutRecorder::shutdown`] does the same and returns once the file
+/// is closed, so the rollout can be reopened as soon as it returns.
 #[derive(Clone)]
 pub struct RolloutFileRecorder {
     commands: mpsc::UnboundedSender<Command>,
@@ -88,6 +94,8 @@ impl RolloutFileRecorder {
         let state = WriterState {
             path: writer.path().to_path_buf(),
             session_id: writer.session_id().clone(),
+            ownership: Some(writer.ownership()),
+            deferred_creation: false,
             writer: Some(writer),
             session_meta: None,
             pending: VecDeque::new(),
@@ -107,15 +115,7 @@ impl RolloutFileRecorder {
     /// If called outside a Tokio runtime, which the writer task needs.
     #[must_use]
     pub fn create(path: impl Into<PathBuf>, session_id: SessionId) -> Self {
-        Self::start(WriterState {
-            path: path.into(),
-            session_id,
-            writer: None,
-            session_meta: None,
-            pending: VecDeque::new(),
-            unconfirmed: None,
-            last_logged_error: None,
-        })
+        Self::deferred(path.into(), session_id, None, None)
     }
 
     /// As [`Self::create`], for the session `meta` describes, which is written as the file's first
@@ -127,11 +127,30 @@ impl RolloutFileRecorder {
     /// If called outside a Tokio runtime, which the writer task needs.
     #[must_use]
     pub fn create_with_session_meta(path: impl Into<PathBuf>, meta: RolloutSessionMeta) -> Self {
+        Self::deferred(path.into(), meta.session_id().clone(), Some(meta), None)
+    }
+
+    pub(crate) fn create_with_ownership(
+        path: PathBuf,
+        meta: RolloutSessionMeta,
+        ownership: Arc<WriterLockGuard>,
+    ) -> Self {
+        Self::deferred(path, meta.session_id().clone(), Some(meta), Some(ownership))
+    }
+
+    fn deferred(
+        path: PathBuf,
+        session_id: SessionId,
+        session_meta: Option<RolloutSessionMeta>,
+        ownership: Option<Arc<WriterLockGuard>>,
+    ) -> Self {
         Self::start(WriterState {
-            path: path.into(),
-            session_id: meta.session_id().clone(),
+            path,
+            session_id,
             writer: None,
-            session_meta: Some(meta),
+            session_meta,
+            ownership,
+            deferred_creation: true,
             pending: VecDeque::new(),
             unconfirmed: None,
             last_logged_error: None,
@@ -170,6 +189,31 @@ impl RolloutRecorder for RolloutFileRecorder {
         }
         written.await.map_err(|_| stopped())?
     }
+
+    async fn persist(&self) -> Result<()> {
+        let (done, written) = oneshot::channel();
+        self.commands
+            .send(Command::Persist(done))
+            .map_err(|_| stopped())?;
+        written.await.map_err(|_| stopped())?
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let (done, closed) = oneshot::channel();
+        if self.commands.send(Command::Shutdown(done)).is_err() {
+            return Err(stopped());
+        }
+        closed.await.map_err(|_| stopped())?
+    }
+
+    async fn discard(&self) -> Result<()> {
+        let (done, stopped_writing) = oneshot::channel();
+        // A task that has stopped already holds nothing.
+        if self.commands.send(Command::Discard(done)).is_ok() {
+            let _ = stopped_writing.await;
+        }
+        Ok(())
+    }
 }
 
 /// What the writer task owns: Codex's `RolloutWriterState`.
@@ -178,6 +222,10 @@ struct WriterState {
     session_id: SessionId,
     /// The open file, or `None` before the first write and after a failure.
     writer: Option<RolloutWriter>,
+    /// Retained even when a failed write closes the rollout file.
+    ownership: Option<Arc<WriterLockGuard>>,
+    /// True only until the rollout is first opened, not during recovery of a materialized file.
+    deferred_creation: bool,
     /// The session's metadata, until the file is first opened: it is then queued ahead of
     /// everything else if the file holds no record yet.
     session_meta: Option<RolloutSessionMeta>,
@@ -190,6 +238,16 @@ struct WriterState {
 }
 
 impl WriterState {
+    /// Writes what is queued, as [`Self::write_with_recovery`] does, unless the file has not been
+    /// created and nothing is queued: as Codex's flush and shutdown leave a deferred rollout
+    /// unmaterialized, a barrier with nothing to write does not create the file.
+    async fn write_pending(&mut self, sync: bool) -> Result<()> {
+        if self.deferred_creation && self.pending.is_empty() {
+            return Ok(());
+        }
+        self.write_with_recovery(sync).await
+    }
+
     /// Writes what is queued, reopening and trying once more if that fails; with `sync`, also
     /// flushes the file. An item leaves the queue only once written.
     async fn write_with_recovery(&mut self, sync: bool) -> Result<()> {
@@ -216,7 +274,19 @@ impl WriterState {
 
     async fn write_once(&mut self, sync: bool) -> Result<()> {
         if self.writer.is_none() {
-            let writer = open(&self.path, &self.session_id).await?;
+            let writer = match &self.ownership {
+                Some(ownership) => {
+                    RolloutWriter::open_with_ownership(
+                        self.path.clone(),
+                        self.session_id.clone(),
+                        Arc::clone(ownership),
+                    )
+                    .await?
+                }
+                None => open(&self.path, &self.session_id).await?,
+            };
+            self.ownership = Some(writer.ownership());
+            self.deferred_creation = false;
             self.settle_unconfirmed(&writer).await?;
             if let Some(meta) = self.session_meta.take()
                 && writer.next_timeline_seq() == 0
@@ -285,6 +355,15 @@ impl WriterState {
         Ok(())
     }
 
+    /// Closes the file, once any write still in flight on it has completed, which lets go of its
+    /// lock.
+    async fn close(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            writer.close().await;
+        }
+        self.ownership = None;
+    }
+
     /// Drops the file handle so the next barrier reopens it, keeping everything still queued.
     fn enter_recovery(&mut self, error: &Error) {
         let message = error.to_string();
@@ -315,7 +394,28 @@ async fn write_all(mut state: WriterState, mut commands: mpsc::UnboundedReceiver
                 let _ = state.write_with_recovery(false).await;
             }
             Command::Flush(done) => {
+                let _ = done.send(state.write_pending(true).await);
+            }
+            Command::Persist(done) => {
                 let _ = done.send(state.write_with_recovery(true).await);
+            }
+            // As Codex's writer: once drained, the file is closed and the task ends; if draining
+            // fails, it keeps everything queued and carries on, so the shutdown can be retried.
+            Command::Shutdown(done) => match state.write_pending(true).await {
+                Ok(()) => {
+                    state.close().await;
+                    let _ = done.send(Ok(()));
+                    return;
+                }
+                Err(error) => {
+                    let _ = done.send(Err(error));
+                }
+            },
+            Command::Discard(done) => {
+                state.pending.clear();
+                state.close().await;
+                let _ = done.send(());
+                return;
             }
         }
     }
@@ -323,6 +423,7 @@ async fn write_all(mut state: WriterState, mut commands: mpsc::UnboundedReceiver
     if !state.pending.is_empty() {
         let _ = state.write_with_recovery(true).await;
     }
+    state.close().await;
 }
 
 fn stopped() -> Error {

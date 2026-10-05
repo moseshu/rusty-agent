@@ -6,6 +6,9 @@
 //! `SessionMeta` with its `ThreadSpawn` source. The threads spawned from one session are found by
 //! reading that metadata, as Codex lists a thread's children by filtering its rollouts' metadata
 //! on the parent thread.
+//!
+//! The directory is also where a thread is resumed from and read back, as Codex's local store
+//! reopens and reads a thread's rollout: it is a [`ThreadStore`].
 
 use std::{
     path::{Path, PathBuf},
@@ -24,7 +27,12 @@ use ra_core::{
 use super::{
     reader::RolloutReader,
     recorder::RolloutFileRecorder,
-    writer::{RolloutSessionMeta, session_rollout_path},
+    writer::{RolloutSessionMeta, RolloutWriter, session_rollout_path},
+    writer_lock::WriterLockCoordinator,
+};
+use crate::store::{
+    LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams, StoredThread,
+    StoredThreadHistory, ThreadStore,
 };
 
 /// A directory holding the rollouts of the threads an agent tree spawns, and usually its root's.
@@ -36,13 +44,18 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct RolloutThreadDirectory {
     dir: PathBuf,
+    writer_locks: Arc<WriterLockCoordinator>,
 }
 
 impl RolloutThreadDirectory {
     /// The rollouts in `dir`, which is created when the first of them is.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        let dir = dir.into();
+        Self {
+            writer_locks: Arc::new(WriterLockCoordinator::new(&dir)),
+            dir,
+        }
     }
 
     /// The directory.
@@ -121,6 +134,24 @@ impl RolloutThreadDirectory {
         }
         Ok(children)
     }
+
+    /// The rollout of `session_id`, which must be a file here.
+    async fn existing_rollout(&self, session_id: &SessionId) -> Result<PathBuf> {
+        let path = self.rollout_path(session_id)?;
+        match tokio::fs::metadata(&path).await {
+            // Only a regular file: anything else may never end when read.
+            Ok(metadata) if metadata.is_file() => Ok(path),
+            Ok(_) => Err(not_found(session_id)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(not_found(session_id))
+            }
+            Err(error) => Err(Error::session(
+                SessionErrorKind::Io,
+                format!("failed to look up the rollout of session `{session_id}`: {error}"),
+            )
+            .with_source(error)),
+        }
+    }
 }
 
 #[async_trait]
@@ -131,11 +162,57 @@ impl RolloutThreadStore for RolloutThreadDirectory {
         spawn: &RolloutThreadSpawn,
     ) -> Result<Arc<dyn RolloutRecorder>> {
         let path = self.rollout_path(session_id)?;
+        let ownership = self.writer_locks.acquire(session_id)?;
         let meta = RolloutSessionMeta::new(session_id.clone()).with_thread_spawn(spawn.clone());
-        Ok(Arc::new(RolloutFileRecorder::create_with_session_meta(
-            path, meta,
+        Ok(Arc::new(RolloutFileRecorder::create_with_ownership(
+            path, meta, ownership,
         )))
     }
+}
+
+#[async_trait]
+impl ThreadStore for RolloutThreadDirectory {
+    /// Reopens the thread's rollout file at once, as Codex's local store reopens its live writer
+    /// on resume, so a live writer still holding it is reported here rather than at the first
+    /// record. Reopening repairs a torn last line and continues the sequence where the file ends.
+    async fn resume_thread(&self, params: &ResumeThreadParams) -> Result<Arc<dyn RolloutRecorder>> {
+        let ownership = self.writer_locks.acquire(params.session_id())?;
+        let path = self.existing_rollout(params.session_id()).await?;
+        let writer =
+            RolloutWriter::open_with_ownership(path, params.session_id().clone(), ownership)
+                .await?;
+        Ok(Arc::new(RolloutFileRecorder::spawn(writer)))
+    }
+
+    async fn load_history(&self, params: &LoadThreadHistoryParams) -> Result<StoredThreadHistory> {
+        let path = self.existing_rollout(params.session_id()).await?;
+        let records = RolloutReader::open(path).read_all().await?;
+        Ok(StoredThreadHistory::new(
+            params.session_id().clone(),
+            records,
+        ))
+    }
+
+    async fn read_thread(&self, params: &ReadThreadParams) -> Result<StoredThread> {
+        let path = self.existing_rollout(params.session_id()).await?;
+        let reader = RolloutReader::open(&path);
+        let thread = if params.include_history() {
+            let history =
+                StoredThreadHistory::new(params.session_id().clone(), reader.read_all().await?);
+            StoredThread::from_history(history)?
+        } else {
+            let meta = reader.session_meta().await?;
+            StoredThread::new(params.session_id().clone(), meta.as_ref())
+        };
+        Ok(thread.with_rollout_path(path))
+    }
+}
+
+fn not_found(session_id: &SessionId) -> Error {
+    Error::session(
+        SessionErrorKind::NotFound,
+        format!("no rollout of session `{session_id}` is kept here"),
+    )
 }
 
 fn list_error(error: &std::io::Error) -> Error {

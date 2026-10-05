@@ -946,10 +946,16 @@ impl RunRequest {
     }
 
     /// Records only the input after its first `count` items as new: the rollout already holds the
-    /// rest. A spawned agent's run starts on the agent's history followed by its mail, and the
-    /// history is in the agent's rollout from its earlier runs, as Codex's thread holds its history
-    /// and records only a turn's new input.
-    pub(crate) const fn with_recorded_input(mut self, count: usize) -> Self {
+    /// rest. Codex's thread holds its history and records only a turn's new input; here a run is
+    /// given its whole input, and this says how much of it is the thread's history.
+    ///
+    /// A host continuing a thread resumed from its rollout starts the run on the history rebuilt
+    /// from that rollout followed by the new input, and passes the history's length; a spawned
+    /// agent's run starts on the agent's history followed by its mail. Without it, the history is
+    /// recorded again as the run's input, and a later rebuild repeats it. A count beyond the input
+    /// counts all of it. It has no effect on a run without a rollout recorder, and none on a run
+    /// continued from its checkpoint, whose input is recorded as the base it continues on.
+    pub const fn with_recorded_input(mut self, count: usize) -> Self {
         self.recorded_input = count;
         self
     }

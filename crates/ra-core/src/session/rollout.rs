@@ -59,18 +59,69 @@ pub trait RolloutRecorder: Send + Sync + 'static {
     ///
     /// Returns an error if writing any item recorded so far failed.
     async fn flush(&self) -> Result<()>;
+
+    /// Makes the thread durable even when no run items have been recorded: Codex's
+    /// `ThreadStore::persist_thread`. A deferred file recorder writes its initial session metadata.
+    /// The default flushes a recorder whose storage is already materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if materializing the thread or writing its pending items failed.
+    async fn persist(&self) -> Result<()> {
+        self.flush().await
+    }
+
+    /// Writes everything recorded so far, then stops recording and lets go of the rollout, so the
+    /// thread can be resumed elsewhere: Codex's `ThreadStore::shutdown_thread`.
+    ///
+    /// A file recorder stops every handle sharing its writer, and [`Self::flush`] then reports
+    /// that recording has stopped. A store without live writers may retain writable handles, as
+    /// Codex's in-memory store does. If the pending items cannot be written, the recorder keeps
+    /// them and keeps going, so the shutdown can be tried again, as Codex's writer stays alive
+    /// when draining fails.
+    ///
+    /// The default flushes: a recorder that holds nothing open has nothing to let go of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing any item recorded so far failed.
+    async fn shutdown(&self) -> Result<()> {
+        self.flush().await
+    }
+
+    /// Discards a live writer without writing what has not been written yet, letting go of the
+    /// rollout: Codex's `ThreadStore::discard_thread`, for a thread whose start failed after its
+    /// writer was opened. What is already written stays.
+    ///
+    /// The default does nothing for stores without live writers, as Codex's in-memory store does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer could not be stopped.
+    async fn discard(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
-/// Creates the rollouts of the agents an agent tree spawns.
+/// Creates the rollouts of a session's threads, handing back the recorder each thread
+/// records through.
 ///
-/// Codex's `ThreadStore::create_thread` for a thread whose source is a thread spawn. The tree calls
-/// it once for each agent it spawns, before the agent's first run, and every run of the agent then
-/// records through the recorder it returns — the agent's whole life, across follow-ups and
-/// approvals, in one rollout. Closing the agent and spawning its path again creates another.
+/// This is the part of Codex's `ThreadStore` that yields a live thread writer: its
+/// `create_thread`. Codex's store keeps the writer and addresses it by thread id; here the writer
+/// is the returned [`RolloutRecorder`], held by whoever records — a run takes it through
+/// `RunRequest::with_rollout_recorder` — and persisted, flushed, shut down or discarded through
+/// it. Resume, reads and the rest of Codex's store speak in the storage layer's records, including
+/// caller-supplied replay history, and are in `ra-session`'s `ThreadStore`, which extends this
+/// trait.
 #[async_trait]
 pub trait RolloutThreadStore: Send + Sync + 'static {
     /// Creates the rollout of `session_id`, the thread of an agent spawned as `spawn` describes,
     /// and returns the recorder its runs record through.
+    ///
+    /// Codex's `create_thread` for a thread whose source is a thread spawn. The tree calls it once
+    /// for each agent it spawns, before the agent's first run, and every run of the agent then
+    /// records through the recorder it returns — the agent's whole life, across follow-ups and
+    /// approvals, in one rollout. Closing the agent and spawning its path again creates another.
     ///
     /// # Errors
     ///
