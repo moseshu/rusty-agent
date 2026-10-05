@@ -12,6 +12,7 @@
 pub mod chain;
 pub mod checkpoint;
 pub mod file_history;
+pub mod fork;
 pub mod lite;
 pub mod memory;
 pub mod mutate;
@@ -21,6 +22,7 @@ pub mod rollout;
 pub mod sqlite;
 pub mod store;
 
+pub use fork::{ForkSnapshot, ForkThreadParams, ForkedThread};
 pub use memory::InMemorySession;
 pub use ra_core::session::{Session, SessionId};
 pub use resume::ResumedThread;
@@ -29,12 +31,13 @@ pub use rollout::{
     RolloutChildAnchor, RolloutFileRecorder, RolloutModelUsage, RolloutPayload, RolloutReader,
     RolloutReconstruction, RolloutRecord, RolloutSessionMeta, RolloutSidecar, RolloutSummary,
     RolloutThreadDirectory, RolloutTurnContext, RolloutWriter, UnifiedReplayItem,
-    graft_child_transcripts, is_persisted_rollout_item, reconstruct_history,
-    truncate_rollout_after_run, truncate_rollout_before_run,
+    UserMessagePosition, graft_child_transcripts, is_persisted_rollout_item, reconstruct_history,
+    truncate_rollout_after_run, truncate_rollout_before_nth_user_message,
+    truncate_rollout_before_run, user_message_positions_in_rollout,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteSession, SqliteSessionBuilder};
 pub use store::{
-    InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
-    StoredThread, StoredThreadHistory, ThreadStore,
+    CreateThreadParams, InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams,
+    ResumeThreadParams, StoredThread, StoredThreadHistory, ThreadStore,
 };

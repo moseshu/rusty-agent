@@ -69,7 +69,8 @@ use ra_core::{
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
     session::{
-        Session, SessionInputCallback, SessionSettings,
+        InterruptedTurnHistoryMarker, Session, SessionInputCallback, SessionSettings,
+        interrupt::is_interrupt,
         rollout::{
             RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
             RolloutRunStarted, RolloutTurnContext,
@@ -173,6 +174,7 @@ pub struct RunConfig {
     group_id: Option<String>,
     session_input_callback: Option<Arc<dyn SessionInputCallback>>,
     session_settings: Option<SessionSettings>,
+    interrupt_message: bool,
 }
 
 impl Default for RunConfig {
@@ -213,6 +215,7 @@ impl RunConfig {
             group_id: None,
             session_input_callback: None,
             session_settings: None,
+            interrupt_message: true,
         }
     }
 
@@ -243,6 +246,27 @@ impl RunConfig {
     #[must_use]
     pub const fn session_settings(&self) -> Option<&SessionSettings> {
         self.session_settings.as_ref()
+    }
+
+    /// Whether a cancelled run leaves a model-visible marker in its thread's history: Codex's
+    /// `agents.interrupt_message`, on by default.
+    ///
+    /// The marker is the message [`InterruptedTurnHistoryMarker`] describes, recorded as the
+    /// cancelled run's last record before its end and reported on its stream, so a rollout rebuilt
+    /// later and an agent tree that keeps the agent's history both hold it. In an agent tree it
+    /// takes the developer form, as Codex's does under multi-agent v2. It is not added to a
+    /// [`Session`]: that port follows the reference, which has no such marker.
+    ///
+    /// [`InterruptedTurnHistoryMarker`]: ra_core::session::InterruptedTurnHistoryMarker
+    pub const fn with_interrupt_message(mut self, enabled: bool) -> Self {
+        self.interrupt_message = enabled;
+        self
+    }
+
+    /// Whether a cancelled run leaves a model-visible marker; see [`Self::with_interrupt_message`].
+    #[must_use]
+    pub const fn interrupt_message(&self) -> bool {
+        self.interrupt_message
     }
 
     /// Configures how this run reaches the sandboxes its sandbox agents run in.
@@ -780,6 +804,7 @@ impl std::fmt::Debug for RunConfig {
                 &self.session_input_callback.is_some(),
             )
             .field("session_settings", &self.session_settings)
+            .field("interrupt_message", &self.interrupt_message)
             .field(
                 "input_guardrails",
                 &self
@@ -1272,6 +1297,7 @@ async fn run_loop(
     }
     let rollout = start_recording(&mut request);
     let rollout_run_id = request.run_id.clone();
+    let interruption = Interruption::new(&request, agent_tree.is_some(), events.as_ref());
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
     // is what the turn spans underneath carry, each recording the agent that ran it; a span that
@@ -1345,9 +1371,7 @@ async fn run_loop(
         .await;
     // Written before the agent's status is published, so whoever that wakes — the host, or a
     // parent waiting on the agent — finds the run's end in its rollout.
-    if let Some(rollout) = &rollout {
-        record_run_end(rollout.as_ref(), &rollout_run_id, &result).await;
-    }
+    finish_recording(&interruption, &result, rollout.as_deref(), &rollout_run_id).await;
     if let Some(handle) = &agent_handle {
         handle.run_ended(&result).await;
     }
@@ -1412,6 +1436,62 @@ impl HostEventSink for RecordingSink {
         if let Some(inner) = &self.inner {
             inner.emit(event);
         }
+    }
+}
+
+/// What it takes to mark a run interrupted once it has ended; see
+/// [`RunConfig::with_interrupt_message`].
+struct Interruption {
+    marker: InterruptedTurnHistoryMarker,
+    scope: CancelScope,
+    stream: Option<mpsc::UnboundedSender<RunStreamEvent>>,
+}
+
+impl Interruption {
+    fn new(
+        request: &RunRequest,
+        in_agent_tree: bool,
+        stream: Option<&mpsc::UnboundedSender<RunStreamEvent>>,
+    ) -> Self {
+        Self {
+            // Codex's `from_config_and_version`: an agent tree runs Codex's multi-agent v2 tools.
+            marker: InterruptedTurnHistoryMarker::from_settings(
+                request.config.interrupt_message(),
+                in_agent_tree,
+            ),
+            scope: request.cancel.clone(),
+            stream: stream.cloned(),
+        }
+    }
+
+    /// The marker to record after `result`: only for a run its scope interrupted.
+    fn marker_after(&self, result: &Result<RunResult>) -> Option<RunItem> {
+        let interrupted = result
+            .as_ref()
+            .is_err_and(ra_core::error::Error::is_cancelled)
+            && self
+                .scope
+                .reason()
+                .is_some_and(|reason| is_interrupt(&reason));
+        interrupted.then(|| self.marker.item()).flatten()
+    }
+}
+
+/// Reports an interrupted run's marker, recording it in the rollout, then records how the run
+/// ended: Codex's interrupt records its marker after whatever the turn produced and before the
+/// turn's end.
+async fn finish_recording(
+    interruption: &Interruption,
+    result: &Result<RunResult>,
+    rollout: Option<&dyn RolloutRecorder>,
+    run_id: &RunId,
+) {
+    if let Some(item) = interruption.marker_after(result) {
+        let stream = interruption.stream.as_ref();
+        emit(RunEvents { stream, rollout }, RunStreamEvent::Item(item));
+    }
+    if let Some(rollout) = rollout {
+        record_run_end(rollout, run_id, result).await;
     }
 }
 

@@ -4,8 +4,9 @@
 //! A thread is a session's rollout, written by a live writer while the thread runs. Creating a
 //! thread hands back that writer through [`RolloutThreadStore`], in `ra-core`, so the runtime can
 //! create the threads it spawns without knowing how they are stored. [`ThreadStore`] extends it
-//! with resuming, including caller-supplied storage records, and reading the stored records:
-//! loading a thread's history for a resume, and reading a thread. Two stores implement it: the
+//! with creating a thread from its whole session metadata and an initial history, as a fork is
+//! created; resuming, including caller-supplied storage records; and reading the stored records:
+//! loading a thread's history for a resume or a fork, and reading a thread. Two stores implement it: the
 //! rollout directory, [`RolloutThreadDirectory`](crate::rollout::RolloutThreadDirectory), as
 //! Codex's local store keeps one rollout file per thread, and [`InMemoryThreadStore`], as Codex
 //! keeps an in-memory one.
@@ -44,18 +45,44 @@ use ra_core::{
     event::EventTimestamp,
     session::{
         SessionId,
-        rollout::{RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore},
+        rollout::{RolloutItem, RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore},
     },
 };
 
 pub use in_memory::InMemoryThreadStore;
 
-use crate::rollout::{RolloutPayload, RolloutRecord, RolloutSessionMeta};
+use crate::rollout::{
+    RolloutPayload, RolloutRecord, RolloutSessionMeta, recorder::is_persisted_rollout_item,
+};
 
-/// Resumes and reads the threads a store holds: the rest of Codex's `ThreadStore` that this
-/// framework ports.
+/// Creates, resumes and reads the threads a store holds: the rest of Codex's `ThreadStore` that
+/// this framework ports.
 #[async_trait]
 pub trait ThreadStore: RolloutThreadStore {
+    /// Creates the thread `params` describes and returns the recorder its runs record through:
+    /// Codex's `create_thread`, followed by the `append_items` its session makes with a forked
+    /// history before anything else.
+    ///
+    /// The supertrait's [`RolloutThreadStore::create_thread`] is the form the runtime uses for the
+    /// agents it spawns. This one takes the thread's whole session metadata, so it can create a
+    /// root thread or a fork, and the records the thread starts with. They are written right after
+    /// the session metadata, renumbered, through the shared persistence policy; a store's
+    /// checkpoints summarize the file they were written in and are left out. As with the spawn
+    /// form, the directory defers creating the file until something is persisted.
+    ///
+    /// The thread must be new: a session id the store already holds is refused before anything is
+    /// written, so the history it holds is never appended to. Codex never meets such an id, since
+    /// it generates the id of every thread it creates; here a caller can choose one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store already holds a thread of the session id or a live writer
+    /// holds it, if a history record cannot be read, or if the session id cannot name a rollout.
+    async fn create_thread_with(
+        &self,
+        params: &CreateThreadParams,
+    ) -> Result<Arc<dyn RolloutRecorder>>;
+
     /// Reopens a thread's writer: Codex's `resume_thread`. Local stores acquire exclusive thread
     /// ownership before opening the file and retain it throughout I/O recovery. In-memory stores
     /// install supplied history or preserve existing history, creating an empty history if absent.
@@ -83,6 +110,56 @@ pub trait ThreadStore: RolloutThreadStore {
     /// Returns an error of kind [`SessionErrorKind::NotFound`](ra_core::error::SessionErrorKind) if
     /// the store holds no such thread, or an error if it cannot be read.
     async fn read_thread(&self, params: &ReadThreadParams) -> Result<StoredThread>;
+}
+
+/// The thread [`ThreadStore::create_thread_with`] creates: Codex's `CreateThreadParams`, with the
+/// history its session appends first.
+///
+/// Codex's parameters carry the pieces of the thread's `SessionMeta`; here they are that metadata,
+/// whose session id is the thread's. Codex appends a forked history through `append_items` once
+/// the thread exists; here a thread's records are written through its recorder, which takes only
+/// what a run records, so the history is handed over at creation.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateThreadParams {
+    meta: RolloutSessionMeta,
+    history: Vec<RolloutRecord>,
+}
+
+impl CreateThreadParams {
+    /// Creates the thread `meta` describes, with no history.
+    #[must_use]
+    pub const fn new(meta: RolloutSessionMeta) -> Self {
+        Self {
+            meta,
+            history: Vec::new(),
+        }
+    }
+
+    /// Sets the records the thread starts with, written after its session metadata.
+    #[must_use]
+    pub fn with_history(mut self, history: Vec<RolloutRecord>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// The thread's session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        self.meta.session_id()
+    }
+
+    /// The thread's session metadata, its first record.
+    #[must_use]
+    pub const fn meta(&self) -> &RolloutSessionMeta {
+        &self.meta
+    }
+
+    /// The records the thread starts with.
+    #[must_use]
+    pub fn history(&self) -> &[RolloutRecord] {
+        &self.history
+    }
 }
 
 /// Which thread to reopen, with known replay history: Codex's `ResumeThreadParams`.
@@ -240,6 +317,7 @@ pub struct StoredThread {
     session_id: SessionId,
     rollout_path: Option<PathBuf>,
     thread_spawn: Option<RolloutThreadSpawn>,
+    forked_from_id: Option<SessionId>,
     created_at: Option<EventTimestamp>,
     cwd: Option<String>,
     model_provider: Option<String>,
@@ -256,6 +334,7 @@ impl StoredThread {
             session_id,
             rollout_path: None,
             thread_spawn: meta.and_then(|meta| meta.thread_spawn().cloned()),
+            forked_from_id: meta.and_then(|meta| meta.forked_from_id().cloned()),
             created_at: meta.and_then(RolloutSessionMeta::created_at),
             cwd: meta.and_then(|meta| meta.cwd().map(str::to_owned)),
             model_provider: meta.and_then(|meta| meta.model_provider().map(str::to_owned)),
@@ -319,6 +398,13 @@ impl StoredThread {
             .map(RolloutThreadSpawn::parent_session_id)
     }
 
+    /// The session whose thread this one was forked from, for a forked thread: Codex's
+    /// `forked_from_id`.
+    #[must_use]
+    pub const fn forked_from_id(&self) -> Option<&SessionId> {
+        self.forked_from_id.as_ref()
+    }
+
     /// When the thread was created.
     #[must_use]
     pub const fn created_at(&self) -> Option<EventTimestamp> {
@@ -366,4 +452,33 @@ pub(crate) fn first_session_meta(records: &[RolloutRecord]) -> Result<Option<Rol
         },
         _ => Ok(None),
     }
+}
+
+/// What a thread created with `history` writes after its session metadata: each record's payload,
+/// in order, without the checkpoints another file's writer left and without host events the
+/// persistence policy drops, as Codex's `append_items` applies its policy.
+pub(crate) fn initial_payloads(history: &[RolloutRecord]) -> Result<Vec<RolloutPayload>> {
+    let mut payloads = Vec::with_capacity(history.len());
+    for record in history {
+        match record.payload()? {
+            RolloutPayload::Checkpoint(_) => {}
+            RolloutPayload::Event(event) => {
+                let item = RolloutItem::Event(event);
+                if is_persisted_rollout_item(&item) {
+                    payloads.push(item.into());
+                }
+            }
+            payload => payloads.push(payload),
+        }
+    }
+    Ok(payloads)
+}
+
+/// The refusal of a thread [`ThreadStore::create_thread_with`] would create over one the store
+/// already holds.
+pub(crate) fn thread_exists(session_id: &SessionId) -> ra_core::error::Error {
+    ra_core::error::Error::caller(format!(
+        "the store already holds a thread of session `{session_id}`; a created thread needs a \
+         session of its own"
+    ))
 }

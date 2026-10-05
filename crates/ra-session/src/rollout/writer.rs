@@ -257,7 +257,8 @@ impl RolloutChildAnchor {
 /// Metadata recorded at session creation: Codex's `SessionMeta`.
 ///
 /// The rollout of an agent spawned in an agent tree also says where it came from, as Codex's does
-/// with its `ThreadSpawn` source: see [`Self::thread_spawn`].
+/// with its `ThreadSpawn` source: see [`Self::thread_spawn`]. A forked thread names the thread it
+/// was forked from: see [`Self::forked_from_id`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutSessionMeta {
@@ -276,6 +277,8 @@ pub struct RolloutSessionMeta {
     created_at: Option<EventTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_spawn: Option<RolloutThreadSpawn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forked_from_id: Option<SessionId>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -293,6 +296,7 @@ impl RolloutSessionMeta {
             model_provider: None,
             created_at: Some(EventTimestamp::now()),
             thread_spawn: None,
+            forked_from_id: None,
             unknown: Unknown::new(),
         }
     }
@@ -301,6 +305,13 @@ impl RolloutSessionMeta {
     #[must_use]
     pub fn with_thread_spawn(mut self, spawn: RolloutThreadSpawn) -> Self {
         self.thread_spawn = Some(spawn);
+        self
+    }
+
+    /// Records that the session is a fork of the thread of `source`: Codex's `forked_from_id`.
+    #[must_use]
+    pub fn with_forked_from_id(mut self, source: SessionId) -> Self {
+        self.forked_from_id = Some(source);
         self
     }
 
@@ -388,6 +399,13 @@ impl RolloutSessionMeta {
         self.thread_spawn
             .as_ref()
             .map(RolloutThreadSpawn::parent_session_id)
+    }
+
+    /// The session whose thread this one was forked from, for a forked thread: Codex's
+    /// `forked_from_id`.
+    #[must_use]
+    pub const fn forked_from_id(&self) -> Option<&SessionId> {
+        self.forked_from_id.as_ref()
     }
 
     /// Schema version of the record.
@@ -752,6 +770,15 @@ impl RolloutRecord {
     #[must_use]
     pub const fn payload_value(&self) -> &serde_json::Value {
         &self.payload
+    }
+
+    /// The same record, envelope and all, carrying `payload` in place of its own: for a cut that
+    /// keeps part of a record.
+    pub(crate) fn with_payload_value(&self, payload: serde_json::Value) -> Self {
+        Self {
+            payload,
+            ..self.clone()
+        }
     }
 
     /// Parses and returns the strongly typed payload from this record.
