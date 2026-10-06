@@ -165,6 +165,7 @@ impl ThreadMetadataSync {
         if let Some(version) = meta.cli_version() {
             set(&mut update, |patch| patch.with_cli_version(version));
         }
+        update = with_lineage(update, meta);
         Self {
             session_id: meta.session_id().clone(),
             cwd_seen: meta.cwd().is_some_and(|cwd| !cwd.is_empty()),
@@ -362,6 +363,7 @@ impl ThreadMetadataSync {
             self.cwd_seen = true;
             set(update, |patch| patch.with_cwd(cwd));
         }
+        *update = with_lineage(std::mem::take(update), meta);
     }
 
     /// Codex's `observe_user_message`: the first user message and preview come from the first
@@ -405,6 +407,18 @@ impl ThreadMetadataSync {
     }
 }
 
+/// `update` with where the thread of `meta` was spawned from and forked from, as Codex's patch
+/// carries the session source.
+fn with_lineage(mut update: ThreadMetadataPatch, meta: &RolloutSessionMeta) -> ThreadMetadataPatch {
+    if let Some(spawn) = meta.thread_spawn() {
+        update = update.with_thread_spawn(spawn.clone());
+    }
+    if let Some(source) = meta.forked_from_id() {
+        update = update.with_forked_from_id(source.clone());
+    }
+    update
+}
+
 /// Whether `update` sets anything but the update time: Codex's `update_has_metadata_facts`.
 fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
     update.preview().is_some()
@@ -417,4 +431,6 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.cwd().is_some()
         || update.cli_version().is_some()
         || update.first_user_message().is_some()
+        || update.thread_spawn().is_some()
+        || update.forked_from_id().is_some()
 }

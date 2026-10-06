@@ -9,9 +9,13 @@
 //!
 //! The directory is also where a root thread or a fork is created, where a thread is resumed from,
 //! read back and listed, and where it is renamed, archived and deleted, as Codex's local store does
-//! with its rollouts when it has no state database: it is a [`ThreadStore`]. Archived rollouts move,
-//! under the same name, into an `archived_sessions` directory inside this one, as Codex keeps them
-//! flat in its own; names are kept in a session index beside the rollouts.
+//! with its rollouts: it is a [`ThreadStore`]. Archived rollouts move, under the same name, into an
+//! `archived_sessions` directory inside this one, as Codex keeps them flat in its own; names are
+//! kept in a session index beside the rollouts. Given a state database
+//! (`RolloutThreadDirectory::with_state_db`, with the `sqlite` feature), the directory also keeps
+//! its threads' metadata there and lists threads from it, as Codex's local store does with its
+//! own; see `ra_session::store::local`. Without one, it works as Codex's local store does without
+//! its state database.
 //!
 //! # Differences from Codex
 //!
@@ -26,8 +30,9 @@
 //! archived history; both ways of creating a thread refuse an id with an archived rollout, too.
 //! Codex's reference checks before deleting a thread guard histories that its paginated forks share
 //! with their source; forks here copy their history, so there is nothing to check. A resume
-//! reopens active threads only. Of a metadata patch only the name is kept, as Codex keeps only the
-//! name without its state database; the rest is read from the rollout when the thread is.
+//! reopens active threads only. Without a state database, of a metadata patch only the name is
+//! kept, as Codex keeps only the name without its state database; the rest is read from the rollout
+//! when the thread is.
 
 use std::{
     collections::HashSet,
@@ -58,7 +63,8 @@ use crate::{
         ArchiveThreadParams, ArchiveThreadsParams, CreateThreadParams, DeleteThreadParams,
         DeleteThreadsParams, ListThreadsParams, LoadThreadHistoryParams, ReadThreadParams,
         ResumeThreadParams, StoredThread, StoredThreadHistory, ThreadPage, ThreadStore,
-        UpdateThreadMetadataParams, initial_payloads, is_not_found, live::LiveThreadRecorder,
+        UpdateThreadMetadataParams, index::ThreadIndex, initial_payloads, is_not_found,
+        live::LiveThreadRecorder,
     },
 };
 
@@ -67,12 +73,14 @@ use crate::{
 /// As a [`RolloutThreadStore`], it gives each spawned agent's thread the rollout
 /// `rollout-<session id>.jsonl` here, recorded through a [`RolloutFileRecorder`] that writes the
 /// thread's session metadata first. The recorder handed back derives the thread's metadata from
-/// what is recorded, as Codex's live thread does; the directory keeps none of it but names. The file is created when the agent's first run records into
-/// it, as Codex defers creating a rollout until something is persisted.
+/// what is recorded, as Codex's live thread does; the directory keeps it in its state database, if
+/// it has one, and otherwise keeps none of it but names. The file is created when the agent's first
+/// run records into it, as Codex defers creating a rollout until something is persisted.
 #[derive(Debug, Clone)]
 pub struct RolloutThreadDirectory {
     dir: PathBuf,
     writer_locks: Arc<WriterLockCoordinator>,
+    index: Option<Arc<dyn ThreadIndex>>,
 }
 
 impl RolloutThreadDirectory {
@@ -83,7 +91,18 @@ impl RolloutThreadDirectory {
         Self {
             writer_locks: Arc::new(WriterLockCoordinator::new(&dir)),
             dir,
+            index: None,
         }
+    }
+
+    /// Keeps the directory's threads in `state_db` as well, as Codex's local store keeps them in
+    /// its state database: see [`crate::store::local`]. `state_db` should be the database
+    /// [`crate::store::local::init`] opened for this directory.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn with_state_db(mut self, state_db: Arc<crate::store::local::StateRuntime>) -> Self {
+        self.index = Some(state_db);
+        self
     }
 
     /// The directory.
@@ -169,7 +188,7 @@ impl RolloutThreadDirectory {
     }
 
     fn files(&self) -> ThreadFiles {
-        ThreadFiles::new(&self.dir)
+        ThreadFiles::new(&self.dir, self.index.clone())
     }
 
     /// The writer locks of `session_ids`, all or none, as Codex's local store takes every lock of
@@ -245,6 +264,9 @@ impl RolloutThreadDirectory {
             .remove(thread.session_id())
         {
             thread.set_name(name);
+        }
+        if let Some(index) = &self.index {
+            index.overlay(thread).await;
         }
         Ok(())
     }
@@ -374,23 +396,35 @@ impl ThreadStore for RolloutThreadDirectory {
         Ok(thread.with_rollout_path(path))
     }
 
+    /// Without a state database, reads the head of every rollout, as Codex's local store does
+    /// without one; a listing of the state database alone then lists nothing, as Codex's does.
+    /// With one, see `ra_session::store::local`.
     async fn list_threads(&self, params: &ListThreadsParams) -> Result<ThreadPage> {
         let dir = if params.is_archived() {
             self.archived_dir()
         } else {
             self.dir.clone()
         };
-        lite::list_threads(&dir, &self.dir, params.is_archived(), params).await
+        match &self.index {
+            Some(index) => index.list_threads(&dir, &self.dir, params).await,
+            None if params.use_state_db_only() => Ok(ThreadPage::new(Vec::new(), None)),
+            None => lite::list_threads(&dir, &self.dir, params.is_archived(), params).await,
+        }
     }
 
     /// Keeps a name in the session index; an empty or cleared name clears it. The other fields
-    /// are not kept, as Codex keeps them only in its state database.
+    /// are kept only in a state database, as Codex keeps them.
     async fn update_thread_metadata(
         &self,
         params: &UpdateThreadMetadataParams,
     ) -> Result<Option<StoredThread>> {
         let session_id = params.session_id();
-        self.locate(session_id, params.include_archived()).await?;
+        let (path, archived) = self.locate(session_id, params.include_archived()).await?;
+        if let Some(index) = &self.index {
+            index
+                .update_thread_metadata(session_id, params.patch(), path, archived)
+                .await;
+        }
         if let Some(name) = params.patch().name() {
             session_index::append_thread_name(&self.dir, session_id, name.unwrap_or_default())?;
         }
@@ -401,15 +435,22 @@ impl ThreadStore for RolloutThreadDirectory {
         self.read_thread(&read).await.map(Some)
     }
 
-    /// Keeps a name as [`Self::update_thread_metadata`] does. A patch without one has nothing here
-    /// to keep, so the thread is not looked up: a live thread's recorder writes such patches before
-    /// its rollout is created, and Codex's local store writes nothing of them without its state
-    /// database.
+    /// Keeps a name as [`Self::update_thread_metadata`] does. A patch without one is not looked up
+    /// against the rollouts: a live thread's recorder writes such patches before its rollout is
+    /// created. It is written to a state database, where the thread is given a row if it has none,
+    /// and otherwise has nothing here to keep, as Codex's local store writes nothing of it without
+    /// its state database.
     async fn record_thread_metadata(&self, params: &UpdateThreadMetadataParams) -> Result<()> {
-        if params.patch().name().is_none() {
-            return Ok(());
+        if params.patch().name().is_some() {
+            return self.update_thread_metadata(params).await.map(|_| ());
         }
-        self.update_thread_metadata(params).await.map(|_| ())
+        if let Some(index) = &self.index {
+            let active_path = self.rollout_path(params.session_id())?;
+            index
+                .record_thread_metadata(params.session_id(), params.patch(), active_path)
+                .await;
+        }
+        Ok(())
     }
 
     /// Moves the rollout, and its sidecar, into `archived_sessions` under the thread's writer lock.

@@ -303,7 +303,7 @@ async fn first_session_meta(path: &Path) -> Option<(RolloutSessionMeta, EventTim
 }
 
 /// The rollout files in `dir`.
-async fn rollout_files(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) async fn rollout_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -367,7 +367,7 @@ pub(crate) async fn modified_time(path: &Path) -> Option<EventTimestamp> {
 }
 
 /// A cursor a listing returned: the sort time in milliseconds and the session id.
-fn parse_cursor(cursor: &str) -> Result<(u64, String)> {
+pub(crate) fn parse_cursor(cursor: &str) -> Result<(u64, String)> {
     cursor
         .split_once('|')
         .and_then(|(at, id)| Some((at.parse().ok()?, id.to_owned())))

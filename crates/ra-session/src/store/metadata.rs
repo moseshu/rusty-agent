@@ -3,7 +3,10 @@
 //! `ArchiveThreadParams`, `ArchiveThreadsParams`, `DeleteThreadParams` and `DeleteThreadsParams`
 //! (`thread-store/src/types.rs`).
 
-use ra_core::{event::EventTimestamp, session::SessionId};
+use ra_core::{
+    event::EventTimestamp,
+    session::{SessionId, rollout::RolloutThreadSpawn},
+};
 
 /// A change to a thread's metadata: Codex's `ThreadMetadataPatch`, with the fields this
 /// framework's records have.
@@ -11,10 +14,15 @@ use ra_core::{event::EventTimestamp, session::SessionId};
 /// A field left unset is left as it is. A field whose value may itself be cleared takes an inner
 /// `Option`, where `Some(None)` clears it.
 ///
-/// Codex's patch also carries the rollout path, recency, the creator's identity, the session
-/// source and agent nickname, role and path, the approval mode and permission profile, the token
-/// usage, Git facts, the memory mode and the product's project and Daybreak preferences. Those
-/// are its product's or its state database's, and are not ported.
+/// Codex's patch also carries the session source, which a live thread derives from its session
+/// metadata. Here that is where a spawned thread was spawned from and the thread a fork was
+/// forked from; they are set only by the live thread's metadata sync, so a state database can
+/// describe a thread before its rollout is written, and cannot be set through the builder.
+///
+/// Codex's patch also carries the rollout path, recency, the creator's identity, the agent
+/// nickname, role and path, the approval mode and permission profile, the token usage, Git facts,
+/// the memory mode and the product's project and Daybreak preferences. Those are its product's or
+/// its state database's, and are not ported.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(
@@ -34,6 +42,8 @@ pub struct ThreadMetadataPatch {
     cwd: Option<String>,
     cli_version: Option<String>,
     originator: Option<String>,
+    thread_spawn: Option<RolloutThreadSpawn>,
+    forked_from_id: Option<SessionId>,
 }
 
 impl ThreadMetadataPatch {
@@ -147,6 +157,8 @@ impl ThreadMetadataPatch {
         take(&mut self.cwd, next.cwd);
         take(&mut self.cli_version, next.cli_version);
         take(&mut self.originator, next.originator);
+        take(&mut self.thread_spawn, next.thread_spawn);
+        take(&mut self.forked_from_id, next.forked_from_id);
     }
 
     /// Whether the patch changes nothing.
@@ -225,6 +237,30 @@ impl ThreadMetadataPatch {
     #[must_use]
     pub fn originator(&self) -> Option<&str> {
         self.originator.as_deref()
+    }
+}
+
+impl ThreadMetadataPatch {
+    /// Sets where the thread was spawned from: Codex's `source`.
+    pub(crate) fn with_thread_spawn(mut self, spawn: RolloutThreadSpawn) -> Self {
+        self.thread_spawn = Some(spawn);
+        self
+    }
+
+    /// Sets the thread the thread was forked from.
+    pub(crate) fn with_forked_from_id(mut self, source: SessionId) -> Self {
+        self.forked_from_id = Some(source);
+        self
+    }
+
+    /// Where the thread was spawned from, to set.
+    pub(crate) const fn thread_spawn(&self) -> Option<&RolloutThreadSpawn> {
+        self.thread_spawn.as_ref()
+    }
+
+    /// The thread the thread was forked from, to set.
+    pub(crate) const fn forked_from_id(&self) -> Option<&SessionId> {
+        self.forked_from_id.as_ref()
     }
 }
 

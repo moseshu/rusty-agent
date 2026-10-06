@@ -6,8 +6,8 @@ use super::StoredThread;
 
 /// What threads are sorted by: Codex's `ThreadSortKey`.
 ///
-/// Codex's `RecencyAt` and `SectionPosition` come from its `SQLite` state database, which is not
-/// ported; without it Codex's own recency falls back to the update time.
+/// Codex's `RecencyAt` and `SectionPosition` come from columns of its `SQLite` state database that
+/// are not ported; without them Codex's own recency falls back to the update time.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ThreadSortKey {
@@ -32,8 +32,8 @@ pub enum SortDirection {
 /// Which threads to list, in what order, from where: Codex's `ListThreadsParams`.
 ///
 /// Codex's source, section, project and spawn-relation filters are not ported: this framework has
-/// no session-source vocabulary, and the others are answered by Codex's state database. Its
-/// `use_state_db_only` has nothing to select here.
+/// no session-source vocabulary, and the others belong to parts of Codex's state database that are
+/// not ported.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListThreadsParams {
@@ -45,6 +45,7 @@ pub struct ListThreadsParams {
     cwd_filters: Option<Vec<String>>,
     archived: bool,
     search_term: Option<String>,
+    use_state_db_only: bool,
 }
 
 impl ListThreadsParams {
@@ -60,6 +61,7 @@ impl ListThreadsParams {
             cwd_filters: None,
             archived: false,
             search_term: None,
+            use_state_db_only: false,
         }
     }
 
@@ -115,6 +117,23 @@ impl ListThreadsParams {
         self
     }
 
+    /// Reads only the store's state database, without scanning its rollouts or repairing the
+    /// database from them: Codex's `use_state_db_only`, which its resume picker uses for a fast
+    /// first page. A store without a state database lists nothing, as Codex's does; the in-memory
+    /// store has no database and ignores it.
+    #[must_use]
+    pub const fn with_state_db_only(mut self) -> Self {
+        self.use_state_db_only = true;
+        self
+    }
+
+    /// The same listing with pages of `page_size`.
+    #[cfg(feature = "sqlite")]
+    pub(crate) const fn with_page_size(mut self, page_size: usize) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
     /// The most threads a page holds.
     #[must_use]
     pub const fn page_size(&self) -> usize {
@@ -161,6 +180,12 @@ impl ListThreadsParams {
     #[must_use]
     pub fn search_term(&self) -> Option<&str> {
         self.search_term.as_deref()
+    }
+
+    /// Whether only the state database is read.
+    #[must_use]
+    pub const fn use_state_db_only(&self) -> bool {
+        self.use_state_db_only
     }
 }
 

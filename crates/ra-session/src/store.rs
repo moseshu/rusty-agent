@@ -23,9 +23,12 @@
 //! its paginated mode — history projected into `SQLite` turn and item tables, with reads of the
 //! latest model context, reference-backed forks, reverts and turn, item and timeline listings —
 //! is not, and neither are the methods Codex's store gives an `Unsupported` default: staged
-//! metadata, sections, attachments, projects, search and queued submissions. Neither is Codex's
-//! `SQLite` state database: listing reads the rollouts themselves, as Codex's local store does
-//! without one, and of the metadata a patch carries only the name is kept by the directory.
+//! metadata, sections, attachments, projects, search and queued submissions.
+//!
+//! Codex's local store keeps an `SQLite` state database beside its rollouts. Here the directory
+//! keeps one only when it is given one (the `local` module, with the `sqlite` feature); without
+//! it, listing reads the rollouts themselves, as Codex's local store does without one, and of the
+//! metadata a patch carries only the name is kept by the directory.
 //!
 //! # Live threads
 //!
@@ -34,11 +37,10 @@
 //! — and writes it through the store's `record_thread_metadata`. Here the recorder both stores hand
 //! back for a created, spawned or resumed thread does the same; a caller using a
 //! [`RolloutFileRecorder`](crate::rollout::RolloutFileRecorder) directly gets none of it. The
-//! directory keeps none of these fields, as Codex's local store keeps them only in its state
-//! database; the in-memory store keeps them all.
+//! directory keeps these fields only in its state database, as Codex's local store does; the
+//! in-memory store keeps them all.
 //!
-//! The `local`, `mirror` and `summary` modules below are empty and kept only because they were
-//! released.
+//! The `mirror` and `summary` modules below are empty and kept only because they were released.
 
 #[cfg(feature = "sqlite")]
 pub mod local;
@@ -46,6 +48,7 @@ pub mod mirror;
 pub mod summary;
 
 mod in_memory;
+pub(crate) mod index;
 mod list;
 pub(crate) mod live;
 mod metadata;
@@ -740,6 +743,12 @@ impl StoredThread {
         }
         if let Some(originator) = patch.originator() {
             self.originator = Some(originator.to_owned());
+        }
+        if let Some(spawn) = patch.thread_spawn() {
+            self.thread_spawn = Some(spawn.clone());
+        }
+        if let Some(source) = patch.forked_from_id() {
+            self.forked_from_id = Some(source.clone());
         }
     }
 }
