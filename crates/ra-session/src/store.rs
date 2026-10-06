@@ -26,8 +26,16 @@
 //! metadata, sections, attachments, projects, search and queued submissions. Neither is Codex's
 //! `SQLite` state database: listing reads the rollouts themselves, as Codex's local store does
 //! without one, and of the metadata a patch carries only the name is kept by the directory.
-//! Codex's `record_thread_metadata`, a deferrable form of `update_thread_metadata` used by its live
-//! layer, comes with that layer.
+//!
+//! # Live threads
+//!
+//! Codex's `LiveThread` derives a thread's metadata from what is appended to it — the first user
+//! message, preview and title, the latest model and effort, the working directory, the update time
+//! — and writes it through the store's `record_thread_metadata`. Here the recorder both stores hand
+//! back for a created, spawned or resumed thread does the same; a caller using a
+//! [`RolloutFileRecorder`](crate::rollout::RolloutFileRecorder) directly gets none of it. The
+//! directory keeps none of these fields, as Codex's local store keeps them only in its state
+//! database; the in-memory store keeps them all.
 //!
 //! The `local`, `mirror` and `summary` modules below are empty and kept only because they were
 //! released.
@@ -39,7 +47,9 @@ pub mod summary;
 
 mod in_memory;
 mod list;
+pub(crate) mod live;
 mod metadata;
+mod metadata_sync;
 
 use std::{
     path::{Path, PathBuf},
@@ -146,6 +156,21 @@ pub trait ThreadStore: RolloutThreadStore {
         &self,
         params: &UpdateThreadMetadataParams,
     ) -> Result<Option<StoredThread>>;
+
+    /// Records metadata derived from a thread's records: Codex's `record_thread_metadata`, which
+    /// the recorders of live threads write through. Unlike [`Self::update_thread_metadata`] it
+    /// does not read the thread back.
+    ///
+    /// The default applies the patch through [`Self::update_thread_metadata`]. A store may defer
+    /// the write only if the recorders it hands back wait for it when flushed and shut down, as
+    /// Codex's deferred writes respect its flush and shutdown guarantees.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change cannot be kept.
+    async fn record_thread_metadata(&self, params: &UpdateThreadMetadataParams) -> Result<()> {
+        self.update_thread_metadata(params).await.map(|_| ())
+    }
 
     /// Archives a thread: Codex's `archive_thread`.
     ///

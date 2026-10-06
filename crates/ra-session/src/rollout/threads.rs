@@ -58,7 +58,7 @@ use crate::{
         ArchiveThreadParams, ArchiveThreadsParams, CreateThreadParams, DeleteThreadParams,
         DeleteThreadsParams, ListThreadsParams, LoadThreadHistoryParams, ReadThreadParams,
         ResumeThreadParams, StoredThread, StoredThreadHistory, ThreadPage, ThreadStore,
-        UpdateThreadMetadataParams, initial_payloads, is_not_found,
+        UpdateThreadMetadataParams, initial_payloads, is_not_found, live::LiveThreadRecorder,
     },
 };
 
@@ -66,7 +66,8 @@ use crate::{
 ///
 /// As a [`RolloutThreadStore`], it gives each spawned agent's thread the rollout
 /// `rollout-<session id>.jsonl` here, recorded through a [`RolloutFileRecorder`] that writes the
-/// thread's session metadata first. The file is created when the agent's first run records into
+/// thread's session metadata first. The recorder handed back derives the thread's metadata from
+/// what is recorded, as Codex's live thread does; the directory keeps none of it but names. The file is created when the agent's first run records into
 /// it, as Codex defers creating a rollout until something is persisted.
 #[derive(Debug, Clone)]
 pub struct RolloutThreadDirectory {
@@ -260,9 +261,17 @@ impl RolloutThreadStore for RolloutThreadDirectory {
         let ownership = self.writer_locks.acquire(session_id)?;
         self.files().ensure_new(session_id)?;
         let meta = RolloutSessionMeta::new(session_id.clone()).with_thread_spawn(spawn.clone());
-        Ok(Arc::new(RolloutFileRecorder::create_with_ownership(
-            path, meta, ownership,
-        )))
+        let recorder = Arc::new(RolloutFileRecorder::create_with_ownership(
+            path,
+            meta.clone(),
+            ownership,
+        ));
+        Ok(LiveThreadRecorder::created(
+            Arc::new(self.clone()),
+            recorder,
+            &meta,
+            &[],
+        ))
     }
 }
 
@@ -280,24 +289,59 @@ impl ThreadStore for RolloutThreadDirectory {
         let path = self.rollout_path(params.session_id())?;
         let ownership = self.writer_locks.acquire(params.session_id())?;
         self.files().ensure_new(params.session_id())?;
-        Ok(Arc::new(RolloutFileRecorder::create_with_history(
+        let recorder = Arc::new(RolloutFileRecorder::create_with_history(
             path,
             params.meta().clone(),
-            history,
+            history.clone(),
             ownership,
-        )))
+        ));
+        Ok(LiveThreadRecorder::created(
+            Arc::new(self.clone()),
+            recorder,
+            params.meta(),
+            &history,
+        ))
     }
 
     /// Reopens the thread's rollout file at once, as Codex's local store reopens its live writer
     /// on resume, so a live writer still holding it is reported here rather than at the first
     /// record. Reopening repairs a torn last line and continues the sequence where the file ends.
+    ///
+    /// Without supplied history the reopened file is read for what its metadata derives from, as
+    /// Codex's live thread loads the history on resume; if it cannot be read, the writer is
+    /// discarded and the error returned.
     async fn resume_thread(&self, params: &ResumeThreadParams) -> Result<Arc<dyn RolloutRecorder>> {
         let ownership = self.writer_locks.acquire(params.session_id())?;
         let path = self.existing_rollout(params.session_id()).await?;
-        let writer =
-            RolloutWriter::open_with_ownership(path, params.session_id().clone(), ownership)
-                .await?;
-        Ok(Arc::new(RolloutFileRecorder::spawn(writer)))
+        let writer = RolloutWriter::open_with_ownership(
+            path.clone(),
+            params.session_id().clone(),
+            ownership,
+        )
+        .await?;
+        let recorder: Arc<dyn RolloutRecorder> = Arc::new(RolloutFileRecorder::spawn(writer));
+        let history = match params.history() {
+            Some(history) => history.to_vec(),
+            None => match RolloutReader::open(&path).read_all().await {
+                Ok(history) => history,
+                Err(error) => {
+                    if let Err(discard) = recorder.discard().await {
+                        tracing::warn!(
+                            session_id = %params.session_id(),
+                            error = %discard,
+                            "failed to discard a resumed writer after its history could not be read"
+                        );
+                    }
+                    return Err(error);
+                }
+            },
+        };
+        Ok(LiveThreadRecorder::resumed(
+            Arc::new(self.clone()),
+            recorder,
+            params.session_id().clone(),
+            &history,
+        ))
     }
 
     async fn load_history(&self, params: &LoadThreadHistoryParams) -> Result<StoredThreadHistory> {
@@ -355,6 +399,17 @@ impl ThreadStore for RolloutThreadDirectory {
             read = read.including_archived();
         }
         self.read_thread(&read).await.map(Some)
+    }
+
+    /// Keeps a name as [`Self::update_thread_metadata`] does. A patch without one has nothing here
+    /// to keep, so the thread is not looked up: a live thread's recorder writes such patches before
+    /// its rollout is created, and Codex's local store writes nothing of them without its state
+    /// database.
+    async fn record_thread_metadata(&self, params: &UpdateThreadMetadataParams) -> Result<()> {
+        if params.patch().name().is_none() {
+            return Ok(());
+        }
+        self.update_thread_metadata(params).await.map(|_| ())
     }
 
     /// Moves the rollout, and its sidecar, into `archived_sessions` under the thread's writer lock.

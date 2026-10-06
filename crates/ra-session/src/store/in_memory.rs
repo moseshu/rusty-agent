@@ -19,7 +19,7 @@ use super::{
     ArchiveThreadParams, CreateThreadParams, DeleteThreadParams, ListThreadsParams,
     LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams, StoredThread,
     StoredThreadHistory, ThreadMetadataPatch, ThreadPage, ThreadStore, UpdateThreadMetadataParams,
-    first_session_meta, initial_payloads, thread_exists,
+    first_session_meta, initial_payloads, live::LiveThreadRecorder, thread_exists,
 };
 use crate::rollout::{
     RolloutPayload, RolloutRecord, RolloutSessionMeta, recorder::is_persisted_rollout_item,
@@ -33,6 +33,9 @@ use crate::rollout::{
 /// rollout directory would write them, numbered from zero and filtered by the same persistence
 /// policy. Either way of creating a thread refuses a session the store already holds, as the
 /// directory does, where Codex's in-memory store appends to it.
+///
+/// The recorders it hands back derive the thread's metadata from what is recorded, as Codex's live
+/// thread does over its in-memory store, and the store keeps every field of it.
 ///
 /// As in Codex, resuming installs supplied history or preserves the current history, creating an
 /// empty history if absent. Persist, shutdown and discard do not invalidate recording handles:
@@ -68,6 +71,15 @@ impl InMemoryThreadStore {
             session_id: session_id.clone(),
             state: Arc::new(Mutex::new(RecorderState::default())),
         })
+    }
+
+    /// The metadata patches the thread of `session_id` was given, merged in the order they were
+    /// applied, explicit and derived alike: what Codex's in-memory store keeps as its metadata
+    /// updates. A read applies only the fields [`StoredThread`] has; this shows the rest, such as
+    /// the derived title.
+    #[must_use]
+    pub fn thread_metadata(&self, session_id: &SessionId) -> Option<ThreadMetadataPatch> {
+        self.metadata().get(session_id).cloned()
     }
 
     fn metadata(&self) -> MutexGuard<'_, HashMap<SessionId, ThreadMetadataPatch>> {
@@ -108,8 +120,11 @@ impl RolloutThreadStore for InMemoryThreadStore {
         spawn: &RolloutThreadSpawn,
     ) -> Result<Arc<dyn RolloutRecorder>> {
         let meta = RolloutSessionMeta::new(session_id.clone()).with_thread_spawn(spawn.clone());
-        let record =
-            RolloutRecord::new(0, EventTimestamp::now(), RolloutPayload::SessionMeta(meta))?;
+        let record = RolloutRecord::new(
+            0,
+            EventTimestamp::now(),
+            RolloutPayload::SessionMeta(meta.clone()),
+        )?;
         {
             let mut threads = self.threads();
             // The same conflict check as `create_thread_with`: a created thread is a new one.
@@ -118,7 +133,12 @@ impl RolloutThreadStore for InMemoryThreadStore {
             }
             threads.insert(session_id.clone(), vec![record]);
         }
-        Ok(self.recorder(session_id))
+        Ok(LiveThreadRecorder::created(
+            Arc::new(self.clone()),
+            self.recorder(session_id),
+            &meta,
+            &[],
+        ))
     }
 }
 
@@ -128,8 +148,9 @@ impl ThreadStore for InMemoryThreadStore {
         &self,
         params: &CreateThreadParams,
     ) -> Result<Arc<dyn RolloutRecorder>> {
+        let history = initial_payloads(params.history())?;
         let mut payloads = vec![RolloutPayload::SessionMeta(params.meta().clone())];
-        payloads.extend(initial_payloads(params.history())?);
+        payloads.extend(history.iter().cloned());
         let created = (0..)
             .zip(payloads)
             .map(|(timeline_seq, payload)| {
@@ -143,19 +164,31 @@ impl ThreadStore for InMemoryThreadStore {
             }
             threads.insert(params.session_id().clone(), created);
         }
-        Ok(self.recorder(params.session_id()))
+        Ok(LiveThreadRecorder::created(
+            Arc::new(self.clone()),
+            self.recorder(params.session_id()),
+            params.meta(),
+            &history,
+        ))
     }
 
     async fn resume_thread(&self, params: &ResumeThreadParams) -> Result<Arc<dyn RolloutRecorder>> {
-        {
+        let history = {
             let mut threads = self.threads();
             if let Some(history) = params.history() {
                 threads.insert(params.session_id().clone(), history.to_vec());
-            } else {
-                threads.entry(params.session_id().clone()).or_default();
             }
-        }
-        Ok(self.recorder(params.session_id()))
+            threads
+                .entry(params.session_id().clone())
+                .or_default()
+                .clone()
+        };
+        Ok(LiveThreadRecorder::resumed(
+            Arc::new(self.clone()),
+            self.recorder(params.session_id()),
+            params.session_id().clone(),
+            &history,
+        ))
     }
 
     async fn load_history(&self, params: &LoadThreadHistoryParams) -> Result<StoredThreadHistory> {

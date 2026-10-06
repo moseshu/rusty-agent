@@ -134,7 +134,8 @@ pub(crate) async fn read_head_summary(path: &Path) -> Result<HeadSummary> {
                 if let Ok(RolloutPayload::RunStarted(started)) = record.payload()
                     && !started.input_is_continuation_base()
                 {
-                    summary.first_user_message = started.input().iter().find_map(preview);
+                    summary.first_user_message =
+                        started.input().iter().find_map(user_message_preview);
                 }
             }
             _ => {}
@@ -148,7 +149,7 @@ pub(crate) async fn read_head_summary(path: &Path) -> Result<HeadSummary> {
 
 /// What a listing shows of a user message: its text, or a placeholder for what has none: Codex's
 /// `user_message_preview`.
-fn preview(item: &ModelInputItem) -> Option<String> {
+pub(crate) fn user_message_preview(item: &ModelInputItem) -> Option<String> {
     if !is_user_message(item) {
         return None;
     }
