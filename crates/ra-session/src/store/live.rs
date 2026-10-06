@@ -30,7 +30,7 @@ use ra_core::{
     event::EventTimestamp,
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRecorder},
+        rollout::{PersistContext, RolloutItem, RolloutRecorder},
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -48,7 +48,7 @@ enum Command {
     /// Write an eligible observation's submission request, if one is still pending.
     Commit,
     Flush(oneshot::Sender<Result<()>>),
-    Persist(oneshot::Sender<Result<()>>),
+    Persist(PersistContext, oneshot::Sender<Result<()>>),
     Shutdown(oneshot::Sender<Result<()>>),
     Discard(oneshot::Sender<Result<()>>),
 }
@@ -167,8 +167,8 @@ impl RolloutRecorder for LiveThreadRecorder {
         self.barrier(Command::Flush).await
     }
 
-    async fn persist(&self) -> Result<()> {
-        self.barrier(Command::Persist).await
+    async fn persist(&self, context: PersistContext) -> Result<()> {
+        self.barrier(|done| Command::Persist(context, done)).await
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -205,8 +205,8 @@ impl ThreadTask {
                 Command::Flush(done) => {
                     let _ = done.send(self.flush().await);
                 }
-                Command::Persist(done) => {
-                    let _ = done.send(self.persist().await);
+                Command::Persist(context, done) => {
+                    let _ = done.send(self.persist(context).await);
                 }
                 Command::Shutdown(done) => {
                     let _ = done.send(self.shutdown().await);
@@ -226,10 +226,16 @@ impl ThreadTask {
         self.write(update).await
     }
 
-    /// Codex's `LiveThread::persist` in its standard context: the thread is made durable, so
-    /// whatever is pending is written, a created thread's initial metadata included.
-    async fn persist(&self) -> Result<()> {
-        self.inner.persist().await?;
+    /// Codex's `LiveThread::persist`: the thread is made durable, so whatever is pending is
+    /// written, a created thread's initial metadata included. A context that allows background
+    /// persistence first writes what is pending for a thread with history, as Codex's does before
+    /// a store may defer the rest.
+    async fn persist(&self, context: PersistContext) -> Result<()> {
+        if context.allows_background_persistence() {
+            let update = lock(&self.sync).take_pending_update_for_existing_history();
+            self.write(update).await?;
+        }
+        self.inner.persist(context).await?;
         let update = lock(&self.sync).take_pending_update();
         self.write(update).await
     }

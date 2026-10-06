@@ -52,8 +52,8 @@
 //!
 //! [`AgentControl::close`] shuts an agent down together with every live agent below it, as Codex's
 //! `close_agent` and `shutdown_agent_tree` do: the descendants are found first, then the agent and
-//! each descendant in turn is stopped — its run cancelled and waited for — and removed from the
-//! tree, so it is no longer listed and its path can be spawned again. The whole subtree is marked
+//! each descendant in turn is stopped — its run cancelled and waited for, its rollout shut down —
+//! and removed from the tree, so it is no longer listed and its path can be spawned again. The whole subtree is marked
 //! closed before the first one stops, so nothing can be spawned into it or started in it meanwhile.
 //!
 //! Cancelling a run does not close anything by default: Codex leaves an interrupted agent's
@@ -103,6 +103,15 @@
 //! rollout does not hold yet — the history it was forked with, on its first run, and its mail. A
 //! run waiting for approval when it is interrupted or shut down is recorded as cancelled, as Codex
 //! aborts the turn. The root's runs are the host's, which records them into the root's session.
+//!
+//! Closing an agent, or shutting the tree down, shuts down the agent's rollout once its run has
+//! ended, as Codex's session shutdown shuts down its thread's live writer: what is still queued is
+//! written and the file is let go of, so the thread can be resumed as soon as the close returns.
+//! Codex persists and flushes the thread before it asks the session to shut down, and a flush that
+//! fails there fails the close and keeps the thread. Here the run is cancelled before anything is
+//! waited for (see [`AgentControl::close`]), so that barrier is the rollout's shutdown, after the
+//! run ends: one that fails fails the close and keeps the agent in the tree — closed, cancelled,
+//! with its recorder — so closing it again, or shutting the tree down, writes what it still holds.
 //!
 //! # What this does not port
 //!
@@ -407,26 +416,34 @@ impl AgentControl {
     /// Closes the agent at `path` and every live agent below it, and returns the status the agent
     /// had before it was closed.
     ///
-    /// Each agent's run is cancelled and waited for — a run paused for approval ends — and the
-    /// agent is removed from the tree: it is no longer listed, messages to it are refused as to an
-    /// unknown agent, and a later spawn may reuse its path. A closed agent reports nothing to its
-    /// parent. Closing the root closes every spawned agent and keeps the root, whose runs belong to
+    /// Each agent's run is cancelled and waited for — a run paused for approval ends — its rollout
+    /// is shut down, and the agent is removed from the tree: it is no longer listed, messages to it
+    /// are refused as to an unknown agent, and a later spawn may reuse its path. A closed agent
+    /// reports nothing to its parent. Closing the root closes every spawned agent and keeps the root, whose runs belong to
     /// the host; the tree goes on accepting spawns.
     ///
     /// # Errors
     ///
-    /// Refuses when the tree has no agent at `path`.
+    /// Refuses when the tree has no agent at `path`. Fails when an agent's rollout cannot be shut
+    /// down: that agent stays in the tree, closed, and so does every agent the close had not
+    /// reached yet, as Codex's close stops at a descendant it cannot shut down. The agent itself is
+    /// still followed by its descendants. Closing it again tries again.
     pub async fn close(&self, path: &AgentPath) -> Result<AgentStatus, AgentControlError> {
         let node = self.tree.node(path).ok_or_else(|| {
             AgentControlError::Unsupported(format!("live agent path `{path}` not found"))
         })?;
         let previous = node.status();
-        drop(self.tree.close_subtree(&node, true).await);
+        self.tree
+            .close_subtree(&node, true)
+            .await
+            .map_err(|_| AgentControlError::Unavailable)??;
         Ok(previous)
     }
 
-    /// Stops every spawned agent: cancels their runs, waits for them to end, and marks each
-    /// [`AgentStatus::Shutdown`]. Further spawns and follow-ups are refused.
+    /// Stops every spawned agent: cancels their runs, waits for them to end, shuts down their
+    /// rollouts, and marks each [`AgentStatus::Shutdown`]. Further spawns and follow-ups are
+    /// refused. A rollout that cannot be shut down is logged and kept, and shutting the tree down
+    /// again tries it again.
     pub async fn shutdown(&self) {
         self.tree.shut_down.store(true, Ordering::Release);
         self.tree.cancel.cancel(CancelReason::Shutdown);
@@ -439,10 +456,16 @@ impl AgentControl {
                 drop(task.await);
             }
         }
-        for node in lock(&self.tree.agents).values() {
-            if !node.path.is_root() {
-                node.status.send_replace(AgentStatus::Shutdown);
-            }
+        let spawned: Vec<Arc<AgentNode>> = lock(&self.tree.agents)
+            .values()
+            .filter(|node| !node.path.is_root())
+            .map(Arc::clone)
+            .collect();
+        for node in spawned {
+            // Logged by the node; a rollout that could not be shut down is tried again by the next
+            // shutdown.
+            let _ = node.shut_down_rollout().await;
+            node.status.send_replace(AgentStatus::Shutdown);
         }
     }
 }
@@ -575,8 +598,13 @@ impl AgentHandle {
         if tree.close_descendants_on_cancel.load(Ordering::Acquire)
             && !tree.shut_down.load(Ordering::Acquire)
             && !self.node.is_closed()
+            && let Ok(Err(error)) = tree.close_subtree(&self.node, false).await
         {
-            drop(tree.close_subtree(&self.node, false).await);
+            tracing::warn!(
+                path = %self.node.path,
+                %error,
+                "the agents below a cancelled run could not all be closed"
+            );
         }
     }
 
@@ -1043,12 +1071,13 @@ impl Tree {
     }
 
     /// Closes the live agents below `node`, and `node` itself when `including_node` is set and it is
-    /// not the root, and returns a receiver that resolves once the close is finished.
+    /// not the root, and returns a receiver that resolves once the close is finished, with the error
+    /// of an agent whose rollout could not be shut down.
     ///
     /// Ported from Codex's `shutdown_agent_tree`: the descendants are collected before anything
     /// stops, then the agent and each descendant in depth-first order, children by path, is
-    /// waited for and removed. Two things differ from Codex, both so that a close cannot be left
-    /// half done:
+    /// waited for, has its rollout shut down, and is removed. Two things differ from Codex, both
+    /// so that a close cannot be outgrown or abandoned:
     ///
     /// - Everything that stops a close from being outgrown or abandoned happens here, before the
     ///   first wait: every target is marked closed and has its run cancelled, and `node` refuses
@@ -1062,7 +1091,7 @@ impl Tree {
         self: &Arc<Self>,
         node: &Arc<AgentNode>,
         including_node: bool,
-    ) -> oneshot::Receiver<()> {
+    ) -> oneshot::Receiver<Result<(), AgentControlError>> {
         let (doomed, closing) = {
             let agents = lock(&self.agents);
             let mut doomed: Vec<Arc<AgentNode>> = agents
@@ -1092,13 +1121,24 @@ impl Tree {
         }
         let tree = Arc::clone(self);
         let (done, finished) = oneshot::channel();
+        let target = including_node.then(|| node.path.clone());
         let task = tokio::spawn(async move {
+            // As Codex's `shutdown_agent_tree`: the agent's own failure is reported once its
+            // descendants are stopped, while a descendant's failure ends the close there. Whatever
+            // is left stays in the tree, closed, for a later close to finish.
+            let mut result = Ok(());
             for agent in doomed {
-                tree.stop(&agent).await;
+                if let Err(error) = tree.stop(&agent).await {
+                    let is_target = target.as_ref() == Some(&agent.path);
+                    result = Err(error);
+                    if !is_target {
+                        break;
+                    }
+                }
             }
             drop(closing);
             // Nobody may be waiting any more; the close is done either way.
-            let _ = done.send(());
+            let _ = done.send(result);
         });
         let mut tasks = lock(&self.tasks);
         tasks.retain(|task| !task.is_finished());
@@ -1106,8 +1146,13 @@ impl Tree {
         finished
     }
 
-    /// Waits for a closed agent's cancelled run to end, and removes the agent from the tree.
-    async fn stop(&self, node: &Arc<AgentNode>) {
+    /// Waits for a closed agent's cancelled run to end, shuts down its rollout, and removes the
+    /// agent from the tree.
+    ///
+    /// As Codex's `shutdown_live_agent`, whose durability barrier fails before the thread is
+    /// removed: a rollout that cannot be shut down keeps the agent in the tree, closed and with its
+    /// recorder, so closing it again — or shutting the tree down — tries again.
+    async fn stop(&self, node: &Arc<AgentNode>) -> Result<(), AgentControlError> {
         if let Some(child) = &node.child {
             // Passing the state lock pairs with the check in `ensure_running`: any run claimed
             // before the agent was marked closed has cleared `idle` by now, and none is claimed
@@ -1117,6 +1162,12 @@ impl Tree {
             // The sender lives in the node held here, so the wait cannot fail.
             drop(idle.wait_for(|idle| *idle).await);
         }
+        node.shut_down_rollout().await.map_err(|error| {
+            AgentControlError::Unsupported(format!(
+                "the rollout of agent `{}` could not be shut down: {error}; close it again to retry",
+                node.path
+            ))
+        })?;
         node.status.send_replace(AgentStatus::Shutdown);
         let mut agents = lock(&self.agents);
         if agents
@@ -1125,6 +1176,7 @@ impl Tree {
         {
             agents.remove(&node.path);
         }
+        Ok(())
     }
 
     /// Starts a run on `node` if it is idle and its mailbox asks for one.
@@ -1439,6 +1491,8 @@ struct AgentNode {
     closing_subtree: AtomicUsize,
     /// Absent for the root, whose runs the host starts.
     child: Option<ChildRuntime>,
+    /// Set once the agent's rollout has been shut down.
+    rollout_shut_down: AtomicBool,
     /// How many thresholds of the tree's rollout budget the agent has been told about.
     budget_reminder_delivered: Mutex<Option<usize>>,
 }
@@ -1454,6 +1508,7 @@ impl AgentNode {
             closed: AtomicBool::new(false),
             closing_subtree: AtomicUsize::new(0),
             child,
+            rollout_shut_down: AtomicBool::new(false),
             budget_reminder_delivered: Mutex::new(None),
         }
     }
@@ -1474,6 +1529,37 @@ impl AgentNode {
         self.child
             .as_ref()
             .is_some_and(|child| lock(&child.state).current_run.is_some())
+    }
+
+    /// Writes what the agent's rollout still holds and lets go of it, once the agent's runs have
+    /// stopped: Codex's session shutdown of the thread's live writer. The rollout can then be
+    /// resumed elsewhere. A rollout already shut down is not shut down again; one that could not
+    /// be keeps what it holds, and the next call tries again.
+    async fn shut_down_rollout(&self) -> Result<()> {
+        let Some(rollout) = self
+            .child
+            .as_ref()
+            .and_then(|child| child.environment.rollout.as_ref())
+        else {
+            return Ok(());
+        };
+        if self.rollout_shut_down.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match rollout.shutdown().await {
+            Ok(()) => {
+                self.rollout_shut_down.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.path,
+                    %error,
+                    "the agent's rollout could not be shut down"
+                );
+                Err(error)
+            }
+        }
     }
 
     fn snapshot(&self) -> LiveAgent {

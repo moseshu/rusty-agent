@@ -43,7 +43,7 @@ use ra_core::{
     event::EventTimestamp,
     session::{
         InterruptedTurnHistoryMarker, SessionId,
-        rollout::{RolloutRecorder, RolloutRunEnd, RolloutRunEnded},
+        rollout::{PersistContext, RolloutRecorder, RolloutRunEnd, RolloutRunEnded},
     },
     state::RunId,
 };
@@ -203,7 +203,7 @@ impl ForkedThread {
         let recorder = store
             .create_thread_with(&CreateThreadParams::new(meta).with_history(records))
             .await?;
-        if let Err(error) = recorder.persist().await {
+        if let Err(error) = recorder.persist(PersistContext::Standard).await {
             tracing::warn!(
                 session_id = %session_id,
                 %error,

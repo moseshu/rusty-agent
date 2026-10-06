@@ -33,7 +33,8 @@ use ra_core::{
     session::{
         InterruptedTurnHistoryMarker, SessionId,
         rollout::{
-            RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutThreadSpawn, RolloutThreadStore,
+            PersistContext, RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutThreadSpawn,
+            RolloutThreadStore,
         },
     },
     state::RunId,
@@ -250,6 +251,10 @@ impl Tool for GuardedTool {
 struct MemoryRecorder {
     items: Mutex<Vec<RolloutItem>>,
     flushes: Mutex<usize>,
+    /// Each persistence asked for, with how many items had been recorded by then.
+    persists: Mutex<Vec<(PersistContext, usize)>>,
+    /// How many shutdowns were asked for, and how many of the next ones fail.
+    shutdowns: Mutex<(usize, usize)>,
     fail_flush: bool,
 }
 
@@ -268,6 +273,14 @@ impl MemoryRecorder {
     fn flushes(&self) -> usize {
         *self.flushes.lock().unwrap()
     }
+
+    fn persists(&self) -> Vec<(PersistContext, usize)> {
+        self.persists.lock().unwrap().clone()
+    }
+
+    fn shutdowns(&self) -> usize {
+        self.shutdowns.lock().unwrap().0
+    }
 }
 
 #[async_trait]
@@ -279,6 +292,25 @@ impl RolloutRecorder for MemoryRecorder {
     async fn flush(&self) -> Result<()> {
         *self.flushes.lock().unwrap() += 1;
         if self.fail_flush {
+            return Err(Error::caller("the disk is full"));
+        }
+        Ok(())
+    }
+
+    async fn persist(&self, context: PersistContext) -> Result<()> {
+        let recorded = self.items.lock().unwrap().len();
+        self.persists.lock().unwrap().push((context, recorded));
+        if self.fail_flush {
+            return Err(Error::caller("the disk is full"));
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let mut shutdowns = self.shutdowns.lock().unwrap();
+        shutdowns.0 += 1;
+        if shutdowns.1 > 0 {
+            shutdowns.1 -= 1;
             return Err(Error::caller("the disk is full"));
         }
         Ok(())
@@ -448,6 +480,9 @@ async fn a_recorded_run_records_its_start_context_records_events_usage_and_end_i
     // The usage records add up to the run's ledger.
     assert_eq!(recorded_usage(&recorder), result.usage());
     assert_eq!(recorder.flushes(), 1);
+    // The thread is persisted once the run's start is recorded, before its first model call
+    // records the turn context.
+    assert_eq!(recorder.persists(), vec![(PersistContext::TurnStart, 1)]);
 }
 
 #[tokio::test]
@@ -676,7 +711,7 @@ async fn only_an_interrupted_run_records_the_marker_and_it_can_be_turned_off() {
 }
 
 #[tokio::test]
-async fn a_flush_that_fails_is_logged_and_the_run_still_succeeds() {
+async fn a_persist_or_flush_that_fails_is_logged_and_the_run_still_succeeds() {
     let scripts = Arc::new(Scripts::default());
     let recorder = Arc::new(MemoryRecorder::failing());
     scripts.push("lead", Step::Respond(final_message("l-1", "done")));
@@ -689,6 +724,7 @@ async fn a_flush_that_fails_is_logged_and_the_run_still_succeeds() {
     .await
     .unwrap();
     assert_eq!(result.final_text(), "done");
+    assert_eq!(recorder.persists(), vec![(PersistContext::TurnStart, 1)]);
     assert_eq!(recorder.flushes(), 1);
 }
 
@@ -1487,12 +1523,21 @@ async fn a_run_continued_on_its_callers_projection_is_rebuilt_without_repeating_
 struct MemoryThreadStore {
     threads: Mutex<Vec<(SessionId, RolloutThreadSpawn, Arc<MemoryRecorder>)>>,
     refuse: bool,
+    /// How many times each recorder it creates fails to shut down before it succeeds.
+    failed_shutdowns: usize,
 }
 
 impl MemoryThreadStore {
     fn refusing() -> Self {
         Self {
             refuse: true,
+            ..Self::default()
+        }
+    }
+
+    fn failing_shutdowns(failed_shutdowns: usize) -> Self {
+        Self {
+            failed_shutdowns,
             ..Self::default()
         }
     }
@@ -1512,7 +1557,10 @@ impl RolloutThreadStore for MemoryThreadStore {
         if self.refuse {
             return Err(Error::caller("the disk is full"));
         }
-        let recorder = Arc::new(MemoryRecorder::default());
+        let recorder = Arc::new(MemoryRecorder {
+            shutdowns: Mutex::new((0, self.failed_shutdowns)),
+            ..MemoryRecorder::default()
+        });
         self.threads.lock().unwrap().push((
             session_id.clone(),
             spawn.clone(),
@@ -1938,6 +1986,222 @@ async fn a_spawned_agents_run_stopped_while_it_waits_for_approval_is_recorded_ca
     );
     assert!(child.flushes() >= 2, "the cancellation was flushed");
     control.shutdown().await;
+}
+
+/// Mail delivered into a running run is persisted before the model call that answers it, as
+/// Codex persists steered input before its next sampling request.
+#[tokio::test]
+async fn mail_delivered_into_a_running_run_is_persisted_before_the_model_answers_it() {
+    let scripts = Arc::new(Scripts::default());
+    let recorder = Arc::new(MemoryRecorder::default());
+    let control = AgentControl::new();
+    let registry = AgentRegistry::builder()
+        .register(agent("worker", Vec::new()))
+        .build()
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+    // The lead's second call returns once the worker has finished, so its answer is waiting in
+    // the lead's mailbox when the third call is prepared. The worker reports its status and posts
+    // its answer in one step, so on this single-threaded runtime the mail is there by then.
+    let watched = control.clone();
+    scripts.push(
+        "lead",
+        Step::After(
+            Box::pin(async move {
+                eventually(
+                    || {
+                        watched.agents().iter().any(|agent| {
+                            matches!(
+                                agent.status(),
+                                ra_core::agent::control::AgentStatus::Completed(_)
+                            )
+                        })
+                    },
+                    "the worker finished",
+                )
+                .await;
+            }),
+            tool_call("l-2", "l-2-call", "touch", json!({})),
+        ),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-3", "done")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "worked")));
+
+    let mut tools = collaboration_tools();
+    tools.push(Arc::new(TouchTool::new()));
+    let run = request(&scripts, agent("lead", tools), "run-1", &recorder)
+        .with_config(RunConfig::new().with_agent_registry(registry))
+        .with_agent_control(control.root());
+    Runner::run(run).await.unwrap();
+
+    let persists = recorder.persists();
+    assert_eq!(persists.first(), Some(&(PersistContext::TurnStart, 1)));
+    let steered: Vec<usize> = persists
+        .iter()
+        .filter(|(context, _)| *context == PersistContext::SteeredUserInput)
+        .map(|(_, recorded)| *recorded)
+        .collect();
+    assert_eq!(steered.len(), 1, "{persists:?}");
+    // Persisted right after the mail was recorded, and before the third model call recorded its
+    // usage.
+    let items = recorder.items();
+    let RolloutItem::Item(mail) = &items[steered[0] - 1] else {
+        panic!("the mail is the last item recorded before the persistence");
+    };
+    assert!(mail.id().as_str().starts_with("agent-message-"), "{mail:?}");
+    assert!(
+        items[steered[0]..]
+            .iter()
+            .any(|item| matches!(item, RolloutItem::ModelUsage(_))),
+        "the model answered after the persistence"
+    );
+    control.shutdown().await;
+}
+
+/// Closing an agent shuts its rollout down once its run has ended, so the thread can be resumed
+/// as soon as the close returns: Codex's session shutdown of a closed agent's live writer.
+#[tokio::test]
+async fn a_closed_agents_rollout_is_shut_down_and_can_be_resumed_at_once() {
+    use ra_session::{ResumeThreadParams, ResumedThread};
+
+    for shut_down_tree in [false, true] {
+        let dir = temp_dir(&format!("rollout_recording_closed_agent_{shut_down_tree}"));
+        let store = Arc::new(ra_session::RolloutThreadDirectory::new(&dir));
+        let control = AgentControl::new()
+            .with_rollout_store(
+                Arc::clone(&store) as Arc<dyn RolloutThreadStore>,
+                SessionId::new("session-root"),
+            )
+            .unwrap();
+        let scripts = Arc::new(Scripts::default());
+        let recorder = Arc::new(MemoryRecorder::default());
+        let registry = AgentRegistry::builder()
+            .register(agent("worker", Vec::new()))
+            .build()
+            .unwrap();
+        scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+        scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+        scripts.push("worker", Step::Hang);
+        let run = request(
+            &scripts,
+            agent("lead", collaboration_tools()),
+            "run-1",
+            &recorder,
+        )
+        .with_config(RunConfig::new().with_agent_registry(registry))
+        .with_agent_control(control.root());
+        Runner::run(run).await.unwrap();
+        eventually(
+            || scripts.requests("worker").len() == 1,
+            "the worker is waiting on its model",
+        )
+        .await;
+        let worker = control.agents()[1].clone();
+        let session_id = worker.session_id().cloned().unwrap();
+
+        if shut_down_tree {
+            control.shutdown().await;
+        } else {
+            control.close(worker.agent_path()).await.unwrap();
+        }
+
+        let resumed = ResumedThread::resume(&*store, &ResumeThreadParams::new(session_id))
+            .await
+            .unwrap();
+        let last = resumed.reconstruction().last_run().unwrap();
+        assert_eq!(
+            last.end().map(|end| end.end()),
+            Some(RolloutRunEnd::Cancelled),
+            "shut_down_tree: {shut_down_tree}"
+        );
+        resumed.recorder().shutdown().await.unwrap();
+        control.shutdown().await;
+    }
+}
+
+/// A rollout that cannot be shut down fails the close and keeps the agent, closed, with its
+/// recorder, as Codex's close keeps a thread whose flush failed: closing it again, or shutting the
+/// tree down, tries again, and one shut down is not shut down twice.
+#[tokio::test]
+async fn a_rollout_that_cannot_be_shut_down_keeps_the_agent_for_a_retry() {
+    for retry_by_tree_shutdown in [false, true] {
+        let scripts = Arc::new(Scripts::default());
+        let recorder = Arc::new(MemoryRecorder::default());
+        let store = Arc::new(MemoryThreadStore::failing_shutdowns(1));
+        let control = AgentControl::new()
+            .with_rollout_store(
+                Arc::clone(&store) as Arc<dyn RolloutThreadStore>,
+                SessionId::new("session-root"),
+            )
+            .unwrap();
+        let registry = AgentRegistry::builder()
+            .register(agent("worker", Vec::new()))
+            .build()
+            .unwrap();
+        scripts.push("lead", Step::Respond(spawn_call("l-1", "worker", "worker")));
+        scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+        scripts.push("worker", Step::Hang);
+        let run = request(
+            &scripts,
+            agent("lead", collaboration_tools()),
+            "run-1",
+            &recorder,
+        )
+        .with_config(RunConfig::new().with_agent_registry(registry))
+        .with_agent_control(control.root());
+        Runner::run(run).await.unwrap();
+        eventually(
+            || scripts.requests("worker").len() == 1,
+            "the worker is waiting on its model",
+        )
+        .await;
+        let worker = AgentPath::root().join("worker").unwrap();
+        let (_, _, child) = store.threads().remove(0);
+
+        let error = control.close(&worker).await.unwrap_err();
+        assert!(
+            error.to_string().contains("could not be shut down"),
+            "{error}"
+        );
+        assert_eq!(child.shutdowns(), 1);
+        // Kept, closed, with its cancelled run's end recorded.
+        assert!(
+            control
+                .agents()
+                .iter()
+                .any(|agent| agent.agent_path() == &worker)
+        );
+        assert_eq!(
+            labels(&child).last().map(String::as_str),
+            Some(format!("run_ended {} Cancelled", ended(&child).run_id()).as_str())
+        );
+
+        if retry_by_tree_shutdown {
+            control.shutdown().await;
+            assert_eq!(child.shutdowns(), 2);
+            control.shutdown().await;
+            assert_eq!(
+                child.shutdowns(),
+                2,
+                "a rollout shut down is not shut down again"
+            );
+        } else {
+            control.close(&worker).await.unwrap();
+            assert_eq!(child.shutdowns(), 2);
+            assert!(
+                control
+                    .agents()
+                    .iter()
+                    .all(|agent| agent.agent_path() != &worker)
+            );
+            control.shutdown().await;
+            assert_eq!(
+                child.shutdowns(),
+                2,
+                "a removed agent is not shut down again"
+            );
+        }
+    }
 }
 
 #[tokio::test]
