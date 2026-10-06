@@ -5,11 +5,13 @@
 //! thread hands back that writer through [`RolloutThreadStore`], in `ra-core`, so the runtime can
 //! create the threads it spawns without knowing how they are stored. [`ThreadStore`] extends it
 //! with creating a thread from its whole session metadata and an initial history, as a fork is
-//! created; resuming, including caller-supplied storage records; and reading the stored records:
-//! loading a thread's history for a resume or a fork, and reading a thread. Two stores implement it: the
-//! rollout directory, [`RolloutThreadDirectory`](crate::rollout::RolloutThreadDirectory), as
-//! Codex's local store keeps one rollout file per thread, and [`InMemoryThreadStore`], as Codex
-//! keeps an in-memory one.
+//! created; resuming, including caller-supplied storage records; reading the stored records:
+//! loading a thread's history for a resume or a fork, reading a thread and listing threads; and
+//! managing them: changing their metadata, archiving, unarchiving and deleting them. Two stores
+//! implement it: the rollout directory,
+//! [`RolloutThreadDirectory`](crate::rollout::RolloutThreadDirectory), as Codex's local store
+//! keeps one rollout file per thread, and [`InMemoryThreadStore`], as Codex keeps an in-memory
+//! one.
 //!
 //! # What is not ported
 //!
@@ -21,8 +23,11 @@
 //! its paginated mode — history projected into `SQLite` turn and item tables, with reads of the
 //! latest model context, reference-backed forks, reverts and turn, item and timeline listings —
 //! is not, and neither are the methods Codex's store gives an `Unsupported` default: staged
-//! metadata, sections, attachments, projects, search and queued submissions. Listing threads,
-//! their metadata, archiving and deletion are yet to come.
+//! metadata, sections, attachments, projects, search and queued submissions. Neither is Codex's
+//! `SQLite` state database: listing reads the rollouts themselves, as Codex's local store does
+//! without one, and of the metadata a patch carries only the name is kept by the directory.
+//! Codex's `record_thread_metadata`, a deferrable form of `update_thread_metadata` used by its live
+//! layer, comes with that layer.
 //!
 //! The `local`, `mirror` and `summary` modules below are empty and kept only because they were
 //! released.
@@ -33,6 +38,8 @@ pub mod mirror;
 pub mod summary;
 
 mod in_memory;
+mod list;
+mod metadata;
 
 use std::{
     path::{Path, PathBuf},
@@ -50,13 +57,18 @@ use ra_core::{
 };
 
 pub use in_memory::InMemoryThreadStore;
+pub use list::{ListThreadsParams, SortDirection, ThreadPage, ThreadSortKey};
+pub use metadata::{
+    ArchiveThreadParams, ArchiveThreadsParams, DeleteThreadParams, DeleteThreadsParams,
+    ThreadMetadataPatch, UpdateThreadMetadataParams,
+};
 
 use crate::rollout::{
     RolloutPayload, RolloutRecord, RolloutSessionMeta, recorder::is_persisted_rollout_item,
 };
 
-/// Creates, resumes and reads the threads a store holds: the rest of Codex's `ThreadStore` that
-/// this framework ports.
+/// Creates, resumes, reads, lists and manages the threads a store holds: the rest of Codex's
+/// `ThreadStore` that this framework ports.
 #[async_trait]
 pub trait ThreadStore: RolloutThreadStore {
     /// Creates the thread `params` describes and returns the recorder its runs record through:
@@ -110,6 +122,109 @@ pub trait ThreadStore: RolloutThreadStore {
     /// Returns an error of kind [`SessionErrorKind::NotFound`](ra_core::error::SessionErrorKind) if
     /// the store holds no such thread, or an error if it cannot be read.
     async fn read_thread(&self, params: &ReadThreadParams) -> Result<StoredThread>;
+
+    /// A page of the threads `params` selects: Codex's `list_threads`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cursor is not one a listing returned, or if the threads cannot be
+    /// listed.
+    async fn list_threads(&self, params: &ListThreadsParams) -> Result<ThreadPage>;
+
+    /// Changes a thread's metadata and returns the thread as it now reads: Codex's
+    /// `update_thread_metadata`. `None` means the change succeeded without the store reading the
+    /// thread back.
+    ///
+    /// The store applies what the patch sets as it is given; deciding what to derive from a
+    /// thread's records belongs above it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`SessionErrorKind::NotFound`](ra_core::error::SessionErrorKind) if
+    /// the store holds no such thread, or an error if the change cannot be kept.
+    async fn update_thread_metadata(
+        &self,
+        params: &UpdateThreadMetadataParams,
+    ) -> Result<Option<StoredThread>>;
+
+    /// Archives a thread: Codex's `archive_thread`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store holds no active thread of the session, if a live writer
+    /// holds it, or if it cannot be moved.
+    async fn archive_thread(&self, params: &ArchiveThreadParams) -> Result<()>;
+
+    /// Archives threads in order and returns the sessions of those archived: Codex's
+    /// `archive_threads`. The first must be archived; a later failure is logged and skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the first thread if it cannot be archived.
+    async fn archive_threads(&self, params: &ArchiveThreadsParams) -> Result<Vec<SessionId>> {
+        let mut archived = Vec::new();
+        for session_id in params.session_ids() {
+            match self
+                .archive_thread(&ArchiveThreadParams::new(session_id.clone()))
+                .await
+            {
+                Ok(()) => archived.push(session_id.clone()),
+                Err(error) if archived.is_empty() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "failed to archive a thread");
+                }
+            }
+        }
+        Ok(archived)
+    }
+
+    /// Unarchives a thread and returns it as it now reads: Codex's `unarchive_thread`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store holds no archived thread of the session, if a live writer
+    /// holds it, or if it cannot be moved back.
+    async fn unarchive_thread(&self, params: &ArchiveThreadParams) -> Result<StoredThread>;
+
+    /// Deletes a thread's records and what the store keeps about it: Codex's `delete_thread`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`SessionErrorKind::NotFound`](ra_core::error::SessionErrorKind) if
+    /// the store holds no such thread, or an error if a live writer holds it or it cannot be
+    /// deleted.
+    async fn delete_thread(&self, params: &DeleteThreadParams) -> Result<()>;
+
+    /// Deletes threads in order, a thread already gone counting as deleted: Codex's
+    /// `delete_threads`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error other than a thread being missing.
+    async fn delete_threads(&self, params: &DeleteThreadsParams) -> Result<()> {
+        for session_id in params.session_ids() {
+            match self
+                .delete_thread(&DeleteThreadParams::new(session_id.clone()))
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if is_not_found(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `error` says the store holds no such thread.
+pub(crate) fn is_not_found(error: &ra_core::error::Error) -> bool {
+    matches!(
+        error,
+        ra_core::error::Error::Session {
+            kind: ra_core::error::SessionErrorKind::NotFound,
+            ..
+        }
+    )
 }
 
 /// The thread [`ThreadStore::create_thread_with`] creates: Codex's `CreateThreadParams`, with the
@@ -212,13 +327,30 @@ impl ResumeThreadParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadThreadHistoryParams {
     session_id: SessionId,
+    include_archived: bool,
 }
 
 impl LoadThreadHistoryParams {
-    /// Loads the history of the thread of `session_id`.
+    /// Loads the history of the active thread of `session_id`.
     #[must_use]
     pub const fn new(session_id: SessionId) -> Self {
-        Self { session_id }
+        Self {
+            session_id,
+            include_archived: false,
+        }
+    }
+
+    /// Loads the history of an archived thread as well: Codex's `include_archived`.
+    #[must_use]
+    pub const fn including_archived(mut self) -> Self {
+        self.include_archived = true;
+        self
+    }
+
+    /// Whether an archived thread's history may be loaded.
+    #[must_use]
+    pub const fn include_archived(&self) -> bool {
+        self.include_archived
     }
 
     /// The thread's session.
@@ -235,6 +367,7 @@ impl LoadThreadHistoryParams {
 pub struct ReadThreadParams {
     session_id: SessionId,
     include_history: bool,
+    include_archived: bool,
 }
 
 impl ReadThreadParams {
@@ -244,7 +377,21 @@ impl ReadThreadParams {
         Self {
             session_id,
             include_history: false,
+            include_archived: false,
         }
+    }
+
+    /// Reads an archived thread as well: Codex's `include_archived`.
+    #[must_use]
+    pub const fn including_archived(mut self) -> Self {
+        self.include_archived = true;
+        self
+    }
+
+    /// Whether an archived thread may be read.
+    #[must_use]
+    pub const fn include_archived(&self) -> bool {
+        self.include_archived
     }
 
     /// Reads the thread's records as well: Codex's `include_history`.
@@ -304,13 +451,18 @@ impl StoredThreadHistory {
     }
 }
 
-/// A thread as a store reads it: Codex's `StoredThread`, so far with what a thread's session
-/// metadata records.
+/// A thread as a store reads it: Codex's `StoredThread`, with the fields this framework's records
+/// have.
 ///
-/// Codex's other fields — preview, name, update and archive times, the model and its settings,
-/// the token usage and the first user message — come from metadata derived as records are appended,
-/// which is not ported yet. A thread whose rollout records no session metadata, such as a root
-/// thread whose recorder was created without it, has none of the metadata here.
+/// The session metadata describes the thread; a thread whose rollout records none, such as a root
+/// thread whose recorder was created without it, has none of that here. The rest is what the
+/// store knows besides: the name a caller gave it, the preview and first user message read from
+/// the head of its records, when it was last written to and archived, and the model and effort a
+/// store that keeps metadata patches was told of.
+///
+/// Codex's source, history mode, agent nickname and role, section, project, Git facts, approval
+/// mode, permission profile, token usage and recency are its product's or its state database's,
+/// and are not ported.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredThread {
@@ -323,6 +475,13 @@ pub struct StoredThread {
     model_provider: Option<String>,
     originator: Option<String>,
     cli_version: Option<String>,
+    name: Option<String>,
+    preview: String,
+    first_user_message: Option<String>,
+    updated_at: Option<EventTimestamp>,
+    archived_at: Option<EventTimestamp>,
+    model: Option<String>,
+    effort: Option<String>,
     history: Option<StoredThreadHistory>,
 }
 
@@ -340,6 +499,13 @@ impl StoredThread {
             model_provider: meta.and_then(|meta| meta.model_provider().map(str::to_owned)),
             originator: meta.and_then(|meta| meta.originator().map(str::to_owned)),
             cli_version: meta.and_then(|meta| meta.cli_version().map(str::to_owned)),
+            name: None,
+            preview: String::new(),
+            first_user_message: None,
+            updated_at: None,
+            archived_at: None,
+            model: None,
+            effort: None,
             history: None,
         }
     }
@@ -435,10 +601,121 @@ impl StoredThread {
         self.cli_version.as_deref()
     }
 
+    /// The user-facing name the thread was given, if any.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The best available preview, usually the first user message; empty when there is none.
+    #[must_use]
+    pub fn preview(&self) -> &str {
+        &self.preview
+    }
+
+    /// The first message from the user the thread holds, if it holds one.
+    #[must_use]
+    pub fn first_user_message(&self) -> Option<&str> {
+        self.first_user_message.as_deref()
+    }
+
+    /// When the thread was last written to, if known.
+    #[must_use]
+    pub const fn updated_at(&self) -> Option<EventTimestamp> {
+        self.updated_at
+    }
+
+    /// When the thread was archived, for an archived thread.
+    #[must_use]
+    pub const fn archived_at(&self) -> Option<EventTimestamp> {
+        self.archived_at
+    }
+
+    /// The latest model, if the store was told of it.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The latest effort, if the store was told of it: Codex's `reasoning_effort`.
+    #[must_use]
+    pub fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
+    }
+
     /// The thread's records, when they were read.
     #[must_use]
     pub const fn history(&self) -> Option<&StoredThreadHistory> {
         self.history.as_ref()
+    }
+}
+
+impl StoredThread {
+    /// Sets what the head of the thread's records shows: the preview and the first user message.
+    pub(crate) fn set_head(&mut self, preview: String, first_user_message: Option<String>) {
+        self.preview = preview;
+        self.first_user_message = first_user_message;
+    }
+
+    /// Sets when the thread was created.
+    pub(crate) const fn set_created_at(&mut self, created_at: EventTimestamp) {
+        self.created_at = Some(created_at);
+    }
+
+    /// Sets when the thread was last written to.
+    pub(crate) const fn set_updated_at(&mut self, updated_at: EventTimestamp) {
+        self.updated_at = Some(updated_at);
+    }
+
+    /// Marks the thread archived at `archived_at`.
+    pub(crate) const fn set_archived_at(&mut self, archived_at: EventTimestamp) {
+        self.archived_at = Some(archived_at);
+    }
+
+    /// Sets the name a caller gave the thread, unless it only repeats the preview: Codex's
+    /// `set_thread_name` for a thread of its legacy history mode.
+    pub(crate) fn set_name(&mut self, name: String) {
+        if self.preview.trim() != name.trim() {
+            self.name = Some(name);
+        }
+    }
+
+    /// Applies what `patch` sets, as Codex's in-memory store reads a thread through the patches it
+    /// was given.
+    pub(crate) fn apply_patch(&mut self, patch: &ThreadMetadataPatch) {
+        if let Some(name) = patch.name() {
+            self.name = name.map(str::to_owned);
+        }
+        if let Some(preview) = patch.preview() {
+            preview.clone_into(&mut self.preview);
+        }
+        if let Some(message) = patch.first_user_message() {
+            self.first_user_message = Some(message.to_owned());
+        }
+        if let Some(provider) = patch.model_provider() {
+            self.model_provider = Some(provider.to_owned());
+        }
+        if let Some(model) = patch.model() {
+            self.model = Some(model.to_owned());
+        }
+        if let Some(effort) = patch.effort() {
+            self.effort = effort.map(str::to_owned);
+        }
+        if let Some(created_at) = patch.created_at() {
+            self.created_at = Some(created_at);
+        }
+        if let Some(updated_at) = patch.updated_at() {
+            self.updated_at = Some(updated_at);
+        }
+        if let Some(cwd) = patch.cwd() {
+            self.cwd = Some(cwd.to_owned());
+        }
+        if let Some(version) = patch.cli_version() {
+            self.cli_version = Some(version.to_owned());
+        }
+        if let Some(originator) = patch.originator() {
+            self.originator = Some(originator.to_owned());
+        }
     }
 }
 

@@ -1015,7 +1015,7 @@ impl RolloutSidecar {
     }
 }
 
-fn sidecar_path_for(path: &Path) -> PathBuf {
+pub(crate) fn sidecar_path_for(path: &Path) -> PathBuf {
     let mut os_str = path.as_os_str().to_os_string();
     os_str.push(".sidecar.json");
     PathBuf::from(os_str)

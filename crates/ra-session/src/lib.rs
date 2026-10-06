@@ -38,6 +38,8 @@ pub use rollout::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteSession, SqliteSessionBuilder};
 pub use store::{
-    CreateThreadParams, InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams,
-    ResumeThreadParams, StoredThread, StoredThreadHistory, ThreadStore,
+    ArchiveThreadParams, ArchiveThreadsParams, CreateThreadParams, DeleteThreadParams,
+    DeleteThreadsParams, InMemoryThreadStore, ListThreadsParams, LoadThreadHistoryParams,
+    ReadThreadParams, ResumeThreadParams, SortDirection, StoredThread, StoredThreadHistory,
+    ThreadMetadataPatch, ThreadPage, ThreadSortKey, ThreadStore, UpdateThreadMetadataParams,
 };
