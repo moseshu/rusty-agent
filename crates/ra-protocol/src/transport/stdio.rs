@@ -1,1 +1,1 @@
-//! Line framing, a buffer-ceiling guard, and a separate stderr channel.
+//! One JSON message per line over the process's stdin and stdout, with logs on stderr.

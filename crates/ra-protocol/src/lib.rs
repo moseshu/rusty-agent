@@ -7,8 +7,9 @@
 //! `ra-session` and execution to the assembly above.
 //!
 //! **Stability**: `Evolving`. Frames are the wire protocol shared with the host, so **fields may
-//! only be added, never removed**, and unknown fields must be preserved verbatim — the two sides
-//! do not upgrade in lockstep.
+//! only be added, never removed**, and what a newer peer adds to parameters and results must reach
+//! their reader untouched — the two sides do not upgrade in lockstep. Envelope members the format
+//! does not define, such as `jsonrpc`, are ignored, as Codex's app-server ignores them.
 
 pub mod control;
 pub mod frame;

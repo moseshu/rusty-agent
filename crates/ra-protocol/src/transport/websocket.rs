@@ -1,1 +1,1 @@
-//! WebSocket transport with a local token and a client allowlist.
+//! WebSocket transport: loopback by default, and authenticated when it listens beyond loopback.
