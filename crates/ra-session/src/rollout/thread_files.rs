@@ -5,6 +5,10 @@
 //! started: the directory runs it on a blocking task that also owns the writer locks it was given,
 //! so dropping the caller's future can neither stop it between two moves nor let go of a thread
 //! while its files are half moved. A move never replaces a rollout already at its destination.
+//!
+//! When the directory keeps an index of its threads, it follows each move and deletion in the same
+//! task, as Codex's local store updates its state database: a move the index cannot follow is
+//! undone and reported, and a deletion it cannot follow is reported once the files are gone.
 
 use std::{
     io,
@@ -17,7 +21,7 @@ use ra_core::{
     session::SessionId,
 };
 
-use crate::store::thread_exists;
+use crate::store::{index::ThreadIndex, thread_exists};
 
 use super::{
     session_index,
@@ -32,12 +36,14 @@ pub(crate) const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadFiles {
     dir: PathBuf,
+    index: Option<Arc<dyn ThreadIndex>>,
 }
 
 impl ThreadFiles {
-    pub(crate) fn new(dir: &Path) -> Self {
+    pub(crate) fn new(dir: &Path, index: Option<Arc<dyn ThreadIndex>>) -> Self {
         Self {
             dir: dir.to_path_buf(),
+            index,
         }
     }
 
@@ -100,7 +106,14 @@ impl ThreadFiles {
             } else {
                 move_error("archive", session_id, &error)
             }
-        })
+        })?;
+        if let Some(index) = &self.index
+            && let Err(error) = index.mark_archived(session_id, &destination)
+        {
+            restore(&destination, &source, session_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Moves the archived rollout of `session_id` back and marks it modified now, as Codex's
@@ -140,10 +153,14 @@ impl ThreadFiles {
             .open(&destination)
             .and_then(|file| file.set_modified(std::time::SystemTime::now()));
         if let Err(error) = touched {
-            if let Err(restore) = move_rollout(&destination, &source) {
-                tracing::warn!(%session_id, %restore, "failed to restore an archived rollout");
-            }
+            restore(&destination, &source, session_id);
             return Err(move_error("unarchive", session_id, &error));
+        }
+        if let Some(index) = &self.index
+            && let Err(error) = index.mark_unarchived(session_id, &destination)
+        {
+            restore(&destination, &source, session_id);
+            return Err(error);
         }
         Ok(destination)
     }
@@ -164,7 +181,11 @@ impl ThreadFiles {
                 Err(error) => return Err(error),
             }
         }
-        Ok(())
+        // As Codex's: the rows go last, once every rollout is gone.
+        match &self.index {
+            Some(index) => index.delete_threads(session_ids),
+            None => Ok(()),
+        }
     }
 
     /// Deletes the active and archived rollouts and their sidecars, then the thread's names, as
@@ -181,6 +202,13 @@ impl ThreadFiles {
         } else {
             Err(not_found(session_id))
         }
+    }
+}
+
+/// Moves a rollout back to where it was, as Codex restores the moves its index could not follow.
+fn restore(moved: &Path, original: &Path, session_id: &SessionId) {
+    if let Err(error) = move_rollout(moved, original) {
+        tracing::warn!(%session_id, %error, "failed to restore a moved rollout");
     }
 }
 

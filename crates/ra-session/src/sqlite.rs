@@ -784,7 +784,7 @@ fn open_file_connection(path: &Path) -> Result<Connection> {
 /// Foreign keys are turned off, as they are on the reference's connections: the bundled `SQLite`
 /// enables them by default, which would make the schema's `ON DELETE CASCADE` act where the
 /// reference's never does.
-fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.pragma_update(None, "foreign_keys", false)?;
     let timeout_ms: i64 = connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
     let deadline = Instant::now() + Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));

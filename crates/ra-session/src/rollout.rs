@@ -5,7 +5,7 @@ pub mod reader;
 pub mod reconstruction;
 pub mod recorder;
 pub(crate) mod session_index;
-mod thread_files;
+pub(crate) mod thread_files;
 pub mod threads;
 pub mod truncation;
 pub mod writer;
