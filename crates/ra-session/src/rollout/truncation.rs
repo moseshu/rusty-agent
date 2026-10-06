@@ -202,7 +202,8 @@ pub fn truncate_rollout_before_nth_user_message(
     Ok(records)
 }
 
-fn is_user_message(item: &ModelInputItem) -> bool {
+/// Whether `item` is a message from the user, as [`user_message_positions_in_rollout`] counts them.
+pub(crate) fn is_user_message(item: &ModelInputItem) -> bool {
     matches!(
         item,
         ModelInputItem::Message(message)

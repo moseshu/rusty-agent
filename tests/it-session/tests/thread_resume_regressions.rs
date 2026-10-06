@@ -16,9 +16,10 @@ use ra_core::{
     state::RunId,
 };
 use ra_session::{
-    CreateThreadParams, InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams,
-    ResumeThreadParams, ResumedThread, RolloutFileRecorder, RolloutReader, RolloutSessionMeta,
-    RolloutThreadDirectory, StoredThread, StoredThreadHistory, ThreadStore,
+    ArchiveThreadParams, CreateThreadParams, DeleteThreadParams, InMemoryThreadStore,
+    ListThreadsParams, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
+    ResumedThread, RolloutFileRecorder, RolloutReader, RolloutSessionMeta, RolloutThreadDirectory,
+    StoredThread, StoredThreadHistory, ThreadPage, ThreadStore, UpdateThreadMetadataParams,
 };
 
 fn directory(name: &str) -> RolloutThreadDirectory {
@@ -270,6 +271,29 @@ impl ThreadStore for ResumeProbe {
 
     async fn read_thread(&self, params: &ReadThreadParams) -> Result<StoredThread> {
         self.directory.read_thread(params).await
+    }
+
+    async fn list_threads(&self, params: &ListThreadsParams) -> Result<ThreadPage> {
+        self.directory.list_threads(params).await
+    }
+
+    async fn update_thread_metadata(
+        &self,
+        params: &UpdateThreadMetadataParams,
+    ) -> Result<Option<StoredThread>> {
+        self.directory.update_thread_metadata(params).await
+    }
+
+    async fn archive_thread(&self, params: &ArchiveThreadParams) -> Result<()> {
+        self.directory.archive_thread(params).await
+    }
+
+    async fn unarchive_thread(&self, params: &ArchiveThreadParams) -> Result<StoredThread> {
+        self.directory.unarchive_thread(params).await
+    }
+
+    async fn delete_thread(&self, params: &DeleteThreadParams) -> Result<()> {
+        self.directory.delete_thread(params).await
     }
 }
 

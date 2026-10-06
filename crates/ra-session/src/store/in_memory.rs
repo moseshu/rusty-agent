@@ -16,9 +16,10 @@ use ra_core::{
 };
 
 use super::{
-    CreateThreadParams, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
-    StoredThread, StoredThreadHistory, ThreadStore, first_session_meta, initial_payloads,
-    thread_exists,
+    ArchiveThreadParams, CreateThreadParams, DeleteThreadParams, ListThreadsParams,
+    LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams, StoredThread,
+    StoredThreadHistory, ThreadMetadataPatch, ThreadPage, ThreadStore, UpdateThreadMetadataParams,
+    first_session_meta, initial_payloads, thread_exists,
 };
 use crate::rollout::{
     RolloutPayload, RolloutRecord, RolloutSessionMeta, recorder::is_persisted_rollout_item,
@@ -30,14 +31,22 @@ use crate::rollout::{
 /// Clones share the threads. A thread is created with its session metadata as its first record, as
 /// Codex's in-memory store records `SessionMeta` on creation, and its records are kept as the
 /// rollout directory would write them, numbered from zero and filtered by the same persistence
-/// policy.
+/// policy. Either way of creating a thread refuses a session the store already holds, as the
+/// directory does, where Codex's in-memory store appends to it.
 ///
 /// As in Codex, resuming installs supplied history or preserves the current history, creating an
 /// empty history if absent. Persist, shutdown and discard do not invalidate recording handles:
 /// there is no live file writer to close. Only the local directory enforces exclusive ownership.
+///
+/// Its management is Codex's in-memory store's, which serves as a test double: a listing returns
+/// every thread, ordered by session id, on one page whatever it was asked; a metadata patch is
+/// merged into the patches the thread was given before, and a read applies them over the thread's
+/// session metadata; archiving keeps nothing and unarchiving reads the thread; deleting forgets
+/// it.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryThreadStore {
     threads: Arc<Mutex<HashMap<SessionId, Vec<RolloutRecord>>>>,
+    metadata: Arc<Mutex<HashMap<SessionId, ThreadMetadataPatch>>>,
 }
 
 impl InMemoryThreadStore {
@@ -61,6 +70,28 @@ impl InMemoryThreadStore {
         })
     }
 
+    fn metadata(&self) -> MutexGuard<'_, HashMap<SessionId, ThreadMetadataPatch>> {
+        self.metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The thread of `session_id` as Codex's in-memory store reads it: its session metadata, with
+    /// the patches it was given applied over it.
+    fn stored_thread(&self, session_id: &SessionId, include_history: bool) -> Result<StoredThread> {
+        let history = StoredThreadHistory::new(session_id.clone(), self.records(session_id)?);
+        let mut thread = if include_history {
+            StoredThread::from_history(history)?
+        } else {
+            let meta = first_session_meta(history.records())?;
+            StoredThread::new(session_id.clone(), meta.as_ref())
+        };
+        if let Some(patch) = self.metadata().get(session_id) {
+            thread.apply_patch(patch);
+        }
+        Ok(thread)
+    }
+
     fn records(&self, session_id: &SessionId) -> Result<Vec<RolloutRecord>> {
         self.threads()
             .get(session_id)
@@ -77,14 +108,15 @@ impl RolloutThreadStore for InMemoryThreadStore {
         spawn: &RolloutThreadSpawn,
     ) -> Result<Arc<dyn RolloutRecorder>> {
         let meta = RolloutSessionMeta::new(session_id.clone()).with_thread_spawn(spawn.clone());
+        let record =
+            RolloutRecord::new(0, EventTimestamp::now(), RolloutPayload::SessionMeta(meta))?;
         {
             let mut threads = self.threads();
-            let records = threads.entry(session_id.clone()).or_default();
-            records.push(RolloutRecord::new(
-                records.last().map_or(0, |last| last.timeline_seq() + 1),
-                EventTimestamp::now(),
-                RolloutPayload::SessionMeta(meta),
-            )?);
+            // The same conflict check as `create_thread_with`: a created thread is a new one.
+            if threads.contains_key(session_id) {
+                return Err(thread_exists(session_id));
+            }
+            threads.insert(session_id.clone(), vec![record]);
         }
         Ok(self.recorder(session_id))
     }
@@ -135,16 +167,50 @@ impl ThreadStore for InMemoryThreadStore {
     }
 
     async fn read_thread(&self, params: &ReadThreadParams) -> Result<StoredThread> {
-        let records = self.records(params.session_id())?;
-        let history = StoredThreadHistory::new(params.session_id().clone(), records);
-        if params.include_history() {
-            return StoredThread::from_history(history);
+        self.stored_thread(params.session_id(), params.include_history())
+    }
+
+    async fn list_threads(&self, _params: &ListThreadsParams) -> Result<ThreadPage> {
+        let mut session_ids = self.threads().keys().cloned().collect::<Vec<_>>();
+        session_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let items = session_ids
+            .iter()
+            .map(|session_id| self.stored_thread(session_id, false))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ThreadPage::new(items, None))
+    }
+
+    async fn update_thread_metadata(
+        &self,
+        params: &UpdateThreadMetadataParams,
+    ) -> Result<Option<StoredThread>> {
+        let session_id = params.session_id();
+        if !self.threads().contains_key(session_id) {
+            return Err(not_found(session_id));
         }
-        let meta = first_session_meta(history.records())?;
-        Ok(StoredThread::new(
-            params.session_id().clone(),
-            meta.as_ref(),
-        ))
+        self.metadata()
+            .entry(session_id.clone())
+            .or_default()
+            .merge(params.patch().clone());
+        self.stored_thread(session_id, false).map(Some)
+    }
+
+    async fn archive_thread(&self, _params: &ArchiveThreadParams) -> Result<()> {
+        Ok(())
+    }
+
+    async fn unarchive_thread(&self, params: &ArchiveThreadParams) -> Result<StoredThread> {
+        self.stored_thread(params.session_id(), false)
+    }
+
+    async fn delete_thread(&self, params: &DeleteThreadParams) -> Result<()> {
+        let existed = self.threads().remove(params.session_id()).is_some();
+        let had_metadata = self.metadata().remove(params.session_id()).is_some();
+        if existed || had_metadata {
+            Ok(())
+        } else {
+            Err(not_found(params.session_id()))
+        }
     }
 }
 
