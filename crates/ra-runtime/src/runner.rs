@@ -72,8 +72,8 @@ use ra_core::{
         InterruptedTurnHistoryMarker, Session, SessionInputCallback, SessionSettings,
         interrupt::is_interrupt,
         rollout::{
-            RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
-            RolloutRunStarted, RolloutTurnContext,
+            PersistContext, RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd,
+            RolloutRunEnded, RolloutRunStarted, RolloutTurnContext,
         },
     },
     state::{
@@ -939,6 +939,14 @@ impl RunRequest {
     /// rather than fails if that does not succeed. These are Codex's turn records: its turn is a
     /// run here.
     ///
+    /// As Codex's session does, the run persists the thread once its input is recorded and before
+    /// its first model call ([`PersistContext::TurnStart`]), and again once mail delivered into it
+    /// is recorded ([`PersistContext::SteeredUserInput`]), so the input the model is about to
+    /// answer survives the process being killed. A persistence that fails is logged as well.
+    ///
+    /// [`PersistContext::TurnStart`]: ra_core::session::rollout::PersistContext::TurnStart
+    /// [`PersistContext::SteeredUserInput`]: ra_core::session::rollout::PersistContext::SteeredUserInput
+    ///
     /// Only this run is recorded. A nested agent-tool run and a spawned agent are not given the
     /// recorder, and their events, though they reach the same event sink, are not recorded with
     /// this run's; a spawned agent records into a rollout of its own when its tree has a store for
@@ -1297,6 +1305,11 @@ async fn run_loop(
     }
     let rollout = start_recording(&mut request);
     let rollout_run_id = request.run_id.clone();
+    // As Codex's turn persists its thread once its input is recorded, so the input is on disk
+    // before the model is asked to answer it.
+    if let Some(rollout) = &rollout {
+        persist_rollout(rollout.as_ref(), &rollout_run_id, PersistContext::TurnStart).await;
+    }
     let interruption = Interruption::new(&request, agent_tree.is_some(), events.as_ref());
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
@@ -1492,6 +1505,15 @@ async fn finish_recording(
     }
     if let Some(rollout) = rollout {
         record_run_end(rollout, run_id, result).await;
+    }
+}
+
+/// Persists a recorded run's thread for `context`: Codex's `ensure_rollout_materialized`.
+///
+/// As there, a recorder that cannot is logged rather than turned into a failure of the run.
+async fn persist_rollout(rollout: &dyn RolloutRecorder, run_id: &RunId, context: PersistContext) {
+    if let Err(error) = rollout.persist(context).await {
+        warn!(run_id = %run_id, ?context, %error, "the run's rollout could not be persisted");
     }
 }
 
@@ -3391,7 +3413,11 @@ async fn run_one_turn(
     // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
-    deliver_agent_mail(context, state, progress, turn_scope);
+    if deliver_agent_mail(context, state, progress, turn_scope)
+        && let Some(rollout) = context.events.rollout
+    {
+        persist_rollout(rollout, context.run_id, PersistContext::SteeredUserInput).await;
+    }
     deliver_rollout_budget_reminder(context, state, progress);
     let reminder = budget_reminder(context.spend, config.budget());
     // What this turn's request is built from: the base the run continues on, and the records
@@ -3867,21 +3893,23 @@ fn deliver_deferred_prompts(
 /// concludes it leaves that mail queued for the agent's next run, as Codex defers mailbox delivery
 /// once a turn has produced its final answer. A turn already cancelled takes nothing, so an
 /// interrupt never swallows a follow-up into a run that is stopping.
+///
+/// Returns whether any mail was delivered.
 fn deliver_agent_mail(
     context: &TurnLoopContext<'_>,
     state: &mut RunState,
     progress: &TurnLoopProgress,
     turn_scope: &CancelScope,
-) {
+) -> bool {
     let Some(handle) = context.agent_mail else {
-        return;
+        return false;
     };
     if (progress.turns <= 1 && !context.deliver_mail_first) || turn_scope.is_cancelled() {
-        return;
+        return false;
     }
     let mail = handle.take_mail();
     if mail.is_empty() {
-        return;
+        return false;
     }
     // Numbered by the whole run's turn, like the other records the loop writes itself, so a
     // resumed segment does not collide with what an earlier one recorded.
@@ -3900,6 +3928,7 @@ fn deliver_agent_mail(
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
     state.record_generated_items(items);
+    true
 }
 
 /// Writes the agent tree's budget reminder into history, when the agent is owed one.

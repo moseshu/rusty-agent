@@ -15,8 +15,9 @@ use ra_core::{
     session::{
         SessionId,
         rollout::{
-            RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
-            RolloutRunStarted, RolloutThreadSpawn, RolloutThreadStore, RolloutTurnContext,
+            PersistContext, RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunEnd,
+            RolloutRunEnded, RolloutRunStarted, RolloutThreadSpawn, RolloutThreadStore,
+            RolloutTurnContext,
         },
     },
     state::{EventSeqAllocator, RunId, RunState},
@@ -482,6 +483,73 @@ async fn session_metadata_is_written_first_into_a_new_rollout_and_not_into_an_ex
     assert_eq!(read.session_id(), &SessionId::new("session-1"));
     assert_eq!(read.cwd(), Some("/work"));
     assert!(read.thread_spawn().is_none());
+}
+
+/// As Codex's local store treats each reason to persist: a spawned agent's copied history waits
+/// for its spawner's barrier and a preparation leaves an empty thread unmaterialized, while every
+/// other context creates the file with its session metadata before returning.
+#[tokio::test]
+async fn each_persist_context_materializes_a_deferred_thread_as_codexs_local_store_does() {
+    let dir = temp_test_dir("persist_contexts");
+    for (index, (context, materialized)) in [
+        (PersistContext::ThreadPreparation, false),
+        (PersistContext::SubagentSpawn, false),
+        (PersistContext::Standard, true),
+        (PersistContext::TurnStart, true),
+        (PersistContext::SteeredUserInput, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session_id = SessionId::new(format!("session-{index}"));
+        let path = dir.join(format!("rollout-{session_id}.jsonl"));
+        let recorder = RolloutFileRecorder::create_with_session_meta(
+            &path,
+            RolloutSessionMeta::new(session_id.clone()),
+        );
+        recorder.persist(context).await.unwrap();
+        assert_eq!(path.exists(), materialized, "{context:?}");
+        if materialized {
+            let records = RolloutReader::open(&path).read_all().await.unwrap();
+            let types: Vec<&str> = records.iter().map(|record| record.type_name()).collect();
+            assert_eq!(types, vec!["session_meta"], "{context:?}");
+        }
+        recorder.shutdown().await.unwrap();
+    }
+    assert_eq!(
+        [
+            PersistContext::ThreadPreparation,
+            PersistContext::Standard,
+            PersistContext::SubagentSpawn,
+            PersistContext::TurnStart,
+            PersistContext::SteeredUserInput,
+        ]
+        .map(PersistContext::allows_background_persistence),
+        [false, false, true, true, true]
+    );
+}
+
+/// A preparation flushes: a thread something was recorded to has it written before it returns.
+#[tokio::test]
+async fn a_persist_writes_what_was_recorded_to_a_thread_that_holds_records() {
+    let dir = temp_test_dir("persist_recorded");
+    let path = dir.join("rollout-session-1.jsonl");
+    let recorder = RolloutFileRecorder::create_with_session_meta(
+        &path,
+        RolloutSessionMeta::new(SessionId::new("session-1")),
+    );
+    recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+        RunId::new("run-1"),
+        AgentId::new("lead"),
+    )));
+    recorder
+        .persist(PersistContext::ThreadPreparation)
+        .await
+        .unwrap();
+    let records = RolloutReader::open(&path).read_all().await.unwrap();
+    let types: Vec<&str> = records.iter().map(|record| record.type_name()).collect();
+    assert_eq!(types, vec!["session_meta", "run_started"]);
+    recorder.shutdown().await.unwrap();
 }
 
 #[tokio::test]

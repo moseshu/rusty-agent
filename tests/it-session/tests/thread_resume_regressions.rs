@@ -10,7 +10,8 @@ use ra_core::{
     session::{
         SessionId,
         rollout::{
-            RolloutItem, RolloutRecorder, RolloutRunStarted, RolloutThreadSpawn, RolloutThreadStore,
+            PersistContext, RolloutItem, RolloutRecorder, RolloutRunStarted, RolloutThreadSpawn,
+            RolloutThreadStore,
         },
     },
     state::RunId,
@@ -112,8 +113,8 @@ async fn persisting_a_thread_without_a_run_keeps_its_metadata_for_resume() {
         .create_thread(&session_id, &spawn())
         .await
         .unwrap();
-    owner.persist().await.unwrap();
-    owner.persist().await.unwrap();
+    owner.persist(PersistContext::Standard).await.unwrap();
+    owner.persist(PersistContext::Standard).await.unwrap();
     owner.shutdown().await.unwrap();
     let resumed = ResumedThread::resume(&directory, &ResumeThreadParams::new(session_id))
         .await
@@ -135,9 +136,9 @@ async fn failed_persistence_retains_initial_metadata_for_retry() {
         &path,
         RolloutSessionMeta::new(SessionId::new("root")),
     );
-    assert!(recorder.persist().await.is_err());
+    assert!(recorder.persist(PersistContext::Standard).await.is_err());
     std::fs::remove_file(blocker).unwrap();
-    recorder.persist().await.unwrap();
+    recorder.persist(PersistContext::Standard).await.unwrap();
     recorder.shutdown().await.unwrap();
     let records = RolloutReader::open(path).read_all().await.unwrap();
     assert_eq!(records.len(), 1);
@@ -206,7 +207,7 @@ async fn in_memory_lifecycle_notifications_keep_recording_handles_writable() {
     let store = InMemoryThreadStore::new();
     let session_id = SessionId::new("worker");
     let owner = store.create_thread(&session_id, &spawn()).await.unwrap();
-    owner.persist().await.unwrap();
+    owner.persist(PersistContext::Standard).await.unwrap();
     owner.shutdown().await.unwrap();
     record(owner.as_ref(), "after-shutdown", "one");
     owner.discard().await.unwrap();
@@ -337,7 +338,7 @@ async fn a_failed_history_read_releases_the_reopened_writer() {
         .create_thread(&session_id, &spawn())
         .await
         .unwrap();
-    owner.persist().await.unwrap();
+    owner.persist(PersistContext::Standard).await.unwrap();
     owner.shutdown().await.unwrap();
     let store = ResumeProbe {
         directory,
@@ -369,7 +370,7 @@ async fn cancelling_resume_while_loading_history_releases_ownership() {
         .create_thread(&session_id, &spawn())
         .await
         .unwrap();
-    owner.persist().await.unwrap();
+    owner.persist(PersistContext::Standard).await.unwrap();
     owner.shutdown().await.unwrap();
     let gate = Arc::new(tokio::sync::Notify::new());
     let store = Arc::new(ResumeProbe {

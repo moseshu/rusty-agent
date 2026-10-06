@@ -16,7 +16,7 @@ use ra_core::{
     session::{
         SessionId,
         rollout::{
-            RolloutItem, RolloutRecorder, RolloutRunStarted, RolloutThreadSpawn,
+            PersistContext, RolloutItem, RolloutRecorder, RolloutRunStarted, RolloutThreadSpawn,
             RolloutThreadStore, RolloutTurnContext,
         },
     },
@@ -352,11 +352,38 @@ async fn a_created_thread_writes_its_initial_metadata_when_persisted() {
     recorder.flush().await.unwrap();
     assert_eq!(store.thread_metadata(&SessionId::new("initial")), None);
 
-    recorder.persist().await.unwrap();
+    recorder.persist(PersistContext::Standard).await.unwrap();
     let patch = metadata(&store, "initial");
     assert_eq!(patch.created_at(), Some(EventTimestamp::from_millis(1_000)));
     assert_eq!(patch.updated_at(), Some(EventTimestamp::from_millis(1_000)));
     assert_eq!(patch.cwd(), Some("/work"));
+}
+
+/// Every reason to persist writes what is pending, a created thread's initial metadata included,
+/// as Codex's live thread does whether or not the store may defer the persistence itself.
+#[tokio::test]
+async fn every_persist_context_writes_a_created_threads_initial_metadata() {
+    for (index, context) in [
+        PersistContext::ThreadPreparation,
+        PersistContext::SubagentSpawn,
+        PersistContext::TurnStart,
+        PersistContext::SteeredUserInput,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let store = InMemoryThreadStore::new();
+        let name = format!("initial-{index}");
+        let recorder = created(&store, &name).await;
+        recorder.persist(context).await.unwrap();
+        let patch = metadata(&store, &name);
+        assert_eq!(
+            patch.created_at(),
+            Some(EventTimestamp::from_millis(1_000)),
+            "{context:?}"
+        );
+        assert_eq!(patch.cwd(), Some("/work"), "{context:?}");
+    }
 }
 
 /// A write that fails keeps its patch pending, and a later barrier reports its own attempt.
@@ -368,14 +395,17 @@ async fn a_failed_write_stays_pending_and_is_retried() {
         .delete_thread(&DeleteThreadParams::new(SessionId::new("retry")))
         .await
         .unwrap();
-    let error = recorder.persist().await.unwrap_err();
+    let error = recorder
+        .persist(PersistContext::Standard)
+        .await
+        .unwrap_err();
     assert!(is_kind(&error, SessionErrorKind::NotFound), "{error}");
     assert_eq!(store.thread_metadata(&SessionId::new("retry")), None);
 
     // Recording makes the in-memory thread exist again; the creation patch is still pending and is
     // written with what the record says.
     recorder.record(run(vec![user("back again")]));
-    recorder.persist().await.unwrap();
+    recorder.persist(PersistContext::Standard).await.unwrap();
     let patch = metadata(&store, "retry");
     assert_eq!(patch.originator(), Some("test_originator"));
     assert_eq!(patch.created_at(), Some(EventTimestamp::from_millis(1_000)));
@@ -412,7 +442,7 @@ async fn discarding_forgets_the_pending_patch() {
     let store = InMemoryThreadStore::new();
     let recorder = created(&store, "discard").await;
     recorder.discard().await.unwrap();
-    recorder.persist().await.unwrap();
+    recorder.persist(PersistContext::Standard).await.unwrap();
     assert_eq!(store.thread_metadata(&SessionId::new("discard")), None);
 }
 
@@ -573,7 +603,7 @@ async fn directory_barriers_and_discard_reach_the_writer() {
     )
     .await
     .unwrap();
-    recorder.persist().await.unwrap();
+    recorder.persist(PersistContext::Standard).await.unwrap();
     recorder.shutdown().await.unwrap();
     assert!(directory.rollout_path(&child).unwrap().is_file());
 

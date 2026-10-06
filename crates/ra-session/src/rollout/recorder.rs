@@ -33,7 +33,7 @@ use ra_core::{
     event::{EventTimestamp, FileEvent, HostEventBody},
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRecorder},
+        rollout::{PersistContext, RolloutItem, RolloutRecorder},
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -209,7 +209,15 @@ impl RolloutRecorder for RolloutFileRecorder {
         written.await.map_err(|_| stopped())?
     }
 
-    async fn persist(&self) -> Result<()> {
+    /// As Codex's local store: a spawned agent's copied history waits for the barrier its spawner
+    /// awaits, a preparation leaves a thread nothing was recorded to unmaterialized, and every other
+    /// context materializes the thread and writes what is queued before returning.
+    async fn persist(&self, context: PersistContext) -> Result<()> {
+        match context {
+            PersistContext::SubagentSpawn => return Ok(()),
+            PersistContext::ThreadPreparation => return self.flush().await,
+            _ => {}
+        }
         let (done, written) = oneshot::channel();
         self.commands
             .send(Command::Persist(done))

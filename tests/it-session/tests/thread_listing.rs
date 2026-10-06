@@ -13,7 +13,7 @@ use ra_core::{
     session::{
         SessionId,
         rollout::{
-            RolloutItem, RolloutRunStarted, RolloutThreadSpawn, RolloutThreadStore,
+            PersistContext, RolloutItem, RolloutRunStarted, RolloutThreadSpawn, RolloutThreadStore,
             RolloutTurnContext,
         },
     },
@@ -904,7 +904,7 @@ async fn an_archived_history_is_never_overwritten() {
     );
     let child = SessionId::new("child");
     let first = directory.create_thread(&child, &spawn).await.unwrap();
-    first.persist().await.unwrap();
+    first.persist(PersistContext::Standard).await.unwrap();
     first.shutdown().await.unwrap();
     directory
         .archive_thread(&ArchiveThreadParams::new(child.clone()))

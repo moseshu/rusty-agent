@@ -60,14 +60,22 @@ pub trait RolloutRecorder: Send + Sync + 'static {
     /// Returns an error if writing any item recorded so far failed.
     async fn flush(&self) -> Result<()>;
 
-    /// Makes the thread durable even when no run items have been recorded: Codex's
-    /// `ThreadStore::persist_thread`. A deferred file recorder writes its initial session metadata.
+    /// Makes the thread durable even when no run items have been recorded, for the reason
+    /// `context` gives: Codex's `ThreadStore::persist_thread`. A deferred file recorder writes its
+    /// initial session metadata.
+    ///
+    /// [`PersistContext::Standard`] must be durable before this returns. A context that
+    /// [allows background persistence](PersistContext::allows_background_persistence) may instead
+    /// be queued before returning, provided the next [`Self::flush`] or [`Self::shutdown`] waits
+    /// for it and reports its failure. A [`PersistContext::ThreadPreparation`] may leave a thread
+    /// that nothing has been recorded to unmaterialized.
+    ///
     /// The default flushes a recorder whose storage is already materialized.
     ///
     /// # Errors
     ///
     /// Returns an error if materializing the thread or writing its pending items failed.
-    async fn persist(&self) -> Result<()> {
+    async fn persist(&self, _context: PersistContext) -> Result<()> {
         self.flush().await
     }
 
@@ -100,6 +108,42 @@ pub trait RolloutRecorder: Send + Sync + 'static {
     /// Returns an error if the writer could not be stopped.
     async fn discard(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Why a thread is asked to persist: Codex's `PersistContext`.
+///
+/// The runner persists a recorded run's thread at the points Codex's session does — once a run's
+/// input is recorded and before its first model call, and once input delivered into a running
+/// run is recorded — so what the model is about to answer is on disk before it answers. A store
+/// decides what each context costs; see [`RolloutRecorder::persist`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersistContext {
+    /// The thread is initialized, or context was injected into it, without a run starting.
+    ThreadPreparation,
+    /// The thread and everything recorded to it so far are made durable and readable.
+    Standard,
+    /// A spawned agent's copied history is recorded, and its durability may overlap the rest of
+    /// the spawn. Whoever spawns the agent persists it with [`Self::Standard`] before
+    /// acknowledging it.
+    SubagentSpawn,
+    /// A run's input is recorded and its first model call is about to be made: Codex's
+    /// `TurnStart`.
+    TurnStart,
+    /// Input delivered into a running run is recorded before its next model call.
+    SteeredUserInput,
+}
+
+impl PersistContext {
+    /// Whether a store may queue the persistence before returning and wait for it at a later
+    /// flush or shutdown. A store may still persist at once.
+    #[must_use]
+    pub const fn allows_background_persistence(self) -> bool {
+        match self {
+            Self::ThreadPreparation | Self::Standard => false,
+            Self::SubagentSpawn | Self::TurnStart | Self::SteeredUserInput => true,
+        }
     }
 }
 
