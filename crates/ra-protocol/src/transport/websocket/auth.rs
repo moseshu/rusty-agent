@@ -18,8 +18,6 @@
 //! [`WebsocketAuthSettings::new`], so either can grow a field without breaking a caller. Codex's
 //! `anyhow` errors for invalid flags are a [`WebsocketAuthArgsError`] with the same messages.
 
-mod absolute_path;
-
 use std::{
     fmt, io,
     io::ErrorKind,
@@ -34,6 +32,8 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use crate::absolute_path;
 
 const DEFAULT_MAX_CLOCK_SKEW_SECONDS: u64 = 30;
 const MIN_SIGNED_BEARER_SECRET_BYTES: usize = 32;

@@ -12,7 +12,9 @@ workspace = true
 
 [features]
 # 只给 tests/ workspace 用：transport 的入站分发（队列满时回过载错误、答复等待而不丢）从公开入口
-# 构造不出「出站队列也满」的情形，这扇门只转出那一个私有函数。
+# 构造不出「出站队列也满」的情形，这扇门只转出那一个私有函数。app server 的出站路由要对容量、能否
+# 断开都由测试掌握的写队列测，所以另转出 `ConnectionOpened` 的构造；服务端尚无自己的通知，测试经
+# `server::test_api::ServerNotifier` 发通知。
 test-api = []
 
 [dependencies]

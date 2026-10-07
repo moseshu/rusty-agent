@@ -226,9 +226,27 @@ fn serialize_outgoing_message(message: &JsonRpcMessage) -> Option<String> {
 #[cfg(feature = "test-api")]
 pub mod test_api {
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
-    use super::{ConnectionId, QueuedOutgoingMessage, TransportEvent};
+    use super::{ConnectionId, ConnectionOrigin, QueuedOutgoingMessage, TransportEvent};
     use crate::frame::JsonRpcMessage;
+
+    /// A connection opening, as a transport reports it, so a server can be given connections whose
+    /// write queues the test holds.
+    #[must_use]
+    pub fn connection_opened(
+        connection_id: ConnectionId,
+        origin: ConnectionOrigin,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
+        disconnect_sender: Option<CancellationToken>,
+    ) -> TransportEvent {
+        TransportEvent::ConnectionOpened {
+            connection_id,
+            origin,
+            writer,
+            disconnect_sender,
+        }
+    }
 
     /// How every transport hands a message to the server, including when the server's channel and
     /// the connection's write queue are full.

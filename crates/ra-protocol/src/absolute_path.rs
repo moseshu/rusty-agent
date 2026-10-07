@@ -1,4 +1,4 @@
-//! How a secret file's path is made absolute: Codex's `AbsolutePathBuf::from_absolute_path`
+//! How a configured path is made absolute: Codex's `AbsolutePathBuf::from_absolute_path`
 //! (`utils/absolute-path/src/lib.rs` and `absolutize.rs`).
 //!
 //! A leading `~` is the home directory. On Windows a `\\?\` or `\\.\` prefix on a drive or UNC path
@@ -16,7 +16,7 @@ use std::{
 };
 
 /// `path` made absolute and normalized. Reads the current directory only when `path` is relative.
-pub(super) fn from_absolute_path(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn from_absolute_path(path: &Path) -> io::Result<PathBuf> {
     let expanded = maybe_expand_home_directory(path);
     let expanded = normalize_path_for_platform(&expanded);
     absolutize(&expanded)

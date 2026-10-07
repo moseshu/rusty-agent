@@ -11,6 +11,8 @@
 //! their reader untouched — the two sides do not upgrade in lockstep. Envelope members the format
 //! does not define, such as `jsonrpc`, are ignored, as Codex's app-server ignores them.
 
+mod absolute_path;
+
 pub mod control;
 pub mod frame;
 pub mod lifecycle;
