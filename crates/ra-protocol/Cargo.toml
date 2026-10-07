@@ -10,13 +10,22 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 只给 tests/ workspace 用：transport 的入站分发（队列满时回过载错误、答复等待而不丢）从公开入口
+# 构造不出「出站队列也满」的情形，这扇门只转出那一个私有函数。
+test-api = []
+
 [dependencies]
 ra-core = { workspace = true }
 ra-session = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { workspace = true }
