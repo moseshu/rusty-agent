@@ -70,12 +70,17 @@ async fn stdio_child() {
         connection_id,
         origin,
         writer,
+        disconnect_sender,
         ..
     }) = events.recv().await
     else {
         panic!("the connection opens first");
     };
     assert_eq!(origin, ConnectionOrigin::Stdio);
+    assert!(
+        disconnect_sender.is_none(),
+        "stdio cannot be dropped by the server"
+    );
     let send = |message: JsonRpcMessage| {
         let writer = writer.clone();
         async move {

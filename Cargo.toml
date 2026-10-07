@@ -62,6 +62,14 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # 信号：收到 SIGTERM 与启动退出期限都不能依赖 tokio 运行时，运行时或日志卡住时也要生效。
 # `signal-hook-registry` 已经经 tokio 在锁文件里，这是同一作者的上层迭代器。
 signal-hook = "0.3.18"
+# WebSocket app-server transport（ra-protocol），照 codex `transport/websocket.rs` 与 `websocket-auth`：
+# axum 承担 HTTP 升级、`/readyz` `/healthz` 与 Origin 拦截；jsonwebtoken 校验签名 bearer token
+# （HS256，与 codex 同一版本，走已在树里的 ring）；constant_time_eq 比较 capability token 摘要。
+# codex 把 tungstenite 换成了 git 上的 fork，deny.toml 不放行 git 源，这里用 crates.io 的版本。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+jsonwebtoken = "9.3.1"
+constant_time_eq = "0.3.1"
+http = "1"
 futures = "0.3"
 async-trait = "0.1"
 base64 = "0.22"

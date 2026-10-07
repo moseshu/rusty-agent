@@ -20,6 +20,13 @@ ra-core = { workspace = true }
 ra-session = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+constant_time_eq = { workspace = true }
+http = { workspace = true }
+jsonwebtoken = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }

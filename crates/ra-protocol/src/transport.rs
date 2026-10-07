@@ -24,6 +24,7 @@ use std::{
 };
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::frame::{JsonRpcError, JsonRpcErrorObject, JsonRpcMessage};
 
@@ -60,13 +61,15 @@ impl fmt::Display for ConnectionId {
 
 /// The transport a connection arrived on: Codex's `ConnectionOrigin`.
 ///
-/// Codex also has in-process and remote-control connections; remote control is not ported, and the
-/// other transports add their origin when they land.
+/// Codex also has in-process and remote-control connections; remote control is not ported, and an
+/// in-process client adds its origin when it lands.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionOrigin {
     /// The process's stdin and stdout.
     Stdio,
+    /// A WebSocket client.
+    WebSocket,
 }
 
 /// What a transport tells the server: Codex's `TransportEvent`.
@@ -75,8 +78,8 @@ pub enum ConnectionOrigin {
 pub enum TransportEvent {
     /// A connection opened; what the server sends it goes through `writer`.
     ///
-    /// Codex's event also carries the connection's authentication and a token to disconnect it,
-    /// which only its WebSocket transport fills in; they arrive with that transport.
+    /// Codex's event also carries the login that established a remote-control connection, which
+    /// belongs to its account machinery and is not ported.
     #[non_exhaustive]
     ConnectionOpened {
         /// The connection.
@@ -85,6 +88,9 @@ pub enum TransportEvent {
         origin: ConnectionOrigin,
         /// The queue of messages to write to it.
         writer: mpsc::Sender<QueuedOutgoingMessage>,
+        /// Cancelling it drops the connection, for a transport that can end a connection on the
+        /// server's behalf: a WebSocket can, stdio cannot.
+        disconnect_sender: Option<CancellationToken>,
     },
     /// A connection closed; nothing more will arrive from it.
     ConnectionClosed {

@@ -76,6 +76,7 @@ pub async fn start_stdio_connection(
             connection_id,
             origin: ConnectionOrigin::Stdio,
             writer: writer_tx,
+            disconnect_sender: None,
         })
         .await
         .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "processor unavailable"))?;

@@ -13,5 +13,15 @@ ra-core = { path = "../../crates/ra-core" }
 ra-protocol = { path = "../../crates/ra-protocol", features = ["test-api"] }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 serde_json = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hmac = "0.12"
+http = "1"
+sha2 = "0.10"
+tempfile = "3"
+time = "0.3"
+tokio-tungstenite = "0.29"
+tokio-util = "0.7"
