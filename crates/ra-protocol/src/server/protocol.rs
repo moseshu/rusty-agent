@@ -6,14 +6,47 @@
 //! has succeeded, and a method or notification marked experimental is withheld from a connection
 //! that did not opt into the experimental API.
 //!
+//! While a turn runs, the server asks the client in turn with a [`ServerRequest`]: to approve a
+//! command, file changes or extra permissions, to call a tool the client provides, or to put
+//! questions to the user. The client answers with a response carrying the method's answer, and the
+//! connections of the thread are sent `serverRequest/resolved` once the request no longer needs
+//! one.
+//!
 //! Field names are Codex's, in camelCase. Members a type does not define are ignored when it is
 //! read, so a client that sends what Codex's server reads and this one does not — such as the
-//! capabilities listed on [`InitializeCapabilities`] — still connects.
+//! capabilities listed on [`InitializeCapabilities`] — still connects. The one exception is
+//! [`RequestPermissionProfile`], which refuses them as Codex does.
+
+mod item;
+mod permissions;
+mod server_request;
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
+pub use self::{
+    item::{
+        CommandAction, CommandExecutionApprovalDecision, CommandExecutionApprovalKind,
+        CommandExecutionRequestApprovalParams, CommandExecutionRequestApprovalResponse,
+        DynamicToolCallOutputContentItem, DynamicToolCallParams, DynamicToolCallResponse,
+        FileChangeApprovalDecision, FileChangeRequestApprovalParams,
+        FileChangeRequestApprovalResponse, ToolRequestUserInputAnswer, ToolRequestUserInputOption,
+        ToolRequestUserInputParams, ToolRequestUserInputQuestion, ToolRequestUserInputResponse,
+    },
+    permissions::{
+        AdditionalFileSystemPermissions, AdditionalNetworkPermissions, AdditionalPermissionProfile,
+        ExecPolicyAmendment, FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        FileSystemSpecialPath, GrantedPermissionProfile, NetworkApprovalContext,
+        NetworkApprovalProtocol, NetworkPolicyAmendment, NetworkPolicyRuleAction,
+        PermissionGrantScope, PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse,
+        RequestPermissionProfile,
+    },
+    server_request::{
+        SERVER_REQUEST_RESOLVED_METHOD, ServerRequest, ServerRequestPayload,
+        ServerRequestResolvedNotification,
+    },
+};
 use crate::{
     absolute_path,
     frame::{JsonRpcRequest, RequestId},

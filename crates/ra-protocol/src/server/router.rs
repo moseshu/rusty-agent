@@ -10,8 +10,8 @@
 //! one slow client does not hold up the others; a connection it cannot drop — stdio — is waited
 //! on instead.
 //!
-//! Codex also strips experimental fields from its command approval requests here for a connection
-//! without the experimental API; those requests are not ported yet.
+//! A command approval request sent to a connection without the experimental API is first
+//! stripped of its experimental `additionalPermissions`, as Codex strips it.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -24,8 +24,14 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::outgoing::{OutgoingEnvelope, OutgoingMessage};
-use crate::transport::{ConnectionId, QueuedOutgoingMessage};
+use super::{
+    outgoing::{OutgoingEnvelope, OutgoingMessage},
+    protocol::ServerRequest,
+};
+use crate::{
+    frame::JsonRpcMessage,
+    transport::{ConnectionId, QueuedOutgoingMessage},
+};
 
 /// What the router knows of a connection: Codex's `OutboundConnectionState`.
 ///
@@ -90,7 +96,36 @@ fn should_skip_notification_for_connection(
             }
             opted_out_notification_methods.contains(notification.method())
         }
-        OutgoingMessage::Response(_) | OutgoingMessage::Error(_) => false,
+        OutgoingMessage::Request(_) | OutgoingMessage::Response(_) | OutgoingMessage::Error(_) => {
+            false
+        }
+    }
+}
+
+/// What `message` becomes for the connection: Codex's `filter_outgoing_message_for_connection`,
+/// which strips the experimental fields of a command approval request for a connection without the
+/// experimental API.
+fn filter_outgoing_message_for_connection(
+    connection_state: &OutboundConnectionState,
+    message: OutgoingMessage,
+) -> OutgoingMessage {
+    let experimental_api_enabled = connection_state
+        .experimental_api_enabled
+        .load(Ordering::Acquire);
+    match message {
+        OutgoingMessage::Request(ServerRequest::CommandExecutionRequestApproval {
+            request_id,
+            mut params,
+        }) => {
+            if !experimental_api_enabled {
+                params.strip_experimental_fields();
+            }
+            OutgoingMessage::Request(ServerRequest::CommandExecutionRequestApproval {
+                request_id,
+                params,
+            })
+        }
+        _ => message,
     }
 }
 
@@ -117,9 +152,17 @@ async fn send_message_to_connection(
         tracing::warn!("dropping message for disconnected connection: {connection_id}");
         return false;
     };
+    let message = filter_outgoing_message_for_connection(connection_state, message);
     if should_skip_notification_for_connection(connection_state, &message) {
         return false;
     }
+    let message = match JsonRpcMessage::try_from(message) {
+        Ok(message) => message,
+        Err(error) => {
+            tracing::error!("failed to serialize message for {connection_id}: {error}");
+            return false;
+        }
+    };
 
     let writer = connection_state.writer.clone();
     let queued_message = QueuedOutgoingMessage::new(message);

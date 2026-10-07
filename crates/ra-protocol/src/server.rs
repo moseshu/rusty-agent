@@ -13,14 +13,30 @@
 //! A connection must open with `initialize`; see [`protocol`] for the handshake. The `thread/*`
 //! and `turn/*` methods and notifications are added over the thread store as they are ported.
 //!
+//! While a turn runs the server asks the client in turn — approvals, dynamic tool calls, questions
+//! for the user — with requests of its own, sent to the connections of the thread. The client's
+//! response or error is routed back to whoever asked; a request whose turn moves on is withdrawn;
+//! and once a request is answered or withdrawn the thread's connections are sent
+//! `serverRequest/resolved`. A connection that attaches to the thread later is sent the requests
+//! still waiting. What the server makes of each answer follows Codex's handlers, failing closed.
+//! The turns that raise these requests arrive with `turn/start`.
+//!
 //! Codex's loop also drains running turns before a restart on a signal, recovers the threads of
 //! its daemon, attaches newly created threads to every connection and reports the status of
 //! remote control; none of it is ported yet.
 
+// Nothing raises a server request until turns run in the server; the tests reach them through
+// `test_api` meanwhile.
+#[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+mod answers;
+mod approvals;
 mod outgoing;
 mod processor;
 pub mod protocol;
 mod router;
+mod thread_state;
+
+pub use self::approvals::ReviewDecision;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -185,6 +201,10 @@ impl AppServer {
                     let Some(connection_state) = connections.remove(&connection_id) else {
                         continue;
                     };
+                    processor
+                        .outgoing()
+                        .thread_state()
+                        .remove_connection(connection_id);
                     if outbound_control_tx
                         .send(OutboundControlEvent::Closed { connection_id })
                         .await
@@ -334,13 +354,28 @@ async fn handle_incoming_message(
 pub mod test_api {
     use std::sync::Arc;
 
+    use ra_core::session::SessionId;
     use serde_json::Value;
+    use tokio::sync::oneshot;
 
     use super::{
-        AppServer,
-        outgoing::{OutgoingMessageSender, ServerNotification},
+        AppServer, answers,
+        outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
+        protocol::{
+            DynamicToolCallResponse, PermissionsRequestApprovalResponse, ServerRequest,
+            ServerRequestPayload, ToolRequestUserInputResponse,
+        },
     };
-    use crate::transport::ConnectionId;
+    use crate::{
+        frame::{RequestId, RequestResult},
+        transport::ConnectionId,
+    };
+
+    pub use super::ReviewDecision;
+
+    /// What the server receives for one of its requests: the client's answer, or nothing if the
+    /// request was withdrawn without one.
+    pub type ClientAnswer = Result<RequestResult, oneshot::error::RecvError>;
 
     /// Sends notifications from a server, which has none of its own yet.
     #[derive(Debug)]
@@ -379,5 +414,125 @@ pub mod test_api {
                     .await;
             }
         }
+    }
+
+    /// Sends a server's requests for one thread to the connections subscribed to it, as the turns
+    /// of the thread will, which do not run in the server yet.
+    #[derive(Debug)]
+    pub struct ThreadRequester {
+        outgoing: Arc<OutgoingMessageSender>,
+        thread: ThreadScopedOutgoingMessageSender,
+        thread_id: SessionId,
+    }
+
+    impl ThreadRequester {
+        /// Sends from `server`, for the thread `thread_id`, to `connection_ids`.
+        #[must_use]
+        pub fn new(
+            server: &AppServer,
+            connection_ids: &[ConnectionId],
+            thread_id: SessionId,
+        ) -> Self {
+            let outgoing = Arc::clone(server.processor.outgoing());
+            for &connection_id in connection_ids {
+                outgoing
+                    .thread_state()
+                    .add_connection_to_thread(&thread_id, connection_id);
+            }
+            Self {
+                thread: ThreadScopedOutgoingMessageSender::new(
+                    Arc::clone(&outgoing),
+                    connection_ids.to_vec(),
+                    thread_id.clone(),
+                ),
+                outgoing,
+                thread_id,
+            }
+        }
+
+        /// Sends `payload` and keeps it until it is answered or withdrawn. Returns its id and
+        /// where its answer will arrive.
+        pub async fn send_request(
+            &self,
+            payload: ServerRequestPayload,
+        ) -> (RequestId, oneshot::Receiver<RequestResult>) {
+            self.thread.send_request(payload).await
+        }
+
+        /// Waits for the answer to `request_id`, then sends `serverRequest/resolved`.
+        pub async fn wait_for_answer(
+            &self,
+            request_id: RequestId,
+            answer: oneshot::Receiver<RequestResult>,
+        ) -> ClientAnswer {
+            self.thread.wait_for_answer(request_id, answer).await
+        }
+
+        /// Withdraws the thread's requests, as a turn starting, completing or being aborted does.
+        pub fn abort_pending_server_requests(&self) {
+            self.thread.abort_pending_server_requests();
+        }
+
+        /// Sends `connection_id` the thread's requests still waiting, as attaching to the thread
+        /// does.
+        pub async fn replay_to_connection(&self, connection_id: ConnectionId) {
+            self.outgoing
+                .thread_state()
+                .add_connection_to_thread(&self.thread_id, connection_id);
+            self.outgoing
+                .replay_requests_to_connection_for_thread(connection_id, &self.thread_id)
+                .await;
+        }
+
+        /// Removes this connection's subscription, as `thread/unsubscribe` does.
+        #[must_use]
+        pub fn unsubscribe_connection(&self, connection_id: ConnectionId) -> bool {
+            self.outgoing
+                .thread_state()
+                .unsubscribe_connection_from_thread(&self.thread_id, connection_id)
+        }
+
+        /// The thread's requests still waiting, in the order of their ids.
+        #[must_use]
+        pub fn pending_requests(&self) -> Vec<ServerRequest> {
+            self.outgoing.pending_requests_for_thread(&self.thread_id)
+        }
+    }
+
+    /// The decision a command approval's answer carries, or `None` if the request was withdrawn
+    /// on a turn transition.
+    #[must_use]
+    pub fn command_execution_approval_decision(answer: ClientAnswer) -> Option<ReviewDecision> {
+        answers::command_execution_approval_decision(answer)
+    }
+
+    /// The decision a file change approval's answer carries, or `None` if the request was
+    /// withdrawn on a turn transition.
+    #[must_use]
+    pub fn file_change_approval_decision(answer: ClientAnswer) -> Option<ReviewDecision> {
+        answers::file_change_approval_decision(answer)
+    }
+
+    /// The user's answers, or `None` if the request was withdrawn on a turn transition.
+    #[must_use]
+    pub fn request_user_input_response(
+        answer: ClientAnswer,
+    ) -> Option<ToolRequestUserInputResponse> {
+        answers::request_user_input_response(answer)
+    }
+
+    /// The permissions granted, or `None` if the request was withdrawn on a turn transition.
+    #[must_use]
+    pub fn request_permissions_response(
+        answer: ClientAnswer,
+    ) -> Option<PermissionsRequestApprovalResponse> {
+        answers::request_permissions_response(answer)
+    }
+
+    /// What the dynamic tool returned, or `None` if the request was withdrawn on a turn
+    /// transition.
+    #[must_use]
+    pub fn dynamic_tool_call_response(answer: ClientAnswer) -> Option<DynamicToolCallResponse> {
+        answers::dynamic_tool_call_response(answer)
     }
 }
