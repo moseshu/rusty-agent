@@ -33,3 +33,5 @@ pub use agent::{
 pub use assembly::render_capability_assembly;
 pub use host::CodingHost;
 pub use profile::CodingProfile;
+
+pub mod thread_settings;

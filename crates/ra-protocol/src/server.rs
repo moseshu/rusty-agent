@@ -10,8 +10,11 @@
 //! when its write queue is full; stdio is waited on. The two loops share no state but the flags a
 //! connection's handshake sets, as in Codex.
 //!
-//! A connection must open with `initialize`; see [`protocol`] for the handshake. The `thread/*`
-//! and `turn/*` methods and notifications are added over the thread store as they are ported.
+//! A connection must open with `initialize`; see [`protocol`] for the handshake. The turn methods
+//! — `turn/start`, `turn/steer`, `turn/interrupt` and `thread/settings/update` — act on the threads
+//! the server has loaded, and each loaded thread has a listener that tells its connections when its
+//! turns start and end. The `thread/*` methods that create and load threads are added over the
+//! thread store as they are ported.
 //!
 //! While a turn runs the server asks the client in turn — approvals, dynamic tool calls, questions
 //! for the user — with requests of its own, sent to the connections of the thread. The client's
@@ -19,7 +22,7 @@
 //! and once a request is answered or withdrawn the thread's connections are sent
 //! `serverRequest/resolved`. A connection that attaches to the thread later is sent the requests
 //! still waiting. What the server makes of each answer follows Codex's handlers, failing closed.
-//! The turns that raise these requests arrive with `turn/start`.
+//! The turns run, but what raises these requests from them is still to be connected.
 //!
 //! Codex's loop also drains running turns before a restart on a signal, recovers the threads of
 //! its daemon, attaches newly created threads to every connection and reports the status of
@@ -30,13 +33,22 @@
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod answers;
 mod approvals;
+mod image_url;
 mod outgoing;
 mod processor;
 pub mod protocol;
 mod router;
+mod settings_adapter;
+// Threads are loaded by `thread/start` and its kin, which are not ported yet; until then only the
+// tests load them, through `test_api`, and start their listeners.
+#[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+mod thread_listener;
+mod thread_manager;
 mod thread_state;
+mod turn_processor;
 
 pub use self::approvals::ReviewDecision;
+pub use self::settings_adapter::ThreadSettingsAdapter;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -358,13 +370,17 @@ pub mod test_api {
     use serde_json::Value;
     use tokio::sync::oneshot;
 
+    use ra_runtime::thread::AgentThread;
+
     use super::{
         AppServer, answers,
         outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
+        processor::MessageProcessor,
         protocol::{
             DynamicToolCallResponse, PermissionsRequestApprovalResponse, ServerRequest,
             ServerRequestPayload, ToolRequestUserInputResponse,
         },
+        thread_listener::ensure_listener_task_running,
     };
     use crate::{
         frame::{RequestId, RequestResult},
@@ -413,6 +429,46 @@ pub mod test_api {
                     .send_server_notification_to_connections(connection_ids, notification)
                     .await;
             }
+        }
+    }
+
+    /// Loads threads into a server, as `thread/start` and its kin will, which are not ported yet.
+    #[derive(Debug)]
+    pub struct ThreadLoader {
+        processor: Arc<MessageProcessor>,
+    }
+
+    impl ThreadLoader {
+        /// Loads into `server`, before or while it runs.
+        #[must_use]
+        pub fn new(server: &AppServer) -> Self {
+            Self {
+                processor: Arc::clone(&server.processor),
+            }
+        }
+
+        /// Loads `thread`, subscribes `connection_ids` to it, and starts its listener, so its turn
+        /// methods reach it and its connections hear of its turns. Must be called within a Tokio
+        /// runtime, on which the listener runs.
+        pub async fn load(&self, thread: AgentThread, connection_ids: &[ConnectionId]) {
+            self.load_with_adapter(thread, connection_ids, None).await;
+        }
+
+        /// Installs the product's explicit policy adapter alongside its live thread.
+        pub async fn load_with_adapter(
+            &self,
+            thread: AgentThread,
+            connection_ids: &[ConnectionId],
+            adapter: Option<Arc<dyn super::ThreadSettingsAdapter>>,
+        ) {
+            let outgoing = self.processor.outgoing();
+            for &connection_id in connection_ids {
+                outgoing
+                    .thread_state()
+                    .add_connection_to_thread(thread.thread_id(), connection_id);
+            }
+            ensure_listener_task_running(outgoing, &thread, adapter.clone()).await;
+            self.processor.thread_manager().add_thread(thread, adapter);
         }
     }
 

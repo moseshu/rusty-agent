@@ -101,6 +101,13 @@ impl ExecEnvironment {
         self
     }
 
+    /// Removes the writable scratch directory for an explicitly read-only child.
+    #[must_use]
+    pub fn without_temp_dir(mut self) -> Self {
+        self.temp_dir = None;
+        self
+    }
+
     /// How a child's environment is derived.
     #[must_use]
     pub const fn env_policy(&self) -> &EnvPolicy {

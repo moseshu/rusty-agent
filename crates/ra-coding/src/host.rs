@@ -125,7 +125,8 @@ impl CodingHost {
 
     /// Creates the workspace-confined editing capability.
     pub fn apply_patch_capability(&self) -> ra_core::error::Result<ApplyPatchCapability> {
-        ApplyPatchCapability::for_workspace(&self.workspace)
+        Ok(ApplyPatchCapability::for_workspace(&self.workspace)?
+            .with_approval_resolver(Arc::new(crate::thread_settings::patch_approval)))
     }
 
     /// Creates the workspace-confined file-reading capability.
@@ -158,7 +159,16 @@ impl CodingHost {
     /// The manager is this host's rather than the capability's own, so the sessions an agent starts
     /// are the ones this host cancels and reports at closeout.
     pub fn shell_capability(&self) -> ra_core::error::Result<ShellCapability> {
-        ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))
+        let base = self.process_manager.environment().clone();
+        Ok(
+            ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))?
+                .with_policy_resolvers(
+                    Arc::new(move |context| {
+                        Ok(crate::thread_settings::command_environment(context, &base))
+                    }),
+                    Arc::new(crate::thread_settings::command_approval),
+                ),
+        )
     }
 
     /// Creates the coding product's workspace-confined patch tool.

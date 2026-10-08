@@ -15,6 +15,7 @@
 
 use super::{
     approvals::ReviewDecision,
+    image_url::{REMOTE_IMAGE_URL_ERROR, is_remote_image_url},
     outgoing::{ClientAnswer, is_turn_transition_server_request_error},
     protocol::{
         CommandExecutionApprovalDecision, CommandExecutionRequestApprovalResponse,
@@ -29,9 +30,6 @@ use crate::frame::JsonRpcErrorObject;
 pub(crate) const REJECTED_BY_USER: &str = "rejected by user";
 /// What the model is told of an approval that could not be obtained: Codex's rejection text.
 pub(crate) const APPROVAL_REQUEST_FAILED: &str = "approval request failed";
-/// Codex's `REMOTE_IMAGE_URL_ERROR`.
-pub(crate) const REMOTE_IMAGE_URL_ERROR: &str =
-    "remote image URLs are not supported; use an inline data URL instead";
 /// Codex's `INVALID_AUDIO_URL_ERROR`.
 pub(crate) const INVALID_AUDIO_URL_ERROR: &str = "audio URLs must use an inline data URL";
 
@@ -236,12 +234,4 @@ fn dynamic_tool_fallback(message: &str) -> DynamicToolCallResponse {
         [DynamicToolCallOutputContentItem::input_text(message)],
         false,
     )
-}
-
-/// Whether `image_url` is fetched over the network rather than inline: Codex's
-/// `is_remote_image_url`.
-fn is_remote_image_url(image_url: &str) -> bool {
-    image_url.split_once(':').is_some_and(|(scheme, _)| {
-        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-    })
 }

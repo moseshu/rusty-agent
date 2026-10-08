@@ -823,9 +823,11 @@ impl ProcessManager {
     /// Wrapping happens here too, rather than inside the spawn, so that a policy the backend cannot
     /// express — an unresolvable root, say — is reported as the sandbox failure it is rather than as
     /// a command that would not start.
-    fn confine(&self, request: &ExecRequest) -> Result<(Confinement, SandboxCommand), ExecError> {
-        let confinement = self
-            .environment
+    fn confine(
+        environment: &ExecEnvironment,
+        request: &ExecRequest,
+    ) -> Result<(Confinement, SandboxCommand), ExecError> {
+        let confinement = environment
             .resolve_confinement()
             .map_err(|source| ExecError::Sandbox { source })?;
         let launched = confinement
@@ -853,6 +855,19 @@ impl ProcessManager {
         request: ExecRequest,
         emitter: Option<&HostEventEmitter>,
     ) -> Result<ExecExecutionResult, ExecError> {
+        self.execute_with_environment(request, emitter, &self.environment)
+            .await
+    }
+
+    /// Executes with the trusted environment a host captured for this step. The manager and its
+    /// registry remain shared, so changes to future commands do not orphan background sessions.
+    /// This environment is host-owned and never deserialized from model tool arguments.
+    pub async fn execute_with_environment(
+        &self,
+        request: ExecRequest,
+        emitter: Option<&HostEventEmitter>,
+        environment: &ExecEnvironment,
+    ) -> Result<ExecExecutionResult, ExecError> {
         // Resolved once, into the request itself, so that nothing downstream can reach past it to
         // the untightened values — the bug that comes back otherwise is one code path reading
         // `request.limits()` directly and quietly running without the host's ceiling.
@@ -879,8 +894,7 @@ impl ProcessManager {
         // Taken before the process exists, not after it yields: a handle acquired later could fail
         // while a command is already writing into the directory, and there would be nothing useful
         // left to do about it.
-        let temp_dir_use = match self
-            .environment
+        let temp_dir_use = match environment
             .temp_dir()
             .map(|dir| dir.use_handle())
             .transpose()
@@ -893,7 +907,7 @@ impl ProcessManager {
             }
         };
 
-        let (confinement, launched) = match self.confine(&request) {
+        let (confinement, launched) = match Self::confine(environment, &request) {
             Ok(confined) => confined,
             Err(error) => {
                 self.abandon_unstarted(&session_id, &session, &error.to_string())
@@ -902,7 +916,7 @@ impl ProcessManager {
             }
         };
 
-        let mut child = match spawn_child(&request, &self.environment, &launched) {
+        let mut child = match spawn_child(&request, environment, &launched) {
             Ok(child) => child,
             Err(error) => {
                 self.abandon_unstarted(&session_id, &session, &error.to_string())

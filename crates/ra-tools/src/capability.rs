@@ -174,6 +174,21 @@ impl ShellCapability {
         })
     }
 
+    /// Installs per-step execution policy while retaining the session manager.
+    #[must_use]
+    pub fn with_policy_resolvers(
+        mut self,
+        environment: Arc<crate::exec_command::EnvironmentResolver>,
+        approval: Arc<crate::exec_command::ApprovalResolver>,
+    ) -> Self {
+        self.exec_command = Arc::new(
+            (*self.exec_command)
+                .clone()
+                .with_policy_resolvers(environment, approval),
+        );
+        self
+    }
+
     /// The entry that starts a command in the workspace.
     #[must_use]
     pub fn exec_command(&self) -> Arc<dyn Tool> {
@@ -307,6 +322,16 @@ impl ApplyPatchCapability {
         Ok(Self {
             apply_patch: Arc::new(ApplyPatchTool::for_workspace(workspace)?),
         })
+    }
+
+    /// Installs the host's per-call patch policy.
+    #[must_use]
+    pub fn with_approval_resolver(
+        mut self,
+        resolver: Arc<crate::exec_command::ApprovalResolver>,
+    ) -> Self {
+        self.apply_patch = Arc::new((*self.apply_patch).clone().with_approval_resolver(resolver));
+        self
     }
 
     /// The patch entry.

@@ -44,6 +44,7 @@ use ra_exec::{
     command::{ExecLimits, ExecRequest},
     fs::{RootedFileSystem, Workspace},
     output::ExecOutputSummary,
+    sandbox::ExecEnvironment,
     session::{ExecError, ExecExecutionResult, ExecSessionState, ProcessManager},
 };
 use ra_macros::ToolInput;
@@ -136,6 +137,7 @@ impl ExecCommandLimits {
 }
 
 /// The `exec_command` tool.
+#[derive(Clone)]
 pub struct ExecCommandTool {
     origin: ToolOrigin,
     func_schema: FuncSchema,
@@ -144,7 +146,15 @@ pub struct ExecCommandTool {
     limits: ExecCommandLimits,
     root: Option<PathBuf>,
     rooted_filesystem: Option<Arc<RootedFileSystem>>,
+    environment_resolver: Option<Arc<EnvironmentResolver>>,
+    approval_resolver: Option<Arc<ApprovalResolver>>,
 }
+
+/// Host callback evaluated against the immutable context captured for a model step.
+pub type EnvironmentResolver = dyn Fn(&ToolContext<'_>) -> Result<ExecEnvironment> + Send + Sync;
+
+/// Host approval callback evaluated for each command.
+pub type ApprovalResolver = dyn Fn(&ToolContext<'_>) -> Result<bool> + Send + Sync;
 
 impl fmt::Debug for ExecCommandTool {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -168,6 +178,8 @@ impl ExecCommandTool {
             limits: ExecCommandLimits::new(),
             root: None,
             rooted_filesystem: None,
+            environment_resolver: None,
+            approval_resolver: None,
         })
     }
 
@@ -199,6 +211,8 @@ impl ExecCommandTool {
             limits: ExecCommandLimits::new(),
             root: Some(workspace.root().to_path_buf()),
             rooted_filesystem: Some(Arc::clone(workspace.filesystem())),
+            environment_resolver: None,
+            approval_resolver: None,
         })
     }
 
@@ -208,6 +222,19 @@ impl ExecCommandTool {
     #[must_use]
     pub fn with_manager(mut self, manager: Arc<ProcessManager>) -> Self {
         self.process_manager = manager;
+        self
+    }
+
+    /// Installs host callbacks for per-step execution and per-call approval policy.
+    #[must_use]
+    pub fn with_policy_resolvers(
+        mut self,
+        environment: Arc<EnvironmentResolver>,
+        approval: Arc<ApprovalResolver>,
+    ) -> Self {
+        self.environment_resolver = Some(environment);
+        self.approval_resolver = Some(approval);
+        self.options = self.options.with_approval(ToolApprovalPolicy::Dynamic);
         self
     }
 
@@ -342,6 +369,12 @@ impl Tool for ExecCommandTool {
             .map_err(|error| ExecCommandFailure::BadArguments(error).into_error())
     }
 
+    async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        self.approval_resolver
+            .as_ref()
+            .map_or(Ok(true), |resolve| resolve(context))
+    }
+
     async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
         let input = context
             .take_decoded_input::<ExecCommandInput>()?
@@ -364,10 +397,16 @@ impl Tool for ExecCommandTool {
         // waited and the effective figure is the one the request carries, not the one asked for.
         let yielded_after = request.limits().initial_yield_timeout();
 
+        let environment = self
+            .environment_resolver
+            .as_ref()
+            .map(|resolve| resolve(&context))
+            .transpose()?
+            .unwrap_or_else(|| self.process_manager.environment().clone());
         let emitter = context.event_emitter();
         let outcome = self
             .process_manager
-            .execute(request, emitter.as_ref())
+            .execute_with_environment(request, emitter.as_ref(), &environment)
             .await
             .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
 

@@ -20,6 +20,7 @@ test-api = []
 
 [dependencies]
 ra-core = { workspace = true }
+ra-runtime = { workspace = true }
 ra-session = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

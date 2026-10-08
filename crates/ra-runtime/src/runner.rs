@@ -89,6 +89,8 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, info_span, warn};
 
 mod grouping;
+mod live_settings;
+mod pending_input;
 pub mod result;
 #[doc(hidden)]
 pub mod session_persistence;
@@ -96,6 +98,8 @@ pub mod stream;
 
 pub use crate::turn::prepare::ActionSurfaceBudget;
 
+pub(crate) use live_settings::LiveRunSettings;
+pub use pending_input::PendingInput;
 pub use result::{
     AgentToolInvocation, ContinuationInput, RunErrorData, RunErrorHandler, RunErrorHandlerInput,
     RunErrorHandlerResult, RunOutcome, RunResult, TurnRecord,
@@ -146,6 +150,7 @@ pub const DEFAULT_MAX_TURNS: u32 = 32;
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct RunConfig {
+    app_context: Option<Arc<dyn Any + Send + Sync>>,
     budget: BudgetLimit,
     max_function_tool_concurrency: usize,
     model: Option<String>,
@@ -187,6 +192,7 @@ impl RunConfig {
     /// Creates the default configuration.
     pub fn new() -> Self {
         Self {
+            app_context: None,
             budget: BudgetLimit::new().with_max_turns(DEFAULT_MAX_TURNS),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             model: None,
@@ -217,6 +223,25 @@ impl RunConfig {
             session_settings: None,
             interrupt_message: true,
         }
+    }
+
+    /// Gives steps an immutable host context snapshot. Live settings can publish a different
+    /// snapshot for later steps while running tools retain the one they captured.
+    pub fn with_app_context(mut self, context: Arc<dyn Any + Send + Sync>) -> Self {
+        self.app_context = Some(context);
+        self
+    }
+
+    /// The host context captured by steps, when supplied by the host's configuration adapter.
+    #[must_use]
+    pub fn app_context(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.app_context.as_ref()
+    }
+
+    /// Replaces the generic permission evaluator, retaining its complete ordered rule table.
+    pub fn with_permission_engine(mut self, permission: PermissionEngine) -> Self {
+        self.permission = permission;
+        self
     }
 
     /// Sets how a run with a session merges the session's history with its new input.
@@ -355,6 +380,18 @@ impl RunConfig {
     pub fn with_model_settings(mut self, model_settings: ModelSettings) -> Self {
         self.model_settings = model_settings;
         self
+    }
+
+    /// The model this run overrides the agent's selector with, if it does.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The run-override layer of model settings.
+    #[must_use]
+    pub const fn model_settings(&self) -> &ModelSettings {
+        &self.model_settings
     }
 
     /// Sets provider-side tracing visibility.
@@ -764,6 +801,7 @@ impl std::fmt::Debug for RunConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RunConfig")
+            .field("has_app_context", &self.app_context.is_some())
             .field("budget", &self.budget)
             .field(
                 "max_function_tool_concurrency",
@@ -882,6 +920,8 @@ pub struct RunRequest {
     /// How many leading items of `input` the rollout already holds.
     recorded_input: usize,
     session: Option<Arc<dyn Session>>,
+    pending_input: Option<PendingInput>,
+    live_settings: Option<LiveRunSettings>,
 }
 
 impl RunRequest {
@@ -922,6 +962,8 @@ impl RunRequest {
             nested_spend: None,
             recorded_input: 0,
             session: None,
+            pending_input: None,
+            live_settings: None,
         }
     }
 
@@ -990,6 +1032,30 @@ impl RunRequest {
     /// continued from its checkpoint, whose input is recorded as the base it continues on.
     pub const fn with_recorded_input(mut self, count: usize) -> Self {
         self.recorded_input = count;
+        self
+    }
+
+    /// Delivers what the host pushes onto `pending_input` into the run while it runs: Codex's
+    /// steered input.
+    ///
+    /// Pushed messages are recorded as user input at the run's next model-call boundary — from
+    /// the second model call on when the request carries new input, so that input is answered
+    /// first, as Codex drains pending input before each sampling request after the first. A run
+    /// that would finish while input is pending carries on to answer it instead, ahead of any
+    /// stop hook, as Codex's turn follows up whenever input is pending. When the run does finish
+    /// it closes the queue in the same step, so input pushed later is refused rather than lost;
+    /// a run that stops any other way — for approval, on an error, cancelled — leaves the queue
+    /// open, and its owner closes it to collect what was not delivered.
+    ///
+    /// A recorded run persists its rollout once delivered input is recorded
+    /// ([`PersistContext::SteeredUserInput`]), as it does for delivered mail.
+    pub fn with_pending_input(mut self, pending_input: PendingInput) -> Self {
+        self.pending_input = Some(pending_input);
+        self
+    }
+
+    pub(crate) fn with_live_settings(mut self, settings: LiveRunSettings) -> Self {
+        self.live_settings = Some(settings);
         self
     }
 
@@ -1182,6 +1248,7 @@ impl Runner {
 /// It exists so the loop can live in its own function: the alternative is a dozen parameters, and
 /// the alternative to *that* is one function long enough that the budget checks and the settlement
 /// hand-off stop being visible together.
+#[derive(Clone, Copy)]
 struct TurnLoopContext<'a> {
     /// The model-input base for this segment.
     ///
@@ -1216,6 +1283,9 @@ struct TurnLoopContext<'a> {
     agent_mail: Option<&'a AgentHandle>,
     /// Whether the first model call of this segment already takes pending mail.
     deliver_mail_first: bool,
+    /// Input the host steers into the run, delivered at model-call boundaries as mail is.
+    pending_input: Option<&'a PendingInput>,
+    live_settings: Option<&'a LiveRunSettings>,
     /// What the run has spent, as the runs it starts and its token ceiling see it.
     spend: &'a RunSpend,
     /// Whether this segment continues a turn that stopped for approval rather than starting one.
@@ -1628,6 +1698,8 @@ async fn run_loop_inner(
         rollout,
         recorded_input: _,
         session,
+        pending_input,
+        live_settings,
     } = request;
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
@@ -1847,7 +1919,7 @@ async fn run_loop_inner(
         authoritative_history_complete,
         model_resolver: &model_resolver,
         run_id: &run_id,
-        app_context: app_context.as_ref(),
+        app_context: config.app_context.as_ref().or(app_context.as_ref()),
         tool_input: tool_input.as_ref(),
         services: &services,
         cancel: &cancel,
@@ -1864,6 +1936,8 @@ async fn run_loop_inner(
         sandbox,
         agent_mail: agent_handle.as_ref(),
         deliver_mail_first,
+        pending_input: pending_input.as_ref(),
+        live_settings: live_settings.as_ref(),
         spend,
         continues_turn,
         session: session.as_deref(),
@@ -3176,7 +3250,9 @@ async fn run_turns(
             .await?;
         }
         if let Some(outcome) = step
+            && !continue_for_pending_input(context, progress, &outcome)
             && !continue_from_stop_hook(context, agent, state, progress, &outcome).await?
+            && !continue_for_late_pending_input(context, progress, &outcome)
         {
             break outcome;
         }
@@ -3399,6 +3475,31 @@ async fn run_one_turn(
     turn_scope: &CancelScope,
     turn_span: &tracing::Span,
 ) -> Result<Option<RunOutcome>> {
+    // Capture once, before any work for this step. Updates published while its model or tools
+    // run are visible only to the next capture, as in Codex's step activation.
+    let captured = context
+        .live_settings
+        .and_then(LiveRunSettings::capture_step);
+    let permission = captured.as_ref().map(|config| {
+        config.permission().clone().with_rules(
+            config
+                .permission()
+                .rules()
+                .iter()
+                .cloned()
+                .chain(state.permission_rules().iter().cloned()),
+        )
+    });
+    let step_context = TurnLoopContext {
+        config: captured.as_ref().unwrap_or(context.config),
+        app_context: captured
+            .as_ref()
+            .and_then(RunConfig::app_context)
+            .or(context.app_context),
+        permission: permission.as_ref().unwrap_or(context.permission),
+        ..*context
+    };
+    let context = &step_context;
     let config = context.config;
     // Every turn, as the reference prepares: a transfer of control may have brought a sandbox agent
     // in, and a session that stopped since the last turn is started again.
@@ -3413,7 +3514,11 @@ async fn run_one_turn(
     // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
-    if deliver_agent_mail(context, state, progress, turn_scope)
+    // Both before the model call, so whatever arrived during the last one is answered by this
+    // one; either delivery is persisted once it is recorded.
+    let delivered_mail = deliver_agent_mail(context, state, progress, turn_scope);
+    let delivered_input = deliver_pending_input(context, state, progress, turn_scope);
+    if (delivered_mail || delivered_input)
         && let Some(rollout) = context.events.rollout
     {
         persist_rollout(rollout, context.run_id, PersistContext::SteeredUserInput).await;
@@ -3929,6 +4034,102 @@ fn deliver_agent_mail(
     }
     state.record_generated_items(items);
     true
+}
+
+/// Records the input the host steered into the run since its last model call, when it may be
+/// delivered now. Returns whether anything was recorded.
+///
+/// Delivered under the same rule as mail: not ahead of the input a request brought, which the
+/// first model call answers on its own, and not into a turn that is already cancelled.
+fn deliver_pending_input(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    progress: &TurnLoopProgress,
+    turn_scope: &CancelScope,
+) -> bool {
+    let Some(pending) = context.pending_input else {
+        return false;
+    };
+    if (progress.turns <= 1 && !context.deliver_mail_first) || turn_scope.is_cancelled() {
+        return false;
+    }
+    let messages = pending.take();
+    if messages.is_empty() {
+        return false;
+    }
+    // Numbered by the whole run's turn, like mail, so a resumed segment does not collide with what
+    // an earlier one recorded.
+    let turn = progress.reference_turn();
+    let items: Vec<RunItem> = messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            RunItem::new(
+                ItemId::new(format!("steered-input-{turn}-{index}")),
+                RunItemKind::Message(message),
+            )
+        })
+        .collect();
+    for item in &items {
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+    }
+    state.record_generated_items(items);
+    true
+}
+
+/// Whether a run that reached `outcome` carries on because input is pending: Codex's follow-up on
+/// pending input, which it decides before its stop hooks. Only a conclusion the run would deliver
+/// is overruled.
+fn continue_for_pending_input(
+    context: &TurnLoopContext<'_>,
+    progress: &mut TurnLoopProgress,
+    outcome: &RunOutcome,
+) -> bool {
+    let Some(pending) = context.pending_input else {
+        return false;
+    };
+    if pending.is_empty() || !concludes(outcome) {
+        return false;
+    }
+    continue_after_conclusion(progress);
+    true
+}
+
+/// Whether a run that is about to finish carries on because input arrived since
+/// [`continue_for_pending_input`] looked. Otherwise the queue is closed in the same step, so no
+/// input is accepted that the run will not read.
+fn continue_for_late_pending_input(
+    context: &TurnLoopContext<'_>,
+    progress: &mut TurnLoopProgress,
+    outcome: &RunOutcome,
+) -> bool {
+    let Some(pending) = context.pending_input else {
+        return false;
+    };
+    if !concludes(outcome) || pending.close_if_empty() {
+        return false;
+    }
+    continue_after_conclusion(progress);
+    true
+}
+
+/// Whether `outcome` is a conclusion the run would deliver, which pending input may overrule.
+fn concludes(outcome: &RunOutcome) -> bool {
+    outcome
+        .finish_reason()
+        .is_some_and(FinishReason::is_complete)
+}
+
+/// Marks the concluding turn as one that runs again, as a stop hook's continuation does, without
+/// a prompt of its own: the next turn delivers the pending input.
+fn continue_after_conclusion(progress: &mut TurnLoopProgress) {
+    let end = progress
+        .turn_records
+        .last()
+        .map(|record| record.item_range().end);
+    if let (Some(record), Some(end)) = (progress.turn_records.last_mut(), end) {
+        record.continue_after_hook(end);
+    }
 }
 
 /// Writes the agent tree's budget reminder into history, when the agent is owed one.

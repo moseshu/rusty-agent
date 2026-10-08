@@ -126,7 +126,10 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-sandbox", &["ra-core"]),
     ("ra-session", &["ra-core"]),
     ("ra-mcp", &["ra-core"]),
-    ("ra-protocol", &["ra-core", "ra-session"]),
+    // `ra-runtime` for the live thread whose turns the app server starts, steers and interrupts, as
+    // Codex's app-server drives `codex-core`'s `CodexThread`. The server still runs no loop of its
+    // own: the thread does, and the host builds it.
+    ("ra-protocol", &["ra-core", "ra-runtime", "ra-session"]),
     (
         "ra-eval",
         &["ra-core", "ra-runtime", "ra-model", "ra-protocol"],
@@ -164,6 +167,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-mcp",
             "ra-patch",
             "ra-tools",
+            "ra-protocol",
         ],
     ),
     (

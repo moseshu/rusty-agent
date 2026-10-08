@@ -43,11 +43,13 @@ struct ApplyPatchInput {
 }
 
 /// An `apply_patch` tool confined to one workspace capability.
+#[derive(Clone)]
 pub struct ApplyPatchTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     options: ToolOptions,
     filesystem: Arc<RootedFileSystem>,
+    approval_resolver: Option<Arc<crate::exec_command::ApprovalResolver>>,
 }
 
 impl fmt::Debug for ApplyPatchTool {
@@ -87,12 +89,24 @@ impl ApplyPatchTool {
         )
     }
 
+    /// Installs a host policy callback. It also validates the policy immediately before writing.
+    #[must_use]
+    pub fn with_approval_resolver(
+        mut self,
+        resolver: Arc<crate::exec_command::ApprovalResolver>,
+    ) -> Self {
+        self.approval_resolver = Some(resolver);
+        self.options = self.options.with_approval(ToolApprovalPolicy::Dynamic);
+        self
+    }
+
     fn with_options(filesystem: Arc<RootedFileSystem>, options: ToolOptions) -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ApplyPatchInput::tool_schema(TOOL_NAME)?,
             options,
             filesystem,
+            approval_resolver: None,
         })
     }
 }
@@ -113,7 +127,16 @@ impl Tool for ApplyPatchTool {
         &self.schema
     }
 
+    async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        self.approval_resolver
+            .as_ref()
+            .map_or(Ok(true), |resolve| resolve(context))
+    }
+
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        if let Some(resolve) = &self.approval_resolver {
+            resolve(&context)?;
+        }
         let patch = match context.arguments() {
             // The current provider-neutral call item carries JSON. Accepting a bare JSON string
             // keeps this handler compatible with the custom/freeform wire item once that item is

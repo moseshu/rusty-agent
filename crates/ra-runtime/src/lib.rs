@@ -29,6 +29,7 @@ pub(crate) mod memory;
 pub mod permission;
 pub mod runner;
 pub mod sandbox;
+pub mod thread;
 pub mod tool;
 #[doc(hidden)]
 pub mod turn;

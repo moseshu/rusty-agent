@@ -6,6 +6,11 @@
 //! has succeeded, and a method or notification marked experimental is withheld from a connection
 //! that did not opt into the experimental API.
 //!
+//! A client starts a thread's turns with `turn/start`, adds input to the running one with
+//! `turn/steer` and stops it with `turn/interrupt`; `thread/settings/update` changes the settings
+//! of the turns the thread starts next. The thread's connections are sent `turn/started` and
+//! `turn/completed` as its turns start and end.
+//!
 //! While a turn runs, the server asks the client in turn with a [`ServerRequest`]: to approve a
 //! command, file changes or extra permissions, to call a tool the client provides, or to put
 //! questions to the user. The client answers with a response carrying the method's answer, and the
@@ -20,6 +25,8 @@
 mod item;
 mod permissions;
 mod server_request;
+mod settings;
+mod turn;
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +53,19 @@ pub use self::{
         SERVER_REQUEST_RESOLVED_METHOD, ServerRequest, ServerRequestPayload,
         ServerRequestResolvedNotification,
     },
+    settings::{
+        ApprovalsReviewer, AskForApproval, NetworkAccess, ReasoningSummary, SandboxPolicy,
+        THREAD_SETTINGS_UPDATED_METHOD, ThreadPolicyOverrides, ThreadSettingsUpdatedNotification,
+        TurnSettingsUpdateParams, TurnSettingsUpdateResponse, TurnSettingsUpdateStatus,
+    },
+    turn::{
+        ByteRange, ERROR_METHOD, ErrorNotification, ImageDetail, ImageReference,
+        TURN_COMPLETED_METHOD, TURN_STARTED_METHOD, TextElement, ThreadSettingsUpdateParams,
+        ThreadSettingsUpdateResponse, Turn, TurnCompletedNotification, TurnError,
+        TurnInterruptParams, TurnInterruptResponse, TurnItemsView, TurnStartParams,
+        TurnStartResponse, TurnStartedNotification, TurnStatus, TurnSteerParams, TurnSteerResponse,
+        UserInput,
+    },
 };
 use crate::{
     absolute_path,
@@ -65,6 +85,9 @@ pub fn experimental_required_message(reason: &str) -> String {
 /// It is read from a [`JsonRpcRequest`] by its method, and its parameters must fit that method's.
 /// Codex's server has one variant per method; the methods of later protocol work are added here
 /// as they are ported.
+// A request is read once and handed to its method; boxing the larger parameters would only add an
+// allocation and change how each variant is built and matched.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
@@ -77,6 +100,51 @@ pub enum ClientRequest {
         request_id: RequestId,
         /// Who the client is and what it can take.
         params: InitializeParams,
+    },
+    /// Changes the settings of the turns a thread starts next. Experimental, as in Codex.
+    #[serde(rename = "thread/settings/update")]
+    ThreadSettingsUpdate {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and its new settings.
+        params: ThreadSettingsUpdateParams,
+    },
+    /// Publishes settings for subsequent steps of one running turn.
+    #[serde(rename = "turn/settings/update")]
+    TurnSettingsUpdate {
+        /// Correlates the response with this request.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Settings published for subsequent steps of the targeted turn.
+        params: TurnSettingsUpdateParams,
+    },
+    /// Starts a turn of a thread, or steers the one running.
+    #[serde(rename = "turn/start")]
+    TurnStart {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread, the input and the settings it carries.
+        params: TurnStartParams,
+    },
+    /// Adds input to the running turn of a thread.
+    #[serde(rename = "turn/steer")]
+    TurnSteer {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread, the turn and the input.
+        params: TurnSteerParams,
+    },
+    /// Stops the running turn of a thread; answered once it has ended.
+    #[serde(rename = "turn/interrupt")]
+    TurnInterrupt {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and the turn.
+        params: TurnInterruptParams,
     },
     /// Echoes its value back. It exists to exercise the experimental gate, as Codex's does.
     #[serde(rename = "mock/experimentalMethod")]
@@ -95,6 +163,11 @@ impl ClientRequest {
     pub const fn id(&self) -> &RequestId {
         match self {
             Self::Initialize { request_id, .. }
+            | Self::ThreadSettingsUpdate { request_id, .. }
+            | Self::TurnSettingsUpdate { request_id, .. }
+            | Self::TurnStart { request_id, .. }
+            | Self::TurnSteer { request_id, .. }
+            | Self::TurnInterrupt { request_id, .. }
             | Self::MockExperimentalMethod { request_id, .. } => request_id,
         }
     }
@@ -104,19 +177,29 @@ impl ClientRequest {
     pub const fn method_name(&self) -> &'static str {
         match self {
             Self::Initialize { .. } => "initialize",
+            Self::ThreadSettingsUpdate { .. } => "thread/settings/update",
+            Self::TurnSettingsUpdate { .. } => "turn/settings/update",
+            Self::TurnStart { .. } => "turn/start",
+            Self::TurnSteer { .. } => "turn/steer",
+            Self::TurnInterrupt { .. } => "turn/interrupt",
             Self::MockExperimentalMethod { .. } => "mock/experimentalMethod",
         }
     }
 
     /// Why the request needs the experimental API, or `None` if it does not: Codex's
-    /// `experimental_reason`, the method's name for a method that is experimental as a whole.
+    /// `experimental_reason` — the method's name for a method that is experimental as a whole,
+    /// and otherwise the reason of the first experimental field its parameters carry.
     ///
-    /// Codex derives it from attributes on the methods and on the fields of their parameters; no
-    /// method ported so far has an experimental field.
+    /// Codex derives it from attributes on the methods and on the fields of their parameters;
+    /// here each method's parameters say it.
     #[must_use]
-    pub const fn experimental_reason(&self) -> Option<&'static str> {
+    pub fn experimental_reason(&self) -> Option<&'static str> {
         match self {
-            Self::Initialize { .. } => None,
+            Self::Initialize { .. } | Self::TurnInterrupt { .. } => None,
+            Self::ThreadSettingsUpdate { .. } => Some("thread/settings/update"),
+            Self::TurnSettingsUpdate { .. } => Some("turn/settings/update"),
+            Self::TurnStart { params, .. } => params.experimental_reason(),
+            Self::TurnSteer { params, .. } => params.experimental_reason(),
             Self::MockExperimentalMethod { .. } => Some("mock/experimentalMethod"),
         }
     }

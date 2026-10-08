@@ -36,7 +36,21 @@ async fn host_backed_agent_advertises_the_editing_entry() {
         .find(|tool| tool.origin().name() == "apply_patch")
         .expect("the host-backed agent advertises the editing entry");
 
-    assert_eq!(editing.options().approval(), ToolApprovalPolicy::Always);
+    assert_eq!(editing.options().approval(), ToolApprovalPolicy::Dynamic);
+    let run = RunContext::new(RunId::new("default-policy"), &agent);
+    let call_id = CallId::new("default-policy-call");
+    let arguments = json!({"patch": "*** Begin Patch\n*** End Patch\n"});
+    assert!(
+        editing
+            .needs_approval(&ToolContext::new(
+                &run,
+                editing.as_ref(),
+                &call_id,
+                &arguments
+            ))
+            .await
+            .expect("default approval")
+    );
 }
 
 /// The capability the host hands the tool is the workspace it was opened on, not the process root.

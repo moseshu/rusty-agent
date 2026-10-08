@@ -196,6 +196,27 @@ impl OutgoingMessageSender {
             .await;
     }
 
+    /// Answers the request `request_id` with `response`, or with an internal error if it cannot be
+    /// written as JSON, as Codex does.
+    pub(crate) async fn send_serialized_response(
+        &self,
+        request_id: ConnectionRequestId,
+        response: impl serde::Serialize,
+    ) {
+        match serde_json::to_value(response) {
+            Ok(result) => self.send_response(request_id, result).await,
+            Err(error) => {
+                self.send_error(
+                    request_id,
+                    JsonRpcErrorObject::internal_error(format!(
+                        "failed to serialize response: {error}"
+                    )),
+                )
+                .await;
+            }
+        }
+    }
+
     /// Answers the request `request_id` with `error`.
     pub(crate) async fn send_error(
         &self,
@@ -440,6 +461,18 @@ impl ThreadScopedOutgoingMessageSender {
         }
         self.outgoing
             .send_server_notification_to_connections(&self.connection_ids, notification)
+            .await;
+    }
+
+    /// Answers the client's request `request_id` with `response`: Codex's `send_response`.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    pub(crate) async fn send_response(
+        &self,
+        request_id: ConnectionRequestId,
+        response: impl serde::Serialize,
+    ) {
+        self.outgoing
+            .send_serialized_response(request_id, response)
             .await;
     }
 

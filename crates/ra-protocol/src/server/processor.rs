@@ -29,6 +29,8 @@ use super::{
         ClientRequest, InitializeParams, InitializeResponse, MockExperimentalMethodResponse,
         experimental_required_message,
     },
+    thread_manager::ThreadManager,
+    turn_processor::{TurnMethodResult, TurnRequestProcessor},
 };
 use crate::{
     frame::{JsonRpcErrorObject, JsonRpcRequest},
@@ -96,18 +98,34 @@ impl ConnectionSessionState {
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     codex_home: PathBuf,
+    // Read by the thread methods that load threads, which are not ported yet; the tests load them
+    // through `test_api`.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    thread_manager: Arc<ThreadManager>,
+    turn_processor: TurnRequestProcessor,
 }
 
 impl MessageProcessor {
-    pub(crate) const fn new(outgoing: Arc<OutgoingMessageSender>, codex_home: PathBuf) -> Self {
+    pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, codex_home: PathBuf) -> Self {
+        let thread_manager = Arc::new(ThreadManager::default());
         Self {
+            turn_processor: TurnRequestProcessor::new(
+                Arc::clone(&thread_manager),
+                Arc::clone(&outgoing),
+            ),
             outgoing,
             codex_home,
+            thread_manager,
         }
     }
 
     pub(crate) fn outgoing(&self) -> &Arc<OutgoingMessageSender> {
         &self.outgoing
+    }
+
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    pub(crate) fn thread_manager(&self) -> &Arc<ThreadManager> {
+        &self.thread_manager
     }
 
     /// Handles a request from `connection_id`, answering it with an error if it fails: Codex's
@@ -242,6 +260,29 @@ impl MessageProcessor {
                 // `handle_client_request` answers `initialize` before anything is dispatched.
                 unreachable!("initialize is handled before initialized request dispatch")
             }
+            ClientRequest::ThreadSettingsUpdate { params, .. } => {
+                let result = self.turn_processor.thread_settings_update(params).await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::TurnSettingsUpdate { params, .. } => {
+                let result = self.turn_processor.turn_settings_update(params).await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::TurnStart { params, .. } => {
+                let result = self.turn_processor.turn_start(params).await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::TurnSteer { params, .. } => {
+                let result = self.turn_processor.turn_steer(params);
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::TurnInterrupt { params, .. } => {
+                let result = self
+                    .turn_processor
+                    .turn_interrupt(&request_id, params)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
             ClientRequest::MockExperimentalMethod { params, .. } => {
                 let response = MockExperimentalMethodResponse::new(params.into_value());
                 self.send_response(request_id, response).await;
@@ -249,22 +290,21 @@ impl MessageProcessor {
         }
     }
 
-    async fn send_response(&self, request_id: ConnectionRequestId, response: impl Serialize) {
-        match serde_json::to_value(response) {
-            Ok(result) => self.outgoing.send_response(request_id, result).await,
-            // The ported responses are plain records, so this does not happen; Codex answers the
-            // same failure with an internal error.
-            Err(error) => {
-                self.outgoing
-                    .send_error(
-                        request_id,
-                        JsonRpcErrorObject::internal_error(format!(
-                            "failed to serialize response: {error}"
-                        )),
-                    )
-                    .await;
-            }
+    /// Sends a turn method's answer, if it has one yet.
+    async fn finish_turn_method(&self, request_id: ConnectionRequestId, result: TurnMethodResult) {
+        match result {
+            Ok(Some(result)) => self.outgoing.send_response(request_id, result).await,
+            Ok(None) => {}
+            Err(error) => self.outgoing.send_error(request_id, error).await,
         }
+    }
+
+    async fn send_response(&self, request_id: ConnectionRequestId, response: impl Serialize) {
+        // The ported responses are plain records, so writing one does not fail; Codex answers the
+        // same failure with an internal error.
+        self.outgoing
+            .send_serialized_response(request_id, response)
+            .await;
     }
 }
 

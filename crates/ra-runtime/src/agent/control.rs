@@ -1471,7 +1471,10 @@ async fn run_once(
 
 /// The history after a run that returned no result: its input and the records of the turns it
 /// settled, normalized so any call left without an output is dropped from the next request.
-fn partial_history(mut input: Vec<ModelInputItem>, produced: &[RunItem]) -> Vec<ModelInputItem> {
+pub(crate) fn partial_history(
+    mut input: Vec<ModelInputItem>,
+    produced: &[RunItem],
+) -> Vec<ModelInputItem> {
     input.extend(produced.iter().filter_map(RunItem::to_model_input));
     InputItemNormalizer::new()
         .normalize_model_items(&input)

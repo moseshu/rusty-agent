@@ -488,8 +488,9 @@ async fn methods_before_initialize_are_not_initialized() {
 async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
     let server = Server::start();
     let mut connection = server.open(1).await;
-    let unknown = "Invalid request: unknown variant `config/read`, expected `initialize` or \
-                   `mock/experimentalMethod`";
+    let unknown = "Invalid request: unknown variant `config/read`, expected one of \
+                   `initialize`, `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \
+                   `turn/interrupt`, `mock/experimentalMethod`";
 
     let answer = server.call(&mut connection, 1, "config/read", None).await;
     assert_eq!(answer, error(1, unknown));
