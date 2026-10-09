@@ -26,6 +26,7 @@ pub(crate) mod final_answer;
 pub mod host;
 pub mod profile;
 pub mod prompt;
+pub mod thread_items;
 
 pub use agent::{
     HOST_BACKED_PROFILE, HostBackedSurface, InstalledCapability, build_agent,

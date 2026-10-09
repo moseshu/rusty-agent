@@ -314,15 +314,24 @@ struct Connection {
 }
 
 impl Connection {
+    /// The next message, passing over the item notifications a turn sends as it runs: the cases
+    /// here are about turns, and `items.rs` checks the items.
     async fn next(&mut self) -> Value {
-        if let Some(message) = self.passed.pop_front() {
-            return message;
+        loop {
+            let message = match self.passed.pop_front() {
+                Some(message) => message,
+                None => {
+                    let queued = timeout(PATIENCE, self.written.recv())
+                        .await
+                        .expect("the server writes a message")
+                        .expect("the server keeps the write queue");
+                    serde_json::to_value(queued.message()).unwrap()
+                }
+            };
+            if !is_item_notification(&message) {
+                return message;
+            }
         }
-        let queued = timeout(PATIENCE, self.written.recv())
-            .await
-            .expect("the server writes a message")
-            .expect("the server keeps the write queue");
-        serde_json::to_value(queued.message()).unwrap()
     }
 
     /// The first message `matches` accepts; the others are kept, in order, for later reads.
@@ -364,6 +373,14 @@ impl Connection {
             .await["params"]
             .clone()
     }
+}
+
+fn is_item_notification(message: &Value) -> bool {
+    message.get("id").is_none()
+        && matches!(
+            message["method"].as_str(),
+            Some("item/started" | "item/completed")
+        )
 }
 
 fn text_turn(text: &str) -> TurnStartParams {

@@ -6,11 +6,12 @@
 //! use a synchronous mutex because test requesters register before the server runs; no lock is
 //! held across an await.
 //!
-//! Each thread's [`ThreadState`] follows its turns as its listener reports them, and holds the
-//! interrupts waiting for the running turn to end. Each thread also publishes whether it has
-//! subscribers and whether a turn of it is active, which its listener watches to unload it once it
-//! has had neither for a while; the server counts the threads with an active turn to know when a
-//! drain may finish. Live-connection admission is added with the thread methods.
+//! Each thread's [`ThreadState`] follows its turns as its listener reports them — the turn running
+//! and its items, rebuilt as Codex rebuilds them — and holds the interrupts waiting for the running
+//! turn to end. Each thread also publishes whether it has subscribers and whether a turn of it is
+//! active, which its listener watches to unload it once it has had neither for a while; the server
+//! counts the threads with an active turn to know when a drain may finish. Live-connection
+//! admission is added with the thread methods.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -22,22 +23,26 @@ use ra_runtime::thread::ThreadEvent;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::{outgoing::ConnectionRequestId, protocol::TurnError};
+use super::{
+    outgoing::ConnectionRequestId,
+    protocol::{MessagePhase, ThreadItem, Turn, TurnError, TurnStatus},
+    thread_history::{ItemChange, ThreadHistoryBuilder, TurnEnding},
+    tool_items::ThreadToolItems,
+};
 use crate::transport::ConnectionId;
 
 /// What a thread's running turn has accumulated: Codex's `TurnSummary`, without the command
-/// executions and the last final answer it keeps for item notifications.
+/// executions it keeps to tell an approval's early start from its tool's own.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
     pub(crate) last_error: Option<TurnError>,
+    /// The turn's last answer so far, which `turn/completed` carries.
+    pub(crate) last_agent_message: Option<ThreadItem>,
 }
 
 /// What the server keeps about one thread: Codex's `ThreadState`, for its turns.
-///
-/// Codex derives the running turn from the history it builds out of the thread's events; here the
-/// turn events alone say it.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct ThreadState {
@@ -51,6 +56,8 @@ pub(crate) struct ThreadState {
     listener_cancel: Option<CancellationToken>,
     /// Last effective settings sent, as Codex deduplicates the thread snapshot.
     pub(crate) last_settings: Option<serde_json::Value>,
+    /// The turn running, rebuilt from the thread's events: Codex's `current_turn_history`.
+    current_turn_history: ThreadHistoryBuilder,
 }
 
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
@@ -75,10 +82,24 @@ impl ThreadState {
         if let Some(cancel) = self.listener_cancel.take() {
             cancel.cancel();
         }
+        self.current_turn_history.reset();
     }
 
-    /// Follows the thread's turns: Codex's `track_current_turn_event`.
-    pub(crate) fn track_current_turn_event(&mut self, event: &ThreadEvent) {
+    /// The turn running, with all its items, as the listener has heard of it: Codex's
+    /// `active_turn_snapshot`.
+    pub(crate) fn active_turn_snapshot(&self) -> Option<Turn> {
+        self.active_turn_id.as_ref()?;
+        self.current_turn_history.active_turn_snapshot()
+    }
+
+    /// Follows the thread's turns: Codex's `track_current_turn_event`. Returns what a record the
+    /// event carries did to the turn's items, for the listener to report.
+    pub(crate) fn track_current_turn_event(
+        &mut self,
+        event: &ThreadEvent,
+        tool_items: Option<&dyn ThreadToolItems>,
+    ) -> Vec<ItemChange> {
+        let mut changes = Vec::new();
         match event {
             ThreadEvent::TurnStarted {
                 turn_id,
@@ -86,13 +107,66 @@ impl ThreadState {
             } => {
                 self.turn_summary.started_at = Some(*started_at);
                 self.active_turn_id = Some(turn_id.clone());
+                self.current_turn_history
+                    .turn_started(turn_id, Some(*started_at));
             }
-            ThreadEvent::TurnComplete { turn_id, .. }
-            | ThreadEvent::TurnAborted { turn_id, .. } => {
+            ThreadEvent::Item { turn_id, item } => {
+                changes = self
+                    .current_turn_history
+                    .item(Some(turn_id), item, tool_items);
+                for change in &changes {
+                    if let ItemChange::Completed(item) = change
+                        && is_answer(item)
+                    {
+                        self.turn_summary.last_agent_message = Some(item.clone());
+                    }
+                }
+            }
+            ThreadEvent::HostEvent(event) => {
+                changes = self.current_turn_history.host_event(event, tool_items);
+                self.current_turn_history.retain_background_turns();
+            }
+            ThreadEvent::Error { turn_id, message } => {
+                self.current_turn_history
+                    .error(turn_id, TurnError::new(message.clone()));
+            }
+            ThreadEvent::TurnComplete {
+                turn_id,
+                completed_at,
+                duration_ms,
+                ..
+            } => {
+                self.current_turn_history.turn_ended(
+                    turn_id,
+                    &TurnEnding {
+                        status: TurnStatus::Completed,
+                        error: None,
+                        completed_at: Some(*completed_at),
+                        duration_ms: Some(*duration_ms),
+                    },
+                );
+                self.end_turn(turn_id);
+            }
+            ThreadEvent::TurnAborted {
+                turn_id,
+                completed_at,
+                duration_ms,
+                ..
+            } => {
+                self.current_turn_history.turn_ended(
+                    turn_id,
+                    &TurnEnding {
+                        status: TurnStatus::Interrupted,
+                        error: None,
+                        completed_at: Some(*completed_at),
+                        duration_ms: Some(*duration_ms),
+                    },
+                );
                 self.end_turn(turn_id);
             }
             _ => {}
         }
+        changes
     }
 
     fn end_turn(&mut self, turn_id: &str) {
@@ -100,7 +174,20 @@ impl ThreadState {
         if self.active_turn_id.as_deref() == Some(turn_id) {
             self.active_turn_id = None;
         }
+        if !self.current_turn_history.has_active_turn() {
+            self.current_turn_history.retain_background_turns();
+        }
     }
+}
+
+/// Whether `item` is an answer `turn/completed` carries: an agent message with text that is not
+/// commentary, as Codex's `track_current_turn_event` picks it.
+fn is_answer(item: &ThreadItem) -> bool {
+    matches!(
+        item,
+        ThreadItem::AgentMessage { text, phase, .. }
+            if matches!(phase, Some(MessagePhase::FinalAnswer) | None) && !text.trim().is_empty()
+    )
 }
 
 /// What the manager keeps of one thread: Codex's `ThreadEntry`.
@@ -168,7 +255,14 @@ impl ThreadStateManager {
         &self,
         thread_id: &SessionId,
     ) -> Arc<tokio::sync::Mutex<ThreadState>> {
-        Arc::clone(&self.lock().threads.entry(thread_id.clone()).or_default().state)
+        Arc::clone(
+            &self
+                .lock()
+                .threads
+                .entry(thread_id.clone())
+                .or_default()
+                .state,
+        )
     }
 
     /// Adds a subscription without replacing the thread's other subscriptions.
@@ -266,7 +360,10 @@ impl ThreadStateManager {
 
     /// Whether a turn of the thread is active, as it changes. `None` once the thread's state has
     /// been removed.
-    pub(crate) fn subscribe_to_active(&self, thread_id: &SessionId) -> Option<watch::Receiver<bool>> {
+    pub(crate) fn subscribe_to_active(
+        &self,
+        thread_id: &SessionId,
+    ) -> Option<watch::Receiver<bool>> {
         self.lock()
             .threads
             .get(thread_id)

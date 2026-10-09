@@ -11,6 +11,11 @@
 //! of the turns the thread starts next. The thread's connections are sent `turn/started` and
 //! `turn/completed` as its turns start and end.
 //!
+//! As a turn runs, the thread's connections are sent `item/started` and `item/completed` for what
+//! it is made of — the user's input, the agent's messages and reasoning, the commands it runs —
+//! and `turn/completed` carries the turn's answer. A client that comes back reads what it missed
+//! with `thread/turns/list`, rebuilt from the thread's rollout.
+//!
 //! A connection leaves a thread with `thread/unsubscribe`; every connection is sent
 //! `thread/closed` once a thread is unloaded. `thread/backgroundTerminals/list`, `terminate` and
 //! `clean` list and stop the commands a thread's tools left running.
@@ -31,6 +36,7 @@ mod permissions;
 mod server_request;
 mod settings;
 mod thread;
+mod thread_item;
 mod turn;
 
 use std::path::{Path, PathBuf};
@@ -64,11 +70,19 @@ pub use self::{
         TurnSettingsUpdateParams, TurnSettingsUpdateResponse, TurnSettingsUpdateStatus,
     },
     thread::{
-        THREAD_CLOSED_METHOD, ThreadBackgroundTerminal, ThreadBackgroundTerminalsCleanParams,
-        ThreadBackgroundTerminalsCleanResponse, ThreadBackgroundTerminalsListParams,
-        ThreadBackgroundTerminalsListResponse, ThreadBackgroundTerminalsTerminateParams,
-        ThreadBackgroundTerminalsTerminateResponse, ThreadClosedNotification,
-        ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+        SortDirection, THREAD_CLOSED_METHOD, ThreadBackgroundTerminal,
+        ThreadBackgroundTerminalsCleanParams, ThreadBackgroundTerminalsCleanResponse,
+        ThreadBackgroundTerminalsListParams, ThreadBackgroundTerminalsListResponse,
+        ThreadBackgroundTerminalsTerminateParams, ThreadBackgroundTerminalsTerminateResponse,
+        ThreadClosedNotification, ThreadItemEntry, ThreadItemsListAnchor, ThreadItemsListCursor,
+        ThreadItemsListParams, ThreadItemsListResponse, ThreadTurnsListParams,
+        ThreadTurnsListResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+        ThreadUnsubscribeStatus,
+    },
+    thread_item::{
+        CommandExecutionItem, CommandExecutionSource, CommandExecutionStatus, FileUpdateChange,
+        ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD, ItemCompletedNotification,
+        ItemStartedNotification, MessagePhase, PatchApplyStatus, PatchChangeKind, ThreadItem,
     },
     turn::{
         ByteRange, ERROR_METHOD, ErrorNotification, ImageDetail, ImageReference,
@@ -121,6 +135,24 @@ pub enum ClientRequest {
         request_id: RequestId,
         /// The thread.
         params: ThreadUnsubscribeParams,
+    },
+    /// Reads a page of a thread's turns.
+    #[serde(rename = "thread/turns/list")]
+    ThreadTurnsList {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and the page.
+        params: ThreadTurnsListParams,
+    },
+    /// Reads a page of a thread's items.
+    #[serde(rename = "thread/items/list")]
+    ThreadItemsList {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and the page.
+        params: ThreadItemsListParams,
     },
     /// Stops every command a thread's tools left running. Experimental, as in Codex.
     #[serde(rename = "thread/backgroundTerminals/clean")]
@@ -212,6 +244,8 @@ impl ClientRequest {
         match self {
             Self::Initialize { request_id, .. }
             | Self::ThreadUnsubscribe { request_id, .. }
+            | Self::ThreadTurnsList { request_id, .. }
+            | Self::ThreadItemsList { request_id, .. }
             | Self::ThreadBackgroundTerminalsClean { request_id, .. }
             | Self::ThreadBackgroundTerminalsList { request_id, .. }
             | Self::ThreadBackgroundTerminalsTerminate { request_id, .. }
@@ -230,6 +264,8 @@ impl ClientRequest {
         match self {
             Self::Initialize { .. } => "initialize",
             Self::ThreadUnsubscribe { .. } => "thread/unsubscribe",
+            Self::ThreadTurnsList { .. } => "thread/turns/list",
+            Self::ThreadItemsList { .. } => "thread/items/list",
             Self::ThreadBackgroundTerminalsClean { .. } => "thread/backgroundTerminals/clean",
             Self::ThreadBackgroundTerminalsList { .. } => "thread/backgroundTerminals/list",
             Self::ThreadBackgroundTerminalsTerminate { .. } => {
@@ -253,9 +289,11 @@ impl ClientRequest {
     #[must_use]
     pub fn experimental_reason(&self) -> Option<&'static str> {
         match self {
-            Self::Initialize { .. } | Self::ThreadUnsubscribe { .. } | Self::TurnInterrupt { .. } => {
-                None
-            }
+            Self::Initialize { .. }
+            | Self::ThreadUnsubscribe { .. }
+            | Self::ThreadTurnsList { .. }
+            | Self::ThreadItemsList { .. }
+            | Self::TurnInterrupt { .. } => None,
             Self::ThreadBackgroundTerminalsClean { .. } => Some("thread/backgroundTerminals/clean"),
             Self::ThreadBackgroundTerminalsList { .. } => Some("thread/backgroundTerminals/list"),
             Self::ThreadBackgroundTerminalsTerminate { .. } => {
@@ -275,7 +313,11 @@ impl ClientRequest {
     /// Codex's `serialization_scope`, for the thread scope its methods declare.
     pub(crate) fn serialization_thread(&self) -> Option<&str> {
         match self {
-            Self::Initialize { .. } | Self::MockExperimentalMethod { .. } => None,
+            // Codex reads history alongside anything, as it reads append-only rollouts.
+            Self::Initialize { .. }
+            | Self::ThreadTurnsList { .. }
+            | Self::ThreadItemsList { .. }
+            | Self::MockExperimentalMethod { .. } => None,
             Self::ThreadUnsubscribe { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsClean { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsList { params, .. } => Some(params.thread_id()),

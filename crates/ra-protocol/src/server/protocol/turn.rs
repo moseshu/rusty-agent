@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use super::{AskForApproval, ReasoningSummary, ThreadPolicyOverrides};
+use super::{AskForApproval, ReasoningSummary, ThreadItem, ThreadPolicyOverrides};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +48,37 @@ pub enum TurnItemsView {
     /// All of them.
     #[default]
     Full,
+}
+
+impl TurnItemsView {
+    /// The items of `items` this view includes, in order: Codex's `project_items`. A summary is
+    /// the first user message and the last agent message, or whichever of them there is.
+    #[must_use]
+    pub fn project_items(self, items: &[ThreadItem]) -> Vec<ThreadItem> {
+        match self {
+            Self::NotLoaded => Vec::new(),
+            Self::Full => items.to_vec(),
+            Self::Summary => {
+                let first_user_message = items
+                    .iter()
+                    .find(|item| matches!(item, ThreadItem::UserMessage { .. }));
+                let final_agent_message = items
+                    .iter()
+                    .rev()
+                    .find(|item| matches!(item, ThreadItem::AgentMessage { .. }));
+                match (first_user_message, final_agent_message) {
+                    (Some(user_message), Some(agent_message))
+                        if user_message.id() != agent_message.id() =>
+                    {
+                        vec![user_message.clone(), agent_message.clone()]
+                    }
+                    (Some(user_message), _) => vec![user_message.clone()],
+                    (None, Some(agent_message)) => vec![agent_message.clone()],
+                    (None, None) => Vec::new(),
+                }
+            }
+        }
+    }
 }
 
 /// Why a turn failed: Codex's `TurnError`.
@@ -104,15 +135,12 @@ impl TurnError {
 }
 
 /// A turn of a thread: Codex's `Turn`.
-///
-/// Its items are Codex's `ThreadItem`s, which arrive with the item notifications; until then they
-/// are carried as JSON and the server sends none.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Turn {
     id: String,
-    items: Vec<Value>,
+    items: Vec<ThreadItem>,
     #[serde(default)]
     items_view: TurnItemsView,
     status: TurnStatus,
@@ -136,6 +164,25 @@ impl Turn {
             completed_at: None,
             duration_ms: None,
         }
+    }
+
+    /// Includes `items`, which are as much of the turn's items as `items_view` says.
+    #[must_use]
+    pub fn with_items(mut self, items: Vec<ThreadItem>, items_view: TurnItemsView) -> Self {
+        self.items = items;
+        self.items_view = items_view;
+        self
+    }
+
+    /// Keeps only as much of its items as `items_view` includes: Codex's
+    /// `apply_thread_turns_items_view` for one turn.
+    #[must_use]
+    pub fn in_items_view(mut self, items_view: TurnItemsView) -> Self {
+        if items_view != TurnItemsView::Full && self.items_view != items_view {
+            self.items = items_view.project_items(&self.items);
+        }
+        self.items_view = items_view;
+        self
     }
 
     /// Records why it failed or was aborted.
@@ -166,9 +213,13 @@ impl Turn {
         &self.id
     }
 
-    /// The items included, as sent.
+    pub(crate) const fn set_status(&mut self, status: TurnStatus) {
+        self.status = status;
+    }
+
+    /// The items included.
     #[must_use]
-    pub fn items(&self) -> &[Value] {
+    pub fn items(&self) -> &[ThreadItem] {
         &self.items
     }
 

@@ -30,7 +30,7 @@ use std::{
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, SessionErrorKind},
-    event::{EventTimestamp, FileEvent, HostEventBody},
+    event::{EventTimestamp, FileEvent, HostEventBody, exec::ExecEvent},
     session::{
         SessionId,
         rollout::{PersistContext, RolloutItem, RolloutRecorder},
@@ -51,10 +51,28 @@ use super::{
 /// events, only those a later reader needs to know happened are: file changes (Codex keeps
 /// `PatchApplyEnd`) and multi-agent activity (Codex keeps sub-agent activity), and families this
 /// build cannot name, which a newer reader may. Process execution, file reads and hook reports are
-/// narration — Codex drops its exec, terminal and hook events — and so are dropped too.
+/// narration — Codex drops its exec, terminal and hook events — and so are dropped too, except a
+/// command's start and exit when they name the tool call that ran it. Codex's paginated rollouts
+/// keep a command's completed item; a history here is rebuilt from records rather than kept as
+/// items, so those two boundaries, with the bounded output the exit carries, stand in for it and
+/// let a command that outlives its turn be read back as it ended. Output deltas stay narration.
 #[must_use]
 pub fn is_persisted_rollout_item(item: &RolloutItem) -> bool {
     match item {
+        // These boundaries carry the authoritative end of a background tool. Output deltas
+        // remain narration; only the bounded final snapshot is needed for replay.
+        RolloutItem::Event(event)
+            if matches!(event.body(),
+            HostEventBody::Exec(ExecEvent::Started(start)) if start.call_id().is_some()) =>
+        {
+            true
+        }
+        RolloutItem::Event(event)
+            if matches!(event.body(),
+            HostEventBody::Exec(ExecEvent::Exited(end)) if end.call_id().is_some()) =>
+        {
+            true
+        }
         RolloutItem::Event(event) => !matches!(
             event.body(),
             HostEventBody::Exec(_)

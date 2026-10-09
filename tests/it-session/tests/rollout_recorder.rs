@@ -6,7 +6,10 @@ use ra_core::{
     agent::control::AgentPath,
     event::{
         AgentEvent, HostEvent, HostEventBody, SubAgentActivityEvent, SubAgentActivityKind,
-        exec::{ExecEvent, ExecSessionId, ExecStartedEvent},
+        exec::{
+            ExecEvent, ExecExitedEvent, ExecOutputEvent, ExecSessionId, ExecStartedEvent,
+            ExecStreamKind,
+        },
         file::{FileChangeKind, FileChangedEvent, FileEvent, FileReadEvent},
     },
     finish::FinishReason,
@@ -730,4 +733,60 @@ async fn a_thread_directory_creates_each_threads_rollout_and_lists_a_sessions_di
         Some(&thread_spawn("sess-1-worker", 2, &helper))
     );
     assert!(store.rollout_path(&SessionId::new("../escape")).is_err());
+}
+
+/// Runtime boundaries survive reload, while output deltas do not inflate the rollout.
+#[tokio::test]
+async fn background_command_boundaries_survive_file_reload() {
+    let dir = temp_test_dir("background_boundaries");
+    let writer = RolloutWriter::create_for_session(&dir, SessionId::generate())
+        .await
+        .unwrap();
+    let path = writer.path().to_path_buf();
+    let recorder = RolloutFileRecorder::spawn(writer);
+    let seqs = allocator("run-background");
+    let session = ExecSessionId::generate();
+    let start = event(
+        &seqs,
+        ExecEvent::Started(
+            ExecStartedEvent::new(session.clone(), "echo late").with_call_id("call-background"),
+        ),
+    );
+    let output = event(
+        &seqs,
+        ExecEvent::Output(ExecOutputEvent::new(
+            session.clone(),
+            ExecStreamKind::Stdout,
+            0,
+            5,
+            "late\n",
+        )),
+    );
+    let end = event(
+        &seqs,
+        ExecEvent::Exited(
+            ExecExitedEvent::new(session, 1200, 5, 0)
+                .with_call_id("call-background")
+                .with_exit_code(0)
+                .with_aggregated_output("late\n"),
+        ),
+    );
+    recorder.record(RolloutItem::Event(start.clone()));
+    recorder.record(RolloutItem::RunEnded(RolloutRunEnded::new(
+        RunId::new("run-background"),
+        RolloutRunEnd::Completed,
+    )));
+    recorder.record(RolloutItem::Event(output));
+    recorder.record(RolloutItem::Event(end.clone()));
+    recorder.shutdown().await.unwrap();
+    let records = RolloutReader::open(&path).read_all().await.unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(
+        matches!(records[0].payload().unwrap(), RolloutPayload::Event(event) if event == start)
+    );
+    assert!(matches!(
+        records[1].payload().unwrap(),
+        RolloutPayload::RunEnded(_)
+    ));
+    assert!(matches!(records[2].payload().unwrap(), RolloutPayload::Event(event) if event == end));
 }

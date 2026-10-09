@@ -93,7 +93,16 @@ impl CodingHost {
     /// load with a thread.
     #[must_use]
     pub fn background_terminals(&self) -> crate::background_terminals::CodingBackgroundTerminals {
-        crate::background_terminals::CodingBackgroundTerminals::new(Arc::clone(&self.process_manager))
+        crate::background_terminals::CodingBackgroundTerminals::new(Arc::clone(
+            &self.process_manager,
+        ))
+    }
+
+    /// The items this host's tool calls show in a thread's turns, for the app server to show them
+    /// by.
+    #[must_use]
+    pub fn thread_tool_items(&self) -> crate::thread_items::CodingThreadToolItems {
+        crate::thread_items::CodingThreadToolItems::new(self.workspace_root())
     }
 
     /// The host event sink for this host.

@@ -236,12 +236,21 @@ impl JsonRpcRequest {
 }
 
 /// A message that expects nothing back: Codex's `JSONRPCNotification`.
+///
+/// A notification the app server sends also says when it was sent, as Codex's
+/// `ServerNotificationEnvelope` does with `emittedAtMs`; a client's notifications do not.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
     method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Value>,
+    #[serde(
+        rename = "emittedAtMs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    emitted_at_ms: Option<i64>,
 }
 
 impl JsonRpcNotification {
@@ -251,6 +260,7 @@ impl JsonRpcNotification {
         Self {
             method: method.into(),
             params: None,
+            emitted_at_ms: None,
         }
     }
 
@@ -259,6 +269,19 @@ impl JsonRpcNotification {
     pub fn with_params(mut self, params: Value) -> Self {
         self.params = Some(params);
         self
+    }
+
+    /// Records when the server sent it, in milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn with_emitted_at_ms(mut self, emitted_at_ms: i64) -> Self {
+        self.emitted_at_ms = Some(emitted_at_ms);
+        self
+    }
+
+    /// When the server sent it, in milliseconds since the Unix epoch, if it says.
+    #[must_use]
+    pub const fn emitted_at_ms(&self) -> Option<i64> {
+        self.emitted_at_ms
     }
 
     /// The method notified.

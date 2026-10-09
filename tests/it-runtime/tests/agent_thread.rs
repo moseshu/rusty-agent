@@ -42,7 +42,7 @@ use ra_runtime::{
     runner::{PendingInput, RunConfig, RunRequest, Runner},
     thread::{
         AgentThread, NotSubmittedReason, SteerSubmission, ThreadEvent, ThreadSettingsOverrides,
-        TurnAbortReason, TurnInputRequest, TurnInputSubmission,
+        TurnAbortReason, TurnInputRequest, TurnInputSubmission, turn_input_item_id,
     },
 };
 use serde_json::json;
@@ -317,7 +317,10 @@ async fn next_event(thread: &AgentThread) -> ThreadEvent {
             .await
             .expect("the thread reports an event")
             .expect("the thread keeps reporting");
-        if !matches!(event, ThreadEvent::ThreadSettingsApplied) {
+        if !matches!(
+            event,
+            ThreadEvent::ThreadSettingsApplied | ThreadEvent::Item { .. }
+        ) {
             return event;
         }
     }
@@ -1311,4 +1314,115 @@ async fn approval_resume_retains_the_step_settings_that_issued_the_tool() {
     next_event(&thread).await;
     next_event(&thread).await;
     assert_eq!(*tool.0.lock().unwrap(), ["issued"]);
+}
+
+/// Every event the thread reports up to and including the end of a turn, records among them.
+async fn events_until_turn_ends(thread: &AgentThread) -> Vec<ThreadEvent> {
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(PATIENCE, thread.next_event())
+            .await
+            .expect("the thread reports an event")
+            .expect("the thread keeps reporting");
+        let ended = matches!(
+            event,
+            ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. }
+        );
+        events.push(event);
+        if ended {
+            return events;
+        }
+    }
+}
+
+/// The records a turn's events carry, by kind and text, in order.
+fn reported_records(events: &[ThreadEvent], turn_id: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ThreadEvent::Item { turn_id: id, item } => {
+                assert_eq!(id, turn_id);
+                Some(match item.kind() {
+                    RunItemKind::Message(message) => {
+                        format!("{} {}", item.id().as_str(), message.text_content())
+                    }
+                    other => format!("{} {}", item.id().as_str(), other.label()),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A turn reports, between its start and its end, each record it adds to the thread, in the order
+/// its rollout keeps them: the input it started on, under the id `turn_input_item_id` gives it,
+/// then what the run produced.
+#[tokio::test]
+async fn a_turn_reports_its_records_between_its_start_and_its_end() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    script.push(Step::Respond(tool_call("m-1", "c-1", "quick_look")));
+    script.push(Step::Respond(final_message("m-2", "seen")));
+
+    let turn_id = started(&thread, text("look")).await;
+    let events = events_until_turn_ends(&thread).await;
+    assert!(matches!(&events[0], ThreadEvent::TurnStarted { turn_id: id, .. } if *id == turn_id));
+    assert_eq!(
+        reported_records(&events, &turn_id),
+        [
+            format!("{} look", turn_input_item_id(&turn_id, 0).as_str()),
+            "m-1 tool_call".to_owned(),
+            "c-1.output tool_call_output".to_owned(),
+            "m-2 seen".to_owned(),
+        ]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ThreadEvent::TurnComplete { .. })
+    ));
+}
+
+/// What a turn's end adds to the thread is reported as its records too: input it never read, and
+/// the marker an interrupt leaves.
+#[tokio::test]
+async fn what_a_turns_end_adds_is_reported_as_its_records() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let (release, wait) = gate();
+    script.push(Step::FailAfter(wait));
+
+    let turn_id = started(&thread, text("try")).await;
+    script.wait_for_calls(1).await;
+    assert!(matches!(
+        thread.steer_turn(&text("and this"), &turn_id),
+        SteerSubmission::Steered { .. }
+    ));
+    release.notify_one();
+    let events = events_until_turn_ends(&thread).await;
+    let records = reported_records(&events, &turn_id);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(records[1].ends_with(" and this"), "{records:?}");
+
+    script.push(Step::Respond(tool_call("m-1", "c-1", "guarded_look")));
+    let turn_id = started(&thread, text("look")).await;
+    timeout(PATIENCE, async {
+        while thread.paused_run().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the run pauses for approval");
+    assert!(thread.interrupt());
+    let events = events_until_turn_ends(&thread).await;
+    let marker = events.iter().rev().find_map(|event| match event {
+        ThreadEvent::Item { item, .. } => Some(item.clone()),
+        _ => None,
+    });
+    assert!(
+        matches!(
+            marker.as_ref().map(RunItem::kind),
+            Some(RunItemKind::Message(message)) if is_interrupted_turn_marker(message)
+        ),
+        "{events:?}"
+    );
 }

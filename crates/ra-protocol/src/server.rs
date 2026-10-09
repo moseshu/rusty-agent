@@ -13,8 +13,12 @@
 //! A connection must open with `initialize`; see [`protocol`] for the handshake. The turn methods
 //! — `turn/start`, `turn/steer`, `turn/interrupt` and `thread/settings/update` — act on the threads
 //! the server has loaded, and each loaded thread has a listener that tells its connections when its
-//! turns start and end. The `thread/*` methods that create and load threads are added over the
-//! thread store as they are ported.
+//! turns start and end and, as they run, what they are made of: `item/started` and
+//! `item/completed` for the user's input, the agent's messages and reasoning, and the tool calls
+//! the host shows ([`AppServer::with_thread_tool_items`]). A client that comes back reads the
+//! turns it missed with `thread/turns/list`, rebuilt from the thread's rollout in the server's
+//! store ([`AppServer::with_thread_store`]). The `thread/*` methods that create and load threads
+//! are added over the thread store as they are ported.
 //!
 //! While a turn runs the server asks the client in turn — approvals, dynamic tool calls, questions
 //! for the user — with requests of its own, sent to the connections of the thread. The client's
@@ -60,6 +64,7 @@ pub mod protocol;
 mod request_serialization;
 mod router;
 mod settings_adapter;
+mod thread_history;
 // Threads are loaded by `thread/start` and its kin, which are not ported yet; until then only the
 // tests load them, through `test_api`, and start their listeners.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
@@ -67,12 +72,14 @@ mod thread_listener;
 mod thread_manager;
 mod thread_processor;
 mod thread_state;
+mod tool_items;
 mod turn_admission;
 mod turn_processor;
 
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
 pub use self::settings_adapter::ThreadSettingsAdapter;
+pub use self::tool_items::{ThreadToolItemEvent, ThreadToolItems};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -85,6 +92,7 @@ use std::{
     time::Duration,
 };
 
+use ra_session::store::ThreadStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -317,6 +325,24 @@ impl AppServer {
             outgoing_rx,
             graceful_restart: None,
         })
+    }
+
+    /// Reads threads' history from `store`, as Codex's server reads its thread store: what
+    /// `thread/turns/list` rebuilds a thread's turns from. Without one, a thread's history cannot
+    /// be read back.
+    #[must_use]
+    pub fn with_thread_store(self, store: Arc<dyn ThreadStore>) -> Self {
+        self.processor.history.set_store(store);
+        self
+    }
+
+    /// Shows the tool calls of threads' turns as `tool_items` says, live and when their history is
+    /// read back. Without it, a tool call shows no item, as a Codex function tool with no item of
+    /// its own shows none.
+    #[must_use]
+    pub fn with_thread_tool_items(self, tool_items: Arc<dyn ThreadToolItems>) -> Self {
+        self.processor.history.set_tool_items(tool_items);
+        self
     }
 
     /// Unloads a thread once it has had no subscribers and no active turn for `delay`, instead of
@@ -896,7 +922,10 @@ pub mod test_api {
         /// Sets `server` to restart gracefully, as [`AppServer::with_graceful_restart`] does, on
         /// the signals sent through the returned handle.
         #[must_use]
-        pub fn install(server: AppServer, transport_shutdown: CancellationToken) -> (AppServer, Self) {
+        pub fn install(
+            server: AppServer,
+            transport_shutdown: CancellationToken,
+        ) -> (AppServer, Self) {
             let (signals, receiver) = mpsc::channel(8);
             let mut server = server;
             server.graceful_restart = Some(GracefulRestart {
@@ -913,7 +942,10 @@ pub mod test_api {
 
         /// Sends `SIGHUP`. Returns whether the server was still listening.
         pub async fn graceful_only(&self) -> bool {
-            self.signals.send(ShutdownSignal::GracefulOnly).await.is_ok()
+            self.signals
+                .send(ShutdownSignal::GracefulOnly)
+                .await
+                .is_ok()
         }
     }
 

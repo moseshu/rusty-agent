@@ -45,6 +45,7 @@ use super::{
     request_serialization::{
         QueuedInitializedRequest, RequestSerializationQueueKey, RequestSerializationQueues,
     },
+    thread_history::HistorySources,
     thread_listener::ListenerTaskContext,
     thread_manager::ThreadManager,
     thread_processor::ThreadRequestProcessor,
@@ -134,6 +135,8 @@ pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
     thread_unload_delay: std::sync::Mutex<Duration>,
+    /// Where threads' history is read from, and how their tools' calls show.
+    pub(crate) history: Arc<HistorySources>,
 }
 
 impl MessageProcessor {
@@ -157,6 +160,7 @@ impl MessageProcessor {
             turn_admission: TurnAdmission::default(),
             pending_thread_unloads,
             thread_unload_delay: std::sync::Mutex::new(DEFAULT_THREAD_UNLOAD_DELAY),
+            history: Arc::default(),
         }
     }
 
@@ -174,6 +178,7 @@ impl MessageProcessor {
     pub(crate) fn listener_context(&self) -> ListenerTaskContext {
         ListenerTaskContext {
             outgoing: Arc::clone(&self.outgoing),
+            history: Arc::clone(&self.history),
             thread_manager: Arc::clone(&self.thread_manager),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
             thread_unload_delay: *self
@@ -329,7 +334,8 @@ impl MessageProcessor {
         }
 
         let (turn_permit, recheck_turn_admission) = match &client_request {
-            ClientRequest::ThreadSettingsUpdate { .. } | ClientRequest::TurnSettingsUpdate { .. } => {
+            ClientRequest::ThreadSettingsUpdate { .. }
+            | ClientRequest::TurnSettingsUpdate { .. } => {
                 (Some(self.turn_admission.admit()?), false)
             }
             ClientRequest::TurnStart { .. } | ClientRequest::TurnSteer { .. } => {
@@ -338,9 +344,7 @@ impl MessageProcessor {
             _ => (None, false),
         };
 
-        let serialization_thread = client_request
-            .serialization_thread()
-            .map(str::to_owned);
+        let serialization_thread = client_request.serialization_thread().map(str::to_owned);
         let error_request_id = request_id.clone();
         let processor = Arc::clone(self);
         let request = QueuedInitializedRequest::new(Arc::clone(&session.rpc_gate), async move {
@@ -381,6 +385,17 @@ impl MessageProcessor {
                     .thread_processor
                     .thread_unsubscribe(&request_id, &params)
                     .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadTurnsList { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_turns_list(params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadItemsList { params, .. } => {
+                let result = ThreadRequestProcessor::thread_items_list(&params);
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadBackgroundTerminalsClean { params, .. } => {

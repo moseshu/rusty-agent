@@ -1,7 +1,10 @@
 //! The thread lifecycle methods and notifications: Codex's `thread/unsubscribe`, `thread/closed`
-//! and `thread/backgroundTerminals/*` (`protocol/v2/thread.rs`).
+//! and `thread/backgroundTerminals/*`, and the history reads `thread/turns/list` and
+//! `thread/items/list` (`protocol/v2/thread.rs`).
 
 use serde::{Deserialize, Serialize};
+
+use super::{ThreadItem, Turn, TurnItemsView};
 
 /// The method of the notification that a thread was unloaded.
 pub const THREAD_CLOSED_METHOD: &str = "thread/closed";
@@ -311,5 +314,321 @@ impl ThreadBackgroundTerminalsTerminateResponse {
     #[must_use]
     pub const fn terminated(&self) -> bool {
         self.terminated
+    }
+}
+
+/// Which way a page runs: Codex's `SortDirection`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    /// Oldest first.
+    Asc,
+    /// Newest first.
+    Desc,
+}
+
+/// The parameters of `thread/turns/list`: Codex's `ThreadTurnsListParams`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListParams {
+    thread_id: String,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    sort_direction: Option<SortDirection>,
+    #[serde(default)]
+    items_view: Option<TurnItemsView>,
+}
+
+impl ThreadTurnsListParams {
+    /// Lists the turns of `thread_id`: the newest page, with summary items.
+    #[must_use]
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            cursor: None,
+            limit: None,
+            sort_direction: None,
+            items_view: None,
+        }
+    }
+
+    /// Starts from `cursor`: a page's `nextCursor`, or its `backwardsCursor` with the opposite
+    /// direction.
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.cursor = Some(cursor.into());
+        self
+    }
+
+    /// Puts at most `limit` turns on the page.
+    #[must_use]
+    pub const fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Runs the page in `sort_direction`; newest first by default.
+    #[must_use]
+    pub const fn with_sort_direction(mut self, sort_direction: SortDirection) -> Self {
+        self.sort_direction = Some(sort_direction);
+        self
+    }
+
+    /// Includes as much of each turn's items as `items_view` says; a summary by default.
+    #[must_use]
+    pub const fn with_items_view(mut self, items_view: TurnItemsView) -> Self {
+        self.items_view = Some(items_view);
+        self
+    }
+
+    /// The thread.
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<String>,
+        Option<u32>,
+        Option<SortDirection>,
+        Option<TurnItemsView>,
+    ) {
+        (
+            self.thread_id,
+            self.cursor,
+            self.limit,
+            self.sort_direction,
+            self.items_view,
+        )
+    }
+}
+
+/// The answer to `thread/turns/list`: Codex's `ThreadTurnsListResponse`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListResponse {
+    data: Vec<Turn>,
+    next_cursor: Option<String>,
+    backwards_cursor: Option<String>,
+}
+
+impl ThreadTurnsListResponse {
+    pub(crate) const fn new(
+        data: Vec<Turn>,
+        next_cursor: Option<String>,
+        backwards_cursor: Option<String>,
+    ) -> Self {
+        Self {
+            data,
+            next_cursor,
+            backwards_cursor,
+        }
+    }
+
+    /// The turns on this page, in its direction.
+    #[must_use]
+    pub fn data(&self) -> &[Turn] {
+        &self.data
+    }
+
+    /// Where the next page starts, or `None` on the last page.
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<&str> {
+        self.next_cursor.as_deref()
+    }
+
+    /// Where a page in the opposite direction starts, including this page's first turn again, or
+    /// `None` if this page is empty.
+    #[must_use]
+    pub fn backwards_cursor(&self) -> Option<&str> {
+        self.backwards_cursor.as_deref()
+    }
+}
+
+/// An item that an item page starts after: Codex's `ThreadItemsListAnchor`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ThreadItemsListAnchor {
+    /// The item `item_id` of the requested turn.
+    #[non_exhaustive]
+    Item {
+        /// The item.
+        #[serde(rename = "itemId")]
+        item_id: String,
+    },
+}
+
+impl ThreadItemsListAnchor {
+    /// The item `item_id`.
+    #[must_use]
+    pub fn item(item_id: impl Into<String>) -> Self {
+        Self::Item {
+            item_id: item_id.into(),
+        }
+    }
+}
+
+/// Where an item page starts: Codex's `ThreadItemsListCursor`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThreadItemsListCursor {
+    /// A cursor a page returned.
+    Opaque(String),
+    /// An item to start after.
+    Anchor(ThreadItemsListAnchor),
+}
+
+/// The parameters of `thread/items/list`: Codex's `ThreadItemsListParams`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListParams {
+    thread_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
+    cursor: Option<ThreadItemsListCursor>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    sort_direction: Option<SortDirection>,
+}
+
+impl ThreadItemsListParams {
+    /// Lists the items of `thread_id`.
+    #[must_use]
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            turn_id: None,
+            cursor: None,
+            limit: None,
+            sort_direction: None,
+        }
+    }
+
+    /// Lists only the items of `turn_id`.
+    #[must_use]
+    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
+        self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Starts from `cursor`.
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: ThreadItemsListCursor) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// Puts at most `limit` items on the page.
+    #[must_use]
+    pub const fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Runs the page in `sort_direction`; oldest first by default.
+    #[must_use]
+    pub const fn with_sort_direction(mut self, sort_direction: SortDirection) -> Self {
+        self.sort_direction = Some(sort_direction);
+        self
+    }
+
+    /// The thread.
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    /// The turn, if the page is of one.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&str> {
+        self.turn_id.as_deref()
+    }
+
+    /// Where the page starts, if not at the beginning.
+    #[must_use]
+    pub const fn cursor(&self) -> Option<&ThreadItemsListCursor> {
+        self.cursor.as_ref()
+    }
+}
+
+/// An item of a thread and where it is: Codex's `ThreadItemEntry`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemEntry {
+    turn_id: String,
+    item: ThreadItem,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+}
+
+impl ThreadItemEntry {
+    /// The turn the item belongs to.
+    #[must_use]
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// The item.
+    #[must_use]
+    pub const fn item(&self) -> &ThreadItem {
+        &self.item
+    }
+
+    /// When it started, in milliseconds since the Unix epoch, if recorded.
+    #[must_use]
+    pub const fn started_at_ms(&self) -> Option<i64> {
+        self.started_at_ms
+    }
+
+    /// When it completed, in milliseconds since the Unix epoch, if recorded.
+    #[must_use]
+    pub const fn completed_at_ms(&self) -> Option<i64> {
+        self.completed_at_ms
+    }
+}
+
+/// The answer to `thread/items/list`: Codex's `ThreadItemsListResponse`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListResponse {
+    data: Vec<ThreadItemEntry>,
+    next_cursor: Option<String>,
+    backwards_cursor: Option<String>,
+}
+
+impl ThreadItemsListResponse {
+    /// The items on this page, in its direction.
+    #[must_use]
+    pub fn data(&self) -> &[ThreadItemEntry] {
+        &self.data
+    }
+
+    /// Where the next page starts, or `None` on the last page.
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<&str> {
+        self.next_cursor.as_deref()
+    }
+
+    /// Where a page in the opposite direction starts, or `None` if this page is empty.
+    #[must_use]
+    pub fn backwards_cursor(&self) -> Option<&str> {
+        self.backwards_cursor.as_deref()
     }
 }

@@ -85,6 +85,8 @@ pub(crate) struct ServerNotification {
     method: String,
     params: Value,
     experimental_reason: Option<&'static str>,
+    /// When it was sent, stamped once before it is fanned out: Codex's `emitted_at_ms`.
+    emitted_at_ms: Option<i64>,
 }
 
 impl ServerNotification {
@@ -95,6 +97,7 @@ impl ServerNotification {
             method: method.into(),
             params,
             experimental_reason: None,
+            emitted_at_ms: None,
         }
     }
 
@@ -141,9 +144,12 @@ impl TryFrom<OutgoingMessage> for JsonRpcMessage {
         Ok(match message {
             OutgoingMessage::Request(request) => JsonRpcRequest::try_from(request)?.into(),
             OutgoingMessage::Notification(notification) => {
-                JsonRpcNotification::new(notification.method)
-                    .with_params(notification.params)
-                    .into()
+                let mut frame =
+                    JsonRpcNotification::new(notification.method).with_params(notification.params);
+                if let Some(emitted_at_ms) = notification.emitted_at_ms {
+                    frame = frame.with_emitted_at_ms(emitted_at_ms);
+                }
+                frame.into()
             }
             OutgoingMessage::Response(response) => response.into(),
             OutgoingMessage::Error(error) => error.into(),
@@ -241,13 +247,14 @@ impl OutgoingMessageSender {
     pub(crate) async fn send_server_notification_to_connections(
         &self,
         connection_ids: &[ConnectionId],
-        notification: ServerNotification,
+        mut notification: ServerNotification,
     ) {
         tracing::trace!(
             targeted_connections = connection_ids.len(),
             "app-server event: {}",
             notification.method()
         );
+        notification.emitted_at_ms = Some(now_unix_timestamp_ms());
         let message = OutgoingMessage::Notification(notification);
         if connection_ids.is_empty() {
             if let Err(error) = self
@@ -531,4 +538,13 @@ impl ThreadScopedOutgoingMessageSender {
         self.resolve_server_request(request_id).await;
         answer
     }
+}
+
+/// Milliseconds since the Unix epoch: Codex's `now_unix_timestamp_ms`.
+pub(crate) fn now_unix_timestamp_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or_default()
 }

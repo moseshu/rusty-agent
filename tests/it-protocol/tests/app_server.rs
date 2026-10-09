@@ -489,7 +489,8 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
     let server = Server::start();
     let mut connection = server.open(1).await;
     let unknown = "Invalid request: unknown variant `config/read`, expected one of \
-                   `initialize`, `thread/unsubscribe`, `thread/backgroundTerminals/clean`, \
+                   `initialize`, `thread/unsubscribe`, `thread/turns/list`, `thread/items/list`, \
+                   `thread/backgroundTerminals/clean`, \
                    `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, \
                    `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \
                    `turn/interrupt`, `mock/experimentalMethod`";
@@ -717,8 +718,16 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
         .await;
 
     server.notify(&[&connection], "configWarning", None).await;
+    let mut notification = connection.next().await;
+    // Codex stamps every server notification with when it was sent.
+    let emitted_at_ms = notification
+        .as_object_mut()
+        .and_then(|notification| notification.remove("emittedAtMs"))
+        .and_then(|emitted_at_ms| emitted_at_ms.as_i64())
+        .expect("the notification says when it was sent");
+    assert!(emitted_at_ms > 0);
     assert_eq!(
-        connection.next().await,
+        notification,
         json!({"method": "configWarning", "params": {"note": "configWarning"}})
     );
 }

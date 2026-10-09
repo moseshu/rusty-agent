@@ -277,6 +277,8 @@ pub struct ExecStartedEvent {
     #[serde(default = "default_schema_version")]
     schema_version: SchemaVersion,
     session_id: ExecSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
     command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     args: Vec<String>,
@@ -295,6 +297,7 @@ impl ExecStartedEvent {
         Self {
             schema_version: EXEC_EVENT_SCHEMA_VERSION,
             session_id: session_id.into(),
+            call_id: None,
             command: command.into(),
             args: Vec::new(),
             cwd: None,
@@ -322,6 +325,19 @@ impl ExecStartedEvent {
     pub const fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
+    }
+
+    /// Associates this execution with the tool call that started it.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = Some(call_id.into());
+        self
+    }
+
+    /// The tool call that started this execution, when known.
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
     }
 
     /// Opaque session identifier.
@@ -600,7 +616,11 @@ pub struct ExecExitedEvent {
     schema_version: SchemaVersion,
     session_id: ExecSessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aggregated_output: Option<String>,
     duration_ms: u64,
     stdout_bytes: usize,
     stderr_bytes: usize,
@@ -620,7 +640,9 @@ impl ExecExitedEvent {
         Self {
             schema_version: EXEC_EVENT_SCHEMA_VERSION,
             session_id: session_id.into(),
+            call_id: None,
             exit_code: None,
+            aggregated_output: None,
             duration_ms,
             stdout_bytes,
             stderr_bytes,
@@ -633,6 +655,32 @@ impl ExecExitedEvent {
     pub const fn with_exit_code(mut self, exit_code: i32) -> Self {
         self.exit_code = Some(exit_code);
         self
+    }
+
+    /// Associates this execution with the tool call that started it.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = Some(call_id.into());
+        self
+    }
+
+    /// The tool call that started this execution, when known.
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+
+    /// Includes the executor's bounded output snapshot for history reconstruction.
+    #[must_use]
+    pub fn with_aggregated_output(mut self, output: impl Into<String>) -> Self {
+        self.aggregated_output = Some(output.into());
+        self
+    }
+
+    /// The final bounded output snapshot, when recorded by the executor.
+    #[must_use]
+    pub fn aggregated_output(&self) -> Option<&str> {
+        self.aggregated_output.as_deref()
     }
 
     /// Opaque session identifier.

@@ -1964,7 +1964,16 @@ async fn supervise(
         .as_ref()
         .ok()
         .and_then(std::process::ExitStatus::code);
-    let (recorded_state, duration_ms, stdout_bytes, stderr_bytes, exit_notify, closed_notify) = {
+    let (
+        recorded_state,
+        duration_ms,
+        stdout_bytes,
+        stderr_bytes,
+        exit_notify,
+        closed_notify,
+        call_id,
+        output,
+    ) = {
         let mut sess = context.session.lock().await;
         sess.exit_code = exit_code;
         // Only when nothing has ended this session yet. A cancelled session ended when it was
@@ -1993,6 +2002,12 @@ async fn supervise(
             sess.stderr_buffer.total_bytes(),
             Arc::clone(&sess.exit_notify),
             Arc::clone(&sess.closed_notify),
+            sess.origin.call_id.clone(),
+            format!(
+                "{}{}",
+                sess.stdout_buffer.to_string_lossy(),
+                sess.stderr_buffer.to_string_lossy()
+            ),
         )
     };
 
@@ -2020,6 +2035,9 @@ async fn supervise(
             stdout_bytes,
             stderr_bytes,
         );
+        if let Some(call_id) = call_id {
+            event = event.with_call_id(call_id).with_aggregated_output(output);
+        }
         if let Some(code) = exit_code {
             event = event.with_exit_code(code);
         }
@@ -2228,6 +2246,9 @@ fn emit_started(
     };
     let mut started = ExecStartedEvent::new(session_id.clone(), request.command().to_owned())
         .with_args(request.args().to_vec());
+    if let Some(call_id) = request.call_id() {
+        started = started.with_call_id(call_id);
+    }
     if let Some(cwd) = request.cwd() {
         started = started.with_cwd(cwd.to_string_lossy().to_string());
     }

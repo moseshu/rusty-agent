@@ -4,7 +4,9 @@
 //! (`bespoke_event_handling.rs`).
 //!
 //! Each event is first tracked in the thread's state, then handled with the connections subscribed
-//! at that moment. A turn that starts withdraws the thread's server requests still waiting, as one
+//! at that moment. A record a turn adds becomes the `item/started` and `item/completed` of the
+//! items it makes (see [`super::thread_history`]), and a turn that completes carries its last
+//! answer in `turn/completed`, as Codex's does. A turn that starts withdraws the thread's server requests still waiting, as one
 //! that ends does, since every request of a thread belongs to a turn; the end of a turn also
 //! answers the `turn/interrupt` requests waiting for it.
 //!
@@ -20,9 +22,7 @@
 //!
 //! # Differences from Codex
 //!
-//! Codex's `turn/completed` carries the turn's last final answer as a summary item; items are
-//! Codex's `ThreadItem`s, which come with the item notifications, so the turn is sent with no
-//! items loaded until then. Codex's listener also handles commands that order a running thread's
+//! Codex's listener also handles commands that order a running thread's
 //! resume and its goals with its notifications; those come with the thread methods. Codex also
 //! sends `thread/status/changed` as the thread goes idle and unloads; thread statuses come with
 //! the thread methods.
@@ -39,16 +39,23 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
+    outgoing::{
+        OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender,
+        now_unix_timestamp_ms,
+    },
     protocol::{
-        ERROR_METHOD, ErrorNotification, THREAD_CLOSED_METHOD, THREAD_SETTINGS_UPDATED_METHOD,
-        TURN_COMPLETED_METHOD, TURN_STARTED_METHOD, ThreadClosedNotification,
-        ThreadSettingsUpdatedNotification, Turn, TurnCompletedNotification, TurnError,
-        TurnInterruptResponse, TurnStartedNotification, TurnStatus,
+        ERROR_METHOD, ErrorNotification, ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD,
+        ItemCompletedNotification, ItemStartedNotification, THREAD_CLOSED_METHOD,
+        THREAD_SETTINGS_UPDATED_METHOD, TURN_COMPLETED_METHOD, TURN_STARTED_METHOD,
+        ThreadClosedNotification, ThreadSettingsUpdatedNotification, Turn,
+        TurnCompletedNotification, TurnError, TurnInterruptResponse, TurnItemsView,
+        TurnStartedNotification, TurnStatus,
     },
     settings_adapter::settings_snapshot,
+    thread_history::{HistorySources, ItemChange},
     thread_manager::{LoadedThread, ThreadManager},
     thread_state::ThreadState,
+    tool_items::ThreadToolItems,
 };
 use crate::frame::JsonRpcErrorObject;
 
@@ -59,6 +66,8 @@ const THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub(crate) struct ListenerTaskContext {
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
+    /// How the thread's tools' calls show as items.
+    pub(crate) history: Arc<HistorySources>,
     pub(crate) thread_manager: Arc<ThreadManager>,
     /// The threads being unloaded, until they are gone or stay.
     pub(crate) pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
@@ -206,7 +215,9 @@ pub(crate) async fn ensure_listener_task_running(
                     let Some(event) = event else {
                         break;
                     };
-                    handle_event(event, &loaded, outgoing, &thread_state).await;
+                    let tool_items = context.history.tool_items();
+                    handle_event(event, &loaded, outgoing, &thread_state, tool_items.as_deref())
+                        .await;
                 }
                 unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
                     if !unloading_watchers_open {
@@ -247,9 +258,13 @@ async fn handle_event(
     loaded: &LoadedThread,
     outgoing: &Arc<OutgoingMessageSender>,
     thread_state: &Mutex<ThreadState>,
+    tool_items: Option<&dyn ThreadToolItems>,
 ) {
     let thread_id = loaded.thread_id().clone();
-    thread_state.lock().await.track_current_turn_event(&event);
+    let item_changes = thread_state
+        .lock()
+        .await
+        .track_current_turn_event(&event, tool_items);
     if matches!(event, ThreadEvent::TurnStarted { .. }) {
         outgoing.thread_state().note_active(&thread_id, true);
     }
@@ -289,6 +304,20 @@ async fn handle_event(
         }
         return;
     }
+    if let ThreadEvent::Item { turn_id, .. } = &event {
+        send_item_changes(item_changes, &thread_id, turn_id, &thread_outgoing).await;
+        return;
+    }
+    if let ThreadEvent::HostEvent(event) = &event {
+        send_item_changes(
+            item_changes,
+            &thread_id,
+            event.run_id().as_str(),
+            &thread_outgoing,
+        )
+        .await;
+        return;
+    }
     let ended = matches!(
         event,
         ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. }
@@ -324,7 +353,11 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
             .await
             .is_err()
         {
-            context.pending_thread_unloads.lock().await.remove(&thread_id);
+            context
+                .pending_thread_unloads
+                .lock()
+                .await
+                .remove(&thread_id);
             tracing::warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
             return;
         }
@@ -332,7 +365,11 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
         // scheduled this unload is removed.
         if !context.thread_manager.remove_thread_if_matches(&loaded) {
             tracing::info!("thread {thread_id} was replaced or removed before teardown finalized");
-            context.pending_thread_unloads.lock().await.remove(&thread_id);
+            context
+                .pending_thread_unloads
+                .lock()
+                .await
+                .remove(&thread_id);
             return;
         }
         broadcast(
@@ -341,7 +378,11 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
             ThreadClosedNotification::new(thread_id.as_str()),
         )
         .await;
-        context.pending_thread_unloads.lock().await.remove(&thread_id);
+        context
+            .pending_thread_unloads
+            .lock()
+            .await
+            .remove(&thread_id);
     });
 }
 
@@ -387,9 +428,11 @@ async fn apply_turn_event_handling(
             outgoing.abort_pending_server_requests();
             respond_to_pending_interrupts(outgoing, thread_state).await;
             let summary = std::mem::take(&mut thread_state.lock().await.turn_summary);
-            let turn = match summary.last_error {
-                Some(error) => Turn::new(turn_id, TurnStatus::Failed).with_error(error),
-                None => Turn::new(turn_id, TurnStatus::Completed),
+            let turn = match (summary.last_error, summary.last_agent_message) {
+                (Some(error), _) => Turn::new(turn_id, TurnStatus::Failed).with_error(error),
+                (None, Some(answer)) => Turn::new(turn_id, TurnStatus::Completed)
+                    .with_items(vec![answer], TurnItemsView::Summary),
+                (None, None) => Turn::new(turn_id, TurnStatus::Completed),
             }
             .with_started_at(summary.started_at)
             .with_completion(completed_at, duration_ms);
@@ -423,6 +466,37 @@ async fn apply_turn_event_handling(
     }
 }
 
+/// Tells the thread's connections what a record did to the turn's items: Codex's
+/// `item_event_to_server_notification`, for `item/started` and `item/completed`.
+async fn send_item_changes(
+    changes: Vec<ItemChange>,
+    thread_id: &SessionId,
+    turn_id: &str,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    for change in changes {
+        let at_ms = now_unix_timestamp_ms();
+        match change {
+            ItemChange::Started(item) => {
+                send_to_thread(
+                    outgoing,
+                    ITEM_STARTED_METHOD,
+                    ItemStartedNotification::new(item, thread_id.as_str(), turn_id, at_ms),
+                )
+                .await;
+            }
+            ItemChange::Completed(item) => {
+                send_to_thread(
+                    outgoing,
+                    ITEM_COMPLETED_METHOD,
+                    ItemCompletedNotification::new(item, thread_id.as_str(), turn_id, at_ms),
+                )
+                .await;
+            }
+        }
+    }
+}
+
 /// Answers the `turn/interrupt` requests waiting for the turn that ended: Codex's
 /// `respond_to_pending_interrupts`.
 async fn respond_to_pending_interrupts(
@@ -448,11 +522,7 @@ async fn send_to_thread(
 }
 
 /// Sends a notification to every initialized connection.
-async fn broadcast(
-    outgoing: &OutgoingMessageSender,
-    method: &'static str,
-    params: impl Serialize,
-) {
+async fn broadcast(outgoing: &OutgoingMessageSender, method: &'static str, params: impl Serialize) {
     if let Some(notification) = notification(method, params) {
         outgoing.send_server_notification(notification).await;
     }

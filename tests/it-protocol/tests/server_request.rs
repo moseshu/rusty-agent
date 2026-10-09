@@ -156,13 +156,25 @@ struct Connection {
 }
 
 impl Connection {
-    /// The next message the server writes, as JSON.
+    /// The next message the server writes, as JSON. A notification's `emittedAtMs` says when it
+    /// was sent; it is checked and taken off, so the cases compare what the notification says.
     async fn next(&mut self) -> Value {
         let queued = timeout(PATIENCE, self.written.recv())
             .await
             .expect("the server writes a message")
             .expect("the server keeps the write queue");
-        serde_json::to_value(queued.message()).unwrap()
+        let mut message = serde_json::to_value(queued.message()).unwrap();
+        if message.get("method").is_some() && message.get("id").is_none() {
+            let emitted_at_ms = message
+                .as_object_mut()
+                .and_then(|message| message.remove("emittedAtMs"))
+                .and_then(|emitted_at_ms| emitted_at_ms.as_i64());
+            assert!(
+                emitted_at_ms.is_some_and(|emitted_at_ms| emitted_at_ms > 0),
+                "{message}"
+            );
+        }
+        message
     }
 
     /// Asserts the next message is the marker notification `method`.

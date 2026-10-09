@@ -31,9 +31,17 @@
 //! # Events
 //!
 //! What happens to the thread's turns is reported in order through [`AgentThread::next_event`], as
-//! Codex's thread reports it through `next_event`: a turn's start, then its end — completed, after
-//! an error if it failed, or aborted. A turn that starts after another has ended is reported after
-//! that end.
+//! Codex's thread reports it through `next_event`: a turn's start, the records it adds to the
+//! thread as it adds them, then its end — completed, after an error if it failed, or aborted. A
+//! turn that starts after another has ended is reported after that end.
+//!
+//! The records are the ones the thread's rollout keeps, in the order it keeps them: the input the
+//! turn started on, under ids [`turn_input_item_id`] gives it, then what the run produced and the
+//! input steered into it, then whatever the turn's end adds — input it never read, or the marker an
+//! interrupt leaves. Records are observed at the rollout boundary, including tool calls recorded
+//! before execution; settlement may replace a record under the same id. This keeps the SDK's
+//! run-item stream unchanged while supplying Codex-style early starts to the thread listener.
+//! Host execution events are forwarded too, including background exits after the turn ended.
 //!
 //! # Settings
 //!
@@ -65,12 +73,13 @@
 //!   automatic, trigger and continuation starts that only its own background work issues.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ra_core::{
     cancel::{CancelReason, CancelScope, ScopeKind},
+    event::HostEvent,
     item::{ContentBlock, ItemId, Message, MessageRole, ModelInputItem, RunItem, RunItemKind},
     model::{Effort, ModelResolver, ModelSettings, ResolvedModel},
     session::{
@@ -100,8 +109,11 @@ pub enum TurnAbortReason {
 }
 
 /// Something that happened to one of the thread's turns: the turn events of Codex's `EventMsg`.
+// An event is moved once, from the thread to whoever reads it; boxing the record would only add an
+// allocation to every item a turn reports.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ThreadEvent {
     /// Persistent thread settings were applied. Consumers read the current thread snapshot.
     ThreadSettingsApplied,
@@ -112,6 +124,16 @@ pub enum ThreadEvent {
         /// When it started, in seconds since the Unix epoch.
         started_at: i64,
     },
+    /// The turn added `item` to the thread: what Codex's `ItemStarted` and `ItemCompleted` report,
+    /// as a record rather than as its display.
+    Item {
+        /// The turn.
+        turn_id: String,
+        /// The record, as the thread's rollout keeps it.
+        item: RunItem,
+    },
+    /// A host execution event, including a background command ending after its turn.
+    HostEvent(HostEvent),
     /// The turn failed, and will complete next: Codex's `Error` event within a turn.
     Error {
         /// The turn.
@@ -218,6 +240,14 @@ pub enum SteerSubmission {
         /// Why.
         reason: NotSubmittedReason,
     },
+}
+
+/// The id under which the turn `turn_id` reports the message at `index` of the input it started
+/// on. The rollout keeps a run's input without ids; a reader rebuilding the turn from it gives the
+/// message the same id the live thread reported it under.
+#[must_use]
+pub fn turn_input_item_id(turn_id: &str, index: usize) -> ItemId {
+    ItemId::new(format!("{turn_id}-input-{index}"))
 }
 
 /// Changes to a thread's settings for the turns it starts from now on: Codex's
@@ -870,10 +900,20 @@ impl AgentThread {
             turn_id: turn_id.clone(),
             started_at,
         });
+        let input = request.message();
+        if let Some(message) = &input {
+            self.inner.emit(ThreadEvent::Item {
+                turn_id: turn_id.clone(),
+                item: RunItem::new(
+                    turn_input_item_id(&turn_id, 0),
+                    RunItemKind::Message(message.clone()),
+                ),
+            });
+        }
         let turn = StartedTurn {
             turn_id: turn_id.clone(),
             history: state.history.clone(),
-            input: request.message(),
+            input,
             config: state.config.clone(),
             pending,
             settings,
@@ -916,6 +956,71 @@ enum TurnEnd {
     Cancelled,
 }
 
+/// Observes the same records used for replay, including calls recorded before execution.
+/// The runner's terminal record waits until the thread has saved unconsumed steering input.
+/// A weak reference lets background execution report its exit without keeping a thread alive.
+struct ThreadRecorder {
+    thread: Weak<ThreadInner>,
+    turn_id: String,
+    store: Option<Arc<dyn RolloutRecorder>>,
+    ending: Mutex<Option<RolloutItem>>,
+}
+
+impl ThreadRecorder {
+    async fn finish(&self) {
+        let ending = self
+            .ending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let (Some(store), Some(ending)) = (&self.store, ending) {
+            store.record(ending);
+        }
+        if let Err(error) = self.flush().await {
+            tracing::warn!(%error, "the thread's rollout could not be flushed");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RolloutRecorder for ThreadRecorder {
+    fn record(&self, item: RolloutItem) {
+        if matches!(&item, RolloutItem::RunEnded(end) if end.end() != RolloutRunEnd::Interrupted) {
+            *self.ending.lock().unwrap_or_else(PoisonError::into_inner) = Some(item);
+            return;
+        }
+        if let Some(store) = &self.store {
+            store.record(item.clone());
+        }
+        if let Some(thread) = self.thread.upgrade() {
+            match item {
+                RolloutItem::Item(item) => thread.emit(ThreadEvent::Item {
+                    turn_id: self.turn_id.clone(),
+                    item,
+                }),
+                RolloutItem::Event(event) => thread.emit(ThreadEvent::HostEvent(event)),
+                _ => {}
+            }
+        }
+    }
+
+    async fn flush(&self) -> ra_core::error::Result<()> {
+        if let Some(store) = &self.store {
+            store.flush().await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn persist(&self, context: PersistContext) -> ra_core::error::Result<()> {
+        if let Some(store) = &self.store {
+            store.persist(context).await
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Runs a turn to its end and reports how it ended.
 async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     let started = Instant::now();
@@ -928,11 +1033,24 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         settings,
         cancel,
     } = turn;
-    let recorded = history.len();
+    let history_len = history.len();
     let mut run_input = history;
     run_input.extend(input.map(ModelInputItem::Message));
+    let recorder = Arc::new(ThreadRecorder {
+        thread: Arc::downgrade(&inner),
+        turn_id: turn_id.clone(),
+        store: inner.rollout.clone(),
+        ending: Mutex::new(None),
+    });
     let (end, history) = run_to_end(
-        &inner, &turn_id, config, &pending, &settings, &cancel, run_input, recorded,
+        &inner,
+        &recorder,
+        config,
+        &pending,
+        &settings,
+        &cancel,
+        run_input,
+        history_len,
     )
     .await;
     settings.close();
@@ -955,12 +1073,11 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     let mut history = history;
     if !interrupted && !leftover.is_empty() {
         for message in leftover {
-            if let Some(rollout) = &inner.rollout {
-                rollout.record(RolloutItem::Item(RunItem::new(
-                    ItemId::new(uuid::Uuid::now_v7().to_string()),
-                    RunItemKind::Message(message.clone()),
-                )));
-            }
+            let item = RunItem::new(
+                ItemId::new(uuid::Uuid::now_v7().to_string()),
+                RunItemKind::Message(message.clone()),
+            );
+            recorder.record(RolloutItem::Item(item));
             history.push(ModelInputItem::Message(message));
         }
         if let Some(rollout) = &inner.rollout
@@ -969,6 +1086,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
             tracing::warn!(%turn_id, %error, "the thread's pending input could not be persisted");
         }
     }
+    recorder.finish().await;
     let completed_at = unix_seconds();
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let mut state = inner.lock();
@@ -1012,32 +1130,30 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
 #[allow(clippy::too_many_arguments)]
 async fn run_to_end(
     inner: &Arc<ThreadInner>,
-    turn_id: &str,
+    recorder: &Arc<ThreadRecorder>,
     mut config: RunConfig,
     pending: &PendingInput,
     settings: &LiveRunSettings,
     cancel: &CancelScope,
     input: Vec<ModelInputItem>,
-    recorded: usize,
+    history_len: usize,
 ) -> (TurnEnd, Vec<ModelInputItem>) {
     let mut fallback = input.clone();
     let mut request = RunRequest::new(
         inner.agent.clone(),
         Arc::clone(&inner.model_resolver),
-        RunId::new(turn_id),
+        RunId::new(&recorder.turn_id),
         cancel.clone(),
         input,
     )
-    .with_recorded_input(recorded);
+    .with_recorded_input(history_len);
     loop {
         request = request
             .with_config(config.clone())
             .with_services(inner.services.clone())
             .with_pending_input(pending.clone());
         request = request.with_live_settings(settings.clone());
-        if let Some(rollout) = &inner.rollout {
-            request = request.with_rollout_recorder(Arc::clone(rollout));
-        }
+        request = request.with_rollout_recorder(recorder.clone());
         let mut stream = Runner::run_streamed(request);
         let mut produced = Vec::new();
         while let Some(event) = stream.next_event().await {
@@ -1078,7 +1194,7 @@ async fn run_to_end(
             active.paused = None;
         }
         let Some(state) = answered else {
-            let history = cancel_paused(inner, &config, cancel, run_id, history).await;
+            let history = cancel_paused(recorder.as_ref(), &config, cancel, run_id, history);
             return (TurnEnd::Cancelled, history);
         };
         fallback = history;
@@ -1096,8 +1212,8 @@ async fn run_to_end(
 /// Ends a run cancelled while it waited for approval, as the runner ends one cancelled while it
 /// works: after the interrupted-run marker, which the returned history keeps, and recorded as
 /// cancelled. Codex aborts a turn waiting for approval the same way it aborts one that is working.
-async fn cancel_paused(
-    inner: &ThreadInner,
+fn cancel_paused(
+    recorder: &ThreadRecorder,
     config: &RunConfig,
     cancel: &CancelScope,
     run_id: RunId,
@@ -1113,18 +1229,13 @@ async fn cancel_paused(
     if let Some(item) = marker.as_ref().and_then(RunItem::to_model_input) {
         history.push(item);
     }
-    if let Some(rollout) = &inner.rollout {
-        if let Some(marker) = marker {
-            rollout.record(RolloutItem::Item(marker));
-        }
-        rollout.record(RolloutItem::RunEnded(RolloutRunEnded::new(
-            run_id.clone(),
-            RolloutRunEnd::Cancelled,
-        )));
-        if let Err(error) = rollout.flush().await {
-            tracing::warn!(run_id = %run_id, %error, "the thread's rollout could not be flushed");
-        }
+    if let Some(marker) = marker {
+        recorder.record(RolloutItem::Item(marker));
     }
+    recorder.record(RolloutItem::RunEnded(RolloutRunEnded::new(
+        run_id,
+        RolloutRunEnd::Cancelled,
+    )));
     history
 }
 
