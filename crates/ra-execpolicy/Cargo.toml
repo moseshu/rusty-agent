@@ -1,0 +1,21 @@
+[package]
+name = "ra-execpolicy"
+description = "命令执行策略：基于前缀的 Starlark 规则，移植自 codex execpolicy。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+multimap = { workspace = true }
+fd-lock = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shlex = { workspace = true }
+starlark = { workspace = true }
+thiserror = { workspace = true }

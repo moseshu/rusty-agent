@@ -45,6 +45,7 @@ ra-eval = { path = "crates/ra-eval", version = "0.2.2" }
 ra-patch = { path = "crates/ra-patch", version = "0.2.2" }
 ra-tools = { path = "crates/ra-tools", version = "0.2.2" }
 ra-coding = { path = "crates/ra-coding", version = "0.2.2" }
+ra-execpolicy = { path = "crates/ra-execpolicy", version = "0.2.2" }
 
 # --- 运行时 ---
 tokio = { version = "1", features = [
@@ -113,6 +114,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25.1"
 globset = "0.4"
+# ra-execpolicy 的规则文件解析，与 codex `execpolicy` 同一版本、同一方言（Extended + f-string）：规则文件是
+# 完整的 Starlark，自己写一个只认 `prefix_rule(...)` 的解析器等于另做一套语言。multimap 是它按程序名
+# 分组的规则表，shlex 解析与渲染规则里的示例命令，版本都照 codex（shlex 1.3 与锁文件里传递进来的 2.x 并存）。
+starlark = { version = "0.14.2", default-features = false }
+multimap = "0.10.0"
+shlex = "1.3.0"
+# ra-execpolicy 追加规则时锁住规则文件。codex 用 `File::lock`（Rust 1.89 起稳定），本工作区 MSRV 是 1.88；
+# fd-lock 在 Unix 上用 flock、Windows 上用 LockFileEx，与 `File::lock` 的整文件独占锁一致，且经 starlark
+# 的 rustyline 已在锁文件里。
+fd-lock = "4.0.4"
 regex = "1"
 # Codex-compatible Git remote parsing for credential-safe thread metadata.
 gix-url = "0.35.2"

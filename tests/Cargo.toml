@@ -20,6 +20,7 @@ members = [
     "it-session",
     "it-session-sqlite",
     "it-exec",
+    "it-execpolicy",
     "it-sandbox",
     "it-mcp",
     "it-protocol",

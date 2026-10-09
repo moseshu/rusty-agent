@@ -60,7 +60,7 @@ impl Layer {
     }
 }
 
-/// The layer allowlist. The target shape is 18 crates; the ones not yet created (`ra-flow`,
+/// The layer allowlist. The target shape is 19 crates; the ones not yet created (`ra-flow`,
 /// `ra-assistant`) are registered in advance so the gate binds them the day they appear.
 const LAYERS: &[(&str, Layer)] = &[
     ("ra-core", Layer::Kernel),
@@ -70,6 +70,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-prompt", Layer::Service),
     ("ra-context", Layer::Service),
     ("ra-exec", Layer::Service),
+    ("ra-execpolicy", Layer::Service),
     ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
     ("ra-mcp", Layer::Service),
@@ -117,6 +118,11 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-prompt", &["ra-core"]),
     ("ra-context", &["ra-core"]),
     ("ra-exec", &["ra-core"]),
+    // Codex's command execution policy: Starlark rules files, their evaluation and amendments. It
+    // needs nothing from the framework — a decision is about command tokens, not tools or runs —
+    // and stays a crate of its own so the Starlark interpreter is a dependency of the one product
+    // that judges commands with it, not of the executor or the tool layer.
+    ("ra-execpolicy", &[]),
     // The sandbox backends. `ra-core` alone: the local backend spawns its own processes — one-shot
     // and interactive alike — rather than going through `ra-exec`, because the environment policy,
     // resource ceilings and per-command fence that crate applies are this product's, not the
