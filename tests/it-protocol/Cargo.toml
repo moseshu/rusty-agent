@@ -15,6 +15,9 @@ ra-core = { path = "../../crates/ra-core" }
 ra-protocol = { path = "../../crates/ra-protocol", features = ["test-api"] }
 # The live threads the turn methods start, steer and interrupt.
 ra-runtime = { path = "../../crates/ra-runtime" }
+# The Responses adapter whose request body carries a turn's output schema, and its mock endpoint.
+ra-model = { path = "../../crates/ra-model" }
+wiremock = "0.6"
 # The thread store `thread/turns/list` reads a thread's rollout from.
 ra-session = { path = "../../crates/ra-session" }
 # The command tool whose background terminals outlive their turn.

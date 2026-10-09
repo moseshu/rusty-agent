@@ -30,6 +30,7 @@ use ra_core::{
         Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
         ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing,
     },
+    output::OutputSchema,
     prompt::{CachePlan, PromptProvenance},
     state::ToolUseTracker,
     tool::{Tool, ToolAvailability, ToolServices},
@@ -142,6 +143,7 @@ pub struct TurnPreparationRequest<'a> {
     tool_use: &'a ToolUseTracker,
     input: Vec<ModelInputItem>,
     model_override: Option<String>,
+    output_schema_override: Option<OutputSchema>,
     model_settings: ModelSettings,
     tracing: ModelTracing,
     collision_policy: ToolNameCollisionPolicy,
@@ -186,6 +188,7 @@ impl<'a> TurnPreparationRequest<'a> {
             tool_use,
             input,
             model_override: None,
+            output_schema_override: None,
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
             collision_policy: ToolNameCollisionPolicy::Warn,
@@ -198,6 +201,16 @@ impl<'a> TurnPreparationRequest<'a> {
     /// Overrides the agent's unresolved provider/model selector for this run.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model_override = Some(model.into());
+        self
+    }
+
+    /// Replaces the agent's output declaration for this call with the run's.
+    ///
+    /// Codex constrains a turn's final answer with the schema the turn was started with, and every
+    /// model request of that turn carries it; a turn is one run here, so the run's declaration
+    /// wins over whatever the agent running the call declared, after a handoff as well.
+    pub fn with_output_schema(mut self, output_schema: OutputSchema) -> Self {
+        self.output_schema_override = Some(output_schema);
         self
     }
 
@@ -737,8 +750,12 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
 
     // 3. Project the public structured-output promise after handoffs. A prepared execution
     // instance may alter its tools or model, but it must not silently downgrade the output
-    // contract callers configured and future closeout validation will enforce.
-    let output_schema = resolve_output_schema(request.agent.public());
+    // contract callers configured and future closeout validation will enforce. A run that
+    // declares its own output replaces the agent's.
+    let output_schema = resolve_output_schema(
+        request.agent.public(),
+        request.output_schema_override.as_ref(),
+    );
 
     // 4. Resolve the provider and model only after the advertised action surface is stable.
     request.cancel.ensure_not_cancelled()?;
@@ -920,8 +937,13 @@ async fn resolve_handoffs(
     Ok(prepared)
 }
 
-fn resolve_output_schema(public_agent: &AgentSpec) -> Option<ModelOutputSchema> {
-    public_agent.output_schema().to_model_output_schema()
+fn resolve_output_schema(
+    public_agent: &AgentSpec,
+    run_override: Option<&OutputSchema>,
+) -> Option<ModelOutputSchema> {
+    run_override
+        .unwrap_or_else(|| public_agent.output_schema())
+        .to_model_output_schema()
 }
 
 /// What the instruction stage contributed to one turn.

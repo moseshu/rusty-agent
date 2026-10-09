@@ -55,6 +55,18 @@
 //! same disabled default as Codex. Product settings arrive through a host-prepared configuration;
 //! reasoning summary and service tier use existing provider-specific model-setting extras.
 //!
+//! # Output schema
+//!
+//! A turn may be started with a JSON schema for its final answer
+//! ([`TurnStartOptions::with_final_output_json_schema`]), as Codex's `final_output_json_schema`.
+//! It holds for that turn alone: every model call of the turn's run is asked for it, in strict
+//! mode and under Codex's name for it ([`TURN_OUTPUT_SCHEMA_NAME`]), in place of what the agent
+//! declares; the next turn goes back to the agent's declaration unless it is given one too. Input
+//! that would steer a running turn and names a schema is taken only if the turn runs with an equal
+//! one ([`NotSubmittedReason::ActiveTurnOutputSchemaMismatch`]), compared as JSON values, so the
+//! order of an object's keys does not matter. Like Codex, the thread leaves checking the schema to
+//! the provider and does not validate the answer against it.
+//!
 //! # Shutting down
 //!
 //! [`AgentThread::shutdown`] ends the thread's life, as Codex's `Op::Shutdown` does: input is
@@ -67,8 +79,8 @@
 //! - Product policy lowering: sandbox and approval policies, permission profiles and reviewer
 //!   routing belong to the host adapter. Working directory and collaboration-mode changes are
 //!   not implemented by this thread.
-//! - Review and compaction turns, which cannot be steered in Codex, a turn's output schema, and
-//!   additional context: this thread runs only regular turns on user input.
+//! - Review and compaction turns, which cannot be steered in Codex, and additional context: this
+//!   thread runs only regular turns on user input.
 //! - Server draining, the admission of turns Codex refuses while its host shuts down, and the
 //!   automatic, trigger and continuation starts that only its own background work issues.
 
@@ -82,6 +94,7 @@ use ra_core::{
     event::HostEvent,
     item::{ContentBlock, ItemId, Message, MessageRole, ModelInputItem, RunItem, RunItemKind},
     model::{Effort, ModelResolver, ModelSettings, ResolvedModel},
+    output::OutputSchema,
     session::{
         InterruptedTurnHistoryMarker, SessionId,
         interrupt::is_interrupt,
@@ -90,6 +103,7 @@ use ra_core::{
     state::{RunId, RunState},
     tool::ToolServices,
 };
+use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::{
@@ -195,6 +209,8 @@ pub enum NotSubmittedReason {
         /// The turn running.
         actual: String,
     },
+    /// Steering named an output schema other than the one the running turn uses.
+    ActiveTurnOutputSchemaMismatch,
     /// Steering was given no input.
     EmptyInput,
     /// The thread has been shut down and takes no more input. Codex's thread refuses it by having
@@ -248,6 +264,40 @@ pub enum SteerSubmission {
 #[must_use]
 pub fn turn_input_item_id(turn_id: &str, index: usize) -> ItemId {
     ItemId::new(format!("{turn_id}-input-{index}"))
+}
+
+/// The name a turn's output schema is sent to the provider under: the one Codex gives it.
+pub const TURN_OUTPUT_SCHEMA_NAME: &str = "codex_output_schema";
+
+/// Options that apply only if the input starts a turn: Codex's `TurnStartOptions`, for the options
+/// a turn here has.
+///
+/// When the input steers a running turn instead, the turn's own options stay, and an output
+/// schema given here must equal the turn's for the input to be taken.
+#[must_use]
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnStartOptions {
+    final_output_json_schema: Option<Value>,
+}
+
+impl TurnStartOptions {
+    /// No options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Constrains the final answer of the turn to `schema`, a JSON schema.
+    pub fn with_final_output_json_schema(mut self, schema: Value) -> Self {
+        self.final_output_json_schema = Some(schema);
+        self
+    }
+
+    /// The schema the turn's final answer is constrained to, if any.
+    #[must_use]
+    pub const fn final_output_json_schema(&self) -> Option<&Value> {
+        self.final_output_json_schema.as_ref()
+    }
 }
 
 /// Changes to a thread's settings for the turns it starts from now on: Codex's
@@ -366,6 +416,7 @@ impl ThreadSettings {
 pub struct TurnInputRequest {
     content: Vec<ContentBlock>,
     thread_settings: ThreadSettingsOverrides,
+    start: TurnStartOptions,
 }
 
 impl TurnInputRequest {
@@ -375,6 +426,7 @@ impl TurnInputRequest {
         Self {
             content,
             thread_settings: ThreadSettingsOverrides::new(),
+            start: TurnStartOptions::new(),
         }
     }
 
@@ -383,6 +435,21 @@ impl TurnInputRequest {
     pub fn with_thread_settings(mut self, thread_settings: ThreadSettingsOverrides) -> Self {
         self.thread_settings = thread_settings;
         self
+    }
+
+    /// Options for the turn the input starts, if it starts one: Codex's `on_start`.
+    pub fn on_start(mut self, start: TurnStartOptions) -> Self {
+        self.start = start;
+        self
+    }
+
+    /// Whether the input may steer `active`: it names no output schema, or the one `active` uses.
+    /// Codex compares the two as JSON values.
+    fn fits_output_schema_of(&self, active: &ActiveTurn) -> bool {
+        self.start
+            .final_output_json_schema
+            .as_ref()
+            .is_none_or(|schema| active.final_output_json_schema.as_ref() == Some(schema))
     }
 
     fn message(&self) -> Option<Message> {
@@ -537,6 +604,8 @@ struct ActiveTurn {
     pending: PendingInput,
     settings: LiveRunSettings,
     cancel: CancelScope,
+    /// The schema the turn's final answer is constrained to, which input steering it must match.
+    final_output_json_schema: Option<Value>,
     /// Set by an interrupt, so the turn ends aborted however its run comes back.
     interrupted: bool,
     /// The run ended and its history is being persisted before its terminal event.
@@ -705,6 +774,11 @@ impl AgentThread {
                         reason: NotSubmittedReason::EmptyInput,
                     };
                 };
+                if !request.fits_output_schema_of(active) {
+                    return TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::ActiveTurnOutputSchemaMismatch,
+                    };
+                }
                 if active.pending.push(vec![message]).is_ok() {
                     let turn_id = active.turn_id.clone();
                     request.thread_settings.apply(&mut state.config);
@@ -753,6 +827,11 @@ impl AgentThread {
                 reason: NotSubmittedReason::EmptyInput,
             };
         };
+        if !request.fits_output_schema_of(active) {
+            return SteerSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ActiveTurnOutputSchemaMismatch,
+            };
+        }
         if active.pending.push(vec![message]).is_err() {
             // The run has finished reading input; the turn ends without it.
             return SteerSubmission::NotSubmitted {
@@ -973,11 +1052,16 @@ impl AgentThread {
         let cancel = CancelScope::root().child(ScopeKind::Run);
         let pending = PendingInput::new();
         let settings = LiveRunSettings::new(state.config.clone());
+        let final_output_json_schema = request.start.final_output_json_schema.clone();
+        let output_schema = final_output_json_schema.clone().map(|schema| {
+            OutputSchema::json_schema(TURN_OUTPUT_SCHEMA_NAME, schema).with_strict(true)
+        });
         state.active_turn = Some(ActiveTurn {
             turn_id: turn_id.clone(),
             pending: pending.clone(),
             settings: settings.clone(),
             cancel: cancel.clone(),
+            final_output_json_schema,
             interrupted: false,
             ending: false,
             paused: None,
@@ -1002,6 +1086,7 @@ impl AgentThread {
             history: state.history.clone(),
             input,
             config: state.config.clone(),
+            output_schema,
             pending,
             settings,
             cancel,
@@ -1028,6 +1113,8 @@ struct StartedTurn {
     history: Vec<ModelInputItem>,
     input: Option<Message>,
     config: RunConfig,
+    /// The turn's output schema, which every segment of its run is given.
+    output_schema: Option<OutputSchema>,
     pending: PendingInput,
     settings: LiveRunSettings,
     cancel: CancelScope,
@@ -1116,6 +1203,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         history,
         input,
         config,
+        output_schema,
         pending,
         settings,
         cancel,
@@ -1133,6 +1221,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         &inner,
         &recorder,
         config,
+        output_schema.as_ref(),
         &pending,
         &settings,
         &cancel,
@@ -1219,6 +1308,7 @@ async fn run_to_end(
     inner: &Arc<ThreadInner>,
     recorder: &Arc<ThreadRecorder>,
     mut config: RunConfig,
+    output_schema: Option<&OutputSchema>,
     pending: &PendingInput,
     settings: &LiveRunSettings,
     cancel: &CancelScope,
@@ -1241,6 +1331,9 @@ async fn run_to_end(
             .with_pending_input(pending.clone());
         request = request.with_live_settings(settings.clone());
         request = request.with_rollout_recorder(recorder.clone());
+        if let Some(output_schema) = output_schema {
+            request = request.with_output_schema(output_schema.clone());
+        }
         let mut stream = Runner::run_streamed(request);
         let mut produced = Vec::new();
         while let Some(event) = stream.next_event().await {

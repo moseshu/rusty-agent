@@ -27,7 +27,7 @@ use ra_core::{
 };
 use ra_runtime::thread::{
     AgentThread, AgentThreadBuilder, NotSubmittedReason, SteerSubmission, ThreadSettingsOverrides,
-    TurnInputRequest, TurnInputSubmission, TurnSettingsUpdateOutcome,
+    TurnInputRequest, TurnInputSubmission, TurnSettingsUpdateOutcome, TurnStartOptions,
 };
 use serde_json::Value;
 
@@ -90,7 +90,7 @@ impl TurnRequestProcessor {
         let policy = params.policy().clone();
         let summary = params.summary();
         let tier = params.service_tier().map(|tier| tier.map(str::to_owned));
-        let (_, input, model, effort) = params.into_parts();
+        let (input, model, effort, output_schema) = params.into_parts();
         let content = input_content(input)?;
         let overrides = prepare_overrides(
             "turn/start",
@@ -102,7 +102,13 @@ impl TurnRequestProcessor {
             summary,
             tier,
         )?;
-        let request = TurnInputRequest::new(content).with_thread_settings(overrides);
+        let mut start = TurnStartOptions::new();
+        if let Some(schema) = output_schema {
+            start = start.with_final_output_json_schema(schema);
+        }
+        let request = TurnInputRequest::new(content)
+            .with_thread_settings(overrides)
+            .on_start(start);
         let turn_id = match thread.start_or_steer_turn(request).await {
             TurnInputSubmission::Started { turn_id } | TurnInputSubmission::Steered { turn_id } => {
                 turn_id

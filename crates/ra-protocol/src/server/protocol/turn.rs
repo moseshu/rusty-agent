@@ -621,6 +621,13 @@ impl TurnStartParams {
         self
     }
 
+    /// Constrains the final assistant message of this turn to `schema`, a JSON schema.
+    #[must_use]
+    pub fn with_output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
     /// The thread.
     #[must_use]
     pub fn thread_id(&self) -> &str {
@@ -649,6 +656,14 @@ impl TurnStartParams {
     #[must_use]
     pub fn client_user_message_id(&self) -> Option<&str> {
         self.client_user_message_id.as_deref()
+    }
+
+    /// The JSON schema the final assistant message of this turn is constrained to, if any. It
+    /// applies only if the request starts a turn; one that steers the running turn is refused
+    /// unless that turn uses an equal schema.
+    #[must_use]
+    pub const fn output_schema(&self) -> Option<&Value> {
+        self.output_schema.as_ref()
     }
 
     /// Why the request needs the experimental API, if it does: the reason Codex gives for the
@@ -696,8 +711,8 @@ impl TurnStartParams {
     /// Such a request is refused. Codex applies these: a working directory and runtime workspace
     /// roots, environments, approval and sandbox policies and permission profiles, a service tier
     /// and reasoning summary, a collaboration mode, disabled plugins, a tool output to answer in
-    /// place of input, a turn trigger and Responses API metadata, additional context, a cyber
-    /// access program, and an output schema for the turn's final answer.
+    /// place of input, a turn trigger and Responses API metadata, additional context, and a cyber
+    /// access program.
     #[must_use]
     pub fn unsupported_field(&self) -> Option<&'static str> {
         [
@@ -714,7 +729,6 @@ impl TurnStartParams {
                 self.runtime_workspace_roots.is_some(),
             ),
             ("serviceTierForTurn", self.service_tier_for_turn.is_some()),
-            ("outputSchema", self.output_schema.is_some()),
             ("cyberAccessProgram", self.cyber_access_program.is_some()),
         ]
         .into_iter()
@@ -722,8 +736,15 @@ impl TurnStartParams {
         .or_else(|| self.settings.first_sent())
     }
 
-    pub(crate) fn into_parts(self) -> (String, Vec<UserInput>, Option<String>, Option<String>) {
-        (self.thread_id, self.input, self.model, self.effort)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<UserInput>,
+        Option<String>,
+        Option<String>,
+        Option<Value>,
+    ) {
+        (self.input, self.model, self.effort, self.output_schema)
     }
 }
 

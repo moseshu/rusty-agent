@@ -66,6 +66,7 @@ use ra_core::{
         ModelStreamEvent, ModelTracing, ReplaySafety, RetryAdvice, RetryBackoff, RetryDecision,
         RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
+    output::OutputSchema,
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
     session::{
@@ -922,6 +923,7 @@ pub struct RunRequest {
     session: Option<Arc<dyn Session>>,
     pending_input: Option<PendingInput>,
     live_settings: Option<LiveRunSettings>,
+    output_schema: Option<OutputSchema>,
 }
 
 impl RunRequest {
@@ -964,6 +966,7 @@ impl RunRequest {
             session: None,
             pending_input: None,
             live_settings: None,
+            output_schema: None,
         }
     }
 
@@ -1051,6 +1054,23 @@ impl RunRequest {
     /// ([`PersistContext::SteeredUserInput`]), as it does for delivered mail.
     pub fn with_pending_input(mut self, pending_input: PendingInput) -> Self {
         self.pending_input = Some(pending_input);
+        self
+    }
+
+    /// Constrains this run's answer with `output_schema` in place of the agent's declaration:
+    /// Codex's per-turn `final_output_json_schema`, since its turn is a run here.
+    ///
+    /// Every model call of the run is asked for it, as every request of a Codex turn carries the
+    /// turn's schema — including calls made by an agent the run handed off to, whatever that agent
+    /// declares. [`OutputSchema::plain_text`] asks for ordinary text even from an agent that
+    /// declares a schema. Without this call each call uses the declaration of the agent making it.
+    ///
+    /// The declaration is passed to the provider as given; unlike an agent's it is not checked by
+    /// [`OutputSchema::validate`] first, as Codex leaves a turn's schema to the provider. A caller
+    /// that wants the check runs it itself. It is not part of the run's checkpoint: a run continued
+    /// from its [`RunState`] is given it again, as it is given its [`RunConfig`] again.
+    pub fn with_output_schema(mut self, output_schema: OutputSchema) -> Self {
+        self.output_schema = Some(output_schema);
         self
     }
 
@@ -1286,6 +1306,8 @@ struct TurnLoopContext<'a> {
     /// Input the host steers into the run, delivered at model-call boundaries as mail is.
     pending_input: Option<&'a PendingInput>,
     live_settings: Option<&'a LiveRunSettings>,
+    /// The run's own output declaration, which replaces the agent's in every model call.
+    output_schema: Option<&'a OutputSchema>,
     /// What the run has spent, as the runs it starts and its token ceiling see it.
     spend: &'a RunSpend,
     /// Whether this segment continues a turn that stopped for approval rather than starting one.
@@ -1700,6 +1722,7 @@ async fn run_loop_inner(
         session,
         pending_input,
         live_settings,
+        output_schema,
     } = request;
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
@@ -1938,6 +1961,7 @@ async fn run_loop_inner(
         deliver_mail_first,
         pending_input: pending_input.as_ref(),
         live_settings: live_settings.as_ref(),
+        output_schema: output_schema.as_ref(),
         spend,
         continues_turn,
         session: session.as_deref(),
@@ -3561,6 +3585,9 @@ async fn run_one_turn(
     .with_services(context.services);
     if let Some(model) = &config.model {
         preparation = preparation.with_model(model.clone());
+    }
+    if let Some(output_schema) = context.output_schema {
+        preparation = preparation.with_output_schema(output_schema.clone());
     }
     let prepared = prepare_turn(preparation).await?;
     let sandbox_processors = context.sandbox.context_processors(agent).await;

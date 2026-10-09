@@ -26,9 +26,10 @@ use ra_core::{
     error::{Error, Result},
     item::{ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
     model::{
-        ApiProtocol, Effort, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings,
-        ProviderKey, ResolvedModel,
+        ApiProtocol, Effort, Model, ModelOutputSchema, ModelRequest, ModelResolver, ModelSelector,
+        ModelSettings, ProviderKey, ResolvedModel,
     },
+    output::OutputSchema,
     session::SessionId,
 };
 use ra_protocol::{
@@ -80,6 +81,7 @@ struct Call {
     model: Option<String>,
     effort: Option<Effort>,
     input: Vec<ModelInputItem>,
+    output_schema: Option<ModelOutputSchema>,
 }
 
 #[derive(Default)]
@@ -145,6 +147,7 @@ impl Model for ScriptedModel {
             model: self.model.clone(),
             effort: request.model_settings().effort(),
             input: request.input().to_vec(),
+            output_schema: request.output_schema().cloned(),
         });
         self.script.called.notify_waiters();
         let step = self.script.steps.lock().unwrap().pop_front();
@@ -267,7 +270,11 @@ impl Server {
 
     /// Loads a thread on `script` with `connections` subscribed.
     async fn load(&self, script: &Arc<Script>, connections: &[&Connection]) -> AgentThread {
-        let thread = agent_thread(script);
+        self.load_thread(agent_thread(script), connections).await
+    }
+
+    /// Loads `thread` with `connections` subscribed.
+    async fn load_thread(&self, thread: AgentThread, connections: &[&Connection]) -> AgentThread {
         let ids: Vec<_> = connections.iter().map(|connection| connection.id).collect();
         self.loader.load(thread.clone(), &ids).await;
         thread
@@ -770,10 +777,6 @@ async fn turn_start_refuses_what_a_run_here_does_not_carry() {
         (
             json!({"threadId": THREAD, "input": [], "sandboxPolicy": {"type": "readOnly"}}),
             invalid_request("the thread's host has not configured a permission settings adapter"),
-        ),
-        (
-            json!({"threadId": THREAD, "input": [], "outputSchema": {"type": "object"}}),
-            invalid_request("turn/start.outputSchema is not supported"),
         ),
         (
             json!({"threadId": THREAD, "input": [], "permissions": "workspace"}),
@@ -1577,4 +1580,294 @@ async fn settings_notification_has_a_persisted_snapshot_and_deduplicates_updates
     let update = connection.notification("thread/settings/updated").await;
     assert_eq!(update["threadSettings"]["serviceTier"], Value::Null);
     assert_eq!(update["threadSettings"]["summary"], "concise");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A turn's output schema: Codex's `output_schema.rs` suite and its steering rule
+// ---------------------------------------------------------------------------------------------
+
+/// Codex's schema in its `output_schema.rs` cases.
+fn answer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "answer": { "type": "string" }
+        },
+        "required": ["answer"],
+        "additionalProperties": false
+    })
+}
+
+/// A Responses endpoint that answers every request with one assistant message, as Codex's
+/// `ev_response_created`, `ev_assistant_message` and `ev_completed` do.
+async fn responses_endpoint() -> wiremock::MockServer {
+    let message = json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Done"}]
+    });
+    let frames = [
+        json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp-1", "status": "in_progress"}
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": message
+        }),
+        json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": {
+                "id": "resp-1",
+                "object": "response",
+                "status": "completed",
+                "output": [message],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        }),
+    ];
+    let body: String = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Resolves every model to the Responses adapter talking to `base_url`.
+struct ResponsesResolver(String);
+
+impl ModelResolver for ResponsesResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        let model = ra_model::openai::responses::OpenAiResponsesModel::new(
+            model_name.unwrap_or("mock-model"),
+            ra_model::openai::auth::OpenAiAuth::new("test-secret")
+                .with_base_url(format!("{}/v1/", self.0)),
+        )?;
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("openai"),
+                Some(model_name.unwrap_or("mock-model").to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::new(model) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+fn responses_thread(endpoint: &wiremock::MockServer) -> AgentThread {
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .instructions("lead")
+        .build()
+        .unwrap();
+    AgentThread::builder(
+        SessionId::new(THREAD),
+        AgentBinding::direct(agent),
+        Arc::new(ResponsesResolver(endpoint.uri())) as Arc<dyn ModelResolver>,
+    )
+    .build()
+}
+
+/// The bodies of the requests `endpoint` has received, in order.
+async fn request_bodies(endpoint: &wiremock::MockServer) -> Vec<Value> {
+    endpoint
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
+}
+
+#[test]
+fn turn_start_params_carry_an_output_schema() {
+    let params = text_turn("Hello").with_output_schema(answer_schema());
+    let wire = serde_json::to_value(&params).unwrap();
+    assert_eq!(wire["outputSchema"], answer_schema());
+    let request = JsonRpcRequest::new(1, "turn/start").with_params(wire);
+    let ClientRequest::TurnStart { params, .. } = ClientRequest::try_from(request).unwrap() else {
+        panic!("expected turn/start");
+    };
+    assert_eq!(params.output_schema(), Some(&answer_schema()));
+
+    // Codex's `Option<JsonValue>`: null is no schema.
+    let request = JsonRpcRequest::new(2, "turn/start").with_params(
+        json!({"threadId": THREAD, "input": [], "outputSchema": null}),
+    );
+    let ClientRequest::TurnStart { params, .. } = ClientRequest::try_from(request).unwrap() else {
+        panic!("expected turn/start");
+    };
+    assert_eq!(params.output_schema(), None);
+    assert_eq!(params.unsupported_field(), None);
+}
+
+/// Codex's `turn_start_accepts_output_schema_v2`.
+#[tokio::test]
+async fn turn_start_accepts_output_schema() {
+    let endpoint = responses_endpoint().await;
+    let server = Server::start();
+    let mut connection = server.connect(1, false).await;
+    server
+        .load_thread(responses_thread(&endpoint), &[&connection])
+        .await;
+
+    let id = server
+        .turn_start(
+            &mut connection,
+            &text_turn("Hello").with_output_schema(answer_schema()),
+        )
+        .await;
+    assert_eq!(
+        connection.response(id).await["turn"]["status"],
+        "inProgress"
+    );
+    let completed = connection.notification("turn/completed").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+
+    let bodies = request_bodies(&endpoint).await;
+    assert_eq!(bodies.len(), 1);
+    let text = bodies[0].get("text").expect("request missing text field");
+    let format = text
+        .get("format")
+        .expect("request missing text.format field");
+    assert_eq!(
+        format,
+        &json!({
+            "name": "codex_output_schema",
+            "type": "json_schema",
+            "strict": true,
+            "schema": answer_schema(),
+        })
+    );
+}
+
+/// Codex's `turn_start_output_schema_is_per_turn_v2`.
+#[tokio::test]
+async fn turn_start_output_schema_is_per_turn() {
+    let endpoint = responses_endpoint().await;
+    let server = Server::start();
+    let mut connection = server.connect(1, false).await;
+    server
+        .load_thread(responses_thread(&endpoint), &[&connection])
+        .await;
+
+    let id = server
+        .turn_start(
+            &mut connection,
+            &text_turn("Hello").with_output_schema(answer_schema()),
+        )
+        .await;
+    connection.response(id).await;
+    connection.notification("turn/completed").await;
+    let bodies = request_bodies(&endpoint).await;
+    assert_eq!(
+        bodies[0].pointer("/text/format"),
+        Some(&json!({
+            "name": "codex_output_schema",
+            "type": "json_schema",
+            "strict": true,
+            "schema": answer_schema(),
+        }))
+    );
+
+    let id = server
+        .turn_start(&mut connection, &text_turn("Hello again"))
+        .await;
+    connection.response(id).await;
+    connection.notification("turn/completed").await;
+    let bodies = request_bodies(&endpoint).await;
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1].pointer("/text/format"), None);
+}
+
+/// Codex's `start_or_steer_turn_requires_matching_active_output_schema`, through `turn/start`:
+/// input that would steer a turn running with another schema is refused with Codex's answer, and
+/// its settings are not applied; an equal schema, whatever the order of its keys, steers.
+#[tokio::test]
+async fn turn_start_steers_only_a_turn_with_the_same_output_schema() {
+    let server = Server::start();
+    let mut connection = server.connect(1, false).await;
+    let script = Arc::new(Script::default());
+    let thread = server.load(&script, &[&connection]).await;
+    let active_schema: Value = serde_json::from_str(
+        r#"{"type":"object","properties":{"answer":{"type":"string"},"count":{"type":"number"}},"required":["answer","count"]}"#,
+    )
+    .unwrap();
+    let matching_schema_with_different_object_order: Value = serde_json::from_str(
+        r#"{"required":["answer","count"],"properties":{"count":{"type":"number"},"answer":{"type":"string"}},"type":"object"}"#,
+    )
+    .unwrap();
+    let different_schema: Value = serde_json::from_str(
+        r#"{"type":"object","properties":{"answer":{"type":"number"}},"required":["answer"]}"#,
+    )
+    .unwrap();
+    let (release, wait) = gate();
+    script.push(Step::After(wait, ModelResponse::new(Vec::new())));
+    script.push(Step::Respond(final_message("m-2", "{}")));
+
+    let id = server
+        .turn_start(
+            &mut connection,
+            &text_turn("start turn").with_output_schema(active_schema.clone()),
+        )
+        .await;
+    let turn_id = connection.response(id).await["turn"]["id"].clone();
+    script.wait_for_calls(1).await;
+
+    let id = server
+        .turn_start(
+            &mut connection,
+            &text_turn("rejected steer")
+                .with_model("other-model")
+                .with_output_schema(different_schema),
+        )
+        .await;
+    assert_eq!(
+        connection.error(id).await,
+        json!({
+            "code": -32603,
+            "message": "failed to submit turn input: ActiveTurnOutputSchemaMismatch"
+        })
+    );
+    assert_eq!(thread.settings().model(), None);
+
+    let id = server
+        .turn_start(
+            &mut connection,
+            &text_turn("accepted steer")
+                .with_output_schema(matching_schema_with_different_object_order),
+        )
+        .await;
+    assert_eq!(connection.response(id).await["turn"]["id"], turn_id);
+
+    release.notify_one();
+    connection.notification("turn/completed").await;
+    let calls = script.calls();
+    assert_eq!(calls.len(), 2);
+    let second_request = texts(&calls[1].input);
+    assert!(second_request.contains(&"accepted steer".to_owned()));
+    assert!(!second_request.contains(&"rejected steer".to_owned()));
+    let expected = OutputSchema::json_schema("codex_output_schema", active_schema)
+        .to_model_output_schema();
+    for call in &calls {
+        assert_eq!(call.output_schema, expected);
+        assert_eq!(call.model, None);
+    }
 }

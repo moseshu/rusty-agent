@@ -27,9 +27,10 @@ use ra_core::{
     },
     lifecycle::{AgentEndInput, LifecycleHook, LifecycleScope},
     model::{
-        ApiProtocol, Effort, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings,
-        ProviderKey, ResolvedModel,
+        ApiProtocol, Effort, Model, ModelOutputSchema, ModelRequest, ModelResolver, ModelSelector,
+        ModelSettings, ProviderKey, ResolvedModel,
     },
+    output::OutputSchema,
     session::{SessionId, interrupt::is_interrupted_turn_marker},
     state::{RunId, RunState},
     tool::{
@@ -41,11 +42,12 @@ use ra_runtime::{
     hook::UserHookRegistration,
     runner::{PendingInput, RunConfig, RunRequest, Runner},
     thread::{
-        AgentThread, NotSubmittedReason, SteerSubmission, ThreadEvent, ThreadSettingsOverrides,
-        TurnAbortReason, TurnInputRequest, TurnInputSubmission, turn_input_item_id,
+        AgentThread, NotSubmittedReason, SteerSubmission, TURN_OUTPUT_SCHEMA_NAME, ThreadEvent,
+        ThreadSettingsOverrides, TurnAbortReason, TurnInputRequest, TurnInputSubmission,
+        TurnStartOptions, turn_input_item_id,
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{sync::Notify, time::timeout};
 
 /// How long a case waits for any one event.
@@ -72,6 +74,7 @@ struct Call {
     model: Option<String>,
     effort: Option<Effort>,
     input: Vec<ModelInputItem>,
+    output_schema: Option<ModelOutputSchema>,
 }
 
 #[derive(Default)]
@@ -146,6 +149,7 @@ impl Model for ScriptedModel {
             model: self.model.clone(),
             effort: request.model_settings().effort(),
             input: request.input().to_vec(),
+            output_schema: request.output_schema().cloned(),
         });
         self.script.called.notify_waiters();
         let step = self.script.steps.lock().unwrap().pop_front();
@@ -1424,5 +1428,308 @@ async fn what_a_turns_end_adds_is_reported_as_its_records() {
             Some(RunItemKind::Message(message)) if is_interrupted_turn_marker(message)
         ),
         "{events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A turn's output schema
+// ---------------------------------------------------------------------------------------------
+
+fn schema(text: &str) -> Value {
+    serde_json::from_str(text).expect("parse schema")
+}
+
+fn with_schema(request: TurnInputRequest, schema: Value) -> TurnInputRequest {
+    request.on_start(TurnStartOptions::new().with_final_output_json_schema(schema))
+}
+
+/// What a turn started with `schema` asks the model for.
+fn turn_output_schema(schema: Value) -> ModelOutputSchema {
+    OutputSchema::json_schema(TURN_OUTPUT_SCHEMA_NAME, schema)
+        .to_model_output_schema()
+        .unwrap()
+}
+
+/// Codex's `start_or_steer_turn_requires_matching_active_output_schema`.
+#[tokio::test]
+async fn start_or_steer_turn_requires_matching_active_output_schema() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let active_schema = schema(
+        r#"{"type":"object","properties":{"answer":{"type":"string"},"count":{"type":"number"}},"required":["answer","count"]}"#,
+    );
+    let matching_schema_with_different_object_order = schema(
+        r#"{"required":["answer","count"],"properties":{"count":{"type":"number"},"answer":{"type":"string"}},"type":"object"}"#,
+    );
+    let different_schema = schema(
+        r#"{"type":"object","properties":{"answer":{"type":"number"}},"required":["answer"]}"#,
+    );
+    let (release, wait) = gate();
+    script.push(Step::After(wait, tool_call("m-1", "c-1", "quick_look")));
+    script.push(Step::Respond(final_message("m-2", "{}")));
+
+    let turn_id = started(
+        &thread,
+        with_schema(text("start turn"), active_schema.clone()),
+    )
+    .await;
+    script.wait_for_calls(1).await;
+
+    let rejected = with_schema(
+        text("rejected steer").with_thread_settings(
+            ThreadSettingsOverrides::new()
+                .with_model("next")
+                .with_effort(Effort::Low),
+        ),
+        different_schema,
+    );
+    assert_eq!(
+        thread.start_or_steer_turn(rejected).await,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ActiveTurnOutputSchemaMismatch,
+        }
+    );
+    // A refused input applies none of its settings.
+    assert_eq!(thread.settings().model(), None);
+    assert_eq!(thread.settings().effort(), None);
+
+    assert_eq!(
+        thread
+            .start_or_steer_turn(with_schema(
+                text("accepted steer"),
+                matching_schema_with_different_object_order,
+            ))
+            .await,
+        TurnInputSubmission::Steered {
+            turn_id: turn_id.clone()
+        }
+    );
+    // Input that names no schema steers whatever the turn uses.
+    assert_eq!(
+        thread.start_or_steer_turn(text("no schema")).await,
+        TurnInputSubmission::Steered {
+            turn_id: turn_id.clone()
+        }
+    );
+
+    release.notify_one();
+    completes(&thread, &turn_id).await;
+
+    let calls = script.calls();
+    assert_eq!(calls.len(), 2);
+    let second_request = texts(&calls[1].input);
+    assert!(second_request.contains(&"accepted steer".to_owned()));
+    assert!(second_request.contains(&"no schema".to_owned()));
+    assert!(!second_request.contains(&"rejected steer".to_owned()));
+    // Every model call of the turn is asked for its schema.
+    for call in &calls {
+        assert_eq!(
+            call.output_schema,
+            Some(turn_output_schema(active_schema.clone()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn steer_turn_requires_matching_active_output_schema() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let active_schema = schema(r#"{"type":"object"}"#);
+    let (release, wait) = gate();
+    script.push(Step::After(wait, tool_call("m-1", "c-1", "quick_look")));
+    script.push(Step::Respond(final_message("m-2", "{}")));
+    let turn_id = started(&thread, with_schema(text("run it"), active_schema.clone())).await;
+    script.wait_for_calls(1).await;
+
+    assert_eq!(
+        thread.steer_turn(
+            &with_schema(text("rejected"), schema(r#"{"type":"array"}"#)),
+            &turn_id
+        ),
+        SteerSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ActiveTurnOutputSchemaMismatch
+        }
+    );
+    // The turn named comes first, as in Codex.
+    assert_eq!(
+        thread.steer_turn(
+            &with_schema(text("rejected"), schema(r#"{"type":"array"}"#)),
+            "wrong-turn"
+        ),
+        SteerSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ExpectedTurnMismatch {
+                expected: "wrong-turn".to_owned(),
+                actual: turn_id.clone(),
+            }
+        }
+    );
+    assert_eq!(
+        thread.steer_turn(&with_schema(text("accepted"), active_schema), &turn_id),
+        SteerSubmission::Steered {
+            turn_id: turn_id.clone()
+        }
+    );
+    release.notify_one();
+    completes(&thread, &turn_id).await;
+    let second_request = texts(&script.calls()[1].input);
+    assert!(second_request.contains(&"accepted".to_owned()));
+    assert!(!second_request.contains(&"rejected".to_owned()));
+}
+
+/// A schema steering cannot match: a turn started without one.
+#[tokio::test]
+async fn a_schema_does_not_steer_a_turn_started_without_one() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let (release, wait) = gate();
+    script.push(Step::After(wait, final_message("m-1", "done")));
+    let turn_id = started(&thread, text("run it")).await;
+    script.wait_for_calls(1).await;
+
+    assert_eq!(
+        thread
+            .start_or_steer_turn(with_schema(text("steer"), schema(r#"{"type":"object"}"#)))
+            .await,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ActiveTurnOutputSchemaMismatch,
+        }
+    );
+    release.notify_one();
+    completes(&thread, &turn_id).await;
+    assert_eq!(script.calls()[0].output_schema, None);
+}
+
+/// Codex's `turn_start_output_schema_is_per_turn_v2`, on the thread: a turn's schema replaces what
+/// the agent declares for that turn alone.
+#[tokio::test]
+async fn a_turns_output_schema_holds_for_that_turn_alone() {
+    let script = Arc::new(Script::default());
+    let agent_schema = json!({
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+        "additionalProperties": false
+    });
+    let agent = AgentSpec::builder()
+        .id(ra_core::agent::AgentId::new("lead"))
+        .name("Lead")
+        .output_schema(OutputSchema::json_schema("verdict", agent_schema.clone()))
+        .build()
+        .unwrap();
+    let thread = AgentThread::builder(
+        SessionId::new("schema-thread"),
+        AgentBinding::direct(agent),
+        Arc::new(Resolver(Arc::clone(&script))) as Arc<dyn ModelResolver>,
+    )
+    .build();
+    let turn_schema = json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    for answer in ["first", "second"] {
+        script.push(Step::Respond(final_message(answer, "{}")));
+    }
+
+    let first = started(&thread, with_schema(text("Hello"), turn_schema.clone())).await;
+    completes(&thread, &first).await;
+    let second = started(&thread, text("Hello again")).await;
+    completes(&thread, &second).await;
+
+    let calls = script.calls();
+    let first_schema = calls[0].output_schema.clone().unwrap();
+    assert_eq!(first_schema, turn_output_schema(turn_schema));
+    assert_eq!(first_schema.name(), "codex_output_schema");
+    assert!(first_schema.strict());
+    assert_eq!(
+        calls[1].output_schema,
+        OutputSchema::json_schema("verdict", agent_schema).to_model_output_schema()
+    );
+}
+
+/// A turn that stops for approval keeps its schema when it continues.
+#[tokio::test]
+async fn a_turns_output_schema_holds_across_an_approval_pause() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let turn_schema = schema(r#"{"type":"object"}"#);
+    script.push(Step::Respond(tool_call("m-1", "c-1", "guarded_look")));
+    script.push(Step::Respond(final_message("m-2", "{}")));
+
+    let turn_id = started(&thread, with_schema(text("look"), turn_schema.clone())).await;
+    let mut state = timeout(PATIENCE, async {
+        loop {
+            if let Some(state) = thread.paused_run() {
+                return state;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the run pauses for approval");
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    thread.resume_turn(state).unwrap();
+    completes(&thread, &turn_id).await;
+
+    let calls = script.calls();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(
+            call.output_schema,
+            Some(turn_output_schema(turn_schema.clone()))
+        );
+    }
+}
+
+/// A run's own declaration replaces the agent's, plain text included.
+#[tokio::test]
+async fn a_runs_output_schema_replaces_the_agents_declaration() {
+    let script = Arc::new(Script::default());
+    let agent = AgentSpec::builder()
+        .id(ra_core::agent::AgentId::new("lead"))
+        .name("Lead")
+        .output_schema(OutputSchema::json_schema(
+            "verdict",
+            json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+        ))
+        .build()
+        .unwrap();
+    let request = |output_schema: Option<OutputSchema>| {
+        let request = RunRequest::new(
+            AgentBinding::direct(Arc::clone(&agent)),
+            Arc::new(Resolver(Arc::clone(&script))) as Arc<dyn ModelResolver>,
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("answer"))],
+        );
+        match output_schema {
+            Some(output_schema) => request.with_output_schema(output_schema),
+            None => request,
+        }
+    };
+    let declared = OutputSchema::json_schema("run", json!({"type": "array"})).with_strict(false);
+    for (output_schema, id) in [
+        (None, "m-1"),
+        (Some(OutputSchema::plain_text()), "m-2"),
+        (Some(declared.clone()), "m-3"),
+    ] {
+        script.push(Step::Respond(final_message(id, "[]")));
+        Runner::run(request(output_schema)).await.unwrap();
+    }
+
+    let schemas: Vec<_> = script
+        .calls()
+        .into_iter()
+        .map(|call| call.output_schema.map(|schema| schema.name().to_owned()))
+        .collect();
+    assert_eq!(
+        schemas,
+        vec![Some("verdict".to_owned()), None, Some("run".to_owned())]
+    );
+    assert_eq!(
+        script.calls()[2].output_schema,
+        declared.to_model_output_schema()
     );
 }
