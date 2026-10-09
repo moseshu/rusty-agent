@@ -89,6 +89,13 @@ impl CodingHost {
         &self.process_manager
     }
 
+    /// The background terminals of the commands this host's tools run, for the app server to
+    /// load with a thread.
+    #[must_use]
+    pub fn background_terminals(&self) -> crate::background_terminals::CodingBackgroundTerminals {
+        crate::background_terminals::CodingBackgroundTerminals::new(Arc::clone(&self.process_manager))
+    }
+
     /// The host event sink for this host.
     #[must_use]
     pub fn event_sink(&self) -> &Arc<dyn HostEventSink> {

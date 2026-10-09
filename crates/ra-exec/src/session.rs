@@ -23,11 +23,20 @@
 //! closeout, the directory requires host recovery even after the session reports completion.
 //! Processes that deliberately escape the group need backend containment; this local executor
 //! cannot establish their lifetime from a process-group probe.
+//!
+//! # Background terminals
+//!
+//! A command outlives the call that started it once it yields, and keeps running until it ends,
+//! is stopped, or the host stops it. [`ProcessManager::background_terminals`] lists the commands
+//! still running with what started them — the call, the command line and the directory — and
+//! [`ProcessManager::terminate_background_terminal`] and
+//! [`ProcessManager::terminate_background_terminals`] stop them, as Codex's unified-exec process
+//! manager (`core/src/unified_exec/process_manager.rs`) lists and terminates its processes.
 
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -424,6 +433,69 @@ struct ExecSession {
     /// What confined this command, recorded once the process exists so that every summary the
     /// session produces — completed, yielded, or read back later — carries the same answer.
     sandbox: Option<crate::sandbox::SandboxReport>,
+    /// What started the command, for [`ProcessManager::background_terminals`].
+    origin: SessionOrigin,
+}
+
+/// What started a session's command.
+#[derive(Debug, Clone, Default)]
+struct SessionOrigin {
+    call_id: Option<String>,
+    command: String,
+    cwd: Option<PathBuf>,
+}
+
+impl SessionOrigin {
+    fn of(request: &ExecRequest) -> Self {
+        Self {
+            call_id: request.call_id().map(str::to_owned),
+            // The command string alone, as Codex lists it: the request's arguments are data the
+            // shell receives as `$0`, `$1`, …, not words of the command line.
+            command: request.command().to_owned(),
+            // A command given no directory runs in this process's.
+            cwd: request
+                .cwd()
+                .cloned()
+                .or_else(|| std::env::current_dir().ok()),
+        }
+    }
+}
+
+/// A command still running, with what started it: Codex's `BackgroundTerminalInfo`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTerminal {
+    session_id: ExecSessionId,
+    call_id: Option<String>,
+    command: String,
+    cwd: Option<PathBuf>,
+}
+
+impl BackgroundTerminal {
+    /// The session running the command.
+    #[must_use]
+    pub const fn session_id(&self) -> &ExecSessionId {
+        &self.session_id
+    }
+
+    /// The tool call that started it, if the request recorded one (see
+    /// [`ExecRequest::with_call_id`]).
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+
+    /// The command string the shell runs.
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The directory it runs in, if known.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
 }
 
 impl ExecSession {
@@ -447,6 +519,7 @@ impl ExecSession {
             closed: false,
             closed_notify: Arc::new(Notify::new()),
             sandbox: None,
+            origin: SessionOrigin::default(),
         }
     }
 
@@ -889,6 +962,7 @@ impl ProcessManager {
         {
             let mut sess = session.lock().await;
             let _ = sess.state.transition_to(ExecSessionState::Starting);
+            sess.origin = SessionOrigin::of(&request);
         }
 
         // Taken before the process exists, not after it yields: a handle acquired later could fail
@@ -1626,6 +1700,69 @@ impl ProcessManager {
     /// until then its process really may still be running.
     pub async fn active_sessions(&self) -> Vec<ExecSessionId> {
         self.registry.active_ids().await
+    }
+
+    /// The commands still running, oldest first, with what started each: Codex's
+    /// `list_processes`.
+    ///
+    /// A command told to stop stays listed until its process and output closeout finishes.
+    pub async fn background_terminals(&self) -> Vec<BackgroundTerminal> {
+        let mut terminals = Vec::new();
+        for session_id in self.registry.active_ids().await {
+            let Some(session) = self.registry.get(&session_id).await else {
+                continue;
+            };
+            let session = session.lock().await;
+            if session.closed || session.terminate.is_none() {
+                continue;
+            }
+            terminals.push(BackgroundTerminal {
+                session_id,
+                call_id: session.origin.call_id.clone(),
+                command: session.origin.command.clone(),
+                cwd: session.origin.cwd.clone(),
+            });
+        }
+        terminals
+    }
+
+    /// Stops the command of `session_id` if it is still running: Codex's `terminate_process`.
+    /// Returns whether it was, after process and output closeout.
+    ///
+    /// Unlike Codex's immediate local kill, this executor preserves its cancellation grace period.
+    /// Waiting for closeout keeps that adaptation from reporting success while the command runs.
+    pub async fn terminate_background_terminal(&self, session_id: &ExecSessionId) -> bool {
+        let Some(session) = self.registry.get(session_id).await else {
+            return false;
+        };
+        let sess = session.lock().await;
+        if sess.state.is_terminal() || sess.terminate.is_none() {
+            return false;
+        }
+        let closed_notify = Arc::clone(&sess.closed_notify);
+        let closed = closed_notify.notified();
+        tokio::pin!(closed);
+        // Register before requesting cancellation, and retain the session across registry eviction.
+        closed.as_mut().enable();
+        drop(sess);
+        self.cancel(session_id).await;
+        closed.await;
+        true
+    }
+
+    /// Stops every command still running: Codex's `terminate_all_processes`.
+    /// Waits for closeout after requesting cancellation of all commands, so their grace periods
+    /// run concurrently and thread shutdown cannot finish while they are still winding down.
+    pub async fn terminate_background_terminals(&self) {
+        let terminals = self.background_terminals().await;
+        for terminal in &terminals {
+            self.cancel(terminal.session_id()).await;
+        }
+        for terminal in &terminals {
+            let _ = self
+                .wait_for_session_close(terminal.session_id(), None)
+                .await;
+        }
     }
 }
 

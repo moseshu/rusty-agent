@@ -9,6 +9,15 @@
 //! opted into the experimental API; a method that passes runs on a task of its own, so a slow one
 //! does not hold up the next request.
 //!
+//! A method that changes a thread runs after the requests for the same thread that arrived before
+//! it, whichever connection sent them (see [`super::request_serialization`]). Every method runs
+//! through its connection's gate: once the connection has closed, what it queued no longer starts,
+//! and its cleanup waits — for at most thirty seconds — for what had started before the
+//! connection's subscriptions are dropped. A method that starts, steers or reconfigures turns
+//! holds a permit from when it arrives until it has been handled; once the server drains for a
+//! restart, no new permit is given (see [`super::turn_admission`]), and a turn that waited in its
+//! thread's queue checks again when its turn comes.
+//!
 //! Codex's `initialize` also does its account and product work: it selects how its gateway logs
 //! in, makes the client's name the `originator` and `User-Agent` suffix of every request to its
 //! backend, enables user verification for its own desktop and terminal clients, reports the
@@ -18,18 +27,28 @@
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, PoisonError},
+    time::Duration,
 };
 
+use ra_core::session::SessionId;
 use serde::Serialize;
+use tokio::{sync::Mutex, time::timeout};
 
 use super::{
+    connection_rpc_gate::ConnectionRpcGate,
     outgoing::{ConnectionRequestId, OutgoingMessageSender},
     protocol::{
         ClientRequest, InitializeParams, InitializeResponse, MockExperimentalMethodResponse,
         experimental_required_message,
     },
+    request_serialization::{
+        QueuedInitializedRequest, RequestSerializationQueueKey, RequestSerializationQueues,
+    },
+    thread_listener::ListenerTaskContext,
     thread_manager::ThreadManager,
+    thread_processor::ThreadRequestProcessor,
+    turn_admission::TurnAdmission,
     turn_processor::{TurnMethodResult, TurnRequestProcessor},
 };
 use crate::{
@@ -40,10 +59,19 @@ use crate::{
 /// The `User-Agent` the agent identifies itself with: the one its model adapters send.
 const USER_AGENT: &str = concat!("rusty-agent/", env!("CARGO_PKG_VERSION"));
 
+/// How long a closed connection's cleanup waits for its running handlers: Codex's
+/// `CONNECTION_RPC_DRAIN_TIMEOUT`.
+const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a thread with no subscribers and no active turn stays loaded by default: Codex's
+/// `thread_unload_delay_secs` default.
+pub(crate) const DEFAULT_THREAD_UNLOAD_DELAY: Duration = Duration::from_secs(60);
+
 /// What the server knows of one connection: Codex's `ConnectionSessionState`.
 #[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
     pub(crate) origin: ConnectionOrigin,
+    pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -63,9 +91,10 @@ struct InitializedConnectionSessionState {
 }
 
 impl ConnectionSessionState {
-    pub(crate) const fn new(origin: ConnectionOrigin) -> Self {
+    pub(crate) fn new(origin: ConnectionOrigin) -> Self {
         Self {
             origin,
+            rpc_gate: Arc::new(ConnectionRpcGate::new()),
             initialized: OnceLock::new(),
         }
     }
@@ -98,25 +127,87 @@ impl ConnectionSessionState {
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     codex_home: PathBuf,
-    // Read by the thread methods that load threads, which are not ported yet; the tests load them
-    // through `test_api`.
-    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
     thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
+    thread_processor: ThreadRequestProcessor,
+    request_serialization_queues: RequestSerializationQueues,
+    pub(crate) turn_admission: TurnAdmission,
+    pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    thread_unload_delay: std::sync::Mutex<Duration>,
 }
 
 impl MessageProcessor {
     pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, codex_home: PathBuf) -> Self {
         let thread_manager = Arc::new(ThreadManager::default());
+        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
         Self {
             turn_processor: TurnRequestProcessor::new(
                 Arc::clone(&thread_manager),
                 Arc::clone(&outgoing),
             ),
+            thread_processor: ThreadRequestProcessor::new(
+                Arc::clone(&thread_manager),
+                Arc::clone(&outgoing),
+                Arc::clone(&pending_thread_unloads),
+            ),
             outgoing,
             codex_home,
             thread_manager,
+            request_serialization_queues: RequestSerializationQueues::default(),
+            turn_admission: TurnAdmission::default(),
+            pending_thread_unloads,
+            thread_unload_delay: std::sync::Mutex::new(DEFAULT_THREAD_UNLOAD_DELAY),
         }
+    }
+
+    /// Sets how long a thread with no subscribers and no active turn stays loaded, for the
+    /// listeners started from now on.
+    pub(crate) fn set_thread_unload_delay(&self, delay: Duration) {
+        *self
+            .thread_unload_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = delay;
+    }
+
+    /// What a thread's listener works with.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    pub(crate) fn listener_context(&self) -> ListenerTaskContext {
+        ListenerTaskContext {
+            outgoing: Arc::clone(&self.outgoing),
+            thread_manager: Arc::clone(&self.thread_manager),
+            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            thread_unload_delay: *self
+                .thread_unload_delay
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    /// Cleans up after a closed connection: Codex's `connection_closed`. Its queued requests are
+    /// dropped, its running handlers waited for, and then its subscriptions removed.
+    pub(crate) async fn connection_closed(
+        &self,
+        connection_id: ConnectionId,
+        session: &ConnectionSessionState,
+    ) {
+        session.rpc_gate.close().await;
+        self.request_serialization_queues.discard_closed().await;
+        if timeout(CONNECTION_RPC_DRAIN_TIMEOUT, session.rpc_gate.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                %connection_id,
+                timeout_seconds = CONNECTION_RPC_DRAIN_TIMEOUT.as_secs(),
+                "timed out waiting for connection RPCs to drain"
+            );
+        }
+        self.thread_processor.connection_closed(connection_id).await;
+    }
+
+    /// Shuts every loaded thread down as the server stops: Codex's `shutdown_threads`.
+    pub(crate) async fn shutdown_threads(&self) {
+        self.thread_processor.shutdown_threads().await;
     }
 
     pub(crate) fn outgoing(&self) -> &Arc<OutgoingMessageSender> {
@@ -168,7 +259,8 @@ impl MessageProcessor {
         if let ClientRequest::Initialize { params, .. } = client_request {
             return self.initialize(request_id, params, &session).await;
         }
-        self.dispatch_initialized_client_request(request_id, client_request, &session)
+        self.dispatch_initialized_client_request(request_id, client_request, session)
+            .await
     }
 
     /// Codex's `InitializeRequestProcessor::initialize`, without its account and product work.
@@ -218,16 +310,11 @@ impl MessageProcessor {
 
     /// Admits a method other than `initialize` and starts it: Codex's
     /// `dispatch_initialized_client_request`.
-    ///
-    /// Codex also counts the turns being admitted, so a server shutting down can refuse new ones,
-    /// orders the requests that touch the same state, and tracks the requests each connection has
-    /// in flight, so a closing connection can wait for them; none of the methods ported so far
-    /// needs any of it.
-    fn dispatch_initialized_client_request(
+    async fn dispatch_initialized_client_request(
         self: &Arc<Self>,
         request_id: ConnectionRequestId,
         client_request: ClientRequest,
-        session: &ConnectionSessionState,
+        session: Arc<ConnectionSessionState>,
     ) -> Result<(), JsonRpcErrorObject> {
         if !session.initialized() {
             return Err(JsonRpcErrorObject::invalid_request("Not initialized"));
@@ -241,12 +328,41 @@ impl MessageProcessor {
             ));
         }
 
+        let (turn_permit, recheck_turn_admission) = match &client_request {
+            ClientRequest::ThreadSettingsUpdate { .. } | ClientRequest::TurnSettingsUpdate { .. } => {
+                (Some(self.turn_admission.admit()?), false)
+            }
+            ClientRequest::TurnStart { .. } | ClientRequest::TurnSteer { .. } => {
+                (Some(self.turn_admission.admit()?), true)
+            }
+            _ => (None, false),
+        };
+
+        let serialization_thread = client_request
+            .serialization_thread()
+            .map(str::to_owned);
+        let error_request_id = request_id.clone();
         let processor = Arc::clone(self);
-        tokio::spawn(async move {
+        let request = QueuedInitializedRequest::new(Arc::clone(&session.rpc_gate), async move {
+            let _turn_permit = turn_permit;
+            // Settings changes admitted before the drain finish normally; turn work still waiting
+            // in its thread's queue must observe the closed admission.
+            if recheck_turn_admission && let Err(error) = processor.turn_admission.admit() {
+                processor.outgoing.send_error(error_request_id, error).await;
+                return;
+            }
             processor
                 .handle_initialized_client_request(request_id, client_request)
                 .await;
         });
+
+        if let Some(thread_id) = serialization_thread {
+            self.request_serialization_queues
+                .enqueue(RequestSerializationQueueKey::Thread { thread_id }, request)
+                .await;
+        } else {
+            tokio::spawn(request.run());
+        }
         Ok(())
     }
 
@@ -259,6 +375,34 @@ impl MessageProcessor {
             ClientRequest::Initialize { .. } => {
                 // `handle_client_request` answers `initialize` before anything is dispatched.
                 unreachable!("initialize is handled before initialized request dispatch")
+            }
+            ClientRequest::ThreadUnsubscribe { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_unsubscribe(&request_id, &params)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadBackgroundTerminalsClean { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_background_terminals_clean(&params)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadBackgroundTerminalsList { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_background_terminals_list(params)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadBackgroundTerminalsTerminate { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_background_terminals_terminate(&params)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadSettingsUpdate { params, .. } => {
                 let result = self.turn_processor.thread_settings_update(params).await;
@@ -290,7 +434,7 @@ impl MessageProcessor {
         }
     }
 
-    /// Sends a turn method's answer, if it has one yet.
+    /// Sends a method's answer, if it has one yet.
     async fn finish_turn_method(&self, request_id: ConnectionRequestId, result: TurnMethodResult) {
         match result {
             Ok(Some(result)) => self.outgoing.send_response(request_id, result).await,

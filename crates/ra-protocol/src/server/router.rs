@@ -67,7 +67,7 @@ impl OutboundConnectionState {
         self.disconnect_sender.is_some()
     }
 
-    fn request_disconnect(&self) {
+    pub(crate) fn request_disconnect(&self) {
         if let Some(disconnect_sender) = &self.disconnect_sender {
             disconnect_sender.cancel();
         }

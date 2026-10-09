@@ -47,6 +47,13 @@
 //! same disabled default as Codex. Product settings arrive through a host-prepared configuration;
 //! reasoning summary and service tier use existing provider-specific model-setting extras.
 //!
+//! # Shutting down
+//!
+//! [`AgentThread::shutdown`] ends the thread's life, as Codex's `Op::Shutdown` does: input is
+//! refused from then on, a running turn is aborted as an interrupt aborts it, and once it has
+//! ended the rollout is flushed. What the thread's tools left running outside it — background
+//! terminals among them — belongs to the host, which stops it alongside.
+//!
 //! # What this does not port
 //!
 //! - Product policy lowering: sandbox and approval policies, permission profiles and reviewer
@@ -168,6 +175,10 @@ pub enum NotSubmittedReason {
     },
     /// Steering was given no input.
     EmptyInput,
+    /// The thread has been shut down and takes no more input. Codex's thread refuses it by having
+    /// no session loop left to submit to (`CodexErr::InternalAgentDied`); this thread has no loop of
+    /// its own, so it says why.
+    ShutDown,
 }
 
 /// What the thread did with input given to [`AgentThread::start_or_steer_turn`]: Codex's
@@ -411,6 +422,7 @@ impl AgentThreadBuilder {
                     history: self.history,
                     config: self.config,
                     active_turn: None,
+                    shut_down: false,
                 }),
                 turn_ended: Notify::new(),
                 events,
@@ -455,6 +467,8 @@ struct ThreadState {
     /// The configuration the next turn starts with, the thread's settings among it.
     config: RunConfig,
     active_turn: Option<ActiveTurn>,
+    /// Set by [`AgentThread::shutdown`]: no input is taken any more.
+    shut_down: bool,
 }
 
 /// The running turn: Codex's `ActiveTurn`.
@@ -599,6 +613,11 @@ impl AgentThread {
         loop {
             let ended = {
                 let mut state = self.inner.lock();
+                if state.shut_down {
+                    return TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::ShutDown,
+                    };
+                }
                 let Some(active) = &state.active_turn else {
                     let turn_id = self.start_turn(&mut state, &request);
                     return TurnInputSubmission::Started { turn_id };
@@ -633,6 +652,11 @@ impl AgentThread {
         expected_turn_id: &str,
     ) -> SteerSubmission {
         let mut state = self.inner.lock();
+        if state.shut_down {
+            return SteerSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ShutDown,
+            };
+        }
         let Some(active) = &state.active_turn else {
             return SteerSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NoActiveTurn,
@@ -774,6 +798,44 @@ impl AgentThread {
             return Err(Box::new(state));
         };
         paused.resume.send(state).map_err(Box::new)
+    }
+
+    /// Shuts the thread down: Codex's `shutdown_and_wait`. Returns once it is down.
+    ///
+    /// Input is refused from now on ([`NotSubmittedReason::ShutDown`]). A running turn — working or
+    /// waiting for approval — is aborted as [`AgentThread::interrupt`] aborts it, as Codex aborts
+    /// its tasks on shutdown, and is waited for; then the rollout is flushed. Shutting down a thread
+    /// that is already down only waits for that.
+    pub async fn shutdown(&self) {
+        loop {
+            let ended = {
+                let mut state = self.inner.lock();
+                state.shut_down = true;
+                let Some(active) = state.active_turn.as_mut() else {
+                    break;
+                };
+                if !active.ending && !active.interrupted {
+                    active.interrupted = true;
+                    active.cancel.cancel(CancelReason::UserInterrupt);
+                }
+                // Registered before the lock is let go, so the end cannot slip past unseen.
+                let mut ended = Box::pin(self.inner.turn_ended.notified());
+                ended.as_mut().enable();
+                ended
+            };
+            ended.await;
+        }
+        if let Some(rollout) = &self.inner.rollout
+            && let Err(error) = rollout.flush().await
+        {
+            tracing::warn!(thread_id = %self.inner.thread_id, %error, "the thread's rollout could not be flushed");
+        }
+    }
+
+    /// Whether [`AgentThread::shutdown`] has been called.
+    #[must_use]
+    pub fn is_shut_down(&self) -> bool {
+        self.inner.lock().shut_down
     }
 
     /// The next thing that happened to the thread's turns: Codex's `next_event`. Waits for it.

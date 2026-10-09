@@ -234,6 +234,10 @@ pub struct ExecRequest {
     limits: ExecLimits,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+    /// The tool call that issued the command, kept by the host and never part of the request's
+    /// serialized form.
+    #[serde(skip)]
+    call_id: Option<String>,
 }
 
 impl ExecRequest {
@@ -250,6 +254,7 @@ impl ExecRequest {
             login: false,
             limits: ExecLimits::default(),
             unknown: Unknown::new(),
+            call_id: None,
         }
     }
 
@@ -306,6 +311,22 @@ impl ExecRequest {
     pub fn with_limits(mut self, limits: ExecLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Records the tool call that issued the command, so that a command still running after the
+    /// call has returned can be traced back to it (see [`crate::session::BackgroundTerminal`]).
+    ///
+    /// Not serialized: the request a model's arguments decode into cannot name a call.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = Some(call_id.into());
+        self
+    }
+
+    /// The tool call that issued the command, if the caller recorded it.
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
     }
 
     /// Command string.

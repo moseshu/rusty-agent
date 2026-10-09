@@ -8,92 +8,340 @@
 //! that ends does, since every request of a thread belongs to a turn; the end of a turn also
 //! answers the `turn/interrupt` requests waiting for it.
 //!
+//! # Unloading
+//!
+//! A turn's end ends neither the thread nor anything its tools left running. The listener also
+//! unloads the thread, as Codex's does, once it has had no subscribers and no active turn for the
+//! server's unload delay — counted from whichever of the two came last, and started afresh when a
+//! subscriber returns or a turn runs. A thread whose turn still runs, waiting for approval among
+//! them, is never unloaded. Unloading withdraws the thread's server requests, forgets its state,
+//! shuts it down — stopping its background terminals — and, once it is down, removes it and tells
+//! every connection with `thread/closed`. A thread that does not shut down in time stays loaded.
+//!
 //! # Differences from Codex
 //!
 //! Codex's `turn/completed` carries the turn's last final answer as a summary item; items are
 //! Codex's `ThreadItem`s, which come with the item notifications, so the turn is sent with no
 //! items loaded until then. Codex's listener also handles commands that order a running thread's
-//! resume and its goals with its notifications, and stops when the thread is unloaded; those come
-//! with the thread methods.
+//! resume and its goals with its notifications; those come with the thread methods. Codex also
+//! sends `thread/status/changed` as the thread goes idle and unloads; thread statuses come with
+//! the thread methods.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use ra_core::session::SessionId;
-use ra_runtime::thread::{AgentThread, ThreadEvent};
+use ra_runtime::thread::ThreadEvent;
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, watch},
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
     protocol::{
-        ERROR_METHOD, ErrorNotification, THREAD_SETTINGS_UPDATED_METHOD, TURN_COMPLETED_METHOD,
-        TURN_STARTED_METHOD, ThreadSettingsUpdatedNotification, Turn, TurnCompletedNotification,
-        TurnError, TurnInterruptResponse, TurnStartedNotification, TurnStatus,
+        ERROR_METHOD, ErrorNotification, THREAD_CLOSED_METHOD, THREAD_SETTINGS_UPDATED_METHOD,
+        TURN_COMPLETED_METHOD, TURN_STARTED_METHOD, ThreadClosedNotification,
+        ThreadSettingsUpdatedNotification, Turn, TurnCompletedNotification, TurnError,
+        TurnInterruptResponse, TurnStartedNotification, TurnStatus,
     },
-    settings_adapter::{ThreadSettingsAdapter, settings_snapshot},
+    settings_adapter::settings_snapshot,
+    thread_manager::{LoadedThread, ThreadManager},
     thread_state::ThreadState,
 };
+use crate::frame::JsonRpcErrorObject;
+
+/// How long an unloading thread is given to shut down: Codex's `wait_for_thread_shutdown`.
+const THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a thread's listener works with: Codex's `ListenerTaskContext`.
+#[derive(Clone, Debug)]
+pub(crate) struct ListenerTaskContext {
+    pub(crate) outgoing: Arc<OutgoingMessageSender>,
+    pub(crate) thread_manager: Arc<ThreadManager>,
+    /// The threads being unloaded, until they are gone or stay.
+    pub(crate) pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    pub(crate) thread_unload_delay: Duration,
+}
+
+/// When a thread may be unloaded: Codex's `UnloadingState`, on Tokio's clock rather than the
+/// system's, which is the same while the runtime's clock runs.
+struct UnloadingState {
+    delay: Duration,
+    has_subscribers_rx: watch::Receiver<bool>,
+    has_subscribers: (bool, Instant),
+    active_rx: watch::Receiver<bool>,
+    is_active: (bool, Instant),
+}
+
+impl UnloadingState {
+    fn new(context: &ListenerTaskContext, thread_id: &SessionId) -> Option<Self> {
+        let thread_state = context.outgoing.thread_state();
+        let has_subscribers_rx = thread_state.subscribe_to_has_connections(thread_id)?;
+        let active_rx = thread_state.subscribe_to_active(thread_id)?;
+        let has_subscribers = (*has_subscribers_rx.borrow(), Instant::now());
+        let is_active = (*active_rx.borrow(), Instant::now());
+        Some(Self {
+            delay: context.thread_unload_delay,
+            has_subscribers_rx,
+            has_subscribers,
+            active_rx,
+            is_active,
+        })
+    }
+
+    fn unloading_target(&self) -> Option<Instant> {
+        match (self.has_subscribers, self.is_active) {
+            ((false, has_no_subscribers_since), (false, is_inactive_since)) => {
+                std::cmp::max(has_no_subscribers_since, is_inactive_since).checked_add(self.delay)
+            }
+            _ => None,
+        }
+    }
+
+    fn sync_receiver_values(&mut self) {
+        let has_subscribers = *self.has_subscribers_rx.borrow();
+        if self.has_subscribers.0 != has_subscribers {
+            self.has_subscribers = (has_subscribers, Instant::now());
+        }
+        let is_active = *self.active_rx.borrow();
+        if self.is_active.0 != is_active {
+            self.is_active = (is_active, Instant::now());
+        }
+    }
+
+    fn should_unload_now(&mut self) -> bool {
+        self.sync_receiver_values();
+        self.unloading_target()
+            .is_some_and(|target| target <= Instant::now())
+    }
+
+    /// Restarts the countdown from now: the thread was found running.
+    fn note_thread_activity_observed(&mut self) {
+        if !self.is_active.0 {
+            self.is_active = (false, Instant::now());
+        }
+    }
+
+    /// Waits until the thread may be unloaded. Returns `false` if the thread's state has gone.
+    async fn wait_for_unloading_trigger(&mut self) -> bool {
+        loop {
+            self.sync_receiver_values();
+            let unloading_target = self.unloading_target();
+            if let Some(target) = unloading_target
+                && target <= Instant::now()
+            {
+                return true;
+            }
+            let unloading_sleep = async {
+                if let Some(target) = unloading_target {
+                    tokio::time::sleep_until(target).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                () = unloading_sleep => return true,
+                changed = self.has_subscribers_rx.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                    self.sync_receiver_values();
+                },
+                changed = self.active_rx.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                    self.sync_receiver_values();
+                },
+            }
+        }
+    }
+}
+
+/// The error a thread that is being unloaded answers attaching with.
+fn thread_closing_error(thread_id: &SessionId) -> JsonRpcErrorObject {
+    JsonRpcErrorObject::invalid_request(format!(
+        "thread {thread_id} is closing; retry after the thread is closed"
+    ))
+}
 
 /// Starts the thread's listener unless one is already running: Codex's
 /// `ensure_listener_task_running`.
+///
+/// # Errors
+///
+/// Fails if the thread's state has already been removed, as it is while the thread is unloaded.
 pub(crate) async fn ensure_listener_task_running(
-    outgoing: &Arc<OutgoingMessageSender>,
-    thread: &AgentThread,
-    adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
-) {
-    let thread_state = outgoing.thread_state().thread_state(thread.thread_id());
+    context: &ListenerTaskContext,
+    loaded: &LoadedThread,
+) -> Result<(), JsonRpcErrorObject> {
+    let thread_id = loaded.thread_id().clone();
+    let Some(mut unloading_state) = UnloadingState::new(context, &thread_id) else {
+        return Err(thread_closing_error(&thread_id));
+    };
+    let thread_state = context.outgoing.thread_state().thread_state(&thread_id);
+    let cancel = CancellationToken::new();
     {
         let mut state = thread_state.lock().await;
-        if state.listener_running {
+        if state.has_listener() {
+            return Ok(());
+        }
+        state.set_listener(cancel.clone());
+    }
+    let context = context.clone();
+    let loaded = loaded.clone();
+    tokio::spawn(async move {
+        let outgoing = &context.outgoing;
+        let thread = &loaded.thread;
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    // The thread's state was removed: it is being unloaded or torn down.
+                    break;
+                }
+                event = thread.next_event() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    handle_event(event, &loaded, outgoing, &thread_state).await;
+                }
+                unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
+                    if !unloading_watchers_open {
+                        break;
+                    }
+                    if !unloading_state.should_unload_now() {
+                        continue;
+                    }
+                    if thread.is_running() {
+                        unloading_state.note_thread_activity_observed();
+                        continue;
+                    }
+                    {
+                        let mut pending_thread_unloads = context.pending_thread_unloads.lock().await;
+                        if pending_thread_unloads.contains(&thread_id) {
+                            continue;
+                        }
+                        if !unloading_state.should_unload_now() {
+                            continue;
+                        }
+                        pending_thread_unloads.insert(thread_id.clone());
+                    }
+                    unload_thread_without_subscribers(&context, loaded.clone()).await;
+                    break;
+                }
+            }
+        }
+        if !cancel.is_cancelled() {
+            thread_state.lock().await.clear_listener();
+        }
+    });
+    Ok(())
+}
+
+/// Tracks one event and tells the thread's connections what it means.
+async fn handle_event(
+    event: ThreadEvent,
+    loaded: &LoadedThread,
+    outgoing: &Arc<OutgoingMessageSender>,
+    thread_state: &Mutex<ThreadState>,
+) {
+    let thread_id = loaded.thread_id().clone();
+    thread_state.lock().await.track_current_turn_event(&event);
+    if matches!(event, ThreadEvent::TurnStarted { .. }) {
+        outgoing.thread_state().note_active(&thread_id, true);
+    }
+    let connection_ids = outgoing
+        .thread_state()
+        .subscribed_connection_ids(&thread_id);
+    let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
+        Arc::clone(outgoing),
+        connection_ids,
+        thread_id.clone(),
+    );
+    if matches!(event, ThreadEvent::ThreadSettingsApplied) {
+        let snapshot = settings_snapshot(&loaded.thread, loaded.adapter.as_deref());
+        if let Err(error) = loaded.persist_settings_snapshot(snapshot.clone()).await {
+            tracing::warn!(%error, "thread settings could not be persisted");
+        }
+        let changed = {
+            let mut state = thread_state.lock().await;
+            let changed = state.last_settings.as_ref() != Some(&snapshot);
+            state.last_settings = Some(snapshot.clone());
+            changed
+        };
+        if changed {
+            let notification = ThreadSettingsUpdatedNotification {
+                thread_id: thread_id.as_str().into(),
+                thread_settings: snapshot,
+            };
+            thread_outgoing
+                .send_server_notification(
+                    ServerNotification::new(
+                        THREAD_SETTINGS_UPDATED_METHOD,
+                        serde_json::json!({"threadId": notification.thread_id, "threadSettings": notification.thread_settings}),
+                    )
+                    .experimental(THREAD_SETTINGS_UPDATED_METHOD),
+                )
+                .await;
+        }
+        return;
+    }
+    let ended = matches!(
+        event,
+        ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. }
+    );
+    apply_turn_event_handling(event, &thread_id, &thread_outgoing, thread_state).await;
+    // Counted as running until its end has been sent, so a drain does not disconnect the client
+    // before it hears of it.
+    if ended && thread_state.lock().await.active_turn_id().is_none() {
+        outgoing.thread_state().note_active(&thread_id, false);
+    }
+}
+
+/// Unloads a thread that has had no subscribers and no active turn for long enough: Codex's
+/// `unload_thread_without_subscribers`.
+async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded: LoadedThread) {
+    let thread_id = loaded.thread_id().clone();
+    tracing::info!("thread {thread_id} has no subscribers and is idle; shutting down");
+
+    // Any pending server request of the thread can no longer be answered; withdraw them before
+    // the thread goes.
+    context
+        .outgoing
+        .cancel_requests_for_thread(&thread_id, None);
+    context
+        .outgoing
+        .thread_state()
+        .remove_thread_state(&thread_id)
+        .await;
+
+    let context = context.clone();
+    tokio::spawn(async move {
+        if tokio::time::timeout(THREAD_SHUTDOWN_TIMEOUT, loaded.shutdown())
+            .await
+            .is_err()
+        {
+            context.pending_thread_unloads.lock().await.remove(&thread_id);
+            tracing::warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
             return;
         }
-        state.listener_running = true;
-    }
-    let outgoing = Arc::clone(outgoing);
-    let thread = thread.clone();
-    tokio::spawn(async move {
-        let thread_id = thread.thread_id().clone();
-        while let Some(event) = thread.next_event().await {
-            thread_state.lock().await.track_current_turn_event(&event);
-            let connection_ids = outgoing
-                .thread_state()
-                .subscribed_connection_ids(&thread_id);
-            let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
-                Arc::clone(&outgoing),
-                connection_ids,
-                thread_id.clone(),
-            );
-            if matches!(event, ThreadEvent::ThreadSettingsApplied) {
-                let snapshot = settings_snapshot(&thread, adapter.as_deref());
-                if let Err(error) = thread.persist_settings_snapshot(snapshot.clone()).await {
-                    tracing::warn!(%error, "thread settings could not be persisted");
-                }
-                let changed = {
-                    let mut state = thread_state.lock().await;
-                    let changed = state.last_settings.as_ref() != Some(&snapshot);
-                    state.last_settings = Some(snapshot.clone());
-                    changed
-                };
-                if changed {
-                    let notification = ThreadSettingsUpdatedNotification {
-                        thread_id: thread_id.as_str().into(),
-                        thread_settings: snapshot,
-                    };
-                    thread_outgoing
-                        .send_server_notification(
-                            ServerNotification::new(
-                                THREAD_SETTINGS_UPDATED_METHOD,
-                                serde_json::json!({"threadId": notification.thread_id, "threadSettings": notification.thread_settings}),
-                            )
-                            .experimental(THREAD_SETTINGS_UPDATED_METHOD),
-                        )
-                        .await;
-                }
-                continue;
-            }
-            apply_turn_event_handling(event, &thread_id, &thread_outgoing, &thread_state).await;
+        // Another thread may have been loaded under the same id meanwhile; only the one that
+        // scheduled this unload is removed.
+        if !context.thread_manager.remove_thread_if_matches(&loaded) {
+            tracing::info!("thread {thread_id} was replaced or removed before teardown finalized");
+            context.pending_thread_unloads.lock().await.remove(&thread_id);
+            return;
         }
-        thread_state.lock().await.listener_running = false;
+        broadcast(
+            &context.outgoing,
+            THREAD_CLOSED_METHOD,
+            ThreadClosedNotification::new(thread_id.as_str()),
+        )
+        .await;
+        context.pending_thread_unloads.lock().await.remove(&thread_id);
     });
 }
 
@@ -113,7 +361,7 @@ async fn apply_turn_event_handling(
             // Already done when the last turn ended; done again in case anything was left.
             outgoing.abort_pending_server_requests();
             let turn = Turn::new(turn_id, TurnStatus::InProgress).with_started_at(Some(started_at));
-            send(
+            send_to_thread(
                 outgoing,
                 TURN_STARTED_METHOD,
                 TurnStartedNotification::new(thread_id.as_str(), turn),
@@ -123,7 +371,7 @@ async fn apply_turn_event_handling(
         ThreadEvent::Error { turn_id, message } => {
             let error = TurnError::new(message);
             thread_state.lock().await.turn_summary.last_error = Some(error.clone());
-            send(
+            send_to_thread(
                 outgoing,
                 ERROR_METHOD,
                 ErrorNotification::new(error, false, thread_id.as_str(), turn_id),
@@ -145,7 +393,7 @@ async fn apply_turn_event_handling(
             }
             .with_started_at(summary.started_at)
             .with_completion(completed_at, duration_ms);
-            send(
+            send_to_thread(
                 outgoing,
                 TURN_COMPLETED_METHOD,
                 TurnCompletedNotification::new(thread_id.as_str(), turn),
@@ -164,7 +412,7 @@ async fn apply_turn_event_handling(
             let turn = Turn::new(turn_id, TurnStatus::Interrupted)
                 .with_started_at(summary.started_at)
                 .with_completion(completed_at, duration_ms);
-            send(
+            send_to_thread(
                 outgoing,
                 TURN_COMPLETED_METHOD,
                 TurnCompletedNotification::new(thread_id.as_str(), turn),
@@ -189,18 +437,34 @@ async fn respond_to_pending_interrupts(
     }
 }
 
-async fn send(
+async fn send_to_thread(
     outgoing: &ThreadScopedOutgoingMessageSender,
     method: &'static str,
     params: impl Serialize,
 ) {
+    if let Some(notification) = notification(method, params) {
+        outgoing.send_server_notification(notification).await;
+    }
+}
+
+/// Sends a notification to every initialized connection.
+async fn broadcast(
+    outgoing: &OutgoingMessageSender,
+    method: &'static str,
+    params: impl Serialize,
+) {
+    if let Some(notification) = notification(method, params) {
+        outgoing.send_server_notification(notification).await;
+    }
+}
+
+fn notification(method: &'static str, params: impl Serialize) -> Option<ServerNotification> {
     match serde_json::to_value(params) {
-        Ok(params) => {
-            outgoing
-                .send_server_notification(ServerNotification::new(method, params))
-                .await;
-        }
+        Ok(params) => Some(ServerNotification::new(method, params)),
         // The notifications are plain records, so this does not happen.
-        Err(error) => tracing::error!("failed to serialize {method}: {error}"),
+        Err(error) => {
+            tracing::error!("failed to serialize {method}: {error}");
+            None
+        }
     }
 }

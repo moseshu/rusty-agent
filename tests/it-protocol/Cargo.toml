@@ -15,10 +15,12 @@ ra-core = { path = "../../crates/ra-core" }
 ra-protocol = { path = "../../crates/ra-protocol", features = ["test-api"] }
 # The live threads the turn methods start, steer and interrupt.
 ra-runtime = { path = "../../crates/ra-runtime" }
+# The command tool whose background terminals outlive their turn.
+ra-tools = { path = "../../crates/ra-tools" }
 async-trait = "0.1"
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "test-util"] }
 serde_json = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }

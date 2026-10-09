@@ -52,6 +52,10 @@ pub(crate) const MAX_USER_INPUT_TEXT_CHARS: usize = 1 << 20;
 /// `INPUT_TOO_LARGE_ERROR_CODE`.
 pub(crate) const INPUT_TOO_LARGE_ERROR_CODE: &str = "input_too_large";
 
+/// What Codex's submission to a thread whose session loop has ended fails with
+/// (`CodexErr::InternalAgentDied`): a thread that was shut down while the request was on its way.
+const AGENT_LOOP_DIED: &str = "internal error; agent loop died unexpectedly";
+
 /// What a turn method answers: a response now, nothing yet, or an error.
 pub(crate) type TurnMethodResult = Result<Option<Value>, JsonRpcErrorObject>;
 
@@ -102,6 +106,13 @@ impl TurnRequestProcessor {
             TurnInputSubmission::Started { turn_id } | TurnInputSubmission::Steered { turn_id } => {
                 turn_id
             }
+            TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ShutDown,
+            } => {
+                return Err(JsonRpcErrorObject::internal_error(format!(
+                    "failed to submit turn input: {AGENT_LOOP_DIED}"
+                )));
+            }
             TurnInputSubmission::NotSubmitted { reason } => {
                 return Err(JsonRpcErrorObject::internal_error(format!(
                     "failed to submit turn input: {reason:?}"
@@ -136,6 +147,11 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(input_content(input)?);
         match thread.steer_turn(&request, &expected_turn_id) {
             SteerSubmission::Steered { turn_id } => response(TurnSteerResponse::new(turn_id)),
+            SteerSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ShutDown,
+            } => Err(JsonRpcErrorObject::internal_error(format!(
+                "failed to steer turn: {AGENT_LOOP_DIED}"
+            ))),
             SteerSubmission::NotSubmitted { reason } => {
                 Err(JsonRpcErrorObject::invalid_request(match reason {
                     NotSubmittedReason::ExpectedTurnMismatch { expected, actual } => {

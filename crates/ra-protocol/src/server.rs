@@ -24,19 +24,40 @@
 //! still waiting. What the server makes of each answer follows Codex's handlers, failing closed.
 //! The turns run, but what raises these requests from them is still to be connected.
 //!
-//! Codex's loop also drains running turns before a restart on a signal, recovers the threads of
-//! its daemon, attaches newly created threads to every connection and reports the status of
-//! remote control; none of it is ported yet.
+//! # Lifecycle
+//!
+//! A turn's end ends only the turn: the thread stays loaded, the connection open, and what the
+//! thread's tools left running — background terminals — keeps running, listed and stopped with
+//! `thread/backgroundTerminals/*`. A connection leaves a thread with `thread/unsubscribe` or by
+//! closing; a thread left with no subscribers and no active turn for the unload delay
+//! ([`AppServer::with_thread_unload_delay`]) is shut down and every connection is told with
+//! `thread/closed`. A closing connection's queued requests are dropped and its running ones waited
+//! for before its subscriptions go; the server requests of its threads stay with the threads, for
+//! the next client to answer.
+//!
+//! A server given [`AppServer::with_graceful_restart`] drains on `SIGINT`, `SIGTERM` or `SIGHUP`,
+//! as Codex's does: requests that would start, steer or reconfigure turns are refused from then
+//! on, and once the turns running have ended, the transports are told to stop and every client is
+//! disconnected. A second `SIGINT` or `SIGTERM` stops it at once; `SIGHUP` never does. When the
+//! server stops on its own — its transports gone, or its stdio client — it first cleans up after
+//! the connections left and shuts its threads down.
+//!
+//! Codex's loop also recovers the threads of its daemon, attaches newly created threads to every
+//! connection and reports the status of remote control; none of it is ported.
 
 // Nothing raises a server request until turns run in the server; the tests reach them through
 // `test_api` meanwhile.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod answers;
 mod approvals;
+mod background_terminals;
+mod connection_cleanup;
+mod connection_rpc_gate;
 mod image_url;
 mod outgoing;
 mod processor;
 pub mod protocol;
+mod request_serialization;
 mod router;
 mod settings_adapter;
 // Threads are loaded by `thread/start` and its kin, which are not ported yet; until then only the
@@ -44,10 +65,13 @@ mod settings_adapter;
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod thread_listener;
 mod thread_manager;
+mod thread_processor;
 mod thread_state;
+mod turn_admission;
 mod turn_processor;
 
 pub use self::approvals::ReviewDecision;
+pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
 pub use self::settings_adapter::ThreadSettingsAdapter;
 
 use std::{
@@ -58,15 +82,18 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use self::{
+    connection_cleanup::ConnectionCleanupTasks,
     outgoing::{OutgoingEnvelope, OutgoingMessageSender},
     processor::{ConnectionSessionState, MessageProcessor},
     router::{OutboundConnectionState, route_outgoing_envelope},
+    turn_admission::TurnAdmission,
 };
 use crate::{
     absolute_path,
@@ -77,7 +104,7 @@ use crate::{
 };
 
 /// What the reading loop tells the writing loop about connections: Codex's
-/// `OutboundControlEvent`, without the graceful restart that disconnects every client.
+/// `OutboundControlEvent`.
 enum OutboundControlEvent {
     /// A connection opened.
     Opened {
@@ -90,6 +117,148 @@ enum OutboundControlEvent {
     },
     /// A connection closed.
     Closed { connection_id: ConnectionId },
+    /// Disconnect every client that can be, as a drained restart does.
+    DisconnectAll,
+}
+
+/// What a signal asks of a server set to restart gracefully: Codex's `ShutdownSignal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownSignal {
+    /// `SIGINT` or `SIGTERM`: drain, or stop at once if already draining.
+    Forceable,
+    /// `SIGHUP`: drain, however often it comes.
+    GracefulOnly,
+}
+
+/// Where a server set to restart gracefully hears its signals from.
+enum ShutdownSignals {
+    /// The process's signals.
+    Os,
+    /// Signals the tests send.
+    #[cfg(feature = "test-api")]
+    Channel(mpsc::Receiver<ShutdownSignal>),
+}
+
+impl ShutdownSignals {
+    /// Waits for the next signal: Codex's `shutdown_signal`.
+    async fn next(&mut self) -> io::Result<ShutdownSignal> {
+        match self {
+            Self::Os => os_shutdown_signal().await,
+            #[cfg(feature = "test-api")]
+            Self::Channel(signals) => match signals.recv().await {
+                Some(signal) => Ok(signal),
+                None => std::future::pending().await,
+            },
+        }
+    }
+}
+
+async fn os_shutdown_signal() -> io::Result<ShutdownSignal> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut term = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        tokio::select! {
+            ctrl_c_result = tokio::signal::ctrl_c() => ctrl_c_result.map(|()| ShutdownSignal::Forceable),
+            _ = term.recv() => Ok(ShutdownSignal::Forceable),
+            _ = hangup.recv() => Ok(ShutdownSignal::GracefulOnly),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(ShutdownSignal::Forceable)
+    }
+}
+
+/// A server's graceful restart: the token that stops its transports, and its signals.
+struct GracefulRestart {
+    transport_shutdown: CancellationToken,
+    signals: ShutdownSignals,
+}
+
+impl std::fmt::Debug for GracefulRestart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GracefulRestart")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a drain stands: Codex's `ShutdownState`.
+#[derive(Default)]
+struct ShutdownState {
+    requested: bool,
+    forced: bool,
+    last_logged_running_turn_count: Option<usize>,
+}
+
+impl ShutdownState {
+    const fn requested(&self) -> bool {
+        self.requested
+    }
+
+    const fn forced(&self) -> bool {
+        self.forced
+    }
+
+    fn on_signal(
+        &mut self,
+        signal: ShutdownSignal,
+        connection_count: usize,
+        running_turn_count: usize,
+        turn_admission: &TurnAdmission,
+    ) {
+        if self.requested {
+            if signal == ShutdownSignal::Forceable {
+                self.forced = true;
+            }
+            return;
+        }
+
+        turn_admission.begin_drain();
+        self.requested = true;
+        self.last_logged_running_turn_count = None;
+        tracing::info!(
+            "received shutdown signal; entering graceful restart drain (connections={connection_count}, runningAssistantTurns={running_turn_count}, new client turns rejected)"
+        );
+    }
+
+    /// Whether the drain may finish now.
+    fn update(
+        &mut self,
+        running_turn_count: usize,
+        active_admissions: usize,
+        connection_count: usize,
+    ) -> bool {
+        if !self.requested {
+            return false;
+        }
+
+        if self.forced || (running_turn_count == 0 && active_admissions == 0) {
+            if self.forced {
+                tracing::info!(
+                    "received second shutdown signal; forcing restart with {running_turn_count} running assistant turn(s) and {connection_count} connection(s)"
+                );
+            } else {
+                tracing::info!(
+                    "shutdown signal restart: no assistant turns running; stopping acceptor and disconnecting {connection_count} connection(s)"
+                );
+            }
+            return true;
+        }
+
+        if self.last_logged_running_turn_count != Some(running_turn_count) {
+            tracing::info!(
+                "shutdown signal restart: waiting for {running_turn_count} running assistant turn(s) and {active_admissions} admitted request(s) to finish"
+            );
+            self.last_logged_running_turn_count = Some(running_turn_count);
+        }
+        false
+    }
 }
 
 /// The reading loop's state of a connection: Codex's `ConnectionState`.
@@ -125,6 +294,7 @@ impl ConnectionState {
 pub struct AppServer {
     processor: Arc<MessageProcessor>,
     outgoing_rx: mpsc::Receiver<OutgoingEnvelope>,
+    graceful_restart: Option<GracefulRestart>,
 }
 
 impl AppServer {
@@ -145,110 +315,256 @@ impl AppServer {
         Ok(Self {
             processor: Arc::new(MessageProcessor::new(outgoing, codex_home)),
             outgoing_rx,
+            graceful_restart: None,
         })
     }
 
-    /// Serves the connections `transport_event_rx` reports until every transport has gone or, as
-    /// Codex does when serving stdio, the stdio connection closes.
+    /// Unloads a thread once it has had no subscribers and no active turn for `delay`, instead of
+    /// the default 60 seconds: Codex's `thread_unload_delay_secs`.
     ///
-    /// Returns once what has been routed to the connections is in their write queues; the
-    /// transports write it out.
+    /// Applies to the threads loaded after it is set. A delay too long to add to the current time
+    /// keeps threads loaded.
+    #[must_use]
+    pub fn with_thread_unload_delay(self, delay: Duration) -> Self {
+        self.processor.set_thread_unload_delay(delay);
+        self
+    }
+
+    /// Drains for a restart on `SIGINT`, `SIGTERM` or `SIGHUP`, as Codex's server does when it
+    /// installs its shutdown signal handler: turn work is refused from the first signal on, and once
+    /// the turns running have ended `transport_shutdown` is cancelled, every client disconnected,
+    /// and [`run`](Self::run) returns. A second `SIGINT` or `SIGTERM` does that at once.
+    ///
+    /// For servers of WebSocket connections — pass the token their acceptor stops on. Codex does
+    /// not drain a stdio server, whose transport handles `SIGTERM` itself; do not set it there.
+    /// Installing the handler takes over the process's handling of these signals.
+    #[must_use]
+    pub fn with_graceful_restart(mut self, transport_shutdown: CancellationToken) -> Self {
+        self.graceful_restart = Some(GracefulRestart {
+            transport_shutdown,
+            signals: ShutdownSignals::Os,
+        });
+        self
+    }
+
+    /// Serves the connections `transport_event_rx` reports until every transport has gone, the
+    /// stdio connection closes — as Codex's server does when it serves stdio — or a graceful
+    /// restart has drained.
+    ///
+    /// Unless a second signal forced the stop, it then cleans up after the connections left and
+    /// shuts the loaded threads down, interrupting any turn still running. Returns once what has
+    /// been routed to the connections is in their write queues; the transports write it out.
+    #[allow(clippy::too_many_lines)] // Codex's processor loop: one select over every source.
     pub async fn run(self, mut transport_event_rx: mpsc::Receiver<TransportEvent>) {
         let Self {
             processor,
             outgoing_rx,
+            graceful_restart,
         } = self;
         let (outbound_control_tx, outbound_control_rx) =
             mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
 
         let outbound_handle = tokio::spawn(run_outbound_router(outbound_control_rx, outgoing_rx));
 
+        let (transport_shutdown, mut signals) = match graceful_restart {
+            Some(GracefulRestart {
+                transport_shutdown,
+                signals,
+            }) => (Some(transport_shutdown), Some(signals)),
+            None => (None, None),
+        };
+        let mut running_turn_count_rx = processor
+            .outgoing()
+            .thread_state()
+            .subscribe_running_turn_count();
+        let mut active_admissions_rx = processor.turn_admission.subscribe_active();
+        let mut shutdown_state = ShutdownState::default();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+        let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
         let exit_reason = loop {
-            let Some(event) = transport_event_rx.recv().await else {
-                break "transport_channel_closed";
-            };
-            match event {
-                TransportEvent::ConnectionOpened {
-                    connection_id,
-                    origin,
-                    writer,
-                    disconnect_sender,
-                } => {
-                    let outbound_initialized = Arc::new(AtomicBool::new(false));
-                    let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
-                    let outbound_opted_out_notification_methods =
-                        Arc::new(RwLock::new(HashSet::new()));
-                    if outbound_control_tx
-                        .send(OutboundControlEvent::Opened {
-                            connection_id,
-                            writer,
-                            disconnect_sender,
-                            initialized: Arc::clone(&outbound_initialized),
-                            experimental_api_enabled: Arc::clone(
-                                &outbound_experimental_api_enabled,
-                            ),
-                            opted_out_notification_methods: Arc::clone(
-                                &outbound_opted_out_notification_methods,
-                            ),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break "outbound_router_closed";
-                    }
-                    connections.insert(
-                        connection_id,
-                        ConnectionState::new(
-                            origin,
-                            outbound_initialized,
-                            outbound_experimental_api_enabled,
-                            outbound_opted_out_notification_methods,
-                        ),
+            // Admissions are read first: a request can start a turn before it lets its permit go,
+            // and the drain must see that turn.
+            let active_admissions = *active_admissions_rx.borrow_and_update();
+            let running_turn_count = running_turn_count(&processor, &mut running_turn_count_rx);
+            if shutdown_state.update(running_turn_count, active_admissions, connections.len()) {
+                if let Some(transport_shutdown) = &transport_shutdown {
+                    transport_shutdown.cancel();
+                }
+                let _ = outbound_control_tx
+                    .send(OutboundControlEvent::DisconnectAll)
+                    .await;
+                break "shutdown_requested";
+            }
+
+            tokio::select! {
+                signal = next_signal(&mut signals), if !shutdown_state.forced() => {
+                    let signal = match signal {
+                        Ok(signal) => signal,
+                        Err(err) => {
+                            tracing::warn!("failed to listen for shutdown signal during graceful restart drain: {err}");
+                            signals = None;
+                            continue;
+                        }
+                    };
+                    shutdown_state.on_signal(
+                        signal,
+                        connections.len(),
+                        running_turn_count,
+                        &processor.turn_admission,
                     );
                 }
-                TransportEvent::ConnectionClosed { connection_id } => {
-                    // A transport may report a connection closed twice, as stdio does when a
-                    // signal follows the end of stdin.
-                    let Some(connection_state) = connections.remove(&connection_id) else {
-                        continue;
-                    };
-                    processor
-                        .outgoing()
-                        .thread_state()
-                        .remove_connection(connection_id);
-                    if outbound_control_tx
-                        .send(OutboundControlEvent::Closed { connection_id })
-                        .await
-                        .is_err()
-                    {
-                        break "outbound_router_closed";
-                    }
-                    if connection_state.session.origin == ConnectionOrigin::Stdio {
-                        break "stdio_connection_closed";
+                changed = running_turn_count_rx.changed(), if shutdown_state.requested() => {
+                    if changed.is_err() {
+                        tracing::warn!("running-turn watcher closed during graceful restart drain");
                     }
                 }
-                TransportEvent::IncomingMessage {
-                    connection_id,
-                    message,
-                } => {
-                    let Some(connection_state) = connections.get(&connection_id) else {
-                        tracing::warn!("dropping message from unknown connection: {connection_id}");
-                        continue;
-                    };
-                    handle_incoming_message(&processor, connection_id, connection_state, message)
-                        .await;
+                changed = active_admissions_rx.changed(), if shutdown_state.requested() => {
+                    if changed.is_err() {
+                        tracing::warn!("turn admission watcher closed during graceful restart drain");
+                    }
                 }
+                event = transport_event_rx.recv() => {
+                    let Some(event) = event else {
+                        break "transport_channel_closed";
+                    };
+                    match event {
+                        TransportEvent::ConnectionOpened {
+                            connection_id,
+                            origin,
+                            writer,
+                            disconnect_sender,
+                        } => {
+                            let Some(connection_state) = open_connection(
+                                &outbound_control_tx,
+                                connection_id,
+                                origin,
+                                writer,
+                                disconnect_sender,
+                            )
+                            .await
+                            else {
+                                break "outbound_router_closed";
+                            };
+                            connections.insert(connection_id, connection_state);
+                        }
+                        TransportEvent::ConnectionClosed { connection_id } => {
+                            // A transport may report a connection closed twice, as stdio does when
+                            // a signal follows the end of stdin.
+                            let Some(connection_state) = connections.remove(&connection_id) else {
+                                continue;
+                            };
+                            let stdio_closed =
+                                connection_state.session.origin == ConnectionOrigin::Stdio;
+                            connection_state.session.rpc_gate.close().await;
+                            let outbound_closed = outbound_control_tx
+                                .send(OutboundControlEvent::Closed { connection_id })
+                                .await
+                                .is_ok();
+                            let processor = Arc::clone(&processor);
+                            connection_cleanup_tasks.spawn(async move {
+                                processor
+                                    .connection_closed(connection_id, &connection_state.session)
+                                    .await;
+                            });
+                            if !outbound_closed {
+                                break "outbound_router_closed";
+                            }
+                            if stdio_closed {
+                                break "stdio_connection_closed";
+                            }
+                        }
+                        TransportEvent::IncomingMessage {
+                            connection_id,
+                            message,
+                        } => {
+                            let Some(connection_state) = connections.get(&connection_id) else {
+                                tracing::warn!("dropping message from unknown connection: {connection_id}");
+                                continue;
+                            };
+                            handle_incoming_message(&processor, connection_id, connection_state, message)
+                                .await;
+                        }
+                    }
+                }
+                () = connection_cleanup_tasks.reap_next() => {}
             }
         };
 
+        if shutdown_state.forced() {
+            connection_cleanup_tasks.abort();
+        } else {
+            futures::future::join_all(connections.iter().map(
+                |(&connection_id, connection_state)| {
+                    processor.connection_closed(connection_id, &connection_state.session)
+                },
+            ))
+            .await;
+            connection_cleanup_tasks.drain().await;
+            processor.shutdown_threads().await;
+        }
         tracing::info!(
             exit_reason,
             remaining_connection_count = connections.len(),
+            shutdown_forced = shutdown_state.forced(),
             "processor task exited"
         );
         drop(outbound_control_tx);
         let _ = outbound_handle.await;
+    }
+}
+
+/// Tells the writing loop of a connection that opened, and returns the reading loop's state of it;
+/// `None` if the writing loop has gone.
+async fn open_connection(
+    outbound_control_tx: &mpsc::Sender<OutboundControlEvent>,
+    connection_id: ConnectionId,
+    origin: ConnectionOrigin,
+    writer: mpsc::Sender<QueuedOutgoingMessage>,
+    disconnect_sender: Option<CancellationToken>,
+) -> Option<ConnectionState> {
+    let outbound_initialized = Arc::new(AtomicBool::new(false));
+    let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
+    let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
+    outbound_control_tx
+        .send(OutboundControlEvent::Opened {
+            connection_id,
+            writer,
+            disconnect_sender,
+            initialized: Arc::clone(&outbound_initialized),
+            experimental_api_enabled: Arc::clone(&outbound_experimental_api_enabled),
+            opted_out_notification_methods: Arc::clone(&outbound_opted_out_notification_methods),
+        })
+        .await
+        .ok()?;
+    Some(ConnectionState::new(
+        origin,
+        outbound_initialized,
+        outbound_experimental_api_enabled,
+        outbound_opted_out_notification_methods,
+    ))
+}
+
+/// Waits for the next signal of a server set to restart gracefully; never returns for one that
+/// is not.
+async fn next_signal(signals: &mut Option<ShutdownSignals>) -> io::Result<ShutdownSignal> {
+    match signals {
+        Some(signals) => signals.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// How many threads are running a turn: those whose listener has heard it start and not yet sent
+/// its end, or — when there are none — whether any thread has started one its listener has not
+/// heard of yet. Codex counts the first alone, so a turn that has just started can be missed.
+fn running_turn_count(
+    processor: &MessageProcessor,
+    running_turn_count_rx: &mut tokio::sync::watch::Receiver<usize>,
+) -> usize {
+    let heard = *running_turn_count_rx.borrow_and_update();
+    if heard == 0 && processor.thread_manager().any_running() {
+        1
+    } else {
+        heard
     }
 }
 
@@ -288,6 +604,22 @@ async fn run_outbound_router(
                     }
                     OutboundControlEvent::Closed { connection_id } => {
                         outbound_connections.remove(&connection_id);
+                    }
+                    OutboundControlEvent::DisconnectAll => {
+                        // What was sent before the drain finished — the answer or the turn's end
+                        // that let it finish among them — reaches the clients first. Codex's router
+                        // takes the disconnect ahead of them.
+                        while let Ok(envelope) = outgoing_rx.try_recv() {
+                            route_outgoing_envelope(&mut outbound_connections, envelope).await;
+                        }
+                        tracing::info!(
+                            "disconnecting {} outbound websocket connection(s) for graceful restart",
+                            outbound_connections.len()
+                        );
+                        for connection_state in outbound_connections.values() {
+                            connection_state.request_disconnect();
+                        }
+                        outbound_connections.clear();
                     }
                 }
             }
@@ -368,12 +700,16 @@ pub mod test_api {
 
     use ra_core::session::SessionId;
     use serde_json::Value;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
 
     use ra_runtime::thread::AgentThread;
 
+    use std::future::Future;
+
     use super::{
-        AppServer, answers,
+        AppServer, GracefulRestart, ShutdownSignal, ShutdownSignals, answers,
+        connection_rpc_gate::ConnectionRpcGate,
         outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
         processor::MessageProcessor,
         protocol::{
@@ -451,7 +787,7 @@ pub mod test_api {
         /// methods reach it and its connections hear of its turns. Must be called within a Tokio
         /// runtime, on which the listener runs.
         pub async fn load(&self, thread: AgentThread, connection_ids: &[ConnectionId]) {
-            self.load_with_adapter(thread, connection_ids, None).await;
+            self.load_with(thread, connection_ids, None, None).await;
         }
 
         /// Installs the product's explicit policy adapter alongside its live thread.
@@ -461,14 +797,123 @@ pub mod test_api {
             connection_ids: &[ConnectionId],
             adapter: Option<Arc<dyn super::ThreadSettingsAdapter>>,
         ) {
+            self.load_with(thread, connection_ids, adapter, None).await;
+        }
+
+        /// Hands over the commands the thread's tools leave running alongside the thread.
+        pub async fn load_with_terminals(
+            &self,
+            thread: AgentThread,
+            connection_ids: &[ConnectionId],
+            terminals: Arc<dyn super::ThreadBackgroundTerminals>,
+        ) {
+            self.load_with(thread, connection_ids, None, Some(terminals))
+                .await;
+        }
+
+        /// Subscribes `connection_id` to the loaded thread `thread_id`, as `thread/resume` will
+        /// when it attaches a connection to a thread, which is not ported yet.
+        pub fn subscribe(&self, thread_id: &SessionId, connection_id: ConnectionId) {
+            self.processor
+                .outgoing()
+                .thread_state()
+                .add_connection_to_thread(thread_id, connection_id);
+        }
+
+        async fn load_with(
+            &self,
+            thread: AgentThread,
+            connection_ids: &[ConnectionId],
+            adapter: Option<Arc<dyn super::ThreadSettingsAdapter>>,
+            terminals: Option<Arc<dyn super::ThreadBackgroundTerminals>>,
+        ) {
             let outgoing = self.processor.outgoing();
+            // The thread's state exists before its listener watches it, subscribers or not.
+            let _ = outgoing.thread_state().thread_state(thread.thread_id());
             for &connection_id in connection_ids {
                 outgoing
                     .thread_state()
                     .add_connection_to_thread(thread.thread_id(), connection_id);
             }
-            ensure_listener_task_running(outgoing, &thread, adapter.clone()).await;
-            self.processor.thread_manager().add_thread(thread, adapter);
+            let loaded = self
+                .processor
+                .thread_manager()
+                .add_thread(thread, adapter, terminals);
+            if let Err(error) =
+                ensure_listener_task_running(&self.processor.listener_context(), &loaded).await
+            {
+                tracing::warn!("failed to attach listener for thread: {}", error.message());
+            }
+        }
+    }
+
+    /// A connection's request gate, reached on its own as Codex's unit tests reach it.
+    #[derive(Debug, Default)]
+    pub struct RpcGate(ConnectionRpcGate);
+
+    impl RpcGate {
+        /// An open gate.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Runs `future` if the gate is open, counting it until it finishes; drops it unpolled if
+        /// not.
+        pub async fn run(&self, future: impl Future<Output = ()>) {
+            self.0.run(future).await;
+        }
+
+        /// Lets no more handlers start.
+        pub async fn close(&self) {
+            self.0.close().await;
+        }
+
+        /// Closes the gate and waits for the handlers running to finish.
+        pub async fn shutdown(&self) {
+            self.0.shutdown().await;
+        }
+
+        /// Whether handlers may still start.
+        pub async fn is_accepting(&self) -> bool {
+            self.0.is_accepting().await
+        }
+
+        /// How many handlers are running.
+        #[must_use]
+        pub fn inflight_count(&self) -> usize {
+            self.0.inflight_count()
+        }
+    }
+
+    /// Sends a server the signals a graceful restart listens for, in place of the process's.
+    #[derive(Debug, Clone)]
+    pub struct RestartSignals {
+        signals: mpsc::Sender<ShutdownSignal>,
+    }
+
+    impl RestartSignals {
+        /// Sets `server` to restart gracefully, as [`AppServer::with_graceful_restart`] does, on
+        /// the signals sent through the returned handle.
+        #[must_use]
+        pub fn install(server: AppServer, transport_shutdown: CancellationToken) -> (AppServer, Self) {
+            let (signals, receiver) = mpsc::channel(8);
+            let mut server = server;
+            server.graceful_restart = Some(GracefulRestart {
+                transport_shutdown,
+                signals: ShutdownSignals::Channel(receiver),
+            });
+            (server, Self { signals })
+        }
+
+        /// Sends `SIGINT` or `SIGTERM`. Returns whether the server was still listening.
+        pub async fn forceable(&self) -> bool {
+            self.signals.send(ShutdownSignal::Forceable).await.is_ok()
+        }
+
+        /// Sends `SIGHUP`. Returns whether the server was still listening.
+        pub async fn graceful_only(&self) -> bool {
+            self.signals.send(ShutdownSignal::GracefulOnly).await.is_ok()
         }
     }
 

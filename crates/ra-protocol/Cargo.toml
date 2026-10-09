@@ -16,6 +16,9 @@ workspace = true
 # 断开都由测试掌握的写队列测，所以另转出 `ConnectionOpened` 的构造；服务端尚无自己的通知，测试经
 # `server::test_api::ServerNotifier` 发通知。turn 还没在服务端跑起来，server request 由
 # `server::test_api::ThreadRequester` 按线程发出、撤回与补发，各请求答复的解读也从同一处转出。
+# `thread/start` / `thread/resume` 未移植，线程经 `ThreadLoader` 加载（可连同后台终端）与重新订阅；
+# 优雅重启的信号经 `RestartSignals` 注入而不发真信号；连接的请求闸门经 `RpcGate` 单独转出，供
+# codex 的闸门单测直接测它。
 test-api = []
 
 [dependencies]

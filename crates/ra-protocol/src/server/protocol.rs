@@ -11,6 +11,10 @@
 //! of the turns the thread starts next. The thread's connections are sent `turn/started` and
 //! `turn/completed` as its turns start and end.
 //!
+//! A connection leaves a thread with `thread/unsubscribe`; every connection is sent
+//! `thread/closed` once a thread is unloaded. `thread/backgroundTerminals/list`, `terminate` and
+//! `clean` list and stop the commands a thread's tools left running.
+//!
 //! While a turn runs, the server asks the client in turn with a [`ServerRequest`]: to approve a
 //! command, file changes or extra permissions, to call a tool the client provides, or to put
 //! questions to the user. The client answers with a response carrying the method's answer, and the
@@ -26,6 +30,7 @@ mod item;
 mod permissions;
 mod server_request;
 mod settings;
+mod thread;
 mod turn;
 
 use std::path::{Path, PathBuf};
@@ -57,6 +62,13 @@ pub use self::{
         ApprovalsReviewer, AskForApproval, NetworkAccess, ReasoningSummary, SandboxPolicy,
         THREAD_SETTINGS_UPDATED_METHOD, ThreadPolicyOverrides, ThreadSettingsUpdatedNotification,
         TurnSettingsUpdateParams, TurnSettingsUpdateResponse, TurnSettingsUpdateStatus,
+    },
+    thread::{
+        THREAD_CLOSED_METHOD, ThreadBackgroundTerminal, ThreadBackgroundTerminalsCleanParams,
+        ThreadBackgroundTerminalsCleanResponse, ThreadBackgroundTerminalsListParams,
+        ThreadBackgroundTerminalsListResponse, ThreadBackgroundTerminalsTerminateParams,
+        ThreadBackgroundTerminalsTerminateResponse, ThreadClosedNotification,
+        ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
     },
     turn::{
         ByteRange, ERROR_METHOD, ErrorNotification, ImageDetail, ImageReference,
@@ -100,6 +112,42 @@ pub enum ClientRequest {
         request_id: RequestId,
         /// Who the client is and what it can take.
         params: InitializeParams,
+    },
+    /// Removes the connection's subscription to a thread.
+    #[serde(rename = "thread/unsubscribe")]
+    ThreadUnsubscribe {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread.
+        params: ThreadUnsubscribeParams,
+    },
+    /// Stops every command a thread's tools left running. Experimental, as in Codex.
+    #[serde(rename = "thread/backgroundTerminals/clean")]
+    ThreadBackgroundTerminalsClean {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread.
+        params: ThreadBackgroundTerminalsCleanParams,
+    },
+    /// Lists the commands a thread's tools left running. Experimental, as in Codex.
+    #[serde(rename = "thread/backgroundTerminals/list")]
+    ThreadBackgroundTerminalsList {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and the page.
+        params: ThreadBackgroundTerminalsListParams,
+    },
+    /// Stops one command a thread's tools left running. Experimental, as in Codex.
+    #[serde(rename = "thread/backgroundTerminals/terminate")]
+    ThreadBackgroundTerminalsTerminate {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and the terminal.
+        params: ThreadBackgroundTerminalsTerminateParams,
     },
     /// Changes the settings of the turns a thread starts next. Experimental, as in Codex.
     #[serde(rename = "thread/settings/update")]
@@ -163,6 +211,10 @@ impl ClientRequest {
     pub const fn id(&self) -> &RequestId {
         match self {
             Self::Initialize { request_id, .. }
+            | Self::ThreadUnsubscribe { request_id, .. }
+            | Self::ThreadBackgroundTerminalsClean { request_id, .. }
+            | Self::ThreadBackgroundTerminalsList { request_id, .. }
+            | Self::ThreadBackgroundTerminalsTerminate { request_id, .. }
             | Self::ThreadSettingsUpdate { request_id, .. }
             | Self::TurnSettingsUpdate { request_id, .. }
             | Self::TurnStart { request_id, .. }
@@ -177,6 +229,12 @@ impl ClientRequest {
     pub const fn method_name(&self) -> &'static str {
         match self {
             Self::Initialize { .. } => "initialize",
+            Self::ThreadUnsubscribe { .. } => "thread/unsubscribe",
+            Self::ThreadBackgroundTerminalsClean { .. } => "thread/backgroundTerminals/clean",
+            Self::ThreadBackgroundTerminalsList { .. } => "thread/backgroundTerminals/list",
+            Self::ThreadBackgroundTerminalsTerminate { .. } => {
+                "thread/backgroundTerminals/terminate"
+            }
             Self::ThreadSettingsUpdate { .. } => "thread/settings/update",
             Self::TurnSettingsUpdate { .. } => "turn/settings/update",
             Self::TurnStart { .. } => "turn/start",
@@ -195,12 +253,38 @@ impl ClientRequest {
     #[must_use]
     pub fn experimental_reason(&self) -> Option<&'static str> {
         match self {
-            Self::Initialize { .. } | Self::TurnInterrupt { .. } => None,
+            Self::Initialize { .. } | Self::ThreadUnsubscribe { .. } | Self::TurnInterrupt { .. } => {
+                None
+            }
+            Self::ThreadBackgroundTerminalsClean { .. } => Some("thread/backgroundTerminals/clean"),
+            Self::ThreadBackgroundTerminalsList { .. } => Some("thread/backgroundTerminals/list"),
+            Self::ThreadBackgroundTerminalsTerminate { .. } => {
+                Some("thread/backgroundTerminals/terminate")
+            }
             Self::ThreadSettingsUpdate { .. } => Some("thread/settings/update"),
             Self::TurnSettingsUpdate { .. } => Some("turn/settings/update"),
             Self::TurnStart { params, .. } => params.experimental_reason(),
             Self::TurnSteer { params, .. } => params.experimental_reason(),
             Self::MockExperimentalMethod { .. } => Some("mock/experimentalMethod"),
+        }
+    }
+}
+
+impl ClientRequest {
+    /// The thread whose requests this one runs in order with, or `None` if it runs alongside any:
+    /// Codex's `serialization_scope`, for the thread scope its methods declare.
+    pub(crate) fn serialization_thread(&self) -> Option<&str> {
+        match self {
+            Self::Initialize { .. } | Self::MockExperimentalMethod { .. } => None,
+            Self::ThreadUnsubscribe { params, .. } => Some(params.thread_id()),
+            Self::ThreadBackgroundTerminalsClean { params, .. } => Some(params.thread_id()),
+            Self::ThreadBackgroundTerminalsList { params, .. } => Some(params.thread_id()),
+            Self::ThreadBackgroundTerminalsTerminate { params, .. } => Some(params.thread_id()),
+            Self::ThreadSettingsUpdate { params, .. } => Some(params.thread_id()),
+            Self::TurnSettingsUpdate { params, .. } => Some(params.thread_id()),
+            Self::TurnStart { params, .. } => Some(params.thread_id()),
+            Self::TurnSteer { params, .. } => Some(params.thread_id()),
+            Self::TurnInterrupt { params, .. } => Some(params.thread_id()),
         }
     }
 }

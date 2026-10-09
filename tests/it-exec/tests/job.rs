@@ -453,3 +453,131 @@ async fn run_to_completion(manager: Arc<ProcessManager>, command: &str) -> Backg
     assert!(matches!(result, JobWaitResult::Done(_)));
     job
 }
+
+/// Codex's `unified_exec_persists_across_requests`, for what the manager lists: a command that
+/// yielded is listed with the call that started it, its command line and its directory, until it
+/// is terminated — once.
+#[tokio::test]
+async fn test_background_terminals_list_what_started_each_command() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(ProcessManager::default());
+    let request = ExecRequest::new("sleep 30")
+        .with_cwd(workspace.path())
+        .with_call_id("call-1")
+        .with_limits(quick_yield());
+    let result = manager
+        .execute(request, None)
+        .await
+        .expect("command starts");
+    let ExecExecutionResult::Yielded { session_id, .. } = result else {
+        panic!("the command must yield: {result:?}");
+    };
+
+    let terminals = manager.background_terminals().await;
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].session_id(), &session_id);
+    assert_eq!(terminals[0].call_id(), Some("call-1"));
+    assert_eq!(terminals[0].command(), "sleep 30");
+    assert_eq!(terminals[0].cwd(), Some(workspace.path()));
+
+    assert!(manager.terminate_background_terminal(&session_id).await);
+    assert!(!manager.terminate_background_terminal(&session_id).await);
+    assert!(manager.background_terminals().await.is_empty());
+}
+
+/// A terminal ignoring graceful termination stays visible until the supervisor has killed and
+/// reaped it, and termination cannot report success before then.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_background_terminal_termination_waits_for_closeout() {
+    let manager = Arc::new(ProcessManager::default());
+    let job = start_job(Arc::clone(&manager), "trap '' TERM; printf ready; sleep 30").await;
+    assert!(matches!(
+        job.wait(JobWaitUntil::Match {
+            text: "ready".to_owned(),
+            timeout: Duration::from_secs(5),
+        })
+        .await
+        .expect("job is retained"),
+        JobWaitResult::Matched { .. }
+    ));
+    let session_id = job.session_id().clone();
+    let terminating_manager = Arc::clone(&manager);
+    let termination = tokio::spawn(async move {
+        terminating_manager
+            .terminate_background_terminal(&session_id)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !job.snapshot().await.unwrap().is_terminal() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation is recorded");
+    assert!(
+        !termination.is_finished(),
+        "termination must wait for closeout"
+    );
+    assert_eq!(manager.background_terminals().await.len(), 1);
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), termination)
+            .await
+            .expect("the supervisor escalates termination")
+            .unwrap()
+    );
+    assert!(job.snapshot().await.unwrap().is_closed());
+    assert!(manager.background_terminals().await.is_empty());
+}
+
+/// A command given no directory is listed in this process's, and with no call when the request
+/// named none. A command that already finished is not listed and cannot be terminated.
+#[tokio::test]
+async fn test_background_terminals_skip_finished_commands() {
+    let manager = Arc::new(ProcessManager::default());
+    let finished = manager
+        .execute(ExecRequest::new("true"), None)
+        .await
+        .expect("command runs");
+    assert!(
+        matches!(finished, ExecExecutionResult::Completed(_)),
+        "a quick command completes: {finished:?}"
+    );
+    let job = start_job(Arc::clone(&manager), "sleep 30").await;
+
+    let terminals = manager.background_terminals().await;
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(
+        terminals[0].session_id().as_str(),
+        job.session_id().as_str()
+    );
+    assert_eq!(terminals[0].call_id(), None);
+    assert_eq!(
+        terminals[0].cwd(),
+        Some(std::env::current_dir().unwrap().as_path())
+    );
+    assert!(
+        !manager
+            .terminate_background_terminal(&ra_exec::session::ExecSessionId::new("exec-unknown"))
+            .await
+    );
+}
+
+/// Codex's `terminate_all_processes`: every command still running is stopped.
+#[tokio::test]
+async fn test_terminate_background_terminals_stops_every_command() {
+    let manager = Arc::new(ProcessManager::default());
+    let first = start_job(Arc::clone(&manager), "sleep 30").await;
+    let second = start_job(Arc::clone(&manager), "sleep 30").await;
+    assert_eq!(manager.background_terminals().await.len(), 2);
+
+    manager.terminate_background_terminals().await;
+    assert!(manager.background_terminals().await.is_empty());
+    for job in [first, second] {
+        let snapshot = job.snapshot().await.expect("job is retained");
+        assert_eq!(snapshot.state(), &ExecSessionState::Cancelled);
+        assert!(snapshot.is_closed());
+    }
+}

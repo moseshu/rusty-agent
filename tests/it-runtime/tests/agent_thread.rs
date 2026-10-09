@@ -708,6 +708,75 @@ async fn interrupt_aborts_the_running_turn_and_drops_undelivered_input() {
     );
 }
 
+/// Codex's `Op::Shutdown`: a running turn is aborted as an interrupt aborts it and waited for,
+/// input is refused from then on, and shutting down again returns at once.
+#[tokio::test]
+async fn shutdown_aborts_the_running_turn_and_refuses_input() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    script.push(Step::Hang);
+    let turn_id = started(&thread, text("run forever")).await;
+    script.wait_for_calls(1).await;
+    assert!(!thread.is_shut_down());
+
+    timeout(PATIENCE, thread.shutdown())
+        .await
+        .expect("shutdown waits only for the aborted turn");
+    assert!(thread.is_shut_down());
+    assert!(!thread.is_running());
+    let _started = next_event(&thread).await;
+    match next_event(&thread).await {
+        ThreadEvent::TurnAborted {
+            turn_id: id,
+            reason,
+            ..
+        } => {
+            assert_eq!(id, turn_id);
+            assert_eq!(reason, TurnAbortReason::Interrupted);
+        }
+        other => panic!("expected the turn to be aborted, got {other:?}"),
+    }
+    assert!(
+        matches!(thread.history().last(), Some(ModelInputItem::Message(message)) if is_interrupted_turn_marker(message)),
+        "{:?}",
+        thread.history()
+    );
+
+    assert_eq!(
+        thread.start_or_steer_turn(text("too late")).await,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ShutDown
+        }
+    );
+    assert_eq!(
+        thread.steer_turn(&text("too late"), &turn_id),
+        SteerSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ShutDown
+        }
+    );
+    timeout(PATIENCE, thread.shutdown())
+        .await
+        .expect("a thread already down shuts down at once");
+    assert_eq!(script.calls().len(), 1);
+}
+
+/// An idle thread shuts down at once and starts no turn afterwards.
+#[tokio::test]
+async fn shutdown_of_an_idle_thread_refuses_the_next_start() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    timeout(PATIENCE, thread.shutdown())
+        .await
+        .expect("an idle thread shuts down at once");
+    assert_eq!(
+        thread.start_or_steer_turn(text("hello")).await,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ShutDown
+        }
+    );
+    assert!(script.calls().is_empty());
+}
+
 #[tokio::test]
 async fn a_turn_waiting_for_approval_stays_active_until_answered() {
     let script = Arc::new(Script::default());

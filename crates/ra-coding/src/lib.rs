@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod assembly;
+pub mod background_terminals;
 pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub mod dangerous_action;

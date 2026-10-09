@@ -392,7 +392,8 @@ impl Tool for ExecCommandTool {
             )?;
         let request = self
             .request(input)
-            .map_err(ExecCommandFailure::into_error)?;
+            .map_err(ExecCommandFailure::into_error)?
+            .with_call_id(context.call_id().as_str());
         // Read before the request is handed over, because the yielded result reports how long it
         // waited and the effective figure is the one the request carries, not the one asked for.
         let yielded_after = request.limits().initial_yield_timeout();

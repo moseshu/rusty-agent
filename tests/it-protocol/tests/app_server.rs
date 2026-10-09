@@ -489,7 +489,9 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
     let server = Server::start();
     let mut connection = server.open(1).await;
     let unknown = "Invalid request: unknown variant `config/read`, expected one of \
-                   `initialize`, `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \
+                   `initialize`, `thread/unsubscribe`, `thread/backgroundTerminals/clean`, \
+                   `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, \
+                   `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \
                    `turn/interrupt`, `mock/experimentalMethod`";
 
     let answer = server.call(&mut connection, 1, "config/read", None).await;
