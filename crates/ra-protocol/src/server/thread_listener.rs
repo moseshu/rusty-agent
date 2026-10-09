@@ -20,12 +20,20 @@
 //! shuts it down — stopping its background terminals — and, once it is down, removes it and tells
 //! every connection with `thread/closed`. A thread that does not shut down in time stays loaded.
 //!
+//! # Statuses and commands
+//!
+//! As turns start and end and errors occur, the listener tells the server's
+//! [`ThreadWatchManager`], which sends every connection `thread/status/changed`; an unloaded
+//! thread is reported not loaded before `thread/closed`. Between events the listener carries out
+//! the commands it is sent: `thread/resume` of a loaded thread is answered here, so that the turns
+//! in the answer and the connection's subscription fall between the same two events, and the
+//! connection misses nothing and hears nothing twice. The connection is then sent the thread's
+//! server requests still waiting.
+//!
 //! # Differences from Codex
 //!
-//! Codex's listener also handles commands that order a running thread's
-//! resume and its goals with its notifications; those come with the thread methods. Codex also
-//! sends `thread/status/changed` as the thread goes idle and unloads; thread statuses come with
-//! the thread methods.
+//! Codex's listener also takes commands that order its goals and warnings with its notifications;
+//! goals are not ported.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -47,14 +55,16 @@ use super::{
         ERROR_METHOD, ErrorNotification, ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD,
         ItemCompletedNotification, ItemStartedNotification, THREAD_CLOSED_METHOD,
         THREAD_SETTINGS_UPDATED_METHOD, TURN_COMPLETED_METHOD, TURN_STARTED_METHOD,
-        ThreadClosedNotification, ThreadSettingsUpdatedNotification, Turn,
+        ThreadClosedNotification, ThreadResumeResponse, ThreadSettingsUpdatedNotification, Turn,
         TurnCompletedNotification, TurnError, TurnInterruptResponse, TurnItemsView,
         TurnStartedNotification, TurnStatus,
     },
     settings_adapter::settings_snapshot,
     thread_history::{HistorySources, ItemChange},
     thread_manager::{LoadedThread, ThreadManager},
-    thread_state::ThreadState,
+    thread_processor::{set_thread_status_and_interrupt_stale_turns, turns_page},
+    thread_state::{PendingThreadResumeRequest, ThreadListenerCommand, ThreadState},
+    thread_status::ThreadWatchManager,
     tool_items::ThreadToolItems,
 };
 use crate::frame::JsonRpcErrorObject;
@@ -72,6 +82,8 @@ pub(crate) struct ListenerTaskContext {
     /// The threads being unloaded, until they are gone or stay.
     pub(crate) pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
     pub(crate) thread_unload_delay: Duration,
+    /// The statuses clients are told of.
+    pub(crate) thread_watch: Arc<ThreadWatchManager>,
 }
 
 /// When a thread may be unloaded: Codex's `UnloadingState`, on Tokio's clock rather than the
@@ -192,12 +204,13 @@ pub(crate) async fn ensure_listener_task_running(
     };
     let thread_state = context.outgoing.thread_state().thread_state(&thread_id);
     let cancel = CancellationToken::new();
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
     {
         let mut state = thread_state.lock().await;
         if state.has_listener() {
             return Ok(());
         }
-        state.set_listener(cancel.clone());
+        state.set_listener(cancel.clone(), command_tx);
     }
     let context = context.clone();
     let loaded = loaded.clone();
@@ -216,7 +229,18 @@ pub(crate) async fn ensure_listener_task_running(
                         break;
                     };
                     let tool_items = context.history.tool_items();
-                    handle_event(event, &loaded, outgoing, &thread_state, tool_items.as_deref())
+                    handle_event(
+                        event,
+                        &loaded,
+                        outgoing,
+                        &context.thread_watch,
+                        &thread_state,
+                        tool_items.as_deref(),
+                    )
+                    .await;
+                }
+                Some(command) = command_rx.recv() => {
+                    handle_thread_listener_command(&context, &loaded, &thread_state, command)
                         .await;
                 }
                 unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
@@ -257,6 +281,7 @@ async fn handle_event(
     event: ThreadEvent,
     loaded: &LoadedThread,
     outgoing: &Arc<OutgoingMessageSender>,
+    thread_watch: &ThreadWatchManager,
     thread_state: &Mutex<ThreadState>,
     tool_items: Option<&dyn ThreadToolItems>,
 ) {
@@ -265,8 +290,16 @@ async fn handle_event(
         .lock()
         .await
         .track_current_turn_event(&event, tool_items);
-    if matches!(event, ThreadEvent::TurnStarted { .. }) {
-        outgoing.thread_state().note_active(&thread_id, true);
+    match &event {
+        ThreadEvent::TurnStarted { .. } => {
+            outgoing.thread_state().note_active(&thread_id, true);
+            thread_watch.note_turn_started(&thread_id).await;
+        }
+        ThreadEvent::Error { .. } => thread_watch.note_system_error(&thread_id).await,
+        ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. } => {
+            thread_watch.note_turn_ended(&thread_id).await;
+        }
+        _ => {}
     }
     let connection_ids = outgoing
         .thread_state()
@@ -372,6 +405,7 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
                 .remove(&thread_id);
             return;
         }
+        context.thread_watch.remove_thread(&thread_id).await;
         broadcast(
             &context.outgoing,
             THREAD_CLOSED_METHOD,
@@ -384,6 +418,124 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
             .await
             .remove(&thread_id);
     });
+}
+
+/// Carries out one command between the thread's events: Codex's
+/// `handle_thread_listener_command`.
+async fn handle_thread_listener_command(
+    context: &ListenerTaskContext,
+    loaded: &LoadedThread,
+    thread_state: &Mutex<ThreadState>,
+    command: ThreadListenerCommand,
+) {
+    match command {
+        ThreadListenerCommand::SendThreadResumeResponse {
+            request,
+            completion_tx,
+        } => {
+            handle_pending_thread_resume_request(context, loaded, thread_state, *request).await;
+            let _ = completion_tx.send(());
+        }
+    }
+}
+
+/// Answers `thread/resume` of the loaded thread and subscribes its connection: Codex's
+/// `handle_pending_thread_resume_request`.
+///
+/// The turns are those the rollout holds with the running one laid over them, as the listener
+/// has followed it; the answer is sent before any later event of the thread, and the connection
+/// is subscribed before it, so the client hears every event after the turns it was given. A
+/// thread being unloaded meanwhile refuses, and a connection that closed meanwhile is not
+/// subscribed and gets no answer.
+async fn handle_pending_thread_resume_request(
+    context: &ListenerTaskContext,
+    loaded: &LoadedThread,
+    thread_state: &Mutex<ThreadState>,
+    pending: PendingThreadResumeRequest,
+) {
+    let thread_id = loaded.thread_id().clone();
+    let active_turn = thread_state.lock().await.active_turn_snapshot();
+    let has_live_in_progress_turn = loaded.is_running()
+        || active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.status() == TurnStatus::InProgress);
+    let PendingThreadResumeRequest {
+        request_id,
+        thread_summary: mut thread,
+        history_turns,
+        include_turns,
+        initial_turns_page,
+        settings,
+    } = pending;
+    let mut turns = history_turns;
+    if let Some(active_turn) = active_turn {
+        turns.retain(|turn| turn.id() != active_turn.id());
+        turns.push(active_turn);
+    }
+    let thread_status = context.thread_watch.loaded_status_for_thread(&thread_id);
+    let page = match initial_turns_page {
+        Some(params) => {
+            let mut page_turns = turns.clone();
+            super::thread_processor::normalize_thread_turns_status(
+                &mut page_turns,
+                thread_status.clone(),
+                has_live_in_progress_turn,
+            );
+            match turns_page(page_turns, &params) {
+                Ok(page) => Some(page),
+                Err(error) => {
+                    context.outgoing.send_error(request_id, error).await;
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    if include_turns {
+        thread.turns = turns;
+    }
+    set_thread_status_and_interrupt_stale_turns(
+        &mut thread,
+        thread_status,
+        has_live_in_progress_turn,
+    );
+
+    {
+        let pending_thread_unloads = context.pending_thread_unloads.lock().await;
+        if pending_thread_unloads.contains(&thread_id) {
+            drop(pending_thread_unloads);
+            context
+                .outgoing
+                .send_error(
+                    request_id,
+                    JsonRpcErrorObject::invalid_request(format!(
+                        "thread {thread_id} is closing; retry thread/resume after the thread is closed"
+                    )),
+                )
+                .await;
+            return;
+        }
+        if !context
+            .outgoing
+            .thread_state()
+            .try_add_connection_to_thread(&thread_id, request_id.connection_id)
+        {
+            tracing::debug!(%thread_id, "skipping running thread resume for closed connection");
+            return;
+        }
+    }
+    let connection_id = request_id.connection_id;
+    context
+        .outgoing
+        .send_serialized_response(
+            request_id,
+            ThreadResumeResponse::new(thread, page, settings),
+        )
+        .await;
+    context
+        .outgoing
+        .replay_requests_to_connection_for_thread(connection_id, &thread_id)
+        .await;
 }
 
 /// Tells the thread's connections what one event means: the turn arms of Codex's

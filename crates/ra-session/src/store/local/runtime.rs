@@ -37,7 +37,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// creation and update order, with the archived flag and working directory in front for filtered
 /// listings, and partial indexes for the active listing, which skips threads without a preview, and
 /// for the archived one. Every index ends in the id, which breaks ties between threads of one time.
-const MIGRATIONS: &[&str] = &[r"
+const MIGRATIONS: &[&str] = &[
+    r"
 CREATE TABLE threads (
     id TEXT PRIMARY KEY,
     rollout_path TEXT NOT NULL,
@@ -89,7 +90,11 @@ CREATE TABLE backfill_state (
 INSERT INTO backfill_state (id, status, last_watermark, last_success_at, updated_at)
 VALUES (1, 'pending', NULL, NULL, CAST(strftime('%s', 'now') AS INTEGER))
 ON CONFLICT(id) DO NOTHING;
-"];
+",
+    r"
+ALTER TABLE threads ADD COLUMN git_info TEXT;
+",
+];
 
 /// The state database a rollout directory keeps beside its rollouts: Codex's `StateRuntime`, with
 /// its thread table and the state of its first backfill.

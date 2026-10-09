@@ -1,9 +1,11 @@
 //! The threads the server has loaded: the part of Codex's `ThreadManager` (`core/src/thread_manager.rs`)
 //! the thread and turn methods look threads up in.
 //!
-//! A thread is loaded by the host, which builds it, and is then reachable by its id until it is
-//! unloaded. Codex's manager also creates, resumes and forks threads; those come with the thread
-//! methods.
+//! A thread is loaded by `thread/start`, `thread/resume` or `thread/fork`, which have the host's
+//! [`ThreadFactory`](super::ThreadFactory) prepare it, and is then reachable by its id until it is
+//! unloaded. Alongside the live thread the manager keeps what a client is told of it that the
+//! thread itself does not know: whether it keeps a rollout, when it was created, what it was
+//! forked from and the client's classification of it.
 
 use std::{
     collections::HashMap,
@@ -19,9 +21,37 @@ use super::{
 use ra_core::session::SessionId;
 use ra_runtime::thread::AgentThread;
 
+/// What a client is told of a loaded thread that the live thread does not know.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoadedThreadInfo {
+    /// The thread keeps no rollout: Codex's `ephemeral`.
+    pub(crate) ephemeral: bool,
+    /// When it was created, in seconds since the Unix epoch.
+    pub(crate) created_at: i64,
+    /// The thread it was forked from, if it is a fork.
+    pub(crate) forked_from_id: Option<SessionId>,
+    /// The client's classification of where it came from.
+    pub(crate) thread_source: Option<String>,
+    /// Its preview, for a thread that keeps no rollout to read one from.
+    pub(crate) preview: String,
+}
+
+impl LoadedThreadInfo {
+    /// A thread loaded from outside the thread methods, whose rollout the server does not know of.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    pub(crate) fn unknown() -> Self {
+        Self {
+            ephemeral: true,
+            created_at: super::outgoing::now_unix_timestamp_ms() / 1000,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LoadedThread {
     pub(crate) thread: AgentThread,
+    pub(crate) info: LoadedThreadInfo,
     pub(crate) adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
     /// The commands the thread's tools left running, if its host handed them over.
     pub(crate) terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
@@ -66,15 +96,16 @@ pub(crate) struct ThreadManager {
 
 impl ThreadManager {
     /// Makes `thread` reachable by its id, in place of any thread loaded under the same id.
-    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
     pub(crate) fn add_thread(
         &self,
         thread: AgentThread,
+        info: LoadedThreadInfo,
         adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
         terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
     ) -> LoadedThread {
         let loaded = LoadedThread {
             thread,
+            info,
             adapter,
             terminals,
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -117,6 +148,16 @@ impl ThreadManager {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The ids of the loaded threads: Codex's `list_thread_ids`.
+    pub(crate) fn list_thread_ids(&self) -> Vec<SessionId> {
+        self.threads
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
             .cloned()
             .collect()
     }

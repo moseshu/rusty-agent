@@ -16,6 +16,8 @@
 //!   effort, working directory, update time — is written to the thread's row, as Codex's
 //!   `ThreadMetadataSync` writes through `record_thread_metadata`; a thread's row is created the
 //!   first time, from that metadata;
+//! - explicit Git patches append canonical session metadata markers and update the indexed Git
+//!   facts; rebuilding an index replays those markers, including explicit clears;
 //! - a name is kept in the row's title, as Codex keeps it in its legacy history mode, and in the
 //!   session index; the row is then rebuilt from the rollout, keeping the name;
 //! - archiving and unarchiving move the row with the rollout, and deleting a thread deletes its
@@ -35,7 +37,7 @@
 //!   session directories. The database here lives in the rollout directory, named
 //!   [`STATE_DB_FILENAME`], and indexes that directory's rollouts.
 //! - **Schema.** Codex's thread table carries its product's columns — source, sandbox policy,
-//!   approval mode, Git facts, sections, projects, recency, memory mode, token usage. This one
+//!   approval mode, sections, projects, recency, memory mode, token usage. This one
 //!   keeps the columns this framework's threads have, under Codex's names, plus where a spawned
 //!   thread came from and what a fork was forked from, so a listing from the database returns what
 //!   a listing of rollouts returns. Its other tables — logs, goals, memories, spawn edges, queued
@@ -153,17 +155,22 @@ impl ThreadIndex for StateRuntime {
         patch: &ThreadMetadataPatch,
         rollout_path: PathBuf,
         archived: bool,
-    ) {
+    ) -> Result<()> {
         if let Err(error) =
             repair::apply_metadata_update(self, session_id, patch, rollout_path.clone(), archived)
                 .await
         {
             tracing::warn!(%session_id, %error, "the state database could not update a thread's metadata");
-            return;
+            return if patch.git_info().is_some() {
+                Err(error)
+            } else {
+                Ok(())
+            };
         }
         if patch.name().is_some() {
             repair::reconcile_rollout(self, &rollout_path, Some(archived)).await;
         }
+        Ok(())
     }
 
     fn mark_archived(&self, session_id: &SessionId, path: &Path) -> Result<()> {

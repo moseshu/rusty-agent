@@ -45,10 +45,13 @@ use super::{
     request_serialization::{
         QueuedInitializedRequest, RequestSerializationQueueKey, RequestSerializationQueues,
     },
+    thread_factory::ThreadFactory,
     thread_history::HistorySources,
     thread_listener::ListenerTaskContext,
+    thread_loading::ThreadMethodContext,
     thread_manager::ThreadManager,
     thread_processor::ThreadRequestProcessor,
+    thread_status::ThreadWatchManager,
     turn_admission::TurnAdmission,
     turn_processor::{TurnMethodResult, TurnRequestProcessor},
 };
@@ -122,6 +125,21 @@ impl ConnectionSessionState {
     }
 }
 
+/// Where the host's thread factory is kept once given.
+#[derive(Default)]
+struct ThreadFactorySlot(std::sync::RwLock<Option<Arc<dyn ThreadFactory>>>);
+
+impl std::fmt::Debug for ThreadFactorySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = self
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        f.debug_tuple("ThreadFactorySlot").field(&set).finish()
+    }
+}
+
 /// Handles the requests of every connection: Codex's `MessageProcessor`, with the methods ported
 /// so far.
 #[derive(Debug)]
@@ -137,12 +155,17 @@ pub(crate) struct MessageProcessor {
     thread_unload_delay: std::sync::Mutex<Duration>,
     /// Where threads' history is read from, and how their tools' calls show.
     pub(crate) history: Arc<HistorySources>,
+    /// What prepares the threads the thread methods load, if the host gave one.
+    thread_factory: ThreadFactorySlot,
+    /// The statuses of the loaded threads.
+    thread_watch: Arc<ThreadWatchManager>,
 }
 
 impl MessageProcessor {
     pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, codex_home: PathBuf) -> Self {
         let thread_manager = Arc::new(ThreadManager::default());
         let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let thread_watch = Arc::new(ThreadWatchManager::new(Arc::clone(&outgoing)));
         Self {
             turn_processor: TurnRequestProcessor::new(
                 Arc::clone(&thread_manager),
@@ -152,6 +175,7 @@ impl MessageProcessor {
                 Arc::clone(&thread_manager),
                 Arc::clone(&outgoing),
                 Arc::clone(&pending_thread_unloads),
+                Arc::clone(&thread_watch),
             ),
             outgoing,
             codex_home,
@@ -161,6 +185,30 @@ impl MessageProcessor {
             pending_thread_unloads,
             thread_unload_delay: std::sync::Mutex::new(DEFAULT_THREAD_UNLOAD_DELAY),
             history: Arc::default(),
+            thread_factory: ThreadFactorySlot::default(),
+            thread_watch,
+        }
+    }
+
+    /// Prepares the threads the thread methods load with `factory`.
+    pub(crate) fn set_thread_factory(&self, factory: Arc<dyn ThreadFactory>) {
+        *self
+            .thread_factory
+            .0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(factory);
+    }
+
+    fn thread_method_context(&self) -> ThreadMethodContext<'_> {
+        ThreadMethodContext {
+            history: &self.history,
+            factory: self
+                .thread_factory
+                .0
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            listener: self.listener_context(),
         }
     }
 
@@ -181,6 +229,7 @@ impl MessageProcessor {
             history: Arc::clone(&self.history),
             thread_manager: Arc::clone(&self.thread_manager),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            thread_watch: Arc::clone(&self.thread_watch),
             thread_unload_delay: *self
                 .thread_unload_delay
                 .lock()
@@ -305,6 +354,9 @@ impl MessageProcessor {
             return Err(JsonRpcErrorObject::invalid_request("Already initialized"));
         }
 
+        self.outgoing
+            .thread_state()
+            .connection_initialized(request_id.connection_id);
         self.send_response(
             request_id,
             InitializeResponse::new(USER_AGENT, self.codex_home.clone()),
@@ -370,6 +422,7 @@ impl MessageProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // One arm per method, as Codex's dispatch has.
     async fn handle_initialized_client_request(
         &self,
         request_id: ConnectionRequestId,
@@ -379,6 +432,80 @@ impl MessageProcessor {
             ClientRequest::Initialize { .. } => {
                 // `handle_client_request` answers `initialize` before anything is dispatched.
                 unreachable!("initialize is handled before initialized request dispatch")
+            }
+            ClientRequest::ThreadStart { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_start(request_id.clone(), params, &self.thread_method_context())
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadResume { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_resume(request_id.clone(), params, &self.thread_method_context())
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadFork { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_fork(request_id.clone(), params, &self.thread_method_context())
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadRead { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_read(params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadLoadedList { params, .. } => {
+                let result = self.thread_processor.thread_loaded_list(&params);
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadArchive { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_archive(request_id.clone(), params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadDelete { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_delete(request_id.clone(), params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadUnarchive { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_unarchive(request_id.clone(), params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadSetName { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_set_name(request_id.clone(), params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadMetadataUpdate { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_metadata_update(params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadList { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_list(params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadUnsubscribe { params, .. } => {
                 let result = self

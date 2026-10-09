@@ -174,6 +174,12 @@ impl RolloutFileRecorder {
         Self::deferred(path, session_id, Some(meta), history, Some(ownership))
     }
 
+    /// Appends a canonical storage payload on the same queue as runtime records, as Codex's
+    /// `record_canonical_items` does for a metadata update.
+    pub(crate) fn record_payload(&self, payload: RolloutPayload) {
+        let _ = self.commands.send(Command::Record(Box::new(payload)));
+    }
+
     fn deferred(
         path: PathBuf,
         session_id: SessionId,

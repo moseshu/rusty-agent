@@ -30,14 +30,15 @@
 //! archived history; both ways of creating a thread refuse an id with an archived rollout, too.
 //! Codex's reference checks before deleting a thread guard histories that its paginated forks share
 //! with their source; forks here copy their history, so there is nothing to check. A resume
-//! reopens active threads only. Without a state database, of a metadata patch only the name is
-//! kept, as Codex keeps only the name without its state database; the rest is read from the rollout
-//! when the thread is.
+//! reopens active threads only. Names are stored in the session index. Explicit Git patches are
+//! appended through the canonical writer, as in Codex, but also work without a state database:
+//! this store replays the markers to recover current Git facts. This adaptation keeps the
+//! optional index from becoming a precondition of metadata updates.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
 };
 
 use async_trait::async_trait;
@@ -81,6 +82,8 @@ pub struct RolloutThreadDirectory {
     dir: PathBuf,
     writer_locks: Arc<WriterLockCoordinator>,
     index: Option<Arc<dyn ThreadIndex>>,
+    live_recorders: Arc<Mutex<HashMap<SessionId, Weak<RolloutFileRecorder>>>>,
+    metadata_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RolloutThreadDirectory {
@@ -92,6 +95,8 @@ impl RolloutThreadDirectory {
             writer_locks: Arc::new(WriterLockCoordinator::new(&dir)),
             dir,
             index: None,
+            live_recorders: Arc::default(),
+            metadata_lock: Arc::default(),
         }
     }
 
@@ -288,6 +293,10 @@ impl RolloutThreadStore for RolloutThreadDirectory {
             meta.clone(),
             ownership,
         ));
+        self.live_recorders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(meta.session_id().clone(), Arc::downgrade(&recorder));
         Ok(LiveThreadRecorder::created(
             Arc::new(self.clone()),
             recorder,
@@ -317,6 +326,10 @@ impl ThreadStore for RolloutThreadDirectory {
             history.clone(),
             ownership,
         ));
+        self.live_recorders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(params.session_id().clone(), Arc::downgrade(&recorder));
         Ok(LiveThreadRecorder::created(
             Arc::new(self.clone()),
             recorder,
@@ -341,7 +354,11 @@ impl ThreadStore for RolloutThreadDirectory {
             ownership,
         )
         .await?;
-        let recorder: Arc<dyn RolloutRecorder> = Arc::new(RolloutFileRecorder::spawn(writer));
+        let recorder = Arc::new(RolloutFileRecorder::spawn(writer));
+        self.live_recorders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(params.session_id().clone(), Arc::downgrade(&recorder));
         let history = match params.history() {
             Some(history) => history.to_vec(),
             None => match RolloutReader::open(&path).read_all().await {
@@ -389,7 +406,7 @@ impl ThreadStore for RolloutThreadDirectory {
                 StoredThreadHistory::new(params.session_id().clone(), reader.read_all().await?);
             StoredThread::from_history(history)?
         } else {
-            let meta = reader.session_meta().await?;
+            let meta = crate::store::first_session_meta(&reader.read_all().await?)?;
             StoredThread::new(params.session_id().clone(), meta.as_ref())
         };
         self.describe(&mut thread, &path, archived).await?;
@@ -408,26 +425,104 @@ impl ThreadStore for RolloutThreadDirectory {
         match &self.index {
             Some(index) => index.list_threads(&dir, &self.dir, params).await,
             None if params.use_state_db_only() => Ok(ThreadPage::new(Vec::new(), None)),
-            None => lite::list_threads(&dir, &self.dir, params.is_archived(), params).await,
+            None => {
+                let page =
+                    lite::list_threads(&dir, &self.dir, params.is_archived(), params).await?;
+                let next = page.next_cursor().map(str::to_owned);
+                let mut items = page.into_items();
+                for thread in &mut items {
+                    if let Some(path) = thread.rollout_path() {
+                        let records = RolloutReader::open(path).read_all().await?;
+                        if let Some(meta) = crate::store::first_session_meta(&records)? {
+                            thread.set_git_info(
+                                StoredThread::new(thread.session_id().clone(), Some(&meta))
+                                    .git_info()
+                                    .cloned(),
+                            );
+                        }
+                    }
+                }
+                Ok(ThreadPage::new(items, next))
+            }
         }
     }
 
-    /// Keeps a name in the session index; an empty or cleared name clears it. The other fields
-    /// are kept only in a state database, as Codex keeps them.
+    async fn list_spawn_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
+        let mut children = self
+            .children(parent)
+            .await?
+            .into_iter()
+            .map(|(_, meta)| meta.session_id().clone())
+            .collect::<Vec<_>>();
+        let archived = Self::new(self.archived_dir());
+        children.extend(
+            archived
+                .children(parent)
+                .await?
+                .into_iter()
+                .map(|(_, meta)| meta.session_id().clone()),
+        );
+        children.sort();
+        children.dedup();
+        Ok(children)
+    }
+
+    /// Keeps names in the session index and Git updates in canonical session metadata markers.
+    /// Unlike Codex's required state database, this store can replay Git markers without an
+    /// index; the writer lock covers reading, merging and persisting each cold-thread patch.
     async fn update_thread_metadata(
         &self,
         params: &UpdateThreadMetadataParams,
     ) -> Result<Option<StoredThread>> {
+        let _metadata_guard = self.metadata_lock.lock().await;
         let session_id = params.session_id();
         let (path, archived) = self.locate(session_id, params.include_archived()).await?;
+        let mut cold_ownership = None;
+        if let Some(patch) = params.patch().git_info() {
+            let live = self
+                .live_recorders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .and_then(Weak::upgrade);
+            if let Some(recorder) = &live {
+                recorder.flush().await?;
+            } else {
+                cold_ownership = Some(self.writer_locks.acquire(session_id)?);
+            }
+            let records = RolloutReader::open(&path).read_all().await?;
+            let meta =
+                crate::store::first_session_meta(&records)?.ok_or_else(|| not_found(session_id))?;
+            if meta.session_id() != session_id {
+                return Err(not_found(session_id));
+            }
+            let mut git_info = meta.git_info().cloned();
+            patch.apply(&mut git_info);
+            let marker = meta.with_git_info(git_info.unwrap_or_default());
+            if let Some(recorder) = live {
+                recorder.record_payload(marker.into());
+                recorder.flush().await?;
+            } else {
+                let ownership = Arc::clone(cold_ownership.as_ref().ok_or_else(|| {
+                    Error::session(SessionErrorKind::Io, "missing metadata writer ownership")
+                })?);
+                let mut writer =
+                    RolloutWriter::open_with_ownership(path.clone(), session_id.clone(), ownership)
+                        .await?;
+                writer.append(marker).await?;
+                writer.flush().await?;
+                writer.close().await;
+            }
+        }
         if let Some(index) = &self.index {
             index
                 .update_thread_metadata(session_id, params.patch(), path, archived)
-                .await;
+                .await?;
         }
         if let Some(name) = params.patch().name() {
             session_index::append_thread_name(&self.dir, session_id, name.unwrap_or_default())?;
         }
+        drop(cold_ownership);
         let mut read = ReadThreadParams::new(session_id.clone());
         if params.include_archived() {
             read = read.including_archived();

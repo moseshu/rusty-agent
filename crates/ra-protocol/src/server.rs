@@ -10,15 +10,19 @@
 //! when its write queue is full; stdio is waited on. The two loops share no state but the flags a
 //! connection's handshake sets, as in Codex.
 //!
-//! A connection must open with `initialize`; see [`protocol`] for the handshake. The turn methods
-//! — `turn/start`, `turn/steer`, `turn/interrupt` and `thread/settings/update` — act on the threads
-//! the server has loaded, and each loaded thread has a listener that tells its connections when its
-//! turns start and end and, as they run, what they are made of: `item/started` and
-//! `item/completed` for the user's input, the agent's messages and reasoning, and the tool calls
-//! the host shows ([`AppServer::with_thread_tool_items`]). A client that comes back reads the
-//! turns it missed with `thread/turns/list`, rebuilt from the thread's rollout in the server's
-//! store ([`AppServer::with_thread_store`]). The `thread/*` methods that create and load threads
-//! are added over the thread store as they are ported.
+//! A connection must open with `initialize`; see [`protocol`] for the handshake. `thread/start`,
+//! `thread/resume` and `thread/fork` load threads — prepared by the host's
+//! [`ThreadFactory`] ([`AppServer::with_thread_factory`]) and recorded into the server's store
+//! ([`AppServer::with_thread_store`]) — and subscribe the calling connection; `thread/read` and
+//! `thread/loaded/list` read them. The turn methods — `turn/start`, `turn/steer`,
+//! `turn/interrupt` and `thread/settings/update` — act on the threads the server has loaded, and
+//! each loaded thread has a listener that tells its connections when its turns start and end and,
+//! as they run, what they are made of: `item/started` and `item/completed` for the user's input,
+//! the agent's messages and reasoning, and the tool calls the host shows
+//! ([`AppServer::with_thread_tool_items`]). Every connection hears `thread/started` of a new
+//! thread and `thread/status/changed` as a loaded thread's status changes. A client that comes back
+//! attaches again with `thread/resume`, which answers with the thread's turns so far, and reads
+//! more with `thread/turns/list`, both rebuilt from the thread's rollout.
 //!
 //! While a turn runs the server asks the client in turn — approvals, dynamic tool calls, questions
 //! for the user — with requests of its own, sent to the connections of the thread. The client's
@@ -46,8 +50,8 @@
 //! server stops on its own — its transports gone, or its stdio client — it first cleans up after
 //! the connections left and shuts its threads down.
 //!
-//! Codex's loop also recovers the threads of its daemon, attaches newly created threads to every
-//! connection and reports the status of remote control; none of it is ported.
+//! Codex's loop also recovers the threads of its daemon, attaches the threads its agents spawn to
+//! every connection and reports the status of remote control; none of it is ported.
 
 // Nothing raises a server request until turns run in the server; the tests reach them through
 // `test_api` meanwhile.
@@ -64,14 +68,15 @@ pub mod protocol;
 mod request_serialization;
 mod router;
 mod settings_adapter;
+mod thread_factory;
 mod thread_history;
-// Threads are loaded by `thread/start` and its kin, which are not ported yet; until then only the
-// tests load them, through `test_api`, and start their listeners.
-#[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod thread_listener;
+mod thread_loading;
+mod thread_management;
 mod thread_manager;
 mod thread_processor;
 mod thread_state;
+mod thread_status;
 mod tool_items;
 mod turn_admission;
 mod turn_processor;
@@ -79,6 +84,7 @@ mod turn_processor;
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
 pub use self::settings_adapter::ThreadSettingsAdapter;
+pub use self::thread_factory::{PreparedThread, ThreadFactory, ThreadFactoryRequest, ThreadOrigin};
 pub use self::tool_items::{ThreadToolItemEvent, ThreadToolItems};
 
 use std::{
@@ -333,6 +339,15 @@ impl AppServer {
     #[must_use]
     pub fn with_thread_store(self, store: Arc<dyn ThreadStore>) -> Self {
         self.processor.history.set_store(store);
+        self
+    }
+
+    /// Prepares the threads `thread/start`, `thread/resume` and `thread/fork` load with `factory`,
+    /// as Codex's server builds its sessions from its configuration (see [`ThreadFactory`]).
+    /// Without one, those methods answer that they are not supported.
+    #[must_use]
+    pub fn with_thread_factory(self, factory: Arc<dyn ThreadFactory>) -> Self {
+        self.processor.set_thread_factory(factory);
         self
     }
 
@@ -794,7 +809,8 @@ pub mod test_api {
         }
     }
 
-    /// Loads threads into a server, as `thread/start` and its kin will, which are not ported yet.
+    /// Loads threads into a server without a thread factory, as the thread methods load them
+    /// through one. A thread loaded this way is taken to keep no rollout the server knows of.
     #[derive(Debug)]
     pub struct ThreadLoader {
         processor: Arc<MessageProcessor>,
@@ -837,8 +853,8 @@ pub mod test_api {
                 .await;
         }
 
-        /// Subscribes `connection_id` to the loaded thread `thread_id`, as `thread/resume` will
-        /// when it attaches a connection to a thread, which is not ported yet.
+        /// Subscribes `connection_id` to the loaded thread `thread_id`, as `thread/resume` does
+        /// when it attaches a connection to a thread, whether or not the connection is live.
         pub fn subscribe(&self, thread_id: &SessionId, connection_id: ConnectionId) {
             self.processor
                 .outgoing()
@@ -861,10 +877,12 @@ pub mod test_api {
                     .thread_state()
                     .add_connection_to_thread(thread.thread_id(), connection_id);
             }
-            let loaded = self
-                .processor
-                .thread_manager()
-                .add_thread(thread, adapter, terminals);
+            let loaded = self.processor.thread_manager().add_thread(
+                thread,
+                super::thread_manager::LoadedThreadInfo::unknown(),
+                adapter,
+                terminals,
+            );
             if let Err(error) =
                 ensure_listener_task_running(&self.processor.listener_context(), &loaded).await
             {

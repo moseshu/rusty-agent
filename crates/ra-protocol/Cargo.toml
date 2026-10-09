@@ -25,6 +25,7 @@ test-api = []
 ra-core = { workspace = true }
 ra-runtime = { workspace = true }
 ra-session = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }

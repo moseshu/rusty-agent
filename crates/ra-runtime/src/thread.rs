@@ -436,6 +436,36 @@ impl AgentThreadBuilder {
         self
     }
 
+    /// Applies `overrides` to the settings the thread starts with, as Codex applies the overrides
+    /// a thread is started or resumed with to the configuration it builds the session from. Unlike
+    /// [`AgentThread::update_settings`] it reports nothing: the thread does not exist yet.
+    pub fn with_settings(mut self, overrides: &ThreadSettingsOverrides) -> Self {
+        overrides.apply(&mut self.config);
+        self
+    }
+
+    /// The thread whose builder this is.
+    #[must_use]
+    pub const fn thread_id(&self) -> &SessionId {
+        &self.thread_id
+    }
+
+    /// The configuration the thread will run its turns with, for a host adapter to prepare
+    /// product settings on before the thread is built.
+    pub const fn config(&self) -> &RunConfig {
+        &self.config
+    }
+
+    /// Resolves `model` as the thread will, so a model it cannot run on is refused before the
+    /// thread is built.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolver's error for a model it does not know.
+    pub fn resolve_model(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
+        self.model_resolver.resolve_model(model)
+    }
+
     /// The thread, idle.
     #[must_use]
     pub fn build(self) -> AgentThread {
@@ -604,6 +634,25 @@ impl AgentThread {
         &self,
         snapshot: serde_json::Value,
     ) -> ra_core::error::Result<()> {
+        if let Some(rollout) = &self.inner.rollout {
+            self.record_settings_snapshot(snapshot)?;
+            rollout.persist(PersistContext::Standard).await?;
+        }
+        Ok(())
+    }
+
+    /// Records the settings snapshot as [`AgentThread::persist_settings_snapshot`] does, but
+    /// leaves it queued until the rollout is next written, so a thread whose rollout is not
+    /// written yet is not written for it: Codex records the settings a thread was started or
+    /// resumed with alongside its next turn rather than before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot cannot be made into an event.
+    pub fn record_settings_snapshot(
+        &self,
+        snapshot: serde_json::Value,
+    ) -> ra_core::error::Result<()> {
         use ra_core::event::{HostEvent, HostEventBody};
         if let Some(rollout) = &self.inner.rollout {
             let allocator = RunState::start(RunId::new(uuid::Uuid::now_v7().to_string()))
@@ -616,7 +665,6 @@ impl AgentThread {
                     data: snapshot,
                 },
             )?));
-            rollout.persist(PersistContext::Standard).await?;
         }
         Ok(())
     }
@@ -859,6 +907,45 @@ impl AgentThread {
             && let Err(error) = rollout.flush().await
         {
             tracing::warn!(thread_id = %self.inner.thread_id, %error, "the thread's rollout could not be flushed");
+        }
+    }
+
+    /// Writes out what the thread's rollout recorder still holds, so a reader of the store sees
+    /// every record the thread has produced so far. Does nothing for a thread without a rollout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorder's error if the records cannot be written.
+    pub async fn flush_rollout(&self) -> ra_core::error::Result<()> {
+        match &self.inner.rollout {
+            Some(rollout) => rollout.flush().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Materializes the thread's rollout for an explicit metadata or lifecycle mutation,
+    /// including before its first turn: Codex's `ensure_rollout_materialized`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorder's error if its pending records cannot be persisted.
+    pub async fn ensure_rollout_materialized(&self) -> ra_core::error::Result<()> {
+        match &self.inner.rollout {
+            Some(rollout) => rollout.persist(PersistContext::Standard).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Closes the rollout after the thread's tasks have stopped, releasing storage ownership
+    /// before its records are moved or deleted: Codex's `shutdown_thread` storage barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorder's error if closing the writer fails.
+    pub async fn close_rollout(&self) -> ra_core::error::Result<()> {
+        match &self.inner.rollout {
+            Some(rollout) => rollout.shutdown().await,
+            None => Ok(()),
         }
     }
 

@@ -20,7 +20,7 @@ use crate::store::{SortDirection, ThreadSortKey};
 /// framework's threads have.
 ///
 /// Codex's source, history mode, agent nickname and role, sandbox policy, approval mode, token
-/// usage, Git facts, sections, project, recency and preferences are its product's and are not
+/// usage, sections, project, recency and preferences are its product's and are not
 /// kept. Its `title`, in its legacy history mode, is the title derived from the first user message
 /// until the thread is given a name, which then replaces it; an empty preview means none.
 #[non_exhaustive]
@@ -35,6 +35,7 @@ pub struct ThreadMetadata {
     pub(crate) model_provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    pub(crate) git_info: Option<crate::store::GitInfo>,
     pub(crate) cwd: Option<String>,
     pub(crate) cli_version: Option<String>,
     pub(crate) originator: Option<String>,
@@ -62,6 +63,7 @@ impl ThreadMetadata {
             model_provider: None,
             model: None,
             effort: None,
+            git_info: None,
             cwd: None,
             cli_version: None,
             originator: None,
@@ -179,6 +181,9 @@ impl ThreadMetadata {
     /// Keeps the name the existing row was given over a title derived again from the rollout:
     /// Codex's `prefer_existing_explicit_title`.
     pub(crate) fn prefer_existing_explicit_title(&mut self, existing: &Self) {
+        if self.git_info.is_none() {
+            self.git_info.clone_from(&existing.git_info);
+        }
         if existing.distinct_title().is_none() {
             return;
         }
@@ -213,7 +218,7 @@ pub(crate) struct ThreadsPage {
 
 const SELECT_COLUMNS: &str = "SELECT id, rollout_path, created_at_ms, updated_at_ms, thread_spawn, \
      forked_from_id, model_provider, model, reasoning_effort, cwd, cli_version, originator, title, \
-     preview, first_user_message, archived_at_ms FROM threads";
+     preview, first_user_message, archived_at_ms, git_info FROM threads";
 
 impl StateRuntime {
     /// The row of `session_id`, if there is one: Codex's `get_thread`.
@@ -451,13 +456,19 @@ pub(crate) fn upsert_thread(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let git_info = metadata
+        .git_info
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     connection.execute(
         r"
 INSERT INTO threads (
     id, rollout_path, created_at_ms, updated_at_ms, thread_spawn, forked_from_id, model_provider,
     model, reasoning_effort, cwd, cli_version, originator, title, preview, first_user_message,
-    archived, archived_at_ms
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+    archived, archived_at_ms, git_info
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at_ms = excluded.created_at_ms,
@@ -474,7 +485,8 @@ ON CONFLICT(id) DO UPDATE SET
     preview = COALESCE(NULLIF(excluded.preview, ''), threads.preview),
     first_user_message = excluded.first_user_message,
     archived = excluded.archived,
-    archived_at_ms = excluded.archived_at_ms
+    archived_at_ms = excluded.archived_at_ms,
+    git_info = excluded.git_info
 ",
         params![
             metadata.session_id.as_str(),
@@ -494,6 +506,7 @@ ON CONFLICT(id) DO UPDATE SET
             metadata.first_user_message.as_deref().unwrap_or_default(),
             metadata.archived_at.is_some(),
             metadata.archived_at.map(millis),
+            git_info,
         ],
     )?;
     Ok(())
@@ -529,6 +542,17 @@ fn metadata_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadMetadata> {
         preview: row.get(13)?,
         first_user_message: (!first_user_message.is_empty()).then_some(first_user_message),
         archived_at: row.get::<_, Option<i64>>(15)?.map(timestamp),
+        git_info: row
+            .get::<_, Option<String>>(16)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    16,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
     })
 }
 

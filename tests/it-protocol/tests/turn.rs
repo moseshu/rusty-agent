@@ -1068,7 +1068,9 @@ async fn turn_interrupt_aborts_running_turn() {
         )
         .await;
     // Answered once the turn has ended, ahead of the notification that it did.
-    let answer = connection.next().await;
+    let answer = connection
+        .until(|message| message["id"] == id || message["method"] == "turn/completed")
+        .await;
     assert_eq!(answer, json!({"id": id, "result": {}}));
     let completed = connection.notification("turn/completed").await;
     assert_eq!(completed["threadId"], THREAD);
@@ -1171,7 +1173,9 @@ async fn turn_interrupt_resolves_pending_server_requests() {
             CommandExecutionRequestApprovalParams::new(THREAD, &turn_id, "call-1", 0),
         ))
         .await;
-    let request = connection.next().await;
+    let request = connection
+        .until(|message| message.get("id").is_some() && message.get("method").is_some())
+        .await;
     assert_eq!(request["method"], "item/commandExecution/requestApproval");
     let waiting = tokio::spawn(async move { requester.wait_for_answer(request_id, answer).await });
 

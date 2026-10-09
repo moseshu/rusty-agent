@@ -128,8 +128,8 @@ impl ListThreadsParams {
     }
 
     /// The same listing with pages of `page_size`.
-    #[cfg(feature = "sqlite")]
-    pub(crate) const fn with_page_size(mut self, page_size: usize) -> Self {
+    #[must_use]
+    pub const fn with_page_size(mut self, page_size: usize) -> Self {
         self.page_size = page_size;
         self
     }

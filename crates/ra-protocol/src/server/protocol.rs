@@ -6,6 +6,12 @@
 //! has succeeded, and a method or notification marked experimental is withheld from a connection
 //! that did not opt into the experimental API.
 //!
+//! A client starts a thread with `thread/start`, loads a stored one — or attaches to one already
+//! loaded — with `thread/resume`, and starts a new thread on a copy of another's history with
+//! `thread/fork`; every connection is sent `thread/started` for a new thread, and
+//! `thread/status/changed` as a loaded thread's status changes. `thread/read` reads a thread, and
+//! `thread/loaded/list` the ids of those loaded.
+//!
 //! A client starts a thread's turns with `turn/start`, adds input to the running one with
 //! `turn/steer` and stops it with `turn/interrupt`; `thread/settings/update` changes the settings
 //! of the turns the thread starts next. The thread's connections are sent `turn/started` and
@@ -36,13 +42,18 @@ mod permissions;
 mod server_request;
 mod settings;
 mod thread;
+mod thread_data;
 mod thread_item;
+mod thread_lifecycle;
+mod thread_management;
 mod turn;
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
+pub(crate) use self::thread_lifecycle::ThreadPolicyFields;
+pub use self::thread_management::*;
 pub use self::{
     item::{
         CommandAction, CommandExecutionApprovalDecision, CommandExecutionApprovalKind,
@@ -79,10 +90,21 @@ pub use self::{
         ThreadTurnsListResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
         ThreadUnsubscribeStatus,
     },
+    thread_data::{
+        THREAD_STARTED_METHOD, THREAD_STATUS_CHANGED_METHOD, Thread, ThreadActiveFlag,
+        ThreadHistoryMode, ThreadStartedNotification, ThreadStatus,
+        ThreadStatusChangedNotification,
+    },
     thread_item::{
         CommandExecutionItem, CommandExecutionSource, CommandExecutionStatus, FileUpdateChange,
         ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD, ItemCompletedNotification,
         ItemStartedNotification, MessagePhase, PatchApplyStatus, PatchChangeKind, ThreadItem,
+    },
+    thread_lifecycle::{
+        SandboxMode, ThreadForkParams, ThreadForkResponse, ThreadLoadedListParams,
+        ThreadLoadedListResponse, ThreadReadParams, ThreadReadResponse,
+        ThreadResumeInitialTurnsPageParams, ThreadResumeParams, ThreadResumeResponse,
+        ThreadSettingsRecord, ThreadStartParams, ThreadStartResponse, ThreadStartSource, TurnsPage,
     },
     turn::{
         ByteRange, ERROR_METHOD, ErrorNotification, ImageDetail, ImageReference,
@@ -127,6 +149,87 @@ pub enum ClientRequest {
         /// Who the client is and what it can take.
         params: InitializeParams,
     },
+    /// Starts a thread and subscribes the connection to it.
+    #[serde(rename = "thread/start")]
+    ThreadStart {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread's settings.
+        params: ThreadStartParams,
+    },
+    /// Loads a stored thread, or attaches to the loaded one, and subscribes the connection to it.
+    #[serde(rename = "thread/resume")]
+    ThreadResume {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread and the settings it resumes with.
+        params: ThreadResumeParams,
+    },
+    /// Starts a new thread on a copy of another's history.
+    #[serde(rename = "thread/fork")]
+    ThreadFork {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread forked, where to cut it, and the new thread's settings.
+        params: ThreadForkParams,
+    },
+    /// The `thread/archive` request.
+    #[serde(rename = "thread/archive")]
+    ThreadArchive {
+        /// The response correlation id.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The method parameters.
+        params: ThreadArchiveParams,
+    },
+    /// The `thread/delete` request.
+    #[serde(rename = "thread/delete")]
+    ThreadDelete {
+        /// The response correlation id.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The method parameters.
+        params: ThreadDeleteParams,
+    },
+    /// The `thread/unarchive` request.
+    #[serde(rename = "thread/unarchive")]
+    ThreadUnarchive {
+        /// The response correlation id.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The method parameters.
+        params: ThreadUnarchiveParams,
+    },
+    /// The `thread/name/set` request.
+    #[serde(rename = "thread/name/set")]
+    ThreadSetName {
+        /// The response correlation id.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The method parameters.
+        params: ThreadSetNameParams,
+    },
+    /// The `thread/metadata/update` request.
+    #[serde(rename = "thread/metadata/update")]
+    ThreadMetadataUpdate {
+        /// The response correlation id.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The method parameters.
+        params: ThreadMetadataUpdateParams,
+    },
+    /// The `thread/list` request.
+    #[serde(rename = "thread/list")]
+    ThreadList {
+        /// The response correlation id.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The method parameters.
+        params: ThreadListParams,
+    },
     /// Removes the connection's subscription to a thread.
     #[serde(rename = "thread/unsubscribe")]
     ThreadUnsubscribe {
@@ -135,6 +238,24 @@ pub enum ClientRequest {
         request_id: RequestId,
         /// The thread.
         params: ThreadUnsubscribeParams,
+    },
+    /// Reads the ids of the loaded threads.
+    #[serde(rename = "thread/loaded/list")]
+    ThreadLoadedList {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The page.
+        params: ThreadLoadedListParams,
+    },
+    /// Reads a thread, and if asked its turns.
+    #[serde(rename = "thread/read")]
+    ThreadRead {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread.
+        params: ThreadReadParams,
     },
     /// Reads a page of a thread's turns.
     #[serde(rename = "thread/turns/list")]
@@ -243,6 +364,17 @@ impl ClientRequest {
     pub const fn id(&self) -> &RequestId {
         match self {
             Self::Initialize { request_id, .. }
+            | Self::ThreadArchive { request_id, .. }
+            | Self::ThreadDelete { request_id, .. }
+            | Self::ThreadUnarchive { request_id, .. }
+            | Self::ThreadSetName { request_id, .. }
+            | Self::ThreadMetadataUpdate { request_id, .. }
+            | Self::ThreadList { request_id, .. }
+            | Self::ThreadStart { request_id, .. }
+            | Self::ThreadResume { request_id, .. }
+            | Self::ThreadFork { request_id, .. }
+            | Self::ThreadLoadedList { request_id, .. }
+            | Self::ThreadRead { request_id, .. }
             | Self::ThreadUnsubscribe { request_id, .. }
             | Self::ThreadTurnsList { request_id, .. }
             | Self::ThreadItemsList { request_id, .. }
@@ -263,6 +395,17 @@ impl ClientRequest {
     pub const fn method_name(&self) -> &'static str {
         match self {
             Self::Initialize { .. } => "initialize",
+            Self::ThreadArchive { .. } => "thread/archive",
+            Self::ThreadDelete { .. } => "thread/delete",
+            Self::ThreadUnarchive { .. } => "thread/unarchive",
+            Self::ThreadSetName { .. } => "thread/name/set",
+            Self::ThreadMetadataUpdate { .. } => "thread/metadata/update",
+            Self::ThreadList { .. } => "thread/list",
+            Self::ThreadStart { .. } => "thread/start",
+            Self::ThreadResume { .. } => "thread/resume",
+            Self::ThreadFork { .. } => "thread/fork",
+            Self::ThreadLoadedList { .. } => "thread/loaded/list",
+            Self::ThreadRead { .. } => "thread/read",
             Self::ThreadUnsubscribe { .. } => "thread/unsubscribe",
             Self::ThreadTurnsList { .. } => "thread/turns/list",
             Self::ThreadItemsList { .. } => "thread/items/list",
@@ -290,10 +433,21 @@ impl ClientRequest {
     pub fn experimental_reason(&self) -> Option<&'static str> {
         match self {
             Self::Initialize { .. }
+            | Self::ThreadArchive { .. }
+            | Self::ThreadDelete { .. }
+            | Self::ThreadUnarchive { .. }
+            | Self::ThreadSetName { .. }
+            | Self::ThreadLoadedList { .. }
+            | Self::ThreadRead { .. }
             | Self::ThreadUnsubscribe { .. }
             | Self::ThreadTurnsList { .. }
             | Self::ThreadItemsList { .. }
             | Self::TurnInterrupt { .. } => None,
+            Self::ThreadMetadataUpdate { params, .. } => params.experimental_reason(),
+            Self::ThreadList { params, .. } => params.experimental_reason(),
+            Self::ThreadStart { params, .. } => params.experimental_reason(),
+            Self::ThreadResume { params, .. } => params.experimental_reason(),
+            Self::ThreadFork { params, .. } => params.experimental_reason(),
             Self::ThreadBackgroundTerminalsClean { .. } => Some("thread/backgroundTerminals/clean"),
             Self::ThreadBackgroundTerminalsList { .. } => Some("thread/backgroundTerminals/list"),
             Self::ThreadBackgroundTerminalsTerminate { .. } => {
@@ -315,9 +469,21 @@ impl ClientRequest {
         match self {
             // Codex reads history alongside anything, as it reads append-only rollouts.
             Self::Initialize { .. }
+            | Self::ThreadStart { .. }
+            | Self::ThreadList { .. }
+            | Self::ThreadLoadedList { .. }
             | Self::ThreadTurnsList { .. }
             | Self::ThreadItemsList { .. }
             | Self::MockExperimentalMethod { .. } => None,
+            // Codex keys these by path when one is given; a path is not supported here.
+            Self::ThreadArchive { params, .. } => Some(params.thread_id()),
+            Self::ThreadDelete { params, .. } => Some(params.thread_id()),
+            Self::ThreadUnarchive { params, .. } => Some(params.thread_id()),
+            Self::ThreadSetName { params, .. } => Some(params.thread_id()),
+            Self::ThreadMetadataUpdate { params, .. } => Some(params.thread_id()),
+            Self::ThreadResume { params, .. } => Some(params.thread_id()),
+            Self::ThreadFork { params, .. } => Some(params.thread_id()),
+            Self::ThreadRead { params, .. } => Some(params.thread_id()),
             Self::ThreadUnsubscribe { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsClean { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsList { params, .. } => Some(params.thread_id()),

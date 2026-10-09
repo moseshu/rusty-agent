@@ -64,6 +64,18 @@ impl CodingHost {
         })
     }
 
+    /// The same host with a process manager of its own, for a thread whose commands must not mix
+    /// with another's: each Codex session has its own unified-exec process manager, so listing or
+    /// stopping one thread's background terminals leaves the others' alone.
+    #[must_use]
+    pub fn with_new_process_manager(&self) -> Self {
+        Self {
+            workspace: self.workspace.clone(),
+            process_manager: Arc::new(ProcessManager::default()),
+            event_sink: Arc::clone(&self.event_sink),
+        }
+    }
+
     /// Sets the host event sink.
     #[must_use]
     pub fn with_event_sink(mut self, event_sink: Arc<dyn HostEventSink>) -> Self {

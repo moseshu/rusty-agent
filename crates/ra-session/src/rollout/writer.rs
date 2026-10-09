@@ -279,6 +279,10 @@ pub struct RolloutSessionMeta {
     thread_spawn: Option<RolloutThreadSpawn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forked_from_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_info: Option<crate::store::GitInfo>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -297,6 +301,8 @@ impl RolloutSessionMeta {
             created_at: Some(EventTimestamp::now()),
             thread_spawn: None,
             forked_from_id: None,
+            thread_source: None,
+            git_info: None,
             unknown: Unknown::new(),
         }
     }
@@ -341,6 +347,27 @@ impl RolloutSessionMeta {
     pub fn with_model_provider(mut self, provider: impl Into<String>) -> Self {
         self.model_provider = Some(provider.into());
         self
+    }
+
+    /// Sets the client's classification of where the thread came from, such as `user`: Codex's
+    /// `thread_source`, kept as its wire string.
+    #[must_use]
+    pub fn with_thread_source(mut self, source: impl Into<String>) -> Self {
+        self.thread_source = Some(source.into());
+        self
+    }
+
+    /// Sets a canonical Git metadata marker. An empty value explicitly clears all Git fields.
+    #[must_use]
+    pub fn with_git_info(mut self, git_info: crate::store::GitInfo) -> Self {
+        self.git_info = Some(git_info);
+        self
+    }
+
+    /// The Git metadata this marker carries, if any.
+    #[must_use]
+    pub const fn git_info(&self) -> Option<&crate::store::GitInfo> {
+        self.git_info.as_ref()
     }
 
     /// Sets the creation timestamp.
@@ -406,6 +433,13 @@ impl RolloutSessionMeta {
     #[must_use]
     pub const fn forked_from_id(&self) -> Option<&SessionId> {
         self.forked_from_id.as_ref()
+    }
+
+    /// The client's classification of where the thread came from, if one was recorded: Codex's
+    /// `thread_source`.
+    #[must_use]
+    pub fn thread_source(&self) -> Option<&str> {
+        self.thread_source.as_deref()
     }
 
     /// Schema version of the record.

@@ -47,6 +47,7 @@ pub mod local;
 pub mod mirror;
 pub mod summary;
 
+mod git;
 mod in_memory;
 pub(crate) mod index;
 mod list;
@@ -69,6 +70,7 @@ use ra_core::{
     },
 };
 
+pub use git::{GitInfo, GitInfoPatch, SanitizedGitUrl};
 pub use in_memory::InMemoryThreadStore;
 pub use list::{ListThreadsParams, SortDirection, ThreadPage, ThreadSortKey};
 pub use metadata::{
@@ -143,6 +145,40 @@ pub trait ThreadStore: RolloutThreadStore {
     /// Returns an error if the cursor is not one a listing returned, or if the threads cannot be
     /// listed.
     async fn list_threads(&self, params: &ListThreadsParams) -> Result<ThreadPage>;
+
+    /// Lists direct spawned children, including archived threads and threads without a preview.
+    /// Codex's subtree lifecycle walks spawn edges; stores without an edge index can derive them
+    /// from session metadata. The default pages listings; directory stores override it to include
+    /// rollouts not visible in interactive listings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if children cannot be listed.
+    async fn list_spawn_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
+        let mut children = std::collections::BTreeSet::new();
+        for archived in [false, true] {
+            let mut params = ListThreadsParams::new(100);
+            if archived {
+                params = params.archived();
+            }
+            loop {
+                let page = self.list_threads(&params).await?;
+                children.extend(
+                    page.items()
+                        .iter()
+                        .filter(|thread| thread.parent_session_id() == Some(parent))
+                        .map(|thread| thread.session_id().clone()),
+                );
+                match page.next_cursor() {
+                    Some(cursor) if Some(cursor) != params.cursor() => {
+                        params = params.with_cursor(cursor);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        Ok(children.into_iter().collect())
+    }
 
     /// Changes a thread's metadata and returns the thread as it now reads: Codex's
     /// `update_thread_metadata`. `None` means the change succeeded without the store reading the
@@ -486,9 +522,11 @@ impl StoredThreadHistory {
 /// thread whose recorder was created without it, has none of that here. The rest is what the
 /// store knows besides: the name a caller gave it, the preview and first user message read from
 /// the head of its records, when it was last written to and archived, and the model and effort a
-/// store that keeps metadata patches was told of.
+/// store that keeps metadata patches was told of. The thread source a client classified the thread
+/// with is read from the session metadata; a state database does not keep it yet, so a thread a
+/// listing reads from one has none.
 ///
-/// Codex's source, history mode, agent nickname and role, section, project, Git facts, approval
+/// Codex's source, history mode, agent nickname and role, section, project, approval
 /// mode, permission profile, token usage and recency are its product's or its state database's,
 /// and are not ported.
 #[non_exhaustive]
@@ -498,6 +536,8 @@ pub struct StoredThread {
     rollout_path: Option<PathBuf>,
     thread_spawn: Option<RolloutThreadSpawn>,
     forked_from_id: Option<SessionId>,
+    thread_source: Option<String>,
+    git_info: Option<GitInfo>,
     created_at: Option<EventTimestamp>,
     cwd: Option<String>,
     model_provider: Option<String>,
@@ -522,6 +562,14 @@ impl StoredThread {
             rollout_path: None,
             thread_spawn: meta.and_then(|meta| meta.thread_spawn().cloned()),
             forked_from_id: meta.and_then(|meta| meta.forked_from_id().cloned()),
+            thread_source: meta.and_then(|meta| meta.thread_source().map(str::to_owned)),
+            git_info: meta
+                .and_then(|meta| meta.git_info().cloned())
+                .filter(|git| {
+                    git.commit_hash.is_some()
+                        || git.branch.is_some()
+                        || git.repository_url.is_some()
+                }),
             created_at: meta.and_then(RolloutSessionMeta::created_at),
             cwd: meta.and_then(|meta| meta.cwd().map(str::to_owned)),
             model_provider: meta.and_then(|meta| meta.model_provider().map(str::to_owned)),
@@ -597,6 +645,21 @@ impl StoredThread {
     #[must_use]
     pub const fn forked_from_id(&self) -> Option<&SessionId> {
         self.forked_from_id.as_ref()
+    }
+
+    /// The client's classification of where the thread came from, as its session metadata
+    /// records it: Codex's `thread_source`.
+    #[must_use]
+    pub fn thread_source(&self) -> Option<&str> {
+        self.thread_source.as_deref()
+    }
+
+    /// The latest persisted Git metadata.
+    #[must_use]
+    pub fn git_info(&self) -> Option<&GitInfo> {
+        self.git_info.as_ref().filter(|git| {
+            git.commit_hash.is_some() || git.branch.is_some() || git.repository_url.is_some()
+        })
     }
 
     /// When the thread was created.
@@ -710,7 +773,14 @@ impl StoredThread {
 
     /// Applies what `patch` sets, as Codex's in-memory store reads a thread through the patches it
     /// was given.
+    pub(crate) fn set_git_info(&mut self, git_info: Option<GitInfo>) {
+        self.git_info = git_info;
+    }
+
     pub(crate) fn apply_patch(&mut self, patch: &ThreadMetadataPatch) {
+        if let Some(git_info) = patch.git_info() {
+            git_info.apply(&mut self.git_info);
+        }
         if let Some(name) = patch.name() {
             self.name = name.map(str::to_owned);
         }
@@ -753,16 +823,31 @@ impl StoredThread {
     }
 }
 
-/// The session metadata `records` open with, if they open with some. Only the first record is
-/// read, as [`RolloutReader::session_meta`](crate::rollout::RolloutReader::session_meta) reads it.
+/// The opening session metadata with subsequent Git update markers folded into it.
+/// Identity and creation metadata always come from the opening record.
 pub(crate) fn first_session_meta(records: &[RolloutRecord]) -> Result<Option<RolloutSessionMeta>> {
-    match records.first() {
+    let mut meta = match records.first() {
         Some(record) if record.type_name() == "session_meta" => match record.payload()? {
-            RolloutPayload::SessionMeta(meta) => Ok(Some(meta)),
-            _ => Ok(None),
+            RolloutPayload::SessionMeta(meta) => Some(meta),
+            _ => None,
         },
-        _ => Ok(None),
+        _ => None,
+    };
+    if let Some(meta) = &mut meta {
+        for record in records
+            .iter()
+            .skip(1)
+            .filter(|record| record.type_name() == "session_meta")
+        {
+            if let RolloutPayload::SessionMeta(update) = record.payload()?
+                && update.session_id() == meta.session_id()
+                && let Some(git) = update.git_info()
+            {
+                *meta = meta.clone().with_git_info(git.clone());
+            }
+        }
     }
+    Ok(meta)
 }
 
 /// What a thread created with `history` writes after its session metadata: each record's payload,

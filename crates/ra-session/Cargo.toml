@@ -15,6 +15,7 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+gix-url = { workspace = true }
 ra-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

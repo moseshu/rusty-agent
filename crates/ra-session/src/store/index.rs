@@ -46,7 +46,7 @@ pub(crate) trait ThreadIndex: Send + Sync + std::fmt::Debug {
         patch: &ThreadMetadataPatch,
         path: PathBuf,
         archived: bool,
-    );
+    ) -> Result<()>;
 
     /// Records the thread archived, its rollout now at `path`.
     fn mark_archived(&self, session_id: &SessionId, path: &Path) -> Result<()>;

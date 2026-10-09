@@ -22,12 +22,12 @@ use std::sync::Arc;
 
 use ra_core::{
     item::{ContentBlock, ImageBlock, ImageDetail as CoreImageDetail, ImageSource},
-    model::Effort,
+    model::{Effort, ResolvedModel},
     session::SessionId,
 };
 use ra_runtime::thread::{
-    NotSubmittedReason, SteerSubmission, ThreadSettingsOverrides, TurnInputRequest,
-    TurnInputSubmission, TurnSettingsUpdateOutcome,
+    AgentThread, AgentThreadBuilder, NotSubmittedReason, SteerSubmission, ThreadSettingsOverrides,
+    TurnInputRequest, TurnInputSubmission, TurnSettingsUpdateOutcome,
 };
 use serde_json::Value;
 
@@ -41,6 +41,7 @@ use super::{
         TurnSettingsUpdateStatus, TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams,
         TurnSteerResponse, UserInput,
     },
+    settings_adapter::ThreadSettingsAdapter,
     thread_manager::{LoadedThread, ThreadManager},
 };
 use crate::frame::JsonRpcErrorObject;
@@ -93,7 +94,7 @@ impl TurnRequestProcessor {
         let content = input_content(input)?;
         let overrides = prepare_overrides(
             "turn/start",
-            &thread,
+            &SettingsTarget::of(&thread),
             thread.run_config(),
             model,
             effort,
@@ -228,7 +229,7 @@ impl TurnRequestProcessor {
         let (_, model, effort) = params.into_parts();
         let overrides = prepare_overrides(
             "thread/settings/update",
-            &thread,
+            &SettingsTarget::of(&thread),
             thread.run_config(),
             model,
             effort,
@@ -278,7 +279,7 @@ impl TurnRequestProcessor {
         };
         let overrides = prepare_overrides(
             "turn/settings/update",
-            &thread,
+            &SettingsTarget::of(&thread),
             config,
             params.model,
             params.effort,
@@ -328,9 +329,9 @@ fn turn_settings_response(outcome: TurnSettingsUpdateOutcome) -> TurnMethodResul
     clippy::option_option,
     reason = "Codex distinguishes omitted, null and supplied service tiers"
 )]
-fn prepare_overrides(
+pub(crate) fn prepare_overrides(
     method: &str,
-    thread: &LoadedThread,
+    target: &SettingsTarget<'_>,
     mut config: ra_runtime::runner::RunConfig,
     model: Option<String>,
     effort: Option<String>,
@@ -342,14 +343,14 @@ fn prepare_overrides(
         .validate()
         .map_err(JsonRpcErrorObject::invalid_request)?;
     if let Some(model) = model.as_deref() {
-        thread
-            .resolve_model(Some(model))
+        target
+            .resolve(Some(model))
             .map_err(|error| JsonRpcErrorObject::invalid_request(error.to_string()))?;
     }
     let target_provider = if summary.is_some() || service_tier.is_some() {
         Some(
-            thread
-                .resolve_model(model.as_deref().or(config.model()))
+            target
+                .resolve(model.as_deref().or(config.model()))
                 .map_err(|error| JsonRpcErrorObject::invalid_request(error.to_string()))?
                 .selector()
                 .provider()
@@ -361,7 +362,7 @@ fn prepare_overrides(
     let mut overrides = thread_settings_overrides(method, model, effort)?;
     let changes_config = !policy.is_empty() || summary.is_some() || service_tier.is_some();
     if !policy.is_empty() {
-        let adapter = thread.adapter.as_ref().ok_or_else(|| {
+        let adapter = target.adapter.ok_or_else(|| {
             JsonRpcErrorObject::invalid_request(
                 "the thread's host has not configured a permission settings adapter",
             )
@@ -410,8 +411,45 @@ fn prepare_overrides(
     Ok(overrides)
 }
 
+/// What settings are prepared against: how the thread resolves models, and the host adapter its
+/// product settings go through, for a loaded thread or for one about to be built.
+pub(crate) struct SettingsTarget<'a> {
+    pub(crate) models: &'a dyn ResolveModel,
+    pub(crate) adapter: Option<&'a dyn ThreadSettingsAdapter>,
+}
+
+impl<'a> SettingsTarget<'a> {
+    fn of(thread: &'a LoadedThread) -> Self {
+        Self {
+            models: &thread.thread,
+            adapter: thread.adapter.as_deref(),
+        }
+    }
+
+    fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
+        self.models.resolve(model)
+    }
+}
+
+/// Resolves models as a thread does, built or not.
+pub(crate) trait ResolveModel {
+    fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel>;
+}
+
+impl ResolveModel for AgentThread {
+    fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
+        self.resolve_model(model)
+    }
+}
+
+impl ResolveModel for AgentThreadBuilder {
+    fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
+        self.resolve_model(model)
+    }
+}
+
 /// The refusal of a field this port does not carry.
-fn unsupported(method: &str, field: &str) -> JsonRpcErrorObject {
+pub(crate) fn unsupported(method: &str, field: &str) -> JsonRpcErrorObject {
     JsonRpcErrorObject::invalid_request(format!("{method}.{field} is not supported"))
 }
 
@@ -505,7 +543,7 @@ fn image_content(
 
 /// The thread settings a request asks for. A reasoning effort a run here does not take is
 /// refused.
-fn thread_settings_overrides(
+pub(crate) fn thread_settings_overrides(
     method: &str,
     model: Option<String>,
     effort: Option<String>,

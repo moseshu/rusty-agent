@@ -40,15 +40,17 @@ use tokio::sync::Mutex;
 use super::{
     outgoing::{ConnectionRequestId, OutgoingMessageSender},
     protocol::{
-        SortDirection, ThreadBackgroundTerminal, ThreadBackgroundTerminalsCleanParams,
+        SortDirection, Thread, ThreadBackgroundTerminal, ThreadBackgroundTerminalsCleanParams,
         ThreadBackgroundTerminalsCleanResponse, ThreadBackgroundTerminalsListParams,
         ThreadBackgroundTerminalsListResponse, ThreadBackgroundTerminalsTerminateParams,
         ThreadBackgroundTerminalsTerminateResponse, ThreadItemsListCursor, ThreadItemsListParams,
-        ThreadTurnsListParams, ThreadTurnsListResponse, ThreadUnsubscribeParams,
-        ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, Turn, TurnItemsView, TurnStatus,
+        ThreadResumeInitialTurnsPageParams, ThreadStatus, ThreadTurnsListParams,
+        ThreadTurnsListResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+        ThreadUnsubscribeStatus, Turn, TurnItemsView, TurnStatus, TurnsPage,
     },
     thread_history::{HistorySources, ThreadHistoryBuilder},
     thread_manager::{LoadedThread, ThreadManager},
+    thread_status::{ThreadWatchManager, resolve_thread_status},
     turn_processor::TurnMethodResult,
 };
 use crate::{frame::JsonRpcErrorObject, transport::ConnectionId};
@@ -66,9 +68,12 @@ const THREAD_TURNS_MAX_LIMIT: usize = 100;
 /// Handles the thread lifecycle methods.
 #[derive(Debug)]
 pub(crate) struct ThreadRequestProcessor {
-    thread_manager: Arc<ThreadManager>,
-    outgoing: Arc<OutgoingMessageSender>,
-    pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    pub(super) thread_manager: Arc<ThreadManager>,
+    pub(super) outgoing: Arc<OutgoingMessageSender>,
+    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    pub(super) thread_watch: Arc<ThreadWatchManager>,
+    /// Serializes mutations spanning multiple threads with thread loading.
+    pub(super) thread_list_state: Mutex<()>,
 }
 
 impl ThreadRequestProcessor {
@@ -76,11 +81,14 @@ impl ThreadRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+        thread_watch: Arc<ThreadWatchManager>,
     ) -> Self {
         Self {
             thread_manager,
             outgoing,
             pending_thread_unloads,
+            thread_watch,
+            thread_list_state: Mutex::const_new(()),
         }
     }
 
@@ -141,7 +149,11 @@ impl ThreadRequestProcessor {
             || active_turn
                 .as_ref()
                 .is_some_and(|turn| turn.status() == TurnStatus::InProgress);
-        normalize_thread_turns_status(&mut turns, has_live_in_progress_turn);
+        normalize_thread_turns_status(
+            &mut turns,
+            self.thread_watch.loaded_status_for_thread(&session_id),
+            has_live_in_progress_turn,
+        );
         if let Some(active_turn) = active_turn {
             turns.retain(|turn| turn.id() != active_turn.id());
             turns.push(active_turn);
@@ -200,14 +212,20 @@ impl ThreadRequestProcessor {
                 }
             }
         }
-        if self.thread_manager.get_thread(session_id).is_none() {
+        let Some(loaded) = self.thread_manager.get_thread(session_id) else {
             return Err(JsonRpcErrorObject::invalid_request(format!(
                 "thread not loaded: {session_id}"
             )));
+        };
+        if loaded.info.ephemeral {
+            return Err(JsonRpcErrorObject::invalid_request(
+                "ephemeral threads do not support thread/turns/list",
+            ));
         }
-        Err(JsonRpcErrorObject::invalid_request(
-            "ephemeral threads do not support thread/turns/list",
-        ))
+        // Codex's `thread_turns_list_history_load_error`, for a rollout not written yet.
+        Err(JsonRpcErrorObject::invalid_request(format!(
+            "thread {session_id} is not materialized yet; thread/turns/list is unavailable before first user message"
+        )))
     }
 
     /// `thread/backgroundTerminals/clean`: Codex's `thread_background_terminals_clean`.
@@ -290,13 +308,14 @@ impl ThreadRequestProcessor {
     }
 
     /// Clears what the server kept of a thread that is gone: Codex's `finalize_thread_teardown`.
-    async fn finalize_thread_teardown(&self, thread_id: &SessionId) {
+    pub(super) async fn finalize_thread_teardown(&self, thread_id: &SessionId) {
         self.pending_thread_unloads.lock().await.remove(thread_id);
         self.outgoing.cancel_requests_for_thread(thread_id, None);
         self.outgoing
             .thread_state()
             .remove_thread_state(thread_id)
             .await;
+        self.thread_watch.remove_thread(thread_id).await;
     }
 
     fn load_thread(&self, thread_id: &str) -> Result<LoadedThread, JsonRpcErrorObject> {
@@ -330,11 +349,16 @@ fn paginate_background_terminals(
     (terminals[start..end].to_vec(), next_cursor)
 }
 
-/// Reports the turns still in progress as interrupted unless the thread is running one: Codex's
+/// Reports the turns still in progress as interrupted unless the thread is active: Codex's
 /// `normalize_thread_turns_status`. A turn in progress in the rollout of a thread that is not
 /// running one was cut off.
-fn normalize_thread_turns_status(turns: &mut [Turn], has_live_in_progress_turn: bool) {
-    if has_live_in_progress_turn {
+pub(crate) fn normalize_thread_turns_status(
+    turns: &mut [Turn],
+    loaded_status: ThreadStatus,
+    has_live_in_progress_turn: bool,
+) {
+    let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
+    if matches!(status, ThreadStatus::Active { .. }) {
         return;
     }
     for turn in turns {
@@ -342,6 +366,48 @@ fn normalize_thread_turns_status(turns: &mut [Turn], has_live_in_progress_turn: 
             turn.set_status(TurnStatus::Interrupted);
         }
     }
+}
+
+/// Sets the thread's status, and reports its turns still in progress as interrupted unless it is
+/// active: Codex's `set_thread_status_and_interrupt_stale_turns`.
+pub(crate) fn set_thread_status_and_interrupt_stale_turns(
+    thread: &mut Thread,
+    loaded_status: ThreadStatus,
+    has_live_in_progress_turn: bool,
+) {
+    let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
+    if !matches!(status, ThreadStatus::Active { .. }) {
+        for turn in &mut thread.turns {
+            if turn.status() == TurnStatus::InProgress {
+                turn.set_status(TurnStatus::Interrupted);
+            }
+        }
+    }
+    thread.status = status;
+}
+
+/// The first page of `turns` `thread/resume` was asked to include: Codex's
+/// `build_thread_resume_initial_turns_page`, on turns already rebuilt and normalized.
+pub(crate) fn turns_page(
+    turns: Vec<Turn>,
+    params: &ThreadResumeInitialTurnsPageParams,
+) -> Result<TurnsPage, JsonRpcErrorObject> {
+    let items_view = params.items_view.unwrap_or(TurnItemsView::Summary);
+    let turns = turns
+        .into_iter()
+        .map(|turn| turn.in_items_view(items_view))
+        .collect();
+    let page = paginate_thread_turns(
+        turns,
+        None,
+        params.limit,
+        params.sort_direction.unwrap_or(SortDirection::Desc),
+    )?;
+    Ok(TurnsPage::new(
+        page.turns,
+        page.next_cursor,
+        page.backwards_cursor,
+    ))
 }
 
 /// A page of turns and the cursors around it: Codex's `ThreadTurnsPage`.
@@ -458,7 +524,7 @@ fn parse_thread_turns_cursor(cursor: &str) -> Result<ThreadTurnsCursor, JsonRpcE
         .map_err(|_| JsonRpcErrorObject::invalid_request(format!("invalid cursor: {cursor}")))
 }
 
-fn response(response: impl serde::Serialize) -> TurnMethodResult {
+pub(super) fn response(response: impl serde::Serialize) -> TurnMethodResult {
     serde_json::to_value(response).map(Some).map_err(|error| {
         JsonRpcErrorObject::internal_error(format!("failed to serialize response: {error}"))
     })

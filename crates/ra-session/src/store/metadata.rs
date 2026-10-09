@@ -3,6 +3,8 @@
 //! `ArchiveThreadParams`, `ArchiveThreadsParams`, `DeleteThreadParams` and `DeleteThreadsParams`
 //! (`thread-store/src/types.rs`).
 
+use super::GitInfoPatch;
+
 use ra_core::{
     event::EventTimestamp,
     session::{SessionId, rollout::RolloutThreadSpawn},
@@ -20,7 +22,7 @@ use ra_core::{
 /// describe a thread before its rollout is written, and cannot be set through the builder.
 ///
 /// Codex's patch also carries the rollout path, recency, the creator's identity, the agent
-/// nickname, role and path, the approval mode and permission profile, the token usage, Git facts,
+/// nickname, role and path, the approval mode and permission profile, the token usage,
 /// the memory mode and the product's project and Daybreak preferences. Those are its product's or
 /// its state database's, and are not ported.
 #[non_exhaustive]
@@ -31,6 +33,7 @@ use ra_core::{
 )]
 pub struct ThreadMetadataPatch {
     name: Option<Option<String>>,
+    git_info: Option<GitInfoPatch>,
     preview: Option<String>,
     title: Option<String>,
     first_user_message: Option<String>,
@@ -58,6 +61,19 @@ impl ThreadMetadataPatch {
     pub fn with_name(mut self, name: Option<String>) -> Self {
         self.name = Some(name);
         self
+    }
+
+    /// Sets a partial Git metadata update.
+    #[must_use]
+    pub fn with_git_info(mut self, git_info: GitInfoPatch) -> Self {
+        self.git_info = Some(git_info);
+        self
+    }
+
+    /// The partial Git metadata update.
+    #[must_use]
+    pub const fn git_info(&self) -> Option<&GitInfoPatch> {
+        self.git_info.as_ref()
     }
 
     /// Sets the preview a listing shows.
@@ -143,6 +159,13 @@ impl ThreadMetadataPatch {
         fn take<T>(current: &mut Option<T>, next: Option<T>) {
             if next.is_some() {
                 *current = next;
+            }
+        }
+        if let Some(git_info) = next.git_info {
+            if let Some(current) = &mut self.git_info {
+                current.merge(git_info);
+            } else {
+                self.git_info = Some(git_info);
             }
         }
         take(&mut self.name, next.name);

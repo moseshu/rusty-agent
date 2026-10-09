@@ -10,8 +10,14 @@
 //! and its items, rebuilt as Codex rebuilds them — and holds the interrupts waiting for the running
 //! turn to end. Each thread also publishes whether it has subscribers and whether a turn of it is
 //! active, which its listener watches to unload it once it has had neither for a while; the server
-//! counts the threads with an active turn to know when a drain may finish. Live-connection
-//! admission is added with the thread methods.
+//! counts the threads with an active turn to know when a drain may finish.
+//!
+//! The thread methods subscribe a connection only while it is live — initialized and not yet
+//! closed — as Codex's `try_add_connection_to_thread` does, so a connection that closed while its
+//! `thread/start` or `thread/resume` was in flight is not left subscribed. A thread's listener
+//! also takes commands, which it carries out between the thread's events: Codex's
+//! `ThreadListenerCommand`, of which one is ported, attaching a connection to a loaded thread for
+//! `thread/resume`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -25,11 +31,41 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     outgoing::ConnectionRequestId,
-    protocol::{MessagePhase, ThreadItem, Turn, TurnError, TurnStatus},
+    protocol::{
+        MessagePhase, Thread, ThreadItem, ThreadResumeInitialTurnsPageParams, ThreadSettingsRecord,
+        Turn, TurnError, TurnStatus,
+    },
     thread_history::{ItemChange, ThreadHistoryBuilder, TurnEnding},
     tool_items::ThreadToolItems,
 };
 use crate::transport::ConnectionId;
+
+/// A `thread/resume` of a loaded thread, answered by the thread's listener so that the answer
+/// and the connection's subscription fall between two of the thread's events: Codex's
+/// `PendingThreadResumeRequest`.
+#[derive(Debug)]
+pub(crate) struct PendingThreadResumeRequest {
+    pub(crate) request_id: ConnectionRequestId,
+    /// The thread as the store and the live thread describe it, without turns.
+    pub(crate) thread_summary: Thread,
+    /// The turns its rollout holds, with all their items, if the answer includes turns or a page.
+    pub(crate) history_turns: Vec<Turn>,
+    pub(crate) include_turns: bool,
+    pub(crate) initial_turns_page: Option<ThreadResumeInitialTurnsPageParams>,
+    pub(crate) settings: ThreadSettingsRecord,
+}
+
+/// What a thread's listener is asked to do between the thread's events: Codex's
+/// `ThreadListenerCommand`.
+#[derive(Debug)]
+pub(crate) enum ThreadListenerCommand {
+    /// Answers a `thread/resume` of the loaded thread and subscribes its connection, then tells
+    /// the caller it is done.
+    SendThreadResumeResponse {
+        request: Box<PendingThreadResumeRequest>,
+        completion_tx: tokio::sync::oneshot::Sender<()>,
+    },
+}
 
 /// What a thread's running turn has accumulated: Codex's `TurnSummary`, without the command
 /// executions it keeps to tell an approval's early start from its tool's own.
@@ -54,6 +90,8 @@ pub(crate) struct ThreadState {
     active_turn_id: Option<String>,
     /// Stops the listener reading the thread's events, if one does.
     listener_cancel: Option<CancellationToken>,
+    /// Sends the listener commands, while one runs.
+    listener_command_tx: Option<tokio::sync::mpsc::UnboundedSender<ThreadListenerCommand>>,
     /// Last effective settings sent, as Codex deduplicates the thread snapshot.
     pub(crate) last_settings: Option<serde_json::Value>,
     /// The turn running, rebuilt from the thread's events: Codex's `current_turn_history`.
@@ -72,9 +110,23 @@ impl ThreadState {
         self.listener_cancel.is_some()
     }
 
-    /// Records the listener now reading the thread's events, stopped by `cancel`.
-    pub(crate) fn set_listener(&mut self, cancel: CancellationToken) {
+    /// Records the listener now reading the thread's events, stopped by `cancel` and taking
+    /// commands through `commands`.
+    pub(crate) fn set_listener(
+        &mut self,
+        cancel: CancellationToken,
+        commands: tokio::sync::mpsc::UnboundedSender<ThreadListenerCommand>,
+    ) {
         self.listener_cancel = Some(cancel);
+        self.listener_command_tx = Some(commands);
+    }
+
+    /// Where the thread's listener takes commands, while one runs: Codex's
+    /// `listener_command_tx`.
+    pub(crate) fn listener_command_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<ThreadListenerCommand>> {
+        self.listener_command_tx.clone()
     }
 
     /// Stops the thread's listener: Codex's `clear_listener`.
@@ -82,6 +134,7 @@ impl ThreadState {
         if let Some(cancel) = self.listener_cancel.take() {
             cancel.cancel();
         }
+        self.listener_command_tx = None;
         self.current_turn_history.reset();
     }
 
@@ -225,8 +278,25 @@ impl ThreadEntry {
 
 #[derive(Debug, Default)]
 struct ThreadStateManagerInner {
+    /// The connections that have been initialized and not closed: Codex's `live_connections`.
+    live_connections: HashSet<ConnectionId>,
     threads: HashMap<SessionId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<SessionId>>,
+}
+
+fn subscribe(
+    state: &mut ThreadStateManagerInner,
+    thread_id: &SessionId,
+    connection_id: ConnectionId,
+) {
+    state
+        .thread_ids_by_connection
+        .entry(connection_id)
+        .or_default()
+        .insert(thread_id.clone());
+    let entry = state.threads.entry(thread_id.clone()).or_default();
+    entry.connection_ids.insert(connection_id);
+    entry.update_has_connections();
 }
 
 /// The current subscribers of each thread, shared by all event senders, and each thread's state.
@@ -265,21 +335,35 @@ impl ThreadStateManager {
         )
     }
 
+    /// Records that a connection has been initialized, so the thread methods may subscribe it:
+    /// Codex's `connection_initialized`.
+    pub(crate) fn connection_initialized(&self, connection_id: ConnectionId) {
+        self.lock().live_connections.insert(connection_id);
+    }
+
+    /// Subscribes a live connection to a thread, keeping its other subscriptions: Codex's
+    /// `try_add_connection_to_thread`. Returns `false`, subscribing nothing, if the connection is
+    /// not live.
+    pub(crate) fn try_add_connection_to_thread(
+        &self,
+        thread_id: &SessionId,
+        connection_id: ConnectionId,
+    ) -> bool {
+        let mut state = self.lock();
+        if !state.live_connections.contains(&connection_id) {
+            return false;
+        }
+        subscribe(&mut state, thread_id, connection_id);
+        true
+    }
+
     /// Adds a subscription without replacing the thread's other subscriptions.
     pub(crate) fn add_connection_to_thread(
         &self,
         thread_id: &SessionId,
         connection_id: ConnectionId,
     ) {
-        let mut state = self.lock();
-        state
-            .thread_ids_by_connection
-            .entry(connection_id)
-            .or_default()
-            .insert(thread_id.clone());
-        let entry = state.threads.entry(thread_id.clone()).or_default();
-        entry.connection_ids.insert(connection_id);
-        entry.update_has_connections();
+        subscribe(&mut self.lock(), thread_id, connection_id);
     }
 
     pub(crate) fn subscribed_connection_ids(&self, thread_id: &SessionId) -> Vec<ConnectionId> {
@@ -325,6 +409,7 @@ impl ThreadStateManager {
     /// `remove_connection`. Returns the threads it leaves without subscribers.
     pub(crate) fn remove_connection(&self, connection_id: ConnectionId) -> Vec<SessionId> {
         let mut state = self.lock();
+        state.live_connections.remove(&connection_id);
         let thread_ids = state
             .thread_ids_by_connection
             .remove(&connection_id)

@@ -1116,3 +1116,35 @@ async fn concurrent_patches_of_one_thread_preserve_unset_fields() {
         );
     }
 }
+
+/// Adding Git metadata migrates the previous schema in place without dropping existing rows.
+#[tokio::test]
+async fn git_metadata_migration_preserves_existing_threads() {
+    let dir = temp_dir("git-migration");
+    let (store, db) = indexed(&dir).await;
+    let recorder = live_thread(&store, "existing", "Kept history").await;
+    recorder.shutdown().await.unwrap();
+    drop(recorder);
+    drop(store);
+    drop(db);
+    db_connection(&dir)
+        .execute_batch("ALTER TABLE threads DROP COLUMN git_info; PRAGMA user_version = 1;")
+        .unwrap();
+    let (store, _db) = indexed(&dir).await;
+    let page = store
+        .list_threads(&ListThreadsParams::new(10).with_state_db_only())
+        .await
+        .unwrap();
+    assert_eq!(ids(page.items()), ["existing"]);
+    let mut git = ra_session::store::GitInfoPatch::default();
+    git.branch = Some(Some("main".into()));
+    let updated = store
+        .update_thread_metadata(&UpdateThreadMetadataParams::new(
+            SessionId::new("existing"),
+            ThreadMetadataPatch::new().with_git_info(git),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.git_info().unwrap().branch.as_deref(), Some("main"));
+}

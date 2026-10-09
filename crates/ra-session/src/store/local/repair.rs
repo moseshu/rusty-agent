@@ -28,6 +28,9 @@ use crate::{
 /// field. The originator only fills a missing one; a name is not a field of the row and is set
 /// apart, through the title.
 pub(crate) fn apply_patch(metadata: &mut ThreadMetadata, patch: &ThreadMetadataPatch) {
+    if let Some(git_info) = patch.git_info() {
+        git_info.apply(&mut metadata.git_info);
+    }
     if let Some(preview) = patch.preview() {
         preview.clone_into(&mut metadata.preview);
     }
@@ -130,6 +133,7 @@ pub(crate) async fn extract_metadata_from_rollout(path: &Path) -> Result<Option<
         .unwrap_or_else(EventTimestamp::now);
     let mut metadata =
         ThreadMetadata::new(meta.session_id().clone(), path.to_path_buf(), created_at);
+    metadata.git_info = meta.git_info().cloned();
     let payloads = readable_payloads(&records);
     let observed = payloads
         .iter()

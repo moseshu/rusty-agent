@@ -194,6 +194,7 @@ pub(crate) fn stored_thread(row: &ThreadMetadata) -> StoredThread {
         .clone_from(&row.first_user_message);
     thread.updated_at = Some(row.updated_at);
     thread.archived_at = row.archived_at;
+    thread.git_info.clone_from(&row.git_info);
     thread.model.clone_from(&row.model);
     thread.effort.clone_from(&row.effort);
     thread
@@ -242,6 +243,7 @@ pub(crate) async fn overlay(db: &StateRuntime, thread: &mut StoredThread) {
 }
 
 fn apply_overlay(thread: &mut StoredThread, row: &ThreadMetadata) {
+    thread.git_info.clone_from(&row.git_info);
     thread.model.clone_from(&row.model);
     thread.effort.clone_from(&row.effort);
     if let Some(name) = row.distinct_title() {

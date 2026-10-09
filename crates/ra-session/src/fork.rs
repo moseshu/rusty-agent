@@ -143,6 +143,17 @@ impl ForkThreadParams {
     pub const fn interrupted_turn_marker(&self) -> InterruptedTurnHistoryMarker {
         self.interrupted_turn_marker
     }
+
+    /// The records a fork of `records` starts from, cut and completed as the snapshot says, for a
+    /// fork that keeps no rollout of its own — Codex's ephemeral fork, which projects the same
+    /// history without materializing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a record cannot be read.
+    pub fn snapshot_records(&self, records: Vec<RolloutRecord>) -> Result<Vec<RolloutRecord>> {
+        fork_records(self, records)
+    }
 }
 
 /// A thread forked from another, with the history it starts from.
