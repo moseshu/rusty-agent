@@ -112,7 +112,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(8);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(9);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -156,8 +156,14 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          older runtime cannot reconcile an uncertain append or prevent replaying terminal work.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(8),
         "Persisted automatic session compaction exchange evidence and append acknowledgement.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the text a host rejection returns to the model, on the answer and on the deny \
+         rule an `always` rejection leaves. An older runtime drops the answer's text and returns \
+         its own refusal, and cannot read a session deny rule that carries one.",
     ),
 ];
 
@@ -198,6 +204,8 @@ impl InterruptionResolution {
 pub struct PendingInterruptionResolution {
     item_id: ItemId,
     resolution: InterruptionResolution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejection_message: Option<String>,
 }
 
 impl PendingInterruptionResolution {
@@ -211,6 +219,14 @@ impl PendingInterruptionResolution {
     #[must_use]
     pub const fn resolution(&self) -> InterruptionResolution {
         self.resolution
+    }
+
+    /// The text a rejection returns to the model in place of the runtime's own refusal, exactly as
+    /// the host supplied it through [`RunState::reject_with_message`]. An empty string is a message
+    /// too. Never set on an approval.
+    #[must_use]
+    pub fn rejection_message(&self) -> Option<&str> {
+        self.rejection_message.as_deref()
     }
 }
 
@@ -1779,8 +1795,42 @@ impl RunState {
     /// Routed to the run that raised the approval, as [`Self::approve`] is.
     pub fn reject(&mut self, item: &RunItem, always: bool) -> Result<()> {
         let owner = self.interruption_owner(item)?;
-        self.owner_mut(&owner)
-            .answer_interruption(item, InterruptionResolution::Reject { always })
+        self.owner_mut(&owner).answer_interruption(
+            item,
+            InterruptionResolution::Reject { always },
+            None,
+        )
+    }
+
+    /// Rejects a pending tool approval, sending `message` back to the model in place of the
+    /// runtime's own refusal: the reference's `reject(..., rejection_message=...)`.
+    ///
+    /// The text is returned verbatim, an empty string included. With `always`, the deny rule the
+    /// answer leaves behind keeps it, so a later call that rule refuses returns the same text, and
+    /// so does a call of the same action rejected without text of its own (see
+    /// [`Self::rejection_message_for`]). A later answer to the same record replaces this one
+    /// together with its text, and an approval carries none. Routed to the run that raised the
+    /// approval, as [`Self::approve`] is.
+    ///
+    /// # Exact answers and sticky defaults
+    ///
+    /// As in the reference, an answer without `always` is an exception for its own call and leaves
+    /// the action's sticky default — the session rule an earlier `always` answer left — in place
+    /// for every other call. An `always` answer replaces that default and settles the other calls
+    /// of the same action still waiting in this run the same way, each keeping its own rejection
+    /// text when it stays rejected.
+    pub fn reject_with_message(
+        &mut self,
+        item: &RunItem,
+        always: bool,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let owner = self.interruption_owner(item)?;
+        self.owner_mut(&owner).answer_interruption(
+            item,
+            InterruptionResolution::Reject { always },
+            Some(message.into()),
+        )
     }
 
     fn approve_own(&mut self, item: &RunItem, always: bool) -> Result<()> {
@@ -1791,7 +1841,7 @@ impl RunState {
                 item.id()
             )));
         }
-        self.answer_interruption(item, InterruptionResolution::Approve { always })
+        self.answer_interruption(item, InterruptionResolution::Approve { always }, None)
     }
 
     /// Finds the run — this one, or a paused agent-tool run inside it — that is waiting on `item`.
@@ -1944,31 +1994,120 @@ impl RunState {
         &mut self,
         item: &RunItem,
         resolution: InterruptionResolution,
+        rejection_message: Option<String>,
     ) -> Result<()> {
         let authoritative = self.authoritative_tool_approval(item)?.clone();
+        self.set_interruption_answer(item.id(), resolution, rejection_message.clone());
+        if !resolution.always() {
+            // An exact answer is an exception for this call alone. The reference keeps the sticky
+            // default of the same tool beside it, for every other call, so the rule stays.
+            return Ok(());
+        }
+        // A sticky answer replaces the previous default for the action, as the reference resets
+        // its approval record, and settles every other call of that action still waiting here:
+        // the reference's sticky value supersedes their exact entries. A rejection keeps their
+        // own rejection text, an approval clears it.
+        let rule =
+            session_rule(&authoritative, resolution).with_rejection_message(rejection_message);
+        self.permission_rules
+            .retain(|existing| !targets_same_action(existing, &rule));
+        let derived = match resolution {
+            InterruptionResolution::Approve { .. } => {
+                InterruptionResolution::Approve { always: false }
+            }
+            InterruptionResolution::Reject { .. } => {
+                InterruptionResolution::Reject { always: false }
+            }
+        };
+        let same_action: Vec<ItemId> = self
+            .pending_interruptions
+            .iter()
+            .filter(|id| *id != item.id())
+            .filter(|id| {
+                self.generated_items
+                    .iter()
+                    .find(|stored| stored.id() == *id)
+                    .and_then(|stored| match stored.kind() {
+                        RunItemKind::ToolApproval(approval) => Some(approval),
+                        _ => None,
+                    })
+                    .is_some_and(|approval| {
+                        targets_same_action(&session_rule(approval, resolution), &rule)
+                    })
+            })
+            .cloned()
+            .collect();
+        for id in same_action {
+            let kept = match derived {
+                InterruptionResolution::Reject { .. } => self
+                    .pending_interruption_resolutions
+                    .iter()
+                    .find(|entry| entry.item_id == id)
+                    .filter(|entry| {
+                        matches!(entry.resolution, InterruptionResolution::Reject { .. })
+                    })
+                    .and_then(|entry| entry.rejection_message.clone()),
+                InterruptionResolution::Approve { .. } => None,
+            };
+            self.set_interruption_answer(&id, derived, kept);
+        }
+        self.permission_rules.push(rule);
+        Ok(())
+    }
+
+    fn set_interruption_answer(
+        &mut self,
+        item_id: &ItemId,
+        resolution: InterruptionResolution,
+        rejection_message: Option<String>,
+    ) {
         if let Some(existing) = self
             .pending_interruption_resolutions
             .iter_mut()
-            .find(|entry| entry.item_id == *item.id())
+            .find(|entry| entry.item_id == *item_id)
         {
             existing.resolution = resolution;
+            existing.rejection_message = rejection_message;
         } else {
             self.pending_interruption_resolutions
                 .push(PendingInterruptionResolution {
-                    item_id: item.id().clone(),
+                    item_id: item_id.clone(),
                     resolution,
+                    rejection_message,
                 });
         }
-        // A re-answer supersedes the one before it, and the rule that answer minted has to go with
-        // it. Appending alone would leave "always allow", later corrected to a plain rejection,
-        // still allowing every subsequent call — a grant the host withdrew and has no way to reach.
-        let rule = session_rule(&authoritative, resolution);
-        self.permission_rules
-            .retain(|existing| !targets_same_action(existing, &rule));
-        if resolution.always() {
-            self.permission_rules.push(rule);
+    }
+
+    /// The text a rejected interruption returns to the model: its own rejection text, or else the
+    /// text of the sticky rejection of the same action, as the reference falls back from a call's
+    /// exact message to the sticky one. `None` for an approval, or when neither carries text.
+    #[must_use]
+    pub fn rejection_message_for(&self, item_id: &ItemId) -> Option<&str> {
+        let answer = self
+            .pending_interruption_resolutions
+            .iter()
+            .find(|entry| entry.item_id == *item_id)?;
+        if !matches!(answer.resolution, InterruptionResolution::Reject { .. }) {
+            return None;
         }
-        Ok(())
+        if let Some(message) = answer.rejection_message.as_deref() {
+            return Some(message);
+        }
+        let RunItemKind::ToolApproval(approval) = self
+            .generated_items
+            .iter()
+            .find(|stored| stored.id() == item_id)?
+            .kind()
+        else {
+            return None;
+        };
+        let identity = session_rule(approval, answer.resolution);
+        self.permission_rules
+            .iter()
+            .rev()
+            .find(|rule| targets_same_action(rule, &identity))
+            .filter(|rule| matches!(rule.decision(), PermissionDecision::Deny))
+            .and_then(PermissionRule::rejection_message)
     }
 
     fn authoritative_tool_approval(&self, item: &RunItem) -> Result<&ToolApproval> {

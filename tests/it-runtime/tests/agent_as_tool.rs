@@ -1185,7 +1185,10 @@ async fn a_rejected_nested_approval_resumes_the_nested_run_with_the_refusal() {
     assert!(guarded_calls.lock().unwrap().is_empty());
     let calls = resolver.calls();
     let [refusal] = tool_output_texts(&calls[2].input).try_into().unwrap();
-    assert!(refusal.contains("approval_rejected"), "{refusal}");
+    assert!(
+        refusal.contains("Tool execution was not approved."),
+        "{refusal}"
+    );
     assert_eq!(tool_output_texts(&calls[3].input), ["rejected, so no"]);
 }
 
@@ -1374,7 +1377,7 @@ async fn check_partial_nested_resume(reject_first: bool, deep: bool) {
             item.kind(),
             RunItemKind::ToolCallOutput(output)
                 if output.call_id() == &CallId::new("n-a")
-                    && output.output().to_string().contains("approval_rejected")
+                    && output.output().to_string().contains("Tool execution was not approved.")
         )
     });
     if reject_first {
@@ -1406,7 +1409,7 @@ async fn check_partial_nested_resume(reject_first: bool, deep: bool) {
     let nested_outputs = tool_output_texts(&calls[2 + usize::from(deep)].input);
     assert_eq!(nested_outputs.len(), 2, "each call has exactly one output");
     if reject_first {
-        assert!(nested_outputs[0].contains("approval_rejected"));
+        assert!(nested_outputs[0].contains("Tool execution was not approved."));
     }
 }
 

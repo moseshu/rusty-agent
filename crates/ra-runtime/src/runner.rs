@@ -1929,14 +1929,10 @@ async fn run_loop_inner(
         session_compaction_usage: std::sync::Mutex::new(Usage::default()),
         turn_context_recorded: false,
     };
-    let permission = config.permission().clone().with_rules(
-        config
-            .permission()
-            .rules()
-            .iter()
-            .cloned()
-            .chain(state.permission_rules().iter().cloned()),
-    );
+    let permission = config
+        .permission()
+        .clone()
+        .with_answered_rules(state.permission_rules().iter().cloned());
     let context = TurnLoopContext {
         input_base: &input_base,
         authoritative_history_complete,
@@ -2514,7 +2510,12 @@ async fn resolve_interrupted_turn(
         let provenance = item.provenance().cloned();
         let approval = approval.clone();
         let (output, outcome) = match answer.resolution() {
-            InterruptionResolution::Reject { .. } => rejection(&approval),
+            InterruptionResolution::Reject { .. } => {
+                let message = state
+                    .rejection_message_for(answer.item_id())
+                    .map(str::to_owned);
+                rejection(&approval, message.as_deref())
+            }
             InterruptionResolution::Approve { .. } => {
                 let resumed =
                     match run_approved_call(context, agent, state, lifecycle, &approval).await {
@@ -2689,13 +2690,19 @@ enum ResumeStage {
 }
 
 /// The answer a rejected approval puts in history, and how the call is filed.
-fn rejection(approval: &ToolApproval) -> (ToolCallOutput, Option<ToolOutcome>) {
-    let output = ToolCallOutput::new(
-        approval.call_id().clone(),
-        serde_json::json!({"code": "approval_rejected", "tool": approval.tool_name()}),
-    )
-    .with_error(true)
-    .with_kind(approval.kind());
+fn rejection(
+    approval: &ToolApproval,
+    message: Option<&str>,
+) -> (ToolCallOutput, Option<ToolOutcome>) {
+    // The host's own text is sent back verbatim, and the reference's default when it gave none.
+    let body = serde_json::Value::String(
+        message
+            .unwrap_or(crate::permission::DEFAULT_APPROVAL_REJECTION_MESSAGE)
+            .to_owned(),
+    );
+    let output = ToolCallOutput::new(approval.call_id().clone(), body)
+        .with_error(true)
+        .with_kind(approval.kind());
     // Filed as a refusal, the same as a call the permission stage declines: both are "the runtime
     // answered without running the tool", which is what `ToolOutcome::refused` names. Recording
     // nothing instead would leave an earlier failure streak standing behind a call that never ran,
@@ -2865,6 +2872,14 @@ async fn execute_resumed_call(
             .tool_failure()
             .no_progress_streak(agent.public_id(), &identity),
     );
+    // A call the host approved by its exact answer is an exception to the sticky defaults its
+    // answers left, as in the reference, so only the configured rules still judge it: a session
+    // deny rule left by an `always` rejection of another call must not refuse it.
+    let permission = if nested.is_some() {
+        context.permission.clone()
+    } else {
+        context.config.permission().clone()
+    };
     let request = ToolDispatchRequest::new(
         Arc::clone(tool),
         call_id.clone(),
@@ -2872,7 +2887,7 @@ async fn execute_resumed_call(
         Arc::new(run),
         context.cancel.child(ScopeKind::Tool),
         history,
-        context.permission.clone(),
+        permission,
     )
     .with_services(context.services.clone())
     .with_tool_guardrails(context.tool_guardrails.clone())
@@ -3505,14 +3520,10 @@ async fn run_one_turn(
         .live_settings
         .and_then(LiveRunSettings::capture_step);
     let permission = captured.as_ref().map(|config| {
-        config.permission().clone().with_rules(
-            config
-                .permission()
-                .rules()
-                .iter()
-                .cloned()
-                .chain(state.permission_rules().iter().cloned()),
-        )
+        config
+            .permission()
+            .clone()
+            .with_answered_rules(state.permission_rules().iter().cloned())
     });
     let step_context = TurnLoopContext {
         config: captured.as_ref().unwrap_or(context.config),

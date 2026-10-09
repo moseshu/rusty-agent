@@ -195,6 +195,8 @@ pub struct PermissionRule {
     namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lookup_key: Option<ToolLookupKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejection_message: Option<String>,
 }
 
 impl PermissionRule {
@@ -206,6 +208,7 @@ impl PermissionRule {
             tool_name: None,
             namespace: None,
             lookup_key: None,
+            rejection_message: None,
         }
     }
 
@@ -237,6 +240,16 @@ impl PermissionRule {
         self
     }
 
+    /// Sets the text a call this deny rule refuses returns to the model.
+    ///
+    /// Only rules minted from a host rejection carry one: it is the reference's sticky rejection
+    /// message, kept with an `always` rejection so later calls it refuses read the same text.
+    #[must_use]
+    pub(crate) fn with_rejection_message(mut self, message: Option<String>) -> Self {
+        self.rejection_message = message;
+        self
+    }
+
     /// The decision this rule contributes.
     #[must_use]
     pub const fn decision(&self) -> PermissionDecision {
@@ -259,6 +272,13 @@ impl PermissionRule {
     #[must_use]
     pub const fn lookup_key(&self) -> Option<&ToolLookupKey> {
         self.lookup_key.as_ref()
+    }
+
+    /// The text a call this deny rule refuses returns to the model, verbatim, if the host supplied
+    /// one with the `always` rejection that minted the rule. An empty string is a message too.
+    #[must_use]
+    pub fn rejection_message(&self) -> Option<&str> {
+        self.rejection_message.as_deref()
     }
 
     /// Whether this rule matches the tool being dispatched.

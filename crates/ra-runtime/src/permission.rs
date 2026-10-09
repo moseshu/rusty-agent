@@ -21,7 +21,13 @@ use ra_core::{
 pub struct PermissionEngine {
     mode: PermissionMode,
     rules: Arc<[PermissionRule]>,
+    // Where the rules a run's own answers left begin, after the configured ones.
+    answered_from: Option<usize>,
 }
+
+/// What a call the host rejected returns to the model when the host gave no text of its own: the
+/// reference's `DEFAULT_APPROVAL_REJECTION_MESSAGE`.
+pub const DEFAULT_APPROVAL_REJECTION_MESSAGE: &str = "Tool execution was not approved.";
 
 impl PermissionEngine {
     /// Creates an evaluator under `mode` with no rule exceptions.
@@ -30,6 +36,7 @@ impl PermissionEngine {
         Self {
             mode,
             rules: Arc::from([]),
+            answered_from: None,
         }
     }
 
@@ -44,6 +51,25 @@ impl PermissionEngine {
     #[must_use]
     pub fn with_rules(mut self, rules: impl IntoIterator<Item = PermissionRule>) -> Self {
         self.rules = rules.into_iter().collect::<Vec<_>>().into();
+        self.answered_from = None;
+        self
+    }
+
+    /// Appends the session rules a run's `always` answers left (see
+    /// [`RunState::permission_rules`](ra_core::state::RunState::permission_rules)) after the
+    /// configured ones, so they take precedence.
+    ///
+    /// They decide like any rule. What differs is what a call one of their deny rules refuses
+    /// returns: the host's rejection text, or [`DEFAULT_APPROVAL_REJECTION_MESSAGE`] when it gave
+    /// none, as the reference answers a call its sticky rejection covers. A configured deny rule
+    /// keeps the runtime's own refusal.
+    #[must_use]
+    pub fn with_answered_rules(mut self, rules: impl IntoIterator<Item = PermissionRule>) -> Self {
+        let mut all = self.rules.to_vec();
+        let start = all.len();
+        all.extend(rules);
+        self.rules = all.into();
+        self.answered_from = Some(self.answered_from.unwrap_or(start));
         self
     }
 
@@ -101,6 +127,30 @@ impl PermissionEngine {
         } else {
             None
         }
+    }
+
+    /// The text a call refused by a matching deny rule returns to the model: the rule's own text
+    /// (see [`PermissionRule::rejection_message`]), or [`DEFAULT_APPROVAL_REJECTION_MESSAGE`] for
+    /// a rule a run's answer left without one (see [`Self::with_answered_rules`]).
+    ///
+    /// `None` for a configured deny rule without text, and whenever something other than a rule
+    /// decides the call: plan mode refuses before any rule is consulted, and `DontAsk` turns an
+    /// `Ask` rule into a denial of its own.
+    #[must_use]
+    pub fn rejection_message(&self, scope: PermissionScope, origin: &ToolOrigin) -> Option<&str> {
+        if matches!(self.mode, PermissionMode::Plan) && !matches!(scope, PermissionScope::Read) {
+            return None;
+        }
+        let (index, rule) = self
+            .rules
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, rule)| rule.matches_origin(origin))
+            .filter(|(_, rule)| matches!(rule.decision(), PermissionDecision::Deny))?;
+        let answered = self.answered_from.is_some_and(|start| index >= start);
+        rule.rejection_message()
+            .or_else(|| answered.then_some(DEFAULT_APPROVAL_REJECTION_MESSAGE))
     }
 
     fn matching_rule(&self, origin: &ToolOrigin) -> Option<PermissionDecision> {

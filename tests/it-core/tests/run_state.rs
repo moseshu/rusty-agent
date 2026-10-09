@@ -353,9 +353,11 @@ fn test_run_state_retains_approval_answers_and_exact_always_rules() {
     assert_eq!(restored.permission_rules(), state.permission_rules());
 }
 
-/// A host that corrects itself before resuming must not leave the withdrawn grant behind.
+/// Ported from the reference's `test_latest_approval_decision_wins_for_call_id` and
+/// `test_matching_exact_call_decisions_preserve_sticky_defaults`: a later exact answer decides its
+/// own call, and leaves the sticky default for the others; a later sticky answer replaces it.
 #[test]
-fn test_run_state_re_answer_retracts_the_superseded_always_rule() {
+fn test_run_state_exact_re_answer_keeps_the_sticky_default() {
     let approval = approval_item("approval-1", "call-1");
     let mut state = RunState::start(RunId::new("run-approval-re-answer"));
     state
@@ -371,18 +373,23 @@ fn test_run_state_re_answer_retracts_the_superseded_always_rule() {
         .expect("the first answer must be retained");
     assert_eq!(state.permission_rules().len(), 1);
 
-    // "Always allow", then corrected to a plain rejection: the resolution flips and the rule the
-    // first answer minted has to go with it, or every later call stays auto-approved.
+    // "Always allow", then this call rejected exactly: the call is rejected and every other call
+    // of the tool stays on the sticky approval, as the reference keeps both.
     state
         .reject(&approval, false)
         .expect("the corrected answer must replace the first one");
     assert_eq!(state.pending_interruption_resolutions().len(), 1);
-    assert!(
-        state.permission_rules().is_empty(),
-        "a withdrawn `always` grant must not survive its own answer"
+    assert!(matches!(
+        state.pending_interruption_resolutions()[0].resolution(),
+        ra_core::state::InterruptionResolution::Reject { .. }
+    ));
+    assert_eq!(state.permission_rules().len(), 1);
+    assert_eq!(
+        state.permission_rules()[0].decision(),
+        PermissionDecision::Allow
     );
 
-    // Re-answering the other way round replaces rather than accumulates.
+    // A sticky answer the other way round replaces the default rather than accumulating.
     state
         .reject(&approval, true)
         .expect("an always-deny answer must be retained");
@@ -1318,4 +1325,448 @@ fn session_compaction_exchange_and_append_acknowledgement_survive_checkpoint_wit
     let mut invalid = wire;
     invalid["pending_session_write"]["before"] = serde_json::Value::Null;
     assert!(serde_json::from_value::<RunState>(invalid).is_err());
+}
+
+fn state_awaiting(run: &str, approvals: &[RunItem]) -> RunState {
+    let mut state = RunState::start(RunId::new(run));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items(approvals.iter().cloned());
+    state
+        .set_pending_interruptions(approvals)
+        .expect("approvals must be pending");
+    state
+}
+
+fn answer_message<'a>(state: &'a RunState, item: &RunItem) -> Option<&'a str> {
+    state
+        .pending_interruption_resolutions()
+        .iter()
+        .find(|answer| answer.item_id() == item.id())
+        .and_then(|answer| answer.rejection_message())
+}
+
+/// Ported from the reference's `test_reject_stores_rejection_message` and
+/// `test_run_context_stores_per_call_rejection_messages`: the text belongs to the call it answered.
+#[test]
+fn test_reject_with_message_stores_the_text_for_that_call_only() {
+    let first = approval_item("approval-1", "call-1");
+    let second = approval_item("approval-2", "call-2");
+    let mut state = state_awaiting("run-reject-message", &[first.clone(), second.clone()]);
+
+    state
+        .reject_with_message(&first, false, "Denied by reviewer")
+        .expect("a rejection with a message must be retained");
+    state
+        .reject(&second, false)
+        .expect("a plain rejection must be retained");
+
+    assert_eq!(answer_message(&state, &first), Some("Denied by reviewer"));
+    assert_eq!(answer_message(&state, &second), None);
+    assert!(
+        state.permission_rules().is_empty(),
+        "a one-off rejection leaves no rule behind"
+    );
+}
+
+/// Ported from the reference's `test_always_reject_reuses_rejection_message_for_future_calls` and
+/// `test_run_context_stores_sticky_rejection_messages_for_always_reject`: an empty string is a
+/// message, and `always` keeps it for the calls its rule refuses later.
+#[test]
+fn test_always_reject_keeps_an_empty_message_for_later_calls() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = state_awaiting("run-reject-sticky", std::slice::from_ref(&approval));
+
+    state
+        .reject_with_message(&approval, true, "")
+        .expect("an always rejection with a message must be retained");
+
+    assert_eq!(answer_message(&state, &approval), Some(""));
+    assert_eq!(state.permission_rules().len(), 1);
+    let rule = &state.permission_rules()[0];
+    assert_eq!(rule.decision(), PermissionDecision::Deny);
+    assert_eq!(rule.rejection_message(), Some(""));
+}
+
+/// Ported from the reference's `test_run_context_clears_rejection_message_after_approval`, with
+/// the sticky side: approving the same record afterwards withdraws the text and its rule.
+#[test]
+fn test_a_later_approval_clears_the_rejection_message() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = state_awaiting("run-reject-then-approve", std::slice::from_ref(&approval));
+
+    state
+        .reject_with_message(&approval, false, "Denied by policy")
+        .expect("the rejection must be retained");
+    state
+        .approve(&approval, false)
+        .expect("the approval must replace it");
+    assert_eq!(answer_message(&state, &approval), None);
+
+    state
+        .reject_with_message(&approval, true, "Denied by policy")
+        .expect("an always rejection must be retained");
+    state
+        .approve(&approval, true)
+        .expect("an always approval must replace it");
+    assert_eq!(answer_message(&state, &approval), None);
+    assert_eq!(state.permission_rules().len(), 1);
+    assert_eq!(
+        state.permission_rules()[0].decision(),
+        PermissionDecision::Allow
+    );
+    assert_eq!(state.permission_rules()[0].rejection_message(), None);
+
+    // A plain rejection after one with text replaces the text too.
+    state
+        .reject_with_message(&approval, false, "Denied by policy")
+        .expect("the rejection must be retained");
+    state
+        .reject(&approval, false)
+        .expect("a plain rejection must replace it");
+    assert_eq!(answer_message(&state, &approval), None);
+}
+
+/// Ported from the reference's `test_serializes_and_restores_rejection_messages`.
+#[test]
+fn test_rejection_messages_survive_a_checkpoint() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = state_awaiting("run-reject-roundtrip", std::slice::from_ref(&approval));
+    state
+        .reject_with_message(&approval, true, "Denied by reviewer")
+        .expect("the rejection must be retained");
+
+    let restored: RunState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+
+    assert_eq!(
+        answer_message(&restored, &approval),
+        Some("Denied by reviewer")
+    );
+    assert_eq!(
+        restored.permission_rules()[0].rejection_message(),
+        Some("Denied by reviewer")
+    );
+}
+
+/// Ported from the reference's
+/// `test_from_json_accepts_previous_schema_version_without_rejection_messages`.
+#[test]
+fn test_a_previous_checkpoint_without_rejection_messages_still_loads() {
+    let approval = approval_item("approval-1", "call-1");
+    let mut state = state_awaiting("run-reject-legacy", std::slice::from_ref(&approval));
+    state
+        .reject_with_message(&approval, true, "Denied by reviewer")
+        .expect("the rejection must be retained");
+
+    let mut json = serde_json::to_value(&state).unwrap();
+    json["schema_version"] = json!(8);
+    for answer in json["pending_interruption_resolutions"]
+        .as_array_mut()
+        .unwrap()
+    {
+        answer.as_object_mut().unwrap().remove("rejection_message");
+    }
+    for rule in json["permission_rules"].as_array_mut().unwrap() {
+        rule.as_object_mut().unwrap().remove("rejection_message");
+    }
+
+    let restored: RunState = serde_json::from_value(json).unwrap();
+
+    assert_eq!(restored.schema_version(), RUN_STATE_SCHEMA_VERSION);
+    assert_eq!(restored.pending_interruption_resolutions().len(), 1);
+    assert_eq!(answer_message(&restored, &approval), None);
+    assert_eq!(
+        restored.permission_rules()[0].decision(),
+        PermissionDecision::Deny
+    );
+    assert_eq!(restored.permission_rules()[0].rejection_message(), None);
+}
+
+/// The message travels with the answer to the paused agent-tool run that raised the approval, as
+/// the reference forwards `rejection_message` to the nested state.
+#[test]
+fn test_a_nested_rejection_message_is_kept_by_the_nested_run() {
+    let approval = approval_item("n-approval", "inner-1");
+    let mut parent = parent_state();
+    parent
+        .set_nested_runs(vec![paused_ref("run-parent", &approval)])
+        .expect("a paused child of this run is recorded");
+
+    parent
+        .reject_with_message(&approval, false, "exact denial")
+        .expect("the nested approval is answered through the parent");
+
+    assert!(parent.pending_interruption_resolutions().is_empty());
+    let nested = parent.nested_runs()[0].state().unwrap();
+    assert_eq!(answer_message(nested, &approval), Some("exact denial"));
+}
+
+fn resolution_of(
+    state: &RunState,
+    item: &RunItem,
+) -> Option<ra_core::state::InterruptionResolution> {
+    state
+        .pending_interruption_resolutions()
+        .iter()
+        .find(|answer| answer.item_id() == item.id())
+        .map(ra_core::state::PendingInterruptionResolution::resolution)
+}
+
+fn is_rejected(state: &RunState, item: &RunItem) -> bool {
+    matches!(
+        resolution_of(state, item),
+        Some(ra_core::state::InterruptionResolution::Reject { .. })
+    )
+}
+
+fn is_approved(state: &RunState, item: &RunItem) -> bool {
+    matches!(
+        resolution_of(state, item),
+        Some(ra_core::state::InterruptionResolution::Approve { .. })
+    )
+}
+
+fn sticky(state: &RunState) -> (PermissionDecision, Option<&str>) {
+    assert_eq!(
+        state.permission_rules().len(),
+        1,
+        "one sticky default per action"
+    );
+    let rule = &state.permission_rules()[0];
+    (rule.decision(), rule.rejection_message())
+}
+
+/// Ported from the reference's `test_exact_call_decisions_override_sticky_defaults`.
+#[test]
+fn test_exact_call_decisions_override_sticky_defaults() {
+    let sticky_call = approval_item("approval-sticky", "approve-sticky");
+    let exception = approval_item("approval-exception", "approve-exception");
+    let mut approved = state_awaiting(
+        "run-sticky-approve",
+        &[sticky_call.clone(), exception.clone()],
+    );
+    approved.approve(&sticky_call, true).unwrap();
+    approved
+        .reject_with_message(&exception, false, "denied by user")
+        .unwrap();
+    assert!(is_rejected(&approved, &exception));
+    assert_eq!(
+        approved.rejection_message_for(exception.id()),
+        Some("denied by user")
+    );
+    assert_eq!(sticky(&approved), (PermissionDecision::Allow, None));
+
+    let sticky_call = approval_item("approval-sticky", "reject-sticky");
+    let exception = approval_item("approval-exception", "reject-exception");
+    let mut rejected = state_awaiting(
+        "run-sticky-reject",
+        &[sticky_call.clone(), exception.clone()],
+    );
+    rejected
+        .reject_with_message(&sticky_call, true, "denied by default")
+        .unwrap();
+    rejected.approve(&exception, false).unwrap();
+    assert!(is_approved(&rejected, &exception));
+    assert_eq!(rejected.rejection_message_for(exception.id()), None);
+    assert_eq!(
+        sticky(&rejected),
+        (PermissionDecision::Deny, Some("denied by default"))
+    );
+}
+
+/// Ported from the reference's `test_exact_call_reversals_keep_other_calls_on_sticky_default`.
+#[test]
+fn test_exact_call_reversals_keep_other_calls_on_sticky_default() {
+    let sticky_call = approval_item("approval-sticky", "approve-sticky");
+    let exception = approval_item("approval-exception", "approve-exception");
+    let mut approved = state_awaiting(
+        "run-reversal-approve",
+        &[sticky_call.clone(), exception.clone()],
+    );
+    approved.approve(&sticky_call, true).unwrap();
+    approved
+        .reject_with_message(&exception, false, "denied")
+        .unwrap();
+    approved.approve(&exception, false).unwrap();
+    assert!(is_approved(&approved, &exception));
+    assert_eq!(approved.rejection_message_for(exception.id()), None);
+    assert_eq!(sticky(&approved), (PermissionDecision::Allow, None));
+
+    let sticky_call = approval_item("approval-sticky", "reject-sticky");
+    let exception = approval_item("approval-exception", "reject-exception");
+    let mut rejected = state_awaiting(
+        "run-reversal-reject",
+        &[sticky_call.clone(), exception.clone()],
+    );
+    rejected
+        .reject_with_message(&sticky_call, true, "denied by default")
+        .unwrap();
+    rejected.approve(&exception, false).unwrap();
+    rejected
+        .reject_with_message(&exception, false, "denied exactly")
+        .unwrap();
+    assert!(is_rejected(&rejected, &exception));
+    assert_eq!(
+        rejected.rejection_message_for(exception.id()),
+        Some("denied exactly")
+    );
+    assert_eq!(
+        sticky(&rejected),
+        (PermissionDecision::Deny, Some("denied by default"))
+    );
+}
+
+/// A call rejected without text of its own falls back to the sticky rejection's text, whichever
+/// answer came first, and a sticky answer settles the calls of its action still waiting.
+#[test]
+fn test_a_sticky_rejection_supplies_text_to_calls_rejected_without_their_own() {
+    let first = approval_item("approval-a", "call-a");
+    let second = approval_item("approval-b", "call-b");
+    let unanswered = approval_item("approval-c", "call-c");
+    let mut state = state_awaiting(
+        "run-sticky-fallback",
+        &[first.clone(), second.clone(), unanswered.clone()],
+    );
+
+    state.reject(&first, false).unwrap();
+    state
+        .reject_with_message(&second, true, "denied by default")
+        .unwrap();
+
+    assert!(is_rejected(&state, &first));
+    assert_eq!(
+        state.rejection_message_for(first.id()),
+        Some("denied by default")
+    );
+    assert_eq!(
+        state.rejection_message_for(second.id()),
+        Some("denied by default")
+    );
+    assert!(
+        is_rejected(&state, &unanswered),
+        "the sticky rejection settles the call still waiting"
+    );
+    assert_eq!(
+        state.rejection_message_for(unanswered.id()),
+        Some("denied by default")
+    );
+    assert_eq!(state.unanswered_interruption_items().count(), 0);
+}
+
+/// An exact rejection keeps another call's sticky rejection and its text, and its own text.
+#[test]
+fn test_an_exact_rejection_keeps_the_sticky_rejection_of_another_call() {
+    let first = approval_item("approval-a", "call-a");
+    let second = approval_item("approval-b", "call-b");
+    let mut state = state_awaiting("run-sticky-kept", &[first.clone(), second.clone()]);
+
+    state
+        .reject_with_message(&first, true, "denied by default")
+        .unwrap();
+    state
+        .reject_with_message(&second, false, "denied exactly")
+        .unwrap();
+
+    assert_eq!(
+        state.rejection_message_for(first.id()),
+        Some("denied by default")
+    );
+    assert_eq!(
+        state.rejection_message_for(second.id()),
+        Some("denied exactly")
+    );
+    assert_eq!(
+        sticky(&state),
+        (PermissionDecision::Deny, Some("denied by default"))
+    );
+}
+
+/// The reference's sticky value supersedes earlier exact entries of the same tool: a sticky
+/// approval turns an exact rejection into an approval, and a sticky rejection turns an exact
+/// approval into a rejection that keeps no text of its own.
+#[test]
+fn test_a_sticky_answer_supersedes_earlier_exact_answers() {
+    let earlier = approval_item("approval-a", "call-a");
+    let sticky_call = approval_item("approval-b", "call-b");
+    let mut state = state_awaiting(
+        "run-sticky-supersedes",
+        &[earlier.clone(), sticky_call.clone()],
+    );
+    state
+        .reject_with_message(&earlier, false, "denied exactly")
+        .unwrap();
+    state.approve(&sticky_call, true).unwrap();
+    assert!(is_approved(&state, &earlier));
+    assert_eq!(state.rejection_message_for(earlier.id()), None);
+
+    let mut state = state_awaiting(
+        "run-sticky-supersedes-2",
+        &[earlier.clone(), sticky_call.clone()],
+    );
+    state.approve(&earlier, false).unwrap();
+    state
+        .reject_with_message(&sticky_call, true, "denied by default")
+        .unwrap();
+    assert!(is_rejected(&state, &earlier));
+    assert_eq!(
+        state.rejection_message_for(earlier.id()),
+        Some("denied by default")
+    );
+
+    // An exact rejection text survives a later sticky rejection, as the reference keeps its
+    // per-call messages when the sticky value changes to a rejection.
+    let mut state = state_awaiting(
+        "run-sticky-supersedes-3",
+        &[earlier.clone(), sticky_call.clone()],
+    );
+    state
+        .reject_with_message(&earlier, false, "denied exactly")
+        .unwrap();
+    state
+        .reject_with_message(&sticky_call, true, "denied by default")
+        .unwrap();
+    assert_eq!(
+        state.rejection_message_for(earlier.id()),
+        Some("denied exactly")
+    );
+}
+
+/// Ported from the reference's `test_exact_call_override_round_trips_with_sticky_default`.
+#[test]
+fn test_exact_call_override_round_trips_with_sticky_default() {
+    for sticky_approved in [true, false] {
+        let sticky_call = approval_item("approval-sticky", "sticky");
+        let exception = approval_item("approval-exception", "exception");
+        let mut state = state_awaiting(
+            "run-mixed-roundtrip",
+            &[sticky_call.clone(), exception.clone()],
+        );
+        if sticky_approved {
+            state.approve(&sticky_call, true).unwrap();
+            state
+                .reject_with_message(&exception, false, "denied exactly")
+                .unwrap();
+        } else {
+            state
+                .reject_with_message(&sticky_call, true, "denied by default")
+                .unwrap();
+            state.approve(&exception, false).unwrap();
+        }
+
+        let restored: RunState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+
+        assert_eq!(is_approved(&restored, &exception), !sticky_approved);
+        assert_eq!(
+            restored.rejection_message_for(exception.id()),
+            sticky_approved.then_some("denied exactly")
+        );
+        let expected = if sticky_approved {
+            (PermissionDecision::Allow, None)
+        } else {
+            (PermissionDecision::Deny, Some("denied by default"))
+        };
+        assert_eq!(sticky(&restored), expected);
+    }
 }

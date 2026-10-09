@@ -5093,3 +5093,374 @@ async fn test_live_host_event_emission_across_multiple_tools() {
     // Invariant 4: run state next seq advanced to at least 4
     assert!(result.state().next_host_event_seq() >= 4);
 }
+
+fn tool_outputs(result: &RunResult) -> Vec<(String, serde_json::Value, bool)> {
+    result
+        .new_items()
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) => Some((
+                output.call_id().as_str().to_owned(),
+                output.output().clone(),
+                output.is_error(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The reference sends an explicit rejection message back to the model unchanged, and an
+/// `always` rejection reuses it for the calls its rule refuses afterwards.
+#[tokio::test]
+async fn a_rejection_message_reaches_the_model_verbatim_and_sticks_with_always() {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, &cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state
+        .reject_with_message(&items[0], true, "rejected by user")
+        .expect("host rejection must be retained");
+    let second_model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-2", "call-2", "write_file")]),
+        ModelResponse::new(vec![message("msg-3", "ok")]),
+    ]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        tool_outputs(&resumed),
+        vec![
+            ("call-1".to_owned(), json!("rejected by user"), true),
+            ("call-2".to_owned(), json!("rejected by user"), true),
+        ],
+        "the answered call and the later call its rule refuses return the host's text"
+    );
+    let inputs = second_model.input_items.lock().unwrap();
+    assert!(
+        inputs[0].iter().any(|item| matches!(
+            item,
+            ModelInputItem::ToolCallOutput(output) if output.output() == &json!("rejected by user")
+        )),
+        "the model must read the host's text as the call's result"
+    );
+}
+
+/// An empty string is a message too, and a one-off rejection leaves later calls to be asked again.
+#[tokio::test]
+async fn an_empty_rejection_message_is_sent_as_is() {
+    let tool = Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, &cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state
+        .reject_with_message(&items[0], false, "")
+        .expect("host rejection must be retained");
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-2",
+        "call-2",
+        "write_file",
+    )])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert_eq!(
+        tool_outputs(&resumed),
+        vec![("call-1".to_owned(), json!(""), true)]
+    );
+    assert!(
+        matches!(resumed.outcome(), RunOutcome::Interrupted { .. }),
+        "a one-off rejection leaves no rule, so the next call is asked about again"
+    );
+}
+
+async fn interrupted_on_two_calls(
+    tool: &Arc<ScriptedTool>,
+    cancel: &CancelScope,
+) -> (RunState, Vec<RunItem>) {
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![
+        tool_call("c-a", "call-a", "write_file"),
+        tool_call("c-b", "call-b", "write_file"),
+    ])]);
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    assert_eq!(items.len(), 2);
+    (interrupted.state().clone(), items.clone())
+}
+
+fn approval_tool() -> Arc<ScriptedTool> {
+    Arc::new(
+        ScriptedTool::new("write_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    )
+}
+
+/// A call rejected without text falls back to the sticky rejection of the same tool given to
+/// another call, as the reference resolves a rejection message from the exact entry first and
+/// the sticky one second.
+#[tokio::test]
+async fn a_rejection_without_text_resumes_with_the_sticky_rejection_text() {
+    let tool = approval_tool();
+    let cancel = CancelScope::root();
+    let (mut state, items) = interrupted_on_two_calls(&tool, &cancel).await;
+    state.reject(&items[0], false).unwrap();
+    state
+        .reject_with_message(&items[1], true, "denied by default")
+        .unwrap();
+
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "ok")])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        tool_outputs(&resumed),
+        vec![
+            ("call-a".to_owned(), json!("denied by default"), true),
+            ("call-b".to_owned(), json!("denied by default"), true),
+        ]
+    );
+}
+
+/// An exact rejection with its own text keeps another call's sticky rejection, so a later call
+/// is still refused with the sticky text rather than asked about again.
+#[tokio::test]
+async fn an_exact_rejection_keeps_the_sticky_rejection_for_later_calls() {
+    let tool = approval_tool();
+    let cancel = CancelScope::root();
+    let (mut state, items) = interrupted_on_two_calls(&tool, &cancel).await;
+    state
+        .reject_with_message(&items[0], true, "denied by default")
+        .unwrap();
+    state
+        .reject_with_message(&items[1], false, "denied exactly")
+        .unwrap();
+
+    let second_model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![tool_call("c-c", "call-c", "write_file")]),
+        ModelResponse::new(vec![message("msg-3", "ok")]),
+    ]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        tool_outputs(&resumed),
+        vec![
+            ("call-a".to_owned(), json!("denied by default"), true),
+            ("call-b".to_owned(), json!("denied exactly"), true),
+            ("call-c".to_owned(), json!("denied by default"), true),
+        ]
+    );
+}
+
+/// Ported from the reference's `test_resume_executes_only_exact_override_result`: with mixed
+/// answers only the call they authorize runs, and an exact approval runs despite another call's
+/// sticky rejection.
+#[tokio::test]
+async fn resume_executes_only_the_call_mixed_answers_authorize() {
+    for sticky_approved in [true, false] {
+        let tool = approval_tool();
+        let cancel = CancelScope::root();
+        let (mut state, items) = interrupted_on_two_calls(&tool, &cancel).await;
+        if sticky_approved {
+            state.approve(&items[0], true).unwrap();
+            state
+                .reject_with_message(&items[1], false, "denied exactly")
+                .unwrap();
+        } else {
+            state
+                .reject_with_message(&items[0], true, "denied by default")
+                .unwrap();
+            state.approve(&items[1], false).unwrap();
+        }
+        let state: RunState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+
+        let second_model =
+            ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "done")])]);
+        let resumed = Runner::run(resume_request(
+            vec![tool.clone()],
+            &second_model,
+            &cancel,
+            state,
+        ))
+        .await
+        .expect("mixed answers must resume");
+
+        assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        let outputs = tool_outputs(&resumed);
+        let (ran, refused) = if sticky_approved {
+            ("call-a", ("call-b", "denied exactly"))
+        } else {
+            ("call-b", ("call-a", "denied by default"))
+        };
+        assert!(
+            outputs.iter().any(|(call, _, error)| call == ran && !error),
+            "{outputs:?}"
+        );
+        assert!(
+            outputs.iter().any(|(call, output, error)| call == refused.0
+                && output == &json!(refused.1)
+                && *error),
+            "{outputs:?}"
+        );
+    }
+}
+
+/// Ported from the reference's `test_execute_approved_tools_with_rejected_tool_formatter_none_uses_default`:
+/// a rejection without text returns the reference's default sentence.
+#[tokio::test]
+async fn a_rejection_without_text_returns_the_reference_default() {
+    let tool = approval_tool();
+    let cancel = CancelScope::root();
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let interrupted = Runner::run(request(vec![tool.clone()], &first_model, &cancel))
+        .await
+        .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state.reject(&items[0], false).unwrap();
+    let second_model = ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-2", "ok")])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool.clone()],
+        &second_model,
+        &cancel,
+        state,
+    ))
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert_eq!(
+        tool_outputs(&resumed),
+        vec![(
+            "call-1".to_owned(),
+            json!("Tool execution was not approved."),
+            true
+        )]
+    );
+}
+
+/// A sticky rejection without text refuses later calls with the reference's default sentence,
+/// while a configured deny rule keeps the runtime's own refusal.
+#[tokio::test]
+async fn a_sticky_rejection_without_text_refuses_later_calls_with_the_default() {
+    let tool = approval_tool();
+    let configured = Arc::new(ScriptedTool::new("delete_file"));
+    let cancel = CancelScope::root();
+    let first_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let interrupted = Runner::run(request(
+        vec![tool.clone(), configured.clone()],
+        &first_model,
+        &cancel,
+    ))
+    .await
+    .expect("first segment must ask for approval");
+    let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+        panic!("expected an approval interruption");
+    };
+    let mut state = interrupted.state().clone();
+    state.reject(&items[0], true).unwrap();
+    let second_model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-2", "call-2", "write_file"),
+            tool_call("c-3", "call-3", "delete_file"),
+        ]),
+        ModelResponse::new(vec![message("msg-3", "ok")]),
+    ]);
+    let resumed = Runner::run(
+        resume_request(
+            vec![tool.clone(), configured.clone()],
+            &second_model,
+            &cancel,
+            state,
+        )
+        .with_config(RunConfig::new().with_permission_rules([
+            PermissionRule::new(PermissionDecision::Deny).with_tool_name("delete_file"),
+        ])),
+    )
+    .await
+    .expect("rejected checkpoint must resume");
+
+    assert!(matches!(resumed.outcome(), RunOutcome::Completed { .. }));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(configured.calls.load(Ordering::SeqCst), 0);
+    let outputs = tool_outputs(&resumed);
+    let default = json!("Tool execution was not approved.");
+    assert_eq!(outputs[0], ("call-1".to_owned(), default.clone(), true));
+    assert_eq!(outputs[1], ("call-2".to_owned(), default, true));
+    let (call, configured_refusal, error) = &outputs[2];
+    assert_eq!(call, "call-3");
+    assert!(*error);
+    assert!(
+        configured_refusal.get("error").is_some(),
+        "a configured denial keeps the runtime's refusal: {configured_refusal}"
+    );
+}

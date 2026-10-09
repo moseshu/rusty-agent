@@ -813,15 +813,30 @@ async fn admit_permission(
     }
     match permission {
         PermissionDecision::Allow => Ok(None),
-        PermissionDecision::Deny => Ok(Some(refused(
-            &request.call_id,
-            name,
-            &Error::tool(
+        PermissionDecision::Deny => {
+            let error = Error::tool(
                 ToolErrorKind::PermissionDenied,
                 name,
                 "the permission policy denied this tool call",
-            ),
-        ))),
+            );
+            // A deny rule left by an `always` rejection keeps the host's text, which every call it
+            // refuses returns, as the reference reuses a sticky rejection message.
+            if let Some(message) = request
+                .permission
+                .rejection_message(options.permission_scope(), tool.origin())
+            {
+                let output = ToolCallOutput::new(
+                    request.call_id.clone(),
+                    serde_json::Value::String(message.to_owned()),
+                )
+                .with_error(true);
+                return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
+                    output,
+                    error.code(),
+                ))));
+            }
+            Ok(Some(refused(&request.call_id, name, &error)))
+        }
         PermissionDecision::Ask => {
             // The optional pre-approval pass. It exists so nobody is asked to approve a call that
             // is going to be refused anyway — and it does not settle the question: the check after
