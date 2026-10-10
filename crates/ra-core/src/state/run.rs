@@ -112,7 +112,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(9);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(10);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -160,10 +160,17 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
         "Persisted automatic session compaction exchange evidence and append acknowledgement.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(9),
         "Persisted the text a host rejection returns to the model, on the answer and on the deny \
          rule an `always` rejection leaves. An older runtime drops the answer's text and returns \
          its own refusal, and cannot read a session deny rule that carries one.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the state a tool keeps with an approval, and approvals a tool asks for from \
+         inside its invocation. An older runtime resumes such a call without the tool's state, \
+         and dispatches a call that already started as if it had not. Started continuations are \
+         retained after failures so a restored checkpoint cannot repeat their side effects.",
     ),
 ];
 
@@ -820,6 +827,8 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_interruption_resolutions: Vec<PendingInterruptionResolution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    started_tool_continuations: Vec<ItemId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
     input_history_is_complete: bool,
@@ -926,6 +935,8 @@ struct RunStateRecord {
     pending_interruptions: Vec<ItemId>,
     #[serde(default)]
     pending_interruption_resolutions: Vec<PendingInterruptionResolution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    started_tool_continuations: Vec<ItemId>,
     #[serde(default)]
     permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
@@ -985,6 +996,7 @@ impl TryFrom<RunStateRecord> for RunState {
             model_responses,
             pending_interruptions,
             pending_interruption_resolutions,
+            started_tool_continuations,
             permission_rules,
             input_history_is_complete,
             handoff_projection,
@@ -1050,6 +1062,16 @@ impl TryFrom<RunStateRecord> for RunState {
             &pending_interruption_resolutions,
             &pending_interruptions,
         )?;
+        for id in &started_tool_continuations {
+            if !generated_items
+                .iter()
+                .any(|item| item.id() == id && matches!(item.kind(), RunItemKind::ToolApproval(_)))
+            {
+                return Err(Error::caller(
+                    "a started tool continuation names no stored approval",
+                ));
+            }
+        }
         validate_nested_runs(&nested_runs, &run_id)?;
         // A count past the end would make the next append skip records the session never received,
         // and nothing afterwards could tell which ones.
@@ -1111,6 +1133,7 @@ impl TryFrom<RunStateRecord> for RunState {
             model_responses,
             pending_interruptions,
             pending_interruption_resolutions,
+            started_tool_continuations,
             permission_rules,
             input_history_is_complete,
             handoff_projection,
@@ -1160,6 +1183,7 @@ impl RunState {
             model_responses: Vec::new(),
             pending_interruptions: Vec::new(),
             pending_interruption_resolutions: Vec::new(),
+            started_tool_continuations: Vec::new(),
             permission_rules: Vec::new(),
             input_history_is_complete: true,
             handoff_projection: None,
@@ -2148,6 +2172,27 @@ impl RunState {
         &self.permission_rules
     }
 
+    /// Consumes an in-call answer before dispatch, as the reference records execution before
+    /// invoking an approved tool. Kept after failures so restoring their checkpoint cannot replay
+    /// side effects. A subsequent question has its own item identity and remains executable.
+    #[doc(hidden)]
+    pub fn begin_tool_continuation(&mut self, item_id: &ItemId) -> Result<()> {
+        if self.started_tool_continuations.contains(item_id) {
+            return Err(Error::caller(
+                "the approved tool continuation has already executed",
+            ));
+        }
+        if !self
+            .pending_interruption_resolutions
+            .iter()
+            .any(|answer| &answer.item_id == item_id)
+        {
+            return Err(Error::caller("the tool continuation has no host answer"));
+        }
+        self.started_tool_continuations.push(item_id.clone());
+        Ok(())
+    }
+
     /// Marks an answered interruption as represented in history.
     #[doc(hidden)]
     pub fn settle_interruption_resolution(&mut self, item_id: &ItemId) -> Result<()> {
@@ -2377,6 +2422,24 @@ impl RunState {
     #[doc(hidden)]
     pub fn record_generated_items(&mut self, items: impl IntoIterator<Item = RunItem>) {
         self.generated_items.extend(items);
+    }
+
+    /// Adds a subsequent tool question without discarding answers to other pending questions.
+    #[doc(hidden)]
+    pub fn push_pending_interruption(&mut self, item: RunItem) -> Result<()> {
+        if !matches!(item.kind(), RunItemKind::ToolApproval(_))
+            || self
+                .generated_items
+                .iter()
+                .any(|stored| stored.id() == item.id())
+        {
+            return Err(Error::caller(
+                "a subsequent interruption must be a new tool approval",
+            ));
+        }
+        self.pending_interruptions.push(item.id().clone());
+        self.generated_items.push(item);
+        Ok(())
     }
 
     /// Appends a completed model response to the checkpoint's resume projection.

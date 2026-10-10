@@ -41,7 +41,7 @@ use ra_core::{
         ContextSummaryRequest, ContextSummaryResponse, LoadSignal,
     },
     context::RunContext,
-    error::{BudgetKind, Error, ProviderErrorKind, Result},
+    error::{BudgetKind, Error, ProviderErrorKind, Result, ToolErrorKind},
     event::{HostEvent, HostEventSink},
     filter::{
         ContextFilter, ContextFilterChain, ContextFilterReport, ContextFilterRequest,
@@ -56,10 +56,11 @@ use ra_core::{
     hook::{HookDecision, HookEvent, HookEventName, StopHookData},
     item::{
         CallId, ItemId, ItemProvenance, Message, MessageRole, ModelInputItem, ModelResponse,
-        OutputPhase, RunItem, RunItemKind, ToolApproval, ToolCallOutput,
+        OutputPhase, RunItem, RunItemKind, ToolApproval, ToolCallOutput, ToolResume,
     },
     lifecycle::{
         AgentEndInput, AgentStartInput, HandoffInput, LifecycleHook, LlmEndInput, LlmStartInput,
+        ToolEndInput, ToolStartInput,
     },
     model::{
         Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
@@ -2060,7 +2061,12 @@ async fn run_loop_inner(
         // and results the stop policy promotes end the run as they would have ended that turn,
         // through the same stop hook, delivery and output checks.
         let resumed_from = progress.segment_items(&state).len();
-        let resumed = resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle).await?;
+        let resumed = resolve_interrupted_turn(&context, &agent, &mut state, &lifecycle)
+            .await
+            .map_err(|error| {
+                state.snapshot_event_seq(context.event_seqs);
+                error.with_run_state(state.clone())
+            })?;
         // The turn this segment finishes was settled on a spent shared budget, or the budget was
         // spent while it waited: as at the end of a turn, it ends the run once its answers are in.
         if continues_turn
@@ -2514,9 +2520,23 @@ async fn resolve_interrupted_turn(
                 let message = state
                     .rejection_message_for(answer.item_id())
                     .map(str::to_owned);
+                end_rejected_continuation(
+                    context,
+                    agent,
+                    state,
+                    lifecycle,
+                    &approval,
+                    message.as_deref(),
+                )
+                .await?;
                 rejection(&approval, message.as_deref())
             }
             InterruptionResolution::Approve { .. } => {
+                if approval.resume().is_some_and(|resume| {
+                    resume.point() == ra_core::item::ToolResumePoint::DuringCall
+                }) {
+                    state.begin_tool_continuation(answer.item_id())?;
+                }
                 let resumed =
                     match run_approved_call(context, agent, state, lifecycle, &approval).await {
                         Ok(resumed) => resumed,
@@ -2545,6 +2565,11 @@ async fn resolve_interrupted_turn(
                     ResumedOutcome::Paused(nested) => {
                         paused.push(*nested);
                         state.settle_interruption_resolution(answer.item_id())?;
+                        continue;
+                    }
+                    ResumedOutcome::Awaiting(approval) => {
+                        state.settle_interruption_resolution(answer.item_id())?;
+                        record_followup_approval(context, state, *approval, provenance)?;
                         continue;
                     }
                 }
@@ -2596,6 +2621,10 @@ async fn resolve_interrupted_turn(
                 paused.push(*nested);
                 continue;
             }
+            ResumedOutcome::Awaiting(approval) => {
+                record_followup_approval(context, state, *approval, None)?;
+                continue;
+            }
         };
         outcomes.push(outcome);
         // Attributed as the batch attributes the output of a call it settles: to the public agent
@@ -2615,6 +2644,29 @@ async fn resolve_interrupted_turn(
         failure.record_turn(agent.public_id(), outcomes);
     }
     end_resume_stage(context, agent, state, paused, &tool_results).await
+}
+
+/// Records a new question reached by a resumed tool without replacing the other pending answers.
+fn record_followup_approval(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    approval: ToolApproval,
+    provenance: Option<ItemProvenance>,
+) -> Result<()> {
+    let mut item = RunItem::new(
+        ItemId::new(format!(
+            "{}.approval.{}",
+            approval.call_id(),
+            state.generated_items().len()
+        )),
+        RunItemKind::ToolApproval(approval),
+    );
+    if let Some(provenance) = provenance {
+        item = item.with_provenance(provenance);
+    }
+    state.push_pending_interruption(item.clone())?;
+    emit(context.events, RunStreamEvent::Item(item));
+    Ok(())
 }
 
 /// Where the host's answers leave a paused agent-tool run, judged over its whole nested tree.
@@ -2719,6 +2771,73 @@ fn rejection(
     (output, outcome)
 }
 
+/// Rebuilds the run view shared by invocation and continuation closeout.
+fn resumed_run_context(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &RunState,
+) -> RunContext {
+    let mut run = RunContext::new(context.run_id.clone(), agent.public())
+        .with_budget(state.budget().clone())
+        .with_usage_totals(context.spend.shared_usage())
+        .with_pending_control_requests(state.pending_control_requests().to_vec())
+        .with_event_seq_allocator(context.event_seqs.clone());
+    if let Some(app_context) = context.app_context {
+        run = run.with_app_context(Arc::clone(app_context));
+    }
+    if let Some(tool_input) = context.tool_input {
+        run = run.with_tool_input(Arc::clone(tool_input));
+    }
+    run
+}
+
+/// A rejected in-call question settles an invocation that already announced its start.
+async fn end_rejected_continuation(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &RunState,
+    lifecycle: &LifecycleHooks,
+    approval: &ToolApproval,
+    message: Option<&str>,
+) -> Result<()> {
+    if lifecycle.is_empty()
+        || !approval
+            .resume()
+            .is_some_and(|resume| resume.point() == ra_core::item::ToolResumePoint::DuringCall)
+    {
+        return Ok(());
+    }
+    let Some(tool) = agent
+        .execution()
+        .tools()
+        .iter()
+        .find(|tool| Some(tool.origin().lookup_key()) == approval.lookup_key())
+    else {
+        return Err(Error::caller(
+            "the rejected continuation's tool is no longer available",
+        ));
+    };
+    let run = resumed_run_context(context, agent, state);
+    let start = ToolStartInput::new(
+        &run,
+        tool.origin(),
+        approval.call_id(),
+        approval.arguments(),
+    )
+    .with_services(context.services);
+    let outcome = Err(Error::tool(
+        ToolErrorKind::PermissionDenied,
+        tool.origin().qualified_name(),
+        message.unwrap_or(crate::permission::DEFAULT_APPROVAL_REJECTION_MESSAGE),
+    ));
+    lifecycle_dispatch::tool_end(
+        lifecycle,
+        &ToolEndInput::new(start, &outcome),
+        context.cancel,
+    )
+    .await
+}
+
 /// Runs a call the host approved before the checkpoint was taken.
 async fn run_approved_call(
     context: &TurnLoopContext<'_>,
@@ -2743,6 +2862,7 @@ async fn run_approved_call(
             call_id: approval.call_id(),
             arguments: approval.arguments(),
             nested: None,
+            resume: approval.resume().cloned(),
         },
     )
     .await
@@ -2779,6 +2899,7 @@ async fn continue_paused_run(
             call_id: &call_id,
             arguments: &arguments,
             nested: Some(checkpoint),
+            resume: None,
         },
     )
     .await
@@ -2791,6 +2912,8 @@ struct ResumedCall<'a> {
     arguments: &'a serde_json::Value,
     /// The paused nested run the call continues; `None` for a call the host approved.
     nested: Option<RunState>,
+    /// The state the tool kept with the approval the host answered.
+    resume: Option<ToolResume>,
 }
 
 /// How a call dispatched on resume ended.
@@ -2810,6 +2933,8 @@ enum ResumedOutcome {
     },
     /// Its nested run stopped on a question again.
     Paused(Box<NestedRunRef>),
+    /// The tool reached another approval boundary inside its invocation.
+    Awaiting(Box<ToolApproval>),
 }
 
 /// Runs one call the host approved before the checkpoint was taken, or continues one whose nested
@@ -2835,6 +2960,7 @@ async fn execute_resumed_call(
         call_id,
         arguments,
         nested,
+        resume,
     } = call;
     // The execution instance's tools, because that is what runs: a capability contributes tools
     // to it alone, and a call the host approved on one of those must still find it on resume.
@@ -2850,17 +2976,7 @@ async fn execute_resumed_call(
             ))
         })?;
 
-    let mut run = RunContext::new(context.run_id.clone(), agent.public())
-        .with_budget(state.budget().clone())
-        .with_usage_totals(context.spend.shared_usage())
-        .with_pending_control_requests(state.pending_control_requests().to_vec())
-        .with_event_seq_allocator(context.event_seqs.clone());
-    if let Some(app_context) = context.app_context {
-        run = run.with_app_context(Arc::clone(app_context));
-    }
-    if let Some(tool_input) = context.tool_input {
-        run = run.with_tool_input(Arc::clone(tool_input));
-    }
+    let run = resumed_run_context(context, agent, state);
 
     // The streak already counts this call: settlement recorded the attempt before it interrupted,
     // so the breaker sees the same history here that it would have seen had the host answered
@@ -2893,9 +3009,10 @@ async fn execute_resumed_call(
     .with_tool_guardrails(context.tool_guardrails.clone())
     .with_user_hooks(context.config.user_hooks().clone())
     .with_lifecycle_hooks(lifecycle.clone());
-    let request = match nested {
-        Some(checkpoint) => request.with_nested_resume(checkpoint),
-        None => request.with_approval_granted(),
+    let request = match (nested, resume) {
+        (Some(checkpoint), _) => request.with_nested_resume(checkpoint),
+        (None, Some(resume)) => request.with_approval_granted().with_resume(resume),
+        (None, None) => request.with_approval_granted(),
     };
     let (dispatch, guardrails) = dispatch_tool(request).await?.into_parts();
     let (input_verdicts, output_verdicts) = guardrails.into_parts();
@@ -2930,9 +3047,9 @@ async fn execute_resumed_call(
                 tool_result: None,
             })
         }
-        ToolDispatch::AwaitingApproval(_) => Err(Error::caller(
-            "an approved tool call requested approval again",
-        )),
+        ToolDispatch::AwaitingApproval(approval) => {
+            Ok(ResumedOutcome::Awaiting(Box::new(approval)))
+        }
         ToolDispatch::AwaitingNestedApproval(nested) => Ok(ResumedOutcome::Paused(nested)),
     }
 }

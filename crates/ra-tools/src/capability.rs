@@ -189,6 +189,17 @@ impl ShellCapability {
         self
     }
 
+    /// Installs the host command policy, including what follows a sandbox denial, while
+    /// retaining the session manager.
+    #[must_use]
+    pub fn with_command_policy(
+        mut self,
+        policy: Arc<dyn crate::exec_command::ExecCommandPolicy>,
+    ) -> Self {
+        self.exec_command = Arc::new((*self.exec_command).clone().with_command_policy(policy));
+        self
+    }
+
     /// The entry that starts a command in the workspace.
     #[must_use]
     pub fn exec_command(&self) -> Arc<dyn Tool> {

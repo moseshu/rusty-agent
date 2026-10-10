@@ -221,6 +221,64 @@ impl ToolCallOutput {
     }
 }
 
+/// Where an approved call resumes: before it started, or inside the invocation that asked.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResumePoint {
+    /// The approval was asked before the tool was invoked. The approved call is dispatched again
+    /// through every stage, as any approved call is.
+    BeforeCall,
+    /// The tool was invoked and asked from inside the invocation. The approved call continues that
+    /// invocation: it was admitted, checked and announced when it started, so it is not again.
+    DuringCall,
+}
+
+/// What a tool asked to keep with its approval, handed back to it when the approved call resumes.
+///
+/// The state is the tool's own and opaque to the runtime, which stores it with the approval and
+/// returns it through [`ToolContext::resume_state`](crate::tool::ToolContext::resume_state). It
+/// is how a tool keeps what it decided, or how far it got, across an approval that may be answered
+/// in another process: an interrupted run cannot hold a tool's stack frame while it waits.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResume {
+    point: ToolResumePoint,
+    state: Value,
+}
+
+impl ToolResume {
+    /// State a tool keeps with an approval asked before it is invoked.
+    #[must_use]
+    pub const fn before_call(state: Value) -> Self {
+        Self {
+            point: ToolResumePoint::BeforeCall,
+            state,
+        }
+    }
+
+    /// State a tool keeps with an approval it asks from inside its invocation.
+    #[must_use]
+    pub const fn during_call(state: Value) -> Self {
+        Self {
+            point: ToolResumePoint::DuringCall,
+            state,
+        }
+    }
+
+    /// Where the approved call resumes.
+    #[must_use]
+    pub const fn point(&self) -> ToolResumePoint {
+        self.point
+    }
+
+    /// The tool's state.
+    #[must_use]
+    pub const fn state(&self) -> &Value {
+        &self.state
+    }
+}
+
 /// A tool call awaiting host approval.
 ///
 /// This is a control-plane record. It may be stored in a session or carried by an interruption,
@@ -239,6 +297,9 @@ pub struct ToolApproval {
     lookup_key: Option<Box<ToolLookupKey>>,
     #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
     kind: ToolCallKind,
+    // Boxed for the reason `lookup_key` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<Box<ToolResume>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -255,8 +316,22 @@ impl ToolApproval {
             namespace: None,
             lookup_key: None,
             kind: ToolCallKind::Function,
+            resume: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Keeps the tool's state with this approval, to hand back when the approved call resumes.
+    #[must_use]
+    pub fn with_resume(mut self, resume: ToolResume) -> Self {
+        self.resume = Some(Box::new(resume));
+        self
+    }
+
+    /// The tool's state kept with this approval, if it asked to keep any.
+    #[must_use]
+    pub fn resume(&self) -> Option<&ToolResume> {
+        self.resume.as_deref()
     }
 
     /// Records whether this belongs to a function tool or a custom one.

@@ -50,6 +50,9 @@ pub struct ExecOutputSummary {
     exit_code: Option<i32>,
     #[serde(default)]
     is_truncated: bool,
+    /// Host termination is distinct from a process exit, even when it prints a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    termination_reason: Option<ExecEvictionReason>,
     /// What confined the command, when the executor was asked to confine it.
     ///
     /// Absent in records written before this field existed, and absent is not "unconfined": a
@@ -79,6 +82,7 @@ impl ExecOutputSummary {
             duration_ms: 0,
             exit_code: None,
             is_truncated: false,
+            termination_reason: None,
             sandbox: None,
             unknown: Unknown::new(),
         }
@@ -95,6 +99,19 @@ impl ExecOutputSummary {
     #[must_use]
     pub const fn sandbox(&self) -> Option<&SandboxReport> {
         self.sandbox.as_ref()
+    }
+
+    /// Records why the host terminated the command instead of observing its exit.
+    #[must_use]
+    pub fn with_termination_reason(mut self, reason: ExecEvictionReason) -> Self {
+        self.termination_reason = Some(reason);
+        self
+    }
+
+    /// Why the host terminated the command, when it did.
+    #[must_use]
+    pub const fn termination_reason(&self) -> Option<&ExecEvictionReason> {
+        self.termination_reason.as_ref()
     }
 
     /// Sets the byte count for standard output.

@@ -37,22 +37,25 @@ use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     event::exec::ExecSessionId,
+    item::CallId,
+    state::{ArgumentFingerprint, RunId},
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool, ToolApprovalPolicy,
-        ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
-        ToolOrigin, ToolOutput, ToolSchema, Truncation, TruncationStage,
+        ToolApprovalRequest, ToolArgumentDecodeError, ToolConcurrency, ToolContext,
+        ToolFailureHandling, ToolLookupKey, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        Truncation, TruncationStage,
     },
 };
 use ra_exec::{
     command::{ExecLimits, ExecRequest},
     fs::{RootedFileSystem, Workspace},
     output::ExecOutputSummary,
-    sandbox::ExecEnvironment,
+    sandbox::{ExecEnvironment, is_likely_sandbox_denied},
     session::{ExecError, ExecExecutionResult, ExecSessionState, ProcessManager},
 };
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::session_return::{ReturnReason, SessionReturn, Watched};
 
@@ -199,8 +202,55 @@ pub struct ExecCommandTool {
     limits: ExecCommandLimits,
     root: Option<PathBuf>,
     rooted_filesystem: Option<Arc<RootedFileSystem>>,
-    environment_resolver: Option<Arc<EnvironmentResolver>>,
-    approval_resolver: Option<Arc<ApprovalResolver>>,
+    policy: Option<Arc<dyn ExecCommandPolicy>>,
+}
+
+/// Prepared command and policy state kept with the approval. The request owns defaults and the
+/// resolved working directory, so restoring a question cannot select a different command.
+#[derive(Serialize, Deserialize)]
+struct ExecCommandResume {
+    run_id: RunId,
+    call_id: CallId,
+    tool: ToolLookupKey,
+    arguments: ArgumentFingerprint,
+    policy_state: serde_json::Value,
+    request: ExecRequest,
+}
+
+impl ExecCommandResume {
+    fn new(
+        context: &ToolContext<'_>,
+        policy_state: serde_json::Value,
+        request: ExecRequest,
+    ) -> Self {
+        Self {
+            run_id: context.run().run_id().clone(),
+            call_id: context.call_id().clone(),
+            tool: context.origin().lookup_key().clone(),
+            arguments: ArgumentFingerprint::compute(context.arguments()),
+            policy_state,
+            request,
+        }
+    }
+
+    fn encode(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self)
+            .map_err(|error| Error::caller(format!("cannot save command approval: {error}")))
+    }
+
+    fn check(&self, context: &ToolContext<'_>) -> Result<()> {
+        if self.run_id != *context.run().run_id()
+            || self.call_id != *context.call_id()
+            || self.tool != *context.origin().lookup_key()
+            || self.arguments != ArgumentFingerprint::compute(context.arguments())
+        {
+            return Err(Error::caller(format!(
+                "Model reused tool call ID `{}` for a different invocation. Use a unique call ID for each tool invocation.",
+                context.call_id()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Host callback evaluated against the immutable context captured for a model step.
@@ -209,11 +259,133 @@ pub type EnvironmentResolver = dyn Fn(&ToolContext<'_>) -> Result<ExecEnvironmen
 /// Host approval callback evaluated for each command.
 pub type ApprovalResolver = dyn Fn(&ToolContext<'_>) -> Result<bool> + Send + Sync;
 
-/// The error an [`EnvironmentResolver`] returns to refuse a command: the model reads `reason`
+/// The error an [`ExecCommandPolicy`] returns to refuse a command: the model reads `reason`
 /// verbatim as the command's result, as Codex returns a rejected command's reason.
 #[must_use]
 pub fn rejection(reason: impl Into<String>) -> Error {
     ExecCommandFailure::Rejected(reason.into()).into_error()
+}
+
+/// Codex's launch grace period: only a sandbox refusal detected while opening the process
+/// enters the orchestrator's retry path. Later refusals are returned as command output.
+const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+
+/// The host policy deciding whether each command asks first, and in which sandbox it runs: the
+/// part of Codex's tool orchestrator a host supplies.
+///
+/// The tool calls it in order: [`Self::needs_approval`] and, when the call asks,
+/// [`Self::approval_state`] before the call; [`Self::attempt`] for the environment the command runs
+/// in; and [`Self::on_sandbox_denial`] when that attempt's sandbox most likely refused the command
+/// as it started. Each is handed the call's context, including
+/// [`ToolContext::resume_state`] when the call resumes from an approval.
+pub trait ExecCommandPolicy: Send + Sync {
+    /// Whether the call asks its host before it runs.
+    ///
+    /// # Errors
+    ///
+    /// An error fails the run, as [`Tool::needs_approval`]'s does.
+    fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool>;
+
+    /// State to keep with the approval the call asks for: see [`Tool::approval_state`].
+    ///
+    /// # Errors
+    ///
+    /// An error fails the run.
+    fn approval_state(&self, _context: &ToolContext<'_>) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    /// The environment the call's command runs in.
+    ///
+    /// # Errors
+    ///
+    /// A [`rejection`] refuses the command with its reason; any other error is the call's failure.
+    fn attempt(&self, context: &ToolContext<'_>) -> Result<ExecCommandAttempt>;
+
+    /// What follows an attempt its sandbox most likely refused as the command started. The default
+    /// returns the attempt's output.
+    ///
+    /// # Errors
+    ///
+    /// An error is the call's failure.
+    fn on_sandbox_denial(
+        &self,
+        _context: &ToolContext<'_>,
+        _attempt: &ExecCommandAttempt,
+        _output: &ExecOutputSummary,
+    ) -> Result<SandboxDenialAction> {
+        Ok(SandboxDenialAction::Return)
+    }
+}
+
+/// The environment one attempt runs a command in, with whatever the policy wants back if the
+/// sandbox refuses it.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ExecCommandAttempt {
+    environment: ExecEnvironment,
+    state: Option<serde_json::Value>,
+}
+
+impl ExecCommandAttempt {
+    /// An attempt in `environment`.
+    #[must_use]
+    pub const fn new(environment: ExecEnvironment) -> Self {
+        Self {
+            environment,
+            state: None,
+        }
+    }
+
+    /// Keeps `state` for [`ExecCommandPolicy::on_sandbox_denial`].
+    #[must_use]
+    pub fn with_state(mut self, state: serde_json::Value) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// The environment the command runs in.
+    #[must_use]
+    pub const fn environment(&self) -> &ExecEnvironment {
+        &self.environment
+    }
+
+    /// The state the policy kept with this attempt.
+    #[must_use]
+    pub const fn state(&self) -> Option<&serde_json::Value> {
+        self.state.as_ref()
+    }
+}
+
+/// What follows an attempt its sandbox refused: the branches of Codex's orchestrator after a
+/// sandbox denial.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum SandboxDenialAction {
+    /// The attempt's output is the call's result.
+    Return,
+    /// Run the command again in this environment, without asking.
+    Retry(Box<ExecEnvironment>),
+    /// Ask the host before running it again; the call resumes with this state in
+    /// [`ToolContext::resume_state`] once approved.
+    RequestApproval(serde_json::Value),
+}
+
+/// The policy [`ExecCommandTool::with_policy_resolvers`] installs: an environment and an approval
+/// callback, and no retry after a sandbox denial.
+struct ResolverPolicy {
+    environment: Arc<EnvironmentResolver>,
+    approval: Arc<ApprovalResolver>,
+}
+
+impl ExecCommandPolicy for ResolverPolicy {
+    fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        (self.approval)(context)
+    }
+
+    fn attempt(&self, context: &ToolContext<'_>) -> Result<ExecCommandAttempt> {
+        (self.environment)(context).map(ExecCommandAttempt::new)
+    }
 }
 
 impl fmt::Debug for ExecCommandTool {
@@ -239,8 +411,7 @@ impl ExecCommandTool {
             limits: ExecCommandLimits::new(),
             root: None,
             rooted_filesystem: None,
-            environment_resolver: None,
-            approval_resolver: None,
+            policy: None,
         })
     }
 
@@ -273,8 +444,7 @@ impl ExecCommandTool {
             limits: ExecCommandLimits::new(),
             root: Some(workspace.root().to_path_buf()),
             rooted_filesystem: Some(Arc::clone(workspace.filesystem())),
-            environment_resolver: None,
-            approval_resolver: None,
+            policy: None,
         })
     }
 
@@ -297,11 +467,31 @@ impl ExecCommandTool {
         environment: Arc<EnvironmentResolver>,
         approval: Arc<ApprovalResolver>,
     ) -> Self {
-        self.func_schema = self.policy_func_schema.clone();
-        self.environment_resolver = Some(environment);
-        self.approval_resolver = Some(approval);
-        self.options = self.options.with_approval(ToolApprovalPolicy::Dynamic);
+        self.install_policy(Arc::new(ResolverPolicy {
+            environment,
+            approval,
+        }));
         self
+    }
+
+    /// Installs the host policy that decides whether each command asks first and in which
+    /// sandbox it runs, including after its sandbox refuses it.
+    ///
+    /// The tool then advertises and accepts Codex's approval arguments, `sandbox_permissions`,
+    /// `justification` and `prefix_rule`, which the policy reads from the call's arguments.
+    #[must_use]
+    pub fn with_command_policy(mut self, policy: Arc<dyn ExecCommandPolicy>) -> Self {
+        self.install_policy(policy);
+        self
+    }
+
+    fn install_policy(&mut self, policy: Arc<dyn ExecCommandPolicy>) {
+        self.func_schema = self.policy_func_schema.clone();
+        self.policy = Some(policy);
+        self.options = self
+            .options
+            .clone()
+            .with_approval(ToolApprovalPolicy::Dynamic);
     }
 
     /// Replaces the output and execution ceilings.
@@ -373,7 +563,22 @@ impl ExecCommandTool {
         if let Some(cwd) = cwd {
             request = request.with_cwd(cwd);
         }
-        Ok(request)
+        let limits = request.limits().tightened_by(self.process_manager.limits());
+        Ok(request.with_limits(limits))
+    }
+
+    fn policy_context<'a>(
+        &'a self,
+        context: &'a ToolContext<'_>,
+        resume: Option<&'a ExecCommandResume>,
+    ) -> ToolContext<'a> {
+        let context = ToolContext::new(context.run(), self, context.call_id(), context.arguments())
+            .with_caller(context.caller())
+            .with_services(context.services());
+        match resume {
+            Some(resume) => context.with_resume_state(&resume.policy_state),
+            None => context,
+        }
     }
 
     /// Resolves a requested working directory against the workspace root.
@@ -455,40 +660,119 @@ impl Tool for ExecCommandTool {
     }
 
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
-        self.approval_resolver
+        // Check invocation identity first, including changed arguments that are themselves invalid.
+        let needs_approval = self
+            .policy
             .as_ref()
-            .map_or(Ok(true), |resolve| resolve(context))
+            .map_or(Ok(true), |policy| policy.needs_approval(context))?;
+        // Invalid requests are handled by the invocation's normal failure renderer, so the model
+        // can correct them without asking the host to approve a command that cannot start.
+        let input = if self.policy.is_some() {
+            serde_json::from_value::<PolicyExecCommandInput>(context.arguments().clone())
+                .map(ExecCommandInput::from)
+        } else {
+            serde_json::from_value::<ExecCommandInput>(context.arguments().clone())
+        };
+        let Ok(input) = input else {
+            return Ok(false);
+        };
+        if self.request(input).is_err() {
+            return Ok(false);
+        }
+        Ok(needs_approval)
+    }
+
+    async fn approval_state(&self, context: &ToolContext<'_>) -> Result<Option<serde_json::Value>> {
+        let Some(policy_state) = self
+            .policy
+            .as_ref()
+            .map_or(Ok(None), |policy| policy.approval_state(context))?
+        else {
+            return Ok(None);
+        };
+        let input: PolicyExecCommandInput = serde_json::from_value(context.arguments().clone())
+            .map_err(|error| rejection(format!("invalid arguments: {error}")))?;
+        let request = self
+            .request(input.into())
+            .map_err(ExecCommandFailure::into_error)?;
+        ExecCommandResume::new(context, policy_state, request)
+            .encode()
+            .map(Some)
     }
 
     async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
-        // Consume the host's frozen decision before input or working-directory validation can
-        // fail, so an attempted call does not leave an executable decision behind.
-        let environment = self
-            .environment_resolver
+        let resume = context
+            .resume_state()
+            .map(|state| {
+                serde_json::from_value::<ExecCommandResume>(state.clone()).map_err(|error| {
+                    Error::caller(format!("cannot restore command approval: {error}"))
+                })
+            })
+            .transpose()?;
+        if let Some(resume) = &resume {
+            if self.policy.is_none() {
+                return Err(Error::caller(
+                    "restoring a command approval requires its execution policy",
+                ));
+            }
+            resume.check(&context)?;
+        }
+        // Consume approval before execution can fail, including spawning and cancellation.
+        let attempt = self
+            .policy
             .as_ref()
-            .map(|resolve| resolve(&context))
+            .map(|policy| policy.attempt(&self.policy_context(&context, resume.as_ref())))
             .transpose()?
-            .unwrap_or_else(|| self.process_manager.environment().clone());
-        let input = if self.environment_resolver.is_some() {
-            self.take_input::<PolicyExecCommandInput>(&mut context)?
-                .into()
+            .unwrap_or_else(|| ExecCommandAttempt::new(self.process_manager.environment().clone()));
+        let request = if let Some(resume) = &resume {
+            resume.request.clone()
         } else {
-            self.take_input::<ExecCommandInput>(&mut context)?
-        };
-        let request = self
-            .request(input)
-            .map_err(ExecCommandFailure::into_error)?
-            .with_call_id(context.call_id().as_str());
+            let input = if self.policy.is_some() {
+                self.take_input::<PolicyExecCommandInput>(&mut context)?
+                    .into()
+            } else {
+                self.take_input::<ExecCommandInput>(&mut context)?
+            };
+            self.request(input)
+                .map_err(ExecCommandFailure::into_error)?
+        }
+        .with_call_id(context.call_id().as_str());
         // Read before the request is handed over, because the yielded result reports how long it
         // waited and the effective figure is the one the request carries, not the one asked for.
         let yielded_after = request.limits().initial_yield_timeout();
 
         let emitter = context.event_emitter();
-        let outcome = self
+        let mut outcome = self
             .process_manager
-            .execute_with_environment(request, emitter.as_ref(), &environment)
+            .execute_with_environment(request.clone(), emitter.as_ref(), attempt.environment())
             .await
             .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
+
+        // Only startup refusals enter Codex's orchestrator. A later refusal is command output;
+        // replaying the whole command could duplicate side effects from its earlier operations.
+        if let (Some(policy), ExecExecutionResult::Completed(summary)) = (&self.policy, &outcome)
+            && summary.duration() <= EARLY_EXIT_GRACE_PERIOD
+            && is_likely_sandbox_denied(summary)
+        {
+            match policy.on_sandbox_denial(
+                &self.policy_context(&context, resume.as_ref()),
+                &attempt,
+                summary,
+            )? {
+                SandboxDenialAction::Retry(environment) => {
+                    outcome = self
+                        .process_manager
+                        .execute_with_environment(request, emitter.as_ref(), environment.as_ref())
+                        .await
+                        .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
+                }
+                SandboxDenialAction::RequestApproval(state) => {
+                    let state = ExecCommandResume::new(&context, state, request).encode()?;
+                    return Err(ToolApprovalRequest::new(state).into_error(TOOL_NAME));
+                }
+                SandboxDenialAction::Return => {}
+            }
+        }
 
         Ok(match outcome {
             ExecExecutionResult::Completed(summary) => completed_output(&summary),

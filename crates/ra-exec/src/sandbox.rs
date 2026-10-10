@@ -21,6 +21,7 @@
 
 #[cfg(feature = "bwrap")]
 pub mod bwrap;
+mod denial;
 #[cfg(feature = "docker")]
 pub mod docker;
 pub mod manifest;
@@ -38,6 +39,8 @@ use std::{
 
 use ra_core::compat::{SchemaVersion, Unknown};
 use serde::{Deserialize, Serialize};
+
+pub use denial::is_likely_sandbox_denied;
 
 use crate::{
     EXEC_SCHEMA_VERSION,

@@ -27,8 +27,19 @@
 //! A call is decided once, when its approval is asked, and runs as decided, as Codex's handler
 //! decides a command once before asking and running it: an amendment approved meanwhile, see
 //! [`CodingThreadSettings::persist_approved_execpolicy_amendment`], changes later calls and not
-//! this one. The decision is held in memory between the two, so a call resumed in another process
-//! is decided again when it runs.
+//! this one. The prepared command, selected sandbox, environment configuration and approval flags
+//! travel with the approval as the tool's resume state (see
+//! [`ra_core::item::ToolResume`]), so it holds however and wherever the approval is answered.
+//!
+//! A sandbox refusal within Codex's 150 ms launch grace period follows its orchestrator: under
+//! `Never` and `OnRequest` its output is the result; otherwise it runs again outside the sandbox, without
+//! asking when the call was already approved and after the host approves it when it was not. That
+//! approval is asked from inside the invocation (see [`ra_core::tool::ToolApprovalRequest`]), which
+//! is the adaptation an interrupted run needs where Codex waits inside its orchestrator: the state
+//! it keeps says the first attempt ran, so the approved call runs only the retry, with the decision
+//! made before the first attempt. Later refusals are returned as output without replaying the
+//! command, whose earlier operations may already have produced side effects.
+//!
 //! Invocation identity covers the tool and complete arguments. Settled calls retain only their
 //! identity until the turn ends, preventing call-ID reuse. The app-server listener forwards events
 //! to [`ThreadSettingsAdapter::on_thread_event`] for cleanup; an embedding host loading threads
@@ -51,16 +62,19 @@ use ra_core::{
     state::{ArgumentFingerprint, RunId},
     tool::{ToolContext, ToolLookupKey},
 };
+use ra_exec::output::ExecOutputSummary;
 use ra_exec::sandbox::{
     ExecEnvironment, NetworkAccess as ExecNetworkAccess, SandboxLevel,
     SandboxPolicy as ExecSandboxPolicy,
+    unix_local::{EnvPolicy, ResourceLimits},
 };
 use ra_protocol::server::{
     ReviewDecision, ThreadSettingsAdapter,
     protocol::{ApprovalsReviewer, AskForApproval, SandboxPolicy, ThreadPolicyOverrides},
 };
 use ra_runtime::{permission::PermissionEngine, runner::RunConfig, thread::ThreadEvent};
-use serde::Deserialize;
+use ra_tools::exec_command::{ExecCommandAttempt, ExecCommandPolicy, SandboxDenialAction};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -335,39 +349,254 @@ fn install(config: RunConfig, settings: CodingThreadSettings) -> RunConfig {
         .with_app_context(Arc::new(settings))
 }
 
-pub(crate) fn command_environment(
-    context: &ToolContext<'_>,
-    base: &ExecEnvironment,
-) -> Result<ExecEnvironment> {
-    let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
-        return Ok(base.clone());
-    };
-    // The call runs as it was decided when its approval was asked; one decided for the first time
-    // here, without asking, is decided the same way. A forbidden command is refused with Codex's
-    // reason.
-    let decision = settings
-        .command_decisions
-        .begin_execution(context, || command_decision(context, settings))?;
-    if let ExecApprovalRequirement::Forbidden { reason } = decision.requirement {
-        return Err(ra_tools::exec_command::rejection(reason));
+/// The coding product's [`ExecCommandPolicy`]: Codex's command policy, and its orchestrator's
+/// first attempt and retry after a sandbox denial, over the executor's `base` environment.
+pub(crate) struct CodingCommandPolicy {
+    base: ExecEnvironment,
+}
+
+impl CodingCommandPolicy {
+    pub(crate) const fn new(base: ExecEnvironment) -> Self {
+        Self { base }
     }
-    // Codex's first-attempt sandbox override: a command every rule explicitly allows, or an
-    // approved `require_escalated` one, runs outside the sandbox. Codex keeps the sandbox when the
-    // policy denies reads; the policies this adapter lowers have no denied reads.
-    let bypass_sandbox = matches!(
-        decision.requirement,
-        ExecApprovalRequirement::Skip {
-            bypass_sandbox: true,
-            ..
+
+    fn environment(&self, decision: &CommandDecision) -> ExecEnvironment {
+        let environment = self.base.clone().with_sandbox(decision.sandbox.clone());
+        if decision.allow_temp_dir {
+            environment
+        } else {
+            environment.without_temp_dir()
         }
-    ) || decision
-        .sandbox_permissions
-        .requires_escalated_permissions();
-    if bypass_sandbox {
-        return Ok(base
-            .clone()
-            .with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined)));
     }
+}
+
+impl ExecCommandPolicy for CodingCommandPolicy {
+    fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        command_approval(context)
+    }
+
+    fn approval_state(&self, context: &ToolContext<'_>) -> Result<Option<Value>> {
+        let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
+            return Ok(None);
+        };
+        // The decision the approval is asked about travels with it, so the approved call runs as
+        // it was decided even when it resumes in another process.
+        let decision = if let Some(decision) = settings.command_decisions.current(context)? {
+            decision
+        } else {
+            let decision = command_decision(context, settings)?;
+            settings.command_decisions.record(context, decision)?
+        };
+        let environment = FrozenEnvironment::of(&self.environment(&decision));
+        encode(&CommandResume::Approval {
+            decision,
+            environment,
+        })
+        .map(Some)
+    }
+
+    fn attempt(&self, context: &ToolContext<'_>) -> Result<ExecCommandAttempt> {
+        let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
+            return Ok(ExecCommandAttempt::new(self.base.clone()));
+        };
+        let resume = context
+            .resume_state()
+            .map(|state| {
+                serde_json::from_value::<CommandResume>(state.clone()).map_err(|error| {
+                    Error::caller(format!(
+                        "exec_command cannot resume from the state its approval kept: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let (decision, already_approved, environment) = match resume {
+            Some(CommandResume::SandboxRetry {
+                decision,
+                environment,
+                ..
+            }) => {
+                settings.command_decisions.resume_retry(context)?;
+                let state = AttemptState {
+                    decision,
+                    already_approved: true,
+                    retry_environment: environment.clone(),
+                };
+                return Ok(ExecCommandAttempt::new(environment.restore(&self.base))
+                    .with_state(encode(&state)?));
+            }
+            Some(CommandResume::Approval {
+                decision,
+                environment,
+            }) => (
+                settings
+                    .command_decisions
+                    .begin_execution(context, || Ok(decision))?,
+                true,
+                Some(environment.restore(&self.base)),
+            ),
+            None => (
+                settings
+                    .command_decisions
+                    .begin_execution(context, || command_decision(context, settings))?,
+                false,
+                None,
+            ),
+        };
+        if let ExecApprovalRequirement::Forbidden { reason } = &decision.requirement {
+            return Err(ra_tools::exec_command::rejection(reason.clone()));
+        }
+        let environment = environment.unwrap_or_else(|| self.environment(&decision));
+        let retry_environment = FrozenEnvironment::of(
+            &environment
+                .clone()
+                .with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined)),
+        );
+        let state = AttemptState {
+            decision,
+            already_approved,
+            retry_environment,
+        };
+        Ok(ExecCommandAttempt::new(environment).with_state(encode(&state)?))
+    }
+
+    fn on_sandbox_denial(
+        &self,
+        context: &ToolContext<'_>,
+        attempt: &ExecCommandAttempt,
+        _output: &ExecOutputSummary,
+    ) -> Result<SandboxDenialAction> {
+        let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
+            return Ok(SandboxDenialAction::Return);
+        };
+        let Some(state) = attempt.state() else {
+            return Ok(SandboxDenialAction::Return);
+        };
+        let AttemptState {
+            decision,
+            already_approved,
+            retry_environment,
+        } = serde_json::from_value(state.clone()).map_err(|error| {
+            Error::caller(format!(
+                "exec_command lost the state of its attempt: {error}"
+            ))
+        })?;
+        // Under `Never` or `OnRequest`, Codex does not retry without the sandbox: the refused
+        // attempt's output is the result.
+        if !wants_no_sandbox_approval(decision.approval_policy) {
+            return Ok(SandboxDenialAction::Return);
+        }
+        // A call the host already approved is not asked about again.
+        settings.command_decisions.request_retry(context)?;
+        if should_bypass_approval(decision.approval_policy, already_approved) {
+            settings.command_decisions.resume_retry(context)?;
+            return Ok(SandboxDenialAction::Retry(Box::new(
+                retry_environment.restore(&self.base),
+            )));
+        }
+        Ok(SandboxDenialAction::RequestApproval(encode(
+            &CommandResume::SandboxRetry {
+                decision,
+                environment: retry_environment,
+                retry_reason: SANDBOX_RETRY_REASON.to_owned(),
+            },
+        )?))
+    }
+}
+
+/// The retry reason Codex's orchestrator gives the approval it asks after a sandbox denial.
+const SANDBOX_RETRY_REASON: &str = "command failed; retry without sandbox?";
+
+/// Whether the approval policy lets a refused command ask to run outside the sandbox: Codex's
+/// `wants_no_sandbox_approval`.
+const fn wants_no_sandbox_approval(policy: AskForApproval) -> bool {
+    match policy {
+        AskForApproval::UnlessTrusted => true,
+        AskForApproval::Granular {
+            sandbox_approval, ..
+        } => sandbox_approval,
+        _ => false,
+    }
+}
+
+/// Whether a retry outside the sandbox runs without asking: Codex's `should_bypass_approval`.
+const fn should_bypass_approval(policy: AskForApproval, already_approved: bool) -> bool {
+    already_approved || matches!(policy, AskForApproval::Never)
+}
+
+/// The state the command tool keeps with an approval, by the point the call resumes from.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+enum CommandResume {
+    /// Asked before the command ran, about the decision made then.
+    Approval {
+        decision: CommandDecision,
+        environment: FrozenEnvironment,
+    },
+    /// The sandbox refused the first attempt, and the host is asked to run it outside.
+    SandboxRetry {
+        decision: CommandDecision,
+        environment: FrozenEnvironment,
+        retry_reason: String,
+    },
+}
+
+/// What one attempt was decided with, for the retry decision after a sandbox denial.
+#[derive(Debug, Serialize, Deserialize)]
+struct AttemptState {
+    decision: CommandDecision,
+    already_approved: bool,
+    retry_environment: FrozenEnvironment,
+}
+
+/// Serializable execution configuration. Scratch directory handles belong to the live runtime;
+/// restoration binds its replacement handle only when the approved attempt allowed one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FrozenEnvironment {
+    env_policy: EnvPolicy,
+    limits: ResourceLimits,
+    sandbox: Option<ExecSandboxPolicy>,
+    allow_temp_dir: bool,
+}
+
+impl FrozenEnvironment {
+    fn of(environment: &ExecEnvironment) -> Self {
+        Self {
+            env_policy: environment.env_policy().clone(),
+            limits: environment.resource_limits().clone(),
+            sandbox: environment.sandbox().cloned(),
+            allow_temp_dir: environment.temp_dir().is_some(),
+        }
+    }
+
+    fn restore(&self, base: &ExecEnvironment) -> ExecEnvironment {
+        let mut environment = ExecEnvironment::new()
+            .with_env_policy(self.env_policy.clone())
+            .with_resource_limits(self.limits.clone());
+        if let Some(sandbox) = &self.sandbox {
+            environment = environment.with_sandbox(sandbox.clone());
+        }
+        if self.allow_temp_dir
+            && let Some(temp_dir) = base.temp_dir()
+        {
+            environment = environment.with_temp_dir(Arc::clone(temp_dir));
+        }
+        environment
+    }
+}
+
+fn encode(value: &impl Serialize) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        Error::caller(format!(
+            "exec_command could not record its decision: {error}"
+        ))
+    })
+}
+
+/// The sandboxed environment the thread's sandbox policy lowers to.
+fn sandboxed_environment(
+    settings: &CodingThreadSettings,
+    base: &ExecEnvironment,
+) -> ExecEnvironment {
     let mut environment = base.clone();
     let policy = match &settings.sandbox_policy {
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
@@ -407,7 +636,7 @@ pub(crate) fn command_environment(
             ExecSandboxPolicy::new(SandboxLevel::WorkspaceWrite).with_network(network(false))
         }
     };
-    Ok(environment.with_sandbox(policy))
+    environment.with_sandbox(policy)
 }
 
 fn network(enabled: bool) -> ExecNetworkAccess {
@@ -418,7 +647,7 @@ fn network(enabled: bool) -> ExecNetworkAccess {
     }
 }
 
-pub(crate) fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
+fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
     };
@@ -459,10 +688,13 @@ struct CommandArguments {
 }
 
 /// What was decided about one command call, kept from its approval to its execution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CommandDecision {
     requirement: ExecApprovalRequirement,
     sandbox_permissions: SandboxPermissions,
+    approval_policy: AskForApproval,
+    sandbox: ExecSandboxPolicy,
+    allow_temp_dir: bool,
 }
 
 /// The invocation identity agents-python binds to a provider call ID. The existing canonical
@@ -488,6 +720,16 @@ impl CommandIdentity {
 struct CommandRecord {
     identity: CommandIdentity,
     decision: Option<CommandDecision>,
+    retry: RetryPhase,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum RetryPhase {
+    #[default]
+    NotRequested,
+    Waiting,
+    Started,
+    Settled,
 }
 
 impl CommandRecord {
@@ -548,6 +790,7 @@ impl CommandDecisions {
         let record = pending.entry(call_key(context)).or_insert(CommandRecord {
             identity: identity.clone(),
             decision: Some(decision),
+            retry: RetryPhase::NotRequested,
         });
         record.check(context, &identity)?;
         record.pending_decision(context)
@@ -572,14 +815,59 @@ impl CommandDecisions {
             CommandRecord {
                 identity,
                 decision: None,
+                retry: RetryPhase::NotRequested,
             },
         );
         Ok(decision)
     }
 
+    /// Records the retry boundary reached by the first attempt.
+    fn request_retry(&self, context: &ToolContext<'_>) -> Result<()> {
+        let identity = CommandIdentity::of(context);
+        let mut pending = self.pending();
+        let record = pending
+            .get_mut(&call_key(context))
+            .ok_or_else(|| Error::caller("the command has no first attempt to retry"))?;
+        record.check(context, &identity)?;
+        if record.retry != RetryPhase::NotRequested {
+            return Err(Error::caller(
+                "the command already requested its sandbox retry",
+            ));
+        }
+        record.retry = RetryPhase::Waiting;
+        Ok(())
+    }
+
+    /// Consumes approval before retry execution, including failures and cancellation. A fresh
+    /// process can restore a checkpoint once; a retained invocation cannot execute it twice.
+    fn resume_retry(&self, context: &ToolContext<'_>) -> Result<()> {
+        let identity = CommandIdentity::of(context);
+        let mut pending = self.pending();
+        if let Some(record) = pending.get_mut(&call_key(context)) {
+            record.check(context, &identity)?;
+            if record.retry != RetryPhase::Waiting {
+                return Err(Error::caller(
+                    "the command's sandbox retry has already started or settled",
+                ));
+            }
+            record.retry = RetryPhase::Started;
+            return Ok(());
+        }
+        pending.insert(
+            call_key(context),
+            CommandRecord {
+                identity,
+                decision: None,
+                retry: RetryPhase::Started,
+            },
+        );
+        Ok(())
+    }
+
     fn settle(&self, run_id: &RunId, call_id: &CallId) {
         if let Some(record) = self.pending().get_mut(&(run_id.clone(), call_id.clone())) {
             record.decision = None;
+            record.retry = RetryPhase::Settled;
         }
     }
 
@@ -644,9 +932,33 @@ fn command_decision(
             },
             Path::new(DEFAULT_SHELL),
         );
+    let bypass_sandbox = matches!(
+        requirement,
+        ExecApprovalRequirement::Skip {
+            bypass_sandbox: true,
+            ..
+        }
+    ) || sandbox_permissions.requires_escalated_permissions();
+    let selected = if bypass_sandbox {
+        ExecEnvironment::new().with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined))
+    } else {
+        sandboxed_environment(settings, &ExecEnvironment::new())
+    };
     Ok(CommandDecision {
         requirement,
         sandbox_permissions,
+        approval_policy,
+        sandbox: selected
+            .sandbox()
+            .cloned()
+            .ok_or_else(|| Error::caller("the coding adapter did not select a command sandbox"))?,
+        allow_temp_dir: bypass_sandbox
+            || matches!(
+                settings.sandbox_policy,
+                SandboxPolicy::DangerFullAccess
+                    | SandboxPolicy::ExternalSandbox { .. }
+                    | SandboxPolicy::WorkspaceWrite { .. }
+            ),
     })
 }
 

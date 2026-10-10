@@ -46,13 +46,13 @@ use ra_core::{
         ToolGuardrailVerdict, ToolInputGuardrail, ToolInputGuardrailData, ToolInputGuardrailResult,
         ToolOutputGuardrail, ToolOutputGuardrailData, ToolOutputGuardrailResult,
     },
-    item::{CallId, ToolApproval, ToolCallKind, ToolCallOutput},
+    item::{CallId, ToolApproval, ToolCallKind, ToolCallOutput, ToolResume, ToolResumePoint},
     lifecycle::{ToolEndInput, ToolStartInput},
     permission::PermissionDecision,
     state::{NestedRunRef, RunState},
     tool::{
-        Tool, ToolApprovalPolicy, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
-        ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior,
+        Tool, ToolApprovalPolicy, ToolApprovalRequest, ToolCaller, ToolConcurrency, ToolContext,
+        ToolFailureHandling, ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -318,6 +318,7 @@ pub struct ToolDispatchRequest {
     lifecycle: LifecycleHooks,
     approval_granted: bool,
     nested_resume: Option<Arc<RunState>>,
+    resume: Option<ToolResume>,
 }
 
 impl ToolDispatchRequest {
@@ -354,6 +355,7 @@ impl ToolDispatchRequest {
             lifecycle: LifecycleHooks::new(),
             approval_granted: false,
             nested_resume: None,
+            resume: None,
         }
     }
 
@@ -416,6 +418,40 @@ impl ToolDispatchRequest {
         self
     }
 
+    /// Hands the tool the state it kept with the approval this call resumes from.
+    ///
+    /// A call that asked from inside its invocation continues that invocation, the way a paused
+    /// agent-tool call does: it is not admitted, checked or announced again.
+    pub(crate) fn with_resume(mut self, resume: ToolResume) -> Self {
+        self.resume = Some(resume);
+        self
+    }
+
+    /// Whether this call continues an invocation that already started.
+    fn is_continuation(&self) -> bool {
+        self.nested_resume.is_some()
+            || self
+                .resume
+                .as_ref()
+                .is_some_and(|resume| resume.point() == ToolResumePoint::DuringCall)
+    }
+
+    /// The approval record a host is asked about for this call.
+    fn approval(&self) -> ToolApproval {
+        let tool = &self.tool;
+        let mut approval = ToolApproval::new(
+            self.call_id.clone(),
+            tool.model_definition().name(),
+            self.arguments.clone(),
+        );
+        if let Some(namespace) = tool.origin().namespace() {
+            approval = approval.with_namespace(namespace.as_str());
+        }
+        approval
+            .with_tool_origin(tool.origin())
+            .with_kind(ToolCallKind::from(tool.model_definition().kind()))
+    }
+
     /// The tool being dispatched.
     #[must_use]
     pub fn tool(&self) -> &Arc<dyn Tool> {
@@ -425,14 +461,18 @@ impl ToolDispatchRequest {
     /// Builds the context for this call. Every stage that enters third-party code takes it from
     /// here, so a tool cannot be asked about a call under one context and then run under another.
     pub fn context(&self) -> ToolContext<'_> {
-        ToolContext::new(
+        let context = ToolContext::new(
             &self.run,
             self.tool.as_ref(),
             &self.call_id,
             &self.arguments,
         )
         .with_caller(self.caller)
-        .with_services(&self.services)
+        .with_services(&self.services);
+        match &self.resume {
+            Some(resume) => context.with_resume_state(resume.state()),
+            None => context,
+        }
     }
 
     fn context_with_decoded(
@@ -553,17 +593,41 @@ async fn run_chain(
     // with an observation the model can react to.
     //
     // Stages 2 to 4 decide whether the call may start, and a continuation already started: it
-    // passed all three the first time, before its nested run paused.
-    let continuation = request.nested_resume.is_some();
+    // passed all three the first time, before its nested run paused or the tool asked for
+    // approval from inside its invocation.
+    let continuation = request.is_continuation();
     if !continuation && let Some(reason) = circuit::admit(&options, request.history, &name) {
         return Ok(refused(&request.call_id, &name, &reason));
     }
 
     // 3. Permission policy and approval, before anything runs.
-    if !continuation
-        && let Some(answer) =
-            admit_permission(request, &options, &name, &input_guardrails, records).await?
+    let continuation_denied = continuation
+        && request.nested_resume.is_none()
+        && matches!(
+            request
+                .permission
+                .fixed_decision(options.permission_scope(), tool.origin()),
+            Some(PermissionDecision::Deny)
+        );
+    if (!continuation || continuation_denied)
+        && let Some(answer) = admit_permission(
+            request,
+            &options,
+            &name,
+            &input_guardrails,
+            &output_guardrails,
+            records,
+        )
+        .await?
     {
+        if continuation_denied {
+            let outcome = Err(Error::tool(
+                ToolErrorKind::PermissionDenied,
+                &name,
+                "continuation denied by current policy",
+            ));
+            announce_invocation_end(request, &outcome).await?;
+        }
         return Ok(answer);
     }
 
@@ -668,11 +732,26 @@ async fn run_chain(
         )));
     }
 
+    // A tool that asked for approval from inside its invocation has not settled either: the
+    // approval keeps its state, and the approved call continues the invocation.
+    if let Err(error) = &outcome
+        && let Some(asked) = ToolApprovalRequest::of(error)
+    {
+        return Ok(ToolDispatch::AwaitingApproval(
+            request
+                .approval()
+                .with_resume(ToolResume::during_call(asked.state().clone())),
+        ));
+    }
+
     // A failed Session append retains completed child work. It must leave through the parent
     // checkpoint rather than become a model-visible tool failure that invites another execution.
     let outcome = match outcome {
         Err(error) => {
-            if let Some(state) = error.run_state() {
+            if let Some(state) = error
+                .run_state()
+                .filter(|state| state.has_session_write_checkpoint())
+            {
                 let nested = NestedRunRef::interrupted(
                     request.run.run_id().as_str(),
                     tool.origin(),
@@ -797,6 +876,7 @@ async fn admit_permission(
     options: &ToolOptions,
     name: &str,
     input_guardrails: &[Arc<dyn ToolInputGuardrail>],
+    output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
     records: &mut ToolGuardrailRecords,
 ) -> Result<Option<ToolDispatch>> {
     let tool = &request.tool;
@@ -863,17 +943,33 @@ async fn admit_permission(
                 }
                 _ => {}
             }
-            let mut approval = ToolApproval::new(
-                request.call_id.clone(),
-                tool.model_definition().name(),
-                request.arguments.clone(),
-            );
-            if let Some(namespace) = tool.origin().namespace() {
-                approval = approval.with_namespace(namespace.as_str());
+            let mut approval = request.approval();
+            // What the tool decided while asking stays with the question, so the approved call
+            // runs as it was decided wherever the answer is given.
+            let state = request
+                .cancel
+                .run(tool.approval_state(&request.context()))
+                .await?;
+            let state = match state {
+                Ok(state) => state,
+                Err(error) if is_invalid_input(&error) => {
+                    return shape_failure(
+                        tool,
+                        request,
+                        options,
+                        name,
+                        error,
+                        output_guardrails,
+                        records,
+                    )
+                    .await
+                    .map(Some);
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(state) = state {
+                approval = approval.with_resume(ToolResume::before_call(state));
             }
-            approval = approval
-                .with_tool_origin(tool.origin())
-                .with_kind(ToolCallKind::from(tool.model_definition().kind()));
             Ok(Some(ToolDispatch::AwaitingApproval(approval)))
         }
         _ => Err(Error::caller(format!(
@@ -990,7 +1086,7 @@ pub(crate) async fn shape_failure(
     }
 
     let timed_out = matches!(
-        error,
+        invocation_error(&error),
         Error::Tool {
             kind: ToolErrorKind::Timeout,
             ..
@@ -1028,7 +1124,7 @@ pub(crate) async fn shape_failure(
             let context = request.context();
             match request
                 .cancel
-                .run(tool.handle_failure(&context, &error))
+                .run(tool.handle_failure(&context, invocation_error(&error)))
                 .await??
             {
                 Some(output) => {
@@ -1080,7 +1176,7 @@ async fn custom_tool_failure(
     output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
     records: &mut ToolGuardrailRecords,
 ) -> Result<ToolDispatch> {
-    let text = match error {
+    let text = match invocation_error(error) {
         Error::Tool { message, .. } if !message.is_empty() => message.clone(),
         _ => error.code().to_owned(),
     };
@@ -1096,12 +1192,20 @@ async fn custom_tool_failure(
 
 fn is_invalid_input(error: &Error) -> bool {
     matches!(
-        error,
+        invocation_error(error),
         Error::Tool {
             kind: ToolErrorKind::InvalidInput,
             ..
         }
     )
+}
+
+/// Checkpoint ownership does not change a tool failure's kind or its authored message.
+fn invocation_error(mut error: &Error) -> &Error {
+    while let Error::Run { error: inner, .. } = error {
+        error = inner;
+    }
+    error
 }
 
 pub(crate) async fn needs_approval(

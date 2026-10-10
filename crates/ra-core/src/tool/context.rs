@@ -56,6 +56,7 @@ pub struct ToolContext<'a> {
     caller: ToolCaller,
     services: &'a ToolServices,
     decoded_input: Option<DecodedToolInput>,
+    resume_state: Option<&'a Value>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -77,7 +78,18 @@ impl<'a> ToolContext<'a> {
             caller: ToolCaller::Direct,
             services: &NO_SERVICES,
             decoded_input: None,
+            resume_state: None,
         }
+    }
+
+    /// Hands the call the state its tool kept with the approval this call resumes from.
+    ///
+    /// The runtime sets it when it resumes an approved call whose approval carries a
+    /// [`ToolResume`](crate::item::ToolResume); a direct caller may set it to drive a tool through
+    /// that resumption in isolation.
+    pub const fn with_resume_state(mut self, state: &'a Value) -> Self {
+        self.resume_state = Some(state);
+        self
     }
 
     /// Sets the caller class.
@@ -124,6 +136,13 @@ impl<'a> ToolContext<'a> {
     #[must_use]
     pub const fn arguments(&self) -> &Value {
         self.arguments
+    }
+
+    /// The state the tool kept with the approval this call resumes from, if any: see
+    /// [`ToolResume`](crate::item::ToolResume).
+    #[must_use]
+    pub const fn resume_state(&self) -> Option<&Value> {
+        self.resume_state
     }
 
     /// Borrows the schema-bound input when this context carries one of type `T`.
@@ -185,3 +204,58 @@ impl fmt::Debug for ToolContext<'_> {
             .finish()
     }
 }
+
+/// A tool's request, from inside its invocation, that its host approve the call before it goes on.
+///
+/// A tool returns it as the error of [`Tool::call`], through
+/// [`Self::into_error`]. The runtime then records an approval for the call carrying `state` as a
+/// [`ToolResume::during_call`](crate::item::ToolResume::during_call), instead of treating the call
+/// as failed, and on approval invokes the tool again with that state in
+/// [`ToolContext::resume_state`]. A rejected or cancelled call is not invoked again.
+///
+/// This adapts an approval that a tool would otherwise wait for inside its invocation, as Codex's
+/// command execution does after its sandbox denies a first attempt: an interrupted run cannot keep
+/// an invocation suspended while its host answers, possibly in another process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolApprovalRequest {
+    state: Value,
+}
+
+impl ToolApprovalRequest {
+    /// A request that keeps `state` until the approved call resumes.
+    #[must_use]
+    pub const fn new(state: Value) -> Self {
+        Self { state }
+    }
+
+    /// The state kept until the approved call resumes.
+    #[must_use]
+    pub const fn state(&self) -> &Value {
+        &self.state
+    }
+
+    /// The error a tool named `tool` returns to make the request.
+    #[must_use]
+    pub fn into_error(self, tool: &str) -> Error {
+        Error::tool(
+            crate::error::ToolErrorKind::PermissionDenied,
+            tool,
+            "the call is waiting for its host to approve it",
+        )
+        .with_source(self)
+    }
+
+    /// The request `error` makes, if it is one.
+    #[must_use]
+    pub fn of(error: &Error) -> Option<&Self> {
+        std::error::Error::source(error).and_then(<dyn std::error::Error + 'static>::downcast_ref)
+    }
+}
+
+impl fmt::Display for ToolApprovalRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the call is waiting for its host to approve it")
+    }
+}
+
+impl std::error::Error for ToolApprovalRequest {}

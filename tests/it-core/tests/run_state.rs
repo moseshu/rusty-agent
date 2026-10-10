@@ -83,7 +83,7 @@ fn test_run_state_02() {
 #[test]
 fn test_run_state_03() {
     let stored = r#"{
-        "schema_version": 9,
+        "schema_version": 10,
         "run_id": "run-future",
         "next_host_event_seq": 12,
         "future_policy": { "enabled": true }
@@ -97,7 +97,7 @@ fn test_run_state_03() {
     let state = state.with_tool_use(carried.tool_use().clone());
 
     assert_eq!(state.tool_use().repeat_streak(&agent, &identity), 1);
-    assert_eq!(state.schema_version(), SchemaVersion::new(9));
+    assert_eq!(state.schema_version(), SchemaVersion::new(10));
     let written = serde_json::to_value(&state).expect("run state must serialize");
     assert_eq!(written["future_policy"]["enabled"], true);
     assert_eq!(written["run_id"], "run-future");
@@ -107,7 +107,7 @@ fn test_run_state_03() {
 #[test]
 fn test_run_state_04() {
     let stored = r#"{
-        "schema_version": 9,
+        "schema_version": 10,
         "run_id": "run-future-04",
         "next_host_event_seq": 3,
         "future_policy": { "enabled": true }
@@ -115,7 +115,7 @@ fn test_run_state_04() {
     let state: RunState = serde_json::from_str(stored).expect("newer state must remain readable");
     let written = serde_json::to_value(&state).expect("run state must serialize");
 
-    assert_eq!(state.schema_version(), SchemaVersion::new(9));
+    assert_eq!(state.schema_version(), SchemaVersion::new(10));
     assert_eq!(state.run_id().as_str(), "run-future-04");
     assert_eq!(state.next_host_event_seq(), 3);
     assert_eq!(state.tool_use().agents().count(), 0);

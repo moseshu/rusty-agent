@@ -286,7 +286,8 @@ pub enum Error {
     /// A failed run's original error and the state retained before returning it.
     ///
     /// The reference mutates the caller's `RunState` in place. Rust runs consume their state, so
-    /// failures at a Session write return it here instead. Display, classification and guardrail
+    /// failures during approval recovery or a Session write return it here instead. Display,
+    /// classification and guardrail
     /// evidence delegate to the original error; callers resume using [`Self::run_state`].
     #[error("{error}")]
     #[non_exhaustive]
@@ -437,7 +438,7 @@ impl Error {
         }
     }
 
-    /// The checkpoint retained by a failed Session operation, if any.
+    /// The checkpoint retained by a failed run or Session operation, if any.
     #[must_use]
     pub fn run_state(&self) -> Option<&crate::state::RunState> {
         match self {

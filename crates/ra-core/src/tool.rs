@@ -24,7 +24,7 @@ pub mod resource;
 pub mod schema;
 pub mod services;
 
-pub use context::{ToolCaller, ToolContext};
+pub use context::{ToolApprovalRequest, ToolCaller, ToolContext};
 pub use namespace::ToolNamespace;
 pub use options::{
     DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, TOOL_OPTIONS_SCHEMA_VERSION,
@@ -133,6 +133,20 @@ pub trait Tool: Send + Sync + 'static {
                 self.origin().qualified_name()
             ))),
         }
+    }
+
+    /// State to keep with the approval this call is about to wait for, handed back through
+    /// [`ToolContext::resume_state`] when the approved call is dispatched again.
+    ///
+    /// The runtime asks only when the call needs approval, right after [`Tool::needs_approval`]
+    /// said so. A tool keeps here what it decided while asking, so the approved call runs as it
+    /// was decided even when the approval is answered in another process. The default keeps
+    /// nothing.
+    async fn approval_state(
+        &self,
+        _context: &ToolContext<'_>,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
     }
 
     /// Optionally turns a call failure into a model-visible result.

@@ -222,7 +222,10 @@ pub enum AllowPrefixRules {
 }
 
 /// What a command needs before it runs: Codex's `ExecApprovalRequirement`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serializable so a decision can travel with the approval it was asked with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecApprovalRequirement {
     /// No approval required for this tool call.
     Skip {

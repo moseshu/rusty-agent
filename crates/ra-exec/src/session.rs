@@ -576,7 +576,13 @@ impl ExecSession {
         if let Some(sandbox) = &self.sandbox {
             summary = summary.with_sandbox(sandbox.clone());
         }
-        summary
+        match &self.state {
+            ExecSessionState::Cancelled => {
+                summary.with_termination_reason(ExecEvictionReason::custom("cancelled"))
+            }
+            ExecSessionState::Expired { reason } => summary.with_termination_reason(reason.clone()),
+            _ => summary,
+        }
     }
 
     fn snapshot(&self) -> SessionSnapshot {
