@@ -174,6 +174,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-patch",
             "ra-tools",
             "ra-protocol",
+            "ra-execpolicy",
         ],
     ),
     (

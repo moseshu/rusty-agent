@@ -15,12 +15,22 @@
 //! explicit embedding-host responsibility. Reviewer selection is retained for the server request
 //! producer; it does not install an automatic reviewer on its own.
 //!
+//! Commands are decided by Codex's command policy (see [`crate::exec_policy`]) with the rules the
+//! host selects through [`CodingThreadSettingsAdapter::with_exec_policy`]: a command that needs
+//! approval asks, a forbidden one is refused with Codex's reason when it is called, and one every
+//! rule explicitly allows runs outside the sandbox. A call's sandbox override and requested prefix
+//! rule are not yet arguments of the command tool, so every call uses the defaults.
+//!
 //! Restricted in-process patches use Codex's unavailable-patch-sandbox approval path: this writer
 //! has directory capabilities, but does not run beneath the command executor's kernel sandbox.
 //! Commands do enter that sandbox. The existing executor's workspace policy grants entire writable
 //! roots; it does not yet port Codex's nested protected-directory rules. Those remain an execution
 //! adapter parity gap rather than a new provider-neutral permission rule.
 
+use crate::exec_policy::{
+    AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyManager,
+    FileSystemSandboxKind, SandboxPermissions,
+};
 use ra_core::{
     error::{Error, Result},
     permission::PermissionMode,
@@ -36,7 +46,11 @@ use ra_protocol::server::{
 };
 use ra_runtime::{permission::PermissionEngine, runner::RunConfig};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// A policy captured by one model step and its tools.
 #[derive(Clone, Debug)]
@@ -47,6 +61,8 @@ pub struct CodingThreadSettings {
     sandbox_policy: SandboxPolicy,
     active_permission_profile: Option<String>,
     base_permission: PermissionEngine,
+    exec_policy: Arc<ExecPolicyManager>,
+    allow_prefix_rules: AllowPrefixRules,
 }
 
 impl CodingThreadSettings {
@@ -115,9 +131,28 @@ impl CodingThreadSettingsAdapter {
                 approvals_reviewer: ApprovalsReviewer::default(),
                 active_permission_profile: None,
                 base_permission: PermissionEngine::default(),
+                exec_policy: Arc::new(ExecPolicyManager::default()),
+                allow_prefix_rules: AllowPrefixRules::default(),
             },
             profiles,
         })
+    }
+
+    /// Decides commands with `exec_policy`'s rules, as Codex's session does with the rules its
+    /// config layers load. Without one, no rule matches and every command is decided by Codex's
+    /// heuristics for unmatched commands.
+    #[must_use]
+    pub fn with_exec_policy(mut self, exec_policy: Arc<ExecPolicyManager>) -> Self {
+        self.initial.exec_policy = exec_policy;
+        self
+    }
+
+    /// Whether allow prefix rules are honored and reusable amendments proposed; honored unless the
+    /// host chooses otherwise.
+    #[must_use]
+    pub const fn with_allow_prefix_rules(mut self, allow_prefix_rules: AllowPrefixRules) -> Self {
+        self.initial.allow_prefix_rules = allow_prefix_rules;
+        self
     }
 
     /// Adds a configured profile, the product's equivalent of Codex's named permission catalog.
@@ -205,10 +240,26 @@ fn install(config: RunConfig, settings: CodingThreadSettings) -> RunConfig {
 pub(crate) fn command_environment(
     context: &ToolContext<'_>,
     base: &ExecEnvironment,
-) -> ExecEnvironment {
+) -> Result<ExecEnvironment> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
-        return base.clone();
+        return Ok(base.clone());
     };
+    // Decided again for the call that runs: a forbidden command is refused here with Codex's
+    // reason, and one every rule explicitly allows runs outside the sandbox on its first attempt.
+    match command_requirement(context, settings) {
+        ExecApprovalRequirement::Forbidden { reason } => {
+            return Err(ra_tools::exec_command::rejection(reason));
+        }
+        ExecApprovalRequirement::Skip {
+            bypass_sandbox: true,
+            ..
+        } => {
+            return Ok(base
+                .clone()
+                .with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined)));
+        }
+        ExecApprovalRequirement::Skip { .. } | ExecApprovalRequirement::NeedsApproval { .. } => {}
+    }
     let mut environment = base.clone();
     let policy = match &settings.sandbox_policy {
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
@@ -248,7 +299,7 @@ pub(crate) fn command_environment(
             ExecSandboxPolicy::new(SandboxLevel::WorkspaceWrite).with_network(network(false))
         }
     };
-    environment.with_sandbox(policy)
+    Ok(environment.with_sandbox(policy))
 }
 
 fn network(enabled: bool) -> ExecNetworkAccess {
@@ -259,34 +310,63 @@ fn network(enabled: bool) -> ExecNetworkAccess {
     }
 }
 
+// The signature is the command tool's approval resolver, which may fail; this one never does.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
     };
-    // Every policy but the two unconfined ones restricts the filesystem, including one this
-    // adapter does not know.
-    let restricted = !matches!(
-        settings.sandbox_policy,
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-    );
-    match settings.approval_policy {
-        AskForApproval::Never => Ok(false),
+    // Only a command that needs approval asks. A forbidden one is refused when it is called, with
+    // the reason the model reads in place of its result.
+    Ok(matches!(
+        command_requirement(context, settings),
+        ExecApprovalRequirement::NeedsApproval { .. }
+    ))
+}
 
-        AskForApproval::OnRequest => Ok(restricted),
-        AskForApproval::Granular {
-            sandbox_approval, ..
-        } => {
-            if restricted && !sandbox_approval {
-                Err(Error::caller(
-                    "approval policy disallowed sandbox approval prompt",
-                ))
-            } else {
-                Ok(restricted)
-            }
-        }
-        // `UnlessTrusted` asks for every command, and so does a policy this adapter does not know.
-        _ => Ok(true),
-    }
+/// The shell the coding executor runs a command with when the call names none.
+const DEFAULT_SHELL: &str = "/bin/sh";
+
+/// What Codex's command policy requires of the call `context` makes.
+///
+/// The command is judged in Codex's form, `[shell, "-lc" or "-c", cmd]`, whatever argument layout
+/// the executor then starts the shell with. The call's per-command sandbox override and requested
+/// prefix rule are the defaults until the command tool takes them.
+fn command_requirement(
+    context: &ToolContext<'_>,
+    settings: &CodingThreadSettings,
+) -> ExecApprovalRequirement {
+    let arguments = context.arguments();
+    let cmd = arguments
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let shell = arguments
+        .get("shell")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_SHELL);
+    let login = arguments
+        .get("login")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let command = vec![
+        shell.to_owned(),
+        if login { "-lc" } else { "-c" }.to_owned(),
+        cmd.to_owned(),
+    ];
+    settings
+        .exec_policy
+        .create_exec_approval_requirement_for_shell(
+            ExecApprovalRequest {
+                command: &command,
+                approval_policy: settings.approval_policy,
+                file_system_sandbox: FileSystemSandboxKind::of(&settings.sandbox_policy),
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                prefix_rule: None,
+                allow_prefix_rules: settings.allow_prefix_rules,
+            },
+            Path::new(DEFAULT_SHELL),
+        )
 }
 
 pub(crate) fn patch_approval(context: &ToolContext<'_>) -> Result<bool> {

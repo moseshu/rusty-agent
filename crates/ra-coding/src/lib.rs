@@ -22,10 +22,12 @@ pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub mod dangerous_action;
 pub mod doctor;
+pub mod exec_policy;
 pub(crate) mod final_answer;
 pub mod host;
 pub mod profile;
 pub mod prompt;
+pub mod shell_command;
 pub mod thread_factory;
 pub mod thread_items;
 

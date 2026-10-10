@@ -156,6 +156,13 @@ pub type EnvironmentResolver = dyn Fn(&ToolContext<'_>) -> Result<ExecEnvironmen
 /// Host approval callback evaluated for each command.
 pub type ApprovalResolver = dyn Fn(&ToolContext<'_>) -> Result<bool> + Send + Sync;
 
+/// The error an [`EnvironmentResolver`] returns to refuse a command: the model reads `reason`
+/// verbatim as the command's result, as Codex returns a rejected command's reason.
+#[must_use]
+pub fn rejection(reason: impl Into<String>) -> Error {
+    ExecCommandFailure::Rejected(reason.into()).into_error()
+}
+
 impl fmt::Debug for ExecCommandTool {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -467,8 +474,13 @@ impl Tool for ExecCommandTool {
         // the sentence back out of prose is the de-lexicalization rule this project bans, and it
         // also produced the doubled text a message-sniffing version emitted.
         Ok(ExecCommandFailure::of(error).map(|failure| {
-            ToolOutput::text(failure.to_string())
-                .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step()))
+            let output = ToolOutput::text(failure.to_string());
+            match failure.next_step() {
+                Some(next_step) => {
+                    output.with_metadata(ObservationMetadata::new().with_guidance(next_step))
+                }
+                None => output,
+            }
         }))
     }
 }
@@ -586,6 +598,8 @@ enum ExecCommandFailure {
     Busy(String),
     /// An execution session could not be addressed.
     Session(String),
+    /// The host's command policy refused the command; the text is its reason, read verbatim.
+    Rejected(String),
 }
 
 impl ExecCommandFailure {
@@ -599,6 +613,7 @@ impl ExecCommandFailure {
             | Self::MissingDirectory(_)
             | Self::PtyUnavailable => ToolErrorKind::InvalidInput,
             Self::Spawn(_) | Self::Busy(_) | Self::Session(_) => ToolErrorKind::ExecutionFailed,
+            Self::Rejected(_) => ToolErrorKind::PermissionDenied,
         }
     }
 
@@ -611,9 +626,9 @@ impl ExecCommandFailure {
     }
 
     /// The next step that follows the diagnosis, kept out of [`fmt::Display`] so a log line gets the
-    /// fact without an instruction addressed to a model.
-    const fn next_step(&self) -> &'static str {
-        match self {
+    /// fact without an instruction addressed to a model. None when the diagnosis is the answer.
+    const fn next_step(&self) -> Option<&'static str> {
+        Some(match self {
             Self::BadArguments(_) => "Send `cmd`, and leave the rest unset unless you need it.",
             Self::OutsideRoot(_) => "Run the command inside the workspace root.",
             Self::AmbiguousParent(_) => "Send `workdir` without `..`.",
@@ -630,7 +645,9 @@ impl ExecCommandFailure {
                 "Wait for them to be reclaimed and try again; tell the user if it persists."
             }
             Self::Session(_) => "Start the command again rather than addressing that session.",
-        }
+            // The reason is the whole answer, as Codex returns a rejected command's reason alone.
+            Self::Rejected(_) => return None,
+        })
     }
 }
 
@@ -673,6 +690,7 @@ impl fmt::Display for ExecCommandFailure {
             Self::Spawn(reason) => write!(f, "The command did not start: {reason}."),
             Self::Busy(reason) => write!(f, "No room to run another command: {reason}."),
             Self::Session(reason) => write!(f, "The execution session is unavailable: {reason}."),
+            Self::Rejected(reason) => f.write_str(reason),
         }
     }
 }

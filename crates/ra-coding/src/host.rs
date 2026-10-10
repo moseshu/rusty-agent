@@ -192,7 +192,7 @@ impl CodingHost {
             ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))?
                 .with_policy_resolvers(
                     Arc::new(move |context| {
-                        Ok(crate::thread_settings::command_environment(context, &base))
+                        crate::thread_settings::command_environment(context, &base)
                     }),
                     Arc::new(crate::thread_settings::command_approval),
                 ),

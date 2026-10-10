@@ -23,6 +23,8 @@ ra-mcp = { workspace = true }
 ra-patch = { workspace = true }
 ra-tools = { workspace = true }
 ra-protocol = { workspace = true }
+ra-execpolicy = { workspace = true }
+shlex = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
