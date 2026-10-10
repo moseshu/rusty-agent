@@ -5,9 +5,9 @@
 //! end does not touch. A thread loaded with [`CodingBackgroundTerminals`] lets its client list and
 //! stop them, and the server stops them all when it shuts the thread down.
 
-use std::{future::Future, pin::Pin, sync::Arc};
 use ra_exec::session::{ExecSessionId, ProcessManager};
 use ra_protocol::server::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 /// The background terminals of the commands one process manager runs.
 #[derive(Clone)]

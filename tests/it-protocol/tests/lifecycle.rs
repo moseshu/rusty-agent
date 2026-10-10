@@ -1531,7 +1531,10 @@ async fn exec_command_terminals_outlive_their_turn() {
                 "tty": null,
                 "login": null,
                 "yield_time_ms": 200,
-                "timeout_ms": null
+                "timeout_ms": null,
+                "sandbox_permissions": null,
+                "justification": null,
+                "prefix_rule": null
             }),
         )),
         Step::Respond(final_message("started")),

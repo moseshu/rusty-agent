@@ -163,6 +163,9 @@ impl TaskModel {
                         "login": null,
                         "yield_time_ms": 300,
                         "timeout_ms": null,
+                        "sandbox_permissions": null,
+                        "justification": null,
+                        "prefix_rule": null,
                     }),
                 ))
             }

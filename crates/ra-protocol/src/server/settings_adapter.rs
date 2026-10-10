@@ -1,7 +1,10 @@
 //! The host boundary for Codex's product-owned settings. The protocol ports their wire shape;
 //! the selected product previews and applies their concrete execution mechanism.
 
-use ra_runtime::{runner::RunConfig, thread::AgentThread};
+use ra_runtime::{
+    runner::RunConfig,
+    thread::{AgentThread, ThreadEvent},
+};
 use serde_json::Value;
 
 use super::protocol::ThreadPolicyOverrides;
@@ -24,6 +27,12 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
 
     /// Returns the product-owned fields of the effective thread settings.
     fn describe(&self, config: &RunConfig) -> Value;
+
+    /// Observes the listener's ordered thread events to release product-owned pending execution
+    /// state after a call settles or a turn ends. No provider-neutral policy is implied.
+    fn on_thread_event(&self, config: &RunConfig, event: &ThreadEvent) {
+        let _ = (config, event);
+    }
 }
 
 pub(crate) fn settings_snapshot(

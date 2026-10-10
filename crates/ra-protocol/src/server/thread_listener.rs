@@ -285,6 +285,9 @@ async fn handle_event(
     thread_state: &Mutex<ThreadState>,
     tool_items: Option<&dyn ThreadToolItems>,
 ) {
+    if let Some(adapter) = &loaded.adapter {
+        adapter.on_thread_event(&loaded.run_config(), &event);
+    }
     let thread_id = loaded.thread_id().clone();
     let item_changes = thread_state
         .lock()

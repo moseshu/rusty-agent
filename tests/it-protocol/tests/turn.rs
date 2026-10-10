@@ -1639,9 +1639,7 @@ async fn responses_endpoint() -> wiremock::MockServer {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/v1/responses"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
         .mount(&server)
         .await;
     server
@@ -1708,9 +1706,8 @@ fn turn_start_params_carry_an_output_schema() {
     assert_eq!(params.output_schema(), Some(&answer_schema()));
 
     // Codex's `Option<JsonValue>`: null is no schema.
-    let request = JsonRpcRequest::new(2, "turn/start").with_params(
-        json!({"threadId": THREAD, "input": [], "outputSchema": null}),
-    );
+    let request = JsonRpcRequest::new(2, "turn/start")
+        .with_params(json!({"threadId": THREAD, "input": [], "outputSchema": null}));
     let ClientRequest::TurnStart { params, .. } = ClientRequest::try_from(request).unwrap() else {
         panic!("expected turn/start");
     };
@@ -1864,10 +1861,114 @@ async fn turn_start_steers_only_a_turn_with_the_same_output_schema() {
     let second_request = texts(&calls[1].input);
     assert!(second_request.contains(&"accepted steer".to_owned()));
     assert!(!second_request.contains(&"rejected steer".to_owned()));
-    let expected = OutputSchema::json_schema("codex_output_schema", active_schema)
-        .to_model_output_schema();
+    let expected =
+        OutputSchema::json_schema("codex_output_schema", active_schema).to_model_output_schema();
     for call in &calls {
         assert_eq!(call.output_schema, expected);
         assert_eq!(call.model, None);
+    }
+}
+
+/// The coding adapter receives terminal events through the real listener, including cancellation
+/// before a pending command enters the executor.
+#[tokio::test]
+async fn coding_command_records_are_released_when_the_turn_ends() {
+    use ra_coding::{
+        host::CodingHost,
+        thread_settings::{CodingThreadSettings, CodingThreadSettingsAdapter},
+    };
+    use ra_core::{context::RunContext, item::CallId, state::RunId, tool::ToolContext};
+    use ra_protocol::server::protocol::SandboxPolicy;
+
+    for interrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = CodingHost::open(dir.path()).unwrap();
+        let adapter = Arc::new(
+            CodingThreadSettingsAdapter::new(
+                host.workspace_root(),
+                SandboxPolicy::ReadOnly {
+                    network_access: false,
+                },
+            )
+            .unwrap(),
+        );
+        let server = Server::start();
+        let mut connection = server.connect(1, true).await;
+        let script = Arc::new(Script::default());
+        let (release, wait) = gate();
+        script.push(Step::After(wait, final_message("answer", "done")));
+        let agent = AgentSpec::builder()
+            .id(AgentId::new("lead"))
+            .name("lead")
+            .instructions("lead")
+            .build()
+            .unwrap();
+        let thread = AgentThread::builder(
+            SessionId::new(THREAD),
+            AgentBinding::direct(agent.clone()),
+            Arc::new(Resolver(Arc::clone(&script))),
+        )
+        .with_config(adapter.initialize(host.build_run_config()))
+        .build();
+        server
+            .loader
+            .load_with_adapter(thread.clone(), &[connection.id], Some(adapter))
+            .await;
+        let request = server.turn_start(&mut connection, &text_turn("work")).await;
+        let turn_id = connection.response(request).await["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        connection.notification("turn/started").await;
+        script.wait_for_calls(1).await;
+
+        let config = thread.run_config();
+        let run_id = RunId::new(&turn_id);
+        let run = RunContext::new(run_id.clone(), &agent)
+            .with_app_context(config.app_context().unwrap().clone());
+        let tool = host.exec_command_tool().unwrap();
+        let call_id = CallId::new("pending");
+        let arguments =
+            json!({"cmd": "touch pending.txt", "sandbox_permissions": "require_escalated"});
+        let context = ToolContext::new(&run, tool.as_ref(), &call_id, &arguments);
+        assert!(tool.needs_approval(&context).await.unwrap());
+        let settings = config
+            .app_context()
+            .unwrap()
+            .downcast_ref::<CodingThreadSettings>()
+            .unwrap();
+        assert!(
+            settings
+                .pending_command_requirement(&run_id, &call_id)
+                .is_some()
+        );
+
+        if interrupt {
+            let request = server
+                .request(
+                    &mut connection,
+                    "turn/interrupt",
+                    serde_json::to_value(TurnInterruptParams::new(THREAD, &turn_id)).unwrap(),
+                )
+                .await;
+            connection.response(request).await;
+        } else {
+            release.notify_one();
+        }
+        let completed = connection.notification("turn/completed").await;
+        assert_eq!(
+            completed["turn"]["status"],
+            if interrupt {
+                "interrupted"
+            } else {
+                "completed"
+            }
+        );
+        assert!(
+            settings
+                .pending_command_requirement(&run_id, &call_id)
+                .is_none()
+        );
+        assert!(!dir.path().join("pending.txt").exists());
     }
 }

@@ -7,8 +7,9 @@
 //! - [`ra_exec`] owns process lifetime, signalling, output capture, and sessions. It knows nothing
 //!   about tools, which is why its failures arrive as [`ExecError`] and are given a tool's name
 //!   here rather than there.
-//! - The product layer supplies the workspace root and, once approval lands, the policy that
-//!   decides whether a command runs at all.
+//! - The product layer supplies the workspace root and, through
+//!   [`ExecCommandTool::with_policy_resolvers`], the policy that decides whether a command runs at
+//!   all and in which sandbox.
 //!
 //! # Every argument in the schema does something
 //!
@@ -16,8 +17,10 @@
 //! tells the model it has control it does not have. `tty` is the sharpest case — a request for a
 //! terminal that quietly produced a pipe would leave the model waiting for a prompt that can never
 //! arrive, so it is refused with a sentence instead. The approval-shaped arguments Codex carries
-//! (`prefix_rule`, `sandbox_permissions`, `justification`) are absent for the same reason: they
-//! belong to the milestone that reads them, and they arrive with their consumer.
+//! (`sandbox_permissions`, `justification`, `prefix_rule`) are advertised only once policy resolvers
+//! are installed, for the same reason: the host's policy is what reads them, so a tool without one
+//! neither advertises nor accepts them. Their descriptions are Codex's; Codex's
+//! `with_additional_permissions` value is not offered yet.
 //!
 //! Output ceilings are host configuration rather than an argument, on the same grounds `read_file`
 //! states: the model cannot know the context budget it is spending against, so an argument asking
@@ -56,29 +59,77 @@ use crate::session_return::{ReturnReason, SessionReturn, Watched};
 /// The advertised name. Identity and schema must agree on it or [`Tool::validate`] refuses.
 const TOOL_NAME: &str = "exec_command";
 
-// The doc comment below is the model-facing description. R2-11's measurement is that the tools
-// doing the work carry short descriptions and the dangerous ones carry contracts; this is both, so
-// the description says what the tool returns and the argument descriptions carry the rest.
-#[derive(Debug, Clone, Deserialize, JsonSchema, ToolInput)]
-#[serde(deny_unknown_fields)]
-/// Runs a command in a shell. Returns its output, or a `session_id` when the command is still
-/// running after the yield timeout.
-struct ExecCommandInput {
-    /// Command to execute in the shell.
-    cmd: String,
-    /// Working directory for the command. A relative path resolves against the workspace root.
-    workdir: Option<String>,
-    /// Shell to run the command with. Defaults to `/bin/sh`.
-    shell: Option<String>,
-    /// Request a terminal. Not available; leave unset or false.
-    tty: Option<bool>,
-    /// Run the shell as a login shell, so that profile files are read.
-    login: Option<bool>,
-    /// Milliseconds to wait before the command yields to the background (default: 10000). The host
-    /// may cap this; asking for longer than it allows yields at the cap.
-    yield_time_ms: Option<u64>,
-    /// Milliseconds after which the command is stopped for good. Unset means the host's limit.
-    timeout_ms: Option<u64>,
+/// Declares an argument form of `exec_command`: the arguments every form takes, then `extra`.
+macro_rules! exec_command_input {
+    ($name:ident { $($extra:tt)* }) => {
+        // The doc comment below is the model-facing description. Measurements show that the
+        // tools doing the work carry short descriptions and the dangerous ones carry contracts;
+        // this is both, so the description says what the tool returns and the argument
+        // descriptions carry the rest.
+        #[derive(Debug, Clone, Deserialize, JsonSchema, ToolInput)]
+        #[serde(deny_unknown_fields)]
+        /// Runs a command in a shell. Returns its output, or a `session_id` when the command is still
+        /// running after the yield timeout.
+        struct $name {
+            /// Command to execute in the shell.
+            cmd: String,
+            /// Working directory for the command. A relative path resolves against the workspace root.
+            workdir: Option<String>,
+            /// Shell to run the command with. Defaults to `/bin/sh`.
+            shell: Option<String>,
+            /// Request a terminal. Not available; leave unset or false.
+            tty: Option<bool>,
+            /// Run the shell as a login shell, so that profile files are read.
+            login: Option<bool>,
+            /// Milliseconds to wait before the command yields to the background (default: 10000). The host
+            /// may cap this; asking for longer than it allows yields at the cap.
+            yield_time_ms: Option<u64>,
+            /// Milliseconds after which the command is stopped for good. Unset means the host's limit.
+            timeout_ms: Option<u64>,
+            $($extra)*
+        }
+    };
+}
+
+exec_command_input!(ExecCommandInput {});
+
+// The approval arguments are read from the call's arguments by the host's policy resolvers, not by
+// this tool, which only advertises and accepts them.
+exec_command_input!(PolicyExecCommandInput {
+    /// Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for
+    /// unsandboxed execution.
+    #[allow(dead_code)]
+    sandbox_permissions: Option<SandboxPermissionsArgument>,
+    /// User-facing approval question for `require_escalated`; omit otherwise.
+    #[allow(dead_code)]
+    justification: Option<String>,
+    /// Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`;
+    /// for example ["git", "pull"].
+    #[allow(dead_code, clippy::doc_link_with_quotes)]
+    prefix_rule: Option<Vec<String>>,
+});
+
+impl From<PolicyExecCommandInput> for ExecCommandInput {
+    fn from(input: PolicyExecCommandInput) -> Self {
+        Self {
+            cmd: input.cmd,
+            workdir: input.workdir,
+            shell: input.shell,
+            tty: input.tty,
+            login: input.login,
+            yield_time_ms: input.yield_time_ms,
+            timeout_ms: input.timeout_ms,
+        }
+    }
+}
+
+// The values of Codex's `sandbox_permissions` this build offers. A plain comment rather than a doc
+// comment, which would reach the model as the schema's description.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SandboxPermissionsArgument {
+    UseDefault,
+    RequireEscalated,
 }
 
 /// Ceilings and timing defaults applied by the `exec_command` tool.
@@ -141,6 +192,8 @@ impl ExecCommandLimits {
 pub struct ExecCommandTool {
     origin: ToolOrigin,
     func_schema: FuncSchema,
+    /// The schema with the approval arguments, advertised once policy resolvers are installed.
+    policy_func_schema: FuncSchema,
     options: ToolOptions,
     process_manager: Arc<ProcessManager>,
     limits: ExecCommandLimits,
@@ -180,6 +233,7 @@ impl ExecCommandTool {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
+            policy_func_schema: FuncSchema::for_input::<PolicyExecCommandInput>(TOOL_NAME)?,
             options: base_options(),
             process_manager: Arc::new(ProcessManager::default()),
             limits: ExecCommandLimits::new(),
@@ -212,6 +266,7 @@ impl ExecCommandTool {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
+            policy_func_schema: FuncSchema::for_input::<PolicyExecCommandInput>(TOOL_NAME)?,
             options: base_options()
                 .with_resource_claim(ResourceClaim::exclusive(workspace.resource_id().clone())),
             process_manager: Arc::new(ProcessManager::default()),
@@ -233,12 +288,16 @@ impl ExecCommandTool {
     }
 
     /// Installs host callbacks for per-step execution and per-call approval policy.
+    ///
+    /// The tool then advertises and accepts Codex's approval arguments, `sandbox_permissions`,
+    /// `justification` and `prefix_rule`, which the callbacks read from the call's arguments.
     #[must_use]
     pub fn with_policy_resolvers(
         mut self,
         environment: Arc<EnvironmentResolver>,
         approval: Arc<ApprovalResolver>,
     ) -> Self {
+        self.func_schema = self.policy_func_schema.clone();
         self.environment_resolver = Some(environment);
         self.approval_resolver = Some(approval);
         self.options = self.options.with_approval(ToolApprovalPolicy::Dynamic);
@@ -268,6 +327,25 @@ impl ExecCommandTool {
     #[must_use]
     pub fn process_manager(&self) -> &Arc<ProcessManager> {
         &self.process_manager
+    }
+
+    /// The call's decoded arguments, decoding them here when the runtime has not.
+    fn take_input<T: ra_core::tool::ToolInput + serde::de::DeserializeOwned>(
+        &self,
+        context: &mut ToolContext<'_>,
+    ) -> Result<T> {
+        context.take_decoded_input::<T>()?.map_or_else(
+            || {
+                serde_json::from_value(context.arguments().clone()).map_err(|error| {
+                    ExecCommandFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
+                        input_type: self.func_schema.input_type_name(),
+                        message: error.to_string(),
+                    })
+                    .into_error()
+                })
+            },
+            Ok,
+        )
     }
 
     /// Turns decoded arguments into the request `ra-exec` runs.
@@ -383,20 +461,20 @@ impl Tool for ExecCommandTool {
     }
 
     async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
-        let input = context
-            .take_decoded_input::<ExecCommandInput>()?
-            .map_or_else(
-                || {
-                    serde_json::from_value(context.arguments().clone()).map_err(|error| {
-                        ExecCommandFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
-                            input_type: self.func_schema.input_type_name(),
-                            message: error.to_string(),
-                        })
-                        .into_error()
-                    })
-                },
-                Ok,
-            )?;
+        // Consume the host's frozen decision before input or working-directory validation can
+        // fail, so an attempted call does not leave an executable decision behind.
+        let environment = self
+            .environment_resolver
+            .as_ref()
+            .map(|resolve| resolve(&context))
+            .transpose()?
+            .unwrap_or_else(|| self.process_manager.environment().clone());
+        let input = if self.environment_resolver.is_some() {
+            self.take_input::<PolicyExecCommandInput>(&mut context)?
+                .into()
+        } else {
+            self.take_input::<ExecCommandInput>(&mut context)?
+        };
         let request = self
             .request(input)
             .map_err(ExecCommandFailure::into_error)?
@@ -405,12 +483,6 @@ impl Tool for ExecCommandTool {
         // waited and the effective figure is the one the request carries, not the one asked for.
         let yielded_after = request.limits().initial_yield_timeout();
 
-        let environment = self
-            .environment_resolver
-            .as_ref()
-            .map(|resolve| resolve(&context))
-            .transpose()?
-            .unwrap_or_else(|| self.process_manager.environment().clone());
         let emitter = context.event_emitter();
         let outcome = self
             .process_manager

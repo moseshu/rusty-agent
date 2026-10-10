@@ -1494,7 +1494,8 @@ async fn the_coding_hosts_commands_show_as_command_executions() {
                 CallId::new(id),
                 "exec_command",
                 json!({"cmd": cmd, "workdir": null, "shell": null, "tty": null, "login": null,
-                       "yield_time_ms": yield_time_ms, "timeout_ms": null}),
+                       "yield_time_ms": yield_time_ms, "timeout_ms": null,
+                       "sandbox_permissions": null, "justification": null, "prefix_rule": null}),
             )),
         )])
     };

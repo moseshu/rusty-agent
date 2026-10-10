@@ -405,3 +405,78 @@ async fn test_exec_command_truncation_limits() {
     assert_eq!(truncations[0].original_bytes(), 200);
     assert_eq!(truncations[0].retained_bytes(), 50);
 }
+
+/// With policy resolvers installed the tool advertises Codex's approval arguments, with Codex's
+/// descriptions, and accepts them; the resolvers read them from the call's arguments.
+#[tokio::test]
+async fn test_exec_command_policy_resolvers_add_the_approval_arguments() {
+    let dir = workspace();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let recorded = std::sync::Arc::clone(&seen);
+    let tool = rooted(&dir).with_policy_resolvers(
+        std::sync::Arc::new(|_context: &ToolContext<'_>| {
+            Ok(ra_exec::sandbox::ExecEnvironment::default())
+        }),
+        std::sync::Arc::new(move |context: &ToolContext<'_>| {
+            *recorded.lock().unwrap() = Some(context.arguments()["prefix_rule"].clone());
+            Ok(false)
+        }),
+    );
+    tool.validate().expect("identity and schema must agree");
+
+    let schema = tool.schema().input_schema();
+    assert_eq!(
+        schema["required"],
+        json!([
+            "cmd",
+            "justification",
+            "login",
+            "prefix_rule",
+            "sandbox_permissions",
+            "shell",
+            "timeout_ms",
+            "tty",
+            "workdir",
+            "yield_time_ms"
+        ])
+    );
+    let properties = &schema["properties"];
+    assert_eq!(
+        properties["justification"]["description"],
+        "User-facing approval question for `require_escalated`; omit otherwise."
+    );
+    assert_eq!(
+        properties["prefix_rule"]["description"],
+        r#"Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#
+    );
+    assert_eq!(
+        properties["sandbox_permissions"]["description"],
+        "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
+    );
+    // Codex's `with_additional_permissions` is not offered.
+    assert_eq!(
+        schema["definitions"]["SandboxPermissionsArgument"]["enum"],
+        json!(["use_default", "require_escalated"])
+    );
+
+    let args = arguments(json!({
+        "cmd": "printf ok",
+        "sandbox_permissions": "require_escalated",
+        "justification": "Do you want to run it?",
+        "prefix_rule": ["printf"],
+        "yield_time_ms": 2000
+    }));
+    tool.decode_input(&args)
+        .expect("the approval arguments decode");
+    let run = run();
+    let call_id = CallId::new("call-exec-1");
+    assert!(
+        !tool
+            .needs_approval(&ToolContext::new(&run, &tool, &call_id, &args))
+            .await
+            .unwrap()
+    );
+    assert_eq!(*seen.lock().unwrap(), Some(json!(["printf"])));
+    let output = observe(&tool, &args).await;
+    assert_eq!(output.as_text(), Some("ok"));
+}

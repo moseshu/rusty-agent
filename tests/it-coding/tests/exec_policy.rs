@@ -13,17 +13,18 @@ use std::{fs, path::Path, sync::Arc};
 use ra_coding::{
     exec_policy::{
         AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyError,
-        ExecPolicyManager, ExecPolicySources, FileSystemSandboxKind, SandboxPermissions,
-        UnmatchedCommandContext, collect_policy_files, commands_for_exec_policy,
-        derive_rejected_prompt_reason, derive_requested_execpolicy_amendment_from_prefix_rule,
+        ExecPolicyManager, ExecPolicySources, ExecPolicyUpdateError, FileSystemSandboxKind,
+        SandboxPermissions, UnmatchedCommandContext, collect_policy_files,
+        commands_for_exec_policy, default_policy_path, derive_rejected_prompt_reason,
+        derive_requested_execpolicy_amendment_from_prefix_rule,
         format_exec_policy_error_with_source, load_exec_policy, load_exec_policy_with_warning,
         parse_starlark_line_from_message, render_decision_for_unmatched_command,
     },
     shell_command::DangerousCommandMatch,
 };
 use ra_execpolicy::{
-    AbsolutePathBuf, Decision, Evaluation, MatchOptions, NetworkRuleProtocol, Policy, PolicyParser,
-    RequirementsExecPolicy, RuleMatch,
+    AbsolutePathBuf, AmendError, Decision, Evaluation, MatchOptions, NetworkRuleProtocol, Policy,
+    PolicyParser, RequirementsExecPolicy, RuleMatch,
 };
 use ra_protocol::server::protocol::{AskForApproval, ExecPolicyAmendment};
 use tempfile::tempdir;
@@ -1007,6 +1008,129 @@ fn heuristics_apply_when_other_commands_match_policy() {
         .file_system(UNRESTRICTED)
         .requirement(),
         needs_approval(None, amendment(&["orange"])),
+    );
+}
+
+#[tokio::test]
+async fn append_execpolicy_amendment_updates_policy_and_file() {
+    let codex_home = tempdir().expect("create temp dir");
+    let prefix = vec!["echo".to_string(), "hello".to_string()];
+    let manager = ExecPolicyManager::default();
+
+    manager
+        .append_amendment_and_update(codex_home.path(), &ExecPolicyAmendment::new(prefix))
+        .await
+        .expect("update policy");
+    let updated_policy = manager.current();
+
+    let evaluation = updated_policy.check(
+        &["echo".to_string(), "hello".to_string(), "world".to_string()],
+        &|_| Decision::Allow,
+    );
+    assert!(matches!(
+        evaluation,
+        Evaluation {
+            decision: Decision::Allow,
+            ..
+        }
+    ));
+
+    let contents = fs::read_to_string(default_policy_path(codex_home.path()))
+        .expect("policy file should have been created");
+    assert_eq!(
+        contents,
+        r#"prefix_rule(pattern=["echo", "hello"], decision="allow")
+"#
+    );
+}
+
+#[tokio::test]
+async fn append_execpolicy_amendment_rejects_empty_prefix() {
+    let codex_home = tempdir().expect("create temp dir");
+    let manager = ExecPolicyManager::default();
+
+    let result = manager
+        .append_amendment_and_update(
+            codex_home.path(),
+            &ExecPolicyAmendment::new(Vec::<String>::new()),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ExecPolicyUpdateError::AppendRule {
+            source: AmendError::EmptyPrefix,
+            ..
+        })
+    ));
+}
+
+/// Amendments approved at the same time are all written, each once, and all allowed afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn concurrent_amendments_are_each_written_once() {
+    let codex_home = tempdir().expect("create temp dir");
+    let manager = Arc::new(ExecPolicyManager::default());
+    let prefixes = [&["echo", "hello"][..], &["git", "pull"], &["echo", "hello"]];
+
+    let updates: Vec<_> = prefixes
+        .iter()
+        .map(|prefix| {
+            let manager = Arc::clone(&manager);
+            let home = codex_home.path().to_path_buf();
+            let amendment = ExecPolicyAmendment::new(prefix.iter().copied());
+            tokio::spawn(
+                async move { manager.append_amendment_and_update(&home, &amendment).await },
+            )
+        })
+        .collect();
+    for update in updates {
+        update.await.unwrap().expect("update policy");
+    }
+
+    let contents = fs::read_to_string(default_policy_path(codex_home.path())).unwrap();
+    let mut lines: Vec<&str> = contents.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        [
+            r#"prefix_rule(pattern=["echo", "hello"], decision="allow")"#,
+            r#"prefix_rule(pattern=["git", "pull"], decision="allow")"#,
+        ]
+    );
+    let policy = manager.current();
+    assert_eq!(policy.rules().get_vec("echo").map(Vec::len), Some(1));
+    for command in [vec_str(&["echo", "hello"]), vec_str(&["git", "pull"])] {
+        assert_eq!(
+            policy.check(&command, &|_| Decision::Forbidden).decision,
+            Decision::Allow
+        );
+    }
+}
+
+/// A prefix a loaded rule already allows is still written to the rules file, and the policy in
+/// force keeps the rule it had rather than gaining a second one.
+#[tokio::test]
+async fn amendment_for_an_allowed_prefix_leaves_the_policy_alone() {
+    let codex_home = tempdir().expect("create temp dir");
+    let manager = ExecPolicyManager::new(policy_from_src(Some(
+        r#"prefix_rule(pattern=["echo"], decision="allow")"#,
+    )));
+
+    manager
+        .append_amendment_and_update(
+            codex_home.path(),
+            &ExecPolicyAmendment::new(["echo", "hello"]),
+        )
+        .await
+        .expect("update policy");
+
+    assert_eq!(
+        manager.current().rules().get_vec("echo").map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        fs::read_to_string(default_policy_path(codex_home.path())).unwrap(),
+        "prefix_rule(pattern=[\"echo\", \"hello\"], decision=\"allow\")\n"
     );
 }
 

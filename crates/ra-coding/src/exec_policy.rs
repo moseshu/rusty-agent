@@ -44,8 +44,8 @@ use std::{
 };
 
 use ra_execpolicy::{
-    Decision, Error as ExecPolicyRuleError, Evaluation, MatchOptions, Policy, PolicyParser,
-    PrefixRule, RequirementsExecPolicy, RuleMatch,
+    AmendError, Decision, Error as ExecPolicyRuleError, Evaluation, MatchOptions, Policy,
+    PolicyParser, PrefixRule, RequirementsExecPolicy, RuleMatch, blocking_append_allow_prefix_rule,
 };
 use ra_protocol::server::protocol::{AskForApproval, ExecPolicyAmendment, SandboxPolicy};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,7 @@ const REJECT_SANDBOX_APPROVAL_REASON: &str =
 const REJECT_RULES_APPROVAL_REASON: &str =
     "approval required by policy rule, but AskForApproval::Granular.rules is false";
 const RULES_DIR_NAME: &str = "rules";
+const DEFAULT_POLICY_FILE: &str = "default.rules";
 const RULE_EXTENSION: &str = "rules";
 
 /// Prefixes never proposed as a reusable rule from a model's `prefix_rule`: each would approve an
@@ -365,11 +366,40 @@ pub enum ExecPolicyError {
     },
 }
 
+/// Why an approved amendment could not be applied: Codex's `ExecPolicyUpdateError`.
+#[derive(Debug, Error)]
+pub enum ExecPolicyUpdateError {
+    /// The rules file could not be written.
+    #[error("failed to update rules file {path}: {source}")]
+    AppendRule {
+        /// The rules file.
+        path: PathBuf,
+        /// The cause.
+        source: AmendError,
+    },
+
+    /// The blocking write did not finish.
+    #[error("failed to join blocking rules update task: {source}")]
+    JoinBlockingTask {
+        /// The cause.
+        source: tokio::task::JoinError,
+    },
+
+    /// The rule could not be added to the policy in force.
+    #[error("failed to update in-memory rules: {source}")]
+    AddRule {
+        /// The cause.
+        #[from]
+        source: ExecPolicyRuleError,
+    },
+}
+
 /// The loaded rules of one coding host, and the decisions made with them: Codex's
 /// `ExecPolicyManager`.
 #[derive(Debug)]
 pub struct ExecPolicyManager {
     policy: RwLock<Arc<Policy>>,
+    update_lock: tokio::sync::Semaphore,
 }
 
 impl Default for ExecPolicyManager {
@@ -384,6 +414,7 @@ impl ExecPolicyManager {
     pub fn new(policy: Arc<Policy>) -> Self {
         Self {
             policy: RwLock::new(policy),
+            update_lock: tokio::sync::Semaphore::new(1),
         }
     }
 
@@ -430,6 +461,64 @@ impl ExecPolicyManager {
             policy.network_rules().to_vec(),
             policy.host_executables().clone(),
         ))
+    }
+
+    /// Allows `amendment`'s prefix from now on: appends its allow rule to
+    /// [`default_policy_path`]`(codex_home)` and adds it to the policy in force, unless a rule
+    /// already allows the prefix. Updates run one at a time; the file write is locked and skips a
+    /// line the file already holds.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the rules file cannot be written, leaving the policy in force unchanged.
+    pub async fn append_amendment_and_update(
+        &self,
+        codex_home: &Path,
+        amendment: &ExecPolicyAmendment,
+    ) -> Result<(), ExecPolicyUpdateError> {
+        let _update_guard =
+            self.update_lock
+                .acquire()
+                .await
+                .map_err(|_| ExecPolicyUpdateError::AddRule {
+                    source: ExecPolicyRuleError::InvalidRule(
+                        "exec policy update semaphore closed".to_string(),
+                    ),
+                })?;
+        let policy_path = default_policy_path(codex_home);
+        tokio::task::spawn_blocking({
+            let policy_path = policy_path.clone();
+            let prefix = amendment.command().to_vec();
+            move || blocking_append_allow_prefix_rule(&policy_path, &prefix)
+        })
+        .await
+        .map_err(|source| ExecPolicyUpdateError::JoinBlockingTask { source })?
+        .map_err(|source| ExecPolicyUpdateError::AppendRule {
+            path: policy_path,
+            source,
+        })?;
+
+        let current_policy = self.current();
+        let match_options = MatchOptions {
+            resolve_host_executables: true,
+        };
+        let existing_evaluation = current_policy.check_multiple_with_options(
+            [amendment.command()],
+            &|_| Decision::Forbidden,
+            &match_options,
+        );
+        let already_allowed = existing_evaluation.decision == Decision::Allow
+            && existing_evaluation.matched_rules.iter().any(|rule_match| {
+                is_policy_match(rule_match) && rule_match.decision() == Decision::Allow
+            });
+        if already_allowed {
+            return Ok(());
+        }
+
+        let mut updated_policy = current_policy.as_ref().clone();
+        updated_policy.add_prefix_rule(amendment.command(), Decision::Allow)?;
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(updated_policy);
+        Ok(())
     }
 
     /// Decides `req.command` as given, splitting a shell script into its commands.
@@ -549,6 +638,12 @@ impl ExecPolicyManager {
             },
         }
     }
+}
+
+/// The rules file approved amendments are appended to: `rules/default.rules` under `codex_home`.
+#[must_use]
+pub fn default_policy_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(RULES_DIR_NAME).join(DEFAULT_POLICY_FILE)
 }
 
 const fn is_policy_match(rule_match: &RuleMatch) -> bool {
