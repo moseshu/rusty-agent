@@ -16,10 +16,12 @@
 //! (enforced by the layering gate).
 
 pub mod agent;
+pub(crate) mod approvals;
 pub mod assembly;
 pub mod background_terminals;
 pub(crate) mod capabilities;
 pub(crate) mod closeout;
+pub mod command_canonicalization;
 pub mod dangerous_action;
 pub mod doctor;
 pub mod exec_policy;

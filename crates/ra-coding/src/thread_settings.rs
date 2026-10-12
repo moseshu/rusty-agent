@@ -40,6 +40,12 @@
 //! made before the first attempt. Later refusals are returned as output without replaying the
 //! command, whose earlier operations may already have produced side effects.
 //!
+//! Each thread caches the approvals its host gives for the session, as Codex's session does (see
+//! [`CodingThreadSettings::cache_review_decision`]): a command with the same key as an approved
+//! one, or a patch touching only approved paths, runs without asking, and an approved command's
+//! sandbox retry does not ask either. Configured permission rules decide before the cache is
+//! consulted, as Codex's permission-request hooks decide before its cache.
+//!
 //! Invocation identity covers the tool and complete arguments. Settled calls retain only their
 //! identity until the turn ends, preventing call-ID reuse. The app-server listener forwards events
 //! to [`ThreadSettingsAdapter::on_thread_event`] for cleanup; an embedding host loading threads
@@ -51,13 +57,16 @@
 //! roots; it does not yet port Codex's nested protected-directory rules. Those remain an execution
 //! adapter parity gap rather than a new provider-neutral permission rule.
 
+use crate::approvals::{
+    ApprovalCacheKey, ApprovalStore, CommandApproval, CommandCacheKey, patch_cache_keys,
+};
 use crate::exec_policy::{
     AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyManager,
     FileSystemSandboxKind, SandboxPermissions, prompt_is_rejected_by_policy,
 };
 use ra_core::{
     error::{Error, Result},
-    item::{CallId, RunItemKind},
+    item::{CallId, RunItemKind, ToolApproval},
     permission::PermissionMode,
     state::{ArgumentFingerprint, RunId},
     tool::{ToolContext, ToolLookupKey},
@@ -95,6 +104,7 @@ pub struct CodingThreadSettings {
     allow_prefix_rules: AllowPrefixRules,
     rules_home: Option<PathBuf>,
     command_decisions: Arc<CommandDecisions>,
+    approvals: Arc<Mutex<ApprovalStore>>,
 }
 
 impl CodingThreadSettings {
@@ -142,6 +152,82 @@ impl CodingThreadSettings {
             tracing::warn!("{message}");
             message
         })
+    }
+
+    /// Caches `decision` for the call `approval` asks about, as Codex's `with_cached_approval` does
+    /// once its prompt is answered: approved for the session, each of the call's keys is approved
+    /// for the rest of this thread, so a later command with the same key, or a patch touching only
+    /// approved paths, does not ask. Any other decision, and an approval of another tool, is left
+    /// alone.
+    ///
+    /// This only fills the thread's cache: the host still approves the call itself, once. A
+    /// session approval is not the framework's sticky approval of the whole tool.
+    pub fn cache_review_decision(&self, approval: &ToolApproval, decision: &ReviewDecision) {
+        if approval.namespace().is_some() {
+            return;
+        }
+        let arguments = approval.arguments();
+        match approval.tool_name() {
+            EXEC_COMMAND_TOOL => {
+                let keys = self.command_cache_keys(arguments);
+                self.approvals().remember(keys, decision);
+            }
+            APPLY_PATCH_TOOL => {
+                let keys = self.patch_cache_keys(arguments);
+                self.approvals().remember(keys, decision);
+            }
+            _ => {}
+        }
+    }
+
+    fn approvals(&self) -> std::sync::MutexGuard<'_, ApprovalStore> {
+        self.approvals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The keys Codex caches a command approval under: the command, where and how it runs, and the
+    /// requirements policy it is decided under. Arguments the policy cannot read have none.
+    fn command_cache_keys(&self, arguments: &Value) -> Vec<CommandCacheKey> {
+        let Ok(arguments) = serde_json::from_value::<CommandArguments>(arguments.clone()) else {
+            return Vec::new();
+        };
+        CommandApproval {
+            command: &arguments.command(),
+            cwd: self.command_cwd(arguments.workdir.as_deref()),
+            tty: arguments.tty.unwrap_or(false),
+            sandbox_permissions: arguments.sandbox_permissions.unwrap_or_default(),
+        }
+        .cache_keys(self.exec_policy.requirements_fingerprint())
+    }
+
+    /// The keys Codex caches a patch approval under, one per path it touches. A patch that does
+    /// not parse has none.
+    fn patch_cache_keys(&self, arguments: &Value) -> Vec<ApprovalCacheKey> {
+        let patch = match arguments {
+            Value::String(patch) => Some(patch.as_str()),
+            Value::Object(arguments) => arguments.get("patch").and_then(Value::as_str),
+            _ => None,
+        };
+        patch
+            .and_then(|patch| ra_patch::parse_patch(patch).ok())
+            .map(|plan| patch_cache_keys(&self.cwd, &plan))
+            .unwrap_or_default()
+    }
+
+    /// The directory a command runs in: `workdir` resolved against the thread's workspace, as
+    /// `exec_command` resolves it.
+    fn command_cwd(&self, workdir: Option<&str>) -> PathBuf {
+        workdir
+            .map_or_else(|| self.cwd.clone(), |workdir| self.cwd.join(workdir))
+            .components()
+            .collect()
+    }
+
+    /// Whether the host approved every key for the session: the lookup half of Codex's
+    /// `with_cached_approval`, made where the call would ask.
+    fn approved_for_session<K: Serialize>(&self, keys: &[K]) -> bool {
+        self.approvals().all_approved_for_session(keys)
     }
 
     /// The configured destination for approval review, captured with a model step.
@@ -213,6 +299,7 @@ impl CodingThreadSettingsAdapter {
                 allow_prefix_rules: AllowPrefixRules::default(),
                 rules_home: None,
                 command_decisions: Arc::new(CommandDecisions::default()),
+                approvals: Arc::default(),
             },
             profiles,
         })
@@ -255,9 +342,12 @@ impl CodingThreadSettingsAdapter {
     }
 
     /// Installs the explicitly selected product snapshot on a framework configuration.
+    ///
+    /// Each thread initialized gets an approval cache of its own, as each Codex session has.
     pub fn initialize(&self, config: RunConfig) -> RunConfig {
         let mut settings = self.initial.clone();
         settings.base_permission = config.permission().clone();
+        settings.approvals = Arc::default();
         install(config, settings)
     }
 
@@ -269,6 +359,7 @@ impl CodingThreadSettingsAdapter {
             .unwrap_or_else(|| {
                 let mut initial = self.initial.clone();
                 initial.base_permission = config.permission().clone();
+                initial.approvals = Arc::default();
                 initial
             })
     }
@@ -485,9 +576,12 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         if !wants_no_sandbox_approval(decision.approval_policy) {
             return Ok(SandboxDenialAction::Return);
         }
-        // A call the host already approved is not asked about again.
+        // A call the host already approved is not asked about again, nor one whose command it
+        // approved for the session, whether that ran this call without asking or not.
         settings.command_decisions.request_retry(context)?;
-        if should_bypass_approval(decision.approval_policy, already_approved) {
+        if should_bypass_approval(decision.approval_policy, already_approved)
+            || settings.approved_for_session(&settings.command_cache_keys(context.arguments()))
+        {
             settings.command_decisions.resume_retry(context)?;
             return Ok(SandboxDenialAction::Retry(Box::new(
                 retry_environment.restore(&self.base),
@@ -662,10 +756,12 @@ fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
         };
         settings.command_decisions.record(context, decision)?
     };
+    // A command the host approved for the session does not ask again.
     let needs_approval = matches!(
         decision.requirement,
         ExecApprovalRequirement::NeedsApproval { .. }
-    );
+    ) && !settings
+        .approved_for_session(&settings.command_cache_keys(context.arguments()));
     Ok(needs_approval)
 }
 
@@ -680,12 +776,37 @@ const JUSTIFICATION_WITHOUT_SANDBOX_PERMISSIONS: &str = "`justification` require
 #[serde(default)]
 struct CommandArguments {
     cmd: String,
+    workdir: Option<String>,
     shell: Option<String>,
+    tty: Option<bool>,
     login: Option<bool>,
     sandbox_permissions: Option<SandboxPermissions>,
     justification: Option<String>,
     prefix_rule: Option<Vec<String>>,
 }
+
+impl CommandArguments {
+    /// The command in Codex's form, `[shell, "-lc" or "-c", cmd]`, whatever argument layout the
+    /// executor then starts the shell with.
+    fn command(&self) -> Vec<String> {
+        vec![
+            self.shell
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SHELL.to_owned()),
+            if self.login.unwrap_or(false) {
+                "-lc"
+            } else {
+                "-c"
+            }
+            .to_owned(),
+            self.cmd.clone(),
+        ]
+    }
+}
+
+/// The tools whose approvals the thread caches, by the names the coding host installs them under.
+const EXEC_COMMAND_TOOL: &str = "exec_command";
+const APPLY_PATCH_TOOL: &str = "apply_patch";
 
 /// What was decided about one command call, kept from its approval to its execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -882,9 +1003,6 @@ fn call_key(context: &ToolContext<'_>) -> (RunId, CallId) {
 
 /// What Codex's `exec_command` handler and command policy decide about the call `context` makes,
 /// or the refusal the model reads.
-///
-/// The command is judged in Codex's form, `[shell, "-lc" or "-c", cmd]`, whatever argument layout
-/// the executor then starts the shell with.
 fn command_decision(
     context: &ToolContext<'_>,
     settings: &CodingThreadSettings,
@@ -909,16 +1027,7 @@ fn command_decision(
             "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
         )));
     }
-    let command = vec![
-        arguments.shell.unwrap_or_else(|| DEFAULT_SHELL.to_owned()),
-        if arguments.login.unwrap_or(false) {
-            "-lc"
-        } else {
-            "-c"
-        }
-        .to_owned(),
-        arguments.cmd,
-    ];
+    let command = arguments.command();
     let requirement = settings
         .exec_policy
         .create_exec_approval_requirement_for_shell(
@@ -962,10 +1071,18 @@ fn command_decision(
     })
 }
 
+/// Whether a patch asks before it is applied: Codex's patch safety check, and its approval cache
+/// when it would ask.
 pub(crate) fn patch_approval(context: &ToolContext<'_>) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
     };
+    // A patch touching only paths the host approved for the session does not ask again.
+    Ok(patch_asks(settings)?
+        && !settings.approved_for_session(&settings.patch_cache_keys(context.arguments())))
+}
+
+fn patch_asks(settings: &CodingThreadSettings) -> Result<bool> {
     if matches!(settings.sandbox_policy, SandboxPolicy::ReadOnly { .. }) {
         return match settings.approval_policy {
             AskForApproval::Never

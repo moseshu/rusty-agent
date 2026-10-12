@@ -402,6 +402,7 @@ pub enum ExecPolicyUpdateError {
 #[derive(Debug)]
 pub struct ExecPolicyManager {
     policy: RwLock<Arc<Policy>>,
+    requirements_fingerprint: Option<Vec<String>>,
     update_lock: tokio::sync::Semaphore,
 }
 
@@ -417,6 +418,7 @@ impl ExecPolicyManager {
     pub fn new(policy: Arc<Policy>) -> Self {
         Self {
             policy: RwLock::new(policy),
+            requirements_fingerprint: None,
             update_lock: tokio::sync::Semaphore::new(1),
         }
     }
@@ -428,7 +430,20 @@ impl ExecPolicyManager {
         if let Some(err) = warning.as_ref() {
             tracing::warn!("failed to parse rules: {err}");
         }
-        Ok(Self::new(Arc::new(policy)))
+        let mut manager = Self::new(Arc::new(policy));
+        manager.requirements_fingerprint = sources
+            .requirements()
+            .map(RequirementsExecPolicy::fingerprint);
+        Ok(manager)
+    }
+
+    /// The fingerprint of the requirements policy merged into the loaded rules, if any. Codex keys
+    /// command approvals approved for a session by the fingerprint of the managed policy their
+    /// environment adds, so that a change of that policy asks again; a coding thread's one
+    /// environment is governed by the requirements policy.
+    #[must_use]
+    pub fn requirements_fingerprint(&self) -> Option<&[String]> {
+        self.requirements_fingerprint.as_deref()
     }
 
     /// The policy in force.
