@@ -787,8 +787,9 @@ async fn thread_start_ephemeral_remains_pathless() {
 
 /// What `thread/start` refuses, in Codex's words where Codex refuses it: a paginated history a
 /// store here does not keep, `permissions` with `sandbox`, an experimental member without the
-/// experimental API, a member this framework does not have, a model the host does not resolve,
-/// and a thread no factory or store is there to build or keep.
+/// experimental API, a member this framework does not have — including valid dynamic tools, whose
+/// calls are not carried yet — a model the host does not resolve, and a thread no factory or store
+/// is there to build or keep.
 #[tokio::test]
 async fn thread_start_refusals() {
     let script = Arc::new(Script::default());
@@ -813,7 +814,12 @@ async fn thread_start_refusals() {
             invalid_request("thread/start.cwd is not supported"),
         ),
         (
-            json!({"dynamicTools": []}),
+            json!({"dynamicTools": [{
+                "type": "function",
+                "name": "lookup_ticket",
+                "description": "Look up a ticket",
+                "inputSchema": {"type": "object", "properties": {}}
+            }]}),
             invalid_request("thread/start.dynamicTools is not supported"),
         ),
         (
@@ -3360,4 +3366,109 @@ async fn unsupported_capability_approvals_are_refused_when_called() {
             .any(|message| message.get("id").is_some() && message.get("method").is_some()),
         "no unsupported request is sent"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dynamic tools
+// ---------------------------------------------------------------------------------------------
+
+/// Ported from Codex's `thread_start_rejects_invalid_dynamic_tool_inputs` and
+/// `thread_start_rejects_hidden_dynamic_tools_without_namespace`: tools in mixed shapes, an empty
+/// namespace, a repeated namespace and a deferred tool outside a namespace are refused with
+/// Codex's texts before anything is built; tools in the legacy shape are read and checked like
+/// canonical ones, and an empty list starts a thread with none.
+#[tokio::test]
+async fn thread_start_checks_dynamic_tools() {
+    let script = Arc::new(Script::default());
+    let factory = Factory::new(&script);
+    let server = Server::start(factory.clone());
+    let mut connection = server.connect(1).await;
+    let schema = json!({"type": "object", "properties": {}});
+    let function = |name: &str| json!({"type": "function", "name": name, "description": name, "inputSchema": schema});
+    let namespace = |name: &str, tools: Vec<Value>| json!({"type": "namespace", "name": name, "description": name, "tools": tools});
+
+    for (dynamic_tools, expected) in [
+        (
+            json!([
+                function("canonical_tool"),
+                {
+                    "namespace": "legacy_app",
+                    "name": "legacy_tool",
+                    "description": "Legacy tool",
+                    "inputSchema": schema
+                }
+            ]),
+            "Invalid request: dynamic tools must use either canonical or legacy format consistently",
+        ),
+        (
+            json!([namespace(
+                "canonical_namespace",
+                vec![json!({
+                    "type": "function",
+                    "name": "legacy_visibility_tool",
+                    "description": "Uses a legacy visibility field",
+                    "inputSchema": schema,
+                    "exposeToContext": false
+                })]
+            )]),
+            "Invalid request: dynamic tools must use either canonical or legacy format consistently",
+        ),
+        (
+            json!([namespace("empty_namespace", vec![])]),
+            "dynamic tool namespace must contain at least one tool: empty_namespace",
+        ),
+        (
+            json!([
+                namespace("duplicate_namespace", vec![function("first_tool")]),
+                namespace("duplicate_namespace", vec![function("second_tool")])
+            ]),
+            "duplicate dynamic tool namespace: duplicate_namespace",
+        ),
+        (
+            json!([{
+                "type": "function",
+                "name": "hidden_tool",
+                "description": "Hidden dynamic tool",
+                "inputSchema": schema,
+                "deferLoading": true
+            }]),
+            "deferred dynamic tool must include a namespace: hidden_tool",
+        ),
+        (
+            json!([{"name": "hidden_tool", "description": "", "inputSchema": schema,
+                "exposeToContext": false}]),
+            "deferred dynamic tool must include a namespace: hidden_tool",
+        ),
+        (
+            json!([{"name": "lookup.ticket", "description": "", "inputSchema": schema}]),
+            "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: lookup.ticket",
+        ),
+        (
+            json!([
+                {"namespace": "legacy_app", "name": "lookup_status", "description": "",
+                    "inputSchema": schema, "exposeToContext": true},
+                {"namespace": "legacy_app", "name": "update_ticket", "description": "",
+                    "inputSchema": schema, "exposeToContext": false},
+            ]),
+            "thread/start.dynamicTools is not supported",
+        ),
+    ] {
+        assert_eq!(
+            server
+                .call_error(
+                    &mut connection,
+                    "thread/start",
+                    json!({"dynamicTools": dynamic_tools}),
+                )
+                .await,
+            invalid_request(expected)
+        );
+    }
+    assert!(factory.origins().is_empty(), "no thread is prepared");
+
+    let started = server
+        .call(&mut connection, "thread/start", json!({"dynamicTools": []}))
+        .await;
+    assert!(started["thread"]["id"].is_string(), "{started}");
+    assert_eq!(factory.origins(), vec![ThreadOrigin::Start]);
 }

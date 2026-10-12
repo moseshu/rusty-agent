@@ -18,7 +18,8 @@ workspace = true
 # `server::test_api::ThreadRequester` 按线程发出、撤回与补发，各请求答复的解读也从同一处转出。
 # `thread/start` / `thread/resume` 未移植，线程经 `ThreadLoader` 加载（可连同后台终端）与重新订阅；
 # 优雅重启的信号经 `RestartSignals` 注入而不发真信号；连接的请求闸门经 `RpcGate` 单独转出，供
-# codex 的闸门单测直接测它。
+# codex 的闸门单测直接测它。动态工具的 schema 读取与校验是 codex 的单测对象，经
+# `parse_tool_input_schema` / `validate_dynamic_tools` 转出，好照搬那些用例。
 test-api = []
 
 [dependencies]

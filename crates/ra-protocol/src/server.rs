@@ -62,7 +62,9 @@ mod approvals;
 mod background_terminals;
 mod connection_cleanup;
 mod connection_rpc_gate;
+mod dynamic_tools;
 mod image_url;
+mod json_schema;
 mod outgoing;
 mod processor;
 pub mod protocol;
@@ -755,8 +757,8 @@ pub mod test_api {
         outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
         processor::MessageProcessor,
         protocol::{
-            DynamicToolCallResponse, PermissionsRequestApprovalResponse, ServerRequest,
-            ServerRequestPayload, ToolRequestUserInputResponse,
+            DynamicToolCallResponse, DynamicToolSpec, PermissionsRequestApprovalResponse,
+            ServerRequest, ServerRequestPayload, ToolRequestUserInputResponse,
         },
         thread_listener::ensure_listener_task_running,
     };
@@ -1086,5 +1088,55 @@ pub mod test_api {
     #[must_use]
     pub fn dynamic_tool_call_response(answer: ClientAnswer) -> Option<DynamicToolCallResponse> {
         answers::dynamic_tool_call_response(answer)
+    }
+
+    /// A tool input schema as read into the schema subset, as JSON: Codex's
+    /// `parse_tool_input_schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason a schema the subset cannot read is refused.
+    pub fn parse_tool_input_schema(input_schema: &Value) -> Result<Value, String> {
+        super::json_schema::parse_tool_input_schema(input_schema)
+            .and_then(serde_json::to_value)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`parse_tool_input_schema`] compacting a schema over `max_bytes` rather than Codex's
+    /// default size.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason a schema the subset cannot read is refused.
+    pub fn parse_tool_input_schema_with_max_bytes(
+        input_schema: &Value,
+        max_bytes: usize,
+    ) -> Result<Value, String> {
+        super::json_schema::parse_tool_input_schema_with_max_bytes(input_schema, max_bytes)
+            .and_then(serde_json::to_value)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`parse_tool_input_schema`] without compacting a large schema: Codex's
+    /// `parse_tool_input_schema_without_compaction`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason a schema the subset cannot read is refused.
+    pub fn parse_tool_input_schema_without_compaction(
+        input_schema: &Value,
+    ) -> Result<Value, String> {
+        super::json_schema::parse_tool_input_schema_without_compaction(input_schema)
+            .and_then(serde_json::to_value)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Codex's `validate_dynamic_tools`.
+    ///
+    /// # Errors
+    ///
+    /// Returns Codex's error for the first tool that fails a check.
+    pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
+        super::dynamic_tools::validate_dynamic_tools(tools)
     }
 }

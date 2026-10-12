@@ -67,6 +67,7 @@ use ra_session::{
 use serde_json::{Map, Value, json};
 
 use super::{
+    dynamic_tools::validate_dynamic_tools,
     outgoing::{ConnectionRequestId, ServerNotification, now_unix_timestamp_ms},
     protocol::{
         ApprovalsReviewer, AskForApproval, THREAD_STARTED_METHOD, Thread, ThreadForkParams,
@@ -126,6 +127,10 @@ impl ThreadRequestProcessor {
             return Err(unsupported(METHOD, field));
         }
         check_approvals_reviewer(METHOD, params.policy.approvals_reviewer)?;
+        if let Some(tools) = params.dynamic_tools().filter(|tools| !tools.is_empty()) {
+            validate_dynamic_tools(tools).map_err(JsonRpcErrorObject::invalid_request)?;
+            return Err(unsupported(METHOD, "dynamicTools"));
+        }
         if params.history_mode == Some(ThreadHistoryMode::Paginated) {
             return Err(JsonRpcErrorObject::invalid_request(
                 "paginated threads require thread/turns/list and thread/items/list support",

@@ -37,6 +37,7 @@
 //! capabilities listed on [`InitializeCapabilities`] — still connects. The one exception is
 //! [`RequestPermissionProfile`], which refuses them as Codex does.
 
+mod dynamic_tools;
 mod item;
 mod permissions;
 mod server_request;
@@ -55,6 +56,10 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error};
 pub(crate) use self::thread_lifecycle::ThreadPolicyFields;
 pub use self::thread_management::*;
 pub use self::{
+    dynamic_tools::{
+        DynamicToolFunctionSpec, DynamicToolNamespaceSpec, DynamicToolNamespaceTool,
+        DynamicToolSpec, group_dynamic_tools_by_namespace, normalize_dynamic_tool_specs,
+    },
     item::{
         CommandAction, CommandExecutionApprovalDecision, CommandExecutionApprovalKind,
         CommandExecutionRequestApprovalParams, CommandExecutionRequestApprovalResponse,
@@ -96,9 +101,10 @@ pub use self::{
         ThreadStatusChangedNotification,
     },
     thread_item::{
-        CommandExecutionItem, CommandExecutionSource, CommandExecutionStatus, FileUpdateChange,
-        ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD, ItemCompletedNotification,
-        ItemStartedNotification, MessagePhase, PatchApplyStatus, PatchChangeKind, ThreadItem,
+        CommandExecutionItem, CommandExecutionSource, CommandExecutionStatus, DynamicToolCallItem,
+        DynamicToolCallStatus, FileUpdateChange, ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD,
+        ItemCompletedNotification, ItemStartedNotification, MessagePhase, PatchApplyStatus,
+        PatchChangeKind, ThreadItem,
     },
     thread_lifecycle::{
         SandboxMode, ThreadForkParams, ThreadForkResponse, ThreadLoadedListParams,

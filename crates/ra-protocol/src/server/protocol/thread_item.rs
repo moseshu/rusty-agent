@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{CommandAction, UserInput};
+use super::{CommandAction, DynamicToolCallOutputContentItem, UserInput};
 
 /// The method of the notification that an item started.
 pub const ITEM_STARTED_METHOD: &str = "item/started";
@@ -77,6 +77,19 @@ pub enum PatchApplyStatus {
     Failed,
     /// It was not approved.
     Declined,
+}
+
+/// Where a call of a client's tool stands: Codex's `DynamicToolCallStatus`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DynamicToolCallStatus {
+    /// The client is running it.
+    InProgress,
+    /// The client said it succeeded.
+    Completed,
+    /// The client said it failed, or no answer came.
+    Failed,
 }
 
 /// What a patch does to one file: Codex's `PatchChangeKind`.
@@ -243,6 +256,27 @@ pub enum ThreadItem {
         /// Where applying them stands.
         status: PatchApplyStatus,
     },
+    /// A call of a tool the client provides.
+    #[non_exhaustive]
+    #[serde(rename_all = "camelCase")]
+    DynamicToolCall {
+        /// Its id: the tool call's.
+        id: String,
+        /// The namespace of the tool, if it has one.
+        namespace: Option<String>,
+        /// The tool.
+        tool: String,
+        /// The arguments, as the model wrote them.
+        arguments: Value,
+        /// Where it stands.
+        status: DynamicToolCallStatus,
+        /// What the tool returned, once it answered.
+        content_items: Option<Vec<DynamicToolCallOutputContentItem>>,
+        /// Whether the tool succeeded, once it answered.
+        success: Option<bool>,
+        /// How long the call took, in milliseconds.
+        duration_ms: Option<i64>,
+    },
     /// The thread's context was compacted.
     #[non_exhaustive]
     #[serde(rename_all = "camelCase")]
@@ -319,6 +353,7 @@ impl ThreadItem {
             | Self::Reasoning { id, .. }
             | Self::CommandExecution { id, .. }
             | Self::FileChange { id, .. }
+            | Self::DynamicToolCall { id, .. }
             | Self::ContextCompaction { id } => id,
         }
     }
@@ -413,6 +448,79 @@ impl From<CommandExecutionItem> for ThreadItem {
             command_actions: item.command_actions,
             aggregated_output: item.aggregated_output,
             exit_code: item.exit_code,
+            duration_ms: item.duration_ms,
+        }
+    }
+}
+
+/// A call of a client's tool, built up before it becomes a [`ThreadItem::DynamicToolCall`].
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicToolCallItem {
+    id: String,
+    namespace: Option<String>,
+    tool: String,
+    arguments: Value,
+    status: DynamicToolCallStatus,
+    content_items: Option<Vec<DynamicToolCallOutputContentItem>>,
+    success: Option<bool>,
+    duration_ms: Option<i64>,
+}
+
+impl DynamicToolCallItem {
+    /// The call `id` of `tool` with `arguments`, where `status` says.
+    pub fn new(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: Value,
+        status: DynamicToolCallStatus,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            namespace: None,
+            tool: tool.into(),
+            arguments,
+            status,
+            content_items: None,
+            success: None,
+            duration_ms: None,
+        }
+    }
+
+    /// The namespace of the tool.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// What the tool returned, and whether it succeeded.
+    pub fn with_response(
+        mut self,
+        content_items: Vec<DynamicToolCallOutputContentItem>,
+        success: bool,
+    ) -> Self {
+        self.content_items = Some(content_items);
+        self.success = Some(success);
+        self
+    }
+
+    /// How long the call took.
+    pub const fn with_duration_ms(mut self, duration_ms: i64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
+}
+
+impl From<DynamicToolCallItem> for ThreadItem {
+    fn from(item: DynamicToolCallItem) -> Self {
+        Self::DynamicToolCall {
+            id: item.id,
+            namespace: item.namespace,
+            tool: item.tool,
+            arguments: item.arguments,
+            status: item.status,
+            content_items: item.content_items,
+            success: item.success,
             duration_ms: item.duration_ms,
         }
     }

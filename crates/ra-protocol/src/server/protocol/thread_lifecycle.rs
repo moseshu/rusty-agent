@@ -27,8 +27,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use super::{
-    ApprovalsReviewer, AskForApproval, SandboxPolicy, SortDirection, Thread, ThreadHistoryMode,
-    Turn, TurnItemsView, settings::double_option,
+    ApprovalsReviewer, AskForApproval, DynamicToolSpec, SandboxPolicy, SortDirection, Thread,
+    ThreadHistoryMode, Turn, TurnItemsView, settings::double_option,
 };
 
 /// Codex's coarse sandbox selection for a new, resumed or forked thread: `SandboxMode`.
@@ -144,8 +144,12 @@ pub struct ThreadStartParams {
     pub(crate) daybreak_enabled: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) environments: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) dynamic_tools: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "super::dynamic_tools::deserialize_dynamic_tool_specs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) dynamic_tools: Option<Vec<DynamicToolSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) selected_capability_roots: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +205,19 @@ impl ThreadStartParams {
     pub fn with_permissions(mut self, profile: impl Into<String>) -> Self {
         self.policy.permissions = Some(profile.into());
         self
+    }
+
+    /// Gives the thread the tools the client provides.
+    #[must_use]
+    pub fn with_dynamic_tools(mut self, tools: impl IntoIterator<Item = DynamicToolSpec>) -> Self {
+        self.dynamic_tools = Some(tools.into_iter().collect());
+        self
+    }
+
+    /// The tools the client provides, read into the canonical shape.
+    #[must_use]
+    pub fn dynamic_tools(&self) -> Option<&[DynamicToolSpec]> {
+        self.dynamic_tools.as_deref()
     }
 
     /// The first member sent that needs the experimental API, in the order Codex declares them.
@@ -276,7 +293,6 @@ impl ThreadStartParams {
             ("projectId", self.project_id.is_some()),
             ("daybreakEnabled", self.daybreak_enabled.is_some()),
             ("environments", self.environments.is_some()),
-            ("dynamicTools", self.dynamic_tools.is_some()),
             (
                 "selectedCapabilityRoots",
                 self.selected_capability_roots.is_some(),
