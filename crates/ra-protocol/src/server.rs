@@ -57,6 +57,7 @@
 // `test_api` meanwhile.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod answers;
+mod approval_requests;
 mod approvals;
 mod background_terminals;
 mod connection_cleanup;
@@ -83,7 +84,7 @@ mod turn_processor;
 
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
-pub use self::settings_adapter::ThreadSettingsAdapter;
+pub use self::settings_adapter::{PendingApproval, ThreadSettingsAdapter};
 pub use self::thread_factory::{PreparedThread, ThreadFactory, ThreadFactoryRequest, ThreadOrigin};
 pub use self::tool_items::{ThreadToolItemEvent, ThreadToolItems};
 

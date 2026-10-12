@@ -11,10 +11,10 @@
 //! Codex's manager also counts the threads running a turn, which its server watches to finish a
 //! drain and its listeners watch to unload idle threads. Here those already follow the
 //! subscription index's record of active turns (see [`super::thread_state`]), which counts a turn
-//! as running until its end has been sent; this manager only reports statuses. The waiting flags
-//! of an active thread — on an approval, on the user's answer — are raised by the requests that
-//! wait for them, which nothing in the server sends yet; until they are connected an active
-//! thread waits on nothing.
+//! as running until its end has been sent; this manager only reports statuses. An active thread
+//! waits on approval while an approval request it sent is unanswered (see
+//! [`ThreadWatchManager::note_permission_requested`]); nothing in the server asks the user
+//! questions yet, so it never waits on the user's input.
 
 use std::{
     collections::HashMap,
@@ -25,7 +25,10 @@ use ra_core::session::SessionId;
 
 use super::{
     outgoing::{OutgoingMessageSender, ServerNotification},
-    protocol::{THREAD_STATUS_CHANGED_METHOD, ThreadStatus, ThreadStatusChangedNotification},
+    protocol::{
+        THREAD_STATUS_CHANGED_METHOD, ThreadActiveFlag, ThreadStatus,
+        ThreadStatusChangedNotification,
+    },
 };
 
 /// The facts a status is derived from: Codex's `RuntimeFacts`.
@@ -34,6 +37,7 @@ struct RuntimeFacts {
     is_loaded: bool,
     running: bool,
     has_system_error: bool,
+    pending_permission_requests: u32,
 }
 
 /// A loaded thread's status: Codex's `loaded_thread_status`.
@@ -41,8 +45,12 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     if !runtime.is_loaded {
         return ThreadStatus::NotLoaded;
     }
-    if runtime.running {
-        return ThreadStatus::active();
+    let mut active_flags = Vec::new();
+    if runtime.pending_permission_requests > 0 {
+        active_flags.push(ThreadActiveFlag::WaitingOnApproval);
+    }
+    if runtime.running || !active_flags.is_empty() {
+        return ThreadStatus::Active { active_flags };
     }
     if runtime.has_system_error {
         return ThreadStatus::SystemError;
@@ -125,15 +133,45 @@ impl ThreadWatchManager {
     /// The thread's turn ended, completed or aborted: Codex's `note_turn_completed` and
     /// `note_turn_interrupted`.
     pub(crate) async fn note_turn_ended(&self, thread_id: &SessionId) {
-        self.update_runtime(thread_id, |runtime| runtime.running = false)
-            .await;
+        self.update_runtime(thread_id, |runtime| {
+            runtime.running = false;
+            runtime.pending_permission_requests = 0;
+        })
+        .await;
     }
 
     /// The thread's turn hit an error: Codex's `note_system_error`.
     pub(crate) async fn note_system_error(&self, thread_id: &SessionId) {
         self.update_runtime(thread_id, |runtime| {
             runtime.running = false;
+            runtime.pending_permission_requests = 0;
             runtime.has_system_error = true;
+        })
+        .await;
+    }
+
+    /// The thread sent an approval request, which it waits on until the returned guard is dropped:
+    /// Codex's `note_permission_requested`.
+    pub(crate) async fn note_permission_requested(
+        self: &Arc<Self>,
+        thread_id: &SessionId,
+    ) -> ThreadWatchActiveGuard {
+        self.update_runtime(thread_id, |runtime| {
+            runtime.pending_permission_requests =
+                runtime.pending_permission_requests.saturating_add(1);
+        })
+        .await;
+        ThreadWatchActiveGuard {
+            manager: Arc::clone(self),
+            thread_id: thread_id.clone(),
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+
+    async fn note_permission_released(&self, thread_id: &SessionId) {
+        self.update_runtime(thread_id, |runtime| {
+            runtime.pending_permission_requests =
+                runtime.pending_permission_requests.saturating_sub(1);
         })
         .await;
     }
@@ -174,6 +212,24 @@ impl ThreadWatchManager {
         self.runtime_by_thread_id
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Keeps its thread waiting on approval until dropped: Codex's `ThreadWatchActiveGuard`, for
+/// approvals.
+pub(crate) struct ThreadWatchActiveGuard {
+    manager: Arc<ThreadWatchManager>,
+    thread_id: SessionId,
+    handle: tokio::runtime::Handle,
+}
+
+impl Drop for ThreadWatchActiveGuard {
+    fn drop(&mut self) {
+        let manager = Arc::clone(&self.manager);
+        let thread_id = self.thread_id.clone();
+        self.handle.spawn(async move {
+            manager.note_permission_released(&thread_id).await;
+        });
     }
 }
 

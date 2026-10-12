@@ -1,13 +1,67 @@
 //! The host boundary for Codex's product-owned settings. The protocol ports their wire shape;
 //! the selected product previews and applies their concrete execution mechanism.
 
+use ra_core::item::ToolApproval;
 use ra_runtime::{
     runner::RunConfig,
     thread::{AgentThread, ThreadEvent},
 };
 use serde_json::Value;
 
-use super::protocol::ThreadPolicyOverrides;
+use super::{
+    approvals::ReviewDecision,
+    protocol::{ServerRequestPayload, ThreadPolicyOverrides},
+};
+
+/// A call a turn's run stopped on, for which the client is to be asked.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct PendingApproval<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
+    started_at_ms: i64,
+    approval: &'a ToolApproval,
+}
+
+impl<'a> PendingApproval<'a> {
+    pub(crate) const fn new(
+        thread_id: &'a str,
+        turn_id: &'a str,
+        started_at_ms: i64,
+        approval: &'a ToolApproval,
+    ) -> Self {
+        Self {
+            thread_id,
+            turn_id,
+            started_at_ms,
+            approval,
+        }
+    }
+
+    /// The thread.
+    #[must_use]
+    pub const fn thread_id(&self) -> &'a str {
+        self.thread_id
+    }
+
+    /// The turn whose run stopped on the call.
+    #[must_use]
+    pub const fn turn_id(&self) -> &'a str {
+        self.turn_id
+    }
+
+    /// When the client is asked, in milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn started_at_ms(&self) -> i64 {
+        self.started_at_ms
+    }
+
+    /// The call and the state its tool keeps with the approval.
+    #[must_use]
+    pub const fn approval(&self) -> &'a ToolApproval {
+        self.approval
+    }
+}
 
 /// Previews a policy update and describes its effective wire snapshot.
 ///
@@ -17,6 +71,11 @@ use super::protocol::ThreadPolicyOverrides;
 /// The wire snapshot remains an open record because framework hosts do not own coding fields
 /// such as cwd or permission-profile provenance. A coding adapter contributes those fields; the
 /// runtime adds model settings. Thread creation and resumption install the appropriate adapter.
+///
+/// The adapter also asks the client about the calls a run stops on for approval, and applies what
+/// an answer asks of the product beyond the call, such as remembering it for the session; the
+/// approval itself is settled on the run.
+#[async_trait::async_trait]
 pub trait ThreadSettingsAdapter: Send + Sync + 'static {
     /// Validates and lowers a candidate without mutating the current configuration.
     fn prepare(
@@ -32,6 +91,31 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
     /// state after a call settles or a turn ends. No provider-neutral policy is implied.
     fn on_thread_event(&self, config: &RunConfig, event: &ThreadEvent) {
         let _ = (config, event);
+    }
+
+    /// The request asking the client to approve `pending`, made with the configuration of the
+    /// turn whose run stopped on it: `item/commandExecution/requestApproval` or
+    /// `item/fileChange/requestApproval`. `None` if the product asks nothing for this call, which
+    /// is then refused as Codex refuses a call whose approval could not be obtained.
+    fn approval_request(
+        &self,
+        config: &RunConfig,
+        pending: PendingApproval<'_>,
+    ) -> Option<ServerRequestPayload> {
+        let _ = (config, pending);
+        None
+    }
+
+    /// Applies what `decision`, the client's answer about `approval`, asks of the product beyond
+    /// the call, before the run is answered: what Codex's session does with an approval for the
+    /// session or with a command-prefix rule.
+    async fn apply_review_decision(
+        &self,
+        config: &RunConfig,
+        approval: &ToolApproval,
+        decision: &ReviewDecision,
+    ) {
+        let _ = (config, approval, decision);
     }
 }
 

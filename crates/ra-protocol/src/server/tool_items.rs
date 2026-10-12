@@ -10,7 +10,11 @@
 //! A call's item starts when the call is recorded, before its tool runs. Where the tool's runtime
 //! reports its own boundaries — a command's start and exit, as host events naming the call — the
 //! host may let them drive the item instead, as Codex's tools drive theirs: a command then ends
-//! when it exits, however long after its call returned, in the turn it began in.
+//! when it exits, however long after its call returned, in the turn it began in. The host's answer
+//! to a call's approval is such an event too
+//! ([`ApprovalEvent`](ra_core::event::ApprovalEvent)): a call that was not approved ends as its
+//! answer says, which is how Codex's tools report a declined call, rather than by the refusal the
+//! model is given.
 
 use std::fmt::Debug;
 

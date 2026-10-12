@@ -8,7 +8,9 @@
 //! items it makes (see [`super::thread_history`]), and a turn that completes carries its last
 //! answer in `turn/completed`, as Codex's does. A turn that starts withdraws the thread's server requests still waiting, as one
 //! that ends does, since every request of a thread belongs to a turn; the end of a turn also
-//! answers the `turn/interrupt` requests waiting for it.
+//! answers the `turn/interrupt` requests waiting for it. A turn whose run stops on approvals has
+//! its questions asked of the client, and its answers settled, by a task of their own (see
+//! [`super::approval_requests`]), so the listener goes on with the thread's events meanwhile.
 //!
 //! # Unloading
 //!
@@ -47,6 +49,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    approval_requests::{awaiting_approval, start_approval_batch},
     outgoing::{
         OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender,
         now_unix_timestamp_ms,
@@ -281,7 +284,7 @@ async fn handle_event(
     event: ThreadEvent,
     loaded: &LoadedThread,
     outgoing: &Arc<OutgoingMessageSender>,
-    thread_watch: &ThreadWatchManager,
+    thread_watch: &Arc<ThreadWatchManager>,
     thread_state: &Mutex<ThreadState>,
     tool_items: Option<&dyn ThreadToolItems>,
 ) {
@@ -338,6 +341,15 @@ async fn handle_event(
                 )
                 .await;
         }
+        return;
+    }
+    if let Some(turn_id) = awaiting_approval(&event) {
+        start_approval_batch(
+            loaded.clone(),
+            thread_outgoing,
+            Arc::clone(thread_watch),
+            turn_id.to_owned(),
+        );
         return;
     }
     if let ThreadEvent::Item { turn_id, .. } = &event {

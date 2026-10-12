@@ -100,7 +100,7 @@ use ra_core::{
         interrupt::is_interrupt,
         rollout::{PersistContext, RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded},
     },
-    state::{RunId, RunState},
+    state::{EventSeqAllocator, RunId, RunState},
     tool::ToolServices,
 };
 use serde_json::Value;
@@ -165,6 +165,12 @@ pub enum ThreadEvent {
         completed_at: i64,
         /// How long it ran.
         duration_ms: i64,
+    },
+    /// The turn's run stopped on approvals and waits for the host to answer them: its checkpoint
+    /// is [`AgentThread::paused_run`] until it is resumed or the turn is interrupted.
+    TurnAwaitingApproval {
+        /// The turn.
+        turn_id: String,
     },
     /// A turn was aborted: Codex's `TurnAborted`.
     TurnAborted {
@@ -617,6 +623,12 @@ struct ActiveTurn {
 struct PausedTurn {
     state: RunState,
     resume: oneshot::Sender<RunState>,
+    /// The step configuration that issued the calls waiting on approval.
+    config: RunConfig,
+    /// Shared with live tool emitters and every continuation of this run.
+    event_seqs: EventSeqAllocator,
+    /// Where the host's answers are recorded while the run waits for them.
+    recorder: Arc<ThreadRecorder>,
 }
 
 impl AgentThread {
@@ -933,6 +945,21 @@ impl AgentThread {
             .map(|paused| paused.state.clone())
     }
 
+    /// The approval checkpoint and issuing step's configuration for `turn_id`, captured together.
+    /// Returns nothing once that turn is interrupted, ending, or no longer waiting for approval.
+    #[must_use]
+    pub fn paused_run_with_config(&self, turn_id: &str) -> Option<(RunState, RunConfig)> {
+        let guard = self.inner.lock();
+        let active = guard.active_turn.as_ref()?;
+        if active.turn_id != turn_id || active.cancel.is_cancelled() || active.ending {
+            return None;
+        }
+        let paused = active.paused.as_ref()?;
+        let mut state = paused.state.clone();
+        state.snapshot_event_seq(&paused.event_seqs);
+        Some((state, paused.config.clone()))
+    }
+
     /// Continues the running turn's run from `state`, its checkpoint with the approvals answered.
     ///
     /// # Errors
@@ -940,6 +967,7 @@ impl AgentThread {
     /// Returns `state` unchanged if the running turn is not waiting for approval, or `state` is
     /// not the checkpoint of its run.
     pub fn resume_turn(&self, state: RunState) -> std::result::Result<(), Box<RunState>> {
+        let mut state = state;
         let mut guard = self.inner.lock();
         let Some(active) = guard.active_turn.as_mut() else {
             return Err(Box::new(state));
@@ -947,14 +975,55 @@ impl AgentThread {
         let matches = active
             .paused
             .as_ref()
-            .is_some_and(|paused| paused.state.run_id() == state.run_id());
+            .is_some_and(|paused| same_approval_pause(&paused.state, &state));
         if !matches {
             return Err(Box::new(state));
         }
         let Some(paused) = active.paused.take() else {
             return Err(Box::new(state));
         };
+        state.snapshot_event_seq(&paused.event_seqs);
         paused.resume.send(state).map_err(Box::new)
+    }
+
+    /// Records how the host answered the approval of a call of the running turn's paused run,
+    /// before `state`, that run's checkpoint, is resumed with the answer: the event joins the
+    /// turn's rollout and is reported as [`ThreadEvent::HostEvent`], so the answer is kept however
+    /// the turn then ends. It draws from the allocator shared with this run's live tool emitters
+    /// and snapshots its bound into `state` for the resumed run.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the running turn is not waiting for approval, or `state` is not the checkpoint of
+    /// its run.
+    pub fn record_approval(
+        &self,
+        state: &mut RunState,
+        event: ra_core::event::ApprovalEvent,
+    ) -> ra_core::error::Result<()> {
+        let mut guard = self.inner.lock();
+        let paused = guard.active_turn.as_mut().and_then(|active| {
+            if active.cancel.is_cancelled() || active.ending {
+                return None;
+            }
+            active.paused.as_mut()
+        });
+        let Some(paused) = paused.filter(|paused| same_approval_pause(&paused.state, state)) else {
+            return Err(ra_core::error::Error::caller(
+                "the thread's running turn is not waiting for approval on this run",
+            ));
+        };
+        let allocator = &paused.event_seqs;
+        allocator.advance_past(&state.restore_event_seq_allocator(None));
+        let event = ra_core::event::HostEvent::allocate(
+            allocator,
+            self.inner.agent.public_id().clone(),
+            event.into(),
+        )?;
+        state.snapshot_event_seq(allocator);
+        paused.state.snapshot_event_seq(allocator);
+        paused.recorder.record(RolloutItem::Event(event));
+        Ok(())
     }
 
     /// Shuts the thread down: Codex's `shutdown_and_wait`. Returns once it is down.
@@ -1324,6 +1393,7 @@ async fn run_to_end(
         input,
     )
     .with_recorded_input(history_len);
+    let event_seqs = request.event_seq_allocator().clone();
     loop {
         request = request
             .with_config(config.clone())
@@ -1363,8 +1433,19 @@ async fn run_to_end(
         let state = result.state().clone();
         let run_id = state.run_id().clone();
         let (resume, answered) = oneshot::channel();
-        if let Some(active) = inner.lock().active_turn.as_mut() {
-            active.paused = Some(PausedTurn { state, resume });
+        let paused = inner.lock().active_turn.as_mut().map(|active| {
+            active.paused = Some(PausedTurn {
+                state,
+                resume,
+                config: config.clone(),
+                event_seqs: event_seqs.clone(),
+                recorder: Arc::clone(recorder),
+            });
+        });
+        if paused.is_some() {
+            inner.emit(ThreadEvent::TurnAwaitingApproval {
+                turn_id: recorder.turn_id.clone(),
+            });
         }
         let answered = tokio::select! {
             answered = answered => answered.ok(),
@@ -1385,7 +1466,7 @@ async fn run_to_end(
             cancel.clone(),
             Vec::new(),
         )
-        .with_state(state);
+        .with_state_and_shared_event_seqs(state, &event_seqs);
     }
 }
 
@@ -1417,6 +1498,15 @@ fn cancel_paused(
         RolloutRunEnd::Cancelled,
     )));
     history
+}
+
+/// Repeated stops of one run still have distinct approval item identities.
+fn same_approval_pause(left: &RunState, right: &RunState) -> bool {
+    left.run_id() == right.run_id()
+        && left
+            .pending_interruption_items()
+            .map(RunItem::id)
+            .eq(right.pending_interruption_items().map(RunItem::id))
 }
 
 /// Seconds since the Unix epoch, as Codex stamps its turn events.

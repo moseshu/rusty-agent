@@ -1172,6 +1172,21 @@ impl RunRequest {
         self.with_state_and_persisted_max_seq(state, None)
     }
 
+    /// Continues a live thread's run on the allocator its earlier segment still uses. State and
+    /// allocator are bound together; background emitters must keep drawing from the same counter.
+    pub(crate) fn with_state_and_shared_event_seqs(
+        self,
+        state: RunState,
+        event_seqs: &EventSeqAllocator,
+    ) -> Self {
+        assert_eq!(state.run_id(), event_seqs.run_id());
+        let mut request = self.with_state(state);
+        event_seqs.advance_past(&request.event_seqs);
+        request.state.snapshot_event_seq(event_seqs);
+        request.event_seqs = event_seqs.clone();
+        request
+    }
+
     /// Continues from an earlier segment, reconciling the sequence bound against a persisted log.
     ///
     /// `persisted_run_max_seq` is the largest sequence number the rollout writer has actually

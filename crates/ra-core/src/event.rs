@@ -19,6 +19,7 @@
 //! events are allocated and dispatched through [`HostEventEmitter`].
 
 pub mod agent;
+pub mod approval;
 pub mod exec;
 pub mod file;
 pub mod sink;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::{
     agent::{AgentEvent, AgentOperationId, SubAgentActivityEvent, SubAgentActivityKind},
+    approval::{ApprovalEvent, ApprovalResolution},
     exec::ExecEvent,
     file::FileEvent,
     sink::{FnHostEventSink, HostEventSink, InMemoryHostEventSink, NoopHostEventSink},
@@ -62,6 +64,8 @@ pub enum HostEventBody {
     File(FileEvent),
     /// Completion of one host hook callback.
     Hook(HookReport),
+    /// The host's answer to a tool call's approval.
+    Approval(ApprovalEvent),
     /// Forward-compatible unknown event family.
     Unknown {
         /// Family identifier tag.
@@ -86,6 +90,12 @@ impl From<AgentEvent> for HostEventBody {
 impl From<FileEvent> for HostEventBody {
     fn from(event: FileEvent) -> Self {
         Self::File(event)
+    }
+}
+
+impl From<ApprovalEvent> for HostEventBody {
+    fn from(event: ApprovalEvent) -> Self {
+        Self::Approval(event)
     }
 }
 
@@ -139,6 +149,14 @@ impl Serialize for HostEventBody {
                 }
                 .serialize(serializer)
             }
+            Self::Approval(event) => {
+                let data = serde_json::to_value(event).map_err(serde::ser::Error::custom)?;
+                Envelope {
+                    family: "approval",
+                    data: &data,
+                }
+                .serialize(serializer)
+            }
             Self::Unknown { family, data } => {
                 let envelope = Envelope { family, data };
                 envelope.serialize(serializer)
@@ -175,6 +193,10 @@ impl<'de> Deserialize<'de> for HostEventBody {
             "hook" => {
                 let report = serde_json::from_value(data).map_err(serde::de::Error::custom)?;
                 Ok(Self::Hook(report))
+            }
+            "approval" => {
+                let event = serde_json::from_value(data).map_err(serde::de::Error::custom)?;
+                Ok(Self::Approval(event))
             }
             other => Ok(Self::Unknown {
                 family: other.to_owned(),

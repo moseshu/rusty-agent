@@ -330,6 +330,14 @@ async fn next_event(thread: &AgentThread) -> ThreadEvent {
     }
 }
 
+/// Waits for the turn `turn_id`'s run to report that it stopped on approvals.
+async fn awaits_approval(thread: &AgentThread, turn_id: &str) {
+    match next_event(thread).await {
+        ThreadEvent::TurnAwaitingApproval { turn_id: id } => assert_eq!(id, turn_id),
+        other => panic!("expected the turn to wait for approval, got {other:?}"),
+    }
+}
+
 async fn started(thread: &AgentThread, request: TurnInputRequest) -> String {
     match thread.start_or_steer_turn(request).await {
         TurnInputSubmission::Started { turn_id } => turn_id,
@@ -796,6 +804,7 @@ async fn a_turn_waiting_for_approval_stays_active_until_answered() {
         ThreadEvent::TurnStarted { .. } => {}
         other => panic!("expected the turn to start, got {other:?}"),
     }
+    awaits_approval(&thread, &turn_id).await;
     let mut state = timeout(PATIENCE, async {
         loop {
             if let Some(state) = thread.paused_run() {
@@ -854,6 +863,7 @@ async fn interrupting_a_turn_waiting_for_approval_aborts_it() {
     assert!(thread.interrupt());
 
     let _started = next_event(&thread).await;
+    awaits_approval(&thread, &turn_id).await;
     match next_event(&thread).await {
         ThreadEvent::TurnAborted { turn_id: id, .. } => assert_eq!(id, turn_id),
         other => panic!("expected the turn to be aborted, got {other:?}"),
@@ -1315,7 +1325,8 @@ async fn approval_resume_retains_the_step_settings_that_issued_the_tool() {
     let pending: Vec<_> = state.pending_interruption_items().cloned().collect();
     state.approve(&pending[0], false).unwrap();
     thread.resume_turn(state).unwrap();
-    next_event(&thread).await;
+    let _started = next_event(&thread).await;
+    awaits_approval(&thread, &turn_id).await;
     next_event(&thread).await;
     assert_eq!(*tool.0.lock().unwrap(), ["issued"]);
 }
@@ -1416,7 +1427,10 @@ async fn what_a_turns_end_adds_is_reported_as_its_records() {
     })
     .await
     .expect("the run pauses for approval");
+    assert!(thread.paused_run_with_config(&turn_id).is_some());
+    assert!(thread.paused_run_with_config("other-turn").is_none());
     assert!(thread.interrupt());
+    assert!(thread.paused_run_with_config(&turn_id).is_none());
     let events = events_until_turn_ends(&thread).await;
     let marker = events.iter().rev().find_map(|event| match event {
         ThreadEvent::Item { item, .. } => Some(item.clone()),
@@ -1671,7 +1685,12 @@ async fn a_turns_output_schema_holds_across_an_approval_pause() {
     let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
     state.approve(&pending[0], false).unwrap();
     thread.resume_turn(state).unwrap();
-    completes(&thread, &turn_id).await;
+    let _started = next_event(&thread).await;
+    awaits_approval(&thread, &turn_id).await;
+    match next_event(&thread).await {
+        ThreadEvent::TurnComplete { turn_id: id, .. } => assert_eq!(id, turn_id),
+        other => panic!("expected the turn to complete, got {other:?}"),
+    }
 
     let calls = script.calls();
     assert_eq!(calls.len(), 2);

@@ -74,3 +74,40 @@ impl ReviewDecision {
         }
     }
 }
+
+/// What a decision tells the run that stopped on the call: Codex's
+/// `ApprovalResolution::into_tool_result`, for a decision the client gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunAnswer {
+    /// The call runs.
+    Approve,
+    /// The call is refused, and the model is told this.
+    Reject(String),
+    /// The turn is aborted.
+    Abort,
+}
+
+impl ReviewDecision {
+    pub(crate) fn run_answer(&self) -> RunAnswer {
+        match self {
+            Self::ApprovedMcpPolicyAmendment => {
+                tracing::error!("Tool approval received ApprovedMcpPolicyAmendment");
+                RunAnswer::Reject("Error while requesting approval".to_owned())
+            }
+            Self::NetworkPolicyAmendment {
+                network_policy_amendment,
+            } if network_policy_amendment.action() == NetworkPolicyRuleAction::Deny => {
+                RunAnswer::Reject(super::answers::REJECTED_BY_USER.to_owned())
+            }
+            Self::Denied { rejection } => RunAnswer::Reject(rejection.clone()),
+            // Only Codex's automatic reviewer times out, and it is not ported; its timeout text
+            // is the reviewer's, so the refusal is the one for an answer that was not obtained.
+            Self::TimedOut => RunAnswer::Reject(super::answers::APPROVAL_REQUEST_FAILED.to_owned()),
+            Self::Abort => RunAnswer::Abort,
+            Self::Approved
+            | Self::ApprovedExecpolicyAmendment { .. }
+            | Self::ApprovedForSession
+            | Self::NetworkPolicyAmendment { .. } => RunAnswer::Approve,
+        }
+    }
+}

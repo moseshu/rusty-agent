@@ -10,8 +10,10 @@
 //! and network rules for the coding runtime. It is not reduced to the framework's whole-tool
 //! approval. The other answers are passed on as the method's own response.
 //!
-//! Codex's handlers also complete a declined command's item and update the thread's status while
-//! a request waits; both come with the thread and item notifications.
+//! Codex's handlers also complete the item of a call that was not approved, with a status their
+//! answer gives. Here an answer also carries how it settled the approval
+//! ([`ApprovalResolution`]), which the thread records for the product to complete the call's item
+//! from (see [`super::approval_requests`]).
 
 use super::{
     approvals::ReviewDecision,
@@ -20,11 +22,12 @@ use super::{
     protocol::{
         CommandExecutionApprovalDecision, CommandExecutionRequestApprovalResponse,
         DynamicToolCallOutputContentItem, DynamicToolCallResponse, FileChangeApprovalDecision,
-        FileChangeRequestApprovalResponse, GrantedPermissionProfile, PermissionGrantScope,
-        PermissionsRequestApprovalResponse, ToolRequestUserInputResponse,
+        FileChangeRequestApprovalResponse, GrantedPermissionProfile, NetworkPolicyRuleAction,
+        PermissionGrantScope, PermissionsRequestApprovalResponse, ToolRequestUserInputResponse,
     },
 };
 use crate::frame::JsonRpcErrorObject;
+use ra_core::event::ApprovalResolution;
 
 /// What the model is told of an approval the user refused: Codex's rejection text.
 pub(crate) const REJECTED_BY_USER: &str = "rejected by user";
@@ -71,13 +74,42 @@ fn deny(message: &str) -> ReviewDecision {
     ReviewDecision::denied(message)
 }
 
+/// An approval's decision, and how it settled the approval: the completion status Codex's
+/// handlers give the item of a call that was not approved, as a resolution the thread records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalAnswer {
+    pub(crate) decision: ReviewDecision,
+    pub(crate) resolution: ApprovalResolution,
+}
+
+impl ApprovalAnswer {
+    const fn new(decision: ReviewDecision, resolution: ApprovalResolution) -> Self {
+        Self {
+            decision,
+            resolution,
+        }
+    }
+
+    /// No answer could be obtained: Codex's refusal with `approval request failed`.
+    pub(crate) fn failed() -> Self {
+        Self::new(deny(APPROVAL_REQUEST_FAILED), ApprovalResolution::Failed)
+    }
+}
+
 /// The decision a command approval's answer carries: Codex's
 /// `on_command_execution_request_approval_response`.
 pub(crate) fn command_execution_approval_decision(answer: ClientAnswer) -> Option<ReviewDecision> {
+    command_execution_approval_answer(answer).map(|answer| answer.decision)
+}
+
+/// The decision a command approval's answer carries, and how it settled the approval: Codex's
+/// `on_command_execution_request_approval_response`, whose completion status is `declined` for a
+/// refusal, a cancellation or a denied network rule, and `failed` when no answer was obtained.
+pub(crate) fn command_execution_approval_answer(answer: ClientAnswer) -> Option<ApprovalAnswer> {
     let value = match Outcome::from(answer) {
         Outcome::Answered(value) => value,
         Outcome::TurnTransition => return None,
-        Outcome::Failed => return Some(deny(APPROVAL_REQUEST_FAILED)),
+        Outcome::Failed => return Some(ApprovalAnswer::failed()),
     };
     let response = match serde_json::from_value::<CommandExecutionRequestApprovalResponse>(value) {
         Ok(response) => response,
@@ -85,47 +117,78 @@ pub(crate) fn command_execution_approval_decision(answer: ClientAnswer) -> Optio
             tracing::error!(
                 "failed to deserialize CommandExecutionRequestApprovalResponse: {error}"
             );
-            return Some(deny(APPROVAL_REQUEST_FAILED));
+            return Some(ApprovalAnswer::failed());
         }
     };
+    let approved = |decision| ApprovalAnswer::new(decision, ApprovalResolution::Approved);
     Some(match response.into_decision() {
-        CommandExecutionApprovalDecision::Accept => ReviewDecision::Approved,
-        CommandExecutionApprovalDecision::AcceptForSession => ReviewDecision::ApprovedForSession,
+        CommandExecutionApprovalDecision::Accept => approved(ReviewDecision::Approved),
+        CommandExecutionApprovalDecision::AcceptForSession => {
+            approved(ReviewDecision::ApprovedForSession)
+        }
         CommandExecutionApprovalDecision::AcceptWithExecpolicyAmendment {
             execpolicy_amendment,
-        } => ReviewDecision::ApprovedExecpolicyAmendment {
+        } => approved(ReviewDecision::ApprovedExecpolicyAmendment {
             proposed_execpolicy_amendment: execpolicy_amendment,
-        },
+        }),
         CommandExecutionApprovalDecision::ApplyNetworkPolicyAmendment {
             network_policy_amendment,
-        } => ReviewDecision::NetworkPolicyAmendment {
-            network_policy_amendment,
-        },
-        CommandExecutionApprovalDecision::Decline => deny(REJECTED_BY_USER),
-        CommandExecutionApprovalDecision::Cancel => ReviewDecision::Abort,
+        } => {
+            let resolution = match network_policy_amendment.action() {
+                NetworkPolicyRuleAction::Allow => ApprovalResolution::Approved,
+                NetworkPolicyRuleAction::Deny => ApprovalResolution::Declined,
+            };
+            ApprovalAnswer::new(
+                ReviewDecision::NetworkPolicyAmendment {
+                    network_policy_amendment,
+                },
+                resolution,
+            )
+        }
+        CommandExecutionApprovalDecision::Decline => {
+            ApprovalAnswer::new(deny(REJECTED_BY_USER), ApprovalResolution::Declined)
+        }
+        CommandExecutionApprovalDecision::Cancel => {
+            ApprovalAnswer::new(ReviewDecision::Abort, ApprovalResolution::Cancelled)
+        }
     })
 }
 
 /// The decision a file change approval's answer carries: Codex's
 /// `on_file_change_request_approval_response` and `map_file_change_approval_decision`.
 pub(crate) fn file_change_approval_decision(answer: ClientAnswer) -> Option<ReviewDecision> {
+    file_change_approval_answer(answer).map(|answer| answer.decision)
+}
+
+/// The decision a file change approval's answer carries, and how it settled the approval: Codex's
+/// `on_file_change_request_approval_response`.
+pub(crate) fn file_change_approval_answer(answer: ClientAnswer) -> Option<ApprovalAnswer> {
     let value = match Outcome::from(answer) {
         Outcome::Answered(value) => value,
         Outcome::TurnTransition => return None,
-        Outcome::Failed => return Some(deny(APPROVAL_REQUEST_FAILED)),
+        Outcome::Failed => return Some(ApprovalAnswer::failed()),
     };
     let response = match serde_json::from_value::<FileChangeRequestApprovalResponse>(value) {
         Ok(response) => response,
         Err(error) => {
             tracing::error!("failed to deserialize FileChangeRequestApprovalResponse: {error}");
-            return Some(deny(APPROVAL_REQUEST_FAILED));
+            return Some(ApprovalAnswer::failed());
         }
     };
     Some(match response.decision() {
-        FileChangeApprovalDecision::Accept => ReviewDecision::Approved,
-        FileChangeApprovalDecision::AcceptForSession => ReviewDecision::ApprovedForSession,
-        FileChangeApprovalDecision::Decline => deny(REJECTED_BY_USER),
-        FileChangeApprovalDecision::Cancel => ReviewDecision::Abort,
+        FileChangeApprovalDecision::Accept => {
+            ApprovalAnswer::new(ReviewDecision::Approved, ApprovalResolution::Approved)
+        }
+        FileChangeApprovalDecision::AcceptForSession => ApprovalAnswer::new(
+            ReviewDecision::ApprovedForSession,
+            ApprovalResolution::Approved,
+        ),
+        FileChangeApprovalDecision::Decline => {
+            ApprovalAnswer::new(deny(REJECTED_BY_USER), ApprovalResolution::Declined)
+        }
+        FileChangeApprovalDecision::Cancel => {
+            ApprovalAnswer::new(ReviewDecision::Abort, ApprovalResolution::Cancelled)
+        }
     })
 }
 
