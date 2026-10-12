@@ -238,6 +238,10 @@ pub struct ExecRequest {
     /// serialized form.
     #[serde(skip)]
     call_id: Option<String>,
+    /// What the host recorded about how it launched the command, kept with a session the command
+    /// leaves running, and never part of the request's serialized form.
+    #[serde(skip)]
+    launch_state: Option<serde_json::Value>,
 }
 
 impl ExecRequest {
@@ -255,6 +259,7 @@ impl ExecRequest {
             limits: ExecLimits::default(),
             unknown: Unknown::new(),
             call_id: None,
+            launch_state: None,
         }
     }
 
@@ -327,6 +332,23 @@ impl ExecRequest {
     #[must_use]
     pub fn call_id(&self) -> Option<&str> {
         self.call_id.as_deref()
+    }
+
+    /// Records what the host decided about how it launches the command — the sandbox it chose, say
+    /// — so that a later decision about the session the command leaves running can be made against
+    /// it (see [`crate::session::BackgroundTerminal::launch_state`]). The executor only keeps it.
+    ///
+    /// Not serialized: the request a model's arguments decode into cannot carry the host's facts.
+    #[must_use]
+    pub fn with_launch_state(mut self, state: serde_json::Value) -> Self {
+        self.launch_state = Some(state);
+        self
+    }
+
+    /// What the host recorded about how it launches the command, if anything.
+    #[must_use]
+    pub const fn launch_state(&self) -> Option<&serde_json::Value> {
+        self.launch_state.as_ref()
     }
 
     /// Command string.

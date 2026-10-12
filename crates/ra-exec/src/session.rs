@@ -443,6 +443,7 @@ struct SessionOrigin {
     call_id: Option<String>,
     command: String,
     cwd: Option<PathBuf>,
+    launch_state: Option<serde_json::Value>,
 }
 
 impl SessionOrigin {
@@ -457,6 +458,7 @@ impl SessionOrigin {
                 .cwd()
                 .cloned()
                 .or_else(|| std::env::current_dir().ok()),
+            launch_state: request.launch_state().cloned(),
         }
     }
 }
@@ -469,6 +471,7 @@ pub struct BackgroundTerminal {
     call_id: Option<String>,
     command: String,
     cwd: Option<PathBuf>,
+    launch_state: Option<serde_json::Value>,
 }
 
 impl BackgroundTerminal {
@@ -495,6 +498,13 @@ impl BackgroundTerminal {
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// What the host recorded about how it launched the command (see
+    /// [`ExecRequest::with_launch_state`]).
+    #[must_use]
+    pub const fn launch_state(&self) -> Option<&serde_json::Value> {
+        self.launch_state.as_ref()
     }
 }
 
@@ -1727,9 +1737,25 @@ impl ProcessManager {
                 call_id: session.origin.call_id.clone(),
                 command: session.origin.command.clone(),
                 cwd: session.origin.cwd.clone(),
+                launch_state: session.origin.launch_state.clone(),
             });
         }
         terminals
+    }
+
+    /// The session `session_id` with what started it, whether or not its command still runs:
+    /// what a decision about input to it is made against. `None` once the manager no longer
+    /// retains the session.
+    pub async fn terminal(&self, session_id: &ExecSessionId) -> Option<BackgroundTerminal> {
+        let session = self.registry.get(session_id).await?;
+        let session = session.lock().await;
+        Some(BackgroundTerminal {
+            session_id: session_id.clone(),
+            call_id: session.origin.call_id.clone(),
+            command: session.origin.command.clone(),
+            cwd: session.origin.cwd.clone(),
+            launch_state: session.origin.launch_state.clone(),
+        })
     }
 
     /// Stops the command of `session_id` if it is still running: Codex's `terminate_process`.

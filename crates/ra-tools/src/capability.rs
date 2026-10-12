@@ -200,6 +200,16 @@ impl ShellCapability {
         self
     }
 
+    /// Installs the host policy deciding which input to a running session asks first.
+    #[must_use]
+    pub fn with_stdin_policy(
+        mut self,
+        policy: Arc<dyn crate::write_stdin::WriteStdinPolicy>,
+    ) -> Self {
+        self.write_stdin = Arc::new((*self.write_stdin).clone().with_policy(policy));
+        self
+    }
+
     /// The entry that starts a command in the workspace.
     #[must_use]
     pub fn exec_command(&self) -> Arc<dyn Tool> {

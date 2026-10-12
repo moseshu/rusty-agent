@@ -172,6 +172,19 @@ fn command(fields: Value) -> Value {
     arguments
 }
 
+/// `write_stdin`'s arguments writing `chars` to `session`, every field the strict schema lists
+/// given.
+fn stdin(session: &str, chars: &str) -> Value {
+    json!({
+        "session_id": session,
+        "chars": chars,
+        "until": null,
+        "match_text": null,
+        "control": null,
+        "yield_time_ms": 500
+    })
+}
+
 fn patch(body: &str) -> Value {
     json!({"patch": format!("*** Begin Patch\n{body}*** End Patch\n")})
 }
@@ -312,6 +325,7 @@ impl Server {
             .instructions("code")
             .tools(vec![
                 self.host.exec_command_tool().unwrap(),
+                self.host.write_stdin_tool().unwrap(),
                 self.host.apply_patch_tool().unwrap(),
             ])
             .build()
@@ -1070,5 +1084,123 @@ async fn a_patch_accepted_for_the_session_is_not_asked_again_for_its_file() {
     assert_eq!(
         std::fs::read_to_string(server.root().join("notes.txt")).unwrap(),
         "after\n"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Terminal input
+// ---------------------------------------------------------------------------------------------
+
+/// Codex's stdin review through the server: once the thread's sandbox changes, input to a terminal
+/// launched under the old one is asked about as a command approval of kind `writeStdin` for the
+/// launching call's item, naming the input call as its approval, offering approving once or
+/// cancelling. Declined, it is not written and the model is told so; accepted, it is written.
+#[tokio::test]
+async fn input_to_a_terminal_whose_sandbox_changed_is_asked_about() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    server
+        .load(&script, AskForApproval::OnRequest, true, &connection)
+        .await;
+    script.push(call(
+        "exec_command",
+        "open",
+        command(json!({"cmd": "cat", "yield_time_ms": 300})),
+    ));
+    script.push(final_message("opened"));
+    server.turn_start(&mut connection, "open a terminal").await;
+    connection.notification("turn/completed").await;
+    let opened = script.last_output("open").unwrap();
+    let start = opened
+        .find("Session `")
+        .expect("the terminal keeps running")
+        + "Session `".len();
+    let session = opened[start..][..opened[start..].find('`').unwrap()].to_owned();
+
+    let id = server
+        .request(
+            &mut connection,
+            "thread/settings/update",
+            json!({"threadId": THREAD, "sandboxPolicy": {"type": "readOnly"}}),
+        )
+        .await;
+    connection.response(id).await;
+
+    // Codex's oversized escaped input is refused before a request or any terminal interaction.
+    let oversized = format!("#{}\nREJECTED=1\n", "\"".repeat(4_100));
+    script.push(call(
+        "write_stdin",
+        "oversized",
+        stdin(&session, &oversized),
+    ));
+    script.push(final_message("refused"));
+    server
+        .turn_start(&mut connection, "refuse oversized input")
+        .await;
+    connection.notification("turn/completed").await;
+    assert_eq!(connection.requests_seen(), 0);
+    assert_eq!(
+        script.last_output("oversized").as_deref(),
+        Some(
+            "terminal input and permission details are too large to review safely; use a smaller input or start a new terminal with fewer grants"
+        )
+    );
+
+    for (call_id, chars, answer) in [
+        ("declined", "declined\n", json!({"decision": "decline"})),
+        ("accepted", "accepted\n", json!({"decision": "accept"})),
+    ] {
+        script.push(call("write_stdin", call_id, stdin(&session, chars)));
+        script.push(final_message(call_id));
+        server.turn_start(&mut connection, call_id).await;
+        let request = connection.server_request().await;
+        assert_eq!(request["method"], "item/commandExecution/requestApproval");
+        let params = &request["params"];
+        assert_eq!(params["kind"], "writeStdin");
+        assert_eq!(params["itemId"], "open");
+        assert_eq!(params["approvalId"], call_id);
+        assert_eq!(params["environmentId"], "local");
+        let shown = params["command"].as_str().unwrap();
+        assert!(
+            shown.starts_with(&format!("write_stdin --session-id {session} "))
+                && shown.contains(call_id),
+            "{shown}"
+        );
+        assert_eq!(
+            params["reason"],
+            "Send input to an existing terminal. This terminal retains sandbox or network settings that differ from the current permissions. The cwd is its launch directory; the terminal's current directory and state may have changed."
+        );
+        assert_eq!(params["availableDecisions"], json!(["accept", "cancel"]));
+        server.answer(&connection, &request, answer).await;
+        connection.notification("turn/completed").await;
+    }
+    assert_eq!(
+        script
+            .inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .nth(2)
+            .and_then(|input| {
+                input.iter().find_map(|item| match item {
+                    ModelInputItem::ToolCallOutput(output)
+                        if output.call_id().as_str() == "declined" =>
+                    {
+                        Some(output_text(output))
+                    }
+                    _ => None,
+                })
+            })
+            .as_deref(),
+        Some("rejected by user")
+    );
+    let accepted = script.last_output("accepted").unwrap();
+    assert!(
+        accepted.contains("accepted")
+            && !accepted.contains("declined")
+            && !accepted.contains("REJECTED"),
+        "{accepted}"
     );
 }

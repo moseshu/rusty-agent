@@ -396,6 +396,18 @@ pub trait ExecCommandPolicy: Send + Sync {
     /// What follows an attempt its sandbox most likely refused as the command started. The default
     /// returns the attempt's output.
     ///
+    /// What to keep about the launch of `attempt`'s command in `environment` — its first
+    /// environment, or the one a retry runs in — with a session the command leaves running, for
+    /// later decisions about input to it (see [`crate::write_stdin::WriteStdinPolicy`]). The
+    /// default keeps nothing.
+    fn launch_state(
+        &self,
+        _attempt: &ExecCommandAttempt,
+        _environment: &ExecEnvironment,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
     /// # Errors
     ///
     /// An error is the call's failure.
@@ -672,6 +684,23 @@ impl ExecCommandTool {
         }
     }
 
+    /// `request` as launched in `environment`, carrying what the policy keeps about that launch.
+    fn launched(
+        &self,
+        request: &ExecRequest,
+        attempt: &ExecCommandAttempt,
+        environment: &ExecEnvironment,
+    ) -> ExecRequest {
+        let launch = self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.launch_state(attempt, environment));
+        match launch {
+            Some(launch) => request.clone().with_launch_state(launch),
+            None => request.clone(),
+        }
+    }
+
     async fn execute_attempt(
         &self,
         mut context: ToolContext<'_>,
@@ -707,7 +736,11 @@ impl ExecCommandTool {
             .or(emitter);
         let mut outcome = self
             .process_manager
-            .execute_with_environment(request.clone(), attempt_emitter, attempt.environment())
+            .execute_with_environment(
+                self.launched(&request, &attempt, attempt.environment()),
+                attempt_emitter,
+                attempt.environment(),
+            )
             .await
             .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
 
@@ -725,7 +758,11 @@ impl ExecCommandTool {
                 SandboxDenialAction::Retry(environment) => {
                     outcome = self
                         .process_manager
-                        .execute_with_environment(request, emitter, environment.as_ref())
+                        .execute_with_environment(
+                            self.launched(&request, &attempt, environment.as_ref()),
+                            emitter,
+                            environment.as_ref(),
+                        )
                         .await
                         .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
                     if let Some(events) = &attempt_events {

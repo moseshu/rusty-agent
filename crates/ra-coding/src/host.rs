@@ -192,7 +192,8 @@ impl CodingHost {
             ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))?
                 .with_command_policy(Arc::new(crate::thread_settings::CodingCommandPolicy::new(
                     base,
-                ))),
+                )))
+                .with_stdin_policy(Arc::new(crate::thread_settings::CodingStdinPolicy)),
         )
     }
 

@@ -52,6 +52,11 @@
 //! gives; a patch with `item/fileChange/requestApproval`. An answer is applied to the thread's
 //! approval cache and, approving a rule, to its rules home, whose failure is the user's warning.
 //!
+//! Input to a running terminal follows Codex's stdin review: a command's launch records the
+//! sandbox it runs in and whether that left the sandbox its decision selected, and input asks first
+//! only when the terminal runs with authority a command launched now would not get, as a command
+//! approval of kind `writeStdin`.
+//!
 //! Invocation identity covers the tool and complete arguments. Settled calls retain only their
 //! identity until the turn ends, preventing call-ID reuse. The app-server listener forwards events
 //! to [`ThreadSettingsAdapter::on_thread_event`] for cleanup; an embedding host loading threads
@@ -84,16 +89,21 @@ use ra_exec::sandbox::{
     SandboxPolicy as ExecSandboxPolicy,
     unix_local::{EnvPolicy, ResourceLimits},
 };
+use ra_exec::session::BackgroundTerminal;
 use ra_protocol::server::{
     PendingApproval, ReviewDecision, ThreadSettingsAdapter,
     protocol::{
         ApprovalsReviewer, AskForApproval, CommandAction, CommandExecutionApprovalDecision,
-        CommandExecutionRequestApprovalParams, FileChangeRequestApprovalParams, SandboxPolicy,
-        ServerRequestPayload, ThreadPolicyOverrides,
+        CommandExecutionApprovalKind, CommandExecutionRequestApprovalParams,
+        FileChangeRequestApprovalParams, SandboxPolicy, ServerRequestPayload,
+        ThreadPolicyOverrides,
     },
 };
 use ra_runtime::{permission::PermissionEngine, runner::RunConfig, thread::ThreadEvent};
-use ra_tools::exec_command::{ExecCommandAttempt, ExecCommandPolicy, SandboxDenialAction};
+use ra_tools::{
+    exec_command::{ExecCommandAttempt, ExecCommandPolicy, SandboxDenialAction},
+    write_stdin::{StdinReview, WriteStdinPolicy},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -251,6 +261,7 @@ impl CodingThreadSettings {
         }
         match approval.tool_name() {
             EXEC_COMMAND_TOOL => self.command_approval_request(pending),
+            WRITE_STDIN_TOOL => stdin_approval_request(pending),
             // A patch is asked about with no reason and no grant root, as Codex asks one its
             // patch safety check sends to the user.
             APPLY_PATCH_TOOL => Some(ServerRequestPayload::FileChangeRequestApproval(
@@ -678,6 +689,24 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         Ok(ExecCommandAttempt::new(environment).with_state(encode(&state)?))
     }
 
+    fn launch_state(
+        &self,
+        attempt: &ExecCommandAttempt,
+        environment: &ExecEnvironment,
+    ) -> Option<Value> {
+        let AttemptState { decision, .. } =
+            serde_json::from_value(attempt.state()?.clone()).ok()?;
+        // Codex's launch permissions: a launch that left the sandbox its decision selected, by an
+        // escalation or a rule's trust before it ran or by a retry after a denial.
+        let escalated =
+            decision.bypasses_sandbox() || environment.sandbox() != Some(&decision.sandbox);
+        encode(&TerminalLaunch {
+            sandbox: environment.sandbox().cloned(),
+            escalated,
+        })
+        .ok()
+    }
+
     fn on_sandbox_denial(
         &self,
         context: &ToolContext<'_>,
@@ -940,6 +969,7 @@ fn shlex_join(tokens: &[String]) -> String {
 
 /// The tools whose approvals the thread caches, by the names the coding host installs them under.
 const EXEC_COMMAND_TOOL: &str = "exec_command";
+const WRITE_STDIN_TOOL: &str = "write_stdin";
 const APPLY_PATCH_TOOL: &str = "apply_patch";
 
 /// What was decided about one command call, kept from its approval to its execution.
@@ -950,6 +980,182 @@ struct CommandDecision {
     approval_policy: AskForApproval,
     sandbox: ExecSandboxPolicy,
     allow_temp_dir: bool,
+}
+
+impl CommandDecision {
+    /// Whether the command runs outside the thread's sandbox from its first attempt: a rule
+    /// trusts it, or the call asked to leave the sandbox.
+    fn bypasses_sandbox(&self) -> bool {
+        matches!(
+            self.requirement,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: true,
+                ..
+            }
+        ) || self.sandbox_permissions.requires_escalated_permissions()
+    }
+}
+
+/// What a command's launch recorded with the session it leaves running: the sandbox it runs in,
+/// and whether that is outside the sandbox its decision selected — Codex's `TerminalPermissions`,
+/// for the permissions this build has.
+#[derive(Debug, Serialize, Deserialize)]
+struct TerminalLaunch {
+    sandbox: Option<ExecSandboxPolicy>,
+    escalated: bool,
+}
+
+/// The coding product's [`WriteStdinPolicy`]: Codex's stdin review. Input to a running terminal
+/// asks first only when the terminal runs with authority a command launched now would not get —
+/// it was launched outside its sandbox, or the thread's sandbox changed since — and is refused
+/// where the approval policy rejects sandbox prompts. A terminal this policy did not launch is
+/// not reviewed.
+///
+/// Codex also reviews a terminal holding permissions an agent granted, which arrive with
+/// `request_permissions`; no grant exists here yet. Its denied-read check has no counterpart
+/// either: the executor's sandboxes deny no reads.
+pub(crate) struct CodingStdinPolicy;
+
+impl WriteStdinPolicy for CodingStdinPolicy {
+    fn review(
+        &self,
+        context: &ToolContext<'_>,
+        terminal: &BackgroundTerminal,
+        chars: &str,
+    ) -> Result<StdinReview> {
+        let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
+            return Ok(StdinReview::Allow);
+        };
+        let Some(launch) = terminal
+            .launch_state()
+            .and_then(|state| serde_json::from_value::<TerminalLaunch>(state.clone()).ok())
+        else {
+            return Ok(StdinReview::Allow);
+        };
+        let current = sandboxed_environment(settings, &ExecEnvironment::new())
+            .sandbox()
+            .cloned();
+        if !launch.escalated && launch.sandbox == current {
+            return Ok(StdinReview::Allow);
+        }
+        // Manual approvals shell-quote the input, which cannot preserve NUL bytes.
+        if chars.contains('\0') {
+            return Ok(StdinReview::Refuse(
+                "terminal input contains a NUL byte and cannot be reviewed safely".to_owned(),
+            ));
+        }
+        let authority = if launch.escalated {
+            "This terminal was launched outside the sandbox, bypassing any managed network proxy."
+        } else if launch
+            .sandbox
+            .as_ref()
+            .is_none_or(|sandbox| sandbox.level() == SandboxLevel::Unconfined)
+        {
+            "This terminal runs without a filesystem sandbox."
+        } else {
+            "This terminal retains sandbox or network settings that differ from the current permissions."
+        };
+        let state = StdinApproval {
+            launch_call_id: terminal.call_id().map(str::to_owned),
+            session_id: terminal.session_id().as_str().to_owned(),
+            cwd: terminal.cwd().map(Path::to_path_buf),
+            input: chars.to_owned(),
+            reason: format!(
+                "Send input to an existing terminal. {authority} The cwd is its launch directory; the terminal's current directory and state may have changed."
+            ),
+        };
+        // Codex bounds the complete pretty-printed action plus its reason, including JSON
+        // escaping. Never ask about a truncated input or execute an unreviewed tail.
+        if !state.can_be_reviewed() {
+            return Ok(StdinReview::Refuse(
+                "terminal input and permission details are too large to review safely; use a smaller input or start a new terminal with fewer grants".to_owned(),
+            ));
+        }
+        if let Some(reason) = prompt_is_rejected_by_policy(settings.approval_policy, false) {
+            return Ok(StdinReview::Refuse(reason.to_owned()));
+        }
+        encode(&state).map(StdinReview::Ask)
+    }
+}
+
+/// Codex's request for input to a running terminal: a command approval of kind `writeStdin` for
+/// the item of the call that launched the terminal, naming the input call as its approval, the
+/// input as Codex's `write_stdin --session-id` command line, and approving once or cancelling as
+/// the only decisions.
+fn stdin_approval_request(pending: PendingApproval<'_>) -> Option<ServerRequestPayload> {
+    let approval = pending.approval();
+    let state = approval
+        .resume()
+        .and_then(|resume| ra_tools::write_stdin::approval_policy_state(resume.state()))
+        .and_then(|state| serde_json::from_value::<StdinApproval>(state.clone()).ok())?;
+    let call_id = approval.call_id().as_str();
+    let mut params = CommandExecutionRequestApprovalParams::new(
+        pending.thread_id(),
+        pending.turn_id(),
+        state.launch_call_id.as_deref().unwrap_or(call_id),
+        pending.started_at_ms(),
+    )
+    .with_kind(CommandExecutionApprovalKind::WriteStdin)
+    .with_approval_id(call_id)
+    .with_environment_id(LOCAL_ENVIRONMENT_ID)
+    .with_command(shlex_join(&[
+        "write_stdin".to_owned(),
+        "--session-id".to_owned(),
+        state.session_id,
+        state.input,
+    ]))
+    .with_reason(state.reason)
+    .with_available_decisions(vec![
+        CommandExecutionApprovalDecision::Accept,
+        CommandExecutionApprovalDecision::Cancel,
+    ]);
+    if let Some(cwd) = state.cwd {
+        params = params.with_cwd(cwd.to_string_lossy());
+    }
+    Some(ServerRequestPayload::CommandExecutionRequestApproval(
+        params,
+    ))
+}
+
+/// What an input approval is asked about: Codex's `ApprovalAction::WriteStdin`, for the
+/// permissions this build has.
+#[derive(Debug, Serialize, Deserialize)]
+struct StdinApproval {
+    launch_call_id: Option<String>,
+    session_id: String,
+    cwd: Option<PathBuf>,
+    input: String,
+    reason: String,
+}
+
+const MAX_STDIN_APPROVAL_BYTES: usize = 8_000;
+
+/// Codex's reviewed stdin action for this executor's string session IDs and pipe input.
+/// Launch permissions stay host-owned; only the requested override enters the reviewed action.
+#[derive(Serialize)]
+struct StdinApprovalAction<'a> {
+    tool: &'static str,
+    session_id: &'a str,
+    chars: &'a str,
+    cwd: Option<&'a Path>,
+    sandbox_permissions: SandboxPermissions,
+    tty: bool,
+}
+
+impl StdinApproval {
+    fn can_be_reviewed(&self) -> bool {
+        let action = StdinApprovalAction {
+            tool: WRITE_STDIN_TOOL,
+            session_id: &self.session_id,
+            chars: &self.input,
+            cwd: self.cwd.as_deref(),
+            sandbox_permissions: SandboxPermissions::RequireEscalated,
+            tty: false,
+        };
+        serde_json::to_string_pretty(&action).is_ok_and(|reviewed| {
+            reviewed.len().saturating_add(self.reason.len()) <= MAX_STDIN_APPROVAL_BYTES
+        })
+    }
 }
 
 /// The invocation identity agents-python binds to a provider call ID. The existing canonical

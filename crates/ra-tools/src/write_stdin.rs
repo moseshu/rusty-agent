@@ -26,6 +26,14 @@
 //! Quietly translating one into the other would break the verbatim-write contract for every program
 //! that reads raw keystrokes. Terminal allocation still has no end-to-end contract and is not
 //! declared here.
+//!
+//! # Asking before input reaches a session
+//!
+//! Without a host policy every call asks first. A host installs a [`WriteStdinPolicy`] to decide
+//! per input instead, against what it recorded when it launched the session (see
+//! [`crate::exec_command::ExecCommandPolicy::launch_state`]): Codex reviews input only when the
+//! terminal runs with authority the current policy would not give it. A wait or a signal is never
+//! reviewed, as Codex reviews neither.
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -33,20 +41,22 @@ use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     event::exec::{ExecSessionId, ExecStreamKind},
+    item::CallId,
+    state::{ArgumentFingerprint, RunId},
     tool::{
         DecodedToolInput, FuncSchema, Tool, ToolApprovalPolicy, ToolArgumentDecodeError,
-        ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin, ToolOutput,
-        ToolSchema,
+        ToolConcurrency, ToolContext, ToolFailureHandling, ToolLookupKey, ToolOptions, ToolOrigin,
+        ToolOutput, ToolSchema,
     },
 };
 use ra_exec::{
     command::ExecCursor,
     job::{BackgroundJob, JobError, JobWaitResult, JobWaitUntil},
-    session::{ExecError, ProcessManager},
+    session::{BackgroundTerminal, ExecError, ProcessManager},
 };
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::session_return::{ReturnReason, SessionReturn, Watched};
 
@@ -96,12 +106,99 @@ enum SessionControl {
     Cancel,
 }
 
+/// What a host's [`WriteStdinPolicy`] says about input to a running session.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum StdinReview {
+    /// The input is written without asking.
+    Allow,
+    /// The host is asked first; `state` is kept with the approval for whoever asks it (see
+    /// [`Tool::approval_state`]).
+    Ask(serde_json::Value),
+    /// The input is refused, and the model reads `reason` in place of a result.
+    Refuse(String),
+}
+
+/// The host policy deciding whether input to a running session asks first: the stdin review of
+/// Codex's unified exec.
+pub trait WriteStdinPolicy: Send + Sync {
+    /// What follows writing `chars` to `terminal`, the session the call names, with what started
+    /// it. Asked only for non-empty input, before an approval is asked and, unless the call resumes
+    /// from one, again before the input is written.
+    ///
+    /// # Errors
+    ///
+    /// An error fails the run.
+    fn review(
+        &self,
+        context: &ToolContext<'_>,
+        terminal: &BackgroundTerminal,
+        chars: &str,
+    ) -> Result<StdinReview>;
+}
+
+/// Codex keeps the reviewed input on its stack while awaiting approval. An interrupted run
+/// instead saves its invocation identity with the policy state, as `exec_command` does.
+#[derive(Serialize, Deserialize)]
+struct WriteStdinResume {
+    run_id: RunId,
+    call_id: CallId,
+    tool: ToolLookupKey,
+    arguments: ArgumentFingerprint,
+    policy_state: serde_json::Value,
+}
+
+impl WriteStdinResume {
+    fn new(context: &ToolContext<'_>, policy_state: serde_json::Value) -> Self {
+        Self {
+            run_id: context.run().run_id().clone(),
+            call_id: context.call_id().clone(),
+            tool: context.origin().lookup_key().clone(),
+            arguments: ArgumentFingerprint::compute(context.arguments()),
+            policy_state,
+        }
+    }
+
+    fn check(&self, context: &ToolContext<'_>) -> Result<()> {
+        if self.run_id != *context.run().run_id()
+            || self.call_id != *context.call_id()
+            || self.tool != *context.origin().lookup_key()
+            || self.arguments != ArgumentFingerprint::compute(context.arguments())
+        {
+            return Err(Error::caller(format!(
+                "Model reused tool call ID `{}` for a different invocation. Use a unique call ID for each tool invocation.",
+                context.call_id()
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_context(context: &ToolContext<'_>) -> Result<()> {
+        let Some(state) = context.resume_state() else {
+            return Ok(());
+        };
+        let resume: Self = serde_json::from_value(state.clone()).map_err(|error| {
+            Error::caller(format!("cannot restore terminal input approval: {error}"))
+        })?;
+        resume.check(context)
+    }
+}
+
+/// The state a [`WriteStdinPolicy`] kept with an input approval, read from the tool's
+/// [`ra_core::item::ToolResume::state`]. `None` for state without that policy payload.
+#[must_use]
+pub fn approval_policy_state(state: &serde_json::Value) -> Option<&serde_json::Value> {
+    state.get("policy_state")
+}
+
 /// The interactive input companion to `exec_command`.
+#[derive(Clone)]
 pub struct WriteStdinTool {
     origin: ToolOrigin,
     func_schema: FuncSchema,
     options: ToolOptions,
     process_manager: Arc<ProcessManager>,
+    policy: Option<Arc<dyn WriteStdinPolicy>>,
 }
 
 impl fmt::Debug for WriteStdinTool {
@@ -124,7 +221,40 @@ impl WriteStdinTool {
                 .with_failure_handling(ToolFailureHandling::Custom)
                 .with_concurrency(ToolConcurrency::Parallel),
             process_manager,
+            policy: None,
         })
+    }
+
+    /// Installs the host policy deciding which input asks first; without one, every call asks.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<dyn WriteStdinPolicy>) -> Self {
+        self.policy = Some(policy);
+        self.options = self.options.with_approval(ToolApprovalPolicy::Dynamic);
+        self
+    }
+
+    /// What the installed policy says about the input `arguments` would write, if it says
+    /// anything: a wait, a signal, input the arguments cannot carry and input to a session the
+    /// manager no longer retains are not reviewed.
+    async fn review(&self, context: &ToolContext<'_>) -> Result<Option<StdinReview>> {
+        let Some(policy) = &self.policy else {
+            return Ok(None);
+        };
+        let Ok(input) = serde_json::from_value::<WriteStdinInput>(context.arguments().clone())
+        else {
+            return Ok(None);
+        };
+        if input.control.is_some() || input.chars.is_empty() {
+            return Ok(None);
+        }
+        let Some(terminal) = self
+            .process_manager
+            .terminal(&ExecSessionId::new(input.session_id))
+            .await
+        else {
+            return Ok(None);
+        };
+        policy.review(context, &terminal, &input.chars).map(Some)
     }
 
     /// The manager shared with `exec_command`.
@@ -173,10 +303,37 @@ impl Tool for WriteStdinTool {
             .map_err(|error| WriteStdinFailure::BadArguments(error).into_error())
     }
 
+    async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        if self.policy.is_none() {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.review(context).await?,
+            Some(StdinReview::Ask(_))
+        ))
+    }
+
+    async fn approval_state(&self, context: &ToolContext<'_>) -> Result<Option<serde_json::Value>> {
+        let Some(StdinReview::Ask(state)) = self.review(context).await? else {
+            return Ok(None);
+        };
+        serde_json::to_value(WriteStdinResume::new(context, state))
+            .map(Some)
+            .map_err(|error| Error::caller(format!("cannot save terminal input approval: {error}")))
+    }
+
     // Session serialization belongs to the manager's interaction guard inside the deadline.
     // A resource claim here would queue before that deadline starts. Control signals are sent
     // before taking the guard, while all output delivery still takes the same guard.
     async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
+        WriteStdinResume::check_context(&context)?;
+        // An approved call writes what it was approved for; any other is reviewed again here, and a
+        // refusal is what the model reads.
+        if context.resume_state().is_none()
+            && let Some(StdinReview::Refuse(reason)) = self.review(&context).await?
+        {
+            return Err(WriteStdinFailure::Rejected(reason).into_error());
+        }
         let input = self.input(&mut context)?;
         let plan = WaitPlan::of(&input).map_err(WriteStdinFailure::into_error)?;
         let session_id = ExecSessionId::new(input.session_id.clone());
@@ -479,6 +636,7 @@ enum WriteStdinFailure {
     StdinClosed(ExecSessionId),
     StdinWrite(ExecSessionId),
     Execution(String),
+    Rejected(String),
 }
 
 impl WriteStdinFailure {
@@ -490,6 +648,7 @@ impl WriteStdinFailure {
             | Self::ControlWithInput
             | Self::UnknownSession(_)
             | Self::SessionNotActive(_) => ToolErrorKind::InvalidInput,
+            Self::Rejected(_) => ToolErrorKind::PermissionDenied,
             Self::InputTimedOut
             | Self::StdinClosed(_)
             | Self::StdinWrite(_)
@@ -529,6 +688,7 @@ impl fmt::Display for WriteStdinFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadArguments(reason) => write!(formatter, "Invalid arguments: {reason}."),
+            Self::Rejected(reason) => formatter.write_str(reason),
             Self::MatchTextMissing => write!(
                 formatter,
                 "`until: match` needs `match_text` to say what to wait for."
