@@ -108,14 +108,16 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
 
     /// Applies what `decision`, the client's answer about `approval`, asks of the product beyond
     /// the call, before the run is answered: what Codex's session does with an approval for the
-    /// session or with a command-prefix rule.
+    /// session or with a command-prefix rule. Returns a warning for the user if part of it could
+    /// not be applied, which is sent as Codex sends its `warning`; the answer stands either way.
     async fn apply_review_decision(
         &self,
         config: &RunConfig,
         approval: &ToolApproval,
         decision: &ReviewDecision,
-    ) {
+    ) -> Option<String> {
         let _ = (config, approval, decision);
+        None
     }
 }
 

@@ -471,6 +471,25 @@ impl ThreadScopedOutgoingMessageSender {
             .await;
     }
 
+    /// Sends a notification produced after an approval answer to the thread's current subscribers,
+    /// as the listener does when Codex emits a warning after persisting an amendment.
+    pub(crate) async fn send_server_notification_to_current_connections(
+        &self,
+        notification: ServerNotification,
+    ) {
+        let connections = self
+            .outgoing
+            .thread_state()
+            .subscribed_connection_ids(&self.thread_id);
+        Self::new(
+            Arc::clone(&self.outgoing),
+            connections,
+            self.thread_id.clone(),
+        )
+        .send_server_notification(notification)
+        .await;
+    }
+
     /// Answers the client's request `request_id` with `response`: Codex's `send_response`.
     #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
     pub(crate) async fn send_response(

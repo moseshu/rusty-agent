@@ -20,7 +20,7 @@ use crate::{
 
 /// The environment a coding thread runs its tools in. Codex keys approvals by the environment a
 /// tool runs in; this build runs every tool in the local one, which Codex names `local`.
-const LOCAL_ENVIRONMENT_ID: &str = "local";
+pub(crate) const LOCAL_ENVIRONMENT_ID: &str = "local";
 
 /// Decisions cached for one thread, by serialized key.
 #[derive(Clone, Default, Debug)]

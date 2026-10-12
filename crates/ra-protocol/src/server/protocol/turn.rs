@@ -1111,6 +1111,41 @@ impl TurnCompletedNotification {
     }
 }
 
+/// The method of the notification that something did not go as asked, without failing a turn.
+pub const WARNING_METHOD: &str = "warning";
+
+/// A warning for the user, such as an approved command-prefix rule that could not be saved:
+/// Codex's `WarningNotification`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarningNotification {
+    thread_id: Option<String>,
+    message: String,
+}
+
+impl WarningNotification {
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    pub(crate) fn new(thread_id: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            thread_id,
+            message: message.into(),
+        }
+    }
+
+    /// The thread it applies to, if one.
+    #[must_use]
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
+    /// The warning.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// The method of the notification that a turn ran into an error.
 pub const ERROR_METHOD: &str = "error";
 

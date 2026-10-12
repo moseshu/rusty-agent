@@ -29,14 +29,17 @@
 use std::{
     fmt,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    event::exec::ExecSessionId,
+    event::{
+        FnHostEventSink, HostEvent, HostEventBody, HostEventEmitter,
+        exec::{ExecEvent, ExecExitedEvent, ExecSessionId},
+    },
     item::CallId,
     state::{ArgumentFingerprint, RunId},
     tool::{
@@ -215,6 +218,9 @@ struct ExecCommandResume {
     arguments: ArgumentFingerprint,
     policy_state: serde_json::Value,
     request: ExecRequest,
+    /// If the retry cannot launch, this unsuccessful attempt becomes the command's final exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_attempt: Option<ExecExitedEvent>,
 }
 
 impl ExecCommandResume {
@@ -230,6 +236,7 @@ impl ExecCommandResume {
             arguments: ArgumentFingerprint::compute(context.arguments()),
             policy_state,
             request,
+            failed_attempt: None,
         }
     }
 
@@ -250,6 +257,90 @@ impl ExecCommandResume {
             )));
         }
         Ok(())
+    }
+}
+
+/// The state an [`ExecCommandPolicy`] kept with the approval a command asked for, read from the
+/// state `exec_command` keeps with that approval ([`ToolResume::state`]): what the policy
+/// returned from [`ExecCommandPolicy::approval_state`], or with
+/// [`SandboxDenialAction::RequestApproval`]. `None` for state that is not `exec_command`'s.
+///
+/// [`ToolResume::state`]: ra_core::item::ToolResume::state
+#[must_use]
+pub fn approval_policy_state(state: &serde_json::Value) -> Option<&serde_json::Value> {
+    state.get("policy_state")
+}
+
+/// A process exit is not the logical command's end until its policy has decided whether to retry.
+/// Codex detects early sandbox denials before publishing execution completion. This executor
+/// reports process exits independently, so hold that boundary until the tool makes the decision.
+/// Start and output events remain immediate; yielded sessions forward their eventual exits.
+struct AttemptExitEvents {
+    emitter: HostEventEmitter,
+    source: HostEventEmitter,
+    pending: Arc<Mutex<Option<Vec<HostEvent>>>>,
+}
+
+impl AttemptExitEvents {
+    fn new(source: &HostEventEmitter) -> Self {
+        let pending = Arc::new(Mutex::new(Some(Vec::new())));
+        let sink_pending = Arc::clone(&pending);
+        let sink_source = source.clone();
+        let sink = FnHostEventSink::new(move |event: HostEvent| {
+            if matches!(event.body(), HostEventBody::Exec(ExecEvent::Exited(_))) {
+                let mut guard = sink_pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(events) = guard.as_mut() {
+                    events.push(event);
+                    return;
+                }
+            }
+            sink_source.sink().emit(event);
+        });
+        Self {
+            emitter: HostEventEmitter::new(
+                source.agent_id().clone(),
+                source.allocator().clone(),
+                Arc::new(sink),
+            ),
+            source: source.clone(),
+            pending,
+        }
+    }
+
+    fn release(&self) {
+        let events = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        for event in events.into_iter().flatten() {
+            self.source.sink().emit(event);
+        }
+    }
+
+    fn discard(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
+    fn failed_attempt(&self) -> Option<ExecExitedEvent> {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()?
+            .iter()
+            .find_map(|event| match event.body() {
+                HostEventBody::Exec(ExecEvent::Exited(exit)) => Some(exit.clone()),
+                _ => None,
+            })
+    }
+}
+
+impl Drop for AttemptExitEvents {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -581,6 +672,121 @@ impl ExecCommandTool {
         }
     }
 
+    async fn execute_attempt(
+        &self,
+        mut context: ToolContext<'_>,
+        resume: Option<&ExecCommandResume>,
+        attempt: ExecCommandAttempt,
+        emitter: Option<&HostEventEmitter>,
+    ) -> Result<ToolOutput> {
+        let request = if let Some(resume) = resume {
+            resume.request.clone()
+        } else {
+            let input = if self.policy.is_some() {
+                self.take_input::<PolicyExecCommandInput>(&mut context)?
+                    .into()
+            } else {
+                self.take_input::<ExecCommandInput>(&mut context)?
+            };
+            self.request(input)
+                .map_err(ExecCommandFailure::into_error)?
+        }
+        .with_call_id(context.call_id().as_str());
+        // Read before the request is handed over, because the yielded result reports how long it
+        // waited and the effective figure is the one the request carries, not the one asked for.
+        let yielded_after = request.limits().initial_yield_timeout();
+
+        let attempt_events = self
+            .policy
+            .as_ref()
+            .and(emitter)
+            .map(AttemptExitEvents::new);
+        let attempt_emitter = attempt_events
+            .as_ref()
+            .map(|events| &events.emitter)
+            .or(emitter);
+        let mut outcome = self
+            .process_manager
+            .execute_with_environment(request.clone(), attempt_emitter, attempt.environment())
+            .await
+            .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
+
+        // Only startup refusals enter Codex's orchestrator. A later refusal is command output;
+        // replaying the whole command could duplicate side effects from its earlier operations.
+        if let (Some(policy), ExecExecutionResult::Completed(summary)) = (&self.policy, &outcome)
+            && summary.duration() <= EARLY_EXIT_GRACE_PERIOD
+            && is_likely_sandbox_denied(summary)
+        {
+            match policy.on_sandbox_denial(
+                &self.policy_context(&context, resume),
+                &attempt,
+                summary,
+            )? {
+                SandboxDenialAction::Retry(environment) => {
+                    outcome = self
+                        .process_manager
+                        .execute_with_environment(request, emitter, environment.as_ref())
+                        .await
+                        .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
+                    if let Some(events) = &attempt_events {
+                        events.discard();
+                    }
+                }
+                SandboxDenialAction::RequestApproval(state) => {
+                    let mut state = ExecCommandResume::new(&context, state, request);
+                    state.failed_attempt = attempt_events
+                        .as_ref()
+                        .and_then(AttemptExitEvents::failed_attempt);
+                    let state = state.encode()?;
+                    if let Some(events) = &attempt_events {
+                        events.discard();
+                    }
+                    return Err(ToolApprovalRequest::new(state).into_error(TOOL_NAME));
+                }
+                SandboxDenialAction::Return => {}
+            }
+        }
+
+        if let Some(events) = &attempt_events {
+            events.release();
+        }
+
+        Ok(match outcome {
+            ExecExecutionResult::Completed(summary) => completed_output(&summary),
+            ExecExecutionResult::Yielded {
+                session_id,
+                summary,
+            } => {
+                // The yielded result is the first delivery on this session's interactive output
+                // stream. Record its exact snapshot rather than the buffers' current end: output
+                // can arrive between the yield and this bookkeeping, and it belongs to the next
+                // `write_stdin` result.
+                //
+                // Discarded on purpose. The only way to fail here is a session the registry no
+                // longer holds, and the identifier below is the whole handle the model gets:
+                // refusing would report a command that actually started as a failure, and take
+                // with it the means to collect that command's output or cancel it. A repeated
+                // line of output is the smaller price, and it is the price of the arm below too.
+                let _ = self
+                    .process_manager
+                    .mark_interactive_output_delivered(
+                        &session_id,
+                        as_u64(summary.stdout_bytes()),
+                        as_u64(summary.stderr_bytes()),
+                    )
+                    .await;
+                yielded_output(&session_id, &summary, yielded_after)
+            }
+            // `ExecExecutionResult` is `#[non_exhaustive]`, so the wildcard is mandatory. A result
+            // this build cannot name is still a result, and answering the call is what keeps the
+            // history well formed.
+            other => ToolOutput::text(format!(
+                "The command ran, but this build cannot describe how it ended ({:?} bytes of output captured).",
+                other.summary().total_bytes()
+            )),
+        })
+    }
+
     /// Resolves a requested working directory against the workspace root.
     ///
     /// Two refusals rather than one, for the reason `read_file` separates them: a path that left the
@@ -700,7 +906,7 @@ impl Tool for ExecCommandTool {
             .map(Some)
     }
 
-    async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         let resume = context
             .resume_state()
             .map(|state| {
@@ -717,6 +923,7 @@ impl Tool for ExecCommandTool {
             }
             resume.check(&context)?;
         }
+        let emitter = context.event_emitter();
         // Consume approval before execution can fail, including spawning and cancellation.
         let attempt = self
             .policy
@@ -724,90 +931,21 @@ impl Tool for ExecCommandTool {
             .map(|policy| policy.attempt(&self.policy_context(&context, resume.as_ref())))
             .transpose()?
             .unwrap_or_else(|| ExecCommandAttempt::new(self.process_manager.environment().clone()));
-        let request = if let Some(resume) = &resume {
-            resume.request.clone()
-        } else {
-            let input = if self.policy.is_some() {
-                self.take_input::<PolicyExecCommandInput>(&mut context)?
-                    .into()
-            } else {
-                self.take_input::<ExecCommandInput>(&mut context)?
-            };
-            self.request(input)
-                .map_err(ExecCommandFailure::into_error)?
-        }
-        .with_call_id(context.call_id().as_str());
-        // Read before the request is handed over, because the yielded result reports how long it
-        // waited and the effective figure is the one the request carries, not the one asked for.
-        let yielded_after = request.limits().initial_yield_timeout();
-
-        let emitter = context.event_emitter();
-        let mut outcome = self
-            .process_manager
-            .execute_with_environment(request.clone(), emitter.as_ref(), attempt.environment())
-            .await
-            .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
-
-        // Only startup refusals enter Codex's orchestrator. A later refusal is command output;
-        // replaying the whole command could duplicate side effects from its earlier operations.
-        if let (Some(policy), ExecExecutionResult::Completed(summary)) = (&self.policy, &outcome)
-            && summary.duration() <= EARLY_EXIT_GRACE_PERIOD
-            && is_likely_sandbox_denied(summary)
+        let result = self
+            .execute_attempt(context, resume.as_ref(), attempt, emitter.as_ref())
+            .await;
+        // Restoring the approval can fail before a new process has any events. Preserve the
+        // original unsuccessful attempt as the terminal failure, using a fresh event sequence.
+        if let Err(error) = &result
+            && ToolApprovalRequest::of(error).is_none()
+            && let Some(exit) = resume
+                .as_ref()
+                .and_then(|resume| resume.failed_attempt.as_ref())
+            && let Some(emitter) = &emitter
         {
-            match policy.on_sandbox_denial(
-                &self.policy_context(&context, resume.as_ref()),
-                &attempt,
-                summary,
-            )? {
-                SandboxDenialAction::Retry(environment) => {
-                    outcome = self
-                        .process_manager
-                        .execute_with_environment(request, emitter.as_ref(), environment.as_ref())
-                        .await
-                        .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
-                }
-                SandboxDenialAction::RequestApproval(state) => {
-                    let state = ExecCommandResume::new(&context, state, request).encode()?;
-                    return Err(ToolApprovalRequest::new(state).into_error(TOOL_NAME));
-                }
-                SandboxDenialAction::Return => {}
-            }
+            emitter.emit_exec(ExecEvent::Exited(exit.clone()))?;
         }
-
-        Ok(match outcome {
-            ExecExecutionResult::Completed(summary) => completed_output(&summary),
-            ExecExecutionResult::Yielded {
-                session_id,
-                summary,
-            } => {
-                // The yielded result is the first delivery on this session's interactive output
-                // stream. Record its exact snapshot rather than the buffers' current end: output
-                // can arrive between the yield and this bookkeeping, and it belongs to the next
-                // `write_stdin` result.
-                //
-                // Discarded on purpose. The only way to fail here is a session the registry no
-                // longer holds, and the identifier below is the whole handle the model gets:
-                // refusing would report a command that actually started as a failure, and take
-                // with it the means to collect that command's output or cancel it. A repeated
-                // line of output is the smaller price, and it is the price of the arm below too.
-                let _ = self
-                    .process_manager
-                    .mark_interactive_output_delivered(
-                        &session_id,
-                        as_u64(summary.stdout_bytes()),
-                        as_u64(summary.stderr_bytes()),
-                    )
-                    .await;
-                yielded_output(&session_id, &summary, yielded_after)
-            }
-            // `ExecExecutionResult` is `#[non_exhaustive]`, so the wildcard is mandatory. A result
-            // this build cannot name is still a result, and answering the call is what keeps the
-            // history well formed.
-            other => ToolOutput::text(format!(
-                "The command ran, but this build cannot describe how it ended ({:?} bytes of output captured).",
-                other.summary().total_bytes()
-            )),
-        })
+        result
     }
 
     fn options(&self) -> ToolOptions {

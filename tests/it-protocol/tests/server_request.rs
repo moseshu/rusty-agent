@@ -1636,3 +1636,58 @@ async fn dynamic_tool_answers_refuse_remote_media_and_fall_back_to_failure() {
     );
     assert_eq!(dynamic_tool_call_response(turn_transition()), None);
 }
+
+/// Codex's `ExecApprovalRequestEvent::default_available_decisions`: a network approval offers
+/// approving once or for the session, the first proposed rule that allows the host, and
+/// cancelling; one asking for more permissions, approving once and cancelling; any other,
+/// approving once, its proposed command-prefix rule, and cancelling.
+#[test]
+fn default_available_decisions_follow_codex() {
+    let network = NetworkApprovalContext::new("example.com", NetworkApprovalProtocol::Https);
+    let rules = [
+        NetworkPolicyAmendment::new("example.com", NetworkPolicyRuleAction::Deny),
+        NetworkPolicyAmendment::new("example.com", NetworkPolicyRuleAction::Allow),
+    ];
+    let amendment = ExecPolicyAmendment::new(["git", "pull"]);
+    assert_eq!(
+        CommandExecutionApprovalDecision::default_available(
+            Some(&network),
+            Some(&amendment),
+            Some(&rules),
+            None,
+        ),
+        [
+            CommandExecutionApprovalDecision::Accept,
+            CommandExecutionApprovalDecision::AcceptForSession,
+            CommandExecutionApprovalDecision::apply_network_policy_amendment(rules[1].clone()),
+            CommandExecutionApprovalDecision::Cancel,
+        ]
+    );
+    assert_eq!(
+        CommandExecutionApprovalDecision::default_available(
+            None,
+            Some(&amendment),
+            None,
+            Some(&AdditionalPermissionProfile::new()),
+        ),
+        [
+            CommandExecutionApprovalDecision::Accept,
+            CommandExecutionApprovalDecision::Cancel,
+        ]
+    );
+    assert_eq!(
+        CommandExecutionApprovalDecision::default_available(None, Some(&amendment), None, None),
+        [
+            CommandExecutionApprovalDecision::Accept,
+            CommandExecutionApprovalDecision::accept_with_execpolicy_amendment(amendment.clone()),
+            CommandExecutionApprovalDecision::Cancel,
+        ]
+    );
+    assert_eq!(
+        CommandExecutionApprovalDecision::default_available(None, None, None, None),
+        [
+            CommandExecutionApprovalDecision::Accept,
+            CommandExecutionApprovalDecision::Cancel,
+        ]
+    );
+}

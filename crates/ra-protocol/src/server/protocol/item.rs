@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::permissions::{
     AdditionalPermissionProfile, ExecPolicyAmendment, NetworkApprovalContext,
-    NetworkPolicyAmendment,
+    NetworkPolicyAmendment, NetworkPolicyRuleAction,
 };
 
 /// How the client answers a command approval: Codex's `CommandExecutionApprovalDecision`.
@@ -63,6 +63,45 @@ impl CommandExecutionApprovalDecision {
         Self::ApplyNetworkPolicyAmendment {
             network_policy_amendment,
         }
+    }
+
+    /// The decisions a command approval offers when its sender names none: Codex's
+    /// `ExecApprovalRequestEvent::default_available_decisions`, as the client reads them.
+    ///
+    /// A network approval offers approving once or for the session, the first rule it proposes
+    /// that allows the host, and cancelling; one that asks for more permissions, approving once
+    /// and cancelling; any other, approving once, the command-prefix rule it proposes, and
+    /// cancelling.
+    #[must_use]
+    pub fn default_available(
+        network_approval_context: Option<&NetworkApprovalContext>,
+        proposed_execpolicy_amendment: Option<&ExecPolicyAmendment>,
+        proposed_network_policy_amendments: Option<&[NetworkPolicyAmendment]>,
+        additional_permissions: Option<&AdditionalPermissionProfile>,
+    ) -> Vec<Self> {
+        if network_approval_context.is_some() {
+            let mut decisions = vec![Self::Accept, Self::AcceptForSession];
+            if let Some(amendment) = proposed_network_policy_amendments.and_then(|amendments| {
+                amendments
+                    .iter()
+                    .find(|amendment| amendment.action() == NetworkPolicyRuleAction::Allow)
+            }) {
+                decisions.push(Self::apply_network_policy_amendment(amendment.clone()));
+            }
+            decisions.push(Self::Cancel);
+            return decisions;
+        }
+
+        if additional_permissions.is_some() {
+            return vec![Self::Accept, Self::Cancel];
+        }
+
+        let mut decisions = vec![Self::Accept];
+        if let Some(prefix) = proposed_execpolicy_amendment {
+            decisions.push(Self::accept_with_execpolicy_amendment(prefix.clone()));
+        }
+        decisions.push(Self::Cancel);
+        decisions
     }
 }
 

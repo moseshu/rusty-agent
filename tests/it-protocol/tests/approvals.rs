@@ -345,7 +345,7 @@ impl ThreadSettingsAdapter for Product {
         config: &RunConfig,
         approval: &ToolApproval,
         decision: &ReviewDecision,
-    ) {
+    ) -> Option<String> {
         self.decision_models
             .lock()
             .unwrap()
@@ -360,6 +360,7 @@ impl ThreadSettingsAdapter for Product {
             .unwrap()
             .push((approval.call_id().as_str().to_owned(), decision.clone()));
         self.decided.notify_waiters();
+        None
     }
 }
 

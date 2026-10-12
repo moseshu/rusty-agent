@@ -40,8 +40,8 @@ use ra_runtime::thread::ThreadEvent;
 use super::{
     answers::{ApprovalAnswer, command_execution_approval_answer, file_change_approval_answer},
     approvals::{ReviewDecision, RunAnswer},
-    outgoing::{ThreadScopedOutgoingMessageSender, now_unix_timestamp_ms},
-    protocol::ServerRequestPayload,
+    outgoing::{ServerNotification, ThreadScopedOutgoingMessageSender, now_unix_timestamp_ms},
+    protocol::{ServerRequestPayload, WARNING_METHOD, WarningNotification},
     settings_adapter::PendingApproval,
     thread_manager::LoadedThread,
     thread_status::ThreadWatchManager,
@@ -131,6 +131,7 @@ async fn run_approval_batch(
         }
         effects.push(apply_product_decision(
             loaded,
+            outgoing,
             &config,
             item,
             answer.decision,
@@ -151,7 +152,7 @@ async fn run_approval_batch(
                     Some(answer) => {
                         ended = !apply_answer(loaded, turn_id, &batch, &mut state, &item, &answer);
                         if !ended {
-                            effects.push(apply_product_decision(loaded, &config, item, answer.decision));
+                            effects.push(apply_product_decision(loaded, outgoing, &config, item, answer.decision));
                         }
                     }
                 }
@@ -206,18 +207,38 @@ fn apply_answer(
 
 /// An amendment can await storage. Keep polling answers meanwhile so a cancellation still aborts
 /// the turn immediately, and finish accepted effects before resuming or releasing the batch.
+///
+/// What could not be applied is sent to the thread's connections as Codex's `warning`.
 async fn apply_product_decision(
     loaded: &LoadedThread,
+    outgoing: &ThreadScopedOutgoingMessageSender,
     config: &ra_runtime::runner::RunConfig,
     item: RunItem,
     decision: ReviewDecision,
 ) {
-    if let (Some(adapter), RunItemKind::ToolApproval(approval)) =
+    let (Some(adapter), RunItemKind::ToolApproval(approval)) =
         (loaded.adapter.as_ref(), item.kind())
-    {
-        adapter
-            .apply_review_decision(config, approval, &decision)
-            .await;
+    else {
+        return;
+    };
+    let Some(message) = adapter
+        .apply_review_decision(config, approval, &decision)
+        .await
+    else {
+        return;
+    };
+    let warning = WarningNotification::new(Some(loaded.thread_id().as_str().to_owned()), message);
+    match serde_json::to_value(warning) {
+        Ok(params) => {
+            outgoing
+                .send_server_notification_to_current_connections(ServerNotification::new(
+                    WARNING_METHOD,
+                    params,
+                ))
+                .await;
+        }
+        // The notification is a plain record, so this does not happen.
+        Err(error) => tracing::error!("failed to serialize {WARNING_METHOD}: {error}"),
     }
 }
 

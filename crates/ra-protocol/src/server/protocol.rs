@@ -112,7 +112,7 @@ pub use self::{
         ThreadSettingsUpdateResponse, Turn, TurnCompletedNotification, TurnError,
         TurnInterruptParams, TurnInterruptResponse, TurnItemsView, TurnStartParams,
         TurnStartResponse, TurnStartedNotification, TurnStatus, TurnSteerParams, TurnSteerResponse,
-        UserInput,
+        UserInput, WARNING_METHOD, WarningNotification,
     },
 };
 use crate::{

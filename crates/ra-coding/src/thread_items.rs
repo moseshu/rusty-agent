@@ -15,13 +15,14 @@
 //! - A patch's changes are the files its text names. A created file's diff is its content, and a
 //!   changed file's is the patch's own hunks rather than a unified diff against the file; a deleted
 //!   file's content is not known, and its diff is empty.
-//! - A call that failed is a failed item. Codex tells a call the user declined from one that
-//!   failed; the result here does not say which.
+//! - A call that failed is a failed item. A call whose approval was not given ends as the answer
+//!   the thread recorded says, as Codex's handlers end it, rather than by the refusal the model is
+//!   given.
 
 use std::path::{Path, PathBuf};
 
 use ra_core::{
-    event::{HostEvent, HostEventBody, exec::ExecEvent},
+    event::{ApprovalEvent, ApprovalResolution, HostEvent, HostEventBody, exec::ExecEvent},
     item::{ToolCall, ToolCallOutput},
     tool::ToolOutput,
 };
@@ -110,6 +111,9 @@ impl ThreadToolItems for CodingThreadToolItems {
     }
 
     fn event(&self, event: &HostEvent, items: &[ThreadItem]) -> Option<ThreadToolItemEvent> {
+        if let HostEventBody::Approval(approval) = event.body() {
+            return refused_item(approval, items).map(ThreadToolItemEvent::Completed);
+        }
         let HostEventBody::Exec(event) = event.body() else {
             return None;
         };
@@ -185,6 +189,42 @@ impl ThreadToolItems for CodingThreadToolItems {
             _ => None,
         }
     }
+}
+
+/// The item of a call whose approval was not given, ended as Codex's handlers end it: a command
+/// declined or cancelled is `declined` and one whose answer could not be obtained `failed`, with
+/// nothing it ran; a patch not approved is `declined` whatever the reason, as Codex's patch tool
+/// reports every refusal. An approved call's item goes on as the call runs.
+fn refused_item(approval: &ApprovalEvent, items: &[ThreadItem]) -> Option<ThreadItem> {
+    let call_id = approval.call_id().as_str();
+    let resolution = approval.resolution();
+    if resolution == ApprovalResolution::Approved {
+        return None;
+    }
+    let mut item = items.iter().find(|item| item.id() == call_id)?.clone();
+    match &mut item {
+        ThreadItem::CommandExecution {
+            status,
+            process_id,
+            aggregated_output,
+            exit_code,
+            duration_ms,
+            ..
+        } => {
+            *status = if resolution == ApprovalResolution::Failed {
+                CommandExecutionStatus::Failed
+            } else {
+                CommandExecutionStatus::Declined
+            };
+            *process_id = None;
+            *aggregated_output = None;
+            *exit_code = None;
+            *duration_ms = None;
+        }
+        ThreadItem::FileChange { status, .. } => *status = PatchApplyStatus::Declined,
+        _ => return None,
+    }
+    Some(item)
 }
 
 /// The text of a tool's result as the model read it, and the guidance that came with it.

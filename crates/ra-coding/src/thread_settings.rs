@@ -46,6 +46,12 @@
 //! sandbox retry does not ask either. Configured permission rules decide before the cache is
 //! consulted, as Codex's permission-request hooks decide before its cache.
 //!
+//! The adapter also asks the client about the calls a run stops on, as Codex's app-server asks for
+//! its shell and patch tools: a command with Codex's `item/commandExecution/requestApproval`, in
+//! the form it is decided and cached in, with the reason and command-prefix rule its kept decision
+//! gives; a patch with `item/fileChange/requestApproval`. An answer is applied to the thread's
+//! approval cache and, approving a rule, to its rules home, whose failure is the user's warning.
+//!
 //! Invocation identity covers the tool and complete arguments. Settled calls retain only their
 //! identity until the turn ends, preventing call-ID reuse. The app-server listener forwards events
 //! to [`ThreadSettingsAdapter::on_thread_event`] for cleanup; an embedding host loading threads
@@ -58,7 +64,8 @@
 //! adapter parity gap rather than a new provider-neutral permission rule.
 
 use crate::approvals::{
-    ApprovalCacheKey, ApprovalStore, CommandApproval, CommandCacheKey, patch_cache_keys,
+    ApprovalCacheKey, ApprovalStore, CommandApproval, CommandCacheKey, LOCAL_ENVIRONMENT_ID,
+    patch_cache_keys,
 };
 use crate::exec_policy::{
     AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyManager,
@@ -78,8 +85,12 @@ use ra_exec::sandbox::{
     unix_local::{EnvPolicy, ResourceLimits},
 };
 use ra_protocol::server::{
-    ReviewDecision, ThreadSettingsAdapter,
-    protocol::{ApprovalsReviewer, AskForApproval, SandboxPolicy, ThreadPolicyOverrides},
+    PendingApproval, ReviewDecision, ThreadSettingsAdapter,
+    protocol::{
+        ApprovalsReviewer, AskForApproval, CommandAction, CommandExecutionApprovalDecision,
+        CommandExecutionRequestApprovalParams, FileChangeRequestApprovalParams, SandboxPolicy,
+        ServerRequestPayload, ThreadPolicyOverrides,
+    },
 };
 use ra_runtime::{permission::PermissionEngine, runner::RunConfig, thread::ThreadEvent};
 use ra_tools::exec_command::{ExecCommandAttempt, ExecCommandPolicy, SandboxDenialAction};
@@ -230,6 +241,96 @@ impl CodingThreadSettings {
         self.approvals().all_approved_for_session(keys)
     }
 
+    /// The request asking the client about `pending`: Codex's `ExecApprovalRequest` for a command
+    /// and `ApplyPatchApprovalRequest` for a patch, as its app-server sends them. Other tools are
+    /// asked nothing.
+    fn approval_request(&self, pending: PendingApproval<'_>) -> Option<ServerRequestPayload> {
+        let approval = pending.approval();
+        if approval.namespace().is_some() {
+            return None;
+        }
+        match approval.tool_name() {
+            EXEC_COMMAND_TOOL => self.command_approval_request(pending),
+            // A patch is asked about with no reason and no grant root, as Codex asks one its
+            // patch safety check sends to the user.
+            APPLY_PATCH_TOOL => Some(ServerRequestPayload::FileChangeRequestApproval(
+                FileChangeRequestApprovalParams::new(
+                    pending.thread_id(),
+                    pending.turn_id(),
+                    approval.call_id().as_str(),
+                    pending.started_at_ms(),
+                ),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Codex's command approval request: the command in the form it is decided and cached in,
+    /// where it runs, why it asks — the retry reason, then the reason its decision gives, then the
+    /// call's justification — the command-prefix rule its decision proposes, and the decisions
+    /// Codex offers by default. The decision is the one kept with the approval, so the request
+    /// says what the approved call will run as, wherever the approval is answered.
+    fn command_approval_request(
+        &self,
+        pending: PendingApproval<'_>,
+    ) -> Option<ServerRequestPayload> {
+        let approval = pending.approval();
+        let arguments =
+            serde_json::from_value::<CommandArguments>(approval.arguments().clone()).ok()?;
+        let resume = approval
+            .resume()
+            .and_then(|resume| ra_tools::exec_command::approval_policy_state(resume.state()))
+            .and_then(|state| serde_json::from_value::<CommandResume>(state.clone()).ok());
+        let (requirement, retry_reason) = match resume {
+            Some(CommandResume::Approval { decision, .. }) => (Some(decision.requirement), None),
+            Some(CommandResume::SandboxRetry {
+                decision,
+                retry_reason,
+                ..
+            }) => (Some(decision.requirement), Some(retry_reason)),
+            None => (None, None),
+        };
+        let approval_reason = match &requirement {
+            Some(ExecApprovalRequirement::NeedsApproval { reason, .. }) => reason.clone(),
+            _ => None,
+        };
+        let reason = retry_reason
+            .or(approval_reason)
+            .or_else(|| arguments.justification.clone());
+        let amendment = requirement
+            .as_ref()
+            .and_then(ExecApprovalRequirement::proposed_execpolicy_amendment)
+            .cloned();
+        let mut params = CommandExecutionRequestApprovalParams::new(
+            pending.thread_id(),
+            pending.turn_id(),
+            approval.call_id().as_str(),
+            pending.started_at_ms(),
+        )
+        .with_environment_id(LOCAL_ENVIRONMENT_ID)
+        .with_command(shlex_join(&arguments.command()))
+        .with_cwd(
+            self.command_cwd(arguments.workdir.as_deref())
+                .to_string_lossy(),
+        )
+        .with_command_actions(vec![CommandAction::unknown(arguments.cmd.clone())])
+        .with_available_decisions(CommandExecutionApprovalDecision::default_available(
+            None,
+            amendment.as_ref(),
+            None,
+            None,
+        ));
+        if let Some(reason) = reason {
+            params = params.with_reason(reason);
+        }
+        if let Some(amendment) = amendment {
+            params = params.with_proposed_execpolicy_amendment(amendment);
+        }
+        Some(ServerRequestPayload::CommandExecutionRequestApproval(
+            params,
+        ))
+    }
+
     /// The configured destination for approval review, captured with a model step.
     #[must_use]
     pub const fn approvals_reviewer(&self) -> ApprovalsReviewer {
@@ -365,6 +466,7 @@ impl CodingThreadSettingsAdapter {
     }
 }
 
+#[async_trait::async_trait]
 impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
     fn prepare(
         &self,
@@ -424,6 +526,32 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
             }
             _ => {}
         }
+    }
+
+    fn approval_request(
+        &self,
+        config: &RunConfig,
+        pending: PendingApproval<'_>,
+    ) -> Option<ServerRequestPayload> {
+        config
+            .app_context()
+            .and_then(|value| value.downcast_ref::<CodingThreadSettings>())?
+            .approval_request(pending)
+    }
+
+    async fn apply_review_decision(
+        &self,
+        config: &RunConfig,
+        approval: &ToolApproval,
+        decision: &ReviewDecision,
+    ) -> Option<String> {
+        let settings = config
+            .app_context()
+            .and_then(|value| value.downcast_ref::<CodingThreadSettings>())?;
+        settings.cache_review_decision(approval, decision);
+        settings
+            .persist_approved_execpolicy_amendment(decision)
+            .await
     }
 }
 
@@ -802,6 +930,12 @@ impl CommandArguments {
             self.cmd.clone(),
         ]
     }
+}
+
+/// A command as Codex's app-server shows it in an approval request: Codex's `shlex_join`.
+fn shlex_join(tokens: &[String]) -> String {
+    shlex::try_join(tokens.iter().map(String::as_str))
+        .unwrap_or_else(|_| "<command included NUL byte>".to_string())
 }
 
 /// The tools whose approvals the thread caches, by the names the coding host installs them under.
