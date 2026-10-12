@@ -12,8 +12,9 @@
 //! The named catalog supports the legacy filesystem policies the executor can enforce. Profile
 //! inheritance, glob grants and externally managed mounts require a richer host adapter; an
 //! unknown profile never falls back to ambient authority. External sandbox enforcement is an
-//! explicit embedding-host responsibility. Reviewer selection is retained for the server request
-//! producer; it does not install an automatic reviewer on its own.
+//! explicit embedding-host responsibility. The client is the only approval reviewer: the server
+//! refuses Codex's automatic reviewer, which is not ported, and a snapshot that names it anyway
+//! asks the client nothing, so its calls are refused.
 //!
 //! Commands are decided by Codex's command policy (see [`crate::exec_policy`]) with the rules the
 //! host selects through [`CodingThreadSettingsAdapter::with_exec_policy`]: a command that needs
@@ -81,7 +82,7 @@ use ra_core::{
     item::{CallId, RunItemKind, ToolApproval},
     permission::PermissionMode,
     state::{ArgumentFingerprint, RunId},
-    tool::{ToolContext, ToolLookupKey},
+    tool::{Tool, ToolContext, ToolLookupKey},
 };
 use ra_exec::output::ExecOutputSummary;
 use ra_exec::sandbox::{
@@ -255,6 +256,11 @@ impl CodingThreadSettings {
     /// and `ApplyPatchApprovalRequest` for a patch, as its app-server sends them. Other tools are
     /// asked nothing.
     fn approval_request(&self, pending: PendingApproval<'_>) -> Option<ServerRequestPayload> {
+        // The server refuses an automatic reviewer, which is not ported; a snapshot that still
+        // names one asks nobody, so the call is refused rather than put to the client instead.
+        if self.approvals_reviewer == ApprovalsReviewer::AutoReview {
+            return None;
+        }
         let approval = pending.approval();
         if approval.namespace().is_some() {
             return None;
@@ -548,6 +554,14 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
             .app_context()
             .and_then(|value| value.downcast_ref::<CodingThreadSettings>())?
             .approval_request(pending)
+    }
+
+    /// Commands and patches are asked about whatever kept state their approval carries. Input to
+    /// a running terminal is asked about only with the review its stdin policy keeps, which a
+    /// `write_stdin` that asks before every input does not have.
+    fn requests_approval_for(&self, tool: &dyn Tool) -> bool {
+        tool.origin().namespace().is_none()
+            && matches!(tool.origin().name(), EXEC_COMMAND_TOOL | APPLY_PATCH_TOOL)
     }
 
     async fn apply_review_decision(

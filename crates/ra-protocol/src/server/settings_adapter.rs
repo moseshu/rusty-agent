@@ -1,7 +1,7 @@
 //! The host boundary for Codex's product-owned settings. The protocol ports their wire shape;
 //! the selected product previews and applies their concrete execution mechanism.
 
-use ra_core::item::ToolApproval;
+use ra_core::{item::ToolApproval, tool::Tool};
 use ra_runtime::{
     runner::RunConfig,
     thread::{AgentThread, ThreadEvent},
@@ -104,6 +104,20 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
     ) -> Option<ServerRequestPayload> {
         let _ = (config, pending);
         None
+    }
+
+    /// Whether [`Self::approval_request`] asks the client about the calls of `tool`, a tool whose
+    /// every call needs approval
+    /// ([`ToolApprovalPolicy::Always`](ra_core::tool::ToolApprovalPolicy::Always)).
+    ///
+    /// A thread with such a statically declared tool is refused when loaded if its effective
+    /// permissions require approval and the product cannot ask for it. Capabilities contribute
+    /// tools only after run binding; their approvals use the normal per-call request path. A tool
+    /// that decides per call whether it needs approval is not checked here; a call that stops
+    /// without a request is refused then. The default asks about no tool.
+    fn requests_approval_for(&self, tool: &dyn Tool) -> bool {
+        let _ = tool;
+        false
     }
 
     /// Applies what `decision`, the client's answer about `approval`, asks of the product beyond

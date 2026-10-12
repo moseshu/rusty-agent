@@ -76,7 +76,7 @@ use super::{
         ThreadStartResponse, ThreadStartedNotification, ThreadStatus, Turn, TurnStatus,
     },
     settings_adapter::{ThreadSettingsAdapter, settings_snapshot},
-    thread_factory::{ThreadFactory, ThreadFactoryRequest, ThreadOrigin},
+    thread_factory::{ThreadFactory, ThreadFactoryRequest, ThreadOrigin, check_approval_requests},
     thread_history::{HistorySources, ThreadHistoryBuilder},
     thread_listener::{ListenerTaskContext, ensure_listener_task_running},
     thread_manager::{LoadedThread, LoadedThreadInfo},
@@ -88,7 +88,8 @@ use super::{
     thread_status::resolve_thread_status,
     tool_items::ThreadToolItems,
     turn_processor::{
-        SettingsTarget, TurnMethodResult, prepare_overrides, thread_settings_overrides, unsupported,
+        SettingsTarget, TurnMethodResult, check_approvals_reviewer, prepare_overrides,
+        thread_settings_overrides, unsupported,
     },
 };
 use crate::frame::JsonRpcErrorObject;
@@ -124,6 +125,7 @@ impl ThreadRequestProcessor {
         if let Some(field) = params.unsupported_field() {
             return Err(unsupported(METHOD, field));
         }
+        check_approvals_reviewer(METHOD, params.policy.approvals_reviewer)?;
         if params.history_mode == Some(ThreadHistoryMode::Paginated) {
             return Err(JsonRpcErrorObject::invalid_request(
                 "paginated threads require thread/turns/list and thread/items/list support",
@@ -223,6 +225,7 @@ impl ThreadRequestProcessor {
         if let Some(field) = params.unsupported_field() {
             return Err(unsupported(METHOD, field));
         }
+        check_approvals_reviewer(METHOD, params.policy.approvals_reviewer)?;
         let thread_id = SessionId::new(&params.thread_id);
         self.refuse_closing(&thread_id).await?;
         check_sandbox_and_permissions(&params.policy)?;
@@ -344,6 +347,7 @@ impl ThreadRequestProcessor {
         if let Some(field) = params.unsupported_field() {
             return Err(unsupported(METHOD, field));
         }
+        check_approvals_reviewer(METHOD, params.policy.approvals_reviewer)?;
         check_sandbox_and_permissions(&params.policy)?;
         let source_id = SessionId::new(&params.thread_id);
         if let Some(source) = self.thread_manager.get_thread(&source_id)
@@ -880,7 +884,17 @@ fn apply_settings(
         None,
         service_tier,
     )?;
-    Ok(builder.with_settings(&overrides))
+    let builder = builder.with_settings(&overrides);
+    check_approval_requests(&builder, adapter).map_err(|error| {
+        let operation = match method {
+            "thread/start" => "creating",
+            "thread/resume" => "resuming",
+            "thread/fork" => "forking",
+            _ => "loading",
+        };
+        JsonRpcErrorObject::internal_error(format!("error {operation} thread: {error}"))
+    })?;
+    Ok(builder)
 }
 
 /// The model and effort a stored thread last ran with, for a resume that sets no model: Codex's
@@ -935,9 +949,13 @@ fn restore_policy_from_snapshot(
             .and_then(|value| serde_json::from_value::<AskForApproval>(value.clone()).ok());
     }
     if policy.approvals_reviewer.is_none() {
+        // A thread recorded under `auto_review` before it was refused resumes with its client
+        // reviewing, as Codex's configuration falls back from a reviewer its requirements
+        // disallow rather than failing to load.
         policy.approvals_reviewer = snapshot
             .get("approvalsReviewer")
-            .and_then(|value| serde_json::from_value::<ApprovalsReviewer>(value.clone()).ok());
+            .and_then(|value| serde_json::from_value::<ApprovalsReviewer>(value.clone()).ok())
+            .filter(|reviewer| *reviewer != ApprovalsReviewer::AutoReview);
     }
     if policy.sandbox_policy.is_none() && policy.permissions.is_none() {
         policy.permissions = snapshot

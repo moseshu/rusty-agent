@@ -529,6 +529,13 @@ impl AgentThreadBuilder {
         &self.config
     }
 
+    /// The agent the thread's turns will run, for a host to check what the thread is loaded with
+    /// before it is built.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentBinding {
+        &self.agent
+    }
+
     /// Resolves `model` as the thread will, so a model it cannot run on is refused before the
     /// thread is built.
     ///

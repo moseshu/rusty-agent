@@ -11,12 +11,19 @@
 //! carry, gives the thread its history and the recorder of its rollout, and builds it.
 //!
 //! A factory is asked once per thread loaded, with the thread's id and why it is loaded; one that
-//! fails leaves nothing loaded, and the request fails with its error.
+//! fails leaves nothing loaded, and the request fails with its error. After applying the final
+//! settings, the server also refuses statically declared tools whose effective permissions require
+//! approval without a corresponding request. Run-bound capability tools follow the normal
+//! per-call approval path.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
-use ra_core::session::SessionId;
+use ra_core::{
+    permission::PermissionDecision,
+    session::SessionId,
+    tool::{Tool, ToolApprovalPolicy, ToolAvailability},
+};
 use ra_runtime::thread::AgentThreadBuilder;
 
 use super::{
@@ -116,6 +123,59 @@ impl PreparedThread {
     pub(crate) fn into_parts(self) -> PreparedParts {
         (self.builder, self.adapter, self.terminals)
     }
+}
+
+/// Checks statically declared tools against the final settings that start, resume or fork applied.
+/// Fixed permissions precede a tool's approval fallback, as they do in runtime dispatch.
+/// Capabilities are bound per run before their tools are read; their calls use the normal
+/// approval path, which refuses a stopped call when its product provides no request.
+pub(crate) fn check_approval_requests(
+    builder: &AgentThreadBuilder,
+    adapter: Option<&dyn ThreadSettingsAdapter>,
+) -> ra_core::error::Result<()> {
+    let unasked = declared_tools(builder)
+        .into_iter()
+        .filter(|tool| {
+            let options = tool.options();
+            options.approval() == ToolApprovalPolicy::Always
+                && options.availability() != ToolAvailability::Disabled
+                && builder.config().permission().evaluate(
+                    options.permission_scope(),
+                    tool.origin(),
+                    PermissionDecision::Ask,
+                ) == PermissionDecision::Ask
+                && !adapter.is_some_and(|adapter| adapter.requests_approval_for(tool.as_ref()))
+        })
+        .map(|tool| format!("`{}`", tool.origin().qualified_name()))
+        .collect::<BTreeSet<_>>();
+    if unasked.is_empty() {
+        return Ok(());
+    }
+    Err(ra_core::error::Error::config(format!(
+        "every call of tool {} needs approval, but the thread's host asks the client about none of them",
+        unasked.into_iter().collect::<Vec<_>>().join(", ")
+    )))
+}
+
+/// The tools a thread's runs can call as `builder` prepares it: its agent's, those of every agent
+/// its handoffs reach. Run-bound capability tools are not available at this lifecycle stage.
+fn declared_tools(builder: &AgentThreadBuilder) -> Vec<Arc<dyn Tool>> {
+    let config = builder.config();
+    let start = builder.agent().execution();
+    let mut reached = BTreeSet::from([start.id().clone()]);
+    let mut agents = vec![Arc::clone(start)];
+    let mut tools = Vec::new();
+    while let Some(agent) = agents.pop() {
+        tools.extend(agent.tools().iter().cloned());
+        for handoff in agent.handoffs() {
+            if reached.insert(handoff.target_agent().clone())
+                && let Some(target) = config.agent_registry().get(handoff.target_agent())
+            {
+                agents.push(Arc::clone(target));
+            }
+        }
+    }
+    tools
 }
 
 /// A prepared thread taken apart: its builder, settings adapter and background terminals.

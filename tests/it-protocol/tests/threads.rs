@@ -23,21 +23,30 @@ use ra_coding::{
     CodingHost, thread_factory::CodingThreadFactory, thread_settings::CodingThreadSettingsAdapter,
 };
 use ra_core::{
-    agent::{AgentId, AgentSpec},
+    agent::{AgentId, AgentSpec, HandoffSpec},
+    capability::{Capability, CapabilityFamily},
     error::{Error, Result},
-    event::EventTimestamp,
-    item::{ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
+    event::{EventTimestamp, HostEvent, HostEventBody},
+    item::{
+        CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
+        ToolCall,
+    },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
         ResolvedModel,
     },
+    permission::{PermissionDecision, PermissionMode, PermissionRule},
     session::{
         SessionId,
         rollout::{
             RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded, RolloutRunStarted,
         },
     },
-    state::RunId,
+    state::{RunId, RunState},
+    tool::{
+        Tool, ToolApprovalPolicy, ToolAvailability, ToolContext, ToolOptions, ToolOrigin,
+        ToolOutput, ToolSchema,
+    },
 };
 use ra_protocol::{
     frame::{JsonRpcMessage, JsonRpcRequest},
@@ -58,7 +67,12 @@ use ra_protocol::{
         test_api::connection_opened,
     },
 };
-use ra_runtime::{agent::AgentBinding, runner::RunConfig, thread::AgentThread};
+use ra_runtime::{
+    agent::{AgentBinding, AgentRegistry},
+    permission::PermissionEngine,
+    runner::RunConfig,
+    thread::AgentThread,
+};
 use ra_session::{
     RolloutSessionMeta,
     rollout::RolloutThreadDirectory,
@@ -192,22 +206,31 @@ fn agent() -> Arc<AgentSpec> {
 struct Factory {
     script: Arc<Script>,
     adapter: Option<CodingThreadSettingsAdapter>,
+    agent: Arc<AgentSpec>,
+    config: RunConfig,
     requests: Mutex<Vec<ThreadFactoryRequest>>,
 }
 
 impl Factory {
     fn new(script: &Arc<Script>) -> Arc<Self> {
-        Arc::new(Self {
-            script: Arc::clone(script),
-            adapter: None,
-            requests: Mutex::default(),
-        })
+        Arc::new(Self::running(script, false, agent(), RunConfig::new()))
     }
 
     fn with_adapter(script: &Arc<Script>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::running(script, true, agent(), RunConfig::new()))
+    }
+
+    /// Prepares threads running `agent` with `config`, with the coding settings adapter if
+    /// `adapter`.
+    fn running(
+        script: &Arc<Script>,
+        adapter: bool,
+        agent: Arc<AgentSpec>,
+        config: RunConfig,
+    ) -> Self {
+        Self {
             script: Arc::clone(script),
-            adapter: Some(
+            adapter: adapter.then(|| {
                 CodingThreadSettingsAdapter::new(
                     "/work",
                     SandboxPolicy::WorkspaceWrite {
@@ -217,10 +240,12 @@ impl Factory {
                         exclude_slash_tmp: false,
                     },
                 )
-                .unwrap(),
-            ),
+                .unwrap()
+            }),
+            agent,
+            config,
             requests: Mutex::default(),
-        })
+        }
     }
 
     fn origins(&self) -> Vec<ThreadOrigin> {
@@ -238,12 +263,12 @@ impl ThreadFactory for Factory {
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
         self.requests.lock().unwrap().push(request.clone());
         let config = match &self.adapter {
-            Some(adapter) => adapter.initialize(RunConfig::new()),
-            None => RunConfig::new(),
+            Some(adapter) => adapter.initialize(self.config.clone()),
+            None => self.config.clone(),
         };
         let builder = AgentThread::builder(
             request.thread_id().clone(),
-            AgentBinding::direct(agent()),
+            AgentBinding::direct(Arc::clone(&self.agent)),
             Arc::new(Resolver(Arc::clone(&self.script))) as Arc<dyn ModelResolver>,
         )
         .with_config(config);
@@ -536,6 +561,17 @@ impl Connection {
             .await;
         assert!(message.get("error").is_some(), "{message}");
         message["error"].clone()
+    }
+
+    /// The result of request `id`, or its error.
+    async fn answer(&mut self, id: i64) -> std::result::Result<Value, Value> {
+        let message = self
+            .until(|message| message["id"] == id && message.get("method").is_none())
+            .await;
+        message
+            .get("result")
+            .cloned()
+            .ok_or_else(|| message["error"].clone())
     }
 
     async fn notification(&mut self, method: &str) -> Value {
@@ -2089,10 +2125,7 @@ async fn thread_fork_at_old_turn_inherits_latest_policy_and_honors_overrides() {
         .call(
             &mut connection,
             "thread/settings/update",
-            json!({
-                "threadId": thread.id(), "approvalPolicy": "never", "permissions": ":read-only",
-                "approvalsReviewer": "auto_review"
-            }),
+            json!({"threadId": thread.id(), "approvalPolicy": "never", "permissions": ":read-only"}),
         )
         .await;
     for boundary in [
@@ -2110,7 +2143,7 @@ async fn thread_fork_at_old_turn_inherits_latest_policy_and_honors_overrides() {
             .await;
         assert_eq!(result["approvalPolicy"], "never");
         assert_eq!(result["activePermissionProfile"]["id"], ":read-only");
-        assert_eq!(result["approvalsReviewer"], "auto_review");
+        assert_eq!(result["approvalsReviewer"], "user");
         assert_eq!(result["thread"]["turns"].as_array().unwrap().len(), 1);
         params.insert("approvalPolicy".into(), json!("on-request"));
         params.insert("sandbox".into(), json!("danger-full-access"));
@@ -2715,4 +2748,616 @@ async fn thread_management_reports_external_writer_conflicts_without_mutation() 
     assert!(persisted.archived_at().is_none());
     assert!(persisted.git_info().is_none());
     recorder.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Approvals the server cannot ask for
+// ---------------------------------------------------------------------------------------------
+
+/// The automatic reviewer is not ported, so every method that sets the reviewer refuses it, under
+/// either of its names, and the thread keeps its client reviewing.
+#[tokio::test]
+async fn approvals_reviewer_auto_review_is_refused_wherever_it_is_set() {
+    let script = Arc::new(Script::default());
+    let (server, _) = build(
+        Options {
+            store: Some(Arc::new(InMemoryThreadStore::new())),
+            factory: Some(Factory::with_adapter(&script)),
+            unload_delay: Some(Duration::ZERO),
+        },
+        None,
+    );
+    let mut connection = server.connect(1).await;
+    for name in ["auto_review", "guardian_subagent"] {
+        let error = server
+            .call_error(
+                &mut connection,
+                "thread/start",
+                json!({"approvalsReviewer": name}),
+            )
+            .await;
+        assert_eq!(
+            error["message"],
+            "thread/start.approvalsReviewer `auto_review` is not supported"
+        );
+    }
+
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.answer("Done");
+    let turn_id = server.run_turn(&mut connection, thread.id(), "first").await;
+    for (method, params) in [
+        (
+            "thread/settings/update",
+            json!({"threadId": thread.id(), "approvalsReviewer": "auto_review"}),
+        ),
+        (
+            "turn/start",
+            json!({"threadId": thread.id(), "input": [{"type": "text", "text": "again"}],
+                "approvalsReviewer": "auto_review"}),
+        ),
+        (
+            "turn/settings/update",
+            json!({"threadId": thread.id(), "turnId": turn_id, "approvalsReviewer": "auto_review"}),
+        ),
+        (
+            "thread/resume",
+            json!({"threadId": thread.id(), "approvalsReviewer": "auto_review"}),
+        ),
+        (
+            "thread/fork",
+            json!({"threadId": thread.id(), "approvalsReviewer": "auto_review"}),
+        ),
+    ] {
+        let error = server.call_error(&mut connection, method, params).await;
+        assert_eq!(
+            error["message"],
+            format!("{method}.approvalsReviewer `auto_review` is not supported")
+        );
+    }
+    assert_eq!(script.requests.lock().unwrap().len(), 1, "no turn started");
+
+    unload(&server, &mut connection, thread.id()).await;
+    let error = server
+        .call_error(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": thread.id(), "approvalsReviewer": "auto_review"}),
+        )
+        .await;
+    assert_eq!(
+        error["message"],
+        "thread/resume.approvalsReviewer `auto_review` is not supported"
+    );
+    let resumed = server
+        .resume(&mut connection, ThreadResumeParams::new(thread.id()))
+        .await;
+    assert_eq!(resumed.settings()["approvalsReviewer"], "user");
+}
+
+/// A thread recorded under `auto_review` before the reviewer was refused is loaded again with its
+/// client reviewing, its other recorded settings restored, rather than refused.
+#[tokio::test]
+async fn thread_resume_falls_back_from_a_recorded_auto_review() {
+    let script = Arc::new(Script::default());
+    let server = Server::start(Factory::with_adapter(&script));
+    let recorder = server.store_thread("recorded", "hello").await;
+    let allocator = RunState::start(RunId::new("settings")).restore_event_seq_allocator(None);
+    record(
+        &recorder,
+        [RolloutItem::Event(
+            HostEvent::allocate(
+                &allocator,
+                AgentId::new("lead"),
+                HostEventBody::Unknown {
+                    family: "threadSettingsApplied".into(),
+                    data: json!({"approvalPolicy": "never", "approvalsReviewer": "auto_review"}),
+                },
+            )
+            .unwrap(),
+        )],
+    )
+    .await;
+    let mut connection = server.connect(1).await;
+
+    let resumed = server
+        .resume(&mut connection, ThreadResumeParams::new("recorded"))
+        .await;
+    assert_eq!(resumed.settings()["approvalsReviewer"], "user");
+    assert_eq!(resumed.settings()["approvalPolicy"], "never");
+}
+
+/// A tool that only declares how it is approved and whether it is enabled.
+struct Declared {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    options: ToolOptions,
+}
+
+#[async_trait]
+impl Tool for Declared {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        self.options.clone()
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("ran"))
+    }
+}
+
+fn declared(name: &str, approval: ToolApprovalPolicy) -> Arc<dyn Tool> {
+    declared_with(name, ToolOptions::new().with_approval(approval))
+}
+
+fn declared_with(name: &str, options: ToolOptions) -> Arc<dyn Tool> {
+    Arc::new(Declared {
+        origin: ToolOrigin::new(name).unwrap(),
+        schema: ToolSchema::new(name, json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false})).unwrap(),
+        options,
+    })
+}
+
+fn agent_with(id: &str, tools: Vec<Arc<dyn Tool>>, handoffs: Vec<HandoffSpec>) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new(id))
+        .name(id)
+        .instructions(id)
+        .tools(tools)
+        .handoffs(handoffs)
+        .build()
+        .unwrap()
+}
+
+/// Contributes one tool to the agents of the runs it is installed on.
+struct Contributes(Arc<dyn Tool>);
+
+#[async_trait]
+impl Capability for Contributes {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new("approval_probe").unwrap()
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![Arc::clone(&self.0)]
+    }
+}
+
+/// What `thread/start` answers with `factory`: the thread's id, or the error's message.
+async fn start_with(factory: Factory) -> std::result::Result<String, String> {
+    let factory = Arc::new(factory);
+    let server = Server::start(factory.clone());
+    let mut connection = server.connect(1).await;
+    let id = server
+        .request(&mut connection, "thread/start", json!({}))
+        .await;
+    let answer = connection.answer(id).await;
+    assert_eq!(factory.origins(), vec![ThreadOrigin::Start]);
+    match answer {
+        Ok(result) => Ok(result["thread"]["id"].as_str().unwrap().to_owned()),
+        Err(error) => {
+            let message = error["message"].as_str().unwrap();
+            assert!(message.starts_with("error creating thread: "), "{message}");
+            Err(message.to_owned())
+        }
+    }
+}
+
+/// A thread one of whose tools needs approval for every call is refused when its settings adapter
+/// asks the client about none of those calls, or it has none: the coding adapter asks about
+/// commands and patches, and not about input to a terminal without its stdin review. Tools that
+/// decide per call, need no approval or are never enabled are not checked; tools reached through
+/// handoffs are checked. Capability tools are checked when their run-bound calls ask for approval.
+#[tokio::test]
+async fn thread_start_refuses_tools_whose_approvals_nobody_is_asked_for() {
+    let script = Arc::new(Script::default());
+    let refusal = |names: &str| {
+        format!(
+            "every call of tool {names} needs approval, but the thread's host asks the client \
+             about none of them"
+        )
+    };
+    let always = |name: &str| declared(name, ToolApprovalPolicy::Always);
+    let solo = |tools| agent_with("lead", tools, Vec::new());
+
+    for adapter in [false, true] {
+        let error = start_with(Factory::running(
+            &script,
+            adapter,
+            solo(vec![always("guarded")]),
+            RunConfig::new(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.contains(&refusal("`guarded`")), "{error}");
+    }
+
+    start_with(Factory::running(
+        &script,
+        true,
+        solo(vec![always("exec_command"), always("apply_patch")]),
+        RunConfig::new(),
+    ))
+    .await
+    .unwrap();
+    let error = start_with(Factory::running(
+        &script,
+        true,
+        solo(vec![
+            always("write_stdin"),
+            always("apply_patch"),
+            always("audit"),
+        ]),
+        RunConfig::new(),
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains(&refusal("`audit`, `write_stdin`")),
+        "{error}"
+    );
+
+    start_with(Factory::running(
+        &script,
+        false,
+        solo(vec![
+            declared("checked", ToolApprovalPolicy::Dynamic),
+            declared("free", ToolApprovalPolicy::Never),
+            declared_with(
+                "off",
+                ToolOptions::new()
+                    .with_approval(ToolApprovalPolicy::Always)
+                    .with_availability(ToolAvailability::Disabled),
+            ),
+        ]),
+        RunConfig::new(),
+    ))
+    .await
+    .unwrap();
+
+    let delegate = agent_with("delegate", vec![always("delegated")], Vec::new());
+    let lead = agent_with(
+        "lead",
+        Vec::new(),
+        vec![HandoffSpec::new(
+            AgentId::new("delegate"),
+            ToolSchema::new("transfer_to_delegate", json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}))
+                .unwrap(),
+        )],
+    );
+    let registry = AgentRegistry::builder()
+        .register(Arc::clone(&lead))
+        .register(delegate)
+        .build()
+        .unwrap();
+    let error = start_with(Factory::running(
+        &script,
+        false,
+        lead,
+        RunConfig::new().with_agent_registry(registry),
+    ))
+    .await
+    .unwrap_err();
+    assert!(error.contains(&refusal("`delegated`")), "{error}");
+}
+
+/// Resuming and forking load a thread as starting one does, and refuse it alike, leaving nothing
+/// loaded.
+#[tokio::test]
+async fn thread_resume_and_fork_refuse_tools_whose_approvals_nobody_is_asked_for() {
+    let script = Arc::new(Script::default());
+    let factory = Arc::new(Factory::running(
+        &script,
+        false,
+        agent_with(
+            "lead",
+            vec![declared("guarded", ToolApprovalPolicy::Always)],
+            Vec::new(),
+        ),
+        RunConfig::new(),
+    ));
+    let server = Server::start(factory);
+    server.store_thread("stored", "hello").await;
+    let mut connection = server.connect(1).await;
+    for (method, prefix) in [
+        ("thread/resume", "error resuming thread"),
+        ("thread/fork", "error forking thread"),
+    ] {
+        let error = server
+            .call_error(&mut connection, method, json!({"threadId": "stored"}))
+            .await;
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(prefix) && message.contains("`guarded`"),
+            "{message}"
+        );
+    }
+    let loaded = server
+        .call(&mut connection, "thread/loaded/list", json!({}))
+        .await;
+    let loaded: ThreadLoadedListResponse = serde_json::from_value(loaded).unwrap();
+    assert!(loaded.data().is_empty(), "{loaded:?}");
+}
+
+/// Reject a reviewer before either returning a loaded thread or shutting an unwatched one down
+/// for reload; the unsupported request must not change subscription or factory state.
+#[tokio::test]
+async fn unsupported_reviewer_does_not_reload_a_loaded_thread() {
+    let script = Arc::new(Script::default());
+    let factory = Factory::with_adapter(&script);
+    let (server, _) = build(
+        Options {
+            store: Some(Arc::new(InMemoryThreadStore::new())),
+            factory: Some(factory.clone()),
+            unload_delay: Some(Duration::from_secs(60)),
+        },
+        None,
+    );
+    let mut connection = server.connect(1).await;
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    for subscribed in [true, false] {
+        if !subscribed {
+            server
+                .call(
+                    &mut connection,
+                    "thread/unsubscribe",
+                    json!({"threadId": thread.id()}),
+                )
+                .await;
+        }
+        for reviewer in ["auto_review", "guardian_subagent"] {
+            let error = server
+                .call_error(
+                    &mut connection,
+                    "thread/resume",
+                    json!({
+                        "threadId": thread.id(), "approvalsReviewer": reviewer
+                    }),
+                )
+                .await;
+            assert_eq!(
+                error["message"],
+                "thread/resume.approvalsReviewer `auto_review` is not supported"
+            );
+        }
+        let loaded = server
+            .call(&mut connection, "thread/loaded/list", json!({}))
+            .await;
+        assert!(
+            loaded["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == thread.id())
+        );
+        assert_eq!(factory.origins(), vec![ThreadOrigin::Start]);
+    }
+    let resumed = server
+        .resume(&mut connection, ThreadResumeParams::new(thread.id()))
+        .await;
+    assert_eq!(resumed.settings()["approvalsReviewer"], "user");
+    assert_eq!(factory.origins(), vec![ThreadOrigin::Start]);
+}
+
+fn tool_response(name: &str) -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new("tool-item"),
+        RunItemKind::ToolCall(ToolCall::new(CallId::new("call"), name, json!({}))),
+    )])
+}
+
+fn last_tool_output(script: &Script) -> Value {
+    script
+        .last_request()
+        .input()
+        .iter()
+        .find_map(|item| match item {
+            ModelInputItem::ToolCallOutput(output) if output.call_id().as_str() == "call" => {
+                Some(output.output().clone())
+            }
+            _ => None,
+        })
+        .expect("the model receives the tool result")
+}
+
+/// A fixed allow runs the tool without a request; a fixed denial keeps the thread usable while
+/// refusing the call. Neither requires an approval adapter despite the tool's Always fallback.
+#[tokio::test]
+async fn static_approval_checks_preserve_effective_permission_decisions() {
+    for (permission, runs) in [
+        (
+            PermissionEngine::new(PermissionMode::BypassPermissions),
+            true,
+        ),
+        (
+            PermissionEngine::default()
+                .with_rules([
+                    PermissionRule::new(PermissionDecision::Allow).with_tool_name("guarded")
+                ]),
+            true,
+        ),
+        (
+            PermissionEngine::default().with_rules([
+                PermissionRule::new(PermissionDecision::Deny).with_tool_name("guarded")
+            ]),
+            false,
+        ),
+        (PermissionEngine::new(PermissionMode::DontAsk), false),
+    ] {
+        let script = Arc::new(Script::default());
+        let factory = Arc::new(Factory::running(
+            &script,
+            false,
+            agent_with(
+                "lead",
+                vec![declared("guarded", ToolApprovalPolicy::Always)],
+                vec![],
+            ),
+            RunConfig::new().with_permission_engine(permission),
+        ));
+        let server = Server::start(factory);
+        let mut connection = server.connect(1).await;
+        let thread = server
+            .start_thread(&mut connection, ThreadStartParams::new())
+            .await;
+        script.push(Step::Respond(tool_response("guarded")));
+        script.answer("done");
+        server
+            .run_turn(&mut connection, thread.id(), "call it")
+            .await;
+        assert_eq!(last_tool_output(&script).to_string().contains("ran"), runs);
+        assert!(
+            !connection
+                .passed
+                .iter()
+                .any(|message| message.get("id").is_some() && message.get("method").is_some()),
+            "no approval request is sent"
+        );
+    }
+}
+
+/// Requested and recorded settings must apply before the static check on every loading path.
+#[tokio::test]
+async fn approval_checks_use_start_resume_and_fork_settings() {
+    let script = Arc::new(Script::default());
+    let factory = Arc::new(Factory::running(
+        &script,
+        true,
+        agent_with(
+            "lead",
+            vec![declared("guarded", ToolApprovalPolicy::Always)],
+            vec![],
+        ),
+        RunConfig::new(),
+    ));
+    let (server, _) = build(
+        Options {
+            store: Some(Arc::new(InMemoryThreadStore::new())),
+            factory: Some(factory),
+            unload_delay: Some(Duration::ZERO),
+        },
+        None,
+    );
+    let mut connection = server.connect(1).await;
+    let started = server
+        .call(
+            &mut connection,
+            "thread/start",
+            json!({"approvalPolicy": "never"}),
+        )
+        .await;
+    let id = started["thread"]["id"].as_str().unwrap();
+    assert_eq!(started["approvalPolicy"], "never");
+    script.answer("done");
+    server.run_turn(&mut connection, id, "save settings").await;
+    let forked = server
+        .call(&mut connection, "thread/fork", json!({"threadId": id}))
+        .await;
+    assert_eq!(forked["approvalPolicy"], "never");
+    unload(&server, &mut connection, id).await;
+    let resumed = server
+        .resume(&mut connection, ThreadResumeParams::new(id))
+        .await;
+    assert_eq!(resumed.settings()["approvalPolicy"], "never");
+}
+
+struct BoundTools {
+    binds: Arc<Mutex<usize>>,
+    unbound_reads: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl Capability for BoundTools {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new("approval_probe").unwrap()
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        *self.unbound_reads.lock().unwrap() += 1;
+        vec![declared("not_bound", ToolApprovalPolicy::Always)]
+    }
+
+    fn bind(&self, _context: &ra_core::context::RunContext) -> Result<Option<Arc<dyn Capability>>> {
+        *self.binds.lock().unwrap() += 1;
+        Ok(Some(Arc::new(Contributes(declared(
+            "bound",
+            ToolApprovalPolicy::Never,
+        )))))
+    }
+}
+
+/// Only the bound capability contributes tools, and binding happens once when its run begins.
+#[tokio::test]
+async fn loading_preserves_capability_binding_and_uses_the_bound_tools() {
+    let script = Arc::new(Script::default());
+    let binds = Arc::new(Mutex::new(0));
+    let unbound_reads = Arc::new(Mutex::new(0));
+    let factory = Arc::new(Factory::running(
+        &script,
+        false,
+        agent(),
+        RunConfig::new().with_capability(Arc::new(BoundTools {
+            binds: Arc::clone(&binds),
+            unbound_reads: Arc::clone(&unbound_reads),
+        })),
+    ));
+    let server = Server::start(factory);
+    let mut connection = server.connect(1).await;
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    assert_eq!(*binds.lock().unwrap(), 0);
+    assert_eq!(*unbound_reads.lock().unwrap(), 0);
+    script.push(Step::Respond(tool_response("bound")));
+    script.answer("done");
+    server
+        .run_turn(&mut connection, thread.id(), "call bound tool")
+        .await;
+    assert!(last_tool_output(&script).to_string().contains("ran"));
+    assert_eq!(*binds.lock().unwrap(), 1);
+    assert_eq!(*unbound_reads.lock().unwrap(), 0);
+}
+
+/// A capability's unsupported approval is refused through the normal path after run binding.
+#[tokio::test]
+async fn unsupported_capability_approvals_are_refused_when_called() {
+    let script = Arc::new(Script::default());
+    let factory = Arc::new(Factory::running(
+        &script,
+        false,
+        agent(),
+        RunConfig::new().with_capability(Arc::new(Contributes(declared(
+            "contributed",
+            ToolApprovalPolicy::Always,
+        )))),
+    ));
+    let server = Server::start(factory);
+    let mut connection = server.connect(1).await;
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.push(Step::Respond(tool_response("contributed")));
+    script.answer("done");
+    server
+        .run_turn(&mut connection, thread.id(), "call contributed tool")
+        .await;
+    let output = last_tool_output(&script);
+    assert_eq!(output, json!("approval request failed"));
+    assert!(
+        !connection
+            .passed
+            .iter()
+            .any(|message| message.get("id").is_some() && message.get("method").is_some()),
+        "no unsupported request is sent"
+    );
 }

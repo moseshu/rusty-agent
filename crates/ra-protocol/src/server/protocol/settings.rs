@@ -48,7 +48,8 @@ pub enum ApprovalsReviewer {
     /// Routes approval review to the user.
     User,
     #[serde(rename = "auto_review", alias = "guardian_subagent")]
-    /// Routes approval review to the configured automatic reviewer.
+    /// Routes approval review to the configured automatic reviewer. Codex's reviewer, Guardian,
+    /// is not ported: the server refuses this reviewer wherever a request sets it.
     AutoReview,
 }
 

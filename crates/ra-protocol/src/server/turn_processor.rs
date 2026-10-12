@@ -35,7 +35,7 @@ use super::{
     image_url::{REMOTE_IMAGE_URL_ERROR, is_remote_image_url},
     outgoing::{ConnectionRequestId, OutgoingMessageSender},
     protocol::{
-        ImageDetail, ImageReference, ReasoningSummary, ThreadPolicyOverrides,
+        ApprovalsReviewer, ImageDetail, ImageReference, ReasoningSummary, ThreadPolicyOverrides,
         ThreadSettingsUpdateParams, ThreadSettingsUpdateResponse, Turn, TurnInterruptParams,
         TurnInterruptResponse, TurnSettingsUpdateParams, TurnSettingsUpdateResponse,
         TurnSettingsUpdateStatus, TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams,
@@ -256,6 +256,7 @@ impl TurnRequestProcessor {
     ) -> TurnMethodResult {
         let thread = self.load_thread(&params.thread_id)?;
         let _settings_guard = thread.settings_lock.lock().await;
+        check_approvals_reviewer("turn/settings/update", params.approvals_reviewer)?;
         let requires_model_switching = params.model.is_some()
             || params.effort.is_some()
             || params.summary.is_some()
@@ -348,6 +349,7 @@ pub(crate) fn prepare_overrides(
     policy
         .validate()
         .map_err(JsonRpcErrorObject::invalid_request)?;
+    check_approvals_reviewer(method, policy.approvals_reviewer)?;
     if let Some(model) = model.as_deref() {
         target
             .resolve(Some(model))
@@ -452,6 +454,20 @@ impl ResolveModel for AgentThreadBuilder {
     fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
         self.resolve_model(model)
     }
+}
+
+/// Refuses `auto_review`: Codex routes those approvals to its Guardian reviewer, which is not
+/// ported, so the client is the only reviewer a thread here has.
+pub(crate) fn check_approvals_reviewer(
+    method: &str,
+    reviewer: Option<ApprovalsReviewer>,
+) -> Result<(), JsonRpcErrorObject> {
+    if reviewer == Some(ApprovalsReviewer::AutoReview) {
+        return Err(JsonRpcErrorObject::invalid_request(format!(
+            "{method}.approvalsReviewer `auto_review` is not supported"
+        )));
+    }
+    Ok(())
 }
 
 /// The refusal of a field this port does not carry.

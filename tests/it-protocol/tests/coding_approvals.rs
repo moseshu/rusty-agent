@@ -38,9 +38,10 @@ use ra_protocol::{
     server::{
         AppServer, ThreadSettingsAdapter,
         protocol::{
-            AskForApproval, ClientInfo, InitializeCapabilities, InitializeParams, SandboxPolicy,
-            ThreadItem, ThreadPolicyOverrides, ThreadTurnsListParams, ThreadTurnsListResponse,
-            TurnItemsView, TurnStartParams, UserInput,
+            ApprovalsReviewer, AskForApproval, ClientInfo, InitializeCapabilities,
+            InitializeParams, SandboxPolicy, ThreadItem, ThreadPolicyOverrides,
+            ThreadTurnsListParams, ThreadTurnsListResponse, TurnItemsView, TurnStartParams,
+            UserInput,
         },
         test_api::ThreadLoader,
     },
@@ -294,6 +295,24 @@ impl Server {
         writes_amendments: bool,
         connection: &Connection,
     ) {
+        self.load_with(
+            script,
+            &ThreadPolicyOverrides::new().with_approval_policy(approval),
+            writes_amendments,
+            connection,
+        )
+        .await;
+    }
+
+    /// Loads a coding thread on `script` with `policy` applied by the adapter itself, as an
+    /// embedding host may apply it without the server.
+    async fn load_with(
+        &self,
+        script: &Arc<Script>,
+        policy: &ThreadPolicyOverrides,
+        writes_amendments: bool,
+        connection: &Connection,
+    ) {
         let manager = ExecPolicyManager::load(
             &ExecPolicySources::new().with_config_folder(self.rules_home.path()),
         )
@@ -307,10 +326,7 @@ impl Server {
             adapter = adapter.with_rules_home(self.rules_home.path());
         }
         let config = adapter
-            .prepare(
-                &adapter.initialize(self.host.build_run_config()),
-                &ThreadPolicyOverrides::new().with_approval_policy(approval),
-            )
+            .prepare(&adapter.initialize(self.host.build_run_config()), policy)
             .unwrap();
         let recorder: Arc<dyn RolloutRecorder> = self
             .store
@@ -607,6 +623,42 @@ async fn a_refused_command_ends_as_its_answer_says() {
         let turns = server.items_read_back(&mut connection).await;
         assert_eq!(item_status(&turns[0], "call-1"), status);
     }
+}
+
+/// A thread whose settings name the automatic reviewer, which the server refuses but an embedding
+/// host can still apply through the adapter, asks the client nothing: its call is refused as one
+/// whose approval could not be requested, rather than put to the client instead.
+#[tokio::test]
+async fn a_thread_set_to_auto_review_refuses_its_approvals() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    server
+        .load_with(
+            &script,
+            &ThreadPolicyOverrides::new()
+                .with_approval_policy(AskForApproval::UnlessTrusted)
+                .with_approvals_reviewer(ApprovalsReviewer::AutoReview),
+            true,
+            &connection,
+        )
+        .await;
+    script.push(call(
+        "exec_command",
+        "call-1",
+        command(json!({"cmd": "touch made.txt"})),
+    ));
+    script.push(final_message("done"));
+
+    server.turn_start(&mut connection, "make it").await;
+    let item = connection.turn_end_item("call-1").await;
+    assert_eq!(item["status"], "failed");
+    assert_eq!(connection.requests_seen(), 0);
+    assert!(!server.root().join("made.txt").exists());
+    assert_eq!(
+        script.last_output("call-1").as_deref(),
+        Some("approval request failed")
+    );
 }
 
 /// An approval for the session is remembered by the thread: the same command later runs without
