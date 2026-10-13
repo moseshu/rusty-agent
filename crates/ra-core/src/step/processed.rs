@@ -9,7 +9,7 @@
 //!
 //! The reference implementation splits those out because each is a distinct provider payload with
 //! its own execution path. This framework has exactly one local execution contract —
-//! [`Tool`] plus [`ToolLookupKey`](crate::tool::ToolLookupKey) dispatch — and a shell or patch
+//! [`Tool`] plus [`ToolLookupKey`] dispatch — and a shell or patch
 //! tool is an ordinary implementation of it living in a product crate. A category per product tool
 //! would put product vocabulary in the kernel and put `if name == "shell"` back in the runner,
 //! which is the text-driven control flow this framework forbids. The categories below are the ones
@@ -38,7 +38,7 @@ use crate::{
         AgentId, CallId, HandoffCall, ItemId, McpApprovalRequest, RunItem, RunItemKind, ToolCall,
     },
     state::ToolUseAttempt,
-    tool::Tool,
+    tool::{Tool, ToolLookupKey, ToolNamespace},
 };
 
 /// Re-exported so classification and the run state it feeds name one type.
@@ -271,7 +271,7 @@ impl ToolNotFound {
 ///
 /// This type is deliberately **not** serializable. It holds `Arc<dyn Tool>`, and a resolved tool
 /// object is not state — a future resume path persists
-/// [`ToolLookupKey`](crate::tool::ToolLookupKey)s and rebinds them against the live registry on
+/// [`ToolLookupKey`]s and rebinds them against the live registry on
 /// resume, which is the only way a restored run can refuse to call a tool that no longer exists
 /// instead of silently calling a different one.
 #[non_exhaustive]
@@ -510,8 +510,17 @@ impl ProcessedResponseBuilder {
     /// it under the model's name and report success.
     pub fn function(mut self, item: RunItem, tool: Arc<dyn Tool>) -> Result<Self> {
         let call = tool_call(&item, "a bound function call")?.clone();
-        let definition = tool.model_definition();
-        if call.name() != definition.name() || call.namespace() != definition.namespace() {
+        let definition = tool
+            .model_definition()
+            .with_defer_loading(tool.options().is_discoverable());
+        let call_key = ToolLookupKey::for_call(
+            call.name(),
+            call.namespace().map(ToolNamespace::new).transpose()?,
+        )?;
+        if call_key != definition.lookup_key()?
+            || ((call.kind() == crate::item::ToolCallKind::ToolSearch)
+                != definition.kind().is_tool_search())
+        {
             return Err(Error::caller(format!(
                 "call `{}` was bound to tool `{}`, which advertises a different name",
                 call.name(),

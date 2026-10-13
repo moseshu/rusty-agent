@@ -30,8 +30,8 @@
 //!
 //! **The module list is the complete advertised tool set**, and it is complete before the tools
 //! are: a module that does not exist yet is a module the next implementer fills in somewhere else.
-//! Two are still one-line stubs — [`mcp_ns`] and [`tool_search`] — which is a statement about what
-//! has been scheduled rather than about where it belongs.
+//! [`mcp_ns`] remains a placeholder. [`tool_search`] is assembled by the runtime from its enabled
+//! registry snapshot, which owns the discovery index and invocation lifecycle.
 //!
 //! [`capability`] is the one module that advertises nothing. It packages the tools below into the
 //! installable units the assembly layer works in, which is where a fact such as "`write_stdin` can

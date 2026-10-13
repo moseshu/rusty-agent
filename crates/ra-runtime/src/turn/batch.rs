@@ -1291,9 +1291,13 @@ fn settle_dispatches(
                             output.clone(),
                             item.clone(),
                         )?);
-                    execution
-                        .tool_results
-                        .push(ToolUseResult::new(completed.tool, output));
+                    // Discovery output is always processed by the model, as the framework's
+                    // native tools are; function-tool stop policies must not end on a catalog.
+                    if kind != ToolCallKind::ToolSearch {
+                        execution
+                            .tool_results
+                            .push(ToolUseResult::new(completed.tool, output));
+                    }
                 }
                 execution.new_items.push(item);
             }

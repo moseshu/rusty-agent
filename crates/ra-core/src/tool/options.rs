@@ -57,18 +57,16 @@ pub enum ToolAvailability {
 ///
 /// **Registered and advertised are different questions**, which is why this is not a boolean.
 /// Every variant here remains registered; they differ in what the direct model surface may expose.
-/// `Deferred` additionally requires a discovery implementation that can carry a discovered-tool
-/// snapshot across turns. Until a future milestone installs that implementation, `ra-runtime`
-/// rejects an enabled deferred tool rather than silently making it unreachable.
+/// The runtime supplies client discovery for enabled deferred tools. Search results carry their
+/// selected definitions in history, while the complete registry retains their implementations.
 ///
 /// | Variant | In the turn's tool list | Found by `tool_search` |
 /// | --- | --- | --- |
 /// | [`Advertised`](Self::Advertised) | yes | — |
-/// | [`Deferred`](Self::Deferred) | no | after that discovery implementation lands |
+/// | [`Deferred`](Self::Deferred) | no | yes |
 /// | [`Hidden`](Self::Hidden) | no | no |
 ///
-/// [`Deferred`](Self::Deferred) is reserved for a future 15-entry tool surface with 40-plus
-/// reachable capabilities: its schema will cost nothing until the model asks for it.
+/// A deferred tool's schema costs nothing until the model asks for it.
 ///
 /// # Why three states and not Codex's six
 ///
@@ -85,7 +83,7 @@ pub enum ToolExposure {
     /// In every turn's tool list, and paying for its schema every turn.
     #[default]
     Advertised,
-    /// Withheld from the tool list until a future discovery mechanism surfaces it.
+    /// Withheld from the initial tool list and exposed through discovery results.
     Deferred,
     /// Never shown to the model; reachable only when something else dispatches it.
     Hidden,
@@ -551,9 +549,8 @@ impl ToolOptions {
 
     /// Whether this tool requests deferred discovery.
     ///
-    /// A future `tool_search` will consume this. Until then, turn preparation rejects an enabled
-    /// deferred tool. Deliberately **not** `!is_advertised()`: [`Hidden`](ToolExposure::Hidden)
-    /// is neither, and a negation would quietly index it.
+    /// The runtime indexes these tools for `tool_search`. Hidden tools are neither advertised nor
+    /// discoverable; negating `is_advertised()` would accidentally index them.
     #[must_use]
     pub const fn is_discoverable(&self) -> bool {
         matches!(self.exposure, ToolExposure::Deferred)

@@ -78,6 +78,12 @@ async fn lower_item(
     codec: &ChatCodec,
 ) -> Result<()> {
     match item {
+        ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::ToolSearch => Err(
+            Error::caller("Tool search history is only supported with OpenAI Responses models."),
+        ),
+        ModelInputItem::ToolCallOutput(output) if output.kind() == ToolCallKind::ToolSearch => Err(
+            Error::caller("Tool search history is only supported with OpenAI Responses models."),
+        ),
         ModelInputItem::Message(message) => lower_message(accumulator, message, codec).await,
         ModelInputItem::Reasoning(reasoning) => {
             accumulator.absorb_reasoning(reasoning, codec);

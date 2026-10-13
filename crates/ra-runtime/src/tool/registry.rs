@@ -128,7 +128,7 @@ impl ToolRegistry {
             ToolSelection::AllRegistered => self.entries.values().map(Arc::clone).collect(),
         };
 
-        let mut names: BTreeMap<String, &ToolLookupKey> = BTreeMap::new();
+        let mut names: BTreeMap<String, Vec<(&ToolLookupKey, ToolLookupKey)>> = BTreeMap::new();
         let mut advertised = Vec::new();
         let mut definitions = Vec::new();
         let mut advertised_name_chars = 0;
@@ -139,10 +139,17 @@ impl ToolRegistry {
             if !tool.options().can_reach_model_surface() {
                 continue;
             }
-            let definition = tool.model_definition();
+            let definition = tool
+                .model_definition()
+                .with_defer_loading(tool.options().is_discoverable());
+            let model_key = definition.lookup_key()?;
             let key = tool.origin().lookup_key();
             let qualified = definition.qualified_name();
-            if let Some(previous) = names.insert(qualified.clone(), key) {
+            let owners = names.entry(qualified.clone()).or_default();
+            if let Some((previous, _)) = owners
+                .iter()
+                .find(|(_, prior)| model_key.collides_on_model_surface(prior))
+            {
                 return Err(Error::config(format!(
                     "tool profile `{id}` advertises the name `{}` from two lookup keys {} and {}; \
                      distinct routing identities still have to project to distinct model-facing \
@@ -152,6 +159,7 @@ impl ToolRegistry {
                     render_lookup_key(key)
                 )));
             }
+            owners.push((key, model_key));
             if is_advertised(tool.as_ref()) {
                 advertised_name_chars += qualified.chars().count();
                 advertised.push(qualified);

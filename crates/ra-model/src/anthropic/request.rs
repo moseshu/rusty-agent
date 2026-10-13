@@ -142,6 +142,16 @@ async fn lower_messages(
     let mut pending_tool_results = BTreeSet::new();
     for entry in normalized.entries() {
         match entry.item() {
+            ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::ToolSearch => {
+                return Err(Error::caller(
+                    "Tool search history is only supported with OpenAI Responses models.",
+                ));
+            }
+            ModelInputItem::ToolCallOutput(output) if output.kind() == ToolCallKind::ToolSearch => {
+                return Err(Error::caller(
+                    "Tool search history is only supported with OpenAI Responses models.",
+                ));
+            }
             ModelInputItem::Message(message) => {
                 ensure_tool_results_are_adjacent(&pending_tool_results)?;
                 accumulator.message(message).await?;
@@ -448,6 +458,14 @@ fn merge_tools(
                 )));
             }
         }
+    }
+    if tools
+        .iter()
+        .any(|tool| tool.kind().is_tool_search() || tool.defer_loading())
+    {
+        return Err(Error::caller(
+            "Deferred tools and tool search are only supported with OpenAI Responses models.",
+        ));
     }
     crate::tool_namespaces::ensure_unnamespaced(tools, "Anthropic Messages models")?;
     if let Some(custom) = tools.iter().find(|tool| tool.kind().is_custom())

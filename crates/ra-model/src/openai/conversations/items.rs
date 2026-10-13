@@ -19,8 +19,8 @@ use crate::openai::{
     error::behavior_error,
     responses::{
         convert::{
-            convert_compaction, convert_custom_tool_call, convert_function_call, required_str,
-            text_segments,
+            convert_compaction, convert_custom_tool_call, convert_function_call,
+            convert_tool_search_call, convert_tool_search_output, required_str, text_segments,
         },
         request::lower_input_item,
     },
@@ -159,6 +159,8 @@ pub(crate) fn lift_history_item(
         "reasoning" => RunItemKind::Reasoning(lift_reasoning(item)),
         "function_call" => convert_function_call(item, &[])?,
         "custom_tool_call" => convert_custom_tool_call(item)?,
+        "tool_search_call" => convert_tool_search_call(item)?,
+        "tool_search_output" => convert_tool_search_output(item)?,
         "function_call_output" => {
             RunItemKind::ToolCallOutput(lift_tool_output(item, ToolCallKind::Function)?)
         }
@@ -308,6 +310,11 @@ fn lift_output_block(part: &Value) -> Result<ToolOutputBlock> {
         )?)),
         "input_image" => Ok(ToolOutputBlock::Image(lift_image(part)?)),
         "input_file" => Ok(ToolOutputBlock::File(lift_file(part)?)),
+        "input_audio" => Ok(ToolOutputBlock::audio(required_str(
+            part,
+            "audio_url",
+            "conversation audio",
+        )?)),
         other => Err(behavior_error(format!(
             "unsupported OpenAI conversation tool output content `{other}`"
         ))),

@@ -1645,3 +1645,60 @@ async fn a_changed_committed_projection_is_refused_before_model_work() {
     assert_eq!(fake.calls(Route::CreateItems).len(), 1);
     assert!(fake.response_bodies().is_empty());
 }
+
+/// Client discovery definitions and audio outputs survive provider-managed conversation storage.
+#[tokio::test]
+async fn client_discovery_and_audio_items_round_trip_through_conversations() {
+    use ra_core::{item::ToolCallKind, model::ModelToolDefinition};
+    let fake = Fake::start().await;
+    let session = fake.session();
+    let search = ToolCall::new(
+        CallId::new("search"),
+        "tool_search",
+        json!({"query": "calendar"}),
+    )
+    .with_kind(ToolCallKind::ToolSearch);
+    let definition = ModelToolDefinition::new("lookup", json!({"type": "object"}))
+        .with_description("Calendar lookup")
+        .with_namespace("calendar", Some("Calendar tools".to_owned()))
+        .with_defer_loading(true);
+    let discovered = ToolCallOutput::new(
+        CallId::new("search"),
+        serde_json::to_value(ToolOutput::tool_search(vec![definition])).unwrap(),
+    )
+    .with_kind(ToolCallKind::ToolSearch);
+    let audio = ToolCallOutput::new(
+        CallId::new("audio"),
+        serde_json::to_value(ToolOutput::block(ToolOutputBlock::audio(
+            "data:audio/wav;base64,YXVkaW8=",
+        )))
+        .unwrap(),
+    );
+    let written = vec![
+        RunItem::new(ItemId::new("search-call"), RunItemKind::ToolCall(search)),
+        RunItem::new(
+            ItemId::new("search-output"),
+            RunItemKind::ToolCallOutput(discovered),
+        ),
+        RunItem::new(
+            ItemId::new("audio-call"),
+            RunItemKind::ToolCall(ToolCall::new(CallId::new("audio"), "play", json!({}))),
+        ),
+        RunItem::new(
+            ItemId::new("audio-output"),
+            RunItemKind::ToolCallOutput(audio),
+        ),
+    ];
+    session.add_items(written.clone()).await.unwrap();
+    let restored = session.get_items(None).await.unwrap();
+    assert_eq!(
+        restored
+            .iter()
+            .filter_map(RunItem::to_model_input)
+            .collect::<Vec<_>>(),
+        written
+            .iter()
+            .filter_map(RunItem::to_model_input)
+            .collect::<Vec<_>>()
+    );
+}

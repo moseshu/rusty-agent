@@ -8,12 +8,13 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result},
     item::{AgentId, CallId},
+    permission::{PermissionDecision, PermissionRule},
     state::{RunId, WorkStateHandle},
     tool::{
         DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy,
         ToolAvailability, ToolCaller, ToolConcurrency, ToolContext, ToolExposure,
-        ToolFailureHandling, ToolGuardrailId, ToolLookupKey, ToolNamespace, ToolOptions,
-        ToolOrigin, ToolOutput, ToolSchema, ToolServices, ToolTimeoutBehavior,
+        ToolFailureHandling, ToolGuardrailId, ToolLookupKey, ToolLookupKind, ToolNamespace,
+        ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -190,6 +191,50 @@ fn test_tool_contract_06() {
     wire["lookup_key"]["future_routing_hint"] = json!({"tier": 2});
     let origin: ToolOrigin = serde_json::from_value(wire).unwrap();
     assert_eq!(registry.get(origin.lookup_key()), Some(&"实现"));
+}
+
+/// Native discovery and a function named `tool_search` share a model-facing name but not an
+/// identity, so a rule pinned to one (such as a sticky approval) never answers for the other.
+#[test]
+fn native_tool_search_identity_is_distinct_from_a_bare_function_of_the_same_name() {
+    let native = ToolLookupKey::tool_search();
+    let function = ToolLookupKey::bare("tool_search").unwrap();
+
+    assert_eq!(native.kind(), ToolLookupKind::ToolSearch);
+    assert_eq!(native.name(), "tool_search");
+    assert_ne!(native, function);
+    assert!(!native.collides_on_model_surface(&function));
+    assert!(native.collides_on_model_surface(&ToolLookupKey::tool_search()));
+    assert_eq!(
+        serde_json::to_value(&native).unwrap(),
+        json!({"schema_version": 1, "kind": "tool_search", "name": "tool_search"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolLookupKey>(serde_json::to_value(&native).unwrap()).unwrap(),
+        native
+    );
+    for wire in [
+        json!({"kind": "tool_search", "name": "lookup"}),
+        json!({"kind": "tool_search", "name": "tool_search", "namespace": "search"}),
+    ] {
+        assert!(serde_json::from_value::<ToolLookupKey>(wire).is_err());
+    }
+
+    let origin = ToolOrigin::tool_search();
+    assert_eq!(origin.qualified_name(), "tool_search");
+    assert_eq!(origin, ToolOrigin::from_lookup_key(native.clone()).unwrap());
+    assert_eq!(
+        serde_json::from_value::<ToolOrigin>(serde_json::to_value(&origin).unwrap()).unwrap(),
+        origin
+    );
+
+    let function_origin = ToolOrigin::new("tool_search").unwrap();
+    let native_rule = PermissionRule::new(PermissionDecision::Allow).with_lookup_key(native);
+    let function_rule = PermissionRule::new(PermissionDecision::Allow).with_lookup_key(function);
+    assert!(native_rule.matches_origin(&origin));
+    assert!(!native_rule.matches_origin(&function_origin));
+    assert!(function_rule.matches_origin(&function_origin));
+    assert!(!function_rule.matches_origin(&origin));
 }
 
 #[test]

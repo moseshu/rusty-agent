@@ -33,7 +33,7 @@ use ra_core::{
     output::OutputSchema,
     prompt::{CachePlan, PromptProvenance},
     state::ToolUseTracker,
-    tool::{Tool, ToolAvailability, ToolServices},
+    tool::{Tool, ToolAvailability, ToolLookupKey, ToolNamespace, ToolServices},
 };
 
 use crate::agent::{AgentBinding, AgentRegistry};
@@ -477,8 +477,9 @@ pub struct TurnActionSurface {
     /// Each tool's qualified model-facing name, which collisions are judged by.
     tool_names: Vec<String>,
     /// Each tool's namespace and name within it, which a call is resolved by.
-    tool_keys: Vec<(Option<String>, String)>,
+    tool_keys: Vec<ToolLookupKey>,
     handoffs: Vec<PreparedHandoff>,
+    tool_search: Option<Arc<dyn Tool>>,
 }
 
 impl TurnActionSurface {
@@ -495,22 +496,20 @@ impl TurnActionSurface {
         mut handoffs: Vec<PreparedHandoff>,
         policy: ToolNameCollisionPolicy,
     ) -> Result<Self> {
-        // A tool advertised in a namespace is named by its qualified name here, as the reference
-        // compares qualified names: it collides with nothing but the same qualified name.
+        // The framework distinguishes a bare function, an explicit namespace, and a synthetic
+        // deferred top-level identity, even when their public names are equal.
         let tool_names: Vec<String> = tools
             .iter()
             .map(|tool| tool.model_definition().qualified_name())
             .collect();
-        let tool_keys: Vec<(Option<String>, String)> = tools
+        let tool_keys: Vec<ToolLookupKey> = tools
             .iter()
             .map(|tool| {
-                let definition = tool.model_definition();
-                (
-                    definition.namespace().map(str::to_owned),
-                    definition.name().to_owned(),
-                )
+                tool.model_definition()
+                    .with_defer_loading(tool.options().is_discoverable())
+                    .lookup_key()
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         let mut owners: BTreeMap<&str, Vec<ActionOwner>> = BTreeMap::new();
         for (index, name) in tool_names.iter().enumerate() {
@@ -525,6 +524,9 @@ impl TurnActionSurface {
                 .or_default()
                 .push(ActionOwner::Handoff(index));
         }
+        let owners = owners
+            .into_iter()
+            .flat_map(|(name, entries)| split_model_name_owners(name, entries, &tool_keys));
 
         let mut retained_tools = vec![true; tools.len()];
         let mut retained_handoffs = vec![true; handoffs.len()];
@@ -595,16 +597,17 @@ impl TurnActionSurface {
             tool_names: retained_tool_names,
             tool_keys: retained_tool_keys,
             handoffs,
+            tool_search: None,
         })
     }
 
-    /// Executable tools this turn advertised.
+    /// Enabled executable tools, including deferred entries available through discovery.
     #[must_use]
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
     }
 
-    /// Model-tool projections for exactly the executable tools in this snapshot.
+    /// Initially visible tool definitions and the generated discovery entry.
     ///
     /// The provider request must be built from this rather than from the pre-policy inventory, or
     /// a warning-resolved collision could be filtered for settlement but still be sent to the
@@ -613,6 +616,8 @@ impl TurnActionSurface {
     pub fn tool_definitions(&self) -> Vec<ModelToolDefinition> {
         self.tools
             .iter()
+            .filter(|tool| tool.options().is_advertised())
+            .chain(self.tool_search.iter())
             .map(|tool| tool.model_definition())
             .collect()
     }
@@ -639,7 +644,12 @@ impl TurnActionSurface {
     /// Number of actions this turn sends the model, each namespaced tool counted on its own.
     #[must_use]
     pub fn advertised_count(&self) -> usize {
-        self.tools.len() + self.handoffs.len()
+        self.tools
+            .iter()
+            .filter(|tool| tool.options().is_advertised())
+            .count()
+            + usize::from(self.tool_search.is_some())
+            + self.handoffs.len()
     }
 
     /// Bytes contributed by every model-facing action this turn sends.
@@ -672,11 +682,19 @@ impl TurnActionSurface {
     /// call names, so a call of `search` never reaches a namespace's `search`, nor the reverse.
     #[must_use]
     pub fn find_tool_in(&self, namespace: Option<&str>, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools.iter().zip(&self.tool_keys).rev().find_map(
-            |(tool, (advertised_namespace, advertised))| {
-                (advertised_namespace.as_deref() == namespace && advertised == name).then_some(tool)
-            },
-        )
+        let namespace = namespace.map(ToolNamespace::new).transpose().ok()?;
+        let key = ToolLookupKey::for_call(name, namespace).ok()?;
+        self.tools
+            .iter()
+            .zip(&self.tool_keys)
+            .rev()
+            .find_map(|(tool, candidate)| (*candidate == key).then_some(tool))
+    }
+
+    /// The client discovery handler, distinct from a function named `tool_search`.
+    #[must_use]
+    pub fn find_tool_search(&self) -> Option<&Arc<dyn Tool>> {
+        self.tool_search.as_ref()
     }
 
     /// Resolves a model-facing name to the transfer it was advertised as.
@@ -710,6 +728,9 @@ impl TurnActionSurface {
     pub fn advertised_names(&self) -> impl Iterator<Item = &str> {
         self.tool_names
             .iter()
+            .zip(&self.tools)
+            .filter(|(_, tool)| tool.options().is_advertised())
+            .map(|(name, _)| name)
             .map(String::as_str)
             .chain(self.handoffs.iter().map(PreparedHandoff::name))
     }
@@ -728,6 +749,25 @@ impl ActionOwner {
             Self::Handoff(_) => "handoff",
         }
     }
+}
+
+/// Explicit qualified labels remain ambiguous; bare and deferred top-level peers are distinct.
+fn split_model_name_owners<'a>(
+    name: &'a str,
+    entries: Vec<ActionOwner>,
+    keys: &[ToolLookupKey],
+) -> Vec<(&'a str, Vec<ActionOwner>)> {
+    if entries.iter().any(|owner| match owner {
+        ActionOwner::Tool(index) => keys[*index].namespace().is_some(),
+        ActionOwner::Handoff(_) => false,
+    }) {
+        return vec![(name, entries)];
+    }
+    let (deferred, bare): (Vec<_>, Vec<_>) = entries.into_iter().partition(|owner| match owner {
+        ActionOwner::Tool(index) => keys[*index].is_deferred_top_level(),
+        ActionOwner::Handoff(_) => false,
+    });
+    vec![(name, deferred), (name, bare)]
 }
 
 impl fmt::Debug for TurnActionSurface {
@@ -767,11 +807,15 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // a transfer whose target cannot be resolved into anything runnable.
     let handoffs =
         resolve_handoffs(agent, request.run, request.cancel, request.agent_registry).await?;
-    let surface = TurnActionSurface::new_with_collision_policy(
+    let mut surface = TurnActionSurface::new_with_collision_policy(
         tools.advertised,
         handoffs,
         request.collision_policy,
     )?;
+    surface.tool_search = request
+        .agent
+        .tool_search_cache
+        .get_or_build(surface.tools())?;
     request.action_surface_budget.validate(&surface)?;
     let tool_definitions = surface.tool_definitions();
 
@@ -879,6 +923,17 @@ struct EnabledTools {
     advertised: Vec<Arc<dyn Tool>>,
 }
 
+/// Reconstructs a client search handler when a serialized approval resumes it.
+pub(crate) async fn resumed_tool_search(
+    agent: &AgentBinding,
+    context: &RunContext,
+    services: &ToolServices,
+    cancel: &CancelScope,
+) -> Result<Option<Arc<dyn Tool>>> {
+    let enabled = resolve_enabled_tools(agent.execution(), context, services, cancel).await?;
+    agent.tool_search_cache.get_or_build(&enabled.advertised)
+}
+
 async fn resolve_enabled_tools(
     agent: &AgentSpec,
     context: &RunContext,
@@ -904,19 +959,8 @@ async fn resolve_enabled_tools(
         if !enabled {
             continue;
         }
-        if tool.options().is_advertised() {
+        if tool.options().is_advertised() || tool.options().is_discoverable() {
             advertised.push(Arc::clone(tool));
-        } else if tool.options().is_discoverable() {
-            // `ToolExposure::Deferred` is a promise that a model-visible `tool_search` call can
-            // find the tool and promote it into a subsequent turn's advertised snapshot.  R2-5c
-            // has not installed that state machine yet.  Treating the tool as merely omitted is
-            // worse than rejecting it: it makes an enabled capability silently unreachable and
-            // still lets the rest of the run look successful.
-            return Err(Error::config(format!(
-                "tool `{}` uses Deferred exposure, but deferred discovery (R2-5c) is not \
-                 implemented; use Advertised or Hidden",
-                tool.origin().qualified_name()
-            )));
         }
         // Hidden tools remain registered for host/programmatic dispatch but are deliberately
         // absent from every model-owned surface.

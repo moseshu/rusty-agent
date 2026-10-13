@@ -188,7 +188,10 @@ pub trait Tool: Send + Sync + 'static {
     /// A tool whose origin has a namespace is advertised in it, as the reference advertises a
     /// `tool_namespace()` tool: its routing identity and what the model calls it by are one.
     fn model_definition(&self) -> ModelToolDefinition {
-        let definition = self.schema().to_model_definition();
+        let definition = self
+            .schema()
+            .to_model_definition()
+            .with_defer_loading(self.options().is_discoverable());
         match self.origin().namespace() {
             Some(namespace) => definition.with_namespace(
                 namespace.as_str(),

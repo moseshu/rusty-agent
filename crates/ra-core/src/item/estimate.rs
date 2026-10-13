@@ -14,8 +14,10 @@ use serde_json::Value;
 
 use crate::{
     error::{Error, Result},
-    item::ModelInputItem,
+    item::{ModelInputItem, ToolCallKind},
+    model::ModelToolDefinition,
     prompt::CHARS_PER_TOKEN,
+    tool::ToolOutput,
 };
 
 /// Counts the characters a model reads from one input item.
@@ -41,12 +43,32 @@ use crate::{
 ///
 /// Returns an error when the item cannot be rendered as JSON.
 pub fn item_chars(item: &ModelInputItem) -> Result<usize> {
-    let rendered = serde_json::to_value(item).map_err(|error| {
+    let mut rendered = serde_json::to_value(item).map_err(|error| {
         Error::caller(format!(
             "failed to render a model-input item for a context estimate: {error}"
         ))
     })?;
-    Ok(content_chars(&rendered))
+    let definitions = if let ModelInputItem::ToolCallOutput(output) = item
+        && output.kind() == ToolCallKind::ToolSearch
+    {
+        let output = ToolOutput::from_stored(output.output())?;
+        let definitions = output
+            .as_ref()
+            .and_then(ToolOutput::discovered_tools)
+            .unwrap_or_default();
+        // Schema property names are content, while ordinary observation keys are framing. Price
+        // discovered definitions by the same rendering as an initially advertised tool table.
+        if let Some(output) = rendered
+            .pointer_mut("/data/output")
+            .and_then(Value::as_object_mut)
+        {
+            output.remove("discovered_tools");
+        }
+        ModelToolDefinition::advertised_table_chars(definitions)?
+    } else {
+        0
+    };
+    Ok(content_chars(&rendered).saturating_add(definitions))
 }
 
 /// Estimates what one model-input item costs in tokens.

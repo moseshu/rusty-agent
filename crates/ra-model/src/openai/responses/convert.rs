@@ -5,9 +5,10 @@ use ra_core::{
     item::{
         CallId, ContentBlock, HandoffCall, ItemId, Message, MessageRole, ModelResponse,
         OutputPhase, ProviderCompaction, RawProviderItem, Reasoning, RunItem, RunItemKind,
-        ToolCall,
+        ToolCall, ToolCallKind, ToolCallOutput,
     },
-    model::{ModelHandoffDefinition, ProviderKey},
+    model::{CustomToolFormat, ModelHandoffDefinition, ModelToolDefinition, ProviderKey},
+    tool::ToolOutput,
     usage::{RequestUsage, Usage},
 };
 use serde_json::Value;
@@ -116,6 +117,8 @@ pub(crate) fn convert_output_item(
         "reasoning" => RunItemKind::Reasoning(convert_reasoning(item, model)),
         "function_call" => convert_function_call(item, handoffs)?,
         "custom_tool_call" => convert_custom_tool_call(item)?,
+        "tool_search_call" => convert_tool_search_call(item)?,
+        "tool_search_output" => convert_tool_search_output(item)?,
         "compaction" => RunItemKind::ProviderCompaction(convert_compaction(item, provider)),
         // Hosted-tool items (web search, file search, hosted MCP, image generation) have no
         // protocol-neutral payload yet. They can only appear when `extra_body.tools` requested
@@ -128,6 +131,105 @@ pub(crate) fn convert_output_item(
     };
     Ok(RunItem::new(item_id, kind)
         .with_raw_provider_item(RawProviderItem::new(provider.as_str(), item.clone())))
+}
+
+/// Lifts Codex's client search call through the ordinary invocation lifecycle.
+pub(crate) fn convert_tool_search_call(item: &Value) -> Result<RunItemKind> {
+    if item.get("execution").and_then(Value::as_str) != Some("client") {
+        return Err(behavior_error(
+            "server-executed tool search is not supported by this client search runtime",
+        ));
+    }
+    let call_id = CallId::new(required_str(item, "call_id", "tool_search_call")?);
+    let arguments = item
+        .get("arguments")
+        .ok_or_else(|| behavior_error("tool_search_call has no arguments"))?
+        .clone();
+    Ok(RunItemKind::ToolCall(
+        ToolCall::new(call_id, "tool_search", arguments).with_kind(ToolCallKind::ToolSearch),
+    ))
+}
+
+/// Reconstructs client discovery output when a provider-managed history is read.
+pub(crate) fn convert_tool_search_output(item: &Value) -> Result<RunItemKind> {
+    if item.get("execution").and_then(Value::as_str) != Some("client") {
+        return Err(behavior_error(
+            "server-executed tool search is not supported by this client search runtime",
+        ));
+    }
+    let tools = item
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| behavior_error("tool_search_output.tools must be an array"))?;
+    let mut definitions = Vec::new();
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            let name = required_str(tool, "name", "discovery namespace")?;
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let functions = tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| behavior_error("discovery namespace.tools must be an array"))?;
+            for function in functions {
+                definitions.push(
+                    lift_discovered_tool(function)?.with_namespace(name, description.clone()),
+                );
+            }
+        } else {
+            definitions.push(lift_discovered_tool(tool)?);
+        }
+    }
+    let output = serde_json::to_value(ToolOutput::tool_search(definitions)).map_err(|error| {
+        behavior_error("could not retain tool search definitions").with_source(error)
+    })?;
+    Ok(RunItemKind::ToolCallOutput(
+        ToolCallOutput::new(
+            CallId::new(required_str(item, "call_id", "tool_search_output")?),
+            output,
+        )
+        .with_kind(ToolCallKind::ToolSearch),
+    ))
+}
+
+fn lift_discovered_tool(tool: &Value) -> Result<ModelToolDefinition> {
+    let name = required_str(tool, "name", "discovered tool")?;
+    let definition = match required_str(tool, "type", "discovered tool")? {
+        "function" => ModelToolDefinition::new(
+            name,
+            tool.get("parameters")
+                .ok_or_else(|| behavior_error("discovered function has no parameters"))?
+                .clone(),
+        ),
+        "custom" => {
+            let format = tool
+                .get("format")
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::from_value::<CustomToolFormat>(value.clone()))
+                .transpose()
+                .map_err(|error| {
+                    behavior_error("invalid discovered custom tool format").with_source(error)
+                })?;
+            ModelToolDefinition::custom(name, format)
+        }
+        other => {
+            return Err(behavior_error(format!(
+                "unsupported discovered tool type `{other}`"
+            )));
+        }
+    }
+    .with_defer_loading(
+        tool.get("defer_loading")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+    .with_strict(tool.get("strict").and_then(Value::as_bool).unwrap_or(false));
+    Ok(match tool.get("description").and_then(Value::as_str) {
+        Some(description) => definition.with_description(description),
+        None => definition,
+    })
 }
 
 /// Keeps a server-side compaction as the opaque item it is, minus `created_by`.

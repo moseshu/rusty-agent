@@ -237,6 +237,14 @@ fn merge_tools(
 
     // The reference's converter raises for any tool that is not a function; advertising a custom
     // tool as one is an extension the caller has to ask for.
+    if tools
+        .iter()
+        .any(|tool| tool.kind().is_tool_search() || tool.defer_loading())
+    {
+        return Err(Error::caller(
+            "Deferred tools and tool search are only supported with OpenAI Responses models.",
+        ));
+    }
     crate::tool_namespaces::ensure_unnamespaced(tools, "Chat Completions-compatible models")?;
     if let Some(custom) = tools.iter().find(|tool| tool.kind().is_custom())
         && !codec.options.custom_tools_as_functions()

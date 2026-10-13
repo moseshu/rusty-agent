@@ -651,6 +651,7 @@ pub(crate) fn update_identity_digest(digest: &mut Sha256, identity: &ToolUse) {
                 ToolLookupKind::Bare => &b"bare"[..],
                 ToolLookupKind::Namespaced => &b"namespaced"[..],
                 ToolLookupKind::DeferredTopLevel => &b"deferred_top_level"[..],
+                ToolLookupKind::ToolSearch => &b"tool_search"[..],
             };
             update_digest(digest, b"kind", kind);
             update_digest(digest, b"name", key.name());

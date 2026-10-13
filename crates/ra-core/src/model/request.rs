@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::ResolvedModelSettings;
 use crate::{
+    compat::{SchemaVersion, Unknown},
     error::{Error, Result},
     item::{AgentId, ModelInputItem},
     prompt::{CachePlan, ContentHash},
@@ -203,6 +204,8 @@ pub enum ModelToolKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<CustomToolFormat>,
     },
+    /// Searches tool definitions. Client execution is supplied by the runtime.
+    ToolSearch,
 }
 
 impl ModelToolKind {
@@ -218,12 +221,18 @@ impl ModelToolKind {
         matches!(self, Self::Custom { .. })
     }
 
+    /// Whether this is a tool discovery entry.
+    #[must_use]
+    pub const fn is_tool_search(&self) -> bool {
+        matches!(self, Self::ToolSearch)
+    }
+
     /// The custom form's constraint, when it is custom and has one.
     #[must_use]
     pub const fn custom_format(&self) -> Option<&CustomToolFormat> {
         match self {
             Self::Custom { format } => format.as_ref(),
-            Self::Function => None,
+            Self::Function | Self::ToolSearch => None,
         }
     }
 }
@@ -248,8 +257,10 @@ pub fn custom_tool_input_schema() -> Value {
 /// Responses carries namespaces; the other adapters refuse a namespaced tool, as the reference's
 /// do.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelToolDefinition {
+    #[serde(default = "model_tool_definition_schema_version")]
+    schema_version: SchemaVersion,
     name: String,
     description: Option<String>,
     input_schema: Value,
@@ -257,6 +268,14 @@ pub struct ModelToolDefinition {
     kind: ModelToolKind,
     namespace: Option<String>,
     namespace_description: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    defer_loading: bool,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+const fn model_tool_definition_schema_version() -> SchemaVersion {
+    SchemaVersion::new(1)
 }
 
 impl ModelToolDefinition {
@@ -266,6 +285,7 @@ impl ModelToolDefinition {
         let mut input_schema = input_schema;
         canonicalize_json(&mut input_schema);
         Self {
+            schema_version: model_tool_definition_schema_version(),
             name: name.into(),
             description: None,
             input_schema,
@@ -273,6 +293,8 @@ impl ModelToolDefinition {
             kind: ModelToolKind::Function,
             namespace: None,
             namespace_description: None,
+            defer_loading: false,
+            unknown: Unknown::new(),
         }
     }
 
@@ -281,6 +303,14 @@ impl ModelToolDefinition {
     pub fn custom(name: impl Into<String>, format: Option<CustomToolFormat>) -> Self {
         let mut definition = Self::new(name, custom_tool_input_schema());
         definition.kind = ModelToolKind::Custom { format };
+        definition
+    }
+
+    /// Creates the client-executed discovery entry used by the runtime.
+    #[must_use]
+    pub fn tool_search(input_schema: Value) -> Self {
+        let mut definition = Self::new("tool_search", input_schema);
+        definition.kind = ModelToolKind::ToolSearch;
         definition
     }
 
@@ -315,6 +345,36 @@ impl ModelToolDefinition {
     pub const fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
+    }
+
+    /// Marks a definition as loaded through discovery, matching the framework's deferral flag.
+    #[must_use]
+    pub const fn with_defer_loading(mut self, defer_loading: bool) -> Self {
+        self.defer_loading = defer_loading;
+        self
+    }
+
+    /// Whether the definition uses deferred loading.
+    #[must_use]
+    pub const fn defer_loading(&self) -> bool {
+        self.defer_loading
+    }
+
+    /// Resolves the framework's model lookup identity, including deferred top-level functions.
+    ///
+    /// A deferred function without an explicit namespace uses the synthetic `name.name` call
+    /// shape. Its public name is unchanged, and a visible function of that name is a separate key.
+    pub fn lookup_key(&self) -> Result<crate::tool::ToolLookupKey> {
+        if self.defer_loading && self.kind.is_function() && self.namespace.is_none() {
+            return crate::tool::ToolLookupKey::deferred_top_level(&self.name);
+        }
+        crate::tool::ToolLookupKey::for_call(
+            &self.name,
+            self.namespace
+                .as_ref()
+                .map(crate::tool::ToolNamespace::new)
+                .transpose()?,
+        )
     }
 
     /// Advertises the tool in `namespace`, which `description` describes to the model.

@@ -434,3 +434,72 @@ fn test_tool_output_18() {
         output
     );
 }
+
+#[test]
+fn audio_tool_output_survives_storage_and_model_projection() {
+    let url = "data:audio/wav;base64,YXVkaW8=";
+    let output = ToolOutput::new(vec![
+        ToolOutputBlock::text("sound"),
+        ToolOutputBlock::audio(url),
+    ])
+    .unwrap();
+    let stored = serde_json::to_value(&output).unwrap();
+    assert_eq!(stored["blocks"][1], json!({"type": "audio", "url": url}));
+    let restored = ToolOutput::from_stored(&stored).unwrap().unwrap();
+    assert_eq!(restored.model_blocks(), output.blocks());
+    assert_eq!(restored.as_text(), None);
+}
+
+#[test]
+fn discovery_definitions_are_preserved_outside_a_context_excerpt() {
+    use ra_core::model::ModelToolDefinition;
+    let tool = ModelToolDefinition::new("lookup", json!({"type": "object"}))
+        .with_namespace("records", Some("Records".to_owned()))
+        .with_defer_loading(true);
+    let mut stored = serde_json::to_value(ToolOutput::tool_search(vec![tool])).unwrap();
+    stored["discovered_tools"][0]["future_metadata"] = json!({"value": 42});
+    let restored: ToolOutput = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), stored);
+    let projection = restored.with_model_excerpt(
+        ModelExcerpt::new(
+            vec![ToolOutputBlock::text("trimmed")],
+            ArtifactRef::new("search-artifact").unwrap(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        projection.discovered_tools().unwrap()[0].qualified_name(),
+        "records.lookup"
+    );
+    let empty = ToolOutput::tool_search(vec![]);
+    assert_eq!(empty.discovered_tools(), Some([].as_slice()));
+    assert_eq!(ToolOutput::text("ordinary").discovered_tools(), None);
+}
+
+#[test]
+fn discovery_estimate_counts_schema_keys_once() {
+    use ra_core::{
+        item::{CallId, ModelInputItem, ToolCallKind, ToolCallOutput},
+        model::ModelToolDefinition,
+    };
+    let tools = vec![ModelToolDefinition::new(
+        "lookup",
+        json!({"type": "object", "properties": {
+            "a_long_parameter_name_that_is_content_rather_than_framing": {"type": "string"}
+        }}),
+    )];
+    let input = |tools| {
+        ModelInputItem::ToolCallOutput(
+            ToolCallOutput::new(
+                CallId::new("search"),
+                serde_json::to_value(ToolOutput::tool_search(tools)).unwrap(),
+            )
+            .with_kind(ToolCallKind::ToolSearch),
+        )
+    };
+    let overhead = ra_core::item::estimate::item_chars(&input(vec![])).unwrap();
+    assert_eq!(
+        ra_core::item::estimate::item_chars(&input(tools.clone())).unwrap() - overhead,
+        ModelToolDefinition::advertised_table_chars(&tools).unwrap()
+    );
+}

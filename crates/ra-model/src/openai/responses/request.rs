@@ -86,7 +86,8 @@ pub(crate) async fn build_request_body(
         );
     }
 
-    let tools = merge_tools(&mut body, request.tools(), request.handoffs())?;
+    validate_tool_search_configuration(&body, request.tools())?;
+    let tools = merge_tools(&mut body, request.tools(), request.handoffs(), false)?;
     insert_cache_scope(&mut body, request, quirks);
     if tools.populated {
         if let Some(tool_choice) = request.model_settings().tool_choice() {
@@ -349,6 +350,13 @@ pub(crate) async fn lower_input_item(
     match item {
         ModelInputItem::Message(message) => lower_message(message).await,
         ModelInputItem::Reasoning(reasoning) => Ok(lower_reasoning(reasoning)),
+        ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::ToolSearch => Ok(json!({
+            "type": "tool_search_call", "call_id": call.call_id().as_str(),
+            "execution": "client", "arguments": call.arguments(), "status": "completed",
+        })),
+        ModelInputItem::ToolCallOutput(output) if output.kind() == ToolCallKind::ToolSearch => {
+            lower_search_output(output)
+        }
         ModelInputItem::ToolCall(call) if call.kind() == ToolCallKind::Custom => Ok(json!({
             "type": "custom_tool_call",
             "call_id": call.call_id().as_str(),
@@ -633,6 +641,7 @@ async fn lower_tool_output(payload: &Value) -> Result<Value> {
             ToolOutputBlock::Text { text } => json!({"type": "input_text", "text": text}),
             ToolOutputBlock::Image(image) => lower_image(&image).await?,
             ToolOutputBlock::File(file) => lower_file(&file)?,
+            ToolOutputBlock::Audio { url } => json!({"type": "input_audio", "audio_url": url}),
             _ => {
                 return Err(Error::caller(
                     "unsupported tool-output block for OpenAI Responses",
@@ -666,6 +675,7 @@ fn merge_tools(
     body: &mut Map<String, Value>,
     tools: &[ModelToolDefinition],
     handoffs: &[ModelHandoffDefinition],
+    discovery_output: bool,
 ) -> Result<MergedTools> {
     let mut lowered = match body.remove("tools") {
         None | Some(Value::Null) => Vec::new(),
@@ -687,29 +697,39 @@ fn merge_tools(
     lowered.reserve(tools.len() + handoffs.len());
 
     let mut custom_names = BTreeSet::new();
-    for tool in tools.iter().filter(|tool| tool.kind().is_custom()) {
-        if tool.namespace().is_some() {
-            return Err(Error::caller(format!(
-                "custom tool `{}` cannot be advertised in a namespace; OpenAI Responses \
-                 namespaces hold function tools",
-                tool.qualified_name()
-            )));
-        }
-        validate_function_name(tool.name())?;
-        if !names.insert(tool.name().to_owned()) {
-            return Err(Error::caller(format!(
-                "duplicate OpenAI tool/handoff name `{}`",
-                tool.name()
-            )));
-        }
-        custom_names.insert(tool.name().to_owned());
-        lowered.push(custom_tool(tool));
-    }
-
     // The reference's `convert_tools`: a namespace takes the place of its first function, holding
-    // every function advertised in it, in order; handoffs come after the tools.
+    // every function advertised in it, in order. Other tool kinds retain their declaration order;
+    // handoffs come after the tools, and discovery results retain their BM25 order.
     let mut namespaces = Namespaces::default();
-    for tool in tools.iter().filter(|tool| !tool.kind().is_custom()) {
+    for tool in tools {
+        if tool.kind().is_tool_search() {
+            lowered.push(json!({"type": "tool_search", "execution": "client",
+                "description": tool.description(), "parameters": tool.input_schema()}));
+            continue;
+        }
+        if tool.kind().is_custom() {
+            if tool.namespace().is_some() {
+                return Err(Error::caller(format!(
+                    "custom tool `{}` cannot be advertised in a namespace; OpenAI Responses \
+                     namespaces hold function tools",
+                    tool.qualified_name()
+                )));
+            }
+            validate_function_name(tool.name())?;
+            if !names.insert(tool.name().to_owned()) {
+                return Err(Error::caller(format!(
+                    "duplicate OpenAI tool/handoff name `{}`",
+                    tool.name()
+                )));
+            }
+            custom_names.insert(tool.name().to_owned());
+            let mut custom = custom_tool(tool);
+            if tool.defer_loading() {
+                custom["defer_loading"] = Value::Bool(true);
+            }
+            lowered.push(custom);
+            continue;
+        }
         let (name, description, schema, strict) = (
             tool.name(),
             tool.description(),
@@ -717,13 +737,12 @@ fn merge_tools(
             tool.strict(),
         );
         validate_function_name(name)?;
+        let mut function = function_tool(name, description, schema, strict);
+        if tool.defer_loading() {
+            function["defer_loading"] = Value::Bool(true);
+        }
         if let Some(namespace) = tool.namespace() {
-            namespaces.add(
-                &mut lowered,
-                namespace,
-                tool,
-                function_tool(name, description, schema, strict),
-            )?;
+            namespaces.add(&mut lowered, namespace, tool, function, discovery_output)?;
             continue;
         }
         if !names.insert(name.to_owned()) {
@@ -731,7 +750,7 @@ fn merge_tools(
                 "duplicate OpenAI tool/handoff name `{name}`"
             )));
         }
-        lowered.push(function_tool(name, description, schema, strict));
+        lowered.push(function);
     }
     namespaces.place(&mut lowered);
     for handoff in handoffs {
@@ -786,8 +805,9 @@ impl Namespaces {
         namespace: &str,
         tool: &ModelToolDefinition,
         function: Value,
+        discovery_output: bool,
     ) -> Result<()> {
-        if namespace == tool.name() {
+        if namespace == tool.name() && !(discovery_output && tool.defer_loading()) {
             return Err(Error::caller(format!(
                 "Responses tool-search reserves the synthetic namespace `{namespace}.{namespace}` for deferred \
                  top-level function tools. Rename the namespace or tool name to avoid ambiguous dispatch."
@@ -835,6 +855,40 @@ impl Namespaces {
             });
         }
     }
+}
+
+/// Top-level deferred functions use the Python framework's synthetic lookup namespace. Codex
+/// instead groups them in `functions`; the framework identity contract takes precedence here.
+///
+/// The framework lets a deferred top-level function share its name with an explicit namespace,
+/// and on the wire both land in one namespace. Calls still route apart (`crm.crm` is the deferred
+/// function, `crm.lookup` the namespaced one), but a namespace carries one description, so the
+/// synthetic entry adopts the explicit namespace's description instead of its own default.
+fn discovery_definitions(tools: &[ModelToolDefinition]) -> Vec<ModelToolDefinition> {
+    let is_synthetic = |tool: &ModelToolDefinition| {
+        tool.kind().is_function()
+            && tool
+                .namespace()
+                .is_none_or(|namespace| namespace == tool.name())
+    };
+    tools
+        .iter()
+        .map(|tool| {
+            let definition = tool.clone().with_defer_loading(true);
+            if tool.namespace().is_none() && tool.kind().is_function() {
+                let description = tools
+                    .iter()
+                    .find(|other| other.namespace() == Some(tool.name()) && !is_synthetic(other))
+                    .map_or_else(
+                        || Some(format!("Tools in the {} namespace.", tool.name())),
+                        |explicit| explicit.namespace_description().map(str::to_owned),
+                    );
+                definition.with_namespace(tool.name(), description)
+            } else {
+                definition
+            }
+        })
+        .collect()
 }
 
 /// The reference's `CustomToolParam`: a name, a description, and the format the raw input is
@@ -927,4 +981,53 @@ fn lower_tool_choice(choice: Option<&ToolChoice>, tools: &MergedTools) -> Result
             "unsupported tool choice for OpenAI Responses",
         )),
     }
+}
+
+/// Validation from the Python framework, with client discovery treated as an opaque local catalog.
+fn validate_tool_search_configuration(
+    body: &Map<String, Value>,
+    tools: &[ModelToolDefinition],
+) -> Result<()> {
+    let count = tools
+        .iter()
+        .filter(|tool| tool.kind().is_tool_search())
+        .count()
+        + body
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"))
+            .count();
+    if count > 1 {
+        return Err(Error::caller(
+            "Only one ToolSearchTool() is allowed when using OpenAI Responses models.",
+        ));
+    }
+    if count == 0 && tools.iter().any(ModelToolDefinition::defer_loading) {
+        return Err(Error::caller(
+            "Deferred-loading Responses tools require ToolSearchTool() when using OpenAI Responses models.",
+        ));
+    }
+    Ok(())
+}
+
+fn lower_search_output(output: &ra_core::item::ToolCallOutput) -> Result<Value> {
+    let stored = ToolOutput::from_stored(output.output())?;
+    let definitions = stored
+        .as_ref()
+        .and_then(ToolOutput::discovered_tools)
+        .unwrap_or_default();
+    let mut discovered = Map::new();
+    merge_tools(
+        &mut discovered,
+        &discovery_definitions(definitions),
+        &[],
+        true,
+    )?;
+    Ok(json!({
+        "type": "tool_search_output", "call_id": output.call_id().as_str(),
+        "execution": "client", "status": "completed",
+        "tools": discovered.remove("tools").unwrap_or_else(|| json!([])),
+    }))
 }

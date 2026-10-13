@@ -298,14 +298,16 @@ fn test_a_host_only_tool_may_share_a_name_with_an_advertised_one() {
 }
 
 #[test]
-fn test_a_deferred_tool_still_claims_its_name() {
-    // Deferred is a promise that discovery can promote the tool into a later turn's advertised
-    // set. It costs nothing today and so is not in `advertised_count`, but it stakes a claim on
-    // its name today — otherwise the collision would appear on the turn it is promoted, which is
-    // the one moment nothing is checking.
+fn test_deferred_tools_with_same_model_identity_conflict() {
+    // Deferred schemas cost nothing in the initial surface, but discovery must still identify
+    // one executable for each synthetic top-level name.
     let deferred = ToolOptions::new().with_exposure(ToolExposure::Deferred);
     let registry = ToolRegistry::builder()
-        .register(StubTool::bare("search").shared())
+        .register(
+            StubTool::bare("search")
+                .with_options(deferred.clone())
+                .shared(),
+        )
         .register(
             StubTool::namespaced("mcp.jira", "search")
                 .advertised_as("search")
@@ -322,7 +324,7 @@ fn test_a_deferred_tool_still_claims_its_name() {
         .expect("a valid profile");
     let error = registry
         .assemble(&profile)
-        .expect_err("a promotable name must not collide");
+        .expect_err("two deferred model identities must not collide");
 
     assert!(error.to_string().contains("search"), "{error}");
 }

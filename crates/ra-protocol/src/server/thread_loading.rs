@@ -140,7 +140,6 @@ impl ThreadRequestProcessor {
         let dynamic_tools = params.dynamic_tools().unwrap_or_default().to_vec();
         if !dynamic_tools.is_empty() {
             validate_dynamic_tools(&dynamic_tools).map_err(JsonRpcErrorObject::invalid_request)?;
-            check_dynamic_tools_supported(METHOD, &dynamic_tools)?;
         }
         if params.history_mode == Some(ThreadHistoryMode::Paginated) {
             return Err(JsonRpcErrorObject::invalid_request(
@@ -901,25 +900,6 @@ fn require_factory(
         .factory
         .clone()
         .ok_or_else(|| unsupported_yet(method))
-}
-
-/// Refuses the dynamic tools a thread cannot carry yet: deferred functions, which need tool search.
-/// The check is the server's own; Codex carries them.
-fn check_dynamic_tools_supported(
-    method: &str,
-    tools: &[DynamicToolSpec],
-) -> Result<(), JsonRpcErrorObject> {
-    let deferred = |tool: &DynamicToolSpec| match tool {
-        DynamicToolSpec::Function(function) => function.defer_loading(),
-        DynamicToolSpec::Namespace(namespace) => namespace
-            .tools()
-            .iter()
-            .any(|tool| tool.function().defer_loading()),
-    };
-    if tools.iter().any(deferred) {
-        return Err(unsupported(method, "dynamicTools.deferLoading"));
-    }
-    Ok(())
 }
 
 fn check_sandbox_and_permissions(policy: &ThreadPolicyFields) -> Result<(), JsonRpcErrorObject> {

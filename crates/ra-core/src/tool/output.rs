@@ -40,11 +40,12 @@ use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
     item::{CallId, FileBlock, ImageBlock, ModelResponse},
+    model::ModelToolDefinition,
     state::RunId,
 };
 
 /// Current tool-output schema version.
-pub const TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+pub const TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
 
 /// A provider-neutral tool result.
 #[non_exhaustive]
@@ -55,6 +56,8 @@ pub struct ToolOutput {
     metadata: ObservationMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_excerpt: Option<ModelExcerpt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovered_tools: Option<Vec<ModelToolDefinition>>,
     #[serde(flatten, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -70,6 +73,8 @@ struct StructuredToolOutputWire {
     metadata: ObservationMetadata,
     #[serde(default)]
     model_excerpt: Option<ModelExcerpt>,
+    #[serde(default)]
+    discovered_tools: Option<Vec<ModelToolDefinition>>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -163,6 +168,7 @@ impl ToolOutput {
             blocks,
             metadata: ObservationMetadata::new(),
             model_excerpt: None,
+            discovered_tools: None,
             unknown: Unknown::new(),
         })
     }
@@ -185,6 +191,7 @@ impl ToolOutput {
             blocks: vec![block],
             metadata: ObservationMetadata::new(),
             model_excerpt: None,
+            discovered_tools: None,
             unknown: Unknown::new(),
         }
     }
@@ -194,6 +201,23 @@ impl ToolOutput {
     pub fn with_metadata(mut self, metadata: ObservationMetadata) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    /// Creates a discovery result, including an empty set of matches.
+    ///
+    /// Definitions are data rather than text or observation metadata. Providers can replay the
+    /// selected schemas without parsing prose, and context trimming cannot erase their identity.
+    #[must_use]
+    pub fn tool_search(tools: Vec<ModelToolDefinition>) -> Self {
+        let mut output = Self::text("");
+        output.discovered_tools = Some(tools);
+        output
+    }
+
+    /// The definitions selected by discovery, or `None` for an ordinary tool result.
+    #[must_use]
+    pub fn discovered_tools(&self) -> Option<&[ModelToolDefinition]> {
+        self.discovered_tools.as_deref()
     }
 
     /// Replaces the provider-facing projection while retaining the complete blocks for storage.
@@ -258,6 +282,7 @@ impl ToolOutput {
                 // No re-validation here: `ModelExcerpt` enforces its own invariants while being
                 // read, so an excerpt cannot reach this point in a shape its constructor rejects.
                 output.model_excerpt = wire.model_excerpt;
+                output.discovered_tools = wire.discovered_tools;
                 output.unknown = wire.unknown;
                 Ok(output)
             }
@@ -607,6 +632,14 @@ pub enum ToolOutputBlock {
     Image(ImageBlock),
     /// A file the model should read.
     File(FileBlock),
+    /// Audio supplied by a tool, as a URL or an inline data URL.
+    ///
+    /// This content capability comes from Codex; the Python framework currently exposes only
+    /// text, image, and file tool outputs. Provider restrictions belong in adapters.
+    Audio {
+        /// Location of the audio, including inline data.
+        url: String,
+    },
 }
 
 impl ToolOutputBlock {
@@ -614,6 +647,12 @@ impl ToolOutputBlock {
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
+    }
+
+    /// Creates an audio block without imposing a provider's URL restrictions.
+    #[must_use]
+    pub fn audio(url: impl Into<String>) -> Self {
+        Self::Audio { url: url.into() }
     }
 
     /// Text projection when this is a text block.

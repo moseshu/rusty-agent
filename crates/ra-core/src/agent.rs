@@ -14,7 +14,12 @@
 //! Private fields and the non-exhaustive public types let those additions remain source
 //! compatible; placeholder strings would freeze the wrong identities and callback shapes.
 
-use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    future::Future,
+    sync::Arc,
+};
 
 use crate::{
     context::RunContext,
@@ -27,7 +32,7 @@ use crate::{
     prompt::{DynamicPromptHandler, ResolvedPrompt},
     sandbox::SandboxAgentConfig,
     state::NestedRunRef,
-    tool::{Tool, ToolOrigin},
+    tool::{Tool, ToolLookupKey, ToolOrigin},
 };
 use async_trait::async_trait;
 
@@ -942,7 +947,7 @@ impl AgentSpecBuilder {
         // integration's `search` is an ordinary installation, and rejecting it here would refuse a
         // configuration no provider would ever see.
         let mut tool_keys = BTreeSet::new();
-        let mut advertised_names = BTreeSet::new();
+        let mut advertised_names: BTreeMap<String, Vec<ToolLookupKey>> = BTreeMap::new();
         for tool in &self.tools {
             tool.validate()?;
             let key = tool.origin().lookup_key();
@@ -954,13 +959,22 @@ impl AgentSpecBuilder {
             if !tool.options().can_reach_model_surface() {
                 continue;
             }
-            let advertised = tool.model_definition().qualified_name();
-            if !advertised_names.insert(advertised.clone()) {
+            let definition = tool
+                .model_definition()
+                .with_defer_loading(tool.options().is_discoverable());
+            let advertised = definition.qualified_name();
+            let model_key = definition.lookup_key()?;
+            let owners = advertised_names.entry(advertised.clone()).or_default();
+            if owners
+                .iter()
+                .any(|prior| model_key.collides_on_model_surface(prior))
+            {
                 return Err(Error::config(format!(
                     "agent `{id}` advertises the tool name `{advertised}` more than once; \
                      distinct lookup keys still have to project to distinct model-facing names"
                 )));
             }
+            owners.push(model_key);
         }
 
         for handoff in &self.handoffs {
@@ -971,12 +985,18 @@ impl AgentSpecBuilder {
                 )));
             }
             let name = handoff.schema().name().to_owned();
-            if !advertised_names.insert(name.clone()) {
+            let model_key = ToolLookupKey::bare(&name)?;
+            let owners = advertised_names.entry(name.clone()).or_default();
+            if owners
+                .iter()
+                .any(|prior| model_key.collides_on_model_surface(prior))
+            {
                 return Err(Error::config(format!(
                     "agent `{id}` advertises the model-facing action name `{name}` more than once; \
                      tools and handoffs share one provider namespace"
                 )));
             }
+            owners.push(model_key);
         }
 
         // Guardrails are deliberately not checked for repeated names here. A name is a display

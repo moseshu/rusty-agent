@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use ra_core::{
     error::{Error, Result},
-    item::{ModelResponse, RunItemKind},
+    item::{ModelResponse, RunItemKind, ToolCallKind},
     step::ProcessedResponse,
 };
 
@@ -33,7 +33,13 @@ pub fn process_model_response(
         builder = match item.kind() {
             // A call within a namespace can only be a namespace's tool; handoffs are top-level.
             RunItemKind::ToolCall(call) => {
-                if let Some(handoff) = call
+                if call.kind() == ToolCallKind::ToolSearch {
+                    if let Some(tool) = surface.find_tool_search() {
+                        builder.function(item.clone(), Arc::clone(tool))?
+                    } else {
+                        builder.tool_not_found(item.clone())?
+                    }
+                } else if let Some(handoff) = call
                     .namespace()
                     .is_none()
                     .then(|| surface.find_handoff(call.name()))

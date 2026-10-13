@@ -58,6 +58,7 @@ pub struct AgentBinding {
     public: Arc<AgentSpec>,
     execution: Arc<AgentSpec>,
     external_tools: Vec<Arc<dyn Tool>>,
+    pub(crate) tool_search_cache: Arc<crate::tool::search::ToolSearchHandlerCache>,
 }
 
 impl AgentBinding {
@@ -72,6 +73,7 @@ impl AgentBinding {
             execution: Arc::clone(&agent),
             public: agent,
             external_tools: Vec::new(),
+            tool_search_cache: Arc::default(),
         }
     }
 
@@ -86,6 +88,7 @@ impl AgentBinding {
             public,
             execution,
             external_tools: Vec::new(),
+            tool_search_cache: Arc::default(),
         }
     }
 
@@ -139,46 +142,60 @@ impl AgentBinding {
     /// Registers the external candidates after a freshly prepared host tool set.
     pub(crate) fn with_prepared_execution(&self, execution: Arc<AgentSpec>) -> Result<Self> {
         if self.external_tools.is_empty() {
-            return Ok(Self::prepared(Arc::clone(&self.public), execution));
+            let mut binding = Self::prepared(Arc::clone(&self.public), execution);
+            binding.tool_search_cache = Arc::clone(&self.tool_search_cache);
+            return Ok(binding);
         }
         // Codex's registry keys a tool by its namespace and name. Rust tools may advertise an
         // alias, so preserve both identities: the routing key protects the executable registry,
         // while the qualified model name protects the advertised table and its handoffs.
-        let mut taken: HashSet<String> = execution
-            .tools()
-            .iter()
-            .map(|tool| tool.model_definition().qualified_name())
-            .chain(
-                execution
-                    .handoffs()
-                    .iter()
-                    .map(|handoff| handoff.schema().name().to_owned()),
-            )
-            .collect();
+        let mut taken: BTreeMap<String, Vec<ra_core::tool::ToolLookupKey>> = BTreeMap::new();
+        for tool in execution.tools() {
+            let definition = tool
+                .model_definition()
+                .with_defer_loading(tool.options().is_discoverable());
+            taken
+                .entry(definition.qualified_name())
+                .or_default()
+                .push(definition.lookup_key()?);
+        }
+        for handoff in execution.handoffs() {
+            taken
+                .entry(handoff.schema().name().to_owned())
+                .or_default()
+                .push(ra_core::tool::ToolLookupKey::bare(handoff.schema().name())?);
+        }
         let mut routing_keys: HashSet<_> = execution
             .tools()
             .iter()
             .map(|tool| tool.origin().lookup_key().clone())
             .collect();
-        let tools: Vec<_> = self
-            .external_tools
-            .iter()
-            .filter(|tool| {
-                let name = tool.model_definition().qualified_name();
-                let key = tool.origin().lookup_key();
-                if routing_keys.contains(key) || taken.contains(&name) {
-                    tracing::warn!(
-                        tool_name = name,
-                        "skipping duplicate external tool that is already registered"
-                    );
-                    return false;
-                }
-                routing_keys.insert(key.clone());
-                taken.insert(name);
-                true
-            })
-            .cloned()
-            .collect();
+        let mut tools = Vec::new();
+        for tool in &self.external_tools {
+            let definition = tool
+                .model_definition()
+                .with_defer_loading(tool.options().is_discoverable());
+            let model_key = definition.lookup_key()?;
+            let key = tool.origin().lookup_key();
+            if routing_keys.contains(key)
+                || taken.get(&definition.qualified_name()).is_some_and(|keys| {
+                    keys.iter()
+                        .any(|prior| model_key.collides_on_model_surface(prior))
+                })
+            {
+                tracing::warn!(
+                    tool_name = definition.qualified_name(),
+                    "skipping duplicate external tool that is already registered"
+                );
+                continue;
+            }
+            routing_keys.insert(key.clone());
+            taken
+                .entry(definition.qualified_name())
+                .or_default()
+                .push(model_key);
+            tools.push(Arc::clone(tool));
+        }
         let execution = if tools.is_empty() {
             execution
         } else {
@@ -188,6 +205,7 @@ impl AgentBinding {
             public: Arc::clone(&self.public),
             execution,
             external_tools: self.external_tools.clone(),
+            tool_search_cache: Arc::clone(&self.tool_search_cache),
         })
     }
 

@@ -13,7 +13,7 @@ use crate::{
 /// Current tool-item schema version.
 pub const TOOL_ITEM_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
-/// Whether a call, and the output answering it, belong to a function tool or a custom one.
+/// Whether a call and its output belong to a function, a custom tool, or client discovery.
 ///
 /// A custom call carries one raw string where a function call carries a JSON object; its arguments
 /// are that string as a JSON string. Only a provider that speaks the custom form natively — `OpenAI`
@@ -32,6 +32,8 @@ pub enum ToolCallKind {
     Function,
     /// A call to a custom tool.
     Custom,
+    /// A client-executed tool discovery call and its definition output.
+    ToolSearch,
 }
 
 impl ToolCallKind {
@@ -45,7 +47,9 @@ impl ToolCallKind {
 
 impl From<&ModelToolKind> for ToolCallKind {
     fn from(kind: &ModelToolKind) -> Self {
-        if kind.is_custom() {
+        if kind.is_tool_search() {
+            Self::ToolSearch
+        } else if kind.is_custom() {
             Self::Custom
         } else {
             Self::Function

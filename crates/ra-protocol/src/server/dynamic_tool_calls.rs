@@ -38,9 +38,6 @@
 //!   every tool result is lowered to by its provider adapter.
 //! - A result with no content items is given to the model as empty text, since a tool result here
 //!   cannot be empty.
-//! - Audio in a result is refused with a text of Rusty's own, until tool results can carry it.
-//! - Deferred functions are not registered: `thread/start` refuses them, and those a history
-//!   records are skipped.
 //! - A namespace holding a function of its own name is refused before thread creation, as the
 //!   framework reserves that shape for deferred top-level tools (see
 //!   [`ra_core::tool::ToolLookupKey::namespaced`]); unsupported entries in old metadata are skipped.
@@ -61,7 +58,10 @@ use ra_core::{
     error::{Error, Result},
     event::{HostEvent, HostEventBody, HostEventEmitter},
     item::{ImageBlock, ImageDetail, ImageSource},
-    tool::{Tool, ToolContext, ToolNamespace, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema},
+    tool::{
+        Tool, ToolContext, ToolExposure, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput,
+        ToolOutputBlock, ToolSchema,
+    },
 };
 use ra_runtime::thread::AgentThreadBuilder;
 use ra_session::rollout::{RolloutPayload, RolloutRecord};
@@ -90,8 +90,6 @@ const RESPONSE_FAMILY: &str = "dynamicToolCallResponse";
 const CANCELLED: &str = "dynamic tool call was cancelled before receiving a response";
 /// The names Codex keeps from external tools whether or not a tool of the name is registered.
 const RESERVED_NAMES: [&str; 2] = ["exec_command", "shell_command"];
-/// What a result carrying audio is refused with, until tool results can carry it.
-const AUDIO_UNSUPPORTED: &str = "dynamic tool audio output is not supported";
 
 /// The calls of a thread's dynamic tools waiting for the client's answer, by call id: Codex's
 /// `pending_dynamic_tools`.
@@ -253,29 +251,8 @@ pub(crate) async fn request_dynamic_tool_call(
         let Some(response) = dynamic_tool_call_response(answer.await) else {
             return;
         };
-        calls.deliver(&request.call_id, refuse_audio(response));
+        calls.deliver(&request.call_id, response);
     });
-}
-
-/// A result carrying audio, refused until tool results can carry it.
-fn refuse_audio(response: DynamicToolCallResponse) -> DynamicToolCallResponse {
-    if response
-        .content_items()
-        .iter()
-        .any(|item| matches!(item, DynamicToolCallOutputContentItem::InputAudio { .. }))
-    {
-        tracing::error!(
-            message = AUDIO_UNSUPPORTED,
-            "dynamic tool response was invalid"
-        );
-        return DynamicToolCallResponse::new(
-            [DynamicToolCallOutputContentItem::input_text(
-                AUDIO_UNSUPPORTED,
-            )],
-            false,
-        );
-    }
-    response
 }
 
 /// A function a client provides, as one of its thread's tools: Codex's `DynamicToolHandler`.
@@ -283,6 +260,7 @@ struct DynamicTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     calls: Arc<DynamicToolCalls>,
+    options: ToolOptions,
 }
 
 impl DynamicTool {
@@ -318,6 +296,11 @@ impl DynamicTool {
             origin,
             schema,
             calls: Arc::clone(calls),
+            options: ToolOptions::new().with_exposure(if function.defer_loading() {
+                ToolExposure::Deferred
+            } else {
+                ToolExposure::Advertised
+            }),
         })
     }
 }
@@ -335,6 +318,10 @@ impl Tool for DynamicTool {
 
     fn schema(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn options(&self) -> ToolOptions {
+        self.options.clone()
     }
 
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
@@ -429,18 +416,19 @@ fn model_output(response: &DynamicToolCallResponse) -> ToolOutput {
     let blocks: Vec<ToolOutputBlock> = response
         .content_items()
         .iter()
-        .filter_map(|item| match item {
+        .map(|item| match item {
             DynamicToolCallOutputContentItem::InputText { text, .. } => {
-                Some(ToolOutputBlock::text(text.clone()))
+                ToolOutputBlock::text(text.clone())
             }
             DynamicToolCallOutputContentItem::InputImage { image_url, .. } => {
-                Some(ToolOutputBlock::Image(
+                ToolOutputBlock::Image(
                     ImageBlock::new(ImageSource::url(image_url.clone()))
                         .with_detail(ImageDetail::High),
-                ))
+                )
             }
-            // Refused before it reaches the call.
-            DynamicToolCallOutputContentItem::InputAudio { .. } => None,
+            DynamicToolCallOutputContentItem::InputAudio { audio_url, .. } => {
+                ToolOutputBlock::audio(audio_url.clone())
+            }
         })
         .collect();
     ToolOutput::new(blocks).unwrap_or_else(|_| ToolOutput::text(""))
@@ -449,8 +437,8 @@ fn model_output(response: &DynamicToolCallResponse) -> ToolOutput {
 /// Gives the agent `builder` prepares the functions `specs` provide, in their namespaces, as
 /// external tools — registered after the agent's own, skipping a name already held, as Codex's
 /// registry does (see [`AgentBinding::with_external_tools`]) — and returns where their calls wait
-/// for answers. A top-level function named like a tool Codex reserves is skipped first, and so is
-/// a deferred function, until deferred tools are carried.
+/// for answers. A top-level function named like a tool Codex reserves is skipped first. Deferred
+/// functions retain their exposure and are discovered through the runtime's search handler.
 ///
 /// # Errors
 ///
@@ -475,10 +463,6 @@ pub(crate) fn register_dynamic_tools(
         };
         for function in functions {
             let name = function.name();
-            if function.defer_loading() {
-                tracing::warn!(tool_name = name, "skipping a deferred dynamic tool");
-                continue;
-            }
             if namespace.is_none() && RESERVED_NAMES.contains(&name) {
                 tracing::warn!(
                     tool_name = name,

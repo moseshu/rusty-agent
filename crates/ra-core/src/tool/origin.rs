@@ -29,7 +29,15 @@ pub enum ToolLookupKind {
     Namespaced,
     /// A top-level tool exposed only after deferred discovery.
     DeferredTopLevel,
+    /// The runtime's client-executed discovery entry.
+    ///
+    /// A function may also be named `tool_search`; it remains [`Bare`](Self::Bare). This separate
+    /// shape keeps approvals and permission rules pinned to one of them from applying to the other.
+    ToolSearch,
 }
+
+/// Model-facing name of the runtime's client-executed discovery entry.
+const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 
 /// Collision-free routing identity.
 ///
@@ -98,6 +106,18 @@ impl ToolLookupKey {
         })
     }
 
+    /// Creates the lookup key of the runtime's client-executed discovery entry.
+    #[must_use]
+    pub fn tool_search() -> Self {
+        Self {
+            schema_version: TOOL_LOOKUP_KEY_SCHEMA_VERSION,
+            kind: ToolLookupKind::ToolSearch,
+            name: TOOL_SEARCH_TOOL_NAME.to_owned(),
+            namespace: None,
+            unknown: Unknown::new(),
+        }
+    }
+
     /// Reconstructs the lookup shape carried by a provider call.
     ///
     /// A provider may encode deferred top-level calls using a synthetic namespace equal to the
@@ -141,6 +161,23 @@ impl ToolLookupKey {
         matches!(self.kind, ToolLookupKind::DeferredTopLevel)
     }
 
+    /// Whether the framework considers these model-facing labels ambiguous.
+    ///
+    /// Bare, deferred top-level, and native discovery peers may share a public name, because
+    /// each reaches the model in a different shape. Explicit namespaces still conflict with a
+    /// top-level tool literally named by the namespace's qualified label.
+    #[must_use]
+    pub fn collides_on_model_surface(&self, other: &Self) -> bool {
+        if self.namespace.is_none() && other.namespace.is_none() {
+            return self.name == other.name && self.kind == other.kind;
+        }
+        let label = |key: &Self| match &key.namespace {
+            Some(namespace) => format!("{}.{}", namespace.as_str(), key.name),
+            None => key.name.clone(),
+        };
+        label(self) == label(other)
+    }
+
     /// Unknown fields retained during deserialization.
     #[must_use]
     pub const fn unknown(&self) -> &Unknown {
@@ -170,6 +207,9 @@ impl<'de> Deserialize<'de> for ToolLookupKey {
             (ToolLookupKind::Bare, None) => Self::bare(wire.name),
             (ToolLookupKind::Namespaced, Some(namespace)) => Self::namespaced(namespace, wire.name),
             (ToolLookupKind::DeferredTopLevel, None) => Self::deferred_top_level(wire.name),
+            (ToolLookupKind::ToolSearch, None) if wire.name == TOOL_SEARCH_TOOL_NAME => {
+                Ok(Self::tool_search())
+            }
             (kind, namespace) => Err(Error::caller(format!(
                 "tool lookup key shape `{kind:?}` has invalid namespace {namespace:?}"
             ))),
@@ -243,6 +283,18 @@ impl ToolOrigin {
     /// Creates a deferred top-level identity distinct from the corresponding bare tool.
     pub fn deferred_top_level(name: impl Into<String>) -> Result<Self> {
         Self::from_lookup_key(ToolLookupKey::deferred_top_level(name)?)
+    }
+
+    /// Creates the identity of the runtime's client-executed discovery entry.
+    #[must_use]
+    pub fn tool_search() -> Self {
+        Self {
+            schema_version: TOOL_ORIGIN_SCHEMA_VERSION,
+            namespace: None,
+            qualified_name: TOOL_SEARCH_TOOL_NAME.to_owned(),
+            lookup_key: ToolLookupKey::tool_search(),
+            unknown: Unknown::new(),
+        }
     }
 
     /// Reconstructs a canonical origin from a persisted lookup key.
@@ -358,6 +410,7 @@ fn validate_lookup_key(key: &ToolLookupKey) -> Result<()> {
     validate_tool_name(key.name())?;
     match (key.kind(), key.namespace()) {
         (ToolLookupKind::Bare | ToolLookupKind::DeferredTopLevel, None) => {}
+        (ToolLookupKind::ToolSearch, None) if key.name() == TOOL_SEARCH_TOOL_NAME => {}
         (ToolLookupKind::Namespaced, Some(namespace)) => {
             validate_namespace(namespace.as_str())?;
             if namespace.as_str() == key.name() {

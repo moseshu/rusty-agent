@@ -83,7 +83,7 @@ use ra_core::{
         RunState, ToolOutcome, ToolUse,
     },
     step::NextStep,
-    tool::{ToolLookupKey, ToolOutputReferenceExtractor, ToolServices},
+    tool::{Tool, ToolLookupKey, ToolOutputReferenceExtractor, ToolServices},
     trace::SpanKind,
     usage::{RequestUsage, Usage},
 };
@@ -1119,7 +1119,7 @@ impl RunRequest {
     /// Installs the framework ports every tool in this run is handed.
     ///
     /// One bag rather than one setter per port: the ports travel from here through settlement,
-    /// batch execution and dispatch into [`Tool::call`](ra_core::tool::Tool::call), so a port added
+    /// batch execution and dispatch into [`Tool::call`], so a port added
     /// as its own parameter would change four signatures and every third-party tool.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
@@ -2891,6 +2891,7 @@ async fn run_approved_call(
         lifecycle,
         ResumedCall {
             key,
+            kind: approval.kind(),
             call_id: approval.call_id(),
             arguments: approval.arguments(),
             nested: None,
@@ -2928,6 +2929,7 @@ async fn continue_paused_run(
         lifecycle,
         ResumedCall {
             key: &key,
+            kind: ra_core::item::ToolCallKind::Function,
             call_id: &call_id,
             arguments: &arguments,
             nested: Some(checkpoint),
@@ -2940,6 +2942,7 @@ async fn continue_paused_run(
 /// One call a resumed run dispatches again before its next model call.
 struct ResumedCall<'a> {
     key: &'a ToolLookupKey,
+    kind: ra_core::item::ToolCallKind,
     call_id: &'a CallId,
     arguments: &'a serde_json::Value,
     /// The paused nested run the call continues; `None` for a call the host approved.
@@ -2989,24 +2992,13 @@ async fn execute_resumed_call(
 ) -> Result<ResumedOutcome> {
     let ResumedCall {
         key,
+        kind,
         call_id,
         arguments,
         nested,
         resume,
     } = call;
-    // The execution instance's tools, because that is what runs: a capability contributes tools
-    // to it alone, and a call the host approved on one of those must still find it on resume.
-    let tool = agent
-        .execution()
-        .tools()
-        .iter()
-        .find(|tool| tool.origin().lookup_key() == key)
-        .ok_or_else(|| {
-            Error::caller(format!(
-                "resumed call `{call_id}` names lookup key `{key:?}`, which the resumed agent no \
-                 longer provides"
-            ))
-        })?;
+    let tool = resolve_resumed_tool(context, agent, state, key, kind, call_id).await?;
 
     let run = resumed_run_context(context, agent, state);
 
@@ -3029,7 +3021,7 @@ async fn execute_resumed_call(
         context.config.permission().clone()
     };
     let request = ToolDispatchRequest::new(
-        Arc::clone(tool),
+        Arc::clone(&tool),
         call_id.clone(),
         arguments.clone(),
         Arc::new(run),
@@ -3055,14 +3047,15 @@ async fn execute_resumed_call(
     match dispatch {
         ToolDispatch::Observed(observation) => {
             let failure_code = observation.failure_code();
-            let output = observation.output().clone();
+            let output = observation.output().clone().with_kind(kind);
             let outcome = match failure_code {
                 Some(code) => {
                     ToolOutcome::failed(identity, call_id, arguments, output.output(), code)
                 }
                 None => ToolOutcome::succeeded(identity, call_id, arguments, output.output()),
             };
-            let tool_result = (!output.is_error())
+            let tool_result = (!output.is_error()
+                && kind != ra_core::item::ToolCallKind::ToolSearch)
                 .then(|| ToolUseResult::new(tool.origin().clone(), output.clone()));
             Ok(ResumedOutcome::Settled {
                 output,
@@ -3071,7 +3064,7 @@ async fn execute_resumed_call(
             })
         }
         ToolDispatch::Refused(refusal) => {
-            let output = refusal.into_output();
+            let output = refusal.into_output().with_kind(kind);
             let outcome = ToolOutcome::refused(identity, call_id, arguments, output.output());
             Ok(ResumedOutcome::Settled {
                 output,
@@ -3084,6 +3077,39 @@ async fn execute_resumed_call(
         }
         ToolDispatch::AwaitingNestedApproval(nested) => Ok(ResumedOutcome::Paused(nested)),
     }
+}
+
+/// Resolves runtime-generated discovery separately from the agent's declared functions.
+async fn resolve_resumed_tool(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &RunState,
+    key: &ToolLookupKey,
+    kind: ra_core::item::ToolCallKind,
+    call_id: &CallId,
+) -> Result<Arc<dyn Tool>> {
+    let tool = if kind == ra_core::item::ToolCallKind::ToolSearch {
+        crate::turn::prepare::resumed_tool_search(
+            agent,
+            &resumed_run_context(context, agent, state),
+            context.services,
+            context.cancel,
+        )
+        .await?
+        .filter(|tool| tool.origin().lookup_key() == key)
+    } else {
+        agent
+            .execution()
+            .tools()
+            .iter()
+            .find(|tool| tool.origin().lookup_key() == key)
+            .cloned()
+    };
+    tool.ok_or_else(|| {
+        Error::caller(format!(
+            "resumed call `{call_id}` names lookup key `{key:?}`, which the resumed agent no longer provides"
+        ))
+    })
 }
 
 /// Whether a segment runs on the input its caller supplied in place of its checkpoint's history.

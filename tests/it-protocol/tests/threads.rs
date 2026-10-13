@@ -814,21 +814,6 @@ async fn thread_start_refusals() {
             invalid_request("thread/start.cwd is not supported"),
         ),
         (
-            json!({"dynamicTools": [{
-                "type": "namespace",
-                "name": "tickets",
-                "description": "Ticket tools",
-                "tools": [{
-                    "type": "function",
-                    "name": "lookup_ticket",
-                    "description": "Look up a ticket",
-                    "inputSchema": {"type": "object", "properties": {}},
-                    "deferLoading": true
-                }]
-            }]}),
-            invalid_request("thread/start.dynamicTools.deferLoading is not supported"),
-        ),
-        (
             json!({"permissions": ":nope"}),
             invalid_request("invalid thread settings override: unknown permissions profile: :nope"),
         ),
@@ -3448,15 +3433,6 @@ async fn thread_start_checks_dynamic_tools() {
         (
             json!([{"name": "lookup.ticket", "description": "", "inputSchema": schema}]),
             "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: lookup.ticket",
-        ),
-        (
-            json!([
-                {"namespace": "legacy_app", "name": "lookup_status", "description": "",
-                    "inputSchema": schema, "exposeToContext": true},
-                {"namespace": "legacy_app", "name": "update_ticket", "description": "",
-                    "inputSchema": schema, "exposeToContext": false},
-            ]),
-            "thread/start.dynamicTools.deferLoading is not supported",
         ),
     ] {
         assert_eq!(

@@ -5,8 +5,7 @@
 //! answer, and the tools a resumed or forked thread takes from its history.
 //!
 //! The server runs in this process, and the thread's agent runs on the Responses adapter against a
-//! mock endpoint, so the cases read the request bodies the model is sent, as Codex's do. Codex's
-//! deferred tools wait for tool search, so its cases drop them.
+//! mock endpoint, so the cases read the request bodies the model is sent, as Codex's do.
 
 use std::{
     collections::VecDeque,
@@ -127,6 +126,14 @@ impl Endpoint {
             "arguments": arguments.to_string(),
         });
         self.script.lock().unwrap().push_back(stream(&item));
+    }
+
+    fn search_next(&self, call_id: &str, query: &str, limit: usize) {
+        self.script.lock().unwrap().push_back(stream(&json!({
+            "type": "tool_search_call", "id": format!("ts-{call_id}"),
+            "call_id": call_id, "execution": "client", "status": "completed",
+            "arguments": {"query": query, "limit": limit}
+        })));
     }
 
     /// The bodies of the requests the endpoint has received, in order.
@@ -1107,9 +1114,9 @@ async fn dynamic_tool_remote_audio_response_becomes_model_visible_error() {
     );
 }
 
-/// Inline audio, which Codex passes to the model, is refused until tool results can carry it.
+/// Inline audio reaches the model and the recorded item as Codex carries it.
 #[tokio::test]
-async fn dynamic_tool_inline_audio_is_refused() {
+async fn dynamic_tool_inline_audio_round_trips() {
     let call_id = "dyn-call-audio";
     let mut pending = start_function_dynamic_tool_call(call_id).await;
     let completed = pending
@@ -1124,16 +1131,27 @@ async fn dynamic_tool_inline_audio_is_refused() {
             }),
         )
         .await;
-    let refusal = "dynamic tool audio output is not supported";
-    assert_eq!(completed["status"], "failed");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["success"], true);
     assert_eq!(
         completed["contentItems"],
-        json!([{"type": "inputText", "text": refusal}])
+        json!([
+            {"type": "inputText", "text": "dynamic-ok"},
+            {"type": "inputAudio", "audioUrl": INLINE_AUDIO_DATA_URL}
+        ])
     );
     assert_eq!(
         pending.model_output(call_id).await,
-        json!([{"type": "input_text", "text": refusal}])
+        json!([
+            {"type": "input_text", "text": "dynamic-ok"},
+            {"type": "input_audio", "audio_url": INLINE_AUDIO_DATA_URL}
+        ])
     );
+    let turns = pending
+        .server
+        .read_turns(&mut pending.connection, &pending.thread_id)
+        .await;
+    assert_eq!(read_back_item(&turns, call_id), completed);
 }
 
 /// Codex's `on_call_response`: an error answer, or one that does not read as a response, fails the
@@ -1405,38 +1423,6 @@ async fn thread_fork_takes_dynamic_tools_from_the_source() {
     connection.notification("turn/completed").await;
     let bodies = endpoint.bodies().await;
     assert_eq!(tool_names(&bodies[2]), ["demo_tool"]);
-}
-
-/// Deferred functions are refused until tool search carries them, before anything is built.
-#[tokio::test]
-async fn thread_start_refuses_deferred_tools() {
-    let endpoint = Endpoint::start().await;
-    let server = Server::plain(&endpoint);
-    let mut connection = server.connect(1).await;
-    let schema = json!({"type": "object", "properties": {}});
-    let function =
-        json!({"type": "function", "name": "lookup", "description": "", "inputSchema": schema});
-    let deferred = json!({"type": "function", "name": "hidden", "description": "", "inputSchema": schema, "deferLoading": true});
-    for dynamic_tools in [
-        json!([{"type": "namespace", "name": "app", "description": "", "tools": [function, deferred]}]),
-        json!([{"namespace": "app", "name": "hidden", "description": "", "inputSchema": schema,
-            "exposeToContext": false}]),
-    ] {
-        assert_eq!(
-            server
-                .call_error(
-                    &mut connection,
-                    "thread/start",
-                    json!({"dynamicTools": dynamic_tools}),
-                )
-                .await,
-            invalid_request("thread/start.dynamicTools.deferLoading is not supported")
-        );
-    }
-    let listed = server
-        .call(&mut connection, "thread/loaded/list", json!({}))
-        .await;
-    assert_eq!(listed["data"], json!([]));
 }
 
 /// The framework reserves the same-name namespace shape for deferred top-level calls and refuses
@@ -1738,4 +1724,150 @@ async fn namespaced_dynamic_tools_are_told_apart_from_top_level_tools() {
         function_call_output(&bodies[1], "dyn-1"),
         Some(json!([{"type": "input_text", "text": "from the client"}]))
     );
+}
+
+/// Deferred tools in canonical and legacy registration formats are searched, invoked, answered,
+/// and restored from thread history. Audio and selected definitions survive another server.
+#[tokio::test]
+async fn deferred_dynamic_tools_search_call_and_restore_with_audio() {
+    for legacy in [false, true] {
+        let endpoint = Endpoint::start().await;
+        endpoint.search_next("search-1", "hidden", 1);
+        endpoint.call_next_in("dynamic-1", "app", "hidden", &json!({}));
+        let store: Arc<dyn ThreadStore> = Arc::new(InMemoryThreadStore::new());
+        let server = Server::start(
+            &endpoint,
+            Arc::clone(&store),
+            agent("lead", vec![], vec![]),
+            RunConfig::new(),
+        );
+        let mut connection = server.connect(1).await;
+        let schema = json!({"type": "object", "properties": {}});
+        let tools = if legacy {
+            json!([{"namespace": "app", "name": "hidden", "description": "hidden records",
+                "inputSchema": schema, "exposeToContext": false}])
+        } else {
+            json!([{"type": "namespace", "name": "app", "description": "App records",
+                "tools": [{"type": "function", "name": "hidden", "description": "hidden records",
+                    "inputSchema": schema, "deferLoading": true}]}])
+        };
+        let thread_id = server.start_thread(&mut connection, tools).await;
+        assert_eq!(
+            server
+                .session_meta(&thread_id)
+                .await
+                .dynamic_tools()
+                .unwrap()[0]["tools"][0]["deferLoading"],
+            true
+        );
+        server
+            .turn_start(&mut connection, &thread_id, "Find records")
+            .await;
+        let request = connection.tool_call_request().await;
+        assert_eq!(request["params"]["namespace"], "app");
+        assert_eq!(request["params"]["tool"], "hidden");
+        let content = json!([{ "type": "inputAudio", "audioUrl": INLINE_AUDIO_DATA_URL }]);
+        server
+            .answer(
+                &connection,
+                &request,
+                json!({"contentItems": content, "success": true}),
+            )
+            .await;
+        let completed = connection.dynamic_item("item/completed", "dynamic-1").await;
+        assert_eq!(completed["item"]["status"], "completed");
+        assert_eq!(completed["item"]["contentItems"], content);
+        let turn = connection.notification("turn/completed").await;
+        assert_eq!(turn["turn"]["status"], "completed", "{turn}");
+        let bodies = endpoint.bodies().await;
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(bodies[0]["tools"][0]["type"], "tool_search");
+        assert_eq!(bodies[0]["tools"][0]["execution"], "client");
+        let search = bodies[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "tool_search_output")
+            .unwrap();
+        assert_eq!(search["call_id"], "search-1");
+        assert_eq!(search["tools"][0]["name"], "app");
+        assert_eq!(search["tools"][0]["tools"][0]["name"], "hidden");
+        assert_eq!(search["tools"][0]["tools"][0]["defer_loading"], true);
+        assert_eq!(
+            function_call_output(&bodies[2], "dynamic-1").unwrap(),
+            json!([{ "type": "input_audio", "audio_url": INLINE_AUDIO_DATA_URL }])
+        );
+        let turns = server.read_turns(&mut connection, &thread_id).await;
+        assert_eq!(read_back_item(&turns, "dynamic-1"), completed["item"]);
+        drop(server);
+
+        let restored = Server::start(
+            &endpoint,
+            store,
+            agent("lead", vec![], vec![]),
+            RunConfig::new(),
+        );
+        let mut restored_connection = restored.connect(2).await;
+        restored
+            .call(
+                &mut restored_connection,
+                "thread/resume",
+                json!({"threadId": thread_id}),
+            )
+            .await;
+        restored
+            .turn_start(&mut restored_connection, &thread_id, "Continue")
+            .await;
+        let turn = restored_connection.notification("turn/completed").await;
+        assert_eq!(turn["turn"]["status"], "completed", "{turn}");
+        let bodies = endpoint.bodies().await;
+        let replay = bodies.last().unwrap();
+        assert_eq!(replay["tools"][0]["type"], "tool_search");
+        assert!(replay["input"].as_array().unwrap().contains(search));
+        assert_eq!(
+            function_call_output(replay, "dynamic-1").unwrap(),
+            json!([{ "type": "input_audio", "audio_url": INLINE_AUDIO_DATA_URL }])
+        );
+    }
+}
+
+/// Search results sharing a namespace are coalesced in ranked order without eager peers.
+#[tokio::test]
+async fn deferred_search_results_coalesce_namespaces() {
+    let endpoint = Endpoint::start().await;
+    endpoint.search_next("search", "calendar", 8);
+    let server = Server::plain(&endpoint);
+    let mut connection = server.connect(1).await;
+    let schema = json!({"type": "object", "properties": {}});
+    let thread_id = server.start_thread(&mut connection, json!([
+        {"type": "namespace", "name": "calendar", "description": "Calendar events", "tools": [
+            {"type": "function", "name": "create_event", "description": "Create calendar events", "inputSchema": schema, "deferLoading": true},
+            {"type": "function", "name": "list_events", "description": "List calendar events", "inputSchema": schema, "deferLoading": true},
+            {"type": "function", "name": "eager", "description": "Already visible", "inputSchema": schema}
+        ]}
+    ])).await;
+    server
+        .turn_start(&mut connection, &thread_id, "Find calendar tools")
+        .await;
+    let turn = connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "completed", "{turn}");
+    let bodies = endpoint.bodies().await;
+    assert_eq!(bodies[0]["tools"][0]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(bodies[0]["tools"][0]["tools"][0]["name"], "eager");
+    let search = bodies[1]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "tool_search_output")
+        .unwrap();
+    assert_eq!(search["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(search["tools"][0]["name"], "calendar");
+    let mut names: Vec<_> = search["tools"][0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["create_event", "list_events"]);
 }

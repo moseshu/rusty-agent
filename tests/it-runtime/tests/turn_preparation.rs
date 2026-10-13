@@ -625,7 +625,7 @@ async fn test_turn_preparation_03() {
     let context = host(&agent);
     let cancel = CancelScope::root();
 
-    let error = prepare_turn(TurnPreparationRequest::new(
+    let prepared = prepare_turn(TurnPreparationRequest::new(
         &direct(&agent),
         &resolver,
         &context,
@@ -634,10 +634,16 @@ async fn test_turn_preparation_03() {
         Vec::new(),
     ))
     .await
-    .expect_err("deferred tools cannot silently disappear before tool_search exists");
-
-    assert!(error.to_string().contains("Deferred exposure"));
-    assert!(error.to_string().contains("R2-5c"));
+    .unwrap();
+    assert_eq!(prepared.request().tools().len(), 1);
+    assert!(prepared.request().tools()[0].kind().is_tool_search());
+    assert!(
+        prepared
+            .action_surface()
+            .find_tool_in(Some("deferred"), "deferred")
+            .is_some()
+    );
+    assert!(prepared.action_surface().find_tool_search().is_some());
 }
 
 #[tokio::test]
