@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::{
     command_canonicalization::canonicalize_command_for_approval, exec_policy::SandboxPermissions,
+    permissions::AdditionalPermissionProfile,
 };
 
 /// The environment a coding thread runs its tools in. Codex keys approvals by the environment a
@@ -77,8 +78,7 @@ impl ApprovalStore {
 }
 
 /// Cache key for approval decisions that can be reused across equivalent command launches:
-/// Codex's `UnifiedExecApprovalKey`. Codex's `additional_permissions` is not accepted by this
-/// build's `exec_command` yet, so it is not part of the key.
+/// Codex's `UnifiedExecApprovalKey`.
 #[derive(Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct UnifiedExecApprovalKey {
     environment_id: String,
@@ -87,6 +87,7 @@ pub(crate) struct UnifiedExecApprovalKey {
     cwd: PathBuf,
     tty: bool,
     sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
 /// Codex's `ApplyPatchApprovalKey`: one path a patch touches.
@@ -116,6 +117,8 @@ pub(crate) struct CommandApproval<'a> {
     pub(crate) cwd: PathBuf,
     pub(crate) tty: bool,
     pub(crate) sandbox_permissions: SandboxPermissions,
+    /// The permissions it runs with beyond the sandbox's.
+    pub(crate) additional_permissions: Option<&'a AdditionalPermissionProfile>,
 }
 
 impl CommandApproval<'_> {
@@ -128,6 +131,7 @@ impl CommandApproval<'_> {
             cwd: self.cwd.clone(),
             tty: self.tty,
             sandbox_permissions: self.sandbox_permissions,
+            additional_permissions: self.additional_permissions.cloned(),
         });
         vec![(key, policy_fingerprint.map(<[String]>::to_vec))]
     }

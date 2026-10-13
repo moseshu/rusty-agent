@@ -8,6 +8,8 @@
 //! the approval policy asks nothing — asks the client through the [`ThreadServerRequests`] the app
 //! server handed the thread. The grant is narrowed to what was requested and kept for the turn or
 //! for the session, as the client chose; the model is given the response as Codex serializes it.
+//! Later commands run with the grants the turn and the session hold (see
+//! [`crate::thread_settings`]).
 //!
 //! # Differences from Codex
 //!
@@ -28,7 +30,8 @@ use ra_core::{state::RunId, tool::ToolContext};
 use ra_protocol::server::{
     ThreadServerRequests,
     protocol::{
-        AdditionalFileSystemPermissions, AdditionalNetworkPermissions, AskForApproval,
+        AdditionalFileSystemPermissions, AdditionalNetworkPermissions,
+        AdditionalPermissionProfile as WireAdditionalProfile, AskForApproval,
         FileSystemAccessMode as WireAccess, FileSystemPath as WirePath,
         FileSystemSandboxEntry as WireEntry, FileSystemSpecialPath as WireSpecial,
         GrantedPermissionProfile, PermissionGrantScope as WireScope,
@@ -236,7 +239,7 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(arguments: Value) -> Result<T, 
 
 /// The paths a thread's permissions are interpreted with: Codex's `FileSystemSandboxContext` for
 /// the local environment.
-struct PolicyPaths {
+pub(crate) struct PolicyPaths {
     cwd: PathBuf,
     workspace_roots: [PathBuf; 1],
     user_home_dir: Option<PathBuf>,
@@ -244,16 +247,23 @@ struct PolicyPaths {
 }
 
 impl PolicyPaths {
-    fn new(cwd: &Path) -> Self {
+    /// The paths of a thread whose cwd, and one project root, is `cwd`.
+    pub(crate) fn new(cwd: &Path) -> Self {
+        Self::for_command(cwd, cwd)
+    }
+
+    /// The paths of a command running in `cwd` in a thread whose project root is `workspace_root`:
+    /// Codex's `file_system_sandbox_policy_context_for_cwd`.
+    pub(crate) fn for_command(workspace_root: &Path, cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
-            workspace_roots: [cwd.to_path_buf()],
+            workspace_roots: [workspace_root.to_path_buf()],
             user_home_dir: std::env::home_dir(),
             temporary_directories: local_temporary_directories(),
         }
     }
 
-    fn context(&self) -> FileSystemSandboxPolicyContext<'_> {
+    pub(crate) fn context(&self) -> FileSystemSandboxPolicyContext<'_> {
         let context = FileSystemSandboxPolicyContext::new(&self.cwd, &self.workspace_roots)
             .with_temporary_directories(&self.temporary_directories);
         match &self.user_home_dir {
@@ -444,6 +454,21 @@ pub(crate) fn resolve_permission_path_string(
 /// The profile as the request carries it: Codex's conversion into its v2 profile.
 fn wire_request_profile(profile: &AdditionalPermissionProfile) -> WireRequestProfile {
     let mut wire = WireRequestProfile::new();
+    if let Some(network) = profile.network() {
+        wire = wire.with_network(wire_network(network));
+    }
+    if let Some(file_system) = profile.file_system() {
+        wire = wire.with_file_system(wire_file_system(file_system));
+    }
+    wire
+}
+
+/// The permissions a command runs with, as its approval request carries them: Codex's conversion
+/// into its v2 `AdditionalPermissionProfile`.
+pub(crate) fn wire_additional_profile(
+    profile: &AdditionalPermissionProfile,
+) -> WireAdditionalProfile {
+    let mut wire = WireAdditionalProfile::new();
     if let Some(network) = profile.network() {
         wire = wire.with_network(wire_network(network));
     }

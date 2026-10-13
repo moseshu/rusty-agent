@@ -578,7 +578,7 @@ fn merge_permission_entries(
 
 /// Every place `entries` name in `context`, with its access: a restricted
 /// `FileSystemSandboxPolicy`'s `resolved_entries`.
-fn resolved_entries(
+pub(crate) fn resolved_entries(
     entries: &[FileSystemSandboxEntry],
     context: &FileSystemSandboxPolicyContext<'_>,
 ) -> Vec<(PathBuf, FileSystemAccessMode)> {
@@ -622,7 +622,7 @@ fn resolved_entries(
 /// The access a restricted policy of `entries` gives `path`: its `resolve_access`. The most
 /// specific entry containing the path decides, a later access breaking a tie; a path no entry
 /// contains is denied.
-fn resolve_access(
+pub(crate) fn resolve_access(
     entries: &[FileSystemSandboxEntry],
     target: &Path,
     context: &FileSystemSandboxPolicyContext<'_>,

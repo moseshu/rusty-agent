@@ -53,10 +53,19 @@
 //! gives; a patch with `item/fileChange/requestApproval`. An answer is applied to the thread's
 //! approval cache and, approving a rule, to its rules home, whose failure is the user's warning.
 //!
+//! Permissions `request_permissions` granted the turn or the session are added to every later
+//! command that stays in the sandbox, as Codex's `apply_granted_turn_permissions` adds them: having
+//! been approved when they were given, they do not make the command ask; its sandbox gains the
+//! roots they write and read and, when they give it, the network; and its approval request and
+//! cache keys carry them. The executor's sandboxes can neither exclude a path from a root they open
+//! nor deny a read, so a command is refused when a grant denies a path or makes a subtree of a
+//! writable root read-only. Path precedence includes both baseline roots and all grants; an
+//! equally specific write overrides a read, as Codex's policy does.
+//!
 //! Input to a running terminal follows Codex's stdin review: a command's launch records the
-//! sandbox it runs in and whether that left the sandbox its decision selected, and input asks first
-//! only when the terminal runs with authority a command launched now would not get, as a command
-//! approval of kind `writeStdin`.
+//! sandbox it runs in, whether that left the sandbox its decision selected, and the grants it ran
+//! with, and input asks first only when the terminal runs with authority a command launched now
+//! would not get, as a command approval of kind `writeStdin`.
 //!
 //! Invocation identity covers the tool and complete arguments. Settled calls retain only their
 //! identity until the turn ends, preventing call-ID reuse. The app-server listener forwards events
@@ -77,8 +86,12 @@ use crate::exec_policy::{
     AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyManager,
     FileSystemSandboxKind, SandboxPermissions, prompt_is_rejected_by_policy,
 };
-use crate::permissions::AdditionalPermissionProfile;
-use crate::request_permissions::ThreadPermissions;
+use crate::permissions::{
+    AdditionalPermissionProfile, FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+    FileSystemSandboxPolicyContext, NetworkPermissions, merge_permission_profiles, resolve_access,
+    resolved_entries,
+};
+use crate::request_permissions::{PolicyPaths, ThreadPermissions, wire_additional_profile};
 use ra_core::{
     error::{Error, Result},
     item::{CallId, RunItemKind, ToolApproval},
@@ -194,7 +207,14 @@ impl CodingThreadSettings {
         let arguments = approval.arguments();
         match approval.tool_name() {
             EXEC_COMMAND_TOOL => {
-                let keys = self.command_cache_keys(arguments);
+                let kept = approval
+                    .resume()
+                    .and_then(|resume| {
+                        ra_tools::exec_command::approval_policy_state(resume.state())
+                    })
+                    .and_then(|state| serde_json::from_value::<CommandResume>(state.clone()).ok());
+                let keys =
+                    self.command_cache_keys(arguments, kept.as_ref().map(CommandResume::decision));
                 self.approvals().remember(keys, decision);
             }
             APPLY_PATCH_TOOL => {
@@ -211,9 +231,14 @@ impl CodingThreadSettings {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The keys Codex caches a command approval under: the command, where and how it runs, and the
-    /// requirements policy it is decided under. Arguments the policy cannot read have none.
-    fn command_cache_keys(&self, arguments: &Value) -> Vec<CommandCacheKey> {
+    /// The keys Codex caches a command approval under: the command, where and how it runs, with
+    /// the permissions `decision` gave it, and the requirements policy it is decided under.
+    /// Arguments the policy cannot read have none.
+    fn command_cache_keys(
+        &self,
+        arguments: &Value,
+        decision: Option<&CommandDecision>,
+    ) -> Vec<CommandCacheKey> {
         let Ok(arguments) = serde_json::from_value::<CommandArguments>(arguments.clone()) else {
             return Vec::new();
         };
@@ -221,7 +246,12 @@ impl CodingThreadSettings {
             command: &arguments.command(),
             cwd: self.command_cwd(arguments.workdir.as_deref()),
             tty: arguments.tty.unwrap_or(false),
-            sandbox_permissions: arguments.sandbox_permissions.unwrap_or_default(),
+            sandbox_permissions: decision.map_or_else(
+                || arguments.sandbox_permissions.unwrap_or_default(),
+                |decision| decision.sandbox_permissions,
+            ),
+            additional_permissions: decision
+                .and_then(|decision| decision.additional_permissions.as_ref()),
         }
         .cache_keys(self.exec_policy.requirements_fingerprint())
     }
@@ -287,8 +317,10 @@ impl CodingThreadSettings {
 
     /// Codex's command approval request: the command in the form it is decided and cached in,
     /// where it runs, why it asks — the retry reason, then the reason its decision gives, then the
-    /// call's justification — the command-prefix rule its decision proposes, and the decisions
-    /// Codex offers by default. The decision is the one kept with the approval, so the request
+    /// call's justification — the permissions it runs with beyond the sandbox's, the command-prefix
+    /// rule its decision proposes, and the decisions Codex offers by default, which are only
+    /// approving once and cancelling for a command with permissions beyond the sandbox's. The
+    /// decision is the one kept with the approval, so the request
     /// says what the approved call will run as, wherever the approval is answered.
     fn command_approval_request(
         &self,
@@ -301,15 +333,24 @@ impl CodingThreadSettings {
             .resume()
             .and_then(|resume| ra_tools::exec_command::approval_policy_state(resume.state()))
             .and_then(|state| serde_json::from_value::<CommandResume>(state.clone()).ok());
-        let (requirement, retry_reason) = match resume {
-            Some(CommandResume::Approval { decision, .. }) => (Some(decision.requirement), None),
+        let (requirement, additional_permissions, retry_reason) = match resume {
+            Some(CommandResume::Approval { decision, .. }) => (
+                Some(decision.requirement),
+                decision.additional_permissions,
+                None,
+            ),
             Some(CommandResume::SandboxRetry {
                 decision,
                 retry_reason,
                 ..
-            }) => (Some(decision.requirement), Some(retry_reason)),
-            None => (None, None),
+            }) => (
+                Some(decision.requirement),
+                decision.additional_permissions,
+                Some(retry_reason),
+            ),
+            None => (None, None, None),
         };
+        let additional_permissions = additional_permissions.as_ref().map(wire_additional_profile);
         let approval_reason = match &requirement {
             Some(ExecApprovalRequirement::NeedsApproval { reason, .. }) => reason.clone(),
             _ => None,
@@ -338,10 +379,13 @@ impl CodingThreadSettings {
             None,
             amendment.as_ref(),
             None,
-            None,
+            additional_permissions.as_ref(),
         ));
         if let Some(reason) = reason {
             params = params.with_reason(reason);
+        }
+        if let Some(additional_permissions) = additional_permissions {
+            params = params.with_additional_permissions(additional_permissions);
         }
         if let Some(amendment) = amendment {
             params = params.with_proposed_execpolicy_amendment(amendment);
@@ -757,6 +801,7 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         encode(&TerminalLaunch {
             sandbox: environment.sandbox().cloned(),
             escalated,
+            additional_permissions: decision.additional_permissions,
         })
         .ok()
     }
@@ -791,7 +836,9 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         // approved for the session, whether that ran this call without asking or not.
         settings.command_decisions.request_retry(context)?;
         if should_bypass_approval(decision.approval_policy, already_approved)
-            || settings.approved_for_session(&settings.command_cache_keys(context.arguments()))
+            || settings.approved_for_session(
+                &settings.command_cache_keys(context.arguments(), Some(&decision)),
+            )
         {
             settings.command_decisions.resume_retry(context)?;
             return Ok(SandboxDenialAction::Retry(Box::new(
@@ -843,6 +890,15 @@ enum CommandResume {
         environment: FrozenEnvironment,
         retry_reason: String,
     },
+}
+
+impl CommandResume {
+    /// The decision the call was asked about with.
+    const fn decision(&self) -> &CommandDecision {
+        match self {
+            Self::Approval { decision, .. } | Self::SandboxRetry { decision, .. } => decision,
+        }
+    }
 }
 
 /// What one attempt was decided with, for the retry decision after a sandbox denial.
@@ -952,6 +1008,147 @@ fn network(enabled: bool) -> ExecNetworkAccess {
     }
 }
 
+/// What a command runs with once the permissions `request_permissions` granted are added to what
+/// it asked for: Codex's `EffectiveAdditionalPermissions`.
+struct EffectiveAdditionalPermissions {
+    sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<AdditionalPermissionProfile>,
+    permissions_preapproved: bool,
+}
+
+/// The session's and the turn's grants added to the call's request: Codex's
+/// `apply_granted_turn_permissions`. A call leaving the sandbox takes none. `exec_command` takes no
+/// `additional_permissions` of its own yet, so the grants are all a call adds, and having been
+/// approved when they were given they are preapproved.
+fn apply_granted_turn_permissions(
+    context: &ToolContext<'_>,
+    settings: &CodingThreadSettings,
+    sandbox_permissions: SandboxPermissions,
+) -> EffectiveAdditionalPermissions {
+    if sandbox_permissions.requires_escalated_permissions() {
+        return EffectiveAdditionalPermissions {
+            sandbox_permissions,
+            additional_permissions: None,
+            permissions_preapproved: false,
+        };
+    }
+    // A grant belongs to the turn that asked for it, however deeply the call is nested.
+    let run_id = ra_runtime::agent::tool::current_root_run_id()
+        .unwrap_or_else(|| context.run().run_id().clone());
+    let granted = merge_permission_profiles(
+        settings.permissions.session().as_ref(),
+        settings.permissions.turn(&run_id).as_ref(),
+    );
+    let sandbox_permissions = if granted.is_some() {
+        SandboxPermissions::WithAdditionalPermissions
+    } else {
+        sandbox_permissions
+    };
+    EffectiveAdditionalPermissions {
+        sandbox_permissions,
+        permissions_preapproved: granted.is_some(),
+        additional_permissions: granted,
+    }
+}
+
+/// Why a command whose grants deny a path is refused.
+const UNENFORCEABLE_DENY: &str = "the permissions granted to this turn or session deny paths the command sandbox cannot exclude, so the command was not run";
+
+/// Why a command whose effective permissions carve a read-only path out of a writable root is refused.
+const UNENFORCEABLE_READ_ONLY: &str = "the granted permissions require read-only paths within writable roots that the command sandbox cannot enforce, so the command was not run";
+
+/// `sandbox` with `permissions` added: Codex's `effective_permission_profile` for the executor's
+/// sandbox. Each path an entry writes becomes a writable root and each it reads a readable root,
+/// resolved in `context`, and a network grant opens the network. An unconfined sandbox is left
+/// alone, as Codex leaves an unrestricted or external one.
+///
+/// The executor's sandboxes can neither exclude a path from a root they open nor deny a read, so
+/// permissions that deny any path or require a read-only carveout are refused. As Codex's
+/// `get_writable_roots_with_cwd_impl` does, the carveout check resolves precedence across the
+/// baseline and the complete grant before deciding whether a read entry restricts a write.
+fn granted_sandbox(
+    sandbox: ExecSandboxPolicy,
+    permissions: &AdditionalPermissionProfile,
+    context: &FileSystemSandboxPolicyContext<'_>,
+) -> std::result::Result<ExecSandboxPolicy, String> {
+    if !sandbox.level().needs_backend() {
+        return Ok(sandbox);
+    }
+    let mut sandbox = sandbox;
+    if permissions
+        .network()
+        .is_some_and(NetworkPermissions::grants)
+    {
+        sandbox = sandbox.with_network(ExecNetworkAccess::Allowed);
+    }
+    let Some(file_system) = permissions.file_system() else {
+        return Ok(sandbox);
+    };
+    if file_system
+        .entries()
+        .iter()
+        .any(|entry| entry.access() == FileSystemAccessMode::Deny)
+    {
+        return Err(UNENFORCEABLE_DENY.to_owned());
+    }
+    let resolved: Vec<_> = file_system
+        .entries()
+        .iter()
+        .flat_map(|entry| {
+            resolved_entries(std::slice::from_ref(entry), context)
+                .into_iter()
+                .filter(|(path, _)| !entry.skips_missing_path() || path.exists())
+        })
+        .collect();
+    if resolved
+        .iter()
+        .any(|(_, access)| *access == FileSystemAccessMode::Read)
+    {
+        // Seatbelt resolves trusted top-level aliases before matching. Compare paths in the
+        // same namespace, preserving mutable components rather than following deeper symlinks.
+        let effective_entries = sandbox
+            .writable_roots()
+            .iter()
+            .map(|path| (path, FileSystemAccessMode::Write))
+            .chain(resolved.iter().map(|(path, access)| (path, *access)))
+            .map(|(path, access)| {
+                #[cfg(target_os = "macos")]
+                let path = ra_exec::sandbox::seatbelt::normalize_root(path)
+                    .map_err(|error| error.to_string())?;
+                #[cfg(not(target_os = "macos"))]
+                let path = path.clone();
+                Ok(FileSystemSandboxEntry::new(
+                    FileSystemPath::Path { path },
+                    access,
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        let effective_paths = resolved_entries(&effective_entries, context);
+        for (path, access) in &effective_paths {
+            if *access == FileSystemAccessMode::Read
+                && effective_paths.iter().any(|(root, access)| {
+                    *access == FileSystemAccessMode::Write && path.starts_with(root)
+                })
+                && resolve_access(&effective_entries, path, context) != FileSystemAccessMode::Write
+            {
+                return Err(UNENFORCEABLE_READ_ONLY.to_owned());
+            }
+        }
+    }
+    for (path, access) in resolved {
+        match access {
+            FileSystemAccessMode::Write if !sandbox.writable_roots().contains(&path) => {
+                sandbox = sandbox.with_writable_root(path);
+            }
+            FileSystemAccessMode::Read if !sandbox.readable_roots().contains(&path) => {
+                sandbox = sandbox.with_readable_root(path);
+            }
+            _ => {}
+        }
+    }
+    Ok(sandbox)
+}
+
 fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
@@ -972,7 +1169,7 @@ fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
         decision.requirement,
         ExecApprovalRequirement::NeedsApproval { .. }
     ) && !settings
-        .approved_for_session(&settings.command_cache_keys(context.arguments()));
+        .approved_for_session(&settings.command_cache_keys(context.arguments(), Some(&decision)));
     Ok(needs_approval)
 }
 
@@ -1030,7 +1227,12 @@ const APPLY_PATCH_TOOL: &str = "apply_patch";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CommandDecision {
     requirement: ExecApprovalRequirement,
+    /// The call's sandbox permissions once the grants are added: `with_additional_permissions`
+    /// when they add any.
     sandbox_permissions: SandboxPermissions,
+    /// What `request_permissions` granted the turn and the session when the call was decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    additional_permissions: Option<AdditionalPermissionProfile>,
     approval_policy: AskForApproval,
     sandbox: ExecSandboxPolicy,
     allow_temp_dir: bool,
@@ -1051,23 +1253,24 @@ impl CommandDecision {
 }
 
 /// What a command's launch recorded with the session it leaves running: the sandbox it runs in,
-/// and whether that is outside the sandbox its decision selected — Codex's `TerminalPermissions`,
-/// for the permissions this build has.
+/// whether that is outside the sandbox its decision selected, and the grants it was launched with
+/// — Codex's `TerminalPermissions`, for the permissions this build has.
 #[derive(Debug, Serialize, Deserialize)]
 struct TerminalLaunch {
     sandbox: Option<ExecSandboxPolicy>,
     escalated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
 /// The coding product's [`WriteStdinPolicy`]: Codex's stdin review. Input to a running terminal
 /// asks first only when the terminal runs with authority a command launched now would not get —
-/// it was launched outside its sandbox, or the thread's sandbox changed since — and is refused
-/// where the approval policy rejects sandbox prompts. A terminal this policy did not launch is
-/// not reviewed.
+/// it was launched outside its sandbox, the thread's sandbox changed since, or it holds
+/// permissions `request_permissions` granted, which it keeps after its turn's grants end — and is
+/// refused where the approval policy rejects sandbox prompts. A terminal this policy did not
+/// launch is not reviewed.
 ///
-/// Codex also reviews a terminal holding permissions an agent granted, which arrive with
-/// `request_permissions`; no grant exists here yet. Its denied-read check has no counterpart
-/// either: the executor's sandboxes deny no reads.
+/// Codex's denied-read check has no counterpart: the executor's sandboxes deny no reads.
 pub(crate) struct CodingStdinPolicy;
 
 impl WriteStdinPolicy for CodingStdinPolicy {
@@ -1086,10 +1289,29 @@ impl WriteStdinPolicy for CodingStdinPolicy {
         else {
             return Ok(StdinReview::Allow);
         };
-        let current = sandboxed_environment(settings, &ExecEnvironment::new())
+        let baseline = sandboxed_environment(settings, &ExecEnvironment::new())
             .sandbox()
             .cloned();
-        if !launch.escalated && launch.sandbox == current {
+        // What a command launched now with the terminal's grants would run in. Grants it would be
+        // refused leave nothing to match, so the input asks.
+        let current = match (&baseline, &launch.additional_permissions) {
+            (Some(sandbox), Some(permissions)) => {
+                let paths = PolicyPaths::for_command(
+                    &settings.cwd,
+                    terminal.cwd().unwrap_or(&settings.cwd),
+                );
+                granted_sandbox(sandbox.clone(), permissions, &paths.context()).ok()
+            }
+            _ => baseline.clone(),
+        };
+        let sandbox_permissions = if launch.escalated || launch.sandbox != current {
+            SandboxPermissions::RequireEscalated
+        } else if launch.sandbox == baseline {
+            SandboxPermissions::UseDefault
+        } else {
+            SandboxPermissions::WithAdditionalPermissions
+        };
+        if sandbox_permissions == SandboxPermissions::UseDefault {
             return Ok(StdinReview::Allow);
         }
         // Manual approvals shell-quote the input, which cannot preserve NUL bytes.
@@ -1106,17 +1328,33 @@ impl WriteStdinPolicy for CodingStdinPolicy {
             .is_none_or(|sandbox| sandbox.level() == SandboxLevel::Unconfined)
         {
             "This terminal runs without a filesystem sandbox."
+        } else if sandbox_permissions == SandboxPermissions::WithAdditionalPermissions {
+            "This terminal retains additional permissions."
         } else {
             "This terminal retains sandbox or network settings that differ from the current permissions."
         };
+        let mut reason = format!(
+            "Send input to an existing terminal. {authority} The cwd is its launch directory; the terminal's current directory and state may have changed."
+        );
+        if let Some(grants) = &launch.additional_permissions {
+            // The reason also reaches clients that strip the experimental `additionalPermissions`.
+            match serde_json::to_string(grants) {
+                Ok(grants) => {
+                    reason.push_str(" Retained grants: ");
+                    reason.push_str(&grants);
+                    reason.push('.');
+                }
+                Err(error) => return Ok(StdinReview::Refuse(error.to_string())),
+            }
+        }
         let state = StdinApproval {
             launch_call_id: terminal.call_id().map(str::to_owned),
             session_id: terminal.session_id().as_str().to_owned(),
             cwd: terminal.cwd().map(Path::to_path_buf),
             input: chars.to_owned(),
-            reason: format!(
-                "Send input to an existing terminal. {authority} The cwd is its launch directory; the terminal's current directory and state may have changed."
-            ),
+            reason,
+            sandbox_permissions,
+            additional_permissions: launch.additional_permissions,
         };
         // Codex bounds the complete pretty-printed action plus its reason, including JSON
         // escaping. Never ask about a truncated input or execute an unreviewed tail.
@@ -1163,6 +1401,10 @@ fn stdin_approval_request(pending: PendingApproval<'_>) -> Option<ServerRequestP
         CommandExecutionApprovalDecision::Accept,
         CommandExecutionApprovalDecision::Cancel,
     ]);
+    if let Some(additional_permissions) = &state.additional_permissions {
+        params =
+            params.with_additional_permissions(wire_additional_profile(additional_permissions));
+    }
     if let Some(cwd) = state.cwd {
         params = params.with_cwd(cwd.to_string_lossy());
     }
@@ -1180,12 +1422,17 @@ struct StdinApproval {
     cwd: Option<PathBuf>,
     input: String,
     reason: String,
+    #[serde(default)]
+    sandbox_permissions: SandboxPermissions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
 const MAX_STDIN_APPROVAL_BYTES: usize = 8_000;
 
 /// Codex's reviewed stdin action for this executor's string session IDs and pipe input.
-/// Launch permissions stay host-owned; only the requested override enters the reviewed action.
+/// Launch sandboxes stay host-owned; only the override the review found and the terminal's grants
+/// enter the reviewed action.
 #[derive(Serialize)]
 struct StdinApprovalAction<'a> {
     tool: &'static str,
@@ -1193,6 +1440,8 @@ struct StdinApprovalAction<'a> {
     chars: &'a str,
     cwd: Option<&'a Path>,
     sandbox_permissions: SandboxPermissions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_permissions: Option<&'a AdditionalPermissionProfile>,
     tty: bool,
 }
 
@@ -1203,7 +1452,8 @@ impl StdinApproval {
             session_id: &self.session_id,
             chars: &self.input,
             cwd: self.cwd.as_deref(),
-            sandbox_permissions: SandboxPermissions::RequireEscalated,
+            sandbox_permissions: self.sandbox_permissions,
+            additional_permissions: self.additional_permissions.as_ref(),
             tty: false,
         };
         serde_json::to_string_pretty(&action).is_ok_and(|reviewed| {
@@ -1421,6 +1671,7 @@ fn command_decision(
             "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
         )));
     }
+    let effective = apply_granted_turn_permissions(context, settings, sandbox_permissions);
     let command = arguments.command();
     let requirement = settings
         .exec_policy
@@ -1429,7 +1680,12 @@ fn command_decision(
                 command: &command,
                 approval_policy,
                 file_system_sandbox: FileSystemSandboxKind::of(&settings.sandbox_policy),
-                sandbox_permissions,
+                // Granted permissions were approved when they were given, so they do not ask again.
+                sandbox_permissions: if effective.permissions_preapproved {
+                    SandboxPermissions::UseDefault
+                } else {
+                    effective.sandbox_permissions
+                },
                 prefix_rule: arguments.prefix_rule.as_deref(),
                 allow_prefix_rules: settings.allow_prefix_rules,
             },
@@ -1445,11 +1701,24 @@ fn command_decision(
     let selected = if bypass_sandbox {
         ExecEnvironment::new().with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined))
     } else {
-        sandboxed_environment(settings, &ExecEnvironment::new())
+        let environment = sandboxed_environment(settings, &ExecEnvironment::new());
+        match (environment.sandbox(), &effective.additional_permissions) {
+            (Some(sandbox), Some(permissions)) => {
+                let paths = PolicyPaths::for_command(
+                    &settings.cwd,
+                    &settings.command_cwd(arguments.workdir.as_deref()),
+                );
+                let sandbox = granted_sandbox(sandbox.clone(), permissions, &paths.context())
+                    .map_err(ra_tools::exec_command::rejection)?;
+                environment.with_sandbox(sandbox)
+            }
+            _ => environment,
+        }
     };
     Ok(CommandDecision {
         requirement,
-        sandbox_permissions,
+        sandbox_permissions: effective.sandbox_permissions,
+        additional_permissions: effective.additional_permissions,
         approval_policy,
         sandbox: selected
             .sandbox()

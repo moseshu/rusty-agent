@@ -1114,3 +1114,872 @@ async fn unparseable_arguments_are_refused() {
         "{refusal}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Grants in later commands
+// ---------------------------------------------------------------------------------------------
+
+fn call(tool: &str, call_id: &str, arguments: Value) -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new(format!("item-{call_id}")),
+        RunItemKind::ToolCall(ToolCall::new(CallId::new(call_id), tool, arguments)),
+    )])
+}
+
+/// `exec_command`'s arguments, every field the strict schema lists given, `fields` over them.
+fn command(fields: Value) -> Value {
+    let mut arguments = json!({
+        "cmd": null,
+        "workdir": null,
+        "shell": null,
+        "tty": null,
+        "login": null,
+        "yield_time_ms": 5000,
+        "timeout_ms": null,
+        "sandbox_permissions": null,
+        "justification": null,
+        "prefix_rule": null
+    });
+    for (key, value) in fields.as_object().unwrap() {
+        arguments[key] = value.clone();
+    }
+    arguments
+}
+
+/// `write_stdin`'s arguments writing `chars` to `session`, every field the strict schema lists
+/// given.
+fn stdin(session: &str, chars: &str) -> Value {
+    json!({
+        "session_id": session,
+        "chars": chars,
+        "until": null,
+        "match_text": null,
+        "control": null,
+        "yield_time_ms": 500
+    })
+}
+
+/// A command writing `text` to `path`, then printing it back.
+fn write_and_cat(path: &Path, text: &str) -> Value {
+    command(json!({"cmd": format!("printf {text} > '{0}' && cat '{0}'", path.display())}))
+}
+
+/// Codex's `requested_directory_write_permissions`.
+fn directory_write(path: &Path) -> Value {
+    json!({"reason": "Allow writing outside the workspace", "permissions": {"file_system": {"write": [text(path)]}}})
+}
+
+fn grant_directory_write(path: &Path, scope: &str) -> Value {
+    json!({"permissions": {"fileSystem": {"write": [text(path)]}}, "scope": scope})
+}
+
+fn command_tools(server: &Server) -> Vec<Arc<dyn Tool>> {
+    vec![
+        server.host.request_permissions_tool().unwrap(),
+        server.host.exec_command_tool().unwrap(),
+        server.host.write_stdin_tool().unwrap(),
+    ]
+}
+
+impl Connection {
+    async fn command_request(&mut self) -> Value {
+        self.until(|message| {
+            message["method"] == "item/commandExecution/requestApproval"
+                && message.get("id").is_some()
+        })
+        .await
+    }
+}
+
+/// Codex's `request_permissions_grants_apply_to_later_exec_command_calls`: a turn's grant opens
+/// its directory to the turn's later commands, which do not ask for it again.
+#[tokio::test]
+async fn request_permissions_grants_apply_to_later_exec_command_calls() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("sticky-write.txt");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        write_and_cat(&written, "sticky-grant-ok"),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    server
+        .turn_start(&mut connection, "write outside the workspace")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    let output = script.last_output("exec-call").unwrap();
+    assert!(output.to_string().contains("sticky-grant-ok"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "sticky-grant-ok"
+    );
+    assert!(
+        connection
+            .drain()
+            .await
+            .iter()
+            .all(|message| { message["method"] != "item/commandExecution/requestApproval" }),
+        "a granted command does not ask"
+    );
+}
+
+/// Codex's `request_permissions_grants_do_not_carry_across_turns`: a turn's grant ends with it,
+/// and the next turn's command is confined to the thread's sandbox again.
+#[tokio::test]
+async fn request_permissions_grants_do_not_carry_across_turns() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("later.txt");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(final_message("granted"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "ask for later").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        write_and_cat(&written, "should-not-run"),
+    ));
+    script.push(final_message("done"));
+    server.turn_start(&mut connection, "reuse it").await;
+    connection.notification("turn/completed").await;
+
+    assert!(!written.exists(), "{:?}", script.last_output("exec-call"));
+}
+
+/// Codex's `request_permissions_session_grants_carry_across_turns`: a session's grant reaches the
+/// commands of later turns.
+#[tokio::test]
+async fn request_permissions_session_grants_carry_across_turns() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("session.txt");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(final_message("granted"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "ask for later").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "session"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        write_and_cat(&written, "session-grant-ok"),
+    ));
+    script.push(final_message("done"));
+    server.turn_start(&mut connection, "use it").await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "session-grant-ok"
+    );
+}
+
+/// A command that asks anyway carries the grant in its approval request, as Codex's
+/// `request_permissions_grants_apply_to_later_exec_command_calls` expects of one, and is offered
+/// only approving once or cancelling.
+#[tokio::test]
+async fn a_granted_command_that_asks_shows_its_grant() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("asked.txt");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        write_and_cat(&written, "asked-ok"),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(
+            &script,
+            AskForApproval::UnlessTrusted,
+            &connection,
+            command_tools(&server),
+        )
+        .await;
+    server
+        .turn_start(&mut connection, "write outside the workspace")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "turn"),
+        )
+        .await;
+
+    let request = connection.command_request().await;
+    let params = &request["params"];
+    assert_eq!(params["itemId"], "exec-call");
+    assert_eq!(
+        params["additionalPermissions"],
+        json!({
+            "network": null,
+            "fileSystem": {
+                "read": null,
+                "write": [text(outside.path())],
+                "entries": [{"path": {"type": "path", "path": text(outside.path())}, "access": "write"}],
+            },
+        })
+    );
+    assert_eq!(params["availableDecisions"], json!(["accept", "cancel"]));
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(std::fs::read_to_string(&written).unwrap(), "asked-ok");
+}
+
+/// The executor's sandbox cannot exclude a path from a root it opens, so while a grant denies a
+/// path, commands are refused rather than run with it open.
+#[tokio::test]
+async fn a_grant_that_denies_a_path_refuses_later_commands() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("open.txt");
+    let entries = json!([
+        {"path": {"type": "path", "path": text(outside.path())}, "access": "write"},
+        {"path": {"type": "path", "path": text(&outside.path().join("secret"))}, "access": "deny"},
+    ]);
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        json!({"permissions": {"file_system": {"entries": entries}}}),
+    ));
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        write_and_cat(&written, "should-not-run"),
+    ));
+    script.push(final_message("done"));
+    let config = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    let turn_id = server
+        .turn_start(&mut connection, "write but not there")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"fileSystem": {"entries": entries}}, "scope": "turn"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    let output = script.last_output("exec-call").unwrap().to_string();
+    assert!(
+        output.contains("the permissions granted to this turn or session deny paths the command sandbox cannot exclude, so the command was not run"),
+        "{output}"
+    );
+    assert!(!written.exists());
+    assert_eq!(
+        settings(&config).granted_turn_permissions(&RunId::new(&turn_id)),
+        None
+    );
+}
+
+async fn run_with_file_system_grant(
+    server: &Server,
+    file_system: Value,
+    arguments: Value,
+) -> Arc<Script> {
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "grant",
+        json!({"permissions": {"file_system": file_system}}),
+    ));
+    script.push(call("exec_command", "exec-call", arguments));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(server))
+        .await;
+    server
+        .turn_start(&mut connection, "use the granted file permissions")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"fileSystem": file_system}, "scope": "turn"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+    assert!(
+        connection
+            .drain()
+            .await
+            .iter()
+            .all(|message| message["method"] != "item/commandExecution/requestApproval")
+    );
+    script
+}
+
+fn assert_read_only_refusal(script: &Script, written: &Path) {
+    let output = script.last_output("exec-call").unwrap().to_string();
+    assert!(output.contains("the granted permissions require read-only paths within writable roots that the command sandbox cannot enforce, so the command was not run"), "{output}");
+    assert!(!written.exists(), "the read-only path was written");
+}
+
+/// Codex preserves read-only children of writable roots. A root-list sandbox cannot do so and
+/// must refuse the command, including when the read-only child does not exist yet.
+#[tokio::test]
+async fn read_only_children_of_granted_writable_roots_refuse_commands() {
+    for existing in [true, false] {
+        let server = Server::start();
+        let outside = tempfile::tempdir().unwrap();
+        let child = outside.path().join("readonly");
+        if existing {
+            std::fs::create_dir(&child).unwrap();
+        }
+        let written = child.join("must-not-exist");
+        let file_system = json!({"entries": [
+            {"path": {"type": "path", "path": text(outside.path())}, "access": "write"},
+            {"path": {"type": "path", "path": text(&child)}, "access": "read"},
+        ]});
+        let script = run_with_file_system_grant(&server, file_system, command(json!({"cmd": format!("mkdir -p '{}' && printf unauthorized > '{}'", child.display(), written.display())}))).await;
+        assert_read_only_refusal(&script, &written);
+    }
+}
+
+/// A read grant can constrain the thread's baseline writable root, even with no write grant.
+#[tokio::test]
+async fn read_only_children_of_baseline_writable_roots_refuse_commands() {
+    let server = Server::start();
+    let child = server.root().join("readonly");
+    std::fs::create_dir(&child).unwrap();
+    let written = child.join("must-not-exist");
+    let script = run_with_file_system_grant(
+        &server,
+        json!({"read": [text(&child)]}),
+        write_and_cat(&written, "unauthorized"),
+    )
+    .await;
+    assert_read_only_refusal(&script, &written);
+}
+
+/// A more specific read survives session/turn merging whichever scope supplied it.
+#[tokio::test]
+async fn read_only_carveouts_survive_session_and_turn_merging() {
+    for session_writes in [true, false] {
+        let server = Server::start();
+        let outside = tempfile::tempdir().unwrap();
+        let child = outside.path().join("readonly");
+        std::fs::create_dir(&child).unwrap();
+        let written = child.join("must-not-exist");
+        let write = json!({"write": [text(outside.path())]});
+        let read = json!({"read": [text(&child)]});
+        let (session_permissions, turn_permissions) = if session_writes {
+            (write, read)
+        } else {
+            (read, write)
+        };
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(request_permissions(
+            "session-grant",
+            json!({"permissions": {"file_system": session_permissions}}),
+        ));
+        script.push(final_message("session granted"));
+        let config = server
+            .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+            .await;
+        server
+            .turn_start(&mut connection, "grant the session")
+            .await;
+        let request = connection.permissions_request().await;
+        server
+            .answer(
+                &connection,
+                &request,
+                json!({"permissions": {"fileSystem": session_permissions}, "scope": "session"}),
+            )
+            .await;
+        connection.notification("turn/completed").await;
+
+        script.push(request_permissions(
+            "turn-grant",
+            json!({"permissions": {"file_system": turn_permissions}}),
+        ));
+        script.push(call(
+            "exec_command",
+            "exec-call",
+            write_and_cat(&written, "unauthorized"),
+        ));
+        script.push(final_message("done"));
+        let turn_id = server
+            .turn_start(&mut connection, "grant the turn, then write")
+            .await;
+        let request = connection.permissions_request().await;
+        server
+            .answer(
+                &connection,
+                &request,
+                json!({"permissions": {"fileSystem": turn_permissions}, "scope": "turn"}),
+            )
+            .await;
+        connection.notification("turn/completed").await;
+        assert_read_only_refusal(&script, &written);
+        assert!(settings(&config).granted_session_permissions().is_some());
+        assert_eq!(
+            settings(&config).granted_turn_permissions(&RunId::new(&turn_id)),
+            None
+        );
+    }
+}
+
+/// Shadowed reads do not create carveouts: an equally specific write wins, including a baseline
+/// write, and a more specific writable root under a readable ancestor remains writable.
+#[tokio::test]
+async fn effective_write_overrides_still_allow_commands() {
+    for case in ["equal-grant", "more-specific-grant", "equal-baseline"] {
+        let server = Server::start();
+        let outside = tempfile::tempdir().unwrap();
+        let child = outside.path().join("writable");
+        std::fs::create_dir(&child).unwrap();
+        let (file_system, written) = match case {
+            "equal-grant" => (
+                json!({"read": [text(&child)], "write": [text(outside.path()), text(&child)]}),
+                child.join("allowed"),
+            ),
+            "more-specific-grant" => (
+                json!({"read": [text(outside.path())], "write": [text(&child)]}),
+                child.join("allowed"),
+            ),
+            _ => (
+                json!({"read": [text(&server.root())]}),
+                server.root().join("allowed"),
+            ),
+        };
+        let script =
+            run_with_file_system_grant(&server, file_system, write_and_cat(&written, "permitted"))
+                .await;
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            "permitted",
+            "{case}: {:?}",
+            script.last_output("exec-call")
+        );
+    }
+}
+
+/// Seatbelt matches system aliases in their resolved namespace; spelling a parent through /tmp
+/// and its child through /private/tmp must not bypass the read-only carveout check.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn read_only_carveouts_match_system_aliases() {
+    for alias_writes in [true, false] {
+        let server = Server::start();
+        let outside = tempfile::tempdir_in("/tmp").unwrap();
+        let canonical = outside.path().canonicalize().unwrap();
+        let child = canonical.join("readonly");
+        std::fs::create_dir(&child).unwrap();
+        let written = child.join("must-not-exist");
+        let (write, read) = if alias_writes {
+            (outside.path().to_path_buf(), child)
+        } else {
+            (canonical, outside.path().join("readonly"))
+        };
+        let script = run_with_file_system_grant(
+            &server,
+            json!({"read": [text(&read)], "write": [text(&write)]}),
+            write_and_cat(&written, "unauthorized"),
+        )
+        .await;
+        assert_read_only_refusal(&script, &written);
+    }
+}
+
+/// A network grant opens the network to the turn's later commands, which reach a listener on this
+/// host only once it is given.
+#[tokio::test]
+async fn a_network_grant_opens_the_network() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let probe = command(json!({
+        "cmd": format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo network-reached"),
+        "shell": "/bin/bash",
+    }));
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(call("exec_command", "before", probe.clone()));
+    script.push(request_permissions(
+        "permissions-call",
+        json!({"permissions": {"network": {"enabled": true}}}),
+    ));
+    script.push(call("exec_command", "after", probe));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    server
+        .turn_start(&mut connection, "reach the network")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    let before = script.last_output("before").unwrap().to_string();
+    let after = script.last_output("after").unwrap().to_string();
+    assert!(!before.contains("network-reached"), "{before}");
+    assert!(after.contains("network-reached"), "{after}");
+}
+
+/// A command a nested agent runs gets the grant of the turn that owns it.
+#[tokio::test]
+async fn a_nested_command_runs_with_its_turns_grant() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("nested.txt");
+    let helper = AgentSpec::builder()
+        .id(AgentId::new("helper"))
+        .name("helper")
+        .instructions("run commands")
+        .tool(server.host.exec_command_tool().unwrap())
+        .build()
+        .unwrap();
+    let helper: Arc<dyn Tool> = Arc::new(helper.as_tool().build().unwrap());
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(call(
+        "helper",
+        "helper-call",
+        json!({"input": "write the file"}),
+    ));
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        write_and_cat(&written, "nested-grant-ok"),
+    ));
+    script.push(final_message("helper done"));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(
+            &script,
+            on_request(),
+            &connection,
+            vec![server.host.request_permissions_tool().unwrap(), helper],
+        )
+        .await;
+    server.turn_start(&mut connection, "delegate").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "nested-grant-ok"
+    );
+}
+
+/// Codex's `stdin_reviews_retained_grants_after_turn_permissions_expire`: a terminal keeps the
+/// grant it was launched with after its turn's grants end, so input to it asks, showing the grant,
+/// and runs with the grant once approved.
+#[tokio::test]
+async fn stdin_reviews_retained_grants_after_turn_permissions_expire() {
+    let server = Server::start();
+    let allowed = tempfile::tempdir().unwrap();
+    let result = allowed.path().join("result");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "grant",
+        directory_write(allowed.path()),
+    ));
+    script.push(call(
+        "exec_command",
+        "open",
+        command(json!({"cmd": "sh", "yield_time_ms": 300})),
+    ));
+    script.push(final_message("opened"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "open terminal").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(allowed.path(), "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+    let opened = script.last_output("open").unwrap().to_string();
+    let start = opened
+        .find("Session `")
+        .expect("the terminal keeps running")
+        + "Session `".len();
+    let session = opened[start..][..opened[start..].find('`').unwrap()].to_owned();
+
+    let grants = format!(
+        "{{\"network\":null,\"file_system\":{{\"write\":[{}]}}}}",
+        serde_json::to_string(&text(allowed.path())).unwrap()
+    );
+    for (call_id, chars, answer) in [
+        (
+            "denied",
+            "REJECTED=1\n".to_owned(),
+            json!({"decision": "decline"}),
+        ),
+        (
+            "allowed",
+            format!(
+                "test -z \"${{REJECTED-}}\" && printf allowed > '{}'; exit\n",
+                result.display()
+            ),
+            json!({"decision": "accept"}),
+        ),
+    ] {
+        script.push(call("write_stdin", call_id, stdin(&session, &chars)));
+        script.push(final_message(call_id));
+        server.turn_start(&mut connection, call_id).await;
+        let request = connection.command_request().await;
+        let params = &request["params"];
+        assert_eq!(params["kind"], "writeStdin");
+        assert_eq!(params["itemId"], "open");
+        assert_eq!(params["approvalId"], call_id);
+        assert_eq!(
+            params["reason"],
+            format!(
+                "Send input to an existing terminal. This terminal retains additional permissions. The cwd is its launch directory; the terminal's current directory and state may have changed. Retained grants: {grants}."
+            )
+        );
+        assert_eq!(
+            params["additionalPermissions"]["fileSystem"]["write"],
+            json!([text(allowed.path())])
+        );
+        assert_eq!(params["availableDecisions"], json!(["accept", "cancel"]));
+        server.answer(&connection, &request, answer).await;
+        connection.notification("turn/completed").await;
+    }
+
+    assert_eq!(std::fs::read_to_string(&result).unwrap(), "allowed");
+}
+
+/// Codex keys a command's session approval by the permissions it runs with: one approved before a
+/// grant asks again once the grant applies, and one approved with the grant does not ask again
+/// while the grant holds.
+#[tokio::test]
+async fn session_approvals_are_kept_per_grant() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let marker = command(json!({"cmd": "touch marker.txt"}));
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let _ = server
+        .load_with_tools(
+            &script,
+            AskForApproval::UnlessTrusted,
+            &connection,
+            command_tools(&server),
+        )
+        .await;
+
+    script.push(call("exec_command", "before-grant", marker.clone()));
+    script.push(final_message("approved"));
+    server.turn_start(&mut connection, "touch").await;
+    let request = connection.command_request().await;
+    assert_eq!(request["params"]["additionalPermissions"], Value::Null);
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"decision": "acceptForSession"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(call("exec_command", "with-grant", marker.clone()));
+    script.push(final_message("approved again"));
+    server
+        .turn_start(&mut connection, "grant, then touch")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "session"),
+        )
+        .await;
+    let request = connection.command_request().await;
+    assert_eq!(request["params"]["itemId"], "with-grant");
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"decision": "acceptForSession"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    script.push(call("exec_command", "cached", marker.clone()));
+    script.push(final_message("done"));
+    server.turn_start(&mut connection, "touch again").await;
+    connection.notification("turn/completed").await;
+    assert!(
+        connection
+            .drain()
+            .await
+            .iter()
+            .all(|message| { message["method"] != "item/commandExecution/requestApproval" }),
+        "the approval kept with the grant covers the command"
+    );
+    assert!(server.root().join("marker.txt").exists());
+
+    let another = tempfile::tempdir().unwrap();
+    script.push(request_permissions(
+        "more-permissions",
+        directory_write(another.path()),
+    ));
+    script.push(call("exec_command", "wider-grant", marker));
+    script.push(final_message("asked once more"));
+    server
+        .turn_start(&mut connection, "grant more, then touch")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(another.path(), "session"),
+        )
+        .await;
+    let request = connection.command_request().await;
+    assert_eq!(request["params"]["itemId"], "wider-grant");
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    connection.notification("turn/completed").await;
+}
+
+/// Codex's `apply_granted_turn_permissions` leaves a call that leaves the sandbox alone: it asks
+/// for its escalation as it would without a grant, and its request carries no grant.
+#[tokio::test]
+async fn an_escalated_command_takes_no_grant() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(call(
+        "exec_command",
+        "escalated",
+        command(json!({
+            "cmd": "touch escalated.txt",
+            "sandbox_permissions": "require_escalated",
+            "justification": "Do you want to leave the sandbox?",
+        })),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, command_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "escalate").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "turn"),
+        )
+        .await;
+
+    let request = connection.command_request().await;
+    let params = &request["params"];
+    assert_eq!(params["itemId"], "escalated");
+    assert_eq!(params["reason"], "Do you want to leave the sandbox?");
+    assert_eq!(params["additionalPermissions"], Value::Null);
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    connection.notification("turn/completed").await;
+    assert!(server.root().join("escalated.txt").exists());
+}

@@ -36,6 +36,7 @@ pub use self::transforms::{
     materialize_additional_permissions_with_context, merge_permission_profiles,
     normalize_additional_permissions, normalize_additional_permissions_with_context,
 };
+pub(crate) use self::transforms::{resolve_access, resolved_entries};
 
 /// The access an entry gives: Codex's `FileSystemAccessMode`.
 ///
