@@ -77,6 +77,8 @@ use crate::exec_policy::{
     AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyManager,
     FileSystemSandboxKind, SandboxPermissions, prompt_is_rejected_by_policy,
 };
+use crate::permissions::AdditionalPermissionProfile;
+use crate::request_permissions::ThreadPermissions;
 use ra_core::{
     error::{Error, Result},
     item::{CallId, RunItemKind, ToolApproval},
@@ -92,7 +94,7 @@ use ra_exec::sandbox::{
 };
 use ra_exec::session::BackgroundTerminal;
 use ra_protocol::server::{
-    PendingApproval, ReviewDecision, ThreadSettingsAdapter,
+    PendingApproval, ReviewDecision, ThreadServerRequests, ThreadSettingsAdapter,
     protocol::{
         ApprovalsReviewer, AskForApproval, CommandAction, CommandExecutionApprovalDecision,
         CommandExecutionApprovalKind, CommandExecutionRequestApprovalParams,
@@ -127,6 +129,7 @@ pub struct CodingThreadSettings {
     rules_home: Option<PathBuf>,
     command_decisions: Arc<CommandDecisions>,
     approvals: Arc<Mutex<ApprovalStore>>,
+    permissions: Arc<ThreadPermissions>,
 }
 
 impl CodingThreadSettings {
@@ -365,6 +368,29 @@ impl CodingThreadSettings {
     pub const fn sandbox_policy(&self) -> &SandboxPolicy {
         &self.sandbox_policy
     }
+
+    /// The thread's working directory.
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// What `request_permissions` granted the session: Codex's `granted_session_permissions`.
+    #[must_use]
+    pub fn granted_session_permissions(&self) -> Option<AdditionalPermissionProfile> {
+        self.permissions.session()
+    }
+
+    /// What `request_permissions` granted the turn `run_id` while it runs: Codex's
+    /// `granted_turn_permissions`.
+    #[must_use]
+    pub fn granted_turn_permissions(&self, run_id: &RunId) -> Option<AdditionalPermissionProfile> {
+        self.permissions.turn(run_id)
+    }
+
+    pub(crate) fn thread_permissions(&self) -> &ThreadPermissions {
+        &self.permissions
+    }
 }
 
 /// Host-selected permission catalog. Unknown profiles are rejected without changing the thread.
@@ -418,6 +444,7 @@ impl CodingThreadSettingsAdapter {
                 rules_home: None,
                 command_decisions: Arc::new(CommandDecisions::default()),
                 approvals: Arc::default(),
+                permissions: Arc::default(),
             },
             profiles,
         })
@@ -461,11 +488,13 @@ impl CodingThreadSettingsAdapter {
 
     /// Installs the explicitly selected product snapshot on a framework configuration.
     ///
-    /// Each thread initialized gets an approval cache of its own, as each Codex session has.
+    /// Each thread initialized gets an approval cache and permission grants of its own, as each
+    /// Codex session has.
     pub fn initialize(&self, config: RunConfig) -> RunConfig {
         let mut settings = self.initial.clone();
         settings.base_permission = config.permission().clone();
         settings.approvals = Arc::default();
+        settings.permissions = Arc::default();
         install(config, settings)
     }
 
@@ -478,6 +507,7 @@ impl CodingThreadSettingsAdapter {
                 let mut initial = self.initial.clone();
                 initial.base_permission = config.permission().clone();
                 initial.approvals = Arc::default();
+                initial.permissions = Arc::default();
                 initial
             })
     }
@@ -540,8 +570,18 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
             ThreadEvent::TurnComplete { turn_id, .. }
             | ThreadEvent::TurnAborted { turn_id, .. } => {
                 settings.command_decisions.finish_run(&RunId::new(turn_id));
+                settings.permissions.finish_turn(&RunId::new(turn_id));
             }
             _ => {}
+        }
+    }
+
+    fn attach_server_requests(&self, config: &RunConfig, requests: ThreadServerRequests) {
+        if let Some(settings) = config
+            .app_context()
+            .and_then(|value| value.downcast_ref::<CodingThreadSettings>())
+        {
+            settings.permissions.attach(requests);
         }
     }
 

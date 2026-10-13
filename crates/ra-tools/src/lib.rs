@@ -63,6 +63,7 @@ pub mod grep;
 pub mod mcp_ns;
 pub mod memory;
 pub mod read_file;
+pub mod request_permissions;
 pub mod request_user_input;
 mod rooted;
 pub mod sandbox;

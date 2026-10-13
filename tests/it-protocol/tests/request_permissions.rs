@@ -1,0 +1,1116 @@
+//! The coding host's `request_permissions`, as Codex's app-server carries it
+//! (`app-server/tests/suite/v2/request_permissions.rs`, the core suite's `request_permissions.rs`):
+//! the `item/permissions/requestApproval` request a call becomes, the thread waiting on approval
+//! meanwhile, what the model is given of the grant, and where the grant is kept.
+//!
+//! Codex's round trip runs with project roots above its cwd; a coding thread's one project root is
+//! its cwd, so its second request is checked against that root.
+
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use ra_coding::{
+    host::CodingHost,
+    permissions::{AdditionalPermissionProfile, FileSystemPermissions},
+    thread_settings::{CodingThreadSettings, CodingThreadSettingsAdapter},
+};
+use ra_core::{
+    agent::{AgentId, AgentSpec},
+    error::{Error, Result},
+    item::{
+        CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
+        ToolCall, ToolCallOutput,
+    },
+    model::{
+        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
+        ResolvedModel,
+    },
+    session::{SessionId, rollout::RolloutRecorder},
+    state::RunId,
+    tool::{Tool, ToolOutput},
+};
+use ra_protocol::{
+    frame::{
+        JsonRpcError, JsonRpcErrorObject, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+        RequestId,
+    },
+    server::{
+        AppServer, ThreadSettingsAdapter,
+        protocol::{
+            AskForApproval, ClientInfo, InitializeCapabilities, InitializeParams, SandboxPolicy,
+            ThreadPolicyOverrides, TurnStartParams, UserInput,
+        },
+        test_api::ThreadLoader,
+    },
+    transport::{
+        CHANNEL_CAPACITY, ConnectionId, ConnectionOrigin, QueuedOutgoingMessage, TransportEvent,
+        test_api::connection_opened,
+    },
+};
+use ra_runtime::{
+    agent::{AgentBinding, tool::AgentAsTool},
+    runner::RunConfig,
+    thread::AgentThread,
+};
+use ra_session::{
+    RolloutSessionMeta,
+    store::{CreateThreadParams, InMemoryThreadStore, ThreadStore},
+};
+use serde_json::{Value, json};
+use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
+use tokio_util::sync::CancellationToken;
+
+const PATIENCE: Duration = Duration::from_secs(10);
+
+const THREAD: &str = "thread-1";
+
+// ---------------------------------------------------------------------------------------------
+// A scripted model
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Script {
+    responses: Mutex<VecDeque<ModelResponse>>,
+    inputs: Mutex<Vec<Vec<ModelInputItem>>>,
+}
+
+impl Script {
+    fn push(&self, response: ModelResponse) {
+        self.responses.lock().unwrap().push_back(response);
+    }
+
+    /// What the model was last given of `call_id`'s output, parsed as JSON when it is.
+    fn last_output(&self, call_id: &str) -> Option<Value> {
+        let inputs = self.inputs.lock().unwrap();
+        inputs.iter().rev().flatten().find_map(|item| match item {
+            ModelInputItem::ToolCallOutput(output) if output.call_id().as_str() == call_id => {
+                let text = output_text(output);
+                Some(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+            }
+            _ => None,
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.inputs.lock().unwrap().len()
+    }
+}
+
+struct Resolver(Arc<Script>);
+
+impl ModelResolver for Resolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some(model_name.unwrap_or("mock-model").to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::new(ScriptedModel(Arc::clone(&self.0))) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+struct ScriptedModel(Arc<Script>);
+
+#[async_trait]
+impl Model for ScriptedModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.0.inputs.lock().unwrap().push(request.input().to_vec());
+        self.0
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| Error::caller("the model ran out of responses"))
+    }
+}
+
+fn output_text(output: &ToolCallOutput) -> String {
+    ToolOutput::from_stored(output.output())
+        .ok()
+        .flatten()
+        .and_then(|output| output.as_text().map(str::to_owned))
+        .unwrap_or_else(|| match output.output() {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+}
+
+fn final_message(text: &str) -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new(format!("answer-{text}")),
+        RunItemKind::Message(Message::assistant(text, OutputPhase::Final)),
+    )])
+}
+
+fn request_permissions(call_id: &str, arguments: Value) -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new(format!("item-{call_id}")),
+        RunItemKind::ToolCall(ToolCall::new(
+            CallId::new(call_id),
+            "request_permissions",
+            arguments,
+        )),
+    )])
+}
+
+/// Codex's `create_request_permissions_sse_response` arguments.
+fn select_a_workspace_root() -> Value {
+    json!({
+        "reason": "Select a workspace root",
+        "permissions": {"file_system": {"write": [".", "../shared"]}}
+    })
+}
+
+/// What a call granted nothing is given: Codex's empty turn grant.
+fn nothing_granted() -> Value {
+    json!({"permissions": {"network": null, "file_system": null}, "scope": "turn"})
+}
+
+fn on_request() -> AskForApproval {
+    AskForApproval::OnRequest
+}
+
+fn granular(request_permissions: bool) -> AskForApproval {
+    AskForApproval::Granular {
+        sandbox_approval: true,
+        rules: true,
+        skill_approval: true,
+        request_permissions,
+        mcp_elicitations: true,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The server in this process, with a coding thread that may ask for permissions
+// ---------------------------------------------------------------------------------------------
+
+struct Server {
+    events: mpsc::Sender<TransportEvent>,
+    loader: ThreadLoader,
+    store: Arc<InMemoryThreadStore>,
+    _task: JoinHandle<()>,
+    _workspace: tempfile::TempDir,
+    host: CodingHost,
+}
+
+impl Server {
+    fn start() -> Self {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = CodingHost::open(workspace.path()).unwrap();
+        let store = Arc::new(InMemoryThreadStore::new());
+        let server = AppServer::new(std::env::temp_dir().join("rusty-agent-request-permissions"))
+            .unwrap()
+            .with_thread_store(Arc::clone(&store) as Arc<dyn ThreadStore>);
+        let loader = ThreadLoader::new(&server);
+        let (events, transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(server.run(transport_event_rx));
+        Self {
+            events,
+            loader,
+            store,
+            _task: task,
+            _workspace: workspace,
+            host,
+        }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.host.workspace_root().to_path_buf()
+    }
+
+    async fn connect(&self, id: u64) -> Connection {
+        let id = ConnectionId::new(id);
+        let (writer, written) = mpsc::channel(CHANNEL_CAPACITY);
+        self.events
+            .send(connection_opened(
+                id,
+                ConnectionOrigin::WebSocket,
+                writer,
+                Some(CancellationToken::new()),
+            ))
+            .await
+            .unwrap();
+        let mut connection = Connection {
+            id,
+            written,
+            passed: VecDeque::new(),
+            next_id: 1,
+        };
+        let params = InitializeParams::new(ClientInfo::new("client", "0.1.0"))
+            .with_capabilities(InitializeCapabilities::new().with_experimental_api(true));
+        for _ in 0..2 {
+            self.send(
+                &connection,
+                JsonRpcRequest::new(0, "initialize")
+                    .with_params(serde_json::to_value(&params).unwrap()),
+            )
+            .await;
+            connection.next().await;
+        }
+        connection
+    }
+
+    /// Loads a coding thread on `script` under `approval`, whose agent may ask for permissions,
+    /// and returns its configuration, whose settings keep the grants.
+    async fn load(
+        &self,
+        script: &Arc<Script>,
+        approval: AskForApproval,
+        connection: &Connection,
+    ) -> RunConfig {
+        self.load_with_tools(
+            script,
+            approval,
+            connection,
+            vec![self.host.request_permissions_tool().unwrap()],
+        )
+        .await
+    }
+
+    async fn load_with_tools(
+        &self,
+        script: &Arc<Script>,
+        approval: AskForApproval,
+        connection: &Connection,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> RunConfig {
+        let adapter = CodingThreadSettingsAdapter::new(
+            self.host.workspace_root(),
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+        )
+        .unwrap();
+        let config = adapter
+            .prepare(
+                &adapter.initialize(self.host.build_run_config()),
+                &ThreadPolicyOverrides::new().with_approval_policy(approval),
+            )
+            .unwrap();
+        let recorder: Arc<dyn RolloutRecorder> = self
+            .store
+            .create_thread_with(&CreateThreadParams::new(RolloutSessionMeta::new(
+                SessionId::new(THREAD),
+            )))
+            .await
+            .unwrap();
+        let agent = AgentSpec::builder()
+            .id(AgentId::new("coder"))
+            .name("coder")
+            .instructions("code")
+            .tools(tools)
+            .build()
+            .unwrap();
+        let thread = AgentThread::builder(
+            SessionId::new(THREAD),
+            AgentBinding::direct(agent),
+            Arc::new(Resolver(Arc::clone(script))) as Arc<dyn ModelResolver>,
+        )
+        .with_config(config.clone())
+        .with_services(self.host.build_tool_services())
+        .with_rollout_recorder(recorder)
+        .build();
+        self.loader
+            .load_with_adapter(
+                thread,
+                &[connection.id],
+                Some(Arc::new(adapter) as Arc<dyn ThreadSettingsAdapter>),
+            )
+            .await;
+        config
+    }
+
+    async fn send(&self, connection: &Connection, message: impl Into<JsonRpcMessage>) {
+        self.events
+            .send(TransportEvent::IncomingMessage {
+                connection_id: connection.id,
+                message: message.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn request(&self, connection: &mut Connection, method: &str, params: Value) -> i64 {
+        let id = connection.next_id;
+        connection.next_id += 1;
+        self.send(
+            connection,
+            JsonRpcRequest::new(id, method).with_params(params),
+        )
+        .await;
+        id
+    }
+
+    async fn turn_start(&self, connection: &mut Connection, text: &str) -> String {
+        let params = TurnStartParams::new(THREAD, vec![UserInput::text(text)]);
+        let id = self
+            .request(
+                connection,
+                "turn/start",
+                serde_json::to_value(params).unwrap(),
+            )
+            .await;
+        connection.response(id).await["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn answer(&self, connection: &Connection, request: &Value, result: Value) {
+        let id: RequestId = serde_json::from_value(request["id"].clone()).unwrap();
+        self.send(connection, JsonRpcResponse::new(id, result))
+            .await;
+    }
+
+    async fn answer_error(&self, connection: &Connection, request: &Value) {
+        let id: RequestId = serde_json::from_value(request["id"].clone()).unwrap();
+        self.send(
+            connection,
+            JsonRpcError::new(id, JsonRpcErrorObject::internal_error("the user went away")),
+        )
+        .await;
+    }
+}
+
+struct Connection {
+    id: ConnectionId,
+    written: mpsc::Receiver<QueuedOutgoingMessage>,
+    passed: VecDeque<Value>,
+    next_id: i64,
+}
+
+impl Connection {
+    async fn next(&mut self) -> Value {
+        if let Some(message) = self.passed.pop_front() {
+            return message;
+        }
+        let queued = timeout(PATIENCE, self.written.recv())
+            .await
+            .expect("the server writes a message")
+            .expect("the server keeps the write queue");
+        serde_json::to_value(queued.message()).unwrap()
+    }
+
+    async fn until(&mut self, matches: impl Fn(&Value) -> bool) -> Value {
+        if let Some(index) = self.passed.iter().position(&matches) {
+            return self.passed.remove(index).unwrap();
+        }
+        loop {
+            let queued = timeout(PATIENCE, self.written.recv())
+                .await
+                .expect("the server writes the message waited for")
+                .expect("the server keeps the write queue");
+            let message = serde_json::to_value(queued.message()).unwrap();
+            if matches(&message) {
+                return message;
+            }
+            self.passed.push_back(message);
+        }
+    }
+
+    async fn response(&mut self, id: i64) -> Value {
+        let message = self
+            .until(|message| message["id"] == id && message.get("method").is_none())
+            .await;
+        assert!(message.get("result").is_some(), "{message}");
+        message["result"].clone()
+    }
+
+    async fn notification(&mut self, method: &str) -> Value {
+        self.until(|message| message["method"] == method && message.get("id").is_none())
+            .await["params"]
+            .clone()
+    }
+
+    async fn permissions_request(&mut self) -> Value {
+        self.until(|message| {
+            message["method"] == "item/permissions/requestApproval" && message.get("id").is_some()
+        })
+        .await
+    }
+
+    async fn status(&mut self, status: &Value) {
+        self.until(|message| {
+            message["method"] == "thread/status/changed" && message["params"]["status"] == *status
+        })
+        .await;
+    }
+
+    /// Everything written to it so far that a case has not read, once the server has had a moment
+    /// to write what it was going to.
+    async fn drain(&mut self) -> Vec<Value> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut messages: Vec<Value> = self.passed.drain(..).collect();
+        while let Ok(queued) = self.written.try_recv() {
+            messages.push(serde_json::to_value(queued.message()).unwrap());
+        }
+        messages
+    }
+}
+
+fn settings(config: &RunConfig) -> &CodingThreadSettings {
+    config
+        .app_context()
+        .and_then(|value| value.downcast_ref::<CodingThreadSettings>())
+        .expect("a coding thread")
+}
+
+fn writes(paths: Vec<PathBuf>) -> AdditionalPermissionProfile {
+    AdditionalPermissionProfile::new().with_file_system(
+        FileSystemPermissions::from_read_write_roots(None, Some(paths)),
+    )
+}
+
+fn text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// A thread asking for permissions once with `arguments`, the request it sent, and its turn.
+struct Asked {
+    server: Server,
+    connection: Connection,
+    script: Arc<Script>,
+    config: RunConfig,
+    turn_id: String,
+    request: Value,
+}
+
+async fn ask(arguments: Value) -> Asked {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions("call1", arguments));
+    script.push(final_message("done"));
+    let config = server.load(&script, on_request(), &connection).await;
+    let turn_id = server.turn_start(&mut connection, "pick a directory").await;
+    let request = connection.permissions_request().await;
+    Asked {
+        server,
+        connection,
+        script,
+        config,
+        turn_id,
+        request,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The cases
+// ---------------------------------------------------------------------------------------------
+
+fn nested_permission_tool(server: &Server, depth: usize) -> Arc<dyn Tool> {
+    let mut tool = server.host.request_permissions_tool().unwrap();
+    for level in (0..depth).rev() {
+        let name = format!("helper{level}");
+        let agent = AgentSpec::builder()
+            .id(AgentId::new(&name))
+            .name(&name)
+            .instructions("delegate or request permissions")
+            .tool(tool)
+            .build()
+            .unwrap();
+        tool = Arc::new(agent.as_tool().build().unwrap());
+    }
+    tool
+}
+
+fn nested_permission_calls(script: &Script, depth: usize) {
+    for level in 0..depth {
+        script.push(ModelResponse::new(vec![RunItem::new(
+            ItemId::new(format!("helper-item{level}")),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new(format!("helper-call{level}")),
+                format!("helper{level}"),
+                json!({"input": "request permissions"}),
+            )),
+        )]));
+    }
+    script.push(request_permissions(
+        "nested-grant",
+        json!({"permissions": {"file_system": {"write": ["out"]}}}),
+    ));
+    script.push(request_permissions(
+        "nested-wait",
+        json!({"permissions": {"network": {"enabled": true}}}),
+    ));
+    for level in (0..=depth).rev() {
+        script.push(final_message(&format!("done{level}")));
+    }
+}
+
+/// Agent tools share the application's permission state, as they share the reference's context.
+/// The RPC and its grant belong to the thread turn, at any nesting depth.
+#[tokio::test]
+async fn nested_permissions_belong_to_the_thread_turn() {
+    for depth in [1, 2] {
+        for scope in ["turn", "session"] {
+            let server = Server::start();
+            let mut connection = server.connect(1).await;
+            let script = Arc::new(Script::default());
+            nested_permission_calls(&script, depth);
+            let config = server
+                .load_with_tools(
+                    &script,
+                    on_request(),
+                    &connection,
+                    vec![nested_permission_tool(&server, depth)],
+                )
+                .await;
+            let turn_id = server.turn_start(&mut connection, "delegate").await;
+            let request = connection.permissions_request().await;
+            assert_eq!(request["params"]["turnId"], turn_id);
+            assert_eq!(request["params"]["itemId"], "nested-grant");
+            let out = server.root().join("out");
+            server
+                .answer(
+                    &connection,
+                    &request,
+                    json!({"permissions": {"fileSystem": {"write": [text(&out)]}}, "scope": scope}),
+                )
+                .await;
+
+            let waiting = connection.permissions_request().await;
+            assert_eq!(waiting["params"]["turnId"], turn_id);
+            let state = settings(&config);
+            if scope == "turn" {
+                assert_eq!(
+                    state.granted_turn_permissions(&RunId::new(&turn_id)),
+                    Some(writes(vec![out.clone()]))
+                );
+                assert_eq!(state.granted_session_permissions(), None);
+            } else {
+                assert_eq!(
+                    state.granted_session_permissions(),
+                    Some(writes(vec![out.clone()]))
+                );
+                assert_eq!(state.granted_turn_permissions(&RunId::new(&turn_id)), None);
+            }
+            server
+                .answer(&connection, &waiting, json!({"permissions": {}}))
+                .await;
+            connection.notification("turn/completed").await;
+            assert_eq!(
+                script.last_output("nested-grant"),
+                Some(
+                    json!({"permissions": {"network": null, "file_system": {"write": [text(&out)]}}, "scope": scope})
+                )
+            );
+            assert_eq!(state.granted_turn_permissions(&RunId::new(&turn_id)), None);
+
+            script.push(final_message("next-turn"));
+            let next_turn = server.turn_start(&mut connection, "continue").await;
+            connection.notification("turn/completed").await;
+            assert_eq!(
+                state.granted_turn_permissions(&RunId::new(&next_turn)),
+                None
+            );
+            assert_eq!(
+                state.granted_session_permissions(),
+                (scope == "session").then(|| writes(vec![out]))
+            );
+        }
+    }
+}
+
+/// Cancelling the enclosing turn withdraws a nested request and rejects a late grant.
+#[tokio::test]
+async fn interrupting_a_nested_permission_request_withdraws_it() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    nested_permission_calls(&script, 2);
+    let config = server
+        .load_with_tools(
+            &script,
+            on_request(),
+            &connection,
+            vec![nested_permission_tool(&server, 2)],
+        )
+        .await;
+    let turn_id = server.turn_start(&mut connection, "delegate").await;
+    let request = connection.permissions_request().await;
+    let interrupted = server
+        .request(
+            &mut connection,
+            "turn/interrupt",
+            json!({"threadId": THREAD, "turnId": turn_id}),
+        )
+        .await;
+    connection.response(interrupted).await;
+    let resolved = connection.notification("serverRequest/resolved").await;
+    assert_eq!(resolved["requestId"], request["id"]);
+    let turn = connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "interrupted");
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"network": {"enabled": true}}, "scope": "session"}),
+        )
+        .await;
+    connection.drain().await;
+    assert_eq!(script.calls(), 3);
+    assert_eq!(settings(&config).granted_session_permissions(), None);
+    assert_eq!(
+        settings(&config).granted_turn_permissions(&RunId::new(turn_id)),
+        None
+    );
+}
+
+/// Codex rejects clearly foreign absolute paths instead of reinterpreting them as POSIX names.
+#[tokio::test]
+async fn foreign_absolute_permission_paths_are_refused() {
+    for raw in [r"C:\outside", "C:/outside", r"\\server\share\outside"] {
+        for file_system in [
+            json!({"write": [raw]}),
+            json!({"entries": [{"path": {"type": "path", "path": raw}, "access": "read"}]}),
+        ] {
+            let server = Server::start();
+            let mut connection = server.connect(1).await;
+            let script = Arc::new(Script::default());
+            script.push(request_permissions(
+                "call1",
+                json!({"permissions": {"file_system": file_system}}),
+            ));
+            script.push(final_message("done"));
+            let config = server.load(&script, on_request(), &connection).await;
+            server
+                .turn_start(&mut connection, "request a foreign path")
+                .await;
+            let completed = connection
+                .until(|message| {
+                    message["method"] == "turn/completed"
+                        || message["method"] == "item/permissions/requestApproval"
+                })
+                .await;
+            assert_eq!(completed["method"], "turn/completed", "{completed}");
+            assert_eq!(
+                script.last_output("call1"),
+                Some(Value::String(format!(
+                    "path {raw} uses Windows paths, but executor cwd {} uses POSIX paths",
+                    server.root().display()
+                )))
+            );
+            assert_eq!(settings(&config).granted_session_permissions(), None);
+        }
+    }
+}
+
+/// A drive-like relative name and a POSIX absolute name remain native POSIX paths.
+#[tokio::test]
+async fn ambiguous_permission_paths_keep_posix_semantics() {
+    let asked = ask(json!({"permissions": {"file_system": {"write": ["C:relative", "/C:/outside", "//server/share"]}}})).await;
+    assert_eq!(
+        asked.request["params"]["permissions"]["fileSystem"]["write"],
+        json!([
+            text(&asked.server.root().join("C:relative")),
+            "/C:/outside",
+            "/server/share"
+        ])
+    );
+}
+
+/// Codex's `request_permissions_round_trip`: the request names the call, its turn and cwd, carries
+/// the requested paths resolved against the cwd, and the thread waits on approval meanwhile; the
+/// grant is kept for the turn and the model is given it, narrowed to what was requested; the last
+/// request is reported resolved before the turn completes, and the turn's grant goes with it.
+#[tokio::test]
+async fn request_permissions_round_trip() {
+    let server = Server::start();
+    let root = server.root();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let project_root_entry = json!({
+        "path": {"type": "special", "value": {"kind": "project_roots", "subpath": "output"}},
+        "access": "write"
+    });
+    script.push(request_permissions("call1", select_a_workspace_root()));
+    script.push(request_permissions(
+        "call2",
+        json!({"permissions": {"file_system": {"entries": [project_root_entry]}}}),
+    ));
+    script.push(final_message("done"));
+    let config = server.load(&script, on_request(), &connection).await;
+    let turn_id = server.turn_start(&mut connection, "pick a directory").await;
+
+    let request = connection.permissions_request().await;
+    let shared = root.parent().unwrap().join("shared");
+    let params = &request["params"];
+    assert_eq!(params["threadId"], THREAD);
+    assert_eq!(params["turnId"], turn_id.as_str());
+    assert_eq!(params["itemId"], "call1");
+    assert_eq!(params["environmentId"], "local");
+    assert_eq!(params["cwd"], text(&root));
+    assert_eq!(params["reason"], "Select a workspace root");
+    assert!(params["startedAtMs"].is_i64());
+    assert_eq!(
+        params["permissions"]["fileSystem"],
+        json!({
+            "read": null,
+            "write": [text(&root), text(&shared)],
+            "entries": [
+                {"path": {"type": "path", "path": text(&root)}, "access": "write"},
+                {"path": {"type": "path", "path": text(&shared)}, "access": "write"},
+            ],
+        })
+    );
+    connection
+        .status(&json!({"type": "active", "activeFlags": ["waitingOnApproval"]}))
+        .await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"fileSystem": {"write": [text(&root)]}}, "scope": "turn"}),
+        )
+        .await;
+
+    let request = connection.permissions_request().await;
+    assert_eq!(request["params"]["itemId"], "call2");
+    assert_eq!(
+        settings(&config).granted_turn_permissions(&RunId::new(&turn_id)),
+        Some(writes(vec![root.clone()])),
+        "the first grant is kept for the turn"
+    );
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"fileSystem": {"entries": [
+                project_root_entry,
+                {"path": {"type": "path", "path": text(&root.join("output"))}, "access": "write"},
+            ]}}}),
+        )
+        .await;
+    let mut saw_resolved = false;
+    loop {
+        let message = connection.next().await;
+        match message["method"].as_str() {
+            Some("serverRequest/resolved") => {
+                saw_resolved |= message["params"]["requestId"] == request["id"];
+            }
+            Some("turn/completed") => {
+                assert!(saw_resolved, "serverRequest/resolved should arrive first");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        script.last_output("call1"),
+        Some(
+            json!({"permissions": {"network": null, "file_system": {"write": [text(&root)]}}, "scope": "turn"})
+        )
+    );
+    assert_eq!(
+        script.last_output("call2"),
+        Some(
+            json!({"permissions": {"network": null, "file_system": {"write": [text(&root.join("output"))]}}, "scope": "turn"})
+        )
+    );
+    assert_eq!(
+        settings(&config).granted_turn_permissions(&RunId::new(&turn_id)),
+        None,
+        "a turn's grant ends with it"
+    );
+    assert_eq!(settings(&config).granted_session_permissions(), None);
+}
+
+/// A grant for the session outlives its turn, and network access is given only when both asked
+/// for and granted.
+#[tokio::test]
+async fn a_session_grant_outlives_its_turn() {
+    let mut asked = ask(json!({"permissions": {
+        "network": {"enabled": true},
+        "file_system": {"read": ["data"]},
+    }}))
+    .await;
+    let root = asked.server.root();
+    asked
+        .server
+        .answer(
+            &asked.connection,
+            &asked.request,
+            json!({
+                "permissions": {"network": {"enabled": true}, "fileSystem": {"read": [text(&root.join("data"))]}},
+                "scope": "session",
+            }),
+        )
+        .await;
+    asked.connection.notification("turn/completed").await;
+
+    let granted = AdditionalPermissionProfile::new()
+        .with_network(ra_coding::permissions::NetworkPermissions::new(Some(true)))
+        .with_file_system(FileSystemPermissions::from_read_write_roots(
+            Some(vec![root.join("data")]),
+            None,
+        ));
+    assert_eq!(
+        settings(&asked.config).granted_session_permissions(),
+        Some(granted)
+    );
+    assert_eq!(
+        settings(&asked.config).granted_turn_permissions(&RunId::new(&asked.turn_id)),
+        None
+    );
+    assert_eq!(
+        asked.script.last_output("call1"),
+        Some(json!({
+            "permissions": {"network": {"enabled": true}, "file_system": {"read": [text(&root.join("data"))]}},
+            "scope": "session",
+        }))
+    );
+}
+
+/// Codex's `request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled`,
+/// and the same under `never`: nobody is asked, and nothing is granted.
+#[tokio::test]
+async fn request_permissions_is_auto_denied_when_its_prompts_are_off() {
+    for approval in [granular(false), AskForApproval::Never] {
+        let server = Server::start();
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(request_permissions("call1", select_a_workspace_root()));
+        script.push(final_message("done"));
+        let config = server.load(&script, approval, &connection).await;
+        server.turn_start(&mut connection, "pick a directory").await;
+        connection.notification("turn/completed").await;
+
+        assert!(
+            connection
+                .drain()
+                .await
+                .iter()
+                .all(|message| message["method"] != "item/permissions/requestApproval"),
+            "nobody is asked under {approval:?}"
+        );
+        assert_eq!(script.last_output("call1"), Some(nothing_granted()));
+        assert_eq!(settings(&config).granted_session_permissions(), None);
+    }
+}
+
+/// Granular approval that lets permission requests prompt asks as `on-request` does.
+#[tokio::test]
+async fn granular_approval_with_permission_prompts_asks() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions("call1", select_a_workspace_root()));
+    script.push(final_message("done"));
+    let _ = server.load(&script, granular(true), &connection).await;
+    server.turn_start(&mut connection, "pick a directory").await;
+
+    let request = connection.permissions_request().await;
+    assert_eq!(request["params"]["itemId"], "call1");
+}
+
+/// A request the client answers with an error grants nothing, for the turn, and is reported
+/// resolved.
+#[tokio::test]
+async fn an_error_answer_grants_nothing() {
+    let mut asked = ask(select_a_workspace_root()).await;
+    asked
+        .server
+        .answer_error(&asked.connection, &asked.request)
+        .await;
+    let resolved = asked
+        .connection
+        .notification("serverRequest/resolved")
+        .await;
+    assert_eq!(resolved["requestId"], asked.request["id"]);
+    asked.connection.notification("turn/completed").await;
+
+    assert_eq!(asked.script.last_output("call1"), Some(nothing_granted()));
+}
+
+/// A grant naming a path that is not an absolute local path fails the turn, as Codex's handler
+/// does when it cannot localize a granted path: the error is reported, the turn is interrupted,
+/// and the model is not called again.
+#[tokio::test]
+async fn an_unlocalizable_grant_fails_the_turn() {
+    let mut asked = ask(select_a_workspace_root()).await;
+    asked
+        .server
+        .answer(
+            &asked.connection,
+            &asked.request,
+            json!({"permissions": {"fileSystem": {"write": ["relative/out"]}}, "scope": "turn"}),
+        )
+        .await;
+
+    let error = asked.connection.notification("error").await;
+    assert_eq!(error["turnId"], asked.turn_id.as_str());
+    assert!(
+        error["error"]["message"].as_str().unwrap().starts_with(
+            "failed to localize granted filesystem paths: invalid native path `relative/out`"
+        ),
+        "{error}"
+    );
+    let turn = asked.connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "interrupted", "{turn}");
+    assert_eq!(asked.script.calls(), 1, "the model is not called again");
+}
+
+/// A grant asking for strict automatic review grants nothing: for a session, as Codex refuses it,
+/// and for a turn, since Codex's reviewer is not ported.
+#[tokio::test]
+async fn a_grant_asking_for_strict_review_grants_nothing() {
+    for scope in ["turn", "session"] {
+        let mut asked = ask(select_a_workspace_root()).await;
+        let root = asked.server.root();
+        asked
+            .server
+            .answer(
+                &asked.connection,
+                &asked.request,
+                json!({
+                    "permissions": {"fileSystem": {"write": [text(&root)]}},
+                    "scope": scope,
+                    "strictAutoReview": true,
+                }),
+            )
+            .await;
+        asked.connection.notification("turn/completed").await;
+
+        assert_eq!(
+            asked.script.last_output("call1"),
+            Some(nothing_granted()),
+            "{scope}"
+        );
+        assert_eq!(settings(&asked.config).granted_session_permissions(), None);
+    }
+}
+
+/// A grant the request does not cover is dropped: the model is given only the part requested.
+#[tokio::test]
+async fn a_grant_beyond_the_request_is_narrowed() {
+    let mut asked = ask(json!({"permissions": {"file_system": {"write": ["out"]}}})).await;
+    let root = asked.server.root();
+    asked
+        .server
+        .answer(
+            &asked.connection,
+            &asked.request,
+            json!({"permissions": {
+                "network": {"enabled": true},
+                "fileSystem": {"write": [text(&root), text(&root.join("out/child"))]},
+            }}),
+        )
+        .await;
+    asked.connection.notification("turn/completed").await;
+
+    assert_eq!(
+        asked.script.last_output("call1"),
+        Some(
+            json!({"permissions": {"network": null, "file_system": {"write": [text(&root.join("out/child"))]}}, "scope": "turn"})
+        )
+    );
+}
+
+/// A turn interrupted while the request waits withdraws it, and it is reported resolved.
+#[tokio::test]
+async fn interrupting_the_turn_withdraws_the_request() {
+    let mut asked = ask(select_a_workspace_root()).await;
+    let interrupted = asked
+        .server
+        .request(
+            &mut asked.connection,
+            "turn/interrupt",
+            json!({"threadId": THREAD, "turnId": asked.turn_id}),
+        )
+        .await;
+    asked.connection.response(interrupted).await;
+    let resolved = asked
+        .connection
+        .notification("serverRequest/resolved")
+        .await;
+    assert_eq!(resolved["requestId"], asked.request["id"]);
+    let turn = asked.connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "interrupted", "{turn}");
+    assert_eq!(asked.script.calls(), 1, "the model is not called again");
+}
+
+/// Calls Codex's handler refuses are refused with its words, and nobody is asked.
+#[tokio::test]
+async fn malformed_calls_are_refused() {
+    for (arguments, refusal) in [
+        (
+            json!({"environment_id": "remote", "permissions": {"network": {"enabled": true}}}),
+            "unknown turn environment id `remote`".to_owned(),
+        ),
+        (
+            json!({"permissions": {}}),
+            "request_permissions requires at least one permission".to_owned(),
+        ),
+        (
+            json!({"permissions": {"network": {}}}),
+            "request_permissions requires at least one permission".to_owned(),
+        ),
+        (
+            json!({"permissions": {"file_system": {"entries": [
+                {"path": {"type": "glob_pattern", "pattern": "**/*.env"}, "access": "read"}
+            ]}}}),
+            "glob file system permissions only support deny-read entries".to_owned(),
+        ),
+    ] {
+        let server = Server::start();
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(request_permissions("call1", arguments.clone()));
+        script.push(final_message("done"));
+        let _ = server.load(&script, on_request(), &connection).await;
+        server.turn_start(&mut connection, "pick a directory").await;
+        connection.notification("turn/completed").await;
+
+        assert!(
+            connection
+                .drain()
+                .await
+                .iter()
+                .all(|message| message["method"] != "item/permissions/requestApproval"),
+            "nobody is asked for {arguments}"
+        );
+        assert_eq!(
+            script.last_output("call1"),
+            Some(Value::String(refusal)),
+            "{arguments}"
+        );
+    }
+}
+
+/// Arguments that do not parse are refused with the parser's words.
+#[tokio::test]
+async fn unparseable_arguments_are_refused() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "call1",
+        json!({"permissions": {"file_system": {"write": ["out"]}, "camera": true}}),
+    ));
+    script.push(final_message("done"));
+    let _ = server.load(&script, on_request(), &connection).await;
+    server.turn_start(&mut connection, "pick a directory").await;
+    connection.notification("turn/completed").await;
+
+    let Some(Value::String(refusal)) = script.last_output("call1") else {
+        panic!("the call is refused");
+    };
+    assert!(
+        refusal.starts_with("failed to parse function arguments: "),
+        "{refusal}"
+    );
+}

@@ -30,6 +30,7 @@ pub mod host;
 pub mod permissions;
 pub mod profile;
 pub mod prompt;
+pub(crate) mod request_permissions;
 pub mod shell_command;
 pub mod thread_factory;
 pub mod thread_items;
@@ -43,3 +44,19 @@ pub use host::CodingHost;
 pub use profile::CodingProfile;
 
 pub mod thread_settings;
+
+/// Controlled executor-path context for the external integration-test workspace.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod request_permissions_test_api {
+    use crate::permissions::FileSystemSandboxPolicyContext;
+    use serde_json::Value;
+
+    /// Resolves a permission path with an explicitly supplied executor home, including no home.
+    pub fn resolve_path(
+        value: &mut Value,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> Result<(), String> {
+        crate::request_permissions::resolve_permission_path_string(value, context)
+    }
+}

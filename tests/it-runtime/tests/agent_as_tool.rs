@@ -234,6 +234,7 @@ struct ProbeTool {
     options: ToolOptions,
     output: String,
     seen_tool_input: SeenToolInput,
+    seen_run_ids: Arc<Mutex<Vec<(RunId, RunId)>>>,
     started: Arc<tokio::sync::Notify>,
     hang: bool,
     dropped: Arc<AtomicBool>,
@@ -251,6 +252,7 @@ impl ProbeTool {
             options: ToolOptions::default(),
             output: output.to_owned(),
             seen_tool_input: Arc::new(Mutex::new(Vec::new())),
+            seen_run_ids: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(tokio::sync::Notify::new()),
             hang: false,
             dropped: Arc::new(AtomicBool::new(false)),
@@ -281,6 +283,10 @@ impl Tool for ProbeTool {
     }
 
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.seen_run_ids.lock().unwrap().push((
+            context.run().run_id().clone(),
+            ra_runtime::agent::tool::current_root_run_id().expect("a dispatched tool has a run"),
+        ));
         self.seen_tool_input
             .lock()
             .unwrap()
@@ -1034,6 +1040,105 @@ fn approve_all(result: &RunResult, always: bool) -> RunState {
         state.approve(&item, always).unwrap();
     }
     state
+}
+
+/// A resumed nested call retains its enclosing run identity through every delegation level.
+#[tokio::test]
+async fn enclosing_run_identity_survives_deep_nested_approval_resume() {
+    assert_eq!(ra_runtime::agent::tool::current_root_run_id(), None);
+    let guarded = gated_probe("guarded", "approved");
+    let seen = Arc::clone(&guarded.seen_run_ids);
+    let inner = AgentSpec::builder()
+        .id(AgentId::new("inner"))
+        .name("inner")
+        .tool(Arc::new(guarded))
+        .build()
+        .unwrap();
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("nested"))
+        .name("nested")
+        .tool(Arc::new(inner.as_tool().build().unwrap()))
+        .build()
+        .unwrap();
+    let parent = orchestrator(nested.as_tool().build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p1", "pcall", "nested", json!({"input": "delegate"})),
+        tool_call("n1", "ncall", "inner", json!({"input": "request approval"})),
+        tool_call("i1", "icall", "guarded", json!({})),
+        final_message("i2", "inner done"),
+        final_message("n2", "nested done"),
+        final_message("p2", "done"),
+    ]);
+    let first = Runner::run(request(Arc::clone(&parent), &resolver))
+        .await
+        .unwrap();
+    assert_eq!(interruptions(&first).len(), 1);
+    assert!(seen.lock().unwrap().is_empty());
+    let checkpoint = serde_json::to_value(approve_all(&first, false)).unwrap();
+    let restored: RunState = serde_json::from_value(checkpoint).unwrap();
+    let resumed = Runner::run(resume(parent, &resolver, restored))
+        .await
+        .unwrap();
+    assert_eq!(resumed.final_text(), "done");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_ne!(seen[0].0, RunId::new("run-parent"));
+    assert_eq!(seen[0].1, RunId::new("run-parent"));
+    assert_eq!(ra_runtime::agent::tool::current_root_run_id(), None);
+}
+
+/// A recorded parent alone does not place an independent run in the parent's tool invocation.
+#[tokio::test]
+async fn independently_started_run_keeps_its_own_enclosing_identity() {
+    let probe = ProbeTool::new("probe", "observed");
+    let seen = Arc::clone(&probe.seen_run_ids);
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("independent"))
+        .name("independent")
+        .tool(Arc::new(probe))
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p1", "call", "probe", json!({})),
+        final_message("p2", "done"),
+    ]);
+    Runner::run(
+        request(agent, &resolver)
+            .with_parent_run_id(RunId::new("another-run"))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(RunId::new("run-parent"), RunId::new("run-parent"))]
+    );
+}
+
+/// Streaming a nested run moves it to a task but keeps the owning invocation's identity.
+#[tokio::test]
+async fn streamed_agent_tool_keeps_the_enclosing_run_identity() {
+    let probe = ProbeTool::new("probe", "observed");
+    let seen = Arc::clone(&probe.seen_run_ids);
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("nested"))
+        .name("nested")
+        .tool(Arc::new(probe))
+        .build()
+        .unwrap();
+    let (handler, _) = recording();
+    let parent = orchestrator(nested.as_tool().on_stream(handler).build().unwrap());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p1", "pcall", "nested", json!({"input": "delegate"})),
+        tool_call("n1", "ncall", "probe", json!({})),
+        final_message("n2", "nested done"),
+        final_message("p2", "done"),
+    ]);
+    Runner::run(request(parent, &resolver)).await.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_ne!(seen[0].0, RunId::new("run-parent"));
+    assert_eq!(seen[0].1, RunId::new("run-parent"));
 }
 
 fn two_calls(first: &str, second: &str) -> ModelResponse {

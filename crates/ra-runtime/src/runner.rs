@@ -1272,8 +1272,10 @@ impl Runner {
         let sandbox = sandbox_runtime(&request);
         let supervised = sandbox.enabled().then(|| Arc::clone(&sandbox));
         let task = tokio::spawn(
-            async move { Box::pin(run_loop(request, Some(sender), sandbox)).await }
-                .instrument(span),
+            crate::agent::tool::parent::carry(async move {
+                Box::pin(run_loop(request, Some(sender), sandbox)).await
+            })
+            .instrument(span),
         );
         RunStream::new(receiver, task, guard, supervised)
     }
@@ -1468,6 +1470,10 @@ async fn run_loop(
         request.config.clone(),
         request.app_context.clone(),
         request.run_id.clone(),
+        request
+            .state
+            .parent_run_id()
+            .filter(|_| request.nested_spend.is_some()),
         Arc::clone(request.agent.public()),
         request.services.clone(),
         request.event_seqs.clone(),

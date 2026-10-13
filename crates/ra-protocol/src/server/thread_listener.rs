@@ -57,6 +57,7 @@ use super::{
         OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender,
         now_unix_timestamp_ms,
     },
+    permission_requests::request_permissions,
     protocol::{
         ERROR_METHOD, ErrorNotification, ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD,
         ItemCompletedNotification, ItemStartedNotification, THREAD_CLOSED_METHOD,
@@ -482,6 +483,35 @@ async fn handle_thread_listener_command(
                 outgoing,
                 &context.thread_watch,
                 thread_id,
+            )
+            .await;
+        }
+        ThreadListenerCommand::RequestPermissions {
+            params,
+            response_tx,
+        } => {
+            // A cancelled call or a turn that already ended must not leave a new pending request.
+            if response_tx.is_closed()
+                || thread_state.lock().await.active_turn_id() != Some(params.turn_id())
+            {
+                return;
+            }
+            let thread_id = loaded.thread_id();
+            let outgoing = ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(&context.outgoing),
+                context
+                    .outgoing
+                    .thread_state()
+                    .subscribed_connection_ids(thread_id),
+                thread_id.clone(),
+            );
+            request_permissions(
+                params,
+                response_tx,
+                outgoing,
+                &context.thread_watch,
+                loaded.clone(),
+                context.outgoing.thread_state().thread_state(thread_id),
             )
             .await;
         }

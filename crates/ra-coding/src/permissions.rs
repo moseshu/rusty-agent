@@ -23,7 +23,7 @@
 //! - [`AbsolutePathBufGuard`] retains Codex's synchronous base and home deserialization scopes. It
 //!   is thread-bound so Rust async hosts cannot move its thread-local state to another worker.
 
-mod path;
+pub(crate) mod path;
 mod transforms;
 
 use std::{num::NonZeroUsize, path::PathBuf};

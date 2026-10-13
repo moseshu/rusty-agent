@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::{
     approvals::ReviewDecision,
+    permission_requests::ThreadServerRequests,
     protocol::{ServerRequestPayload, ThreadPolicyOverrides},
 };
 
@@ -92,6 +93,11 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
     fn on_thread_event(&self, config: &RunConfig, event: &ThreadEvent) {
         let _ = (config, event);
     }
+
+    /// Hands the product of a thread just loaded with `config` the way to ask its client: Codex's
+    /// session reaching its app server. The product keeps it for requests of its own, such as
+    /// `item/permissions/requestApproval`. The default keeps nothing.
+    fn attach_server_requests(&self, _config: &RunConfig, _requests: ThreadServerRequests) {}
 
     /// The request asking the client to approve `pending`, made with the configuration of the
     /// turn whose run stopped on it: `item/commandExecution/requestApproval` or

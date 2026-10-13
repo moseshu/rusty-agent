@@ -8,9 +8,9 @@
 //! across the task spawn each tool dispatch makes, and narrows it to the call's own cancellation
 //! scope immediately around [`Tool::call`](ra_core::tool::Tool::call).
 //!
-//! Nothing outside this crate can read it. A tool invoked directly — not through the runner's
-//! dispatch — finds no parent here, which [`super::AgentTool`] reports as a caller error rather
-//! than guessing a model provider.
+//! Only the enclosing run identity is exposed outside this crate. A tool invoked directly, outside
+//! the runner's dispatch, finds no parent here, which [`super::AgentTool`] reports as a caller error
+//! rather than guessing a model provider.
 //!
 //! The narrowing also carries, for a call the parent is resuming, the checkpoint of the nested run
 //! that call paused on. The reference finds that state in its registry by tool-call identity; here
@@ -52,6 +52,7 @@ struct ParentRunEnvironment {
     config: RunConfig,
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     run_id: RunId,
+    root_run_id: RunId,
     services: ToolServices,
     /// The run's host event sequence, which events the control plane records for it draw from.
     event_seqs: EventSeqAllocator,
@@ -82,18 +83,25 @@ impl ParentRun {
         config: RunConfig,
         app_context: Option<Arc<dyn Any + Send + Sync>>,
         run_id: RunId,
+        parent_run_id: Option<&RunId>,
         agent: Arc<AgentSpec>,
         services: ToolServices,
         event_seqs: EventSeqAllocator,
         agent_tree: Option<AgentTreeRef>,
         spend: Arc<RunSpend>,
     ) -> Self {
+        // Only agent-tool runs inherit this identity. Background agents have independent runs,
+        // even when their checkpoints record a parent for hooks and communication.
+        let root_run_id = Self::current()
+            .filter(|parent| Some(parent.run_id()) == parent_run_id)
+            .map_or_else(|| run_id.clone(), |parent| parent.run.root_run_id.clone());
         Self {
             run: Arc::new(ParentRunEnvironment {
                 model_resolver,
                 config,
                 app_context,
                 run_id,
+                root_run_id,
                 services,
                 event_seqs,
                 agent_tree,
@@ -201,6 +209,11 @@ impl ParentRun {
     pub(crate) fn nested_resume(&self) -> Option<&RunState> {
         self.resume.as_deref()
     }
+}
+
+/// The outermost run enclosing this agent-tool invocation, if a runner installed one.
+pub(super) fn current_root_run_id() -> Option<RunId> {
+    ParentRun::current().map(|parent| parent.run.root_run_id.clone())
 }
 
 /// Carries the current run's environment into a future that is about to be spawned.

@@ -17,8 +17,8 @@
 //! `thread/start` or `thread/resume` was in flight is not left subscribed. A thread's listener
 //! also takes commands, which it carries out between the thread's events: Codex's
 //! `ThreadListenerCommand`, including attaching a connection to a loaded thread for
-//! `thread/resume`. Questions use the same queue so they follow their turn's start without being
-//! recorded in its rollout.
+//! `thread/resume`. Questions and permission requests use the same queue so they follow their turn's
+//! start without being recorded in its rollout.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -33,7 +33,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     outgoing::ConnectionRequestId,
     protocol::{
-        MessagePhase, Thread, ThreadItem, ThreadResumeInitialTurnsPageParams, ThreadSettingsRecord,
+        MessagePhase, PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse, Thread,
+        ThreadItem, ThreadResumeInitialTurnsPageParams, ThreadSettingsRecord,
         ToolRequestUserInputParams, Turn, TurnError, TurnStatus,
     },
     thread_history::{ItemChange, ThreadHistoryBuilder, TurnEnding},
@@ -65,6 +66,12 @@ pub(crate) enum ThreadListenerCommand {
     RequestUserInput {
         params: ToolRequestUserInputParams,
         response_tx: tokio::sync::oneshot::Sender<RequestUserInputResponse>,
+    },
+    /// Asks for permissions after the listener has processed the preceding turn events. The grant
+    /// goes to the waiting product; dropping its receiver withdraws a request not yet sent.
+    RequestPermissions {
+        params: PermissionsRequestApprovalParams,
+        response_tx: tokio::sync::oneshot::Sender<PermissionsRequestApprovalResponse>,
     },
     /// Answers a `thread/resume` of the loaded thread and subscribes its connection, then tells
     /// the caller it is done.

@@ -60,6 +60,12 @@ impl<'a> FileSystemSandboxPolicyContext<'a> {
     pub const fn cwd(&self) -> &'a Path {
         self.cwd
     }
+
+    /// The home directory a `~` names, if known.
+    #[must_use]
+    pub const fn user_home_dir(&self) -> Option<&'a Path> {
+        self.user_home_dir
+    }
 }
 
 /// Checks a profile without knowing where it applies: Codex's `normalize_additional_permissions`.

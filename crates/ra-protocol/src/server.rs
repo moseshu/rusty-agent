@@ -31,8 +31,8 @@
 //! `serverRequest/resolved` — except for a dynamic tool call's, which Codex does not report. A
 //! connection that attaches to the thread later is sent the requests still waiting. What the
 //! server makes of each answer follows Codex's handlers, failing closed. Approvals, dynamic tool
-//! calls and questions for the user are raised from the turns; permission requests are still to be
-//! connected.
+//! calls and questions for the user are raised from the turns; a thread's product asks for permissions
+//! through the [`ThreadServerRequests`] it is handed.
 //!
 //! # Lifecycle
 //!
@@ -55,8 +55,7 @@
 //! Codex's loop also recovers the threads of its daemon, attaches the threads its agents spawn to
 //! every connection and reports the status of remote control; none of it is ported.
 
-// Nothing raises permission requests yet; the tests reach their answers through `test_api`
-// meanwhile.
+// The decoders of a bare decision are reached only by the tests, through `test_api`.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod answers;
 mod approval_requests;
@@ -69,6 +68,7 @@ mod dynamic_tools;
 mod image_url;
 mod json_schema;
 mod outgoing;
+mod permission_requests;
 mod processor;
 pub mod protocol;
 mod request_serialization;
@@ -90,6 +90,7 @@ mod user_input_requests;
 
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
+pub use self::permission_requests::ThreadServerRequests;
 pub use self::settings_adapter::{PendingApproval, ThreadSettingsAdapter};
 pub use self::thread_factory::{PreparedThread, ThreadFactory, ThreadFactoryRequest, ThreadOrigin};
 pub use self::tool_items::{ThreadToolItemEvent, ThreadToolItems};
@@ -891,6 +892,12 @@ pub mod test_api {
                 terminals,
                 Arc::default(),
             );
+            if let Some(adapter) = &loaded.adapter {
+                adapter.attach_server_requests(
+                    &loaded.run_config(),
+                    super::ThreadServerRequests::new(outgoing, loaded.thread_id()),
+                );
+            }
             if let Err(error) =
                 ensure_listener_task_running(&self.processor.listener_context(), &loaded).await
             {

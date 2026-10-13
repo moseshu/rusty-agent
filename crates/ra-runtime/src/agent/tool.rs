@@ -78,6 +78,17 @@ mod input;
 pub(crate) mod parent;
 mod stream;
 
+/// Returns the run enclosing the current invocation, including through nested agent tools.
+///
+/// A background agent has its own root. The identity follows tool dispatch and is reconstructed
+/// from the enclosing invocation when a paused agent tool resumes. Product tools can use it to
+/// associate shared application state with the owning turn without changing `RunContext`.
+/// Outside a runner this returns `None`.
+#[must_use]
+pub fn current_root_run_id() -> Option<ra_core::state::RunId> {
+    parent::current_root_run_id()
+}
+
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;

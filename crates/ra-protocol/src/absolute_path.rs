@@ -22,6 +22,21 @@ pub(crate) fn from_absolute_path(path: &Path) -> io::Result<PathBuf> {
     absolutize(&expanded)
 }
 
+/// `path` made absolute and normalized, refused unless it is absolute once a leading `~` is
+/// expanded: Codex's `AbsolutePathBuf::from_absolute_path_checked`. Never reads the current
+/// directory.
+pub(crate) fn from_absolute_path_checked(path: &Path) -> io::Result<PathBuf> {
+    let expanded = maybe_expand_home_directory(path);
+    let expanded = normalize_path_for_platform(&expanded);
+    if !expanded.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not absolute: {}", path.display()),
+        ));
+    }
+    absolutize(&expanded)
+}
+
 fn maybe_expand_home_directory(path: &Path) -> PathBuf {
     if let Some(path_str) = path.to_str()
         && let Some(rest) = path_str.strip_prefix('~')

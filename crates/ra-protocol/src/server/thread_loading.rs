@@ -75,6 +75,7 @@ use super::{
     },
     dynamic_tools::validate_dynamic_tools,
     outgoing::{ConnectionRequestId, ServerNotification, now_unix_timestamp_ms},
+    permission_requests::attach_server_requests,
     protocol::{
         ApprovalsReviewer, AskForApproval, DynamicToolSpec, THREAD_STARTED_METHOD, Thread,
         ThreadForkParams, ThreadForkResponse, ThreadHistoryMode, ThreadLoadedListParams,
@@ -185,6 +186,7 @@ impl ThreadRequestProcessor {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
             })?;
         let builder = install_user_input(builder, &self.outgoing);
+        attach_server_requests(&builder, adapter.as_deref(), &self.outgoing);
         let builder = match &store {
             Some(store) => {
                 let meta = new_session_meta(
@@ -336,7 +338,9 @@ impl ThreadRequestProcessor {
                     )));
                 }
             };
-        let builder = install_user_input(builder, &self.outgoing)
+        let builder = install_user_input(builder, &self.outgoing);
+        attach_server_requests(&builder, adapter.as_deref(), &self.outgoing);
+        let builder = builder
             .with_history(reconstruction.history().to_vec())
             .with_rollout_recorder(recorder);
         let info = LoadedThreadInfo {
@@ -463,6 +467,7 @@ impl ThreadRequestProcessor {
                 JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
             })?;
         let builder = install_user_input(builder, &self.outgoing);
+        attach_server_requests(&builder, adapter.as_deref(), &self.outgoing);
         let snapshot = ForkThreadParams::new(ForkSnapshot::Interrupted);
         let (builder, fork_records) = if params.ephemeral {
             let fork_records = snapshot

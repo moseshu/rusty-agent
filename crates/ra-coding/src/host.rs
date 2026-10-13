@@ -182,6 +182,21 @@ impl CodingHost {
         TodoCapability::new()
     }
 
+    /// The `request_permissions` tool, asking the client of the thread it runs in. Codex offers it
+    /// only behind its `request_permissions_tool` feature, which is off by default; a host that
+    /// wants it adds it to its agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the tool's identity or schema cannot be built.
+    pub fn request_permissions_tool(&self) -> ra_core::error::Result<Arc<dyn ra_core::tool::Tool>> {
+        Ok(Arc::new(
+            ra_tools::request_permissions::RequestPermissionsTool::new(Arc::new(
+                crate::request_permissions::CodingPermissionRequests,
+            ))?,
+        ))
+    }
+
     /// Creates the workspace-rooted execution capability on this host's session manager.
     ///
     /// The manager is this host's rather than the capability's own, so the sessions an agent starts
