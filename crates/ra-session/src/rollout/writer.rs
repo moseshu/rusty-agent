@@ -258,7 +258,8 @@ impl RolloutChildAnchor {
 ///
 /// The rollout of an agent spawned in an agent tree also says where it came from, as Codex's does
 /// with its `ThreadSpawn` source: see [`Self::thread_spawn`]. A forked thread names the thread it
-/// was forked from: see [`Self::forked_from_id`].
+/// was forked from: see [`Self::forked_from_id`]. A thread started with tools its client provides
+/// keeps them here, so a resume or fork registers them again: see [`Self::dynamic_tools`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutSessionMeta {
@@ -283,6 +284,8 @@ pub struct RolloutSessionMeta {
     thread_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     git_info: Option<crate::store::GitInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_tools: Option<serde_json::Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -303,6 +306,7 @@ impl RolloutSessionMeta {
             forked_from_id: None,
             thread_source: None,
             git_info: None,
+            dynamic_tools: None,
             unknown: Unknown::new(),
         }
     }
@@ -368,6 +372,20 @@ impl RolloutSessionMeta {
     #[must_use]
     pub const fn git_info(&self) -> Option<&crate::store::GitInfo> {
         self.git_info.as_ref()
+    }
+
+    /// Records the tools the thread's client provides, as the app server writes them: Codex's
+    /// `dynamic_tools`. The session layer keeps the list as it is given and does not read it.
+    #[must_use]
+    pub fn with_dynamic_tools(mut self, tools: serde_json::Value) -> Self {
+        self.dynamic_tools = Some(tools);
+        self
+    }
+
+    /// The tools the thread's client provides, if any were recorded: Codex's `dynamic_tools`.
+    #[must_use]
+    pub const fn dynamic_tools(&self) -> Option<&serde_json::Value> {
+        self.dynamic_tools.as_ref()
     }
 
     /// Sets the creation timestamp.

@@ -536,6 +536,14 @@ impl AgentThreadBuilder {
         &self.agent
     }
 
+    /// Runs the thread's turns with `agent` instead, as a host that prepares the agent further
+    /// before the thread is built — giving it tools its client provides, say — binds the prepared
+    /// instance in place of the one the thread was made with.
+    pub fn with_agent(mut self, agent: AgentBinding) -> Self {
+        self.agent = agent;
+        self
+    }
+
     /// Resolves `model` as the thread will, so a model it cannot run on is refused before the
     /// thread is built.
     ///

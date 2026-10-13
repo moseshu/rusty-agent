@@ -1,7 +1,7 @@
-//! R3-12: the two agent identities a turn runs under, and which one every consumer reads.
+//! The two agent identities a turn runs under, and which one every consumer reads.
 //!
-//! A run has one agent from the user's point of view and, once R10 assembles capabilities and R11
-//! prepares a sandbox, potentially a different one that actually executes. Keeping a single
+//! A run has one agent from the user's point of view and, once capabilities are assembled and a
+//! sandbox is prepared, potentially a different one that actually executes. Keeping a single
 //! `Arc<AgentSpec>` in a variable called `agent` is what quietly merges them: the prepared clone
 //! flows onward and from then on the tool-use tracker keys on it, records are attributed to it, and
 //! hooks report it — so a user who configured `coder` is shown events belonging to something they
@@ -35,12 +35,17 @@
 pub mod control;
 pub mod tool;
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use ra_core::{
     agent::{AgentDefinition, AgentSpec},
     error::{Error, Result},
     item::AgentId,
+    tool::Tool,
 };
 
 /// The public agent a turn is attributed to, bound to the instance that executes it.
@@ -52,19 +57,21 @@ use ra_core::{
 pub struct AgentBinding {
     public: Arc<AgentSpec>,
     execution: Arc<AgentSpec>,
+    external_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl AgentBinding {
     /// The user's agent runs exactly as they configured it.
     ///
     /// Both sides are the same object, so there is no identity to get wrong. This is the shape
-    /// every run has until capability assembly (R10) or sandbox preparation (R11) produces a
+    /// every run has until capability assembly or sandbox preparation produces a
     /// different executable instance.
     #[must_use]
     pub fn direct(agent: Arc<AgentSpec>) -> Self {
         Self {
             execution: Arc::clone(&agent),
             public: agent,
+            external_tools: Vec::new(),
         }
     }
 
@@ -75,7 +82,109 @@ impl AgentBinding {
     /// the public agent it stands in for.
     #[must_use]
     pub fn prepared(public: Arc<AgentSpec>, execution: Arc<AgentSpec>) -> Self {
-        Self { public, execution }
+        Self {
+            public,
+            execution,
+            external_tools: Vec::new(),
+        }
+    }
+
+    /// Registers host-provided external tools after the agent's own tools and handoffs, skipping
+    /// names already registered, as Codex's `ToolRegistry::register_external` does.
+    ///
+    /// The binding retains the candidates separately so run-bound and sandbox capabilities are
+    /// assembled first and take precedence on each preparation. This runtime registration does
+    /// not change the provider-neutral agent declaration or its duplicate-tool validation.
+    /// Provider-specific reserved names are checked by the host before registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution agent cannot be rebuilt with the selected tools.
+    pub fn with_external_tools(
+        mut self,
+        tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+    ) -> Result<Self> {
+        let execution = self.execution_without_external_tools()?;
+        self.external_tools.extend(tools);
+        self.with_prepared_execution(execution)
+    }
+
+    /// The base for capability assembly, excluding tools previously registered as external.
+    pub(crate) fn execution_without_external_tools(&self) -> Result<Arc<AgentSpec>> {
+        if !self.execution.tools().iter().any(|tool| {
+            self.external_tools
+                .iter()
+                .any(|external| Arc::ptr_eq(tool, external))
+        }) {
+            return Ok(Arc::clone(&self.execution));
+        }
+        self.execution
+            .to_builder()
+            .clear_tools()
+            .tools(
+                self.execution
+                    .tools()
+                    .iter()
+                    .filter(|tool| {
+                        !self
+                            .external_tools
+                            .iter()
+                            .any(|external| Arc::ptr_eq(tool, external))
+                    })
+                    .cloned(),
+            )
+            .build()
+    }
+
+    /// Registers the external candidates after a freshly prepared host tool set.
+    pub(crate) fn with_prepared_execution(&self, execution: Arc<AgentSpec>) -> Result<Self> {
+        if self.external_tools.is_empty() {
+            return Ok(Self::prepared(Arc::clone(&self.public), execution));
+        }
+        let mut taken: HashSet<String> = execution
+            .tools()
+            .iter()
+            .flat_map(|tool| {
+                [
+                    tool.origin().name().to_owned(),
+                    tool.model_definition().name().to_owned(),
+                ]
+            })
+            .chain(
+                execution
+                    .handoffs()
+                    .iter()
+                    .map(|handoff| handoff.schema().name().to_owned()),
+            )
+            .collect();
+        let tools: Vec<_> = self
+            .external_tools
+            .iter()
+            .filter(|tool| {
+                let name = tool.model_definition().name().to_owned();
+                if taken.contains(&name) || taken.contains(tool.origin().name()) {
+                    tracing::warn!(
+                        tool_name = name,
+                        "skipping duplicate external tool that is already registered"
+                    );
+                    return false;
+                }
+                taken.insert(name);
+                taken.insert(tool.origin().name().to_owned());
+                true
+            })
+            .cloned()
+            .collect();
+        let execution = if tools.is_empty() {
+            execution
+        } else {
+            execution.to_builder().tools(tools).build()?
+        };
+        Ok(Self {
+            public: Arc::clone(&self.public),
+            execution,
+            external_tools: self.external_tools.clone(),
+        })
     }
 
     /// The agent as the user configured it. Use it for display and for reading declared

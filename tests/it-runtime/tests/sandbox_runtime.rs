@@ -1417,6 +1417,93 @@ async fn one_sandbox_agent_cannot_serve_two_runs_at_once() {
 
 // -- preparation ----------------------------------------------------------------------------------
 
+/// An external tool that must not replace a sandbox tool of the same name.
+struct ExternalTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+}
+
+impl ExternalTool {
+    fn shared(name: &str) -> Arc<dyn Tool> {
+        Arc::new(Self {
+            origin: ToolOrigin::new(name).unwrap(),
+            schema: ToolSchema::loose(name, json!({"type": "object", "properties": {}})).unwrap(),
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ExternalTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        assert_ne!(self.origin.name(), "touch", "the sandbox tool must win");
+        Ok(ToolOutput::text("from the external tool"))
+    }
+}
+
+/// External registration follows sandbox binding too. Cached preparation keeps both the host
+/// tool's precedence and the non-conflicting external tool on later inference steps.
+#[tokio::test]
+async fn sandbox_tools_take_precedence_over_external_tools_and_cache_keeps_them() {
+    let mut capability = WorkspaceCapability::new("notes");
+    capability.tool = true;
+    let model = ScriptedModel::new(vec![
+        tool_call("host-1", "touch"),
+        tool_call("external-1", "client_tool"),
+        final_answer("m", "done"),
+    ]);
+    let client = FakeClient::new();
+    let agent = sandbox_agent(
+        "coder",
+        "Coder",
+        SandboxAgentConfig::empty()
+            .with_default_manifest(workspace_manifest())
+            .with_capability(Arc::new(capability)),
+    );
+    let binding = AgentBinding::direct(agent)
+        .with_external_tools([
+            ExternalTool::shared("touch"),
+            ExternalTool::shared("client_tool"),
+        ])
+        .unwrap();
+    let result = Runner::run(
+        RunRequest::new(
+            binding,
+            Arc::new(FixedResolver(Arc::clone(&model))),
+            RunId::new("external-sandbox-tools"),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("go"))],
+        )
+        .with_config(RunConfig::new().with_sandbox(with_client(&client))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.final_text(), "done");
+    assert!(client.log().contains(&"write[touched.txt]:s0".to_owned()));
+    assert_eq!(
+        *model.tools.lock().unwrap(),
+        vec![vec!["touch", "client_tool"]; 3]
+    );
+    assert!(model.inputs.lock().unwrap()[2].iter().any(|item| {
+        match item {
+            ModelInputItem::ToolCallOutput(output) => {
+                serde_json::from_value::<ToolOutput>(output.output().clone())
+                    .unwrap()
+                    .as_text()
+                    == Some("from the external tool")
+            }
+            _ => false,
+        }
+    }));
+}
+
 /// `test_runner_merges_sandbox_instructions_and_tools` and
 /// `test_prepare_sandbox_agent_passes_session_manifest_to_capability_instructions`: the default
 /// prompt comes first, the agent's own instructions under their heading, then each capability's

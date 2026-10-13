@@ -16,7 +16,8 @@ use std::{
 };
 
 use super::{
-    background_terminals::ThreadBackgroundTerminals, settings_adapter::ThreadSettingsAdapter,
+    background_terminals::ThreadBackgroundTerminals, dynamic_tool_calls::DynamicToolCalls,
+    settings_adapter::ThreadSettingsAdapter,
 };
 use ra_core::session::SessionId;
 use ra_runtime::thread::AgentThread;
@@ -55,6 +56,8 @@ pub(crate) struct LoadedThread {
     pub(crate) adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
     /// The commands the thread's tools left running, if its host handed them over.
     pub(crate) terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+    /// The calls of the tools its client provides that wait for the client's answer.
+    pub(crate) dynamic_tool_calls: Arc<DynamicToolCalls>,
     pub(crate) settings_lock: Arc<tokio::sync::Mutex<()>>,
     /// Tells this loading of the thread from a later one under the same id.
     generation: u64,
@@ -102,12 +105,14 @@ impl ThreadManager {
         info: LoadedThreadInfo,
         adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
         terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+        dynamic_tool_calls: Arc<DynamicToolCalls>,
     ) -> LoadedThread {
         let loaded = LoadedThread {
             thread,
             info,
             adapter,
             terminals,
+            dynamic_tool_calls,
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
         };

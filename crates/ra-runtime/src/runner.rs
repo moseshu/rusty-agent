@@ -1897,7 +1897,7 @@ async fn run_loop_inner(
         );
         match cancel.run(assembly).await.and_then(|result| result) {
             Ok((execution, context_processors, deferred)) => {
-                agent = AgentBinding::prepared(Arc::clone(agent.public()), execution);
+                agent = execution;
                 config.extend_context_processors(context_processors);
                 deferred_prompts = deferred;
             }
@@ -2449,7 +2449,7 @@ async fn assemble_capabilities(
     state: &RunState,
     event_seqs: &EventSeqAllocator,
 ) -> Result<(
-    Arc<AgentSpec>,
+    AgentBinding,
     Vec<Arc<dyn ContextProcessor>>,
     Vec<DeferredPrompt>,
 )> {
@@ -2468,7 +2468,9 @@ async fn assemble_capabilities(
     }
 
     let assembled = plan.assemble(&context).await?;
-    let execution = assembled.prepare_agent(agent.execution())?;
+    let base = agent.execution_without_external_tools()?;
+    let execution = assembled.prepare_agent(&base)?;
+    let execution = agent.with_prepared_execution(execution)?;
     Ok((
         execution,
         assembled.context_processors().to_vec(),

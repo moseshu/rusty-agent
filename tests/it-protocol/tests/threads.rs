@@ -787,8 +787,8 @@ async fn thread_start_ephemeral_remains_pathless() {
 
 /// What `thread/start` refuses, in Codex's words where Codex refuses it: a paginated history a
 /// store here does not keep, `permissions` with `sandbox`, an experimental member without the
-/// experimental API, a member this framework does not have — including valid dynamic tools, whose
-/// calls are not carried yet — a model the host does not resolve, and a thread no factory or store
+/// experimental API, a member this framework does not have — including a dynamic tool namespace,
+/// which the model request does not describe yet — a model the host does not resolve, and a thread no factory or store
 /// is there to build or keep.
 #[tokio::test]
 async fn thread_start_refusals() {
@@ -815,12 +815,17 @@ async fn thread_start_refusals() {
         ),
         (
             json!({"dynamicTools": [{
-                "type": "function",
-                "name": "lookup_ticket",
-                "description": "Look up a ticket",
-                "inputSchema": {"type": "object", "properties": {}}
+                "type": "namespace",
+                "name": "tickets",
+                "description": "Ticket tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup_ticket",
+                    "description": "Look up a ticket",
+                    "inputSchema": {"type": "object", "properties": {}}
+                }]
             }]}),
-            invalid_request("thread/start.dynamicTools is not supported"),
+            invalid_request("thread/start.dynamicTools.namespace is not supported"),
         ),
         (
             json!({"permissions": ":nope"}),
@@ -3450,7 +3455,7 @@ async fn thread_start_checks_dynamic_tools() {
                 {"namespace": "legacy_app", "name": "update_ticket", "description": "",
                     "inputSchema": schema, "exposeToContext": false},
             ]),
-            "thread/start.dynamicTools is not supported",
+            "thread/start.dynamicTools.deferLoading is not supported",
         ),
     ] {
         assert_eq!(

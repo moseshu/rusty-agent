@@ -28,9 +28,11 @@
 //! for the user — with requests of its own, sent to the connections of the thread. The client's
 //! response or error is routed back to whoever asked; a request whose turn moves on is withdrawn;
 //! and once a request is answered or withdrawn the thread's connections are sent
-//! `serverRequest/resolved`. A connection that attaches to the thread later is sent the requests
-//! still waiting. What the server makes of each answer follows Codex's handlers, failing closed.
-//! The turns run, but what raises these requests from them is still to be connected.
+//! `serverRequest/resolved` — except for a dynamic tool call's, which Codex does not report. A
+//! connection that attaches to the thread later is sent the requests still waiting. What the
+//! server makes of each answer follows Codex's handlers, failing closed. Approvals and dynamic
+//! tool calls are raised from the turns; questions for the user and permission requests are still
+//! to be connected.
 //!
 //! # Lifecycle
 //!
@@ -53,8 +55,8 @@
 //! Codex's loop also recovers the threads of its daemon, attaches the threads its agents spawn to
 //! every connection and reports the status of remote control; none of it is ported.
 
-// Nothing raises a server request until turns run in the server; the tests reach them through
-// `test_api` meanwhile.
+// Nothing raises questions for the user or permission requests yet; the tests reach their answers
+// through `test_api` meanwhile.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod answers;
 mod approval_requests;
@@ -62,6 +64,7 @@ mod approvals;
 mod background_terminals;
 mod connection_cleanup;
 mod connection_rpc_gate;
+mod dynamic_tool_calls;
 mod dynamic_tools;
 mod image_url;
 mod json_schema;
@@ -885,6 +888,7 @@ pub mod test_api {
                 super::thread_manager::LoadedThreadInfo::unknown(),
                 adapter,
                 terminals,
+                Arc::default(),
             );
             if let Err(error) =
                 ensure_listener_task_running(&self.processor.listener_context(), &loaded).await

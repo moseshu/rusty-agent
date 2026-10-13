@@ -38,6 +38,8 @@
 //! original turn. Codex's legacy rollouts drop its exec events and have no command items at all;
 //! its paginated rollouts keep the completed items instead. The boundaries are this port's
 //! counterpart of the latter, since its history is rebuilt from records rather than kept as items.
+//! A call of a tool the client provides records its request and its end the same way, and is
+//! replayed from them (see [`super::dynamic_tool_calls`]).
 //!
 //! Codex's legacy replay gives messages and reasoning sequential ids of its own (`item-1`, …),
 //! unlike the ids its live items carry. Records here have ids of their own, and replay uses them, so
@@ -66,6 +68,7 @@ use ra_session::{
 };
 
 use super::{
+    dynamic_tool_calls::dynamic_tool_item,
     protocol::{
         CommandExecutionStatus, ImageDetail, ImageReference, MessagePhase, PatchApplyStatus,
         ThreadItem, Turn, TurnError, TurnItemsView, TurnStatus, UserInput,
@@ -390,19 +393,24 @@ impl ThreadHistoryBuilder {
         changes
     }
 
-    /// Projects runtime events into their original turn, including late command exits.
+    /// Projects runtime events into their original turn, including late command exits. The calls
+    /// of the client's own tools are the server's to show (see [`super::dynamic_tool_calls`]); the
+    /// host's tools show the rest.
     pub(crate) fn host_event(
         &mut self,
         event: &HostEvent,
         tools: Option<&dyn ThreadToolItems>,
     ) -> Vec<ItemChange> {
-        let Some(tools) = tools else {
+        let dynamic = dynamic_tool_item(event);
+        if dynamic.is_none() && tools.is_none() {
             return Vec::new();
-        };
+        }
         let Some(turn) = self.turn_for(Some(event.run_id().as_str())) else {
             return Vec::new();
         };
-        let Some(change) = tools.event(event, &turn.items) else {
+        let Some(change) =
+            dynamic.or_else(|| tools.and_then(|tools| tools.event(event, &turn.items)))
+        else {
             return Vec::new();
         };
         let existed = turn

@@ -10,7 +10,9 @@
 //! that ends does, since every request of a thread belongs to a turn; the end of a turn also
 //! answers the `turn/interrupt` requests waiting for it. A turn whose run stops on approvals has
 //! its questions asked of the client, and its answers settled, by a task of their own (see
-//! [`super::approval_requests`]), so the listener goes on with the thread's events meanwhile.
+//! [`super::approval_requests`]), so the listener goes on with the thread's events meanwhile. A
+//! call of a tool the client provides is asked of the client once its item has started, and its
+//! answer awaited by a task of its own too (see [`super::dynamic_tool_calls`]).
 //!
 //! # Unloading
 //!
@@ -50,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     approval_requests::{awaiting_approval, start_approval_batch},
+    dynamic_tool_calls::request_dynamic_tool_call,
     outgoing::{
         OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender,
         now_unix_timestamp_ms,
@@ -361,6 +364,13 @@ async fn handle_event(
             item_changes,
             &thread_id,
             event.run_id().as_str(),
+            &thread_outgoing,
+        )
+        .await;
+        request_dynamic_tool_call(
+            event,
+            &loaded.dynamic_tool_calls,
+            thread_id.as_str(),
             &thread_outgoing,
         )
         .await;

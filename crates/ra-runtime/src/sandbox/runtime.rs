@@ -267,13 +267,10 @@ impl SandboxRuntime {
 
             let base = match inner.prepared.get(public.id()) {
                 Some(cached) if Arc::ptr_eq(&cached.session, &session) => {
-                    return Ok(AgentBinding::prepared(
-                        Arc::clone(public),
-                        Arc::clone(&cached.agent),
-                    ));
+                    return agent.with_prepared_execution(Arc::clone(&cached.agent));
                 }
                 Some(cached) => Arc::clone(&cached.base),
-                None => Arc::clone(agent.execution()),
+                None => agent.execution_without_external_tools()?,
             };
 
             let selector = resolver
@@ -311,7 +308,7 @@ impl SandboxRuntime {
                     capabilities,
                 },
             );
-            Ok(AgentBinding::prepared(Arc::clone(public), prepared))
+            agent.with_prepared_execution(prepared)
         }
         .instrument(span)
         .await

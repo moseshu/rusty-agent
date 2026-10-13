@@ -4,12 +4,13 @@
 //! Every member Codex's parameters have is read, so a client sending one is told what happens to
 //! it rather than having it dropped. Those this framework acts on are the model and service tier,
 //! the approval and sandbox policy and named permissions, the thread's ephemerality and source,
-//! the fork boundaries and the history to include. Codex's deprecated `personality` and
+//! the tools its client provides, the fork boundaries and the history to include. Codex's
+//! deprecated `personality` and
 //! `multiAgentMode`, which it ignores, and its test-only `mockExperimentalField` are ignored here
 //! too. Any other member, when sent, is refused as `<method>.<member> is not supported`: a working
 //! directory, workspace roots, environments, instructions, configuration overrides, projects,
-//! dynamic tools, raw events and the like belong to Codex's product configuration, which a host
-//! here does not have.
+//! raw events and the like belong to Codex's product configuration, which a host here does not
+//! have.
 //!
 //! A thread's effective settings are an open record in the answers, as in
 //! `thread/settings/updated`: the model, its provider, service tier and reasoning effort come from

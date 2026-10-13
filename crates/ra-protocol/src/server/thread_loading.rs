@@ -35,9 +35,11 @@
 //!
 //! # Differences from Codex
 //!
-//! - Codex's own configuration, its project trust, instruction files, MCP servers, dynamic tools,
-//!   environments, goals and token usage replay are not ported; the members that set them are
-//!   refused (see [`super::protocol::ThreadStartParams::unsupported_field`]).
+//! - Codex's own configuration, its project trust, instruction files, MCP servers, environments,
+//!   goals and token usage replay are not ported; the members that set them are refused (see
+//!   [`super::protocol::ThreadStartParams::unsupported_field`]).
+//! - Dynamic tool namespaces and deferred dynamic tools are refused until they are carried; see
+//!   [`super::dynamic_tool_calls`] for the rest.
 //! - Threads are named by `UUIDv7` ids, as Codex names them; `thread/loaded/list` takes any loaded
 //!   id as a cursor rather than refusing one that is not a UUID, since a host may load threads
 //!   under ids of its own.
@@ -67,14 +69,19 @@ use ra_session::{
 use serde_json::{Map, Value, json};
 
 use super::{
+    dynamic_tool_calls::{
+        DynamicToolCalls, dynamic_tools_from_records, recorded_dynamic_tools,
+        register_dynamic_tools,
+    },
     dynamic_tools::validate_dynamic_tools,
     outgoing::{ConnectionRequestId, ServerNotification, now_unix_timestamp_ms},
     protocol::{
-        ApprovalsReviewer, AskForApproval, THREAD_STARTED_METHOD, Thread, ThreadForkParams,
-        ThreadForkResponse, ThreadHistoryMode, ThreadLoadedListParams, ThreadLoadedListResponse,
-        ThreadPolicyFields, ThreadPolicyOverrides, ThreadReadParams, ThreadReadResponse,
-        ThreadResumeParams, ThreadResumeResponse, ThreadSettingsRecord, ThreadStartParams,
-        ThreadStartResponse, ThreadStartedNotification, ThreadStatus, Turn, TurnStatus,
+        ApprovalsReviewer, AskForApproval, DynamicToolSpec, THREAD_STARTED_METHOD, Thread,
+        ThreadForkParams, ThreadForkResponse, ThreadHistoryMode, ThreadLoadedListParams,
+        ThreadLoadedListResponse, ThreadPolicyFields, ThreadPolicyOverrides, ThreadReadParams,
+        ThreadReadResponse, ThreadResumeParams, ThreadResumeResponse, ThreadSettingsRecord,
+        ThreadStartParams, ThreadStartResponse, ThreadStartedNotification, ThreadStatus, Turn,
+        TurnStatus,
     },
     settings_adapter::{ThreadSettingsAdapter, settings_snapshot},
     thread_factory::{ThreadFactory, ThreadFactoryRequest, ThreadOrigin, check_approval_requests},
@@ -115,6 +122,7 @@ pub(crate) struct ThreadMethodContext<'a> {
 
 impl ThreadRequestProcessor {
     /// `thread/start`: Codex's `thread_start`.
+    #[allow(clippy::too_many_lines)] // Codex's `thread_start_task`, step for step.
     pub(crate) async fn thread_start(
         &self,
         request_id: ConnectionRequestId,
@@ -127,9 +135,10 @@ impl ThreadRequestProcessor {
             return Err(unsupported(METHOD, field));
         }
         check_approvals_reviewer(METHOD, params.policy.approvals_reviewer)?;
-        if let Some(tools) = params.dynamic_tools().filter(|tools| !tools.is_empty()) {
-            validate_dynamic_tools(tools).map_err(JsonRpcErrorObject::invalid_request)?;
-            return Err(unsupported(METHOD, "dynamicTools"));
+        let dynamic_tools = params.dynamic_tools().unwrap_or_default().to_vec();
+        if !dynamic_tools.is_empty() {
+            validate_dynamic_tools(&dynamic_tools).map_err(JsonRpcErrorObject::invalid_request)?;
+            check_dynamic_tools_supported(METHOD, &dynamic_tools)?;
         }
         if params.history_mode == Some(ThreadHistoryMode::Paginated) {
             return Err(JsonRpcErrorObject::invalid_request(
@@ -170,6 +179,10 @@ impl ThreadRequestProcessor {
             &to_policy_overrides(&params.policy),
             params.service_tier,
         )?;
+        let (builder, dynamic_tool_calls) = register_dynamic_tools(builder, &dynamic_tools)
+            .map_err(|error| {
+                JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
+            })?;
         let builder = match &store {
             Some(store) => {
                 let meta = new_session_meta(
@@ -177,6 +190,7 @@ impl ThreadRequestProcessor {
                     &builder,
                     adapter.as_deref(),
                     params.thread_source.as_deref(),
+                    &dynamic_tools,
                 );
                 let recorder = store
                     .create_thread_with(&CreateThreadParams::new(meta))
@@ -196,7 +210,13 @@ impl ThreadRequestProcessor {
             thread_source: params.thread_source,
             ..LoadedThreadInfo::default()
         };
-        let loaded = self.load(builder.build(), info, adapter, terminals);
+        let loaded = self.load(
+            builder.build(),
+            info,
+            adapter,
+            terminals,
+            dynamic_tool_calls,
+        );
         self.attach(&request_id, &loaded, &context.listener).await;
         self.thread_watch.upsert_thread_silently(loaded.thread_id());
 
@@ -302,6 +322,18 @@ impl ThreadRequestProcessor {
                 return Err(error);
             }
         };
+        // Codex's sessions take the dynamic tools their history records when given none, and a
+        // resume gives none.
+        let (builder, dynamic_tool_calls) =
+            match register_dynamic_tools(builder, &dynamic_tools_from_records(&records)) {
+                Ok(registered) => registered,
+                Err(error) => {
+                    discard(&recorder).await;
+                    return Err(JsonRpcErrorObject::internal_error(format!(
+                        "error resuming thread: {error}"
+                    )));
+                }
+            };
         let builder = builder
             .with_history(reconstruction.history().to_vec())
             .with_rollout_recorder(recorder);
@@ -312,7 +344,13 @@ impl ThreadRequestProcessor {
             thread_source: stored.thread_source().map(str::to_owned),
             preview: stored.preview().to_owned(),
         };
-        let loaded = self.load(builder.build(), info, adapter, terminals);
+        let loaded = self.load(
+            builder.build(),
+            info,
+            adapter,
+            terminals,
+            dynamic_tool_calls,
+        );
         self.attach(&request_id, &loaded, &context.listener).await;
         self.thread_watch.upsert_thread(loaded.thread_id()).await;
 
@@ -377,8 +415,10 @@ impl ThreadRequestProcessor {
             .map_err(|error| store_read_error(&source_id, &error))?
             .into_records();
         let tool_items = context.history.tool_items();
-        // Settings belong to the source thread, independently of the history cutoff.
+        // Settings belong to the source thread, independently of the history cutoff, and so do the
+        // dynamic tools its session metadata records.
         let persisted_policy = latest_settings_snapshot(&records);
+        let dynamic_tools = dynamic_tools_from_records(&records);
         let records = match (&params.last_turn_id, &params.before_turn_id) {
             (Some(last_turn_id), None) => {
                 truncate_records_after_turn_id(records, last_turn_id, tool_items.as_deref())?
@@ -416,6 +456,10 @@ impl ThreadRequestProcessor {
             &policy,
             params.service_tier.clone(),
         )?;
+        let (builder, dynamic_tool_calls) = register_dynamic_tools(builder, &dynamic_tools)
+            .map_err(|error| {
+                JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
+            })?;
         let snapshot = ForkThreadParams::new(ForkSnapshot::Interrupted);
         let (builder, fork_records) = if params.ephemeral {
             let fork_records = snapshot
@@ -433,6 +477,7 @@ impl ThreadRequestProcessor {
                 &builder,
                 adapter.as_deref(),
                 params.thread_source.as_deref(),
+                &dynamic_tools,
             );
             let forked = ForkedThread::fork_from_history(
                 store.as_ref(),
@@ -479,7 +524,13 @@ impl ThreadRequestProcessor {
                 String::new()
             },
         };
-        let loaded = self.load(builder.build(), info, adapter, terminals);
+        let loaded = self.load(
+            builder.build(),
+            info,
+            adapter,
+            terminals,
+            dynamic_tool_calls,
+        );
         self.attach(&request_id, &loaded, &context.listener).await;
 
         let mut thread = if params.ephemeral {
@@ -757,10 +808,11 @@ impl ThreadRequestProcessor {
         info: LoadedThreadInfo,
         adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
         terminals: Option<Arc<dyn super::ThreadBackgroundTerminals>>,
+        dynamic_tool_calls: Arc<DynamicToolCalls>,
     ) -> LoadedThread {
-        let loaded = self
-            .thread_manager
-            .add_thread(thread, info, adapter, terminals);
+        let loaded =
+            self.thread_manager
+                .add_thread(thread, info, adapter, terminals, dynamic_tool_calls);
         // The product settings the thread was loaded with, for a later resume or fork to restore,
         // as Codex records the settings each turn runs with.
         if loaded.adapter.is_some() {
@@ -841,6 +893,30 @@ fn require_factory(
         .factory
         .clone()
         .ok_or_else(|| unsupported_yet(method))
+}
+
+/// Refuses the dynamic tools a thread cannot carry yet: deferred functions, which need tool search,
+/// and namespaces, which the model request does not describe yet. The check is the server's own;
+/// Codex carries both.
+fn check_dynamic_tools_supported(
+    method: &str,
+    tools: &[DynamicToolSpec],
+) -> Result<(), JsonRpcErrorObject> {
+    let namespaced = |tool: &DynamicToolSpec| matches!(tool, DynamicToolSpec::Namespace(_));
+    let deferred = |tool: &DynamicToolSpec| match tool {
+        DynamicToolSpec::Function(function) => function.defer_loading(),
+        DynamicToolSpec::Namespace(namespace) => namespace
+            .tools()
+            .iter()
+            .any(|tool| tool.function().defer_loading()),
+    };
+    if tools.iter().any(deferred) {
+        return Err(unsupported(method, "dynamicTools.deferLoading"));
+    }
+    if tools.iter().any(namespaced) {
+        return Err(unsupported(method, "dynamicTools.namespace"));
+    }
+    Ok(())
 }
 
 fn check_sandbox_and_permissions(policy: &ThreadPolicyFields) -> Result<(), JsonRpcErrorObject> {
@@ -1126,8 +1202,12 @@ fn new_session_meta(
     builder: &AgentThreadBuilder,
     adapter: Option<&dyn ThreadSettingsAdapter>,
     thread_source: Option<&str>,
+    dynamic_tools: &[DynamicToolSpec],
 ) -> RolloutSessionMeta {
     let mut meta = RolloutSessionMeta::new(thread_id.clone()).with_cli_version(CLI_VERSION);
+    if let Some(tools) = recorded_dynamic_tools(dynamic_tools) {
+        meta = meta.with_dynamic_tools(tools);
+    }
     if let Ok(resolved) = builder.resolve_model(builder.config().model()) {
         meta = meta.with_model_provider(resolved.selector().provider().as_str());
     }
