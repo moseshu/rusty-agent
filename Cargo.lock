@@ -2342,6 +2342,7 @@ name = "ra-exec"
 version = "0.2.2"
 dependencies = [
  "async-trait",
+ "cap-primitives",
  "cap-std",
  "libc",
  "ra-core",

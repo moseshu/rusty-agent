@@ -406,6 +406,110 @@ async fn test_exec_command_truncation_limits() {
     assert_eq!(truncations[0].retained_bytes(), 50);
 }
 
+fn permissive_policy(tool: ExecCommandTool) -> ExecCommandTool {
+    tool.with_policy_resolvers(
+        std::sync::Arc::new(|_context: &ToolContext<'_>| {
+            Ok(ra_exec::sandbox::ExecEnvironment::default())
+        }),
+        std::sync::Arc::new(|_context: &ToolContext<'_>| Ok(false)),
+    )
+}
+
+/// Codex's `exec_permission_approvals` schema: once turned on, a tool with a policy offers
+/// `with_additional_permissions` and the permissions it asks for, with Codex's descriptions, and
+/// accepts them, whichever is installed first. Without a policy nothing is offered.
+#[tokio::test]
+async fn test_exec_command_offers_additional_permissions_when_turned_on() {
+    let dir = workspace();
+    let tools = [
+        permissive_policy(rooted(&dir)).with_additional_permissions(),
+        permissive_policy(rooted(&dir).with_additional_permissions()),
+    ];
+    for tool in &tools {
+        tool.validate().expect("identity and schema must agree");
+        let schema = tool.schema().input_schema();
+        assert_eq!(
+            schema["required"],
+            json!([
+                "additional_permissions",
+                "cmd",
+                "justification",
+                "login",
+                "prefix_rule",
+                "sandbox_permissions",
+                "shell",
+                "timeout_ms",
+                "tty",
+                "workdir",
+                "yield_time_ms"
+            ])
+        );
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["sandbox_permissions"]["description"],
+            "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`, or `require_escalated` for unsandboxed execution."
+        );
+        assert_eq!(
+            schema["definitions"]["SandboxPermissionsArgument"]["enum"],
+            json!(["use_default", "with_additional_permissions", "require_escalated"])
+        );
+        assert_eq!(
+            properties["additional_permissions"]["description"],
+            "Sandboxed filesystem or network access for this command; only with `sandbox_permissions: \"with_additional_permissions\"`."
+        );
+        let definitions = &schema["definitions"];
+        assert_eq!(
+            definitions["PermissionProfileArgument"]["description"],
+            "Filesystem or network access request."
+        );
+        assert_eq!(
+            definitions["NetworkPermissionsArgument"]["properties"]["enabled"]["description"],
+            "True requests network access; false or omitted requests none."
+        );
+        let file_system = &definitions["FileSystemPermissionsArgument"]["properties"];
+        assert_eq!(
+            file_system["read"]["description"],
+            "Absolute paths to grant read access; omit when none are needed."
+        );
+        assert_eq!(
+            file_system["write"]["description"],
+            "Absolute paths to grant write access; omit when none are needed."
+        );
+
+        let args = arguments(json!({
+            "cmd": "printf ok",
+            "sandbox_permissions": "with_additional_permissions",
+            "justification": null,
+            "prefix_rule": null,
+            "additional_permissions": {
+                "network": null,
+                "file_system": {"read": null, "write": ["out"]}
+            }
+        }));
+        tool.decode_input(&args)
+            .expect("the additional permissions decode");
+        assert_eq!(observe(tool, &args).await.as_text(), Some("ok"));
+    }
+
+    let without_policy = rooted(&dir).with_additional_permissions();
+    assert!(
+        without_policy.schema().input_schema()["properties"]
+            .get("additional_permissions")
+            .is_none()
+    );
+    let off = permissive_policy(rooted(&dir));
+    assert!(
+        off.decode_input(&arguments(json!({
+            "sandbox_permissions": "use_default",
+            "justification": null,
+            "prefix_rule": null,
+            "additional_permissions": {"network": {"enabled": true}, "file_system": null}
+        })))
+        .is_err(),
+        "a tool that does not offer them does not accept them"
+    );
+}
+
 /// With policy resolvers installed the tool advertises Codex's approval arguments, with Codex's
 /// descriptions, and accepts them; the resolvers read them from the call's arguments.
 #[tokio::test]
@@ -453,7 +557,7 @@ async fn test_exec_command_policy_resolvers_add_the_approval_arguments() {
         properties["sandbox_permissions"]["description"],
         "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
     );
-    // Codex's `with_additional_permissions` is not offered.
+    // Codex's `with_additional_permissions` is offered only once turned on.
     assert_eq!(
         schema["definitions"]["SandboxPermissionsArgument"]["enum"],
         json!(["use_default", "require_escalated"])

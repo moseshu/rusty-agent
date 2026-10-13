@@ -62,6 +62,13 @@
 //! writable root read-only. Path precedence includes both baseline roots and all grants; an
 //! equally specific write overrides a read, as Codex's policy does.
 //!
+//! A command may also ask for permissions of its own with `sandbox_permissions:
+//! "with_additional_permissions"` and `additional_permissions`, once the host turns on Codex's
+//! `exec_permission_approvals` feature (see [`crate::host::CodingHost::with_exec_permission_approvals`]).
+//! Its paths are read relative to the directory it runs in and checked as Codex's handler checks
+//! them; merged with the grants, they widen its sandbox, and the command asks unless the grants
+//! already give everything it asked for.
+//!
 //! Input to a running terminal follows Codex's stdin review: a command's launch records the
 //! sandbox it runs in, whether that left the sandbox its decision selected, and the grants it ran
 //! with, and input asks first only when the terminal runs with authority a command launched now
@@ -73,11 +80,17 @@
 //! outside that server must forward their events to the adapter itself.
 //!
 //! Restricted in-process patches use Codex's unavailable-patch-sandbox approval path: this writer
-//! has directory capabilities, but does not run beneath the command executor's kernel sandbox.
+//! has directory capabilities, but does not run beneath the command executor's kernel sandbox. A
+//! patch the grants already let write every path it touches is preapproved and does not ask, as
+//! Codex's patch handler preapproves it.
 //! Commands do enter that sandbox. The existing executor's workspace policy grants entire writable
 //! roots; it does not yet port Codex's nested protected-directory rules. Those remain an execution
 //! adapter parity gap rather than a new provider-neutral permission rule.
 
+use crate::additional_permissions::{
+    EffectiveAdditionalPermissions, apply_granted_turn_permissions, granted_sandbox,
+    implicit_granted_permissions, normalize_and_validate_additional_permissions, patch_preapproved,
+};
 use crate::approvals::{
     ApprovalCacheKey, ApprovalStore, CommandApproval, CommandCacheKey, LOCAL_ENVIRONMENT_ID,
     patch_cache_keys,
@@ -87,9 +100,7 @@ use crate::exec_policy::{
     FileSystemSandboxKind, SandboxPermissions, prompt_is_rejected_by_policy,
 };
 use crate::permissions::{
-    AdditionalPermissionProfile, FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
-    FileSystemSandboxPolicyContext, NetworkPermissions, merge_permission_profiles, resolve_access,
-    resolved_entries,
+    AbsolutePathBufGuard, AdditionalPermissionProfile, FileSystemSandboxPolicyContext,
 };
 use crate::request_permissions::{PolicyPaths, ThreadPermissions, wire_additional_profile};
 use ra_core::{
@@ -256,15 +267,35 @@ impl CodingThreadSettings {
         .cache_keys(self.exec_policy.requirements_fingerprint())
     }
 
+    /// Whether the grants preapprove the patch `context` applies: Codex's patch handler adds them
+    /// with `apply_granted_turn_permissions`. A patch that does not parse is not preapproved.
+    fn patch_preapproved(&self, context: &ToolContext<'_>) -> bool {
+        let Some(plan) =
+            patch_text(context.arguments()).and_then(|patch| ra_patch::parse_patch(patch).ok())
+        else {
+            return false;
+        };
+        let paths: Vec<PathBuf> = plan
+            .actions()
+            .iter()
+            .flat_map(ra_patch::PatchAction::target_paths)
+            .map(|path| self.cwd.join(path).components().collect())
+            .collect();
+        let sandbox = sandboxed_environment(self, &ExecEnvironment::new());
+        let policy_paths = PolicyPaths::new(&self.cwd);
+        patch_preapproved(
+            context,
+            self,
+            sandbox.sandbox(),
+            &paths,
+            &policy_paths.context(),
+        )
+    }
+
     /// The keys Codex caches a patch approval under, one per path it touches. A patch that does
     /// not parse has none.
     fn patch_cache_keys(&self, arguments: &Value) -> Vec<ApprovalCacheKey> {
-        let patch = match arguments {
-            Value::String(patch) => Some(patch.as_str()),
-            Value::Object(arguments) => arguments.get("patch").and_then(Value::as_str),
-            _ => None,
-        };
-        patch
+        patch_text(arguments)
             .and_then(|patch| ra_patch::parse_patch(patch).ok())
             .map(|plan| patch_cache_keys(&self.cwd, &plan))
             .unwrap_or_default()
@@ -681,11 +712,22 @@ fn install(config: RunConfig, settings: CodingThreadSettings) -> RunConfig {
 /// first attempt and retry after a sandbox denial, over the executor's `base` environment.
 pub(crate) struct CodingCommandPolicy {
     base: ExecEnvironment,
+    exec_permission_approvals: bool,
 }
 
 impl CodingCommandPolicy {
     pub(crate) const fn new(base: ExecEnvironment) -> Self {
-        Self { base }
+        Self {
+            base,
+            exec_permission_approvals: false,
+        }
+    }
+
+    /// Lets a call ask for permissions of its own with `with_additional_permissions`: Codex's
+    /// `exec_permission_approvals` feature.
+    pub(crate) const fn with_exec_permission_approvals(mut self) -> Self {
+        self.exec_permission_approvals = true;
+        self
     }
 
     fn environment(&self, decision: &CommandDecision) -> ExecEnvironment {
@@ -700,7 +742,7 @@ impl CodingCommandPolicy {
 
 impl ExecCommandPolicy for CodingCommandPolicy {
     fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
-        command_approval(context)
+        command_approval(context, self.exec_permission_approvals)
     }
 
     fn approval_state(&self, context: &ToolContext<'_>) -> Result<Option<Value>> {
@@ -712,7 +754,7 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         let decision = if let Some(decision) = settings.command_decisions.current(context)? {
             decision
         } else {
-            let decision = command_decision(context, settings)?;
+            let decision = command_decision(context, settings, self.exec_permission_approvals)?;
             settings.command_decisions.record(context, decision)?
         };
         let environment = FrozenEnvironment::of(&self.environment(&decision));
@@ -763,9 +805,9 @@ impl ExecCommandPolicy for CodingCommandPolicy {
                 Some(environment.restore(&self.base)),
             ),
             None => (
-                settings
-                    .command_decisions
-                    .begin_execution(context, || command_decision(context, settings))?,
+                settings.command_decisions.begin_execution(context, || {
+                    command_decision(context, settings, self.exec_permission_approvals)
+                })?,
                 false,
                 None,
             ),
@@ -1008,148 +1050,7 @@ fn network(enabled: bool) -> ExecNetworkAccess {
     }
 }
 
-/// What a command runs with once the permissions `request_permissions` granted are added to what
-/// it asked for: Codex's `EffectiveAdditionalPermissions`.
-struct EffectiveAdditionalPermissions {
-    sandbox_permissions: SandboxPermissions,
-    additional_permissions: Option<AdditionalPermissionProfile>,
-    permissions_preapproved: bool,
-}
-
-/// The session's and the turn's grants added to the call's request: Codex's
-/// `apply_granted_turn_permissions`. A call leaving the sandbox takes none. `exec_command` takes no
-/// `additional_permissions` of its own yet, so the grants are all a call adds, and having been
-/// approved when they were given they are preapproved.
-fn apply_granted_turn_permissions(
-    context: &ToolContext<'_>,
-    settings: &CodingThreadSettings,
-    sandbox_permissions: SandboxPermissions,
-) -> EffectiveAdditionalPermissions {
-    if sandbox_permissions.requires_escalated_permissions() {
-        return EffectiveAdditionalPermissions {
-            sandbox_permissions,
-            additional_permissions: None,
-            permissions_preapproved: false,
-        };
-    }
-    // A grant belongs to the turn that asked for it, however deeply the call is nested.
-    let run_id = ra_runtime::agent::tool::current_root_run_id()
-        .unwrap_or_else(|| context.run().run_id().clone());
-    let granted = merge_permission_profiles(
-        settings.permissions.session().as_ref(),
-        settings.permissions.turn(&run_id).as_ref(),
-    );
-    let sandbox_permissions = if granted.is_some() {
-        SandboxPermissions::WithAdditionalPermissions
-    } else {
-        sandbox_permissions
-    };
-    EffectiveAdditionalPermissions {
-        sandbox_permissions,
-        permissions_preapproved: granted.is_some(),
-        additional_permissions: granted,
-    }
-}
-
-/// Why a command whose grants deny a path is refused.
-const UNENFORCEABLE_DENY: &str = "the permissions granted to this turn or session deny paths the command sandbox cannot exclude, so the command was not run";
-
-/// Why a command whose effective permissions carve a read-only path out of a writable root is refused.
-const UNENFORCEABLE_READ_ONLY: &str = "the granted permissions require read-only paths within writable roots that the command sandbox cannot enforce, so the command was not run";
-
-/// `sandbox` with `permissions` added: Codex's `effective_permission_profile` for the executor's
-/// sandbox. Each path an entry writes becomes a writable root and each it reads a readable root,
-/// resolved in `context`, and a network grant opens the network. An unconfined sandbox is left
-/// alone, as Codex leaves an unrestricted or external one.
-///
-/// The executor's sandboxes can neither exclude a path from a root they open nor deny a read, so
-/// permissions that deny any path or require a read-only carveout are refused. As Codex's
-/// `get_writable_roots_with_cwd_impl` does, the carveout check resolves precedence across the
-/// baseline and the complete grant before deciding whether a read entry restricts a write.
-fn granted_sandbox(
-    sandbox: ExecSandboxPolicy,
-    permissions: &AdditionalPermissionProfile,
-    context: &FileSystemSandboxPolicyContext<'_>,
-) -> std::result::Result<ExecSandboxPolicy, String> {
-    if !sandbox.level().needs_backend() {
-        return Ok(sandbox);
-    }
-    let mut sandbox = sandbox;
-    if permissions
-        .network()
-        .is_some_and(NetworkPermissions::grants)
-    {
-        sandbox = sandbox.with_network(ExecNetworkAccess::Allowed);
-    }
-    let Some(file_system) = permissions.file_system() else {
-        return Ok(sandbox);
-    };
-    if file_system
-        .entries()
-        .iter()
-        .any(|entry| entry.access() == FileSystemAccessMode::Deny)
-    {
-        return Err(UNENFORCEABLE_DENY.to_owned());
-    }
-    let resolved: Vec<_> = file_system
-        .entries()
-        .iter()
-        .flat_map(|entry| {
-            resolved_entries(std::slice::from_ref(entry), context)
-                .into_iter()
-                .filter(|(path, _)| !entry.skips_missing_path() || path.exists())
-        })
-        .collect();
-    if resolved
-        .iter()
-        .any(|(_, access)| *access == FileSystemAccessMode::Read)
-    {
-        // Seatbelt resolves trusted top-level aliases before matching. Compare paths in the
-        // same namespace, preserving mutable components rather than following deeper symlinks.
-        let effective_entries = sandbox
-            .writable_roots()
-            .iter()
-            .map(|path| (path, FileSystemAccessMode::Write))
-            .chain(resolved.iter().map(|(path, access)| (path, *access)))
-            .map(|(path, access)| {
-                #[cfg(target_os = "macos")]
-                let path = ra_exec::sandbox::seatbelt::normalize_root(path)
-                    .map_err(|error| error.to_string())?;
-                #[cfg(not(target_os = "macos"))]
-                let path = path.clone();
-                Ok(FileSystemSandboxEntry::new(
-                    FileSystemPath::Path { path },
-                    access,
-                ))
-            })
-            .collect::<std::result::Result<Vec<_>, String>>()?;
-        let effective_paths = resolved_entries(&effective_entries, context);
-        for (path, access) in &effective_paths {
-            if *access == FileSystemAccessMode::Read
-                && effective_paths.iter().any(|(root, access)| {
-                    *access == FileSystemAccessMode::Write && path.starts_with(root)
-                })
-                && resolve_access(&effective_entries, path, context) != FileSystemAccessMode::Write
-            {
-                return Err(UNENFORCEABLE_READ_ONLY.to_owned());
-            }
-        }
-    }
-    for (path, access) in resolved {
-        match access {
-            FileSystemAccessMode::Write if !sandbox.writable_roots().contains(&path) => {
-                sandbox = sandbox.with_writable_root(path);
-            }
-            FileSystemAccessMode::Read if !sandbox.readable_roots().contains(&path) => {
-                sandbox = sandbox.with_readable_root(path);
-            }
-            _ => {}
-        }
-    }
-    Ok(sandbox)
-}
-
-fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
+fn command_approval(context: &ToolContext<'_>, exec_permission_approvals: bool) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
     };
@@ -1159,7 +1060,7 @@ fn command_approval(context: &ToolContext<'_>) -> Result<bool> {
     let decision = if let Some(decision) = settings.command_decisions.current(context)? {
         decision
     } else {
-        let Ok(decision) = command_decision(context, settings) else {
+        let Ok(decision) = command_decision(context, settings, exec_permission_approvals) else {
             return Ok(false);
         };
         settings.command_decisions.record(context, decision)?
@@ -1191,6 +1092,8 @@ struct CommandArguments {
     sandbox_permissions: Option<SandboxPermissions>,
     justification: Option<String>,
     prefix_rule: Option<Vec<String>>,
+    /// Read where the command's directory is known, so relative paths resolve against it.
+    additional_permissions: Option<Value>,
 }
 
 impl CommandArguments {
@@ -1216,6 +1119,15 @@ impl CommandArguments {
 fn shlex_join(tokens: &[String]) -> String {
     shlex::try_join(tokens.iter().map(String::as_str))
         .unwrap_or_else(|_| "<command included NUL byte>".to_string())
+}
+
+/// The patch an `apply_patch` call carries, as a string or as its `patch` argument.
+fn patch_text(arguments: &Value) -> Option<&str> {
+    match arguments {
+        Value::String(patch) => Some(patch.as_str()),
+        Value::Object(arguments) => arguments.get("patch").and_then(Value::as_str),
+        _ => None,
+    }
 }
 
 /// The tools whose approvals the thread caches, by the names the coding host installs them under.
@@ -1650,28 +1562,24 @@ fn call_key(context: &ToolContext<'_>) -> (RunId, CallId) {
 fn command_decision(
     context: &ToolContext<'_>,
     settings: &CodingThreadSettings,
+    exec_permission_approvals: bool,
 ) -> Result<CommandDecision> {
     let arguments: CommandArguments =
         serde_json::from_value(context.arguments().clone()).map_err(|error| {
             ra_tools::exec_command::rejection(format!("invalid arguments: {error}"))
         })?;
-    if arguments.justification.is_some() && arguments.sandbox_permissions.is_none() {
-        return Err(ra_tools::exec_command::rejection(
-            JUSTIFICATION_WITHOUT_SANDBOX_PERMISSIONS,
-        ));
-    }
+    let cwd = settings.command_cwd(arguments.workdir.as_deref());
+    let paths = PolicyPaths::for_command(&settings.cwd, &cwd);
+    let policy_context = paths.context();
+    let effective = command_permissions(
+        context,
+        settings,
+        &arguments,
+        &policy_context,
+        exec_permission_approvals,
+    )?;
     let sandbox_permissions = arguments.sandbox_permissions.unwrap_or_default();
     let approval_policy = settings.approval_policy;
-    // Codex formats the policy with `Debug`, which differs from Codex's only for `Granular`: this
-    // build's variant carries its fields itself rather than in a `GranularApprovalConfig`.
-    if sandbox_permissions.requests_sandbox_override()
-        && prompt_is_rejected_by_policy(approval_policy, false).is_some()
-    {
-        return Err(ra_tools::exec_command::rejection(format!(
-            "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
-        )));
-    }
-    let effective = apply_granted_turn_permissions(context, settings, sandbox_permissions);
     let command = arguments.command();
     let requirement = settings
         .exec_policy
@@ -1680,7 +1588,7 @@ fn command_decision(
                 command: &command,
                 approval_policy,
                 file_system_sandbox: FileSystemSandboxKind::of(&settings.sandbox_policy),
-                // Granted permissions were approved when they were given, so they do not ask again.
+                // Preapproved permissions do not ask again.
                 sandbox_permissions: if effective.permissions_preapproved {
                     SandboxPermissions::UseDefault
                 } else {
@@ -1704,11 +1612,7 @@ fn command_decision(
         let environment = sandboxed_environment(settings, &ExecEnvironment::new());
         match (environment.sandbox(), &effective.additional_permissions) {
             (Some(sandbox), Some(permissions)) => {
-                let paths = PolicyPaths::for_command(
-                    &settings.cwd,
-                    &settings.command_cwd(arguments.workdir.as_deref()),
-                );
-                let sandbox = granted_sandbox(sandbox.clone(), permissions, &paths.context())
+                let sandbox = granted_sandbox(sandbox.clone(), permissions, &policy_context)
                     .map_err(ra_tools::exec_command::rejection)?;
                 environment.with_sandbox(sandbox)
             }
@@ -1734,14 +1638,91 @@ fn command_decision(
     })
 }
 
+/// What the call runs with beyond the thread's sandbox, as Codex's `exec_command` handler decides
+/// it: the call's own `additional_permissions`, read relative to the directory it runs in, with the
+/// turn's and the session's grants added, checked as Codex checks what a call asks for inline. The
+/// permissions returned are the normalized ones the command runs with.
+fn command_permissions(
+    context: &ToolContext<'_>,
+    settings: &CodingThreadSettings,
+    arguments: &CommandArguments,
+    policy_context: &FileSystemSandboxPolicyContext<'_>,
+    exec_permission_approvals: bool,
+) -> Result<EffectiveAdditionalPermissions> {
+    let additional_permissions = arguments
+        .additional_permissions
+        .clone()
+        .map(|permissions| {
+            let _guard = AbsolutePathBufGuard::new(policy_context.cwd());
+            serde_json::from_value::<AdditionalPermissionProfile>(permissions)
+        })
+        .transpose()
+        .map_err(|error| {
+            ra_tools::exec_command::rejection(format!("invalid arguments: {error}"))
+        })?;
+    if arguments.justification.is_some() && arguments.sandbox_permissions.is_none() {
+        return Err(ra_tools::exec_command::rejection(
+            JUSTIFICATION_WITHOUT_SANDBOX_PERMISSIONS,
+        ));
+    }
+    let sandbox_permissions = arguments.sandbox_permissions.unwrap_or_default();
+    let approval_policy = settings.approval_policy;
+    let effective = apply_granted_turn_permissions(
+        context,
+        settings,
+        policy_context,
+        sandbox_permissions,
+        additional_permissions.clone(),
+    );
+    // Codex's `request_permissions_tool` feature also lets preapproved permissions through; grants
+    // exist only once that tool was installed and answered.
+    let additional_permissions_allowed =
+        exec_permission_approvals || effective.permissions_preapproved;
+    // Sticky grants were approved when they were given, so they continue through the normal
+    // approval flow for the command. Codex formats the policy with `Debug`, which differs from
+    // Codex's only for `Granular`: this build's variant carries its fields itself rather than in a
+    // `GranularApprovalConfig`.
+    if effective.sandbox_permissions.requests_sandbox_override()
+        && !effective.permissions_preapproved
+        && prompt_is_rejected_by_policy(approval_policy, false).is_some()
+    {
+        return Err(ra_tools::exec_command::rejection(format!(
+            "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
+        )));
+    }
+    let normalized = match implicit_granted_permissions(
+        sandbox_permissions,
+        additional_permissions.as_ref(),
+        &effective,
+    ) {
+        Some(permissions) => Some(permissions),
+        None => normalize_and_validate_additional_permissions(
+            additional_permissions_allowed,
+            approval_policy,
+            effective.sandbox_permissions,
+            effective.additional_permissions,
+            effective.permissions_preapproved,
+            policy_context,
+        )
+        .map_err(ra_tools::exec_command::rejection)?,
+    };
+    Ok(EffectiveAdditionalPermissions {
+        sandbox_permissions: effective.sandbox_permissions,
+        additional_permissions: normalized,
+        permissions_preapproved: effective.permissions_preapproved,
+    })
+}
+
 /// Whether a patch asks before it is applied: Codex's patch safety check, and its approval cache
 /// when it would ask.
 pub(crate) fn patch_approval(context: &ToolContext<'_>) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
     };
-    // A patch touching only paths the host approved for the session does not ask again.
+    // A patch the grants already cover runs without asking, as Codex's preapproved patch does,
+    // and one touching only paths the host approved for the session does not ask again.
     Ok(patch_asks(settings)?
+        && !settings.patch_preapproved(context)
         && !settings.approved_for_session(&settings.patch_cache_keys(context.arguments())))
 }
 

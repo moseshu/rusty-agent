@@ -283,16 +283,32 @@ impl Server {
         connection: &Connection,
         tools: Vec<Arc<dyn Tool>>,
     ) -> RunConfig {
-        let adapter = CodingThreadSettingsAdapter::new(
-            self.host.workspace_root(),
+        self.load_in_sandbox(
+            script,
+            approval,
             SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![],
                 network_access: false,
                 exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
             },
+            connection,
+            tools,
         )
-        .unwrap();
+        .await
+    }
+
+    /// Loads a coding thread whose commands run in `sandbox`.
+    async fn load_in_sandbox(
+        &self,
+        script: &Arc<Script>,
+        approval: AskForApproval,
+        sandbox: SandboxPolicy,
+        connection: &Connection,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> RunConfig {
+        let adapter =
+            CodingThreadSettingsAdapter::new(self.host.workspace_root(), sandbox).unwrap();
         let config = adapter
             .prepare(
                 &adapter.initialize(self.host.build_run_config()),
@@ -1982,4 +1998,890 @@ async fn an_escalated_command_takes_no_grant() {
         .await;
     connection.notification("turn/completed").await;
     assert!(server.root().join("escalated.txt").exists());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Permissions a command asks for itself, and patches the grants cover
+// ---------------------------------------------------------------------------------------------
+
+fn read_only() -> SandboxPolicy {
+    SandboxPolicy::ReadOnly {
+        network_access: false,
+    }
+}
+
+/// The tools of a host that turned on Codex's `exec_permission_approvals`.
+fn inline_tools(server: &Server) -> Vec<Arc<dyn Tool>> {
+    let host = server.host.clone().with_exec_permission_approvals();
+    vec![
+        host.request_permissions_tool().unwrap(),
+        host.exec_command_tool().unwrap(),
+        host.apply_patch_tool().unwrap(),
+    ]
+}
+
+/// `exec_command`'s arguments once additional permissions are offered.
+fn inline_command(fields: Value) -> Value {
+    let mut arguments = command(json!({"additional_permissions": null}));
+    for (key, value) in fields.as_object().unwrap() {
+        arguments[key] = value.clone();
+    }
+    arguments
+}
+
+/// A command asking for `write` with `with_additional_permissions`.
+fn asking_to_write(cmd: &str, write: &[String]) -> Value {
+    inline_command(json!({
+        "cmd": cmd,
+        "sandbox_permissions": "with_additional_permissions",
+        "additional_permissions": {"network": null, "file_system": {"read": null, "write": write}},
+    }))
+}
+
+fn printf_into(path: &Path, text: &str) -> String {
+    format!("printf {text} > '{0}' && cat '{0}'", path.display())
+}
+
+/// The paths a command approval request says the command may write.
+fn requested_writes(request: &Value) -> Vec<String> {
+    let mut writes: Vec<String> = request["params"]["additionalPermissions"]["fileSystem"]["write"]
+        .as_array()
+        .expect("the request carries the permissions")
+        .iter()
+        .map(|path| path.as_str().unwrap().to_owned())
+        .collect();
+    writes.sort();
+    writes
+}
+
+/// One turn running `call`, whose command asks for approval, answered with `decision`. Returns
+/// the approval request.
+async fn run_asking(
+    sandbox: SandboxPolicy,
+    call: Value,
+    decision: &str,
+) -> (Server, Arc<Script>, Value) {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(self::call("exec_command", "exec-call", call));
+    script.push(final_message("done"));
+    let _ = server
+        .load_in_sandbox(
+            &script,
+            on_request(),
+            sandbox,
+            &connection,
+            inline_tools(&server),
+        )
+        .await;
+    server.turn_start(&mut connection, "run it").await;
+    let request = connection.command_request().await;
+    server
+        .answer(&connection, &request, json!({"decision": decision}))
+        .await;
+    connection.notification("turn/completed").await;
+    (server, script, request)
+}
+
+/// Codex's `with_additional_permissions_requires_approval_under_on_request`: a read-only thread's
+/// command asking to write a directory asks, showing what it asks for, and once approved writes
+/// there.
+#[tokio::test]
+async fn with_additional_permissions_requires_approval_under_on_request() {
+    let server = Server::start();
+    let requested_dir = server.root().join("requested-dir");
+    std::fs::create_dir_all(&requested_dir).unwrap();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(call(
+        "exec_command",
+        "request_permissions_skip_approval",
+        asking_to_write(
+            "touch requested-dir/requested-but-unused.txt",
+            &[text(&requested_dir)],
+        ),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_in_sandbox(
+            &script,
+            on_request(),
+            read_only(),
+            &connection,
+            inline_tools(&server),
+        )
+        .await;
+    server.turn_start(&mut connection, "touch it").await;
+    let request = connection.command_request().await;
+    assert_eq!(
+        request["params"]["itemId"],
+        "request_permissions_skip_approval"
+    );
+    assert_eq!(requested_writes(&request), vec![text(&requested_dir)]);
+    assert_eq!(
+        request["params"]["availableDecisions"],
+        json!(["accept", "cancel"])
+    );
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert!(requested_dir.join("requested-but-unused.txt").exists());
+}
+
+/// Codex's `relative_additional_permissions_resolve_against_tool_workdir`.
+#[tokio::test]
+async fn relative_additional_permissions_resolve_against_tool_workdir() {
+    let server = Server::start();
+    let nested = server.root().join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let mut arguments = asking_to_write("touch relative-write.txt", &[".".to_owned()]);
+    arguments["workdir"] = json!("nested");
+    script.push(call("exec_command", "exec-call", arguments));
+    script.push(final_message("done"));
+    let _ = server
+        .load_in_sandbox(
+            &script,
+            on_request(),
+            read_only(),
+            &connection,
+            inline_tools(&server),
+        )
+        .await;
+    server.turn_start(&mut connection, "touch it").await;
+    let request = connection.command_request().await;
+    assert_eq!(requested_writes(&request), vec![text(&nested)]);
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert!(nested.join("relative-write.txt").exists());
+}
+
+/// Codex's `read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd_write` and
+/// `..._tmp_write`: approving what a command asks for opens nothing else.
+#[tokio::test]
+async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (requested, unrequested) in [
+        ("requested-only-cwd.txt", None),
+        (
+            "requested-only-tmp.txt",
+            Some(tmp.path().join("tmp-widening.txt")),
+        ),
+    ] {
+        let server = Server::start();
+        let requested = server.root().join(requested);
+        let unrequested =
+            unrequested.unwrap_or_else(|| server.root().join("unrequested-cwd-write.txt"));
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(call(
+            "exec_command",
+            "exec-call",
+            asking_to_write(&printf_into(&unrequested, "widened"), &[text(&requested)]),
+        ));
+        script.push(final_message("done"));
+        let _ = server
+            .load_in_sandbox(
+                &script,
+                on_request(),
+                read_only(),
+                &connection,
+                inline_tools(&server),
+            )
+            .await;
+        server.turn_start(&mut connection, "write elsewhere").await;
+        let request = connection.command_request().await;
+        assert_eq!(requested_writes(&request), vec![text(&requested)]);
+        server
+            .answer(&connection, &request, json!({"decision": "accept"}))
+            .await;
+        connection.notification("turn/completed").await;
+
+        assert!(
+            !unrequested.exists(),
+            "{:?}",
+            script.last_output("exec-call")
+        );
+    }
+}
+
+/// Codex's `workspace_write_with_additional_permissions_can_write_outside_cwd` and
+/// `with_additional_permissions_denied_approval_blocks_execution`.
+#[tokio::test]
+async fn approving_what_a_command_asks_for_decides_whether_it_runs() {
+    for (decision, runs) in [("accept", true), ("decline", false)] {
+        let outside = tempfile::tempdir().unwrap();
+        let written = outside.path().join("outside-write.txt");
+        let (_server, script, request) = run_asking(
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            asking_to_write(
+                &printf_into(&written, "outside-ok"),
+                &[text(outside.path())],
+            ),
+            decision,
+        )
+        .await;
+        assert_eq!(requested_writes(&request), vec![text(outside.path())]);
+        assert_eq!(
+            written.exists(),
+            runs,
+            "{decision}: {:?}",
+            script.last_output("exec-call")
+        );
+    }
+}
+
+/// Codex's `request_permissions_preapprove_explicit_exec_permissions_outside_on_request`: a
+/// command asking for what the turn was granted does not ask again.
+#[tokio::test]
+async fn request_permissions_preapprove_explicit_exec_permissions() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let written = outside.path().join("sticky-explicit-write.txt");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(outside.path()),
+    ));
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        asking_to_write(
+            &printf_into(&written, "sticky-explicit-grant-ok"),
+            &[text(outside.path())],
+        ),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, inline_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "write outside").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(outside.path(), "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "sticky-explicit-grant-ok"
+    );
+    assert!(
+        connection
+            .drain()
+            .await
+            .iter()
+            .all(|message| { message["method"] != "item/commandExecution/requestApproval" }),
+        "a preapproved command does not ask"
+    );
+}
+
+/// Codex's `partial_request_permissions_grants_do_not_preapprove_new_permissions`: a command
+/// asking for more than the turn was granted asks, for the grant and its request together.
+#[tokio::test]
+async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() {
+    let server = Server::start();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let written = second.path().join("partial-grant-write.txt");
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        json!({"permissions": {"file_system": {"write": [text(first.path()), text(second.path())]}}}),
+    ));
+    script.push(call(
+        "exec_command",
+        "exec-call",
+        asking_to_write(
+            &printf_into(&written, "partial-grant-ok"),
+            &[text(second.path())],
+        ),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, inline_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "write both").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(first.path(), "turn"),
+        )
+        .await;
+    let request = connection.command_request().await;
+    let mut expected = vec![text(first.path()), text(second.path())];
+    expected.sort();
+    assert_eq!(requested_writes(&request), expected);
+    assert_eq!(
+        request["params"]["additionalPermissions"]["network"],
+        Value::Null
+    );
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "partial-grant-ok"
+    );
+}
+
+/// A command asking for permissions where Codex's handler refuses it is refused with Codex's text
+/// and does not run: under `never`, and under any policy but `on-request`.
+#[tokio::test]
+async fn inline_permissions_are_refused_outside_on_request() {
+    for (approval, refusal) in [
+        (
+            AskForApproval::Never,
+            "approval policy is Never; reject command — you cannot ask for escalated permissions if the approval policy is Never",
+        ),
+        (
+            AskForApproval::UnlessTrusted,
+            "approval policy is UnlessTrusted; reject command — you cannot request additional permissions unless the approval policy is OnRequest",
+        ),
+    ] {
+        let server = Server::start();
+        let outside = tempfile::tempdir().unwrap();
+        let written = outside.path().join("refused.txt");
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(call(
+            "exec_command",
+            "exec-call",
+            asking_to_write(&printf_into(&written, "refused"), &[text(outside.path())]),
+        ));
+        script.push(final_message("done"));
+        let _ = server
+            .load_with_tools(&script, approval, &connection, inline_tools(&server))
+            .await;
+        server.turn_start(&mut connection, "write outside").await;
+        connection.notification("turn/completed").await;
+
+        let output = script.last_output("exec-call").unwrap().to_string();
+        assert!(output.contains(refusal), "{output}");
+        assert!(!written.exists());
+    }
+}
+
+/// `path` spelled through macOS's `/var` alias when it lies below `/private/var`, as a client may
+/// name it; elsewhere as it is.
+fn aliased(path: &Path) -> String {
+    let path = text(path);
+    path.strip_prefix("/private/var/")
+        .map_or(path.clone(), |rest| format!("/var/{rest}"))
+}
+
+fn add_file(path: &str, content: &str) -> Value {
+    json!({"patch": format!("*** Begin Patch\n*** Add File: {path}\n+{content}\n*** End Patch\n")})
+}
+
+/// Codex's `approved_folder_write_request_permissions_unblocks_later_apply_patch`, inside the
+/// workspace this patch tool is confined to: once a read-only turn is granted a directory, a patch
+/// writing only there does not ask, while one writing elsewhere, or a path the grant keeps
+/// read-only, still does. The grant names its paths through a system alias where there is one.
+#[tokio::test]
+async fn approved_folder_write_request_permissions_unblocks_later_apply_patch() {
+    let server = Server::start();
+    let granted = server.root().join("granted");
+    std::fs::create_dir_all(&granted).unwrap();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(call(
+        "apply_patch",
+        "before-grant",
+        add_file("granted/early.txt", "early"),
+    ));
+    script.push(request_permissions(
+        "permissions-call",
+        json!({"permissions": {"file_system": {"entries": [
+            {"path": {"type": "path", "path": aliased(&granted)}, "access": "write"},
+            {"path": {"type": "path", "path": aliased(&granted.join("locked.txt"))}, "access": "read"},
+        ]}}}),
+    ));
+    script.push(call(
+        "apply_patch",
+        "granted-patch",
+        add_file("granted/new.txt", "patched"),
+    ));
+    script.push(call(
+        "apply_patch",
+        "locked-patch",
+        add_file("granted/locked.txt", "locked"),
+    ));
+    script.push(call(
+        "apply_patch",
+        "outside-patch",
+        add_file("other.txt", "other"),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_in_sandbox(
+            &script,
+            on_request(),
+            read_only(),
+            &connection,
+            inline_tools(&server),
+        )
+        .await;
+    server.turn_start(&mut connection, "patch").await;
+
+    let file_change = |message: &Value| {
+        message["method"] == "item/fileChange/requestApproval" && message.get("id").is_some()
+    };
+    let request = connection.until(file_change).await;
+    assert_eq!(request["params"]["itemId"], "before-grant");
+    server
+        .answer(&connection, &request, json!({"decision": "decline"}))
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"fileSystem": {"entries": [
+                {"path": {"type": "path", "path": aliased(&granted)}, "access": "write"},
+                {"path": {"type": "path", "path": aliased(&granted.join("locked.txt"))}, "access": "read"},
+            ]}}, "scope": "turn"}),
+        )
+        .await;
+    for item in ["locked-patch", "outside-patch"] {
+        let request = connection.until(file_change).await;
+        assert_eq!(request["params"]["itemId"], item);
+        server
+            .answer(&connection, &request, json!({"decision": "decline"}))
+            .await;
+    }
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(granted.join("new.txt")).unwrap(),
+        "patched\n"
+    );
+    for refused in ["granted/early.txt", "granted/locked.txt", "other.txt"] {
+        assert!(!server.root().join(refused).exists(), "{refused}");
+    }
+}
+
+/// A preapproved update changes only the authorized directory entry, leaving an ungranted file
+/// sharing its old inode unchanged. The in-process patch writer cannot rely on a kernel sandbox.
+#[tokio::test]
+async fn preapproved_patches_do_not_modify_ungranted_hardlinks() {
+    let server = Server::start();
+    let granted = server.root().join("granted");
+    std::fs::create_dir(&granted).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let protected = outside.path().join("protected.txt");
+    let alias = granted.join("alias.txt");
+    std::fs::write(&protected, "original\n").unwrap();
+    std::fs::hard_link(&protected, &alias).unwrap();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions("grant", directory_write(&granted)));
+    script.push(call("apply_patch", "patch", json!({"patch": "*** Begin Patch\n*** Update File: granted/alias.txt\n@@\n-original\n+updated\n*** End Patch\n"})));
+    script.push(final_message("done"));
+    let _ = server
+        .load_in_sandbox(
+            &script,
+            on_request(),
+            read_only(),
+            &connection,
+            inline_tools(&server),
+        )
+        .await;
+    server
+        .turn_start(&mut connection, "patch only the granted directory")
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(&granted, "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+    assert_eq!(std::fs::read_to_string(&protected).unwrap(), "original\n");
+    assert_eq!(std::fs::read_to_string(&alias).unwrap(), "updated\n");
+    assert!(
+        connection
+            .drain()
+            .await
+            .iter()
+            .all(|message| message["method"] != "item/fileChange/requestApproval")
+    );
+}
+
+/// An aliased deny glob must match a patch's canonical target while permitting other files.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn patch_deny_globs_match_system_aliases() {
+    for use_alias in [true, false] {
+        let server = Server::start();
+        let granted = server.root().join("granted");
+        std::fs::create_dir(&granted).unwrap();
+        let root = if use_alias {
+            aliased(&granted)
+        } else {
+            text(&granted)
+        };
+        let entries = json!([
+            {"path": {"type": "path", "path": root}, "access": "write"},
+            {"path": {"type": "glob_pattern", "pattern": format!("{root}/*.env")}, "access": "deny"},
+        ]);
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(request_permissions(
+            "grant",
+            json!({"permissions": {"file_system": {"entries": entries}}}),
+        ));
+        script.push(call(
+            "apply_patch",
+            "allowed",
+            add_file("granted/public.txt", "allowed"),
+        ));
+        script.push(call(
+            "apply_patch",
+            "denied",
+            add_file("granted/private.env", "secret"),
+        ));
+        script.push(final_message("done"));
+        let config = server
+            .load_in_sandbox(
+                &script,
+                on_request(),
+                read_only(),
+                &connection,
+                inline_tools(&server),
+            )
+            .await;
+        server
+            .turn_start(&mut connection, "keep environment files denied")
+            .await;
+        let request = connection.permissions_request().await;
+        server
+            .answer(
+                &connection,
+                &request,
+                json!({"permissions": {"fileSystem": {"entries": entries}}, "scope": "session"}),
+            )
+            .await;
+        let request = connection
+            .until(|message| {
+                message["method"] == "item/fileChange/requestApproval"
+                    || message["method"] == "turn/completed"
+            })
+            .await;
+        assert_eq!(
+            request["method"], "item/fileChange/requestApproval",
+            "{request}"
+        );
+        assert_eq!(request["params"]["itemId"], "denied");
+        server
+            .answer(&connection, &request, json!({"decision": "decline"}))
+            .await;
+        connection.notification("turn/completed").await;
+        assert_eq!(
+            std::fs::read_to_string(granted.join("public.txt")).unwrap(),
+            "allowed\n"
+        );
+        assert!(!granted.join("private.env").exists());
+        assert!(
+            settings(&config)
+                .granted_session_permissions()
+                .unwrap()
+                .file_system()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| entry.access() == ra_coding::permissions::FileSystemAccessMode::Deny)
+        );
+    }
+}
+
+/// A restriction that cannot be translated into the sandbox namespace prevents preapproval;
+/// neither an unresolvable deny path nor an ambiguous glob root can be dropped.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn unresolvable_patch_restrictions_prevent_preapproval() {
+    for case in ["symlink-deny", "nonliteral-glob-root"] {
+        let server = Server::start();
+        let granted = server.root().join("granted");
+        std::fs::create_dir(&granted).unwrap();
+        let restriction = if case == "symlink-deny" {
+            std::fs::create_dir(granted.join("secret")).unwrap();
+            std::os::unix::fs::symlink("secret", granted.join("link")).unwrap();
+            json!({"path": {"type": "path", "path": text(&granted.join("link"))}, "access": "deny"})
+        } else {
+            json!({"path": {"type": "glob_pattern", "pattern": "/v*/**/*.env"}, "access": "deny"})
+        };
+        let root = if case == "symlink-deny" {
+            text(&granted)
+        } else {
+            aliased(&granted)
+        };
+        let entries = json!([
+            {"path": {"type": "path", "path": root}, "access": "write"}, restriction,
+        ]);
+        let mut connection = server.connect(1).await;
+        let script = Arc::new(Script::default());
+        script.push(request_permissions(
+            "grant",
+            json!({"permissions": {"file_system": {"entries": entries}}}),
+        ));
+        script.push(call(
+            "apply_patch",
+            "patch",
+            add_file("granted/public.txt", "unreviewed"),
+        ));
+        script.push(final_message("done"));
+        let _ = server
+            .load_in_sandbox(
+                &script,
+                on_request(),
+                read_only(),
+                &connection,
+                inline_tools(&server),
+            )
+            .await;
+        server
+            .turn_start(&mut connection, "check the complete restrictions")
+            .await;
+        let request = connection.permissions_request().await;
+        server
+            .answer(
+                &connection,
+                &request,
+                json!({"permissions": {"fileSystem": {"entries": entries}}, "scope": "turn"}),
+            )
+            .await;
+        let request = connection
+            .until(|message| {
+                message["method"] == "item/fileChange/requestApproval"
+                    || message["method"] == "turn/completed"
+            })
+            .await;
+        assert_eq!(
+            request["method"], "item/fileChange/requestApproval",
+            "{case}: {request}"
+        );
+        server
+            .answer(&connection, &request, json!({"decision": "decline"}))
+            .await;
+        connection.notification("turn/completed").await;
+        assert!(!granted.join("public.txt").exists());
+    }
+}
+
+/// Preapproved permissions skip Codex's refusal of sandbox overrides where sandbox prompts are
+/// rejected: a granular policy without sandbox approval still runs a granted command, and one
+/// asking inline for what was granted, while a command asking for more is refused.
+#[tokio::test]
+async fn grants_apply_where_sandbox_prompts_are_rejected() {
+    let server = Server::start();
+    let granted = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(request_permissions(
+        "permissions-call",
+        directory_write(granted.path()),
+    ));
+    script.push(call(
+        "exec_command",
+        "implicit",
+        inline_command(
+            json!({"cmd": printf_into(&granted.path().join("implicit.txt"), "implicit")}),
+        ),
+    ));
+    script.push(call(
+        "exec_command",
+        "explicit",
+        asking_to_write(
+            &printf_into(&granted.path().join("explicit.txt"), "explicit"),
+            &[text(granted.path())],
+        ),
+    ));
+    script.push(call(
+        "exec_command",
+        "beyond",
+        asking_to_write(
+            &printf_into(&other.path().join("beyond.txt"), "beyond"),
+            &[text(other.path())],
+        ),
+    ));
+    script.push(final_message("done"));
+    let approval = AskForApproval::Granular {
+        sandbox_approval: false,
+        rules: true,
+        skill_approval: true,
+        request_permissions: true,
+        mcp_elicitations: true,
+    };
+    let _ = server
+        .load_with_tools(&script, approval, &connection, inline_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "write").await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            grant_directory_write(granted.path(), "turn"),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    for name in ["implicit", "explicit"] {
+        assert_eq!(
+            std::fs::read_to_string(granted.path().join(format!("{name}.txt"))).unwrap(),
+            name
+        );
+    }
+    let beyond = script.last_output("beyond").unwrap().to_string();
+    assert!(
+        beyond.contains("you cannot ask for escalated permissions"),
+        "{beyond}"
+    );
+    assert!(!other.path().join("beyond.txt").exists());
+}
+
+/// As Codex's patch handler preapproves it, a patch inside a workspace-write thread's workspace
+/// runs without asking once the turn holds any grant, here one for a path elsewhere.
+#[tokio::test]
+async fn any_grant_preapproves_patches_the_sandbox_already_allows() {
+    let server = Server::start();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = text(outside.path());
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(call(
+        "apply_patch",
+        "before-grant",
+        add_file("early.txt", "early"),
+    ));
+    script.push(request_permissions(
+        "permissions-call",
+        json!({"permissions": {"file_system": {"write": [outside_path]}}}),
+    ));
+    script.push(call(
+        "apply_patch",
+        "after-grant",
+        add_file("late.txt", "late"),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_with_tools(&script, on_request(), &connection, inline_tools(&server))
+        .await;
+    server.turn_start(&mut connection, "patch").await;
+    let request = connection
+        .until(|message| {
+            message["method"] == "item/fileChange/requestApproval" && message.get("id").is_some()
+        })
+        .await;
+    assert_eq!(request["params"]["itemId"], "before-grant");
+    server
+        .answer(&connection, &request, json!({"decision": "decline"}))
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"fileSystem": {"write": [outside_path]}}, "scope": "turn"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(server.root().join("late.txt")).unwrap(),
+        "late\n"
+    );
+    assert!(!server.root().join("early.txt").exists());
+    assert!(
+        connection
+            .drain()
+            .await
+            .iter()
+            .all(|message| { message["method"] != "item/fileChange/requestApproval" }),
+        "the preapproved patch does not ask"
+    );
+}
+
+/// A thread whose commands run unconfined can write anywhere, so under `unless-trusted`, where its
+/// patches ask, any grant preapproves them, as Codex's patch handler does.
+#[tokio::test]
+async fn any_grant_preapproves_patches_of_an_unconfined_thread() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(call(
+        "apply_patch",
+        "before-grant",
+        add_file("early.txt", "early"),
+    ));
+    script.push(request_permissions(
+        "permissions-call",
+        json!({"permissions": {"network": {"enabled": true}}}),
+    ));
+    script.push(call(
+        "apply_patch",
+        "after-grant",
+        add_file("late.txt", "late"),
+    ));
+    script.push(final_message("done"));
+    let _ = server
+        .load_in_sandbox(
+            &script,
+            AskForApproval::UnlessTrusted,
+            SandboxPolicy::DangerFullAccess,
+            &connection,
+            inline_tools(&server),
+        )
+        .await;
+    server.turn_start(&mut connection, "patch").await;
+    let request = connection
+        .until(|message| {
+            message["method"] == "item/fileChange/requestApproval" && message.get("id").is_some()
+        })
+        .await;
+    assert_eq!(request["params"]["itemId"], "before-grant");
+    server
+        .answer(&connection, &request, json!({"decision": "decline"}))
+        .await;
+    let request = connection.permissions_request().await;
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        std::fs::read_to_string(server.root().join("late.txt")).unwrap(),
+        "late\n"
+    );
+    assert!(!server.root().join("early.txt").exists());
 }

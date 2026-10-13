@@ -9,6 +9,12 @@
 //! The tool binds a confined filesystem capability to [`ra_patch`]'s parser and applier; it owns
 //! neither. Actions are committed one at a time and a later failure keeps the earlier ones, so the
 //! result reports what was actually written rather than claiming an atomicity this does not have.
+//!
+//! Updates replace the target with a fresh inode instead of rewriting a shared inode. Codex's
+//! in-place writer runs in a kernel sandbox; this in-process writer cannot rely on that to protect
+//! files outside the granted paths that share a hard link. File permissions are preserved, while
+//! ownership, extended attributes and hard-link relationships are not copied. New files use
+//! exclusive creation, and write paths cannot traverse symbolic-link directories.
 
 use std::{fmt, io::Read as _, path::Path, sync::Arc};
 
@@ -189,7 +195,7 @@ impl ApplyPatchTool {
                     ));
                 }
                 self.filesystem
-                    .write_file(path, content.as_bytes())
+                    .create_new_file(path, content.as_bytes())
                     .map_err(|error| PatchToolFailure::filesystem(&error))?;
                 Ok(append_delta(committed, path, content.lines().count(), 0))
             }
@@ -200,7 +206,7 @@ impl ApplyPatchTool {
                     }));
                 }
                 self.filesystem
-                    .remove_file(path)
+                    .remove_file_nofollow(path)
                     .map_err(|error| PatchToolFailure::filesystem(&error))?;
                 Ok(append_delta(committed, path, 0, 0))
             }
@@ -209,7 +215,7 @@ impl ApplyPatchTool {
                 let update =
                     apply_hunks(path, &original, hunks).map_err(PatchToolFailure::Conflict)?;
                 self.filesystem
-                    .write_file(path, update.content().as_bytes())
+                    .replace_file(path, update.content().as_bytes())
                     .map_err(|error| PatchToolFailure::filesystem(&error))?;
                 Ok(append_delta(
                     committed,
@@ -230,7 +236,7 @@ impl ApplyPatchTool {
                     ));
                 }
                 self.filesystem
-                    .rename(from, to)
+                    .rename_nofollow(from, to)
                     .map_err(|error| PatchToolFailure::filesystem(&error))?;
                 let mut files = committed.applied_files().to_vec();
                 if !files.contains(from) {

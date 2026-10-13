@@ -200,6 +200,14 @@ impl ShellCapability {
         self
     }
 
+    /// Offers Codex's additional permissions with the command's approval arguments; see
+    /// [`ExecCommandTool::with_additional_permissions`].
+    #[must_use]
+    pub fn with_additional_permissions(mut self) -> Self {
+        self.exec_command = Arc::new((*self.exec_command).clone().with_additional_permissions());
+        self
+    }
+
     /// Installs the host policy deciding which input to a running session asks first.
     #[must_use]
     pub fn with_stdin_policy(

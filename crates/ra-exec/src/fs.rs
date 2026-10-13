@@ -11,10 +11,16 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
 
 /// One canonical workspace root, the filesystem capability derived from it, and the scheduler
 /// identity that names it.
@@ -228,6 +234,102 @@ impl RootedFileSystem {
         file.write_all(content).map_err(RootedOpenError::Io)
     }
 
+    /// Creates a new regular file without following symbolic links in its relative path.
+    /// An existing destination, including a hard link, is never opened or truncated.
+    pub fn create_new_file(&self, path: &Path, content: &[u8]) -> Result<(), RootedOpenError> {
+        let (parent, name) = self.write_parent(path, true)?;
+        let mut file = parent
+            .open_with(&name, OpenOptions::new().write(true).create_new(true))
+            .map_err(classify)?;
+        file.write_all(content).map_err(RootedOpenError::Io)
+    }
+
+    /// Replaces an existing regular file with a fresh inode, preserving its permissions.
+    ///
+    /// Other hard links keep their original contents. The complete contents are written before
+    /// the directory entry is replaced, and staging files are removed if preparation fails.
+    /// Parent directories are held by handles and symbolic links are never traversed. Ownership,
+    /// extended attributes and hard-link relationships are not copied to the replacement.
+    pub fn replace_file(&self, path: &Path, content: &[u8]) -> Result<(), RootedOpenError> {
+        let (parent, name) = self.write_parent(path, false)?;
+        let metadata = parent.symlink_metadata(&name).map_err(classify)?;
+        if !metadata.is_file() {
+            return Err(RootedOpenError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only regular files can be replaced",
+            )));
+        }
+        let (mut file, staged_name) = create_staging_file(&parent).map_err(classify)?;
+        let mut cleanup = StagedFile {
+            parent: &parent,
+            name: &staged_name,
+            active: true,
+        };
+        file.write_all(content).map_err(RootedOpenError::Io)?;
+        file.set_permissions(metadata.permissions())
+            .map_err(RootedOpenError::Io)?;
+        drop(file);
+        parent
+            .rename(&staged_name, &parent, &name)
+            .map_err(classify)?;
+        cleanup.active = false;
+        Ok(())
+    }
+
+    /// Removes a directory entry without following symbolic links in its parent path.
+    pub fn remove_file_nofollow(&self, path: &Path) -> Result<(), RootedOpenError> {
+        let (parent, name) = self.write_parent(path, false)?;
+        parent.remove_file(name).map_err(classify)
+    }
+
+    /// Moves a directory entry through held parent handles, without traversing symbolic links.
+    /// Missing destination parents are created through the same handles.
+    pub fn rename_nofollow(&self, from: &Path, to: &Path) -> Result<(), RootedOpenError> {
+        let (source, source_name) = self.write_parent(from, false)?;
+        let (destination, destination_name) = self.write_parent(to, true)?;
+        source
+            .rename(source_name, &destination, destination_name)
+            .map_err(classify)
+    }
+
+    /// Opens each parent separately without following a symbolic link, creating missing parents.
+    /// Holding the final directory handle keeps staging and replacement in the same directory.
+    fn write_parent(
+        &self,
+        path: &Path,
+        create_missing: bool,
+    ) -> Result<(Dir, std::ffi::OsString), RootedOpenError> {
+        let relative = relative_path(path)?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| {
+                RootedOpenError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a file path must name a file",
+                ))
+            })?
+            .to_owned();
+        let mut parent = self.root.try_clone().map_err(classify)?;
+        for component in relative.parent().into_iter().flat_map(Path::components) {
+            let start = parent.try_clone().map_err(classify)?.into_std_file();
+            let component = Path::new(component.as_os_str());
+            let child = match cap_primitives::fs::open_dir_nofollow(&start, component) {
+                Ok(child) => child,
+                Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
+                    match parent.create_dir(component) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(classify(error)),
+                    }
+                    cap_primitives::fs::open_dir_nofollow(&start, component).map_err(classify)?
+                }
+                Err(error) => return Err(classify(error)),
+            };
+            parent = Dir::from_std_file(child);
+        }
+        Ok((parent, name))
+    }
+
     /// Creates directories recursively below the root.
     pub fn create_dir_all(&self, path: &Path) -> Result<(), RootedOpenError> {
         let relative = relative_path(path)?;
@@ -317,6 +419,46 @@ impl RootedFileSystem {
         walk_directory(&directory, &relative, limit, enter, &mut walked);
         walked.files.sort();
         Ok(walked)
+    }
+}
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusive creation owns a fresh inode even if another process races the generated name.
+fn create_staging_file(parent: &Dir) -> io::Result<(cap_std::fs::File, String)> {
+    for _ in 0..128 {
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".ra-patch-{}-{sequence}.tmp", std::process::id());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match parent.open_with(&name, &options) {
+            Ok(file) => return Ok((file, name)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot reserve a replacement staging file",
+    ))
+}
+
+struct StagedFile<'a> {
+    parent: &'a Dir,
+    name: &'a str,
+    active: bool,
+}
+
+impl Drop for StagedFile<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.parent.remove_file(self.name);
+        }
     }
 }
 

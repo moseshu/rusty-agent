@@ -38,6 +38,7 @@ pub struct CodingHost {
     workspace: Workspace,
     process_manager: Arc<ProcessManager>,
     event_sink: Arc<dyn HostEventSink>,
+    exec_permission_approvals: bool,
 }
 
 impl fmt::Debug for CodingHost {
@@ -61,6 +62,7 @@ impl CodingHost {
             workspace,
             process_manager: Arc::new(ProcessManager::default()),
             event_sink: Arc::new(NoopHostEventSink),
+            exec_permission_approvals: false,
         })
     }
 
@@ -73,7 +75,18 @@ impl CodingHost {
             workspace: self.workspace.clone(),
             process_manager: Arc::new(ProcessManager::default()),
             event_sink: Arc::clone(&self.event_sink),
+            exec_permission_approvals: self.exec_permission_approvals,
         }
+    }
+
+    /// Lets `exec_command` ask for permissions of its own: Codex's `exec_permission_approvals`
+    /// feature, off by default as Codex's is. The tool then offers `with_additional_permissions`
+    /// and `additional_permissions`, and a call that asks for them is checked as Codex checks it
+    /// and asks before it runs in a sandbox widened by them.
+    #[must_use]
+    pub const fn with_exec_permission_approvals(mut self) -> Self {
+        self.exec_permission_approvals = true;
+        self
     }
 
     /// Sets the host event sink.
@@ -203,13 +216,16 @@ impl CodingHost {
     /// are the ones this host cancels and reports at closeout.
     pub fn shell_capability(&self) -> ra_core::error::Result<ShellCapability> {
         let base = self.process_manager.environment().clone();
-        Ok(
-            ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))?
-                .with_command_policy(Arc::new(crate::thread_settings::CodingCommandPolicy::new(
-                    base,
-                )))
-                .with_stdin_policy(Arc::new(crate::thread_settings::CodingStdinPolicy)),
-        )
+        let mut policy = crate::thread_settings::CodingCommandPolicy::new(base);
+        let mut capability =
+            ShellCapability::for_workspace(&self.workspace, Arc::clone(&self.process_manager))?;
+        if self.exec_permission_approvals {
+            policy = policy.with_exec_permission_approvals();
+            capability = capability.with_additional_permissions();
+        }
+        Ok(capability
+            .with_command_policy(Arc::new(policy))
+            .with_stdin_policy(Arc::new(crate::thread_settings::CodingStdinPolicy)))
     }
 
     /// Creates the coding product's workspace-confined patch tool.

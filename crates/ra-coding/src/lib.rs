@@ -15,6 +15,7 @@
 //! tool set, and discipline criteria all change with the business, and no crate may depend on it
 //! (enforced by the layering gate).
 
+pub(crate) mod additional_permissions;
 pub mod agent;
 pub(crate) mod approvals;
 pub mod assembly;
@@ -58,5 +59,75 @@ pub mod request_permissions_test_api {
         context: &FileSystemSandboxPolicyContext<'_>,
     ) -> Result<(), String> {
         crate::request_permissions::resolve_permission_path_string(value, context)
+    }
+}
+
+/// Codex's permission helpers for the external integration-test workspace, which ports their unit
+/// tests.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod additional_permissions_test_api {
+    use crate::{
+        additional_permissions::EffectiveAdditionalPermissions,
+        exec_policy::SandboxPermissions,
+        permissions::{AdditionalPermissionProfile, FileSystemSandboxPolicyContext},
+    };
+    use ra_protocol::server::protocol::AskForApproval;
+
+    /// Codex's `preapproved_permission_profile`.
+    #[must_use]
+    pub fn preapproved_permission_profile(
+        effective_permissions: &AdditionalPermissionProfile,
+        granted_permissions: &AdditionalPermissionProfile,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> Option<AdditionalPermissionProfile> {
+        crate::additional_permissions::preapproved_permission_profile(
+            effective_permissions,
+            granted_permissions,
+            context,
+        )
+    }
+
+    /// Codex's `normalize_and_validate_additional_permissions`.
+    ///
+    /// # Errors
+    ///
+    /// Returns Codex's refusal.
+    pub fn normalize_and_validate_additional_permissions(
+        additional_permissions_allowed: bool,
+        approval_policy: AskForApproval,
+        sandbox_permissions: SandboxPermissions,
+        additional_permissions: Option<AdditionalPermissionProfile>,
+        permissions_preapproved: bool,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> Result<Option<AdditionalPermissionProfile>, String> {
+        crate::additional_permissions::normalize_and_validate_additional_permissions(
+            additional_permissions_allowed,
+            approval_policy,
+            sandbox_permissions,
+            additional_permissions,
+            permissions_preapproved,
+            context,
+        )
+    }
+
+    /// Codex's `implicit_granted_permissions`, given the effective permissions' parts.
+    #[must_use]
+    pub fn implicit_granted_permissions(
+        sandbox_permissions: SandboxPermissions,
+        additional_permissions: Option<&AdditionalPermissionProfile>,
+        effective_sandbox_permissions: SandboxPermissions,
+        effective_additional_permissions: Option<AdditionalPermissionProfile>,
+        permissions_preapproved: bool,
+    ) -> Option<AdditionalPermissionProfile> {
+        crate::additional_permissions::implicit_granted_permissions(
+            sandbox_permissions,
+            additional_permissions,
+            &EffectiveAdditionalPermissions {
+                sandbox_permissions: effective_sandbox_permissions,
+                additional_permissions: effective_additional_permissions,
+                permissions_preapproved,
+            },
+        )
     }
 }

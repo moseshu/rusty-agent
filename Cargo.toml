@@ -75,6 +75,7 @@ futures = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
 cap-std = "4.0.2"
+cap-primitives = "4.0.2"
 # 用 `flock`（ra-session）与进程组信号（ra-exec）。选 rustix 而不是 libc 直调，是因为
 # workspace 里 `unsafe_code = "forbid"`，而它已经作为传递依赖在锁文件里了，不新增第三方
 # 代码面。`process` 是取消契约要的那一半：只杀 leader 会留下孤儿，`kill_process_group`

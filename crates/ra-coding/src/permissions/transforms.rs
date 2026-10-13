@@ -66,6 +66,16 @@ impl<'a> FileSystemSandboxPolicyContext<'a> {
     pub const fn user_home_dir(&self) -> Option<&'a Path> {
         self.user_home_dir
     }
+
+    /// The project roots.
+    pub(crate) const fn workspace_roots(&self) -> &'a [PathBuf] {
+        self.workspace_roots
+    }
+
+    /// The temporary directories `tmpdir` names, if known.
+    pub(crate) const fn temporary_directories(&self) -> Option<&'a [PathBuf]> {
+        self.temporary_directories
+    }
 }
 
 /// Checks a profile without knowing where it applies: Codex's `normalize_additional_permissions`.
@@ -646,6 +656,17 @@ struct ReadDenyMatcher {
     denied_roots: Vec<PathBuf>,
     deny_read_matchers: Vec<GlobMatcher>,
     invalid_pattern: bool,
+}
+
+/// Whether `entries` deny reading `target`, globs included: the check Codex's deny-read matcher
+/// makes.
+pub(crate) fn is_read_denied(
+    entries: &[FileSystemSandboxEntry],
+    target: &Path,
+    context: &FileSystemSandboxPolicyContext<'_>,
+) -> bool {
+    ReadDenyMatcher::from_context(entries, context)
+        .is_some_and(|matcher| matcher.is_read_denied(target))
 }
 
 impl ReadDenyMatcher {

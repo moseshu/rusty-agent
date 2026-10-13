@@ -19,8 +19,12 @@
 //! arrive, so it is refused with a sentence instead. The approval-shaped arguments Codex carries
 //! (`sandbox_permissions`, `justification`, `prefix_rule`) are advertised only once policy resolvers
 //! are installed, for the same reason: the host's policy is what reads them, so a tool without one
-//! neither advertises nor accepts them. Their descriptions are Codex's; Codex's
-//! `with_additional_permissions` value is not offered yet.
+//! neither advertises nor accepts them. Their descriptions are Codex's. Codex's
+//! `with_additional_permissions` value and its `additional_permissions` argument are advertised
+//! only when the host also turns them on with [`ExecCommandTool::with_additional_permissions`], as
+//! Codex offers them only behind its `exec_permission_approvals` feature. A call is decoded against
+//! what the tool advertises, so with them off it cannot send them, where Codex, whose schema is not
+//! strict, still reads them.
 //!
 //! Output ceilings are host configuration rather than an argument, on the same grounds `read_file`
 //! states: the model cannot know the context budget it is spending against, so an argument asking
@@ -115,6 +119,41 @@ exec_command_input!(PolicyExecCommandInput {
     prefix_rule: Option<Vec<String>>,
 });
 
+// Codex's approval arguments with its `with_additional_permissions` value and the permissions it
+// asks for, which the host's policy reads from the call's arguments.
+exec_command_input!(PermissionsExecCommandInput {
+    /// Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions`
+    /// with `additional_permissions`, or `require_escalated` for unsandboxed execution.
+    #[allow(dead_code)]
+    sandbox_permissions: Option<AdditionalSandboxPermissionsArgument>,
+    /// User-facing approval question for `require_escalated`; omit otherwise.
+    #[allow(dead_code)]
+    justification: Option<String>,
+    /// Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`;
+    /// for example ["git", "pull"].
+    #[allow(dead_code, clippy::doc_link_with_quotes)]
+    prefix_rule: Option<Vec<String>>,
+    /// Sandboxed filesystem or network access for this command; only with
+    /// `sandbox_permissions: "with_additional_permissions"`.
+    #[allow(dead_code)]
+    #[schemars(with = "Option<PermissionProfileArgument>")]
+    additional_permissions: Option<serde_json::Value>,
+});
+
+impl From<PermissionsExecCommandInput> for ExecCommandInput {
+    fn from(input: PermissionsExecCommandInput) -> Self {
+        Self {
+            cmd: input.cmd,
+            workdir: input.workdir,
+            shell: input.shell,
+            tty: input.tty,
+            login: input.login,
+            yield_time_ms: input.yield_time_ms,
+            timeout_ms: input.timeout_ms,
+        }
+    }
+}
+
 impl From<PolicyExecCommandInput> for ExecCommandInput {
     fn from(input: PolicyExecCommandInput) -> Self {
         Self {
@@ -136,6 +175,45 @@ impl From<PolicyExecCommandInput> for ExecCommandInput {
 enum SandboxPermissionsArgument {
     UseDefault,
     RequireEscalated,
+}
+
+// Codex's `sandbox_permissions` values once additional permissions are offered, in its order.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "SandboxPermissionsArgument")]
+enum AdditionalSandboxPermissionsArgument {
+    UseDefault,
+    WithAdditionalPermissions,
+    RequireEscalated,
+}
+
+/// Filesystem or network access request.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct PermissionProfileArgument {
+    network: Option<NetworkPermissionsArgument>,
+    file_system: Option<FileSystemPermissionsArgument>,
+}
+
+/// Network access request.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct NetworkPermissionsArgument {
+    /// True requests network access; false or omitted requests none.
+    enabled: Option<bool>,
+}
+
+/// Filesystem access request.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FileSystemPermissionsArgument {
+    /// Absolute paths to grant read access; omit when none are needed.
+    read: Option<Vec<String>>,
+    /// Absolute paths to grant write access; omit when none are needed.
+    write: Option<Vec<String>>,
 }
 
 /// Ceilings and timing defaults applied by the `exec_command` tool.
@@ -200,6 +278,10 @@ pub struct ExecCommandTool {
     func_schema: FuncSchema,
     /// The schema with the approval arguments, advertised once policy resolvers are installed.
     policy_func_schema: FuncSchema,
+    /// The approval arguments with Codex's additional permissions, advertised in their place once
+    /// the host also turns those on.
+    permissions_func_schema: FuncSchema,
+    additional_permissions: bool,
     options: ToolOptions,
     process_manager: Arc<ProcessManager>,
     limits: ExecCommandLimits,
@@ -509,6 +591,10 @@ impl ExecCommandTool {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
             policy_func_schema: FuncSchema::for_input::<PolicyExecCommandInput>(TOOL_NAME)?,
+            permissions_func_schema: FuncSchema::for_input::<PermissionsExecCommandInput>(
+                TOOL_NAME,
+            )?,
+            additional_permissions: false,
             options: base_options(),
             process_manager: Arc::new(ProcessManager::default()),
             limits: ExecCommandLimits::new(),
@@ -541,6 +627,10 @@ impl ExecCommandTool {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
             policy_func_schema: FuncSchema::for_input::<PolicyExecCommandInput>(TOOL_NAME)?,
+            permissions_func_schema: FuncSchema::for_input::<PermissionsExecCommandInput>(
+                TOOL_NAME,
+            )?,
+            additional_permissions: false,
             options: base_options()
                 .with_resource_claim(ResourceClaim::exclusive(workspace.resource_id().clone())),
             process_manager: Arc::new(ProcessManager::default()),
@@ -588,8 +678,24 @@ impl ExecCommandTool {
         self
     }
 
+    /// Offers Codex's `with_additional_permissions` value and its `additional_permissions`
+    /// argument with the approval arguments, as Codex's `exec_permission_approvals` feature does.
+    /// They are advertised once a policy is installed, which reads them from the call's arguments.
+    #[must_use]
+    pub fn with_additional_permissions(mut self) -> Self {
+        self.additional_permissions = true;
+        if self.policy.is_some() {
+            self.func_schema = self.permissions_func_schema.clone();
+        }
+        self
+    }
+
     fn install_policy(&mut self, policy: Arc<dyn ExecCommandPolicy>) {
-        self.func_schema = self.policy_func_schema.clone();
+        self.func_schema = if self.additional_permissions {
+            self.permissions_func_schema.clone()
+        } else {
+            self.policy_func_schema.clone()
+        };
         self.policy = Some(policy);
         self.options = self
             .options
@@ -639,6 +745,20 @@ impl ExecCommandTool {
             },
             Ok,
         )
+    }
+
+    /// A call's arguments in the form the installed policy accepts.
+    fn policy_input(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> std::result::Result<ExecCommandInput, serde_json::Error> {
+        if self.additional_permissions {
+            serde_json::from_value::<PermissionsExecCommandInput>(arguments.clone())
+                .map(ExecCommandInput::from)
+        } else {
+            serde_json::from_value::<PolicyExecCommandInput>(arguments.clone())
+                .map(ExecCommandInput::from)
+        }
     }
 
     /// Turns decoded arguments into the request `ra-exec` runs.
@@ -711,7 +831,10 @@ impl ExecCommandTool {
         let request = if let Some(resume) = resume {
             resume.request.clone()
         } else {
-            let input = if self.policy.is_some() {
+            let input = if self.policy.is_some() && self.additional_permissions {
+                self.take_input::<PermissionsExecCommandInput>(&mut context)?
+                    .into()
+            } else if self.policy.is_some() {
                 self.take_input::<PolicyExecCommandInput>(&mut context)?
                     .into()
             } else {
@@ -911,8 +1034,7 @@ impl Tool for ExecCommandTool {
         // Invalid requests are handled by the invocation's normal failure renderer, so the model
         // can correct them without asking the host to approve a command that cannot start.
         let input = if self.policy.is_some() {
-            serde_json::from_value::<PolicyExecCommandInput>(context.arguments().clone())
-                .map(ExecCommandInput::from)
+            self.policy_input(context.arguments())
         } else {
             serde_json::from_value::<ExecCommandInput>(context.arguments().clone())
         };
@@ -933,10 +1055,11 @@ impl Tool for ExecCommandTool {
         else {
             return Ok(None);
         };
-        let input: PolicyExecCommandInput = serde_json::from_value(context.arguments().clone())
+        let input = self
+            .policy_input(context.arguments())
             .map_err(|error| rejection(format!("invalid arguments: {error}")))?;
         let request = self
-            .request(input.into())
+            .request(input)
             .map_err(ExecCommandFailure::into_error)?;
         ExecCommandResume::new(context, policy_state, request)
             .encode()

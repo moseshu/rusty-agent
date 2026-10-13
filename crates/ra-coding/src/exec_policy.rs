@@ -179,6 +179,12 @@ impl SandboxPermissions {
         matches!(self, Self::RequireEscalated)
     }
 
+    /// Whether this asks to widen the sandbox with additional permissions.
+    #[must_use]
+    pub const fn uses_additional_permissions(self) -> bool {
+        matches!(self, Self::WithAdditionalPermissions)
+    }
+
     /// Whether this asks for any override beyond the default.
     #[must_use]
     pub const fn requests_sandbox_override(self) -> bool {
