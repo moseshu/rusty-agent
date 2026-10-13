@@ -37,11 +37,26 @@ cargo run -p minimal_agent
 
 | Example | Topic | Concepts covered |
 | :--- | :--- | :--- |
-| **`01_basic_agent.rs`** | Basic agent conversation | Initializing a provider client, configuring the system preamble, and running a multi-turn conversation. |
-| **`02_custom_tools.rs`** | Custom tools and function calling | Registering a Rust function as a tool with the `#[tool]` macro, and handling argument schemas and errors. |
-| **`03_react_loop.rs`** | The ReAct loop | Reasoning-and-acting dual-channel output and self-correction, driven by the `NextStep` state machine. |
-| **`04_subagent_as_tool.rs`** | Sub-agents and context isolation | Wrapping a sub-agent as a tool via `Agent::as_tool()` for file-level context isolation. |
-| **`05_mcp_integration.rs`** | MCP integration | Connecting to external or in-process Model Context Protocol tool and resource servers. |
+| **`basic_agent/`** | First run with an existing provider | Configure a shipped provider and reuse its resolver without implementing `Model` or `ModelResolver`. Show the current Runner API, then adopt the R3-7a convenience entry. |
+| **`custom_tools/`** | Function tools | R2-2a: a Rust function becomes a tool through the planned attribute macro, with name, description, typed arguments, and errors. Current custom tools still use handwritten `Tool` implementations. |
+| **`structured_output/`** | Typed final results | R1-16: declare an output type and consume a validated Rust value; include invalid JSON and type mismatch handling. Schema declaration alone does not complete this example. |
+| **`sessions/`** | Multi-turn memory | Existing `InMemorySession` / `SqliteSession`, new input, and automatic history persistence. |
+| **`streaming/`** | Streamed text and items | Existing `run_streamed`, `next_event`, and `finish`; show how to consume deltas and settled items without duplicating text. |
+| **`app_context/`** | Context and dynamic instructions | Existing typed app-context access and dynamic instruction callbacks; keep local dependencies out of model input. |
+| **`handoffs/`** | Conversation transfer | R12-1a: default history inheritance, explicit filtering, typed handoff input, callback failures, and target registration. |
+| **`agents_as_tools/`** | Specialist agents as tools | Existing `as_tool()` / `AgentTool`; the parent agent consumes the specialist's result and retains control. |
+| **`approvals/`** | Approval and recovery | Existing interruption/state APIs; resume with the original run identity and session. |
+| **`guardrails/`** | Validation callbacks | Existing input/output guardrails and their errors; adopt convenience adapters as they land. |
+| **`mcp_integration/`** | MCP integration | Connect to external or in-process MCP servers and register their tools. |
+
+These directories are planned example crates, not shipped commands. They are tracked
+under R0-9 in the development plan. Existing-capability examples can be added now;
+examples that depend on R2-2a, R1-16, or R12-1a follow those implementations.
+
+The examples address a different need from `minimal_agent`: users should be able to
+use shipped providers and framework APIs without reproducing extension-point fixtures.
+Each example must compile in CI and have a deterministic offline check where possible.
+Live-provider runs require explicit credentials and must be distinguished from mock runs.
 
 ---
 
@@ -54,8 +69,8 @@ workspace members), so they run with `-p`, not `--example`:
 cargo run -p minimal_agent
 ```
 
-`minimal_agent` supplies its own model and needs no environment variables. The
-planned examples talk to real providers and will need credentials:
+`minimal_agent` supplies its own model and needs no environment variables. Planned
+examples that call a live provider will document the credentials they need:
 
 ```bash
 export OPENAI_API_KEY="your-openai-api-key"
