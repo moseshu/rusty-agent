@@ -99,6 +99,7 @@ use super::{
         SettingsTarget, TurnMethodResult, check_approvals_reviewer, prepare_overrides,
         thread_settings_overrides, unsupported,
     },
+    user_input_requests::install_user_input,
 };
 use crate::frame::JsonRpcErrorObject;
 
@@ -183,6 +184,7 @@ impl ThreadRequestProcessor {
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
             })?;
+        let builder = install_user_input(builder, &self.outgoing);
         let builder = match &store {
             Some(store) => {
                 let meta = new_session_meta(
@@ -334,7 +336,7 @@ impl ThreadRequestProcessor {
                     )));
                 }
             };
-        let builder = builder
+        let builder = install_user_input(builder, &self.outgoing)
             .with_history(reconstruction.history().to_vec())
             .with_rollout_recorder(recorder);
         let info = LoadedThreadInfo {
@@ -460,6 +462,7 @@ impl ThreadRequestProcessor {
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
             })?;
+        let builder = install_user_input(builder, &self.outgoing);
         let snapshot = ForkThreadParams::new(ForkSnapshot::Interrupted);
         let (builder, fork_records) = if params.ephemeral {
             let fork_records = snapshot

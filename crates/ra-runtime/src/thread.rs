@@ -495,6 +495,12 @@ impl AgentThreadBuilder {
         self
     }
 
+    /// The services every turn will be given, for a host to add a port of its own to before the
+    /// thread is built.
+    pub const fn services(&self) -> &ToolServices {
+        &self.services
+    }
+
     /// Starts the thread on `history`, as a thread resumed from its rollout continues from the
     /// history rebuilt from it. A thread with a rollout recorder takes it as already recorded.
     pub fn with_history(mut self, history: Vec<ModelInputItem>) -> Self {

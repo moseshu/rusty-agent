@@ -65,7 +65,7 @@ const CODEX_LIKE_EXTRA: [&str; 9] = [
     "view_image",
     "web_search",
     "web_fetch",
-    "ask_user",
+    "request_user_input",
     "skill",
     "tool_search",
     "agent",

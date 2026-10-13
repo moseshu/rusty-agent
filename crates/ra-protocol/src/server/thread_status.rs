@@ -13,8 +13,8 @@
 //! subscription index's record of active turns (see [`super::thread_state`]), which counts a turn
 //! as running until its end has been sent; this manager only reports statuses. An active thread
 //! waits on approval while an approval request it sent is unanswered (see
-//! [`ThreadWatchManager::note_permission_requested`]); nothing in the server asks the user
-//! questions yet, so it never waits on the user's input.
+//! [`ThreadWatchManager::note_permission_requested`]), and on the user's input while a question it
+//! asked is (see [`ThreadWatchManager::note_user_input_requested`]).
 
 use std::{
     collections::HashMap,
@@ -38,6 +38,7 @@ struct RuntimeFacts {
     running: bool,
     has_system_error: bool,
     pending_permission_requests: u32,
+    pending_user_input_requests: u32,
 }
 
 /// A loaded thread's status: Codex's `loaded_thread_status`.
@@ -48,6 +49,9 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     let mut active_flags = Vec::new();
     if runtime.pending_permission_requests > 0 {
         active_flags.push(ThreadActiveFlag::WaitingOnApproval);
+    }
+    if runtime.pending_user_input_requests > 0 {
+        active_flags.push(ThreadActiveFlag::WaitingOnUserInput);
     }
     if runtime.running || !active_flags.is_empty() {
         return ThreadStatus::Active { active_flags };
@@ -136,6 +140,7 @@ impl ThreadWatchManager {
         self.update_runtime(thread_id, |runtime| {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
+            runtime.pending_user_input_requests = 0;
         })
         .await;
     }
@@ -145,6 +150,7 @@ impl ThreadWatchManager {
         self.update_runtime(thread_id, |runtime| {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
+            runtime.pending_user_input_requests = 0;
             runtime.has_system_error = true;
         })
         .await;
@@ -156,22 +162,46 @@ impl ThreadWatchManager {
         self: &Arc<Self>,
         thread_id: &SessionId,
     ) -> ThreadWatchActiveGuard {
+        self.note_pending_request(thread_id, ThreadWatchActiveGuardType::Permission)
+            .await
+    }
+
+    /// The thread asked the user questions, whose answers it waits on until the returned guard is
+    /// dropped: Codex's `note_user_input_requested`.
+    pub(crate) async fn note_user_input_requested(
+        self: &Arc<Self>,
+        thread_id: &SessionId,
+    ) -> ThreadWatchActiveGuard {
+        self.note_pending_request(thread_id, ThreadWatchActiveGuardType::UserInput)
+            .await
+    }
+
+    async fn note_pending_request(
+        self: &Arc<Self>,
+        thread_id: &SessionId,
+        guard_type: ThreadWatchActiveGuardType,
+    ) -> ThreadWatchActiveGuard {
         self.update_runtime(thread_id, |runtime| {
-            runtime.pending_permission_requests =
-                runtime.pending_permission_requests.saturating_add(1);
+            let counter = pending_counter(runtime, guard_type);
+            *counter = counter.saturating_add(1);
         })
         .await;
         ThreadWatchActiveGuard {
             manager: Arc::clone(self),
             thread_id: thread_id.clone(),
+            guard_type,
             handle: tokio::runtime::Handle::current(),
         }
     }
 
-    async fn note_permission_released(&self, thread_id: &SessionId) {
+    async fn note_active_guard_released(
+        &self,
+        thread_id: &SessionId,
+        guard_type: ThreadWatchActiveGuardType,
+    ) {
         self.update_runtime(thread_id, |runtime| {
-            runtime.pending_permission_requests =
-                runtime.pending_permission_requests.saturating_sub(1);
+            let counter = pending_counter(runtime, guard_type);
+            *counter = counter.saturating_sub(1);
         })
         .await;
     }
@@ -215,11 +245,30 @@ impl ThreadWatchManager {
     }
 }
 
-/// Keeps its thread waiting on approval until dropped: Codex's `ThreadWatchActiveGuard`, for
-/// approvals.
+/// What a thread waits on while a guard is held: Codex's `ThreadWatchActiveGuardType`.
+#[derive(Debug, Clone, Copy)]
+enum ThreadWatchActiveGuardType {
+    Permission,
+    UserInput,
+}
+
+/// The count of the requests of `guard_type` the thread waits on: Codex's `pending_counter`.
+const fn pending_counter(
+    runtime: &mut RuntimeFacts,
+    guard_type: ThreadWatchActiveGuardType,
+) -> &mut u32 {
+    match guard_type {
+        ThreadWatchActiveGuardType::Permission => &mut runtime.pending_permission_requests,
+        ThreadWatchActiveGuardType::UserInput => &mut runtime.pending_user_input_requests,
+    }
+}
+
+/// Keeps its thread waiting on approval or on the user's input until dropped: Codex's
+/// `ThreadWatchActiveGuard`.
 pub(crate) struct ThreadWatchActiveGuard {
     manager: Arc<ThreadWatchManager>,
     thread_id: SessionId,
+    guard_type: ThreadWatchActiveGuardType,
     handle: tokio::runtime::Handle,
 }
 
@@ -227,8 +276,11 @@ impl Drop for ThreadWatchActiveGuard {
     fn drop(&mut self) {
         let manager = Arc::clone(&self.manager);
         let thread_id = self.thread_id.clone();
+        let guard_type = self.guard_type;
         self.handle.spawn(async move {
-            manager.note_permission_released(&thread_id).await;
+            manager
+                .note_active_guard_released(&thread_id, guard_type)
+                .await;
         });
     }
 }

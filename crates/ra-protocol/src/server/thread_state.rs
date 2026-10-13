@@ -16,15 +16,16 @@
 //! closed — as Codex's `try_add_connection_to_thread` does, so a connection that closed while its
 //! `thread/start` or `thread/resume` was in flight is not left subscribed. A thread's listener
 //! also takes commands, which it carries out between the thread's events: Codex's
-//! `ThreadListenerCommand`, of which one is ported, attaching a connection to a loaded thread for
-//! `thread/resume`.
+//! `ThreadListenerCommand`, including attaching a connection to a loaded thread for
+//! `thread/resume`. Questions use the same queue so they follow their turn's start without being
+//! recorded in its rollout.
 
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use ra_core::session::SessionId;
+use ra_core::{session::SessionId, user_input::RequestUserInputResponse};
 use ra_runtime::thread::ThreadEvent;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -33,7 +34,7 @@ use super::{
     outgoing::ConnectionRequestId,
     protocol::{
         MessagePhase, Thread, ThreadItem, ThreadResumeInitialTurnsPageParams, ThreadSettingsRecord,
-        Turn, TurnError, TurnStatus,
+        ToolRequestUserInputParams, Turn, TurnError, TurnStatus,
     },
     thread_history::{ItemChange, ThreadHistoryBuilder, TurnEnding},
     tool_items::ThreadToolItems,
@@ -59,6 +60,12 @@ pub(crate) struct PendingThreadResumeRequest {
 /// `ThreadListenerCommand`.
 #[derive(Debug)]
 pub(crate) enum ThreadListenerCommand {
+    /// Raises a question after the listener has processed the preceding turn events. The reply
+    /// goes to the waiting tool; dropping its receiver withdraws a request not yet sent.
+    RequestUserInput {
+        params: ToolRequestUserInputParams,
+        response_tx: tokio::sync::oneshot::Sender<RequestUserInputResponse>,
+    },
     /// Answers a `thread/resume` of the loaded thread and subscribes its connection, then tells
     /// the caller it is done.
     SendThreadResumeResponse {

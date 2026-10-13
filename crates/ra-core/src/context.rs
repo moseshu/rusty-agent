@@ -105,6 +105,7 @@ pub struct RunContext {
     pending_control_requests: Vec<PendingControlRequest>,
     event_seq_allocator: Option<EventSeqAllocator>,
     tool_input: Option<Arc<Value>>,
+    parent_run_id: Option<RunId>,
 }
 
 impl RunContext {
@@ -125,6 +126,7 @@ impl RunContext {
             pending_control_requests: Vec::new(),
             event_seq_allocator: None,
             tool_input: None,
+            parent_run_id: None,
         }
     }
 
@@ -180,10 +182,26 @@ impl RunContext {
         self
     }
 
+    /// Marks this run as started by the run `parent` — an agent-tool call or a spawned agent — as
+    /// its [`RunState`](crate::state::RunState) records.
+    #[must_use]
+    pub fn with_parent_run_id(mut self, parent: RunId) -> Self {
+        self.parent_run_id = Some(parent);
+        self
+    }
+
     /// Identity of this run, stable across every segment it is resumed in.
     #[must_use]
     pub const fn run_id(&self) -> &RunId {
         &self.run_id
+    }
+
+    /// The run that started this one, if another did: an agent-tool call's nested run or a
+    /// spawned agent's run. A run with none is the root of its thread, as a Codex session that is
+    /// no sub-agent's is.
+    #[must_use]
+    pub const fn parent_run_id(&self) -> Option<&RunId> {
+        self.parent_run_id.as_ref()
     }
 
     /// The credential-free public agent view this run is attributed to.
@@ -273,6 +291,7 @@ impl fmt::Debug for RunContext {
         formatter
             .debug_struct("RunContext")
             .field("run_id", &self.run_id)
+            .field("parent_run_id", &self.parent_run_id)
             .field("agent_id", self.agent_id())
             .field("has_app_context", &self.app.is_some())
             .field("has_tool_input", &self.tool_input.is_some())

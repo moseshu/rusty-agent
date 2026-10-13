@@ -30,9 +30,9 @@
 //! and once a request is answered or withdrawn the thread's connections are sent
 //! `serverRequest/resolved` — except for a dynamic tool call's, which Codex does not report. A
 //! connection that attaches to the thread later is sent the requests still waiting. What the
-//! server makes of each answer follows Codex's handlers, failing closed. Approvals and dynamic
-//! tool calls are raised from the turns; questions for the user and permission requests are still
-//! to be connected.
+//! server makes of each answer follows Codex's handlers, failing closed. Approvals, dynamic tool
+//! calls and questions for the user are raised from the turns; permission requests are still to be
+//! connected.
 //!
 //! # Lifecycle
 //!
@@ -55,8 +55,8 @@
 //! Codex's loop also recovers the threads of its daemon, attaches the threads its agents spawn to
 //! every connection and reports the status of remote control; none of it is ported.
 
-// Nothing raises questions for the user or permission requests yet; the tests reach their answers
-// through `test_api` meanwhile.
+// Nothing raises permission requests yet; the tests reach their answers through `test_api`
+// meanwhile.
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
 mod answers;
 mod approval_requests;
@@ -86,6 +86,7 @@ mod thread_status;
 mod tool_items;
 mod turn_admission;
 mod turn_processor;
+mod user_input_requests;
 
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};

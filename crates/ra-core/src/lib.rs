@@ -50,4 +50,5 @@ mod strict;
 pub mod tool;
 pub mod trace;
 pub mod usage;
+pub mod user_input;
 pub mod web;

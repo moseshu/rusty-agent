@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::{
     agent::control::AgentControlPort, event::HostEventSink, state::WorkStateHandle,
-    tool::ToolOutputProjector,
+    tool::ToolOutputProjector, user_input::UserInputPort,
 };
 
 /// Framework-owned ports handed to a tool, each behind its own accessor.
@@ -43,6 +43,7 @@ pub struct ToolServices {
     event_sink: Option<Arc<dyn HostEventSink>>,
     output_projector: Option<Arc<dyn ToolOutputProjector>>,
     agent_control: Option<Arc<dyn AgentControlPort>>,
+    user_input: Option<Arc<dyn UserInputPort>>,
 }
 
 impl ToolServices {
@@ -53,6 +54,7 @@ impl ToolServices {
             event_sink: None,
             output_projector: None,
             agent_control: None,
+            user_input: None,
         }
     }
 
@@ -90,6 +92,12 @@ impl ToolServices {
         self
     }
 
+    /// Installs where the run's questions for the user go.
+    pub fn with_user_input(mut self, user_input: Arc<dyn UserInputPort>) -> Self {
+        self.user_input = Some(user_input);
+        self
+    }
+
     /// The task state spanning this run, when the host attached one.
     ///
     /// `None` is not a failure: a run belongs to a task only when something above it says so. A
@@ -122,6 +130,15 @@ impl ToolServices {
     pub fn agent_control(&self) -> Option<&Arc<dyn AgentControlPort>> {
         self.agent_control.as_ref()
     }
+
+    /// Where the run's questions for the user go, when the host can ask one.
+    ///
+    /// `None` means nobody can be asked; `request_user_input` answers the model that it is not
+    /// enabled.
+    #[must_use]
+    pub fn user_input(&self) -> Option<&Arc<dyn UserInputPort>> {
+        self.user_input.as_ref()
+    }
 }
 
 impl fmt::Debug for ToolServices {
@@ -133,6 +150,7 @@ impl fmt::Debug for ToolServices {
             .field("event_sink", &self.event_sink.is_some())
             .field("output_projector", &self.output_projector.is_some())
             .field("agent_control", &self.agent_control.is_some())
+            .field("user_input", &self.user_input.is_some())
             .finish_non_exhaustive()
     }
 }

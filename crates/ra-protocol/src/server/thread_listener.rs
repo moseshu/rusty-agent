@@ -72,6 +72,7 @@ use super::{
     thread_state::{PendingThreadResumeRequest, ThreadListenerCommand, ThreadState},
     thread_status::ThreadWatchManager,
     tool_items::ThreadToolItems,
+    user_input_requests::request_user_input,
 };
 use crate::frame::JsonRpcErrorObject;
 
@@ -230,6 +231,8 @@ pub(crate) async fn ensure_listener_task_running(
                     // The thread's state was removed: it is being unloaded or torn down.
                     break;
                 }
+                // Drain ready turn events before commands so a queued question follows its turn's
+                // start and call records, or is discarded after its turn ends.
                 event = thread.next_event() => {
                     let Some(event) = event else {
                         break;
@@ -454,6 +457,34 @@ async fn handle_thread_listener_command(
     command: ThreadListenerCommand,
 ) {
     match command {
+        ThreadListenerCommand::RequestUserInput {
+            params,
+            response_tx,
+        } => {
+            // A cancelled call or a turn that already ended must not leave a new pending request.
+            if response_tx.is_closed()
+                || thread_state.lock().await.active_turn_id() != Some(params.turn_id())
+            {
+                return;
+            }
+            let thread_id = loaded.thread_id();
+            let outgoing = ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(&context.outgoing),
+                context
+                    .outgoing
+                    .thread_state()
+                    .subscribed_connection_ids(thread_id),
+                thread_id.clone(),
+            );
+            request_user_input(
+                params,
+                response_tx,
+                outgoing,
+                &context.thread_watch,
+                thread_id,
+            )
+            .await;
+        }
         ThreadListenerCommand::SendThreadResumeResponse {
             request,
             completion_tx,

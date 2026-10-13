@@ -1675,6 +1675,9 @@ impl InterruptNotice {
             .with_budget(request.state.budget().clone())
             .with_usage_totals(request.state.usage_totals().clone())
             .with_event_seq_allocator(request.event_seqs.clone());
+        if let Some(parent) = request.state.parent_run_id() {
+            run = run.with_parent_run_id(parent.clone());
+        }
         if let Some(app_context) = &request.app_context {
             run = run.with_app_context(Arc::clone(app_context));
         }
@@ -2460,6 +2463,9 @@ async fn assemble_capabilities(
         .with_usage_totals(state.usage_totals().clone())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(event_seqs.clone());
+    if let Some(parent) = state.parent_run_id() {
+        context = context.with_parent_run_id(parent.clone());
+    }
     if let Some(app_context) = app_context {
         context = context.with_app_context(Arc::clone(app_context));
     }
@@ -2799,6 +2805,9 @@ fn resumed_run_context(
         .with_usage_totals(context.spend.shared_usage())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(context.event_seqs.clone());
+    if let Some(parent) = state.parent_run_id() {
+        run = run.with_parent_run_id(parent.clone());
+    }
     if let Some(app_context) = context.app_context {
         run = run.with_app_context(Arc::clone(app_context));
     }
@@ -4837,6 +4846,9 @@ fn live_context(
         .with_usage_totals(context.spend.shared_usage())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(context.event_seqs.clone());
+    if let Some(parent) = state.parent_run_id() {
+        run = run.with_parent_run_id(parent.clone());
+    }
     if let Some(app_context) = context.app_context {
         run = run.with_app_context(Arc::clone(app_context));
     }
