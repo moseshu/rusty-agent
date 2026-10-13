@@ -141,15 +141,13 @@ impl AgentBinding {
         if self.external_tools.is_empty() {
             return Ok(Self::prepared(Arc::clone(&self.public), execution));
         }
+        // Codex's registry keys a tool by its namespace and name. Rust tools may advertise an
+        // alias, so preserve both identities: the routing key protects the executable registry,
+        // while the qualified model name protects the advertised table and its handoffs.
         let mut taken: HashSet<String> = execution
             .tools()
             .iter()
-            .flat_map(|tool| {
-                [
-                    tool.origin().name().to_owned(),
-                    tool.model_definition().name().to_owned(),
-                ]
-            })
+            .map(|tool| tool.model_definition().qualified_name())
             .chain(
                 execution
                     .handoffs()
@@ -157,20 +155,26 @@ impl AgentBinding {
                     .map(|handoff| handoff.schema().name().to_owned()),
             )
             .collect();
+        let mut routing_keys: HashSet<_> = execution
+            .tools()
+            .iter()
+            .map(|tool| tool.origin().lookup_key().clone())
+            .collect();
         let tools: Vec<_> = self
             .external_tools
             .iter()
             .filter(|tool| {
-                let name = tool.model_definition().name().to_owned();
-                if taken.contains(&name) || taken.contains(tool.origin().name()) {
+                let name = tool.model_definition().qualified_name();
+                let key = tool.origin().lookup_key();
+                if routing_keys.contains(key) || taken.contains(&name) {
                     tracing::warn!(
                         tool_name = name,
                         "skipping duplicate external tool that is already registered"
                     );
                     return false;
                 }
+                routing_keys.insert(key.clone());
                 taken.insert(name);
-                taken.insert(tool.origin().name().to_owned());
                 true
             })
             .cloned()

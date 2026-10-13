@@ -91,6 +91,8 @@ pub struct ToolSchema {
     strict_json_schema: bool,
     #[serde(default, skip_serializing_if = "ModelToolKind::is_function")]
     kind: ModelToolKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace_description: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -149,8 +151,25 @@ impl ToolSchema {
             input_schema_hash,
             strict_json_schema: strict,
             kind: ModelToolKind::Function,
+            namespace_description: None,
             unknown: Unknown::new(),
         })
+    }
+
+    /// Describes to the model the namespace the tool is advertised in — its
+    /// [`ToolOrigin::namespace`](super::ToolOrigin::namespace) — as the reference's
+    /// `tool_namespace(description=...)` does. Every tool of one namespace has to describe it
+    /// alike; a tool outside any namespace advertises none.
+    #[must_use]
+    pub fn with_namespace_description(mut self, description: impl Into<String>) -> Self {
+        self.namespace_description = Some(description.into());
+        self
+    }
+
+    /// What the namespace the tool is advertised in is described as, if anything.
+    #[must_use]
+    pub fn namespace_description(&self) -> Option<&str> {
+        self.namespace_description.as_deref()
     }
 
     /// Adds the behavior contract shown to the model.
@@ -266,6 +285,8 @@ struct ToolSchemaWire {
     strict_json_schema: bool,
     #[serde(default)]
     kind: ModelToolKind,
+    #[serde(default)]
+    namespace_description: Option<String>,
     #[serde(flatten, default)]
     unknown: Unknown,
 }
@@ -302,6 +323,7 @@ impl<'de> Deserialize<'de> for ToolSchema {
             input_schema_hash: actual_hash,
             strict_json_schema: wire.strict_json_schema,
             kind: wire.kind,
+            namespace_description: wire.namespace_description,
             unknown: wire.unknown,
         })
     }

@@ -28,4 +28,5 @@ pub mod openai;
 pub mod protocol;
 pub mod provider;
 pub mod retry;
+pub(crate) mod tool_namespaces;
 pub mod usage;

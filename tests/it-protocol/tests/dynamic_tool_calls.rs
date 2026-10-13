@@ -6,7 +6,7 @@
 //!
 //! The server runs in this process, and the thread's agent runs on the Responses adapter against a
 //! mock endpoint, so the cases read the request bodies the model is sent, as Codex's do. Codex's
-//! namespace cases wait for namespaces; their functions are top-level here.
+//! deferred tools wait for tool search, so its cases drop them.
 
 use std::{
     collections::VecDeque,
@@ -109,6 +109,20 @@ impl Endpoint {
             "type": "function_call",
             "status": "completed",
             "call_id": call_id,
+            "name": tool,
+            "arguments": arguments.to_string(),
+        });
+        self.script.lock().unwrap().push_back(stream(&item));
+    }
+
+    /// Answers the next request with a call `call_id` of `tool` within `namespace`.
+    fn call_next_in(&self, call_id: &str, namespace: &str, tool: &str, arguments: &Value) {
+        let item = json!({
+            "id": format!("fc-{call_id}"),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "namespace": namespace,
             "name": tool,
             "arguments": arguments.to_string(),
         });
@@ -1296,7 +1310,7 @@ async fn thread_start_records_dynamic_tools_in_session_metadata() {
 
 /// A resumed thread takes its dynamic tools from the session metadata its rollout opens with —
 /// either shape — as Codex's session does when given none; its calls are carried as a new
-/// thread's are. Namespaces it records are skipped until they are carried.
+/// thread's are, namespaces and all.
 #[tokio::test]
 async fn thread_resume_takes_dynamic_tools_from_history() {
     let endpoint = Endpoint::start().await;
@@ -1340,7 +1354,11 @@ async fn thread_resume_takes_dynamic_tools_from_history() {
     connection.notification("turn/completed").await;
 
     let bodies = endpoint.bodies().await;
-    assert_eq!(tool_names(&bodies[0]), ["demo_tool"]);
+    assert_eq!(tool_names(&bodies[0]), ["demo_tool", "app"]);
+    assert_eq!(
+        find_tool(&bodies[0], "app").unwrap()["description"],
+        "Tools in the app namespace."
+    );
     assert_eq!(
         function_call_output(&bodies[1], "resumed-1"),
         Some(json!([{"type": "input_text", "text": "sunny"}]))
@@ -1389,9 +1407,9 @@ async fn thread_fork_takes_dynamic_tools_from_the_source() {
     assert_eq!(tool_names(&bodies[2]), ["demo_tool"]);
 }
 
-/// Namespaces and deferred functions are refused until they are carried, before anything is built.
+/// Deferred functions are refused until tool search carries them, before anything is built.
 #[tokio::test]
-async fn thread_start_refuses_namespaces_and_deferred_tools() {
+async fn thread_start_refuses_deferred_tools() {
     let endpoint = Endpoint::start().await;
     let server = Server::plain(&endpoint);
     let mut connection = server.connect(1).await;
@@ -1399,19 +1417,10 @@ async fn thread_start_refuses_namespaces_and_deferred_tools() {
     let function =
         json!({"type": "function", "name": "lookup", "description": "", "inputSchema": schema});
     let deferred = json!({"type": "function", "name": "hidden", "description": "", "inputSchema": schema, "deferLoading": true});
-    for (dynamic_tools, field) in [
-        (
-            json!([{"type": "namespace", "name": "app", "description": "", "tools": [function]}]),
-            "namespace",
-        ),
-        (
-            json!([{"type": "namespace", "name": "app", "description": "", "tools": [function, deferred]}]),
-            "deferLoading",
-        ),
-        (
-            json!([{"namespace": "app", "name": "lookup", "description": "", "inputSchema": schema}]),
-            "namespace",
-        ),
+    for dynamic_tools in [
+        json!([{"type": "namespace", "name": "app", "description": "", "tools": [function, deferred]}]),
+        json!([{"namespace": "app", "name": "hidden", "description": "", "inputSchema": schema,
+            "exposeToContext": false}]),
     ] {
         assert_eq!(
             server
@@ -1421,13 +1430,312 @@ async fn thread_start_refuses_namespaces_and_deferred_tools() {
                     json!({"dynamicTools": dynamic_tools}),
                 )
                 .await,
-            invalid_request(&format!(
-                "thread/start.dynamicTools.{field} is not supported"
-            ))
+            invalid_request("thread/start.dynamicTools.deferLoading is not supported")
         );
     }
     let listed = server
         .call(&mut connection, "thread/loaded/list", json!({}))
         .await;
     assert_eq!(listed["data"], json!([]));
+}
+
+/// The framework reserves the same-name namespace shape for deferred top-level calls and refuses
+/// it explicitly, before a thread or its metadata is created, in both input formats.
+#[tokio::test]
+async fn thread_start_rejects_same_name_namespace_tools() {
+    let endpoint = Endpoint::start().await;
+    let server = Server::plain(&endpoint);
+    let mut connection = server.connect(1).await;
+    for tools in [
+        json!([{"type": "namespace", "name": "app", "description": "App tools", "tools": [
+            {"type": "function", "name": "app", "description": "App function", "inputSchema": city_schema()}
+        ]}]),
+        json!([{"namespace": "app", "name": "app", "description": "App function", "inputSchema": city_schema()}]),
+    ] {
+        let error = server
+            .call_error(
+                &mut connection,
+                "thread/start",
+                json!({"dynamicTools": tools}),
+            )
+            .await;
+        assert_eq!(
+            error,
+            invalid_request(
+                "Responses tool-search reserves the synthetic namespace `app.app` for deferred top-level function tools. Rename the namespace or tool name to avoid ambiguous dispatch."
+            )
+        );
+    }
+    let listed = server
+        .call(&mut connection, "thread/loaded/list", json!({}))
+        .await;
+    assert_eq!(listed["data"], json!([]));
+    assert!(endpoint.bodies().await.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Namespaces
+// ---------------------------------------------------------------------------------------------
+
+/// Ported from Codex's `thread_start_normalizes_legacy_dynamic_tools_into_model_request`, without
+/// its deferred tool: legacy functions naming a namespace are grouped into it, described as Codex
+/// describes a namespace the client left undescribed.
+#[tokio::test]
+async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() {
+    let endpoint = Endpoint::start().await;
+    let server = Server::plain(&endpoint);
+    let mut connection = server.connect(1).await;
+    let visible_schema = json!({
+        "type": "object",
+        "properties": {
+            "ticket_id": { "type": "string" }
+        },
+        "required": ["ticket_id"],
+        "additionalProperties": false,
+    });
+    let thread_id = server
+        .start_thread(
+            &mut connection,
+            json!([
+                {
+                    "name": "lookup_ticket",
+                    "description": "Look up a ticket",
+                    "inputSchema": visible_schema,
+                },
+                {
+                    "namespace": "legacy_app",
+                    "name": "lookup_status",
+                    "description": "Look up a ticket status",
+                    "inputSchema": visible_schema,
+                    "exposeToContext": true
+                }
+            ]),
+        )
+        .await;
+    server
+        .turn_start(&mut connection, &thread_id, "Look up the ticket")
+        .await;
+    connection.notification("turn/completed").await;
+
+    let bodies = endpoint.bodies().await;
+    assert_eq!(
+        find_tool(&bodies[0], "lookup_ticket"),
+        Some(&json!({
+            "type": "function",
+            "name": "lookup_ticket",
+            "description": "Look up a ticket",
+            "strict": false,
+            "parameters": visible_schema,
+        }))
+    );
+    assert_eq!(
+        find_tool(&bodies[0], "legacy_app"),
+        Some(&json!({
+            "type": "namespace",
+            "name": "legacy_app",
+            "description": "Tools in the legacy_app namespace.",
+            "tools": [{
+                "type": "function",
+                "name": "lookup_status",
+                "description": "Look up a ticket status",
+                "strict": false,
+                "parameters": visible_schema,
+            }],
+        }))
+    );
+}
+
+/// Ported from Codex's `dynamic_tool_call_round_trip_sends_text_content_items_to_model`, namespace
+/// and all: the namespace reaches the model as the client describes it, the model's call names it,
+/// the item and the request carry it, and the call's answer reaches the model.
+#[tokio::test]
+async fn dynamic_tool_call_round_trip_in_a_namespace() {
+    let call_id = "dyn-call-1";
+    let tool_namespace = "codex_app";
+    let tool_name = "demo_tool";
+    let tool_args = json!({ "city": "Paris" });
+    let endpoint = Endpoint::start().await;
+    endpoint.call_next_in(call_id, tool_namespace, tool_name, &tool_args);
+    let server = Server::plain(&endpoint);
+    let mut connection = server.connect(1).await;
+
+    let status_schema = json!({
+        "type": "object",
+        "properties": {
+            "ticket_id": { "type": "string" }
+        },
+        "required": ["ticket_id"],
+        "additionalProperties": false,
+    });
+    let namespace_description = "Demo namespace tools";
+    let thread_id = server
+        .start_thread(
+            &mut connection,
+            json!([{
+                "type": "namespace",
+                "name": tool_namespace,
+                "description": namespace_description,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": tool_name,
+                        "description": "Demo dynamic tool",
+                        "inputSchema": city_schema(),
+                    },
+                    {
+                        "type": "function",
+                        "name": "lookup_status",
+                        "description": "Look up ticket status",
+                        "inputSchema": status_schema,
+                    },
+                ],
+            }]),
+        )
+        .await;
+    let turn_id = server
+        .turn_start(&mut connection, &thread_id, "Run the tool")
+        .await;
+
+    let started = connection.dynamic_item("item/started", call_id).await;
+    assert_eq!(started["threadId"], thread_id);
+    assert_eq!(started["turnId"], turn_id);
+    assert_eq!(
+        started["item"],
+        json!({
+            "type": "dynamicToolCall",
+            "id": call_id,
+            "namespace": tool_namespace,
+            "tool": tool_name,
+            "arguments": tool_args,
+            "status": "inProgress",
+            "contentItems": null,
+            "success": null,
+            "durationMs": null,
+        })
+    );
+    let request = connection.tool_call_request().await;
+    assert_eq!(
+        request["params"],
+        json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "callId": call_id,
+            "namespace": tool_namespace,
+            "tool": tool_name,
+            "arguments": tool_args,
+        })
+    );
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"contentItems": [{"type": "inputText", "text": "dynamic-ok"}], "success": true}),
+        )
+        .await;
+    let completed = connection.dynamic_item("item/completed", call_id).await;
+    assert_eq!(completed["item"]["namespace"], tool_namespace);
+    assert_eq!(completed["item"]["status"], "completed");
+    assert_eq!(
+        completed["item"]["contentItems"],
+        json!([{"type": "inputText", "text": "dynamic-ok"}])
+    );
+    let turn = connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "completed", "{turn}");
+
+    let bodies = endpoint.bodies().await;
+    assert_eq!(
+        find_tool(&bodies[0], tool_namespace),
+        Some(&json!({
+            "type": "namespace",
+            "name": tool_namespace,
+            "description": namespace_description,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": tool_name,
+                    "description": "Demo dynamic tool",
+                    "strict": false,
+                    "parameters": city_schema(),
+                },
+                {
+                    "type": "function",
+                    "name": "lookup_status",
+                    "description": "Look up ticket status",
+                    "strict": false,
+                    "parameters": status_schema,
+                },
+            ],
+        }))
+    );
+    // The call is handed back to the model as it made it, with its answer.
+    let echoed = bodies[1]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap()
+        .clone();
+    assert_eq!(echoed["namespace"], tool_namespace);
+    assert_eq!(echoed["name"], tool_name);
+    assert_eq!(
+        function_call_output(&bodies[1], call_id),
+        Some(json!([{"type": "input_text", "text": "dynamic-ok"}]))
+    );
+
+    let turns = server.read_turns(&mut connection, &thread_id).await;
+    assert_eq!(read_back_item(&turns, call_id), completed["item"]);
+}
+
+/// Codex's registry keys a tool by namespace and name: a namespace's function is not skipped for
+/// sharing its name with one of the agent's own tools, a namespace's function of a reserved name
+/// is no reserved tool, and each call reaches the tool it names.
+#[tokio::test]
+async fn namespaced_dynamic_tools_are_told_apart_from_top_level_tools() {
+    let endpoint = Endpoint::start().await;
+    endpoint.call_next_in("dyn-1", "app", "own_tool", &json!({}));
+    let server = Server::start(
+        &endpoint,
+        Arc::new(InMemoryThreadStore::new()),
+        agent("lead", vec![OwnTool::shared("own_tool")], Vec::new()),
+        RunConfig::new(),
+    );
+    let mut connection = server.connect(1).await;
+    let function = |name: &str| json!({"type": "function", "name": name, "description": "dynamic", "inputSchema": {"type": "object", "properties": {}}});
+    let thread_id = server
+        .start_thread(
+            &mut connection,
+            json!([{
+                "type": "namespace",
+                "name": "app",
+                "description": "App tools",
+                "tools": [function("own_tool"), function("exec_command")],
+            }]),
+        )
+        .await;
+    server.turn_start(&mut connection, &thread_id, "Go").await;
+    let request = connection.tool_call_request().await;
+    assert_eq!(request["params"]["namespace"], "app");
+    assert_eq!(request["params"]["tool"], "own_tool");
+    server
+        .answer(
+            &connection,
+            &request,
+            json!({"contentItems": [{"type": "inputText", "text": "from the client"}], "success": true}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    let bodies = endpoint.bodies().await;
+    assert_eq!(tool_names(&bodies[0]), ["own_tool", "app"]);
+    let namespaced: Vec<_> = find_tool(&bodies[0], "app").unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(namespaced, ["own_tool", "exec_command"]);
+    assert_eq!(
+        function_call_output(&bodies[1], "dyn-1"),
+        Some(json!([{"type": "input_text", "text": "from the client"}]))
+    );
 }

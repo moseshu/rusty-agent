@@ -94,6 +94,17 @@ fn tool_call(id: &str, call_id: &str, name: &str) -> RunItem {
     )
 }
 
+/// A call of `name` within `namespace`, as a namespaced tool is called.
+fn namespaced_call(id: &str, call_id: &str, namespace: &str, name: &str) -> RunItem {
+    item(
+        id,
+        RunItemKind::ToolCall(
+            ToolCall::new(CallId::new(call_id), name, json!({ "path": "a.txt" }))
+                .with_namespace(namespace),
+        ),
+    )
+}
+
 fn mcp_approval(id: &str, request_id: &str) -> RunItem {
     item(
         id,
@@ -377,17 +388,17 @@ fn test_processed_response_08() {
 fn test_processed_response_09() {
     let processed = ProcessedResponse::builder()
         .function(
-            tool_call("call-item-1", "call-1", "search"),
+            namespaced_call("call-item-1", "call-1", "mcp.github", "search"),
             namespaced_tool("mcp.github", "search"),
         )
         .unwrap()
         .function(
-            tool_call("call-item-2", "call-2", "search"),
+            namespaced_call("call-item-2", "call-2", "mcp.gitlab", "search"),
             namespaced_tool("mcp.gitlab", "search"),
         )
         .unwrap()
         .function(
-            tool_call("call-item-3", "call-3", "search"),
+            namespaced_call("call-item-3", "call-3", "mcp.github", "search"),
             namespaced_tool("mcp.github", "search"),
         )
         .unwrap()
@@ -455,4 +466,31 @@ fn test_processed_response_09() {
     let mut from_projection = used;
     from_projection.sort();
     assert_eq!(from_actions, from_projection);
+}
+
+/// A namespaced tool is bound only to a call within its namespace: the call's name alone, or the
+/// same name in another namespace, names a different tool.
+#[test]
+fn a_call_binds_only_to_the_tool_of_its_namespace() {
+    let tool = namespaced_tool("mcp.github", "search");
+    for call in [
+        tool_call("item-1", "call-1", "search"),
+        namespaced_call("item-2", "call-2", "mcp.gitlab", "search"),
+    ] {
+        let error = ProcessedResponse::builder()
+            .function(call, Arc::clone(&tool))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("advertises a different name"),
+            "{error}"
+        );
+    }
+    assert!(
+        ProcessedResponse::builder()
+            .function(
+                namespaced_call("item-3", "call-3", "mcp.github", "search"),
+                tool,
+            )
+            .is_ok()
+    );
 }

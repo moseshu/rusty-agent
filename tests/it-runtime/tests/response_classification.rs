@@ -597,3 +597,115 @@ fn typed_handoffs_reject_ambiguous_missing_and_mismatched_names() {
         );
     }
 }
+
+/// A tool in a namespace, projected as the framework projects it.
+struct NamespacedTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+}
+
+#[async_trait]
+impl Tool for NamespacedTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("unused"))
+    }
+}
+
+fn namespaced(namespace: &str, name: &str) -> Arc<dyn Tool> {
+    Arc::new(NamespacedTool {
+        origin: ToolOrigin::namespaced(ra_core::tool::ToolNamespace::new(namespace).unwrap(), name)
+            .unwrap(),
+        schema: ToolSchema::loose(name, json!({"type": "object", "properties": {}}))
+            .unwrap()
+            .with_namespace_description(format!("{namespace} tools")),
+    })
+}
+
+fn namespaced_call(id: &str, call_id: &str, namespace: &str, name: &str) -> RunItem {
+    item(
+        id,
+        RunItemKind::ToolCall(
+            ToolCall::new(CallId::new(call_id), name, json!({})).with_namespace(namespace),
+        ),
+    )
+}
+
+/// The reference routes a call by its namespace and name: two namespaces may offer one name, a
+/// top-level tool and a handoff may share it too, and each call reaches the one it names. A call
+/// within a namespace never reaches a handoff, nor a top-level tool of its name.
+#[test]
+fn calls_are_routed_by_namespace_and_name() {
+    let surface = TurnActionSurface::new(
+        vec![
+            namespaced("github", "search"),
+            namespaced("jira", "search"),
+            tool("lookup"),
+        ],
+        vec![handoff("search", "reviewer")],
+    )
+    .expect("one name in two namespaces, a handoff and a top-level tool is no collision");
+    assert_eq!(
+        surface.advertised_names().collect::<Vec<_>>(),
+        ["github.search", "jira.search", "lookup", "search"]
+    );
+    let definitions = surface.tool_definitions();
+    assert_eq!(definitions[0].namespace(), Some("github"));
+    assert_eq!(definitions[0].namespace_description(), Some("github tools"));
+    assert_eq!(definitions[0].name(), "search");
+
+    let response = ModelResponse::new(vec![
+        namespaced_call("item-1", "call-1", "jira", "search"),
+        namespaced_call("item-2", "call-2", "github", "search"),
+        tool_call("item-3", "call-3", "search"),
+        namespaced_call("item-4", "call-4", "github", "lookup"),
+        namespaced_call("item-5", "call-5", "confluence", "search"),
+    ]);
+    let processed = process_model_response(&response, &surface).unwrap();
+    let routed: Vec<_> = processed
+        .functions()
+        .iter()
+        .map(|function| function.tool().origin().qualified_name().to_owned())
+        .collect();
+    assert_eq!(routed, ["jira.search", "github.search"]);
+    assert_eq!(
+        processed.handoffs().len(),
+        1,
+        "the top-level call is the handoff"
+    );
+    assert_eq!(processed.tools_not_found().len(), 2);
+
+    // Without a handoff to answer it, a top-level call of a namespace's name reaches nothing.
+    let surface = TurnActionSurface::new(vec![namespaced("github", "search")], Vec::new()).unwrap();
+    let processed = process_model_response(
+        &ModelResponse::new(vec![tool_call("item-6", "call-6", "search")]),
+        &surface,
+    )
+    .unwrap();
+    assert!(processed.functions().is_empty());
+    assert_eq!(processed.tools_not_found().len(), 1);
+}
+
+/// Two tools may not be advertised under one qualified name.
+#[test]
+fn one_qualified_name_is_advertised_once() {
+    let error = TurnActionSurface::new(
+        vec![
+            namespaced("github", "search"),
+            Arc::new(
+                StubTool::new("dotted", ToolAvailability::Enabled, true)
+                    .advertised_as("github.search"),
+            ),
+        ],
+        Vec::new(),
+    )
+    .expect_err("a top-level `github.search` collides with the namespaced one");
+    assert!(error.to_string().contains("`github.search`"), "{error}");
+}

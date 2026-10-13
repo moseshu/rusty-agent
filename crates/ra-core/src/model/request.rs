@@ -4,7 +4,7 @@
 //! output parsers, agent graphs, credentials, and provider SDK types do not belong here. Rich
 //! runtime types project into the lightweight model-facing definitions below before a call.
 
-use std::borrow::Borrow;
+use std::{borrow::Borrow, collections::BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -242,6 +242,11 @@ pub fn custom_tool_input_schema() -> Value {
 /// [`Tool`](crate::tool::Tool) and its [`ToolOptions`](crate::tool::ToolOptions) own invocation,
 /// approval, timeout, guards, and identity. None of those are provider request fields, so the
 /// model boundary receives only this advertiseable definition.
+///
+/// A tool may be advertised in a namespace, the reference's `tool_namespace()`: the model sees the
+/// namespace, with its description, holding the tool, and calls it by both names. Only `OpenAI`
+/// Responses carries namespaces; the other adapters refuse a namespaced tool, as the reference's
+/// do.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelToolDefinition {
@@ -250,6 +255,8 @@ pub struct ModelToolDefinition {
     input_schema: Value,
     strict: bool,
     kind: ModelToolKind,
+    namespace: Option<String>,
+    namespace_description: Option<String>,
 }
 
 impl ModelToolDefinition {
@@ -264,6 +271,8 @@ impl ModelToolDefinition {
             input_schema,
             strict: false,
             kind: ModelToolKind::Function,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -308,10 +317,44 @@ impl ModelToolDefinition {
         self
     }
 
-    /// Tool name advertised to the model.
+    /// Advertises the tool in `namespace`, which `description` describes to the model.
+    #[must_use]
+    pub fn with_namespace(
+        mut self,
+        namespace: impl Into<String>,
+        description: Option<String>,
+    ) -> Self {
+        self.namespace = Some(namespace.into());
+        self.namespace_description = description;
+        self
+    }
+
+    /// Tool name advertised to the model, within its namespace when it has one.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The namespace the tool is advertised in, if any.
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// What the namespace the tool is advertised in is described as, if it has a description.
+    #[must_use]
+    pub fn namespace_description(&self) -> Option<&str> {
+        self.namespace_description.as_deref()
+    }
+
+    /// The name the model calls the tool by, qualified by its namespace: the reference's
+    /// `tool_qualified_name`, `namespace.name` for a namespaced tool and the name alone otherwise.
+    #[must_use]
+    pub fn qualified_name(&self) -> String {
+        match &self.namespace {
+            Some(namespace) => format!("{namespace}.{}", self.name),
+            None => self.name.clone(),
+        }
     }
 
     /// Optional model-facing description.
@@ -334,10 +377,10 @@ impl ModelToolDefinition {
 
     /// What one advertised entry costs in a turn's tool table, in bytes.
     ///
-    /// The three model-visible parts are counted — the input schema, the name, and the
-    /// description — and each provider's envelope around them is not. That envelope differs per
-    /// wire format, so including it would make the same tool measure differently depending on
-    /// which endpoint the run happens to use, and a surface budget has to be comparable across
+    /// The model-visible parts are counted — the input schema, the name, the description, and
+    /// the namespace's name and description — and each provider's envelope around them is not.
+    /// That envelope differs per wire format, so including it would make the same tool measure
+    /// differently depending on which endpoint the run happens to use. A surface budget has to be comparable across
     /// providers to be worth stating.
     ///
     /// This is the single definition of the byte measure, and it sits on the projection rather
@@ -351,11 +394,7 @@ impl ModelToolDefinition {
     ///
     /// Returns a configuration error if the input schema cannot be rendered.
     pub fn advertised_bytes(&self) -> Result<usize> {
-        advertised_definition_bytes(
-            &self.name,
-            self.description.as_deref(),
-            &self.advertised_input()?,
-        )
+        Self::advertised_table_bytes(std::slice::from_ref(self))
     }
 
     /// The same advertised entry counted in characters rather than bytes.
@@ -370,11 +409,52 @@ impl ModelToolDefinition {
     ///
     /// Returns a configuration error if the input schema cannot be rendered.
     pub fn advertised_chars(&self) -> Result<usize> {
-        advertised_definition_chars(
-            &self.name,
-            self.description.as_deref(),
-            &self.advertised_input()?,
-        )
+        Self::advertised_table_chars(std::slice::from_ref(self))
+    }
+
+    /// Measures a tool table in bytes, counting a shared namespace's name and description once.
+    ///
+    /// This is the same provider-neutral rendering as [`Self::advertised_bytes`], without charging
+    /// each inner function again for namespace metadata the model receives only once. Differently
+    /// described namespaces are measured separately; adapters enforce description consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an input schema cannot be rendered or the total exceeds `usize`.
+    pub fn advertised_table_bytes(tools: &[Self]) -> Result<usize> {
+        Self::measure_advertised_table(tools, str::len)
+    }
+
+    /// The same tool table counted in characters for context estimates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an input schema cannot be rendered or the total exceeds `usize`.
+    pub fn advertised_table_chars(tools: &[Self]) -> Result<usize> {
+        Self::measure_advertised_table(tools, |text| text.chars().count())
+    }
+
+    fn measure_advertised_table(tools: &[Self], measure: fn(&str) -> usize) -> Result<usize> {
+        let mut namespaces = BTreeSet::new();
+        let mut total = 0_usize;
+        for tool in tools {
+            let mut rendered = render_advertised_definition(
+                tool.name(),
+                tool.description(),
+                &tool.advertised_input()?,
+            )?;
+            if let Some(namespace) = tool.namespace() {
+                let description = tool.namespace_description().unwrap_or_default();
+                if namespaces.insert((namespace, description)) {
+                    rendered.push_str(namespace);
+                    rendered.push_str(description);
+                }
+            }
+            total = total.checked_add(measure(&rendered)).ok_or_else(|| {
+                Error::config("the advertised model-tool table is too large to measure")
+            })?;
+        }
+        Ok(total)
     }
 }
 

@@ -362,14 +362,7 @@ pub(crate) async fn lower_input_item(
                 "output": lower_tool_output(output.output()).await?
             }))
         }
-        ModelInputItem::ToolCall(call) => Ok(json!({
-            "type": "function_call",
-            "call_id": call.call_id().as_str(),
-            "name": call.name(),
-            "arguments": serde_json::to_string(call.arguments()).map_err(|error| {
-                behavior_error("tool-call arguments could not be serialized").with_source(error)
-            })?
-        })),
+        ModelInputItem::ToolCall(call) => lower_function_call(call),
         ModelInputItem::ToolCallOutput(output) => Ok(json!({
             "type": "function_call_output",
             "call_id": output.call_id().as_str(),
@@ -445,6 +438,22 @@ pub(crate) async fn lower_input_item(
             "unsupported model-input item for OpenAI Responses",
         )),
     }
+}
+
+/// A function call, handed back as the model made it, namespace and all.
+fn lower_function_call(call: &ra_core::item::ToolCall) -> Result<Value> {
+    let mut lowered = json!({
+        "type": "function_call",
+        "call_id": call.call_id().as_str(),
+        "name": call.name(),
+        "arguments": serde_json::to_string(call.arguments()).map_err(|error| {
+            behavior_error("tool-call arguments could not be serialized").with_source(error)
+        })?
+    });
+    if let Some(namespace) = call.namespace() {
+        lowered["namespace"] = Value::String(namespace.to_owned());
+    }
+    Ok(lowered)
 }
 
 /// A custom call's raw input, which is stored as a JSON string.
@@ -646,6 +655,11 @@ struct MergedTools {
     /// The subset of `function_names` advertised as custom tools, which `tool_choice` names by a
     /// different type.
     custom_names: BTreeSet<String>,
+    /// The qualified names of the functions advertised in a namespace, which `tool_choice` may
+    /// name.
+    namespaced_names: BTreeSet<String>,
+    /// The namespaces and the names within them, which `tool_choice` may not name on their own.
+    namespace_parts: BTreeSet<String>,
 }
 
 fn merge_tools(
@@ -674,6 +688,13 @@ fn merge_tools(
 
     let mut custom_names = BTreeSet::new();
     for tool in tools.iter().filter(|tool| tool.kind().is_custom()) {
+        if tool.namespace().is_some() {
+            return Err(Error::caller(format!(
+                "custom tool `{}` cannot be advertised in a namespace; OpenAI Responses \
+                 namespaces hold function tools",
+                tool.qualified_name()
+            )));
+        }
         validate_function_name(tool.name())?;
         if !names.insert(tool.name().to_owned()) {
             return Err(Error::caller(format!(
@@ -685,33 +706,48 @@ fn merge_tools(
         lowered.push(custom_tool(tool));
     }
 
-    let neutral = tools
-        .iter()
-        .filter(|tool| !tool.kind().is_custom())
-        .map(|tool| {
-            (
-                tool.name(),
-                tool.description(),
-                tool.input_schema(),
-                tool.strict(),
-            )
-        })
-        .chain(handoffs.iter().map(|handoff| {
-            (
-                handoff.name(),
-                handoff.description(),
-                handoff.input_schema(),
-                handoff.strict(),
-            )
-        }));
-    for (name, description, schema, strict) in neutral {
+    // The reference's `convert_tools`: a namespace takes the place of its first function, holding
+    // every function advertised in it, in order; handoffs come after the tools.
+    let mut namespaces = Namespaces::default();
+    for tool in tools.iter().filter(|tool| !tool.kind().is_custom()) {
+        let (name, description, schema, strict) = (
+            tool.name(),
+            tool.description(),
+            tool.input_schema(),
+            tool.strict(),
+        );
         validate_function_name(name)?;
+        if let Some(namespace) = tool.namespace() {
+            namespaces.add(
+                &mut lowered,
+                namespace,
+                tool,
+                function_tool(name, description, schema, strict),
+            )?;
+            continue;
+        }
         if !names.insert(name.to_owned()) {
             return Err(Error::caller(format!(
                 "duplicate OpenAI tool/handoff name `{name}`"
             )));
         }
         lowered.push(function_tool(name, description, schema, strict));
+    }
+    namespaces.place(&mut lowered);
+    for handoff in handoffs {
+        let name = handoff.name();
+        validate_function_name(name)?;
+        if !names.insert(name.to_owned()) {
+            return Err(Error::caller(format!(
+                "duplicate OpenAI tool/handoff name `{name}`"
+            )));
+        }
+        lowered.push(function_tool(
+            name,
+            handoff.description(),
+            handoff.input_schema(),
+            handoff.strict(),
+        ));
     }
 
     let populated = !lowered.is_empty();
@@ -722,7 +758,83 @@ fn merge_tools(
         populated,
         function_names: names,
         custom_names,
+        namespaced_names: namespaces.qualified_names,
+        namespace_parts: namespaces.parts,
     })
+}
+
+/// The namespaces a request advertises, built up as their functions are lowered.
+#[derive(Default)]
+struct Namespaces {
+    /// Each namespace's description, its functions, and where it goes in the tool array.
+    entries: Vec<(String, String, Vec<Value>, usize)>,
+    qualified_names: BTreeSet<String>,
+    parts: BTreeSet<String>,
+}
+
+impl Namespaces {
+    /// Adds `function`, lowered from `tool`, to `namespace`, reserving the namespace's place in
+    /// `lowered` the first time it is seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reference's error for a namespace its tools describe differently, and an error
+    /// for a function advertised twice in one namespace, or a namespace name the endpoint rejects.
+    fn add(
+        &mut self,
+        lowered: &mut Vec<Value>,
+        namespace: &str,
+        tool: &ModelToolDefinition,
+        function: Value,
+    ) -> Result<()> {
+        if namespace == tool.name() {
+            return Err(Error::caller(format!(
+                "Responses tool-search reserves the synthetic namespace `{namespace}.{namespace}` for deferred \
+                 top-level function tools. Rename the namespace or tool name to avoid ambiguous dispatch."
+            )));
+        }
+        let description = tool.namespace_description().unwrap_or_default();
+        let qualified = tool.qualified_name();
+        if !self.qualified_names.insert(qualified.clone()) {
+            return Err(Error::caller(format!(
+                "duplicate OpenAI namespaced tool name `{qualified}`"
+            )));
+        }
+        self.parts.insert(namespace.to_owned());
+        self.parts.insert(tool.name().to_owned());
+        if let Some((_, expected, functions, _)) =
+            self.entries.iter_mut().find(|(name, ..)| name == namespace)
+        {
+            if expected != description {
+                return Err(Error::caller(format!(
+                    "All tools in namespace '{namespace}' must share the same description."
+                )));
+            }
+            functions.push(function);
+            return Ok(());
+        }
+        validate_function_name(namespace)?;
+        self.entries.push((
+            namespace.to_owned(),
+            description.to_owned(),
+            vec![function],
+            lowered.len(),
+        ));
+        lowered.push(Value::Null);
+        Ok(())
+    }
+
+    /// Fills each namespace's reserved place in `lowered`.
+    fn place(&mut self, lowered: &mut [Value]) {
+        for (name, description, functions, index) in self.entries.drain(..) {
+            lowered[index] = json!({
+                "type": "namespace",
+                "name": name,
+                "description": description,
+                "tools": functions,
+            });
+        }
+    }
 }
 
 /// The reference's `CustomToolParam`: a name, a description, and the format the raw input is
@@ -784,6 +896,18 @@ fn lower_tool_choice(choice: Option<&ToolChoice>, tools: &MergedTools) -> Result
         ToolChoice::Auto => Ok(Value::String("auto".to_owned())),
         ToolChoice::Required => Ok(Value::String("required".to_owned())),
         ToolChoice::None => Ok(Value::String("none".to_owned())),
+        ToolChoice::Tool(name) if tools.namespaced_names.contains(name) => {
+            Ok(json!({"type": "function", "name": name}))
+        }
+        ToolChoice::Tool(name)
+            if tools.namespace_parts.contains(name) && !function_names.contains(name) =>
+        {
+            Err(Error::caller(
+                "Named tool_choice must target a callable tool, not a namespace wrapper or bare \
+                 inner name of a namespace, on the OpenAI Responses API. Use `auto`, \
+                 `required`, `none`, or target a top-level or qualified namespaced function tool.",
+            ))
+        }
         ToolChoice::Tool(name) => {
             validate_function_name(name)?;
             if !function_names.contains(name) {

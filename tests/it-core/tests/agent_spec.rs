@@ -32,6 +32,22 @@ impl EchoTool {
         )
     }
 
+    /// A top-level tool named `name`.
+    fn named(name: &str) -> Self {
+        let mut tool = Self::with_origin(ToolOrigin::new(name).unwrap());
+        tool.schema = ToolSchema::new(
+            name,
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap();
+        tool
+    }
+
     fn with_origin(origin: ToolOrigin) -> Self {
         Self {
             origin,
@@ -192,41 +208,40 @@ fn builder_rejects_duplicate_tool_identities() {
 }
 
 #[test]
-fn builder_rejects_tools_projecting_to_the_same_model_facing_name() {
+fn builder_rejects_tools_projecting_to_the_same_qualified_name() {
+    // Two namespaces may each offer `echo`: the namespace is part of what the model calls a tool
+    // by, as in the reference, so the two are told apart at the model boundary too.
     let first: Arc<dyn Tool> = Arc::new(EchoTool::namespaced("server_a"));
     let second: Arc<dyn Tool> = Arc::new(EchoTool::namespaced("server_b"));
-
-    // Their lookup keys differ because namespaces separate them, but their model-facing names
-    // collide. Without this check, every turn would fail at the provider boundary.
-    assert_ne!(
-        first.origin().lookup_key(),
-        second.origin().lookup_key(),
-        "两个命名空间应当产生不同的查找键"
-    );
     assert_eq!(
         first.model_definition().name(),
         second.model_definition().name()
     );
+    assert_eq!(first.model_definition().qualified_name(), "server_a.echo");
+    assert!(
+        AgentSpec::builder()
+            .id(AgentId::new("worker"))
+            .name("Worker")
+            .tools([Arc::clone(&first), second])
+            .build()
+            .is_ok()
+    );
 
+    // A top-level tool literally named like a namespaced one is the reference's ambiguous
+    // qualified name: every call of either would be ambiguous.
+    let dotted: Arc<dyn Tool> = Arc::new(EchoTool::named("server_a.echo"));
+    assert_ne!(first.origin().lookup_key(), dotted.origin().lookup_key());
     let error = AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")
-        .tools([Arc::clone(&first), second])
+        .tools([first, dotted])
         .build()
         .unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("advertises the tool name `echo`")
-    );
-
-    assert!(
-        AgentSpec::builder()
-            .id(AgentId::new("worker"))
-            .name("Worker")
-            .tool(first)
-            .build()
-            .is_ok()
+            .contains("advertises the tool name `server_a.echo`"),
+        "{error}"
     );
 }
 

@@ -699,6 +699,46 @@ fn a_custom_definition_is_measured_by_its_format() {
     assert!(grammar.advertised_chars().unwrap() > 1000);
 }
 
+/// Namespace metadata is model-visible text, counted once per namespace in a table. Unicode
+/// contributes its UTF-8 byte size to budgets and its character count to context estimates.
+#[test]
+fn namespaced_definition_measures_metadata_and_shares_it_across_functions() {
+    use ra_core::model::ModelToolDefinition;
+    let schema = json!({"type": "object"});
+    let plain = ModelToolDefinition::new("search", schema.clone()).with_description("Find");
+    let other = ModelToolDefinition::new("update", schema);
+    let namespace = "tickets";
+    let description = "資料".repeat(100);
+    let first = plain
+        .clone()
+        .with_namespace(namespace, Some(description.clone()));
+    let second = other
+        .clone()
+        .with_namespace(namespace, Some(description.clone()));
+    assert_eq!(
+        first.advertised_bytes().unwrap(),
+        plain.advertised_bytes().unwrap() + namespace.len() + description.len()
+    );
+    assert_eq!(
+        first.advertised_chars().unwrap(),
+        plain.advertised_chars().unwrap() + namespace.chars().count() + description.chars().count()
+    );
+    assert_eq!(
+        ModelToolDefinition::advertised_table_bytes(&[first.clone(), second.clone()]).unwrap(),
+        plain.advertised_bytes().unwrap()
+            + other.advertised_bytes().unwrap()
+            + namespace.len()
+            + description.len()
+    );
+    assert_eq!(
+        ModelToolDefinition::advertised_table_chars(&[first, second]).unwrap(),
+        plain.advertised_chars().unwrap()
+            + other.advertised_chars().unwrap()
+            + namespace.chars().count()
+            + description.chars().count()
+    );
+}
+
 /// A custom call carries its raw input as a JSON string, and the kind is written only for custom
 /// items, so function-call records keep their shape.
 #[test]

@@ -38,8 +38,8 @@
 //! - Codex's own configuration, its project trust, instruction files, MCP servers, environments,
 //!   goals and token usage replay are not ported; the members that set them are refused (see
 //!   [`super::protocol::ThreadStartParams::unsupported_field`]).
-//! - Dynamic tool namespaces and deferred dynamic tools are refused until they are carried; see
-//!   [`super::dynamic_tool_calls`] for the rest.
+//! - Deferred dynamic tools are refused until they are carried; see [`super::dynamic_tool_calls`]
+//!   for the rest.
 //! - Threads are named by `UUIDv7` ids, as Codex names them; `thread/loaded/list` takes any loaded
 //!   id as a cursor rather than refusing one that is not a UUID, since a host may load threads
 //!   under ids of its own.
@@ -895,14 +895,12 @@ fn require_factory(
         .ok_or_else(|| unsupported_yet(method))
 }
 
-/// Refuses the dynamic tools a thread cannot carry yet: deferred functions, which need tool search,
-/// and namespaces, which the model request does not describe yet. The check is the server's own;
-/// Codex carries both.
+/// Refuses the dynamic tools a thread cannot carry yet: deferred functions, which need tool search.
+/// The check is the server's own; Codex carries them.
 fn check_dynamic_tools_supported(
     method: &str,
     tools: &[DynamicToolSpec],
 ) -> Result<(), JsonRpcErrorObject> {
-    let namespaced = |tool: &DynamicToolSpec| matches!(tool, DynamicToolSpec::Namespace(_));
     let deferred = |tool: &DynamicToolSpec| match tool {
         DynamicToolSpec::Function(function) => function.defer_loading(),
         DynamicToolSpec::Namespace(namespace) => namespace
@@ -912,9 +910,6 @@ fn check_dynamic_tools_supported(
     };
     if tools.iter().any(deferred) {
         return Err(unsupported(method, "dynamicTools.deferLoading"));
-    }
-    if tools.iter().any(namespaced) {
-        return Err(unsupported(method, "dynamicTools.namespace"));
     }
     Ok(())
 }

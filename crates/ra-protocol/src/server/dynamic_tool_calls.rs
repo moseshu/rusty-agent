@@ -7,10 +7,13 @@
 //!
 //! A thread started with `dynamicTools` gives its agent one tool per function, after the tools
 //! the agent already has: a function named like one of them — or like a handoff — is skipped, as
-//! Codex's registry skips an external tool it already holds, and so is one named `exec_command`
-//! or `shell_command`, which Codex reserves. Each is described to the model as Codex describes it:
-//! its input schema read into the schema subset (see [`super::json_schema`]), not strict. The list
-//! is recorded in the thread's session metadata, and a thread resumed or forked takes it from its
+//! Codex's registry skips an external tool it already holds, and so is a top-level one named
+//! `exec_command` or `shell_command`, which Codex reserves. A function in a namespace is a tool in
+//! that namespace: the model sees the namespace, described as the client describes it or as Codex
+//! does when it is not, and the call names both, so it is routed by namespace and name (see
+//! [`ToolOrigin::namespaced`]). Each function is described to the model as Codex describes it: its
+//! input schema read into the schema subset (see [`super::json_schema`]), not strict. The list is
+//! recorded in the thread's session metadata, and a thread resumed or forked takes it from its
 //! history, as Codex's sessions do.
 //!
 //! # A call
@@ -36,14 +39,19 @@
 //! - A result with no content items is given to the model as empty text, since a tool result here
 //!   cannot be empty.
 //! - Audio in a result is refused with a text of Rusty's own, until tool results can carry it.
-//! - Only functions outside namespaces are registered: `thread/start` refuses namespaces and
-//!   deferred functions, and those a history records are skipped.
+//! - Deferred functions are not registered: `thread/start` refuses them, and those a history
+//!   records are skipped.
+//! - A namespace holding a function of its own name is refused before thread creation, as the
+//!   framework reserves that shape for deferred top-level tools (see
+//!   [`ra_core::tool::ToolLookupKey::namespaced`]); unsupported entries in old metadata are skipped.
+//! - Namespaces reach the model only through `OpenAI` Responses; a thread on another provider
+//!   fails its turn with the framework's refusal, as the reference's other backends refuse them.
 //! - The tools are given to the thread's own agent, not to the agents it hands off to, and are
 //!   registered after its declared and run-bound capability tools, skipping names already held
 //!   by the host as Codex's external-tool registry does.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
@@ -53,7 +61,7 @@ use ra_core::{
     error::{Error, Result},
     event::{HostEvent, HostEventBody, HostEventEmitter},
     item::{ImageBlock, ImageDetail, ImageSource},
-    tool::{Tool, ToolContext, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema},
+    tool::{Tool, ToolContext, ToolNamespace, ToolOrigin, ToolOutput, ToolOutputBlock, ToolSchema},
 };
 use ra_runtime::thread::AgentThreadBuilder;
 use ra_session::rollout::{RolloutPayload, RolloutRecord};
@@ -67,7 +75,8 @@ use super::{
     outgoing::ThreadScopedOutgoingMessageSender,
     protocol::{
         DynamicToolCallItem, DynamicToolCallOutputContentItem, DynamicToolCallParams,
-        DynamicToolCallResponse, DynamicToolCallStatus, DynamicToolSpec, ServerRequestPayload,
+        DynamicToolCallResponse, DynamicToolCallStatus, DynamicToolFunctionSpec,
+        DynamicToolNamespaceSpec, DynamicToolNamespaceTool, DynamicToolSpec, ServerRequestPayload,
         ThreadItem, normalize_dynamic_tool_specs,
     },
     tool_items::ThreadToolItemEvent,
@@ -277,26 +286,45 @@ struct DynamicTool {
 }
 
 impl DynamicTool {
-    /// The tool for `name`, or `None` if its schema cannot be described to the model, which
-    /// Codex's `DynamicToolHandler::new` refuses too.
+    /// The tool for `function`, in `namespace` if one is given, or `None` if it cannot be
+    /// described to the model: Codex's `DynamicToolHandler::from_parts`, which refuses a schema it
+    /// cannot read. A namespace with no description is described as Codex describes it.
     fn new(
-        name: &str,
-        description: &str,
-        input_schema: &Value,
+        function: &DynamicToolFunctionSpec,
+        namespace: Option<&DynamicToolNamespaceSpec>,
         calls: &Arc<DynamicToolCalls>,
     ) -> Option<Self> {
-        let parameters = parse_tool_input_schema(input_schema)
+        let name = function.name();
+        let parameters = parse_tool_input_schema(function.input_schema())
             .and_then(serde_json::to_value)
             .ok()?;
-        let schema = ToolSchema::loose(name, parameters)
+        let mut schema = ToolSchema::loose(name, parameters)
             .ok()?
-            .with_description(description);
+            .with_description(function.description());
+        let origin = match namespace {
+            Some(namespace) => {
+                schema = schema.with_namespace_description(
+                    if namespace.description().trim().is_empty() {
+                        default_namespace_description(namespace.name())
+                    } else {
+                        namespace.description().to_owned()
+                    },
+                );
+                ToolOrigin::namespaced(ToolNamespace::new(namespace.name()).ok()?, name).ok()?
+            }
+            None => ToolOrigin::new(name).ok()?,
+        };
         Some(Self {
-            origin: ToolOrigin::new(name).ok()?,
+            origin,
             schema,
             calls: Arc::clone(calls),
         })
     }
+}
+
+/// Codex's `default_namespace_description`.
+fn default_namespace_description(namespace: &str) -> String {
+    format!("Tools in the {namespace} namespace.")
 }
 
 #[async_trait]
@@ -320,7 +348,10 @@ impl Tool for DynamicTool {
             call_id: context.call_id().as_str().to_owned(),
             turn_id: context.run().run_id().as_str().to_owned(),
             started_at_ms: super::outgoing::now_unix_timestamp_ms(),
-            namespace: None,
+            namespace: self
+                .origin
+                .namespace()
+                .map(|namespace| namespace.as_str().to_owned()),
             tool: self.origin.name().to_owned(),
             arguments: context.arguments().clone(),
         };
@@ -415,8 +446,11 @@ fn model_output(response: &DynamicToolCallResponse) -> ToolOutput {
     ToolOutput::new(blocks).unwrap_or_else(|_| ToolOutput::text(""))
 }
 
-/// Gives the agent `builder` prepares the functions `specs` provide, skipping those Codex's
-/// registry would, and returns where their calls wait for answers.
+/// Gives the agent `builder` prepares the functions `specs` provide, in their namespaces, as
+/// external tools — registered after the agent's own, skipping a name already held, as Codex's
+/// registry does (see [`AgentBinding::with_external_tools`]) — and returns where their calls wait
+/// for answers. A top-level function named like a tool Codex reserves is skipped first, and so is
+/// a deferred function, until deferred tools are carried.
 ///
 /// # Errors
 ///
@@ -426,66 +460,50 @@ pub(crate) fn register_dynamic_tools(
     specs: &[DynamicToolSpec],
 ) -> Result<(AgentThreadBuilder, Arc<DynamicToolCalls>)> {
     let calls = Arc::new(DynamicToolCalls::default());
-    if specs.is_empty() {
-        return Ok((builder, calls));
-    }
-    let binding = builder.agent();
-    let execution = binding.execution();
-    let mut taken: HashSet<String> = execution
-        .tools()
-        .iter()
-        .flat_map(|tool| {
-            [
-                tool.origin().name().to_owned(),
-                tool.model_definition().name().to_owned(),
-            ]
-        })
-        .chain(
-            execution
-                .handoffs()
-                .iter()
-                .map(|handoff| handoff.schema().name().to_owned()),
-        )
-        .collect();
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for spec in specs {
-        let function = match spec {
-            DynamicToolSpec::Function(function) if !function.defer_loading() => function,
-            _ => {
-                tracing::warn!("skipping a dynamic tool namespace or deferred dynamic tool");
+        let (namespace, functions): (_, Vec<&DynamicToolFunctionSpec>) = match spec {
+            DynamicToolSpec::Function(function) => (None, vec![function]),
+            DynamicToolSpec::Namespace(namespace) => (
+                Some(namespace),
+                namespace
+                    .tools()
+                    .iter()
+                    .map(DynamicToolNamespaceTool::function)
+                    .collect(),
+            ),
+        };
+        for function in functions {
+            let name = function.name();
+            if function.defer_loading() {
+                tracing::warn!(tool_name = name, "skipping a deferred dynamic tool");
                 continue;
             }
-        };
-        let name = function.name();
-        if RESERVED_NAMES.contains(&name) {
-            tracing::warn!(
-                tool_name = name,
-                "skipping external tool with reserved name"
-            );
-            continue;
+            if namespace.is_none() && RESERVED_NAMES.contains(&name) {
+                tracing::warn!(
+                    tool_name = name,
+                    "skipping external tool with reserved name"
+                );
+                continue;
+            }
+            let Some(tool) = DynamicTool::new(function, namespace, &calls) else {
+                if let Some(namespace) = namespace {
+                    tracing::error!(
+                        "Failed to convert dynamic tool {:?}.{name:?} to OpenAI tool",
+                        namespace.name()
+                    );
+                } else {
+                    tracing::error!("Failed to convert dynamic tool {name:?} to OpenAI tool");
+                }
+                continue;
+            };
+            tools.push(Arc::new(tool));
         }
-        if !taken.insert(name.to_owned()) {
-            tracing::warn!(
-                tool_name = name,
-                "skipping duplicate external tool that is already registered"
-            );
-            continue;
-        }
-        let Some(tool) = DynamicTool::new(
-            name,
-            function.description(),
-            function.input_schema(),
-            &calls,
-        ) else {
-            tracing::error!("Failed to convert dynamic tool {name:?} to OpenAI tool");
-            continue;
-        };
-        tools.push(Arc::new(tool));
     }
     if tools.is_empty() {
         return Ok((builder, calls));
     }
-    let binding = binding.clone().with_external_tools(tools)?;
+    let binding = builder.agent().clone().with_external_tools(tools)?;
     Ok((builder.with_agent(binding), calls))
 }
 

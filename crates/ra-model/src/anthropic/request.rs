@@ -449,6 +449,7 @@ fn merge_tools(
             }
         }
     }
+    crate::tool_namespaces::ensure_unnamespaced(tools, "Anthropic Messages models")?;
     if let Some(custom) = tools.iter().find(|tool| tool.kind().is_custom())
         && !custom_tools_as_functions
     {

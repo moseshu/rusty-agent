@@ -54,12 +54,18 @@ impl From<&ModelToolKind> for ToolCallKind {
 }
 
 /// A provider-neutral tool call.
+///
+/// A call of a tool advertised in a namespace names the namespace too, as the reference's
+/// `ResponseFunctionToolCall.namespace` does: the name alone is ambiguous once two namespaces
+/// offer the same one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     schema_version: SchemaVersion,
     call_id: CallId,
     name: String,
     arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
     #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
     kind: ToolCallKind,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
@@ -81,6 +87,7 @@ impl ToolCall {
             call_id,
             name: name.into(),
             arguments,
+            namespace: None,
             kind: ToolCallKind::Function,
             unknown: Unknown::new(),
         }
@@ -90,6 +97,13 @@ impl ToolCall {
     #[must_use]
     pub const fn with_kind(mut self, kind: ToolCallKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    /// Records the namespace the called tool was advertised in.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
         self
     }
 
@@ -111,10 +125,16 @@ impl ToolCall {
         &self.call_id
     }
 
-    /// Tool name.
+    /// Tool name, within its namespace when it has one.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The namespace the called tool was advertised in, if any.
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
     }
 
     /// Parsed argument JSON.

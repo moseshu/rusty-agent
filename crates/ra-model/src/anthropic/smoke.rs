@@ -272,6 +272,10 @@ fn lower_message_content(blocks: &[ContentBlock]) -> Result<Vec<Value>> {
 }
 
 fn insert_tools(body: &mut Map<String, Value>, request: &ModelRequest) -> Result<BTreeSet<String>> {
+    crate::tool_namespaces::ensure_unnamespaced(
+        request.tools(),
+        "the Anthropic compatibility preview",
+    )?;
     if let Some(custom) = request.tools().iter().find(|tool| tool.kind().is_custom()) {
         return Err(crate::custom_tools::unsupported(
             "the Anthropic compatibility preview",

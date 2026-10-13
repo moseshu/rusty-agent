@@ -1,4 +1,4 @@
-//! R3-12 contracts for the public agent / execution agent split.
+//! Contracts for the public agent / execution agent split.
 
 use std::sync::{Arc, Mutex};
 
@@ -392,4 +392,118 @@ async fn test_agent_binding_07() {
     .unwrap();
 
     assert_eq!(*seen.lock().unwrap(), ["coder"]);
+}
+
+/// A tool named `name`, in `namespace` when one is given.
+struct NamedTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+    advertised_as: Option<String>,
+}
+
+#[async_trait]
+impl Tool for NamedTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn model_definition(&self) -> ra_core::model::ModelToolDefinition {
+        let mut definition = self.schema.to_model_definition();
+        if let Some(name) = &self.advertised_as {
+            definition =
+                ra_core::model::ModelToolDefinition::new(name, self.schema.input_schema().clone());
+        }
+        match self.origin.namespace() {
+            Some(namespace) => definition.with_namespace(namespace.as_str(), None),
+            None => definition,
+        }
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("unused"))
+    }
+}
+
+fn named_tool(namespace: Option<&str>, name: &str) -> Arc<dyn Tool> {
+    aliased_tool(namespace, name, None)
+}
+
+fn aliased_tool(namespace: Option<&str>, name: &str, advertised_as: Option<&str>) -> Arc<dyn Tool> {
+    let origin = match namespace {
+        Some(namespace) => {
+            ToolOrigin::namespaced(ra_core::tool::ToolNamespace::new(namespace).unwrap(), name)
+                .unwrap()
+        }
+        None => ToolOrigin::new(name).unwrap(),
+    };
+    Arc::new(NamedTool {
+        origin,
+        schema: ToolSchema::loose(name, json!({"type": "object", "properties": {}})).unwrap(),
+        advertised_as: advertised_as.map(str::to_owned),
+    })
+}
+
+/// Codex's registry holds a tool under its namespace and name: an external tool is skipped only
+/// when the agent already holds that namespace's tool of that name, so a top-level tool and other
+/// namespaces' tools of the same name are still added.
+#[test]
+fn external_tools_are_skipped_by_namespace_and_name() {
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .tool(named_tool(Some("app"), "search"))
+        .build()
+        .unwrap();
+    let binding = AgentBinding::direct(agent)
+        .with_external_tools([
+            named_tool(None, "search"),
+            named_tool(Some("app"), "search"),
+            named_tool(Some("other"), "search"),
+        ])
+        .unwrap();
+    let held: Vec<_> = binding
+        .execution()
+        .tools()
+        .iter()
+        .map(|tool| tool.origin().qualified_name().to_owned())
+        .collect();
+    assert_eq!(held, ["app.search", "search", "other.search"]);
+}
+
+/// A routing collision is skipped even when the two tools advertise different names. Rejected
+/// candidates claim neither identity; an unrelated namespace can still own the same bare name.
+#[test]
+fn external_registration_checks_routing_keys_and_advertised_names_separately() {
+    for namespace in [None, Some("app")] {
+        let held = aliased_tool(namespace, "route_name", Some("visible_name"));
+        let agent = AgentSpec::builder()
+            .id(AgentId::new("lead"))
+            .name("Lead")
+            .tool(Arc::clone(&held))
+            .build()
+            .unwrap();
+        let binding = AgentBinding::direct(agent)
+            .with_external_tools([
+                aliased_tool(namespace, "route_name", Some("free_name")),
+                named_tool(namespace, "free_name"),
+                aliased_tool(namespace, "another_route", Some("visible_name")),
+                named_tool(Some("other"), "route_name"),
+            ])
+            .unwrap();
+        assert_eq!(binding.execution().tools().len(), 3);
+        assert!(Arc::ptr_eq(&binding.execution().tools()[0], &held));
+        assert_eq!(binding.execution().tools()[1].origin().name(), "free_name");
+        assert_eq!(
+            binding.execution().tools()[2]
+                .origin()
+                .namespace()
+                .unwrap()
+                .as_str(),
+            "other"
+        );
+    }
 }

@@ -929,10 +929,11 @@ impl AgentSpecBuilder {
         self.output_schema.validate()?;
 
         // Two identities have to be unique, and neither implies the other. The lookup key is how
-        // dispatch finds the executable object; the model-facing name is what the turn advertises.
-        // A namespace separates two lookup keys without separating the names they project to, so
-        // two servers that both expose `search` would build fine here and then fail on every model
-        // call instead.
+        // dispatch finds the executable object; the model-facing name is what the turn advertises,
+        // qualified by the namespace the tool is advertised in, as the reference's
+        // `validate_function_tool_lookup_configuration` compares qualified names. Two namespaces
+        // may each offer `search`; a namespaced `search` and a top-level tool literally named
+        // `ns.search` may not.
         //
         // **The two checks cover different sets, and that is the point.** Every declared tool
         // needs a distinct lookup key, because dispatch has to find it whoever called. Only the
@@ -953,7 +954,7 @@ impl AgentSpecBuilder {
             if !tool.options().can_reach_model_surface() {
                 continue;
             }
-            let advertised = tool.model_definition().name().to_owned();
+            let advertised = tool.model_definition().qualified_name();
             if !advertised_names.insert(advertised.clone()) {
                 return Err(Error::config(format!(
                     "agent `{id}` advertises the tool name `{advertised}` more than once; \

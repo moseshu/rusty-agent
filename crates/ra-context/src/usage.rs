@@ -139,7 +139,7 @@ impl ContextUsageBreakdown {
     /// Schema carries its meaning in its keys — `properties`, and every parameter name — so the
     /// content-only walk that suits a replay item would charge a tool's parameter names nothing
     /// and undercount a real tool surface several-fold. Definitions are therefore measured with
-    /// [`ModelToolDefinition::advertised_chars`], the same rendering the tool-surface byte budget
+    /// [`ModelToolDefinition::advertised_table_chars`], the same rendering the tool-surface byte budget
     /// counts, and the whole definition table is rounded to tokens once rather than once per part.
     ///
     /// # Errors
@@ -149,21 +149,18 @@ impl ContextUsageBreakdown {
     pub fn estimate_model_request(request: &ModelRequest) -> Result<Self> {
         let system_tokens = request.system_instructions().map_or(0, estimate_tokens);
         let definition_chars = request
-            .tools()
+            .handoffs()
             .iter()
-            .map(ModelToolDefinition::advertised_chars)
-            .chain(
-                request
-                    .handoffs()
-                    .iter()
-                    .map(ModelHandoffDefinition::advertised_chars),
-            )
+            .map(ModelHandoffDefinition::advertised_chars)
             .chain(
                 request
                     .output_schema()
                     .map(ModelOutputSchema::advertised_chars),
             )
-            .try_fold(0_usize, |total, chars| checked_add(total, chars?))?;
+            .try_fold(
+                ModelToolDefinition::advertised_table_chars(request.tools())?,
+                |total, chars| checked_add(total, chars?),
+            )?;
 
         let mut tokens = [0_usize; ContextUsageCategory::COUNT];
         tokens[ContextUsageCategory::System.index()] = system_tokens;

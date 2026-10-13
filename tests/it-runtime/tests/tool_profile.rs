@@ -16,6 +16,7 @@ use ra_runtime::tool::{
     profile::{ToolProfile, ToolProfileId, ToolSelection, ToolSurfaceBudget},
     registry::ToolRegistry,
 };
+use ra_runtime::turn::prepare::TurnActionSurface;
 use serde_json::json;
 
 struct StubTool {
@@ -101,7 +102,17 @@ impl Tool for StubTool {
             Some(name) => {
                 ModelToolDefinition::new(name.clone(), self.schema.input_schema().clone())
             }
-            None => self.schema.to_model_definition(),
+            // The framework's own projection: a namespaced tool is advertised in its namespace.
+            None => {
+                let definition = self.schema.to_model_definition();
+                match self.origin.namespace() {
+                    Some(namespace) => definition.with_namespace(
+                        namespace.as_str(),
+                        self.schema.namespace_description().map(str::to_owned),
+                    ),
+                    None => definition,
+                }
+            }
         }
     }
 }
@@ -210,36 +221,50 @@ fn test_all_registered_takes_whatever_the_host_installed() {
     assert_eq!(surface.advertised_count(), 2);
     assert_eq!(
         surface.advertised_names().collect::<Vec<_>>(),
-        ["read_file", "search"]
+        ["read_file", "mcp.github.search"]
     );
 }
 
 #[test]
-fn test_two_servers_may_export_the_same_name_but_one_surface_may_not() {
-    let registry = ToolRegistry::builder()
-        .register(StubTool::namespaced("mcp.github", "search").shared())
-        .register(StubTool::namespaced("mcp.jira", "search").shared())
-        .build()
-        .expect("two servers exporting `search` is a normal installation");
-
-    // The lookup keys differ, so the registry routes them apart...
-    assert_eq!(registry.len(), 2);
-
-    // ...but both project to `search` at the model boundary, so a surface holding both is a
-    // request every provider rejects. It fails here, where the error can name both keys.
+fn test_two_namespaces_may_each_advertise_a_name_but_one_qualified_name_may_not_repeat() {
     let profile = ToolProfile::builder(profile_id("full"))
         .all_registered()
         .budget(ToolSurfaceBudget::new(0, 24).expect("a valid budget"))
         .build()
         .expect("a valid profile");
-    let error = registry
-        .assemble(&profile)
-        .expect_err("two entries named `search` must fail");
 
-    let message = error.to_string();
-    assert!(message.contains("mcp.github"), "{message}");
-    assert!(message.contains("mcp.jira"), "{message}");
-    assert!(message.contains("search"), "{message}");
+    // A namespace is part of what the model calls a tool by, as in the reference: two servers
+    // each exporting `search` are two tools the model tells apart.
+    let registry = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(StubTool::namespaced("mcp.jira", "search").shared())
+        .build()
+        .expect("two servers exporting `search` is a normal installation");
+    let surface = registry
+        .assemble(&profile)
+        .expect("the namespaces keep the two apart");
+    assert_eq!(
+        surface.advertised_names().collect::<Vec<_>>(),
+        ["mcp.github.search", "mcp.jira.search"]
+    );
+
+    // A top-level tool advertised under a namespaced tool's qualified name is the reference's
+    // ambiguous qualified name, and fails here, where the error can name both keys.
+    let colliding = ToolRegistry::builder()
+        .register(StubTool::namespaced("mcp", "search").shared())
+        .register(
+            StubTool::bare("mcp_search")
+                .advertised_as("mcp.search")
+                .shared(),
+        )
+        .build()
+        .expect("distinct routing identities are registrable");
+    let message = colliding
+        .assemble(&profile)
+        .expect_err("two entries named `mcp.search` must fail")
+        .to_string();
+    assert!(message.contains("`mcp.search`"), "{message}");
+    assert!(message.contains("mcp_search"), "{message}");
 }
 
 #[test]
@@ -249,9 +274,10 @@ fn test_a_host_only_tool_may_share_a_name_with_an_advertised_one() {
     // integration's `search` — over a conflict no provider would ever see.
     let hidden = ToolOptions::new().with_exposure(ToolExposure::Hidden);
     let registry = ToolRegistry::builder()
-        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(StubTool::bare("search").shared())
         .register(
             StubTool::namespaced("host", "search")
+                .advertised_as("search")
                 .with_options(hidden)
                 .shared(),
         )
@@ -279,9 +305,10 @@ fn test_a_deferred_tool_still_claims_its_name() {
     // the one moment nothing is checking.
     let deferred = ToolOptions::new().with_exposure(ToolExposure::Deferred);
     let registry = ToolRegistry::builder()
-        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(StubTool::bare("search").shared())
         .register(
             StubTool::namespaced("mcp.jira", "search")
+                .advertised_as("search")
                 .with_options(deferred)
                 .shared(),
         )
@@ -306,9 +333,10 @@ fn test_a_switched_off_tool_claims_nothing() {
     // It holds no name and pays no budget.
     let disabled = ToolOptions::new().with_availability(ToolAvailability::Disabled);
     let registry = ToolRegistry::builder()
-        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(StubTool::bare("search").shared())
         .register(
             StubTool::namespaced("mcp.jira", "search")
+                .advertised_as("search")
                 .with_options(disabled)
                 .shared(),
         )
@@ -508,6 +536,55 @@ fn test_the_byte_ceiling_is_separate_from_the_entry_count() {
     assert_eq!(surface.advertised_bytes(), expected);
 }
 
+/// A namespace's model-visible description costs bytes once, even when it holds several tools;
+/// the names rendered into a prompt inventory are the qualified names.
+#[test]
+fn namespace_metadata_and_qualified_names_count_against_surface_budgets() {
+    let description = "d".repeat(4096);
+    let namespaced = |name| {
+        let mut tool = StubTool::namespaced("tickets", name);
+        tool.schema = tool.schema.with_namespace_description(&description);
+        tool.shared()
+    };
+    let registry = ToolRegistry::builder()
+        .register(namespaced("search"))
+        .register(namespaced("update"))
+        .build()
+        .unwrap();
+    let expected = registry
+        .tools()
+        .map(|tool| tool.schema().advertised_bytes().unwrap())
+        .sum::<usize>()
+        + "tickets".len()
+        + description.len();
+    let assemble = |bytes, chars| {
+        registry.assemble(
+            &ToolProfile::builder(profile_id("namespace"))
+                .all_registered()
+                .budget(
+                    ToolSurfaceBudget::new(2, 2)
+                        .unwrap()
+                        .with_max_advertised_bytes(bytes)
+                        .with_max_advertised_name_chars(chars),
+                )
+                .build()
+                .unwrap(),
+        )
+    };
+    assert!(assemble(expected - 1, usize::MAX).is_err());
+    assert!(
+        assemble(
+            usize::MAX,
+            "tickets.search".len() + "tickets.update".len() - 1
+        )
+        .is_err()
+    );
+    let surface = assemble(expected, "tickets.search".len() + "tickets.update".len()).unwrap();
+    assert_eq!(surface.advertised_bytes(), expected);
+    let actions = TurnActionSurface::new(surface.into_tools(), Vec::new()).unwrap();
+    assert_eq!(actions.advertised_bytes().unwrap(), expected);
+}
+
 #[test]
 fn test_the_name_character_ceiling_is_separate_from_other_surface_budgets() {
     let long_name = format!("tool_{}", "n".repeat(32));
@@ -662,7 +739,7 @@ fn test_the_name_check_reads_the_projection_a_provider_is_sent() {
     // A tool may advertise itself under a name it does not route under, and the projection is
     // what a provider is handed. Two distinct schema names that collide there are a collision.
     let colliding = ToolRegistry::builder()
-        .register(StubTool::namespaced("mcp.github", "issues").shared())
+        .register(StubTool::bare("issues").shared())
         .register(
             StubTool::namespaced("mcp.jira", "tickets")
                 .advertised_as("issues")
@@ -678,7 +755,11 @@ fn test_the_name_check_reads_the_projection_a_provider_is_sent() {
     // And the mirror image, which reading the schema name would have refused: two tools whose
     // schemas share a name are a legal surface once one of them is advertised under another.
     let renamed = ToolRegistry::builder()
-        .register(StubTool::namespaced("mcp.github", "search").shared())
+        .register(
+            StubTool::namespaced("mcp.github", "search")
+                .advertised_as("search")
+                .shared(),
+        )
         .register(
             StubTool::namespaced("mcp.jira", "search")
                 .advertised_as("jira_search")

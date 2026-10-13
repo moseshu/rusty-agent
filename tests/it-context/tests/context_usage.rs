@@ -25,6 +25,30 @@ fn settings() -> ResolvedModelSettings {
     empty.resolve(&ProviderKey::new("test"), &empty, &empty, &empty)
 }
 
+/// The model receives a shared namespace description once, including when it holds several
+/// functions; namespace text must increase the tools category instead of being omitted.
+#[test]
+fn namespace_metadata_is_estimated_once_in_the_tools_category() {
+    let schema = json!({"type": "object"});
+    let description = "x".repeat(4096);
+    let tools = ["search", "update"].map(|name| ModelToolDefinition::new(name, schema.clone()));
+    let plain_chars: usize = tools
+        .iter()
+        .map(|tool| tool.advertised_chars().unwrap())
+        .sum();
+    let namespaced = tools
+        .into_iter()
+        .map(|tool| tool.with_namespace("tickets", Some(description.clone())))
+        .collect();
+    let request = ModelRequest::new(vec![], settings()).with_tools(namespaced);
+    let usage = breakdown(&request);
+    let expected_chars = plain_chars + "tickets".len() + description.len();
+    assert_eq!(
+        usage.tokens(ContextUsageCategory::Tools),
+        expected_chars.div_ceil(4)
+    );
+}
+
 fn item_tokens(item: ModelInputItem) -> usize {
     ContextUsage::estimate_model_input(&[item])
         .expect("test item should serialize")

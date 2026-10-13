@@ -7,6 +7,10 @@
 //! of its own hosted tools. A namespace holds at least one tool and no name twice; a tool is not
 //! deferred outside a namespace; and every input schema must be one the schema subset reads (see
 //! [`super::json_schema`]).
+//!
+//! The framework's `validate_function_tool_namespace_shape` additionally rejects a namespace
+//! equal to its function's name: that shape belongs to deferred top-level routing. Codex permits
+//! it, but the framework contract takes precedence, so it is refused before thread creation.
 
 use std::collections::HashSet;
 
@@ -124,6 +128,13 @@ fn validate_dynamic_tool<'a>(
     if tool.defer_loading() && namespace.is_none() {
         return Err(format!(
             "deferred dynamic tool must include a namespace: {name}"
+        ));
+    }
+
+    if namespace == Some(name) {
+        return Err(format!(
+            "Responses tool-search reserves the synthetic namespace `{name}.{name}` for deferred \
+             top-level function tools. Rename the namespace or tool name to avoid ambiguous dispatch."
         ));
     }
 

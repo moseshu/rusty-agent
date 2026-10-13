@@ -14,15 +14,17 @@
 //! # The one identity the registry enforces, and the one it does not
 //!
 //! Registration is keyed by [`ToolLookupKey`], and two tools cannot share one. It deliberately
-//! does *not* require model-facing names to be unique: two MCP servers each exporting `search` is
-//! a normal thing for a host to install, and the lookup keys keep them apart. That collision is
-//! real only for a surface that advertises both, so it is caught during assembly, where the error
-//! can name the profile and both keys — see [`ToolRegistry::assemble`].
+//! does *not* require model-facing names to be unique: a host-only tool may share a name with an
+//! advertised one, and the lookup keys keep them apart. A collision is real only for a surface
+//! that advertises both under one qualified name — a namespace is part of what the model calls a
+//! tool by, so two namespaces may each offer `search` — and is caught during assembly, where the
+//! error can name the profile and both keys — see [`ToolRegistry::assemble`].
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use ra_core::{
     error::{Error, Result},
+    model::ModelToolDefinition,
     tool::{Tool, ToolLookupKey},
 };
 
@@ -128,7 +130,7 @@ impl ToolRegistry {
 
         let mut names: BTreeMap<String, &ToolLookupKey> = BTreeMap::new();
         let mut advertised = Vec::new();
-        let mut advertised_bytes = 0;
+        let mut definitions = Vec::new();
         let mut advertised_name_chars = 0;
         for tool in &tools {
             // Everything the budget pays for can also reach a model surface, so one projection
@@ -139,23 +141,25 @@ impl ToolRegistry {
             }
             let definition = tool.model_definition();
             let key = tool.origin().lookup_key();
-            if let Some(previous) = names.insert(definition.name().to_owned(), key) {
+            let qualified = definition.qualified_name();
+            if let Some(previous) = names.insert(qualified.clone(), key) {
                 return Err(Error::config(format!(
                     "tool profile `{id}` advertises the name `{}` from two lookup keys {} and {}; \
                      distinct routing identities still have to project to distinct model-facing \
                      names",
-                    definition.name(),
+                    qualified,
                     render_lookup_key(previous),
                     render_lookup_key(key)
                 )));
             }
             if is_advertised(tool.as_ref()) {
-                advertised.push(definition.name().to_owned());
-                advertised_bytes += definition.advertised_bytes()?;
-                advertised_name_chars += definition.name().chars().count();
+                advertised_name_chars += qualified.chars().count();
+                advertised.push(qualified);
+                definitions.push(definition);
             }
         }
 
+        let advertised_bytes = ModelToolDefinition::advertised_table_bytes(&definitions)?;
         let advertised_count = advertised.len();
         let budget = profile.budget();
         if advertised_count < budget.min_advertised() {

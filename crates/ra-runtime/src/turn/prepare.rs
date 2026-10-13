@@ -41,7 +41,8 @@ use crate::agent::{AgentBinding, AgentRegistry};
 /// What to do when two actions claim one model-facing tool name.
 ///
 /// This is a turn-preparation policy rather than a registry policy: registry lookup keys remain
-/// unambiguous, while tools and handoffs share one flat provider namespace. [`Warn`](Self::Warn)
+/// unambiguous, while top-level tools and handoffs share the provider's top-level names, and a
+/// namespaced tool claims its qualified name. [`Warn`](Self::Warn)
 /// retains a deterministic winner and records the discarded entry; [`Error`](Self::Error) refuses
 /// the turn before a provider call.
 #[non_exhaustive]
@@ -59,7 +60,7 @@ pub enum ToolNameCollisionPolicy {
 /// Unlike [`ToolSurfaceBudget`](crate::tool::profile::ToolSurfaceBudget), this is applied after
 /// dynamic availability and includes both function tools and handoffs. Tool profiles remain a
 /// tool-selection concern; this value is the only budget that can account for everything a
-/// provider receives in one flat action namespace.
+/// provider receives in its action table.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ActionSurfaceBudget {
@@ -473,7 +474,10 @@ impl fmt::Debug for PreparedHandoff {
 #[non_exhaustive]
 pub struct TurnActionSurface {
     tools: Vec<Arc<dyn Tool>>,
+    /// Each tool's qualified model-facing name, which collisions are judged by.
     tool_names: Vec<String>,
+    /// Each tool's namespace and name within it, which a call is resolved by.
+    tool_keys: Vec<(Option<String>, String)>,
     handoffs: Vec<PreparedHandoff>,
 }
 
@@ -491,9 +495,21 @@ impl TurnActionSurface {
         mut handoffs: Vec<PreparedHandoff>,
         policy: ToolNameCollisionPolicy,
     ) -> Result<Self> {
+        // A tool advertised in a namespace is named by its qualified name here, as the reference
+        // compares qualified names: it collides with nothing but the same qualified name.
         let tool_names: Vec<String> = tools
             .iter()
-            .map(|tool| tool.model_definition().name().to_owned())
+            .map(|tool| tool.model_definition().qualified_name())
+            .collect();
+        let tool_keys: Vec<(Option<String>, String)> = tools
+            .iter()
+            .map(|tool| {
+                let definition = tool.model_definition();
+                (
+                    definition.namespace().map(str::to_owned),
+                    definition.name().to_owned(),
+                )
+            })
             .collect();
 
         let mut owners: BTreeMap<&str, Vec<ActionOwner>> = BTreeMap::new();
@@ -556,13 +572,16 @@ impl TurnActionSurface {
         }
 
         let mut retained_tool_names = Vec::with_capacity(tools.len());
+        let mut retained_tool_keys = Vec::with_capacity(tools.len());
         tools = tools
             .into_iter()
             .zip(tool_names)
+            .zip(tool_keys)
             .zip(retained_tools)
-            .filter_map(|((tool, name), retained)| retained.then_some((tool, name)))
-            .map(|(tool, name)| {
+            .filter_map(|(((tool, name), key), retained)| retained.then_some((tool, name, key)))
+            .map(|(tool, name, key)| {
                 retained_tool_names.push(name);
+                retained_tool_keys.push(key);
                 tool
             })
             .collect();
@@ -574,6 +593,7 @@ impl TurnActionSurface {
         Ok(Self {
             tools,
             tool_names: retained_tool_names,
+            tool_keys: retained_tool_keys,
             handoffs,
         })
     }
@@ -616,7 +636,7 @@ impl TurnActionSurface {
             .collect()
     }
 
-    /// Number of entries this turn sends in its flat model-facing action namespace.
+    /// Number of actions this turn sends the model, each namespaced tool counted on its own.
     #[must_use]
     pub fn advertised_count(&self) -> usize {
         self.tools.len() + self.handoffs.len()
@@ -628,29 +648,35 @@ impl TurnActionSurface {
     /// so charging only executable tools would accept a request whose actual action schema exceeds
     /// the configured budget.
     pub fn advertised_bytes(&self) -> Result<usize> {
-        self.tool_definitions()
+        self.handoffs
             .iter()
-            .map(ModelToolDefinition::advertised_bytes)
-            .chain(
-                self.handoffs
-                    .iter()
-                    .map(|handoff| handoff.definition().advertised_bytes()),
+            .map(|handoff| handoff.definition().advertised_bytes())
+            .try_fold(
+                ModelToolDefinition::advertised_table_bytes(&self.tool_definitions())?,
+                |total, bytes| {
+                    total.checked_add(bytes?).ok_or_else(|| {
+                        Error::config("the advertised model-action table is too large to measure")
+                    })
+                },
             )
-            .try_fold(0_usize, |total, bytes| {
-                total.checked_add(bytes?).ok_or_else(|| {
-                    Error::config("the advertised model-action table is too large to measure")
-                })
-            })
     }
 
-    /// Resolves a model-facing name to its executable tool.
+    /// Resolves a model-facing name to its executable tool, outside any namespace.
     #[must_use]
     pub fn find_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools
-            .iter()
-            .zip(&self.tool_names)
-            .rev()
-            .find_map(|(tool, advertised)| (advertised == name).then_some(tool))
+        self.find_tool_in(None, name)
+    }
+
+    /// Resolves a call's namespace and name to its executable tool: the reference's lookup by
+    /// `get_function_tool_lookup_key_for_call`. A name is looked up only within the namespace the
+    /// call names, so a call of `search` never reaches a namespace's `search`, nor the reverse.
+    #[must_use]
+    pub fn find_tool_in(&self, namespace: Option<&str>, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.iter().zip(&self.tool_keys).rev().find_map(
+            |(tool, (advertised_namespace, advertised))| {
+                (advertised_namespace.as_deref() == namespace && advertised == name).then_some(tool)
+            },
+        )
     }
 
     /// Resolves a model-facing name to the transfer it was advertised as.
@@ -674,7 +700,8 @@ impl TurnActionSurface {
             .any(|handoff| handoff.target_agent() == target)
     }
 
-    /// Every name this turn puts in front of the model.
+    /// Every name this turn puts in front of the model, a namespaced tool's qualified by its
+    /// namespace, which is how the reference lets a `tool_choice` name one.
     ///
     /// Settings reconciliation and response classification both ask this question, and they have to
     /// get the same answer: a `tool_choice` kept for a name the surface cannot resolve is a request

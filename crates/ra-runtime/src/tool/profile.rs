@@ -402,13 +402,14 @@ impl ToolSurface {
         self.advertised.len()
     }
 
-    /// What the advertised tool entries cost, by [`ToolSchema::advertised_bytes`].
+    /// What the advertised tool entries cost, including shared namespace metadata once, by
+    /// [`ModelToolDefinition::advertised_table_bytes`].
     ///
     /// This excludes handoffs because a [`ToolSurface`] is a tool-selection result. Use the final
     /// turn's [`ActionSurfaceBudget`](crate::runner::ActionSurfaceBudget) to bound the complete
     /// provider action table.
     ///
-    /// [`ToolSchema::advertised_bytes`]: ra_core::tool::ToolSchema::advertised_bytes
+    /// [`ModelToolDefinition::advertised_table_bytes`]: ra_core::model::ModelToolDefinition::advertised_table_bytes
     #[must_use]
     pub const fn advertised_bytes(&self) -> usize {
         self.advertised_bytes

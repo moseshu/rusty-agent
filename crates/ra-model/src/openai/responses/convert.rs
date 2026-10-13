@@ -236,6 +236,17 @@ pub(crate) fn convert_function_call(
         ))
         .with_source(error)
     })?;
+    // The reference's `get_tool_call_namespace`: a call of a namespace's function names it, and an
+    // empty one names none.
+    let namespace = item
+        .get("namespace")
+        .and_then(Value::as_str)
+        .filter(|namespace| !namespace.is_empty());
+    if let Some(namespace) = namespace {
+        return Ok(RunItemKind::ToolCall(
+            ToolCall::new(call_id, name, arguments).with_namespace(namespace),
+        ));
+    }
 
     if let Some(handoff) = handoffs.iter().find(|handoff| handoff.name() == name) {
         Ok(RunItemKind::HandoffCall(

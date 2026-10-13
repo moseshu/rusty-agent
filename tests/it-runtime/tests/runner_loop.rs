@@ -2083,10 +2083,17 @@ async fn stop_at_tools_stops_only_for_matching_names_and_supports_qualified_name
     ));
 
     let matched = Arc::new(ScriptedTool::namespaced("workspace", "write_file"));
-    let matching_model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+    // A namespaced tool is called within its namespace.
+    let matching_model = ScriptedModel::new(vec![ModelResponse::new(vec![item(
         "c-2",
-        "call-2",
-        "write_file",
+        RunItemKind::ToolCall(
+            ToolCall::new(
+                CallId::new("call-2"),
+                "write_file",
+                json!({ "path": "a.txt" }),
+            )
+            .with_namespace("workspace"),
+        ),
     )])]);
     let matched_cancel = CancelScope::root();
     let stopped = Runner::run(request_with_tool_use_behavior(

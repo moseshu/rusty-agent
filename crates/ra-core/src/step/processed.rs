@@ -505,12 +505,13 @@ impl ProcessedResponseBuilder {
 
     /// Records a call bound to the tool that will run it.
     ///
-    /// The tool's model-boundary name has to match the name the model used. A classifier that
-    /// bound the wrong implementation would otherwise run it under the model's name and report
-    /// success.
+    /// The tool's model-boundary name, and the namespace it is advertised in, have to match the
+    /// ones the model used. A classifier that bound the wrong implementation would otherwise run
+    /// it under the model's name and report success.
     pub fn function(mut self, item: RunItem, tool: Arc<dyn Tool>) -> Result<Self> {
         let call = tool_call(&item, "a bound function call")?.clone();
-        if call.name() != tool.model_definition().name() {
+        let definition = tool.model_definition();
+        if call.name() != definition.name() || call.namespace() != definition.namespace() {
             return Err(Error::caller(format!(
                 "call `{}` was bound to tool `{}`, which advertises a different name",
                 call.name(),

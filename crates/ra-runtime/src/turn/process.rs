@@ -31,14 +31,20 @@ pub fn process_model_response(
 
     for item in response.output() {
         builder = match item.kind() {
+            // A call within a namespace can only be a namespace's tool; handoffs are top-level.
             RunItemKind::ToolCall(call) => {
-                if let Some(handoff) = surface.find_handoff(call.name()) {
+                if let Some(handoff) = call
+                    .namespace()
+                    .is_none()
+                    .then(|| surface.find_handoff(call.name()))
+                    .flatten()
+                {
                     builder.handoff(
                         item.clone(),
                         handoff.spec().clone(),
                         Arc::clone(handoff.target()),
                     )?
-                } else if let Some(tool) = surface.find_tool(call.name()) {
+                } else if let Some(tool) = surface.find_tool_in(call.namespace(), call.name()) {
                     builder.function(item.clone(), Arc::clone(tool))?
                 } else {
                     // Not an error. The model naming a tool that is gone this turn is ordinary,
