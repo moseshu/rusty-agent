@@ -2269,6 +2269,7 @@ name = "ra-coding"
 version = "0.2.2"
 dependencies = [
  "async-trait",
+ "globset",
  "ra-context",
  "ra-core",
  "ra-exec",

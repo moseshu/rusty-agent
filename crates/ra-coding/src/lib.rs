@@ -27,6 +27,7 @@ pub mod doctor;
 pub mod exec_policy;
 pub(crate) mod final_answer;
 pub mod host;
+pub mod permissions;
 pub mod profile;
 pub mod prompt;
 pub mod shell_command;
