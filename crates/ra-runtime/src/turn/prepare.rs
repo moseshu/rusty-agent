@@ -388,6 +388,7 @@ pub struct PreparedHandoff {
     spec: HandoffSpec,
     definition: ModelHandoffDefinition,
     target: Arc<AgentSpec>,
+    declaration: Option<usize>,
 }
 
 impl PreparedHandoff {
@@ -420,7 +421,19 @@ impl PreparedHandoff {
             spec,
             definition,
             target,
+            declaration: None,
         })
+    }
+
+    /// Records the position of `spec` among the source agent's handoff declarations.
+    pub(crate) const fn with_declaration(mut self, index: usize) -> Self {
+        self.declaration = Some(index);
+        self
+    }
+
+    /// Position of the declaration among the source agent's handoffs, when preparation bound it.
+    pub(crate) const fn declaration(&self) -> Option<usize> {
+        self.declaration
     }
 
     /// The declaration that offers the transfer.
@@ -985,7 +998,7 @@ async fn resolve_handoffs(
         .await??;
 
     let mut prepared = Vec::new();
-    for (handoff, enabled) in agent.handoffs().iter().zip(decisions) {
+    for (index, (handoff, enabled)) in agent.handoffs().iter().zip(decisions).enumerate() {
         if !enabled {
             continue;
         }
@@ -1003,7 +1016,9 @@ async fn resolve_handoffs(
                     handoff.target_agent()
                 ))
             })?;
-        prepared.push(PreparedHandoff::new(handoff.clone(), Arc::clone(target))?);
+        prepared.push(
+            PreparedHandoff::new(handoff.clone(), Arc::clone(target))?.with_declaration(index),
+        );
     }
     Ok(prepared)
 }

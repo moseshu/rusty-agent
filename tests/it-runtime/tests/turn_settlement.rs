@@ -1829,7 +1829,8 @@ async fn test_turn_settlement_22() {
         HandoffSpec::new(
             AgentId::new("reviewer"),
             handoff_schema("transfer_to_reviewer"),
-        ),
+        )
+        .with_history_projection(HistoryProjection::None),
     )]);
     let response = ModelResponse::new(vec![
         message("msg-1", "转给审阅者"),
@@ -1876,7 +1877,7 @@ async fn test_turn_settlement_22() {
     assert_eq!(transfer.target_agent().as_str(), "reviewer");
 
     // The session keeps everything; what the receiving agent carries forward is only the transfer,
-    // because `HistoryProjection::None` is the default.
+    // because `HistoryProjection::None` was explicitly selected.
     assert_eq!(settled.session_step_items().len(), 3);
     assert!(settled.original_input().is_empty());
     let carried = settled
@@ -1938,10 +1939,10 @@ async fn test_turn_settlement_22b() {
     assert_eq!(new_agent.id().as_str(), "reviewer");
 
     let refused = output_for(settled.session_step_items(), "call-2");
-    assert!(refused.is_error());
+    assert!(!refused.is_error());
     assert_eq!(
-        refused.output()["error"]["code"],
-        json!("handoff_not_performed")
+        refused.output(),
+        &json!("Multiple handoffs detected, ignoring this one.")
     );
 
     // The winner declared `Full`, so the caller's input and both records travel with it.
@@ -1950,7 +1951,7 @@ async fn test_turn_settlement_22b() {
 }
 
 #[tokio::test]
-async fn a_turn_that_stops_to_ask_performs_no_transfer_but_still_answers_it() {
+async fn a_turn_that_stops_to_ask_defers_its_transfer() {
     let tool = Arc::new(
         ScriptedTool::new("write_file", Behavior::Succeed("ok"))
             .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
@@ -2003,14 +2004,10 @@ async fn a_turn_that_stops_to_ask_performs_no_transfer_but_still_answers_it() {
             .any(|item| matches!(item.kind(), RunItemKind::HandoffOutput(_)))
     );
 
-    // The call is still answered: an unanswered call makes the next request malformed, and the
-    // model is told why this one did not happen.
-    let refused = output_for(settled.session_step_items(), "call-2");
-    assert!(refused.is_error());
-    assert_eq!(
-        refused.output()["error"]["code"],
-        json!("handoff_not_performed")
-    );
+    // The transfer is deferred until approvals finish; no output pretends it was refused.
+    assert!(!settled.session_step_items().iter().any(|item| {
+        matches!(item.kind(), RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-2")
+    }));
 }
 
 fn handoff_schema(name: &str) -> ToolSchema {
@@ -2024,6 +2021,46 @@ fn handoff_schema(name: &str) -> ToolSchema {
         }),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn server_managed_history_rejects_the_selected_handoff_filter_after_invocation() {
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let callback = Arc::clone(&invoked);
+    let spec = HandoffSpec::new(
+        AgentId::new("reviewer"),
+        handoff_schema("transfer_to_reviewer"),
+    )
+    .with_on_handoff_fn(move |_| {
+        callback.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok(()))
+    })
+    .with_input_filter_fn(|_: &RunContext, data| std::future::ready(Ok(data)));
+    let surface = handoff_surface(vec![("reviewer", spec)]);
+    let response = ModelResponse::new(vec![tool_call(
+        "transfer",
+        "transfer",
+        "transfer_to_reviewer",
+    )]);
+    let cancel = CancelScope::root();
+    let error = settle_turn(
+        TurnSettlementRequest::new(
+            &binding(),
+            &response,
+            &surface,
+            run(),
+            &cancel,
+            &mut ToolUseTracker::new(),
+            &mut ToolFailureTracker::new(),
+            Default::default(),
+        )
+        .with_server_managed_conversation(true),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "config");
+    assert!(error.to_string().contains("server-managed conversations"));
+    assert_eq!(invoked.load(Ordering::SeqCst), 1);
 }
 
 fn handoff_surface(handoffs: Vec<(&str, HandoffSpec)>) -> TurnActionSurface {

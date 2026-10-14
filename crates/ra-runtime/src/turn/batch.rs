@@ -105,6 +105,13 @@ pub struct TurnExecution {
 pub(crate) struct TurnRecovery {
     pub(crate) execution: TurnExecution,
     pub(crate) nested_runs: Vec<NestedRunRef>,
+    pub(crate) handoff: Option<(ProcessedResponse, ra_core::agent::HandoffInputData)>,
+    pub(crate) handoff_reached: bool,
+    /// The turn's complete records when a handoff filter changed what the turn stores.
+    ///
+    /// The model's own records were already streamed before the filter ran upstream, so the loop
+    /// still streams them from this list; everything else streams from what the turn stores.
+    pub(crate) unfiltered_records: Option<Vec<RunItem>>,
 }
 
 /// One completed task, retained until the whole batch is known to be safe to settle.
@@ -453,7 +460,18 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
     // Last, and after the interruptions are known. A transfer record says control moved, and a turn
     // that stops to ask a human has not moved it — writing one before that is settled would leave
     // history claiming a transfer the run then did not make.
-    execute_handoffs(processed, request.agent_id, &mut execution);
+    if !processed.handoffs().is_empty()
+        && let Some(recovery) = request.recovery.as_deref_mut()
+    {
+        recovery.handoff_reached = true;
+    }
+    let handoff_result = execute_handoffs(&request, &mut execution).await;
+    if !processed.handoffs().is_empty()
+        && let Some(recovery) = request.recovery.as_deref_mut()
+    {
+        recovery.execution = execution.clone();
+    }
+    handoff_result?;
 
     Ok(execution)
 }
@@ -1384,68 +1402,55 @@ fn outcome(
 /// A turn that stops to ask a human performs none of them: the transfer would be recorded now and
 /// taken after the answer comes back, and anything reading history in between would see a run
 /// attributed to an agent that had not started.
-fn execute_handoffs(
-    processed: &ProcessedResponse,
-    source: &AgentId,
+async fn execute_handoffs(
+    request: &TurnExecutionRequest<'_>,
     execution: &mut TurnExecution,
-) {
-    let mut handoffs = processed.handoffs().iter();
-    let taken = if execution.has_interruptions() {
-        None
-    } else {
-        handoffs.next()
+) -> Result<()> {
+    let mut handoffs = request.processed.handoffs().iter();
+    let Some(handoff) = handoffs.next() else {
+        return Ok(());
     };
-
-    if let Some(handoff) = taken {
-        let target = handoff.target();
-        execution.new_items.push(RunItem::new(
-            output_item_id(handoff.call_id()),
-            RunItemKind::HandoffOutput(
-                HandoffOutput::new(
-                    handoff.call_id().clone(),
-                    source.clone(),
-                    target.id().clone(),
-                )
-                // The reference implementation's transfer message, kept verbatim. It is what the
-                // receiving agent reads as the answer to the call that moved control, and matching
-                // it keeps a prompt written against that ecosystem working here unchanged.
-                .with_note(transfer_message(target.name())),
-            ),
-        ));
+    if execution.has_interruptions() {
+        // The original transfer resumes after this turn's tools finish. No callback or output
+        // claims a transfer or refusal before that approval boundary.
+        return Ok(());
     }
-
-    for refused in handoffs {
-        let reason = match taken {
-            Some(winner) => format!(
-                "control already transferred to `{}` in this response",
-                winner.target_agent()
-            ),
-            None => {
-                "this turn stopped for a pending decision before control could transfer".to_owned()
-            }
-        };
-        // Not one of the tool error kinds: nothing was dispatched, refused by a policy, or found
-        // missing. What the model has to read is that this particular transfer did not happen, and
-        // borrowing a kind that names a different cause would put a misleading code in history.
+    for ignored in handoffs {
         execution.new_items.push(output_item(
-            refused.call_id(),
+            ignored.call_id(),
             ToolCallOutput::new(
-                refused.call_id().clone(),
-                json!({
-                    "error": {
-                        "code": HANDOFF_NOT_PERFORMED,
-                        "target_agent": refused.target_agent().as_str(),
-                        "message": reason,
-                    }
-                }),
-            )
-            .with_error(true),
+                ignored.call_id().clone(),
+                json!("Multiple handoffs detected, ignoring this one."),
+            ),
         ));
     }
+    request
+        .cancel
+        .run(
+            handoff
+                .spec()
+                .invoke(&request.run, handoff.call().arguments()),
+        )
+        .await??;
+    request.cancel.ensure_not_cancelled()?;
+    let target = handoff.target();
+    execution.new_items.push(RunItem::new(
+        output_item_id(handoff.call_id()),
+        RunItemKind::HandoffOutput(
+            HandoffOutput::new(
+                handoff.call_id().clone(),
+                request.agent_id.clone(),
+                target.id().clone(),
+            )
+            .with_note(transfer_message(target.name())),
+        ),
+    ));
+    let input = ra_core::lifecycle::HandoffInput::new(&request.run, target)
+        .with_services(&request.services);
+    crate::lifecycle::dispatch::handoff(&request.lifecycle, &input, request.cancel).await?;
+    request.cancel.ensure_not_cancelled()?;
+    Ok(())
 }
-
-/// Machine-readable code answering a transfer the turn declined to perform.
-const HANDOFF_NOT_PERFORMED: &str = "handoff_not_performed";
 
 /// What the agent receiving control reads as the answer to the call that moved it.
 fn transfer_message(agent_name: &str) -> String {

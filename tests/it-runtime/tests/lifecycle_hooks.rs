@@ -1211,13 +1211,8 @@ impl LifecycleHook for TransferRecorder {
 }
 
 #[tokio::test]
-async fn a_transfer_is_announced_to_the_run_and_to_the_receiving_agent() {
-    // The agent-scoped half of the moment belongs to the arriving agent, matching
-    // `AgentHooksBase.on_handoff`, so the set is rebound before the moment is raised. The departing
-    // agent's own record of losing control is the handoff item in the run's history.
-    //
-    // Driven through the dispatch entry rather than the loop: settlement refuses handoffs, so this
-    // is the only reachable call site until control transfer lands.
+async fn a_transfer_is_announced_to_the_run_and_to_the_source_agent() {
+    // The source agent observes the transfer before the receiving agent starts.
     let log = Arc::new(Mutex::new(Vec::new()));
     let hook = |name| Arc::new(TransferRecorder(name, Arc::clone(&log))) as Arc<dyn LifecycleHook>;
     let source = AgentSpec::builder()
@@ -1234,10 +1229,9 @@ async fn a_transfer_is_announced_to_the_run_and_to_the_receiving_agent() {
         .expect("an agent that narrates");
 
     let installed = LifecycleHooks::installed(&[hook("whole-run")], source.lifecycle_hooks());
-    let receiving = installed.rebound(target.lifecycle_hooks());
     let run = RunContext::new(RunId::new("run-lifecycle"), &source);
     ra_runtime::lifecycle::dispatch::handoff(
-        &receiving,
+        &installed,
         &HandoffInput::new(&run, &target),
         &CancelScope::root(),
     )
@@ -1246,8 +1240,8 @@ async fn a_transfer_is_announced_to_the_run_and_to_the_receiving_agent() {
 
     assert_eq!(
         log.lock().expect("no poisoned fixture").clone(),
-        vec!["whole-run:run".to_owned(), "target:agent".to_owned()],
-        "the departing agent's hooks are gone by the time the moment is raised"
+        vec!["whole-run:run".to_owned(), "source:agent".to_owned()],
+        "the source agent observes the transfer"
     );
 }
 

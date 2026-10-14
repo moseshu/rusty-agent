@@ -12,40 +12,46 @@
 //! narrow further, reshape, or summarize, but it cannot hand back context the declaration did not
 //! grant, because it is never given it.
 //!
-//! # What a projection can never reach
+//! # What each narrowing may store
 //!
-//! The authoritative session history. Both narrowings produce the receiving agent's **model input**;
-//! the records this turn generated are stored complete either way. That split is the reason
+//! A [`HistoryProjection`] only narrows the receiving agent's **model input**; the records the turn
+//! generated are stored complete whatever it says. A filter follows the reference instead: the
+//! `new_items` it returns are what the turn stores, so a filter that removes tool records keeps
+//! them out of the session too, while [`HandoffInputData::with_input_items`] narrows the model input
+//! alone. A filter only governs records the session has not received yet, and records a projection
+//! withheld from it are stored as they were. That split is why
 //! [`SingleStepResult`](crate::step::SingleStepResult) carries `new_step_items` and
-//! `session_step_items` separately, and it is what keeps a filter from silently deleting history
-//! that a later replay, audit, or resume still needs.
+//! `session_step_items` separately.
 
-use std::{collections::BTreeSet, fmt, future::Future, sync::Arc};
+use std::{collections::BTreeSet, fmt, future::Future, marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
-use super::validate_required_text;
+use super::{AgentSpec, validate_required_text};
 use crate::{
     context::RunContext,
-    error::{Error, Result},
+    error::{Error, ProviderErrorKind, Result},
     item::{AgentId, CallId, ModelInputItem, RunItem},
     model::ModelHandoffDefinition,
-    tool::ToolSchema,
+    tool::{ToolInput, ToolSchema, schema::ToolInputRequirements},
 };
 
 /// Controls how much predecessor history a handoff gives its target as model input.
 ///
 /// This declares a model-input projection only. It never changes the authoritative session
 /// history, which retains the complete records that led to the transfer. The default is
-/// deliberately [`None`](Self::None): silently granting another agent the caller's complete
-/// transcript is both a context-cost surprise and an authority expansion.
+/// [`Full`](Self::Full), matching the framework's conversation-transfer contract. Restrictions
+/// are explicit host extensions.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum HistoryProjection {
     /// Do not provide predecessor history to the receiving agent.
-    #[default]
     None,
     /// Provide the complete predecessor history.
+    #[default]
     Full,
     /// Provide the most recent number of input items.
     LastItems(usize),
@@ -101,13 +107,14 @@ where
 
 /// Reshapes what a transfer hands the receiving agent, after the declaration's projection.
 ///
-/// # What a filter may and may not do
+/// A filter may drop, rewrite or synthesize model-input items in any of the three source lists.
 ///
-/// It may **drop** anything and may rewrite [`HandoffInputData::input_history`] freely — that half
-/// is model input the session does not own. It may **not** rewrite the records in
-/// [`HandoffInputData::new_items`]: those are the records this very turn is storing, and a rewritten
-/// copy carried forward under the same identity would leave the run holding two versions of one
-/// record. Settlement refuses such a result rather than storing one version and sending the other.
+/// As in the reference, the returned [`HandoffInputData::new_items`] are what the transferring turn
+/// stores, and the receiving agent sees them too unless [`HandoffInputData::input_items`] is set,
+/// which narrows the model input alone. The filter governs only records it was handed that are
+/// model input and that the session has not received yet: records an earlier write delivered, and
+/// records a declared projection withheld, are stored unchanged. Calls and their outputs stay
+/// paired in what is stored.
 ///
 /// # Cancellation
 ///
@@ -141,6 +148,58 @@ where
     }
 }
 
+/// Invokes a handoff's callback before control transfers or history is filtered.
+///
+/// Typed declarations validate the model payload before invoking user code. The payload is
+/// callback data; it does not replace the receiving agent's conversation input.
+#[async_trait]
+pub trait HandoffInvocationHandler: Send + Sync + 'static {
+    /// Validates the payload and runs the callback, propagating failures to the run.
+    async fn on_handoff(&self, context: &RunContext, arguments: &Value) -> Result<()>;
+}
+
+struct HandoffInvocationFn<F>(F);
+
+#[async_trait]
+impl<F, Fut> HandoffInvocationHandler for HandoffInvocationFn<F>
+where
+    F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    async fn on_handoff(&self, context: &RunContext, _arguments: &Value) -> Result<()> {
+        (self.0)(context).await
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct HandoffArguments<T>(T);
+
+impl<T: ToolInputRequirements> ToolInput for HandoffArguments<T> {}
+
+struct TypedHandoffInvocation<T, F> {
+    callback: F,
+    input: PhantomData<T>,
+}
+
+#[async_trait]
+impl<T, F, Fut> HandoffInvocationHandler for TypedHandoffInvocation<T, F>
+where
+    T: ToolInputRequirements,
+    F: Fn(&RunContext, T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    async fn on_handoff(&self, context: &RunContext, arguments: &Value) -> Result<()> {
+        // The input type is the validation authority, as TypeAdapter is upstream. Strict schema
+        // normalization describes model generation; it must not turn serde defaults into runtime
+        // required fields or override the input type's policy for unknown fields.
+        let input = serde_json::from_value::<T>(arguments.clone()).map_err(|error| {
+            Error::provider(ProviderErrorKind::Behavior, "invalid handoff input").with_source(error)
+        })?;
+        (self.callback)(context, input).await
+    }
+}
+
 /// Declarative, provider-neutral transfer of control to another agent.
 ///
 /// The declaration carries a stable target identity rather than the target's own declaration.
@@ -154,18 +213,126 @@ pub struct HandoffSpec {
     history_projection: HistoryProjection,
     availability: Option<Arc<dyn HandoffAvailabilityHandler>>,
     input_filter: Option<Arc<dyn HandoffInputFilter>>,
+    invocation: Option<Arc<dyn HandoffInvocationHandler>>,
 }
 
 impl HandoffSpec {
-    /// Creates an always-enabled handoff with no predecessor history by default.
+    /// Creates an always-enabled handoff inheriting the complete conversation by default.
     #[must_use]
     pub fn new(target_agent: AgentId, schema: ToolSchema) -> Self {
         Self {
             target_agent,
             schema,
-            history_projection: HistoryProjection::None,
+            history_projection: HistoryProjection::Full,
             availability: None,
             input_filter: None,
+            invocation: None,
+        }
+    }
+
+    /// Derives the name, description and empty strict parameter schema from a target agent.
+    ///
+    /// Only the stable target identity is retained; the runtime still resolves and validates it
+    /// through its agent registry, avoiding ownership cycles between mutually handing-off agents.
+    pub fn from_agent(agent: &AgentSpec) -> Result<Self> {
+        Ok(Self::new(
+            agent.id().clone(),
+            ToolSchema::new(Self::default_tool_name(agent), json!({
+                "type": "object", "properties": {}, "required": [], "additionalProperties": false
+            }))?.with_description(Self::default_tool_description(agent)),
+        ))
+    }
+
+    /// Derives the upstream function-style name for a target.
+    #[must_use]
+    pub fn default_tool_name(agent: &AgentSpec) -> String {
+        format!("transfer_to_{}", agent.name())
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    character.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    /// Derives the upstream description, including the target's handoff description.
+    #[must_use]
+    pub fn default_tool_description(agent: &AgentSpec) -> String {
+        format!(
+            "Handoff to the {} agent to handle the request. {}",
+            agent.name(),
+            agent.handoff_description().unwrap_or_default()
+        )
+    }
+
+    /// Overrides the model-facing tool name without changing routing identity.
+    pub fn with_tool_name(mut self, name: impl Into<String>) -> Result<Self> {
+        let mut schema = if self.schema.strict_json_schema() {
+            ToolSchema::new(name, self.schema.input_schema().clone())?
+        } else {
+            ToolSchema::loose(name, self.schema.input_schema().clone())?
+        };
+        if let Some(description) = self.schema.description() {
+            schema = schema.with_description(description);
+        }
+        self.schema = schema;
+        Ok(self)
+    }
+
+    /// Overrides the description shown to the model.
+    #[must_use]
+    pub fn with_tool_description(mut self, description: impl Into<String>) -> Self {
+        self.schema = self.schema.with_description(description);
+        self
+    }
+
+    /// Installs a custom payload-validation and invocation handler.
+    #[must_use]
+    pub fn with_on_handoff(mut self, handler: Arc<dyn HandoffInvocationHandler>) -> Self {
+        self.invocation = Some(handler);
+        self
+    }
+
+    /// Installs a callback taking only live context, ignoring the model payload as upstream does.
+    #[must_use]
+    pub fn with_on_handoff_fn<F, Fut>(self, callback: F) -> Self
+    where
+        F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.with_on_handoff(Arc::new(HandoffInvocationFn(callback)))
+    }
+
+    /// Replaces the parameter schema with a strict schema for `T` and its mandatory callback.
+    ///
+    /// Rust proves the callback arity and input type at construction. `Deserialize` and
+    /// `JsonSchema` supply the upstream type-adapter roles without requiring a tool declaration.
+    pub fn with_input_type<T, F, Fut>(mut self, callback: F) -> Result<Self>
+    where
+        T: ToolInputRequirements,
+        F: Fn(&RunContext, T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let mut declaration = HandoffArguments::<T>::tool_schema(self.schema.name())?;
+        if let Some(description) = self.schema.description() {
+            declaration = declaration.with_description(description);
+        }
+        self.schema = declaration;
+        self.invocation = Some(Arc::new(TypedHandoffInvocation::<T, F> {
+            callback,
+            input: PhantomData,
+        }));
+        Ok(self)
+    }
+
+    /// Runs the payload callback, or succeeds without inspecting arguments when none is set.
+    pub async fn invoke(&self, context: &RunContext, arguments: &Value) -> Result<()> {
+        match &self.invocation {
+            Some(handler) => handler.on_handoff(context, arguments).await,
+            None => Ok(()),
         }
     }
 
@@ -192,6 +359,12 @@ impl HandoffSpec {
     {
         self.availability = Some(Arc::new(HandoffAvailabilityFn(f)));
         self
+    }
+
+    /// Sets static enablement, replacing any dynamic availability callback.
+    #[must_use]
+    pub fn with_is_enabled(self, enabled: bool) -> Self {
+        self.with_availability_fn(move |_| std::future::ready(Ok(enabled)))
     }
 
     /// Installs the transform applied after this declaration's history projection.
@@ -276,6 +449,7 @@ impl fmt::Debug for HandoffSpec {
             .field("history_projection", &self.history_projection)
             .field("dynamic_availability", &self.availability.is_some())
             .field("input_filter", &self.input_filter.is_some())
+            .field("on_handoff", &self.invocation.is_some())
             .finish()
     }
 }
@@ -293,6 +467,7 @@ pub struct HandoffInputData {
     input_history: Vec<ModelInputItem>,
     pre_handoff_items: Vec<RunItem>,
     new_items: Vec<RunItem>,
+    input_items: Option<Vec<RunItem>>,
 }
 
 impl HandoffInputData {
@@ -307,6 +482,7 @@ impl HandoffInputData {
             input_history,
             pre_handoff_items,
             new_items,
+            input_items: None,
         }
     }
 
@@ -328,6 +504,19 @@ impl HandoffInputData {
         &self.new_items
     }
 
+    /// Optional model-input override; the turn still stores `new_items`.
+    #[must_use]
+    pub fn input_items(&self) -> Option<&[RunItem]> {
+        self.input_items.as_deref()
+    }
+
+    /// Selects the items forwarded to the model instead of `new_items`, which the turn still stores.
+    #[must_use]
+    pub fn with_input_items(mut self, items: Vec<RunItem>) -> Self {
+        self.input_items = Some(items);
+        self
+    }
+
     /// Replaces the run's opening input.
     #[must_use]
     pub fn with_input_history(mut self, input_history: Vec<ModelInputItem>) -> Self {
@@ -342,17 +531,21 @@ impl HandoffInputData {
         self
     }
 
-    /// Replaces what the transferring turn contributes.
+    /// Replaces what the transferring turn contributes and, from a filter, what it stores.
     #[must_use]
     pub fn with_new_items(mut self, new_items: Vec<RunItem>) -> Self {
         self.new_items = new_items;
         self
     }
 
-    /// Takes the three parts apart, in the order they are read in.
+    /// Takes the three model-input contributions apart, selecting `input_items` when set.
     #[must_use]
     pub fn into_parts(self) -> (Vec<ModelInputItem>, Vec<RunItem>, Vec<RunItem>) {
-        (self.input_history, self.pre_handoff_items, self.new_items)
+        (
+            self.input_history,
+            self.pre_handoff_items,
+            self.input_items.unwrap_or(self.new_items),
+        )
     }
 
     /// Applies the declared ceiling, keeping the transfer itself whatever the ceiling says.
@@ -374,6 +567,7 @@ impl HandoffInputData {
         match projection {
             HistoryProjection::Full => Ok(self.clone()),
             HistoryProjection::None => Ok(Self {
+                input_items: None,
                 input_history: Vec::new(),
                 pre_handoff_items: Vec::new(),
                 new_items: self
@@ -393,6 +587,7 @@ impl HandoffInputData {
                     take_last_by(&self.pre_handoff_items, &mut remaining, |_| false);
                 let start = self.input_history.len().saturating_sub(remaining);
                 Ok(Self {
+                    input_items: None,
                     input_history: self.input_history[start..].to_vec(),
                     pre_handoff_items,
                     new_items,
@@ -420,7 +615,7 @@ impl HandoffInputData {
         items.extend(
             self.pre_handoff_items
                 .iter()
-                .chain(&self.new_items)
+                .chain(self.input_items.as_ref().unwrap_or(&self.new_items))
                 .filter_map(RunItem::to_model_input),
         );
         repair_pairing(items)

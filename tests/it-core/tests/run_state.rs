@@ -83,7 +83,7 @@ fn test_run_state_02() {
 #[test]
 fn test_run_state_03() {
     let stored = r#"{
-        "schema_version": 10,
+        "schema_version": 999,
         "run_id": "run-future",
         "next_host_event_seq": 12,
         "future_policy": { "enabled": true }
@@ -97,7 +97,7 @@ fn test_run_state_03() {
     let state = state.with_tool_use(carried.tool_use().clone());
 
     assert_eq!(state.tool_use().repeat_streak(&agent, &identity), 1);
-    assert_eq!(state.schema_version(), SchemaVersion::new(10));
+    assert_eq!(state.schema_version(), SchemaVersion::new(999));
     let written = serde_json::to_value(&state).expect("run state must serialize");
     assert_eq!(written["future_policy"]["enabled"], true);
     assert_eq!(written["run_id"], "run-future");
@@ -107,7 +107,7 @@ fn test_run_state_03() {
 #[test]
 fn test_run_state_04() {
     let stored = r#"{
-        "schema_version": 10,
+        "schema_version": 999,
         "run_id": "run-future-04",
         "next_host_event_seq": 3,
         "future_policy": { "enabled": true }
@@ -115,7 +115,7 @@ fn test_run_state_04() {
     let state: RunState = serde_json::from_str(stored).expect("newer state must remain readable");
     let written = serde_json::to_value(&state).expect("run state must serialize");
 
-    assert_eq!(state.schema_version(), SchemaVersion::new(10));
+    assert_eq!(state.schema_version(), SchemaVersion::new(999));
     assert_eq!(state.run_id().as_str(), "run-future-04");
     assert_eq!(state.next_host_event_seq(), 3);
     assert_eq!(state.tool_use().agents().count(), 0);
@@ -650,6 +650,95 @@ fn test_run_state_carries_the_model_input_projection_a_transfer_installed() {
     assert_eq!(carried.len(), 3);
 }
 
+#[test]
+fn pending_handoffs_validate_stored_calls_and_migrate_without_widening_old_projections() {
+    use ra_core::{item::HandoffCall, state::PendingHandoff};
+    let call = HandoffCall::new(
+        CallId::new("handoff"),
+        AgentId::new("target"),
+        json!({"reason": "review"}),
+    )
+    .with_tool_name("transfer_to_target");
+    let item = RunItem::new(ItemId::new("handoff-item"), RunItemKind::HandoffCall(call));
+    let mut state = RunState::start(RunId::new("migration"));
+    state
+        .begin_segment(
+            AgentId::new("source"),
+            vec![ModelInputItem::Message(Message::user("full input"))],
+        )
+        .unwrap();
+    state.record_generated_items([item.clone()]);
+    let projection = HandoffProjection::new(Vec::new(), item.id().clone());
+    state
+        .install_handoff_projection(projection.clone())
+        .unwrap();
+    state
+        .set_pending_handoff(Some(
+            PendingHandoff::new(
+                vec![item],
+                Vec::new(),
+                Vec::new(),
+                ItemId::new("handoff-item"),
+            )
+            .with_declarations(vec![1])
+            .with_unpublished_items(vec![ItemId::new("handoff-item")])
+            .with_server_managed_conversation(true),
+        ))
+        .unwrap();
+    let stored = serde_json::to_value(&state).unwrap();
+    let restored: RunState = serde_json::from_value(stored.clone()).unwrap();
+    assert!(
+        restored
+            .pending_handoff()
+            .unwrap()
+            .server_manages_conversation()
+    );
+    assert_eq!(restored.pending_handoff().unwrap().declarations(), [1]);
+    assert_eq!(
+        restored.pending_handoff().unwrap().unpublished_items(),
+        [ItemId::new("handoff-item")]
+    );
+    for unpublished in [json!(["missing"]), json!(["handoff-item", "handoff-item"])] {
+        let mut corrupted = stored.clone();
+        corrupted["pending_handoff"]["unpublished_items"] = unpublished;
+        assert!(serde_json::from_value::<RunState>(corrupted).is_err());
+    }
+    let mut earlier = stored.clone();
+    earlier["pending_handoff"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unpublished_items");
+    let earlier: RunState = serde_json::from_value(earlier).unwrap();
+    assert!(
+        earlier
+            .pending_handoff()
+            .unwrap()
+            .unpublished_items()
+            .is_empty()
+    );
+    // Resume rebinds by declaration position, so a call without one cannot be restored.
+    for declarations in [json!([]), json!([1, 2])] {
+        let mut corrupted = stored.clone();
+        corrupted["pending_handoff"]["declarations"] = declarations;
+        assert!(serde_json::from_value::<RunState>(corrupted).is_err());
+    }
+    for field in ["call_id", "arguments", "target_agent"] {
+        let mut corrupted = stored.clone();
+        corrupted["pending_handoff"]["calls"][0]["kind"]["data"][field] = json!("altered");
+        assert!(
+            serde_json::from_value::<RunState>(corrupted).is_err(),
+            "{field}"
+        );
+    }
+    let mut legacy = stored;
+    legacy["schema_version"] = json!(10);
+    legacy.as_object_mut().unwrap().remove("pending_handoff");
+    let legacy: RunState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.schema_version(), RUN_STATE_SCHEMA_VERSION);
+    assert!(legacy.pending_handoff().is_none());
+    assert_eq!(legacy.handoff_projection(), Some(&projection));
+}
+
 /// A projection whose boundary the history no longer holds refuses rather than picking a boundary.
 #[test]
 fn test_run_state_refuses_a_projection_that_names_no_stored_record() {
@@ -663,6 +752,83 @@ fn test_run_state_refuses_a_projection_that_names_no_stored_record() {
         .install_handoff_projection(HandoffProjection::new(Vec::new(), ItemId::new("msg-404")))
         .expect_err("a boundary this run never generated cannot be accepted");
     assert!(error.to_string().contains("msg-404"));
+}
+
+/// A filter can remove every record of a run's first turn; the projection then precedes all
+/// stored history instead of naming a boundary record.
+#[test]
+fn a_projection_from_the_start_precedes_every_stored_record() {
+    let mut state = RunState::start(RunId::new("run-from-start"));
+    state
+        .begin_segment(
+            AgentId::new("coder"),
+            vec![ModelInputItem::Message(Message::user("full input"))],
+        )
+        .unwrap();
+    let projection = HandoffProjection::from_start(
+        vec![ModelInputItem::Message(Message::user("kept input"))],
+        ItemId::new("removed-transfer"),
+    );
+    state
+        .install_handoff_projection(projection.clone())
+        .unwrap();
+    state.record_generated_items(vec![commentary_item("msg-1", "after the transfer")]);
+
+    let restored: RunState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(restored.handoff_projection().unwrap().is_from_start());
+    let (input, carried) = restored.model_input_base().unwrap();
+    assert_eq!(input, projection.input());
+    assert_eq!(ids(carried), ["msg-1"]);
+
+    // Once anything is stored, a projection has to name its boundary.
+    assert!(
+        state
+            .install_handoff_projection(HandoffProjection::from_start(
+                Vec::new(),
+                ItemId::new("removed-transfer"),
+            ))
+            .is_err()
+    );
+}
+
+/// A handoff filter may replace only records the session has not received, and only in a way
+/// that keeps every record the run still refers to.
+#[test]
+fn unpersisted_records_can_be_replaced_without_dropping_referenced_ones() {
+    let mut state = RunState::start(RunId::new("run-replace"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .unwrap();
+    state.record_generated_items(vec![
+        commentary_item("stored", "already in the session"),
+        commentary_item("unsent", "not yet in the session"),
+    ]);
+    state.mark_session_persisted(1).unwrap();
+
+    assert!(
+        state.replace_unpersisted_records(0, Vec::new()).is_err(),
+        "a record the session holds cannot be removed"
+    );
+    assert!(
+        state
+            .replace_unpersisted_records(
+                1,
+                vec![commentary_item("twice", "a"), commentary_item("twice", "b"),],
+            )
+            .is_err(),
+        "the replacement cannot store one record twice"
+    );
+    state
+        .replace_unpersisted_records(1, vec![commentary_item("rewritten", "kept by the filter")])
+        .unwrap();
+    assert_eq!(ids(state.generated_items()), ["stored", "rewritten"]);
+
+    let approval = approval_item("approval-1", "call-1");
+    state.push_pending_interruption(approval).unwrap();
+    assert!(
+        state.replace_unpersisted_records(1, Vec::new()).is_err(),
+        "a pending question must stay in history"
+    );
 }
 
 fn ids(items: &[RunItem]) -> Vec<&str> {

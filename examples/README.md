@@ -43,15 +43,15 @@ cargo run -p minimal_agent
 | **`sessions/`** | Multi-turn memory | Existing `InMemorySession` / `SqliteSession`, new input, and automatic history persistence. |
 | **`streaming/`** | Streamed text and items | Existing `run_streamed`, `next_event`, and `finish`; show how to consume deltas and settled items without duplicating text. |
 | **`app_context/`** | Context and dynamic instructions | Existing typed app-context access and dynamic instruction callbacks; keep local dependencies out of model input. |
-| **`handoffs/`** | Conversation transfer | R12-1a: default history inheritance, explicit filtering, typed handoff input, callback failures, and target registration. |
+| **[`handoffs/`](handoffs/README.md)** | Conversation transfer | Shipped OpenAI Responses provider, full history by default, explicit filtering, typed bookkeeping callback, registry validation, and an offline `--check` mode. |
 | **`agents_as_tools/`** | Specialist agents as tools | Existing `as_tool()` / `AgentTool`; the parent agent consumes the specialist's result and retains control. |
 | **`approvals/`** | Approval and recovery | Existing interruption/state APIs; resume with the original run identity and session. |
 | **`guardrails/`** | Validation callbacks | Existing input/output guardrails and their errors; adopt convenience adapters as they land. |
 | **`mcp_integration/`** | MCP integration | Connect to external or in-process MCP servers and register their tools. |
 
-These directories are planned example crates, not shipped commands. They are tracked
+`handoffs/` is shipped; the remaining rows describe planned example crates, not shipped commands. They are tracked
 under R0-9 in the development plan. Existing-capability examples can be added now;
-examples that depend on R2-2a, R1-16, or R12-1a follow those implementations.
+examples that depend on R2-2a or R1-16 follow those implementations. The handoff example accompanies R12-1a.
 
 The examples address a different need from `minimal_agent`: users should be able to
 use shipped providers and framework APIs without reproducing extension-point fixtures.

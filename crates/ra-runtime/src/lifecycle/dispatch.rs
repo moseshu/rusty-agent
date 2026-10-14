@@ -137,7 +137,7 @@ pub async fn tool_end(
     settle(told, cancel).await
 }
 
-/// Tells both scopes that control is transferring, the agent scope belonging to the receiving agent.
+/// Tells both scopes that control is transferring, the agent scope belonging to the source agent.
 pub async fn handoff(
     hooks: &LifecycleHooks,
     input: &HandoffInput<'_>,

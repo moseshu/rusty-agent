@@ -11,16 +11,16 @@
 //! The streaming path (R3-7) consumes this same function. Two settlement paths would be two loops,
 //! and the second one drifts.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use ra_core::{
     agent::{HandoffInputData, HandoffInputFilter},
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result},
-    item::{ModelInputItem, ModelResponse, RunItem},
+    item::{CallId, ItemId, ModelInputItem, ModelResponse, RunItem, RunItemKind},
     state::{ToolFailureTracker, ToolUseTracker},
-    step::{NextStep, ProcessedResponse, SingleStepResult},
+    step::{NextStep, ProcessedResponse, SingleStepResult, resolve_output_phases},
     tool::ToolServices,
 };
 
@@ -76,6 +76,7 @@ pub struct TurnSettlementRequest<'a> {
     original_input: Vec<ModelInputItem>,
     pre_step_items: Vec<RunItem>,
     handoff_input_filter: Option<Arc<dyn HandoffInputFilter>>,
+    server_manages_conversation: bool,
     recovery: Option<&'a mut TurnRecovery>,
 }
 
@@ -123,6 +124,7 @@ impl<'a> TurnSettlementRequest<'a> {
             original_input: Vec::new(),
             pre_step_items: Vec::new(),
             handoff_input_filter: None,
+            server_manages_conversation: false,
             recovery: None,
         }
     }
@@ -184,6 +186,12 @@ impl<'a> TurnSettlementRequest<'a> {
         self
     }
 
+    /// Records whether the provider owns conversation history for this turn.
+    pub const fn with_server_managed_conversation(mut self, enabled: bool) -> Self {
+        self.server_manages_conversation = enabled;
+        self
+    }
+
     pub(crate) fn with_recovery(mut self, recovery: &'a mut TurnRecovery) -> Self {
         self.recovery = Some(recovery);
         self
@@ -221,6 +229,19 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         .tool_use
         .record_turn(public_id, processed.attempts());
 
+    if !processed.handoffs().is_empty()
+        && let Some(recovery) = request.recovery.as_deref_mut()
+    {
+        recovery.handoff = Some((
+            processed.clone(),
+            HandoffInputData::new(
+                request.original_input.clone(),
+                request.pre_step_items.clone(),
+                Vec::new(),
+            ),
+        ));
+    }
+
     // 2. Answer every bound action. Interruptions come back rather than blocking: a pending
     // approval is a state the run can be saved in, not an `await` somebody is stuck on.
     let execution_request = TurnExecutionRequest::new(
@@ -237,7 +258,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     .with_user_hooks(request.user_hooks.clone())
     .with_lifecycle_hooks(request.lifecycle.clone())
     .with_max_function_tool_concurrency(request.max_function_tool_concurrency)
-    .with_recovery(request.recovery.take());
+    .with_recovery(request.recovery.as_deref_mut());
     let execution_request = match request.streamed_dispatches.take() {
         Some(streamed_dispatches) => {
             execution_request.with_streamed_dispatches(streamed_dispatches)
@@ -267,9 +288,8 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     )
     .await?;
 
-    // 4. Record. `new_step_items` and `session_step_items` are the same list this turn: nothing
-    // filters the model-facing view yet, and R5's budgeting is what will make them diverge. The
-    // builder's checks are what keeps that future divergence from quietly dropping history.
+    // 4. Record. `new_step_items` and `session_step_items` start as the same list; only a transfer
+    // of control below makes them diverge, through its projection and its filter.
     //
     // Recording reads the decision above, because R3-10's two channels are a fact about how the
     // turn settled rather than about what the provider wrote. Doing it here instead of in the
@@ -285,13 +305,24 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
     let next_step = rebind_interruption(next_step, &items, execution.nested_interruptions())?;
 
     // 5. Project, and only on the turn that transfers control. Everything above produced the
-    // authoritative records; this decides how much of them the *next* agent is shown. The two
-    // answers are deliberately different values — `session_step_items` below is always the complete
-    // set, and the carried-forward list is what a projection or a filter is allowed to narrow.
-    let (input_history, pre_handoff_items, new_items) =
-        project_handoff_input(&request, &processed, &next_step, &items)
-            .await?
-            .into_parts();
+    // turn's records; this decides how much of them the *next* agent is shown and, when a filter
+    // runs, which of them the turn stores. A declared projection only narrows the model view. A
+    // filter's `new_items` are what the reference persists for the turn, while its `input_items`
+    // narrow the model view alone.
+    let projected = project_handoff_input(&request, &processed, &next_step, &items).await?;
+    let items = match projected.session {
+        Some((handed, kept)) => {
+            // A filter's own messages land on the channel this turn settled on, like the rest.
+            let stored =
+                resolve_output_phases(filtered_turn_records(&items, 0, &handed, kept), &next_step);
+            if let Some(recovery) = request.recovery.as_deref_mut() {
+                recovery.unfiltered_records = Some(items);
+            }
+            stored
+        }
+        None => items,
+    };
+    let (input_history, pre_handoff_items, new_items) = projected.input.into_parts();
 
     SingleStepResult::builder()
         .original_input(input_history)
@@ -310,6 +341,15 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         .build()
 }
 
+/// What a transfer hands the receiving agent, and what its filter decided the turn stores.
+pub(crate) struct ProjectedHandoff {
+    /// The receiving agent's model input, before it is flattened.
+    pub(crate) input: HandoffInputData,
+    /// When a filter ran: the IDs of the turn records it was handed in `new_items`, and the
+    /// `new_items` it returned.
+    pub(crate) session: Option<(Vec<ItemId>, Vec<RunItem>)>,
+}
+
 /// Decides what the agent taking over is shown, and leaves every other turn untouched.
 ///
 /// Two narrowings run here, in one order and never the other way round. The declared
@@ -326,14 +366,17 @@ async fn project_handoff_input(
     processed: &ProcessedResponse,
     next_step: &NextStep,
     items: &[RunItem],
-) -> Result<HandoffInputData> {
+) -> Result<ProjectedHandoff> {
     let complete = HandoffInputData::new(
         request.original_input.clone(),
         request.pre_step_items.clone(),
         items.to_vec(),
     );
     if !matches!(next_step, NextStep::Handoff { .. }) {
-        return Ok(complete);
+        return Ok(ProjectedHandoff {
+            input: complete,
+            session: None,
+        });
     }
     let Some(handoff) = processed.handoffs().first() else {
         return Err(Error::caller(
@@ -341,25 +384,151 @@ async fn project_handoff_input(
         ));
     };
 
-    let projected = complete.project(handoff.spec().history_projection(), handoff.call_id())?;
-    let filter = handoff
-        .spec()
-        .input_filter()
-        .or(request.handoff_input_filter.as_ref());
+    filter_handoff_input(
+        complete,
+        handoff.spec(),
+        handoff.call_id(),
+        &request.run,
+        request.handoff_input_filter.as_ref(),
+        request.server_manages_conversation,
+        request.cancel,
+    )
+    .await
+}
+
+/// Applies the selected declaration's projection and filter to ordinary or resumed input.
+pub(crate) async fn filter_handoff_input(
+    complete: HandoffInputData,
+    spec: &ra_core::agent::HandoffSpec,
+    call_id: &ra_core::item::CallId,
+    run: &RunContext,
+    default_filter: Option<&Arc<dyn HandoffInputFilter>>,
+    server_manages_conversation: bool,
+    cancel: &CancelScope,
+) -> Result<ProjectedHandoff> {
+    let projected = complete.project(spec.history_projection(), call_id)?;
+    let filter = spec.input_filter().or(default_filter);
+    if server_manages_conversation && filter.is_some() {
+        return Err(Error::config(
+            "server-managed conversations do not support handoff input filters",
+        ));
+    }
     match filter {
-        None => Ok(projected),
+        None => Ok(ProjectedHandoff {
+            input: projected,
+            session: None,
+        }),
         // Third-party `async` code, so it is never awaited bare — the cancellation contract's one
         // rule. The exit check is the same one the tool-stop policy makes for the same reason:
         // `CancelScope::run` polls the future before it looks at the cancellation, so a filter that
         // becomes ready in the wake-up that delivered the interrupt would otherwise hand a cancelled
         // run a fresh agent and a fresh input to spend on.
         Some(filter) => {
-            let data = request
-                .cancel
-                .run(filter.filter(&request.run, projected))
-                .await??;
-            request.cancel.ensure_not_cancelled()?;
-            Ok(data)
+            let handed = projected
+                .new_items()
+                .iter()
+                .map(|item| item.id().clone())
+                .collect();
+            let data = cancel.run(filter.filter(run, projected)).await??;
+            cancel.ensure_not_cancelled()?;
+            let kept = data.new_items().to_vec();
+            Ok(ProjectedHandoff {
+                input: data,
+                session: Some((handed, kept)),
+            })
         }
+    }
+}
+
+/// The records a turn stores once a handoff filter has returned its `new_items`.
+///
+/// The reference persists the filter's `new_items` for the turn; its `input_items` only narrow the
+/// model view. The filter governs the turn records it was handed that are model input and that the
+/// session has not received yet — the first `locked` records are already stored and stay, as the
+/// reference cannot unpersist an earlier write. Records a declared projection withheld from the
+/// filter, and records that are not model input (such as approval questions), stay as they were.
+/// The returned records replace the governed ones at the position of the first of them.
+///
+/// A governed call or output whose counterpart the filter removed is removed with it, as the
+/// reference's held session writes keep each call paired. A call the session already holds stays
+/// even when the filter removed its output: the reference leaves it unanswered in the session
+/// rather than store the output the filter withheld, and model input drops unanswered calls.
+pub(crate) fn filtered_turn_records(
+    turn: &[RunItem],
+    locked: usize,
+    handed: &[ItemId],
+    kept: Vec<RunItem>,
+) -> Vec<RunItem> {
+    let handed: HashSet<&ItemId> = handed.iter().collect();
+    let governed = |index: usize, item: &RunItem| {
+        index >= locked && item.is_model_input() && handed.contains(item.id())
+    };
+    // The filter's copy of a record it does not govern is ignored, and repeats are dropped.
+    let protected: HashSet<ItemId> = turn
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| !governed(*index, item))
+        .map(|(_, item)| item.id().clone())
+        .collect();
+    let mut present = protected.clone();
+    let mut kept: Vec<RunItem> = kept
+        .into_iter()
+        .filter(|item| present.insert(item.id().clone()))
+        .collect();
+    let mut records = Vec::with_capacity(turn.len());
+    let mut placed = false;
+    for (index, item) in turn.iter().enumerate() {
+        if !governed(index, item) {
+            records.push(item.clone());
+            continue;
+        }
+        if !placed {
+            records.append(&mut kept);
+            placed = true;
+        }
+    }
+    records.append(&mut kept);
+
+    let answered: HashSet<&CallId> = turn
+        .iter()
+        .filter_map(|item| {
+            call_side(item)
+                .filter(|(_, output)| *output)
+                .map(|(id, _)| id)
+        })
+        .collect();
+    let calls: HashSet<CallId> = records
+        .iter()
+        .filter_map(|item| call_side(item).filter(|(_, output)| !output))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let outputs: HashSet<CallId> = records
+        .iter()
+        .filter_map(|item| call_side(item).filter(|(_, output)| *output))
+        .map(|(id, _)| id.clone())
+        .collect();
+    records
+        .into_iter()
+        .filter(|item| {
+            protected.contains(item.id())
+                || call_side(item).is_none_or(|(id, output)| {
+                    if output {
+                        calls.contains(id)
+                    } else {
+                        !answered.contains(id) || outputs.contains(id)
+                    }
+                })
+        })
+        .collect()
+}
+
+/// The call a record makes or answers, and whether it is the answer.
+fn call_side(item: &RunItem) -> Option<(&CallId, bool)> {
+    match item.kind() {
+        RunItemKind::ToolCall(call) => Some((call.call_id(), false)),
+        RunItemKind::HandoffCall(call) => Some((call.call_id(), false)),
+        RunItemKind::ToolCallOutput(output) => Some((output.call_id(), true)),
+        RunItemKind::HandoffOutput(output) => Some((output.call_id(), true)),
+        _ => None,
     }
 }

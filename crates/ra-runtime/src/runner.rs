@@ -59,8 +59,8 @@ use ra_core::{
         OutputPhase, RunItem, RunItemKind, ToolApproval, ToolCallOutput, ToolResume,
     },
     lifecycle::{
-        AgentEndInput, AgentStartInput, HandoffInput, LifecycleHook, LlmEndInput, LlmStartInput,
-        ToolEndInput, ToolStartInput,
+        AgentEndInput, AgentStartInput, LifecycleHook, LlmEndInput, LlmStartInput, ToolEndInput,
+        ToolStartInput,
     },
     model::{
         Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
@@ -79,8 +79,8 @@ use ra_core::{
         },
     },
     state::{
-        EventSeqAllocator, HandoffProjection, InterruptionResolution, NestedRunRef, RunId,
-        RunState, ToolOutcome, ToolUse,
+        EventSeqAllocator, HandoffProjection, InterruptionResolution, NestedRunRef, PendingHandoff,
+        RunId, RunState, ToolOutcome, ToolUse,
     },
     step::NextStep,
     tool::{Tool, ToolLookupKey, ToolOutputReferenceExtractor, ToolServices},
@@ -1830,8 +1830,9 @@ async fn run_loop_inner(
     let resuming = state.current_agent().is_some();
     // A segment that answers questions the last one stopped on finishes that turn rather than
     // starting a new one, which is what the agent tree's budget reminder is keyed to.
-    let continues_turn =
-        !state.pending_interruptions().is_empty() || !state.nested_runs().is_empty();
+    let continues_turn = !state.pending_interruptions().is_empty()
+        || !state.nested_runs().is_empty()
+        || state.pending_handoff().is_some();
     // A fresh run with a session starts from the session's history and owes the session its new
     // input. A continuation takes its history from the checkpoint, as the reference's resumed
     // state does, and owes nothing for input.
@@ -2070,7 +2071,10 @@ async fn run_loop_inner(
         // the prepared agent carries. After the blocking checks either way, so a tripped one stops
         // the run before a sandbox is created, started or changed. Every other run is prepared at
         // the top of its first turn, as the reference prepares at the top of each loop.
-        if !state.pending_interruption_resolutions().is_empty() || !state.nested_runs().is_empty() {
+        if !state.pending_interruption_resolutions().is_empty()
+            || !state.nested_runs().is_empty()
+            || state.pending_handoff().is_some()
+        {
             agent = cancel
                 .run(sandbox.prepare_agent(
                     &agent,
@@ -2091,6 +2095,20 @@ async fn run_loop_inner(
                 state.snapshot_event_seq(context.event_seqs);
                 error.with_run_state(state.clone())
             })?;
+        if !matches!(resumed, ResumeStage::Interrupted(_)) && state.pending_handoff().is_some() {
+            resume_handoff(
+                &context,
+                &mut agent,
+                &mut state,
+                &mut lifecycle,
+                &mut progress.first_item,
+            )
+            .await
+            .map_err(|error| {
+                state.snapshot_event_seq(context.event_seqs);
+                error.with_run_state(state.clone())
+            })?;
+        }
         // The turn this segment finishes was settled on a spent shared budget, or the budget was
         // spent while it waited: as at the end of a turn, it ends the run once its answers are in.
         if continues_turn
@@ -2105,8 +2123,9 @@ async fn run_loop_inner(
         match resumed {
             ResumeStage::Interrupted(items) => return Ok(RunOutcome::Interrupted { items }),
             ResumeStage::Concluded(reason) => {
-                progress.resumed_conclusion =
-                    Some(resumed_from..progress.segment_items(&state).len());
+                // A resumed handoff filter may have removed records, never added earlier ones.
+                let end = progress.segment_items(&state).len();
+                progress.resumed_conclusion = Some(resumed_from.min(end)..end);
                 let outcome = RunOutcome::Completed { reason };
                 if !continue_from_stop_hook(&context, &agent, &mut state, &mut progress, &outcome)
                     .await?
@@ -2613,8 +2632,7 @@ async fn resolve_interrupted_turn(
         if let Some(provenance) = provenance {
             output_item = output_item.with_provenance(provenance);
         }
-        emit(context.events, RunStreamEvent::Item(output_item.clone()));
-        state.record_generated_items([output_item]);
+        record_resumed_items(context, state, vec![output_item])?;
         state.settle_interruption_resolution(answer.item_id())?;
     }
     let mut continued = continued.into_iter();
@@ -2665,14 +2683,365 @@ async fn resolve_interrupted_turn(
         .with_provenance(
             ItemProvenance::new(agent.public_id().clone()).with_agent_name(agent.public().name()),
         );
-        emit(context.events, RunStreamEvent::Item(output_item.clone()));
-        state.record_generated_items([output_item]);
+        record_resumed_items(context, state, vec![output_item])?;
     }
     if !outcomes.is_empty() {
         let (_, failure) = state.trackers_mut();
         failure.record_turn(agent.public_id(), outcomes);
     }
-    end_resume_stage(context, agent, state, paused, &tool_results).await
+    let resumed = end_resume_stage(context, agent, state, paused, &tool_results).await?;
+    if matches!(resumed, ResumeStage::Interrupted(_)) {
+        // A partial approval attempt has no handoff filter to run yet. Publish its settled
+        // outputs once, as the reference publishes each staged attempt before asking again.
+        publish_pending_handoff_items(context, state)?;
+    }
+    Ok(resumed)
+}
+
+/// Checkpoints outputs before a deferred transfer decides what can be published.
+fn record_resumed_items(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    items: Vec<RunItem>,
+) -> Result<()> {
+    if let Some(pending) = state.pending_handoff().cloned() {
+        let unpublished = pending
+            .unpublished_items()
+            .iter()
+            .cloned()
+            .chain(items.iter().map(|item| item.id().clone()))
+            .collect();
+        state.record_generated_items(items);
+        state.set_pending_handoff(Some(pending.with_unpublished_items(unpublished)))?;
+    } else {
+        for item in &items {
+            emit(context.events, RunStreamEvent::Item(item.clone()));
+        }
+        state.record_generated_items(items);
+    }
+    Ok(())
+}
+
+/// Publishes the outputs of a staged approval attempt that still waits on other answers.
+fn publish_pending_handoff_items(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+) -> Result<()> {
+    let Some(pending) = state.pending_handoff().cloned() else {
+        return Ok(());
+    };
+    for item in state.generated_items() {
+        if pending.unpublished_items().contains(item.id()) {
+            emit(context.events, RunStreamEvent::Item(item.clone()));
+        }
+    }
+    state.set_pending_handoff(Some(pending.with_unpublished_items(Vec::new())))
+}
+
+/// Captures a deferred transfer without retaining live declarations or callbacks.
+///
+/// Each call keeps its routing identity and the position of the declaration this turn's surface
+/// bound it to, which is what resume rebinds instead of searching by name and target.
+fn pending_handoff_record(
+    processed: &ra_core::step::ProcessedResponse,
+    surface: &TurnActionSurface,
+    input_history: Vec<ModelInputItem>,
+    pre_handoff_items: Vec<RunItem>,
+    start: ItemId,
+    server_manages_conversation: bool,
+) -> Result<PendingHandoff> {
+    let mut calls = Vec::new();
+    let mut declarations = Vec::new();
+    for handoff in processed.handoffs() {
+        let name = handoff.spec().schema().name();
+        let declaration = surface
+            .find_handoff(name)
+            .and_then(crate::turn::prepare::PreparedHandoff::declaration)
+            .ok_or_else(|| {
+                Error::caller(format!(
+                    "handoff `{name}` was not bound to a declaration of the running agent"
+                ))
+            })?;
+        calls.push(RunItem::new(
+            handoff.item_id().clone(),
+            RunItemKind::HandoffCall(handoff.call().clone().with_tool_name(name)),
+        ));
+        declarations.push(declaration);
+    }
+    Ok(
+        PendingHandoff::new(calls, input_history, pre_handoff_items, start)
+            .with_declarations(declarations)
+            .with_server_managed_conversation(server_manages_conversation),
+    )
+}
+
+/// Binds deferred calls to the original routing identities without reevaluating enablement.
+fn pending_handoff_surface(
+    pending: &PendingHandoff,
+    agent: &AgentSpec,
+    registry: &AgentRegistry,
+) -> Result<TurnActionSurface> {
+    let mut prepared = Vec::new();
+    for (item, &index) in pending.calls().iter().zip(pending.declarations()) {
+        let RunItemKind::HandoffCall(call) = item.kind() else {
+            return Err(Error::caller(
+                "pending transfer contains a non-handoff call",
+            ));
+        };
+        // The exact declaration the turn bound, not the first one sharing its name and target: the
+        // turn's collision policy and enablement may have chosen another of them.
+        let spec = agent
+            .handoffs()
+            .get(index)
+            .filter(|spec| {
+                spec.target_agent() == call.target_agent()
+                    && call.tool_name() == Some(spec.schema().name())
+            })
+            .ok_or_else(|| {
+                Error::config("the pending handoff declaration is no longer registered")
+            })?;
+        let target = registry
+            .get(call.target_agent())
+            .ok_or_else(|| Error::config("the pending handoff target is no longer registered"))?;
+        if !prepared
+            .iter()
+            .any(|entry: &crate::turn::prepare::PreparedHandoff| {
+                entry.name() == spec.schema().name()
+            })
+        {
+            prepared.push(
+                crate::turn::prepare::PreparedHandoff::new(spec.clone(), Arc::clone(target))?
+                    .with_declaration(index),
+            );
+        }
+    }
+    TurnActionSurface::new(Vec::new(), prepared)
+}
+
+/// Finishes a deferred transfer after all function-tool approvals have been resolved.
+///
+/// `segment_start` is the position in the run's records where this segment began. A filter may
+/// replace records of the interrupted turn that an earlier segment produced, so it moves with them.
+async fn resume_handoff(
+    context: &TurnLoopContext<'_>,
+    agent: &mut AgentBinding,
+    state: &mut RunState,
+    lifecycle: &mut LifecycleHooks,
+    segment_start: &mut usize,
+) -> Result<()> {
+    let pending = state
+        .pending_handoff()
+        .cloned()
+        .ok_or_else(|| Error::caller("no pending handoff to resume"))?;
+    let surface =
+        pending_handoff_surface(&pending, agent.execution(), context.config.agent_registry())?;
+    let response = ModelResponse::new(pending.calls().to_vec());
+    let processed = crate::turn::process::process_model_response(&response, &surface)?;
+    let handoff = processed
+        .handoffs()
+        .first()
+        .ok_or_else(|| Error::caller("pending transfer has no executable handoff"))?;
+    let run = Arc::new(live_context(context, agent, state));
+    let pending_input = pending.input_data(state.generated_items())?;
+    let already_invoked = pending_input.new_items().iter().any(|item| {
+        matches!(item.kind(), RunItemKind::HandoffOutput(output) if output.call_id() == handoff.call_id())
+    });
+    if !already_invoked {
+        let mut recovery = crate::turn::batch::TurnRecovery::default();
+        let execution = crate::turn::batch::execute_actions(
+            crate::turn::batch::TurnExecutionRequest::new(
+                &processed,
+                agent.public_id(),
+                state.tool_use(),
+                state.tool_failure(),
+                Arc::clone(&run),
+                context.cancel,
+                context.permission.clone(),
+            )
+            .with_services(context.services.clone())
+            .with_lifecycle_hooks(lifecycle.clone())
+            .with_recovery(Some(&mut recovery)),
+        )
+        .await;
+        match execution {
+            Ok(execution) => {
+                record_handoff_outputs(
+                    context,
+                    agent,
+                    state,
+                    &execution,
+                    pending_input.new_items(),
+                )?;
+            }
+            Err(error) => {
+                record_handoff_outputs(
+                    context,
+                    agent,
+                    state,
+                    &recovery.execution,
+                    pending_input.new_items(),
+                )?;
+                return Err(error.with_run_state(state.clone()));
+            }
+        }
+    }
+    // Completed model records and outputs from earlier staged approvals have already been
+    // published. Everything else waits for this attempt's filter, including checkpointed
+    // outputs recovered after an earlier callback or filter failure.
+    let pending = state
+        .pending_handoff()
+        .ok_or_else(|| Error::caller("the transfer is no longer pending"))?;
+    let complete = pending.input_data(state.generated_items())?;
+    let start = pending.start(state.generated_items())?;
+    let published: std::collections::HashSet<ItemId> = complete
+        .new_items()
+        .iter()
+        .filter(|item| !pending.unpublished_items().contains(item.id()))
+        .map(|item| item.id().clone())
+        .collect();
+    let projected = crate::turn::filter_handoff_input(
+        complete,
+        handoff.spec(),
+        handoff.call_id(),
+        &run,
+        context.config.handoff_input_filter(),
+        pending.server_manages_conversation()
+            || context.session.is_some_and(Session::manages_server_history),
+        context.cancel,
+    )
+    .await?;
+    state.set_pending_handoff(None)?;
+    if let Some((handed, kept)) = projected.session {
+        store_filtered_turn(state, handoff.target(), start, &handed, kept, segment_start)?;
+    }
+    publish_filtered_handoff_items(context, state, start, &published);
+    let projection =
+        transfer_projection(state, projected.input.into_model_input(), handoff.item_id());
+    enter_handoff(
+        context,
+        agent,
+        state,
+        lifecycle,
+        handoff.target(),
+        projection,
+        context.cancel,
+    )
+    .await
+}
+
+/// Publishes the settled transfer records without replaying already published history.
+fn publish_filtered_handoff_items(
+    context: &TurnLoopContext<'_>,
+    state: &RunState,
+    start: usize,
+    published: &std::collections::HashSet<ItemId>,
+) {
+    for item in &state.generated_items()[start..] {
+        if !published.contains(item.id()) {
+            emit(context.events, RunStreamEvent::Item(item.clone()));
+        }
+    }
+}
+
+/// Replaces an interrupted turn's unsent records with what its handoff filter kept.
+///
+/// Records the session already received stay: the reference's filter governs only what a write has
+/// not delivered yet, which is the whole turn when the run deferred it for output guardrails.
+fn store_filtered_turn(
+    state: &mut RunState,
+    target: &Arc<AgentSpec>,
+    start: usize,
+    handed: &[ItemId],
+    kept: Vec<RunItem>,
+    segment_start: &mut usize,
+) -> Result<()> {
+    let turn = state.generated_items()[start..].to_vec();
+    let locked = state
+        .session_persisted_item_count()
+        .unwrap_or(0)
+        .saturating_sub(start)
+        .min(turn.len());
+    let records = crate::turn::filtered_turn_records(&turn, locked, handed, kept);
+    // The segment starts after the records an earlier segment produced, whichever of them remain.
+    if *segment_start > start {
+        let earlier: std::collections::HashSet<&ItemId> = turn
+            [..(*segment_start - start).min(turn.len())]
+            .iter()
+            .map(RunItem::id)
+            .collect();
+        let retained = records
+            .iter()
+            .take_while(|item| earlier.contains(item.id()))
+            .count();
+        *segment_start = start + retained;
+    }
+    // A transfer settles every assistant message the filter stores on the commentary channel.
+    let replacement = ra_core::step::resolve_output_phases(
+        records[locked..].to_vec(),
+        &NextStep::Handoff {
+            new_agent: Arc::clone(target),
+        },
+    );
+    state.replace_unpersisted_records(start + locked, replacement)
+}
+
+/// Commits new transfer outputs once, including outputs produced before a callback failed.
+fn record_handoff_outputs(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
+    execution: &crate::turn::batch::TurnExecution,
+    already_stored: &[RunItem],
+) -> Result<()> {
+    let outputs = execution
+        .new_items()
+        .iter()
+        .filter(|item| !already_stored.iter().any(|stored| stored.id() == item.id()))
+        .cloned()
+        .map(|item| {
+            item.with_provenance(
+                ItemProvenance::new(agent.public_id().clone())
+                    .with_agent_name(agent.public().name()),
+            )
+        })
+        .collect::<Vec<_>>();
+    record_resumed_items(context, state, outputs)
+}
+
+/// The projection a transfer installs: history resumes after the last stored record, or from the
+/// start when a filter removed everything the run has stored so far.
+fn transfer_projection(
+    state: &RunState,
+    projected: Vec<ModelInputItem>,
+    transfer: &ItemId,
+) -> HandoffProjection {
+    match state.generated_items().last() {
+        Some(boundary) => HandoffProjection::new(projected, boundary.id().clone()),
+        None => HandoffProjection::from_start(projected, transfer.clone()),
+    }
+}
+
+/// Installs the selected model input and starts the receiving agent after transfer callbacks.
+async fn enter_handoff(
+    context: &TurnLoopContext<'_>,
+    agent: &mut AgentBinding,
+    state: &mut RunState,
+    lifecycle: &mut LifecycleHooks,
+    target: &Arc<AgentSpec>,
+    projection: HandoffProjection,
+    cancel: &CancelScope,
+) -> Result<()> {
+    let projected = projection.input().to_vec();
+    state.install_handoff_projection(projection)?;
+    *agent = AgentBinding::direct(Arc::clone(target));
+    state.set_current_agent(agent.public_id().clone());
+    *lifecycle = lifecycle.rebound(target.lifecycle_hooks());
+    if !lifecycle.is_empty() {
+        let run = live_context(context, agent, state);
+        let starting = AgentStartInput::new(&run, &projected).with_services(context.services);
+        lifecycle_dispatch::agent_start(lifecycle, &starting, cancel).await?;
+    }
+    Ok(())
 }
 
 /// Records a new question reached by a resumed tool without replacing the other pending answers.
@@ -2746,6 +3115,9 @@ async fn end_resume_stage(
     let items: Vec<_> = state.unanswered_interruption_items().cloned().collect();
     if !items.is_empty() {
         return Ok(ResumeStage::Interrupted(items));
+    }
+    if state.pending_handoff().is_some() {
+        return Ok(ResumeStage::Continue);
     }
     let concluded = check_for_final_output_from_tools(
         tool_results,
@@ -3838,6 +4210,8 @@ async fn run_one_turn(
     // The model identity outlives the request it came from: `into_call` consumes the preparation,
     // and the closing half of this bracket has to name the same model the opening half did.
     let selector = prepared.selector().clone();
+    let server_manages_conversation = prepared.request().continuation().is_server_managed()
+        || context.session.is_some_and(Session::manages_server_history);
     if let Some(rollout) = context.events.rollout
         && !progress.turn_context_recorded
     {
@@ -3972,6 +4346,7 @@ async fn run_one_turn(
     .with_tool_guardrails(context.tool_guardrails.clone())
     .with_user_hooks(context.config.user_hooks().clone())
     .with_lifecycle_hooks(lifecycle.clone())
+    .with_server_managed_conversation(server_manages_conversation)
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches)
     .with_recovery(&mut recovery);
@@ -3984,6 +4359,64 @@ async fn run_one_turn(
     let settled = match settle_turn(settlement).await {
         Ok(settled) => settled,
         Err(error) => {
+            if let Some((processed, input)) = &recovery.handoff
+                && (recovery.handoff_reached || !recovery.nested_runs.is_empty())
+            {
+                // Retain paid model output and completed sibling tools when a transfer callback
+                // fails. A committed transfer output prevents replaying its invocation after a
+                // filter failure; the registry supplies live callbacks on the restored run.
+                let items = crate::turn::resolve::step_items(
+                    processed,
+                    &recovery.execution,
+                    agent.public(),
+                    &NextStep::RunAgain,
+                );
+                let start = items
+                    .first()
+                    .ok_or_else(|| Error::caller("a failed handoff has no call record"))?
+                    .id()
+                    .clone();
+                let produced: std::collections::HashSet<&ItemId> =
+                    response.output().iter().map(RunItem::id).collect();
+                let unpublished = items
+                    .iter()
+                    .filter(|item| item.is_model_input() && !produced.contains(item.id()))
+                    .map(|item| item.id().clone())
+                    .collect();
+                state.record_generated_items(items);
+                state.set_pending_interruptions(recovery.execution.interruptions())?;
+                recovery.nested_runs.extend(
+                    recovery
+                        .execution
+                        .function_results()
+                        .iter()
+                        .filter_map(|result| result.nested_run().cloned()),
+                );
+                state.set_nested_runs(recovery.nested_runs)?;
+                state.set_pending_handoff(Some(
+                    pending_handoff_record(
+                        processed,
+                        &surface,
+                        input.input_history().to_vec(),
+                        input.pre_handoff_items().to_vec(),
+                        start,
+                        server_manages_conversation,
+                    )?
+                    .with_unpublished_items(unpublished),
+                ))?;
+                state.record_tool_input_guardrail_results(
+                    recovery.execution.tool_input_guardrail_results().to_vec(),
+                );
+                state.record_tool_output_guardrail_results(
+                    recovery.execution.tool_output_guardrail_results().to_vec(),
+                );
+                state
+                    .trackers_mut()
+                    .1
+                    .record_turn(agent.public_id(), recovery.execution.outcomes().to_vec());
+                state.snapshot_event_seq(context.event_seqs);
+                return Err(error.with_run_state(state.clone()));
+            }
             if !recovery.nested_runs.is_empty() {
                 // Retain paid-for calls, completed siblings and every failed child's routing.
                 // This mirrors the reference's tool-output committer on a failed batch.
@@ -4028,7 +4461,28 @@ async fn run_one_turn(
         referenced_outputs,
     )?;
 
-    for item in settled.session_step_items() {
+    // A handoff filter decides what the turn stores, after the model's own records would already
+    // have been streamed: the reference streams those before it runs the turn's tools, and streams
+    // the rest from what the turn stores. Without a filter the two lists are one.
+    let streamed = match recovery.unfiltered_records.take() {
+        Some(complete) => {
+            let produced: std::collections::HashSet<&ItemId> =
+                response.output().iter().map(RunItem::id).collect();
+            complete
+                .into_iter()
+                .filter(|item| produced.contains(item.id()))
+                .chain(
+                    settled
+                        .session_step_items()
+                        .iter()
+                        .filter(|item| !produced.contains(item.id()))
+                        .cloned(),
+                )
+                .collect()
+        }
+        None => settled.session_step_items().to_vec(),
+    };
+    for item in &streamed {
         let events = if early.recorded(item) {
             context.events.stream_only()
         } else {
@@ -4082,6 +4536,22 @@ async fn run_one_turn(
                     .filter_map(|result| result.nested_run().cloned())
                     .collect(),
             )?;
+            if !settled.processed_response().handoffs().is_empty() {
+                let start = settled
+                    .session_step_items()
+                    .first()
+                    .ok_or_else(|| Error::caller("an interrupted handoff turn has no records"))?
+                    .id()
+                    .clone();
+                state.set_pending_handoff(Some(pending_handoff_record(
+                    settled.processed_response(),
+                    &surface,
+                    settled.original_input().to_vec(),
+                    settled.pre_step_items().to_vec(),
+                    start,
+                    server_manages_conversation,
+                )?))?;
+            }
             Ok(Some(RunOutcome::Interrupted {
                 items: items.clone(),
             }))
@@ -4104,42 +4574,17 @@ async fn run_one_turn(
                 settled.new_step_items().to_vec(),
             )
             .into_model_input();
-            let boundary = state
-                .generated_items()
-                .last()
-                .map(RunItem::id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::caller(
-                        "a transfer of control settled without the run having stored any record; \
-                         there is nothing for the receiving agent's history to resume after",
-                    )
-                })?;
-            state.install_handoff_projection(HandoffProjection::new(projected, boundary))?;
-
-            // Handoff belongs to the receiving agent, while the input still names the source.
-            let receiving = lifecycle.rebound(new_agent.lifecycle_hooks());
-            if !receiving.is_empty() {
-                let run = live_context(context, agent, state);
-                let transfer = HandoffInput::new(&run, new_agent).with_services(context.services);
-                lifecycle_dispatch::handoff(&receiving, &transfer, turn_scope).await?;
-            }
-            *agent = AgentBinding::direct(Arc::clone(new_agent));
-            state.set_current_agent(agent.public_id().clone());
-            // Narration follows control. The departing agent's hooks stop here — one that kept
-            // reporting would attribute the next agent's model calls and tool runs to it — and the
-            // arriving agent's take over, together with the run-scoped half that spans both.
-            *lifecycle = receiving;
-            if !lifecycle.is_empty() {
-                // The input the arriving agent is starting on, not the one the run opened with:
-                // an observer told otherwise would be shown a transcript this agent never receives.
-                let (projected, _) = state.model_input_base()?;
-                let projected = projected.to_vec();
-                let run = live_context(context, agent, state);
-                let starting =
-                    AgentStartInput::new(&run, &projected).with_services(context.services);
-                lifecycle_dispatch::agent_start(lifecycle, &starting, turn_scope).await?;
-            }
+            let transfer = settled
+                .processed_response()
+                .handoffs()
+                .first()
+                .map(|handoff| handoff.item_id().clone())
+                .ok_or_else(|| Error::caller("a transfer of control bound no handoff"))?;
+            let projection = transfer_projection(state, projected, &transfer);
+            enter_handoff(
+                context, agent, state, lifecycle, new_agent, projection, turn_scope,
+            )
+            .await?;
             Ok(None)
         }
     };

@@ -41,8 +41,8 @@ mod handoff;
 
 pub use crate::item::AgentId;
 pub use handoff::{
-    HandoffAvailabilityHandler, HandoffInputData, HandoffInputFilter, HandoffSpec,
-    HistoryProjection,
+    HandoffAvailabilityHandler, HandoffInputData, HandoffInputFilter, HandoffInvocationHandler,
+    HandoffSpec, HistoryProjection,
 };
 
 struct DynamicPromptFn<F>(F);
@@ -475,6 +475,7 @@ impl fmt::Debug for AgentInstructions {
 pub struct AgentSpec {
     id: AgentId,
     name: String,
+    handoff_description: Option<String>,
     instructions: Option<AgentInstructions>,
     model: Option<String>,
     model_settings: ModelSettings,
@@ -510,6 +511,7 @@ impl AgentSpec {
         AgentSpecBuilder {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
+            handoff_description: self.handoff_description.clone(),
             instructions: self.instructions.clone(),
             model: self.model.clone(),
             model_settings: self.model_settings.clone(),
@@ -534,6 +536,17 @@ impl AgentSpec {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Description appended to the default handoff tool description for this agent.
+    #[must_use]
+    pub fn handoff_description(&self) -> Option<&str> {
+        self.handoff_description.as_deref()
+    }
+
+    /// Creates a handoff declaration targeting this agent, using upstream defaults.
+    pub fn as_handoff(&self) -> Result<HandoffSpec> {
+        HandoffSpec::from_agent(self)
     }
 
     /// Configured instruction source.
@@ -688,6 +701,7 @@ impl fmt::Debug for AgentSpec {
 pub struct AgentSpecBuilder {
     id: Option<AgentId>,
     name: Option<String>,
+    handoff_description: Option<String>,
     instructions: Option<AgentInstructions>,
     model: Option<String>,
     model_settings: ModelSettings,
@@ -707,6 +721,7 @@ impl AgentSpecBuilder {
         Self {
             id: None,
             name: None,
+            handoff_description: None,
             instructions: None,
             model: None,
             model_settings: ModelSettings::new(),
@@ -730,6 +745,12 @@ impl AgentSpecBuilder {
     /// Sets the display name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the description used when another agent declares a handoff to this one.
+    pub fn handoff_description(mut self, description: impl Into<String>) -> Self {
+        self.handoff_description = Some(description.into());
         self
     }
 
@@ -979,24 +1000,8 @@ impl AgentSpecBuilder {
 
         for handoff in &self.handoffs {
             handoff.validate()?;
-            if handoff.target_agent() == &id {
-                return Err(Error::config(format!(
-                    "agent `{id}` cannot hand off control to itself"
-                )));
-            }
-            let name = handoff.schema().name().to_owned();
-            let model_key = ToolLookupKey::bare(&name)?;
-            let owners = advertised_names.entry(name.clone()).or_default();
-            if owners
-                .iter()
-                .any(|prior| model_key.collides_on_model_surface(prior))
-            {
-                return Err(Error::config(format!(
-                    "agent `{id}` advertises the model-facing action name `{name}` more than once; \
-                     tools and handoffs share one provider namespace"
-                )));
-            }
-            owners.push(model_key);
+            // Enablement can remove a colliding declaration. The runtime applies the configured
+            // name-collision policy to enabled handoffs and tools before model exposure.
         }
 
         // Guardrails are deliberately not checked for repeated names here. A name is a display
@@ -1005,6 +1010,7 @@ impl AgentSpecBuilder {
         Ok(Arc::new(AgentSpec {
             id,
             name,
+            handoff_description: self.handoff_description,
             instructions: self.instructions,
             model: self.model,
             model_settings: self.model_settings,

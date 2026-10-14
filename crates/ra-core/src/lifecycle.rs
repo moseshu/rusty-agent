@@ -667,19 +667,13 @@ impl<'a> ToolEndInput<'a> {
 ///
 /// Raised before the transfer takes effect, so [`Self::from`] identifies the source agent
 /// and [`Self::to`] identifies the target. Run-scoped hooks observe every transfer; the
-/// agent-scoped callback belongs to the receiving agent, matching `AgentHooksBase.on_handoff`.
+/// agent-scoped callback belongs to the source agent, matching `AgentHooksBase.on_handoff`.
 /// The receiving agent's start callback follows the transfer.
 ///
 /// Neither side is handed an [`AgentSpec`], for the reason [`RunAgent`] gives: the spec reaches
 /// transport headers and the other agent's executable tools, and an extension point that could read
 /// either would be a way around the whole dispatch chain.
 ///
-/// # No transfer happens in this build
-///
-/// Turn settlement refuses a handoff call, so nothing reaches this moment yet. It is wired at the
-/// one point control actually changes hands rather than left out, because that point is also where
-/// the agent-scoped hooks are swapped, and a transfer that moved the narration without announcing
-/// it would be the harder half done and the visible half missing.
 #[must_use]
 #[non_exhaustive]
 #[derive(Debug, Clone)]

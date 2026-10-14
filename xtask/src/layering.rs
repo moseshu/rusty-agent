@@ -87,6 +87,7 @@ const LAYERS: &[(&str, Layer)] = &[
     // product, and this one must not. Its two-entry row in [`ALLOWED_INTERNAL_DEPS`] is the actual
     // gate.
     ("minimal_agent", Layer::Binary),
+    ("handoffs", Layer::Binary),
 ];
 
 /// The direct internal dependencies each crate's responsibility table allows.
@@ -192,6 +193,11 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // the capability that has to move into a `ra-core` contract instead. Widening it is not a fix —
     // it is the admission that the extension surface has a hole. See MVP acceptance item 6b.
     ("minimal_agent", &["ra-core", "ra-runtime"]),
+    // Provider-backed examples consume shipped adapters and Session implementations directly.
+    (
+        "handoffs",
+        &["ra-core", "ra-runtime", "ra-model", "ra-session"],
+    ),
 ];
 
 fn layer_of(name: &str) -> Option<Layer> {

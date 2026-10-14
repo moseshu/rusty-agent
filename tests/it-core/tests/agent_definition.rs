@@ -22,13 +22,13 @@ fn schema(name: &str) -> ToolSchema {
 }
 
 #[test]
-fn handoff_spec_projects_a_strict_model_definition_without_history_by_default() {
+fn handoff_spec_projects_a_strict_model_definition_with_full_history_by_default() {
     let handoff = HandoffSpec::new(
         AgentId::new("reviewer"),
         schema("delegate_review").with_description("Ask a reviewer to inspect the change."),
     );
 
-    assert_eq!(handoff.history_projection(), &HistoryProjection::None);
+    assert_eq!(handoff.history_projection(), &HistoryProjection::Full);
     let definition = handoff.model_definition();
     assert_eq!(definition.target_agent().as_str(), "reviewer");
     assert_eq!(definition.name(), "delegate_review");
@@ -59,7 +59,7 @@ fn agent_definition_alias_has_one_declaration_shape_and_validates_handoffs() {
 }
 
 #[test]
-fn agent_definition_rejects_self_transfers_duplicate_names_and_empty_history_windows() {
+fn agent_definition_accepts_self_transfers_and_defers_name_collisions_but_rejects_empty_windows() {
     let self_transfer = AgentSpec::builder()
         .id(AgentId::new("planner"))
         .name("Planner")
@@ -68,11 +68,10 @@ fn agent_definition_rejects_self_transfers_duplicate_names_and_empty_history_win
             schema("delegate_planner"),
         ))
         .build()
-        .unwrap_err();
-    assert!(
-        self_transfer
-            .to_string()
-            .contains("cannot hand off control to itself")
+        .unwrap();
+    assert_eq!(
+        self_transfer.handoffs()[0].target_agent(),
+        self_transfer.id()
     );
 
     let duplicate_name = AgentSpec::builder()
@@ -83,12 +82,8 @@ fn agent_definition_rejects_self_transfers_duplicate_names_and_empty_history_win
             HandoffSpec::new(AgentId::new("writer"), schema("delegate")),
         ])
         .build()
-        .unwrap_err();
-    assert!(
-        duplicate_name
-            .to_string()
-            .contains("advertises the model-facing action name `delegate` more than once")
-    );
+        .unwrap();
+    assert_eq!(duplicate_name.handoffs().len(), 2);
 
     let empty_window = AgentSpec::builder()
         .id(AgentId::new("planner"))

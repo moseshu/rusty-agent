@@ -246,8 +246,8 @@ fn builder_rejects_tools_projecting_to_the_same_qualified_name() {
 }
 
 #[test]
-fn builder_rejects_a_tool_and_handoff_with_the_same_model_facing_name() {
-    let error = AgentSpec::builder()
+fn builder_defers_tool_and_handoff_name_collisions_to_the_turn_policy() {
+    let agent = AgentSpec::builder()
         .id(AgentId::new("planner"))
         .name("Planner")
         .tool(Arc::new(EchoTool::new()))
@@ -265,12 +265,11 @@ fn builder_rejects_a_tool_and_handoff_with_the_same_model_facing_name() {
             .unwrap(),
         ))
         .build()
-        .unwrap_err();
+        .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("tools and handoffs share one provider namespace")
+    assert_eq!(
+        agent.tools()[0].schema().name(),
+        agent.handoffs()[0].schema().name()
     );
 }
 

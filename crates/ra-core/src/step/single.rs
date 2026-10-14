@@ -10,11 +10,13 @@
 //!   without replaying the loop;
 //! - `pre_step_items` is what earlier turns generated;
 //! - `new_step_items` is what this turn generated **and carries forward**;
-//! - `session_step_items` is what this turn generated **and must be stored** — the complete,
-//!   unfiltered set.
+//! - `session_step_items` is what this turn generated **and must be stored** — the complete set,
+//!   except where a handoff's input filter chose what the turn stores.
 //!
-//! The last two exist separately because context budgeting filters the model-facing view while the
-//! session stays authoritative. Collapsing them means a filter silently deletes history.
+//! The last two exist separately because context budgeting and handoff projections filter the
+//! model-facing view while the session stays authoritative. Collapsing them means a filter silently
+//! deletes history. The one deliberate exception is the reference's handoff input filter: its
+//! `new_items` are what the turn persists, so a handoff turn may store less than the model said.
 //!
 //! # Two of the four guardrail result lists, not four
 //!
@@ -281,13 +283,20 @@ impl SingleStepResultBuilder {
         })?;
 
         let session_items = index_unique_items(&session_step_items, "`session_step_items`")?;
-        let pre_items = index_unique_items(&self.pre_step_items, "`pre_step_items`")?;
-        let new_items = index_unique_items(&self.new_step_items, "`new_step_items`")?;
-
         check_classifies_this_response(&processed_response, &model_response)?;
-        check_response_reaches_the_session(&model_response, &session_items)?;
-        check_carried_items(&new_items, &pre_items, &session_items)?;
-        check_session_items_are_new(&session_items, &pre_items)?;
+        // The reference persists a handoff filter's `new_items`, which may drop or rewrite what the
+        // model said. Every other turn stores the whole response.
+        if !matches!(next_step, NextStep::Handoff { .. }) {
+            check_response_reaches_the_session(&model_response, &session_items)?;
+        }
+        // Handoff filters produce an independent model-input projection. Upstream permits
+        // rewriting and synthesizing these items.
+        if !matches!(next_step, NextStep::Handoff { .. }) {
+            let pre_items = index_unique_items(&self.pre_step_items, "`pre_step_items`")?;
+            let new_items = index_unique_items(&self.new_step_items, "`new_step_items`")?;
+            check_carried_items(&new_items, &pre_items, &session_items)?;
+            check_session_items_are_new(&session_items, &pre_items)?;
+        }
         check_nested_ownership(&self.nested_history_owned_items, &session_items)?;
         check_next_step(
             &next_step,

@@ -1,0 +1,20 @@
+[package]
+name = "handoffs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ra-core.workspace = true
+ra-model.workspace = true
+ra-runtime.workspace = true
+ra-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

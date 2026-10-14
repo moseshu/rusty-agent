@@ -18,7 +18,7 @@ pub mod work;
 
 pub use run::{
     EventSeqAllocator, GraphCursor, HandoffProjection, InterruptionResolution, NestedRunRef,
-    PendingControlRequest, PendingInterruptionResolution, PendingSessionWrite,
+    PendingControlRequest, PendingHandoff, PendingInterruptionResolution, PendingSessionWrite,
     RUN_STATE_SCHEMA_VERSION, RUN_STATE_SCHEMA_VERSION_SUMMARIES, RunId, RunState, WorkStateRef,
     WorkspaceLeaseRef,
 };

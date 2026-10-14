@@ -112,7 +112,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(10);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(11);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -166,11 +166,20 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          its own refusal, and cannot read a session deny rule that carries one.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(10),
         "Persisted the state a tool keeps with an approval, and approvals a tool asks for from \
          inside its invocation. An older runtime resumes such a call without the tool's state, \
          and dispatches a call that already started as if it had not. Started continuations are \
          retained after failures so a restored checkpoint cannot repeat their side effects.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted handoffs deferred by same-turn tool approvals, their selected targets, the \
+         declaration each call was bound to, their unpublished outputs and model-input \
+         decomposition, and handoff \
+         projections installed before the run stored any record. An older runtime forgets the \
+         pending control transfer and continues the source agent with an unanswered handoff call, \
+         and refuses a projection whose boundary record a filter removed.",
     ),
 ];
 
@@ -580,23 +589,187 @@ impl WorkStateRef {
 ///
 /// A handoff may narrow what the receiving agent sees — through the declared
 /// [`HistoryProjection`](crate::agent::HistoryProjection), through a
-/// [`HandoffInputFilter`](crate::agent::HandoffInputFilter), or both — while the session keeps every
-/// record. Those two facts can only stay true together if the narrowed view is *state*: rebuilding
-/// the next request from the opening input and the complete history would hand the receiving agent
-/// exactly the transcript the projection withheld, and it would do it silently, on the first turn
-/// after a resume.
+/// [`HandoffInputFilter`](crate::agent::HandoffInputFilter), or both — and the stored history is a
+/// different list: a projection never changes it, and a filter changes only the records it was
+/// handed that the session has not received yet. The two can only stay apart if the narrowed view
+/// is *state*: rebuilding the next request from the opening input and the stored history would hand
+/// the receiving agent a transcript the transfer did not choose, silently, on the first turn after a
+/// resume.
 ///
 /// `resume_after` names the last record folded into `input` rather than counting how many there
 /// were. A position is only meaningful against the list it was taken from; an identity still says
 /// what it means in a checkpoint read by another build, and a run whose history no longer contains
 /// it refuses rather than guessing at a boundary.
+///
+/// A filter can leave a run with no stored record at all, as when it removes every record of the
+/// run's first turn. [`Self::from_start`] covers that case: no stored record is folded into
+/// `input`, and every record the run stores afterwards follows it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HandoffProjection {
     input: Vec<ModelInputItem>,
     resume_after: ItemId,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    from_start: bool,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+}
+
+/// A transfer deferred until the interrupted turn's function tools have finished.
+///
+/// Call records retain model order and target identity. Live callbacks stay in the agent registry;
+/// a checkpoint stores only the input decomposition and the boundary of this turn's records.
+///
+/// Each call also records the position of the declaration the turn bound it to. Two declarations
+/// may share a name and a target, and the turn's collision policy and dynamic enablement chose one
+/// of them; resuming by name and target alone could run the other one's callback and filter.
+/// Outputs checkpointed before a callback or filter fails retain their publication boundary, so a
+/// resumed attempt can publish what its filter keeps without repeating earlier staged outputs.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingHandoff {
+    calls: Vec<RunItem>,
+    #[serde(default)]
+    declarations: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unpublished_items: Vec<ItemId>,
+    input_history: Vec<ModelInputItem>,
+    pre_handoff_items: Vec<RunItem>,
+    new_items_start: ItemId,
+    #[serde(default)]
+    server_manages_conversation: bool,
+}
+
+impl PendingHandoff {
+    /// Captures typed handoff calls and the conversation decomposition of an interrupted turn.
+    #[must_use]
+    pub fn new(
+        calls: Vec<RunItem>,
+        input_history: Vec<ModelInputItem>,
+        pre_handoff_items: Vec<RunItem>,
+        new_items_start: ItemId,
+    ) -> Self {
+        Self {
+            calls,
+            declarations: Vec::new(),
+            unpublished_items: Vec::new(),
+            input_history,
+            pre_handoff_items,
+            new_items_start,
+            server_manages_conversation: false,
+        }
+    }
+
+    /// Typed handoff calls in original model order.
+    #[must_use]
+    pub fn calls(&self) -> &[RunItem] {
+        &self.calls
+    }
+
+    /// Records, for each call in order, the position of the declaration the turn bound it to.
+    #[must_use]
+    pub fn with_declarations(mut self, declarations: Vec<usize>) -> Self {
+        self.declarations = declarations;
+        self
+    }
+
+    /// Positions in the source agent's handoff declarations, one per call in order.
+    #[must_use]
+    pub fn declarations(&self) -> &[usize] {
+        &self.declarations
+    }
+
+    /// Records retained for recovery but not yet published to the stream or rollout.
+    #[must_use]
+    pub fn unpublished_items(&self) -> &[ItemId] {
+        &self.unpublished_items
+    }
+
+    /// Retains publication boundaries across callback and filter failures.
+    #[must_use]
+    pub fn with_unpublished_items(mut self, items: Vec<ItemId>) -> Self {
+        self.unpublished_items = items;
+        self
+    }
+
+    /// Position of the first stored record of the interrupted turn.
+    pub fn start(&self, generated: &[RunItem]) -> Result<usize> {
+        self.validate(generated)
+    }
+
+    /// Retains the provider's conversation-ownership constraint across approval recovery.
+    #[must_use]
+    pub const fn with_server_managed_conversation(mut self, enabled: bool) -> Self {
+        self.server_manages_conversation = enabled;
+        self
+    }
+
+    /// Whether the interrupted provider call used server-managed conversation history.
+    #[must_use]
+    pub const fn server_manages_conversation(&self) -> bool {
+        self.server_manages_conversation
+    }
+
+    /// Reconstructs the handoff input including outputs settled during approval recovery.
+    pub fn input_data(&self, generated: &[RunItem]) -> Result<crate::agent::HandoffInputData> {
+        let start = self.validate(generated)?;
+        Ok(crate::agent::HandoffInputData::new(
+            self.input_history.clone(),
+            self.pre_handoff_items.clone(),
+            generated[start..].to_vec(),
+        ))
+    }
+
+    fn validate(&self, generated: &[RunItem]) -> Result<usize> {
+        let start = generated
+            .iter()
+            .position(|item| item.id() == &self.new_items_start)
+            .ok_or_else(|| Error::caller("pending handoff has no stored turn boundary"))?;
+        if self.calls.is_empty() {
+            return Err(Error::caller("pending handoff has no calls"));
+        }
+        if self.declarations.len() != self.calls.len() {
+            return Err(Error::caller(
+                "pending handoff must name the declaration each call was bound to",
+            ));
+        }
+        let mut unpublished = std::collections::BTreeSet::new();
+        for id in &self.unpublished_items {
+            if !unpublished.insert(id)
+                || !generated[start..]
+                    .iter()
+                    .any(|item| item.id() == id && item.is_model_input())
+            {
+                return Err(Error::caller(
+                    "unpublished handoff records must name distinct stored model-input records",
+                ));
+            }
+        }
+        for call in &self.calls {
+            let RunItemKind::HandoffCall(handoff) = call.kind() else {
+                return Err(Error::caller("pending handoff contains a non-handoff call"));
+            };
+            if !generated[start..].iter().any(|item| {
+                item.id() == call.id()
+                    && match item.kind() {
+                        RunItemKind::ToolCall(stored) => {
+                            stored.call_id() == handoff.call_id()
+                                && Some(stored.name()) == handoff.tool_name()
+                                && stored.arguments() == handoff.arguments()
+                        }
+                        RunItemKind::HandoffCall(stored) => {
+                            stored.call_id() == handoff.call_id()
+                                && stored.target_agent() == handoff.target_agent()
+                                && stored.arguments() == handoff.arguments()
+                        }
+                        _ => false,
+                    }
+            }) {
+                return Err(Error::caller("pending handoff call has no stored record"));
+            }
+        }
+        Ok(start)
+    }
 }
 
 impl HandoffProjection {
@@ -606,8 +779,29 @@ impl HandoffProjection {
         Self {
             input,
             resume_after,
+            from_start: false,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Creates a projection installed before the run stored any record.
+    ///
+    /// `transfer` names the record that moved control, which the filter removed from history; it
+    /// is kept for diagnostics and is not looked up.
+    #[must_use]
+    pub fn from_start(input: Vec<ModelInputItem>, transfer: ItemId) -> Self {
+        Self {
+            input,
+            resume_after: transfer,
+            from_start: true,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Whether no stored record precedes the projection, so all stored history follows it.
+    #[must_use]
+    pub const fn is_from_start(&self) -> bool {
+        self.from_start
     }
 
     /// Model input the receiving agent continues from.
@@ -617,6 +811,9 @@ impl HandoffProjection {
     }
 
     /// The last record folded into [`Self::input`]; history carries on after it.
+    ///
+    /// For a projection [`from_start`](Self::from_start) this names the removed transfer record
+    /// instead, and history carries on from the beginning.
     #[must_use]
     pub const fn resume_after(&self) -> &ItemId {
         &self.resume_after
@@ -835,6 +1032,8 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_projection: Option<HandoffProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_handoff: Option<PendingHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     session_persisted_item_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_session_write: Option<PendingSessionWrite>,
@@ -944,6 +1143,8 @@ struct RunStateRecord {
     #[serde(default)]
     handoff_projection: Option<HandoffProjection>,
     #[serde(default)]
+    pending_handoff: Option<PendingHandoff>,
+    #[serde(default)]
     session_persisted_item_count: Option<usize>,
     #[serde(default)]
     pending_session_write: Option<PendingSessionWrite>,
@@ -1000,6 +1201,7 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            pending_handoff,
             session_persisted_item_count,
             pending_session_write,
             session_compaction,
@@ -1073,6 +1275,9 @@ impl TryFrom<RunStateRecord> for RunState {
             }
         }
         validate_nested_runs(&nested_runs, &run_id)?;
+        if let Some(pending) = &pending_handoff {
+            pending.validate(&generated_items)?;
+        }
         // A count past the end would make the next append skip records the session never received,
         // and nothing afterwards could tell which ones.
         if let Some(count) = session_persisted_item_count
@@ -1137,6 +1342,7 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            pending_handoff,
             session_persisted_item_count,
             pending_session_write,
             session_compaction,
@@ -1187,6 +1393,7 @@ impl RunState {
             permission_rules: Vec::new(),
             input_history_is_complete: true,
             handoff_projection: None,
+            pending_handoff: None,
             session_persisted_item_count: None,
             pending_session_write: None,
             session_compaction: None,
@@ -1617,6 +1824,9 @@ impl RunState {
         let Some(projection) = &self.handoff_projection else {
             return Ok((&self.original_input, &self.generated_items));
         };
+        if projection.is_from_start() {
+            return Ok((projection.input(), &self.generated_items));
+        }
         let boundary = self
             .generated_items
             .iter()
@@ -1635,6 +1845,21 @@ impl RunState {
     #[must_use]
     pub const fn handoff_projection(&self) -> Option<&HandoffProjection> {
         self.handoff_projection.as_ref()
+    }
+
+    /// Transfer waiting for this turn's function tools to finish.
+    #[must_use]
+    pub const fn pending_handoff(&self) -> Option<&PendingHandoff> {
+        self.pending_handoff.as_ref()
+    }
+
+    /// Saves or clears a deferred transfer without serializing live callbacks.
+    pub fn set_pending_handoff(&mut self, pending: Option<PendingHandoff>) -> Result<()> {
+        if let Some(pending) = &pending {
+            pending.validate(&self.generated_items)?;
+        }
+        self.pending_handoff = pending;
+        Ok(())
     }
 
     /// How many leading [`Self::generated_items`] have been settled with the run's session, or
@@ -2403,6 +2628,16 @@ impl RunState {
     /// failure would surface one turn later with nothing left to say which transfer caused it.
     #[doc(hidden)]
     pub fn install_handoff_projection(&mut self, projection: HandoffProjection) -> Result<()> {
+        if projection.is_from_start() {
+            if !self.generated_items.is_empty() {
+                return Err(Error::caller(
+                    "a transfer of control projected history from the start of a run that has \
+                     already stored records",
+                ));
+            }
+            self.handoff_projection = Some(projection);
+            return Ok(());
+        }
         if !self
             .generated_items
             .iter()
@@ -2415,6 +2650,64 @@ impl RunState {
             )));
         }
         self.handoff_projection = Some(projection);
+        Ok(())
+    }
+
+    /// Replaces the stored records from `start` on with the records a handoff filter kept.
+    ///
+    /// Only records the session has not received yet can be replaced, as the reference's filter
+    /// cannot unpersist history an earlier write already delivered. The replacement must still hold
+    /// every record a pending question, answer or continuation names, and the record an installed
+    /// projection resumes after.
+    #[doc(hidden)]
+    pub fn replace_unpersisted_records(
+        &mut self,
+        start: usize,
+        records: Vec<RunItem>,
+    ) -> Result<()> {
+        if start > self.generated_items.len()
+            || start < self.session_persisted_item_count.unwrap_or(0)
+            || self.pending_session_write.is_some()
+        {
+            return Err(Error::caller(
+                "only records the session has not received yet can be replaced",
+            ));
+        }
+        let mut replaced = self.generated_items[..start].to_vec();
+        replaced.extend(records);
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(duplicate) = replaced.iter().find(|item| !seen.insert(item.id().clone())) {
+            return Err(Error::caller(format!(
+                "replacement history stores record `{}` more than once",
+                duplicate.id()
+            )));
+        }
+        let referenced = self
+            .pending_interruptions
+            .iter()
+            .chain(&self.started_tool_continuations)
+            .chain(
+                self.pending_interruption_resolutions
+                    .iter()
+                    .map(PendingInterruptionResolution::item_id),
+            )
+            .chain(
+                self.handoff_projection
+                    .iter()
+                    .filter(|projection| !projection.is_from_start())
+                    .map(HandoffProjection::resume_after),
+            );
+        for id in referenced {
+            if !seen.contains(id) {
+                return Err(Error::caller(format!(
+                    "replacement history drops record `{id}`, which the run still refers to"
+                )));
+            }
+        }
+        if let Some(pending) = &self.pending_handoff {
+            pending.validate(&replaced)?;
+        }
+        self.generated_items = replaced;
         Ok(())
     }
 
