@@ -244,7 +244,8 @@ async fn one_neutral_request_has_stable_payloads_for_all_supported_protocols() {
         "openai_compatible": capture_compat(request).await,
     });
 
-    insta::assert_json_snapshot!(matrix, @r###"
+    // Keep JSON numbers stable when another test host enables arbitrary_precision.
+    insta::assert_snapshot!(serde_json::to_string_pretty(&matrix).unwrap(), @r###"
 {
   "anthropic_messages": {
     "max_tokens": 256,

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use insta::assert_json_snapshot;
+use insta::assert_snapshot;
 use ra_core::model::{
     Effort, JsonMap, McpToolChoice, ModelRetrySettings, ModelSettings, ProviderKey,
     RetryBackoffSettings, ThinkingConfig, ToolChoice,
@@ -90,7 +90,7 @@ fn test_model_settings_01() {
     assert_eq!(resolved.extra_headers()["x-agent"], "yes");
     assert_eq!(resolved.extra_query()["api-version"], "v2");
 
-    assert_json_snapshot!(resolved.to_traceable_value().expect("trace 投影应可序列化"), @r###"
+    assert_snapshot!(serde_json::to_string_pretty(&resolved.to_traceable_value().expect("trace 投影应可序列化")).unwrap(), @r###"
     {
       "effort": "xhigh",
       "frequency_penalty": 0.2,

@@ -224,7 +224,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use insta::assert_json_snapshot;
+use insta::assert_snapshot;
 use ra_context::{
     compaction::{CompactionCapability, anchor::AnchorRetention},
     window::ContextWindowConfig,
@@ -1916,8 +1916,9 @@ async fn loop_skeleton_keeps_its_per_turn_decisions_and_record_sequence() {
         .await
         .unwrap();
 
-    // Keys are alphabetical: `assert_json_snapshot!` serializes through a sorted map.
-    assert_json_snapshot!(loop_skeleton(&result), @r###"
+    // Serialize through serde_json itself so numeric snapshots are stable when a dependency
+    // enables arbitrary_precision. The expected JSON remains unchanged.
+    assert_snapshot!(serde_json::to_string_pretty(&loop_skeleton(&result)).unwrap(), @r###"
     {
       "outcome": "completed:final",
       "turn_count": 3,
