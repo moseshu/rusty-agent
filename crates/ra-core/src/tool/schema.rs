@@ -498,6 +498,7 @@ pub struct FuncSchema {
     inject_tool_context: bool,
     return_type_name: Option<&'static str>,
     decoder: ArgumentDecoder,
+    argument_schema: Option<Value>,
 }
 
 impl FuncSchema {
@@ -510,6 +511,49 @@ impl FuncSchema {
             inject_tool_context: false,
             return_type_name: None,
             decoder: decode_arguments::<T>,
+            argument_schema: None,
+        })
+    }
+
+    /// Builds a function decorator's schema and decoder from one input type.
+    ///
+    /// Like Python's `function_schema`, strictness constrains the advertised schema while runtime
+    /// validation follows the callable's defaults and extra-field policy. `required` distinguishes
+    /// a nullable parameter from one with an explicit default, which Serde and schemars otherwise
+    /// conflate for `Option<T>`. Ordinary [`Self::for_input`] retains schema-bound validation.
+    #[doc(hidden)]
+    pub fn for_function_input<T: ToolInput>(
+        name: impl Into<String>,
+        required: &[&str],
+    ) -> Result<Self> {
+        let mut arguments = serde_json::to_value(schemars::schema_for!(T)).map_err(|error| {
+            Error::config("failed to serialize function argument schema").with_source(error)
+        })?;
+        let root = arguments
+            .as_object_mut()
+            .ok_or_else(|| Error::config("function arguments must have an object schema"))?;
+        root.remove("$schema");
+        root.remove("title");
+        root.remove("description");
+        root.insert("required".to_owned(), serde_json::json!(required));
+        let mut advertised = arguments.clone();
+        let mut tool_schema = if T::STRICT_JSON_SCHEMA {
+            ensure_strict_json_schema(&mut advertised, TOOL_INPUT_SCHEMA_LABEL)?;
+            ToolSchema::new(name, advertised)?
+        } else {
+            ToolSchema::loose(name, advertised)?
+        };
+        if let Some(description) = T::DESCRIPTION {
+            tool_schema = tool_schema.with_description(description);
+        }
+        Ok(Self {
+            schema_version: FUNC_SCHEMA_VERSION,
+            tool_schema,
+            input_type_name: core::any::type_name::<T>(),
+            inject_tool_context: false,
+            return_type_name: None,
+            decoder: decode_arguments::<T>,
+            argument_schema: Some(arguments),
         })
     }
 
@@ -570,7 +614,12 @@ impl FuncSchema {
         &self,
         value: Value,
     ) -> std::result::Result<DecodedToolInput, ToolArgumentDecodeError> {
-        validate_argument_shape(&value, self.tool_schema.input_schema())?;
+        validate_argument_shape(
+            &value,
+            self.argument_schema
+                .as_ref()
+                .unwrap_or_else(|| self.tool_schema.input_schema()),
+        )?;
         (self.decoder)(value)
     }
 
@@ -623,6 +672,7 @@ impl fmt::Debug for FuncSchema {
             .field("inject_tool_context", &self.inject_tool_context)
             .field("return_type_name", &self.return_type_name)
             .field("decoder", &"<schema-bound-decoder>")
+            .field("argument_schema", &self.argument_schema)
             .finish()
     }
 }

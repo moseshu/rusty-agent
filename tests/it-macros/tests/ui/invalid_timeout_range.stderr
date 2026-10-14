@@ -1,0 +1,23 @@
+error: function tool timeout cannot be represented as a Rust Duration: cannot convert float seconds to Duration: value is either too big or NaN
+ --> tests/ui/invalid_timeout_range.rs:3:18
+  |
+3 | #[tool(timeout = 1e30)]
+  |                  ^^^^
+
+error: function tool timeout is too small to represent as a nonzero Rust Duration
+ --> tests/ui/invalid_timeout_range.rs:6:18
+  |
+6 | #[tool(timeout = 1e-30)]
+  |                  ^^^^^
+
+error: function tool timeout must be a finite number of seconds greater than 0
+ --> tests/ui/invalid_timeout_range.rs:9:18
+  |
+9 | #[tool(timeout = -1)]
+  |                  ^
+
+error: function tool timeout must be a finite number of seconds greater than 0
+  --> tests/ui/invalid_timeout_range.rs:12:18
+   |
+12 | #[tool(timeout = -0.5)]
+   |                  ^

@@ -1,0 +1,59 @@
+error: duplicate `name` option
+ --> tests/ui/invalid_options.rs:3:22
+  |
+3 | #[tool(name = "one", name = "two")]
+  |                      ^^^^^^^^^^^^
+
+error: expected `true` or `false`
+ --> tests/ui/invalid_options.rs:6:17
+  |
+6 | #[tool(strict = "yes")]
+  |                 ^^^^^
+
+error: unsupported tool option; expected name, description, strict, use_docstring_info, is_enabled, needs_approval, failure_error_function, timeout, timeout_behavior, tool_input_guardrails, tool_output_guardrails, defer_loading, allowed_callers, or options
+ --> tests/ui/invalid_options.rs:9:8
+  |
+9 | #[tool(unknown = true)]
+  |        ^^^^^^^^^^^^^^
+
+error: timeout is only supported for async function tools, as upstream requires; a timeout cannot stop a running synchronous body
+  --> tests/ui/invalid_options.rs:12:18
+   |
+12 | #[tool(timeout = 1)]
+   |                  ^
+
+error: function tool timeout must be a finite number of seconds greater than 0
+  --> tests/ui/invalid_options.rs:15:18
+   |
+15 | #[tool(timeout = 0)]
+   |                  ^
+
+error: timeout_behavior must be "error_as_result", "raise_exception", or a ToolTimeoutBehavior expression
+  --> tests/ui/invalid_options.rs:18:27
+   |
+18 | #[tool(timeout_behavior = "retry")]
+   |                           ^^^^^^^
+
+error: allowed_callers must be a nonempty list containing "direct", "programmatic", or both
+  --> tests/ui/invalid_options.rs:21:26
+   |
+21 | #[tool(allowed_callers = [])]
+   |                          ^^
+
+error: allowed_callers contains a duplicate caller
+  --> tests/ui/invalid_options.rs:24:37
+   |
+24 | #[tool(allowed_callers = ["direct", "direct"])]
+   |                                     ^^^^^^^^
+
+error: `options` takes an adjustment such as `|options| options.with_concurrency(...)`; it receives the function-tool defaults
+  --> tests/ui/invalid_options.rs:27:18
+   |
+27 | #[tool(options = ToolOptions::new())]
+   |                  ^^^^^^^^^^^^^^^^^^
+
+error: this upstream option has no function-tool contract yet; see Docs/Function_Tool_Contract.md
+  --> tests/ui/invalid_options.rs:30:8
+   |
+30 | #[tool(output_json_schema = "schema")]
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

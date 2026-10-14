@@ -106,12 +106,31 @@ as you need them:
 | Crate | Adds | Features |
 | --- | --- | --- |
 | `ra-model` | Model providers: OpenAI Responses and Chat, Anthropic Messages, OpenAI-compatible endpoints | `openai` (default), `anthropic`, `compat` |
+| `ra-macros` | `#[tool]` function tools and the `ToolInput` derive | — |
 | `ra-tools` | Reusable tools, and the sandbox capabilities: filesystem, shell, skills, memory, compaction | — |
 | `ra-sandbox` | Sandbox backends: unix-local and Docker | `docker` connects to a real Docker daemon; `http-sink` posts session events over HTTP |
 
 Take every crate from the same tag. Crates from two tags are two copies of `ra-core`, and
 their types do not interoperate. The crates declare Rust 1.88 as their minimum supported
 version.
+
+### Function tools
+
+On this checkout, `#[ra_macros::tool]` preserves a sync or async function and adds
+`function_name::tool()?` for registration through `AgentSpec::builder().tool(...)`.
+It generates argument schemas and decoding and uses the existing approval, failure,
+timeout, and guardrail lifecycle. Sync bodies run on the blocking pool.
+
+Run the [function-tool example](examples/custom_tools/README.md) without credentials:
+
+```bash
+cargo run -p custom_tools -- --check
+```
+
+The same example supports a shipped provider for live runs. See the
+[function-tool contract](Docs/Function_Tool_Contract.md) for options, supported types,
+Rust adaptations, and remaining upstream gaps. Handwritten `Tool` implementations
+remain available for custom behavior.
 
 ### Upgrading from v0.1.0
 

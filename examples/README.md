@@ -15,6 +15,7 @@ capabilities land, this directory picks up the corresponding examples.
 
 | Example | Topic | Notes |
 | :--- | :--- | :--- |
+| **[`custom_tools/`](custom_tools/README.md)** | Function tools | Sync/async `#[tool]`, parameter docs/defaults, injected context, and fallible output through the existing Runner; shipped provider plus deterministic `--check`. |
 | **`minimal_agent/`** | A minimal custom agent | Depends on `ra-core` and `ra-runtime` only. Brings its own `Tool`, `Model`, and `ModelResolver`, and runs the two rounds of "tool call → final answer" entirely offline. |
 
 `minimal_agent` **is a gate, not a tutorial.** It exists to prove that a third party
@@ -38,7 +39,6 @@ cargo run -p minimal_agent
 | Example | Topic | Concepts covered |
 | :--- | :--- | :--- |
 | **`basic_agent/`** | First run with an existing provider | Configure a shipped provider and reuse its resolver without implementing `Model` or `ModelResolver`. Show the current Runner API, then adopt the R3-7a convenience entry. |
-| **`custom_tools/`** | Function tools | R2-2a: a Rust function becomes a tool through the planned attribute macro, with name, description, typed arguments, and errors. Current custom tools still use handwritten `Tool` implementations. |
 | **`structured_output/`** | Typed final results | R1-16: declare an output type and consume a validated Rust value; include invalid JSON and type mismatch handling. Schema declaration alone does not complete this example. |
 | **`sessions/`** | Multi-turn memory | Existing `InMemorySession` / `SqliteSession`, new input, and automatic history persistence. |
 | **`streaming/`** | Streamed text and items | Existing `run_streamed`, `next_event`, and `finish`; show how to consume deltas and settled items without duplicating text. |
@@ -49,9 +49,9 @@ cargo run -p minimal_agent
 | **`guardrails/`** | Validation callbacks | Existing input/output guardrails and their errors; adopt convenience adapters as they land. |
 | **`mcp_integration/`** | MCP integration | Connect to external or in-process MCP servers and register their tools. |
 
-`handoffs/` is shipped; the remaining rows describe planned example crates, not shipped commands. They are tracked
+`custom_tools/` and `handoffs/` are shipped; the remaining rows describe planned example crates, not shipped commands. They are tracked
 under R0-9 in the development plan. Existing-capability examples can be added now;
-examples that depend on R2-2a or R1-16 follow those implementations. The handoff example accompanies R12-1a.
+Typed-output examples follow R1-16; the function-tool example accompanies R2-2a. The handoff example accompanies R12-1a.
 
 The examples address a different need from `minimal_agent`: users should be able to
 use shipped providers and framework APIs without reproducing extension-point fixtures.

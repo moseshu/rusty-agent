@@ -88,6 +88,7 @@ const LAYERS: &[(&str, Layer)] = &[
     // gate.
     ("minimal_agent", Layer::Binary),
     ("handoffs", Layer::Binary),
+    ("custom_tools", Layer::Binary),
 ];
 
 /// The direct internal dependencies each crate's responsibility table allows.
@@ -197,6 +198,10 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     (
         "handoffs",
         &["ra-core", "ra-runtime", "ra-model", "ra-session"],
+    ),
+    (
+        "custom_tools",
+        &["ra-core", "ra-macros", "ra-runtime", "ra-model"],
     ),
 ];
 

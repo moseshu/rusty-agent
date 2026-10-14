@@ -94,7 +94,12 @@ impl RunAgent {
 /// Everything running code may read about the run it is part of.
 ///
 /// Cloning is not offered: the run owns one of these per stage and hands out borrows, so there is
-/// no copy that can drift from the state it was projected from.
+/// no copy that can drift from the state it was projected from. The one exception is a synchronous
+/// function tool: Tokio's blocking pool needs an owned `'static` view, so that thread receives a
+/// crate-internal snapshot. Its stage facts (budget, usage, pending control requests) are frozen
+/// at dispatch and can go stale while the body runs; app state and services remain shared.
+/// Function tools reject timeouts on synchronous bodies, so a timeout never detaches the thread;
+/// cancelling the run still can, as with upstream's `asyncio.to_thread`.
 #[non_exhaustive]
 pub struct RunContext {
     run_id: RunId,
@@ -109,6 +114,23 @@ pub struct RunContext {
 }
 
 impl RunContext {
+    /// Keeps the current read view alive for a synchronous function running on another thread.
+    ///
+    /// The deliberate exception to the no-clone rule above; see the type documentation.
+    pub(crate) fn snapshot_for_tool_thread(&self) -> Self {
+        Self {
+            run_id: self.run_id.clone(),
+            agent: self.agent.clone(),
+            app: self.app.clone(),
+            budget: self.budget.clone(),
+            usage_totals: self.usage_totals.clone(),
+            pending_control_requests: self.pending_control_requests.clone(),
+            event_seq_allocator: self.event_seq_allocator.clone(),
+            tool_input: self.tool_input.clone(),
+            parent_run_id: self.parent_run_id.clone(),
+        }
+    }
+
     /// Creates the context of a run that is executing `agent` under `run_id`.
     ///
     /// `agent` is the **public** agent — the one the user configured and the one every record is

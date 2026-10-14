@@ -45,7 +45,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     })
 }
 
-fn ra_core_path() -> syn::Result<TokenStream> {
+pub(crate) fn ra_core_path() -> syn::Result<TokenStream> {
     match crate_name("ra-core") {
         Ok(FoundCrate::Itself) => Ok(quote!(crate)),
         Ok(FoundCrate::Name(name)) => {
@@ -54,12 +54,12 @@ fn ra_core_path() -> syn::Result<TokenStream> {
         }
         Err(error) => Err(syn::Error::new(
             Span::call_site(),
-            format!("ToolInput derive could not find the `ra-core` dependency: {error}"),
+            format!("tool macro could not find the `ra-core` dependency: {error}"),
         )),
     }
 }
 
-fn documentation(attributes: &[syn::Attribute]) -> Option<String> {
+pub(crate) fn documentation(attributes: &[syn::Attribute]) -> Option<String> {
     let mut lines = Vec::new();
     for attribute in attributes
         .iter()

@@ -1,0 +1,43 @@
+error: tool functions must be safe free functions with concrete argument types
+ --> tests/ui/invalid_signatures.rs:5:1
+  |
+5 | fn generic<T>(value: T) {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: tool functions must be safe free functions with concrete argument types
+ --> tests/ui/invalid_signatures.rs:8:1
+  |
+8 | unsafe fn unsafe_function() {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: model arguments must have concrete owned Deserialize + JsonSchema + Send + Sync + 'static types
+  --> tests/ui/invalid_signatures.rs:11:20
+   |
+11 | fn borrowed(value: &str) {}
+   |                    ^^^^
+
+error: tool arguments must use named bindings, not destructuring patterns
+  --> tests/ui/invalid_signatures.rs:14:12
+   |
+14 | fn pattern((left, right): (u32, u32)) {}
+   |            ^^^^^^^^^^^^^
+
+error: ToolContext/RunContext must be the first parameter
+  --> tests/ui/invalid_signatures.rs:17:29
+   |
+17 | fn late_context(value: u32, context: ToolContext<'_>) {}
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: inject ToolContext<'_>, &ToolContext<'_>, or &RunContext
+  --> tests/ui/invalid_signatures.rs:20:29
+   |
+20 | fn invalid_context(context: &mut ToolContext<'_>) {}
+   |                             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `core_contract::tool::ToolContext`
+ --> tests/ui/invalid_signatures.rs:1:5
+  |
+1 | use core_contract::tool::ToolContext;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

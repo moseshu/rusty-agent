@@ -1,0 +1,166 @@
+error: duplicate parameter default
+ --> tests/ui/invalid_parameters.rs:4:34
+  |
+4 | fn duplicate(#[tool(default = 1, default = 2)] value: u32) {}
+  |                                  ^^^^^^^
+
+error: unsupported parameter option; expected description or default
+ --> tests/ui/invalid_parameters.rs:7:23
+  |
+7 | fn unsupported(#[tool(rename = "x")] value: u32) {}
+  |                       ^^^^^^
+
+error[E0277]: `Rc<String>` cannot be shared between threads safely
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^ `Rc<String>` cannot be shared between threads safely
+  |
+  = help: within `__RaInput`, the trait `std::marker::Sync` is not implemented for `Rc<String>`
+note: required because it appears within the type `__RaInput`
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^
+  = note: required for `__RaInput` to implement `ra_core::tool::schema::ToolInputRequirements`
+note: required by a bound in `ra_core::tool::ToolInput`
+ --> $CORE_CONTRACT/src/tool/schema.rs
+  |
+  | pub trait ToolInput: ToolInputRequirements {
+  |                      ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ToolInput`
+  = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Rc<String>` cannot be sent between threads safely
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^ `Rc<String>` cannot be sent between threads safely
+  |
+  = help: within `__RaInput`, the trait `Send` is not implemented for `Rc<String>`
+note: required because it appears within the type `__RaInput`
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^
+  = note: required for `__RaInput` to implement `ra_core::tool::schema::ToolInputRequirements`
+note: required by a bound in `ra_core::tool::ToolInput`
+ --> $CORE_CONTRACT/src/tool/schema.rs
+  |
+  | pub trait ToolInput: ToolInputRequirements {
+  |                      ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ToolInput`
+  = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `Rc<String>: serde::Deserialize<'de>` is not satisfied
+  --> tests/ui/invalid_parameters.rs:10:21
+   |
+10 | fn non_owned(value: std::rc::Rc<String>) {}
+   |                     ^^^^^^^^^^^^^^^^^^^ the trait `serde_core::de::Deserialize<'_>` is not implemented for `Rc<String>`
+   |
+   = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `Rc<String>` type
+   = note: for types from other crates check whether the crate offers a `serde` feature flag
+   = help: the following other types implement trait `serde_core::de::Deserialize<'de>`:
+             &'a Path
+             &'a [u8]
+             &'a str
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+             (T0, T1, T2, T3)
+           and $N others
+note: required by a bound in `serde_core::de::SeqAccess::next_element`
+  --> $CARGO/serde_core-$VERSION/src/de/mod.rs
+   |
+   |     fn next_element<T>(&mut self) -> Result<Option<T>, Self::Error>
+   |        ------------ required by a bound in this associated function
+   |     where
+   |         T: Deserialize<'de>,
+   |            ^^^^^^^^^^^^^^^^ required by this bound in `SeqAccess::next_element`
+
+error[E0277]: the trait bound `Rc<String>: serde::Deserialize<'de>` is not satisfied
+  --> tests/ui/invalid_parameters.rs:10:21
+   |
+10 | fn non_owned(value: std::rc::Rc<String>) {}
+   |                     ^^^^^^^^^^^^^^^^^^^ the trait `serde_core::de::Deserialize<'_>` is not implemented for `Rc<String>`
+   |
+   = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `Rc<String>` type
+   = note: for types from other crates check whether the crate offers a `serde` feature flag
+   = help: the following other types implement trait `serde_core::de::Deserialize<'de>`:
+             &'a Path
+             &'a [u8]
+             &'a str
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+             (T0, T1, T2, T3)
+           and $N others
+note: required by a bound in `serde_core::de::MapAccess::next_value`
+  --> $CARGO/serde_core-$VERSION/src/de/mod.rs
+   |
+   |     fn next_value<V>(&mut self) -> Result<V, Self::Error>
+   |        ---------- required by a bound in this associated function
+   |     where
+   |         V: Deserialize<'de>,
+   |            ^^^^^^^^^^^^^^^^ required by this bound in `MapAccess::next_value`
+
+error[E0277]: the trait bound `Rc<String>: serde::Deserialize<'de>` is not satisfied
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^ the trait `serde_core::de::Deserialize<'_>` is not implemented for `Rc<String>`
+  |
+  = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `Rc<String>` type
+  = note: for types from other crates check whether the crate offers a `serde` feature flag
+  = help: the following other types implement trait `serde_core::de::Deserialize<'de>`:
+            &'a Path
+            &'a [u8]
+            &'a str
+            ()
+            (T,)
+            (T0, T1)
+            (T0, T1, T2)
+            (T0, T1, T2, T3)
+          and $N others
+note: required by a bound in `ra_core::tool::__private::serde::private::de::missing_field`
+ --> $CARGO/serde-$VERSION/src/private/de.rs
+  |
+  | pub fn missing_field<'de, V, E>(field: &'static str) -> Result<V, E>
+  |        ------------- required by a bound in this function
+  | where
+  |     V: Deserialize<'de>,
+  |        ^^^^^^^^^^^^^^^^ required by this bound in `missing_field`
+  = note: this error originates in the derive macro `::core_contract::tool::__private::serde::Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Rc<String>` cannot be sent between threads safely
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^
+  | |
+  | `Rc<String>` cannot be sent between threads safely
+  | within this `{closure@$DIR/tests/ui/invalid_parameters.rs:9:1: 9:8}`
+  |
+  = help: within `{closure@$DIR/tests/ui/invalid_parameters.rs:9:1: 9:8}`, the trait `Send` is not implemented for `Rc<String>`
+note: required because it's used within this closure
+ --> tests/ui/invalid_parameters.rs:9:1
+  |
+9 | #[tool]
+  | ^^^^^^^
+note: required by a bound in `ra_core::tool::__private::tokio::task::blocking::spawn_blocking`
+ --> $CARGO/tokio-$VERSION/src/task/blocking.rs
+  |
+  |     pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+  |            -------------- required by a bound in this function
+  |     where
+  |         F: FnOnce() -> R + Send + 'static,
+  |                            ^^^^ required by this bound in `spawn_blocking`
+  = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `value`
+  --> tests/ui/invalid_parameters.rs:10:14
+   |
+10 | fn non_owned(value: std::rc::Rc<String>) {}
+   |              ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default

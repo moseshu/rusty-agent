@@ -24,6 +24,49 @@ pub mod resource;
 pub mod schema;
 pub mod services;
 
+/// Dependencies and codecs used only by procedural macro expansions.
+#[doc(hidden)]
+pub mod __private {
+    pub use async_trait::async_trait;
+    pub use schemars;
+    pub use serde;
+    pub use tokio;
+
+    /// Renders a JSON-serializable return value as model-readable text.
+    pub fn function_output<T: serde::Serialize + 'static>(
+        value: T,
+    ) -> crate::error::Result<super::ToolOutput> {
+        if let Some(output) = (&value as &dyn std::any::Any).downcast_ref::<super::ToolOutput>() {
+            return Ok(output.clone());
+        }
+        let value = serde_json::to_value(value).map_err(|error| {
+            crate::error::Error::config("failed to serialize function tool output")
+                .with_source(error)
+        })?;
+        Ok(super::ToolOutput::text(match value {
+            serde_json::Value::String(text) => text,
+            value => value.to_string(),
+        }))
+    }
+
+    /// Preserves framework errors and wraps another Rust error with its concrete source intact.
+    pub fn function_error<E>(name: &str, error: E) -> crate::error::Error
+    where
+        E: Into<crate::error::BoxError>,
+    {
+        let error = error.into();
+        match error.downcast::<crate::error::Error>() {
+            Ok(error) => *error,
+            Err(error) => crate::error::Error::tool(
+                crate::error::ToolErrorKind::ExecutionFailed,
+                name,
+                error.to_string(),
+            )
+            .with_source(error),
+        }
+    }
+}
+
 pub use context::{ToolApprovalRequest, ToolCaller, ToolContext};
 pub use namespace::ToolNamespace;
 pub use options::{
@@ -65,8 +108,9 @@ pub trait Tool: Send + Sync + 'static {
     /// A tool that returns one has its parsed model arguments schema-validated and decoded before
     /// [`Tool::call`] runs. The resulting value is available through
     /// [`ToolContext::decoded_input`]. Implementations that override [`Tool::decode_input`] must
-    /// decode against this same schema; the runtime calls `decode_input`, not this method,
-    /// directly. Tools without a Rust input type, such as a remote MCP proxy, keep receiving the
+    /// use this same decoder; function decorators retain callable defaults separately from their
+    /// strict advertised schema. The runtime calls `decode_input`, not this method, directly.
+    /// Tools without a Rust input type, such as a remote MCP proxy, keep receiving the
     /// parsed JSON value unchanged.
     fn func_schema(&self) -> Option<&FuncSchema> {
         None

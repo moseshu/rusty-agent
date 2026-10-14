@@ -60,6 +60,26 @@ pub struct ToolContext<'a> {
 }
 
 impl<'a> ToolContext<'a> {
+    /// Keeps this invocation's read view alive across a blocking-thread boundary.
+    ///
+    /// Tokio requires a `'static` closure because dropping an awaiting future cannot stop an
+    /// already-running synchronous body. App state and service handles retain their shared owners;
+    /// stage facts are snapshots, never a second mutable run state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_owned(self) -> OwnedToolContext {
+        OwnedToolContext {
+            run: self.run.snapshot_for_tool_thread(),
+            origin: self.origin.clone(),
+            call_id: self.call_id.clone(),
+            arguments: self.arguments.clone(),
+            caller: self.caller,
+            services: self.services.clone(),
+            decoded_input: self.decoded_input,
+            resume_state: self.resume_state.cloned(),
+        }
+    }
+
     /// Creates the context of one direct call, with no ports installed.
     ///
     /// The origin is always derived from `tool`, so callers cannot invoke one implementation while
@@ -188,6 +208,36 @@ impl<'a> ToolContext<'a> {
     pub fn event_emitter(&self) -> Option<HostEventEmitter> {
         let sink = self.services.event_sink()?;
         self.run.event_emitter(Arc::clone(sink))
+    }
+}
+
+/// Invocation storage used by generated synchronous function tools.
+#[doc(hidden)]
+#[non_exhaustive]
+pub struct OwnedToolContext {
+    run: RunContext,
+    origin: ToolOrigin,
+    call_id: CallId,
+    arguments: Value,
+    caller: ToolCaller,
+    services: ToolServices,
+    decoded_input: Option<DecodedToolInput>,
+    resume_state: Option<Value>,
+}
+
+impl OwnedToolContext {
+    /// Borrows the stored invocation, moving its decoded input into the borrowed view.
+    pub fn as_context(&mut self) -> ToolContext<'_> {
+        ToolContext {
+            run: &self.run,
+            origin: &self.origin,
+            call_id: &self.call_id,
+            arguments: &self.arguments,
+            caller: self.caller,
+            services: &self.services,
+            decoded_input: self.decoded_input.take(),
+            resume_state: self.resume_state.as_ref(),
+        }
     }
 }
 
