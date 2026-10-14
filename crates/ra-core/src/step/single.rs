@@ -61,6 +61,7 @@ pub struct SingleStepResult {
     function_results: Vec<FunctionToolResult>,
     processed_response: ProcessedResponse,
     next_step: NextStep,
+    final_output: Option<crate::output::OutputValue>,
 }
 
 impl SingleStepResult {
@@ -160,6 +161,33 @@ impl SingleStepResult {
         &self.next_step
     }
 
+    /// The exact value selected by a tool-stop policy, when this turn promoted one.
+    #[must_use]
+    pub const fn final_output(&self) -> Option<&crate::output::OutputValue> {
+        self.final_output.as_ref()
+    }
+
+    /// Continues an empty structured-output turn, reconciling both record views' phases.
+    #[doc(hidden)]
+    pub fn continue_empty_output(mut self) -> Result<Self> {
+        if !matches!(
+            self.next_step,
+            NextStep::FinalOutput {
+                reason: crate::finish::FinishReason::Final
+            }
+        ) {
+            return Err(Error::caller(
+                "only a model final-output step can continue for missing output",
+            ));
+        }
+        self.next_step = NextStep::RunAgain;
+        self.final_output = None;
+        self.new_step_items = super::resolve_output_phases(self.new_step_items, &self.next_step);
+        self.session_step_items =
+            super::resolve_output_phases(self.session_step_items, &self.next_step);
+        Ok(self)
+    }
+
     /// Everything generated so far, earlier turns first. This is what the next turn's input is
     /// built from.
     pub fn generated_items(&self) -> impl Iterator<Item = &RunItem> {
@@ -187,9 +215,15 @@ pub struct SingleStepResultBuilder {
     function_results: Vec<FunctionToolResult>,
     processed_response: Option<ProcessedResponse>,
     next_step: Option<NextStep>,
+    final_output: Option<crate::output::OutputValue>,
 }
 
 impl SingleStepResultBuilder {
+    /// Records the output selected by the tool-use policy without selecting it again.
+    pub fn final_output(mut self, output: Option<crate::output::OutputValue>) -> Self {
+        self.final_output = output;
+        self
+    }
     /// Creates an empty builder.
     pub fn new() -> Self {
         Self::default()
@@ -275,6 +309,11 @@ impl SingleStepResultBuilder {
         let next_step = self
             .next_step
             .ok_or_else(|| Error::caller("a settled turn requires a `next_step`"))?;
+        if self.final_output.is_some() && !matches!(next_step, NextStep::FinalOutput { .. }) {
+            return Err(Error::caller(
+                "only a final-output step can carry a selected output",
+            ));
+        }
         let session_step_items = self.session_step_items.ok_or_else(|| {
             Error::caller(
                 "a settled turn requires `session_step_items`; it has no default because \
@@ -318,6 +357,7 @@ impl SingleStepResultBuilder {
             function_results: self.function_results,
             processed_response,
             next_step,
+            final_output: self.final_output,
         })
     }
 }

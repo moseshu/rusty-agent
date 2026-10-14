@@ -324,6 +324,16 @@ pub enum Error {
         source: Option<BoxError>,
     },
 
+    /// The model's final response could not be decoded as the declared output type.
+    #[error("Invalid final output: {message}")]
+    #[non_exhaustive]
+    InvalidFinalOutput {
+        /// Validation diagnostic, without the model's response content.
+        message: String,
+        /// Underlying validation error.
+        source: Option<BoxError>,
+    },
+
     /// A model provider call failed.
     #[error("provider 错误（{kind:?}）：{message}")]
     #[non_exhaustive]
@@ -496,6 +506,15 @@ impl Error {
         }
     }
 
+    /// Creates a model-behavior error specifically for final-output validation.
+    #[must_use]
+    pub fn invalid_final_output(message: impl Into<String>) -> Self {
+        Self::InvalidFinalOutput {
+            message: message.into(),
+            source: None,
+        }
+    }
+
     /// Creates a [provider error](Error::Provider).
     #[must_use]
     pub fn provider(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
@@ -652,6 +671,7 @@ impl Error {
             | Self::Session { message, .. }
             | Self::Protocol { message, .. }
             | Self::Budget { message, .. }
+            | Self::InvalidFinalOutput { message, .. }
             | Self::Guardrail { message, .. } => *message = format!("{context}: {message}"),
             Self::Cancelled { .. } => {}
         }
@@ -678,6 +698,7 @@ impl Error {
             Self::Run { .. } => unreachable!("run errors were delegated above"),
             Self::Config { source, .. }
             | Self::Caller { source, .. }
+            | Self::InvalidFinalOutput { source, .. }
             | Self::Provider { source, .. }
             | Self::Tool { source, .. }
             | Self::Sandbox { source, .. }
@@ -707,6 +728,7 @@ impl Error {
 
             // A caller defect: retrying never helps.
             Self::Caller { .. } => Recoverability::Fatal,
+            Self::InvalidFinalOutput { .. } => Recoverability::RetryableWithChange,
 
             // A configuration problem always needs a human to change the configuration.
             Self::Config { .. } => Recoverability::NeedsIntervention,
@@ -796,6 +818,7 @@ impl Error {
             Self::Run { error, .. } => error.code(),
             Self::Config { .. } => "config",
             Self::Caller { .. } => "caller",
+            Self::InvalidFinalOutput { .. } => "output.invalid_final_output",
             Self::Cancelled { .. } => "cancelled",
             Self::Budget { kind, .. } => match kind {
                 BudgetKind::MaxTurns => "budget.max_turns",
@@ -865,6 +888,9 @@ impl Error {
                 format!("配置有问题：{message}。请检查配置文件与环境变量。")
             }
             Self::Caller { .. } => "内部错误：调用方式不正确。这是程序缺陷，请反馈。".to_owned(),
+            Self::InvalidFinalOutput { .. } => {
+                "模型输出不符合声明的格式，请调整输入后重试。".to_owned()
+            }
             Self::Cancelled { reason } => format!("已取消：{reason}"),
 
             Self::Budget { kind, .. } => match kind {

@@ -383,6 +383,7 @@ impl fmt::Display for OutputGuardrailResult {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct GuardrailFinalOutput<'a> {
+    output: Option<&'a crate::output::OutputValue>,
     message: Option<&'a Message>,
     tool_outputs: &'a [ToolCallOutput],
     finish_reason: FinishReason,
@@ -393,6 +394,7 @@ impl<'a> GuardrailFinalOutput<'a> {
     #[must_use]
     pub const fn new(finish_reason: FinishReason) -> Self {
         Self {
+            output: None,
             message: None,
             tool_outputs: &[],
             finish_reason,
@@ -404,6 +406,19 @@ impl<'a> GuardrailFinalOutput<'a> {
     pub const fn with_message(mut self, message: &'a Message) -> Self {
         self.message = Some(message);
         self
+    }
+
+    /// Attaches the exact decoded or tool-promoted value the host will receive.
+    #[must_use]
+    pub const fn with_output(mut self, output: &'a crate::output::OutputValue) -> Self {
+        self.output = Some(output);
+        self
+    }
+
+    /// The decoded final value.
+    #[must_use]
+    pub const fn output(&self) -> Option<&'a crate::output::OutputValue> {
+        self.output
     }
 
     /// Attaches what the concluding turn's tool calls produced.
@@ -440,6 +455,9 @@ impl<'a> GuardrailFinalOutput<'a> {
     /// block tags instead of the words the tool produced.
     #[must_use]
     pub fn text(&self) -> String {
+        if let Some(output) = self.output {
+            return output.text_content();
+        }
         if let Some(message) = self.message {
             return message.text_content();
         }

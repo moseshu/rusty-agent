@@ -1642,8 +1642,9 @@ async fn a_turns_output_schema_holds_for_that_turn_alone() {
         "required": ["answer"],
         "additionalProperties": false
     });
-    for answer in ["first", "second"] {
-        script.push(Step::Respond(final_message(answer, "{}")));
+    // The turn schema is only forwarded; the agent's declaration is validated.
+    for (id, answer) in [("first", "{}"), ("second", r#"{"verdict":"done"}"#)] {
+        script.push(Step::Respond(final_message(id, answer)));
     }
 
     let first = started(&thread, with_schema(text("Hello"), turn_schema.clone())).await;
@@ -1734,7 +1735,11 @@ async fn a_runs_output_schema_replaces_the_agents_declaration() {
         (Some(OutputSchema::plain_text()), "m-2"),
         (Some(declared.clone()), "m-3"),
     ] {
-        script.push(Step::Respond(final_message(id, "[]")));
+        // Without an override the agent's object declaration is validated.
+        script.push(Step::Respond(final_message(
+            id,
+            if id == "m-1" { "{}" } else { "[]" },
+        )));
         Runner::run(request(output_schema)).await.unwrap();
     }
 

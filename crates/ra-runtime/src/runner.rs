@@ -67,7 +67,7 @@ use ra_core::{
         ModelStreamEvent, ModelTracing, ReplaySafety, RetryAdvice, RetryBackoff, RetryDecision,
         RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
-    output::OutputSchema,
+    output::{OutputSchema, OutputValue},
     permission::{PermissionMode, PermissionRule},
     prompt::CachePlan,
     session::{
@@ -92,6 +92,7 @@ use tracing::{Instrument, info_span, warn};
 
 mod grouping;
 mod live_settings;
+mod output;
 mod pending_input;
 pub mod result;
 #[doc(hidden)]
@@ -1067,8 +1068,10 @@ impl RunRequest {
     /// declares a schema. Without this call each call uses the declaration of the agent making it.
     ///
     /// The declaration is passed to the provider as given; unlike an agent's it is not checked by
-    /// [`OutputSchema::validate`] first, as Codex leaves a turn's schema to the provider. A caller
-    /// that wants the check runs it itself. It is not part of the run's checkpoint: a run continued
+    /// [`OutputSchema::validate`] first, and the final answer is not validated against it, as Codex
+    /// leaves a turn's schema to the provider. [`RunResult::final_output`] then holds the parsed
+    /// JSON when the answer is JSON, and its text otherwise. A caller that wants validation declares
+    /// the output on the agent instead. It is not part of the run's checkpoint: a run continued
     /// from its [`RunState`] is given it again, as it is given its [`RunConfig`] again.
     pub fn with_output_schema(mut self, output_schema: OutputSchema) -> Self {
         self.output_schema = Some(output_schema);
@@ -1362,6 +1365,10 @@ struct TurnLoopProgress {
     /// A resume that concludes on the stop policy has no turn of its own to read the delivery from,
     /// and these are what that delivery consists of.
     resumed_conclusion: Option<Range<usize>>,
+    final_output: Option<OutputValue>,
+    final_message: Option<Message>,
+    /// Whether the recovery message already has a history item instead of needing final delivery.
+    final_message_in_history: bool,
     /// What the agent-tool runs this segment started spent, as moved into the run's ledger.
     nested_usage: Usage,
     /// Billed session compactions, which do not produce ordinary model responses.
@@ -1371,6 +1378,13 @@ struct TurnLoopProgress {
 }
 
 impl TurnLoopProgress {
+    /// Withdraws a candidate when the run continues or ends without completing its answer.
+    fn clear_final_output(&mut self) {
+        self.final_output = None;
+        self.final_message = None;
+        self.final_message_in_history = false;
+    }
+
     /// The whole run's number for the turn now running, as the reference ledger counts turns.
     fn reference_turn(&self) -> u64 {
         self.reference_turn_base
@@ -1951,6 +1965,9 @@ async fn run_loop_inner(
             .unwrap_or(0),
         budget_stop: None,
         resumed_conclusion: None,
+        final_output: None,
+        final_message: None,
+        final_message_in_history: false,
         nested_usage: Usage::default(),
         session_compaction_usage: std::sync::Mutex::new(Usage::default()),
         turn_context_recorded: false,
@@ -2122,7 +2139,8 @@ async fn run_loop_inner(
         }
         match resumed {
             ResumeStage::Interrupted(items) => return Ok(RunOutcome::Interrupted { items }),
-            ResumeStage::Concluded(reason) => {
+            ResumeStage::Concluded(reason, output) => {
+                progress.final_output = Some(output);
                 // A resumed handoff filter may have removed records, never added earlier ones.
                 let end = progress.segment_items(&state).len();
                 progress.resumed_conclusion = Some(resumed_from.min(end)..end);
@@ -2202,6 +2220,16 @@ async fn run_loop_inner(
         }
     };
 
+    // A candidate may have been recovered before a stop hook or other awaited stage exhausted
+    // the budget. Only a completed answer retains it; history survives the withdrawal, and an
+    // explicit budget closeout can supply a new delivery below.
+    if !outcome
+        .finish_reason()
+        .is_some_and(FinishReason::is_complete)
+    {
+        progress.clear_final_output();
+    }
+
     // Which allowance ran out, recorded next to the finish reason rather than folded into it:
     // `FinishReason` maps tokens, cost and wall clock all onto `budget_exhausted`, so without this
     // a cost report cannot tell an expensive run from a slow one.
@@ -2209,44 +2237,42 @@ async fn run_loop_inner(
         span.record(ra_core::trace::field::BUDGET_KIND, kind.code());
     }
 
-    let final_message =
-        match deliver_budget_closeout(&context, &agent, &mut progress, &mut state).await {
-            Ok(message) => message,
-            Err(error) => {
-                return Err(terminal_failure(
-                    span,
-                    sandbox,
-                    &input_base,
-                    &progress,
-                    &state,
-                    error,
-                    &closeout_cancel,
-                ));
-            }
-        };
+    if let Err(error) = resolve_budget_closeout(&context, &agent, &mut progress, &mut state).await {
+        return Err(terminal_failure(
+            span,
+            sandbox,
+            &input_base,
+            &progress,
+            &state,
+            error,
+            &closeout_cancel,
+        ));
+    }
 
     // Resolve delivery once for both output checks and the result. A blocked candidate stays in
     // history, but its turn no longer has a final-output decision.
     //
     // Only a run that concluded delivers its concluding turn's answer: a turn that answered on a
     // spent shared budget keeps the answer in history, and the run ends without handing it over.
-    let final_message = final_message.or_else(|| {
+    let final_message = progress.final_message.clone().or_else(|| {
         outcome
             .finish_reason()
             .filter(|reason| reason.is_complete())
             .and_then(|_| concluding_turn_message(&state, &progress).cloned())
     });
+    let final_output = progress.final_output.clone();
 
     // The closing half of the agent bracket, and ahead of the output guardrails: an observer is
     // told the answer the agent produced, not the one a check may go on to refuse. Only a run that
     // ended with an answer reaches here — a run handed back with approvals outstanding raises
     // nothing, and a run that failed or was cancelled returned long before this line.
     //
-    // Only final answers close the agent lifecycle; resumable budget stops do not.
+    // Only a completed answer or an explicit budget closeout closes the agent lifecycle, as the
+    // reference runs end hooks on its max-turns handler output; a budget stop without one does not.
     if !lifecycle.is_empty()
         && let Some(reason) = outcome
             .finish_reason()
-            .filter(|reason| reason.is_complete())
+            .filter(|reason| reason.is_complete() || final_output.is_some())
     {
         let run = live_context(&context, &agent, &state);
         let tool_outputs = concluding_turn_tool_outputs(&state, &progress);
@@ -2255,6 +2281,9 @@ async fn run_loop_inner(
             .with_tool_outputs(&tool_outputs);
         if let Some(message) = &final_message {
             ending = ending.with_message(message);
+        }
+        if let Some(output) = &final_output {
+            ending = ending.with_output(output);
         }
         if let Err(error) =
             lifecycle_dispatch::agent_end(&lifecycle, &ending, &closeout_cancel).await
@@ -2284,7 +2313,7 @@ async fn run_loop_inner(
     // was installed to look at, with nobody having looked. It stops as an error instead.
     if let Some(reason) = outcome
         .finish_reason()
-        .filter(|reason| reason.is_complete())
+        .filter(|reason| reason.is_complete() || final_output.is_some())
     {
         // Re-merged only when control moved, because the checks belong to the agent whose answer is
         // being handed over. A refusal here is late — the model call has been paid for — but the
@@ -2313,8 +2342,16 @@ async fn run_loop_inner(
             if let Some(message) = delivered {
                 delivery = delivery.with_message(message);
             }
+            if let Some(output) = &final_output {
+                delivery = delivery.with_output(output);
+            }
             let run = live_context(&context, &agent, &state);
-            run_output_guardrails(&output_guardrails, &run, &delivery, &cancel).await
+            let delivery_cancel = if progress.budget_stop.is_some() {
+                &closeout_cancel
+            } else {
+                &cancel
+            };
+            run_output_guardrails(&output_guardrails, &run, &delivery, delivery_cancel).await
         };
         match verdicts {
             // Recorded before the stop is propagated, and recorded whether or not one fired: a
@@ -2426,6 +2463,8 @@ async fn run_loop_inner(
     // Cut out of the run's history rather than accumulated alongside it: a result reports the
     // segment it ran, and the checkpoint it carries reports every segment.
     let (new_items, model_responses) = segment_records(&progress, &state);
+    let stream_final_message =
+        progress.final_message.is_some() && !progress.final_message_in_history;
     let result = RunResult::new(
         outcome.clone(),
         Arc::clone(agent.public()),
@@ -2437,6 +2476,7 @@ async fn run_loop_inner(
         progress.turns,
         state,
         final_message,
+        final_output,
         progress.nested_usage,
         progress
             .session_compaction_usage
@@ -2447,13 +2487,19 @@ async fn run_loop_inner(
         crate::memory::report_final_citations(&result, sink, &run_id).await;
     }
     record_run_outcome(span, &result);
-    emit(
-        RunEvents {
-            stream: events.as_ref(),
-            rollout: None,
-        },
-        RunStreamEvent::Finished(outcome),
-    );
+    let delivery_events = RunEvents {
+        stream: events.as_ref(),
+        rollout: None,
+    };
+    // An unrecorded recovery is delivery, not turn history. Publish it only after budget and
+    // stop decisions, output checks, and session persistence have accepted the final result.
+    if stream_final_message && let Some(message) = result.final_message() {
+        emit(
+            delivery_events,
+            RunStreamEvent::FinalMessage(message.clone()),
+        );
+    }
+    emit(delivery_events, RunStreamEvent::Finished(outcome));
     Ok(result)
 }
 
@@ -2538,7 +2584,13 @@ async fn resolve_interrupted_turn(
     let answers = state.pending_interruption_resolutions().to_vec();
     let continued = state.take_nested_runs();
     let mut paused = Vec::new();
-    let mut tool_results = Vec::new();
+    let resolving_turn =
+        !answers.is_empty() || !continued.is_empty() || !state.pending_interruptions().is_empty();
+    let mut tool_results = if resolving_turn {
+        completed_sibling_results(agent, state)?
+    } else {
+        Vec::new()
+    };
     // Filed once for the whole stage rather than once per answer, because these are the tail of a
     // single interrupted turn. `ToolFailureTracker::record_turn` fingerprints the ordered turn it
     // is given to recognise a re-settle, so splitting one turn into several one-outcome calls
@@ -2577,7 +2629,14 @@ async fn resolve_interrupted_turn(
                     message.as_deref(),
                 )
                 .await?;
-                rejection(&approval, message.as_deref())
+                let result = rejection(&approval, message.as_deref());
+                if let Some(key) = approval.lookup_key().cloned() {
+                    tool_results.push(ToolUseResult::new(
+                        ra_core::tool::ToolOrigin::from_lookup_key(key)?,
+                        result.0.clone(),
+                    ));
+                }
+                result
             }
             InterruptionResolution::Approve { .. } => {
                 if approval.resume().is_some_and(|resume| {
@@ -2689,6 +2748,13 @@ async fn resolve_interrupted_turn(
         let (_, failure) = state.trackers_mut();
         failure.record_turn(agent.public_id(), outcomes);
     }
+    if let Some(response) = state.model_responses().last() {
+        tool_results.sort_by_key(|result| {
+            response.output().iter().position(|item| {
+            matches!(item.kind(), RunItemKind::ToolCall(call) if call.call_id() == result.call_id())
+        }).unwrap_or(usize::MAX)
+        });
+    }
     let resumed = end_resume_stage(context, agent, state, paused, &tool_results).await?;
     if matches!(resumed, ResumeStage::Interrupted(_)) {
         // A partial approval attempt has no handoff filter to run yet. Publish its settled
@@ -2696,6 +2762,56 @@ async fn resolve_interrupted_turn(
         publish_pending_handoff_items(context, state)?;
     }
     Ok(resumed)
+}
+
+/// Restores completed siblings from the paused model turn without executing them again.
+/// Current declarations supply the same selectable function identities as upstream restoration.
+fn completed_sibling_results(agent: &AgentBinding, state: &RunState) -> Result<Vec<ToolUseResult>> {
+    let Some(response) = state.model_responses().last() else {
+        return Ok(Vec::new());
+    };
+    let mut results = Vec::new();
+    // Reused call IDs must not let an earlier turn answer a pending call in this turn.
+    let start = response
+        .output()
+        .iter()
+        .filter_map(|raw| {
+            state
+                .generated_items()
+                .iter()
+                .rposition(|item| item.id() == raw.id())
+        })
+        .min()
+        .unwrap_or(state.generated_items().len());
+    let turn_items = &state.generated_items()[start..];
+    for item in response.output() {
+        let RunItemKind::ToolCall(call) = item.kind() else {
+            continue;
+        };
+        let namespace = call
+            .namespace()
+            .map(ra_core::tool::ToolNamespace::new)
+            .transpose()?;
+        let key = ra_core::tool::ToolLookupKey::for_call(call.name(), namespace)?;
+        let Some(tool) = agent
+            .execution()
+            .tools()
+            .iter()
+            .find(|tool| tool.origin().lookup_key() == &key)
+        else {
+            continue;
+        };
+        if let Some(output) = turn_items.iter().rev().find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id() == call.call_id() => {
+                Some(output)
+            }
+            _ => None,
+        }) && output.kind() != ra_core::item::ToolCallKind::ToolSearch
+        {
+            results.push(ToolUseResult::new(tool.origin().clone(), output.clone()));
+        }
+    }
+    Ok(results)
 }
 
 /// Checkpoints outputs before a deferred transfer decides what can be published.
@@ -3123,10 +3239,18 @@ async fn end_resume_stage(
         tool_results,
         agent.public().tool_use_behavior(),
         context.cancel,
+        &resumed_run_context(context, agent, state),
     )
     .await?;
-    Ok(if concluded {
-        ResumeStage::Concluded(FinishReason::ToolStop)
+    Ok(if let Some(output) = concluded {
+        ResumeStage::Concluded(
+            FinishReason::ToolStop,
+            if output::schema(context, agent).is_plain_text() {
+                OutputValue::text(output.text_content())
+            } else {
+                output
+            },
+        )
     } else {
         ResumeStage::Continue
     })
@@ -3139,7 +3263,7 @@ enum ResumeStage {
     /// A call still waits on a nested run's questions, which the run asks again.
     Interrupted(Vec<RunItem>),
     /// The stop policy promoted a result settled here to the run's answer.
-    Concluded(FinishReason),
+    Concluded(FinishReason, OutputValue),
 }
 
 /// The answer a rejected approval puts in history, and how the call is filed.
@@ -3426,8 +3550,7 @@ async fn execute_resumed_call(
                 }
                 None => ToolOutcome::succeeded(identity, call_id, arguments, output.output()),
             };
-            let tool_result = (!output.is_error()
-                && kind != ra_core::item::ToolCallKind::ToolSearch)
+            let tool_result = (kind != ra_core::item::ToolCallKind::ToolSearch)
                 .then(|| ToolUseResult::new(tool.origin().clone(), output.clone()));
             Ok(ResumedOutcome::Settled {
                 output,
@@ -3439,9 +3562,10 @@ async fn execute_resumed_call(
             let output = refusal.into_output().with_kind(kind);
             let outcome = ToolOutcome::refused(identity, call_id, arguments, output.output());
             Ok(ResumedOutcome::Settled {
-                output,
+                output: output.clone(),
                 outcome,
-                tool_result: None,
+                tool_result: (kind != ra_core::item::ToolCallKind::ToolSearch)
+                    .then(|| ToolUseResult::new(tool.origin().clone(), output.clone())),
             })
         }
         ToolDispatch::AwaitingApproval(approval) => {
@@ -3522,13 +3646,16 @@ fn terminal_failure(
     input_base: &[ModelInputItem],
     progress: &TurnLoopProgress,
     state: &RunState,
-    error: Error,
+    mut error: Error,
     scope: &CancelScope,
 ) -> Error {
     record_progress_usage(span, progress.segment_responses(state));
     record_terminal_error(span, &error, scope);
     sandbox.record_failed_segment(input_base, progress.segment_items(state));
-    if state.has_session_write_checkpoint() {
+    if let Some(checkpoint) = error.run_state_mut() {
+        *checkpoint = state.clone();
+        error
+    } else if state.has_session_write_checkpoint() {
         error.with_run_state(state.clone())
     } else {
         error
@@ -3714,6 +3841,7 @@ async fn run_turns(
 ) -> Result<RunOutcome> {
     let config = context.config;
     let outcome = loop {
+        progress.clear_final_output();
         // Checked before the budget so a cancelled run reports as cancelled rather than as having
         // exhausted its turns — the reason a host reacts to is different for each.
         context.cancel.ensure_not_cancelled()?;
@@ -3785,7 +3913,7 @@ async fn run_turns(
                 ))
                 .await
             }
-            None => (Ok(StageOutcome::empty_stage()), turn.await),
+            None => (Ok(StageOutcome::empty_stage()), Box::pin(turn).await),
         };
         turn_span.record(
             ra_core::trace::field::DURATION_MS,
@@ -3893,7 +4021,10 @@ async fn continue_from_stop_hook(
         let outputs = concluding_turn_tool_outputs(state, progress);
         let delivery = StopHookData::new(
             reason,
-            concluding_turn_message(state, progress),
+            progress
+                .final_message
+                .as_ref()
+                .or_else(|| concluding_turn_message(state, progress)),
             &outputs,
             state.stop_hook_active(),
         );
@@ -4461,6 +4592,51 @@ async fn run_one_turn(
         referenced_outputs,
     )?;
 
+    let original_items = settled.session_step_items().to_vec();
+    let (settled, recovery_message) =
+        match output::resolve(context, agent, progress, state, settled).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // Validation failed after tools settled. Preserve paid output and completed calls so
+                // a checkpoint resume cannot repeat effects from this turn.
+                let original_items =
+                    ra_core::step::resolve_output_phases(original_items, &NextStep::RunAgain);
+                for item in &original_items {
+                    // As on success, a record the rollout already holds is only streamed.
+                    let events = if early.recorded(item) {
+                        context.events.stream_only()
+                    } else {
+                        context.events
+                    };
+                    emit(events, RunStreamEvent::Item(item.clone()));
+                }
+                state.record_generated_items(original_items);
+                state.snapshot_event_seq(context.event_seqs);
+                return Err(error.with_run_state(state.clone()));
+            }
+        };
+
+    let mut session_step_items = settled.session_step_items().to_vec();
+    if let Some((message, write_to_history)) = recovery_message {
+        if write_to_history {
+            let mut known_items = state.generated_items().to_vec();
+            known_items.extend_from_slice(&session_step_items);
+            session_step_items.push(crate::turn::resolve::attribute(
+                RunItem::new(
+                    next_error_item_id(&known_items, progress.turns),
+                    RunItemKind::Message(message),
+                ),
+                agent.public(),
+            ));
+        }
+        let phase_step = if write_to_history {
+            settled.next_step()
+        } else {
+            &NextStep::RunAgain
+        };
+        session_step_items = ra_core::step::resolve_output_phases(session_step_items, phase_step);
+    }
+
     // A handoff filter decides what the turn stores, after the model's own records would already
     // have been streamed: the reference streams those before it runs the turn's tools, and streams
     // the rest from what the turn stores. Without a filter the two lists are one.
@@ -4472,15 +4648,14 @@ async fn run_one_turn(
                 .into_iter()
                 .filter(|item| produced.contains(item.id()))
                 .chain(
-                    settled
-                        .session_step_items()
+                    session_step_items
                         .iter()
                         .filter(|item| !produced.contains(item.id()))
                         .cloned(),
                 )
                 .collect()
         }
-        None => settled.session_step_items().to_vec(),
+        None => session_step_items.clone(),
     };
     for item in &streamed {
         let events = if early.recorded(item) {
@@ -4491,7 +4666,7 @@ async fn run_one_turn(
         emit(events, RunStreamEvent::Item(item.clone()));
     }
     // The range is relative to the segment, because that is what `RunResult::turn_items` indexes.
-    state.record_generated_items(settled.session_step_items().iter().cloned());
+    state.record_generated_items(session_step_items);
     let last_item = progress.segment_items(state).len();
 
     // Recorded before the `match` below, which is where a handoff replaces the running agent: the
@@ -5880,78 +6055,48 @@ fn record_generation_usage(span: &tracing::Span, usage: &ra_core::usage::Usage) 
 }
 
 /// Asks the configured handler to turn an exhausted budget into something deliverable.
-async fn deliver_budget_closeout(
+async fn resolve_budget_closeout(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     progress: &mut TurnLoopProgress,
     state: &mut RunState,
-) -> Result<Option<Message>> {
-    let (Some(kind), Some(handler)) = (progress.budget_stop, context.config.error_handler.as_ref())
+) -> Result<()> {
+    let (Some(kind), Some(_handler)) =
+        (progress.budget_stop, context.config.error_handler.as_ref())
     else {
-        return Ok(None);
+        return Ok(());
     };
 
     let error = Error::budget(kind, "the configured run budget was exhausted");
-    // A closeout speaks for the current agent and must respect the history its handoff allowed.
-    // Ordinary runs retain the segment decomposition exposed by the error-handler contract.
-    let (base, carried) = if state.handoff_projection().is_some() {
-        state.model_input_base()?
-    } else {
-        (context.input_base, progress.segment_items(state))
-    };
-    let data = RunErrorData::new(
-        agent.public(),
-        base,
-        carried,
-        progress.segment_responses(state),
-        progress.turns,
-        state.budget().clone(),
-        state.usage_totals().clone(),
-    );
-    // A deadline cancels the run scope, so this uses its sibling: budget exhaustion still gets a
-    // chance to produce a closeout, while an interrupt on the caller's scope cancels both paths.
-    // A deadline the caller put on its *own* scope reaches this sibling too, so a run that exhausts
-    // its budget at the moment the caller's clock also runs out ends as a cancellation with nothing
-    // delivered. That is the caller's limit winning, which is the same order every other path uses.
-    let Some(closeout) = context
-        .closeout_cancel
-        .run(handler.handle(RunErrorHandlerInput::new(&error, data)))
-        .await??
+    let Some(closeout) = output::call_handler(
+        context,
+        agent,
+        progress,
+        state,
+        &error,
+        &[],
+        context.closeout_cancel,
+    )
+    .await?
     else {
-        // Declined. The run ends the way it would have with no handler at all.
-        return Ok(None);
+        return Ok(());
     };
-    validate_error_handler_message(closeout.message())?;
+    progress.final_output = Some(output::validate_handler_message(
+        context,
+        agent,
+        closeout.message(),
+    )?);
 
     let message = closeout.message().clone();
+    progress.final_message = Some(message.clone());
+    progress.final_message_in_history = closeout.write_to_history();
     if closeout.write_to_history() {
         let item = RunItem::new(
             next_error_item_id(state.generated_items(), progress.turns),
-            RunItemKind::Message(message.clone()),
+            RunItemKind::Message(message),
         );
         emit(context.events, RunStreamEvent::Item(item.clone()));
         state.record_generated_items([item]);
-    } else {
-        emit(
-            context.events,
-            RunStreamEvent::FinalMessage(message.clone()),
-        );
-    }
-    Ok(Some(message))
-}
-
-/// Checks that a closeout can stand where the model's own answer would have stood.
-///
-/// Shape is all this can check today, because an agent cannot yet declare an output schema.
-/// **Once one can, a closeout has to satisfy it here too** — otherwise a run whose contract
-/// promises structured output can end with free text that every caller parsing
-/// [`RunResult::final_message`] chokes on, and it will have arrived through the framework's own
-/// delivery path rather than the model's.
-fn validate_error_handler_message(message: &Message) -> Result<()> {
-    if message.role() != MessageRole::Assistant || message.phase() != Some(OutputPhase::Final) {
-        return Err(Error::caller(
-            "a run error handler must return an assistant message with final output phase",
-        ));
     }
     Ok(())
 }

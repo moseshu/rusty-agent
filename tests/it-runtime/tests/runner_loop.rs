@@ -1,5 +1,8 @@
 //! Contracts for the agent loop and its two entry points.
 
+#[path = "runner_loop/structured_output.rs"]
+mod structured_output;
+
 mod memory_feedback {
     use super::*;
     use ra_core::memory::*;
@@ -2260,11 +2263,8 @@ impl Tool for FailingTool {
 }
 
 #[tokio::test]
-async fn not_every_observation_is_a_result_that_can_end_the_run() {
-    // Both rows answer the model with a `tool.*` observation, and neither is a value any policy
-    // could promote. Stopping on one would report `FinishReason::ToolStop`, whose `is_complete()`
-    // is true — R15 sees no closeout owed and R17-3 takes the success edge — over a call that
-    // failed, or one that never ran at all.
+async fn handled_failure_and_refusal_values_can_end_the_run() {
+    // Handled failures and refusals are completed function values upstream.
     let cases: [(&str, Arc<dyn Tool>); 2] =
         [
             // Caller admission refused it, so from the model's side the tool does not exist. The other
@@ -2275,8 +2275,7 @@ async fn not_every_observation_is_a_result_that_can_end_the_run() {
                     ToolOptions::new().with_allowed_callers([ToolCaller::Programmatic]),
                 )),
             ),
-            // It ran and failed. The model has not read the failure yet, which is exactly why the turn
-            // owes it another round.
+            // A model-visible failure is a completed function result.
             ("failed", Arc::new(FailingTool::new("write_file"))),
         ];
 
@@ -2296,21 +2295,20 @@ async fn not_every_observation_is_a_result_that_can_end_the_run() {
         .await
         .unwrap();
 
+        let failed = matches!(label, "failed" | "not_admitted");
         assert_eq!(
             model.calls.load(Ordering::SeqCst),
-            2,
-            "{label} 应当逼出下一轮，而不是当场收尾"
+            if failed { 1 } else { 2 }
         );
-        assert!(
-            matches!(
-                result.outcome(),
-                RunOutcome::Completed {
-                    reason: FinishReason::Final
-                }
-            ),
-            "{label} 的结局是：{:?}",
-            result.outcome()
+        assert_eq!(
+            result.outcome().finish_reason(),
+            Some(if failed {
+                FinishReason::ToolStop
+            } else {
+                FinishReason::Final
+            })
         );
+        assert!(result.final_output().is_some());
         // Still answered: excluding it from the policy's view must not drop the record the next
         // request pairs to this call.
         assert!(

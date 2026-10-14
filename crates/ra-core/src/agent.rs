@@ -60,18 +60,11 @@ where
 
 /// One function-tool result that a [`ToolUseBehavior`] may inspect.
 ///
-/// These values exist only for the duration of a turn, and they are the settled, model-order view
-/// of the calls that **ran and produced a value**. Everything a stop policy could otherwise mistake
-/// for an answer is excluded at the source: a request awaiting approval, a name the turn never
-/// advertised, a propagating failure that became the turn's error, and — the two that are easy to
-/// miss — a call the dispatch chain refused before it ran, and a call that ran and failed.
-///
-/// That last exclusion is the invariant every policy here depends on: `StopOnFirstTool` and
-/// `StopAtTools` have no way to inspect what they are stopping on, so a run that ended because a
-/// tool *failed* would report [`FinishReason::ToolStop`](crate::finish::FinishReason::ToolStop),
-/// whose [`is_complete`](crate::finish::FinishReason::is_complete) is true — telling anything
-/// downstream that watches for it that no closeout is owed and the run reached its own success
-/// edge, over an error the model never even read.
+/// These are completed function calls in model order, including failures handled as values.
+/// Pending approvals, unknown tools, and propagated errors are excluded. Refusal messages are
+/// completed function results too, even though they do not authorize executing a tool.
+/// A stop policy promotes the actual result without applying the agent's model-output decoder,
+/// matching the reference's direct tool-result finalization.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ToolUseResult {
@@ -80,7 +73,7 @@ pub struct ToolUseResult {
 }
 
 impl ToolUseResult {
-    /// Creates the result for one successful function-tool call.
+    /// Creates a completed function-tool result, including a handled failure or refusal.
     #[must_use]
     pub fn new(tool: ToolOrigin, output: ToolCallOutput) -> Self {
         Self { tool, output }
@@ -103,14 +96,64 @@ impl ToolUseResult {
     pub const fn output(&self) -> &ToolCallOutput {
         &self.output
     }
+
+    /// The function's result, without its persistence envelope.
+    pub fn final_output(&self) -> Result<crate::output::OutputValue> {
+        if let Some(stored) = crate::tool::ToolOutput::from_stored(self.output.output())? {
+            return Ok(match stored.as_text() {
+                Some(text) => crate::output::OutputValue::text(text),
+                None => crate::output::OutputValue::json(serde_json::to_value(stored).map_err(
+                    |error| Error::caller("cannot project tool output").with_source(error),
+                )?),
+            });
+        }
+        Ok(crate::output::OutputValue::json(
+            self.output.output().clone(),
+        ))
+    }
+}
+
+/// A function-tool policy's decision and the exact output it promotes.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct ToolsToFinalOutputResult {
+    final_output: Option<crate::output::OutputValue>,
+}
+
+impl ToolsToFinalOutputResult {
+    /// Continues the model loop.
+    #[must_use]
+    pub const fn run_again() -> Self {
+        Self { final_output: None }
+    }
+
+    /// Ends the run with this value, including an explicit JSON null if desired.
+    #[must_use]
+    pub const fn final_output(output: crate::output::OutputValue) -> Self {
+        Self {
+            final_output: Some(output),
+        }
+    }
+
+    /// The selected output, or no selection when the policy continues.
+    #[must_use]
+    pub const fn output(&self) -> Option<&crate::output::OutputValue> {
+        self.final_output.as_ref()
+    }
+
+    /// Transfers the selected output to settlement.
+    #[must_use]
+    pub fn into_output(self) -> Option<crate::output::OutputValue> {
+        self.final_output
+    }
 }
 
 /// The complete result of one function-tool dispatch.
 ///
 /// Unlike [`ToolUseResult`], this preserves every terminal path the dispatcher produced. A
 /// model-visible failure has an error output, and an approval interruption has no output yet. The
-/// narrower value remains the input to [`ToolUseBehavior`] because a stop policy must not turn a
-/// failed or unapproved call into a successful terminal run.
+/// narrower value remains the input to [`ToolUseBehavior`], excluding pending approvals and
+/// propagated errors while permitting completed failure and refusal values as upstream does.
 ///
 /// `nested_run` is a persistent identity, not a live child runtime result. `ra-core` cannot own
 /// that runtime object without reversing the crate dependency, so an agent tool whose nested run
@@ -274,7 +317,31 @@ impl FunctionToolResult {
 #[async_trait]
 pub trait ToolUseBehaviorHandler: Send + Sync + 'static {
     /// Returns whether this batch of tool results should end the run.
-    async fn should_stop(&self, tool_results: &[ToolUseResult]) -> Result<bool>;
+    async fn should_stop(&self, tool_results: &[ToolUseResult]) -> Result<bool> {
+        let _ = tool_results;
+        Err(Error::caller(
+            "implement should_stop or final_output for a tool-use handler",
+        ))
+    }
+
+    /// Selects a final value. Existing boolean handlers promote the first result when stopping.
+    /// Override this to supply the reference's custom final-output behavior.
+    async fn final_output(
+        &self,
+        context: &RunContext,
+        tool_results: &[ToolUseResult],
+    ) -> Result<ToolsToFinalOutputResult> {
+        let _ = context;
+        if self.should_stop(tool_results).await?
+            && let Some(first) = tool_results.first()
+        {
+            Ok(ToolsToFinalOutputResult::final_output(
+                first.final_output()?,
+            ))
+        } else {
+            Ok(ToolsToFinalOutputResult::run_again())
+        }
+    }
 }
 
 #[async_trait]
@@ -810,6 +877,19 @@ impl AgentSpecBuilder {
     pub fn output_schema(mut self, output_schema: OutputSchema) -> Self {
         self.output_schema = output_schema;
         self
+    }
+
+    /// Generates and installs the strict schema and decoder for the final Rust output type.
+    pub fn output_type<T>(self) -> Result<Self>
+    where
+        T: schemars::JsonSchema
+            + serde::de::DeserializeOwned
+            + serde::Serialize
+            + Send
+            + Sync
+            + 'static,
+    {
+        Ok(self.output_schema(OutputSchema::for_type::<T>()?))
     }
 
     /// Restores ordinary plain-text output after deriving from another agent.

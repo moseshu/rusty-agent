@@ -207,6 +207,11 @@ impl RunSpend {
             .total_tokens()
     }
 
+    /// This run's live ledger, including nested spend not yet moved into [`RunState`].
+    pub(crate) fn run_usage(&self) -> Usage {
+        self.lock().total.clone()
+    }
+
     /// The usage the code running in this run reads: the live total of the outermost run of its
     /// agent-tool chain, which every nested call reaches as it is paid for.
     pub(crate) fn shared_usage(&self) -> Usage {

@@ -28,8 +28,8 @@ use ra_core::{
     event::{AgentEvent, HostEventBody, InMemoryHostEventSink, SubAgentActivityKind},
     finish::FinishReason,
     item::{
-        CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
-        ToolCall,
+        CallId, ContentBlock, ItemId, Message, MessageRole, ModelInputItem, ModelResponse,
+        OutputPhase, RunItem, RunItemKind, ToolCall,
     },
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
@@ -48,7 +48,10 @@ use ra_runtime::{
         control::{AgentControl, PausedAgentRun, RolloutBudgetConfig},
         tool::AgentAsTool,
     },
-    runner::{ContinuationInput, RunConfig, RunRequest, Runner},
+    runner::{
+        ContinuationInput, RunConfig, RunRequest, RunStreamEvent, Runner,
+        result::{RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult},
+    },
 };
 use ra_tools::agent_ns::{WaitAgentTimeoutOptions, collaboration_tools_with};
 use serde_json::{Value, json};
@@ -2225,6 +2228,89 @@ async fn an_exhausted_budget_fails_the_current_run_and_every_later_one_after_its
     );
     assert!(second.final_message().is_none());
     assert_eq!(scripts.inputs("lead").len(), 2);
+}
+
+/// Recovers a refusal and declines every other terminal condition.
+struct RecoverRefusalOnly {
+    history: bool,
+}
+
+#[async_trait]
+impl RunErrorHandler for RecoverRefusalOnly {
+    async fn handle(
+        &self,
+        input: RunErrorHandlerInput<'_>,
+    ) -> Result<Option<RunErrorHandlerResult>> {
+        Ok((input.error().code() == "provider.refusal").then(|| {
+            RunErrorHandlerResult::new(Message::assistant("recovered", OutputPhase::Final))
+                .with_write_to_history(self.history)
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_recovered_answer_on_a_spent_budget_is_kept_but_not_delivered() {
+    for streamed in [false, true] {
+        for history in [false, true] {
+            let scripts = Arc::new(Scripts::default());
+            let control = AgentControl::new()
+                .with_rollout_budget(rollout_budget())
+                .unwrap();
+            let refusal = RunItem::new(
+                ItemId::new("l-1"),
+                RunItemKind::Message(Message::new(
+                    MessageRole::Assistant,
+                    vec![ContentBlock::refusal("declined")],
+                )),
+            );
+            scripts.push(
+                "lead",
+                Step::Respond(billed(
+                    ModelResponse::new(vec![refusal]),
+                    RequestUsage::new(200, 50),
+                )),
+            );
+            let registry = AgentRegistry::builder()
+                .register(worker_agent(Vec::new()))
+                .build()
+                .unwrap();
+            let request = root_request(&scripts, &control, worker_agent(Vec::new())).with_config(
+                RunConfig::new()
+                    .with_agent_registry(registry)
+                    .with_error_handler(Arc::new(RecoverRefusalOnly { history })),
+            );
+
+            let mut events = Vec::new();
+            let result = if streamed {
+                let mut stream = Runner::run_streamed(request);
+                while let Some(event) = stream.next_event().await {
+                    events.push(event);
+                }
+                stream.finish().await.unwrap()
+            } else {
+                Runner::run(request).await.unwrap()
+            };
+
+            assert_eq!(
+                result.outcome().finish_reason(),
+                Some(FinishReason::BudgetExhausted)
+            );
+            assert!(result.final_message().is_none());
+            assert!(result.final_output().is_none());
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, RunStreamEvent::FinalMessage(_)))
+            );
+            assert_eq!(
+                result.new_items().iter().any(|item| matches!(
+                    item.kind(),
+                    RunItemKind::Message(message) if message.text_content() == "recovered"
+                )),
+                history
+            );
+        }
+    }
 }
 
 #[tokio::test]

@@ -855,9 +855,8 @@ async fn function_results_preserve_output_items_failures_and_approval_interrupti
         RunItemKind::ToolApproval(_)
     ));
 
-    // Stop policies retain their narrower contract: a failure or waiting approval cannot become a
-    // completed ToolStop outcome just because it has a full execution result.
-    assert_eq!(execution.tool_results().len(), 1);
+    // Completed failures are promotable function results; waiting approvals remain excluded.
+    assert_eq!(execution.tool_results().len(), 2);
     assert_eq!(execution.tool_results()[0].call_id().as_str(), "call-1");
 }
 

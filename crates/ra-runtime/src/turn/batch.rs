@@ -1219,27 +1219,11 @@ fn merge_failure(
 /// Converts a fully collected batch into records in model order. This is intentionally the only
 /// place that mutates `TurnExecution` from tool completions.
 ///
-/// # Why an observation is not automatically a result
-///
-/// Every observation is answered to the model; only some become a [`ToolUseResult`] that a
-/// tool-use stop policy may promote to the run's outcome. The dividing line is `is_error`, and it is the
-/// invariant those policies rest on — **a result is a value a tool successfully produced**.
-/// `StopOnFirstTool` and `StopAtTools` cannot inspect what they stop on, so anything else would let
-/// a run report [`FinishReason::ToolStop`](ra_core::finish::FinishReason::ToolStop), whose
-/// `is_complete()` is true, over something that went wrong.
-///
-/// Two answers look like results and are not:
-///
-/// - **A call the chain refused before running it**, which is [`ToolDispatch::Refused`] and so is
-///   excluded by the match rather than by inspecting what it rendered. `execute_actions` keeps the
-///   other half of that same story, a name the turn never advertised, out of `tool_results` too.
-///   Reporting a completed run over a tool that never executed is the sharper version of the
-///   problem.
-/// - **A call that ran and failed** under `ToolFailureHandling::ModelVisible`. The model has not
-///   even read the failure yet, which is precisely why settlement owes it another turn.
-///
-/// A tool that handled its own failure through `ToolFailureHandling::Custom` *does* produce a
-/// result: it returned a value it means the model to act on, and it wrote that value itself.
+/// Completed function observations, including handled failures, are eligible for tool-stop
+/// promotion. Refusal messages are completed values too; pending approvals and discovery outputs
+/// remain excluded.
+/// This follows the reference's function-results contract; a promoted failure remains visible
+/// through its tool record and outcome classification.
 ///
 /// # Why the outcome record is built here and not from the items
 ///
@@ -1293,29 +1277,19 @@ fn settle_dispatches(
                 }
                 let output = observation.into_output().with_kind(kind);
                 let item = output_item(&completed.call_id, output.clone());
-                if output.is_error() {
+                execution
+                    .function_results
+                    .push(FunctionToolResult::completed(
+                        completed.tool.clone(),
+                        output.clone(),
+                        item.clone(),
+                    )?);
+                // Function failures handled as model-visible values are promotable too, as in
+                // the reference. Discovery results are always processed by another model turn.
+                if kind != ToolCallKind::ToolSearch {
                     execution
-                        .function_results
-                        .push(FunctionToolResult::completed(
-                            completed.tool,
-                            output,
-                            item.clone(),
-                        )?);
-                } else {
-                    execution
-                        .function_results
-                        .push(FunctionToolResult::completed(
-                            completed.tool.clone(),
-                            output.clone(),
-                            item.clone(),
-                        )?);
-                    // Discovery output is always processed by the model, as the framework's
-                    // native tools are; function-tool stop policies must not end on a catalog.
-                    if kind != ToolCallKind::ToolSearch {
-                        execution
-                            .tool_results
-                            .push(ToolUseResult::new(completed.tool, output));
-                    }
+                        .tool_results
+                        .push(ToolUseResult::new(completed.tool, output));
                 }
                 execution.new_items.push(item);
             }
@@ -1332,13 +1306,16 @@ fn settle_dispatches(
                 execution
                     .function_results
                     .push(FunctionToolResult::completed(
-                        completed.tool,
-                        output,
+                        completed.tool.clone(),
+                        output.clone(),
                         item.clone(),
                     )?);
-                // Never a `ToolUseResult`: a stop policy cannot inspect what it stops on, and a run
-                // reporting `FinishReason::ToolStop` over a call that never ran would be reporting
-                // that the agent reached its own conclusion.
+                // The refusal is a completed model-visible function value, as upstream.
+                if kind != ToolCallKind::ToolSearch {
+                    execution
+                        .tool_results
+                        .push(ToolUseResult::new(completed.tool, output));
+                }
                 execution.new_items.push(item);
             }
             ToolDispatch::AwaitingApproval(approval) => {

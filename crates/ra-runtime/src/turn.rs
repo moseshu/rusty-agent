@@ -46,7 +46,7 @@ use batch::{
 };
 use prepare::TurnActionSurface;
 use process::process_model_response;
-use resolve::{rebind_interruption, resolve_next_step, step_items};
+use resolve::{rebind_interruption, resolve_next_step_with_output, step_items};
 
 /// Inputs for settling one turn.
 ///
@@ -280,11 +280,12 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         .record_turn(public_id, execution.outcomes().to_vec());
 
     // 3. Decide. One function, four states, priority written down once.
-    let next_step = resolve_next_step(
+    let (next_step, final_output) = resolve_next_step_with_output(
         &processed,
         &execution,
         request.agent.public().tool_use_behavior(),
         request.cancel,
+        &request.run,
     )
     .await?;
 
@@ -336,6 +337,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         .tool_input_guardrail_results(execution.tool_input_guardrail_results().to_vec())
         .tool_output_guardrail_results(execution.tool_output_guardrail_results().to_vec())
         .function_results(execution.function_results().to_vec())
+        .final_output(final_output)
         .processed_response(processed)
         .next_step(next_step)
         .build()

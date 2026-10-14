@@ -13,9 +13,11 @@ use std::{collections::BTreeMap, sync::Arc};
 use ra_core::{
     agent::{AgentSpec, ToolUseBehavior, ToolUseResult},
     cancel::CancelScope,
+    context::RunContext,
     error::{Error, Result},
     finish::FinishReason,
     item::{ItemId, ItemProvenance, RunItem},
+    output::OutputValue,
     step::{NextStep, ProcessedResponse, resolve_output_phases},
 };
 
@@ -27,7 +29,20 @@ pub async fn resolve_next_step(
     execution: &TurnExecution,
     tool_use_behavior: &ToolUseBehavior,
     cancel: &CancelScope,
+    run: &RunContext,
 ) -> Result<NextStep> {
+    resolve_next_step_with_output(processed, execution, tool_use_behavior, cancel, run)
+        .await
+        .map(|(step, _)| step)
+}
+
+pub(super) async fn resolve_next_step_with_output(
+    processed: &ProcessedResponse,
+    execution: &TurnExecution,
+    tool_use_behavior: &ToolUseBehavior,
+    cancel: &CancelScope,
+    run: &RunContext,
+) -> Result<(NextStep, Option<OutputValue>)> {
     // The run's own questions first, then those its agent tools' nested runs stopped on, each run's
     // in model order. The reference interleaves the two by call; keeping this run's records together
     // is what lets settlement re-point them at the stored copies without having to tell a nested
@@ -35,47 +50,56 @@ pub async fn resolve_next_step(
     if execution.has_interruptions() {
         let mut items = execution.interruptions().to_vec();
         items.extend_from_slice(execution.nested_interruptions());
-        return NextStep::interruption(items);
+        return NextStep::interruption(items).map(|step| (step, None));
     }
 
     // The first transfer in model order, which is the one `execute_actions` performed and wrote a
     // record for. Reading `processed` rather than re-picking a winner keeps the decision and the
     // history that documents it from ever naming two different agents.
     if let Some(handoff) = processed.handoffs().first() {
-        return Ok(NextStep::Handoff {
-            new_agent: Arc::clone(handoff.target()),
-        });
+        return Ok((
+            NextStep::Handoff {
+                new_agent: Arc::clone(handoff.target()),
+            },
+            None,
+        ));
     }
 
-    if check_for_final_output_from_tools(execution.tool_results(), tool_use_behavior, cancel)
-        .await?
+    if let Some(output) =
+        check_for_final_output_from_tools(execution.tool_results(), tool_use_behavior, cancel, run)
+            .await?
     {
-        return Ok(NextStep::FinalOutput {
-            reason: FinishReason::ToolStop,
-        });
+        return Ok((
+            NextStep::FinalOutput {
+                reason: FinishReason::ToolStop,
+            },
+            Some(output),
+        ));
     }
 
     // Something was owed an answer and now has one — including a call that resolved to nothing,
     // whose failure observation the model has not seen yet. Concluding here would end the run on
     // a result the model never got to read.
     if processed.has_tools_or_approvals_to_run() {
-        return Ok(NextStep::RunAgain);
+        return Ok((NextStep::RunAgain, None));
     }
 
     // The model asked for nothing further. This is deliberately *not* keyed on message content or
     // on an output phase: "no actions requested" is a structural fact every provider expresses the
     // same way, while reading intent out of the text would make the loop's own control flow depend
     // on how a model happened to word its answer.
-    Ok(NextStep::FinalOutput {
-        reason: FinishReason::Final,
-    })
+    Ok((
+        NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        },
+        None,
+    ))
 }
 
 /// Applies `tool_use_behavior`: whether this response's tool results end the run.
 ///
-/// Only the answer is returned. The [`FinishReason::ToolStop`] that goes with it is written at the
-/// single call site above, because every policy here stops for the same reason — the caller would
-/// only be choosing between one value and itself.
+/// The selected value is returned once, in model order. Settlement carries it to the runner so
+/// custom policies are never called again to reconstruct which result ended the turn.
 ///
 /// The decision reads [`TurnExecution::tool_results`], not `new_items`: what a policy is allowed to
 /// promote is decided where the batch settles, not by re-inspecting records here. A resumed run
@@ -93,23 +117,34 @@ pub(crate) async fn check_for_final_output_from_tools(
     tool_results: &[ToolUseResult],
     tool_use_behavior: &ToolUseBehavior,
     cancel: &CancelScope,
-) -> Result<bool> {
+    run: &RunContext,
+) -> Result<Option<OutputValue>> {
     match tool_use_behavior {
-        ToolUseBehavior::RunLlmAgain => Ok(false),
-        ToolUseBehavior::StopOnFirstTool => Ok(!tool_results.is_empty()),
-        ToolUseBehavior::StopAtTools { names } => Ok(tool_results.iter().any(|result| {
-            names.contains(result.tool().name()) || names.contains(result.tool().qualified_name())
-        })),
+        ToolUseBehavior::RunLlmAgain => Ok(None),
+        ToolUseBehavior::StopOnFirstTool => tool_results
+            .first()
+            .map(ToolUseResult::final_output)
+            .transpose(),
+        ToolUseBehavior::StopAtTools { names } => tool_results
+            .iter()
+            .find(|result| {
+                names.contains(result.tool().name())
+                    || names.contains(result.tool().qualified_name())
+            })
+            .map(ToolUseResult::final_output)
+            .transpose(),
         ToolUseBehavior::Custom(handler) => {
             if tool_results.is_empty() {
-                return Ok(false);
+                return Ok(None);
             }
             // Third-party `async` code, so it is never awaited bare — the cancellation contract's
             // one rule. A handler that ignored a stop signal would otherwise keep the whole run
             // alive after the user asked it to stop, with no tool left running to blame. There is
             // no entry check here because `CancelScope::run` already refuses to start work on an
             // already-cancelled scope; a second one would only restate its contract.
-            let stop = cancel.run(handler.should_stop(tool_results)).await??;
+            let selection = cancel
+                .run(handler.final_output(run, tool_results))
+                .await??;
 
             // The exit check is not symmetry with that entry check, and it is not optional.
             // `CancelScope::run` polls the handler *before* it looks at the cancellation, so a
@@ -122,7 +157,7 @@ pub(crate) async fn check_for_final_output_from_tools(
             // reached its own success edge — claiming the agent finished on the turn the user
             // stopped it.
             cancel.ensure_not_cancelled()?;
-            Ok(stop)
+            Ok(selection.into_output())
         }
         _ => Err(Error::config(
             "this runtime does not support the configured tool-use behavior",

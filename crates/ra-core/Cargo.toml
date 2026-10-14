@@ -21,4 +21,5 @@ tokio-util = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 schemars = { workspace = true }
+jsonschema = { workspace = true }
 sha2 = { workspace = true }

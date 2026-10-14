@@ -61,6 +61,9 @@ pub enum RunStreamEvent {
     Item(RunItem),
     /// A final delivery that was intentionally not added to session history.
     ///
+    /// Emitted immediately before [`Self::Finished`], after output checks and session persistence
+    /// succeed. A candidate withdrawn by a stop hook or budget stop does not emit this event.
+    ///
     /// **A subscriber that renders the delivered answer has to watch this and [`Self::Item`].**
     /// Which one carries it is decided by the error handler's `write_to_history`, and the split is
     /// the point: a record the run chose not to keep must not reach a subscriber as one, or a host

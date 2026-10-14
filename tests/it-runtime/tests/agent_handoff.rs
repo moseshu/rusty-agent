@@ -1,5 +1,8 @@
 //! Contracts for a transfer of control inside the run loop.
 
+#[path = "agent_handoff/structured_output.rs"]
+mod structured_output;
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},

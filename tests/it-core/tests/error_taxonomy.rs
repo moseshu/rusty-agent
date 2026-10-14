@@ -20,6 +20,7 @@ fn all_errors() -> Vec<Error> {
     let mut v = vec![
         Error::config("缺少 model"),
         Error::caller("状态机被违规驱动"),
+        Error::invalid_final_output("Invalid JSON"),
     ];
 
     for kind in [

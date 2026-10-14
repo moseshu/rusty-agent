@@ -273,6 +273,7 @@ impl<'a> AgentStartInput<'a> {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct AgentEndInput<'a> {
+    output: Option<&'a crate::output::OutputValue>,
     run: &'a RunContext,
     services: &'a ToolServices,
     finish_reason: FinishReason,
@@ -284,6 +285,7 @@ impl<'a> AgentEndInput<'a> {
     /// Describes a run whose agent reached `finish_reason`.
     pub fn new(run: &'a RunContext, finish_reason: FinishReason) -> Self {
         Self {
+            output: None,
             run,
             services: ToolServices::none(),
             finish_reason,
@@ -296,6 +298,18 @@ impl<'a> AgentEndInput<'a> {
     pub const fn with_message(mut self, message: &'a Message) -> Self {
         self.message = Some(message);
         self
+    }
+
+    /// Attaches the decoded or tool-promoted final value.
+    pub const fn with_output(mut self, output: &'a crate::output::OutputValue) -> Self {
+        self.output = Some(output);
+        self
+    }
+
+    /// The exact output the host receives if output guardrails accept it.
+    #[must_use]
+    pub const fn output(&self) -> Option<&'a crate::output::OutputValue> {
+        self.output
     }
 
     /// Attaches the concluding turn's tool outputs, including a tool-produced final answer.
