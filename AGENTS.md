@@ -24,6 +24,15 @@ Apply these rules to every Rust source file (`.rs`), including tests.
 - Keep provider wire formats, provider-only parameters and constraints, hosted-tool implementations,
   and pricing policy in adapters or runtime layers rather than expanding the provider-neutral core.
 
+# Completion Requires Review
+
+- Do not mark a development task as `DONE` in plans, checklists, or other documentation until its
+  review is complete and all review findings that block completion are resolved.
+- Implementation completion and passing tests alone do not authorize a `DONE` status. Record such
+  work as implemented and awaiting review, preserving the implementation and validation evidence.
+- This rule applies to future status changes; do not reopen an existing `DONE` task unless the user
+  asks for it.
+
 # Porting Over Redesign
 
 - For every rusty-agent framework development review, explicitly check alignment with the
