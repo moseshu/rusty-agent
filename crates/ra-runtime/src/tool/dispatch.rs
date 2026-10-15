@@ -1,4 +1,4 @@
-//! One tool invocation, in the only permitted stage order (R3-4).
+//! One tool invocation, in the only permitted stage order.
 //!
 //! The chain is guardrail resolution -> typed argument decoding -> repeat admission -> permission
 //! -> approval -> input guardrail -> invoke -> output guardrail. Every stage that can refuse does
@@ -12,13 +12,16 @@
 //!
 //! # Framework error text must never reach the model
 //!
-//! A model-visible failure observation carries a machine-readable code and the tool's qualified
+//! A generic model-visible failure observation carries a machine-readable code and the tool's qualified
 //! name — and nothing else. [`Error`]'s `Display` and `user_message` are written for logs and for
 //! the person at the keyboard, in this project's own language; splicing either into a tool result
 //! would put framework prose into the model's context and make the next turn depend on it. A tool
 //! that wants to explain a failure to the model has a dedicated path:
 //! [`ToolFailureHandling::Custom`] plus [`Tool::handle_failure`], which lets the tool write its own
 //! model-facing text.
+//! Function tools also use the reference's fixed sanitized failure message, and every tool's own
+//! Runner deadline uses the reference's default timeout message; those approved messages are
+//! rendered directly, without forwarding an arbitrary error's Display.
 //!
 //! A custom tool — one taking raw input rather than JSON — has that path by default. The reference's
 //! custom-tool runner reports a tool that raised with the error's own text, so the model can correct
@@ -32,10 +35,12 @@
 //! execution — which is why every call it announced is announced again when it settles, whichever
 //! way that went.
 //!
-//! Concurrency ceilings and batching are deliberately absent: R3-4b owns the batch shape and R3-4c
-//! owns what happens when several of these run at once.
+//! Concurrency ceilings, batch settlement, and cancellation draining belong to the batch module.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use ra_core::hook::{HookDecision, HookEvent, ToolHookData};
 use ra_core::{
@@ -51,8 +56,9 @@ use ra_core::{
     permission::PermissionDecision,
     state::{NestedRunRef, RunState},
     tool::{
-        Tool, ToolApprovalPolicy, ToolApprovalRequest, ToolCaller, ToolConcurrency, ToolContext,
-        ToolFailureHandling, ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior,
+        FunctionToolCustomDataContext, Tool, ToolApprovalPolicy, ToolApprovalRequest, ToolCaller,
+        ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions, ToolOutput, ToolServices,
+        ToolTimeoutBehavior, ToolTimeoutError,
     },
 };
 use serde_json::{Value, json};
@@ -319,9 +325,17 @@ pub struct ToolDispatchRequest {
     approval_granted: bool,
     nested_resume: Option<Arc<RunState>>,
     resume: Option<ToolResume>,
+    output_committer: Option<Arc<Mutex<Option<ToolDispatchOutcome>>>>,
 }
 
 impl ToolDispatchRequest {
+    pub(crate) fn with_output_committer(
+        mut self,
+        committer: Arc<Mutex<Option<ToolDispatchOutcome>>>,
+    ) -> Self {
+        self.output_committer = Some(committer);
+        self
+    }
     /// Creates a request for a call the model made directly.
     ///
     /// `cancel` is required rather than optional for the same reason it is in turn preparation:
@@ -356,6 +370,7 @@ impl ToolDispatchRequest {
             approval_granted: false,
             nested_resume: None,
             resume: None,
+            output_committer: None,
         }
     }
 
@@ -519,7 +534,18 @@ pub(crate) async fn dispatch_tool_with_admission(
     admission_started: Instant,
 ) -> Result<ToolDispatchOutcome> {
     let mut guardrails = ToolGuardrailRecords::default();
-    let dispatch = run_chain(&request, admission, admission_started, &mut guardrails).await?;
+    let result = run_chain(&request, admission, admission_started, &mut guardrails).await;
+    if result.is_err()
+        && let Some(committer) = &request.output_committer
+    {
+        let mut committed = committer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(outcome) = committed.as_mut() {
+            outcome.guardrails = guardrails.clone();
+        }
+    }
+    let dispatch = result?;
     Ok(ToolDispatchOutcome {
         dispatch,
         guardrails,
@@ -702,7 +728,7 @@ async fn run_chain(
     }
 
     // 7. Invoke tool.
-    let outcome = invoke(
+    let (outcome, deadline_elapsed) = invoke(
         tool,
         request.context_with_decoded(decoded_input),
         &options,
@@ -770,6 +796,10 @@ async fn run_chain(
 
     let output = match outcome {
         Ok(output) => output,
+        Err(error) if deadline_elapsed => {
+            return shape_deadline(tool, request, &options, error, &output_guardrails, records)
+                .await;
+        }
         Err(error) => {
             return shape_failure(
                 tool,
@@ -801,14 +831,13 @@ async fn run_chain(
     if let Some(replacement) =
         check_output_guardrails(request, &output_guardrails, &output, records).await?
     {
-        return Ok(replacement);
+        return finish_guardrail_output(request, replacement).await;
     }
 
     // 9. Context projection happens after the guardrail has inspected the complete observation
     // and immediately before the record is made.  The stored ToolOutput retains those complete
     // blocks; only its model-facing excerpt changes.
-    let output = project_output(request, output)?;
-    observed_success(&request.call_id, &output)
+    finish_output(request, output, None, false).await
 }
 
 fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
@@ -887,7 +916,7 @@ async fn admit_permission(
             run_user_hook(request, HookEvent::PreToolUse(tool_hook_data(request))).await?
     {
         return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
-            guardrail_message(&request.call_id, message)?,
+            pre_invocation_rejection(request, message)?,
             PRE_TOOL_USE_HOOK_CODE,
         ))));
     }
@@ -937,7 +966,7 @@ async fn admit_permission(
                 HookDecision::Allow => return Ok(None),
                 HookDecision::Deny { message } => {
                     return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
-                        guardrail_message(&request.call_id, message)?,
+                        pre_invocation_rejection(request, message)?,
                         PERMISSION_REQUEST_HOOK_CODE,
                     ))));
                 }
@@ -1018,6 +1047,10 @@ async fn resolve_permission(
 }
 
 /// Invokes the tool, applying its per-call time limit.
+///
+/// The flag is set only when this call's own deadline elapsed. A body that returns a timeout of
+/// its own — including a nested run's propagated [`ToolTimeoutError`] — is not this deadline, as
+/// the reference re-raises a timeout the tool task itself produced instead of rewriting it.
 async fn invoke(
     tool: &Arc<dyn Tool>,
     context: ToolContext<'_>,
@@ -1025,11 +1058,12 @@ async fn invoke(
     cancel: &CancelScope,
     name: &str,
     nested_resume: Option<Arc<RunState>>,
-) -> Result<ToolOutput> {
+) -> (Result<ToolOutput>, bool) {
     let started = Instant::now();
     // Scoped to this call so an agent tool can start its nested run under the call's own
     // cancellation scope — or continue the one it paused on; see `agent::tool::parent`.
     let call = crate::agent::tool::parent::within_call(cancel, nested_resume, tool.call(context));
+    let mut deadline_elapsed = false;
     let result = match options.timeout() {
         None => cancel.run(call).await.and_then(|result| result),
         Some(limit) => cancel
@@ -1037,18 +1071,62 @@ async fn invoke(
             .await
             .and_then(|result| match result {
                 Ok(result) => result,
-                Err(_elapsed) => Err(Error::tool(
-                    ToolErrorKind::Timeout,
-                    name,
-                    format!("the tool exceeded its {limit:?} limit"),
-                )),
+                Err(_elapsed) => {
+                    deadline_elapsed = true;
+                    let timeout = ToolTimeoutError::new(tool.schema().name(), limit);
+                    Err(
+                        Error::tool(ToolErrorKind::Timeout, name, timeout.to_string())
+                            .with_source(timeout),
+                    )
+                }
             }),
     };
     tracing::Span::current().record(
         ra_core::trace::field::TOOL_EXECUTION_MS,
         duration_ms(started.elapsed()),
     );
-    result
+    (result, deadline_elapsed)
+}
+
+/// Applies `timeout_behavior` to this call's own elapsed deadline.
+///
+/// The default text and a custom formatter's result are tool results like any other: output
+/// guardrails see them, and a custom formatter's result must satisfy a declared output schema.
+async fn shape_deadline(
+    tool: &Arc<dyn Tool>,
+    request: &ToolDispatchRequest,
+    options: &ToolOptions,
+    error: Error,
+    output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
+    records: &mut ToolGuardrailRecords,
+) -> Result<ToolDispatch> {
+    match options.timeout_behavior() {
+        ToolTimeoutBehavior::ModelVisible => {
+            let Some(timeout) = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<ToolTimeoutError>())
+            else {
+                return Err(error);
+            };
+            let context = request.context();
+            let custom = request
+                .cancel
+                .run(tool.handle_timeout(&context, timeout))
+                .await??;
+            let bypass = custom.is_none();
+            let output = custom.unwrap_or_else(|| ToolOutput::text(timeout.to_string()));
+            if let Some(replacement) =
+                check_output_guardrails(request, output_guardrails, &output, records).await?
+            {
+                return finish_guardrail_output(request, replacement).await;
+            }
+            finish_output(request, output, Some(error.code()), bypass).await
+        }
+        ToolTimeoutBehavior::Propagate => Err(error),
+        behavior => Err(Error::caller(format!(
+            "tool `{}` uses an unsupported timeout behavior `{behavior:?}`",
+            tool.origin().qualified_name()
+        ))),
+    }
 }
 
 /// Converts elapsed time to the trace vocabulary's millisecond unit.
@@ -1085,14 +1163,18 @@ pub(crate) async fn shape_failure(
         return Err(error);
     }
 
-    let timed_out = matches!(
+    // This call's own deadline is shaped by `shape_deadline`. A tool may still explicitly report
+    // the framework's timeout classification — including a nested run's propagated deadline —
+    // without that deadline. It keeps its existing policy and never invokes this tool's timeout
+    // formatter; native body errors do not acquire this classification and are handled as
+    // ordinary invocation failures.
+    if matches!(
         invocation_error(&error),
         Error::Tool {
             kind: ToolErrorKind::Timeout,
             ..
         }
-    );
-    if timed_out {
+    ) {
         return match options.timeout_behavior() {
             ToolTimeoutBehavior::ModelVisible => {
                 Ok(observed_failure(&request.call_id, name, &error))
@@ -1132,12 +1214,20 @@ pub(crate) async fn shape_failure(
                         check_output_guardrails(request, output_guardrails, &output, records)
                             .await?
                     {
-                        return Ok(replacement);
+                        return finish_guardrail_output(request, replacement).await;
                     }
-                    let output = project_output(request, output)?;
-                    observed(&request.call_id, &output, Some(error.code()))
+                    finish_output(
+                        request,
+                        output,
+                        Some(error.code()),
+                        tool.uses_default_failure_handler(),
+                    )
+                    .await
                 }
-                None if is_invalid_input(&error) => {
+                None if is_invalid_input(&error)
+                    && !(tool.output_schema().is_some()
+                        && request.caller == ToolCaller::Programmatic) =>
+                {
                     Ok(observed_failure(&request.call_id, name, &error))
                 }
                 None => Err(error),
@@ -1146,6 +1236,99 @@ pub(crate) async fn shape_failure(
         handling => Err(Error::caller(format!(
             "tool `{name}` uses an unsupported failure handling policy `{handling:?}`"
         ))),
+    }
+}
+
+/// Completes schema rendering and SDK-only extraction before persisting an observation.
+async fn finish_output(
+    request: &ToolDispatchRequest,
+    output: ToolOutput,
+    failure_code: Option<&'static str>,
+    bypass_schema: bool,
+) -> Result<ToolDispatch> {
+    let schema = request.tool.output_schema();
+    let rendered = match schema {
+        Some(schema) if !bypass_schema => schema.validate_output(&output)?,
+        // As the reference's `function_tool_error_output`, only text becomes an error object;
+        // any other bypassed output is replayed unchanged.
+        Some(_) if request.caller == ToolCaller::Programmatic => match output.as_text() {
+            Some(text) => ToolOutput::text(json!({ "error": text }).to_string())
+                .with_metadata(output.metadata().clone()),
+            None => output.clone(),
+        },
+        _ => output.clone(),
+    };
+    let rendered = project_output(request, rendered)?;
+    let ToolDispatch::Observed(mut observation) =
+        observed(&request.call_id, &rendered, failure_code)?
+    else {
+        return Err(Error::caller(
+            "a completed tool output must be an observation",
+        ));
+    };
+    if matches!(
+        failure_code,
+        Some("tool.timeout" | TOOL_OUTPUT_GUARDRAIL_CODE)
+    ) {
+        observation.output = observation.output.with_error(true);
+    }
+    let mut context = FunctionToolCustomDataContext::new(
+        request.context(),
+        request.tool.as_ref(),
+        &output,
+        observation.output.clone(),
+    );
+    // The callable has completed. Preserve its final output before running user extraction code,
+    // so a formatter failure or cancellation cannot cause a resumed run to execute it again.
+    if let Some(committer) = &request.output_committer {
+        *committer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ToolDispatchOutcome {
+            dispatch: ToolDispatch::Observed(observation.clone()),
+            guardrails: ToolGuardrailRecords::default(),
+        });
+    }
+    if let Some(data) = extract_custom_data(request, &mut context).await? {
+        observation.output = observation.output.with_custom_data(data);
+    }
+    Ok(ToolDispatch::Observed(observation))
+}
+
+/// Runs the extractor, polling it before observing cancellation.
+///
+/// [`CancelScope::run`] refuses to start on an already-cancelled scope, which would turn a
+/// completed call into a failure even when the tool has no extractor — for example a sibling whose
+/// scope a failing peer cancelled while it was rendering its output. The reference returns
+/// immediately for an absent extractor and only interrupts an extractor at a suspension point;
+/// polling it first gives the same order, while a pending extractor still stops on cancellation.
+async fn extract_custom_data(
+    request: &ToolDispatchRequest,
+    context: &mut FunctionToolCustomDataContext<'_>,
+) -> Result<Option<serde_json::Map<String, Value>>> {
+    let extraction = std::pin::pin!(request.tool.extract_custom_data(context));
+    let cancelled = std::pin::pin!(request.cancel.cancelled());
+    match futures::future::select(extraction, cancelled).await {
+        futures::future::Either::Left((data, _)) => data,
+        futures::future::Either::Right(((), _)) => {
+            request.cancel.ensure_not_cancelled()?;
+            Err(Error::caller(
+                "custom-data extraction stopped on a scope that reports no cancellation",
+            ))
+        }
+    }
+}
+
+async fn finish_guardrail_output(
+    request: &ToolDispatchRequest,
+    dispatch: ToolDispatch,
+) -> Result<ToolDispatch> {
+    match dispatch {
+        ToolDispatch::Observed(observation) => {
+            let output = ToolOutput::from_stored(observation.output.output())?
+                .ok_or_else(|| Error::caller("guardrail output must contain a tool result"))?;
+            finish_output(request, output, observation.failure_code, true).await
+        }
+        dispatch => Ok(dispatch),
     }
 }
 
@@ -1248,7 +1431,7 @@ async fn check_input_guardrails(
             // `Refused`, not a failed observation: the tool did not run, and a record that said it
             // had would hand the no-progress breaker evidence about a tool that never executed.
             Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
-                guardrail_message(&request.call_id, message)?,
+                pre_invocation_rejection(request, message)?,
                 TOOL_INPUT_GUARDRAIL_CODE,
             ))))
         }
@@ -1292,6 +1475,19 @@ async fn check_output_guardrails(
 /// this module's documentation is on *framework* prose, written for logs and for the person at the
 /// keyboard. It is flagged as an error so that a refusal can never be promoted to the run's answer
 /// by a tool-use stop policy, which cannot inspect what it stops on.
+fn pre_invocation_rejection(
+    request: &ToolDispatchRequest,
+    message: String,
+) -> Result<ToolCallOutput> {
+    let message =
+        if request.caller == ToolCaller::Programmatic && request.tool.output_schema().is_some() {
+            json!({"error":message}).to_string()
+        } else {
+            message
+        };
+    guardrail_message(&request.call_id, message)
+}
+
 fn guardrail_message(call_id: &CallId, message: String) -> Result<ToolCallOutput> {
     let payload = serde_json::to_value(ToolOutput::text(message)).map_err(|error| {
         Error::caller("failed to render a tool guardrail's message as provider-neutral JSON")
@@ -1304,10 +1500,6 @@ fn unsupported_verdict(verdict: &ToolGuardrailVerdict) -> Error {
     Error::caller(format!(
         "a tool guardrail reduced to the unsupported verdict `{verdict:?}`"
     ))
-}
-
-pub(crate) fn observed_success(call_id: &CallId, output: &ToolOutput) -> Result<ToolDispatch> {
-    observed(call_id, output, None)
 }
 
 /// Renders a tool's own output as the model-visible result, classified for the records.

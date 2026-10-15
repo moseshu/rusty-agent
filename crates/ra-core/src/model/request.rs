@@ -270,6 +270,10 @@ pub struct ModelToolDefinition {
     namespace_description: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     defer_loading: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_json_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowed_callers: Option<Vec<crate::tool::ToolCaller>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -294,6 +298,8 @@ impl ModelToolDefinition {
             namespace: None,
             namespace_description: None,
             defer_loading: false,
+            output_json_schema: None,
+            allowed_callers: None,
             unknown: Unknown::new(),
         }
     }
@@ -358,6 +364,30 @@ impl ModelToolDefinition {
     #[must_use]
     pub const fn defer_loading(&self) -> bool {
         self.defer_loading
+    }
+
+    /// Advertises the strict object schema of a function's output.
+    #[must_use]
+    pub fn with_output_json_schema(mut self, mut schema: Value) -> Self {
+        canonicalize_json(&mut schema);
+        self.output_json_schema = Some(schema);
+        self
+    }
+    /// Declared function-output schema, when present.
+    #[must_use]
+    pub const fn output_json_schema(&self) -> Option<&Value> {
+        self.output_json_schema.as_ref()
+    }
+    /// Advertises the permitted function caller classes.
+    #[must_use]
+    pub fn with_allowed_callers(mut self, callers: Vec<crate::tool::ToolCaller>) -> Self {
+        self.allowed_callers = Some(callers);
+        self
+    }
+    /// Explicit function caller classes, when configured.
+    #[must_use]
+    pub fn allowed_callers(&self) -> Option<&[crate::tool::ToolCaller]> {
+        self.allowed_callers.as_deref()
     }
 
     /// Resolves the framework's model lookup identity, including deferred top-level functions.
@@ -503,6 +533,14 @@ impl ModelToolDefinition {
                 tool.description(),
                 &tool.advertised_input()?,
             )?;
+            if let Some(schema) = tool.output_json_schema() {
+                rendered.push_str(&schema.to_string());
+            }
+            if let Some(callers) = tool.allowed_callers() {
+                rendered.push_str(&serde_json::to_string(callers).map_err(|error| {
+                    Error::config("cannot render allowed callers").with_source(error)
+                })?);
+            }
             if let Some(namespace) = tool.namespace() {
                 let description = tool.namespace_description().unwrap_or_default();
                 if namespaces.insert((namespace, description)) {

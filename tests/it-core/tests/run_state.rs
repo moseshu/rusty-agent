@@ -1936,3 +1936,30 @@ fn test_exact_call_override_round_trips_with_sticky_default() {
         assert_eq!(sticky(&restored), expected);
     }
 }
+
+#[test]
+fn pending_tool_output_settlement_survives_a_checkpoint_and_defaults_off_for_legacy_records() {
+    let mut state = RunState::start(RunId::new("settlement"));
+    assert!(!state.tool_output_settlement_pending());
+    state.set_tool_output_settlement_pending(true);
+    let wire = serde_json::to_value(&state).unwrap();
+    assert_eq!(wire["tool_output_settlement_pending"], true);
+    let mut restored: RunState = serde_json::from_value(wire.clone()).unwrap();
+    assert!(restored.tool_output_settlement_pending());
+    restored.set_tool_output_settlement_pending(false);
+    assert!(
+        serde_json::to_value(restored)
+            .unwrap()
+            .get("tool_output_settlement_pending")
+            .is_none()
+    );
+    let mut legacy = wire;
+    legacy["schema_version"] = json!(11);
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_output_settlement_pending");
+    let restored: RunState = serde_json::from_value(legacy).unwrap();
+    assert!(!restored.tool_output_settlement_pending());
+    assert_eq!(restored.schema_version(), RUN_STATE_SCHEMA_VERSION);
+}

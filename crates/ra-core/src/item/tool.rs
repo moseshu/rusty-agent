@@ -164,6 +164,8 @@ pub struct ToolCallOutput {
     is_error: bool,
     #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
     kind: ToolCallKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_data: Option<serde_json::Map<String, Value>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -178,6 +180,7 @@ impl ToolCallOutput {
             output,
             is_error: false,
             kind: ToolCallKind::Function,
+            custom_data: None,
             unknown: Unknown::new(),
         }
     }
@@ -211,6 +214,26 @@ impl ToolCallOutput {
     #[must_use]
     pub fn with_output(mut self, output: Value) -> Self {
         self.output = output;
+        self
+    }
+
+    /// Attaches SDK-only JSON data; empty mappings are treated as absent.
+    #[must_use]
+    pub fn with_custom_data(mut self, data: serde_json::Map<String, Value>) -> Self {
+        self.custom_data = (!data.is_empty()).then_some(data);
+        self
+    }
+
+    /// SDK-only data retained in authoritative output records.
+    #[must_use]
+    pub const fn custom_data(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.custom_data.as_ref()
+    }
+
+    /// Creates the model-facing view without SDK-only data.
+    #[must_use]
+    pub fn without_custom_data(mut self) -> Self {
+        self.custom_data = None;
         self
     }
 

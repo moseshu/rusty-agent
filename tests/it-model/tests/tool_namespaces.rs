@@ -340,3 +340,301 @@ async fn other_protocols_refuse_namespaced_tools() {
     );
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn responses_advertises_function_output_schema_and_callers_inside_namespaces() {
+    use ra_core::tool::ToolCaller;
+    let server = MockServer::start().await;
+    let model = responses_model(&server, json!({"id":"resp","output":[]})).await;
+    let output_schema = json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false});
+    let definition = in_namespace("inventory", "lookup", "Inventory tools")
+        .with_output_json_schema(output_schema.clone())
+        .with_allowed_callers(vec![ToolCaller::Direct, ToolCaller::Programmatic]);
+    model
+        .get_response(
+            ModelRequest::new(vec![], resolved(ModelSettings::new())).with_tools(vec![definition]),
+        )
+        .await
+        .unwrap();
+    let body = request_body(&server).await;
+    assert_eq!(body["tools"][0]["tools"][0]["output_schema"], output_schema);
+    assert_eq!(
+        body["tools"][0]["tools"][0]["allowed_callers"],
+        json!(["direct", "programmatic"])
+    );
+    assert!(body.get("text").is_none());
+}
+
+#[tokio::test]
+async fn other_protocols_reject_output_schemas_before_sending() {
+    let server = MockServer::start().await;
+    let request = || {
+        ModelRequest::new(vec![], resolved(ModelSettings::new().with_max_tokens(64))).with_tools(
+            vec![function("lookup").with_output_json_schema(json!({"type":"object"}))],
+        )
+    };
+    let chat = OpenAiChatModel::new(
+        "gpt-test",
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+    )
+    .unwrap();
+    let error = chat.get_response(request()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("models: output_json_schema. Tool `lookup`")
+    );
+    let anthropic = AnthropicMessagesModel::new(
+        "claude-test",
+        AnthropicAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+    )
+    .unwrap();
+    let error = anthropic.get_response(request()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("models: output_json_schema. Tool `lookup`")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn responses_replay_does_not_send_sdk_custom_data() {
+    let server = MockServer::start().await;
+    let model = responses_model(&server, json!({"id":"resp","output":[]})).await;
+    let output = ToolCallOutput::new(CallId::new("call"), json!("tool result")).with_custom_data(
+        json!({"renderer":"private chart"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    model
+        .get_response(ModelRequest::new(
+            vec![ModelInputItem::ToolCallOutput(output)],
+            resolved(ModelSettings::new()),
+        ))
+        .await
+        .unwrap();
+    let body = request_body(&server).await;
+    assert!(!body.to_string().contains("custom_data"));
+    assert!(!body.to_string().contains("private chart"));
+    assert_eq!(body["input"][0]["output"], "tool result");
+}
+
+#[tokio::test]
+async fn responses_requires_a_program_tool_for_programmatic_only_callers() {
+    use ra_core::tool::ToolCaller;
+    let server = MockServer::start().await;
+    let model = responses_model(&server, json!({"id":"resp","output":[]})).await;
+    let program_only = || function("lookup").with_allowed_callers(vec![ToolCaller::Programmatic]);
+    let hosted = |tools: Value| {
+        ModelSettings::new().with_extra_body(
+            ProviderKey::new("openai"),
+            std::collections::BTreeMap::from_iter([("tools".to_owned(), tools)]),
+        )
+    };
+
+    let error = model
+        .get_response(
+            ModelRequest::new(vec![], resolved(ModelSettings::new()))
+                .with_tools(vec![program_only()]),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(
+        "Tool `lookup` only allows programmatic callers and requires a `programmatic_tool_calling` tool"
+    ));
+    let error = model
+        .get_response(ModelRequest::new(
+            vec![],
+            resolved(hosted(json!([{
+                "type":"code_interpreter", "container":"auto", "allowed_callers":["programmatic"]
+            }]))),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("only allows programmatic callers")
+    );
+    let error = model
+        .get_response(ModelRequest::new(
+            vec![],
+            resolved(hosted(json!([{
+                "type":"mcp", "server_label":"inventory", "server_url":"https://mcp.test",
+                "allowed_callers":["programmatic"]
+            }]))),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Tool `hosted MCP server `inventory`` only allows programmatic callers")
+    );
+    let error = model
+        .get_response(
+            ModelRequest::new(
+                vec![],
+                resolved(hosted(json!([
+                    {"type":"programmatic_tool_calling"},
+                    {"type":"programmatic_tool_calling"}
+                ]))),
+            )
+            .with_tools(vec![program_only()]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Only one `programmatic_tool_calling` tool is allowed")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    // Mixed callers need no hosted program tool, as in the reference.
+    model
+        .get_response(
+            ModelRequest::new(vec![], resolved(ModelSettings::new())).with_tools(vec![
+                function("mixed")
+                    .with_allowed_callers(vec![ToolCaller::Direct, ToolCaller::Programmatic]),
+            ]),
+        )
+        .await
+        .unwrap();
+    model
+        .get_response(
+            ModelRequest::new(
+                vec![],
+                resolved(hosted(json!([{"type":"programmatic_tool_calling"}]))),
+            )
+            .with_tools(vec![
+                program_only(),
+                ModelToolDefinition::custom("patch", None)
+                    .with_allowed_callers(vec![ToolCaller::Programmatic]),
+            ]),
+        )
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        body["tools"][0],
+        json!({"type":"programmatic_tool_calling"})
+    );
+    assert_eq!(body["tools"][1]["allowed_callers"], json!(["programmatic"]));
+    assert_eq!(body["tools"][2]["type"], "custom");
+    assert_eq!(body["tools"][2]["allowed_callers"], json!(["programmatic"]));
+}
+
+#[tokio::test]
+async fn programmatic_tools_require_an_eligible_or_prompt_managed_surface() {
+    let server = MockServer::start().await;
+    let model = responses_model(&server, json!({"id":"resp","output":[]})).await;
+    let settings = |extra: std::collections::BTreeMap<String, Value>| {
+        ModelSettings::new().with_extra_body(ProviderKey::new("openai"), extra)
+    };
+    let hosted = json!([{"type":"programmatic_tool_calling"}]);
+    for prompt in [None, Some(Value::Null)] {
+        let mut extra =
+            std::collections::BTreeMap::from_iter([("tools".to_owned(), hosted.clone())]);
+        if let Some(prompt) = prompt {
+            extra.insert("prompt".to_owned(), prompt);
+        }
+        let error = model
+            .get_response(
+                ModelRequest::new(vec![], resolved(settings(extra)))
+                    .with_tools(vec![function("direct_only")]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one tool whose allowed_callers")
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let error = model
+        .get_response(ModelRequest::new(
+            vec![],
+            resolved(settings(std::collections::BTreeMap::from_iter([(
+                "tools".to_owned(),
+                json!([
+                    {"type":"programmatic_tool_calling"},
+                    {"type":"web_search", "allowed_callers":["programmatic"]}
+                ]),
+            )]))),
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("requires at least one tool"));
+    // A stored prompt may provide opaque tools, so the reference skips only the eligible-surface
+    // requirement for this branch, rather than skipping the complete configuration validator.
+    model
+        .get_response(ModelRequest::new(
+            vec![],
+            resolved(settings(std::collections::BTreeMap::from_iter([
+                ("tools".to_owned(), hosted.clone()),
+                ("prompt".to_owned(), json!({"id":"pmpt_catalog"})),
+            ]))),
+        ))
+        .await
+        .unwrap();
+    model
+        .get_response(
+            ModelRequest::new(
+                vec![],
+                resolved(settings(std::collections::BTreeMap::from_iter([(
+                    "tools".to_owned(),
+                    hosted.clone(),
+                )]))),
+            )
+            .with_tools(vec![ModelToolDefinition::tool_search(schema())]),
+        )
+        .await
+        .unwrap();
+    model.get_response(ModelRequest::new(vec![], resolved(settings(std::collections::BTreeMap::from_iter([
+        ("tools".to_owned(), json!([{"type":"programmatic_tool_calling"}, {"type":"code_interpreter", "container":"auto", "allowed_callers":["programmatic"]}]))
+    ]))))).await.unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn discovery_outputs_do_not_revalidate_a_partial_programmatic_tool_surface() {
+    use ra_core::tool::{ToolCaller, ToolOutput};
+    let server = MockServer::start().await;
+    let model = responses_model(&server, json!({"id":"resp","output":[]})).await;
+    let definition = function("discovered")
+        .with_allowed_callers(vec![ToolCaller::Programmatic])
+        .with_defer_loading(true);
+    let output = ToolOutput::tool_search(vec![definition]);
+    let input = ToolCallOutput::new(CallId::new("search"), serde_json::to_value(output).unwrap())
+        .with_kind(ra_core::item::ToolCallKind::ToolSearch);
+    let settings = ModelSettings::new().with_extra_body(
+        ProviderKey::new("openai"),
+        std::collections::BTreeMap::from_iter([(
+            "tools".to_owned(),
+            json!([{"type":"programmatic_tool_calling"}]),
+        )]),
+    );
+    model
+        .get_response(
+            ModelRequest::new(
+                vec![ModelInputItem::ToolCallOutput(input)],
+                resolved(settings),
+            )
+            .with_tools(vec![ModelToolDefinition::tool_search(schema())]),
+        )
+        .await
+        .unwrap();
+    let body = request_body(&server).await;
+    assert_eq!(body["input"][0]["type"], "tool_search_output");
+    assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+    assert_eq!(
+        body["input"][0]["tools"][0]["tools"][0]["allowed_callers"],
+        json!(["programmatic"])
+    );
+    assert_eq!(body["tools"][0]["type"], "programmatic_tool_calling");
+}

@@ -16,6 +16,7 @@ use serde_json::Value;
 pub use crate::permission::PermissionScope;
 
 pub mod context;
+pub mod function_output;
 pub mod namespace;
 pub mod options;
 pub mod origin;
@@ -23,6 +24,7 @@ pub mod output;
 pub mod resource;
 pub mod schema;
 pub mod services;
+pub mod timeout;
 
 /// Dependencies and codecs used only by procedural macro expansions.
 #[doc(hidden)]
@@ -30,6 +32,7 @@ pub mod __private {
     pub use async_trait::async_trait;
     pub use schemars;
     pub use serde;
+    pub use serde_json;
     pub use tokio;
 
     /// Renders a JSON-serializable return value as model-readable text.
@@ -47,6 +50,29 @@ pub mod __private {
             serde_json::Value::String(text) => text,
             value => value.to_string(),
         }))
+    }
+
+    /// Validates typed callable output before rendering it as text.
+    pub fn function_output_with_schema<T: serde::Serialize + 'static>(
+        value: T,
+        schema: Option<&super::FunctionToolOutputSchema>,
+        tool_name: &str,
+    ) -> crate::error::Result<super::ToolOutput> {
+        let Some(schema) = schema else {
+            return function_output(value);
+        };
+        if !schema.is_typed()
+            && let Some(output) = (&value as &dyn std::any::Any).downcast_ref::<super::ToolOutput>()
+        {
+            return Ok(output.clone());
+        }
+        let value = serde_json::to_value(value).map_err(|error| {
+            crate::error::Error::config("cannot serialize function output").with_source(error)
+        })?;
+        let value = schema.validate_return(value).map_err(|error| {
+            crate::error::Error::config(format!("Function tool {tool_name} returned an output that does not match its declared output type")).with_source(error)
+        })?;
+        function_output(value)
     }
 
     /// Preserves framework errors and wraps another Rust error with its concrete source intact.
@@ -68,6 +94,7 @@ pub mod __private {
 }
 
 pub use context::{ToolApprovalRequest, ToolCaller, ToolContext};
+pub use function_output::FunctionToolOutputSchema;
 pub use namespace::ToolNamespace;
 pub use options::{
     DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, TOOL_OPTIONS_SCHEMA_VERSION,
@@ -90,6 +117,7 @@ pub use schema::{
     ToolArgumentDecodeError, ToolInput, ToolSchema,
 };
 pub use services::ToolServices;
+pub use timeout::ToolTimeoutError;
 
 /// An executable tool exposed by an application or integration.
 ///
@@ -205,6 +233,36 @@ pub trait Tool: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Whether failures use the reference's sanitized default rather than a user formatter.
+    /// Default failures bypass the declared output schema for direct calls.
+    fn uses_default_failure_handler(&self) -> bool {
+        false
+    }
+
+    /// Formats a runner deadline when timeout behavior returns an error as a result.
+    /// `None` selects the SDK's default timeout message and bypasses output-schema validation.
+    async fn handle_timeout(
+        &self,
+        _context: &ToolContext<'_>,
+        _error: &ToolTimeoutError,
+    ) -> Result<Option<ToolOutput>> {
+        Ok(None)
+    }
+
+    /// Optional strict function-output schema, separate from the agent's final output.
+    fn output_schema(&self) -> Option<&FunctionToolOutputSchema> {
+        None
+    }
+
+    /// Extracts JSON-compatible SDK data after final output validation and output guardrails.
+    /// It is persisted with the tool output item and removed from model input projections.
+    async fn extract_custom_data(
+        &self,
+        _context: &mut FunctionToolCustomDataContext<'_>,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        Ok(None)
+    }
+
     /// Evaluates resource claims for this invocation.
     ///
     /// Defaults to the static claims declared in [`ToolOptions::resource_claims`].
@@ -232,10 +290,16 @@ pub trait Tool: Send + Sync + 'static {
     /// A tool whose origin has a namespace is advertised in it, as the reference advertises a
     /// `tool_namespace()` tool: its routing identity and what the model calls it by are one.
     fn model_definition(&self) -> ModelToolDefinition {
-        let definition = self
+        let mut definition = self
             .schema()
             .to_model_definition()
             .with_defer_loading(self.options().is_discoverable());
+        if let Some(schema) = self.output_schema() {
+            definition = definition.with_output_json_schema(schema.json_schema_value().clone());
+        }
+        if let Some(callers) = self.options().allowed_callers() {
+            definition = definition.with_allowed_callers(callers.to_vec());
+        }
         match self.origin().namespace() {
             Some(namespace) => definition.with_namespace(
                 namespace.as_str(),
@@ -243,5 +307,55 @@ pub trait Tool: Send + Sync + 'static {
             ),
             None => definition,
         }
+    }
+}
+
+/// The completed invocation view supplied to a function tool's custom-data extractor.
+/// The raw item is an owned snapshot; editing it cannot alter the result replayed to the model.
+pub struct FunctionToolCustomDataContext<'a> {
+    tool_context: ToolContext<'a>,
+    tool: &'a dyn Tool,
+    output: &'a ToolOutput,
+    raw_item: crate::item::ToolCallOutput,
+}
+
+impl<'a> FunctionToolCustomDataContext<'a> {
+    /// Creates a completed invocation view from its final output and an isolated raw-item copy.
+    #[must_use]
+    pub const fn new(
+        tool_context: ToolContext<'a>,
+        tool: &'a dyn Tool,
+        output: &'a ToolOutput,
+        raw_item: crate::item::ToolCallOutput,
+    ) -> Self {
+        Self {
+            tool_context,
+            tool,
+            output,
+            raw_item,
+        }
+    }
+    /// The invocation context.
+    pub const fn tool_context(&self) -> &ToolContext<'a> {
+        &self.tool_context
+    }
+    /// The invoked tool.
+    #[must_use]
+    pub const fn tool(&self) -> &dyn Tool {
+        self.tool
+    }
+    /// Final tool output after guardrails.
+    #[must_use]
+    pub const fn output(&self) -> &ToolOutput {
+        self.output
+    }
+    /// The raw neutral output record that will be replayed.
+    #[must_use]
+    pub const fn raw_item(&self) -> &crate::item::ToolCallOutput {
+        &self.raw_item
+    }
+    /// An isolated copy that the extractor may replace without mutating replay data.
+    pub const fn raw_item_mut(&mut self) -> &mut crate::item::ToolCallOutput {
+        &mut self.raw_item
     }
 }

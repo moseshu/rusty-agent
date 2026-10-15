@@ -2584,8 +2584,10 @@ async fn resolve_interrupted_turn(
     let answers = state.pending_interruption_resolutions().to_vec();
     let continued = state.take_nested_runs();
     let mut paused = Vec::new();
-    let resolving_turn =
-        !answers.is_empty() || !continued.is_empty() || !state.pending_interruptions().is_empty();
+    let resolving_turn = state.tool_output_settlement_pending()
+        || !answers.is_empty()
+        || !continued.is_empty()
+        || !state.pending_interruptions().is_empty();
     let mut tool_results = if resolving_turn {
         completed_sibling_results(agent, state)?
     } else {
@@ -2639,6 +2641,14 @@ async fn resolve_interrupted_turn(
                 result
             }
             InterruptionResolution::Approve { .. } => {
+                // An earlier attempt completed the approved call and committed its output before a
+                // post-output callback failed. That output already answers the call; the stop
+                // policy reads it through the restored sibling results, and the callable and its
+                // extractor do not run again, as in the reference's committed-output retry.
+                if approved_output_committed(state, answer.item_id(), approval.call_id()) {
+                    state.settle_interruption_resolution(answer.item_id())?;
+                    continue;
+                }
                 if approval.resume().is_some_and(|resume| {
                     resume.point() == ra_core::item::ToolResumePoint::DuringCall
                 }) {
@@ -2678,6 +2688,23 @@ async fn resolve_interrupted_turn(
                         state.settle_interruption_resolution(answer.item_id())?;
                         record_followup_approval(context, state, *approval, provenance)?;
                         continue;
+                    }
+                    // The answer stays pending so a retry finalizes this turn from the committed
+                    // output instead of treating the turn as already resolved.
+                    ResumedOutcome::Committed { output, error } => {
+                        let mut output_item = RunItem::new(
+                            ItemId::new(format!("{}.output", approval.call_id())),
+                            RunItemKind::ToolCallOutput(output.with_kind(approval.kind())),
+                        );
+                        if let Some(provenance) = provenance {
+                            output_item = output_item.with_provenance(provenance);
+                        }
+                        record_resumed_items(context, state, vec![output_item])?;
+                        state.set_tool_output_settlement_pending(true);
+                        paused.extend(continued);
+                        state.set_nested_runs(paused)?;
+                        state.snapshot_event_seq(context.event_seqs);
+                        return Err(*error);
                     }
                 }
             }
@@ -2731,18 +2758,19 @@ async fn resolve_interrupted_turn(
                 record_followup_approval(context, state, *approval, None)?;
                 continue;
             }
+            // The continued call has its committed output, so it is not paused again: a retry must
+            // not continue the nested run a second time.
+            ResumedOutcome::Committed { output, error } => {
+                record_resumed_items(context, state, vec![resumed_output_item(agent, output)])?;
+                state.set_tool_output_settlement_pending(true);
+                paused.extend(continued);
+                state.set_nested_runs(paused)?;
+                state.snapshot_event_seq(context.event_seqs);
+                return Err(*error);
+            }
         };
         outcomes.push(outcome);
-        // Attributed as the batch attributes the output of a call it settles: to the public agent
-        // that made the call, which is the agent this checkpoint resumes.
-        let output_item = RunItem::new(
-            ItemId::new(format!("{}.output", output.call_id())),
-            RunItemKind::ToolCallOutput(output),
-        )
-        .with_provenance(
-            ItemProvenance::new(agent.public_id().clone()).with_agent_name(agent.public().name()),
-        );
-        record_resumed_items(context, state, vec![output_item])?;
+        record_resumed_items(context, state, vec![resumed_output_item(agent, output)])?;
     }
     if !outcomes.is_empty() {
         let (_, failure) = state.trackers_mut();
@@ -2756,6 +2784,9 @@ async fn resolve_interrupted_turn(
         });
     }
     let resumed = end_resume_stage(context, agent, state, paused, &tool_results).await?;
+    if !matches!(resumed, ResumeStage::Interrupted(_)) {
+        state.set_tool_output_settlement_pending(false);
+    }
     if matches!(resumed, ResumeStage::Interrupted(_)) {
         // A partial approval attempt has no handoff filter to run yet. Publish its settled
         // outputs once, as the reference publishes each staged attempt before asking again.
@@ -2812,6 +2843,31 @@ fn completed_sibling_results(agent: &AgentBinding, state: &RunState) -> Result<V
         }
     }
     Ok(results)
+}
+
+/// Attributed as the batch attributes the output of a call it settles: to the public agent that
+/// made the call, which is the agent this checkpoint resumes.
+fn resumed_output_item(agent: &AgentBinding, output: ToolCallOutput) -> RunItem {
+    RunItem::new(
+        ItemId::new(format!("{}.output", output.call_id())),
+        RunItemKind::ToolCallOutput(output),
+    )
+    .with_provenance(
+        ItemProvenance::new(agent.public_id().clone()).with_agent_name(agent.public().name()),
+    )
+}
+
+/// Whether an approved call's output was committed after its approval by an earlier attempt.
+fn approved_output_committed(state: &RunState, approval_item: &ItemId, call_id: &CallId) -> bool {
+    let items = state.generated_items();
+    items
+        .iter()
+        .position(|item| item.id() == approval_item)
+        .is_some_and(|start| {
+            items[start + 1..].iter().any(|item| {
+                matches!(item.kind(), RunItemKind::ToolCallOutput(output) if output.call_id() == call_id)
+            })
+        })
 }
 
 /// Checkpoints outputs before a deferred transfer decides what can be published.
@@ -3466,6 +3522,13 @@ enum ResumedOutcome {
     Paused(Box<NestedRunRef>),
     /// The tool reached another approval boundary inside its invocation.
     Awaiting(Box<ToolApproval>),
+    /// The call completed and its output was committed, then a post-output callback failed.
+    ///
+    /// The output is checkpointed before the error leaves, so retrying does not repeat the call.
+    Committed {
+        output: ToolCallOutput,
+        error: Box<Error>,
+    },
 }
 
 /// Runs one call the host approved before the checkpoint was taken, or continues one whose nested
@@ -3534,10 +3597,20 @@ async fn execute_resumed_call(
         (None, Some(resume)) => request.with_approval_granted().with_resume(resume),
         (None, None) => request.with_approval_granted(),
     };
-    let (dispatch, guardrails) = dispatch_tool(request).await?.into_parts();
+    let (outcome, failure) = dispatch_with_committed_output(request).await?;
+    let (dispatch, guardrails) = outcome.into_parts();
     let (input_verdicts, output_verdicts) = guardrails.into_parts();
     state.record_tool_input_guardrail_results(input_verdicts);
     state.record_tool_output_guardrail_results(output_verdicts);
+    if let Some(error) = failure {
+        let ToolDispatch::Observed(observation) = dispatch else {
+            return Err(error);
+        };
+        return Ok(ResumedOutcome::Committed {
+            output: observation.into_output().with_kind(kind),
+            error: Box::new(error),
+        });
+    }
 
     let call_id = call_id.clone();
     match dispatch {
@@ -3572,6 +3645,27 @@ async fn execute_resumed_call(
             Ok(ResumedOutcome::Awaiting(Box::new(approval)))
         }
         ToolDispatch::AwaitingNestedApproval(nested) => Ok(ResumedOutcome::Paused(nested)),
+    }
+}
+
+/// Dispatches one resumed call, recovering the output it committed before a later callback failed.
+///
+/// `Ok((outcome, Some(error)))` is that committed output with the failure that followed it; an
+/// error with nothing committed is returned as it is.
+async fn dispatch_with_committed_output(
+    request: ToolDispatchRequest,
+) -> Result<(crate::tool::dispatch::ToolDispatchOutcome, Option<Error>)> {
+    let slot = Arc::new(std::sync::Mutex::new(None));
+    match dispatch_tool(request.with_output_committer(Arc::clone(&slot))).await {
+        Ok(outcome) => Ok((outcome, None)),
+        Err(error) => match slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(outcome) => Ok((outcome, Some(error))),
+            None => Err(error),
+        },
     }
 }
 
@@ -4491,7 +4585,9 @@ async fn run_one_turn(
         Ok(settled) => settled,
         Err(error) => {
             if let Some((processed, input)) = &recovery.handoff
-                && (recovery.handoff_reached || !recovery.nested_runs.is_empty())
+                && (recovery.handoff_reached
+                    || !recovery.nested_runs.is_empty()
+                    || recovery.post_invoke_failure)
             {
                 // Retain paid model output and completed sibling tools when a transfer callback
                 // fails. A committed transfer output prevents replaying its invocation after a
@@ -4546,9 +4642,12 @@ async fn run_one_turn(
                     .1
                     .record_turn(agent.public_id(), recovery.execution.outcomes().to_vec());
                 state.snapshot_event_seq(context.event_seqs);
+                if recovery.post_invoke_failure {
+                    state.set_tool_output_settlement_pending(true);
+                }
                 return Err(error.with_run_state(state.clone()));
             }
-            if !recovery.nested_runs.is_empty() {
+            if !recovery.nested_runs.is_empty() || recovery.post_invoke_failure {
                 // Retain paid-for calls, completed siblings and every failed child's routing.
                 // This mirrors the reference's tool-output committer on a failed batch.
                 state.record_generated_items(response.output().iter().cloned());
@@ -4573,6 +4672,10 @@ async fn run_one_turn(
                     .1
                     .record_turn(agent.public_id(), recovery.execution.outcomes().to_vec());
                 state.snapshot_event_seq(context.event_seqs);
+                if recovery.post_invoke_failure {
+                    state.set_tool_output_settlement_pending(true);
+                    return Err(error.with_run_state(state.clone()));
+                }
             }
             return Err(error);
         }

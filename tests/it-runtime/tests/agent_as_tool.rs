@@ -3472,3 +3472,116 @@ async fn an_agent_tools_session_is_preserved_through_nested_approval_resume() {
         );
     }
 }
+
+#[ra_macros::tool(timeout = Duration::from_millis(10), timeout_behavior = "raise_exception")]
+async fn propagating_deadline() -> &'static str {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    "late"
+}
+
+#[tokio::test]
+async fn a_nested_propagated_deadline_is_not_rewritten_as_the_agent_tools_own_timeout() {
+    let nested = AgentSpec::builder()
+        .id(AgentId::new("inner"))
+        .name("Inner")
+        .instructions("i")
+        .tool(Arc::new(propagating_deadline::tool().unwrap()))
+        .build()
+        .unwrap();
+    let tool = nested.as_tool().build().unwrap();
+    assert!(tool.options().timeout().is_none());
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "inner", json!({"input": "go"})),
+        tool_call("n-1", "n-call", "propagating_deadline", json!({})),
+        final_message("p-2", "done"),
+    ]);
+    Runner::run(request(orchestrator(tool), &resolver))
+        .await
+        .unwrap();
+    // The agent tool has no deadline of its own, so the formatter path is not taken; the
+    // explicit timeout classification keeps its stable failure observation.
+    assert_eq!(
+        tool_output_texts(&resolver.calls()[2].input),
+        [r#"{"error":{"code":"tool.timeout","tool":"inner"}}"#]
+    );
+}
+
+struct FailingNestedExtractor {
+    inner: AgentTool,
+    extractions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for FailingNestedExtractor {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+    fn options(&self) -> ToolOptions {
+        self.inner.options()
+    }
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.inner.call(context).await
+    }
+    async fn extract_custom_data(
+        &self,
+        _: &mut ra_core::tool::FunctionToolCustomDataContext<'_>,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        self.extractions.fetch_add(1, Ordering::SeqCst);
+        Err(Error::caller("nested extractor failed"))
+    }
+}
+
+#[tokio::test]
+async fn a_committed_nested_output_reaches_the_stop_policy_after_extraction_failure() {
+    let (nested, guarded_calls) = guarded_nested();
+    let extractions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let parent = AgentSpec::builder()
+        .id(AgentId::new("orchestrator"))
+        .name("Orchestrator")
+        .tool(Arc::new(FailingNestedExtractor {
+            inner: nested.as_tool().build().unwrap(),
+            extractions: extractions.clone(),
+        }))
+        .tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
+        .build()
+        .unwrap();
+    let resolver = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "nested", json!({"input":"go"})),
+        tool_call("n-1", "n-call-1", "guarded", json!({})),
+        final_message("n-2", "nested done"),
+    ]);
+    let first = Runner::run(request(parent.clone(), &resolver))
+        .await
+        .unwrap();
+    let failed = Runner::run(resume(
+        parent.clone(),
+        &resolver,
+        approve_all(&first, false),
+    ))
+    .await
+    .unwrap_err();
+    assert!(failed.to_string().contains("nested extractor failed"));
+    let state: RunState =
+        serde_json::from_value(serde_json::to_value(failed.run_state().unwrap()).unwrap()).unwrap();
+    assert_eq!(guarded_calls.lock().unwrap().len(), 1);
+    assert_eq!(extractions.load(Ordering::SeqCst), 1);
+    assert!(state.tool_output_settlement_pending());
+    assert!(state.nested_runs().is_empty());
+    let result = Runner::run(resume(parent, &resolver, state)).await;
+    assert!(
+        result.is_ok(),
+        "retry should stop from committed output without another model call: {result:?}"
+    );
+    let result = result.unwrap();
+    assert_eq!(
+        result.outcome().finish_reason(),
+        Some(FinishReason::ToolStop)
+    );
+    assert_eq!(result.final_output().unwrap().text_content(), "nested done");
+    assert_eq!(resolver.calls().len(), 3);
+    assert_eq!(extractions.load(Ordering::SeqCst), 1);
+    assert!(!result.state().tool_output_settlement_pending());
+}

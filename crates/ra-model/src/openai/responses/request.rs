@@ -13,7 +13,7 @@ use ra_core::{
         ModelToolDefinition, ToolChoice,
     },
     prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
-    tool::{ToolOutput, ToolOutputBlock},
+    tool::{ToolCaller, ToolOutput, ToolOutputBlock},
 };
 use serde_json::{Map, Value, json};
 
@@ -694,6 +694,9 @@ fn merge_tools(
             )));
         }
     }
+    if !discovery_output {
+        validate_programmatic_tool_calling(&lowered, tools, body.get("prompt"))?;
+    }
     lowered.reserve(tools.len() + handoffs.len());
 
     let mut custom_names = BTreeSet::new();
@@ -724,23 +727,18 @@ fn merge_tools(
             }
             custom_names.insert(tool.name().to_owned());
             let mut custom = custom_tool(tool);
+            if let Some(callers) = tool.allowed_callers() {
+                custom["allowed_callers"] = allowed_callers(callers)?;
+            }
             if tool.defer_loading() {
                 custom["defer_loading"] = Value::Bool(true);
             }
             lowered.push(custom);
             continue;
         }
-        let (name, description, schema, strict) = (
-            tool.name(),
-            tool.description(),
-            tool.input_schema(),
-            tool.strict(),
-        );
+        let name = tool.name();
         validate_function_name(name)?;
-        let mut function = function_tool(name, description, schema, strict);
-        if tool.defer_loading() {
-            function["defer_loading"] = Value::Bool(true);
-        }
+        let function = configured_function_tool(tool)?;
         if let Some(namespace) = tool.namespace() {
             namespaces.add(&mut lowered, namespace, tool, function, discovery_output)?;
             continue;
@@ -780,6 +778,127 @@ fn merge_tools(
         namespaced_names: namespaces.qualified_names,
         namespace_parts: namespaces.parts,
     })
+}
+
+fn configured_function_tool(tool: &ModelToolDefinition) -> Result<Value> {
+    let mut function = function_tool(
+        tool.name(),
+        tool.description(),
+        tool.input_schema(),
+        tool.strict(),
+    );
+    if let Some(schema) = tool.output_json_schema() {
+        function["output_schema"] = schema.clone();
+    }
+    if let Some(callers) = tool.allowed_callers() {
+        function["allowed_callers"] = allowed_callers(callers)?;
+    }
+    if tool.defer_loading() {
+        function["defer_loading"] = Value::Bool(true);
+    }
+    Ok(function)
+}
+
+fn allowed_callers(callers: &[ToolCaller]) -> Result<Value> {
+    serde_json::to_value(callers)
+        .map_err(|error| Error::caller("cannot serialize allowed callers").with_source(error))
+}
+
+/// The reference's `validate_responses_programmatic_tool_calling_configuration`.
+///
+/// The hosted `programmatic_tool_calling` tool has no protocol-neutral representation, so it can
+/// only arrive through `extra_body.tools`. A tool callable only from a hosted program cannot be
+/// reached without it. Only prompt-managed requests admit an opaque tool surface; ordinary
+/// requests must expose an eligible tool or discovery entry. Discovery output is a partial
+/// definition list and is converted without validating it as a complete request tool surface.
+fn validate_programmatic_tool_calling(
+    hosted: &[Value],
+    tools: &[ModelToolDefinition],
+    prompt: Option<&Value>,
+) -> Result<()> {
+    let programs = hosted
+        .iter()
+        .filter(|tool| {
+            tool.get("type").and_then(Value::as_str) == Some("programmatic_tool_calling")
+        })
+        .count();
+    if programs > 1 {
+        return Err(Error::caller(
+            "Only one `programmatic_tool_calling` tool is allowed when using OpenAI Responses \
+             models.",
+        ));
+    }
+    if programs == 1 {
+        let has_eligible = tools.iter().any(|tool| {
+            tool.allowed_callers()
+                .is_some_and(|callers| callers.contains(&ToolCaller::Programmatic))
+        }) || hosted.iter().any(|tool| {
+            programmatic_wire_callers(tool)
+                .is_some_and(|callers| callers.iter().any(|caller| caller == "programmatic"))
+        });
+        let has_search = tools.iter().any(|tool| tool.kind().is_tool_search())
+            || hosted
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"));
+        if has_eligible || has_search || prompt.is_some_and(|prompt| !prompt.is_null()) {
+            return Ok(());
+        }
+        return Err(Error::caller(
+            "`programmatic_tool_calling` requires at least one tool whose allowed_callers includes \
+             'programmatic', a tool_search tool, or an opaque prompt-managed tool surface.",
+        ));
+    }
+    if let Some(tool) = tools.iter().find(|tool| {
+        tool.allowed_callers().is_some_and(|callers| {
+            callers.contains(&ToolCaller::Programmatic) && !callers.contains(&ToolCaller::Direct)
+        })
+    }) {
+        return Err(Error::caller(format!(
+            "Tool `{}` only allows programmatic callers and requires a `programmatic_tool_calling` \
+             tool when using OpenAI Responses models.",
+            tool.qualified_name()
+        )));
+    }
+    if let Some(tool) = hosted.iter().find(|tool| {
+        programmatic_wire_callers(tool).is_some_and(|callers| {
+            callers.iter().any(|caller| caller == "programmatic")
+                && !callers.iter().any(|caller| caller == "direct")
+        })
+    }) {
+        // The reference's `_get_tool_display_name`.
+        let name = if tool.get("type").and_then(Value::as_str) == Some("mcp") {
+            format!(
+                "hosted MCP server `{}`",
+                tool.get("server_label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )
+        } else {
+            tool.get("name")
+                .or_else(|| tool.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        };
+        return Err(Error::caller(format!(
+            "Tool `{name}` only allows programmatic callers and requires a \
+             `programmatic_tool_calling` tool when using OpenAI Responses models."
+        )));
+    }
+    Ok(())
+}
+
+/// The eligible wire tool kinds corresponding to the reference's `_get_tool_allowed_callers`.
+fn programmatic_wire_callers(tool: &Value) -> Option<&[Value]> {
+    if !matches!(
+        tool.get("type").and_then(Value::as_str),
+        Some("function" | "custom" | "shell" | "apply_patch" | "mcp" | "code_interpreter")
+    ) {
+        return None;
+    }
+    tool.get("allowed_callers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
 }
 
 /// The namespaces a request advertises, built up as their functions are lowered.

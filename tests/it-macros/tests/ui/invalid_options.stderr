@@ -10,7 +10,7 @@ error: expected `true` or `false`
 6 | #[tool(strict = "yes")]
   |                 ^^^^^
 
-error: unsupported tool option; expected name, description, strict, use_docstring_info, is_enabled, needs_approval, failure_error_function, timeout, timeout_behavior, tool_input_guardrails, tool_output_guardrails, defer_loading, allowed_callers, or options
+error: unsupported tool option; expected name, description, strict, use_docstring_info, is_enabled, needs_approval, failure_error_function, timeout, timeout_behavior, timeout_error_function, custom_data_extractor, output_type, output_json_schema, tool_input_guardrails, tool_output_guardrails, defer_loading, allowed_callers, or options
  --> tests/ui/invalid_options.rs:9:8
   |
 9 | #[tool(unknown = true)]
@@ -52,8 +52,20 @@ error: `options` takes an adjustment such as `|options| options.with_concurrency
 27 | #[tool(options = ToolOptions::new())]
    |                  ^^^^^^^^^^^^^^^^^^
 
-error: this upstream option has no function-tool contract yet; see Docs/Function_Tool_Contract.md
-  --> tests/ui/invalid_options.rs:30:8
+error: output_type and output_json_schema cannot both be provided.
+  --> tests/ui/invalid_options.rs:30:51
    |
-30 | #[tool(output_json_schema = "schema")]
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+30 | #[tool(output_type = String, output_json_schema = "schema")]
+   |                                                   ^^^^^^^^
+
+error: expected an async callback path or sync(callback)
+  --> tests/ui/invalid_options.rs:33:33
+   |
+33 | #[tool(timeout_error_function = "formatter")]
+   |                                 ^^^^^^^^^^^
+
+error: expected an async callback path or sync(callback)
+  --> tests/ui/invalid_options.rs:36:32
+   |
+36 | #[tool(custom_data_extractor = true)]
+   |                                ^^^^

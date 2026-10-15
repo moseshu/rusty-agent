@@ -75,9 +75,31 @@ pub(super) fn expand(
         }
     } else {
         hooks.push(quote! {
-            async fn handle_failure(&self, _context: &#core::tool::ToolContext<'_>, _error: &#core::error::Error) -> #core::error::Result<::core::option::Option<#core::tool::ToolOutput>> {
+            fn uses_default_failure_handler(&self) -> bool { true }
+            async fn handle_failure(&self, __ra_context: &#core::tool::ToolContext<'_>, _error: &#core::error::Error) -> #core::error::Result<::core::option::Option<#core::tool::ToolOutput>> {
+                if self.output_schema.is_some() && __ra_context.caller() == #core::tool::ToolCaller::Programmatic {
+                    return ::core::result::Result::Ok(::core::option::Option::None);
+                }
                 ::core::result::Result::Ok(::core::option::Option::Some(#core::tool::ToolOutput::text("An error occurred while running the tool. Please try again.")))
             }
+        });
+    }
+    if let Some(timeout) = &options.timeout_error
+        && !matches!(timeout, Expr::Path(path) if path.path.is_ident("None"))
+    {
+        let call = callback(timeout, &quote!(__ra_context, __ra_error))?;
+        hooks.push(quote! {
+            async fn handle_timeout(&self, __ra_context: &#core::tool::ToolContext<'_>, __ra_error: &#core::tool::ToolTimeoutError) -> #core::error::Result<::core::option::Option<#core::tool::ToolOutput>> {
+                #core::tool::__private::function_output(#call?).map(::core::option::Option::Some)
+            }
+        });
+    }
+    if let Some(extractor) = &options.custom_data
+        && !matches!(extractor, Expr::Path(path) if path.path.is_ident("None"))
+    {
+        let call = callback(extractor, &quote!(__ra_context))?;
+        hooks.push(quote! {
+            async fn extract_custom_data(&self, __ra_context: &mut #core::tool::FunctionToolCustomDataContext<'_>) -> #core::error::Result<::core::option::Option<#core::tool::__private::serde_json::Map<::std::string::String, #core::tool::__private::serde_json::Value>>> { #call }
         });
     }
     configure.extend(execution(options, core)?);

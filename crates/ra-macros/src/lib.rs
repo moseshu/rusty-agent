@@ -35,6 +35,14 @@ pub fn derive_tool_input(input: TokenStream) -> TokenStream {
 /// only, as upstream), `timeout_behavior`, `tool_input_guardrails`, `tool_output_guardrails`
 /// (registered guardrail IDs), `defer_loading`, `allowed_callers`, and `options`, an adjustment
 /// `|options| ...` applied to the function-tool defaults before the explicit keywords.
+/// `timeout_error_function` accepts `(&ToolContext, &ToolTimeoutError)` and returns a
+/// `Result` containing a serializable value or native `ToolOutput`. `custom_data_extractor`
+/// accepts `&mut FunctionToolCustomDataContext` and returns `Result<Option<Map<String, Value>>>`.
+/// Both accept an async callback path, `sync(callback)`, or `None`.
+/// `output_type = MyType` generates a strict object schema and Serde validation;
+/// `output_json_schema = expression` supplies a strict object schema directly. They are mutually
+/// exclusive. Structured returns infer an output type when `allowed_callers` includes
+/// `"programmatic"`; strings, unit, and `serde_json::Value` retain untyped output behavior.
 /// Boolean policies accept a literal, an async callback path, or `sync(callback)`. Failure
 /// callbacks accept `(&ToolContext, &Error)` and return `Result<Option<ToolOutput>>`;
 /// `failure_error_function = None` selects error propagation.

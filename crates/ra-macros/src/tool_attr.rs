@@ -11,6 +11,7 @@ use syn::{
 
 use crate::tool_input::{documentation, ra_core_path};
 
+mod output;
 mod parameters;
 mod policies;
 
@@ -30,6 +31,10 @@ struct Options {
     output_guardrails: Option<Vec<Expr>>,
     defer_loading: Option<bool>,
     allowed_callers: Option<Vec<Expr>>,
+    timeout_error: Option<Expr>,
+    custom_data: Option<Expr>,
+    output_type: Option<Type>,
+    output_schema: Option<Expr>,
 }
 
 impl Options {
@@ -75,14 +80,26 @@ impl Options {
                 }
                 "defer_loading" => options.defer_loading = Some(bool_literal(&meta.value)?),
                 "allowed_callers" => options.allowed_callers = Some(callers(meta.value)?),
-                "timeout_error_function"
-                | "custom_data_extractor"
-                | "output_type"
-                | "output_json_schema" => {
-                    return Err(syn::Error::new_spanned(
-                        meta,
-                        "this upstream option has no function-tool contract yet; see Docs/Function_Tool_Contract.md",
-                    ));
+                "timeout_error_function" | "custom_data_extractor" => {
+                    if !matches!(&meta.value, Expr::Path(path) if path.path.is_ident("None")) {
+                        callback(&meta.value, &TokenStream::new())?;
+                    }
+                    if key == "timeout_error_function" {
+                        options.timeout_error = Some(meta.value);
+                    } else {
+                        options.custom_data = Some(meta.value);
+                    }
+                }
+                "output_type" => {
+                    let value = meta.value;
+                    if !matches!(&value, Expr::Path(path) if path.path.is_ident("None")) {
+                        options.output_type = Some(syn::parse2(quote!(#value))?);
+                    }
+                }
+                "output_json_schema" => {
+                    if !matches!(&meta.value, Expr::Path(path) if path.path.is_ident("None")) {
+                        options.output_schema = Some(meta.value);
+                    }
                 }
                 "docstring_style" => {
                     return Err(syn::Error::new_spanned(
@@ -93,10 +110,16 @@ impl Options {
                 _ => {
                     return Err(syn::Error::new_spanned(
                         meta,
-                        "unsupported tool option; expected name, description, strict, use_docstring_info, is_enabled, needs_approval, failure_error_function, timeout, timeout_behavior, tool_input_guardrails, tool_output_guardrails, defer_loading, allowed_callers, or options",
+                        "unsupported tool option; expected name, description, strict, use_docstring_info, is_enabled, needs_approval, failure_error_function, timeout, timeout_behavior, timeout_error_function, custom_data_extractor, output_type, output_json_schema, tool_input_guardrails, tool_output_guardrails, defer_loading, allowed_callers, or options",
                     ));
                 }
             }
+        }
+        if options.output_type.is_some() && options.output_schema.is_some() {
+            return Err(syn::Error::new_spanned(
+                options.output_schema.as_ref(),
+                "output_type and output_json_schema cannot both be provided.",
+            ));
         }
         Ok(options)
     }
@@ -326,6 +349,7 @@ pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result
         function.sig.ident.to_string().trim_start_matches("r#")
     );
     let (configure, hooks) = policies::expand(&options, &core)?;
+    let output_schema = output::construction(&options, &function.sig, &core);
     let (declared, validate_options) = policies::construction(&options, &core, synchronous);
     let cfg = configurations(&function)?;
     let companion = companion(&function, &implementation, &cfg);
@@ -351,6 +375,7 @@ pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result
                 origin: #core::tool::ToolOrigin,
                 function: #core::tool::FuncSchema,
                 options: #core::tool::ToolOptions,
+                output_schema: ::core::option::Option<#core::tool::FunctionToolOutputSchema>,
             }
             #validate_options
             /// Returns the declared policies: function-tool defaults, the `options` adjustment,
@@ -368,12 +393,14 @@ pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result
             /// Builds one instance with replacement policies; start from the declared options to keep defaults.
             pub fn __ra_tool_with_options(options: #core::tool::ToolOptions) -> #core::error::Result<impl #core::tool::Tool> {
                 __ra_validate_options(&options)?;
+                let output_schema = #output_schema;
                 ::core::result::Result::Ok(__RaTool {
                     origin: #core::tool::ToolOrigin::new(#tool_name)?,
                     function: #core::tool::FuncSchema::for_function_input::<__RaInput>(#tool_name, &[#(#required),*])?
                         .with_tool_context(#inject_context)
                         .with_return_type::<#output_type>(),
                     options,
+                    output_schema,
                 })
             }
             #[#support::async_trait]
@@ -382,6 +409,7 @@ pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result
                 fn schema(&self) -> &#core::tool::ToolSchema { self.function.tool_schema() }
                 fn func_schema(&self) -> ::core::option::Option<&#core::tool::FuncSchema> { ::core::option::Option::Some(&self.function) }
                 fn options(&self) -> #core::tool::ToolOptions { self.options.clone() }
+                fn output_schema(&self) -> ::core::option::Option<&#core::tool::FunctionToolOutputSchema> { self.output_schema.as_ref() }
                 async fn call(&self, mut __ra_context: #core::tool::ToolContext<'_>) -> #core::error::Result<#core::tool::ToolOutput> {
                     let __ra_input = match __ra_context.take_decoded_input::<__RaInput>()? {
                         ::core::option::Option::Some(input) => input,
@@ -418,10 +446,10 @@ fn invocation(
     };
     let body = quote! {
         #invoke
-        #support::function_output(__ra_output)
+        #support::function_output_with_schema(__ra_output, __ra_output_schema.as_ref(), #tool_name)
     };
     if async_function {
-        body
+        quote! { let __ra_output_schema = self.output_schema.clone(); #body }
     } else {
         let context = if inject_context {
             quote!(let mut __ra_owned_context = __ra_context.into_owned();)
@@ -434,6 +462,7 @@ fn invocation(
             quote!()
         };
         quote! {
+            let __ra_output_schema = self.output_schema.clone();
             #context
             #support::tokio::task::spawn_blocking(move || {
                 #borrow

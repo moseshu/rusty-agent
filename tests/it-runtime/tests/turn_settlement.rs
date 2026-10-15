@@ -1644,7 +1644,10 @@ async fn test_turn_settlement_17() {
     .unwrap();
     let output = output_for(settled.new_step_items(), "call-1");
     assert!(output.is_error());
-    assert_eq!(output.output()["error"]["code"], json!("tool.timeout"));
+    assert_eq!(
+        stored_text(output),
+        Some("Tool 'slow' timed out after 0.005 seconds.".to_owned())
+    );
 
     let propagating = Arc::new(
         ScriptedTool::new("slow", Behavior::Sleep(Duration::from_millis(80))).with_options(

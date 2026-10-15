@@ -13,12 +13,25 @@ use ra_core::{
 /// Refuses the first of `tools` advertised in a namespace, on `backend`: the reference's
 /// `ensure_function_tool_supports_responses_only_features`.
 pub(crate) fn ensure_unnamespaced(tools: &[ModelToolDefinition], backend: &str) -> Result<()> {
-    match tools.iter().find(|tool| tool.namespace().is_some()) {
-        Some(tool) => Err(Error::caller(format!(
-            "The following function-tool features are only supported with OpenAI Responses \
-             models: tool namespace. Tool `{}` cannot be used with {backend}.",
-            tool.qualified_name()
-        ))),
-        None => Ok(()),
+    for tool in tools {
+        let mut features = Vec::new();
+        if tool.namespace().is_some() {
+            features.push("tool namespace");
+        }
+        if tool.allowed_callers().is_some() {
+            features.push("allowed_callers");
+        }
+        if tool.output_json_schema().is_some() {
+            features.push("output_json_schema");
+        }
+        if !features.is_empty() {
+            return Err(Error::caller(format!(
+                "The following function-tool features are only supported with OpenAI Responses \
+             models: {}. Tool `{}` cannot be used with {backend}.",
+                features.join(", "),
+                tool.qualified_name()
+            )));
+        }
     }
+    Ok(())
 }

@@ -4,7 +4,8 @@
 //! entry points applies is not a preference: a schema this framework *generates* from a Rust type
 //! is normalized ([`ensure_strict_json_schema`]), because the caller never wrote it and cannot fix
 //! it; a schema a caller *hands over* is only verified ([`verify_strict_json_schema`]), because
-//! rewriting it would silently change a contract its author chose.
+//! rewriting it would silently change a contract its author chose. Function-tool output schemas
+//! are the reference's explicit exception: their declaration normalizes even a handwritten schema.
 //!
 //! The `label` every entry point takes names the declaration in error messages. It is a parameter
 //! rather than a constant because the same violation reads very differently depending on which

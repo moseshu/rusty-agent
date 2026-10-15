@@ -513,7 +513,9 @@ impl RunItem {
             RunItemKind::Message(item) => Some(ModelInputItem::Message(item.clone())),
             RunItemKind::Reasoning(item) => Some(ModelInputItem::Reasoning(item.clone())),
             RunItemKind::ToolCall(item) => Some(ModelInputItem::ToolCall(item.clone())),
-            RunItemKind::ToolCallOutput(item) => Some(ModelInputItem::ToolCallOutput(item.clone())),
+            RunItemKind::ToolCallOutput(item) => Some(ModelInputItem::ToolCallOutput(
+                item.clone().without_custom_data(),
+            )),
             RunItemKind::HandoffCall(item) => Some(ModelInputItem::HandoffCall(item.clone())),
             RunItemKind::HandoffOutput(item) => Some(ModelInputItem::HandoffOutput(item.clone())),
             RunItemKind::McpListTools(item) => Some(ModelInputItem::McpListTools(item.clone())),

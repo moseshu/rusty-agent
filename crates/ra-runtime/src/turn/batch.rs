@@ -107,6 +107,7 @@ pub(crate) struct TurnRecovery {
     pub(crate) nested_runs: Vec<NestedRunRef>,
     pub(crate) handoff: Option<(ProcessedResponse, ra_core::agent::HandoffInputData)>,
     pub(crate) handoff_reached: bool,
+    pub(crate) post_invoke_failure: bool,
     /// The turn's complete records when a handoff filter changed what the turn stores.
     ///
     /// The model's own records were already streamed before the filter ran upstream, so the loop
@@ -129,6 +130,7 @@ struct DispatchTaskResult {
     call_id: CallId,
     tool: ToolOrigin,
     result: Result<ToolDispatchOutcome>,
+    committed_output: Option<ToolDispatchOutcome>,
 }
 
 /// The error classes used to choose one batch-level outcome when several calls fail together.
@@ -157,6 +159,7 @@ struct CollectedDispatches {
     completed: Vec<CompletedDispatch>,
     failure: Option<RankedFailure>,
     nested_runs: Vec<(usize, NestedRunRef)>,
+    post_invoke_failure: bool,
 }
 
 impl TurnExecution {
@@ -406,7 +409,17 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
     )
     .await;
 
-    if !collected.nested_runs.is_empty() {
+    // Retaining a committed output after a post-output callback failed is a product extension:
+    // the reference leaves a failed fresh turn without resumable state. It is kept only when every
+    // call in the batch is answered or resumable. A call that failed, was cancelled by the failure,
+    // or was never found has no output here, and a checkpoint without it would replay that call to
+    // the model unanswered and never run it.
+    if collected.post_invoke_failure && !every_call_settled(&collected, processed) {
+        collected.post_invoke_failure = false;
+    }
+
+    if !collected.nested_runs.is_empty() || collected.post_invoke_failure {
+        let post_invoke_failure = collected.post_invoke_failure;
         collected.nested_runs.sort_by_key(|(order, _)| *order);
         let nested_runs = std::mem::take(&mut collected.nested_runs)
             .into_iter()
@@ -417,6 +430,7 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
         if let Some(recovery) = request.recovery {
             recovery.execution = execution;
             recovery.nested_runs = nested_runs;
+            recovery.post_invoke_failure = post_invoke_failure;
         }
         // Preserve the cancellation outcome while retaining the completed work it interrupted.
         request.cancel.ensure_not_cancelled()?;
@@ -891,6 +905,9 @@ fn spawn_dispatch_task(
         .spawn(
             crate::agent::tool::parent::carry(async move {
                 let started = Instant::now();
+                let committer = Arc::new(std::sync::Mutex::new(None));
+                let dispatch_request =
+                    dispatch_request.with_output_committer(Arc::clone(&committer));
                 // 1. Acquire batch concurrency slot permit before entering third-party code.
                 // This bounds peak concurrent needs_approval(), resource_claims(), and call()
                 // invocations to `max_function_tool_concurrency`.
@@ -915,6 +932,10 @@ fn spawn_dispatch_task(
                     call_id,
                     tool,
                     result,
+                    committed_output: committer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take(),
                 }
             })
             .instrument(task_span),
@@ -1066,6 +1087,22 @@ async fn drain_dispatches(
 
 /// Records one joined task. It is shared by normal collection and drain so the latter cannot lose
 /// a failure merely because a different tool caused the batch to begin shutting down.
+/// Whether every function action ended in a dispatch — an output, an approval, or a committed
+/// output — or in a nested run's routing, and no call names an unadvertised tool.
+fn every_call_settled(collected: &CollectedDispatches, processed: &ProcessedResponse) -> bool {
+    processed.tools_not_found().is_empty()
+        && (0..processed.functions().len()).all(|order| {
+            collected
+                .completed
+                .iter()
+                .any(|completed| completed.order == order)
+                || collected
+                    .nested_runs
+                    .iter()
+                    .any(|(nested, _)| *nested == order)
+        })
+}
+
 fn record_task_result(
     joined: std::result::Result<(Id, DispatchTaskResult), JoinError>,
     task_orders: &mut HashMap<Id, usize>,
@@ -1090,6 +1127,19 @@ fn record_task_result(
                 && let Some(nested) = error.nested_run()
             {
                 collected.nested_runs.push((task.order, nested.clone()));
+            }
+            if task.result.is_err()
+                && let Some(committed) = task.committed_output
+            {
+                let (dispatch, guardrails) = committed.into_parts();
+                collected.post_invoke_failure = true;
+                collected.completed.push(CompletedDispatch {
+                    order: task.order,
+                    call_id: task.call_id.clone(),
+                    tool: task.tool.clone(),
+                    dispatch,
+                    guardrails,
+                });
             }
             match task.result {
                 Ok(outcome) => {

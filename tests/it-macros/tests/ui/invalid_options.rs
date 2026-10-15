@@ -27,7 +27,13 @@ fn duplicate_callers() {}
 #[tool(options = ToolOptions::new())]
 fn replacement_options() {}
 
-#[tool(output_json_schema = "schema")]
-fn unavailable() {}
+#[tool(output_type = String, output_json_schema = "schema")]
+fn conflicting_output() {}
+
+#[tool(timeout_error_function = "formatter")]
+async fn invalid_timeout_formatter() {}
+
+#[tool(custom_data_extractor = true)]
+fn invalid_extractor() {}
 
 fn main() {}

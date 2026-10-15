@@ -112,7 +112,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(11);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(12);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -173,13 +173,19 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          retained after failures so a restored checkpoint cannot repeat their side effects.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(11),
         "Persisted handoffs deferred by same-turn tool approvals, their selected targets, the \
          declaration each call was bound to, their unpublished outputs and model-input \
          decomposition, and handoff \
          projections installed before the run stored any record. An older runtime forgets the \
          pending control transfer and continues the source agent with an unanswered handoff call, \
          and refuses a projection whose boundary record a filter removed.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted pending settlement of committed tool outputs after a post-output callback \
+         fails. An older runtime may skip the tool stop policy once the last nested approval \
+         has been removed and call the model instead of concluding from the saved output.",
     ),
 ];
 
@@ -1025,6 +1031,8 @@ pub struct RunState {
     pending_interruption_resolutions: Vec<PendingInterruptionResolution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     started_tool_continuations: Vec<ItemId>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    tool_output_settlement_pending: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
@@ -1136,6 +1144,8 @@ struct RunStateRecord {
     pending_interruption_resolutions: Vec<PendingInterruptionResolution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     started_tool_continuations: Vec<ItemId>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    tool_output_settlement_pending: bool,
     #[serde(default)]
     permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_input_history_is_complete")]
@@ -1198,6 +1208,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_interruptions,
             pending_interruption_resolutions,
             started_tool_continuations,
+            tool_output_settlement_pending,
             permission_rules,
             input_history_is_complete,
             handoff_projection,
@@ -1339,6 +1350,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_interruptions,
             pending_interruption_resolutions,
             started_tool_continuations,
+            tool_output_settlement_pending,
             permission_rules,
             input_history_is_complete,
             handoff_projection,
@@ -1390,6 +1402,7 @@ impl RunState {
             pending_interruptions: Vec::new(),
             pending_interruption_resolutions: Vec::new(),
             started_tool_continuations: Vec::new(),
+            tool_output_settlement_pending: false,
             permission_rules: Vec::new(),
             input_history_is_complete: true,
             handoff_projection: None,
@@ -1407,6 +1420,22 @@ impl RunState {
     #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
         self.schema_version
+    }
+
+    /// Whether committed tool outputs still need the interrupted turn's stop-policy settlement.
+    ///
+    /// This is the persisted subset of the reference's pending step needed after a post-output
+    /// callback fails. It remains meaningful when no approval or nested run is left to resume.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn tool_output_settlement_pending(&self) -> bool {
+        self.tool_output_settlement_pending
+    }
+
+    /// Records or settles the pending stop-policy phase without repeating committed callables.
+    #[doc(hidden)]
+    pub const fn set_tool_output_settlement_pending(&mut self, pending: bool) {
+        self.tool_output_settlement_pending = pending;
     }
 
     /// Stable identity of the run this state belongs to.
