@@ -90,6 +90,7 @@ use ra_core::{
 use tokio::sync::mpsc;
 use tracing::{Instrument, info_span, warn};
 
+mod entry;
 mod grouping;
 mod live_settings;
 mod output;
@@ -100,6 +101,7 @@ pub mod session_persistence;
 pub mod stream;
 
 pub use crate::turn::prepare::ActionSurfaceBudget;
+pub use entry::{AgentRunner, RunInput};
 
 pub(crate) use live_settings::LiveRunSettings;
 pub use pending_input::PendingInput;

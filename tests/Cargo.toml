@@ -11,6 +11,7 @@ resolver = "3"
 # "属于本 workspace 却没登记"。
 exclude = ["test-gemini"]
 members = [
+    "it-rusty-agent",
     "it-core",
     "it-macros",
     "it-model",

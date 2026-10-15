@@ -26,6 +26,7 @@ use std::process::{Command, Stdio};
 
 use crate::gate::Outcome;
 use crate::source;
+use xtask::tests_workspace_policy::has_path_dependency;
 
 /// The host for cross-crate contracts; it corresponds to no single crate under test.
 const CROSS_CRATE_HOST: &str = "it-e2e";
@@ -154,8 +155,7 @@ fn validate_layout(manifest: &Path) -> Vec<String> {
 
         let host_manifest = tests_root.join(&host).join("Cargo.toml");
         let text = std::fs::read_to_string(&host_manifest).unwrap_or_default();
-        let expected = format!("{crate_name} = {{ path = \"../../crates/{crate_name}\"");
-        if !text.contains(&expected) {
+        if !has_path_dependency(&text, &crate_name) {
             violations.push(format!(
                 "{}：宿主 `{host}` 没有通过 path 依赖 `{crate_name}`",
                 source::relative(&host_manifest),

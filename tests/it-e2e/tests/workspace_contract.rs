@@ -30,9 +30,8 @@ fn test_workspace_contract_01() {
 
         let host_manifest = root.join("tests").join(&host).join("Cargo.toml");
         let text = read(&host_manifest);
-        let expected_path = format!("{crate_name} = {{ path = \"../../crates/{crate_name}\"");
         assert!(
-            text.contains(&expected_path),
+            xtask::tests_workspace_policy::has_path_dependency(&text, &crate_name),
             "{} 没有通过 path 依赖被测 crate `{crate_name}`",
             host_manifest.display()
         );

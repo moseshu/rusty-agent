@@ -21,6 +21,8 @@
 pub mod anthropic;
 #[cfg(feature = "compat")]
 pub mod compat;
+// Shared codec helpers; only the provider codecs use them.
+#[cfg(any(feature = "openai", feature = "anthropic"))]
 pub(crate) mod custom_tools;
 pub mod fallback;
 #[cfg(feature = "openai")]
@@ -28,5 +30,6 @@ pub mod openai;
 pub mod protocol;
 pub mod provider;
 pub mod retry;
+#[cfg(any(feature = "openai", feature = "anthropic"))]
 pub(crate) mod tool_namespaces;
 pub mod usage;

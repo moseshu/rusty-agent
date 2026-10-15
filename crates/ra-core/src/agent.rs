@@ -47,6 +47,20 @@ pub use handoff::{
 
 struct DynamicPromptFn<F>(F);
 
+struct BorrowingDynamicPromptFn<F>(F);
+
+#[async_trait]
+impl<F> DynamicPromptHandler for BorrowingDynamicPromptFn<F>
+where
+    F: for<'a> Fn(&'a RunContext) -> futures::future::BoxFuture<'a, Result<ResolvedPrompt>>
+        + Send
+        + Sync,
+{
+    async fn resolve(&self, context: &RunContext) -> Result<ResolvedPrompt> {
+        (self.0)(context).await
+    }
+}
+
 #[async_trait]
 impl<F, Fut> DynamicPromptHandler for DynamicPromptFn<F>
 where
@@ -476,6 +490,20 @@ impl AgentInstructions {
         Self::dynamic(Arc::new(DynamicPromptFn(f)))
     }
 
+    /// Creates asynchronous instructions that may borrow the live context across an await.
+    ///
+    /// Return `Box::pin(async move { ... })` from the closure. Missing or mismatched application
+    /// context still returns `None` from `RunContext::app_context`; the callback decides its error.
+    pub fn dynamic_async_fn<F>(f: F) -> Self
+    where
+        F: for<'a> Fn(&'a RunContext) -> futures::future::BoxFuture<'a, Result<ResolvedPrompt>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::dynamic(Arc::new(BorrowingDynamicPromptFn(f)))
+    }
+
     /// Returns the static text, or `None` for a dynamic source.
     #[must_use]
     pub fn as_static(&self) -> Option<&str> {
@@ -840,6 +868,18 @@ impl AgentSpecBuilder {
         Fut: Future<Output = Result<ResolvedPrompt>> + Send + 'static,
     {
         self.instructions = Some(AgentInstructions::dynamic_fn(f));
+        self
+    }
+
+    /// Sets an async instruction callback that may borrow the live context across an await.
+    pub fn dynamic_instructions_async_fn<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&'a RunContext) -> futures::future::BoxFuture<'a, Result<ResolvedPrompt>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.instructions = Some(AgentInstructions::dynamic_async_fn(f));
         self
     }
 

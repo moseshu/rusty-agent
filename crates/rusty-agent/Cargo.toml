@@ -1,0 +1,25 @@
+[package]
+name = "rusty-agent"
+description = "Convenient framework entry points and unified public exports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["openai"]
+openai = ["ra-model/openai"]
+anthropic = ["ra-model/anthropic"]
+compat = ["ra-model/compat"]
+sqlite = ["ra-session/sqlite"]
+
+[dependencies]
+ra-core.workspace = true
+ra-macros.workspace = true
+ra-runtime.workspace = true
+ra-model = { path = "../ra-model", version = "0.2.2", default-features = false }
+ra-session = { path = "../ra-session", version = "0.2.2", default-features = false }

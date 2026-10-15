@@ -18,7 +18,7 @@
 use ra_core::{
     cancel::{CancelOnDrop, CancelReason, DRAIN_GRACE},
     error::Result,
-    item::{AgentId, Message, RunItem},
+    item::{AgentId, Message, MessageRole, RunItem, RunItemKind},
     model::RawResponseEvent,
 };
 use std::sync::Arc;
@@ -74,6 +74,24 @@ pub enum RunStreamEvent {
     Finished(RunOutcome),
 }
 
+impl RunStreamEvent {
+    /// A settled message or an intentionally unrecorded final delivery.
+    ///
+    /// Raw provider deltas are never interpreted as messages. Render either those deltas or
+    /// settled text for a given call; concatenating both would duplicate the answer.
+    #[must_use]
+    pub fn message(&self) -> Option<&Message> {
+        match self {
+            Self::Item(item) => match item.kind() {
+                RunItemKind::Message(message) => Some(message),
+                _ => None,
+            },
+            Self::FinalMessage(message) => Some(message),
+            _ => None,
+        }
+    }
+}
+
 /// A run in progress, with its events and its eventual outcome.
 ///
 /// **Draining the events does not consume the result.** A stream that only yielded events would
@@ -111,6 +129,35 @@ impl RunStream {
     /// Waits for the next event, or `None` once the run has emitted its last one.
     pub async fn next_event(&mut self) -> Option<RunStreamEvent> {
         self.events.recv().await
+    }
+
+    /// Reads the next settled record, consuming other events on the same cursor.
+    ///
+    /// Unrecorded final deliveries are not records; use [`Self::next_event`] to observe them, or
+    /// [`Self::next_text`] for assistant text. The final result remains available via [`Self::finish`].
+    pub async fn next_item(&mut self) -> Option<RunItem> {
+        while let Some(event) = self.next_event().await {
+            if let RunStreamEvent::Item(item) = event {
+                return Some(item);
+            }
+        }
+        None
+    }
+
+    /// Reads the next settled assistant message's text, including unrecorded final deliveries.
+    ///
+    /// Consumes other events on the same cursor and skips raw provider deltas, so text is not
+    /// appended twice. Each value is a complete message, not a token delta. This does not enable
+    /// partial messages or change the run's persistence. The result is still read with [`Self::finish`].
+    pub async fn next_text(&mut self) -> Option<String> {
+        while let Some(event) = self.next_event().await {
+            if let Some(message) = event.message()
+                && message.role() == MessageRole::Assistant
+            {
+                return Some(message.text_content());
+            }
+        }
+        None
     }
 
     /// Waits for the run to end and returns its result.

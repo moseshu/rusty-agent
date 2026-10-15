@@ -79,6 +79,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-tools", Layer::Reusable),
     ("ra-flow", Layer::Reusable),
     ("ra-patch", Layer::Reusable),
+    ("rusty-agent", Layer::Reusable),
     ("ra-coding", Layer::Product),
     ("ra-assistant", Layer::Product),
     ("ra-cli", Layer::Binary),
@@ -90,6 +91,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("handoffs", Layer::Binary),
     ("custom_tools", Layer::Binary),
     ("structured_output", Layer::Binary),
+    ("basic_agent", Layer::Binary),
 ];
 
 /// The direct internal dependencies each crate's responsibility table allows.
@@ -117,6 +119,17 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-macros", &[]),
     // See above: this is dependency inversion, not something nobody got around to adding.
     ("ra-runtime", &["ra-core"]),
+    // The facade assembles public APIs; it must never be a dependency of the kernel or services.
+    (
+        "rusty-agent",
+        &[
+            "ra-core",
+            "ra-runtime",
+            "ra-macros",
+            "ra-model",
+            "ra-session",
+        ],
+    ),
     ("ra-model", &["ra-core"]),
     ("ra-prompt", &["ra-core"]),
     ("ra-context", &["ra-core"]),
@@ -196,6 +209,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // it is the admission that the extension surface has a hole. See MVP acceptance item 6b.
     ("minimal_agent", &["ra-core", "ra-runtime"]),
     ("structured_output", &["ra-core", "ra-model", "ra-runtime"]),
+    ("basic_agent", &["rusty-agent"]),
     // Provider-backed examples consume shipped adapters and Session implementations directly.
     (
         "handoffs",

@@ -61,6 +61,12 @@ pub struct AgentBinding {
     pub(crate) tool_search_cache: Arc<crate::tool::search::ToolSearchHandlerCache>,
 }
 
+impl From<Arc<AgentSpec>> for AgentBinding {
+    fn from(agent: Arc<AgentSpec>) -> Self {
+        Self::direct(agent)
+    }
+}
+
 impl AgentBinding {
     /// The user's agent runs exactly as they configured it.
     ///

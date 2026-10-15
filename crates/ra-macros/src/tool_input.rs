@@ -52,10 +52,17 @@ pub(crate) fn ra_core_path() -> syn::Result<TokenStream> {
             let ident = format_ident!("{name}");
             Ok(quote!(::#ident))
         }
-        Err(error) => Err(syn::Error::new(
-            Span::call_site(),
-            format!("tool macro could not find the `ra-core` dependency: {error}"),
-        )),
+        Err(error) => match crate_name("rusty-agent") {
+            Ok(FoundCrate::Itself) => Ok(quote!(crate::core)),
+            Ok(FoundCrate::Name(name)) => {
+                let ident = format_ident!("{name}");
+                Ok(quote!(::#ident::core))
+            }
+            Err(_) => Err(syn::Error::new(
+                Span::call_site(),
+                format!("tool macro requires a `ra-core` or `rusty-agent` dependency: {error}"),
+            )),
+        },
     }
 }
 

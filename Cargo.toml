@@ -29,6 +29,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
+rusty-agent = { path = "crates/rusty-agent", version = "0.2.2" }
 # --- 内部 crate ---
 ra-core = { path = "crates/ra-core", version = "0.2.2" }
 ra-macros = { path = "crates/ra-macros", version = "0.2.2" }

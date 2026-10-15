@@ -7,10 +7,10 @@
 //! repository pins the toolchain to 1.97.1 stable (`rust-toolchain.toml`). Making CI install a
 //! second toolchain for one gate costs more than it returns.
 //!
-//! This scans source directly with `syn` instead. **It is genuinely less precise**: `pub use`
-//! re-exports, `#[cfg]` conditional compilation, and generic impl expansion are all invisible to
-//! it. But what the gate has to catch is "a public item was deleted / a signature changed / one
-//! quietly appeared", and a source-level scan catches all three, which is enough. If nightly ever
+//! This scans source directly with `syn` instead. **It is less precise**: re-export declarations
+//! are recorded but not resolved, and `#[cfg]` conditional compilation and generic impl expansion
+//! are not evaluated. The gate catches deleted public items, changed signatures, and new items
+//! appearing without a baseline update. If nightly ever
 //! becomes acceptable, switching back to `cargo public-api` means replacing this module only —
 //! the baseline format and the gate logic stay as they are.
 //!
@@ -183,6 +183,9 @@ fn one_line(tokens: impl ToTokens) -> String {
 fn collect(items: &[Item], module: &str, out: &mut BTreeSet<String>) {
     for item in items {
         match item {
+            Item::Use(export) if is_public(&export.vis) => {
+                out.insert(format!("use {module}::{}", one_line(&export.tree)));
+            }
             Item::Struct(s) if is_public(&s.vis) => {
                 out.insert(format!("struct {module}::{}", s.ident));
                 for field in &s.fields {

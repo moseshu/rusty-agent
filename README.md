@@ -114,6 +114,17 @@ Take every crate from the same tag. Crates from two tags are two copies of `ra-c
 their types do not interoperate. The crates declare Rust 1.88 as their minimum supported
 version.
 
+On the current checkout, `rusty-agent` provides a unified import surface and a configured
+`AgentRunner`: configure a shipped `ProviderRegistry` once, then call
+`runner.run(agent, "Hello").await?`. Optional session, context, or configuration goes through
+`runner.request(agent, input).with_session(session).run().await?`. The explicit `RunRequest`
+entry remains available. See the [basic agent example](examples/basic_agent/README.md) and
+[run entry contract](Docs/Run_Entry_Contract.md) for sync, streaming, recovery, and feature options.
+
+```bash
+cargo run -p basic_agent -- --check
+```
+
 ### Function tools
 
 On this checkout, `#[ra_macros::tool]` preserves a sync or async function and adds

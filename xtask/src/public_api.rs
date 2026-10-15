@@ -23,6 +23,7 @@ use crate::source;
 /// the reference product — a product's public surface is not a framework contract, and it changing
 /// with the business is normal.
 const TRACKED: &[&str] = &[
+    "rusty-agent",
     "ra-core",
     "ra-macros",
     "ra-model",
