@@ -173,11 +173,12 @@ pub fn build_profile(request: &ConfinementRequest) -> Result<SeatbeltProfile, Sa
             policy.push_str(")\n");
             for (index, root) in request.readable_roots().iter().enumerate() {
                 let key = format!("READABLE_ROOT_{index}");
-                params.push((key.clone(), normalize_root(root)?));
-                let _ = write!(
+                let root = normalize_root(root)?;
+                append_ancestor_access(&mut policy, &key, &root);
+                params.push((key.clone(), root));
+                let _ = writeln!(
                     policy,
-                    "(allow file-read-metadata file-test-existence (path-ancestors (param \"{key}\")))\n\
-                     (allow file-read* file-test-existence file-map-executable (subpath (param \"{key}\")))\n"
+                    "(allow file-read* file-test-existence file-map-executable (subpath (param \"{key}\")))"
                 );
             }
         }
@@ -197,14 +198,24 @@ pub fn build_profile(request: &ConfinementRequest) -> Result<SeatbeltProfile, Sa
     policy.push_str("\n; Writes: only the roots this policy declared.\n");
     for (index, root) in request.writable_roots().iter().enumerate() {
         let key = format!("WRITABLE_ROOT_{index}");
-        params.push((key.clone(), normalize_root(root)?));
+        let root = normalize_root(root)?;
+        append_ancestor_access(&mut policy, &key, &root);
         // A writable root is readable too, at every level: a command that may change a file it
         // cannot read is a combination no caller has ever wanted and every editor breaks on.
-        let _ = write!(
-            policy,
-            "(allow file-read-metadata file-test-existence (path-ancestors (param \"{key}\")))\n\
-             (allow file-read* file-test-existence file-map-executable file-write* (subpath (param \"{key}\")))\n"
-        );
+        if root.parent().is_none() {
+            // Codex uses this regex for full-disk writes instead of an unfiltered write grant.
+            let _ = writeln!(
+                policy,
+                "(allow file-read* file-test-existence file-map-executable (subpath (param \"{key}\")))\n\
+                 (allow file-write* (regex #\"^/\"))"
+            );
+        } else {
+            let _ = writeln!(
+                policy,
+                "(allow file-read* file-test-existence file-map-executable file-write* (subpath (param \"{key}\")))"
+            );
+        }
+        params.push((key, root));
     }
 
     if request.network().is_allowed() {
@@ -225,6 +236,16 @@ pub fn build_profile(request: &ConfinementRequest) -> Result<SeatbeltProfile, Sa
     }
 
     Ok(SeatbeltProfile { policy, params })
+}
+
+fn append_ancestor_access(policy: &mut String, key: &str, root: &Path) {
+    // The filesystem root has no ancestors; path-ancestors would expand to an empty filter.
+    if root.parent().is_some() {
+        let _ = writeln!(
+            policy,
+            "(allow file-read-metadata file-test-existence (path-ancestors (param \"{key}\")))"
+        );
+    }
 }
 
 /// Turns a declared root into the path the kernel will match against.

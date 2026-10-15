@@ -379,6 +379,48 @@ fn test_seatbelt_denies_by_default_and_names_every_root_as_a_parameter() {
     );
 }
 
+/// The filesystem root grants exactly what Codex's full-disk branches grant, and never asks
+/// `sandbox-exec` for the ancestors of `/`, which it rejects as an empty filter.
+#[test]
+fn test_seatbelt_grants_the_filesystem_root_with_codex_full_disk_rules() {
+    let writable = ra_exec::sandbox::seatbelt::build_profile(&request_for(
+        SandboxLevel::WorkspaceWrite,
+        NetworkAccess::Denied,
+        &[Path::new("/")],
+    ))
+    .expect("profile");
+    assert!(
+        writable
+            .policy()
+            .contains("(allow file-write* (regex #\"^/\"))"),
+        "{}",
+        writable.policy()
+    );
+    assert!(
+        !writable.policy().contains("path-ancestors"),
+        "{}",
+        writable.policy()
+    );
+
+    let readable = SandboxPolicy::new(SandboxLevel::Isolated)
+        .with_network(NetworkAccess::Denied)
+        .with_readable_root("/");
+    let readable = resolve(stub(&STUB_ISOLATED), readable).expect("stub delivers every level");
+    let readable = readable
+        .request()
+        .expect("a confined command has a request");
+    let readable = ra_exec::sandbox::seatbelt::build_profile(readable).expect("profile");
+    assert!(
+        readable
+            .policy()
+            .contains("(subpath (param \"READABLE_ROOT_0\"))"),
+        "{}",
+        readable.policy()
+    );
+    assert!(!readable.policy().contains("path-ancestors"));
+    assert!(!readable.policy().contains("file-write* (regex"));
+}
+
 #[test]
 fn test_seatbelt_opens_the_network_only_when_the_policy_allows_it() {
     let allowed = ra_exec::sandbox::seatbelt::build_profile(&request_for(
@@ -469,6 +511,107 @@ fn canonical_temp() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("temp dir");
     let path = dir.path().canonicalize().expect("canonicalize");
     (dir, path)
+}
+
+/// A full-disk grant must still launch through Seatbelt and keep the network policy in force.
+#[cfg(target_os = "macos")]
+#[rstest::rstest]
+#[case(SandboxLevel::WorkspaceWrite, NetworkAccess::Denied)]
+#[case(SandboxLevel::WorkspaceWrite, NetworkAccess::Allowed)]
+#[case(SandboxLevel::Isolated, NetworkAccess::Denied)]
+#[case(SandboxLevel::Isolated, NetworkAccess::Allowed)]
+#[tokio::test]
+async fn test_a_writable_filesystem_root_starts_commands_and_preserves_network_policy(
+    #[case] level: SandboxLevel,
+    #[case] network: NetworkAccess,
+) {
+    let (_guard, workspace) = canonical_temp();
+    let manager = confined_manager(Path::new("/"), level, network);
+    let output = run_in(
+        &manager,
+        &workspace,
+        "printf written > root.txt && cat root.txt",
+    )
+    .await;
+    assert_eq!(output.exit_code(), Some(0), "{}", output.stderr());
+    assert_eq!(output.stdout(), "written");
+    assert_eq!(
+        std::fs::read(workspace.join("root.txt")).unwrap(),
+        b"written"
+    );
+    let sandbox = output.sandbox().expect("Seatbelt remains in force");
+    assert_eq!(sandbox.backend(), Some("seatbelt"));
+    assert_eq!(sandbox.level(), level);
+    assert_eq!(sandbox.network(), network);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    TcpStream::connect(address).expect("host can reach the listener");
+    let probe = format!(
+        "exec 3<>/dev/tcp/127.0.0.1/{} && printf reached",
+        address.port()
+    );
+    let probe = ExecRequest::new(probe)
+        .with_shell(Some("/bin/bash"))
+        .with_login(false)
+        .with_cwd(&workspace);
+    let probe = match manager
+        .execute(probe, None)
+        .await
+        .expect("execute network probe")
+    {
+        ExecExecutionResult::Completed(summary) => summary,
+        other => panic!("probe did not finish: {other:?}"),
+    };
+    assert_eq!(
+        probe.exit_code() == Some(0),
+        network.is_allowed(),
+        "{}",
+        probe.stderr()
+    );
+    assert_eq!(
+        probe.stdout() == "reached",
+        network.is_allowed(),
+        "{}",
+        probe.stderr()
+    );
+}
+
+/// A readable filesystem root permits reads everywhere without granting writes everywhere.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_a_readable_filesystem_root_keeps_writes_scoped() {
+    let (_guard, workspace) = canonical_temp();
+    let (_outside_guard, outside) = canonical_temp();
+    std::fs::write(outside.join("secret.txt"), "classified").unwrap();
+    let policy = SandboxPolicy::new(SandboxLevel::Isolated)
+        .with_readable_root("/")
+        .with_writable_root(&workspace);
+    let manager =
+        ProcessManager::default().with_environment(ExecEnvironment::new().with_sandbox(policy));
+    let read = run_in(
+        &manager,
+        &workspace,
+        &format!(
+            "cat {} && printf written > inside.txt",
+            outside.join("secret.txt").display()
+        ),
+    )
+    .await;
+    assert_eq!(read.exit_code(), Some(0), "{}", read.stderr());
+    assert_eq!(read.stdout(), "classified");
+    assert_eq!(
+        std::fs::read(workspace.join("inside.txt")).unwrap(),
+        b"written"
+    );
+    let write = run_in(
+        &manager,
+        &workspace,
+        &format!("printf leaked > {}", outside.join("outside.txt").display()),
+    )
+    .await;
+    assert_ne!(write.exit_code(), Some(0), "{}", write.stderr());
+    assert!(!outside.join("outside.txt").exists());
 }
 
 #[cfg(target_os = "macos")]

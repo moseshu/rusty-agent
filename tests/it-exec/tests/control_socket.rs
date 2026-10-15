@@ -273,7 +273,7 @@ fn unrestricted_writes_skip_control_socket_protection_as_in_codex() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn unrestricted_writes_leave_the_daemon_socket_reachable() {
     let root = prepare_shared_daemon_socket_directory().unwrap();
