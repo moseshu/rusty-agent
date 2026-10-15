@@ -31,6 +31,7 @@ missing_panics_doc = "allow"
 [workspace.dependencies]
 rusty-agent = { path = "crates/rusty-agent", version = "0.2.2" }
 # --- 内部 crate ---
+ra-uds = { path = "crates/ra-uds", version = "0.2.2" }
 ra-core = { path = "crates/ra-core", version = "0.2.2" }
 ra-macros = { path = "crates/ra-macros", version = "0.2.2" }
 ra-model = { path = "crates/ra-model", version = "0.2.2" }
@@ -72,6 +73,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 jsonwebtoken = "9.3.1"
 constant_time_eq = "0.3.1"
 http = "1"
+# WebSocket framing over the local control socket, using the published transport dependency.
+tokio-tungstenite = "0.29"
 futures = "0.3"
 async-trait = "0.1"
 base64 = "0.22"

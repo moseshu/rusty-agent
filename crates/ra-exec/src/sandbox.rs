@@ -519,6 +519,18 @@ impl ConfinementRequest {
     pub fn readable_roots(&self) -> &[PathBuf] {
         &self.readable_roots
     }
+
+    /// Whether filesystem writes are unrestricted: Codex's `has_full_disk_write_access`.
+    ///
+    /// Codex requires a writable root entry and no entry that narrows writes beneath it. Readable
+    /// roots here only add reads and never carve read-only paths out of a writable root, so a
+    /// writable `/` is the whole condition.
+    #[cfg(all(unix, any(feature = "seatbelt", feature = "bwrap")))]
+    pub(crate) fn has_full_disk_write_access(&self) -> bool {
+        self.writable_roots
+            .iter()
+            .any(|root| root == Path::new("/"))
+    }
 }
 
 /// A platform mechanism that can confine a spawned process.

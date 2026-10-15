@@ -60,7 +60,7 @@ impl Layer {
     }
 }
 
-/// The layer allowlist. The target shape is 19 crates; the ones not yet created (`ra-flow`,
+/// The layer allowlist. The ones not yet created (`ra-flow`,
 /// `ra-assistant`) are registered in advance so the gate binds them the day they appear.
 const LAYERS: &[(&str, Layer)] = &[
     ("ra-core", Layer::Kernel),
@@ -69,6 +69,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-model", Layer::Service),
     ("ra-prompt", Layer::Service),
     ("ra-context", Layer::Service),
+    ("ra-uds", Layer::Service),
     ("ra-exec", Layer::Service),
     ("ra-execpolicy", Layer::Service),
     ("ra-sandbox", Layer::Service),
@@ -139,7 +140,9 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-model", &["ra-core"]),
     ("ra-prompt", &["ra-core"]),
     ("ra-context", &["ra-core"]),
-    ("ra-exec", &["ra-core"]),
+    // Socket location is shared with transports so every sandbox hides the same directory.
+    ("ra-uds", &[]),
+    ("ra-exec", &["ra-core", "ra-uds"]),
     // Codex's command execution policy: Starlark rules files, their evaluation and amendments. It
     // needs nothing from the framework — a decision is about command tokens, not tools or runs —
     // and stays a crate of its own so the Starlark interpreter is a dependency of the one product
@@ -157,7 +160,10 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // `ra-runtime` for the live thread whose turns the app server starts, steers and interrupts, as
     // Codex's app-server drives `codex-core`'s `CodexThread`. The server still runs no loop of its
     // own: the thread does, and the host builds it.
-    ("ra-protocol", &["ra-core", "ra-runtime", "ra-session"]),
+    (
+        "ra-protocol",
+        &["ra-core", "ra-runtime", "ra-session", "ra-uds"],
+    ),
     (
         "ra-eval",
         &["ra-core", "ra-runtime", "ra-model", "ra-protocol"],

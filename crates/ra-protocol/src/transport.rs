@@ -1,4 +1,5 @@
-//! How messages travel: one JSON message per line over stdio, or WebSocket frames, as Codex's
+//! How messages travel: one JSON message per line over stdio, or WebSocket frames over TCP or
+//! a local Unix socket, as Codex's
 //! app-server transports carry them (`app-server-transport/src/transport/mod.rs`,
 //! `app-server-transport/src/outgoing_message.rs`).
 //!
@@ -16,6 +17,8 @@
 //! writing it cannot fail that way.
 
 pub mod stdio;
+#[cfg(unix)]
+pub mod unix_socket;
 pub mod websocket;
 
 use std::{
@@ -76,6 +79,8 @@ pub enum ConnectionOrigin {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum TransportEvent {
+    /// A managed local control socket accepted a shutdown request outside JSON-RPC.
+    DaemonShutdown,
     /// A connection opened; what the server sends it goes through `writer`.
     ///
     /// Codex's event also carries the login that established a remote-control connection, which

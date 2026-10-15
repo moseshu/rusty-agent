@@ -374,8 +374,8 @@ fn test_seatbelt_denies_by_default_and_names_every_root_as_a_parameter() {
         Some("WRITABLE_ROOT_0")
     );
     assert!(
-        !profile.policy().contains("network-outbound"),
-        "denial needs no rule; the base already denies what is not named"
+        !profile.policy().contains("(allow network-outbound)"),
+        "network access is denied, including the mandatory control socket carveout"
     );
 }
 

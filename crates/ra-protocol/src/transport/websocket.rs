@@ -11,8 +11,8 @@
 //! cancel to drop it. A ping is answered with a pong; a binary frame is dropped; a close frame, a
 //! read error or a failed write ends the connection, and it is then reported closed.
 //!
-//! Codex's tungstenite is a fork of its own; this one is the published crate. Codex's unix-socket
-//! control transport, which carries the same connections, is not part of this port.
+//! Codex's tungstenite is a fork of its own; this one is the published crate. The Unix control
+//! socket reuses the same connection loops through its tungstenite message adapter.
 
 pub mod auth;
 
@@ -174,7 +174,7 @@ pub async fn start_websocket_acceptor(
 /// The connection opens with a write queue and a disconnect token. Reading and writing run as two
 /// tasks; whichever ends first cancels the token and stops the other, and the connection is then
 /// reported closed. Cancelling the token from the server ends both.
-async fn run_websocket_connection<M, SinkError, StreamError>(
+pub(super) async fn run_websocket_connection<M, SinkError, StreamError>(
     websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -234,7 +234,7 @@ async fn run_websocket_connection<M, SinkError, StreamError>(
 }
 
 /// The frames the transport tells apart: Codex's `IncomingWebSocketMessage`.
-enum IncomingWebSocketMessage {
+pub(super) enum IncomingWebSocketMessage {
     Text(String),
     Binary,
     Ping(Bytes),
@@ -245,7 +245,7 @@ enum IncomingWebSocketMessage {
 /// Turns a WebSocket library's frames into the few the transport needs, and builds the only frames
 /// it sends itself: Codex's `AppServerWebSocketMessage`. Codex also implements it for tungstenite's
 /// frames, which only its unix-socket and remote-control transports use.
-trait AppServerWebSocketMessage: Sized {
+pub(super) trait AppServerWebSocketMessage: Sized {
     fn text(text: String) -> Self;
     fn pong(payload: Bytes) -> Self;
     fn into_incoming(self) -> Option<IncomingWebSocketMessage>;
@@ -267,6 +267,28 @@ impl AppServerWebSocketMessage for AxumWebSocketMessage {
             Self::Ping(payload) => IncomingWebSocketMessage::Ping(payload),
             Self::Pong(_) => IncomingWebSocketMessage::Pong,
             Self::Close(_) => IncomingWebSocketMessage::Close,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl AppServerWebSocketMessage for tokio_tungstenite::tungstenite::Message {
+    fn text(text: String) -> Self {
+        Self::Text(text.into())
+    }
+
+    fn pong(payload: Bytes) -> Self {
+        Self::Pong(payload)
+    }
+
+    fn into_incoming(self) -> Option<IncomingWebSocketMessage> {
+        Some(match self {
+            Self::Text(text) => IncomingWebSocketMessage::Text(text.to_string()),
+            Self::Binary(_) => IncomingWebSocketMessage::Binary,
+            Self::Ping(payload) => IncomingWebSocketMessage::Ping(payload),
+            Self::Pong(_) => IncomingWebSocketMessage::Pong,
+            Self::Close(_) => IncomingWebSocketMessage::Close,
+            Self::Frame(_) => return None,
         })
     }
 }

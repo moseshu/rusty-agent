@@ -51,6 +51,7 @@ target
 !/Docs/Run_Entry_Contract.md
 !/Docs/Framework_Quickstart.md
 !/Docs/Dynamic_Instructions_Contract.md
+!/Docs/Unix_Socket_Transport_Contract.md
 
 # 门禁基线与快照（不上传 GitHub）——本地产物，`cargo xtask <gate> --bless` 生成。
 # 注意代价：它们是 `public-api` / `schema-stability` / `prompt-dump` 三条门禁的对账对象，

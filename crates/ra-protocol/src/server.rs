@@ -52,6 +52,8 @@
 //! server stops on its own — its transports gone, or its stdio client — it first cleans up after
 //! the connections left and shuts its threads down.
 //!
+//! A managed Unix control socket can request the same drain through `TransportEvent::DaemonShutdown`.
+//!
 //! Codex's loop also recovers the threads of its daemon, attaches the threads its agents spawn to
 //! every connection and reports the status of remote control; none of it is ported.
 
@@ -477,6 +479,14 @@ impl AppServer {
                         break "transport_channel_closed";
                     };
                     match event {
+                        TransportEvent::DaemonShutdown => {
+                            shutdown_state.on_signal(
+                                ShutdownSignal::Forceable,
+                                connections.len(),
+                                running_turn_count,
+                                &processor.turn_admission,
+                            );
+                        }
                         TransportEvent::ConnectionOpened {
                             connection_id,
                             origin,

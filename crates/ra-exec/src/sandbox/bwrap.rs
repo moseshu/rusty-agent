@@ -28,11 +28,15 @@
 //! Linux, and on any other platform the backend reports itself unavailable — so
 //! [`crate::sandbox::platform_backend`] never hands it to a host that could not be confined by it.
 
+#[cfg(any(target_os = "linux", all(unix, feature = "test-api")))]
+use std::collections::BTreeSet;
 use std::{
     path::{Component, Path, PathBuf},
     sync::OnceLock,
 };
 
+#[cfg(any(target_os = "linux", all(unix, feature = "test-api")))]
+mod daemon_mounts;
 #[cfg(target_os = "linux")]
 pub(crate) mod seccomp;
 
@@ -381,6 +385,9 @@ fn confine_with(
     request: &ConfinementRequest,
     command: SandboxCommand,
 ) -> Result<SandboxCommand, SandboxError> {
+    #[cfg(target_os = "linux")]
+    let args = protected_args(request, control_socket_directories)?;
+    #[cfg(not(target_os = "linux"))]
     let args = build_args(request)?;
     let wrapped = command_args(program, args, command);
     #[cfg(target_os = "linux")]
@@ -417,6 +424,46 @@ pub mod test_api {
     #[cfg(target_os = "linux")]
     use crate::sandbox::NetworkAccess;
 
+    /// Upstream mount-identity validation, fed recorded mountinfo for portable regression tests.
+    #[cfg(unix)]
+    pub fn check_control_socket_mounts(
+        directory: &std::path::Path,
+        device: &str,
+        btrfs: bool,
+        mount_id: Option<&str>,
+        mountinfo: &[u8],
+        masked_root: Option<&std::path::Path>,
+    ) -> std::io::Result<std::collections::BTreeSet<PathBuf>> {
+        let filesystem = if btrfs {
+            super::daemon_mounts::SocketFilesystem::Btrfs
+        } else {
+            super::daemon_mounts::SocketFilesystem::Other
+        };
+        super::daemon_mounts::check_mounts(
+            directory,
+            device,
+            filesystem,
+            mount_id,
+            mountinfo,
+            masked_root,
+        )
+    }
+
+    /// The launch arguments with control socket masks for `directories`, as a Linux launch builds
+    /// them from the host's socket directory and its mount aliases.
+    ///
+    /// # Errors
+    ///
+    /// Returns what a launch would: [`crate::sandbox::SandboxError::UnusableRoot`] for an unusable
+    /// root, and [`crate::sandbox::SandboxError::Unavailable`] when a directory cannot be masked.
+    #[cfg(unix)]
+    pub fn protected_args(
+        request: &crate::sandbox::ConfinementRequest,
+        directories: &std::collections::BTreeSet<PathBuf>,
+    ) -> Result<Vec<String>, crate::sandbox::SandboxError> {
+        super::protected_args(request, || Ok(directories.clone()))
+    }
+
     /// The program this backend would launch for a given `PATH`.
     #[must_use]
     pub fn program_on_path(path: &OsStr) -> Option<PathBuf> {
@@ -438,4 +485,92 @@ pub mod test_api {
     ) -> Result<SandboxCommand, SandboxError> {
         super::confine_with(program, request, command)
     }
+}
+
+/// The arguments a launch uses: [`build_args`] followed by Codex's control socket masks.
+///
+/// As in Codex, unrestricted writes leave the control sockets reachable, so a writable `/` skips
+/// the masks without preparing or inspecting the socket directory. Otherwise `directories` yields
+/// the socket directory and its host mount aliases.
+#[cfg(any(target_os = "linux", all(unix, feature = "test-api")))]
+fn protected_args(
+    request: &ConfinementRequest,
+    directories: impl FnOnce() -> std::io::Result<BTreeSet<PathBuf>>,
+) -> Result<Vec<String>, SandboxError> {
+    let args = build_args(request)?;
+    if request.has_full_disk_write_access() {
+        return Ok(args);
+    }
+    directories()
+        .and_then(|directories| insert_control_socket_masks(args, &directories))
+        .map_err(|error| SandboxError::Unavailable {
+            source: SandboxUnavailable::new(BACKEND_NAME, error.to_string()),
+        })
+}
+
+/// The shared socket directory, created if missing, and every host path that aliases it: the set
+/// Codex's `create_filesystem_args` masks.
+#[cfg(target_os = "linux")]
+fn control_socket_directories() -> std::io::Result<BTreeSet<PathBuf>> {
+    let directory = ra_uds::prepare_shared_daemon_socket_directory()?;
+    daemon_mounts::daemon_socket_mask_paths(&directory, None)
+}
+
+/// Inserts Codex's `append_daemon_socket_masks` after every bind that exposes a socket directory,
+/// so a later writable root cannot reopen it.
+///
+/// A bind source inside a socket directory is refused, and a mask path that is not UTF-8 is an
+/// error because a lossy conversion could mask a different path. A missing source is skipped:
+/// bubblewrap skips it for `--ro-bind-try` and refuses to start for the other binds.
+#[cfg(any(target_os = "linux", all(unix, feature = "test-api")))]
+fn insert_control_socket_masks(
+    args: Vec<String>,
+    directories: &BTreeSet<PathBuf>,
+) -> std::io::Result<Vec<String>> {
+    let mut protected = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let is_bind = matches!(arg.as_str(), "--bind" | "--ro-bind" | "--ro-bind-try");
+        protected.push(arg);
+        if is_bind {
+            let source = args
+                .next()
+                .ok_or_else(|| std::io::Error::other("missing bind source"))?;
+            let destination = args
+                .next()
+                .ok_or_else(|| std::io::Error::other("missing bind destination"))?;
+            protected.extend([source.clone(), destination.clone()]);
+            let source = match std::fs::canonicalize(source) {
+                Ok(source) => source,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for directory in directories {
+                if source.starts_with(directory) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "app-server socket directory cannot be a sandbox mount root",
+                    ));
+                }
+                if let Ok(relative) = directory.strip_prefix(&source) {
+                    let destination = Path::new(&destination).join(relative);
+                    let destination = destination
+                        .to_str()
+                        .ok_or_else(|| {
+                            std::io::Error::other("app-server socket mask path must be valid UTF-8")
+                        })?
+                        .to_owned();
+                    protected.extend([
+                        "--perms".to_owned(),
+                        "000".to_owned(),
+                        "--tmpfs".to_owned(),
+                        destination.clone(),
+                        "--remount-ro".to_owned(),
+                        destination,
+                    ]);
+                }
+            }
+        }
+    }
+    Ok(protected)
 }

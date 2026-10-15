@@ -2706,6 +2706,7 @@ dependencies = [
  "cap-std",
  "libc",
  "ra-core",
+ "ra-uds",
  "rustix",
  "seccompiler",
  "serde",
@@ -2806,6 +2807,8 @@ dependencies = [
  "ra-core",
  "ra-runtime",
  "ra-session",
+ "ra-uds",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -2813,6 +2816,7 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "uuid",
@@ -2906,6 +2910,13 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ra-uds"
+version = "0.2.2"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

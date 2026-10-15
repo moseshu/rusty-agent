@@ -1126,8 +1126,11 @@ async fn a_closed_connections_queued_requests_never_run() {
 /// `websocket_transport_allows_turn_interrupt_during_drain`: once a signal arrives, turn work is
 /// refused while other methods are answered; the running turn may still be interrupted, and once
 /// it has ended the transports are stopped and every client is disconnected.
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
 #[tokio::test]
-async fn a_drain_refuses_turn_work_and_waits_for_the_running_turn() {
+async fn a_drain_refuses_turn_work_and_waits_for_the_running_turn(#[case] daemon_shutdown: bool) {
     let server = Server::restartable();
     let mut client = server.connect(1).await;
     let script = Script::with([Step::Hang]);
@@ -1137,7 +1140,15 @@ async fn a_drain_refuses_turn_work_and_waits_for_the_running_turn() {
     let turn_id = client.response(id).await["turn"]["id"].clone();
     script.wait_for_calls(1).await;
 
-    assert!(server.restart.as_ref().unwrap().forceable().await);
+    if daemon_shutdown {
+        server
+            .events
+            .send(TransportEvent::DaemonShutdown)
+            .await
+            .unwrap();
+    } else {
+        assert!(server.restart.as_ref().unwrap().forceable().await);
+    }
     let refused = server.turn_start(&mut client, THREAD).await;
     assert_eq!(client.error(refused).await, draining());
     for (method, params) in [

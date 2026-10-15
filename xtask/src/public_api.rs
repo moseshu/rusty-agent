@@ -32,6 +32,7 @@ const TRACKED: &[&str] = &[
     "ra-runtime",
     "ra-session",
     "ra-exec",
+    "ra-uds",
     "ra-sandbox",
     "ra-mcp",
     "ra-protocol",

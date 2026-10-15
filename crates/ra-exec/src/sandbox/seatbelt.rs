@@ -218,6 +218,12 @@ pub fn build_profile(request: &ConfinementRequest) -> Result<SeatbeltProfile, Sa
         policy.push_str(")\n");
     }
 
+    // As in Codex, unrestricted writes leave the control sockets reachable.
+    #[cfg(unix)]
+    if !request.has_full_disk_write_access() {
+        append_control_socket_protection(&mut policy, &mut params)?;
+    }
+
     Ok(SeatbeltProfile { policy, params })
 }
 
@@ -355,4 +361,31 @@ impl SandboxBackend for SeatbeltBackend {
         let profile = build_profile(request)?;
         Ok(command_args(&profile, command))
     }
+}
+
+/// Mandatory denies follow every grant, as in Codex's `seatbelt_daemon.rs`.
+#[cfg(unix)]
+fn append_control_socket_protection(
+    policy: &mut String,
+    params: &mut Vec<(String, PathBuf)>,
+) -> Result<(), SandboxError> {
+    let directory =
+        ra_uds::shared_daemon_socket_directory().map_err(|error| SandboxError::Unavailable {
+            source: SandboxUnavailable::new(BACKEND_NAME, error.to_string()),
+        })?;
+    params.push(("CONTROL_SOCKET_DIRECTORY".to_owned(), directory.clone()));
+    policy.push_str(
+        "\n; Privileged control sockets remain inaccessible even with network and filesystem grants.\n\
+         (deny file-read* file-write* (literal (param \"CONTROL_SOCKET_DIRECTORY\")) (subpath (param \"CONTROL_SOCKET_DIRECTORY\")))\n\
+         (deny network-outbound (remote unix-socket (subpath (param \"CONTROL_SOCKET_DIRECTORY\"))))\n",
+    );
+    for (index, ancestor) in directory.ancestors().skip(1).enumerate() {
+        let key = format!("CONTROL_SOCKET_ANCESTOR_{index}");
+        params.push((key.clone(), ancestor.to_path_buf()));
+        let _ = writeln!(
+            policy,
+            "(deny file-write-unlink (require-all (vnode-type DIRECTORY) (literal (param \"{key}\"))))"
+        );
+    }
+    Ok(())
 }
