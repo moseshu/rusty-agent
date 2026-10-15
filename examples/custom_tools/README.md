@@ -5,6 +5,10 @@ This example registers a synchronous line counter and an asynchronous calculator
 with injected application context, parameter descriptions, an explicit default,
 and fallible output. It uses the existing Runner and shipped Responses provider.
 
+Dependencies: `ra-core`, `ra-macros`, `ra-runtime`, `ra-model` with default `openai`,
+`async-trait`, `serde_json`, and `tokio`. See [Cargo.toml](Cargo.toml) and
+[the runnable source](src/main.rs).
+
 Run the deterministic offline model/tool/result round trip:
 
 ```bash

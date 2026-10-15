@@ -4,6 +4,9 @@ Declare a Rust type with `Deserialize`, `Serialize`, and `JsonSchema`, then inst
 `AgentSpec::builder().output_type::<Review>()?`. The runner validates and decodes before delivery.
 `result.final_output_as::<Review>()?` borrows that decoded object without parsing the final text.
 
+Dependencies: `ra-core`, `ra-model` with default `openai`, `ra-runtime`, `async-trait`,
+`schemars`, `serde`, and `tokio`. See [Cargo.toml](Cargo.toml) and [the runnable source](src/main.rs).
+
 ```bash
 cargo run -p structured_output -- --check
 cargo run -p structured_output -- --check --stream

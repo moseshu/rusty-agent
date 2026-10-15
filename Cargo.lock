@@ -19,6 +19,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agents_as_tools"
+version = "0.2.2"
+dependencies = [
+ "rusty-agent",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -141,6 +150,25 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "app_context"
+version = "0.2.2"
+dependencies = [
+ "async-trait",
+ "rusty-agent",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "approvals"
+version = "0.2.2"
+dependencies = [
+ "rusty-agent",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "arbitrary"
@@ -1416,13 +1444,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "guardrails"
+version = "0.2.2"
+dependencies = [
+ "async-trait",
+ "rusty-agent",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "handoffs"
 version = "0.2.2"
 dependencies = [
- "ra-core",
- "ra-model",
- "ra-runtime",
- "ra-session",
+ "rusty-agent",
  "schemars",
  "serde",
  "serde_json",
@@ -3456,6 +3491,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sessions"
+version = "0.2.2"
+dependencies = [
+ "rusty-agent",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3724,6 +3769,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "645a3d441ccf4bf47f2e4b7681461986681a6eeea9937d4c3bc9febd61d17c71"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "streaming"
+version = "0.2.2"
+dependencies = [
+ "rusty-agent",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

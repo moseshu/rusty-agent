@@ -1,30 +1,20 @@
 //! A triage agent transferring a conversation to a refund specialist through a shipped provider.
 //!
-//! `--check` validates declarations offline. A live run requires `OPENAI_API_KEY` and `RA_MODEL`.
+//! `--check` runs a local HTTP handoff round trip. A live run requires `OPENAI_API_KEY` and
+//! `RA_MODEL`.
 //! `--filter` forwards only the opening input through `input_items`, so the Session still stores
 //! the whole turn; a filter that rewrites `new_items` would change the stored turn too.
 
 use std::sync::{Arc, Mutex};
 
-use ra_core::{
-    agent::{AgentId, AgentSpec, HandoffInputData},
-    cancel::CancelScope,
-    context::RunContext,
-    error::{Error, Result},
-    item::{Message, ModelInputItem},
-    model::{ApiProtocol, ModelProvider, ProviderKey},
-    state::RunId,
-};
-use ra_model::{
-    openai::{auth::OpenAiAuth, responses::OpenAiResponsesProvider},
-    provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
-};
-use ra_runtime::{
-    agent::{AgentBinding, AgentRegistry},
-    runner::{RunConfig, RunRequest, Runner},
-};
+#[path = "../../support.rs"]
+mod support;
+
+use rusty_agent::{agent::HandoffInputData, prelude::*};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::json;
+use support::{answer, call, messages, require};
 
 /// Bookkeeping payload for the transfer; the specialist's main input remains the conversation.
 #[derive(Deserialize, JsonSchema)]
@@ -33,13 +23,48 @@ struct RefundTransfer {
     reason: String,
 }
 
+fn offline_steps(filtered: bool) -> Vec<support::Step> {
+    vec![
+        Box::new(|request| {
+            require(
+                request["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["name"] == "transfer_to_refund_specialist")
+                }),
+                "handoff schema did not reach the provider",
+            )?;
+            Ok(call(
+                "transfer_to_refund_specialist",
+                &json!({"reason":"refund request"}),
+            ))
+        }),
+        Box::new(move |request| {
+            require(
+                messages(request) == ["I need help requesting a refund for invoice 123."],
+                "handoff lost opening input",
+            )?;
+            require(
+                request["input"]
+                    .as_array()
+                    .is_some_and(|items| items.len() == if filtered { 1 } else { 3 }),
+                "handoff history or explicit input filtering differs from the contract",
+            )?;
+            Ok(answer("I can help you request a refund for invoice 123."))
+        }),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let refunds = AgentSpec::builder()
         .id(AgentId::new("refunds"))
         .name("Refund Specialist")
         .handoff_description("Helps the user understand refund requests.")
-        .instructions("Answer the user's refund question using the conversation history. Do not claim to have issued a refund.")
+        .instructions(
+            "Answer the user's refund question using the conversation history. \
+             Do not claim to have issued a refund.",
+        )
         .build()?;
     let transfer_log = Arc::new(Mutex::new(Vec::<String>::new()));
     let handoff =
@@ -57,7 +82,8 @@ async fn main() -> Result<()> {
                     });
                 std::future::ready(result)
             })?;
-    let handoff = if std::env::args().any(|arg| arg == "--filter") {
+    let filtered = std::env::args().any(|arg| arg == "--filter");
+    let handoff = if filtered {
         handoff.with_input_filter_fn(|_: &RunContext, input: HandoffInputData| {
             std::future::ready(Ok(input
                 .with_pre_handoff_items(Vec::new())
@@ -69,59 +95,60 @@ async fn main() -> Result<()> {
     let triage = AgentSpec::builder()
         .id(AgentId::new("triage"))
         .name("Triage")
-        .instructions("For refund questions, transfer the conversation to the refund specialist with a reason.")
+        .instructions(
+            "For refund questions, transfer the conversation to the refund specialist \
+             with a reason.",
+        )
         .handoff(handoff)
         .build()?;
     let agents = AgentRegistry::builder()
         .register(Arc::clone(&triage))
         .register(refunds)
         .build()?;
-    if std::env::args().any(|arg| arg == "--check") {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(triage.handoffs()[0].schema()).map_err(|error| {
-                Error::caller("the handoff declaration could not be rendered").with_source(error)
-            })?
-        );
-        return Ok(());
-    }
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| Error::config("set OPENAI_API_KEY for a live run"))?;
-    let model = std::env::var("RA_MODEL")
-        .map_err(|_| Error::config("set RA_MODEL to a model available at your endpoint"))?;
-    let mut auth = OpenAiAuth::new(api_key);
-    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-        auth = auth.with_base_url(base_url);
-    }
-    let provider = ProviderKey::new("openai");
-    let models = ProviderRegistry::builder(provider.clone())
-        .register(ProviderRegistration::new(
-            provider,
-            ApiProtocol::OpenAiResponses,
-            move |quirks: ProviderQuirks| {
-                Ok(Arc::new(
-                    OpenAiResponsesProvider::new(auth.clone(), model.clone())?.with_quirks(quirks),
-                ) as Arc<dyn ModelProvider>)
-            },
-        ))
-        .build()?;
-    let input = std::env::var("RA_REQUEST")
-        .unwrap_or_else(|_| "I need help requesting a refund for invoice 123.".to_owned());
-    let result = Runner::run(
-        RunRequest::new(
-            AgentBinding::direct(triage),
-            Arc::new(models),
-            RunId::generate(),
-            CancelScope::root(),
-            vec![ModelInputItem::Message(Message::user(input))],
-        )
-        .with_app_context(transfer_log)
-        .with_session(Arc::new(ra_session::InMemorySession::new(
-            "refund-conversation",
-        )))
-        .with_config(RunConfig::new().with_agent_registry(agents)),
-    )
-    .await?;
+    let example = support::setup(offline_steps(filtered)).await?;
+    let input = if example.check {
+        "I need help requesting a refund for invoice 123.".to_owned()
+    } else {
+        std::env::var("RA_REQUEST")
+            .unwrap_or_else(|_| "I need help requesting a refund for invoice 123.".to_owned())
+    };
+    let session = Arc::new(InMemorySession::new("refund-conversation"));
+    let result = example
+        .runner
+        .request(triage, input)
+        .with_app_context(transfer_log.clone())
+        .with_session(session.clone())
+        .with_config(RunConfig::new().with_agent_registry(agents))
+        .run()
+        .await?;
     println!("{}", result.final_text());
-    Ok(())
+    if example.check {
+        require(
+            result.last_agent().id().as_str() == "refunds",
+            "specialist did not take over",
+        )?;
+        require(
+            transfer_log
+                .lock()
+                .map_err(|_| Error::caller("transfer log is poisoned"))?
+                .as_slice()
+                == ["refund request"],
+            "typed callback did not run exactly once",
+        )?;
+        let items = session.get_items(None).await?;
+        require(items.len() == 4, "filter changed authoritative history")?;
+        require(
+            items
+                .iter()
+                .any(|item| matches!(item.kind(), RunItemKind::HandoffCall(_))),
+            "session lost handoff call",
+        )?;
+        require(
+            items
+                .iter()
+                .any(|item| matches!(item.kind(), RunItemKind::HandoffOutput(_))),
+            "session lost handoff result",
+        )?;
+    }
+    example.finish().await
 }

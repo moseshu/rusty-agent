@@ -125,6 +125,11 @@ entry remains available. See the [basic agent example](examples/basic_agent/READ
 cargo run -p basic_agent -- --check
 ```
 
+Continue with the [framework quickstart](Docs/Framework_Quickstart.md) for runnable
+sessions, streaming, application context, handoffs, agents as tools, approval recovery,
+guardrails, and lifecycle callbacks. The [example index](examples/README.md) distinguishes
+live provider runs from the offline checks executed in CI.
+
 ### Function tools
 
 On this checkout, `#[ra_macros::tool]` preserves a sync or async function and adds

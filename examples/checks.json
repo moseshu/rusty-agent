@@ -1,0 +1,13 @@
+{
+  "minimal_agent": [[]],
+  "basic_agent": [["--check"], ["--check", "--sync"], ["--check", "--stream"], ["--check", "--items"]],
+  "custom_tools": [["--check"]],
+  "structured_output": [["--check"], ["--check", "--stream"]],
+  "handoffs": [["--check"], ["--check", "--filter"]],
+  "sessions": [["--check"], ["--check", "--sqlite"]],
+  "streaming": [["--check"], ["--check", "--items"]],
+  "app_context": [["--check"]],
+  "agents_as_tools": [["--check"]],
+  "approvals": [["--check"], ["--check", "--reject"], ["--check", "--stream"], ["--check", "--stream", "--reject"]],
+  "guardrails": [["--check"]]
+}

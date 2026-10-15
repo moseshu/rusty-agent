@@ -52,6 +52,9 @@ jobs:
       - name: 编译
         run: cargo check --workspace --all-targets
 
+      - name: Framework examples (offline HTTP, recovery, and documentation)
+        run: python3 scripts/check_examples.py
+
       # 文档链接：解析不到、指向私有项（没有页面）、多余的显式目标都算错误。两种配置都要跑：
       # 可选 feature 后面的文档只在全开时生成，而指向可选 feature 里某一项的链接只在默认配置下
       # 才解析失败。

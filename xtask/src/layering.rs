@@ -92,6 +92,12 @@ const LAYERS: &[(&str, Layer)] = &[
     ("custom_tools", Layer::Binary),
     ("structured_output", Layer::Binary),
     ("basic_agent", Layer::Binary),
+    ("sessions", Layer::Binary),
+    ("streaming", Layer::Binary),
+    ("app_context", Layer::Binary),
+    ("agents_as_tools", Layer::Binary),
+    ("approvals", Layer::Binary),
+    ("guardrails", Layer::Binary),
 ];
 
 /// The direct internal dependencies each crate's responsibility table allows.
@@ -210,11 +216,15 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("minimal_agent", &["ra-core", "ra-runtime"]),
     ("structured_output", &["ra-core", "ra-model", "ra-runtime"]),
     ("basic_agent", &["rusty-agent"]),
-    // Provider-backed examples consume shipped adapters and Session implementations directly.
-    (
-        "handoffs",
-        &["ra-core", "ra-runtime", "ra-model", "ra-session"],
-    ),
+    ("sessions", &["rusty-agent"]),
+    ("streaming", &["rusty-agent"]),
+    ("app_context", &["rusty-agent"]),
+    ("agents_as_tools", &["rusty-agent"]),
+    ("approvals", &["rusty-agent"]),
+    ("guardrails", &["rusty-agent"]),
+    ("handoffs", &["rusty-agent"]),
+    // Like `structured_output` above, `custom_tools` predates the facade and consumes the shipped
+    // adapter through the lower-level crates directly.
     (
         "custom_tools",
         &["ra-core", "ra-macros", "ra-runtime", "ra-model"],

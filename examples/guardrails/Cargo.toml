@@ -1,0 +1,16 @@
+[package]
+name = "guardrails"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rusty-agent = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+serde_json.workspace = true
+async-trait.workspace = true
+
+[lints]
+workspace = true

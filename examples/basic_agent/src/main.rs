@@ -105,8 +105,10 @@ fn main() -> Result<()> {
         .map_err(|error| Error::caller("cannot start the example runtime").with_source(error))?
         .block_on(async move {
             // The minimal ordinary call needs only the configured runner, agent, and text.
+            // tutorial:hello:start
             let result = runner.run(agent.clone(), "Greet Rust.").await?;
             println!("{}", result.final_text());
+            // tutorial:hello:end
             let session = Arc::new(InMemorySession::new(SessionId::generate()));
             let contextual_agent = agent
                 .to_builder()

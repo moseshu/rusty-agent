@@ -5,11 +5,21 @@ a refund specialist, which receives the full conversation by default. The typed
 `RefundTransfer` payload is validated and passed to the callback for bookkeeping;
 it does not replace the specialist's conversation input.
 
-Check the declarations without credentials or network calls:
+Dependencies: `rusty-agent` with default `openai`, `schemars`, `serde`, `serde_json`,
+and `tokio` with `net`. See [Cargo.toml](Cargo.toml)
+and [the runnable source](src/main.rs).
+
+Check the complete transfer against local HTTP/SSE fixtures without external credentials:
 
 ```sh
 cargo run -p handoffs -- --check
+cargo run -p handoffs -- --check --filter
 ```
+
+The check uses the shipped provider for both model calls and verifies schema registration,
+the target's input, one typed bookkeeping callback, the final agent identity, and the
+authoritative session records. `--filter` removes the transfer pair from model input
+while preserving it in the session. Shared provider and fixture code is in [support.rs](../support.rs).
 
 For a live run, set `OPENAI_API_KEY` and `RA_MODEL` to a model available at your
 endpoint, then run `cargo run -p handoffs`. `OPENAI_BASE_URL` and `RA_REQUEST` are
