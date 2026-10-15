@@ -27,11 +27,10 @@ use crate::source;
 /// enum and an inward-facing control-flow enum are constraints in opposite directions, not a
 /// contradiction.
 ///
-/// `ResolvedInstructions` is the same shape of decision. Its variants are the two positions an
-/// agent's instructions may occupy in a model request — the cached prefix, or volatile tail
-/// messages — and turn preparation `match`es it to decide which. A `_` arm would send a third
-/// placement to whichever slot the arm happened to pick, which is the silent misplacement the type
-/// was introduced to make impossible.
+/// `ResolvedInstructions` is the same shape of decision. Its variants distinguish static and
+/// generated system instructions from the explicitly selected volatile tail extension. Turn
+/// preparation `match`es it to decide the placement. A `_` arm could silently misplace a new
+/// variant, which is the failure the type was introduced to make impossible.
 ///
 /// `SummarySlot` is a fixed external format, not an open classification. A tenth slot would make
 /// an existing compaction summary no longer conform to its own durable format, so consumers must

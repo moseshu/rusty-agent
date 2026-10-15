@@ -1,9 +1,8 @@
 //! Dynamic prompt evaluation, resolution, and tail message lowering.
 //!
-//! The placement rule — a generated prompt may only occupy volatile tail messages — is enforced by
-//! [`ResolvedPrompt`] itself rather than here. Turn preparation has to apply the same rule and
-//! cannot reach this crate, so a copy of the check living here would be a second implementation
-//! free to disagree with the one that actually guards the model request.
+//! Tail lowering is an explicitly selected extension. Default agent instructions use system
+//! text regardless of whether their source is static or dynamic. [`ResolvedPrompt`] owns both
+//! lowering paths so runtime preparation and these helpers share the same implementation.
 
 use ra_core::context::RunContext;
 use ra_core::error::Result;

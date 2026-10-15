@@ -113,7 +113,11 @@ fn reject_unsupported(request: &ModelRequest) -> Result<()> {
 /// Adds the system prompt, marked cacheable when it and the tools already merged into `body` are
 /// long enough to be worth a breakpoint.
 fn insert_system(body: &mut Map<String, Value>, request: &ModelRequest) {
-    let Some(instructions) = request.system_instructions() else {
+    // Messages rejects an empty text block, so empty instructions send no `system` field at all.
+    let Some(instructions) = request
+        .system_instructions()
+        .filter(|instructions| !instructions.is_empty())
+    else {
         return;
     };
     let mut block = json!({"type": "text", "text": instructions});

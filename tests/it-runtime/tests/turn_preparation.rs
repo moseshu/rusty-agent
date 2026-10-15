@@ -1188,7 +1188,7 @@ async fn test_turn_preparation_ignores_an_output_schema_only_the_execution_insta
 }
 
 #[tokio::test]
-async fn test_dynamic_instructions_lowering_to_tail_items() {
+async fn test_dynamic_instructions_lowering_to_system_instructions() {
     let event_log: Events = Arc::new(Mutex::new(Vec::new()));
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
 
@@ -1221,21 +1221,21 @@ async fn test_dynamic_instructions_lowering_to_tail_items() {
     .await
     .unwrap();
 
-    // System instructions slot remains None: a generated prompt never reaches the cached prefix.
-    assert_eq!(prepared.request().system_instructions(), None);
-
-    // Input items have user message + dynamic tail item
-    assert_eq!(prepared.request().input().len(), 2);
-    let tail = &prepared.request().input()[1];
-    if let ModelInputItem::Message(msg) = tail {
-        assert_eq!(msg.role(), ra_core::item::MessageRole::User);
-        assert_eq!(
-            msg.content()[0].as_text(),
-            Some("Turn-specific volatile data for run run-preparation")
-        );
-    } else {
-        panic!("expected message input item for dynamic tail");
-    }
+    assert_eq!(
+        prepared.request().system_instructions(),
+        Some("Turn-specific volatile data for run run-preparation")
+    );
+    assert_eq!(prepared.request().input().len(), 1);
+    assert_eq!(
+        prepared.request().input()[0],
+        ModelInputItem::Message(Message::user("Hello"))
+    );
+    assert_eq!(
+        prepared.request().cache_plan().unwrap().prefix_hash(),
+        &ra_core::prompt::ContentHash::compute(
+            "Turn-specific volatile data for run run-preparation"
+        )
+    );
 
     // The text is in the request; the record of what produced it travels alongside.
     let provenance = prepared
@@ -1251,35 +1251,33 @@ async fn test_dynamic_instructions_lowering_to_tail_items() {
     );
 }
 
-/// A generated prompt asking for the prefix is rejected, not silently relocated or dropped.
-///
-/// The prefix is the cached span. A generator reads the run, so anything it writes there changes
-/// every turn — this is the case that would quietly take prompt caching to a zero hit rate while
-/// every test still passed.
+/// The explicitly selected tail extension rejects sections that request the prefix.
 #[tokio::test]
-async fn test_dynamic_instructions_cannot_reach_the_stable_prefix() {
+async fn test_tail_extension_cannot_reach_the_stable_prefix() {
     let event_log: Events = Arc::new(Mutex::new(Vec::new()));
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
 
     let agent = AgentSpec::builder()
         .id(AgentId::new("prefix-grabbing-agent"))
         .name("Prefix Grabbing Agent")
-        .dynamic_instructions_fn(|_| async move {
-            let prefix_section = ra_core::prompt::PromptSection::new(
-                ra_core::prompt::PromptSectionName::CORE_BEHAVIOR,
-                "Stable prefix constitution",
-                ra_core::prompt::PromptSource::Agent,
-                ra_core::prompt::SectionStability::Stable,
-                ra_core::prompt::SectionPosition::Prefix,
-                "Stable constitution text",
-            )?;
+        .with_instructions(ra_core::agent::AgentInstructions::dynamic_tail_fn(
+            |_| async move {
+                let prefix_section = ra_core::prompt::PromptSection::new(
+                    ra_core::prompt::PromptSectionName::CORE_BEHAVIOR,
+                    "Stable prefix constitution",
+                    ra_core::prompt::PromptSource::Agent,
+                    ra_core::prompt::SectionStability::Stable,
+                    ra_core::prompt::SectionPosition::Prefix,
+                    "Stable constitution text",
+                )?;
 
-            Ok(ra_core::prompt::ResolvedPrompt::new(
-                "Full text representation",
-                ra_core::prompt::PromptSource::Agent,
-            )
-            .with_sections(vec![prefix_section]))
-        })
+                Ok(ra_core::prompt::ResolvedPrompt::new(
+                    "Full text representation",
+                    ra_core::prompt::PromptSource::Agent,
+                )
+                .with_sections(vec![prefix_section]))
+            },
+        ))
         .build()
         .unwrap();
 
@@ -1308,40 +1306,86 @@ async fn test_dynamic_instructions_cannot_reach_the_stable_prefix() {
     );
 }
 
+/// Default system lowering fails rather than dropping section content the text does not carry.
+#[tokio::test]
+async fn test_system_instructions_reject_sections_that_differ_from_the_text() {
+    let event_log: Events = Arc::new(Mutex::new(Vec::new()));
+    let resolver = RecordingResolver::new(Arc::clone(&event_log));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("summary-agent"))
+        .name("Summary Agent")
+        .dynamic_instructions_fn(|_| async move {
+            let section = ra_core::prompt::PromptSection::new(
+                ra_core::prompt::PromptSectionName::new("volatile_delta"),
+                "Volatile tail delta",
+                ra_core::prompt::PromptSource::Agent,
+                ra_core::prompt::SectionStability::Volatile,
+                ra_core::prompt::SectionPosition::TailMessage,
+                "The content the model must receive",
+            )?;
+            Ok(ra_core::prompt::ResolvedPrompt::new(
+                "Summary only",
+                ra_core::prompt::PromptSource::Agent,
+            )
+            .with_sections(vec![section]))
+        })
+        .build()
+        .unwrap();
+    let context = host(&agent);
+    let cancel = CancelScope::root();
+
+    let err = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &resolver,
+        &context,
+        &cancel,
+        &ToolUseTracker::new(),
+        vec![ModelInputItem::Message(Message::user("Hello"))],
+    ))
+    .await
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("summary-agent"), "{message}");
+    assert!(message.contains("dynamic_tail"), "{message}");
+}
+
 /// Every tail section a generator emits reaches the model, in order.
 #[tokio::test]
-async fn test_dynamic_instructions_lower_every_tail_section() {
+async fn test_explicit_tail_extension_lowers_every_section() {
     let event_log: Events = Arc::new(Mutex::new(Vec::new()));
     let resolver = RecordingResolver::new(Arc::clone(&event_log));
 
     let agent = AgentSpec::builder()
         .id(AgentId::new("structured-dynamic-agent"))
         .name("Structured Dynamic Agent")
-        .dynamic_instructions_fn(|_| async move {
-            let first = ra_core::prompt::PromptSection::new(
-                ra_core::prompt::PromptSectionName::new("volatile_delta"),
-                "Volatile tail delta",
-                ra_core::prompt::PromptSource::Dynamic("delta".into()),
-                ra_core::prompt::SectionStability::Volatile,
-                ra_core::prompt::SectionPosition::TailMessage,
-                "Volatile delta update",
-            )?;
+        .with_instructions(ra_core::agent::AgentInstructions::dynamic_tail_fn(
+            |_| async move {
+                let first = ra_core::prompt::PromptSection::new(
+                    ra_core::prompt::PromptSectionName::new("volatile_delta"),
+                    "Volatile tail delta",
+                    ra_core::prompt::PromptSource::Dynamic("delta".into()),
+                    ra_core::prompt::SectionStability::Volatile,
+                    ra_core::prompt::SectionPosition::TailMessage,
+                    "Volatile delta update",
+                )?;
 
-            let second = ra_core::prompt::PromptSection::new(
-                ra_core::prompt::PromptSectionName::new("volatile_status"),
-                "Volatile tail status",
-                ra_core::prompt::PromptSource::Dynamic("status".into()),
-                ra_core::prompt::SectionStability::Volatile,
-                ra_core::prompt::SectionPosition::TailMessage,
-                "Volatile status update",
-            )?;
+                let second = ra_core::prompt::PromptSection::new(
+                    ra_core::prompt::PromptSectionName::new("volatile_status"),
+                    "Volatile tail status",
+                    ra_core::prompt::PromptSource::Dynamic("status".into()),
+                    ra_core::prompt::SectionStability::Volatile,
+                    ra_core::prompt::SectionPosition::TailMessage,
+                    "Volatile status update",
+                )?;
 
-            Ok(ra_core::prompt::ResolvedPrompt::new(
-                "Full text representation",
-                ra_core::prompt::PromptSource::Agent,
-            )
-            .with_sections(vec![first, second]))
-        })
+                Ok(ra_core::prompt::ResolvedPrompt::new(
+                    "Full text representation",
+                    ra_core::prompt::PromptSource::Agent,
+                )
+                .with_sections(vec![first, second]))
+            },
+        ))
         .build()
         .unwrap();
 

@@ -204,7 +204,15 @@ fn assemble(base: Option<&str>, agent: Option<&str>, sections: &[String]) -> Str
 async fn resolve_text(instructions: &AgentInstructions, context: &RunContext) -> Result<String> {
     Ok(match instructions.resolve(context).await? {
         ResolvedInstructions::Prefix(text) => text,
-        ResolvedInstructions::Generated(prompt) => prompt.text().to_owned(),
+        // The same lowering as an ordinary turn, so sections that disagree with the text fail
+        // here too instead of being dropped by the assembled prompt.
+        ResolvedInstructions::Generated(prompt) => prompt.lower_to_system_instructions()?.0,
+        ResolvedInstructions::Tail(_) => {
+            return Err(Error::config(
+                "the tail-message instruction extension cannot be assembled into sandbox \
+                 system instructions",
+            ));
+        }
     })
 }
 

@@ -47,7 +47,19 @@ pub use handoff::{
 
 struct DynamicPromptFn<F>(F);
 
+struct SyncDynamicPromptFn<F>(F);
+
 struct BorrowingDynamicPromptFn<F>(F);
+
+#[async_trait]
+impl<F> DynamicPromptHandler for SyncDynamicPromptFn<F>
+where
+    F: Fn(&RunContext) -> Result<ResolvedPrompt> + Send + Sync,
+{
+    async fn resolve(&self, context: &RunContext) -> Result<ResolvedPrompt> {
+        (self.0)(context)
+    }
+}
 
 #[async_trait]
 impl<F> DynamicPromptHandler for BorrowingDynamicPromptFn<F>
@@ -427,14 +439,12 @@ impl fmt::Debug for ToolUseBehavior {
     }
 }
 
-/// What an agent's instructions resolved to, tagged with the one placement each may occupy.
+/// Resolved agent instructions, distinguishing system instructions from the explicit tail
+/// extension.
 ///
-/// The tag is the whole point of the type. A [`ResolvedPrompt`] lowers to volatile tail messages,
-/// while static agent text belongs in the cached prefix; returning one type for both made the
-/// wrong placement a plain function call away — resolving a static agent and lowering the result
-/// put the entire system constitution into a user message, with nothing about the value saying it
-/// had ever been anything else. Every value of this enum names where it goes, so a caller that
-/// ignores the distinction no longer compiles.
+/// Static text and generated text both occupy the model's system-instruction field. Generated
+/// instructions are evaluated for each model turn. Only an explicitly selected tail source may
+/// add user messages to the input instead.
 ///
 /// Deliberately **not** `#[non_exhaustive]`, unlike most public types here. A third placement would
 /// not be an additive detail a consumer may ignore — it would be a new position in the model
@@ -444,14 +454,17 @@ impl fmt::Debug for ToolUseBehavior {
 pub enum ResolvedInstructions {
     /// Static text, bound for the stable system-instruction prefix.
     Prefix(String),
-    /// Generator output, bound for volatile tail messages.
+    /// Generator output, bound for system instructions using its complete text verbatim.
     Generated(ResolvedPrompt),
+    /// Explicit extension that lowers generated sections into volatile user messages.
+    Tail(ResolvedPrompt),
 }
 
 /// Instructions attached to an agent declaration.
 ///
-/// Supports both static instruction text (for the stable prefix) and dynamic prompt generators
-/// that evaluate against runtime context.
+/// Static text and dynamic generators both provide system instructions. Generators read the
+/// live context, including its public agent projection, once per model turn. Tail messages are
+/// an explicitly selected extension rather than the default placement for generated text.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct AgentInstructions {
@@ -462,6 +475,7 @@ pub struct AgentInstructions {
 enum InstructionSource {
     Static(String),
     Dynamic(Arc<dyn DynamicPromptHandler>),
+    DynamicTail(Arc<dyn DynamicPromptHandler>),
 }
 
 impl AgentInstructions {
@@ -479,6 +493,34 @@ impl AgentInstructions {
         Self {
             source: InstructionSource::Dynamic(handler),
         }
+    }
+
+    /// Creates system instructions from a synchronous function.
+    pub fn dynamic_sync_fn<F>(f: F) -> Self
+    where
+        F: Fn(&RunContext) -> Result<ResolvedPrompt> + Send + Sync + 'static,
+    {
+        Self::dynamic(Arc::new(SyncDynamicPromptFn(f)))
+    }
+
+    /// Selects the extension that places generated sections in trailing user messages.
+    ///
+    /// This changes message priority relative to system instructions. Section placement and
+    /// stability are validated by [`ResolvedPrompt::lower`].
+    #[must_use]
+    pub fn dynamic_tail(handler: Arc<dyn DynamicPromptHandler>) -> Self {
+        Self {
+            source: InstructionSource::DynamicTail(handler),
+        }
+    }
+
+    /// Selects the tail-message extension with an asynchronous generator.
+    pub fn dynamic_tail_fn<F, Fut>(f: F) -> Self
+    where
+        F: Fn(&RunContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResolvedPrompt>> + Send + 'static,
+    {
+        Self::dynamic_tail(Arc::new(DynamicPromptFn(f)))
     }
 
     /// Creates dynamic instructions from an asynchronous function.
@@ -509,14 +551,14 @@ impl AgentInstructions {
     pub fn as_static(&self) -> Option<&str> {
         match &self.source {
             InstructionSource::Static(text) => Some(text),
-            InstructionSource::Dynamic(_) => None,
+            InstructionSource::Dynamic(_) | InstructionSource::DynamicTail(_) => None,
         }
     }
 
     /// Returns whether these instructions are generated dynamically.
     #[must_use]
     pub const fn is_dynamic(&self) -> bool {
-        matches!(&self.source, InstructionSource::Dynamic(_))
+        !matches!(&self.source, InstructionSource::Static(_))
     }
 
     /// Resolves the instructions against the current run context, tagged with their placement.
@@ -531,6 +573,10 @@ impl AgentInstructions {
                 .resolve(context)
                 .await
                 .map(ResolvedInstructions::Generated),
+            InstructionSource::DynamicTail(handler) => handler
+                .resolve(context)
+                .await
+                .map(ResolvedInstructions::Tail),
         }
     }
 
@@ -539,7 +585,9 @@ impl AgentInstructions {
             InstructionSource::Static(text) if text.is_empty() => {
                 Err(Error::config("agent instructions must not be empty"))
             }
-            InstructionSource::Static(_) | InstructionSource::Dynamic(_) => Ok(()),
+            InstructionSource::Static(_)
+            | InstructionSource::Dynamic(_)
+            | InstructionSource::DynamicTail(_) => Ok(()),
         }
     }
 }
@@ -555,6 +603,10 @@ impl fmt::Debug for AgentInstructions {
             InstructionSource::Dynamic(_) => formatter
                 .debug_struct("AgentInstructions")
                 .field("kind", &"dynamic")
+                .finish_non_exhaustive(),
+            InstructionSource::DynamicTail(_) => formatter
+                .debug_struct("AgentInstructions")
+                .field("kind", &"dynamic_tail")
                 .finish_non_exhaustive(),
         }
     }
@@ -858,6 +910,15 @@ impl AgentSpecBuilder {
     /// Sets dynamic instructions evaluated via a handler.
     pub fn dynamic_instructions(mut self, handler: Arc<dyn DynamicPromptHandler>) -> Self {
         self.instructions = Some(AgentInstructions::dynamic(handler));
+        self
+    }
+
+    /// Sets system instructions from a synchronous function evaluated each model turn.
+    pub fn dynamic_instructions_sync_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&RunContext) -> Result<ResolvedPrompt> + Send + Sync + 'static,
+    {
+        self.instructions = Some(AgentInstructions::dynamic_sync_fn(f));
         self
     }
 

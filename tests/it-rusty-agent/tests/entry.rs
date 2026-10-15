@@ -328,7 +328,10 @@ async fn borrowed_context_and_async_merge_use_existing_semantics() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(session.get_items(None).await.unwrap().len(), 4);
-    assert_eq!(model.requests.lock().unwrap()[1].input().len(), 4);
+    assert_eq!(model.requests.lock().unwrap()[1].input().len(), 3);
+    for request in model.requests.lock().unwrap().iter() {
+        assert_eq!(request.system_instructions(), Some("Hello Rust"));
+    }
     for request in [
         runner.request(agent.clone(), "missing"),
         runner.request(agent.clone(), "wrong").with_context(4_u32),
@@ -341,6 +344,87 @@ async fn borrowed_context_and_async_merge_use_existing_semantics() {
         assert!(matches!(error, Error::Caller { .. }));
     }
     assert_eq!(model.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn dynamic_system_instructions_are_evaluated_once_per_turn_in_both_delivery_modes() {
+    for streamed in [false, true] {
+        let tool_call = ModelResponse::new(vec![RunItem::new(
+            ItemId::new("greeting-call"),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new("greeting-call"),
+                "greeting",
+                json!({"name":"Rust"}),
+            )),
+        )]);
+        let model = ScriptedModel::new(vec![tool_call, answer("done")]);
+        let runner = AgentRunner::new(registry(model.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let run_agent = agent()
+            .to_builder()
+            .dynamic_instructions_sync_fn(|context| {
+                assert_eq!(context.agent().id(), &AgentId::new("test-agent"));
+                let turn = context
+                    .app_context::<AtomicUsize>()
+                    .unwrap()
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
+                Ok(ResolvedPrompt::new(
+                    format!("System turn {turn} in run {}", context.run_id()),
+                    PromptSource::Agent,
+                ))
+            })
+            .tool(Arc::new(greeting::tool().unwrap()))
+            .build()
+            .unwrap();
+        let session = Arc::new(InMemorySession::new("instructions"));
+        let request = runner
+            .request(run_agent, "hello")
+            .with_app_context(calls.clone())
+            .with_session(session.clone());
+        let result = if streamed {
+            request.run_streamed().finish().await
+        } else {
+            request.run().await
+        }
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            let text = format!(
+                "System turn {} in run {}",
+                index + 1,
+                result.state().run_id()
+            );
+            assert_eq!(request.system_instructions(), Some(text.as_str()));
+            assert_eq!(
+                request.cache_plan().unwrap().prefix_hash(),
+                &agents::prompt::ContentHash::compute(&text)
+            );
+            assert_eq!(request.input().len(), if index == 0 { 1 } else { 3 });
+            for item in request.input() {
+                if let ModelInputItem::Message(message) = item {
+                    assert!(!message.text_content().contains("System turn"));
+                }
+            }
+        }
+        assert_ne!(
+            requests[0].cache_plan().unwrap().prefix_hash(),
+            requests[1].cache_plan().unwrap().prefix_hash()
+        );
+        assert_eq!(
+            requests[0].cache_plan().unwrap().cache_scope(),
+            requests[1].cache_plan().unwrap().cache_scope()
+        );
+        drop(requests);
+        let history = session.get_items(None).await.unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(!history.iter().any(|item| match item.kind() {
+            RunItemKind::Message(message) => message.text_content().contains("System turn"),
+            _ => false,
+        }));
+    }
 }
 
 #[tokio::test]

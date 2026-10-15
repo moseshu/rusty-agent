@@ -36,9 +36,9 @@ async fn test_static_instructions_resolve_to_the_prefix_placement() {
         ResolvedInstructions::Prefix(text) => {
             assert_eq!(text, "You are a helpful assistant.");
         }
-        ResolvedInstructions::Generated(prompt) => panic!(
-            "static instructions must not resolve to tail-bound generator output: {prompt:?}"
-        ),
+        ResolvedInstructions::Generated(prompt) | ResolvedInstructions::Tail(prompt) => {
+            panic!("static instructions must not resolve to generator output: {prompt:?}")
+        }
     }
 }
 
@@ -124,6 +124,56 @@ async fn test_agent_spec_builder_dynamic_instructions() {
         panic!("a dynamic source must resolve to generator output");
     };
     assert_eq!(prompt.text(), "Instructions for agent dynamic-agent");
+}
+
+fn metadata_section(content: &str) -> PromptSection {
+    PromptSection::new(
+        PromptSectionName::CORE_BEHAVIOR,
+        "Optional section metadata",
+        PromptSource::Agent,
+        SectionStability::Stable,
+        SectionPosition::Prefix,
+        content,
+    )
+    .unwrap()
+}
+
+#[test]
+fn system_lowering_preserves_complete_text_and_hash_with_matching_section_metadata() {
+    let text = "  Complete system instructions\n\n  ";
+    let resolved = ResolvedPrompt::new(text, PromptSource::Dynamic("callback".into()))
+        .with_version("v2")
+        .with_provenance("application")
+        .with_sections(vec![metadata_section("Complete system instructions")]);
+    let (instructions, record) = resolved.lower_to_system_instructions().unwrap();
+    assert_eq!(instructions, text);
+    assert_eq!(record.content_hash(), &ContentHash::compute(text));
+    assert_eq!(record.source(), &PromptSource::Dynamic("callback".into()));
+    assert_eq!(record.version(), Some("v2"));
+    assert_eq!(record.provenance(), Some("application"));
+    assert!(
+        resolved.lower().is_err(),
+        "tail constraints apply only to explicit tail lowering"
+    );
+}
+
+/// Section content that the text does not carry would be dropped on the system path, so it fails.
+#[test]
+fn system_lowering_rejects_sections_whose_content_differs_from_the_text() {
+    let summary = ResolvedPrompt::new("Summary", PromptSource::Agent)
+        .with_sections(vec![metadata_section("The content the model must receive")]);
+    let error = summary.lower_to_system_instructions().unwrap_err();
+    assert_eq!(error.code(), "config", "{error:?}");
+    assert!(error.to_string().contains("dynamic_tail"), "{error}");
+
+    let split = ResolvedPrompt::new("First\n\nSecond", PromptSource::Agent).with_sections(vec![
+        metadata_section(" First "),
+        metadata_section("Second"),
+    ]);
+    assert_eq!(
+        split.lower_to_system_instructions().unwrap().0,
+        "First\n\nSecond"
+    );
 }
 
 /// The volatile-cannot-be-prefix rule survives a round trip through serde.

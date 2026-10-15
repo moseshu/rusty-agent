@@ -6,12 +6,10 @@ tool selects a project name to return. The runner never serializes the context i
 model input. This example verifies that a local account marker stays out of both HTTP
 requests while the explicitly selected language and project name reach the model.
 
-Known contract deviation (D-003): the current `dynamic_instructions_async_fn` returns
-`ResolvedPrompt`, which the runtime lowers to a trailing **user** message. Python's dynamic
-instructions become system instructions. This changes role priority and is not required
-by Rust ownership or async execution. The example shows the currently implemented API;
-it does not establish parity, and its offline check pins the current trailing-user placement
-so that the fix tracked by task R4-11a must update it deliberately. See the [open deviation list](../../Docs/Rusty_Agent_Framework_Development_Plan.md#参考优先级移植记录与偏差状态).
+The `dynamic_instructions_async_fn` callback returns `ResolvedPrompt`; its complete text
+becomes system instructions on each model turn, matching Python's dynamic instructions.
+The offline check asserts the Responses `instructions` field and rejects a duplicate in
+conversation input. See the [instruction contract](../../Docs/Dynamic_Instructions_Contract.md).
 
 ```bash
 cargo run -p app_context -- --check

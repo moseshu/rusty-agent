@@ -527,7 +527,7 @@ impl fmt::Display for PromptRole {
 /// The recorded identity of one prompt lowered into the model request.
 ///
 /// This is what a turn keeps after the prompt text itself has been lowered into the request: which
-/// generator produced it, the canonical tail text it lowered to, and the version and provenance
+/// generator produced it, the text it lowered to, and the version and provenance
 /// tag it declared. A prompt that reaches the model without this record leaves no way to answer
 /// "which generator wrote the text in turn 7" after the fact.
 #[non_exhaustive]
@@ -546,7 +546,7 @@ impl PromptProvenance {
         &self.source
     }
 
-    /// Hash of the canonical tail text the generator produced and preparation lowered.
+    /// Hash of the system text or canonical tail text that preparation lowered.
     ///
     /// **It covers what the generator wrote, not necessarily the bytes that left the process.** A
     /// [`ContextFilter`](crate::filter::ContextFilter) runs after preparation and may project the
@@ -688,11 +688,51 @@ impl ResolvedPrompt {
         self.provenance.as_deref()
     }
 
-    /// Captures the source, lowered-content hash, version, and provenance for the run record.
+    /// Lowers the complete text verbatim into system instructions and matching provenance.
     ///
-    /// The hash covers the text that lowering sends, not [`Self::text`] — a generator that supplies
-    /// explicit sections may leave `text` as a summary that never reaches the model, and recording
-    /// a hash of bytes nobody sent defeats the point of recording one.
+    /// This is the default agent-instruction path, and it sends [`Self::text`] exactly. Sections
+    /// may accompany that text as metadata only when they describe the same content: their
+    /// trimmed, non-empty contents joined by a blank line must equal the trimmed text.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when sections are present and their content differs from
+    /// the text. Sending the text would silently drop the section content, which the explicit
+    /// tail-message extension ([`Self::lower`]) would have delivered instead.
+    pub fn lower_to_system_instructions(&self) -> Result<(String, PromptProvenance)> {
+        if !self.sections.is_empty() {
+            let joined = self
+                .sections
+                .iter()
+                .map(|section| section.content().trim())
+                .filter(|content| !content.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if joined != self.text.trim() {
+                return Err(Error::config(
+                    "generated instructions carry sections whose content differs from their \
+                     text; system instructions send the complete text and would drop the \
+                     section content. Make the text the joined section content, or select the \
+                     tail-message extension with `AgentInstructions::dynamic_tail`",
+                ));
+            }
+        }
+        Ok((
+            self.text.clone(),
+            PromptProvenance {
+                source: self.source.clone(),
+                content_hash: self.content_hash.clone(),
+                version: self.version.clone(),
+                provenance: self.provenance.clone(),
+            },
+        ))
+    }
+
+    /// Captures provenance for the explicitly selected tail-message lowering.
+    ///
+    /// The hash covers the text that tail lowering sends, not [`Self::text`] — on this path a
+    /// generator that supplies explicit sections may leave `text` as a summary that never reaches
+    /// the model, and recording a hash of bytes nobody sent defeats the point of recording one.
     ///
     /// It is a hash of the *content*, over sections joined by a blank line. It deliberately does
     /// not identify the split: one section holding two paragraphs and two sections holding one
@@ -708,10 +748,10 @@ impl ResolvedPrompt {
 
     /// Lowers into tail items and the matching record in one pass.
     ///
-    /// This is the entry a turn uses. Calling [`Self::lower_to_tail_items`] and
-    /// [`Self::provenance_record`] separately would validate and clone the sections twice, and
-    /// would leave "the hash covers the text that was sent" resting on the two calls happening to
-    /// see the same value — true here, but true by inspection rather than by construction. One
+    /// This is the entry the explicit tail-message extension uses. Calling
+    /// [`Self::lower_to_tail_items`] and [`Self::provenance_record`] separately would validate and
+    /// clone the sections twice, and would leave "the hash covers the text that was sent" resting
+    /// on the two calls happening to see the same value — true here, but true by inspection rather than by construction. One
     /// pass makes the record and the items the same derivation.
     ///
     /// # Errors
@@ -742,12 +782,10 @@ impl ResolvedPrompt {
         Ok((items, record))
     }
 
-    /// Projects this prompt onto the only placement a dynamically generated prompt may occupy.
+    /// Validates section placement for the explicit tail-message extension.
     ///
-    /// A generated prompt reads the live run, so its text is a function of the turn. The stable
-    /// prefix is the cached span: text that varies per turn cannot be placed there without
-    /// invalidating the cache on every single call, which is why the placement is a validated
-    /// contract rather than a convention the generator is trusted to follow.
+    /// These constraints apply only when the caller explicitly selects tail lowering. Default
+    /// agent instructions use [`Self::lower_to_system_instructions`] regardless of their source.
     ///
     /// A prompt carrying no sections is treated as one volatile tail section holding its whole
     /// text; empty text yields no sections at all.
@@ -776,9 +814,9 @@ impl ResolvedPrompt {
         for section in &self.sections {
             if !section.position().is_tail_message() {
                 return Err(Error::config(format!(
-                    "dynamic prompt section `{}` requests position `{}`, but a generated prompt \
-                     may only occupy `{}`; placing per-turn text in the stable prefix invalidates \
-                     the prompt cache on every turn",
+                    "dynamic prompt section `{}` requests position `{}`, but the tail-message \
+                     extension may only occupy `{}`; use the default system-instruction path \
+                     for text that belongs in the system position",
                     section.name(),
                     section.position(),
                     SectionPosition::TailMessage,
@@ -786,8 +824,8 @@ impl ResolvedPrompt {
             }
             if !section.stability().is_volatile() {
                 return Err(Error::config(format!(
-                    "dynamic prompt section `{}` declares stability `{}`, but a generated prompt \
-                     may only contribute `{}` sections",
+                    "dynamic prompt section `{}` declares stability `{}`, but the tail-message \
+                     extension may only contribute `{}` sections",
                     section.name(),
                     section.stability(),
                     SectionStability::Volatile,
@@ -890,10 +928,11 @@ impl CachePlan {
         }
     }
 
-    /// Builds the plan naming one stable prefix.
+    /// Builds the plan naming one request's instruction prefix.
     ///
-    /// Always returns a plan. Whether it is worth acting on is the adapter's call — see the type
-    /// documentation.
+    /// The prefix is stable across calls only while its bytes are; generated instructions that
+    /// change per turn produce a different hash each turn. Always returns a plan. Whether it is
+    /// worth acting on is the adapter's call — see the type documentation.
     #[must_use]
     pub fn for_prefix(prefix: &str, cache_scope: Option<&str>) -> Self {
         let plan = Self::new(ContentHash::compute(prefix));

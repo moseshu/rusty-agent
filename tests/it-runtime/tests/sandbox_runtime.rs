@@ -1607,13 +1607,46 @@ async fn generated_agent_instructions_sit_below_the_default_prompt() {
     .await
     .unwrap();
 
-    let text = model.input_text(0);
+    let text = model.instructions(0);
+    assert!(!model.input_text(0).contains("generated for Coder"));
     let default_at = text.find(DEFAULT_SANDBOX_INSTRUCTIONS.trim()).unwrap();
     let agent_at = text
         .find("# Agent instructions\n\ngenerated for Coder")
         .unwrap();
     assert!(default_at < agent_at, "{text}");
     assert!(text.contains("# Filesystem"), "{text}");
+}
+
+#[tokio::test]
+async fn sandbox_assembly_does_not_promote_explicit_tail_instructions_to_system_text() {
+    let model = ScriptedModel::answering("unused");
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .with_instructions(ra_core::agent::AgentInstructions::dynamic_tail_fn(
+            |_| async {
+                Ok(ResolvedPrompt::new(
+                    "user-tail extension",
+                    PromptSource::Agent,
+                ))
+            },
+        ))
+        .sandbox(SandboxAgentConfig::empty())
+        .build()
+        .unwrap();
+    let error = Runner::run(request(
+        agent,
+        &model,
+        RunConfig::new().with_sandbox(with_client(&FakeClient::new())),
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tail-message instruction extension")
+    );
+    assert!(model.instructions.lock().unwrap().is_empty());
 }
 
 /// Capabilities contribute tools after the agent's own and fold over its settings in order.

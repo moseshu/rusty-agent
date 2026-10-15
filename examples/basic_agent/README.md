@@ -30,9 +30,9 @@ settled assistant messages with `next_text`; `--items` reads settled records wit
 Both call `finish` to get the final result or error. They share the existing event cursor and
 skip events outside their selected view. They never append raw deltas to settled messages.
 
-The current generated `ResolvedPrompt` becomes a trailing user message, unlike Python's
-system-instruction callback. This existing role-priority deviation is recorded as D-003
-and tracked by task R4-11a; see the [quickstart](../../Docs/Framework_Quickstart.md#state-context-and-streamed-output).
+The generated `ResolvedPrompt` supplies system instructions on each model turn, matching
+Python's instruction callback. It does not add a user message or enter session history.
+See the [instruction contract](../../Docs/Dynamic_Instructions_Contract.md).
 
 `--sync` runs twice on the same thread to demonstrate executor and provider reuse. Call it
 outside a Tokio runtime. In async applications await `run` instead.

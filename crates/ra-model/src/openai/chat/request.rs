@@ -95,7 +95,12 @@ pub(crate) async fn build_request_body(
 /// Places the stable prefix at index 0, where the protocol caches from.
 async fn lower_messages(codec: &ChatCodec, request: &ModelRequest) -> Result<Vec<Value>> {
     let mut messages = convert::lower_messages(codec, request).await?;
-    if let Some(instructions) = request.system_instructions() {
+    // Empty instructions add no system message, as the upstream Chat Completions model omits a
+    // falsy `system_instructions`.
+    if let Some(instructions) = request
+        .system_instructions()
+        .filter(|instructions| !instructions.is_empty())
+    {
         messages.insert(0, json!({"role": "system", "content": instructions}));
     }
     Ok(messages)

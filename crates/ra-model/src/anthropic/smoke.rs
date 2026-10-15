@@ -48,7 +48,11 @@ pub fn preview_request_payload(model: &str, request: &ModelRequest) -> Result<Va
     let mut body = Map::new();
     body.insert("model".to_owned(), Value::String(model.to_owned()));
     body.insert("max_tokens".to_owned(), json!(max_tokens));
-    if let Some(instructions) = request.system_instructions() {
+    // An empty text block is rejected by the API, so empty instructions are omitted.
+    if let Some(instructions) = request
+        .system_instructions()
+        .filter(|instructions| !instructions.is_empty())
+    {
         body.insert(
             "system".to_owned(),
             json!([{"type": "text", "text": instructions}]),

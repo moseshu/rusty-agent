@@ -45,7 +45,7 @@ use std::{
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::AgentSpec,
+    agent::{AgentInstructions, AgentSpec, ResolvedInstructions},
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
         ContextProcessorResult, ContextSummarizer, LoadSignal,
@@ -53,9 +53,64 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result},
     item::{ItemId, Message, RunItem, RunItemKind},
-    prompt::{PromptSection, PromptSectionName, PromptSource, SectionPosition},
+    prompt::{
+        DynamicPromptHandler, PromptSection, PromptSectionName, PromptSource, ResolvedPrompt,
+        SectionPosition,
+    },
     tool::Tool,
 };
+
+/// Appends capability prompt fragments to an agent's generated instructions on every turn.
+struct ComposedInstructions {
+    agent: AgentInstructions,
+    fragments: String,
+    owners: String,
+}
+
+#[async_trait]
+impl DynamicPromptHandler for ComposedInstructions {
+    async fn resolve(&self, context: &RunContext) -> Result<ResolvedPrompt> {
+        let prompt = match self.agent.resolve(context).await? {
+            ResolvedInstructions::Prefix(text) => {
+                return Ok(ResolvedPrompt::new(
+                    append_fragments(&text, &self.fragments),
+                    PromptSource::Agent,
+                ));
+            }
+            ResolvedInstructions::Generated(prompt) => prompt,
+            ResolvedInstructions::Tail(_) => {
+                return Err(Error::config(format!(
+                    "capabilities {} contribute system instruction text, which cannot be merged \
+                     with the tail-message instruction extension",
+                    self.owners
+                )));
+            }
+        };
+        let (text, _) = prompt.lower_to_system_instructions()?;
+        let mut composed = ResolvedPrompt::new(
+            append_fragments(&text, &self.fragments),
+            prompt.source().clone(),
+        );
+        if let Some(version) = prompt.version() {
+            composed = composed.with_version(version);
+        }
+        if let Some(provenance) = prompt.provenance() {
+            composed = composed.with_provenance(provenance);
+        }
+        Ok(composed)
+    }
+}
+
+/// Joins instructions and capability fragments without altering the base's bytes.
+///
+/// Only an empty string is skipped, matching upstream's string truthiness check.
+fn append_fragments(base: &str, fragments: &str) -> String {
+    if base.is_empty() {
+        fragments.to_owned()
+    } else {
+        format!("{base}\n\n{fragments}")
+    }
+}
 
 /// The capabilities installed for one run, validated and frozen in assembly order.
 ///
@@ -648,15 +703,18 @@ impl AssembledCapabilities {
     ///
     /// Three of the four contributions land here. Tools are appended to the agent's own, the
     /// sampling fold starts from the agent's settings layer and replaces it, and prompt fragments
-    /// follow the agent's static instructions in assembly order. The fourth — context processing —
-    /// is not the agent's to hold and is installed on the run configuration instead.
+    /// follow the agent's instructions in assembly order. Generated instructions are evaluated on
+    /// every turn and the fragments appended to that turn's text, as upstream
+    /// `build_sandbox_instructions` composes a callable base with capability instructions. The
+    /// fourth — context processing — is not the agent's to hold and is installed on the run
+    /// configuration instead.
     ///
     /// # Errors
     ///
     /// Returns a configuration error when a capability's tool collides with one the agent already
-    /// declares, and when a capability contributes prefix text to an agent whose own instructions
-    /// are generated per turn: a generated prompt may only reach the volatile tail, so the two
-    /// cannot share the one instruction slot an agent has.
+    /// declares. An agent that selected the tail-message instruction extension fails when its
+    /// instructions are resolved, because capability fragments are system text and the two
+    /// placements cannot be merged.
     pub fn prepare_agent(&self, agent: &AgentSpec) -> Result<Arc<AgentSpec>> {
         let settings = self
             .capabilities
@@ -671,24 +729,19 @@ impl AssembledCapabilities {
             .model_settings(settings);
 
         if let Some(fragments) = self.prompt_text() {
-            let instructions = match agent.instructions() {
-                None => fragments,
+            builder = match agent.instructions() {
+                None => builder.instructions(fragments),
                 Some(instructions) => match instructions.as_static() {
-                    Some(text) => format!("{}\n\n{fragments}", text.trim_end()),
-                    None => {
-                        return Err(Error::config(format!(
-                            "agent `{}` generates its instructions per turn, and capabilities {} \
-                             contribute prompt text for the cached prefix; a generated prompt \
-                             reaches the volatile tail only, so the two cannot share the one \
-                             instruction slot an agent has. Make the agent's own instructions \
-                             static, or move the per-turn text into a reminder",
-                            agent.id(),
-                            self.section_owners()
-                        )));
-                    }
+                    Some(text) => builder.instructions(append_fragments(text, &fragments)),
+                    None => builder.with_instructions(AgentInstructions::dynamic(Arc::new(
+                        ComposedInstructions {
+                            agent: instructions.clone(),
+                            fragments,
+                            owners: self.section_owners(),
+                        },
+                    ))),
                 },
             };
-            builder = builder.instructions(instructions);
         }
 
         builder.build().map_err(|error| {

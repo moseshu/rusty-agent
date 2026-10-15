@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
-    agent::{AgentId, AgentSpec},
+    agent::{AgentId, AgentInstructions, AgentSpec, ResolvedInstructions},
     cancel::CancelScope,
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
@@ -928,13 +928,24 @@ async fn a_per_run_fragment_must_claim_its_own_capability_section() {
     );
 }
 
+/// Capability fragments follow generated instructions, which are still evaluated every turn.
+///
+/// Upstream `build_sandbox_instructions` resolves a callable base on each call and appends the
+/// capability instructions to it, so the fragments neither replace the generator nor freeze it.
 #[tokio::test]
-async fn prefix_text_and_a_per_turn_prompt_cannot_share_one_instruction_slot() {
+async fn capability_fragments_follow_generated_instructions_on_every_turn() {
+    let turns = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&turns);
     let dynamic_agent = AgentSpec::builder()
         .id(AgentId::new("coder"))
         .name("Coder")
-        .dynamic_instructions_fn(|_context| async {
-            Ok(ResolvedPrompt::new("generated", PromptSource::Agent))
+        .dynamic_instructions_sync_fn(move |_context| {
+            let turn = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(ResolvedPrompt::new(
+                format!("generated turn {turn}\n"),
+                PromptSource::Dynamic("callback".into()),
+            )
+            .with_version("v3"))
         })
         .build()
         .unwrap();
@@ -942,15 +953,109 @@ async fn prefix_text_and_a_per_turn_prompt_cannot_share_one_instruction_slot() {
         .with_section("shell", "Run commands.")
         .into_shared()])
     .unwrap();
-
     let assembled = plan.assemble(&run_context("run-1")).await.unwrap();
-    let error = assembled.prepare_agent(&dynamic_agent).unwrap_err();
+    let prepared = assembled.prepare_agent(&dynamic_agent).unwrap();
+    let instructions = prepared.instructions().unwrap();
+    assert!(instructions.is_dynamic());
+
+    for turn in 1..=2 {
+        let ResolvedInstructions::Generated(prompt) =
+            instructions.resolve(&run_context("run-1")).await.unwrap()
+        else {
+            panic!("composed instructions must stay generated system text");
+        };
+        assert_eq!(
+            prompt.text(),
+            format!("generated turn {turn}\n\n\nRun commands.")
+        );
+        assert_eq!(prompt.source(), &PromptSource::Dynamic("callback".into()));
+        assert_eq!(prompt.version(), Some("v3"));
+    }
+    assert_eq!(turns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn capability_composition_preserves_static_and_generated_instruction_whitespace() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_section("shell", "Run commands.")
+        .into_shared()])
+    .unwrap();
+    let context = run_context("run-1");
+    let assembled = plan.assemble(&context).await.unwrap();
+
+    for base in ["", " \t\n ", "generated\n", "  generated \t\n\n"] {
+        let mut sources = vec![AgentInstructions::dynamic_sync_fn(move |_| {
+            Ok(ResolvedPrompt::new(base, PromptSource::Agent))
+        })];
+        // Static declarations require non-empty text; generated empty text is allowed.
+        if !base.is_empty() {
+            sources.push(AgentInstructions::static_text(base));
+        }
+        let expected = if base.is_empty() {
+            "Run commands.".to_owned()
+        } else {
+            format!("{base}\n\nRun commands.")
+        };
+        for source in sources {
+            let agent = AgentSpec::builder()
+                .id(AgentId::new("coder"))
+                .name("Coder")
+                .with_instructions(source)
+                .build()
+                .unwrap();
+            let prepared = assembled.prepare_agent(&agent).unwrap();
+            let resolved = prepared
+                .instructions()
+                .unwrap()
+                .resolve(&context)
+                .await
+                .unwrap();
+            let text = match resolved {
+                ResolvedInstructions::Prefix(text) => text,
+                ResolvedInstructions::Generated(prompt) => {
+                    let (text, provenance) = prompt.lower_to_system_instructions().unwrap();
+                    assert_eq!(
+                        provenance.content_hash(),
+                        &ra_core::prompt::ContentHash::compute(&expected),
+                    );
+                    text
+                }
+                ResolvedInstructions::Tail(_) => panic!("expected system instructions"),
+            };
+            assert_eq!(text, expected, "base instruction text: {base:?}");
+        }
+    }
+}
+
+/// Capability fragments are system text, so they cannot merge with the tail-message extension.
+#[tokio::test]
+async fn capability_fragments_reject_the_tail_instruction_extension() {
+    let tail_agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .with_instructions(AgentInstructions::dynamic_tail_fn(|_context| async {
+            Ok(ResolvedPrompt::new("tail", PromptSource::Agent))
+        }))
+        .build()
+        .unwrap();
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_section("shell", "Run commands.")
+        .into_shared()])
+    .unwrap();
+    let assembled = plan.assemble(&run_context("run-1")).await.unwrap();
+    let prepared = assembled.prepare_agent(&tail_agent).unwrap();
+
+    let error = prepared
+        .instructions()
+        .unwrap()
+        .resolve(&run_context("run-1"))
+        .await
+        .unwrap_err();
 
     let message = error.to_string();
     assert!(
-        message.contains("`shell`") && message.contains("volatile tail"),
-        "an agent has one instruction slot and a generated prompt may only reach the tail, so the \
-         refusal has to name the capability whose prefix text has nowhere to go: {message}"
+        message.contains("`shell`") && message.contains("tail-message"),
+        "the refusal must name the capability whose text cannot be placed: {message}"
     );
 }
 

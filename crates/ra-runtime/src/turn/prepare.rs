@@ -868,9 +868,10 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // 6. Resolve instructions. A generated prompt reads the run, so it runs inside the cancel
     // scope like every other stage that enters third-party code.
     //
-    // This is the last stage. What a generated prompt contributed goes to the tail, and the record
-    // of which generator wrote it travels beside the request rather than inside it: the text is
-    // already in the input, and re-deriving the generator from it afterwards is not possible.
+    // This is the last stage. Instructions use the selected system or tail placement, and the
+    // record of which generator wrote them travels beside the request rather than inside it: the
+    // text is already in the request, and re-deriving the generator from it afterwards is not
+    // possible.
     let TurnInstructions {
         prefix: instructions,
         tail_items,
@@ -898,14 +899,16 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         // span this stage can name, and naming a narrower one would partition the cache rather
         // than share it.
         //
-        // **An agent with generated instructions gets no plan at all**, because it has no stable
-        // prefix and `CachePlan` is a plan for one. That is honest but leaves value on the table:
-        // a cache scope is useful even without stable instructions, since the tool table and the
-        // history ahead of the tail are still a prefix. Modelling a scope that does not name a
-        // prefix is a change to the type, and it belongs with the rest of the session-scoped
-        // caching work rather than here.
+        // Generated system instructions also carry a plan whose hash names this turn's text.
+        // When a generator returns the same bytes every turn, as context-derived settings usually
+        // do, that prefix caches like static text. When it changes every turn, an adapter that
+        // writes explicit breakpoints (Anthropic `cache_control`) pays a cache write per turn
+        // without a later read. The plan does not suppress that: the runtime cannot predict the
+        // next turn's bytes, and dropping the plan would also drop the shared scope that
+        // `prompt_cache_key` relies on. Cache preferences never change the instruction role.
         //
-        // The plan says only which bytes are stable and which calls should share an entry. Whether
+        // The plan says only which bytes form this request's instruction prefix and which calls
+        // should share an entry. Whether
         // that becomes `cache_control` marks, a `prompt_cache_key`, or nothing is the adapter's
         // decision, and depends on the endpoint rather than on the protocol.
         //
@@ -1043,15 +1046,10 @@ struct TurnInstructions {
     provenance: Option<PromptProvenance>,
 }
 
-/// Resolves the agent's instructions into a stable prefix and volatile tail items.
+/// Resolves static and generated system instructions, or the explicitly selected tail extension.
 ///
-/// **A static source owns the prefix; a generated one may only reach the tail.** A generator reads
-/// the live run, so its text is a function of the turn — the date, the budget, the run id. Placing
-/// that in the prefix changes the cached span on every call, and the prefix is the span the whole
-/// cache plan is built to hold still. The placement comes from [`ResolvedInstructions`] rather than
-/// from a test this function performs, and lowering rejects a generator that asks for the prefix
-/// rather than dropping the section, so the generator learns its text went nowhere instead of
-/// quietly losing it.
+/// Generated system text is reevaluated each turn. Cache planning measures the resulting request;
+/// cache preferences do not change instruction roles or constrain the callback's text.
 ///
 /// The source is read from the execution instance but errors name `public_id`. A configuration
 /// error has to point at the agent the user wrote down; naming a prepared clone would send them
@@ -1084,6 +1082,18 @@ async fn resolve_instructions(
             ..TurnInstructions::default()
         }),
         ResolvedInstructions::Generated(prompt) => {
+            let (text, provenance) = prompt.lower_to_system_instructions().map_err(|err| {
+                err.with_context(format!(
+                    "lowering dynamic instructions for agent `{public_id}`"
+                ))
+            })?;
+            Ok(TurnInstructions {
+                prefix: Some(text),
+                provenance: Some(provenance),
+                ..TurnInstructions::default()
+            })
+        }
+        ResolvedInstructions::Tail(prompt) => {
             let (tail_items, provenance) = prompt.lower().map_err(|err| {
                 err.with_context(format!(
                     "lowering dynamic instructions for agent `{public_id}`"

@@ -74,24 +74,13 @@ impl LifecycleHook for Events {
 async fn main() -> Result<()> {
     let check_request = |request: &serde_json::Value| {
         let instructions = "Answer briefly in English. Use lookup_project for the project name.";
-        // Pins the current placement recorded as deviation D-003: a generated prompt is sent as
-        // one trailing user message on every request, not as Python's system instructions. The
-        // system-instruction fix must change this check to assert `request["instructions"]`.
-        let tail = request["input"].as_array().and_then(|items| items.last());
         require(
-            tail.is_some_and(|item| {
-                item["role"] == "user" && messages(&json!({"input": [item]})) == [instructions]
-            }),
-            "dynamic instructions were not evaluated into the trailing user message",
+            request["instructions"] == instructions,
+            "dynamic instructions did not reach the system-instruction field",
         )?;
         require(
-            messages(request)
-                .iter()
-                .filter(|text| *text == instructions)
-                .count()
-                == 1
-                && request["instructions"] != instructions,
-            "dynamic instructions were duplicated or moved",
+            !messages(request).iter().any(|text| text == instructions),
+            "dynamic instructions were duplicated into conversation input",
         )?;
         require(
             !request.to_string().contains("local-account-42"),
