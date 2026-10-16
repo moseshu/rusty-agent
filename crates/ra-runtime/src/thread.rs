@@ -146,6 +146,30 @@ pub enum ThreadEvent {
         /// The record, as the thread's rollout keeps it.
         item: RunItem,
     },
+    /// An incomplete message or reasoning item opened; never written to the rollout.
+    ItemStarted {
+        /// The turn.
+        turn_id: String,
+        /// The incomplete display item.
+        item: RunItem,
+    },
+    /// Text narration from the current model call, never written to the rollout.
+    Delta {
+        /// The turn.
+        turn_id: String,
+        /// The item and text part this narration belongs to.
+        delta: ra_core::model::ModelStreamDelta,
+    },
+    /// A model request failed and is being sent again: Codex's `StreamError`. Intermediate,
+    /// so the turn does not fail on it.
+    StreamError {
+        /// The turn.
+        turn_id: String,
+        /// What the client is told, such as `Reconnecting... 1/3`.
+        message: String,
+        /// The error that caused the retry.
+        additional_details: String,
+    },
     /// A host execution event, including a background command ending after its turn.
     HostEvent(HostEvent),
     /// The turn failed, and will complete next: Codex's `Error` event within a turn.
@@ -1246,6 +1270,36 @@ impl ThreadRecorder {
     }
 }
 
+impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
+    fn emit(&self, event: &RunStreamEvent) {
+        let Some(thread) = self.thread.upgrade() else {
+            return;
+        };
+        match event {
+            RunStreamEvent::ItemStarted(item) => thread.emit(ThreadEvent::ItemStarted {
+                turn_id: self.turn_id.clone(),
+                item: item.clone(),
+            }),
+            RunStreamEvent::Delta(delta) => thread.emit(ThreadEvent::Delta {
+                turn_id: self.turn_id.clone(),
+                delta: delta.clone(),
+            }),
+            _ => {}
+        }
+    }
+
+    fn retrying(&self, retry: u32, max_retries: u32, error: &ra_core::error::Error) {
+        let Some(thread) = self.thread.upgrade() else {
+            return;
+        };
+        thread.emit(ThreadEvent::StreamError {
+            turn_id: self.turn_id.clone(),
+            message: format!("Reconnecting... {retry}/{max_retries}"),
+            additional_details: error.to_string(),
+        });
+    }
+}
+
 #[async_trait::async_trait]
 impl RolloutRecorder for ThreadRecorder {
     fn record(&self, item: RolloutItem) {
@@ -1422,6 +1476,7 @@ async fn run_to_end(
             .with_pending_input(pending.clone());
         request = request.with_live_settings(settings.clone());
         request = request.with_rollout_recorder(recorder.clone());
+        request = request.with_model_stream_sink(recorder.clone());
         if let Some(output_schema) = output_schema {
             request = request.with_output_schema(output_schema.clone());
         }

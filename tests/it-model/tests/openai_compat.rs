@@ -601,3 +601,26 @@ async fn an_endpoint_without_a_terminator_still_refuses_a_stream_that_delivered_
         "unexpected message: {message}"
     );
 }
+
+/// Compatible endpoints inherit the neutral Chat narration, including terminal item identity.
+#[tokio::test]
+async fn compatible_endpoint_streams_neutral_text_deltas() {
+    use ra_core::model::ModelStreamDeltaKind;
+    let server = MockServer::start().await;
+    mount_stream(&server, "data: [DONE]\n\n").await;
+    let events: Vec<_> = model_of(&endpoint(&server))
+        .stream_response(request(user_turn()))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal response")
+    };
+    assert!(events.iter().any(|event| matches!(event,
+        ModelStreamEvent::Delta(narration)
+        if narration.item_id() == response.output()[0].id()
+            && matches!(narration.kind(), ModelStreamDeltaKind::OutputText { delta } if delta == "hi")
+    )));
+}

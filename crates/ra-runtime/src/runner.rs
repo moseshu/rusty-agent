@@ -906,6 +906,7 @@ impl std::fmt::Debug for RunConfig {
 #[must_use]
 #[non_exhaustive]
 pub struct RunRequest {
+    model_stream_sink: Option<Arc<dyn stream::ModelStreamSink>>,
     agent: AgentBinding,
     model_resolver: Arc<dyn ModelResolver>,
     run_id: RunId,
@@ -951,6 +952,7 @@ impl RunRequest {
         let state = RunState::start(run_id.clone());
         let event_seqs = state.restore_event_seq_allocator(None);
         Self {
+            model_stream_sink: None,
             agent,
             model_resolver,
             run_id,
@@ -972,6 +974,11 @@ impl RunRequest {
             live_settings: None,
             output_schema: None,
         }
+    }
+
+    pub(crate) fn with_model_stream_sink(mut self, sink: Arc<dyn stream::ModelStreamSink>) -> Self {
+        self.model_stream_sink = Some(sink);
+        self
     }
 
     /// Records the structured arguments of the agent-tool call this run answers.
@@ -1631,7 +1638,14 @@ async fn finish_recording(
 ) {
     if let Some(item) = interruption.marker_after(result) {
         let stream = interruption.stream.as_ref();
-        emit(RunEvents { stream, rollout }, RunStreamEvent::Item(item));
+        emit(
+            RunEvents {
+                stream,
+                rollout,
+                model_stream_sink: None,
+            },
+            RunStreamEvent::Item(item),
+        );
     }
     if let Some(rollout) = rollout {
         record_run_end(rollout, run_id, result).await;
@@ -1744,6 +1758,7 @@ async fn run_loop_inner(
     spend: &RunSpend,
 ) -> Result<RunResult> {
     let RunRequest {
+        model_stream_sink,
         mut agent,
         model_resolver,
         run_id,
@@ -1994,6 +2009,7 @@ async fn run_loop_inner(
         events: RunEvents {
             stream: events.as_ref(),
             rollout: rollout.as_deref(),
+            model_stream_sink: model_stream_sink.as_deref(),
         },
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
@@ -2492,6 +2508,7 @@ async fn run_loop_inner(
     let delivery_events = RunEvents {
         stream: events.as_ref(),
         rollout: None,
+        model_stream_sink: None,
     };
     // An unrecorded recovery is delivery, not turn history. Publish it only after budget and
     // stop decisions, output checks, and session persistence have accepted the final result.
@@ -5619,7 +5636,7 @@ struct ModelCallAttempt<'a> {
     turn_scope: &'a CancelScope,
     model: &'a Arc<dyn Model>,
     selector: &'a ra_core::model::ModelSelector,
-    events: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
+    events: RunEvents<'a>,
     attempt: u32,
     max_retries: u32,
     retry_trace: Option<RetryTrace>,
@@ -5734,13 +5751,16 @@ async fn call_model(
 
     // Tools start from completed stream items even when no host subscribes to raw narration, so
     // every call streams. `partial_messages` decides one separate thing: whether that narration
-    // leaves the runtime. A run that forwards nothing has consumed nothing, which is what keeps
-    // its failures replayable.
-    let narration = context
-        .config
-        .partial_messages
-        .then_some(context.events.stream)
-        .flatten();
+    // leaves the runtime. A thread installs a synchronous sink and uses its internal run queue
+    // only for settled records; sending narration to that discarded queue would falsely close
+    // its retry window when live settings enable partial messages.
+    let narration = RunEvents {
+        stream: (context.config.partial_messages && context.events.model_stream_sink.is_none())
+            .then_some(context.events.stream)
+            .flatten(),
+        rollout: None,
+        model_stream_sink: context.events.model_stream_sink,
+    };
     let retry_settings = model_request.model_settings().retry().cloned();
     let max_retries = retry_settings
         .as_ref()
@@ -5801,6 +5821,9 @@ async fn call_model(
                     retry.reason = decision.reason().unwrap_or(""),
                     "retrying failed model request"
                 );
+                if let Some(sink) = narration.model_stream_sink {
+                    sink.retrying(attempt.saturating_add(1), max_retries, &error);
+                }
                 turn_scope.run(tokio::time::sleep(delay)).await?;
                 attempt = attempt.saturating_add(1);
                 failed_attempts = failed_attempts.saturating_add(1);
@@ -6004,7 +6027,7 @@ fn prepend_failed_attempts(usage: &Usage, failed_attempts: u32) -> Usage {
 async fn stream_model_call(
     model: &Arc<dyn Model>,
     request: ModelRequest,
-    events: Option<&mpsc::UnboundedSender<RunStreamEvent>>,
+    events: RunEvents<'_>,
     surface: &TurnActionSurface,
     cancel: &CancelScope,
     mut dispatches: StreamedFunctionDispatches,
@@ -6056,7 +6079,7 @@ async fn stream_model_call(
 async fn read_model_stream(
     model: &Arc<dyn Model>,
     request: ModelRequest,
-    events: Option<&mpsc::UnboundedSender<RunStreamEvent>>,
+    events: RunEvents<'_>,
     surface: &TurnActionSurface,
     cancel: &CancelScope,
     dispatches: &mut StreamedFunctionDispatches,
@@ -6093,15 +6116,34 @@ async fn read_model_stream(
                 // replay would duplicate even a harmless-looking `response.created` frame, so
                 // every published raw event closes the retry window for this call. With narration
                 // switched off there is no subscriber, and nothing is published.
-                if events.is_some() {
+                if events.stream.is_some() {
                     consumed.published = true;
                 }
                 // Narration only: it is not a session record, so it never reaches the rollout.
-                if let Some(sender) = events {
+                if let Some(sender) = events.stream {
                     let _ = sender.send(RunStreamEvent::RawResponse(raw));
                 }
             }
             ModelStreamEvent::Completed(response) => settled = Some(*response),
+            // Only the run subscriber closes the retry window, as with raw events. The thread
+            // sink follows Codex instead: a retried sampling request is announced as a stream
+            // error that will retry, and the client keeps what it already rendered.
+            ModelStreamEvent::OutputItemAdded(item) => {
+                if events.stream.is_some() {
+                    consumed.published = true;
+                }
+                if events.stream.is_some() || events.model_stream_sink.is_some() {
+                    emit(events, RunStreamEvent::ItemStarted(item.item().clone()));
+                }
+            }
+            ModelStreamEvent::Delta(delta) => {
+                if events.stream.is_some() {
+                    consumed.published = true;
+                }
+                if events.stream.is_some() || events.model_stream_sink.is_some() {
+                    emit(events, RunStreamEvent::Delta(delta));
+                }
+            }
             ModelStreamEvent::RunItem(item) => {
                 early.completed(item.item());
                 start_streamed_call(item.item(), surface, dispatches, consumed, early)?;
@@ -6318,6 +6360,7 @@ fn next_input(
 struct RunEvents<'a> {
     stream: Option<&'a mpsc::UnboundedSender<RunStreamEvent>>,
     rollout: Option<&'a dyn RolloutRecorder>,
+    model_stream_sink: Option<&'a dyn stream::ModelStreamSink>,
 }
 
 impl RunEvents<'_> {
@@ -6417,6 +6460,13 @@ impl<'a> EarlyRecords<'a> {
 /// Sends `event` to the subscriber and records each session record it carries in the rollout, so
 /// the rollout holds exactly the records the stream reports, in the same order.
 fn emit(events: RunEvents<'_>, event: RunStreamEvent) {
+    if matches!(
+        event,
+        RunStreamEvent::ItemStarted(_) | RunStreamEvent::Delta(_)
+    ) && let Some(sink) = events.model_stream_sink
+    {
+        sink.emit(&event);
+    }
     if let (Some(rollout), RunStreamEvent::Item(item)) = (events.rollout, &event) {
         rollout.record(RolloutItem::Item(item.clone()));
     }

@@ -5,9 +5,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use futures::{StreamExt, stream, stream::BoxStream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
+    item::{ItemId, Message, MessageRole, Reasoning, RunItem, RunItemKind},
     model::{
-        ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
-        ReplaySafety, RunItemStreamEvent, stamp_replay_safety,
+        ModelHandoffDefinition, ModelStream, ModelStreamDelta, ModelStreamDeltaKind,
+        ModelStreamEvent, ProviderKey, RawResponseEvent, ReplaySafety, RunItemStreamEvent,
+        replay_safety_of, stamp_replay_safety,
     },
 };
 use serde_json::Value;
@@ -44,6 +46,7 @@ pub(crate) fn events(
             pending: VecDeque::new(),
             message: None,
             blocks: BTreeMap::new(),
+            started_items: BTreeSet::new(),
             emitted: false,
             finished: false,
             outcome: Outcome::Open,
@@ -67,6 +70,7 @@ struct Driver {
     pending: VecDeque<Result<ModelStreamEvent>>,
     message: Option<Value>,
     blocks: BTreeMap<u64, Value>,
+    started_items: BTreeSet<String>,
     emitted: bool,
     finished: bool,
     outcome: Outcome,
@@ -127,12 +131,12 @@ impl Driver {
         }
     }
 
-    /// Reports the failure that ends this stream, stamped with what the consumer has already seen.
+    /// Reports a terminal failure, leaving output-consumption checks to the runtime once started.
     fn fail(&mut self, error: Error) -> Result<ModelStreamEvent> {
         self.finished = true;
         self.outcome = Outcome::Failed;
         let safety = if self.emitted {
-            ReplaySafety::Unsafe
+            replay_safety_of(&error)
         } else {
             self.unstarted
         };
@@ -202,8 +206,14 @@ impl Driver {
                     index,
                     object(frame, "content_block", "content_block_start")?,
                 );
+                self.block_narration(index, None, &mut events);
             }
-            "content_block_delta" => self.apply_delta(frame)?,
+            "content_block_delta" => {
+                self.apply_delta(frame)?;
+                if let Some(index) = frame.get("index").and_then(Value::as_u64) {
+                    self.block_narration(index, frame.get("delta"), &mut events);
+                }
+            }
             "message_delta" => self.apply_message_delta(frame),
             "message_stop" => {
                 let payload = self.assembled()?;
@@ -227,6 +237,91 @@ impl Driver {
             _ => {}
         }
         Ok(events)
+    }
+
+    /// Messages group adjacent text blocks, exactly as the terminal converter groups them.
+    fn block_narration(
+        &mut self,
+        index: u64,
+        delta: Option<&Value>,
+        events: &mut Vec<ModelStreamEvent>,
+    ) {
+        let Some(response_id) = self
+            .message
+            .as_ref()
+            .and_then(|message| message.get("id"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let Some(block) = self.blocks.get(&index) else {
+            return;
+        };
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let ordinal = self.blocks.range(..index).count();
+        let (start, item_kind) = match kind {
+            "text" | "refusal" => {
+                let start = self.blocks.range(..index).enumerate().fold(
+                    0,
+                    |start, (position, (_, block))| {
+                        if matches!(
+                            block.get("type").and_then(Value::as_str),
+                            Some("text" | "refusal")
+                        ) {
+                            start
+                        } else {
+                            position + 1
+                        }
+                    },
+                );
+                (
+                    start,
+                    RunItemKind::Message(Message::new(MessageRole::Assistant, Vec::new())),
+                )
+            }
+            "thinking" | "redacted_thinking" => (ordinal, RunItemKind::Reasoning(Reasoning::new())),
+            _ => return,
+        };
+        let item_id = ItemId::new(format!("{response_id}:{start}:{}", item_kind.label()));
+        if self.started_items.insert(item_id.as_str().to_owned()) {
+            events.push(ModelStreamEvent::OutputItemAdded(RunItemStreamEvent::new(
+                item_kind.label(),
+                RunItem::new(item_id.clone(), item_kind),
+            )));
+        }
+        let text = if let Some(delta) = delta {
+            match (kind, delta.get("type").and_then(Value::as_str)) {
+                ("text", Some("text_delta")) => delta.get("text"),
+                ("thinking", Some("thinking_delta")) => delta.get("thinking"),
+                _ => None,
+            }
+        } else {
+            block.get(if kind == "thinking" {
+                "thinking"
+            } else {
+                "text"
+            })
+        }
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            let kind = if kind == "thinking" {
+                ModelStreamDeltaKind::ReasoningText {
+                    delta: text.to_owned(),
+                    content_index: 0,
+                }
+            } else {
+                ModelStreamDeltaKind::OutputText {
+                    delta: text.to_owned(),
+                }
+            };
+            events.push(ModelStreamEvent::Delta(ModelStreamDelta::new(
+                item_id, kind,
+            )));
+        }
     }
 
     fn apply_delta(&mut self, frame: &Value) -> Result<()> {

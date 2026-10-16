@@ -1,4 +1,4 @@
-//! The run channel and the streaming wrapper (R3-7).
+//! The run channel and the streaming wrapper.
 //!
 //! # Why this is not the model channel
 //!
@@ -9,17 +9,19 @@
 //! extends the other.
 //!
 //! Provider deltas are forwarded onto it, unchanged, when the run asks for partial messages. What
-//! is *not* forwarded is the model channel's normalized items: this channel already delivers each
+//! is *not* forwarded is the model channel's completed normalized items: this channel already delivers each
 //! record when the turn settles, attributed and with its output phase decided, and a settlement
 //! decides things the adapter cannot know. Publishing the adapter's copy as well would show every
 //! message twice, the first time without the phase — which is the confusion the settlement stamp
 //! exists to prevent.
+//! Incomplete item starts and neutral text deltas are forwarded as narration, separately from
+//! those settled records.
 
 use ra_core::{
     cancel::{CancelOnDrop, CancelReason, DRAIN_GRACE},
     error::Result,
     item::{AgentId, Message, MessageRole, RunItem, RunItemKind},
-    model::RawResponseEvent,
+    model::{ModelStreamDelta, RawResponseEvent},
 };
 use std::sync::Arc;
 
@@ -27,6 +29,15 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::result::{RunOutcome, RunResult};
 use crate::sandbox::SandboxRuntime;
+
+/// Synchronous thread narration, ordered at the same producer boundary as rollout records.
+pub(crate) trait ModelStreamSink: Send + Sync {
+    fn emit(&self, event: &RunStreamEvent);
+
+    /// A failed model request is about to be sent again: Codex's `notify_stream_error`.
+    /// `retry` is the 1-based retry about to start.
+    fn retrying(&self, retry: u32, max_retries: u32, error: &ra_core::error::Error);
+}
 
 /// One thing that happened during a run.
 ///
@@ -37,7 +48,7 @@ use crate::sandbox::SandboxRuntime;
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum RunStreamEvent {
-    /// A turn began. `agent` is the public identity (R3-12), which is the one a host displays.
+    /// A turn began. `agent` is the public identity, which is the one a host displays.
     TurnStarted {
         /// 1-based index of this turn within the run.
         turn: u32,
@@ -46,14 +57,19 @@ pub enum RunStreamEvent {
     },
     /// A provider event from the model call this turn is making, forwarded unchanged.
     ///
-    /// Only when the run asked for partial messages; a run that did not never opens a streamed
-    /// model call at all, because the deltas would be assembled and then dropped.
+    /// Only when the run asked for partial messages. Model calls stream regardless, so tools
+    /// can start before generation ends.
     ///
     /// **This is narration, not record.** The payload is provider-shaped, isolated behind the
     /// provider key, and carries no stability promise — the same event may be spelled differently
     /// by the next protocol, or by the next version of this adapter. Render it; do not persist it,
     /// and do not reconstruct the turn from it. [`Self::Item`] is the record.
     RawResponse(RawResponseEvent),
+    /// An incomplete display item opened. Only emitted when partial messages are enabled;
+    /// this is narration and never a session record.
+    ItemStarted(RunItem),
+    /// Provider-neutral text narration, only when partial messages are enabled.
+    Delta(ModelStreamDelta),
     /// One record the turn produced, already attributed.
     ///
     /// A closeout that *was* recorded arrives here rather than as [`Self::FinalMessage`], because

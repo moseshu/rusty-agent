@@ -776,6 +776,7 @@ async fn the_stream_forwards_every_provider_event_and_lifts_items_as_they_finish
             ModelStreamEvent::RawResponse(event) => raw.push(event.event_type().to_owned()),
             ModelStreamEvent::RunItem(event) => items.push(event.item().id().as_str().to_owned()),
             ModelStreamEvent::Completed(response) => terminal = Some(*response),
+            ModelStreamEvent::OutputItemAdded(_) | ModelStreamEvent::Delta(_) => {}
             _ => panic!("unexpected model stream event"),
         }
     }
@@ -1431,5 +1432,92 @@ async fn a_short_span_with_no_tool_table_gets_no_cache_key() {
     assert!(
         body.get("prompt_cache_key").is_none(),
         "no provider caches a span this short, so asking buys nothing"
+    );
+}
+
+/// The neutral stream retains canonical item identities and each reasoning part's own index.
+#[tokio::test]
+async fn text_narration_preserves_item_identity_and_reasoning_parts() {
+    use ra_core::model::{ModelStreamDelta, ModelStreamDeltaKind};
+    let server = MockServer::start().await;
+    let frames = [
+        json!({"type":"response.created","response":{"id":"resp"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"reason","type":"reasoning","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":2}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reason","summary_index":2,"delta":"summary"}),
+        json!({"type":"response.reasoning_text.delta","item_id":"reason","content_index":3,"delta":"body"}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"answer","type":"message","role":"assistant","content":[]}}),
+        json!({"type":"response.output_text.delta","output_index":1,"delta":"Hello"}),
+        json!({"type":"response.completed","response":{"id":"resp","status":"completed","output":[
+            {"id":"reason","type":"reasoning","summary":[{"type":"summary_text","text":"summary"}]},
+            {"id":"answer","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}
+        ]}}),
+    ];
+    let events: Vec<_> = streamed_events(&server, &frames)
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::OutputItemAdded(item) => Some(item.item().id().as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, ["reason", "answer"]);
+    let deltas: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::Delta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        [
+            ModelStreamDelta::new(
+                ItemId::new("reason"),
+                ModelStreamDeltaKind::ReasoningSummaryPartAdded { summary_index: 2 },
+            ),
+            ModelStreamDelta::new(
+                ItemId::new("reason"),
+                ModelStreamDeltaKind::ReasoningSummaryText {
+                    summary_index: 2,
+                    delta: "summary".into()
+                },
+            ),
+            ModelStreamDelta::new(
+                ItemId::new("reason"),
+                ModelStreamDeltaKind::ReasoningText {
+                    content_index: 3,
+                    delta: "body".into()
+                },
+            ),
+            ModelStreamDelta::new(
+                ItemId::new("answer"),
+                ModelStreamDeltaKind::OutputText {
+                    delta: "Hello".into()
+                },
+            ),
+        ]
+    );
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal response")
+    };
+    assert_eq!(
+        response
+            .output()
+            .iter()
+            .map(|item| item.id().as_str())
+            .collect::<Vec<_>>(),
+        started
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelStreamEvent::RawResponse(_)))
+            .count(),
+        frames.len()
     );
 }

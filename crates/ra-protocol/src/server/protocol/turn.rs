@@ -109,6 +109,13 @@ impl TurnError {
         }
     }
 
+    /// Adds what more is known about the error.
+    #[must_use]
+    pub(crate) fn with_additional_details(mut self, details: impl Into<String>) -> Self {
+        self.additional_details = Some(details.into());
+        self
+    }
+
     /// What went wrong.
     #[must_use]
     pub fn message(&self) -> &str {

@@ -1638,6 +1638,20 @@ async fn the_coding_hosts_commands_show_as_command_executions() {
     let ids: Vec<_> = page.data().iter().map(Turn::id).collect();
     assert_eq!(ids, [first_turn.as_str(), second_turn.as_str()]);
     std::fs::write(workspace.path().join("release-command"), "go").unwrap();
+    let delta = connection
+        .notification("item/commandExecution/outputDelta")
+        .await;
+    assert_eq!(delta["turnId"], first_turn);
+    assert_eq!(delta["itemId"], "call-echo");
+    assert_eq!(delta["delta"], "hi\n");
+    let late_delta = connection
+        .until(|v| {
+            v["method"] == "item/commandExecution/outputDelta"
+                && v["params"]["itemId"] == "call-sleep"
+        })
+        .await;
+    assert_eq!(late_delta["params"]["turnId"], first_turn);
+    assert_eq!(late_delta["params"]["delta"], "late");
     let exit = connection
         .until(|v| v["method"] == "item/completed" && v["params"]["item"]["id"] == "call-sleep")
         .await;
@@ -1944,4 +1958,463 @@ async fn a_record_recorded_again_starts_its_item_once() {
         "{note:?}"
     );
     assert_eq!(note.last(), Some(&("item/completed", json!("commentary"))));
+}
+
+/// A model whose terminal response can be held after it has narrated the turn's items.
+struct NarratingModel {
+    release: Option<Arc<Notify>>,
+    fail: bool,
+    empty_answer: bool,
+}
+
+#[async_trait]
+impl Model for NarratingModel {
+    async fn get_response(&self, _: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller("this fixture uses streaming"))
+    }
+
+    fn stream_response(&self, _: ModelRequest) -> ra_core::model::ModelStream<'_> {
+        use futures::{StreamExt, stream};
+        use ra_core::model::{
+            ModelStreamDelta, ModelStreamDeltaKind, ModelStreamEvent, RunItemStreamEvent,
+        };
+        let reasoning = RunItem::new(
+            ItemId::new("reasoning"),
+            RunItemKind::Reasoning(Reasoning::new()),
+        );
+        let message = RunItem::new(
+            ItemId::new("answer"),
+            RunItemKind::Message(Message::new(MessageRole::Assistant, vec![])),
+        );
+        let events = vec![
+            ModelStreamEvent::OutputItemAdded(RunItemStreamEvent::new("reasoning", reasoning)),
+            ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new("reasoning"),
+                ModelStreamDeltaKind::ReasoningSummaryPartAdded { summary_index: 1 },
+            )),
+            ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new("reasoning"),
+                ModelStreamDeltaKind::ReasoningSummaryText {
+                    summary_index: 1,
+                    delta: "summary".into(),
+                },
+            )),
+            ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new("reasoning"),
+                ModelStreamDeltaKind::ReasoningText {
+                    content_index: 2,
+                    delta: "body".into(),
+                },
+            )),
+            ModelStreamEvent::OutputItemAdded(RunItemStreamEvent::new("message", message)),
+            ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new("answer"),
+                ModelStreamDeltaKind::OutputText {
+                    delta: "Hello".into(),
+                },
+            )),
+            ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new("answer"),
+                ModelStreamDeltaKind::OutputText {
+                    delta: " world".into(),
+                },
+            )),
+        ];
+        let release = self.release.clone();
+        let fail = self.fail;
+        let answer = if self.empty_answer { "" } else { "Hello world" };
+        stream::iter(events.into_iter().map(Ok))
+            .chain(stream::once(async move {
+                if let Some(release) = release {
+                    release.notified().await;
+                }
+                if fail {
+                    return Err(Error::caller("generation failed"));
+                }
+                Ok(ModelStreamEvent::Completed(Box::new(ModelResponse::new(
+                    vec![
+                        RunItem::new(
+                            ItemId::new("reasoning"),
+                            RunItemKind::Reasoning(
+                                Reasoning::new()
+                                    .with_summary(vec![String::new(), "summary".into()])
+                                    .with_content(vec![
+                                        String::new(),
+                                        String::new(),
+                                        "body".into(),
+                                    ]),
+                            ),
+                        ),
+                        RunItem::new(
+                            ItemId::new("answer"),
+                            RunItemKind::Message(Message::assistant(answer, OutputPhase::Final)),
+                        ),
+                    ],
+                ))))
+            }))
+            .boxed()
+    }
+}
+
+struct NarratingResolver(Arc<NarratingModel>);
+impl ModelResolver for NarratingResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("neutral"),
+                model_name.map(str::to_owned),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.0) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+/// Both immediate and suspended generation must send started, then deltas, then completed.
+#[rstest::rstest]
+#[case::immediate(false, false)]
+#[case::suspended(true, false)]
+#[case::failed(true, true)]
+#[tokio::test]
+async fn text_deltas_arrive_before_settlement_and_never_become_records(
+    #[case] gated: bool,
+    #[case] fail: bool,
+) {
+    let server = Server::start(None);
+    let mut connection = server.connect(1).await;
+    let mut outsider = server.connect(2).await;
+    let release = gated.then(|| Arc::new(Notify::new()));
+    let model = Arc::new(NarratingModel {
+        release: release.clone(),
+        fail,
+        empty_answer: false,
+    });
+    let recorder = server.create_thread().await;
+    let thread = AgentThread::builder(
+        SessionId::new(THREAD),
+        AgentBinding::direct(agent()),
+        Arc::new(NarratingResolver(model)),
+    )
+    .with_rollout_recorder(recorder)
+    .build();
+    server.load_thread(thread.clone(), &[&connection]).await;
+    let turn_id = server.turn_start(&mut connection, "go").await;
+    connection.notification("turn/started").await;
+    let mut seen = Vec::new();
+    loop {
+        let message = connection.next().await;
+        let last_delta = message["method"] == "item/agentMessage/delta"
+            && message["params"]["delta"] == " world";
+        let completed = message["method"] == "turn/completed";
+        seen.push(message);
+        if last_delta && let Some(release) = &release {
+            assert!(
+                thread.is_running(),
+                "narration is visible while generation is suspended"
+            );
+            let page = server
+                .turns_list(
+                    &mut connection,
+                    ThreadTurnsListParams::new(THREAD).with_items_view(TurnItemsView::Full),
+                )
+                .await;
+            assert_eq!(page.data()[0].status(), TurnStatus::InProgress);
+            assert_eq!(
+                page.data()[0].items().len(),
+                1,
+                "incomplete model narration is absent from history"
+            );
+            release.notify_one();
+        }
+        if completed {
+            break;
+        }
+    }
+    let deltas: Vec<_> = seen
+        .iter()
+        .filter(|message| {
+            matches!(
+                message["method"].as_str(),
+                Some(
+                    "item/agentMessage/delta"
+                        | "item/reasoning/summaryPartAdded"
+                        | "item/reasoning/summaryTextDelta"
+                        | "item/reasoning/textDelta"
+                )
+            )
+        })
+        .collect();
+    assert_eq!(deltas.len(), 5);
+    assert_eq!(
+        deltas[0]["params"],
+        json!({"threadId":THREAD,"turnId":turn_id,"itemId":"reasoning","summaryIndex":1})
+    );
+    assert_eq!(deltas[1]["params"]["summaryIndex"], 1);
+    assert_eq!(deltas[2]["params"]["contentIndex"], 2);
+    assert_eq!(deltas[3]["params"]["delta"], "Hello");
+    assert_eq!(deltas[4]["params"]["delta"], " world");
+    for delta in &deltas {
+        assert_eq!(delta["params"]["threadId"], THREAD);
+        assert_eq!(delta["params"]["turnId"], turn_id);
+        assert!(delta["emittedAtMs"].is_i64());
+    }
+    for id in ["reasoning", "answer"] {
+        let starts: Vec<_> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m["method"] == "item/started" && m["params"]["item"]["id"] == id)
+            .collect();
+        assert_eq!(starts.len(), 1, "an item must never start twice: {seen:?}");
+        let first_delta = seen
+            .iter()
+            .position(|m| m["params"]["itemId"] == id)
+            .unwrap();
+        assert!(starts[0].0 < first_delta);
+        let ends: Vec<_> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m["method"] == "item/completed" && m["params"]["item"]["id"] == id)
+            .collect();
+        assert_eq!(ends.len(), usize::from(!fail));
+        if !fail {
+            assert!(first_delta < ends[0].0);
+        }
+    }
+    let page = server
+        .turns_list(
+            &mut connection,
+            ThreadTurnsListParams::new(THREAD).with_items_view(TurnItemsView::Full),
+        )
+        .await;
+    assert_eq!(
+        page.data()[0].status(),
+        if fail {
+            TurnStatus::Failed
+        } else {
+            TurnStatus::Completed
+        }
+    );
+    assert_eq!(page.data()[0].items().len(), if fail { 1 } else { 3 });
+    let request_id = server
+        .request(&mut outsider, "thread/loaded/list", json!({}))
+        .await;
+    outsider.response(request_id).await;
+    assert!(
+        !outsider
+            .passed
+            .iter()
+            .any(|m| m["method"] == "item/agentMessage/delta")
+    );
+}
+
+/// An item opened during generation must complete even when its final text is empty.
+#[tokio::test]
+async fn an_empty_streamed_message_still_completes() {
+    let server = Server::start(None);
+    let mut connection = server.connect(1).await;
+    let model = Arc::new(NarratingModel {
+        release: None,
+        fail: false,
+        empty_answer: true,
+    });
+    let recorder = server.create_thread().await;
+    let thread = AgentThread::builder(
+        SessionId::new(THREAD),
+        AgentBinding::direct(agent()),
+        Arc::new(NarratingResolver(model)),
+    )
+    .with_rollout_recorder(recorder)
+    .build();
+    server.load_thread(thread, &[&connection]).await;
+    server.turn_start(&mut connection, "go").await;
+    let notifications = connection.turn_notifications().await;
+    let completed = notifications
+        .iter()
+        .find(|(method, item)| method == "item/completed" && item["id"] == "answer")
+        .expect("a started empty item completes");
+    assert_eq!(completed.1["text"], "");
+    assert_eq!(
+        notifications
+            .iter()
+            .filter(|(method, item)| method == "item/started" && item["id"] == "answer")
+            .count(),
+        1
+    );
+}
+
+/// Narrates an answer, drops the connection once, then answers on the retried request.
+struct DroppedOnceModel {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Model for DroppedOnceModel {
+    async fn get_response(&self, _: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller("this fixture uses streaming"))
+    }
+
+    fn stream_response(&self, _: ModelRequest) -> ra_core::model::ModelStream<'_> {
+        use futures::{StreamExt, stream};
+        use ra_core::{
+            error::ProviderErrorKind,
+            model::{
+                ModelStreamDelta, ModelStreamDeltaKind, ModelStreamEvent, NormalizedProviderError,
+                RunItemStreamEvent,
+            },
+        };
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("answer-{call}");
+        let started = RunItem::new(
+            ItemId::new(id.clone()),
+            RunItemKind::Message(Message::new(MessageRole::Assistant, vec![])),
+        );
+        let mut events = vec![
+            Ok(ModelStreamEvent::OutputItemAdded(RunItemStreamEvent::new(
+                "message", started,
+            ))),
+            Ok(ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new(id.clone()),
+                ModelStreamDeltaKind::OutputText {
+                    delta: "Hel".into(),
+                },
+            ))),
+        ];
+        if call == 0 {
+            events.push(Err(NormalizedProviderError::new(
+                ProviderErrorKind::Network,
+                "connection reset",
+            )
+            .into_error()));
+        } else {
+            events.push(Ok(ModelStreamEvent::Completed(Box::new(
+                ModelResponse::new(vec![RunItem::new(
+                    ItemId::new(id),
+                    RunItemKind::Message(Message::assistant("Hello", OutputPhase::Final)),
+                )]),
+            ))));
+        }
+        stream::iter(events).boxed()
+    }
+
+    fn get_retry_advice(
+        &self,
+        _: &ra_core::model::ModelRetryAdviceRequest<'_>,
+    ) -> Option<ra_core::model::RetryAdvice> {
+        Some(
+            ra_core::model::RetryAdvice::new()
+                .with_replay_safety(ra_core::model::ReplaySafety::Safe),
+        )
+    }
+}
+
+struct DroppedOnceResolver(Arc<DroppedOnceModel>);
+impl ModelResolver for DroppedOnceResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        let retry = ra_core::model::ModelRetrySettings::new()
+            .with_max_retries(1)
+            .with_backoff(
+                ra_core::model::RetryBackoffSettings::new()
+                    .with_initial_delay(Duration::ZERO)
+                    .with_jitter(false),
+            )
+            .with_policy(Arc::new(ra_core::model::NetworkErrorRetryPolicy));
+        let settings = ModelSettings::new().with_retry(retry);
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("neutral"),
+                model_name.map(str::to_owned),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.0) as Arc<dyn Model>,
+            settings.clone(),
+            settings,
+        ))
+    }
+}
+
+/// Like Codex, a thread retries a dropped stream after narrating it, and says so first.
+#[rstest::rstest]
+#[case::default(false)]
+#[case::partial_messages(true)]
+#[tokio::test]
+async fn a_dropped_stream_retries_after_narration_and_reports_it(#[case] partial_messages: bool) {
+    let server = Server::start(None);
+    let mut connection = server.connect(1).await;
+    let model = Arc::new(DroppedOnceModel {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let recorder = server.create_thread().await;
+    let thread = AgentThread::builder(
+        SessionId::new(THREAD),
+        AgentBinding::direct(agent()),
+        Arc::new(DroppedOnceResolver(Arc::clone(&model))),
+    )
+    .with_config(RunConfig::new().with_partial_messages(partial_messages))
+    .with_rollout_recorder(recorder)
+    .build();
+    server.load_thread(thread, &[&connection]).await;
+    let turn_id = server.turn_start(&mut connection, "go").await;
+    connection.notification("turn/started").await;
+    let mut seen = Vec::new();
+    loop {
+        let message = connection.next().await;
+        let completed = message["method"] == "turn/completed";
+        seen.push(message);
+        if completed {
+            break;
+        }
+    }
+    assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let errors: Vec<_> = seen.iter().filter(|m| m["method"] == "error").collect();
+    assert_eq!(errors.len(), 1, "{seen:?}");
+    let error = &errors[0]["params"];
+    assert_eq!(error["willRetry"], true);
+    assert_eq!(error["turnId"], turn_id);
+    assert_eq!(error["error"]["message"], "Reconnecting... 1/1");
+    assert!(
+        error["error"]["additionalDetails"]
+            .as_str()
+            .is_some_and(|details| details.contains("connection reset")),
+        "{error}"
+    );
+    let position = |predicate: &dyn Fn(&Value) -> bool| seen.iter().position(predicate).unwrap();
+    let first_delta = position(&|m| m["params"]["itemId"] == "answer-0");
+    let retry = position(&|m| m["method"] == "error");
+    let retried_delta = position(&|m| m["params"]["itemId"] == "answer-1");
+    assert!(first_delta < retry && retry < retried_delta);
+    let turn = &seen.last().unwrap()["params"]["turn"];
+    assert_eq!(turn["status"], "completed", "{turn}");
+    assert!(turn["error"].is_null());
+}
+
+/// Wire payloads keep Codex's field names and signed numeric part indexes.
+#[test]
+fn incremental_notifications_match_codex_wire_shapes() {
+    use ra_protocol::server::protocol::{
+        AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
+        ReasoningSummaryPartAddedNotification, ReasoningSummaryTextDeltaNotification,
+        ReasoningTextDeltaNotification,
+    };
+    macro_rules! round_trip {
+        ($ty:ty, $wire:expr $(,)?) => {{
+            let wire = $wire;
+            let value: $ty = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(value).unwrap(), wire);
+        }};
+    }
+    let text = json!({"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"hello"});
+    round_trip!(AgentMessageDeltaNotification, text.clone());
+    round_trip!(CommandExecutionOutputDeltaNotification, text.clone());
+    let mut summary = text.clone();
+    summary["summaryIndex"] = json!(2);
+    round_trip!(ReasoningSummaryTextDeltaNotification, summary);
+    let mut content = text;
+    content["contentIndex"] = json!(3);
+    round_trip!(ReasoningTextDeltaNotification, content);
+    round_trip!(
+        ReasoningSummaryPartAddedNotification,
+        json!({"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","summaryIndex":2}),
+    );
 }

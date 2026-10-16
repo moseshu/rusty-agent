@@ -651,10 +651,7 @@ pub(crate) fn convert_completion(
             .unwrap_or("OpenAI chat completion contained an error");
         return Err(behavior_error(message));
     }
-    let completion_id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or(FAKE_ITEM_ID);
+    let completion_id = payload.get("id").and_then(Value::as_str);
     let choices = payload
         .get("choices")
         .and_then(Value::as_array)
@@ -732,7 +729,7 @@ fn lift_message(
     codec: &ChatCodec,
     message: &Value,
     finish_reason: Option<&str>,
-    completion_id: &str,
+    completion_id: Option<&str>,
     handoffs: &[ModelHandoffDefinition],
     custom_tools: &BTreeSet<String>,
     provider: &ProviderKey,
@@ -751,8 +748,9 @@ fn lift_message(
     });
 
     let mut items = Vec::new();
-    let mut next = ItemIdCounter::new(completion_id);
-    if let Some(reasoning) = lift_reasoning(codec, message, completion_id) {
+    let item_prefix = item_id_prefix(completion_id);
+    let mut next = ItemIdCounter::new(&item_prefix);
+    if let Some(reasoning) = lift_reasoning(codec, message, completion_id.unwrap_or(FAKE_ITEM_ID)) {
         items.push(next.item(RunItemKind::Reasoning(reasoning), message, provider));
     }
     if text.is_some() || refusal.is_some() {
@@ -941,6 +939,19 @@ pub(crate) fn reasoning_provider_data(
         data.insert("reasoning".to_owned(), Value::String(body.to_owned()));
     }
     data
+}
+
+/// The prefix of the item identifiers of one completion.
+///
+/// A completion that names itself prefixes its items with that name. One that does not gets a
+/// prefix of its own rather than the shared sentinel: items of two such completions in one
+/// session would otherwise share identifiers, and a host that tracks items by identifier would
+/// merge them. The sentinel stays at the front so the identifier still reads as synthesized.
+pub(crate) fn item_id_prefix(completion_id: Option<&str>) -> String {
+    completion_id.map_or_else(
+        || format!("{FAKE_ITEM_ID}-{}", uuid::Uuid::new_v4().simple()),
+        str::to_owned,
+    )
 }
 
 /// Hands out deterministic identifiers for the items lifted out of one completion.

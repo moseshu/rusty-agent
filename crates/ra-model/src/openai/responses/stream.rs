@@ -20,14 +20,15 @@
 //! evidence here, and the failure frames are refused rather than being allowed to fall through to
 //! the same "ran out of bytes" ending.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
+    item::ItemId,
     model::{
         ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
-        ReplaySafety, RunItemStreamEvent, stamp_replay_safety,
+        ReplaySafety, RunItemStreamEvent, replay_safety_of, stamp_replay_safety,
     },
 };
 use serde_json::Value;
@@ -58,6 +59,7 @@ pub(crate) fn events(
         handoffs,
         request_id,
         response_id: None,
+        output_ids: BTreeMap::new(),
         pending: VecDeque::new(),
         emitted: false,
         unstarted,
@@ -80,6 +82,8 @@ struct StreamDriver {
     request_id: Option<String>,
     /// The response identifier, used to name an item the endpoint did not name itself.
     response_id: Option<String>,
+    /// Canonical identities for deltas whose frame only names an output slot.
+    output_ids: BTreeMap<u64, ItemId>,
     /// Events decoded from the last frame, waiting to be yielded.
     ///
     /// One frame can mean two events: the provider's own narration always, plus the normalized
@@ -95,27 +99,25 @@ struct StreamDriver {
 }
 
 impl StreamDriver {
-    /// Yields the next event, recording what a later failure would have to be replayed over.
+    /// Yields the next event, distinguishing an unstarted call from an interrupted stream.
     ///
-    /// This is the only layer that can answer the replay question. The frame reader below has no
-    /// idea what its bytes were turned into, and the policy above receives the error long after the
-    /// stream that produced it is gone.
+    /// After an event, preserve provider evidence without inventing an output-consumption veto.
+    /// The runtime knows whether it published output to a public run subscriber, sent narration
+    /// to a retry-aware thread, or dispatched a tool; this decoder does not.
     async fn next_event(&mut self) -> Option<Result<ModelStreamEvent>> {
         match self.decode_next().await? {
             Ok(event) => {
                 self.emitted = true;
                 Some(Ok(event))
             }
-            // Any event already delivered makes a transparent replay a duplicate for whoever read
-            // it, whether that event carried output or only narration.
-            Err(error) => Some(Err(stamp_replay_safety(
-                error,
-                if self.emitted {
-                    ReplaySafety::Unsafe
+            Err(error) => {
+                let safety = if self.emitted {
+                    replay_safety_of(&error)
                 } else {
                     self.unstarted
-                },
-            ))),
+                };
+                Some(Err(stamp_replay_safety(error, safety)))
+            }
         }
     }
 
@@ -212,7 +214,50 @@ impl StreamDriver {
             }
             _ => {}
         }
+        self.lift_narration(&event_type, frame);
         Ok(())
+    }
+
+    fn lift_narration(&mut self, event_type: &str, frame: &Value) {
+        use crate::openai::stream_events::{text_delta, text_item_added};
+        if event_type == "response.output_item.added" {
+            let Some(item) = frame.get("item") else {
+                return;
+            };
+            let Some(kind) = item.get("type").and_then(Value::as_str) else {
+                return;
+            };
+            let index = frame
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let id = item.get("id").and_then(Value::as_str).map_or_else(
+                || {
+                    ItemId::new(format!(
+                        "{}:{index}:{kind}",
+                        self.response_id.as_deref().unwrap_or_default()
+                    ))
+                },
+                ItemId::new,
+            );
+            self.output_ids.insert(index, id.clone());
+            if let Some(event) = text_item_added(item, id) {
+                self.pending.push_back(Ok(event));
+            }
+        } else {
+            let id = frame
+                .get("item_id")
+                .and_then(Value::as_str)
+                .map(ItemId::new)
+                .or_else(|| {
+                    self.output_ids
+                        .get(&frame.get("output_index")?.as_u64()?)
+                        .cloned()
+                });
+            if let Some(delta) = id.and_then(|id| text_delta(event_type, frame, id)) {
+                self.pending.push_back(Ok(ModelStreamEvent::Delta(delta)));
+            }
+        }
     }
 
     /// Publishes a finished output item on the normalized channel.

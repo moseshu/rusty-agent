@@ -41,6 +41,7 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use ra_core::model::{ModelStreamDelta, ModelStreamDeltaKind};
 use ra_core::session::SessionId;
 use ra_runtime::thread::ThreadEvent;
 use serde::Serialize;
@@ -59,12 +60,16 @@ use super::{
     },
     permission_requests::request_permissions,
     protocol::{
+        AGENT_MESSAGE_DELTA_METHOD, AgentMessageDeltaNotification,
+        COMMAND_EXECUTION_OUTPUT_DELTA_METHOD, CommandExecutionOutputDeltaNotification,
         ERROR_METHOD, ErrorNotification, ITEM_COMPLETED_METHOD, ITEM_STARTED_METHOD,
-        ItemCompletedNotification, ItemStartedNotification, THREAD_CLOSED_METHOD,
-        THREAD_SETTINGS_UPDATED_METHOD, TURN_COMPLETED_METHOD, TURN_STARTED_METHOD,
-        ThreadClosedNotification, ThreadResumeResponse, ThreadSettingsUpdatedNotification, Turn,
-        TurnCompletedNotification, TurnError, TurnInterruptResponse, TurnItemsView,
-        TurnStartedNotification, TurnStatus,
+        ItemCompletedNotification, ItemStartedNotification, REASONING_SUMMARY_PART_ADDED_METHOD,
+        REASONING_SUMMARY_TEXT_DELTA_METHOD, REASONING_TEXT_DELTA_METHOD,
+        ReasoningSummaryPartAddedNotification, ReasoningSummaryTextDeltaNotification,
+        ReasoningTextDeltaNotification, THREAD_CLOSED_METHOD, THREAD_SETTINGS_UPDATED_METHOD,
+        TURN_COMPLETED_METHOD, TURN_STARTED_METHOD, ThreadClosedNotification, ThreadResumeResponse,
+        ThreadSettingsUpdatedNotification, Turn, TurnCompletedNotification, TurnError,
+        TurnInterruptResponse, TurnItemsView, TurnStartedNotification, TurnStatus,
     },
     settings_adapter::settings_snapshot,
     thread_history::{HistorySources, ItemChange},
@@ -359,25 +364,16 @@ async fn handle_event(
         );
         return;
     }
-    if let ThreadEvent::Item { turn_id, .. } = &event {
+    if let ThreadEvent::Item { turn_id, .. } | ThreadEvent::ItemStarted { turn_id, .. } = &event {
         send_item_changes(item_changes, &thread_id, turn_id, &thread_outgoing).await;
         return;
     }
+    if let ThreadEvent::Delta { turn_id, delta } = &event {
+        send_model_delta(delta, &thread_id, turn_id, &thread_outgoing).await;
+        return;
+    }
     if let ThreadEvent::HostEvent(event) = &event {
-        send_item_changes(
-            item_changes,
-            &thread_id,
-            event.run_id().as_str(),
-            &thread_outgoing,
-        )
-        .await;
-        request_dynamic_tool_call(
-            event,
-            &loaded.dynamic_tool_calls,
-            thread_id.as_str(),
-            &thread_outgoing,
-        )
-        .await;
+        handle_host_event(event, loaded, &thread_outgoing, thread_state, item_changes).await;
         return;
     }
     let ended = matches!(
@@ -389,6 +385,108 @@ async fn handle_event(
     // before it hears of it.
     if ended && thread_state.lock().await.active_turn_id().is_none() {
         outgoing.thread_state().note_active(&thread_id, false);
+    }
+}
+
+/// Maps tool runtime events after the listener has tracked their item boundaries.
+async fn handle_host_event(
+    event: &ra_core::event::HostEvent,
+    loaded: &LoadedThread,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    thread_state: &Mutex<ThreadState>,
+    item_changes: Vec<ItemChange>,
+) {
+    let thread_id = loaded.thread_id();
+    let command_output = thread_state.lock().await.command_output(event);
+    send_item_changes(item_changes, thread_id, event.run_id().as_str(), outgoing).await;
+    if let Some((item_id, delta)) = command_output {
+        send_to_thread(
+            outgoing,
+            COMMAND_EXECUTION_OUTPUT_DELTA_METHOD,
+            CommandExecutionOutputDeltaNotification::new(
+                thread_id.as_str(),
+                event.run_id().as_str(),
+                item_id,
+                delta,
+            ),
+        )
+        .await;
+    }
+    request_dynamic_tool_call(
+        event,
+        &loaded.dynamic_tool_calls,
+        thread_id.as_str(),
+        outgoing,
+    )
+    .await;
+}
+
+/// Codex's item event mapping, after adapters have removed provider wire details.
+async fn send_model_delta(
+    delta: &ModelStreamDelta,
+    thread_id: &SessionId,
+    turn_id: &str,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    let item_id = delta.item_id().as_str();
+    let thread_id = thread_id.as_str();
+    match delta.kind() {
+        ModelStreamDeltaKind::OutputText { delta } => {
+            send_to_thread(
+                outgoing,
+                AGENT_MESSAGE_DELTA_METHOD,
+                AgentMessageDeltaNotification::new(thread_id, turn_id, item_id, delta),
+            )
+            .await;
+        }
+        ModelStreamDeltaKind::ReasoningSummaryText {
+            delta,
+            summary_index,
+        } => {
+            send_to_thread(
+                outgoing,
+                REASONING_SUMMARY_TEXT_DELTA_METHOD,
+                ReasoningSummaryTextDeltaNotification::new(
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    delta,
+                    *summary_index,
+                ),
+            )
+            .await;
+        }
+        ModelStreamDeltaKind::ReasoningSummaryPartAdded { summary_index } => {
+            send_to_thread(
+                outgoing,
+                REASONING_SUMMARY_PART_ADDED_METHOD,
+                ReasoningSummaryPartAddedNotification::new(
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    *summary_index,
+                ),
+            )
+            .await;
+        }
+        ModelStreamDeltaKind::ReasoningText {
+            delta,
+            content_index,
+        } => {
+            send_to_thread(
+                outgoing,
+                REASONING_TEXT_DELTA_METHOD,
+                ReasoningTextDeltaNotification::new(
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    delta,
+                    *content_index,
+                ),
+            )
+            .await;
+        }
+        _ => {}
     }
 }
 
@@ -654,6 +752,21 @@ async fn apply_turn_event_handling(
                 outgoing,
                 ERROR_METHOD,
                 ErrorNotification::new(error, false, thread_id.as_str(), turn_id),
+            )
+            .await;
+        }
+        // Codex's `StreamError` arm: an intermediate state of a retry, so the turn summary keeps
+        // no error and the turn does not fail on it.
+        ThreadEvent::StreamError {
+            turn_id,
+            message,
+            additional_details,
+        } => {
+            let error = TurnError::new(message).with_additional_details(additional_details);
+            send_to_thread(
+                outgoing,
+                ERROR_METHOD,
+                ErrorNotification::new(error, true, thread_id.as_str(), turn_id),
             )
             .await;
         }

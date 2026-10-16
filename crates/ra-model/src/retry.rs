@@ -128,10 +128,9 @@ pub const fn unstarted_replay_safety(continuation: &ConversationContinuation) ->
 
 /// Whether replaying this request can duplicate what a consumer already saw.
 ///
-/// The stamp the adapter left is authoritative when there is one: it is the only layer that knows
-/// what reached the consumer. Advice never upgrades it — an unstamped streaming failure stays
-/// unknown, because an adapter that did not say what it emitted has not established that it emitted
-/// nothing.
+/// An explicit stamp is authoritative; advice never upgrades it. After streaming begins, adapters
+/// preserve provider evidence and leave output-consumption checks to the runtime. An unstamped
+/// streaming failure stays unknown rather than claiming that no output or state was accepted.
 fn replay_safety(
     request: &ModelRetryAdviceRequest<'_>,
     normalized: Option<&NormalizedProviderError>,

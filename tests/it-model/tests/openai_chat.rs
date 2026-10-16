@@ -1069,6 +1069,7 @@ async fn collect_stream_with_terminal(
                     "a stream settles exactly once"
                 );
             }
+            ModelStreamEvent::OutputItemAdded(_) | ModelStreamEvent::Delta(_) => {}
             _ => panic!("unexpected model stream event"),
         }
     }
@@ -1854,4 +1855,328 @@ async fn the_provider_caches_one_instance_per_model_name() {
     let second = ra_core::model::ModelProvider::get_model(&provider, Some("chat-default"))
         .expect("named model should resolve");
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+/// Synthesized wire ids are placeholders; neutral narration must use the actual output ids.
+#[tokio::test]
+async fn neutral_deltas_use_terminal_ids_after_reasoning_and_tools() {
+    use ra_core::model::{ModelStreamDelta, ModelStreamDeltaKind};
+    let server = MockServer::start().await;
+    let model = streaming_model(&server, &[
+        delta(json!({"reasoning_content":"summary one"}), None),
+        delta(json!({"reasoning":"body"}), None),
+        delta(json!({"tool_calls":[{"index":0,"id":"call","function":{"name":"lookup","arguments":"{}"}}]}), None),
+        delta(json!({"reasoning_content":"summary two"}), None),
+        delta(json!({"content":"Hel"}), None),
+        delta(json!({"content":"lo"}), Some("stop")),
+    ]).await.with_quirks(ProviderQuirks::new().with_reasoning_content(true));
+    let events: Vec<_> = model
+        .stream_response(request(vec![]))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal response")
+    };
+    let reasoning_id = response
+        .output()
+        .iter()
+        .find(|item| matches!(item.kind(), RunItemKind::Reasoning(_)))
+        .unwrap()
+        .id();
+    let message_id = response
+        .output()
+        .iter()
+        .find(|item| matches!(item.kind(), RunItemKind::Message(_)))
+        .unwrap()
+        .id();
+    assert_eq!(message_id.as_str(), "chatcmpl_stream:2:message");
+    let deltas: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::Delta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        [
+            ModelStreamDelta::new(
+                reasoning_id.clone(),
+                ModelStreamDeltaKind::ReasoningSummaryPartAdded { summary_index: 0 },
+            ),
+            ModelStreamDelta::new(
+                reasoning_id.clone(),
+                ModelStreamDeltaKind::ReasoningSummaryText {
+                    summary_index: 0,
+                    delta: "summary one".into()
+                },
+            ),
+            ModelStreamDelta::new(
+                reasoning_id.clone(),
+                ModelStreamDeltaKind::ReasoningText {
+                    content_index: 0,
+                    delta: "body".into()
+                },
+            ),
+            ModelStreamDelta::new(
+                reasoning_id.clone(),
+                ModelStreamDeltaKind::ReasoningSummaryPartAdded { summary_index: 1 },
+            ),
+            ModelStreamDelta::new(
+                reasoning_id.clone(),
+                ModelStreamDeltaKind::ReasoningSummaryText {
+                    summary_index: 1,
+                    delta: "summary two".into()
+                },
+            ),
+            ModelStreamDelta::new(
+                message_id.clone(),
+                ModelStreamDeltaKind::OutputText {
+                    delta: "Hel".into()
+                },
+            ),
+            ModelStreamDelta::new(
+                message_id.clone(),
+                ModelStreamDeltaKind::OutputText { delta: "lo".into() },
+            ),
+        ]
+    );
+}
+
+/// Mixed gateway fields retain body-first terminal content, even when thinking arrives first.
+#[rstest]
+#[case::thinking_only(false)]
+#[case::mixed_fields(true)]
+#[tokio::test]
+async fn thinking_deltas_keep_their_terminal_content_index(#[case] mixed: bool) {
+    use ra_core::model::ModelStreamDeltaKind;
+    let server = MockServer::start().await;
+    let mut frames = vec![
+        delta(
+            json!({"thinking_blocks":[{"type":"thinking","thinking":"think"}]}),
+            None,
+        ),
+        delta(
+            json!({"thinking_blocks":[{"type":"thinking","thinking":"ing","signature":"private"}]}),
+            None,
+        ),
+    ];
+    if mixed {
+        frames.push(delta(json!({"reasoning":"body"}), None));
+    }
+    frames.push(delta(json!({"content":"done"}), Some("stop")));
+    let model = streaming_model(&server, &frames).await.with_quirks(
+        ProviderQuirks::new()
+            .with_thinking_blocks(true)
+            .with_reasoning_content(mixed),
+    );
+    let events: Vec<_> = model
+        .stream_response(request(vec![]))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let texts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::Delta(narration) => match narration.kind() {
+                ModelStreamDeltaKind::ReasoningText {
+                    delta,
+                    content_index,
+                } => Some((delta.as_str(), *content_index)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        if mixed {
+            vec![("body", 0), ("think", 1), ("ing", 1)]
+        } else {
+            vec![("think", 0), ("ing", 0)]
+        }
+    );
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal response")
+    };
+    let RunItemKind::Reasoning(reasoning) = response.output()[0].kind() else {
+        panic!("reasoning")
+    };
+    for (index, text) in reasoning.content().iter().enumerate() {
+        let streamed: String = texts
+            .iter()
+            .filter(|(_, part)| *part == index as i64)
+            .map(|(text, _)| *text)
+            .collect();
+        assert_eq!(&streamed, text);
+    }
+}
+
+/// Some compatible endpoints disclose their completion id only after starting their output.
+#[tokio::test]
+async fn a_late_completion_id_does_not_rename_narrated_items() {
+    let server = MockServer::start().await;
+    let mut first = delta(json!({"content":"Hel"}), None);
+    first.as_object_mut().unwrap().remove("id");
+    let model = streaming_model(
+        &server,
+        &[first, delta(json!({"content":"lo"}), Some("stop"))],
+    )
+    .await;
+    let events: Vec<_> = model
+        .stream_response(request(vec![]))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal response")
+    };
+    let id = response.output()[0].id();
+    for event in &events {
+        match event {
+            ModelStreamEvent::OutputItemAdded(item) => assert_eq!(item.item().id(), id),
+            ModelStreamEvent::Delta(delta) => assert_eq!(delta.item_id(), id),
+            _ => {}
+        }
+    }
+}
+
+/// The reasoning and answer narration of one stream, in arrival order.
+fn narrated_texts(events: &[ModelStreamEvent]) -> Vec<(&'static str, String, i64)> {
+    use ra_core::model::ModelStreamDeltaKind;
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::Delta(narration) => match narration.kind() {
+                ModelStreamDeltaKind::ReasoningText {
+                    delta,
+                    content_index,
+                } => Some(("reasoning", delta.clone(), *content_index)),
+                ModelStreamDeltaKind::OutputText { delta } => Some(("answer", delta.clone(), 0)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Held thinking waits for its content index, not for the end of the response.
+#[rstest]
+#[case::released_by_output(false, false)]
+#[case::released_by_body(true, false)]
+#[case::body_after_output(false, true)]
+#[tokio::test]
+async fn held_thinking_is_released_before_the_answer(
+    #[case] early_body: bool,
+    #[case] late_body: bool,
+) {
+    let server = MockServer::start().await;
+    let mut frames = vec![delta(
+        json!({"thinking_blocks":[{"type":"thinking","thinking":"think","signature":"s"}]}),
+        None,
+    )];
+    if early_body {
+        frames.push(delta(json!({"reasoning":"body"}), None));
+    }
+    frames.push(delta(json!({"content":"do"}), None));
+    if late_body {
+        frames.push(delta(json!({"reasoning":"body"}), None));
+    }
+    frames.push(delta(json!({"content":"ne"}), Some("stop")));
+    let model = streaming_model(&server, &frames).await.with_quirks(
+        ProviderQuirks::new()
+            .with_thinking_blocks(true)
+            .with_reasoning_content(true),
+    );
+    let events: Vec<_> = model
+        .stream_response(request(vec![]))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let narrated = narrated_texts(&events);
+    let expected: Vec<(&str, &str, i64)> = match (early_body, late_body) {
+        (true, _) => vec![
+            ("reasoning", "body", 0),
+            ("reasoning", "think", 1),
+            ("answer", "do", 0),
+            ("answer", "ne", 0),
+        ],
+        // The answer started before any body, so thinking is narrated as the first part; a body
+        // after that takes the next part instead of sharing it.
+        (false, true) => vec![
+            ("reasoning", "think", 0),
+            ("answer", "do", 0),
+            ("reasoning", "body", 1),
+            ("answer", "ne", 0),
+        ],
+        (false, false) => vec![
+            ("reasoning", "think", 0),
+            ("answer", "do", 0),
+            ("answer", "ne", 0),
+        ],
+    };
+    let narrated: Vec<_> = narrated
+        .iter()
+        .map(|(kind, text, index)| (*kind, text.as_str(), *index))
+        .collect();
+    assert_eq!(narrated, expected);
+}
+
+/// Completions that name no id still give each call's items identifiers of their own.
+#[tokio::test]
+async fn unnamed_completions_do_not_share_item_ids() {
+    let server = MockServer::start().await;
+    let mut frame = delta(json!({"content":"hi"}), Some("stop"));
+    frame.as_object_mut().unwrap().remove("id");
+    let model = streaming_model(&server, &[frame]).await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let events: Vec<_> = model
+            .stream_response(request(vec![]))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+            panic!("terminal response")
+        };
+        let id = response.output()[0].id().clone();
+        for event in &events {
+            match event {
+                ModelStreamEvent::OutputItemAdded(item) => assert_eq!(item.item().id(), &id),
+                ModelStreamEvent::Delta(narration) => assert_eq!(narration.item_id(), &id),
+                _ => {}
+            }
+        }
+        assert!(id.as_str().starts_with("__fake_id__-"), "{id}");
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
+
+    let server = MockServer::start().await;
+    let mut completion = empty_completion();
+    completion.as_object_mut().unwrap().remove("id");
+    completion["choices"][0]["message"]["content"] = json!("hi");
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(completion),
+    )
+    .await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let response = model.get_response(request(vec![])).await.unwrap();
+        ids.push(response.output()[0].id().clone());
+    }
+    assert!(ids[0].as_str().starts_with("__fake_id__-"), "{}", ids[0]);
+    assert_ne!(ids[0], ids[1]);
 }

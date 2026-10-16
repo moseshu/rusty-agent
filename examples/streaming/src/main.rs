@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use rusty_agent::model::ModelStreamDeltaKind;
 use rusty_agent::prelude::*;
 use serde_json::json;
 use support::{answer, call, has_tool_output, require};
@@ -48,14 +49,8 @@ async fn main() -> Result<()> {
         .run_streamed();
     while let Some(event) = stream.next_event().await {
         match event {
-            RunStreamEvent::RawResponse(raw)
-                if !items && raw.event_type() == "response.output_text.delta" =>
-            {
-                if let Some(delta) = raw
-                    .payload()
-                    .get("delta")
-                    .and_then(serde_json::Value::as_str)
-                {
+            RunStreamEvent::Delta(narration) if !items => {
+                if let ModelStreamDeltaKind::OutputText { delta } = narration.kind() {
                     print!("{delta}");
                     io::stdout()
                         .flush()

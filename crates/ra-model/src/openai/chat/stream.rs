@@ -30,7 +30,7 @@
 //! response as one recorded request, exactly as the non-streaming path reports it, so a streamed
 //! turn and a non-streamed one produce the same ledger entry for the same call.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
@@ -40,8 +40,9 @@ use ra_core::{
         Reasoning, RunItem, RunItemKind,
     },
     model::{
-        ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
-        ReplaySafety, RunItemStreamEvent, stamp_replay_safety,
+        ModelHandoffDefinition, ModelStream, ModelStreamDelta, ModelStreamDeltaKind,
+        ModelStreamEvent, ProviderKey, RawResponseEvent, ReplaySafety, RunItemStreamEvent,
+        replay_safety_of, stamp_replay_safety,
     },
     usage::Usage,
 };
@@ -81,6 +82,10 @@ pub(crate) fn events(
         state: StreamingState::default(),
         layout: OutputLayout::default(),
         sequence: 0,
+        item_ids: BTreeMap::new(),
+        fallback_item_prefix: convert::item_id_prefix(None),
+        pending_thinking_deltas: Vec::new(),
+        thinking_content_index: None,
         pending: VecDeque::new(),
         emitted: false,
         unstarted,
@@ -323,6 +328,16 @@ struct StreamDriver {
     state: StreamingState,
     layout: OutputLayout,
     sequence: u64,
+    /// Once exposed, an item identity does not change if the completion id arrives late.
+    item_ids: BTreeMap<(u64, String), ItemId>,
+    /// Names this call's items while no completion id has arrived, unique to the call.
+    fallback_item_prefix: String,
+    /// Mixed gateway reasoning fields place body text before thinking blocks at settlement.
+    /// Thinking fragments wait only while that index is still undecided: until a body arrives,
+    /// visible output starts, or the reasoning item closes.
+    pending_thinking_deltas: Vec<String>,
+    /// The content index thinking narration uses, once decided.
+    thinking_content_index: Option<i64>,
     pending: VecDeque<Result<ModelStreamEvent>>,
     /// Whether any event has already reached the consumer.
     emitted: bool,
@@ -340,27 +355,25 @@ struct StreamDriver {
 }
 
 impl StreamDriver {
-    /// Yields the next event, recording what a later failure would have to be replayed over.
+    /// Yields the next event, distinguishing an unstarted call from an interrupted stream.
     ///
-    /// This is the only layer that can answer the replay question. The frame reader below has no
-    /// idea what its bytes were turned into, and the policy above receives the error long after the
-    /// stream that produced it is gone.
+    /// After an event, preserve provider evidence without inventing an output-consumption veto.
+    /// The runtime knows whether it published output to a public run subscriber, sent narration
+    /// to a retry-aware thread, or dispatched a tool; this decoder does not.
     async fn next_event(&mut self) -> Option<Result<ModelStreamEvent>> {
         match self.decode_next().await? {
             Ok(event) => {
                 self.emitted = true;
                 Some(Ok(event))
             }
-            // Any event already delivered makes a transparent replay a duplicate for whoever read
-            // it, whether that event carried output or only narration.
-            Err(error) => Some(Err(stamp_replay_safety(
-                error,
-                if self.emitted {
-                    ReplaySafety::Unsafe
+            Err(error) => {
+                let safety = if self.emitted {
+                    replay_safety_of(&error)
                 } else {
                     self.unstarted
-                },
-            ))),
+                };
+                Some(Err(stamp_replay_safety(error, safety)))
+            }
         }
     }
 
@@ -423,10 +436,8 @@ impl StreamDriver {
     /// confidently reads as a model with nothing to say rather than as a connection that never
     /// carried one.
     ///
-    /// The two messages are deliberately different, and so is what the error carries: whether
-    /// anything was already emitted decides whether the request may be replayed at all, and the
-    /// verdict is stamped onto every error leaving this driver rather than left for a reader to
-    /// infer from the wording.
+    /// The message describes how far the stream got. Replay safety is separate evidence: the
+    /// runtime decides whether its consumer or a dispatched tool prevents replay.
     fn truncation_error(&self) -> Option<Error> {
         if self.state.saw_done || self.state.finish_reason.is_some() {
             return None;
@@ -436,7 +447,7 @@ impl StreamDriver {
         }
         let message = if self.state.started {
             "OpenAI stream ended after partial output, without `[DONE]` or a finish reason; the \
-             turn is incomplete and its emitted events cannot be replayed transparently"
+             turn is incomplete"
         } else {
             "OpenAI stream closed without sending an event, `[DONE]`, or a finish reason"
         };
@@ -452,6 +463,40 @@ impl StreamDriver {
     }
 
     fn emit(&mut self, event_type: &str, mut payload: Value) {
+        use crate::openai::stream_events::{text_delta, text_item_added};
+        let index = payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let kind = if event_type == "response.output_text.delta" {
+            "message"
+        } else if event_type == "response.output_item.added" {
+            payload
+                .pointer("/item/type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        } else {
+            "reasoning"
+        };
+        let narration = if event_type == "response.output_item.added" {
+            let id = self.narration_item_id(index, kind);
+            payload
+                .get("item")
+                .and_then(|item| text_item_added(item, id))
+        } else if matches!(
+            event_type,
+            "response.output_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_summary_part.added"
+                | "response.reasoning_text.delta"
+        ) {
+            let id = self.narration_item_id(index, kind);
+            text_delta(event_type, &payload, id)
+                .map(|delta| self.place_body_delta(delta))
+                .map(ModelStreamEvent::Delta)
+        } else {
+            None
+        };
         let sequence = self.next_sequence();
         if let Some(object) = payload.as_object_mut() {
             object.insert("type".to_owned(), Value::String(event_type.to_owned()));
@@ -463,16 +508,45 @@ impl StreamDriver {
                 event_type,
                 payload,
             ))));
+        if let Some(event) = narration {
+            self.pending.push_back(Ok(event));
+        }
+    }
+
+    fn narration_item_id(&mut self, index: u64, kind: &str) -> ItemId {
+        let prefix = self
+            .state
+            .completion_id
+            .as_deref()
+            .unwrap_or(&self.fallback_item_prefix);
+        self.item_ids
+            .entry((index, kind.to_owned()))
+            .or_insert_with(|| ItemId::new(format!("{prefix}:{index}:{kind}")))
+            .clone()
+    }
+
+    /// Keeps a reasoning body that arrives after thinking narration was already placed at index 0
+    /// from sharing that part. The completed item still orders the body first.
+    fn place_body_delta(&self, delta: ModelStreamDelta) -> ModelStreamDelta {
+        match delta.kind() {
+            ModelStreamDeltaKind::ReasoningText { delta: text, .. }
+                if self.thinking_content_index == Some(0) =>
+            {
+                ModelStreamDelta::new(
+                    delta.item_id().clone(),
+                    ModelStreamDeltaKind::ReasoningText {
+                        delta: text.clone(),
+                        content_index: 1,
+                    },
+                )
+            }
+            _ => delta,
+        }
     }
 
     /// Publishes a completed item on the normalized channel.
     fn emit_item(&mut self, kind: RunItemKind, output_index: usize, raw: Value) {
-        let id = ItemId::new(format!(
-            "{}:{}:{}",
-            self.state.completion_id(),
-            output_index,
-            kind.label()
-        ));
+        let id = self.narration_item_id(output_index as u64, kind.label());
         let name = kind.label();
         let item = RunItem::new(id, kind)
             .with_raw_provider_item(RawProviderItem::new(self.provider.as_str(), raw));
@@ -631,6 +705,7 @@ impl StreamDriver {
         self.process_thinking_blocks(delta);
         self.process_reasoning_content(delta);
         self.process_reasoning_text(delta);
+        self.flush_thinking_if_superseded(delta);
         self.close_summary_part_if_superseded(delta);
         self.process_content(delta);
         self.process_refusal(delta);
@@ -649,6 +724,80 @@ impl StreamDriver {
         }
         if accumulated {
             self.open_reasoning_item();
+            for block in &blocks {
+                if block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("thinking")
+                    != "thinking"
+                {
+                    continue;
+                }
+                let Some(text) = non_empty(block.get("thinking")) else {
+                    continue;
+                };
+                let decided = self.thinking_content_index.or_else(|| {
+                    // Without the gateway declaration there is no body field, so thinking is the
+                    // only content part; with it, a body already seen settles the order.
+                    if self.codec.quirks.reasoning_content() {
+                        self.state
+                            .reasoning
+                            .as_ref()
+                            .and_then(|reasoning| reasoning.body.as_ref())
+                            .map(|_| 1)
+                    } else {
+                        Some(0)
+                    }
+                });
+                if let Some(content_index) = decided {
+                    self.thinking_content_index = Some(content_index);
+                    self.emit_thinking_delta(text.to_owned(), content_index);
+                } else {
+                    self.pending_thinking_deltas.push(text.to_owned());
+                }
+            }
+        }
+    }
+
+    fn emit_thinking_delta(&mut self, text: String, content_index: i64) {
+        let item_id = self.narration_item_id(0, "reasoning");
+        self.pending
+            .push_back(Ok(ModelStreamEvent::Delta(ModelStreamDelta::new(
+                item_id,
+                ModelStreamDeltaKind::ReasoningText {
+                    delta: text,
+                    content_index,
+                },
+            ))));
+    }
+
+    /// Releases held thinking narration once its content index is decided.
+    fn flush_thinking_deltas(&mut self, content_index: i64) {
+        if self.pending_thinking_deltas.is_empty() {
+            return;
+        }
+        self.thinking_content_index = Some(content_index);
+        for text in std::mem::take(&mut self.pending_thinking_deltas) {
+            self.emit_thinking_delta(text, content_index);
+        }
+    }
+
+    /// Visible output almost always ends reasoning, so held thinking stops waiting for a body
+    /// once it starts. A body that still arrives later is narrated after the thinking part.
+    fn flush_thinking_if_superseded(&mut self, delta: &Value) {
+        let moved_on = non_empty(delta.get("content")).is_some()
+            || non_empty(delta.get("refusal")).is_some()
+            || delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty());
+        if moved_on {
+            let body = self
+                .state
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.body.is_some());
+            self.flush_thinking_deltas(i64::from(body));
         }
     }
 
@@ -722,6 +871,8 @@ impl StreamDriver {
         if let Some(reasoning) = self.state.reasoning.as_mut() {
             reasoning.body.get_or_insert_default().push_str(&text);
         }
+        // A body places any held thinking after it.
+        self.flush_thinking_deltas(1);
     }
 
     /// Closes the open summary part once the turn moves on to visible output.
@@ -1108,6 +1259,8 @@ impl StreamDriver {
         if !text.is_empty() {
             reasoning.thinking_text = Some(text);
         }
+        let content_index = i64::from(reasoning.body.is_some());
+        self.flush_thinking_deltas(content_index);
     }
 
     fn finish_reasoning_item(&mut self) {

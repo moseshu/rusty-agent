@@ -159,6 +159,13 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn command_output(
+        &mut self,
+        event: &ra_core::event::HostEvent,
+    ) -> Option<(String, String)> {
+        self.current_turn_history.command_output(event)
+    }
+
     /// Follows the thread's turns: Codex's `track_current_turn_event`. Returns what a record the
     /// event carries did to the turn's items, for the listener to report.
     pub(crate) fn track_current_turn_event(
@@ -176,6 +183,9 @@ impl ThreadState {
                 self.active_turn_id = Some(turn_id.clone());
                 self.current_turn_history
                     .turn_started(turn_id, Some(*started_at));
+            }
+            ThreadEvent::ItemStarted { turn_id, item } => {
+                changes = self.current_turn_history.item_started(turn_id, item);
             }
             ThreadEvent::Item { turn_id, item } => {
                 changes = self

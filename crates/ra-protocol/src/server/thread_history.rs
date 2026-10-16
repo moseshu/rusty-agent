@@ -105,7 +105,7 @@ impl ItemProjector {
         let whole_item = match item.kind() {
             RunItemKind::Message(message) => match message.role() {
                 MessageRole::User => user_message(id, message),
-                MessageRole::Assistant => agent_message(id, message),
+                MessageRole::Assistant => agent_message(id, message, self.started.contains(id)),
                 _ => None,
             },
             RunItemKind::Reasoning(reasoning) => Some(ThreadItem::reasoning(
@@ -224,10 +224,10 @@ fn user_input(block: &ContentBlock) -> Option<UserInput> {
     })
 }
 
-/// The agent's message, or `None` for one with no text, which Codex does not show either.
-fn agent_message(id: &str, message: &Message) -> Option<ThreadItem> {
+/// The agent's message. An empty message still completes an item already shown as started.
+fn agent_message(id: &str, message: &Message, started: bool) -> Option<ThreadItem> {
     let text = message.text_content();
-    if text.is_empty() {
+    if text.is_empty() && !started {
         return None;
     }
     let phase = message.phase().map(|phase| match phase {
@@ -319,6 +319,58 @@ impl ThreadHistoryBuilder {
         Self::default()
     }
 
+    /// Tracks an incomplete display item without completing it or adding a rollout record.
+    pub(crate) fn item_started(&mut self, turn_id: &str, item: &RunItem) -> Vec<ItemChange> {
+        let projected = match item.kind() {
+            RunItemKind::Message(message) if message.role() == MessageRole::Assistant => {
+                Some(ThreadItem::agent_message(
+                    item.id().as_str(),
+                    message.text_content(),
+                    message.phase().map(|phase| match phase {
+                        OutputPhase::Commentary => MessagePhase::Commentary,
+                        _ => MessagePhase::FinalAnswer,
+                    }),
+                ))
+            }
+            RunItemKind::Reasoning(reasoning) => Some(ThreadItem::reasoning(
+                item.id().as_str(),
+                reasoning.summary().to_vec(),
+                reasoning.content().to_vec(),
+            )),
+            _ => None,
+        };
+        let Some(projected) = projected else {
+            return Vec::new();
+        };
+        if self.turn_for(Some(turn_id)).is_none() {
+            return Vec::new();
+        }
+        if self.projector.started.insert(item.id().as_str().to_owned()) {
+            vec![ItemChange::Started(projected)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Finds the displayed command of an execution output event in its original turn.
+    pub(crate) fn command_output(&mut self, event: &HostEvent) -> Option<(String, String)> {
+        use ra_core::event::{HostEventBody, exec::ExecEvent};
+        let HostEventBody::Exec(ExecEvent::Output(output)) = event.body() else {
+            return None;
+        };
+        let turn = self.turn_for(Some(event.run_id().as_str()))?;
+        turn.items.iter().find_map(|item| match item {
+            ThreadItem::CommandExecution {
+                id,
+                process_id: Some(process_id),
+                ..
+            } if process_id == output.session_id().as_str() => {
+                Some((id.clone(), output.text().to_owned()))
+            }
+            _ => None,
+        })
+    }
+
     /// Forgets everything: Codex's `reset`.
     pub(crate) fn reset(&mut self) {
         *self = Self::new();
@@ -381,6 +433,12 @@ impl ThreadHistoryBuilder {
         }
         if let Some(turn) = self.turn_for(turn_id) {
             for change in &changes {
+                // Codex's legacy history ignores empty agent messages, even when their live
+                // lifecycle completes an item that was opened while streaming.
+                if matches!(change.item(), ThreadItem::AgentMessage { text, .. } if text.is_empty())
+                {
+                    continue;
+                }
                 turn.upsert(change.item().clone());
             }
         } else {

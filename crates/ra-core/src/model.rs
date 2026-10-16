@@ -40,7 +40,9 @@ pub use settings::{
     Effort, JsonMap, McpToolChoice, ModelSettings, ProviderKey, ResolvedModelSettings,
     ThinkingConfig, ToolChoice,
 };
-pub use stream::{ModelStreamEvent, RawResponseEvent, RunItemStreamEvent};
+pub use stream::{
+    ModelStreamDelta, ModelStreamDeltaKind, ModelStreamEvent, RawResponseEvent, RunItemStreamEvent,
+};
 
 /// Sendable stream returned by a model adapter.
 pub type ModelStream<'a> = BoxStream<'a, Result<ModelStreamEvent>>;

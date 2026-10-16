@@ -16,6 +16,7 @@ pub mod conversations;
 pub(crate) mod error;
 pub mod responses;
 pub(crate) mod sse;
+mod stream_events;
 
 use self::auth::OpenAiAuth;
 

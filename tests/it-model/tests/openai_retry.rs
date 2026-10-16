@@ -299,10 +299,10 @@ async fn the_endpoint_verdict_outranks_what_the_status_class_would_suggest() {
     assert_eq!(advice.reason(), Some(REASON_ENDPOINT_VERDICT));
 }
 
-/// The one case the whole replay dimension exists for: a stream that already delivered events
-/// cannot be repeated transparently, however retryable the failure that ended it looks.
+/// Adapters cannot know how their events were consumed. The runtime owns the output veto, while
+/// provider advice stays unknown unless the endpoint supplied replay evidence of its own.
 #[tokio::test]
-async fn a_stream_that_already_emitted_events_is_not_replay_safe() {
+async fn an_interrupted_stream_leaves_output_consumption_to_the_runtime() {
     let server = MockServer::start().await;
     // One text delta, then the connection simply ends: no `[DONE]`, no finish reason.
     let body = format!(
@@ -321,13 +321,13 @@ async fn a_stream_that_already_emitted_events_is_not_replay_safe() {
 
     let error = failed_stream(&model).await;
     assert_eq!(error.recoverability(), Recoverability::Retryable);
-    assert_eq!(facts(&error).replay_safety(), ReplaySafety::Unsafe);
+    assert_eq!(facts(&error).replay_safety(), ReplaySafety::Unknown);
     assert_eq!(
         advice(&model, &error, true)
             .expect("a provider failure yields advice")
             .replay_safety(),
-        ReplaySafety::Unsafe,
-        "advice must not soften a verdict the decoder established"
+        ReplaySafety::Unknown,
+        "advice must not invent replay evidence for an interrupted stream"
     );
 }
 

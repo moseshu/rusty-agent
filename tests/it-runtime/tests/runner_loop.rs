@@ -5470,3 +5470,90 @@ async fn a_sticky_rejection_without_text_refuses_later_calls_with_the_default() 
         "a configured denial keeps the runtime's refusal: {configured_refusal}"
     );
 }
+
+struct NarrationThenFailModel {
+    calls: AtomicUsize,
+    item_start: bool,
+}
+
+#[async_trait]
+impl Model for NarrationThenFailModel {
+    async fn get_response(&self, _: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller("this fixture uses streaming"))
+    }
+
+    fn stream_response(&self, _: ModelRequest) -> ModelStream<'_> {
+        use ra_core::model::{ModelStreamDelta, ModelStreamDeltaKind, RunItemStreamEvent};
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let event = if self.item_start {
+            ModelStreamEvent::OutputItemAdded(RunItemStreamEvent::new("message", message("m", "")))
+        } else {
+            ModelStreamEvent::Delta(ModelStreamDelta::new(
+                ItemId::new("m"),
+                ModelStreamDeltaKind::OutputText {
+                    delta: "partial".into(),
+                },
+            ))
+        };
+        stream::iter(vec![
+            Ok(event),
+            Err(
+                NormalizedProviderError::new(ProviderErrorKind::Network, "connection reset")
+                    .into_error(),
+            ),
+        ])
+        .boxed()
+    }
+
+    fn get_retry_advice(&self, _: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
+        Some(RetryAdvice::new().with_replay_safety(ReplaySafety::Safe))
+    }
+}
+
+/// Publishing any neutral narration vetoes replay; suppressed narration leaves retries available.
+#[rstest::rstest]
+#[case::start_visible(true, true)]
+#[case::delta_visible(false, true)]
+#[case::start_suppressed(true, false)]
+#[case::delta_suppressed(false, false)]
+#[tokio::test]
+async fn neutral_narration_respects_partial_messages_and_retry_consumption(
+    #[case] item_start: bool,
+    #[case] partial: bool,
+) {
+    let model = Arc::new(NarrationThenFailModel {
+        calls: AtomicUsize::new(0),
+        item_start,
+    });
+    let retry = ModelRetrySettings::new()
+        .with_max_retries(1)
+        .with_backoff(
+            RetryBackoffSettings::new()
+                .with_initial_delay(Duration::ZERO)
+                .with_jitter(false),
+        )
+        .with_policy(Arc::new(NetworkErrorRetryPolicy));
+    let request = model_request(Arc::clone(&model) as Arc<dyn Model>, &CancelScope::root())
+        .with_config(
+            RunConfig::new()
+                .with_partial_messages(partial)
+                .with_model_settings(ModelSettings::new().with_retry(retry)),
+        );
+    let mut stream = Runner::run_streamed(request);
+    let mut narration = 0;
+    while let Some(event) = stream.next_event().await {
+        if matches!(
+            event,
+            RunStreamEvent::ItemStarted(_) | RunStreamEvent::Delta(_)
+        ) {
+            narration += 1;
+        }
+    }
+    let error = stream.finish().await.expect_err("the stream fails");
+    assert_eq!(error.code(), "provider.network");
+    assert_eq!(narration, usize::from(partial));
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        if partial { 1 } else { 2 }
+    );
+}

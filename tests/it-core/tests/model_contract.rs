@@ -403,6 +403,22 @@ fn test_model_contract_07() {
             "response.delta",
             json!({}),
         )),
+        ModelStreamEvent::OutputItemAdded(ra_core::model::RunItemStreamEvent::new(
+            "message",
+            ra_core::item::RunItem::new(
+                ItemId::new("item-1"),
+                ra_core::item::RunItemKind::Message(Message::new(
+                    ra_core::item::MessageRole::Assistant,
+                    vec![],
+                )),
+            ),
+        )),
+        ModelStreamEvent::Delta(ra_core::model::ModelStreamDelta::new(
+            ItemId::new("item-1"),
+            ra_core::model::ModelStreamDeltaKind::OutputText {
+                delta: "hello".into(),
+            },
+        )),
         ModelStreamEvent::RunItem(ra_core::model::RunItemStreamEvent::new(
             "message_output_created",
             ra_core::item::RunItem::new(
@@ -414,12 +430,53 @@ fn test_model_contract_07() {
     ]
     .iter()
     .map(|event| {
-        serde_json::to_value(event).expect("事件应可序列化")["type"]
-            .as_str()
-            .expect("tag 应是字符串")
-            .to_owned()
+        let value = serde_json::to_value(event).expect("events serialize");
+        assert_eq!(
+            &serde_json::from_value::<ModelStreamEvent>(value.clone()).unwrap(),
+            event
+        );
+        value["type"].as_str().expect("tag 应是字符串").to_owned()
     })
     .collect();
 
-    assert_eq!(labels, vec!["raw_response", "run_item", "completed"]);
+    assert_eq!(
+        labels,
+        vec![
+            "raw_response",
+            "output_item_added",
+            "delta",
+            "run_item",
+            "completed"
+        ]
+    );
+}
+
+/// Neutral narration carries the stream schema version and keeps fields a newer writer added.
+#[test]
+fn model_stream_delta_is_versioned_and_keeps_unknown_fields() {
+    use ra_core::model::{ModelStreamDelta, ModelStreamDeltaKind};
+    let delta = ModelStreamDelta::new(
+        ItemId::new("item-1"),
+        ModelStreamDeltaKind::ReasoningText {
+            delta: "body".into(),
+            content_index: 1,
+        },
+    );
+    let wire = serde_json::to_value(&delta).unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "schema_version": 1,
+            "item_id": "item-1",
+            "kind": {"type": "reasoning_text", "delta": "body", "content_index": 1}
+        })
+    );
+    let raw = RawResponseEvent::new(ProviderKey::new("test"), "response.delta", json!({}));
+    assert_eq!(delta.schema_version(), raw.schema_version());
+    let mut newer = wire;
+    newer["obfuscation"] = json!("pad");
+    let read: ModelStreamDelta = serde_json::from_value(newer.clone()).unwrap();
+    assert_eq!(read.kind(), delta.kind());
+    assert_eq!(read.unknown().get("obfuscation"), Some(&json!("pad")));
+    assert_eq!(serde_json::to_value(&read).unwrap(), newer);
 }

@@ -30,7 +30,7 @@ use serde_json::Value;
 use super::ProviderKey;
 use crate::{
     compat::{SchemaVersion, Unknown},
-    item::{ModelResponse, RunItem},
+    item::{ItemId, ModelResponse, RunItem},
 };
 
 /// Current model-stream-event schema version.
@@ -43,6 +43,11 @@ pub const MODEL_STREAM_EVENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(
 pub enum ModelStreamEvent {
     /// Provider event preserved for diagnostics and protocol-aware consumers.
     RawResponse(RawResponseEvent),
+    /// An incomplete message or reasoning item opened, before its deltas arrive.
+    /// This is narration, never a record to persist or dispatch as a completed tool call.
+    OutputItemAdded(RunItemStreamEvent),
+    /// Provider-neutral text narration. The terminal response remains authoritative.
+    Delta(ModelStreamDelta),
     /// A normalized item became available. Lifting belongs to the adapter, so this is still the
     /// model channel.
     RunItem(RunItemStreamEvent),
@@ -63,6 +68,90 @@ pub enum ModelStreamEvent {
     /// [`ModelResponse`] already versions itself and already retains unknown fields — a wrapper
     /// would add a second copy of both.
     Completed(Box<ModelResponse>),
+}
+
+/// Text narration lifted by a provider adapter, following the Responses streaming semantics.
+///
+/// The Python framework exposes these through raw Responses events. Rust adapters also lift this
+/// subset so consumers can display providers with different wire protocols without parsing them.
+/// The identifier matches the eventual output item; [`ModelStreamDeltaKind`] says what was
+/// appended and to which part of that item.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStreamDelta {
+    schema_version: SchemaVersion,
+    item_id: ItemId,
+    kind: ModelStreamDeltaKind,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl ModelStreamDelta {
+    /// Creates narration for the output item `item_id`.
+    #[must_use]
+    pub const fn new(item_id: ItemId, kind: ModelStreamDeltaKind) -> Self {
+        Self {
+            schema_version: MODEL_STREAM_EVENT_SCHEMA_VERSION,
+            item_id,
+            kind,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// The output item this narration belongs to.
+    #[must_use]
+    pub const fn item_id(&self) -> &ItemId {
+        &self.item_id
+    }
+
+    /// What was appended, and where.
+    #[must_use]
+    pub const fn kind(&self) -> &ModelStreamDeltaKind {
+        &self.kind
+    }
+
+    /// Unknown fields retained during deserialization.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// What one [`ModelStreamDelta`] appends to its output item.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelStreamDeltaKind {
+    /// Assistant text appended to a message.
+    OutputText {
+        /// Text appended by this event.
+        delta: String,
+    },
+    /// Text appended to one reasoning summary part.
+    ReasoningSummaryText {
+        /// Text appended by this event.
+        delta: String,
+        /// Zero-based summary part index, as in the upstream streaming contract.
+        summary_index: i64,
+    },
+    /// A reasoning summary part opened.
+    ReasoningSummaryPartAdded {
+        /// Zero-based summary part index.
+        summary_index: i64,
+    },
+    /// Text appended to one reasoning body part.
+    ReasoningText {
+        /// Text appended by this event.
+        delta: String,
+        /// Zero-based reasoning content part index.
+        content_index: i64,
+    },
 }
 
 /// Raw provider event isolated behind the provider registration key.

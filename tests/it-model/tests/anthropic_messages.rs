@@ -484,3 +484,89 @@ async fn stream_requires_message_stop_and_backfills_the_completed_response() {
     assert_eq!(completed.usage().input_tokens(), 3);
     assert_eq!(completed.usage().output_tokens(), 2);
 }
+
+/// Thinking signatures stay private, and adjacent text blocks share their terminal message id.
+#[rstest::rstest]
+#[case::contiguous(0, 1, 2)]
+#[case::sparse(4, 7, 9)]
+#[tokio::test]
+async fn neutral_deltas_group_text_blocks_and_stream_thinking_without_signatures(
+    #[case] thinking: u64,
+    #[case] first: u64,
+    #[case] second: u64,
+) {
+    use ra_core::model::ModelStreamDeltaKind;
+    let server = MockServer::start().await;
+    let frames = [
+        json!({"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[]}}),
+        json!({"type":"content_block_start","index":thinking,"content_block":{"type":"thinking","thinking":""}}),
+        json!({"type":"content_block_delta","index":thinking,"delta":{"type":"thinking_delta","thinking":"check"}}),
+        json!({"type":"content_block_delta","index":thinking,"delta":{"type":"signature_delta","signature":"secret-signature"}}),
+        json!({"type":"content_block_start","index":first,"content_block":{"type":"text","text":"Hel"}}),
+        json!({"type":"content_block_delta","index":first,"delta":{"type":"text_delta","text":"lo"}}),
+        json!({"type":"content_block_start","index":second,"content_block":{"type":"text","text":" world"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ];
+    let body: String = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+    let model = model(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+    )
+    .await;
+    let events: Vec<_> = model
+        .stream_response(request())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::OutputItemAdded(item) => Some(item.item().id().as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, ["msg:0:reasoning", "msg:1:message"]);
+    let deltas: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::Delta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(deltas[0].kind(), ModelStreamDeltaKind::ReasoningText { content_index: 0, delta } if delta == "check")
+    );
+    let text: String = deltas
+        .iter()
+        .filter_map(|delta| match delta.kind() {
+            ModelStreamDeltaKind::OutputText { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "Hello world");
+    assert_eq!(deltas.len(), 4);
+    for delta in &deltas {
+        assert!(
+            !serde_json::to_string(delta)
+                .unwrap()
+                .contains("secret-signature")
+        );
+    }
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal response")
+    };
+    assert_eq!(
+        response
+            .output()
+            .iter()
+            .map(|item| item.id().as_str())
+            .collect::<Vec<_>>(),
+        started
+    );
+}

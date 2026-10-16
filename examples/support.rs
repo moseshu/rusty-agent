@@ -225,8 +225,15 @@ async fn serve(listener: TcpListener, steps: Vec<Step>) -> Result<()> {
         let mut events = vec![json!({"type":"response.created",
             "response":{"id":response_id, "status":"in_progress"}})];
         if let Some(text) = item["content"][0]["text"].as_str() {
+            events.push(
+                json!({"type":"response.output_item.added", "output_index":0,
+                "item":{"type":"message", "id":item["id"], "role":"assistant", "content":[]}}),
+            );
             for delta in text.split_inclusive(' ') {
-                events.push(json!({"type":"response.output_text.delta", "delta":delta}));
+                events.push(
+                    json!({"type":"response.output_text.delta", "item_id":item["id"],
+                    "output_index":0, "content_index":0, "delta":delta}),
+                );
             }
         }
         events.push(json!({"type":"response.completed", "response":{
