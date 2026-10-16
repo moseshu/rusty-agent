@@ -30,10 +30,21 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "http")]
 pub mod http;
-#[cfg(feature = "sse")]
-pub mod sse;
 #[cfg(feature = "stdio")]
 pub mod stdio;
+
+#[cfg(any(feature = "stdio", feature = "http"))]
+/// Configured transport selection. Wire-specific options stay in this adapter crate.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum McpTransportConfig {
+    /// An owned child process.
+    #[cfg(feature = "stdio")]
+    Stdio(stdio::McpStdioParams),
+    /// A Streamable HTTP endpoint.
+    #[cfg(feature = "http")]
+    StreamableHttp(http::McpHttpParams),
+}
 
 /// Default per-request deadline, Python's `client_session_timeout_seconds = 5`.
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -120,6 +131,9 @@ struct ClientSessionServer {
     initialize_result: Arc<ServerPeerInfo>,
     service: Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
     options: McpClientOptions,
+    request_lock: Option<Mutex<()>>,
+    #[cfg(feature = "http")]
+    http_session: Option<Arc<http::HttpSession>>,
 }
 
 /// A connected server. Clones and registered tools retain the same session until cleanup.
@@ -131,6 +145,23 @@ pub struct McpClient {
 }
 
 impl McpClient {
+    #[cfg(any(feature = "stdio", feature = "http"))]
+    /// Connects a configured transport through the same initialized session implementation.
+    pub async fn connect_transport(
+        server_name: impl Into<String>,
+        transport: McpTransportConfig,
+        options: McpClientOptions,
+    ) -> Result<Self> {
+        let name = server_name.into();
+        match transport {
+            #[cfg(feature = "stdio")]
+            McpTransportConfig::Stdio(params) => Self::connect_stdio(name, params, options).await,
+            #[cfg(feature = "http")]
+            McpTransportConfig::StreamableHttp(params) => {
+                Self::connect_http(name, params, options).await
+            }
+        }
+    }
     /// Initializes an SDK transport and sends its initialized notification.
     /// The transport owns its I/O resources; no raw protocol implementation is duplicated here.
     pub async fn connect<T, E, A>(
@@ -163,6 +194,9 @@ impl McpClient {
                 service: Mutex::new(Some(service)),
                 cleanup_unconfirmed: AtomicBool::new(false),
                 options,
+                request_lock: None,
+                #[cfg(feature = "http")]
+                http_session: None,
             }),
         })
     }
@@ -214,13 +248,14 @@ impl McpClient {
                     rmcp::model::ListToolsRequest::default,
                     rmcp::model::ListToolsRequest::with_param,
                 );
-                match send_request(
-                    peer,
-                    ClientRequest::ListToolsRequest(request),
-                    self.options().session_timeout,
-                    None,
-                )
-                .await?
+                match self
+                    .send_request(
+                        peer,
+                        ClientRequest::ListToolsRequest(request),
+                        self.options().session_timeout,
+                        None,
+                    )
+                    .await?
                 {
                     ServerResult::ListToolsResult(page) => Ok((page.tools, page.next_cursor)),
                     _ => Err(unexpected_response()),
@@ -239,13 +274,14 @@ impl McpClient {
             async move {
                 let request =
                     params.map_or_else(ListPromptsRequest::default, ListPromptsRequest::with_param);
-                match send_request(
-                    peer,
-                    ClientRequest::ListPromptsRequest(request),
-                    self.options().session_timeout,
-                    None,
-                )
-                .await?
+                match self
+                    .send_request(
+                        peer,
+                        ClientRequest::ListPromptsRequest(request),
+                        self.options().session_timeout,
+                        None,
+                    )
+                    .await?
                 {
                     ServerResult::ListPromptsResult(mut page) => {
                         let prompts = std::mem::take(&mut page.prompts);
@@ -329,13 +365,26 @@ impl McpClient {
         }
     }
     async fn request(&self, request: ClientRequest) -> Result<ServerResult> {
-        send_request(
+        self.send_request(
             self.peer().await?,
             request,
             self.options().session_timeout,
             None,
         )
         .await
+    }
+    async fn send_request(
+        &self,
+        peer: Peer<RoleClient>,
+        request: ClientRequest,
+        timeout: Option<Duration>,
+        meta: Option<JsonObject>,
+    ) -> Result<ServerResult> {
+        let _request = match &self.session.request_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        send_request(peer, request, timeout, meta).await
     }
     /// Calls the original protocol tool name. Arguments may be omitted or a JSON object; `meta`
     /// becomes the request's `_meta`, as Python's `call_tool(..., meta=...)`.
@@ -359,13 +408,14 @@ impl McpClient {
         let peer = self.peer().await?;
         let mut params = CallToolRequestParams::new(name.to_owned());
         params.arguments = arguments;
-        let result = send_request(
-            peer,
-            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-            self.options().tool_timeout(),
-            meta,
-        )
-        .await?;
+        let result = self
+            .send_request(
+                peer,
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                self.options().tool_timeout(),
+                meta,
+            )
+            .await?;
         match result {
             ServerResult::CallToolResult(result) => Ok(result),
             _ => Err(safe_error(
@@ -377,6 +427,10 @@ impl McpClient {
     /// Closes this session for all clones. Repeated cleanup succeeds.
     pub async fn cleanup(&self) -> Result<()> {
         let mut slot = self.session.service.lock().await;
+        #[cfg(feature = "http")]
+        if let Some(session) = &self.session.http_session {
+            session.clear();
+        }
         if let Some(mut service) = slot.take() {
             self.session
                 .cleanup_unconfirmed

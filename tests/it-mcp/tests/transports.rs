@@ -156,10 +156,6 @@ async fn http_roundtrip(bearer_env: bool) {
     };
     let app = axum::Router::new()
         .nest_service("/mcp", service)
-        .route(
-            "/redirect",
-            axum::routing::any(|| async { axum::response::Redirect::temporary("/mcp") }),
-        )
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let observed = observed.clone();
@@ -181,14 +177,12 @@ async fn http_roundtrip(bearer_env: bool) {
             .await
             .unwrap();
     });
-    let mut params = McpHttpParams::new(format!(
-        "http://{address}/{}",
-        if bearer_env { "redirect" } else { "mcp" }
-    ))
-    .with_headers(std::collections::BTreeMap::from([
-        ("Authorization".into(), "Bearer fixture-token".into()),
-        ("x-fixture".into(), "present".into()),
-    ]));
+    let mut params = McpHttpParams::new(format!("http://{address}/mcp")).with_headers(
+        std::collections::BTreeMap::from([
+            ("Authorization".into(), "Bearer fixture-token".into()),
+            ("x-fixture".into(), "present".into()),
+        ]),
+    );
     if bearer_env {
         params = params.with_bearer_token_env_var("PATH");
     }

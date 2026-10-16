@@ -1,8 +1,8 @@
 # MCP clients and servers
 
-Status: the minimum tool integration and the stdio server follow-up are implemented
-and self-checked; awaiting review. The shared session now supports tools, prompts,
-and resources. Other MCP roadmap slices remain separate.
+Status: the minimum tool integration, reusable stdio server and Streamable HTTP follow-up
+are implemented and self-checked; awaiting review. The shared session supports tools,
+prompts and resources. Other MCP roadmap slices remain separate.
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -51,9 +51,10 @@ async fn configured_agent() -> ra_core::error::Result<()> {
 
 For HTTP, use `McpClient::connect_http` with `McpHttpParams::new(url)`,
 `.with_headers(...)`, and optionally `.with_bearer_token_env_var(name)`.
-The environment token overrides static Authorization. This initialize-based transport
-follows bounded redirects, matching Codex's legacy HTTP path. Codex's modern protocol and
-agent-plugin redirect policies are outside this slice. Stdio inherits the Codex core
+The environment token overrides static Authorization and any authentication hook.
+Automatic redirects are disabled by default, matching Python's default factory; a custom
+factory may explicitly change that policy. Codex's modern protocol discovery and recovery
+remain outside this slice. Stdio inherits the Codex core
 environment allowlist and overlays explicit `with_env` values. It does not inherit
 the host's entire environment. Stderr is discarded in this adapter.
 
@@ -137,11 +138,75 @@ spawned with tokio directly and JSON-RPC stays in the official SDK.
 policies and approval integration remain the dedicated follow-up tasks; the runner receives
 no server lifecycle or MCP-specific policy. See [the stdio contract and validation record](../../Docs/R11-1_MCP_stdio_契约与验证.md).
 
+## Reusable Streamable HTTP lifecycle
+
+`McpServerStreamableHttp` shares stdio's lifecycle state and implements the same `McpServer`
+protocol. `McpTransportConfig::{Stdio, StreamableHttp}` selects either transport through
+`McpClient::connect_transport`. The default HTTP name is `streamable_http: <url>`; diagnostics
+sanitize URL-derived names. Old client handles remain bound to their original session.
+
+```rust,no_run
+use ra_mcp::{McpServer, client::{McpClientOptions, http::{McpHttpParams, McpServerStreamableHttp}}};
+use std::time::Duration;
+
+async fn remote_server() -> ra_core::error::Result<()> {
+    let params = McpHttpParams::new("https://example.test/mcp")
+        .with_timeout(Duration::from_secs(5))
+        .with_sse_read_timeout(Duration::from_secs(300))
+        .with_terminate_on_close(true)
+        .with_auth(|request| async move { Ok(request.bearer_auth("host-supplied-token")) })
+        .with_http_client_factory(|builder| builder.user_agent("my-agent").build());
+    let server = McpServerStreamableHttp::new(params)
+        .with_options(McpClientOptions::default());
+    server.connect().await?;
+    let _session_id = server.session_id();
+    let _tools = server.list_tools().await?;
+    server.cleanup().await?;
+    assert!(server.session_id().is_none());
+    Ok(())
+}
+```
+
+The native authentication hook runs for POST, GET and DELETE. Reqwest configures auth on
+requests, so the factory receives a configured `ClientBuilder` while auth stays a request
+hook. It can obtain credentials asynchronously; challenge flows and OAuth storage remain
+separate. Static headers are applied first, then auth, then the explicit environment token.
+Factory and auth errors discard their original sources before entering SDK diagnostics.
+These hooks use reqwest 0.13 types; `ra_mcp::client::http::reqwest` re-exports that version.
+Response media types are matched case-insensitively.
+
+HTTP connect timeout defaults to 5 seconds and read inactivity timeout to 300 seconds.
+Reqwest has no separate HTTPX-style write or connection-pool timeout; the shared MCP session
+deadline bounds complete requests and defaults to 5 seconds. Disabling that deadline leaves
+only the HTTP connect and read timers. This phase-timeout difference is a documented Rust
+adaptation. HTTP session requests are serialized, including each catalog page; cancellation
+releases the lock and sends the shared SDK cancellation notification.
+
+Stateful cleanup sends DELETE by default and waits for the SDK's bounded shutdown; stateless
+sessions and `with_terminate_on_close(false)` skip it. A 405 DELETE is accepted. Failed
+initialization awaits deletion of an assigned session; as in Python's transport, a failed or
+timed-out DELETE is logged and the connection error is returned. Cleanup transfers the client
+and session ID into one task with a 5-second bound before awaiting it. Cancelling the waiter
+detaches that task, so the same DELETE and asynchronous auth hook continue without a retry.
+Dropping an initializing connect starts the same task because Rust Drop cannot await; this
+fallback needs the Tokio runtime to stay alive. Cleanup always clears the visible session ID.
+
+Initialized-notification failures remain errors by default.
+`with_ignore_initialized_notification_failure(true)` selects Python v1's compatibility behavior
+for that notification alone. The pinned Rust SDK exposes this boundary, so Python v2's
+unsupported-option rejection has no counterpart here. HTTP status errors, invalid JSON/SSE,
+auth failures, URL credentials, challenges and error bodies are sanitized before SDK logging.
+A JSON-RPC error body is a server answer at any HTTP status, as in the MCP Python SDK; it keeps
+its code and message and is correlated to the request. SSE validation applies only to message
+events. Initialize filters control frames before the SDK's separate initialize reader, which
+otherwise parses their data as JSON. Established streams retain their control frames for the
+SDK connector. No transparent session recovery or tool replay is enabled. See the [HTTP contract and validation record](../../Docs/R11-2_MCP_HTTP_契约与验证.md).
+
 ## Contract and adaptations
 
 | Behavior | Reference and implementation |
 | --- | --- |
-| SDK ownership | Codex `rmcp-client/src/rmcp_client.rs` and `in_process_transport.rs`; the SDK owns JSON-RPC, initialization, protocol framing and HTTP session headers. One shared client implements discovery/calls for every transport. |
+| SDK ownership | Codex `rmcp-client/src/rmcp_client.rs` and `in_process_transport.rs`; the SDK owns JSON-RPC dispatch, initialization and HTTP session lifecycle. A native HTTP boundary translates responses into SDK protocol types, without retaining credential-bearing HTTP errors. One shared client implements discovery/calls for every transport. |
 | Catalog bounds | Python defaults: no automatic page, item, cursor-byte or overall deadline limit; repeated cursors are rejected and no partial listing is returned. `with_max_list_pages` ports Python's optional positive page bound. `with_codex_catalog_limits()` explicitly selects Codex `codex-mcp/src/pagination.rs`: 2048 items, 100 pages, 64 KiB cursors and one 30 s overall deadline. Empty cursors are valid. Resource pagination remains explicit and is unaffected. |
 | Timeouts | Python `client_session_timeout_seconds = 5` bounds initialize and each tool, prompt or resource request. `with_session_timeout(None)` or `with_session_timeout(Duration::ZERO)` disables that deadline, matching Python's `None` and zero semantics. An explicitly configured catalog deadline still applies, and Codex's per-server tool timeout may replace the session timeout for calls. The client owns these timers so protocol cancellation can be sent before the timeout result returns. |
 | Naming | Default and `ServerPrefixed`: Python `MCPUtil.get_all_function_tools` and `_build_prefixed_tool_name_overrides`, checked against names produced by running upstream; duplicate names are reported with Python's escaped `repr`. `Namespaced`: Codex `codex-mcp/src/tools.rs`, retaining its 128-byte combined limit. The necessary adapter adaptation also bounds each namespace and function name to 64 bytes so discovered tools can pass the existing Responses request validation. Namespace shortening uses the server identity, shared across its tools, and avoids literal names that resemble generated hashes. This adaptation only affects the explicitly selected namespaced extension. Original protocol names and client handles remain unchanged. |
@@ -160,8 +225,9 @@ no server lifecycle or MCP-specific policy. See [the stdio contract and validati
 No MCP transport or provider wire types were added to `ra-core`. Approval
 configuration, OAuth, cache invalidation/dynamic filtering,
 connection pools/lazy startup, manager workers and runtime control remain later
-slices. The published `sse` feature and its empty module remain as deprecated no-ops so
-dependents keep building; they add no transport.
+slices. The obsolete empty `sse` feature and module have been removed in the HTTP follow-up,
+as selected by the roadmap; legacy HTTP+SSE servers are not supported. Streamable HTTP's
+SSE response bodies remain supported through the SDK worker.
 
 ## Validation and review record
 
@@ -172,7 +238,11 @@ Tests cover multi-page discovery (including an empty cursor), cycle/page/item/cu
 bounds, original-name routing across colliding servers, strictness, filters,
 visibility, annotation defaults, metadata precedence, media bytes/order, error
 content, credential-safe diagnostics, cancellation, timeouts and idempotent cleanup.
-The HTTP check verifies static request headers and environment-token precedence; a missing token is also tested.
+HTTP checks also cover stateful and stateless JSON/SSE responses, session IDs and reconnect,
+auth/factory hooks, token precedence, redirects, serialization, read/session timeouts,
+initialized-notification failure scope, failed/cancelled initialize cleanup, JSON-RPC errors at
+non-2xx statuses, media-type case, SSE control frames and TRACE-level credential redaction.
+A missing token is also tested.
 
 Self-review read the upstream implementation and relevant tests:
 

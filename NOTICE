@@ -17,6 +17,8 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-mcp/src/client/stdio.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/stdio_server_launcher.rs; src/utils.rs; codex-rs/protocol/src/shell_environment.rs |
 | `crates/ra-mcp/src/client/stdio/encoding.rs` | modelcontextprotocol/rust-sdk | 79437f291b2c44053d00dcd5db969fd0cca7c887 | crates/rmcp/src/transport/child_process.rs |
 | `crates/ra-mcp/src/client/http.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/rmcp_client.rs; src/http_headers.rs |
+| `crates/ra-mcp/src/client/http/transport.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/http_client_adapter.rs |
+| `crates/ra-mcp/src/client/http/transport/sse.rs` | modelcontextprotocol/rust-sdk | 79437f291b2c44053d00dcd5db969fd0cca7c887 | crates/rmcp/src/transport/common/client_side_sse.rs |
 | `crates/ra-mcp/src/filter.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/connection_manager/tool_catalog.rs |
 | `crates/ra-mcp/src/in_process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/in_process_transport.rs |
 | `crates/ra-mcp/src/tool.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; src/mcp_tool_exposure.rs |
@@ -36,3 +38,13 @@ crates/ra-mcp/src/client.rs, and cases in tests/it-mcp/tests/server.rs also adap
 openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/mcp/server.py and tests/mcp/{test_connect_disconnect,test_prompt_server,
 test_mcp_resources,test_list_page_limits}.py (MIT). See the retained license above.
+
+The Streamable HTTP lifecycle and parameters in crates/ra-mcp/src/client/http.rs,
+request serialization in crates/ra-mcp/src/client.rs, and cases in
+tests/it-mcp/tests/{http,http_logging}.rs also adapt openai/openai-agents-python,
+revision f53c62451c7f34c15f0c87fa745e05404025420f, src/agents/mcp/server.py and
+tests/mcp/{test_streamable_http_client_factory,test_streamable_http_session_id,
+test_mcp_auth_params,test_mcp_v2_http}.py (MIT). See the retained license above.
+The native HTTP boundary in crates/ra-mcp/src/client/http/transport.rs also adapts
+modelcontextprotocol/rust-sdk revision 79437f291b2c44053d00dcd5db969fd0cca7c887,
+crates/rmcp/src/transport/common/reqwest/streamable_http_client.rs (Apache-2.0).

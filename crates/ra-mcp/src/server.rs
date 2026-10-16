@@ -73,20 +73,20 @@ fn unsupported_resource_operation(operation: &str) -> ra_core::error::Error {
 // Python lets cleanup close the exit stack under a pending connect. Rust cannot close a future
 // it does not own, so cleanup cancels active and queued connects, dropping their transports.
 // A shared cancellation scope stays closed until every cleanup finishes or is dropped.
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 #[derive(Default)]
 pub(crate) struct ServerConnection {
     lifecycle: tokio::sync::Mutex<()>,
     state: std::sync::Mutex<ConnectionState>,
 }
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 #[derive(Default)]
 struct ConnectionState {
     client: Option<crate::client::McpClient>,
     connect_cancellation: tokio_util::sync::CancellationToken,
     active_cleanups: usize,
 }
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 impl ServerConnection {
     fn state(&self) -> std::sync::MutexGuard<'_, ConnectionState> {
         self.state
@@ -151,10 +151,10 @@ impl ServerConnection {
         Ok(())
     }
 }
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 struct CleanupScope<'a>(&'a ServerConnection);
 
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 impl<'a> CleanupScope<'a> {
     fn new(connection: &'a ServerConnection) -> Self {
         let mut state = connection.state();
@@ -164,7 +164,7 @@ impl<'a> CleanupScope<'a> {
     }
 }
 
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 impl Drop for CleanupScope<'_> {
     fn drop(&mut self) {
         let mut state = self.0.state();
@@ -175,12 +175,12 @@ impl Drop for CleanupScope<'_> {
     }
 }
 
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 fn connect_cancelled_error() -> ra_core::error::Error {
     ra_core::error::Error::config("MCP server connect was cancelled by cleanup")
 }
 
-#[cfg(feature = "stdio")]
+#[cfg(any(feature = "stdio", feature = "http"))]
 fn log_cleanup_failure(name: &str, result: Result<()>) {
     if let Err(error) = result {
         tracing::warn!(server = %crate::catalog::safe_server_name(name), %error, "Error cleaning up MCP server");
