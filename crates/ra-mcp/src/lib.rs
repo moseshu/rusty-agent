@@ -15,7 +15,10 @@ pub mod catalog;
 pub mod client;
 pub mod filter;
 pub mod in_process;
+pub mod server;
 pub mod tool;
+
+pub use server::McpServer;
 
 // Protocol types stay in this adapter crate; hosts can implement an in-process MCP handler.
 pub use rmcp;

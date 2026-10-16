@@ -115,7 +115,7 @@ impl McpToolInfo {
 }
 
 // Ported from Python mcp/_logging.py: URL-derived display names exclude credentials.
-fn safe_server_name(name: &str) -> String {
+pub(crate) fn safe_server_name(name: &str) -> String {
     let prefix = ["sse: ", "streamable_http: ", "streamable-http: "]
         .into_iter()
         .find(|prefix| name.starts_with(prefix))

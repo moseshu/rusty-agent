@@ -1,9 +1,11 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Child-process transport; protocol operations stay in the shared session.
 
-use super::{McpClient, McpClientOptions, safe_error};
-use ra_core::error::{Result, ToolErrorKind};
+use super::{McpClient, McpClientOptions};
+use ra_core::error::Result;
 use std::{collections::BTreeMap, path::PathBuf};
+
+mod encoding;
 
 /// Explicit process launch parameters, corresponding to `MCPServerStdioParams`.
 #[derive(Clone)]
@@ -12,6 +14,8 @@ pub struct McpStdioParams {
     args: Vec<String>,
     cwd: Option<PathBuf>,
     env: Option<BTreeMap<String, String>>,
+    encoding: String,
+    encoding_error_handler: McpEncodingErrorHandler,
 }
 impl McpStdioParams {
     /// Selects an executable. Arguments are passed literally without a shell.
@@ -22,6 +26,8 @@ impl McpStdioParams {
             args: vec![],
             cwd: None,
             env: None,
+            encoding: "utf-8".to_owned(),
+            encoding_error_handler: McpEncodingErrorHandler::Strict,
         }
     }
     /// Sets process arguments.
@@ -36,12 +42,37 @@ impl McpStdioParams {
         self.cwd = Some(cwd.into());
         self
     }
-    /// Overlays explicit values onto the MCP SDK default environment allowlist.
+    /// Overlays explicit values onto the Codex core environment allowlist.
     #[must_use]
     pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
         self.env = Some(env);
         self
     }
+    /// Selects the text codec. Defaults to UTF-8; labels are resolved before spawning.
+    #[must_use]
+    pub fn with_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.encoding = encoding.into();
+        self
+    }
+    /// Selects Python's strict, ignore or replace text error behavior.
+    #[must_use]
+    pub const fn with_encoding_error_handler(mut self, handler: McpEncodingErrorHandler) -> Self {
+        self.encoding_error_handler = handler;
+        self
+    }
+}
+
+/// Text codec error policy, matching Python's stdio parameters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpEncodingErrorHandler {
+    /// Fail on malformed input or unrepresentable output.
+    #[default]
+    Strict,
+    /// Discard malformed input and unrepresentable characters.
+    Ignore,
+    /// Replace malformed input with U+FFFD and unrepresentable output with a question mark.
+    Replace,
 }
 impl McpClient {
     /// Spawns and initializes one stdio MCP server.
@@ -50,6 +81,9 @@ impl McpClient {
         params: McpStdioParams,
         options: McpClientOptions,
     ) -> Result<Self> {
+        let server_name = server_name.into();
+        super::validate_server_name(&server_name)?;
+        let codec = encoding::TextCodec::new(&params.encoding, params.encoding_error_handler)?;
         let mut command = tokio::process::Command::new(params.command);
         command.args(params.args).kill_on_drop(true).env_clear();
         for name in DEFAULT_ENV_VARS {
@@ -63,12 +97,10 @@ impl McpClient {
         if let Some(env) = params.env {
             command.envs(env);
         }
-        let transport = rmcp::transport::TokioChildProcess::builder(command)
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|_| safe_error(ToolErrorKind::ExecutionFailed, "MCP process spawn failed"))?
-            .0;
-        Self::connect(server_name, transport, options).await
+        let (transport, failed) = encoding::spawn(command, codec)?;
+        let mut client = Self::connect(server_name, transport, options).await?;
+        client.transport_failed = failed;
+        Ok(client)
     }
 }
 
@@ -114,3 +146,103 @@ const DEFAULT_ENV_VARS: &[&str] = &[
     "POWERSHELL",
     "PWSH",
 ];
+
+/// A reusable configured stdio server, corresponding to Python's `MCPServerStdio`.
+/// Existing client handles stay bound to their original session after a reconnect.
+pub struct McpServerStdio {
+    name: String,
+    params: McpStdioParams,
+    options: McpClientOptions,
+    connection: crate::server::ServerConnection,
+}
+impl McpServerStdio {
+    /// Configures a disconnected server. The default name is `stdio: <command>`.
+    #[must_use]
+    pub fn new(params: McpStdioParams) -> Self {
+        Self {
+            name: format!("stdio: {}", params.command),
+            params,
+            options: McpClientOptions::default(),
+            connection: crate::server::ServerConnection::default(),
+        }
+    }
+    /// Sets the host-assigned name before connecting.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+    /// Sets shared session options before connecting.
+    #[must_use]
+    pub fn with_options(mut self, options: McpClientOptions) -> Self {
+        self.options = options;
+        self
+    }
+    /// Returns the connected snapshot used by tool discovery. A reconnect never retargets it.
+    pub fn client(&self) -> Result<McpClient> {
+        self.connection.client()
+    }
+    /// Reports the current session's liveness without starting a process.
+    pub async fn is_connected(&self) -> bool {
+        self.connection.is_connected().await
+    }
+}
+#[async_trait::async_trait]
+impl crate::server::McpServer for McpServerStdio {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn connect(&self) -> Result<()> {
+        self.connection
+            .connect(
+                &self.name,
+                Box::pin(McpClient::connect_stdio(
+                    &self.name,
+                    self.params.clone(),
+                    self.options.clone(),
+                )),
+            )
+            .await
+    }
+    /// Always clears the session. As in Python, stdio teardown failures are logged, not raised;
+    /// a retained [`McpClient`] handle still reports them from [`McpClient::cleanup`].
+    async fn cleanup(&self) -> Result<()> {
+        self.connection.cleanup(&self.name).await
+    }
+    async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>> {
+        self.client()?.list_tools().await
+    }
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        meta: Option<rmcp::model::JsonObject>,
+    ) -> Result<rmcp::model::CallToolResult> {
+        self.client()?.call_tool(name, arguments, meta).await
+    }
+    async fn list_prompts(&self) -> Result<rmcp::model::ListPromptsResult> {
+        self.client()?.list_prompts().await
+    }
+    async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<rmcp::model::JsonObject>,
+    ) -> Result<rmcp::model::GetPromptResult> {
+        self.client()?.get_prompt(name, arguments).await
+    }
+    async fn list_resources(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<rmcp::model::ListResourcesResult> {
+        self.client()?.list_resources(cursor).await
+    }
+    async fn list_resource_templates(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult> {
+        self.client()?.list_resource_templates(cursor).await
+    }
+    async fn read_resource(&self, uri: &str) -> Result<rmcp::model::ReadResourceResult> {
+        self.client()?.read_resource(uri).await
+    }
+}

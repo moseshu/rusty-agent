@@ -16,6 +16,19 @@ use std::{
 };
 
 async fn roundtrip(client: McpClient) {
+    let prompts = client.list_prompts().await.unwrap();
+    assert_eq!(prompts.prompts.len(), 2);
+    assert!(prompts.next_cursor.is_none());
+    assert_eq!(
+        client
+            .list_resources(None)
+            .await
+            .unwrap()
+            .next_cursor
+            .as_deref(),
+        Some("")
+    );
+    assert!(client.read_resource("memo://fixture/note").await.is_ok());
     let tools = discover_tools(
         &[(client.clone(), ToolFilter::default())],
         &McpDiscoveryOptions::new(),
@@ -274,10 +287,13 @@ async fn pagination_rejects_cycles_and_all_catalog_limits() {
         let mut fixture = support::Fixture::new("limits");
         fixture.mode = mode;
         let requests = fixture.pages.clone();
-        let mut server =
-            InProcessToolServer::connect("limits", fixture, McpClientOptions::default())
-                .await
-                .unwrap();
+        let mut server = InProcessToolServer::connect(
+            "limits",
+            fixture,
+            McpClientOptions::default().with_codex_catalog_limits(),
+        )
+        .await
+        .unwrap();
         assert!(
             server
                 .client()
