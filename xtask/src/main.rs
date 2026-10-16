@@ -18,6 +18,7 @@ mod feature_matrix;
 mod gate;
 mod inline_tests;
 mod layering;
+mod ported_notice;
 mod prompt_dump;
 mod public_api;
 mod sandbox_parity;
@@ -83,6 +84,8 @@ enum Task {
     /// The four dependency-direction rules: kernel, reusable pieces, and product may not depend
     /// upward.
     Layering,
+    /// Reconciles ported source headers against NOTICE in both directions.
+    PortedNotice,
     /// Per crate, checks that all features off and all features on both compile.
     FeatureMatrix,
     /// Runs the same runner-level scenarios on every built-in sandbox backend. A backend whose
@@ -100,6 +103,7 @@ enum Task {
 fn all_gates() -> Vec<(&'static str, Outcome)> {
     vec![
         ("layering", layering::run()),
+        ("ported-notice", ported_notice::run()),
         ("no-inline-tests", inline_tests::run()),
         ("public-api", public_api::run(false)),
         ("schema-stability", schema_stability::run(false)),
@@ -115,6 +119,7 @@ fn main() -> std::process::ExitCode {
     let outcomes = match Cli::parse().task {
         Task::All => all_gates(),
         Task::Layering => vec![("layering", layering::run())],
+        Task::PortedNotice => vec![("ported-notice", ported_notice::run())],
         Task::NoInlineTests => vec![("no-inline-tests", inline_tests::run())],
         Task::PublicApi { bless, accept } => {
             let outcome = if accept.is_empty() {

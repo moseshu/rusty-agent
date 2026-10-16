@@ -35,7 +35,7 @@ graph agents, long-running tool-using assistants, and embedded or self-hosted pr
 2. **Model providers**: A shared model contract with OpenAI Responses, OpenAI Chat,
    Anthropic Messages, and OpenAI-compatible adapters.
 3. **Tools**: Typed tool contracts, input schemas, registration, and execution dispatch.
-4. **MCP**: Model Context Protocol clients for stdio, SSE, and HTTP transports, plus
+4. **MCP**: Model Context Protocol clients for stdio and Streamable HTTP transports, plus
    in-process tool servers.
 5. **Prompts**: Prompt assembly, stable prefixes, cache planning, and incremental reminders.
 6. **Context management**: Context budgeting, compaction, archival, and bounded tool output.

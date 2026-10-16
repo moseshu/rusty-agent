@@ -1,0 +1,27 @@
+Third-party attribution
+
+This product includes modified code from openai/codex, Copyright OpenAI,
+licensed under the Apache License, Version 2.0. The repository LICENSE contains
+that license. Source: https://github.com/openai/codex
+
+The following manifest is checked by `cargo xtask ported-notice`. Revisions identify
+local upstream checkouts used for the port; each file lists its original source.
+
+| File | Upstream | Revision | Original source |
+| --- | --- | --- | --- |
+| `crates/ra-mcp/src/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/mcp/mod.rs |
+| `crates/ra-mcp/src/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/pagination.rs; codex-rs/rmcp-client/src/rmcp_client.rs |
+| `crates/ra-mcp/src/client/stdio.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/stdio_server_launcher.rs; src/utils.rs; codex-rs/protocol/src/shell_environment.rs |
+| `crates/ra-mcp/src/client/http.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/rmcp_client.rs; src/http_headers.rs |
+| `crates/ra-mcp/src/filter.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/connection_manager/tool_catalog.rs |
+| `crates/ra-mcp/src/in_process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/in_process_transport.rs |
+| `crates/ra-mcp/src/tool.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; src/mcp_tool_exposure.rs |
+| `tests/it-mcp/tests/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager_tests.rs |
+
+The metadata/title resolution, URL display-name behavior, and bare function-tool naming
+(original names and include_server_in_tool_names prefixes) in crates/ra-mcp/src/catalog.rs,
+and the prefixed-name cases in tests/it-mcp/tests/catalog.rs, also adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/_mcp_tool_metadata.py, src/agents/mcp/_logging.py, src/agents/mcp/util.py and
+tests/mcp/test_mcp_util.py (MIT).
+Its original license is retained in third_party/openai-agents-python.LICENSE.

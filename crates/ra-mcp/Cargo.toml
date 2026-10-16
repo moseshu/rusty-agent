@@ -1,6 +1,6 @@
 [package]
 name = "ra-mcp"
-description = "MCP client（stdio/sse/http）与进程内工具服务器。"
+description = "MCP clients (stdio/streamable HTTP) and in-process tool servers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,17 +12,24 @@ workspace = true
 
 [features]
 default = ["stdio"]
-stdio = []
-sse = ["dep:reqwest"]
-http = ["dep:reqwest"]
+stdio = ["rmcp/transport-child-process"]
+# Published before this transport set; kept as a no-op so dependents that enable it still build.
+# SSE is superseded by Streamable HTTP and has no transport here.
+sse = []
+http = ["dep:reqwest", "rmcp/transport-streamable-http-client-reqwest"]
 
 [dependencies]
 ra-core = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true, optional = true }
+tokio-util.workspace = true
+# rmcp 3 uses reqwest 0.13; keep that adapter detail out of the workspace's other clients.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
+sha1 = "0.10.6"
+base64.workspace = true
+url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
