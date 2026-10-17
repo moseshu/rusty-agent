@@ -34,6 +34,7 @@ hmac = "0.12"
 http = "1"
 sha2 = "0.10"
 tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
 time = "0.3"
 tokio-tungstenite = "0.29"
 tokio-util = "0.7"

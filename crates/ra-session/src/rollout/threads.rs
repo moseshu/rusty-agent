@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The rollouts of an agent tree's threads, side by side in one directory.
 //!
 //! Ported from Codex's local thread store as it serves spawned threads. Every agent a tree spawns
@@ -82,6 +83,8 @@ pub struct RolloutThreadDirectory {
     dir: PathBuf,
     writer_locks: Arc<WriterLockCoordinator>,
     index: Option<Arc<dyn ThreadIndex>>,
+    #[cfg(feature = "sqlite")]
+    state_db: Option<Arc<crate::store::local::StateRuntime>>,
     live_recorders: Arc<Mutex<HashMap<SessionId, Weak<RolloutFileRecorder>>>>,
     metadata_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -95,6 +98,8 @@ impl RolloutThreadDirectory {
             writer_locks: Arc::new(WriterLockCoordinator::new(&dir)),
             dir,
             index: None,
+            #[cfg(feature = "sqlite")]
+            state_db: None,
             live_recorders: Arc::default(),
             metadata_lock: Arc::default(),
         }
@@ -106,6 +111,7 @@ impl RolloutThreadDirectory {
     #[cfg(feature = "sqlite")]
     #[must_use]
     pub fn with_state_db(mut self, state_db: Arc<crate::store::local::StateRuntime>) -> Self {
+        self.state_db = Some(Arc::clone(&state_db));
         self.index = Some(state_db);
         self
     }
@@ -308,6 +314,11 @@ impl RolloutThreadStore for RolloutThreadDirectory {
 
 #[async_trait]
 impl ThreadStore for RolloutThreadDirectory {
+    #[cfg(feature = "sqlite")]
+    fn state_db(&self) -> Option<Arc<crate::store::local::StateRuntime>> {
+        self.state_db.clone()
+    }
+
     /// Takes the thread's writer lock at once, then refuses a session whose rollout is already
     /// here, active or archived, as the spawn form does, and queues the history behind the session
     /// metadata; the file is created when something is persisted. Holding the lock while checking

@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The task that reads a loaded thread's events and tells the thread's connections what happened:
 //! Codex's thread listener (`request_processors/thread_lifecycle.rs`,
 //! `ensure_listener_task_running`) and its handling of turn events
@@ -251,6 +252,7 @@ pub(crate) async fn ensure_listener_task_running(
                         &context.thread_watch,
                         &thread_state,
                         tool_items.as_deref(),
+                        &context.history,
                     )
                     .await;
                 }
@@ -299,6 +301,7 @@ async fn handle_event(
     thread_watch: &Arc<ThreadWatchManager>,
     thread_state: &Mutex<ThreadState>,
     tool_items: Option<&dyn ThreadToolItems>,
+    history: &HistorySources,
 ) {
     if let Some(adapter) = &loaded.adapter {
         adapter.on_thread_event(&loaded.run_config(), &event);
@@ -308,6 +311,14 @@ async fn handle_event(
         .lock()
         .await
         .track_current_turn_event(&event, tool_items);
+    if matches!(
+        event,
+        ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. }
+    ) {
+        let summary = thread_state.lock().await.turn_summary.clone();
+        super::thread_management::publish_read_state(&event, loaded, &summary, history, outgoing)
+            .await;
+    }
     match &event {
         ThreadEvent::TurnStarted { .. } => {
             outgoing.thread_state().note_active(&thread_id, true);

@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! What [`ThreadStore::update_thread_metadata`](super::ThreadStore::update_thread_metadata),
 //! archiving and deletion take: Codex's `ThreadMetadataPatch`, `UpdateThreadMetadataParams`,
 //! `ArchiveThreadParams`, `ArchiveThreadsParams`, `DeleteThreadParams` and `DeleteThreadsParams`
@@ -17,8 +18,8 @@ use ra_core::{
 /// `Option`, where `Some(None)` clears it.
 ///
 /// Codex's patch also carries the session source, which a live thread derives from its session
-/// metadata. Here that is where a spawned thread was spawned from and the thread a fork was
-/// forked from; they are set only by the live thread's metadata sync, so a state database can
+/// metadata, together with the thread scope, where a spawned thread was spawned from and the
+/// thread a fork was forked from. They are set only by the live thread's metadata sync, so a state database can
 /// describe a thread before its rollout is written, and cannot be set through the builder.
 ///
 /// Codex's patch also carries the rollout path, recency, the creator's identity, the agent
@@ -46,6 +47,8 @@ pub struct ThreadMetadataPatch {
     cli_version: Option<String>,
     originator: Option<String>,
     thread_spawn: Option<RolloutThreadSpawn>,
+    source: Option<serde_json::Value>,
+    thread_source: Option<String>,
     forked_from_id: Option<SessionId>,
 }
 
@@ -181,6 +184,8 @@ impl ThreadMetadataPatch {
         take(&mut self.cli_version, next.cli_version);
         take(&mut self.originator, next.originator);
         take(&mut self.thread_spawn, next.thread_spawn);
+        take(&mut self.source, next.source);
+        take(&mut self.thread_source, next.thread_source);
         take(&mut self.forked_from_id, next.forked_from_id);
     }
 
@@ -264,6 +269,23 @@ impl ThreadMetadataPatch {
 }
 
 impl ThreadMetadataPatch {
+    /// Sets the product's session source, derived from its opening metadata.
+    pub(crate) fn with_source(mut self, source: serde_json::Value) -> Self {
+        self.source = Some(source);
+        self
+    }
+    /// Sets the product scope, derived from the opening metadata.
+    pub(crate) fn with_thread_source(mut self, source: String) -> Self {
+        self.thread_source = Some(source);
+        self
+    }
+    pub(crate) const fn source(&self) -> Option<&serde_json::Value> {
+        self.source.as_ref()
+    }
+    pub(crate) fn thread_source(&self) -> Option<&str> {
+        self.thread_source.as_deref()
+    }
+
     /// Sets where the thread was spawned from: Codex's `source`.
     pub(crate) fn with_thread_spawn(mut self, spawn: RolloutThreadSpawn) -> Self {
         self.thread_spawn = Some(spawn);

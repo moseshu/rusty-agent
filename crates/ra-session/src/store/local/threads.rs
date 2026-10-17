@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The thread table: Codex's `ThreadMetadata` and the statements of `state/src/runtime/threads.rs`
 //! that this framework's thread metadata uses.
 
@@ -19,7 +20,7 @@ use crate::store::{SortDirection, ThreadSortKey};
 /// What the state database keeps of a thread: Codex's `ThreadMetadata`, with the fields this
 /// framework's threads have.
 ///
-/// Codex's source, history mode, agent nickname and role, sandbox policy, approval mode, token
+/// Codex's history mode, agent nickname and role, sandbox policy, approval mode, token
 /// usage, sections, project, recency and preferences are its product's and are not
 /// kept. Its `title`, in its legacy history mode, is the title derived from the first user message
 /// until the thread is given a name, which then replaces it; an empty preview means none.
@@ -31,6 +32,8 @@ pub struct ThreadMetadata {
     pub(crate) created_at: EventTimestamp,
     pub(crate) updated_at: EventTimestamp,
     pub(crate) thread_spawn: Option<RolloutThreadSpawn>,
+    pub(crate) source: Option<serde_json::Value>,
+    pub(crate) thread_source: Option<String>,
     pub(crate) forked_from_id: Option<SessionId>,
     pub(crate) model_provider: Option<String>,
     pub(crate) model: Option<String>,
@@ -59,6 +62,8 @@ impl ThreadMetadata {
             created_at,
             updated_at: created_at,
             thread_spawn: None,
+            source: None,
+            thread_source: None,
             forked_from_id: None,
             model_provider: None,
             model: None,
@@ -218,7 +223,7 @@ pub(crate) struct ThreadsPage {
 
 const SELECT_COLUMNS: &str = "SELECT id, rollout_path, created_at_ms, updated_at_ms, thread_spawn, \
      forked_from_id, model_provider, model, reasoning_effort, cwd, cli_version, originator, title, \
-     preview, first_user_message, archived_at_ms, git_info FROM threads";
+     preview, first_user_message, archived_at_ms, git_info, source, thread_source FROM threads";
 
 impl StateRuntime {
     /// The row of `session_id`, if there is one: Codex's `get_thread`.
@@ -292,6 +297,10 @@ impl StateRuntime {
         self.run_blocking(|connection| {
             let transaction = connection.transaction()?;
             for session_id in session_ids {
+                transaction.execute(
+                    "DELETE FROM thread_read_receipts WHERE thread_id = ?1",
+                    params![session_id.as_str()],
+                )?;
                 transaction.execute(
                     "DELETE FROM threads WHERE id = ?1",
                     params![session_id.as_str()],
@@ -467,8 +476,8 @@ pub(crate) fn upsert_thread(
 INSERT INTO threads (
     id, rollout_path, created_at_ms, updated_at_ms, thread_spawn, forked_from_id, model_provider,
     model, reasoning_effort, cwd, cli_version, originator, title, preview, first_user_message,
-    archived, archived_at_ms, git_info
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+    archived, archived_at_ms, git_info, source, thread_source
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at_ms = excluded.created_at_ms,
@@ -486,7 +495,9 @@ ON CONFLICT(id) DO UPDATE SET
     first_user_message = excluded.first_user_message,
     archived = excluded.archived,
     archived_at_ms = excluded.archived_at_ms,
-    git_info = excluded.git_info
+    git_info = excluded.git_info,
+    source = excluded.source,
+    thread_source = excluded.thread_source
 ",
         params![
             metadata.session_id.as_str(),
@@ -507,6 +518,13 @@ ON CONFLICT(id) DO UPDATE SET
             metadata.archived_at.is_some(),
             metadata.archived_at.map(millis),
             git_info,
+            metadata
+                .source
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+            metadata.thread_source,
         ],
     )?;
     Ok(())
@@ -531,6 +549,18 @@ fn metadata_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadMetadata> {
         created_at: timestamp(row.get(2)?),
         updated_at: timestamp(row.get(3)?),
         thread_spawn,
+        source: row
+            .get::<_, Option<String>>(17)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        thread_source: row.get(18)?,
         forked_from_id: row.get::<_, Option<String>>(5)?.map(SessionId::new),
         model_provider: row.get(6)?,
         model: row.get(7)?,

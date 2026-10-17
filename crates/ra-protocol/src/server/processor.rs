@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! What the server makes of a client's requests: Codex's `MessageProcessor`, `ConnectionSessionState`
 //! and `InitializeRequestProcessor` (`app-server/src/message_processor.rs`,
 //! `app-server/src/request_processors/initialize_processor.rs`).
@@ -27,7 +28,7 @@
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, OnceLock, PoisonError},
+    sync::{Arc, OnceLock, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -36,6 +37,7 @@ use serde::Serialize;
 use tokio::{sync::Mutex, time::timeout};
 
 use super::{
+    SessionSource,
     connection_rpc_gate::ConnectionRpcGate,
     outgoing::{ConnectionRequestId, OutgoingMessageSender},
     protocol::{
@@ -157,6 +159,7 @@ pub(crate) struct MessageProcessor {
     pub(crate) history: Arc<HistorySources>,
     /// What prepares the threads the thread methods load, if the host gave one.
     thread_factory: ThreadFactorySlot,
+    session_source: RwLock<SessionSource>,
     /// The statuses of the loaded threads.
     thread_watch: Arc<ThreadWatchManager>,
 }
@@ -186,8 +189,17 @@ impl MessageProcessor {
             thread_unload_delay: std::sync::Mutex::new(DEFAULT_THREAD_UNLOAD_DELAY),
             history: Arc::default(),
             thread_factory: ThreadFactorySlot::default(),
+            session_source: RwLock::new(SessionSource::default()),
             thread_watch,
         }
+    }
+
+    /// Sets the server-level session source used by newly started and forked threads.
+    pub(crate) fn set_session_source(&self, session_source: SessionSource) {
+        *self
+            .session_source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = session_source;
     }
 
     /// Prepares the threads the thread methods load with `factory`.
@@ -209,6 +221,11 @@ impl MessageProcessor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
             listener: self.listener_context(),
+            session_source: self
+                .session_source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         }
     }
 
@@ -458,6 +475,13 @@ impl MessageProcessor {
                 let result = self
                     .thread_processor
                     .thread_read(params, &self.history)
+                    .await;
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadReadStateUpdate { params, .. } => {
+                let result = self
+                    .thread_processor
+                    .thread_read_state_update(params, &self.history)
                     .await;
                 self.finish_turn_method(request_id, result).await;
             }

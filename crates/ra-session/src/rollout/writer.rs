@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Line-level append-only writes; a crash never damages what was already written.
 
 use core::fmt;
@@ -283,6 +284,8 @@ pub struct RolloutSessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     git_info: Option<crate::store::GitInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dynamic_tools: Option<serde_json::Value>,
@@ -305,6 +308,7 @@ impl RolloutSessionMeta {
             thread_spawn: None,
             forked_from_id: None,
             thread_source: None,
+            source: None,
             git_info: None,
             dynamic_tools: None,
             unknown: Unknown::new(),
@@ -359,6 +363,19 @@ impl RolloutSessionMeta {
     pub fn with_thread_source(mut self, source: impl Into<String>) -> Self {
         self.thread_source = Some(source.into());
         self
+    }
+
+    /// Records Codex's session source as its wire value. Missing sources remain unknown.
+    #[must_use]
+    pub fn with_source(mut self, source: serde_json::Value) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// The product's session source, when recorded.
+    #[must_use]
+    pub const fn source(&self) -> Option<&serde_json::Value> {
+        self.source.as_ref()
     }
 
     /// Sets a canonical Git metadata marker. An empty value explicitly clears all Git fields.

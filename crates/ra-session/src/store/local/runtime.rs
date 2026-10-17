@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Opening the state database and running statements on it: Codex's `StateRuntime`
 //! (`state/src/runtime.rs`, `state/src/sqlite.rs`) as far as its thread table goes.
 
@@ -93,6 +94,16 @@ ON CONFLICT(id) DO NOTHING;
 ",
     r"
 ALTER TABLE threads ADD COLUMN git_info TEXT;
+",
+    r"
+CREATE TABLE thread_read_receipts (
+    thread_id TEXT PRIMARY KEY NOT NULL,
+    first_unread_turn TEXT,
+    revision TEXT NOT NULL,
+    last_published_turn TEXT
+);
+ALTER TABLE threads ADD COLUMN source TEXT;
+ALTER TABLE threads ADD COLUMN thread_source TEXT;
 ",
 ];
 

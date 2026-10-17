@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The typed requests, notifications and payloads of the app server's methods: Codex's
 //! `app-server-protocol` (`protocol/common.rs`, `protocol/v1.rs`, `experimental_api.rs`).
 //!
@@ -265,6 +266,15 @@ pub enum ClientRequest {
         /// The thread.
         params: ThreadReadParams,
     },
+    /// Applies a revision-checked durable read or unread mark.
+    #[serde(rename = "thread/readState/update")]
+    ThreadReadStateUpdate {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// The thread, mark and observed revision.
+        params: ThreadReadStateUpdateParams,
+    },
     /// Reads a page of a thread's turns.
     #[serde(rename = "thread/turns/list")]
     ThreadTurnsList {
@@ -383,6 +393,7 @@ impl ClientRequest {
             | Self::ThreadFork { request_id, .. }
             | Self::ThreadLoadedList { request_id, .. }
             | Self::ThreadRead { request_id, .. }
+            | Self::ThreadReadStateUpdate { request_id, .. }
             | Self::ThreadUnsubscribe { request_id, .. }
             | Self::ThreadTurnsList { request_id, .. }
             | Self::ThreadItemsList { request_id, .. }
@@ -414,6 +425,7 @@ impl ClientRequest {
             Self::ThreadFork { .. } => "thread/fork",
             Self::ThreadLoadedList { .. } => "thread/loaded/list",
             Self::ThreadRead { .. } => "thread/read",
+            Self::ThreadReadStateUpdate { .. } => "thread/readState/update",
             Self::ThreadUnsubscribe { .. } => "thread/unsubscribe",
             Self::ThreadTurnsList { .. } => "thread/turns/list",
             Self::ThreadItemsList { .. } => "thread/items/list",
@@ -461,6 +473,7 @@ impl ClientRequest {
             Self::ThreadBackgroundTerminalsTerminate { .. } => {
                 Some("thread/backgroundTerminals/terminate")
             }
+            Self::ThreadReadStateUpdate { .. } => Some("thread/readState/update"),
             Self::ThreadSettingsUpdate { .. } => Some("thread/settings/update"),
             Self::TurnSettingsUpdate { .. } => Some("turn/settings/update"),
             Self::TurnStart { params, .. } => params.experimental_reason(),
@@ -492,6 +505,7 @@ impl ClientRequest {
             Self::ThreadResume { params, .. } => Some(params.thread_id()),
             Self::ThreadFork { params, .. } => Some(params.thread_id()),
             Self::ThreadRead { params, .. } => Some(params.thread_id()),
+            Self::ThreadReadStateUpdate { params, .. } => Some(&params.thread_id),
             Self::ThreadUnsubscribe { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsClean { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsList { params, .. } => Some(params.thread_id()),

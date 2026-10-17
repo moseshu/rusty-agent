@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The methods that load threads and read them: the parts of Codex's `ThreadRequestProcessor`
 //! (`request_processors/thread_processor.rs`, `request_processors/thread_lifecycle.rs`) for
 //! `thread/start`, `thread/resume`, `thread/fork`, `thread/read` and `thread/loaded/list`.
@@ -69,6 +70,7 @@ use ra_session::{
 use serde_json::{Map, Value, json};
 
 use super::{
+    SessionSource,
     dynamic_tool_calls::{
         DynamicToolCalls, dynamic_tools_from_records, recorded_dynamic_tools,
         register_dynamic_tools,
@@ -120,6 +122,7 @@ pub(crate) struct ThreadMethodContext<'a> {
     pub(crate) history: &'a HistorySources,
     pub(crate) factory: Option<Arc<dyn ThreadFactory>>,
     pub(crate) listener: ListenerTaskContext,
+    pub(crate) session_source: SessionSource,
 }
 
 impl ThreadRequestProcessor {
@@ -194,6 +197,7 @@ impl ThreadRequestProcessor {
                     adapter.as_deref(),
                     params.thread_source.as_deref(),
                     &dynamic_tools,
+                    &context.session_source,
                 );
                 let recorder = store
                     .create_thread_with(&CreateThreadParams::new(meta))
@@ -211,6 +215,7 @@ impl ThreadRequestProcessor {
             ephemeral,
             created_at: now_unix_seconds(),
             thread_source: params.thread_source,
+            source: Some(context.session_source.api_value()),
             ..LoadedThreadInfo::default()
         };
         let loaded = self.load(
@@ -347,6 +352,7 @@ impl ThreadRequestProcessor {
             created_at: stored.created_at().map_or_else(now_unix_seconds, seconds),
             forked_from_id: stored.forked_from_id().cloned(),
             thread_source: stored.thread_source().map(str::to_owned),
+            source: Some(session_source(&stored)),
             preview: stored.preview().to_owned(),
         };
         let loaded = self.load(
@@ -485,6 +491,7 @@ impl ThreadRequestProcessor {
                 adapter.as_deref(),
                 params.thread_source.as_deref(),
                 &dynamic_tools,
+                &context.session_source,
             );
             let forked = ForkedThread::fork_from_history(
                 store.as_ref(),
@@ -525,6 +532,7 @@ impl ThreadRequestProcessor {
             created_at: now_unix_seconds(),
             forked_from_id: Some(source_id.clone()),
             thread_source: params.thread_source.clone(),
+            source: Some(context.session_source.api_value()),
             preview: if params.ephemeral {
                 preview_from_records(&fork_records)
             } else {
@@ -591,6 +599,20 @@ impl ThreadRequestProcessor {
         params: ThreadReadParams,
         history: &HistorySources,
     ) -> TurnMethodResult {
+        let thread = self.read_thread_view(params, history).await?;
+        let read_state =
+            super::thread_management::read_state_snapshots(history, std::slice::from_ref(&thread))
+                .await
+                .and_then(|mut states| states.remove(&thread.id));
+        response(ThreadReadResponse::new(thread, read_state))
+    }
+
+    /// Reads the same thread view for snapshots and explicit receipt edits.
+    pub(super) async fn read_thread_view(
+        &self,
+        params: ThreadReadParams,
+        history: &HistorySources,
+    ) -> Result<Thread, JsonRpcErrorObject> {
         let thread_id = SessionId::new(&params.thread_id);
         let loaded = self.thread_manager.get_thread(&thread_id);
         if params.include_turns
@@ -662,7 +684,7 @@ impl ThreadRequestProcessor {
             self.thread_watch.loaded_status_for_thread(&thread_id),
             has_live_in_progress_turn,
         );
-        response(ThreadReadResponse::new(thread))
+        Ok(thread)
     }
 
     /// `thread/loaded/list`: Codex's `thread_loaded_list`.
@@ -1186,8 +1208,11 @@ fn new_session_meta(
     adapter: Option<&dyn ThreadSettingsAdapter>,
     thread_source: Option<&str>,
     dynamic_tools: &[DynamicToolSpec],
+    session_source: &SessionSource,
 ) -> RolloutSessionMeta {
-    let mut meta = RolloutSessionMeta::new(thread_id.clone()).with_cli_version(CLI_VERSION);
+    let mut meta = RolloutSessionMeta::new(thread_id.clone())
+        .with_cli_version(CLI_VERSION)
+        .with_source(session_source.metadata_value());
     if let Some(tools) = recorded_dynamic_tools(dynamic_tools) {
         meta = meta.with_dynamic_tools(tools);
     }
@@ -1339,7 +1364,7 @@ fn session_source(stored: &StoredThread) -> Value {
             "agent_nickname": null,
             "agent_role": spawn.agent_type().map(ra_core::agent::AgentId::as_str),
         }}}),
-        None => Value::String("unknown".to_owned()),
+        None => SessionSource::from_metadata(stored.source()).api_value(),
     }
 }
 
@@ -1472,7 +1497,11 @@ pub(super) fn build_thread_from_loaded(loaded: &LoadedThread) -> Thread {
         cwd,
         cli_version: CLI_VERSION.to_owned(),
         originator: None,
-        source: Value::String("unknown".to_owned()),
+        source: loaded
+            .info
+            .source
+            .clone()
+            .unwrap_or_else(|| Value::String("unknown".to_owned())),
         can_accept_direct_input: Some(true),
         thread_source: loaded.info.thread_source.clone(),
         agent_nickname: None,

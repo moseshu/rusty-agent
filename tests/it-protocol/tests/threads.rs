@@ -14,6 +14,8 @@
 
 #[path = "threads/thread_list.rs"]
 mod thread_list;
+#[path = "threads/thread_read_state.rs"]
+mod thread_read_state;
 
 use std::{
     collections::VecDeque,
@@ -493,11 +495,22 @@ impl Server {
 /// Builds a server from `options` and runs it, keeping a requester for `requester_thread` made
 /// before it runs, as requesters must be.
 fn build(options: Options, requester_thread: Option<&str>) -> (Server, Option<ThreadRequester>) {
+    build_with_session_source(options, requester_thread, None)
+}
+
+fn build_with_session_source(
+    options: Options,
+    requester_thread: Option<&str>,
+    source: Option<ra_protocol::server::SessionSource>,
+) -> (Server, Option<ThreadRequester>) {
     let store = options
         .store
         .clone()
         .unwrap_or_else(|| Arc::new(InMemoryThreadStore::new()));
     let mut server = AppServer::new(std::env::temp_dir().join("rusty-agent-threads-test")).unwrap();
+    if let Some(source) = source {
+        server = server.with_session_source(source);
+    }
     if options.store.is_some() {
         server = server.with_thread_store(Arc::clone(&store));
     }

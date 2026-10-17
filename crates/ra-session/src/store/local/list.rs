@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Listing threads with the state database: Codex's `list_threads_db` (`rollout/src/state_db.rs`),
 //! `list_threads_with_db_fallback` and `fill_missing_thread_item_metadata_from_state_db`
 //! (`rollout/src/recorder.rs`) and the name resolution of its local store
@@ -182,6 +183,8 @@ pub(crate) fn stored_thread(row: &ThreadMetadata) -> StoredThread {
     let mut thread = StoredThread::new(row.session_id.clone(), None);
     thread.rollout_path = Some(row.rollout_path.clone());
     thread.thread_spawn.clone_from(&row.thread_spawn);
+    thread.source.clone_from(&row.source);
+    thread.thread_source.clone_from(&row.thread_source);
     thread.forked_from_id.clone_from(&row.forked_from_id);
     thread.created_at = Some(row.created_at);
     thread.cwd.clone_from(&row.cwd);

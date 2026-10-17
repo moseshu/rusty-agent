@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The storage boundary of a session's threads: Codex's `ThreadStore`
 //! (`thread-store/src/store.rs`).
 //!
@@ -86,6 +87,13 @@ use crate::rollout::{
 /// `ThreadStore` that this framework ports.
 #[async_trait]
 pub trait ThreadStore: RolloutThreadStore {
+    /// The local state database, when this store has one. Receipts are a local capability,
+    /// independent of the provider-neutral session port.
+    #[cfg(feature = "sqlite")]
+    fn state_db(&self) -> Option<Arc<local::StateRuntime>> {
+        None
+    }
+
     /// Creates the thread `params` describes and returns the recorder its runs record through:
     /// Codex's `create_thread`, followed by the `append_items` its session makes with a forked
     /// history before anything else.
@@ -522,11 +530,10 @@ impl StoredThreadHistory {
 /// thread whose recorder was created without it, has none of that here. The rest is what the
 /// store knows besides: the name a caller gave it, the preview and first user message read from
 /// the head of its records, when it was last written to and archived, and the model and effort a
-/// store that keeps metadata patches was told of. The thread source a client classified the thread
-/// with is read from the session metadata; a state database does not keep it yet, so a thread a
-/// listing reads from one has none.
+/// store that keeps metadata patches was told of. The session source and the client's thread
+/// classification are preserved in both the opening metadata and the state database.
 ///
-/// Codex's source, history mode, agent nickname and role, section, project, approval
+/// Codex's history mode, agent nickname and role, section, project, approval
 /// mode, permission profile, token usage and recency are its product's or its state database's,
 /// and are not ported.
 #[non_exhaustive]
@@ -537,6 +544,7 @@ pub struct StoredThread {
     thread_spawn: Option<RolloutThreadSpawn>,
     forked_from_id: Option<SessionId>,
     thread_source: Option<String>,
+    source: Option<serde_json::Value>,
     git_info: Option<GitInfo>,
     created_at: Option<EventTimestamp>,
     cwd: Option<String>,
@@ -563,6 +571,7 @@ impl StoredThread {
             thread_spawn: meta.and_then(|meta| meta.thread_spawn().cloned()),
             forked_from_id: meta.and_then(|meta| meta.forked_from_id().cloned()),
             thread_source: meta.and_then(|meta| meta.thread_source().map(str::to_owned)),
+            source: meta.and_then(|meta| meta.source().cloned()),
             git_info: meta
                 .and_then(|meta| meta.git_info().cloned())
                 .filter(|git| {
@@ -652,6 +661,12 @@ impl StoredThread {
     #[must_use]
     pub fn thread_source(&self) -> Option<&str> {
         self.thread_source.as_deref()
+    }
+
+    /// The product's session source, when recorded.
+    #[must_use]
+    pub const fn source(&self) -> Option<&serde_json::Value> {
+        self.source.as_ref()
     }
 
     /// The latest persisted Git metadata.
@@ -778,6 +793,12 @@ impl StoredThread {
     }
 
     pub(crate) fn apply_patch(&mut self, patch: &ThreadMetadataPatch) {
+        if let Some(source) = patch.source() {
+            self.source = Some(source.clone());
+        }
+        if let Some(source) = patch.thread_source() {
+            self.thread_source = Some(source.to_owned());
+        }
         if let Some(git_info) = patch.git_info() {
             git_info.apply(&mut self.git_info);
         }

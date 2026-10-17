@@ -493,7 +493,7 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
                    `thread/archive`, `thread/delete`, `thread/unarchive`, \
                    `thread/name/set`, `thread/metadata/update`, `thread/list`, \
                    `thread/unsubscribe`, `thread/loaded/list`, `thread/read`, \
-                   `thread/turns/list`, `thread/items/list`, \
+                   `thread/readState/update`, `thread/turns/list`, `thread/items/list`, \
                    `thread/backgroundTerminals/clean`, \
                    `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, \
                    `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \

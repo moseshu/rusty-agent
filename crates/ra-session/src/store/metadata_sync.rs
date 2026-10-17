@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Deriving a live thread's metadata from the records appended to it: Codex's
 //! `ThreadMetadataSync` (`thread-store/src/thread_metadata_sync.rs`).
 //!
@@ -410,6 +411,12 @@ impl ThreadMetadataSync {
 /// `update` with where the thread of `meta` was spawned from and forked from, as Codex's patch
 /// carries the session source.
 fn with_lineage(mut update: ThreadMetadataPatch, meta: &RolloutSessionMeta) -> ThreadMetadataPatch {
+    if let Some(source) = meta.source() {
+        update = update.with_source(source.clone());
+    }
+    if let Some(source) = meta.thread_source() {
+        update = update.with_thread_source(source.to_owned());
+    }
     if let Some(spawn) = meta.thread_spawn() {
         update = update.with_thread_spawn(spawn.clone());
     }
@@ -431,6 +438,8 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.cwd().is_some()
         || update.cli_version().is_some()
         || update.first_user_message().is_some()
+        || update.source().is_some()
+        || update.thread_source().is_some()
         || update.thread_spawn().is_some()
         || update.forked_from_id().is_some()
 }

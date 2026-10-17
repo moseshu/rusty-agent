@@ -11,8 +11,8 @@
 //! - `cwd` is `null` for a thread whose working directory nobody recorded. Codex always records
 //!   one, since its sessions run in a directory; a thread here belongs to its host, which may have
 //!   none.
-//! - `source` is `subAgent` for a spawned agent's thread and `unknown` otherwise: Codex records the
-//!   source its embedding product names, which nothing here names.
+//! - `source` preserves the recorded session source, or is `subAgent` for a spawned thread.
+//!   Old metadata without a source and threads loaded outside the thread methods stay `unknown`.
 //! - `recencyAt` is `null`: Codex's state database orders threads by a recency of its own, which no
 //!   store here keeps.
 //! - `reasoningEffort` is the effort's label — `low` through `max` — as `thread/settings/updated`

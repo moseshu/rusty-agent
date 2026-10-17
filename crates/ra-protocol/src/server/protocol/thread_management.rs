@@ -429,3 +429,54 @@ pub enum ThreadUnreadPosition {
         turn_id: String,
     },
 }
+
+/// An explicit read or unread mark, guarded by the snapshot the caller actually saw.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ThreadReadStateOperation {
+    /// Acknowledge the observed activity.
+    Read,
+    /// Mark the whole thread unread, including an empty thread.
+    Unread,
+}
+
+/// The parameters of `thread/readState/update`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadStateUpdateParams {
+    /// The thread to mark.
+    pub thread_id: String,
+    /// The explicit mark to apply.
+    pub operation: ThreadReadStateOperation,
+    /// Revision of the row or transcript actually seen. Conflicts require a fresh user action.
+    pub expected_revision: String,
+}
+
+/// The committed answer to `thread/readState/update`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadStateUpdateResponse {
+    /// The receipt after the mark.
+    pub read_state: ThreadReadState,
+}
+
+/// A committed receipt sent to the thread's usual subscribers.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadStateChangedNotification {
+    /// The changed thread.
+    pub thread_id: String,
+    /// The current committed receipt.
+    pub read_state: ThreadReadState,
+}
+
+/// The experimental receipt-change notification method.
+pub const THREAD_READ_STATE_CHANGED_METHOD: &str = "thread/readState/changed";

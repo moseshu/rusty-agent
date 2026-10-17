@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Keeping the thread table in step with the rollouts: Codex's `apply_metadata_update`
 //! (`thread-store/src/local/update_thread_metadata.rs`), `extract_metadata_from_rollout`
 //! (`rollout/src/metadata.rs`) and `reconcile_rollout` and `read_repair_rollout_path`
@@ -28,6 +29,12 @@ use crate::{
 /// field. The originator only fills a missing one; a name is not a field of the row and is set
 /// apart, through the title.
 pub(crate) fn apply_patch(metadata: &mut ThreadMetadata, patch: &ThreadMetadataPatch) {
+    if let Some(source) = patch.source() {
+        metadata.source = Some(source.clone());
+    }
+    if let Some(source) = patch.thread_source() {
+        metadata.thread_source = Some(source.to_owned());
+    }
     if let Some(git_info) = patch.git_info() {
         git_info.apply(&mut metadata.git_info);
     }

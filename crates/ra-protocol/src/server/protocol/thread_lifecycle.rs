@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The methods that load threads and read them: Codex's `thread/start`, `thread/resume`,
 //! `thread/fork`, `thread/read` and `thread/loaded/list` (`protocol/v2/thread.rs`).
 //!
@@ -824,11 +825,19 @@ impl ThreadReadParams {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadReadResponse {
     thread: Thread,
+    /// Local receipt. Null means this thread's durable read state is unavailable.
+    read_state: Option<super::ThreadReadState>,
 }
 
 impl ThreadReadResponse {
-    pub(crate) const fn new(thread: Thread) -> Self {
-        Self { thread }
+    pub(crate) const fn new(thread: Thread, read_state: Option<super::ThreadReadState>) -> Self {
+        Self { thread, read_state }
+    }
+
+    /// The durable local receipt, or none when unavailable for this thread.
+    #[must_use]
+    pub const fn read_state(&self) -> Option<&super::ThreadReadState> {
+        self.read_state.as_ref()
     }
 
     /// The thread.

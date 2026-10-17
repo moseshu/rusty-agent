@@ -123,7 +123,10 @@ async fn exclusions_refill_pages_across_storage_paths_and_preserve_both_cursors(
                             let page = server
                                 .call(&mut connection, "thread/list", next_query.clone())
                                 .await;
-                            assert_eq!(page.get("readStates"), Some(&Value::Null));
+                            assert_eq!(
+                                page.get("readStates"),
+                                Some(&if indexed { json!({}) } else { Value::Null })
+                            );
                             let page_ids = ids(&page);
                             assert_eq!(
                                 page_ids.len(),

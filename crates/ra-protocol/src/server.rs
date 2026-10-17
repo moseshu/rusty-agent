@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The app server: reads what the transports deliver, answers the client's requests and routes the
 //! server's messages back, as Codex's app-server does (`app-server/src/lib.rs`).
 //!
@@ -75,6 +76,7 @@ mod processor;
 pub mod protocol;
 mod request_serialization;
 mod router;
+mod session_source;
 mod settings_adapter;
 mod thread_factory;
 mod thread_history;
@@ -93,6 +95,9 @@ mod user_input_requests;
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
 pub use self::permission_requests::ThreadServerRequests;
+pub use self::session_source::{
+    InternalSessionSource, SessionSource, SessionSourceArgs, SubAgentSource,
+};
 pub use self::settings_adapter::{PendingApproval, ThreadSettingsAdapter};
 pub use self::thread_factory::{PreparedThread, ThreadFactory, ThreadFactoryRequest, ThreadOrigin};
 pub use self::tool_items::{ThreadToolItemEvent, ThreadToolItems};
@@ -341,6 +346,14 @@ impl AppServer {
             outgoing_rx,
             graceful_restart: None,
         })
+    }
+
+    /// Sets the source stamped into newly started and forked sessions. The default is VS Code,
+    /// matching Codex's server startup default. Resumes preserve their recorded source.
+    #[must_use]
+    pub fn with_session_source(self, session_source: SessionSource) -> Self {
+        self.processor.set_session_source(session_source);
+        self
     }
 
     /// Reads threads' history from `store`, as Codex's server reads its thread store: what

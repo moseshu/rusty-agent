@@ -1128,7 +1128,7 @@ async fn git_metadata_migration_preserves_existing_threads() {
     drop(store);
     drop(db);
     db_connection(&dir)
-        .execute_batch("ALTER TABLE threads DROP COLUMN git_info; PRAGMA user_version = 1;")
+        .execute_batch("ALTER TABLE threads DROP COLUMN git_info; ALTER TABLE threads DROP COLUMN source; ALTER TABLE threads DROP COLUMN thread_source; DROP TABLE thread_read_receipts; PRAGMA user_version = 1;")
         .unwrap();
     let (store, _db) = indexed(&dir).await;
     let page = store

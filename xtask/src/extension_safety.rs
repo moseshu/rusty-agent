@@ -184,6 +184,19 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-protocol/src/server/protocol/thread_management.rs",
         "ThreadReadState",
     ),
+    // Field-for-field Codex read-state update and notification wire records.
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadReadStateUpdateParams",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadReadStateUpdateResponse",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadReadStateChangedNotification",
+    ),
     // Persisted Git facts and their patch: Codex `protocol/src/protocol.rs` `GitInfo` and
     // `thread-store/src/types.rs` `GitInfoPatch`.
     ("crates/ra-session/src/store/git.rs", "GitInfo"),

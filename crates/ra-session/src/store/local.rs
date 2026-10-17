@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The state database a rollout directory keeps beside its rollouts: Codex's `SQLite` state
 //! database (`state/`) as its local store uses it for threads (`rollout/src/state_db.rs`,
 //! `rollout/src/metadata.rs`, `thread-store/src/local/`).
@@ -36,9 +37,10 @@
 //! - **One directory, one database.** Codex keeps one database per home, beside a tree of dated
 //!   session directories. The database here lives in the rollout directory, named
 //!   [`STATE_DB_FILENAME`], and indexes that directory's rollouts.
-//! - **Schema.** Codex's thread table carries its product's columns — source, sandbox policy,
+//! - **Schema.** Codex's thread table carries its product's columns — sandbox policy,
 //!   approval mode, sections, projects, recency, memory mode, token usage. This one
-//!   keeps the columns this framework's threads have, under Codex's names, plus where a spawned
+//!   keeps session source and thread scope for local receipt eligibility, and the columns this
+//!   framework's threads have, under Codex's names, plus where a spawned
 //!   thread came from and what a fork was forked from, so a listing from the database returns what
 //!   a listing of rollouts returns. Its other tables — logs, goals, memories, spawn edges, queued
 //!   items, paginated history — are not ported.
@@ -67,6 +69,7 @@
 
 mod backfill;
 mod list;
+mod read_state;
 mod repair;
 mod runtime;
 mod threads;
@@ -80,6 +83,7 @@ use async_trait::async_trait;
 use ra_core::{error::Result, event::EventTimestamp, session::SessionId};
 
 pub use backfill::{BackfillState, BackfillStatus};
+pub use read_state::{ReadStateOperation, ReadStateUpdate, ThreadReadState};
 pub use runtime::{STATE_DB_FILENAME, StateRuntime};
 pub use threads::ThreadMetadata;
 

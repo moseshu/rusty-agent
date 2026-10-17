@@ -57,6 +57,7 @@ target
 !/Docs/R11-2_MCP_HTTP_契约与验证.md
 !/Docs/Rustls_Provider_Initialization.md
 !/Docs/Thread_List_Contract.md
+!/Docs/Thread_Read_State_Review.md
 
 # 门禁基线与快照（不上传 GitHub）——本地产物，`cargo xtask <gate> --bless` 生成。
 # 注意代价：它们是 `public-api` / `schema-stability` / `prompt-dump` 三条门禁的对账对象，

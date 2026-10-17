@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The threads the server has loaded: the part of Codex's `ThreadManager` (`core/src/thread_manager.rs`)
 //! the thread and turn methods look threads up in.
 //!
@@ -33,6 +34,8 @@ pub(crate) struct LoadedThreadInfo {
     pub(crate) forked_from_id: Option<SessionId>,
     /// The client's classification of where it came from.
     pub(crate) thread_source: Option<String>,
+    /// The persisted product source; missing values stay unknown.
+    pub(crate) source: Option<serde_json::Value>,
     /// Its preview, for a thread that keeps no rollout to read one from.
     pub(crate) preview: String,
 }

@@ -24,12 +24,34 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-mcp/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `crates/ra-mcp/src/tool.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; src/mcp_tool_exposure.rs |
 | `crates/ra-protocol/src/server/protocol/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/thread.rs |
-| `crates/ra-protocol/src/server/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/thread_processor.rs; thread_read_state.rs |
+| `crates/ra-protocol/src/server/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/thread_processor.rs; thread_read_state.rs; codex-rs/app-server/src/filters.rs |
 | `crates/ra-sandbox/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `tests/it-mcp/tests/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager_tests.rs |
 | `tests/it-mcp/tests/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/tests/provider.rs; tests/preinstalled.rs |
 | `tests/it-protocol/tests/threads/thread_list.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/tests/suite/v2/thread_list.rs; thread_read_state.rs |
 | `tests/it-sandbox/tests/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/tests/provider.rs; tests/preinstalled.rs |
+| `crates/ra-protocol/src/server/processor.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/message_processor.rs; request_processors.rs |
+| `crates/ra-protocol/src/server/protocol.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/common.rs |
+| `crates/ra-protocol/src/server/protocol/thread_lifecycle.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/thread.rs |
+| `crates/ra-protocol/src/server/thread_listener.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/thread_lifecycle.rs |
+| `crates/ra-protocol/src/server/thread_loading.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/thread_processor.rs; codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs |
+| `crates/ra-protocol/src/server/thread_manager.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/thread_state.rs; codex-rs/core/src/thread_manager.rs |
+| `crates/ra-session/src/rollout/threads.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/thread-store/src/local.rs; codex-rs/core/src/codex_thread.rs |
+| `crates/ra-session/src/rollout/writer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs (SessionMeta) |
+| `crates/ra-session/src/store.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/thread-store/src/store.rs; types.rs; codex-rs/core/src/codex_thread.rs (state_db) |
+| `crates/ra-session/src/store/local.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/state/src/runtime.rs |
+| `crates/ra-session/src/store/local/list.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/thread-store/src/local/list_threads.rs; read_thread.rs |
+| `crates/ra-session/src/store/local/read_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/state/src/runtime/thread_read_state.rs |
+| `crates/ra-session/src/store/local/repair.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/thread-store/src/local/update_thread_metadata.rs; codex-rs/rollout/src/state_db.rs |
+| `crates/ra-session/src/store/local/runtime.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/state/src/runtime.rs; codex-rs/state/migrations/0061_thread_read_state.sql |
+| `crates/ra-session/src/store/local/threads.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/state/src/runtime/threads.rs |
+| `crates/ra-session/src/store/metadata.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/thread-store/src/types.rs |
+| `crates/ra-session/src/store/metadata_sync.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/thread-store/src/thread_metadata_sync.rs |
+| `tests/it-protocol/tests/threads/thread_read_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/tests/suite/v2/thread_read_state.rs |
+| `tests/it-session-sqlite/tests/thread_read_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/state/src/runtime/thread_read_state_tests.rs |
+| `crates/ra-protocol/src/server.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/main.rs; src/in_process.rs; src/message_processor.rs |
+| `crates/ra-protocol/src/server/session_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs (SessionSource, InternalSessionSource, SubAgentSource, from_startup_arg); codex-rs/app-server/src/main.rs |
+| `tests/it-protocol/tests/session_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs (session_source_from_startup_arg tests); codex-rs/app-server/src/main.rs |
 
 The metadata/title resolution, URL display-name behavior, and bare function-tool naming
 (original names and include_server_in_tool_names prefixes) in crates/ra-mcp/src/catalog.rs,

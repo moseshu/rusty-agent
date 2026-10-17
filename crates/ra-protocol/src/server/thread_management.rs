@@ -13,7 +13,11 @@
 //! use the store's timestamp/id ordering, including its tie breaking, rather than Codex's
 //! timestamp-only legacy cursors.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use ra_core::{error::Error, session::SessionId};
 use ra_session::store::{
@@ -25,16 +29,23 @@ use ra_session::store::{
 use serde::Serialize;
 
 use super::{
-    outgoing::{ConnectionRequestId, ServerNotification},
+    SessionSource, SubAgentSource,
+    outgoing::{
+        ConnectionRequestId, OutgoingMessageSender, ServerNotification,
+        ThreadScopedOutgoingMessageSender,
+    },
     protocol::{
         SortDirection, THREAD_ARCHIVED_METHOD, THREAD_DELETED_METHOD, THREAD_NAME_UPDATED_METHOD,
-        THREAD_UNARCHIVED_METHOD, Thread, ThreadArchiveParams, ThreadArchiveResponse,
-        ThreadArchivedNotification, ThreadDeleteParams, ThreadDeleteResponse,
-        ThreadDeletedNotification, ThreadListCwdFilter, ThreadListParams, ThreadListResponse,
-        ThreadMetadataGitInfoUpdateParams, ThreadMetadataUpdateParams,
-        ThreadMetadataUpdateResponse, ThreadNameUpdatedNotification, ThreadSetNameParams,
-        ThreadSetNameResponse, ThreadSortKey, ThreadSourceKind, ThreadUnarchiveParams,
-        ThreadUnarchiveResponse, ThreadUnarchivedNotification,
+        THREAD_READ_STATE_CHANGED_METHOD, THREAD_UNARCHIVED_METHOD, Thread, ThreadArchiveParams,
+        ThreadArchiveResponse, ThreadArchivedNotification, ThreadDeleteParams,
+        ThreadDeleteResponse, ThreadDeletedNotification, ThreadItem, ThreadListCwdFilter,
+        ThreadListParams, ThreadListResponse, ThreadMetadataGitInfoUpdateParams,
+        ThreadMetadataUpdateParams, ThreadMetadataUpdateResponse, ThreadNameUpdatedNotification,
+        ThreadReadParams, ThreadReadState, ThreadReadStateChangedNotification,
+        ThreadReadStateOperation, ThreadReadStateUpdateParams, ThreadReadStateUpdateResponse,
+        ThreadSetNameParams, ThreadSetNameResponse, ThreadSortKey, ThreadSourceKind,
+        ThreadUnarchiveParams, ThreadUnarchiveResponse, ThreadUnarchivedNotification,
+        ThreadUnreadPosition,
     },
     thread_history::HistorySources,
     thread_loading::{apply_live_thread_settings, is_not_found, thread_from_stored},
@@ -469,15 +480,7 @@ impl ThreadRequestProcessor {
                     .source_kinds
                     .as_ref()
                     .filter(|kinds| !kinds.is_empty())
-                    .is_some_and(|kinds| {
-                        !kinds.iter().any(|kind| match kind {
-                            ThreadSourceKind::Unknown => thread.thread_spawn().is_none(),
-                            ThreadSourceKind::SubAgent | ThreadSourceKind::SubAgentThreadSpawn => {
-                                thread.thread_spawn().is_some()
-                            }
-                            _ => false,
-                        })
-                    })
+                    .is_some_and(|kinds| !source_kind_matches(thread, kinds))
                 {
                     continue;
                 }
@@ -511,15 +514,14 @@ impl ThreadRequestProcessor {
             // first row's actual key, preserving other rows sharing its timestamp.
             Some(format!("{}|{}", at.as_millis(), thread.session_id()))
         });
-        let data = items
+        let data: Vec<_> = items
             .iter()
             .map(|thread| self.describe_stored_thread(thread))
             .collect();
+        let read_states = read_state_snapshots(history, &data).await;
         super::thread_processor::response(ThreadListResponse {
             data,
-            // Codex returns null when durable receipts are unavailable. Listing history must
-            // not manufacture read acknowledgements from thread status or loaded state.
-            read_states: None,
+            read_states,
             next_cursor,
             backwards_cursor,
         })
@@ -623,5 +625,243 @@ fn normalize_git_field(
             Ok(Some(Some(value)))
         }
         other => Ok(other),
+    }
+}
+
+/// Codex's explicit source-kind filter, with spawned lineage overriding raw root metadata.
+fn source_kind_matches(thread: &StoredThread, filter: &[ThreadSourceKind]) -> bool {
+    if thread.thread_spawn().is_some() {
+        return filter.iter().any(|kind| {
+            matches!(
+                kind,
+                ThreadSourceKind::SubAgent | ThreadSourceKind::SubAgentThreadSpawn
+            )
+        });
+    }
+    let source = SessionSource::from_metadata(thread.source());
+    filter.iter().any(|kind| match kind {
+        ThreadSourceKind::Cli => matches!(source, SessionSource::Cli),
+        ThreadSourceKind::VsCode => matches!(source, SessionSource::VSCode),
+        ThreadSourceKind::Exec => matches!(source, SessionSource::Exec),
+        ThreadSourceKind::AppServer => matches!(source, SessionSource::Mcp),
+        ThreadSourceKind::SubAgent => matches!(source, SessionSource::SubAgent(_)),
+        ThreadSourceKind::SubAgentReview => {
+            matches!(source, SessionSource::SubAgent(SubAgentSource::Review))
+        }
+        ThreadSourceKind::SubAgentCompact => {
+            matches!(source, SessionSource::SubAgent(SubAgentSource::Compact))
+        }
+        ThreadSourceKind::SubAgentThreadSpawn => matches!(
+            source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ),
+        ThreadSourceKind::SubAgentOther => {
+            matches!(source, SessionSource::SubAgent(SubAgentSource::Other(_)))
+        }
+        ThreadSourceKind::Unknown => matches!(source, SessionSource::Unknown),
+    })
+}
+
+/// Codex excludes ephemeral, subagent, unknown and product-policy scopes from local receipts.
+fn read_state_eligible(thread: &Thread) -> bool {
+    !thread.ephemeral
+        && source_has_local_read_state(&thread.source)
+        && matches!(thread.thread_source.as_deref(), None | Some("user"))
+}
+
+fn source_has_local_read_state(source: &serde_json::Value) -> bool {
+    matches!(
+        source.as_str(),
+        Some("cli" | "vscode" | "exec" | "appServer")
+    ) || source
+        .get("custom")
+        .is_some_and(serde_json::Value::is_string)
+}
+
+fn read_state_to_api(state: &ra_session::store::local::ThreadReadState) -> ThreadReadState {
+    ThreadReadState {
+        first_unread: state.first_unread_turn().map(|turn_id| {
+            if turn_id.is_empty() {
+                ThreadUnreadPosition::ThreadStart
+            } else {
+                ThreadUnreadPosition::Turn {
+                    turn_id: turn_id.to_owned(),
+                }
+            }
+        }),
+        revision: state.revision().to_owned(),
+    }
+}
+
+/// Reads only eligible local threads in the requested page. No DB or a failed read means null.
+pub(super) async fn read_state_snapshots(
+    history: &HistorySources,
+    threads: &[Thread],
+) -> Option<HashMap<String, ThreadReadState>> {
+    let db = history.store()?.state_db()?;
+    let ids = threads
+        .iter()
+        .filter(|thread| read_state_eligible(thread))
+        .map(|thread| SessionId::new(&thread.id))
+        .collect::<Vec<_>>();
+    match db.thread_read_states(&ids).await {
+        Ok(states) => Some(
+            states
+                .into_iter()
+                .map(|(id, state)| (id.as_str().to_owned(), read_state_to_api(&state)))
+                .collect(),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "thread read state unavailable");
+            None
+        }
+    }
+}
+
+async fn notify_read_state(
+    db: &ra_session::store::local::StateRuntime,
+    outgoing: &Arc<OutgoingMessageSender>,
+    id: &SessionId,
+) {
+    match db.thread_read_states(std::slice::from_ref(id)).await {
+        Ok(mut states) => {
+            if let Some(state) = states.remove(id) {
+                let subscribers = outgoing.thread_state().subscribed_connection_ids(id);
+                let params = ThreadReadStateChangedNotification {
+                    thread_id: id.as_str().to_owned(),
+                    read_state: read_state_to_api(&state),
+                };
+                ThreadScopedOutgoingMessageSender::new(
+                    Arc::clone(outgoing),
+                    subscribers,
+                    id.clone(),
+                )
+                .send_server_notification(
+                    ServerNotification::new(
+                        THREAD_READ_STATE_CHANGED_METHOD,
+                        serde_json::json!(params),
+                    )
+                    .experimental(THREAD_READ_STATE_CHANGED_METHOD),
+                )
+                .await;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not project committed read state"),
+    }
+}
+
+/// Runs only on newly delivered terminal events, before their completion notification.
+pub(super) async fn publish_read_state(
+    event: &ra_runtime::thread::ThreadEvent,
+    loaded: &super::thread_manager::LoadedThread,
+    summary: &super::thread_state::TurnSummary,
+    history: &HistorySources,
+    outgoing: &Arc<OutgoingMessageSender>,
+) {
+    use ra_runtime::thread::ThreadEvent;
+    let Some(db) = history.store().and_then(|store| store.state_db()) else {
+        return;
+    };
+    if loaded.info.ephemeral
+        || !loaded
+            .info
+            .source
+            .as_ref()
+            .is_some_and(source_has_local_read_state)
+        || !matches!(loaded.info.thread_source.as_deref(), None | Some("user"))
+    {
+        return;
+    }
+    let has_error = summary.last_error.is_some();
+    let final_text = match &summary.last_agent_message {
+        Some(ThreadItem::AgentMessage { text, .. }) => Some(text.as_str()),
+        _ => None,
+    };
+    let (turn_id, visible) = match event {
+        ThreadEvent::TurnComplete { turn_id, .. } if has_error => (turn_id, true),
+        ThreadEvent::TurnComplete { turn_id, .. } => {
+            let Some(text) = final_text else {
+                return;
+            };
+            // Goals and automatic goal continuation are not supported by this runtime.
+            (
+                turn_id,
+                !text.contains("<decision>DONT_NOTIFY</decision>") && !text.trim().is_empty(),
+            )
+        }
+        // This runtime's abort event only represents interruption; failures arrive as Error.
+        ThreadEvent::TurnAborted { turn_id, .. } => (turn_id, has_error || final_text.is_some()),
+        _ => return,
+    };
+    if !visible {
+        return;
+    }
+    if let Err(error) = loaded.flush_rollout().await {
+        tracing::warn!(%error, "cannot publish attention before the terminal result is durable");
+        return;
+    }
+    match db
+        .publish_thread_attention(loaded.thread_id(), turn_id)
+        .await
+    {
+        Ok(true) => notify_read_state(&db, outgoing, loaded.thread_id()).await,
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "failed to publish terminal attention"),
+    }
+}
+
+impl ThreadRequestProcessor {
+    /// Applies Codex's revision-checked local read-state operation.
+    pub(crate) async fn thread_read_state_update(
+        &self,
+        params: ThreadReadStateUpdateParams,
+        history: &HistorySources,
+    ) -> TurnMethodResult {
+        use ra_session::store::local::{ReadStateOperation, ReadStateUpdate};
+        let id = SessionId::new(&params.thread_id);
+        let db = history
+            .store()
+            .and_then(|store| store.state_db())
+            .ok_or_else(|| {
+                JsonRpcErrorObject::method_not_found("durable thread read state unavailable")
+            })?;
+        let thread = self
+            .read_thread_view(ThreadReadParams::new(params.thread_id), history)
+            .await?;
+        if !read_state_eligible(&thread) {
+            return Err(JsonRpcErrorObject::invalid_request(
+                "thread read state unavailable",
+            ));
+        }
+        let operation = match params.operation {
+            ThreadReadStateOperation::Read => ReadStateOperation::Read,
+            ThreadReadStateOperation::Unread => ReadStateOperation::Unread,
+        };
+        let outcome = db
+            .update_thread_read_state(&id, &params.expected_revision, operation)
+            .await
+            .map_err(|error| {
+                JsonRpcErrorObject::internal_error(format!("read state was not saved: {error}"))
+            })?;
+        match outcome {
+            ReadStateUpdate::Applied(state) => {
+                notify_read_state(&db, &self.outgoing, &id).await;
+                super::thread_processor::response(ThreadReadStateUpdateResponse {
+                    read_state: read_state_to_api(&state),
+                })
+            }
+            ReadStateUpdate::Conflict(state) => {
+                let data = serde_json::json!({
+                    "reason": "readStateConflict", "readState": read_state_to_api(&state),
+                });
+                Err(JsonRpcErrorObject::invalid_request("read state changed").with_data(data))
+            }
+            ReadStateUpdate::Unavailable => Err(JsonRpcErrorObject::invalid_request(
+                "thread read state unavailable",
+            )),
+            _ => Err(JsonRpcErrorObject::internal_error(
+                "unsupported read state update outcome",
+            )),
+        }
     }
 }
