@@ -28,6 +28,8 @@ pub mod mounts;
 pub mod pty_output;
 pub mod remote;
 pub mod runtime_helpers;
+#[cfg(feature = "docker")]
+mod rustls_provider;
 pub(crate) mod session_scripts;
 pub mod shell;
 pub mod sinks;

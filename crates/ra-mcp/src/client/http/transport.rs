@@ -112,6 +112,7 @@ impl HttpClient {
                 Ok::<_, ra_core::error::Error>(token)
             })
             .transpose()?;
+        crate::rustls_provider::ensure_rustls_crypto_provider();
         let builder = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(params.timeout)

@@ -61,6 +61,13 @@ impl BollardDockerApi {
     /// Returns a transport error when the address cannot be used, as
     /// [`Self::connect_with_defaults`] does.
     pub fn connect_with_host(host: &str) -> Result<Self, DockerApiError> {
+        // Match bollard's TLS selection; local sockets and plaintext HTTP need no provider.
+        if host.starts_with("https://")
+            || ((host.starts_with("tcp://") || host.starts_with("http://"))
+                && std::env::var("DOCKER_TLS_VERIFY").is_ok())
+        {
+            crate::rustls_provider::ensure_rustls_crypto_provider();
+        }
         Docker::connect_with_host(host)
             .map(|docker| Self {
                 docker,

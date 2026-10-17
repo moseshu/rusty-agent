@@ -14,7 +14,7 @@ workspace = true
 default = ["stdio"]
 # Process spawning uses tokio directly; the transcoding pump wraps the SDK async-rw transport.
 stdio = ["dep:encoding_rs"]
-http = ["dep:reqwest", "dep:sse-stream", "rmcp/transport-streamable-http-client"]
+http = ["dep:reqwest", "dep:rustls", "dep:sse-stream", "rmcp/transport-streamable-http-client"]
 
 [dependencies]
 ra-core = { workspace = true }
@@ -23,6 +23,7 @@ tokio-util.workspace = true
 # rmcp 3 uses reqwest 0.13. HTTP auth hooks and client factories expose it, so `client::http`
 # re-exports it; the workspace's other clients keep their own HTTP stack.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"], optional = true }
+rustls = { workspace = true, features = ["aws_lc_rs"], optional = true }
 sse-stream = { version = "0.2.6", optional = true }
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
 sha1 = "0.10.6"

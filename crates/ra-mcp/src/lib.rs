@@ -15,6 +15,8 @@ pub mod catalog;
 pub mod client;
 pub mod filter;
 pub mod in_process;
+#[cfg(feature = "http")]
+mod rustls_provider;
 pub mod server;
 pub mod tool;
 

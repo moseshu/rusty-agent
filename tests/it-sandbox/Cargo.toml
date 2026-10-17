@@ -26,7 +26,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-ut
 # 终端附着测试：进程内的假 daemon 走 Unix socket、TCP 与 TLS，TLS 一侧用这几项做服务端。
 # 都已在锁文件里（bollard 与 reqwest 的依赖树），不引入新的 crate。
 bollard = "0.21"
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# Reproduce workspace feature unification even when this test host runs on its own.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "aws_lc_rs"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 tracing = "0.1"
