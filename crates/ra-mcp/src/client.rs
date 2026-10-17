@@ -12,7 +12,7 @@ use rmcp::{
         PaginatedRequestParams, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResult,
         RequestMetaObject, ServerPeerInfo, ServerResult, Tool,
     },
-    service::{Peer, PeerRequestOptions, RunningService, ServiceError},
+    service::{ClientInitializeError, Peer, PeerRequestOptions, RunningService, ServiceError},
     transport::IntoTransport,
 };
 use serde_json::Value;
@@ -182,7 +182,7 @@ impl McpClient {
                 .map_err(|_| safe_error(ToolErrorKind::Timeout, "initialize timed out"))?,
             None => initialize.await,
         }
-        .map_err(|_| safe_error(ToolErrorKind::ExecutionFailed, "initialize failed"))?;
+        .map_err(initialize_error)?;
         let initialize_result = service.peer().peer_info().ok_or_else(|| {
             safe_error(ToolErrorKind::ExecutionFailed, "missing initialize result")
         })?;
@@ -574,6 +574,13 @@ impl Drop for CancelOnDrop {
                     .await;
             });
         }
+    }
+}
+
+fn initialize_error(error: ClientInitializeError) -> Error {
+    match error {
+        ClientInitializeError::JsonRpcError(error) => service_error(ServiceError::McpError(error)),
+        _ => safe_error(ToolErrorKind::ExecutionFailed, "initialize failed"),
     }
 }
 

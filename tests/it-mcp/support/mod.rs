@@ -7,6 +7,18 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+pub struct RejectInitialize(pub ErrorData);
+
+impl ServerHandler for RejectInitialize {
+    async fn initialize(
+        &self,
+        _: InitializeRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        Err(self.0.clone())
+    }
+}
+
 #[derive(Clone)]
 pub struct Fixture {
     pub label: String,

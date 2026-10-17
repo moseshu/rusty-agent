@@ -1,8 +1,9 @@
 # MCP clients and servers
 
-Status: the minimum tool integration, reusable stdio server and Streamable HTTP follow-up
-are implemented and self-checked; awaiting review. The shared session supports tools,
-prompts and resources. Other MCP roadmap slices remain separate.
+Status: the minimum tool integration and reusable stdio server passed their full re-review
+and initialize-error fix verification on 2026-10-17; both roadmap tasks are DONE. The
+Streamable HTTP follow-up has also passed its recorded review. The shared session supports
+tools, prompts and resources. Other MCP roadmap slices remain separate.
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -264,16 +265,16 @@ unchanged. It also reported uncarried server error messages, Codex timeout defau
 of Python's, missing call `_meta`, hard failures on unknown content and on one unadaptable
 declaration, missing namespace descriptions, and the removed `sse` feature. All of these are
 fixed as described above. Python's prefixed names were checked against output from running
-upstream `MCPUtil.get_all_function_tools`. The fixes await re-review; the roadmap status must
-remain awaiting review.
+upstream `MCPUtil.get_all_function_tools`. The fixes awaited re-review at that stage; their completion is recorded in the
+2026-10-17 re-review and fix verification below.
 
 The second review found three remaining issues: namespaced allocation could exceed the
 Responses adapter's per-part name limit; Python's disabled session timeout could not be
 represented; and unexpanded resource links were treated as file URLs. These are fixed with
 regressions for long-name Responses requests and raw routing, stable namespace allocation,
 delayed initialize/list/call with `None` and zero, finite deadlines and cancellation, and
-resource-link JSON round trips through Responses and Anthropic requests. The fixes await
-re-review; the roadmap status remains awaiting review.
+resource-link JSON round trips through Responses and Anthropic requests. The fixes awaited
+re-review at that stage; their completion is recorded below.
 
 Ported-file provenance is recorded in the top-level NOTICE and checked in both
 directions by `cargo xtask ported-notice`.
@@ -313,7 +314,7 @@ was stricter than Python. It also found Python ASCII/Latin-1 aliases resolving t
 Windows-1252, undocumented UTF-16 differences with an empty-stream decode failure, and the
 unused SDK child-process feature. All six are fixed and covered above; a fixture EOF bug that
 made each transcoding test wait for the 3 s kill deadline was also fixed. The implementation
-awaits re-review.
+awaited re-review at that stage; the final conclusion is recorded below.
 
 The second review found that cleanup could still wait behind a queued connect with no
 session deadline, and that cleanup/reconnect warnings logged credential-bearing server
@@ -321,4 +322,65 @@ names verbatim. Both are fixed: shared cancellation covers active and queued con
 cleanup scopes reopen connections only after all cleanup callers finish or are dropped,
 and warnings use the existing Python-compatible safe server name. Regressions cover queued
 connects, cancelled and overlapping cleanup, and captured credential-safe logs on cleanup
-and reconnect. Original server identities remain unchanged. These fixes await re-review.
+and reconnect. Original server identities remain unchanged. These fixes were verified in
+the final re-review below.
+
+## Minimum integration and stdio re-review (2026-10-17)
+
+Reviewed the current implementation at `549317f` against the pinned Python and Codex
+implementations and their relevant naming, pagination, prompt/resource, cancellation and
+lifecycle tests. The earlier review fixes are present and their regressions pass. Rust
+session ownership, encoding/BOM adaptations and explicitly selected Codex naming/catalog
+extensions remain documented separately from the Python framework contract.
+
+The re-review found one P2 issue: `McpClient::connect` maps every SDK initialize failure to
+`initialize failed`, including `ClientInitializeError::JsonRpcError`. A server response
+with code `-32602` and message `workspace configuration is unsupported` loses both the
+code/message and its invalid-input classification. Python preserves the connection
+exception after cleanup; Codex retains the typed handshake source. The request path in
+this crate already maps protocol errors separately from credential-bearing transport
+errors, so the same distinction is needed at initialize. Preserve the protocol code and
+message while keeping raw transport errors sanitized.
+
+Two temporary regression tests reproduced the loss through the in-process and real stdio
+paths: `initialize_protocol_error_keeps_code_and_message_in_memory` and
+`initialize_protocol_error_keeps_code_and_message_on_stdio`. Both failed with only
+`initialize failed`. The temporary test source was retained outside the repository and
+removed from the integration suite after reproduction; production code was not changed.
+
+Validation before the initialize-error fix: 73 integration tests passed, with one child-process fixture skipped
+by the parent harness (the provider tests execute it in a fresh process); three doctests
+passed. Default/no-default/HTTP-only/all-feature checks, MCP and integration-test Clippy
+with warnings denied, rustdoc with warnings denied, formatting, layering, no-inline-tests
+and ported-notice passed. The public API gate, unified `cargo xtask test -p it-mcp --locked`
+entry and `cargo deny check all` now also pass; their older failures above are historical.
+
+The finding blocked completion at that stage. Its fix and the subsequent verification
+are recorded below.
+
+## Initialize-error fix verification (2026-10-17)
+
+`McpClient::connect` now handles the SDK's `JsonRpcError` separately and reuses the
+ordinary request error mapping. Server code/message and the invalid-input classification
+for `-32602` survive initialization; other protocol codes remain execution failures.
+Protocol diagnostic data and SDK sources are not retained. Other initialize failures
+still use the original sanitized error, and session timeout and cleanup paths are unchanged.
+
+The permanent `tests/it-mcp/tests/initialize.rs` regressions both failed before the fix
+and pass afterward. Memory tests cover invalid params, internal error and a server-defined
+code, retained messages, discarded diagnostic data and absent sources. The real stdio
+fixture rejects initialize twice through one configured server; each attempt retains the
+protocol error, publishes no client and allows cleanup and another connection attempt.
+The full suite also retains its transport-error/log redaction, timeout and cleanup tests.
+
+Fix review checked the changed mapping against Python's connection-error preservation,
+Codex's typed handshake error and the SDK's separate protocol/transport error variants.
+It confirms that the change resolves the sole open finding without retaining unsafe
+transport errors or adding a public API or provider type to the core. Together with the
+full re-review above, all blocking findings for the minimum integration and stdio tasks
+are resolved; both are marked DONE on 2026-10-17.
+
+`cargo xtask test -p it-mcp --locked` now passes 75 tests with one parent-harness fixture
+skip, and three doctests pass. Both Clippy scopes, all four MCP feature configurations,
+rustdoc, formatting, layering, ported-notice, no-inline-tests and public-api pass again.
+The reviewed fix is the working-tree change on `549317f`; no commit or push was made.

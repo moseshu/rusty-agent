@@ -10,6 +10,15 @@ async fn main() {
     if args.iter().any(|arg| arg == "--exit-early") {
         return;
     }
+    if args.iter().any(|arg| arg == "--reject-init") {
+        let _ = support::RejectInitialize(rmcp::ErrorData::invalid_params(
+            "workspace configuration is unsupported",
+            Some(serde_json::json!({"token": "initialize-data-credential"})),
+        ))
+        .serve(rmcp::transport::stdio())
+        .await;
+        return;
+    }
     if args.iter().any(|arg| arg == "--delay-init") {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
