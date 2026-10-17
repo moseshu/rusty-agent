@@ -179,6 +179,40 @@ fn every_bind_exposing_the_socket_directory_is_followed_by_its_mask() {
 }
 
 #[test]
+fn workspace_write_tmp_keeps_daemon_sockets_masked_with_or_without_a_write_grant() {
+    let directory = shared_daemon_socket_directory().unwrap();
+    let directories = BTreeSet::from([directory.clone()]);
+    for writable_tmp in [false, true] {
+        let request = if writable_tmp {
+            request(&[Path::new("/tmp")])
+        } else {
+            request(&[])
+        };
+        let args = protected_args(&request, &directories).unwrap();
+        assert_eq!(
+            masks_after(&args, ["--ro-bind", "/", "/"]),
+            mask(&directory)
+        );
+        assert!(
+            !args.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]),
+            "only the daemon directory should be hidden: {args:?}"
+        );
+        if writable_tmp {
+            let destination = Path::new("/tmp").join(directory.file_name().unwrap());
+            assert_eq!(
+                masks_after(&args, ["--bind", "/tmp", "/tmp"]),
+                mask(&destination)
+            );
+        }
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--perms").count(),
+            if writable_tmp { 2 } else { 1 },
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn a_platform_root_is_masked_and_a_missing_one_is_skipped() {
     let directory = Path::new("/usr/ra-daemon-1000");
     let args = protected_args(

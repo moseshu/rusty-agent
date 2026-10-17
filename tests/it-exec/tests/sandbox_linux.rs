@@ -5,7 +5,9 @@ use std::{os::unix::net::UnixListener, path::Path};
 
 use ra_exec::{
     command::ExecRequest,
-    sandbox::{ExecEnvironment, NetworkAccess, SandboxLevel, SandboxPolicy},
+    sandbox::{
+        ExecEnvironment, NetworkAccess, SandboxLevel, SandboxPolicy, is_likely_sandbox_denied,
+    },
     session::{ExecExecutionResult, ProcessManager},
 };
 
@@ -132,4 +134,47 @@ async fn sandbox_preserves_shell_execution_and_confines_files() {
             NetworkAccess::Denied
         );
     }
+}
+
+#[tokio::test]
+async fn workspace_write_preserves_host_tmp_and_reports_denied_writes_until_granted() {
+    let root = tempfile::tempdir_in("/tmp").expect("workspace");
+    let outside = tempfile::tempdir_in("/tmp").expect("host temporary directory");
+    let secret = outside.path().join("secret");
+    let target = outside.path().join("written.txt");
+    std::fs::write(&secret, "host-data").expect("host file");
+    let confined = manager(
+        root.path(),
+        SandboxLevel::WorkspaceWrite,
+        NetworkAccess::Denied,
+    );
+
+    let read = run(&confined, root.path(), "cat \"$1\"", &secret).await;
+    assert_eq!(read.exit_code(), Some(0), "{}", read.stderr());
+    assert_eq!(read.stdout(), "host-data");
+
+    let write = "export LC_ALL=C; printf changed > \"$1\"";
+    let denied = run(&confined, root.path(), write, &target).await;
+    assert_ne!(denied.exit_code(), Some(0));
+    assert!(
+        is_likely_sandbox_denied(&denied),
+        "an existing host directory must produce a sandbox refusal: {}",
+        denied.stderr()
+    );
+    assert!(!target.exists());
+
+    let granted = ProcessManager::default().with_environment(
+        ExecEnvironment::new().with_sandbox(
+            SandboxPolicy::new(SandboxLevel::WorkspaceWrite)
+                .with_network(NetworkAccess::Denied)
+                .with_writable_root(root.path())
+                .with_writable_root("/tmp"),
+        ),
+    );
+    let allowed = run(&granted, root.path(), write, &target).await;
+    assert_eq!(allowed.exit_code(), Some(0), "{}", allowed.stderr());
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("written file"),
+        "changed"
+    );
 }

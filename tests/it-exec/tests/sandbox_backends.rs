@@ -284,7 +284,34 @@ fn test_bwrap_binds_the_world_read_only_before_the_writable_roots() {
     assert_eq!(args[ro + 1], "/", "the whole filesystem is readable here");
     assert_eq!(args[bind + 1], "/work/repo");
     assert_eq!(args[bind + 2], "/work/repo", "bound at the same path");
+    assert!(
+        !args.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]),
+        "workspace-write must preserve the host's read-only /tmp: {args:?}"
+    );
     assert_eq!(args.last().map(String::as_str), Some("--"));
+}
+
+#[test]
+fn test_bwrap_workspace_write_makes_tmp_writable_only_when_granted() {
+    let request = request_for(
+        SandboxLevel::WorkspaceWrite,
+        NetworkAccess::Denied,
+        &[Path::new("/work/repo"), Path::new("/tmp")],
+    );
+    let args = ra_exec::sandbox::bwrap::build_args(&request).expect("args");
+    let read_only = args
+        .windows(3)
+        .position(|mount| mount == ["--ro-bind", "/", "/"])
+        .expect("read-only root");
+    let writable_tmp = args
+        .windows(3)
+        .position(|mount| mount == ["--bind", "/tmp", "/tmp"])
+        .expect("explicit /tmp write grant");
+    assert!(read_only < writable_tmp, "{args:?}");
+    assert!(
+        !args.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]),
+        "an explicit grant must bind the host's /tmp: {args:?}"
+    );
 }
 
 #[test]
@@ -334,6 +361,12 @@ fn test_bwrap_at_the_isolated_level_binds_only_the_platform_and_the_declared_roo
             .any(|triple| triple[0] == "--ro-bind-try" && triple[1] == "/usr"),
         "the platform's own runtime is bound with -try, since a distribution has only some of it"
     );
+    let private_tmp = args
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", "/tmp"])
+        .expect("isolated keeps a private /tmp");
+    let writable = index_of(&args, "--bind").expect("writable root");
+    assert!(private_tmp < writable, "{args:?}");
 }
 
 #[test]

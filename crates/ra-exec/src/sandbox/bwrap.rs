@@ -75,9 +75,10 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500)
 /// Builds the bubblewrap arguments for one confinement request.
 ///
 /// The order is the order bubblewrap applies them in, and it is load-bearing: the read-only world
-/// goes down first, then the kernel filesystems over it, then a private `/tmp`, and only then the
-/// writable roots — each later mount covering the earlier one at that path. A writable root listed
-/// before `--ro-bind / /` would be buried by it.
+/// goes down first, then the kernel filesystems over it, then a private `/tmp` only at the isolated
+/// level, and finally the writable roots. Each later mount covers the earlier one at that path.
+/// Workspace-write preserves the host's `/tmp` read-only unless it is a writable root, as Codex
+/// does. A writable root listed before `--ro-bind / /` would be buried by it.
 ///
 /// # Errors
 ///
@@ -133,12 +134,12 @@ pub fn build_args(request: &ConfinementRequest) -> Result<Vec<String>, SandboxEr
     }
 
     // A fresh `/proc` shows only this namespace's processes; `/dev` is the small device set a
-    // program expects; `/tmp` is private and dies with the sandbox, so nothing a command leaves
-    // there outlives it or is visible to the next one.
-    push(
-        &mut args,
-        &["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"],
-    );
+    // program expects. Workspace-write keeps host temporary paths visible so refused writes
+    // report a permission error instead of a missing directory.
+    push(&mut args, &["--proc", "/proc", "--dev", "/dev"]);
+    if request.level() == SandboxLevel::Isolated {
+        push(&mut args, &["--tmpfs", "/tmp"]);
+    }
 
     for root in request.writable_roots() {
         let root = literal_root(root)?;
