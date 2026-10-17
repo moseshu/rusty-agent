@@ -209,11 +209,10 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
             // not taken from the crate: that one decodes invalid UTF-8 lossily and keeps whatever
             // follows a NUL, where the reference refuses the one and truncates at the other.
             let metadata = member.get_metadata();
-            let name =
-                zip_member_name(&metadata.file_name_raw, metadata.is_utf8).map_err(|error| {
-                    Self::refuse(path, "unreadable archive")
-                        .with_context("os_error", error.to_string())
-                })?;
+            let is_utf8 = metadata.flags.as_u16() & (1 << 11) != 0;
+            let name = zip_member_name(member.name_raw(), is_utf8).map_err(|error| {
+                Self::refuse(path, "unreadable archive").with_context("os_error", error.to_string())
+            })?;
             let is_directory = name.ends_with('/');
             let relative = Self::safe_zip_path(path, &name, metadata.external_attributes)?;
             let Some(relative) = relative else { continue };
@@ -384,9 +383,10 @@ impl<'a> WorkspaceArchiveExtractor<'a> {
         let mut file = archive
             .by_index(member.content.index)
             .map_err(|error| unreadable(&error))?;
-        // The limits were checked against the size the archive declares, and nothing in the zip
-        // reader holds a member to it: a deflate stream can inflate far past what its header
-        // claims. One byte past the declared size is enough to know it lied.
+        // The limits were checked against the size the archive declares, and a deflate stream can
+        // inflate far past what its header claims. The zip reader refuses to read past that size
+        // itself; this bound does not depend on it, and also catches a member that ends short.
+        // One byte past the declared size is enough to know it lied.
         let mut bytes = Vec::new();
         file.by_ref()
             .take(declared.saturating_add(1))

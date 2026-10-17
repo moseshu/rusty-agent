@@ -374,6 +374,8 @@ fn denied_by_glob(
 /// `path` as the command sandbox matches it. Seatbelt resolves trusted top-level aliases such as
 /// `/var` before matching, so paths are compared in that namespace on macOS, keeping deeper
 /// components as written rather than following symbolic links.
+// Only the macOS normalization can fail; elsewhere the path is returned as written.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_wraps))]
 fn sandbox_namespace_path(path: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {

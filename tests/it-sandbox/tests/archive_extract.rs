@@ -920,8 +920,10 @@ async fn a_zip_member_larger_than_its_header_declares_is_refused() {
             .expect_err("size mismatch");
 
         assert_eq!(error.error_code(), ErrorCode::WorkspaceArchiveWriteError);
+        // Either the zip reader stops at the declared size or the extractor's own bound does;
+        // both name the declared size as what the member broke.
         assert!(
-            format!("{error:?}").contains("does not match header"),
+            format!("{error:?}").contains("declared"),
             "{method:?}: {error:?}"
         );
         assert_eq!(

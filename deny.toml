@@ -40,6 +40,10 @@ allow = [
     # bzip2 自己的许可证（BSD 式、宽松）。经由 libbz2-rs-sys（纯 Rust 移植）进来，
     # ra-sandbox 解 bzip2 压缩的归档要用它（R8-P7）。2026-09-29 由维护者明确允许。
     "bzip2-1.0.6",
+    # MIT 去掉署名要求的版本（OSI 认可，比 MIT 更宽松）。经 ra-core -> jsonschema 0.58.6 ->
+    # referencing -> fluent-uri 0.4.1 -> borrow-or-share 0.2.4 进来（R1-16 结构化输出的 schema 校验）。
+    # 2026-10-17 由维护者明确允许。
+    "MIT-0",
 ]
 confidence-threshold = 0.8
 
