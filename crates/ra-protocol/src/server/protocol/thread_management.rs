@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Thread management payloads ported from Codex's `protocol/v2/thread.rs`.
 //!
 //! Git metadata is stored by the session layer. Project, section and Daybreak controls require
@@ -5,6 +6,7 @@
 
 use super::{SortDirection, Thread, settings::double_option};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Archives a persistent thread and its spawned descendants.
 #[non_exhaustive]
@@ -323,6 +325,9 @@ pub struct ThreadListParams {
     pub cursor: Option<String>,
     /// Page size, clamped to 1 through 100, default 25.
     pub limit: Option<u32>,
+    /// IDs excluded before applying the page limit, with at most 100 entries.
+    /// Omitted, null, or empty means no exclusions. Repeat the exclusions on each page.
+    pub excluded_thread_ids: Option<Vec<String>>,
     /// Sort key, default creation time.
     pub sort_key: Option<ThreadSortKey>,
     /// Sort direction, default newest first.
@@ -390,8 +395,37 @@ impl ThreadListParams {
 pub struct ThreadListResponse {
     /// The page's threads, without turns.
     pub data: Vec<Thread>,
+    /// Experimental local receipts keyed by thread ID. Null means durable read state is
+    /// unavailable; an absent key means the thread is ineligible.
+    pub read_states: Option<HashMap<String, ThreadReadState>>,
     /// Continues in the current direction.
     pub next_cursor: Option<String>,
     /// Continues in the opposite direction.
     pub backwards_cursor: Option<String>,
+}
+
+/// The first unread position in a durable local thread; a null position means read.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadState {
+    /// The first unread result, or none when the thread is read.
+    pub first_unread: Option<ThreadUnreadPosition>,
+    /// Opaque revision guarding updates against activity or marks the caller has not seen.
+    pub revision: String,
+}
+
+/// The first position needing attention in a durable local thread.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ThreadUnreadPosition {
+    /// Explicitly marked unread, including a thread with no turns.
+    ThreadStart,
+    /// The earliest completed result needing attention.
+    Turn {
+        /// The turn that produced the result.
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
 }

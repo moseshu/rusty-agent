@@ -23,9 +23,12 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-mcp/src/in_process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/in_process_transport.rs |
 | `crates/ra-mcp/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `crates/ra-mcp/src/tool.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; src/mcp_tool_exposure.rs |
+| `crates/ra-protocol/src/server/protocol/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/thread.rs |
+| `crates/ra-protocol/src/server/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/thread_processor.rs; thread_read_state.rs |
 | `crates/ra-sandbox/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `tests/it-mcp/tests/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager_tests.rs |
 | `tests/it-mcp/tests/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/tests/provider.rs; tests/preinstalled.rs |
+| `tests/it-protocol/tests/threads/thread_list.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/tests/suite/v2/thread_list.rs; thread_read_state.rs |
 | `tests/it-sandbox/tests/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/tests/provider.rs; tests/preinstalled.rs |
 
 The metadata/title resolution, URL display-name behavior, and bare function-tool naming

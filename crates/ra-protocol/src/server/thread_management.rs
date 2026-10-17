@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Persistent thread management, ported from Codex's thread processor and thread delete handler.
 //!
 //! Archive and delete stop the spawned subtree before moving or removing storage. Explicit
@@ -44,6 +45,7 @@ use super::{
 use crate::frame::JsonRpcErrorObject;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const THREAD_LIST_MAX_EXCLUDED_IDS: usize = 100;
 
 impl ThreadRequestProcessor {
     pub(crate) async fn thread_archive(
@@ -338,6 +340,18 @@ impl ThreadRequestProcessor {
         params: ThreadListParams,
         history: &HistorySources,
     ) -> TurnMethodResult {
+        let excluded_thread_ids = params.excluded_thread_ids.unwrap_or_default();
+        if excluded_thread_ids.len() > THREAD_LIST_MAX_EXCLUDED_IDS {
+            return Err(JsonRpcErrorObject::invalid_params(format!(
+                "excludedThreadIds accepts at most {THREAD_LIST_MAX_EXCLUDED_IDS} entries"
+            )));
+        }
+        // Framework session IDs are opaque strings, including host-supplied IDs and `sess-`
+        // IDs. Preserve that contract instead of imposing Codex's UUID-only parser here.
+        let excluded_thread_ids: HashSet<_> = excluded_thread_ids
+            .into_iter()
+            .map(SessionId::new)
+            .collect();
         if params
             .originators
             .as_ref()
@@ -430,12 +444,16 @@ impl ThreadRequestProcessor {
             );
         }
         let mut items = Vec::new();
+        let mut seen_cursors: HashSet<_> = query.cursor().map(str::to_owned).into_iter().collect();
         let next_cursor = loop {
             query = query.with_page_size(limit - items.len());
             let page = store.list_threads(&query).await.map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("failed to list threads: {error}"))
             })?;
             for thread in page.items() {
+                if excluded_thread_ids.contains(thread.session_id()) {
+                    continue;
+                }
                 if params.parent_thread_id.as_ref().is_some_and(|id| {
                     thread.parent_session_id().map(SessionId::as_str) != Some(id.as_str())
                 }) {
@@ -469,15 +487,19 @@ impl ThreadRequestProcessor {
                 }
             }
             let next = page.next_cursor().map(str::to_owned);
+            if let Some(cursor) = &next
+                && !seen_cursors.insert(cursor.clone())
+            {
+                return Err(JsonRpcErrorObject::internal_error(
+                    "thread listing returned a repeated cursor",
+                ));
+            }
             if items.len() == limit {
                 break next;
             }
             let Some(next) = next else {
                 break None;
             };
-            if Some(next.as_str()) == query.cursor() {
-                break None;
-            }
             query = query.with_cursor(next);
         };
         let backwards_cursor = items.first().and_then(|thread| {
@@ -495,6 +517,9 @@ impl ThreadRequestProcessor {
             .collect();
         super::thread_processor::response(ThreadListResponse {
             data,
+            // Codex returns null when durable receipts are unavailable. Listing history must
+            // not manufacture read acknowledgements from thread status or loaded state.
+            read_states: None,
             next_cursor,
             backwards_cursor,
         })

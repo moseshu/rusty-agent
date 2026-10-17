@@ -141,11 +141,9 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
     ),
     // Thread management payloads: Codex `app-server-protocol/src/protocol/v2/thread.rs`
     // `ThreadMetadataGitInfoUpdateParams`, `ThreadUnarchiveResponse`,
-    // `ThreadMetadataUpdateResponse`, `ThreadListParams`, `ThreadListResponse`,
+    // `ThreadMetadataUpdateResponse`, `ThreadListParams`, `ThreadListResponse`, `ThreadReadState`,
     // `ThreadArchivedNotification`, `ThreadDeletedNotification`, `ThreadUnarchivedNotification`
     // and `ThreadNameUpdatedNotification`. They are wire records whose fields are Codex's.
-    // `ThreadListParams` does not yet carry Codex's `excluded_thread_ids`, nor
-    // `ThreadListResponse` its experimental `read_states`.
     (
         "crates/ra-protocol/src/server/protocol/thread_management.rs",
         "ThreadArchivedNotification",
@@ -181,6 +179,10 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/ra-protocol/src/server/protocol/thread_management.rs",
         "ThreadListResponse",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadReadState",
     ),
     // Persisted Git facts and their patch: Codex `protocol/src/protocol.rs` `GitInfo` and
     // `thread-store/src/types.rs` `GitInfoPatch`.

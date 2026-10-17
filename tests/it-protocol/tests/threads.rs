@@ -12,6 +12,9 @@
 //! cover what this port adds or changes.
 //! Persistent management cases also port archive, unarchive, delete, list, name and Git updates.
 
+#[path = "threads/thread_list.rs"]
+mod thread_list;
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
