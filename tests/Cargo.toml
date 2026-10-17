@@ -28,6 +28,7 @@ members = [
     "it-eval",
     "it-patch",
     "it-tools",
+    "it-uds",
     "it-coding",
     "it-cli",
     "it-e2e",

@@ -139,6 +139,53 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-sandbox/src/mounts/config.rs",
         "DockerVolumeDriverConfig",
     ),
+    // Thread management payloads: Codex `app-server-protocol/src/protocol/v2/thread.rs`
+    // `ThreadMetadataGitInfoUpdateParams`, `ThreadUnarchiveResponse`,
+    // `ThreadMetadataUpdateResponse`, `ThreadListParams`, `ThreadListResponse`,
+    // `ThreadArchivedNotification`, `ThreadDeletedNotification`, `ThreadUnarchivedNotification`
+    // and `ThreadNameUpdatedNotification`. They are wire records whose fields are Codex's.
+    // `ThreadListParams` does not yet carry Codex's `excluded_thread_ids`, nor
+    // `ThreadListResponse` its experimental `read_states`.
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadArchivedNotification",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadDeletedNotification",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadUnarchivedNotification",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadNameUpdatedNotification",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadMetadataGitInfoUpdateParams",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadUnarchiveResponse",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadMetadataUpdateResponse",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadListParams",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/thread_management.rs",
+        "ThreadListResponse",
+    ),
+    // Persisted Git facts and their patch: Codex `protocol/src/protocol.rs` `GitInfo` and
+    // `thread-store/src/types.rs` `GitInfoPatch`.
+    ("crates/ra-session/src/store/git.rs", "GitInfo"),
+    ("crates/ra-session/src/store/git.rs", "GitInfoPatch"),
 ];
 
 /// The valid stability levels.

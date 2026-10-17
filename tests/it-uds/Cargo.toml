@@ -1,0 +1,12 @@
+[package]
+name = "it-uds"
+description = "ra-uds 的集成测试。不随主 workspace 发布。"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-uds = { path = "../../crates/ra-uds" }

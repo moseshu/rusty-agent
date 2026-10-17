@@ -4,7 +4,7 @@
 use std::{
     collections::BTreeSet,
     ffi::OsString,
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt, net::UnixListener},
+    os::unix::{ffi::OsStringExt, net::UnixListener},
     path::{Path, PathBuf},
 };
 
@@ -14,36 +14,6 @@ use ra_exec::sandbox::{
     ConfinementRequest, NetworkAccess, SandboxBackend, SandboxCommand, SandboxError, SandboxLevel,
     SandboxPolicy, SandboxUnavailable, bwrap::test_api::protected_args, resolve_confinement_with,
 };
-
-#[test]
-fn shared_socket_directory_is_fixed_private_and_independent_of_the_state_directory() {
-    let path = shared_daemon_socket_directory().unwrap();
-    assert_eq!(
-        path.parent(),
-        Some(std::fs::canonicalize("/tmp").unwrap().as_path())
-    );
-    assert!(
-        path.file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("ra-daemon-")
-    );
-    let name = path.file_name().unwrap().to_str().unwrap();
-    let prefix = name.rsplit_once('-').unwrap().0;
-    let longest = Path::new("/private/tmp")
-        .join(format!("{prefix}-{}", u32::MAX))
-        .join("f".repeat(64));
-    assert!(
-        longest.as_os_str().len() <= 103,
-        "physical path must fit Darwin sun_path"
-    );
-    assert_eq!(prepare_shared_daemon_socket_directory().unwrap(), path);
-    assert_eq!(
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-}
 
 #[derive(Debug)]
 struct Available;
