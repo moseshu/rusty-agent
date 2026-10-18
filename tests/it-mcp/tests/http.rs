@@ -34,6 +34,7 @@ struct Seen {
 }
 #[derive(Default)]
 struct Behavior {
+    initialize_error: Option<Value>,
     initialized_status: Option<StatusCode>,
     request_status: Option<StatusCode>,
     delete_status: Option<StatusCode>,
@@ -150,7 +151,7 @@ async fn handle(
     if operation.starts_with("notifications/") {
         return StatusCode::ACCEPTED.into_response();
     }
-    let (delay, status, sse, initialize_sse_prefix, stateless, malformed) = {
+    let (delay, status, sse, initialize_sse_prefix, initialize_error, stateless, malformed) = {
         let behavior = state.behavior.lock().unwrap();
         (
             if operation == "initialize" {
@@ -168,6 +169,11 @@ async fn handle(
                 behavior.initialize_sse_prefix.clone()
             } else {
                 String::new()
+            },
+            if operation == "initialize" {
+                behavior.initialize_error.clone()
+            } else {
+                None
             },
             behavior.stateless,
             behavior.malformed,
@@ -207,7 +213,10 @@ async fn handle(
         "tools/call" => json!({"content":[{"type":"text","text":"ok"}]}),
         _ => panic!("unexpected operation: {operation}"),
     };
-    let payload = json!({"jsonrpc":"2.0","id":body["id"],"result":result});
+    let payload = match initialize_error {
+        Some(error) => json!({"jsonrpc":"2.0","id":body["id"],"error":error}),
+        None => json!({"jsonrpc":"2.0","id":body["id"],"result":result}),
+    };
     let mut response = if malformed && operation != "initialize" {
         ([("content-type", "application/json")], "credential-secret").into_response()
     } else if sse {
@@ -225,6 +234,70 @@ async fn handle(
             .insert("mcp-session-id", session.parse().unwrap());
     }
     response
+}
+
+#[tokio::test]
+async fn initialize_protocol_errors_keep_details_and_cleanup_http_sessions() {
+    for sse in [false, true] {
+        for stateless in [false, true] {
+            for (code, classification) in [
+                (-32602, "tool.invalid_input"),
+                (-32603, "tool.execution_failed"),
+                (-32001, "tool.execution_failed"),
+            ] {
+                let fixture = Server::new().await;
+                {
+                    let mut behavior = fixture.state.behavior.lock().unwrap();
+                    behavior.sse = sse;
+                    behavior.stateless = stateless;
+                    behavior.initialize_error = Some(json!({
+                        "code": code,
+                        "message": "workspace configuration is unsupported",
+                        "data": {"token": "initialize-data-credential"},
+                    }));
+                }
+                let server = McpServerStreamableHttp::new(fixture.params());
+                let error = server.connect().await.unwrap_err();
+                assert_eq!(error.code(), classification);
+                let rendered = format!("{error} {error:?}");
+                assert!(rendered.contains(&code.to_string()), "{rendered}");
+                assert!(
+                    rendered.contains("workspace configuration is unsupported"),
+                    "{rendered}"
+                );
+                assert!(!rendered.contains("initialize-data-credential"));
+                assert!(std::error::Error::source(&error).is_none());
+                assert!(!server.is_connected().await);
+                assert!(server.client().is_err());
+                assert_eq!(server.session_id(), None);
+                assert!(fixture.requests("notifications/initialized").is_empty());
+                let expected_deletes = usize::from(!stateless);
+                assert_eq!(fixture.requests("DELETE").len(), expected_deletes);
+                if !stateless {
+                    assert_eq!(
+                        fixture.requests("DELETE")[0].headers["mcp-session-id"],
+                        "session-0"
+                    );
+                }
+                server.cleanup().await.unwrap();
+                assert_eq!(fixture.requests("DELETE").len(), expected_deletes);
+
+                fixture.state.behavior.lock().unwrap().initialize_error = None;
+                server.connect().await.unwrap();
+                assert!(server.is_connected().await);
+                assert_eq!(fixture.requests("initialize").len(), 2);
+                assert!(server.list_tools().await.unwrap().is_empty());
+                server.cleanup().await.unwrap();
+                assert_eq!(fixture.requests("DELETE").len(), expected_deletes * 2);
+                if !stateless {
+                    assert_eq!(
+                        fixture.requests("DELETE")[1].headers["mcp-session-id"],
+                        "session-1"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

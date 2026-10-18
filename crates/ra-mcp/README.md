@@ -380,7 +380,24 @@ transport errors or adding a public API or provider type to the core. Together w
 full re-review above, all blocking findings for the minimum integration and stdio tasks
 are resolved; both are marked DONE on 2026-10-17.
 
-`cargo xtask test -p it-mcp --locked` now passes 75 tests with one parent-harness fixture
+The initialize-error fix verification passed 75 tests via `cargo xtask test -p it-mcp --locked`, with one parent-harness fixture
 skip, and three doctests pass. Both Clippy scopes, all four MCP feature configurations,
 rustdoc, formatting, layering, ported-notice, no-inline-tests and public-api pass again.
-The reviewed fix is the working-tree change on `549317f`; no commit or push was made.
+The reviewed fix was committed as `e8cf669`, based on `549317f`.
+
+### HTTP initialize-error coverage follow-up (2026-10-17)
+
+The HTTP fixture now has an initialize JSON-RPC error switch. Its regression covers JSON
+and SSE responses, stateful and stateless sessions, invalid params, internal errors and a
+server-defined code. It checks code/message/classification, discarded diagnostic data and
+sources, unpublished failed sessions, DELETE of assigned sessions, idempotent cleanup and
+a successful connection after the rejection is removed.
+
+The new test exposed an SSE-specific gap: the SDK's initialize reader returns only success
+responses and drains JSON-RPC errors until EOF. The native boundary now reads the first
+terminal success or error message and supplies it to the SDK as its typed message, matching
+Python's SSE handling. It still filters control frames, validates message payloads and
+enforces the existing event size and timeout bounds; established streams are unchanged.
+The regression failed before this adapter fix and passes afterward. The full MCP suite
+now passes 76 tests with the same one parent-harness fixture skip. This follow-up does not
+change the completed roadmap task statuses.

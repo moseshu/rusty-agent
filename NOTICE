@@ -76,4 +76,5 @@ tests/mcp/{test_streamable_http_client_factory,test_streamable_http_session_id,
 test_mcp_auth_params,test_mcp_v2_http}.py (MIT). See the retained license above.
 The native HTTP boundary in crates/ra-mcp/src/client/http/transport.rs also adapts
 modelcontextprotocol/rust-sdk revision 79437f291b2c44053d00dcd5db969fd0cca7c887,
-crates/rmcp/src/transport/common/reqwest/streamable_http_client.rs (Apache-2.0).
+crates/rmcp/src/transport/common/reqwest/streamable_http_client.rs and
+crates/rmcp/src/transport/streamable_http_client.rs::expect_initialized (Apache-2.0).

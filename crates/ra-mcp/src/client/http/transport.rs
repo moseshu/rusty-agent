@@ -227,10 +227,14 @@ impl HttpClient {
                 return Ok(StreamableHttpPostResponse::Accepted);
             }
             match media_type(&response).as_deref() {
-                Some("text/event-stream") => Ok(StreamableHttpPostResponse::Sse(
-                    events(response, max_event_size, is_initialize),
-                    session_id,
-                )),
+                Some("text/event-stream") => {
+                    let stream = events(response, max_event_size, is_initialize);
+                    if is_initialize {
+                        initialize_response(stream, session_id).await
+                    } else {
+                        Ok(StreamableHttpPostResponse::Sse(stream, session_id))
+                    }
+                }
                 Some("application/json") => {
                     let body = response.bytes().await.map_err(http_error)?;
                     match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
@@ -389,6 +393,33 @@ fn status_error(status: StatusCode) -> StreamableHttpError<io::Error> {
         status.as_u16()
     )))
 }
+
+// Adapt the SDK's initialize SSE reader to accept error responses as Python does. The SDK only
+// returns success responses here and otherwise drains protocol errors until the stream closes.
+async fn initialize_response(
+    mut stream: Events,
+    session_id: Option<String>,
+) -> HttpResult<StreamableHttpPostResponse> {
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(StreamableHttpError::Sse)?;
+        let payload = event.data.unwrap_or_default();
+        if payload.trim().is_empty() {
+            continue;
+        }
+        let message = serde_json::from_str::<ServerJsonRpcMessage>(&payload)
+            .map_err(|_| failure("invalid MCP HTTP SSE message"))?;
+        if matches!(
+            message,
+            ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+        ) {
+            return Ok(StreamableHttpPostResponse::Json(message, session_id));
+        }
+    }
+    Err(failure(
+        "MCP HTTP initialize stream ended without a response",
+    ))
+}
+
 fn events(response: Response, maximum: usize, initializing: bool) -> Events {
     let bytes = response.bytes_stream().scan(
         (sse::EventSizeLimit::new(maximum), false),
