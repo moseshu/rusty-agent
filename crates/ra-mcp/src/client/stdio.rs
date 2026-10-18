@@ -175,8 +175,19 @@ impl McpServerStdio {
     /// Sets shared session options before connecting.
     #[must_use]
     pub fn with_options(mut self, options: McpClientOptions) -> Self {
+        self.connection
+            .tools
+            .configure(options.cache_tools_list, options.tool_filter.clone());
         self.options = options;
         self
+    }
+    /// Replaces the active filter, including before connection and across reconnects.
+    pub fn set_tool_filter(&self, filter: crate::filter::ToolFilter) {
+        self.connection.tools.set_filter(filter);
+    }
+    /// Changes cache reuse without invalidating the last successful listing.
+    pub fn set_cache_tools_list(&self, enabled: bool) {
+        self.connection.tools.set_cache_tools_list(enabled);
     }
     /// Returns the connected snapshot used by tool discovery. A reconnect never retargets it.
     pub fn client(&self) -> Result<McpClient> {
@@ -211,6 +222,21 @@ impl crate::server::McpServer for McpServerStdio {
     }
     async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>> {
         self.client()?.list_tools().await
+    }
+    async fn list_tools_with_context(
+        &self,
+        run_context: Option<&ra_core::context::RunContext>,
+        agent: Option<&ra_core::context::RunAgent>,
+    ) -> Result<Vec<rmcp::model::Tool>> {
+        self.client()?
+            .list_tools_with_context(run_context, agent)
+            .await
+    }
+    fn cached_tools(&self) -> Option<Vec<rmcp::model::Tool>> {
+        self.connection.tools.snapshot()
+    }
+    fn invalidate_tools_cache(&self) {
+        self.connection.tools.invalidate();
     }
     async fn call_tool(
         &self,

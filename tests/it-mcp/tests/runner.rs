@@ -15,13 +15,13 @@ use ra_core::{
         ResolvedModel,
     },
     state::RunId,
-    tool::Tool,
 };
 use ra_mcp::{
     client::McpClientOptions,
     filter::ToolFilter,
     in_process::InProcessToolServer,
-    tool::{McpDiscoveryOptions, McpToolNaming, discover_tools},
+    resolver::McpToolResolver,
+    tool::{McpDiscoveryOptions, McpToolNaming},
 };
 use ra_runtime::{
     agent::AgentBinding,
@@ -85,23 +85,11 @@ async fn direct_and_deferred_mcp_tools_complete_an_agent_run() {
         )
         .await
         .unwrap();
-        let tools = discover_tools(
-            &[(server.client(), ToolFilter::default())],
-            &McpDiscoveryOptions::new()
-                .with_naming(naming)
-                .with_tool_search(deferred),
-        )
-        .await
-        .unwrap();
-        let tool = tools
-            .iter()
-            .find(|t| t.info().tool().name == "search")
-            .unwrap();
         // A deferred top-level function is called through the synthetic namespace equal to its
         // name, as the Responses adapter reports it.
-        let namespace = match tool.origin().namespace() {
-            Some(namespace) => Some(namespace.as_str().to_owned()),
-            None => deferred.then(|| tool.schema().name().to_owned()),
+        let namespace = match naming {
+            McpToolNaming::Namespaced => Some("mcp__memory".to_owned()),
+            _ => deferred.then(|| "search".to_owned()),
         };
         let mut script = Vec::new();
         if deferred {
@@ -114,7 +102,7 @@ async fn direct_and_deferred_mcp_tools_complete_an_agent_run() {
         }
         script.push(call(
             "invoke",
-            tool.schema().name(),
+            "search",
             namespace.as_deref(),
             ToolCallKind::Function,
         ));
@@ -130,7 +118,12 @@ async fn direct_and_deferred_mcp_tools_complete_an_agent_run() {
             AgentSpec::builder()
                 .name("MCP agent")
                 .id(AgentId::new("mcp-agent"))
-                .tools(tools.into_iter().map(|t| t as Arc<dyn Tool>))
+                .tool_resolver(Arc::new(McpToolResolver::new(
+                    vec![(Arc::new(server.client()), ToolFilter::default())],
+                    McpDiscoveryOptions::new()
+                        .with_naming(naming)
+                        .with_tool_search(deferred),
+                )))
                 .build()
                 .unwrap(),
         );

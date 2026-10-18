@@ -73,6 +73,12 @@ impl McpDiscoveryOptions {
         self.reserved_tool_names = names.into_iter().collect();
         self
     }
+    pub(crate) const fn reserved_tool_names(&self) -> &BTreeSet<String> {
+        &self.reserved_tool_names
+    }
+    pub(crate) const fn requires_reserved_tool_names(&self) -> bool {
+        matches!(self.naming, McpToolNaming::ServerPrefixed)
+    }
 }
 
 /// Immutable metadata and the connection selected when discovering this tool.
@@ -164,6 +170,13 @@ impl Tool for McpTool {
     fn origin(&self) -> &ToolOrigin {
         &self.origin
     }
+    fn recipient_binding(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!([
+            crate::catalog::safe_server_name(self.info.server_name()),
+            self.info.tool.name.as_ref(),
+            self.info.server_index
+        ]))
+    }
     fn schema(&self) -> &ToolSchema {
         &self.schema
     }
@@ -188,6 +201,16 @@ pub async fn discover_tools(
     servers: &[(McpClient, ToolFilter)],
     options: &McpDiscoveryOptions,
 ) -> Result<Vec<Arc<McpTool>>> {
+    discover_tools_with_context(servers, options, None, None).await
+}
+
+/// Discovers the joint catalog with the run and agent needed by dynamic server or discovery filters.
+pub async fn discover_tools_with_context(
+    servers: &[(McpClient, ToolFilter)],
+    options: &McpDiscoveryOptions,
+    run_context: Option<&ra_core::context::RunContext>,
+    agent: Option<&ra_core::context::RunAgent>,
+) -> Result<Vec<Arc<McpTool>>> {
     let mut infos = Vec::new();
     let mut server_names = HashSet::new();
     for (server_index, (client, filter)) in servers.iter().enumerate() {
@@ -197,12 +220,12 @@ pub async fn discover_tools(
             return Err(Error::config("duplicate MCP server name"));
         }
         let instructions = client.server_instructions().map(str::to_owned);
+        let tools = client.list_tools_with_context(run_context, agent).await?;
         infos.extend(
-            client
-                .list_tools()
+            filter
+                .apply(tools, run_context, agent, client.server_name())
                 .await?
                 .into_iter()
-                .filter(|tool| filter.allows(&tool.name))
                 .map(|tool| {
                     McpToolInfo::new(client.server_name(), tool)
                         .with_server_index(server_index)

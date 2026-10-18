@@ -9,11 +9,32 @@
 //! dotted display name is ambiguous as soon as namespaces or tool names themselves contain dots.
 
 use async_trait::async_trait;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{context::RunContext, error::Result, model::ModelToolDefinition};
 use serde_json::Value;
 
 pub use crate::permission::PermissionScope;
+
+/// Resolves an agent's external tools for each model call, as Python's `Agent.get_mcp_tools`.
+///
+/// The implementation owns its transport and discovery policy. This boundary carries only
+/// framework tools so the loop can refresh an inventory without depending on an MCP adapter.
+#[async_trait]
+pub trait ToolResolver: Send + Sync {
+    /// Whether discovery needs enabled handoff names before resolving tools.
+    /// Defaults to false so ordinary discovery precedes handoff enablement.
+    fn requires_reserved_tool_names(&self) -> bool {
+        false
+    }
+
+    /// Resolves one inventory using the live run and, when requested, reserved local/handoff names.
+    async fn get_tools(
+        &self,
+        context: &RunContext,
+        reserved_tool_names: &BTreeSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>>;
+}
 
 pub mod context;
 pub mod function_output;
@@ -127,6 +148,11 @@ pub use timeout::ToolTimeoutError;
 pub trait Tool: Send + Sync + 'static {
     /// Stable source and routing identity.
     fn origin(&self) -> &ToolOrigin;
+    /// Stable adapter-owned recipient identity retained with an approval across rediscovery.
+    /// The runner compares this opaque value; transport-specific fields remain in the adapter.
+    fn recipient_binding(&self) -> Option<Value> {
+        None
+    }
 
     /// Provider-neutral model-facing schema.
     fn schema(&self) -> &ToolSchema;

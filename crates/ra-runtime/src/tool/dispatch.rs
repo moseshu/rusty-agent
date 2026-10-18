@@ -464,6 +464,7 @@ impl ToolDispatchRequest {
         }
         approval
             .with_tool_origin(tool.origin())
+            .with_recipient_binding(tool.recipient_binding())
             .with_kind(ToolCallKind::from(tool.model_definition().kind()))
     }
 

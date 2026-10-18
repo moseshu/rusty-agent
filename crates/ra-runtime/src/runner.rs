@@ -2617,6 +2617,7 @@ async fn resolve_interrupted_turn(
     // is given to recognise a re-settle, so splitting one turn into several one-outcome calls
     // would leave that guard describing a turn nothing will ever settle again.
     let mut outcomes = Vec::new();
+    let mut resumed_surface = None;
     for answer in answers {
         let item = state
             .generated_items()
@@ -2673,20 +2674,28 @@ async fn resolve_interrupted_turn(
                 }) {
                     state.begin_tool_continuation(answer.item_id())?;
                 }
-                let resumed =
-                    match run_approved_call(context, agent, state, lifecycle, &approval).await {
-                        Ok(resumed) => resumed,
-                        Err(error) => {
-                            if let Some(nested) = error.nested_run() {
-                                paused.push(nested.clone());
-                                state.settle_interruption_resolution(answer.item_id())?;
-                                paused.extend(continued);
-                                state.set_nested_runs(paused)?;
-                                state.snapshot_event_seq(context.event_seqs);
-                            }
-                            return Err(error);
+                let resumed = match run_approved_call(
+                    context,
+                    agent,
+                    state,
+                    lifecycle,
+                    &approval,
+                    &mut resumed_surface,
+                )
+                .await
+                {
+                    Ok(resumed) => resumed,
+                    Err(error) => {
+                        if let Some(nested) = error.nested_run() {
+                            paused.push(nested.clone());
+                            state.settle_interruption_resolution(answer.item_id())?;
+                            paused.extend(continued);
+                            state.set_nested_runs(paused)?;
+                            state.snapshot_event_seq(context.event_seqs);
                         }
-                    };
+                        return Err(error);
+                    }
+                };
                 match resumed {
                     ResumedOutcome::Settled {
                         output,
@@ -2750,7 +2759,16 @@ async fn resolve_interrupted_turn(
             continue;
         }
         let saved = nested.clone();
-        let resumed = match continue_paused_run(context, agent, state, lifecycle, nested).await {
+        let resumed = match continue_paused_run(
+            context,
+            agent,
+            state,
+            lifecycle,
+            nested,
+            &mut resumed_surface,
+        )
+        .await
+        {
             Ok(resumed) => resumed,
             Err(error) => {
                 paused.push(error.nested_run().cloned().unwrap_or(saved));
@@ -3448,6 +3466,7 @@ async fn run_approved_call(
     state: &mut RunState,
     lifecycle: &LifecycleHooks,
     approval: &ToolApproval,
+    surface: &mut Option<Arc<TurnActionSurface>>,
 ) -> Result<ResumedOutcome> {
     let key = approval.lookup_key().ok_or_else(|| {
         Error::caller(format!(
@@ -3462,6 +3481,8 @@ async fn run_approved_call(
         lifecycle,
         ResumedCall {
             key,
+            surface,
+            recipient_binding: approval.recipient_binding(),
             kind: approval.kind(),
             call_id: approval.call_id(),
             arguments: approval.arguments(),
@@ -3479,6 +3500,7 @@ async fn continue_paused_run(
     state: &mut RunState,
     lifecycle: &LifecycleHooks,
     nested: NestedRunRef,
+    surface: &mut Option<Arc<TurnActionSurface>>,
 ) -> Result<ResumedOutcome> {
     let key = nested.lookup_key().cloned().ok_or_else(|| {
         Error::caller(format!(
@@ -3500,6 +3522,8 @@ async fn continue_paused_run(
         lifecycle,
         ResumedCall {
             key: &key,
+            surface,
+            recipient_binding: None,
             kind: ra_core::item::ToolCallKind::Function,
             call_id: &call_id,
             arguments: &arguments,
@@ -3513,6 +3537,8 @@ async fn continue_paused_run(
 /// One call a resumed run dispatches again before its next model call.
 struct ResumedCall<'a> {
     key: &'a ToolLookupKey,
+    surface: &'a mut Option<Arc<TurnActionSurface>>,
+    recipient_binding: Option<&'a serde_json::Value>,
     kind: ra_core::item::ToolCallKind,
     call_id: &'a CallId,
     arguments: &'a serde_json::Value,
@@ -3570,13 +3596,20 @@ async fn execute_resumed_call(
 ) -> Result<ResumedOutcome> {
     let ResumedCall {
         key,
+        surface,
+        recipient_binding,
         kind,
         call_id,
         arguments,
         nested,
         resume,
     } = call;
-    let tool = resolve_resumed_tool(context, agent, state, key, kind, call_id).await?;
+    let tool = resolve_resumed_tool(context, agent, state, key, kind, call_id, surface).await?;
+    if recipient_binding != tool.recipient_binding().as_ref() {
+        return Err(Error::caller(
+            "Cannot resume a tool call with a missing or different recipient binding. Restore the original tool configuration, or start a new run.",
+        ));
+    }
 
     let run = resumed_run_context(context, agent, state);
 
@@ -3696,16 +3729,41 @@ async fn resolve_resumed_tool(
     key: &ToolLookupKey,
     kind: ra_core::item::ToolCallKind,
     call_id: &CallId,
+    cached_surface: &mut Option<Arc<TurnActionSurface>>,
 ) -> Result<Arc<dyn Tool>> {
-    let tool = if kind == ra_core::item::ToolCallKind::ToolSearch {
-        crate::turn::prepare::resumed_tool_search(
-            agent,
-            &resumed_run_context(context, agent, state),
-            context.services,
-            context.cancel,
-        )
-        .await?
-        .filter(|tool| tool.origin().lookup_key() == key)
+    let tool = if agent.execution().tool_resolver().is_some()
+        || kind == ra_core::item::ToolCallKind::ToolSearch
+    {
+        let surface = if let Some(surface) = cached_surface.as_ref() {
+            Arc::clone(surface)
+        } else {
+            let surface = crate::turn::prepare::resolve_action_surface(
+                agent,
+                &resumed_run_context(context, agent, state),
+                context.services,
+                context.cancel,
+                Some(context.config.agent_registry()),
+                context.config.tool_name_collision_policy(),
+                crate::turn::prepare::ActionSurfaceMode::Resume,
+            )
+            .await?;
+            context.tool_guardrails.preflight(surface.tools())?;
+            let surface = Arc::new(surface);
+            *cached_surface = Some(Arc::clone(&surface));
+            surface
+        };
+        if kind == ra_core::item::ToolCallKind::ToolSearch {
+            surface
+                .find_tool_search()
+                .filter(|tool| tool.origin().lookup_key() == key)
+                .cloned()
+        } else {
+            surface
+                .tools()
+                .iter()
+                .find(|tool| tool.origin().lookup_key() == key)
+                .cloned()
+        }
     } else {
         agent
             .execution()
@@ -4392,6 +4450,9 @@ async fn run_one_turn(
         preparation = preparation.with_output_schema(output_schema.clone());
     }
     let prepared = prepare_turn(preparation).await?;
+    if agent.execution().tool_resolver().is_some() {
+        context.tool_guardrails.preflight(prepared.tools())?;
+    }
     let sandbox_processors = context.sandbox.context_processors(agent).await;
     let (prepared, context_records, context_responses) = process_context_processors(
         context,

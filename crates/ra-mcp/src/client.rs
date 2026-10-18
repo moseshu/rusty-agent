@@ -66,6 +66,8 @@ pub struct McpClientOptions {
     max_list_pages: Option<NonZeroUsize>,
     max_catalog_items: Option<usize>,
     tool_timeout: Option<Duration>,
+    cache_tools_list: bool,
+    tool_filter: crate::filter::ToolFilter,
 }
 impl Default for McpClientOptions {
     fn default() -> Self {
@@ -75,10 +77,24 @@ impl Default for McpClientOptions {
             max_list_pages: None,
             max_catalog_items: None,
             tool_timeout: None,
+            cache_tools_list: false,
+            tool_filter: crate::filter::ToolFilter::default(),
         }
     }
 }
 impl McpClientOptions {
+    /// Reuses clean, nonempty tool lists. Defaults to false, as in Python.
+    #[must_use]
+    pub const fn with_cache_tools_list(mut self, enabled: bool) -> Self {
+        self.cache_tools_list = enabled;
+        self
+    }
+    /// Applies a static or dynamic filter after refreshing or reading the complete catalog.
+    #[must_use]
+    pub fn with_tool_filter(mut self, filter: crate::filter::ToolFilter) -> Self {
+        self.tool_filter = filter;
+        self
+    }
     /// Sets the per-request deadline, Python's `client_session_timeout_seconds`.
     /// `None` or zero disables it; an explicitly configured catalog deadline still applies.
     #[must_use]
@@ -142,6 +158,7 @@ pub struct McpClient {
     server_name: Arc<str>,
     session: Arc<ClientSessionServer>,
     transport_failed: Arc<AtomicBool>,
+    pub(crate) tools: Arc<crate::server::tools::ToolsCache>,
 }
 
 impl McpClient {
@@ -189,6 +206,10 @@ impl McpClient {
         Ok(Self {
             server_name: name.into(),
             transport_failed: Arc::default(),
+            tools: Arc::new(crate::server::tools::ToolsCache::new(
+                options.cache_tools_list,
+                options.tool_filter.clone(),
+            )),
             session: Arc::new(ClientSessionServer {
                 initialize_result,
                 service: Mutex::new(Some(service)),
@@ -240,6 +261,39 @@ impl McpClient {
     }
     /// Lists every tool page. Optional catalog limits never return a partial result.
     pub async fn list_tools(&self) -> Result<Vec<Tool>> {
+        self.list_tools_with_context(None, None).await
+    }
+    /// Lists tools with the run and agent required by dynamic filters, even on cache hits.
+    pub async fn list_tools_with_context(
+        &self,
+        run_context: Option<&ra_core::context::RunContext>,
+        agent: Option<&ra_core::context::RunAgent>,
+    ) -> Result<Vec<Tool>> {
+        self.peer().await?;
+        let tools = self.tools.list(self.fetch_tools()).await?;
+        self.tools
+            .filter()
+            .apply(tools, run_context, agent, self.server_name())
+            .await
+    }
+    /// Replaces the active discovery filter without invalidating the unfiltered cache.
+    pub fn set_tool_filter(&self, filter: crate::filter::ToolFilter) {
+        self.tools.set_filter(filter);
+    }
+    /// Changes cache reuse for subsequent listings without discarding the snapshot.
+    pub fn set_cache_tools_list(&self, enabled: bool) {
+        self.tools.set_cache_tools_list(enabled);
+    }
+    /// Returns the last complete unfiltered listing, including when caching is disabled or dirty.
+    #[must_use]
+    pub fn cached_tools(&self) -> Option<Vec<Tool>> {
+        self.tools.snapshot()
+    }
+    /// Invalidates future cache hits without discarding the last successful listing.
+    pub fn invalidate_tools_cache(&self) {
+        self.tools.invalidate();
+    }
+    async fn fetch_tools(&self) -> Result<Vec<Tool>> {
         let peer = self.peer().await?;
         collect_paginated(self.options(), "tools/list", |params| {
             let peer = peer.clone();
@@ -407,6 +461,8 @@ impl McpClient {
         };
         let peer = self.peer().await?;
         let mut params = CallToolRequestParams::new(name.to_owned());
+        self.tools
+            .validate_required(name, arguments.as_ref(), self.server_name())?;
         params.arguments = arguments;
         let result = self
             .send_request(

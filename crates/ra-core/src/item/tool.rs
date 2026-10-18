@@ -330,7 +330,7 @@ impl ToolResume {
 ///
 /// This is a control-plane record. It may be stored in a session or carried by an interruption,
 /// but it must never be sent to the model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolApproval {
     schema_version: SchemaVersion,
     call_id: CallId,
@@ -342,6 +342,8 @@ pub struct ToolApproval {
     // routing key widens every message and reasoning record the session stores by the same amount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lookup_key: Option<Box<ToolLookupKey>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipient_binding: Option<Box<Value>>,
     #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
     kind: ToolCallKind,
     // Boxed for the reason `lookup_key` is.
@@ -349,6 +351,24 @@ pub struct ToolApproval {
     resume: Option<Box<ToolResume>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+}
+
+impl std::fmt::Debug for ToolApproval {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolApproval")
+            .field("schema_version", &self.schema_version)
+            .field("call_id", &self.call_id)
+            .field("tool_name", &self.tool_name)
+            .field("arguments", &self.arguments)
+            .field("namespace", &self.namespace)
+            .field("lookup_key", &self.lookup_key)
+            .field("has_recipient_binding", &self.recipient_binding.is_some())
+            .field("kind", &self.kind)
+            .field("resume", &self.resume)
+            .field("unknown", &self.unknown)
+            .finish()
+    }
 }
 
 impl ToolApproval {
@@ -362,6 +382,7 @@ impl ToolApproval {
             arguments,
             namespace: None,
             lookup_key: None,
+            recipient_binding: None,
             kind: ToolCallKind::Function,
             resume: None,
             unknown: Unknown::new(),
@@ -414,6 +435,17 @@ impl ToolApproval {
     pub fn with_tool_origin(mut self, origin: &ToolOrigin) -> Self {
         self.lookup_key = Some(Box::new(origin.lookup_key().clone()));
         self
+    }
+    /// Retains the selected adapter recipient independently of its allocated model name.
+    #[must_use]
+    pub fn with_recipient_binding(mut self, binding: Option<Value>) -> Self {
+        self.recipient_binding = binding.map(Box::new);
+        self
+    }
+    /// Opaque recipient identity for validating a resumed call against rediscovered tools.
+    #[must_use]
+    pub fn recipient_binding(&self) -> Option<&Value> {
+        self.recipient_binding.as_deref()
     }
 
     /// Schema version.

@@ -106,7 +106,8 @@ impl ToolGuardrails {
 
     /// Checks that every identity these tools declare resolves to something installed.
     ///
-    /// Asked once, before the run's first model call. A declaration that resolves to nothing is a
+    /// Asked before the run's first model call and after resolving a new external inventory.
+    /// A declaration that resolves to nothing is a
     /// configuration mistake, and finding it at dispatch time means finding it after a model call
     /// has been paid for and a tool is waiting to run.
     pub fn preflight<'a>(&self, tools: impl IntoIterator<Item = &'a Arc<dyn Tool>>) -> Result<()> {

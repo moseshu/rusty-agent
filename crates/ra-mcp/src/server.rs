@@ -8,6 +8,8 @@ use rmcp::model::{
 };
 use serde_json::Value;
 
+pub(crate) mod tools;
+
 /// A configured MCP server, distinct from a connected session handle.
 ///
 /// Hosts connect before discovery and clean up after the run. Cache, filtering and approval
@@ -22,6 +24,14 @@ pub trait McpServer: Send + Sync {
     async fn cleanup(&self) -> Result<()>;
     /// Lists all available tools.
     async fn list_tools(&self) -> Result<Vec<Tool>>;
+    /// Lists tools for a run and agent. Dynamic filters require both views.
+    async fn list_tools_with_context(
+        &self,
+        _run_context: Option<&ra_core::context::RunContext>,
+        _agent: Option<&ra_core::context::RunAgent>,
+    ) -> Result<Vec<Tool>> {
+        self.list_tools().await
+    }
     /// Invokes the original tool name, preserving omitted arguments and request metadata.
     async fn call_tool(
         &self,
@@ -33,6 +43,8 @@ pub trait McpServer: Send + Sync {
     fn cached_tools(&self) -> Option<Vec<Tool>> {
         None
     }
+    /// Marks the complete catalog dirty without clearing its last successful snapshot.
+    fn invalidate_tools_cache(&self) {}
     /// Lists all available prompts.
     async fn list_prompts(&self) -> Result<ListPromptsResult>;
     /// Fetches one prompt with optional arguments.
@@ -78,6 +90,7 @@ fn unsupported_resource_operation(operation: &str) -> ra_core::error::Error {
 pub(crate) struct ServerConnection {
     lifecycle: tokio::sync::Mutex<()>,
     state: std::sync::Mutex<ConnectionState>,
+    pub(crate) tools: std::sync::Arc<tools::ToolsCache>,
 }
 #[cfg(any(feature = "stdio", feature = "http"))]
 #[derive(Default)]
@@ -128,7 +141,8 @@ impl ServerConnection {
                     self.state().client = None;
                     log_cleanup_failure(name, client.cleanup().await);
                 }
-                let client = initialize.await?;
+                let mut client = initialize.await?;
+                client.tools = self.tools.clone();
                 let mut state = self.state();
                 // Publishing and starting cleanup use the same state lock.
                 if cancelled.is_cancelled() {

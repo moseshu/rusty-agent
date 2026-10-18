@@ -17,7 +17,11 @@
 //! Every stage that can block runs inside the caller's [`CancelScope`]: dynamic availability calls
 //! third-party `async` code, which the cancellation contract does not allow to be awaited bare.
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 
 use futures::future::try_join_all;
 use ra_core::{
@@ -811,24 +815,17 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // exception below: it is a public delivery promise, not an execution capability.
     let agent = request.agent.execution();
 
-    // 1. Resolve dynamic availability first. Every later stage observes this exact snapshot.
-    let tools = resolve_enabled_tools(agent, request.run, request.services, request.cancel).await?;
-
-    // 2. Resolve enabled handoffs after tools, binding each to the agent that would receive it.
-    // Sealing the two into one surface here — not lazily at settlement — is what applies the
-    // collision policy before the model call is paid for, and what keeps the turn from advertising
-    // a transfer whose target cannot be resolved into anything runnable.
-    let handoffs =
-        resolve_handoffs(agent, request.run, request.cancel, request.agent_registry).await?;
-    let mut surface = TurnActionSurface::new_with_collision_policy(
-        tools.advertised,
-        handoffs,
+    // Resolve discovery and dynamic availability first. Later stages observe this exact snapshot.
+    let surface = resolve_action_surface(
+        request.agent,
+        request.run,
+        request.services,
+        request.cancel,
+        request.agent_registry,
         request.collision_policy,
-    )?;
-    surface.tool_search = request
-        .agent
-        .tool_search_cache
-        .get_or_build(surface.tools())?;
+        ActionSurfaceMode::Normal,
+    )
+    .await?;
     request.action_surface_budget.validate(&surface)?;
     let tool_definitions = surface.tool_definitions();
 
@@ -939,15 +936,63 @@ struct EnabledTools {
     advertised: Vec<Arc<dyn Tool>>,
 }
 
-/// Reconstructs a client search handler when a serialized approval resumes it.
-pub(crate) async fn resumed_tool_search(
+#[derive(PartialEq, Eq)]
+pub(crate) enum ActionSurfaceMode {
+    Normal,
+    Resume,
+}
+
+pub(crate) async fn resolve_action_surface(
     agent: &AgentBinding,
     context: &RunContext,
     services: &ToolServices,
     cancel: &CancelScope,
-) -> Result<Option<Arc<dyn Tool>>> {
-    let enabled = resolve_enabled_tools(agent.execution(), context, services, cancel).await?;
-    agent.tool_search_cache.get_or_build(&enabled.advertised)
+    registry: Option<&AgentRegistry>,
+    collision_policy: ToolNameCollisionPolicy,
+    mode: ActionSurfaceMode,
+) -> Result<TurnActionSurface> {
+    let execution = agent.execution();
+    let handoff_snapshot = if mode == ActionSurfaceMode::Resume {
+        Some(resolve_handoffs(execution, context, cancel, registry).await?)
+    } else {
+        None
+    };
+    let enabled = if let Some(resolver) = execution.tool_resolver() {
+        let mut reserved = BTreeSet::new();
+        if resolver.requires_reserved_tool_names() {
+            reserved.extend(
+                execution
+                    .tools()
+                    .iter()
+                    .map(|tool| tool.model_definition().qualified_name()),
+            );
+            if let Some(handoffs) = &handoff_snapshot {
+                reserved.extend(handoffs.iter().map(|handoff| handoff.name().to_owned()));
+            } else {
+                for handoff in execution.handoffs() {
+                    if cancel.run(handoff.is_enabled(context)).await?? {
+                        reserved.insert(handoff.schema().name().to_owned());
+                    }
+                }
+            }
+        }
+        let mut tools = cancel.run(resolver.get_tools(context, &reserved)).await??;
+        tools.extend(execution.tools().iter().cloned());
+        resolve_enabled_inventory(&tools, context, services, cancel).await?
+    } else {
+        resolve_enabled_tools(execution, context, services, cancel).await?
+    };
+    let handoffs = match handoff_snapshot {
+        Some(handoffs) => handoffs,
+        None => resolve_handoffs(execution, context, cancel, registry).await?,
+    };
+    let mut surface = TurnActionSurface::new_with_collision_policy(
+        enabled.advertised,
+        handoffs,
+        collision_policy,
+    )?;
+    surface.tool_search = agent.tool_search_cache.get_or_build(surface.tools())?;
+    Ok(surface)
 }
 
 async fn resolve_enabled_tools(
@@ -956,8 +1001,17 @@ async fn resolve_enabled_tools(
     services: &ToolServices,
     cancel: &CancelScope,
 ) -> Result<EnabledTools> {
+    resolve_enabled_inventory(agent.tools(), context, services, cancel).await
+}
+
+async fn resolve_enabled_inventory(
+    tools: &[Arc<dyn Tool>],
+    context: &RunContext,
+    services: &ToolServices,
+    cancel: &CancelScope,
+) -> Result<EnabledTools> {
     let decisions = cancel
-        .run(try_join_all(agent.tools().iter().map(|tool| async move {
+        .run(try_join_all(tools.iter().map(|tool| async move {
             match tool.options().availability() {
                 ToolAvailability::Enabled => Ok(true),
                 ToolAvailability::Disabled => Ok(false),
@@ -971,7 +1025,7 @@ async fn resolve_enabled_tools(
         .await??;
 
     let mut advertised = Vec::new();
-    for (tool, enabled) in agent.tools().iter().zip(decisions) {
+    for (tool, enabled) in tools.iter().zip(decisions) {
         if !enabled {
             continue;
         }

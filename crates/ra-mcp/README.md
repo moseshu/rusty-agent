@@ -5,6 +5,9 @@ and initialize-error fix verification on 2026-10-17; both roadmap tasks are DONE
 Streamable HTTP follow-up has also passed its recorded review. The shared session supports
 tools, prompts and resources. Other MCP roadmap slices remain separate.
 
+Tool filtering/cache review findings are fixed and awaiting verification. The contract and validation
+record is in [the filtering/cache notes](../../Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md).
+
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
 local Codex `815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052`. The SDK dependency is the
@@ -20,32 +23,31 @@ The common session and in-process server also compile with default features off.
 
 ```rust,no_run
 use std::sync::Arc;
-use ra_core::{agent::{AgentId, AgentSpec}, tool::Tool};
+use ra_core::agent::{AgentId, AgentSpec};
 use ra_mcp::{
-    client::{McpClient, McpClientOptions, stdio::McpStdioParams},
+    McpServer,
+    client::stdio::{McpServerStdio, McpStdioParams},
     filter::ToolFilter,
-    tool::{McpDiscoveryOptions, discover_tools},
+    resolver::McpToolResolver,
+    tool::McpDiscoveryOptions,
 };
 
 async fn configured_agent() -> ra_core::error::Result<()> {
-    let client = McpClient::connect_stdio(
-        "documents",
+    let server = Arc::new(McpServerStdio::new(
         McpStdioParams::new("my-mcp-server")
             .with_args(["--workspace".into(), "/workspace".into()]),
-        McpClientOptions::default(),
-    ).await?;
-    // Discover the complete server set together, so names are checked across servers.
-    let tools = discover_tools(
-        &[(client.clone(), ToolFilter::default())],
-        &McpDiscoveryOptions::new(),
-    ).await?;
+    ).with_name("documents"));
+    server.connect().await?;
+    let resolver = Arc::new(McpToolResolver::new(
+        vec![(server.clone(), ToolFilter::default())],
+        McpDiscoveryOptions::new(),
+    ));
     let _agent = AgentSpec::builder()
         .id(AgentId::new("assistant"))
         .name("Assistant")
-        .tools(tools.into_iter().map(|tool| tool as Arc<dyn Tool>))
+        .tool_resolver(resolver)
         .build()?;
-    // Keep the client alive through the run, then close its owned transport.
-    client.cleanup().await?;
+    server.cleanup().await?;
     Ok(())
 }
 ```
@@ -135,9 +137,110 @@ each later JSON value. Encoding failures retain no raw data in diagnostics. The 
 pump is needed because the SDK child transport fixes its byte stream to UTF-8; processes are
 spawned with tokio directly and JSON-RPC stays in the official SDK.
 
-`cached_tools()` defaults to `None`, matching Python with caching disabled. Cache/filter
-policies and approval integration remain the dedicated follow-up tasks; the runner receives
-no server lifecycle or MCP-specific policy. See [the stdio contract and validation record](../../Docs/R11-1_MCP_stdio_契约与验证.md).
+`cached_tools()` is `None` before the first complete listing. It subsequently returns the
+unfiltered snapshot even when cache reuse is disabled. Approval integration remains follow-up
+work; the runner receives no server lifecycle or MCP-specific policy. See
+[the stdio contract and validation record](../../Docs/R11-1_MCP_stdio_契约与验证.md).
+
+## Tool filtering and caching
+
+All transports use `McpClientOptions::with_cache_tools_list(bool)` (default false) and
+`with_tool_filter(ToolFilter)`. Reusable servers receive these through `with_options`.
+Clients and reusable servers also expose `set_tool_filter` and `set_cache_tools_list` for live
+changes, matching Python's mutable attributes. These changes retain the unfiltered snapshot and
+remain active after reconnect; a client's `options()` describes its initial connection options.
+`ToolFilter::new(allowlist, blocklist)` retains the existing static constructor;
+`create_static_tool_filter` accepts optional name lists and returns `None` when both are absent.
+An explicit empty allowlist excludes everything, and blocking wins over allowing. Filters
+inspect original protocol names before model-name allocation. They control discovery, rather
+than granting or enforcing sandbox authorization on direct `call_tool` invocations.
+
+`ToolFilter::dynamic_sync` accepts a fallible synchronous predicate; `ToolFilter::dynamic`
+accepts a boxed asynchronous future that can borrow `ToolFilterContext`. The context exposes
+`run_context()`, `agent()` and `server_name()`. The agent is a `RunAgent` public identity view;
+it exposes neither sibling executables nor model settings. Dynamic predicates require both run and agent,
+even for an empty catalog; contextless discovery reports a configuration error. Each predicate
+receives an owned tool snapshot. A returned error excludes that tool, logs a generic diagnostic
+without tool identity, server credentials or exception text, and continues with the remaining
+tools. Rust panics are not predicate errors: return `Result<bool>` for recoverable failures.
+
+```rust,no_run
+use ra_core::context::RunContext;
+use ra_mcp::{
+    client::{McpClient, McpClientOptions},
+    filter::ToolFilter,
+    tool::{McpDiscoveryOptions, discover_tools_with_context},
+};
+
+fn options() -> McpClientOptions {
+    McpClientOptions::default()
+        .with_cache_tools_list(true)
+        .with_tool_filter(ToolFilter::dynamic(|context, tool| Box::pin(async move {
+            let admin = context.run_context().app_context::<bool>().copied().unwrap_or(false);
+            Ok(admin || tool.name == "read")
+        })))
+}
+
+async fn refresh(client: McpClient, context: &RunContext)
+    -> ra_core::error::Result<()>
+{
+    let _tools = discover_tools_with_context(
+        &[(client.clone(), ToolFilter::default())],
+        &McpDiscoveryOptions::new(), Some(context), Some(context.agent()),
+    ).await?;
+    let _unfiltered = client.cached_tools();
+    client.invalidate_tools_cache();
+    Ok(())
+}
+```
+
+Attach `McpToolResolver` with `AgentSpecBuilder::tool_resolver` for runner integration. Before
+every ordinary or streamed model call, preparation supplies that step's real `RunContext`,
+including current usage, host app state and the public agent identity. Handoffs use the target's
+resolver and public identity; execution variants preserve or explicitly clear their resolver.
+This boundary ports Python's `Agent.get_mcp_tools` through `ra_core::tool::ToolResolver`, so the
+runtime kernel depends only on neutral tools rather than on this adapter.
+
+Register configured servers as `Arc<dyn McpClientSource>` (coercion is automatic in the example).
+The resolver captures each server's current session on every preparation, so cleanup/reconnect
+is visible on the next turn or run without rebuilding the agent. An explicitly registered
+`Arc<McpClient>` instead stays bound to that one session. Discovery results retain the captured
+session for their model call; reconnects never silently retarget already advertised tools.
+
+Normal preparation resolves MCP tools, local enablement, then handoffs. Only prefixed naming
+first evaluates enabled handoff names for reservations, then evaluates handoffs again after
+tools, as Python does. Approval resumption instead reuses one handoff snapshot for discovery.
+MCP tools precede enabled local tools, matching Python's collision precedence. Collision
+checks, tool search and action budgets all consume this same frozen inventory, which dispatch
+retains through the model call. A later filter update affects the next preparation. Approval
+resumption also resolves the current inventory and compares a persisted recipient binding;
+MCP's credential-safe server name, raw tool name and server position cannot be replaced by a newly allocated name.
+Recipient data stays in the control plane, is omitted from approval Debug output, and is never
+sent to the model. Server approval policy configuration remains separate follow-up work.
+
+Use `list_tools_with_context` on a client or `dyn McpServer` for raw protocol declarations,
+and `discover_tools_with_context` for framework tools. The existing zero-context methods remain
+available for static filters. A discovery tuple's filter is an additional explicit restriction
+after the configured server filter; neither filtered result is stored in the cache.
+
+Every successful complete listing publishes an unfiltered snapshot. Cache reuse requires an
+enabled, clean, nonempty cache, following Python (empty lists are fetched again). Dynamic filters
+run on every listing, including cache hits. Invalidation retains the last complete snapshot and
+marks it dirty. A refresh started before an invalidation cannot publish; an older refresh cannot
+overwrite a newer successful publication, but may publish if that newer refresh failed.
+Pagination failure, timeout and cancellation never publish partial results. Refreshes are not
+coalesced or serialized beyond the existing transport request serialization.
+
+Snapshot values own their mutable fields; SDK schema `Arc`s use Rust's copy-on-write semantics,
+so `Arc::make_mut` on a returned declaration cannot alter the cache. Clean cached schemas also
+validate string-valued `required` names before `call_tool`, including when cache reuse is off;
+dirty or absent caches skip this check, as Python does. Reusable servers retain their catalog
+through cleanup/reconnect, as upstream does; invalidate explicitly when the server's tools change.
+Retained clients and registered tools keep their original transport session.
+
+`ToolFilter` now represents the static-or-callable union. Synchronous static inspection methods
+`allows` and `filter_tools` move to `ToolFilterStatic`; construct that type directly or match
+`ToolFilter::Static`. The existing `ToolFilter::new` and default discovery tuples still work.
 
 ## Reusable Streamable HTTP lifecycle
 
@@ -212,7 +315,8 @@ SDK connector. No transparent session recovery or tool replay is enabled. See th
 | Timeouts | Python `client_session_timeout_seconds = 5` bounds initialize and each tool, prompt or resource request. `with_session_timeout(None)` or `with_session_timeout(Duration::ZERO)` disables that deadline, matching Python's `None` and zero semantics. An explicitly configured catalog deadline still applies, and Codex's per-server tool timeout may replace the session timeout for calls. The client owns these timers so protocol cancellation can be sent before the timeout result returns. |
 | Naming | Default and `ServerPrefixed`: Python `MCPUtil.get_all_function_tools` and `_build_prefixed_tool_name_overrides`, checked against names produced by running upstream; duplicate names are reported with Python's escaped `repr`. `Namespaced`: Codex `codex-mcp/src/tools.rs`, retaining its 128-byte combined limit. The necessary adapter adaptation also bounds each namespace and function name to 64 bytes so discovered tools can pass the existing Responses request validation. Namespace shortening uses the server identity, shared across its tools, and avoids literal names that resemble generated hashes. This adaptation only affects the explicitly selected namespaced extension. Original protocol names and client handles remain unchanged. |
 | Frozen routing | Discovered `Arc<McpTool>` objects retain their exact client and raw tool name, bound by server position as Python binds a server object, so repeated server names still route correctly. They enter the existing runtime action surface; no second dispatch registry or live name lookup is added. A declaration the neutral tool contract cannot carry is skipped with a warning, as Codex does. |
-| Filtering | Codex allowlist followed by denylist, using raw names. Absent allowlist allows all; an empty explicit allowlist allows none. Explicit UI visibility without `model` becomes Hidden, and remains available to host invocation. |
+| Filtering | Python static-or-callable filtering after the unfiltered catalog snapshot, with Codex's equivalent static allow/block membership. Missing dynamic context errors; per-tool predicate errors exclude the tool and log a credential-safe message. Explicit UI visibility without `model` becomes Hidden, and remains available to host invocation. |
+| Caching | Python's default-disabled reuse, complete unfiltered snapshots, explicit dirty-generation invalidation, and successful-refresh publication order. Dynamic filters run again on cache hits. Clean snapshots validate required arguments before invocation. |
 | Scheduling | Codex handler: `read_only_hint == Some(true)` permits Parallel; missing/false hints use Exclusive. Hints do not grant sandbox permissions. Server-wide parallel override is outside this slice. |
 | Exposure | Codex `core/src/mcp_tool_exposure.rs`: deferred when tool search is selected, advertised otherwise. Current Codex's 8 KiB/64 KiB spec budgets apply to agent plugins; they are not imposed globally on this provider-neutral adapter. |
 | Schema | Python `MCPUtil.to_function_tool` with strict conversion off: an absent `properties` becomes `{}`, and Codex's null `properties` also does. `ToolSchema::loose` otherwise preserves the original MCP schema. |
@@ -224,7 +328,7 @@ SDK connector. No transparent session recovery or tool replay is enabled. See th
 | Cleanup | Client clones share closure. Normal client cleanup is idempotent; SDK close timeout or worker failure is reported by `McpClient::cleanup` and later client cleanup does not claim confirmed success. The configured `McpServer` cleanup follows Python instead: it always clears its session and logs such failures. Stdio byte I/O is transcoded around the SDK's `AsyncRwTransport`; its owner closes the pipes, waits up to 3 s, then kills and reaps the child, following the SDK child transport's shutdown mechanism. A shared failure flag carries transcoder/shutdown errors that the SDK otherwise only logs. Full Codex process-group/executor launcher behavior, sandbox authorization, and lifecycle recovery are not implemented by this slice. |
 
 No MCP transport or provider wire types were added to `ra-core`. Approval
-configuration, OAuth, cache invalidation/dynamic filtering,
+configuration, OAuth,
 connection pools/lazy startup, manager workers and runtime control remain later
 slices. The obsolete empty `sse` feature and module have been removed in the HTTP follow-up,
 as selected by the roadmap; legacy HTTP+SSE servers are not supported. Streamable HTTP's

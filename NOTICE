@@ -78,3 +78,21 @@ The native HTTP boundary in crates/ra-mcp/src/client/http/transport.rs also adap
 modelcontextprotocol/rust-sdk revision 79437f291b2c44053d00dcd5db969fd0cca7c887,
 crates/rmcp/src/transport/common/reqwest/streamable_http_client.rs and
 crates/rmcp/src/transport/streamable_http_client.rs::expect_initialized (Apache-2.0).
+
+The contextual/static filtering and cache implementation in crates/ra-mcp/src/filter.rs,
+crates/ra-mcp/src/server/tools.rs, crates/ra-mcp/src/{client,server,tool}.rs,
+crates/ra-mcp/src/client/{stdio,http}.rs, and the cases in
+tests/it-mcp/tests/{filtering_caching,filter_logging}.rs also adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/mcp/{server,util}.py and tests/mcp/{test_tool_filtering,test_caching,
+test_list_page_limits}.py (MIT). See the retained license above.
+
+The per-model-call resolver and approval recipient binding in crates/ra-core/src/{agent,tool}.rs,
+crates/ra-core/src/item/tool.rs, crates/ra-runtime/src/turn/prepare.rs,
+crates/ra-runtime/src/{runner,tool/dispatch}.rs, crates/ra-mcp/src/{resolver,tool}.rs,
+and tests/it-mcp/tests/{runtime_discovery,runner}.rs also adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/agent.py, src/agents/mcp/{server,util}.py,
+src/agents/run_internal/{run_loop,turn_preparation,turn_resolution}.py,
+and tests/{test_start_hook_tool_concurrency,mcp/test_mcp_resume_binding}.py (MIT).
+See the retained license above.

@@ -32,7 +32,7 @@ use crate::{
     prompt::{DynamicPromptHandler, ResolvedPrompt},
     sandbox::SandboxAgentConfig,
     state::NestedRunRef,
-    tool::{Tool, ToolLookupKey, ToolOrigin},
+    tool::{Tool, ToolLookupKey, ToolOrigin, ToolResolver},
 };
 use async_trait::async_trait;
 
@@ -628,6 +628,7 @@ pub struct AgentSpec {
     model_settings: ModelSettings,
     output_schema: OutputSchema,
     tools: Vec<Arc<dyn Tool>>,
+    tool_resolver: Option<Arc<dyn ToolResolver>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
@@ -664,6 +665,7 @@ impl AgentSpec {
             model_settings: self.model_settings.clone(),
             output_schema: self.output_schema.clone(),
             tools: self.tools.clone(),
+            tool_resolver: self.tool_resolver.clone(),
             handoffs: self.handoffs.clone(),
             tool_use_behavior: self.tool_use_behavior.clone(),
             input_guardrails: self.input_guardrails.clone(),
@@ -739,6 +741,11 @@ impl AgentSpec {
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
     }
+    /// External tool discovery, reevaluated with the live context before each model call.
+    #[must_use]
+    pub fn tool_resolver(&self) -> Option<&Arc<dyn ToolResolver>> {
+        self.tool_resolver.as_ref()
+    }
 
     /// Handoffs this agent may offer during a turn.
     #[must_use]
@@ -812,6 +819,7 @@ impl fmt::Debug for AgentSpec {
             .field("model", &self.model)
             .field("output_schema", &self.output_schema)
             .field("tools", &tools)
+            .field("has_tool_resolver", &self.tool_resolver.is_some())
             .field("handoffs", &self.handoffs)
             .field("tool_use_behavior", &self.tool_use_behavior)
             .field(
@@ -854,6 +862,7 @@ pub struct AgentSpecBuilder {
     model_settings: ModelSettings,
     output_schema: OutputSchema,
     tools: Vec<Arc<dyn Tool>>,
+    tool_resolver: Option<Arc<dyn ToolResolver>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
@@ -874,6 +883,7 @@ impl AgentSpecBuilder {
             model_settings: ModelSettings::new(),
             output_schema: OutputSchema::default(),
             tools: Vec::new(),
+            tool_resolver: None,
             handoffs: Vec::new(),
             tool_use_behavior: ToolUseBehavior::default(),
             input_guardrails: Vec::new(),
@@ -1020,6 +1030,16 @@ impl AgentSpecBuilder {
     /// Removes tools inherited through [`AgentSpec::to_builder`].
     pub fn clear_tools(mut self) -> Self {
         self.tools.clear();
+        self
+    }
+    /// Installs the resolver for external tools, preserving direct tools as a separate declaration.
+    pub fn tool_resolver(mut self, resolver: Arc<dyn ToolResolver>) -> Self {
+        self.tool_resolver = Some(resolver);
+        self
+    }
+    /// Removes an inherited external tool resolver from a prepared execution instance.
+    pub fn clear_tool_resolver(mut self) -> Self {
+        self.tool_resolver = None;
         self
     }
 
@@ -1197,6 +1217,7 @@ impl AgentSpecBuilder {
             model_settings: self.model_settings,
             output_schema: self.output_schema,
             tools: self.tools,
+            tool_resolver: self.tool_resolver,
             handoffs: self.handoffs,
             tool_use_behavior: self.tool_use_behavior,
             input_guardrails: self.input_guardrails,

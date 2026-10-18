@@ -8,7 +8,7 @@ use ra_mcp::{
         McpToolInfo, name_tools_for_function_calling,
         normalize_tools_for_model_with_prefix as normalize,
     },
-    filter::{ToolFilter, tool_is_model_visible},
+    filter::{ToolFilterStatic, tool_is_model_visible},
 };
 use serde_json::json;
 use std::collections::{BTreeSet, HashSet};
@@ -136,9 +136,9 @@ fn shortened_namespaces_are_shared_and_cannot_merge_with_literal_names() {
 }
 #[test]
 fn filters_distinguish_missing_and_empty_allowlist_and_deny_wins() {
-    assert!(ToolFilter::default().allows("any"));
-    assert!(!ToolFilter::new(Some(HashSet::new()), HashSet::new()).allows("any"));
-    let filter = ToolFilter::new(
+    assert!(ToolFilterStatic::default().allows("any"));
+    assert!(!ToolFilterStatic::new(Some(HashSet::new()), HashSet::new()).allows("any"));
+    let filter = ToolFilterStatic::new(
         Some(HashSet::from(["read".into(), "write".into()])),
         HashSet::from(["write".into()]),
     );
