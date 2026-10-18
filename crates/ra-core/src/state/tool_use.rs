@@ -192,9 +192,9 @@ pub struct ToolUseRecord {
 impl ToolUseRecord {
     /// Pairing ID of the call.
     ///
-    /// For a [`ToolUse::Mcp`] identity this is the approval `request_id`: the hosted path pairs on
-    /// that string, and [`CallId`] is the framework's pairing ID for a tool, handoff, or MCP call
-    /// alike. Nothing reads it as a local call id, because the identity beside it says it is hosted.
+    /// For a [`ToolUse::Mcp`] identity this is the approval `request_id` or the provider's executed
+    /// call ID. The identity distinguishes these records from local function calls; recording an
+    /// executed hosted call does not create a local call-output pairing obligation.
     #[must_use]
     pub const fn call_id(&self) -> &CallId {
         &self.call_id

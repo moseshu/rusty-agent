@@ -438,10 +438,8 @@ pub(crate) async fn lower_input_item(
         // Replayed exactly as the provider returned it: the item is opaque server state, and the
         // reference hands it back unchanged.
         ModelInputItem::ProviderCompaction(compaction) => Ok(compaction.payload().clone()),
-        ModelInputItem::McpListTools(_) => Err(Error::caller(format!(
-            "OpenAI Responses cannot lower `{}` without provider replay data",
-            item.label()
-        ))),
+        ModelInputItem::McpListTools(list) => super::mcp::lower_list(list),
+        ModelInputItem::McpCall(call) => super::mcp::lower_call(call),
         _ => Err(Error::caller(
             "unsupported model-input item for OpenAI Responses",
         )),

@@ -119,8 +119,10 @@ pub(crate) fn convert_output_item(
         "custom_tool_call" => convert_custom_tool_call(item)?,
         "tool_search_call" => convert_tool_search_call(item)?,
         "tool_search_output" => convert_tool_search_output(item)?,
+        "mcp_list_tools" => RunItemKind::McpListTools(super::mcp::lift_list(item)),
+        "mcp_call" => RunItemKind::McpCall(super::mcp::lift_call(item)?),
         "compaction" => RunItemKind::ProviderCompaction(convert_compaction(item, provider)),
-        // Hosted-tool items (web search, file search, hosted MCP, image generation) have no
+        // Other hosted-tool items (web search, file search, image generation) have no
         // protocol-neutral payload yet. They can only appear when `extra_body.tools` requested
         // them, so the message names the item rather than silently dropping part of the turn.
         other => {

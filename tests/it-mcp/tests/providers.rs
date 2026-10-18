@@ -39,9 +39,13 @@ async fn request_tools(model: &dyn Model, server: &MockServer, request: ModelReq
 async fn bare_mcp_tools_are_accepted_by_chat_completions_and_anthropic() {
     let mut fixture = support::Fixture::new("providers");
     let mut bare = support::declaration("ping");
+    bare.description = None;
+    bare.title = Some("Ping title fallback".into());
     bare.input_schema =
         std::sync::Arc::new(serde_json::from_value(json!({"type":"object"})).unwrap());
-    fixture.tools_override = Some(vec![support::declaration("search"), bare]);
+    let mut search = support::declaration("search");
+    search.title = Some("UI-only search title".into());
+    fixture.tools_override = Some(vec![search, bare]);
     let mut server = InProcessToolServer::connect("docs", fixture, McpClientOptions::default())
         .await
         .unwrap();
@@ -80,6 +84,9 @@ async fn bare_mcp_tools_are_accepted_by_chat_completions_and_anthropic() {
         .await;
         assert_eq!(sent[0]["function"]["name"], search);
         assert_eq!(sent[1]["function"]["name"], ping);
+        assert_eq!(sent[0]["function"]["description"], "Search fixture");
+        assert_eq!(sent[1]["function"]["description"], "Ping title fallback");
+        assert!(!sent.to_string().contains("UI-only search title"));
         assert_eq!(
             sent[1]["function"]["parameters"],
             json!({"type":"object","properties":{}})
@@ -107,6 +114,9 @@ async fn bare_mcp_tools_are_accepted_by_chat_completions_and_anthropic() {
         .await;
         assert_eq!(sent[0]["name"], search);
         assert_eq!(sent[1]["name"], ping);
+        assert_eq!(sent[0]["description"], "Search fixture");
+        assert_eq!(sent[1]["description"], "Ping title fallback");
+        assert!(!sent.to_string().contains("UI-only search title"));
         assert_eq!(
             sent[1]["input_schema"],
             json!({"type":"object","properties":{}})
@@ -130,7 +140,17 @@ async fn long_namespaced_mcp_tools_reach_responses_and_keep_raw_routing() {
         fixture.tools_override = Some(
             names
                 .iter()
-                .map(|name| support::declaration(name))
+                .enumerate()
+                .map(|(index, name)| {
+                    let mut tool = support::declaration(name);
+                    if index == 0 {
+                        tool.description = None;
+                        tool.title = Some("Namespaced title fallback".into());
+                    } else {
+                        tool.title = Some("UI-only namespaced title".into());
+                    }
+                    tool
+                })
                 .collect(),
         );
         let mut server =
@@ -168,6 +188,7 @@ async fn long_namespaced_mcp_tools_reach_responses_and_keep_raw_routing() {
         assert_eq!(sent[0]["type"], "namespace");
         assert_eq!(sent[0]["description"], "Shared namespace instructions");
         assert_eq!(sent[0]["tools"].as_array().unwrap().len(), tools.len());
+        assert!(!sent.to_string().contains("UI-only namespaced title"));
         for (index, tool) in tools.iter().enumerate() {
             let namespace = tool.info().callable_namespace().unwrap();
             assert!(namespace.len() <= 64);
@@ -175,6 +196,10 @@ async fn long_namespaced_mcp_tools_reach_responses_and_keep_raw_routing() {
             assert!(namespace.len() + 2 + tool.schema().name().len() <= 128);
             assert_eq!(sent[0]["name"], namespace);
             assert_eq!(sent[0]["tools"][index]["name"], tool.schema().name());
+            assert_eq!(
+                sent[0]["tools"][index]["description"],
+                tool.info().description_for_model()
+            );
             assert_eq!(
                 tool.invoke(json!({"query":"hello"}))
                     .await

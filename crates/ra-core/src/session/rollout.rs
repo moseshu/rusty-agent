@@ -270,6 +270,10 @@ impl RolloutThreadSpawn {
 /// One thing a run records.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep RunItem by value to preserve the rollout API when optional display fields are added."
+)]
 pub enum RolloutItem {
     /// A run, or a segment continuing it, started.
     RunStarted(RolloutRunStarted),

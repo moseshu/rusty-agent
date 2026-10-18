@@ -272,6 +272,7 @@ impl PendingInputItem {
 enum DedupeKey {
     Reasoning(String),
     ToolCall(CallId),
+    McpCall(String),
     ToolCallOutput(CallId),
     HandoffCall(CallId),
     HandoffOutput(CallId),
@@ -285,6 +286,7 @@ fn dedupe_key(item: &ModelInputItem) -> Option<DedupeKey> {
             reasoning.id().map(|id| DedupeKey::Reasoning(id.to_owned()))
         }
         ModelInputItem::ToolCall(call) => Some(DedupeKey::ToolCall(call.call_id().clone())),
+        ModelInputItem::McpCall(call) => Some(DedupeKey::McpCall(call.id().to_owned())),
         ModelInputItem::ToolCallOutput(output) => {
             Some(DedupeKey::ToolCallOutput(output.call_id().clone()))
         }

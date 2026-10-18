@@ -29,6 +29,7 @@ use crate::agent::AgentBinding;
 #[doc(hidden)]
 pub mod batch;
 pub(crate) mod interrupt;
+mod mcp_metadata;
 #[doc(hidden)]
 pub mod prepare;
 #[doc(hidden)]
@@ -45,7 +46,7 @@ use batch::{
     TurnRecovery, execute_actions,
 };
 use prepare::TurnActionSurface;
-use process::process_model_response;
+use process::process_model_response_with_history;
 use resolve::{rebind_interruption, resolve_next_step_with_output, step_items};
 
 /// Inputs for settling one turn.
@@ -202,7 +203,11 @@ impl<'a> TurnSettlementRequest<'a> {
 pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<SingleStepResult> {
     // 1. Classify. Nothing runs until every call the model made is bound to the thing that will
     // answer it, so no later stage has to re-read a provider payload to find out what it is.
-    let processed = match process_model_response(request.response, request.surface) {
+    let processed = match process_model_response_with_history(
+        request.response,
+        request.surface,
+        &request.pre_step_items,
+    ) {
         Ok(processed) => processed,
         Err(error) => {
             // A completed stream item can already have spawned tool work. Classification normally

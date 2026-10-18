@@ -19,11 +19,12 @@
 //! # Two things this type deliberately derives instead of storing
 //!
 //! [`ProcessedResponse::interruptions`] and [`ProcessedResponse::tools_used`] are projections over
-//! the stored categories, not fields. A stored copy is a second source of truth that can disagree
-//! with the first — the same reason `Recoverability` is derived from the error variant rather than
-//! stored beside it.
+//! the stored items and categories, not fields. A stored copy is a second source of truth that can
+//! disagree with the first — the same reason `Recoverability` is derived from the error variant
+//! rather than stored beside it.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
@@ -364,7 +365,7 @@ impl ProcessedResponse {
     pub fn attempts(&self) -> Vec<ToolUseAttempt> {
         self.ordered_actions()
             .into_iter()
-            .map(|action| ToolUseAttempt::new(action.identity, action.call_id, action.arguments))
+            .map(|action| ToolUseAttempt::new(action.identity, action.call_id, &action.arguments))
             .collect()
     }
 
@@ -379,15 +380,14 @@ impl ProcessedResponse {
             .collect()
     }
 
-    /// Indexes the four categories back onto the response's own order.
+    /// Indexes local actions and provider-executed MCP calls onto the response's own order.
     ///
     /// The categories are stored separately because settlement treats them differently, but the
     /// order the model asked in is only recoverable from `new_items`. Both public projections go
     /// through this so they cannot disagree about it.
     ///
-    /// Every identity comes from the action's own `identity()` rather than being rebuilt here, so
-    /// this walk and a later consumer asking the same action the same question cannot answer
-    /// differently.
+    /// Local action identities come from their own `identity()` methods. Hosted executions have
+    /// no local action and are read directly from their stored call records.
     fn ordered_actions(&self) -> Vec<OrderedAction<'_>> {
         let mut by_item: BTreeMap<&ItemId, OrderedAction<'_>> = BTreeMap::new();
         for action in &self.functions {
@@ -396,7 +396,7 @@ impl ProcessedResponse {
                 OrderedAction {
                     identity: action.identity(),
                     call_id: action.call_id().clone(),
-                    arguments: action.call.arguments(),
+                    arguments: Cow::Borrowed(action.call.arguments()),
                 },
             );
         }
@@ -406,7 +406,7 @@ impl ProcessedResponse {
                 OrderedAction {
                     identity: action.identity(),
                     call_id: action.call_id().clone(),
-                    arguments: action.call.arguments(),
+                    arguments: Cow::Borrowed(action.call.arguments()),
                 },
             );
         }
@@ -419,7 +419,7 @@ impl ProcessedResponse {
                     // minted. `CallId` is the framework's pairing ID for a tool, handoff, or MCP
                     // call alike, and the identity beside it says which of the three this is.
                     call_id: CallId::new(action.request_id()),
-                    arguments: action.request.arguments(),
+                    arguments: Cow::Borrowed(action.request.arguments()),
                 },
             );
         }
@@ -429,14 +429,26 @@ impl ProcessedResponse {
                 OrderedAction {
                     identity: action.identity(),
                     call_id: action.call_id().clone(),
-                    arguments: action.call.arguments(),
+                    arguments: Cow::Borrowed(action.call.arguments()),
                 },
             );
         }
 
         self.new_items
             .iter()
-            .filter_map(|item| by_item.remove(item.id()))
+            .filter_map(|item| {
+                if let RunItemKind::McpCall(call) = item.kind() {
+                    return Some(OrderedAction {
+                        identity: ToolUse::Mcp {
+                            server: call.server().to_owned(),
+                            tool_name: call.name().to_owned(),
+                        },
+                        call_id: CallId::new(call.id()),
+                        arguments: Cow::Owned(Value::String(call.arguments().to_owned())),
+                    });
+                }
+                by_item.remove(item.id())
+            })
             .collect()
     }
 }
@@ -445,7 +457,7 @@ impl ProcessedResponse {
 struct OrderedAction<'a> {
     identity: ToolUse,
     call_id: CallId,
-    arguments: &'a Value,
+    arguments: Cow<'a, Value>,
 }
 
 impl fmt::Debug for ProcessedResponse {
@@ -497,7 +509,7 @@ impl ProcessedResponseBuilder {
         Self::default()
     }
 
-    /// Records an item that carries no action: a message, reasoning, or a control-plane record.
+    /// Records an item that needs no local action, including a provider-executed MCP call.
     pub fn item(mut self, item: RunItem) -> Self {
         self.new_items.push(item);
         self
@@ -510,6 +522,14 @@ impl ProcessedResponseBuilder {
     /// it under the model's name and report success.
     pub fn function(mut self, item: RunItem, tool: Arc<dyn Tool>) -> Result<Self> {
         let call = tool_call(&item, "a bound function call")?.clone();
+        let item = if call.kind() == crate::item::ToolCallKind::Function {
+            item.with_tool_call_metadata(
+                tool.schema().description().map(str::to_owned),
+                tool.title().map(str::to_owned),
+            )
+        } else {
+            item
+        };
         let definition = tool
             .model_definition()
             .with_defer_loading(tool.options().is_discoverable());

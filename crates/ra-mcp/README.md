@@ -5,8 +5,10 @@ and initialize-error fix verification on 2026-10-17; both roadmap tasks are DONE
 Streamable HTTP follow-up has also passed its recorded review. The shared session supports
 tools, prompts and resources. Other MCP roadmap slices remain separate.
 
-Tool filtering/cache review findings are fixed and awaiting verification. The contract and validation
-record is in [the filtering/cache notes](../../Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md).
+Tool filtering/cache passed re-review on 2026-10-18. The contract and validation record is in
+[the filtering/cache notes](../../Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md).
+Metadata resolution, caching and tool-call display metadata passed re-review on 2026-10-18; see
+[the metadata notes](../../Docs/R11-12_MCP_工具元数据解析_契约与验证.md).
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -241,6 +243,63 @@ Retained clients and registered tools keep their original transport session.
 `ToolFilter` now represents the static-or-callable union. Synchronous static inspection methods
 `allows` and `filter_tools` move to `ToolFilterStatic`; construct that type directly or match
 `ToolFilter::Static`. The existing `ToolFilter::new` and default discovery tuples still work.
+
+## Tool display metadata
+
+`McpTool::info().metadata()` returns an immutable `metadata::McpToolMetadata` with the original
+long-form `description()` and resolved `title()`. The existing `McpToolInfo::title()` and
+`description_for_ui()` delegate to this snapshot. Explicit `title` precedes `annotations.title`;
+there is no tool-name fallback. Empty strings are absent, while whitespace is preserved.
+Only `description_for_model()` falls back from the description to the resolved title and then
+the empty string. The model schema carries that one description, without additional UI fields.
+The title fallback is intentional upstream behavior when the long-form description is absent.
+
+Metadata is resolved once for each declaration in a complete tools/list refresh, before filtering.
+Cache hits, static/dynamic filtering, name allocation, and direct/deferred tool adaptation share
+the immutable value. Tools retain their exact declaration and metadata after later refreshes.
+Metadata uses the existing cache enablement, generation and publication rules; it has no separate
+TTL, global name-keyed cache, or additional invalidation API. Configured servers retain their
+complete catalog across cleanup/reconnect as Python does, including its metadata, until refresh
+or invalidation. Newly discovered tools still bind to the new session.
+
+`McpToolMetadata::from(&rmcp_tool)` resolves an SDK declaration. Raw JSON helpers and the
+hosted collector are internal implementation details; they are not part of `ra_mcp`'s public API.
+
+The runner copies a local function tool's schema description and `Tool::title()` onto the
+created `RunItem`. The description already includes the MCP title fallback when needed;
+`Tool::title()` defaults to `None` for ordinary tools. Both fields are optional, preserved by
+`RunState` and session serialization, and visible in settled run stream items. They live on the
+run-item envelope, separately from the raw tool call and `ModelInputItem`:
+
+```rust
+use ra_core::item::{CallId, ItemId, RunItem, RunItemKind, ToolCall};
+use serde_json::json;
+
+let item = RunItem::new(ItemId::new("call-item"), RunItemKind::ToolCall(
+    ToolCall::new(CallId::new("call"), "search", json!({})),
+)).with_tool_call_metadata(Some("Search docs".into()), Some("Search".into()));
+assert_eq!(item.title(), Some("Search"));
+let replay = serde_json::to_value(item.to_model_input().unwrap()).unwrap();
+assert!(replay["data"].get("title").is_none());
+assert!(replay["data"].get("description").is_none());
+```
+
+Hosted MCP output uses the Responses adapter's normalized `McpListTools` and `McpCall` items.
+The runtime collects metadata from authoritative pre-step items, then current output,
+keyed by `(server_label, name)`. Later entries replace whole metadata values. A hosted call's
+description remains absent when the directory has no description; it does not use the local
+function-tool fallback. Collection uses typed records, even when a model-input filter or server
+continuation hides an earlier directory from the actual request. Provider catalogs retain their
+complete `McpListTools::provider_data` for replay; only the private collector validates metadata
+fields, without filtering declarations or supplying missing schemas. A provider-executed call
+stores its output/error on that same record and schedules no local tool execution. It counts as
+`ToolUse::Mcp` in the existing tracker, allowing `reset_tool_choice` to release a forced choice.
+Custom call items do not inherit the tool declaration's description or title.
+
+The Responses adapter owns wire conversion and replay of both hosted item kinds. Existing schema
+and model-input projections never acquire the run item's display fields. The source contract,
+Rust representation adaptations and validation are recorded in
+[the metadata notes](../../Docs/R11-12_MCP_工具元数据解析_契约与验证.md).
 
 ## Reusable Streamable HTTP lifecycle
 

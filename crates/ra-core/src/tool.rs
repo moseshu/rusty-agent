@@ -157,6 +157,11 @@ pub trait Tool: Send + Sync + 'static {
     /// Provider-neutral model-facing schema.
     fn schema(&self) -> &ToolSchema;
 
+    /// Optional short display label, kept on run items separately from the model-facing schema.
+    fn title(&self) -> Option<&str> {
+        None
+    }
+
     /// Optional typed function schema from which the default [`Tool::decode_input`] is derived.
     ///
     /// A tool that returns one has its parsed model arguments schema-validated and decoded before

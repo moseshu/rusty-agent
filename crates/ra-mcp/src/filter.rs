@@ -2,6 +2,7 @@
 //! Static and contextual filtering using original protocol tool names.
 
 use crate::catalog::McpToolInfo;
+use crate::metadata::CachedTool;
 use futures::future::BoxFuture;
 use ra_core::{
     context::{RunAgent, RunContext},
@@ -109,16 +110,16 @@ impl ToolFilter {
     }
     pub(crate) async fn apply(
         &self,
-        tools: Vec<Tool>,
+        tools: Vec<CachedTool>,
         run_context: Option<&RunContext>,
         agent: Option<&RunAgent>,
         server_name: &str,
-    ) -> Result<Vec<Tool>> {
+    ) -> Result<Vec<CachedTool>> {
         let filter = match self {
             Self::Static(filter) => {
                 return Ok(tools
                     .into_iter()
-                    .filter(|tool| filter.allows(&tool.name))
+                    .filter(|tool| filter.allows(&tool.tool.name))
                     .collect());
             }
             Self::Dynamic(filter) => filter,
@@ -131,7 +132,7 @@ impl ToolFilter {
         let mut filtered = Vec::new();
         for tool in tools {
             let context = ToolFilterContext::new(run_context, agent, server_name);
-            match filter(context, tool.clone()).await {
+            match filter(context, tool.tool.clone()).await {
                 Ok(true) => filtered.push(tool),
                 Ok(false) => {}
                 Err(_) => tracing::error!("Error applying MCP tool filter"),

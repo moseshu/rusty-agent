@@ -9,13 +9,13 @@ use ra_core::{
     cancel::{CancelReason, CancelScope, ScopeKind},
     context::RunContext,
     error::{Error, Result},
-    item::{CallId, Message, ModelInputItem, ModelResponse},
+    item::{CallId, ItemId, McpCall, Message, ModelInputItem, ModelResponse, RunItem, RunItemKind},
     model::{
-        ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
-        ModelTracing, ProviderKey, ResolvedModel, ToolChoice,
+        ApiProtocol, McpToolChoice, Model, ModelRequest, ModelResolver, ModelSelector,
+        ModelSettings, ModelStream, ModelTracing, ProviderKey, ResolvedModel, ToolChoice,
     },
     output::OutputSchema,
-    state::{RunId, ToolUse, ToolUseAttempt, ToolUseTracker},
+    state::{RunId, ToolFailureTracker, ToolUse, ToolUseAttempt, ToolUseTracker},
     tool::{
         Tool, ToolAvailability, ToolContext, ToolExposure, ToolOptions, ToolOrigin, ToolOutput,
         ToolSchema,
@@ -24,7 +24,11 @@ use ra_core::{
 use ra_runtime::{
     agent::{AgentBinding, AgentRegistry},
     runner::ActionSurfaceBudget,
-    turn::prepare::{PreparedTurn, TurnPreparationRequest, prepare_turn},
+    turn::{
+        TurnSettlementRequest,
+        prepare::{PreparedTurn, TurnPreparationRequest, prepare_turn},
+        settle_turn,
+    },
 };
 use serde_json::{Value, json};
 
@@ -979,6 +983,82 @@ async fn test_turn_preparation_12() {
     let request = prepared.into_request();
     assert_eq!(request.input(), input);
     assert!(model.get_response(request).await.is_err());
+}
+
+#[tokio::test]
+async fn hosted_mcp_execution_releases_forced_tool_choice_without_a_local_action() {
+    for tool_choice in [
+        ToolChoice::Required,
+        ToolChoice::Mcp(McpToolChoice::new("docs", "search")),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let agent = AgentSpec::builder()
+            .id(AgentId::new("worker"))
+            .name("Worker")
+            .tool(dynamic_tool("write_file", &events, true))
+            .model_settings(ModelSettings::new().with_tool_choice(tool_choice.clone()))
+            .build()
+            .unwrap();
+        let binding = direct(&agent);
+        let resolver = RecordingResolver::new(events);
+        let context = Arc::new(host(&agent));
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        let prepared = prepare_turn(TurnPreparationRequest::new(
+            &binding,
+            &resolver,
+            &context,
+            &cancel,
+            &tracker,
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.request().model_settings().tool_choice(),
+            Some(&tool_choice)
+        );
+
+        let response = ModelResponse::new(vec![RunItem::new(
+            ItemId::new("hosted-item"),
+            RunItemKind::McpCall(McpCall::new("hosted-call", "docs", "search", "{}")),
+        )]);
+        let settled = settle_turn(TurnSettlementRequest::new(
+            &binding,
+            &response,
+            prepared.action_surface(),
+            context.clone(),
+            &cancel,
+            &mut tracker,
+            &mut ToolFailureTracker::new(),
+            Default::default(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            settled.processed_response().tools_used(),
+            [ToolUse::Mcp {
+                server: "docs".into(),
+                tool_name: "search".into(),
+            }]
+        );
+        assert!(!settled.processed_response().has_tools_or_approvals_to_run());
+        assert!(settled.function_results().is_empty());
+        let entry = &tracker.agent(agent.id()).unwrap().entries()[0];
+        assert_eq!(entry.recent()[0].call_id(), &CallId::new("hosted-call"));
+
+        let released = prepare_turn(TurnPreparationRequest::new(
+            &binding,
+            &resolver,
+            &context,
+            &cancel,
+            &tracker,
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(released.request().model_settings().tool_choice(), None);
+    }
 }
 
 #[tokio::test]

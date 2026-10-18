@@ -36,6 +36,7 @@ pub use content::{
     ThinkingBlock, UrlSource,
 };
 pub use handoff::{HandoffCall, HandoffOutput};
+pub use mcp::McpCall;
 pub use mcp::{McpApprovalRequest, McpApprovalResponse, McpListTools, McpTool};
 pub use message::{Message, MessageRole, ModelResponse};
 #[doc(hidden)]
@@ -291,6 +292,8 @@ pub enum RunItemKind {
     HandoffOutput(HandoffOutput),
     /// MCP tool-list result.
     McpListTools(McpListTools),
+    /// An MCP call executed by the provider, with its result carried on the same item.
+    McpCall(McpCall),
     /// MCP approval request.
     McpApprovalRequest(McpApprovalRequest),
     /// MCP approval response.
@@ -315,6 +318,7 @@ impl RunItemKind {
             Self::HandoffCall(_) => "handoff_call",
             Self::HandoffOutput(_) => "handoff_output",
             Self::McpListTools(_) => "mcp_list_tools",
+            Self::McpCall(_) => "mcp_call",
             Self::McpApprovalRequest(_) => "mcp_approval_request",
             Self::McpApprovalResponse(_) => "mcp_approval_response",
             Self::Compaction(_) => "compaction",
@@ -341,6 +345,7 @@ impl RunItemKind {
             | Self::HandoffCall(_)
             | Self::HandoffOutput(_)
             | Self::McpListTools(_)
+            | Self::McpCall(_)
             | Self::McpApprovalResponse(_)
             | Self::Compaction(_)
             | Self::ProviderCompaction(_) => false,
@@ -367,6 +372,7 @@ impl RunItemKind {
             | Self::ToolCallOutput(_)
             | Self::HandoffOutput(_)
             | Self::McpListTools(_)
+            | Self::McpCall(_)
             | Self::McpApprovalResponse(_)
             | Self::Compaction(_)
             | Self::ProviderCompaction(_)
@@ -381,6 +387,10 @@ pub struct RunItem {
     schema_version: SchemaVersion,
     id: ItemId,
     kind: RunItemKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provenance: Option<ItemProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,6 +410,8 @@ impl RunItem {
             schema_version: RUN_ITEM_SCHEMA_VERSION,
             id,
             kind,
+            description: None,
+            title: None,
             provenance: None,
             raw_provider_item: None,
             session_data: SessionData::new(),
@@ -412,6 +424,31 @@ impl RunItem {
     pub fn with_provenance(mut self, provenance: ItemProvenance) -> Self {
         self.provenance = Some(provenance);
         self
+    }
+
+    /// Records a tool call's display metadata, separately from its replayable payload.
+    /// Missing values replace previous metadata, matching newly resolved call items.
+    #[must_use]
+    pub fn with_tool_call_metadata(
+        mut self,
+        description: Option<String>,
+        title: Option<String>,
+    ) -> Self {
+        self.description = description;
+        self.title = title;
+        self
+    }
+
+    /// Tool description known when this call item was created; never included in model input.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Short tool display label known at item creation; never included in model input.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// Adds a raw provider copy.
@@ -519,6 +556,7 @@ impl RunItem {
             RunItemKind::HandoffCall(item) => Some(ModelInputItem::HandoffCall(item.clone())),
             RunItemKind::HandoffOutput(item) => Some(ModelInputItem::HandoffOutput(item.clone())),
             RunItemKind::McpListTools(item) => Some(ModelInputItem::McpListTools(item.clone())),
+            RunItemKind::McpCall(item) => Some(ModelInputItem::McpCall(item.clone())),
             RunItemKind::McpApprovalRequest(item) => {
                 Some(ModelInputItem::McpApprovalRequest(item.clone()))
             }
@@ -545,6 +583,7 @@ impl From<ModelInputItem> for RunItemKind {
             ModelInputItem::HandoffCall(item) => Self::HandoffCall(item),
             ModelInputItem::HandoffOutput(item) => Self::HandoffOutput(item),
             ModelInputItem::McpListTools(item) => Self::McpListTools(item),
+            ModelInputItem::McpCall(item) => Self::McpCall(item),
             ModelInputItem::McpApprovalRequest(item) => Self::McpApprovalRequest(item),
             ModelInputItem::McpApprovalResponse(item) => Self::McpApprovalResponse(item),
             ModelInputItem::Compaction(item) => Self::Compaction(item),
@@ -576,6 +615,8 @@ pub enum ModelInputItem {
     HandoffOutput(HandoffOutput),
     /// MCP tool list.
     McpListTools(McpListTools),
+    /// An MCP call whose execution and result belong to the provider.
+    McpCall(McpCall),
     /// MCP approval request.
     McpApprovalRequest(McpApprovalRequest),
     /// MCP approval response.
@@ -598,6 +639,7 @@ impl ModelInputItem {
             Self::HandoffCall(_) => "handoff_call",
             Self::HandoffOutput(_) => "handoff_output",
             Self::McpListTools(_) => "mcp_list_tools",
+            Self::McpCall(_) => "mcp_call",
             Self::McpApprovalRequest(_) => "mcp_approval_request",
             Self::McpApprovalResponse(_) => "mcp_approval_response",
             Self::Compaction(_) => "compaction",

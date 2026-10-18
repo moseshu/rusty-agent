@@ -269,6 +269,18 @@ impl McpClient {
         run_context: Option<&ra_core::context::RunContext>,
         agent: Option<&ra_core::context::RunAgent>,
     ) -> Result<Vec<Tool>> {
+        Ok(self
+            .list_cached_tools_with_context(run_context, agent)
+            .await?
+            .into_iter()
+            .map(|cached| cached.tool)
+            .collect())
+    }
+    pub(crate) async fn list_cached_tools_with_context(
+        &self,
+        run_context: Option<&ra_core::context::RunContext>,
+        agent: Option<&ra_core::context::RunAgent>,
+    ) -> Result<Vec<crate::metadata::CachedTool>> {
         self.peer().await?;
         let tools = self.tools.list(self.fetch_tools()).await?;
         self.tools

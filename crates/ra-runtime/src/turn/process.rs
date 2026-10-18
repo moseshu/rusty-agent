@@ -5,15 +5,15 @@
 //! and R3-4b's jobs, and keeping them out is what stops the runner from becoming a place where
 //! provider decoding, approval, execution, and output parsing all happen in one function.
 //!
-//! Classification is also **non-destructive**: `new_items` carries the adapter's records unchanged,
-//! including a handoff that arrived in its wire form as an ordinary tool call. The typed view lives
-//! on the action, so the session keeps what the provider actually sent and replay stays exact.
+//! Classification preserves each provider payload while attaching the display metadata known at
+//! item creation. A handoff that arrived as an ordinary tool call retains that payload; its typed
+//! view lives on the action. Display metadata stays outside the model-input projection.
 
 use std::sync::Arc;
 
 use ra_core::{
     error::{Error, Result},
-    item::{ModelResponse, RunItemKind, ToolCallKind},
+    item::{ModelResponse, RunItem, RunItemKind, ToolCallKind},
     step::ProcessedResponse,
 };
 
@@ -27,6 +27,15 @@ pub fn process_model_response(
     response: &ModelResponse,
     surface: &TurnActionSurface,
 ) -> Result<ProcessedResponse> {
+    process_model_response_with_history(response, surface, &[])
+}
+
+pub(crate) fn process_model_response_with_history(
+    response: &ModelResponse,
+    surface: &TurnActionSurface,
+    existing_items: &[RunItem],
+) -> Result<ProcessedResponse> {
+    let metadata = super::mcp_metadata::collect(existing_items, response.output());
     let mut builder = ProcessedResponse::builder();
 
     for item in response.output() {
@@ -103,7 +112,7 @@ pub fn process_model_response(
             // match in `ra-core` **is** exhaustive — that is where a new kind has to declare
             // whether it is a pending decision, and it is a compile error there rather than a
             // silent pass here.
-            _ => builder.item(item.clone()),
+            _ => builder.item(super::mcp_metadata::enrich(item.clone(), &metadata)),
         };
     }
 

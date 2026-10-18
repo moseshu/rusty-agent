@@ -606,6 +606,32 @@ async fn a_hosted_tool_item_in_the_history_is_an_error() {
     assert!(error.to_string().contains("web_search_call"), "{error}");
 }
 
+#[tokio::test]
+async fn hosted_mcp_history_roundtrips_without_run_item_display_metadata() {
+    let fake = Fake::start().await;
+    let directory = json!({"id":"directory", "type":"mcp_list_tools", "server_label":"docs", "tools":[
+        null, {"name":123}, {"name":"search", "description":false, "title":null, "annotations":{"title":"Search title"}, "provider_extra":42}
+    ]});
+    let call = json!({"id":"call", "type":"mcp_call", "server_label":"docs", "name":"search",
+        "arguments":"{}", "output":"found", "status":"completed"});
+    fake.seed("source", vec![directory.clone(), call.clone()]);
+    fake.seed("target", vec![]);
+    let source = fake.session().with_conversation_id("source");
+    let mut items = source.get_items(None).await.unwrap();
+    assert!(matches!(items[0].kind(), RunItemKind::McpListTools(_)));
+    assert!(matches!(items[1].kind(), RunItemKind::McpCall(_)));
+    items[1] = items[1].clone().with_tool_call_metadata(
+        Some("Display description".into()),
+        Some("Display title".into()),
+    );
+    fake.session()
+        .with_conversation_id("target")
+        .add_items(items)
+        .await
+        .unwrap();
+    assert_eq!(fake.items("target"), [directory, call]);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Appending
 // ---------------------------------------------------------------------------------------------

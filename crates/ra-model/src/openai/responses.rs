@@ -21,6 +21,7 @@ use crate::{provider::quirks::ProviderQuirks, retry::unstarted_replay_safety};
 
 pub(crate) mod cache;
 pub(crate) mod convert;
+pub(crate) mod mcp;
 pub(crate) mod request;
 pub(crate) mod stream;
 

@@ -159,6 +159,223 @@ fn caching() -> McpClientOptions {
     McpClientOptions::default().with_cache_tools_list(true)
 }
 
+async fn discovered(client: &McpClient) -> Vec<Arc<ra_mcp::tool::McpTool>> {
+    discover_tools(
+        &[(client.clone(), ToolFilter::default())],
+        &McpDiscoveryOptions::new(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn metadata_cache_is_shared_through_filtering_and_all_naming_modes() {
+    use ra_core::tool::Tool as _;
+    let mut harness = Harness::new(caching()).await;
+    let client = harness.client();
+    let mut read = tool("read", "Model description", &[]);
+    read.title = Some("UI-only title".into());
+    harness
+        .list(vec![read, tool("write", "Other description", &[])])
+        .await;
+    let original = discovered(&client).await;
+    for naming in [
+        McpToolNaming::Original,
+        McpToolNaming::ServerPrefixed,
+        McpToolNaming::Namespaced,
+    ] {
+        for deferred in [false, true] {
+            client.set_tool_filter(
+                create_static_tool_filter(Some(vec!["read".into()]), None).unwrap(),
+            );
+            let tools = discover_tools(
+                &[(client.clone(), ToolFilter::default())],
+                &McpDiscoveryOptions::new()
+                    .with_naming(naming)
+                    .with_tool_search(deferred),
+            )
+            .await
+            .unwrap();
+            assert_eq!(tools.len(), 1);
+            assert!(std::ptr::eq(
+                original[0].info().metadata(),
+                tools[0].info().metadata()
+            ));
+            assert_eq!(tools[0].info().title(), Some("UI-only title"));
+            assert_eq!(
+                tools[0].info().description_for_ui(),
+                Some("Model description")
+            );
+            assert_eq!(tools[0].schema().description(), Some("Model description"));
+            assert!(
+                !serde_json::to_string(&tools[0].model_definition())
+                    .unwrap()
+                    .contains("UI-only title")
+            );
+        }
+    }
+    assert_eq!(client.cached_tools().unwrap().len(), 2);
+    assert!(harness.requests.try_recv().is_err());
+    harness.server.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_refresh_replaces_absent_fields_and_keeps_discovered_snapshots_immutable() {
+    let mut harness = Harness::new(caching()).await;
+    let client = harness.client();
+    let mut first = tool("read", "Old description", &[]);
+    first.title = Some("Old title".into());
+    harness.list(vec![first]).await;
+    let original = discovered(&client).await;
+    // The caller receives an owned declaration; editing it cannot change the cached metadata.
+    let mut snapshot = client.cached_tools().unwrap();
+    snapshot[0].title = Some("Consumer edit".into());
+    assert_eq!(
+        discovered(&client).await[0].info().title(),
+        Some("Old title")
+    );
+    client.invalidate_tools_cache();
+    let mut replacement = tool("read", "", &[]);
+    replacement.annotations =
+        Some(serde_json::from_value(json!({"title":"Annotation fallback"})).unwrap());
+    let (refreshed, ()) = tokio::join!(
+        discovered(&client),
+        harness.respond(vec![replacement], None)
+    );
+    assert_eq!(refreshed[0].info().title(), Some("Annotation fallback"));
+    assert_eq!(refreshed[0].info().description_for_ui(), None);
+    assert_eq!(
+        refreshed[0].info().description_for_model(),
+        "Annotation fallback"
+    );
+    assert!(!std::ptr::eq(
+        original[0].info().metadata(),
+        refreshed[0].info().metadata()
+    ));
+    assert_eq!(original[0].info().title(), Some("Old title"));
+    assert_eq!(
+        original[0].info().description_for_ui(),
+        Some("Old description")
+    );
+    client.set_cache_tools_list(false);
+    let (uncached, ()) = tokio::join!(
+        discovered(&client),
+        harness.respond(vec![tool("read", "", &[])], None)
+    );
+    assert_eq!(uncached[0].info().title(), None);
+    assert_eq!(uncached[0].info().description_for_model(), "");
+    client.set_cache_tools_list(true);
+    assert!(std::ptr::eq(
+        uncached[0].info().metadata(),
+        discovered(&client).await[0].info().metadata()
+    ));
+    harness.server.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_discoveries_keep_metadata_with_their_own_declarations() {
+    for newer_succeeds in [false, true] {
+        let mut harness = Harness::new(caching()).await;
+        let first_client = harness.client();
+        let first = tokio::spawn(async move { discovered(&first_client).await });
+        let first_request = harness.request().await;
+        let second_client = harness.client();
+        let second = tokio::spawn(async move {
+            discover_tools(
+                &[(second_client, ToolFilter::default())],
+                &McpDiscoveryOptions::new(),
+            )
+            .await
+        });
+        let second_request = harness.request().await;
+        let newer = if newer_succeeds {
+            second_request
+                .reply
+                .send(Ok(ListToolsResult {
+                    tools: vec![tool("read", "Newer description", &[])],
+                    ..Default::default()
+                }))
+                .unwrap();
+            Some(second.await.unwrap().unwrap())
+        } else {
+            second_request
+                .reply
+                .send(Err(ErrorData::invalid_params("refresh failed", None)))
+                .unwrap();
+            assert!(second.await.unwrap().is_err());
+            None
+        };
+        first_request
+            .reply
+            .send(Ok(ListToolsResult {
+                tools: vec![tool("read", "Older description", &[])],
+                ..Default::default()
+            }))
+            .unwrap();
+        let older = first.await.unwrap();
+        assert_eq!(older[0].info().description_for_model(), "Older description");
+        let current = discovered(&harness.client()).await;
+        let expected = newer.as_ref().unwrap_or(&older);
+        assert!(std::ptr::eq(
+            expected[0].info().metadata(),
+            current[0].info().metadata()
+        ));
+        assert_eq!(
+            current[0].info().description_for_ui(),
+            current[0].info().tool().description.as_deref()
+        );
+        harness.server.cleanup().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn metadata_cache_does_not_cross_sessions_with_the_same_server_and_tool_names() {
+    let mut first = Harness::new(caching()).await;
+    let mut second = Harness::new(caching()).await;
+    first.list(vec![tool("read", "First session", &[])]).await;
+    second.list(vec![tool("read", "Second session", &[])]).await;
+    let first_tools = discovered(&first.client()).await;
+    let second_tools = discovered(&second.client()).await;
+    assert_eq!(
+        first_tools[0].info().description_for_model(),
+        "First session"
+    );
+    assert_eq!(
+        second_tools[0].info().description_for_model(),
+        "Second session"
+    );
+    first.server.cleanup().await.unwrap();
+    second.server.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_reconnect_retains_metadata_with_the_server_cache_until_invalidated() {
+    let server = McpServerStdio::new(McpStdioParams::new(env!("CARGO_BIN_EXE_mcp_fixture")))
+        .with_options(caching());
+    server.connect().await.unwrap();
+    let original = discovered(&server.client().unwrap()).await;
+    server.cleanup().await.unwrap();
+    server.connect().await.unwrap();
+    let reconnected = discovered(&server.client().unwrap()).await;
+    assert!(std::ptr::eq(
+        original[0].info().metadata(),
+        reconnected[0].info().metadata()
+    ));
+    assert!(original[0].invoke(json!({})).await.is_err());
+    assert!(reconnected[0].invoke(json!({})).await.is_ok());
+    server.invalidate_tools_cache();
+    let refreshed = discovered(&server.client().unwrap()).await;
+    assert!(!std::ptr::eq(
+        reconnected[0].info().metadata(),
+        refreshed[0].info().metadata()
+    ));
+    assert_eq!(
+        reconnected[0].info().metadata(),
+        refreshed[0].info().metadata()
+    );
+    server.cleanup().await.unwrap();
+}
+
 #[tokio::test]
 async fn caching_defaults_off_but_keeps_the_last_complete_snapshot() {
     let mut harness = Harness::new(McpClientOptions::default()).await;
@@ -427,9 +644,10 @@ async fn invalidation_during_refresh_keeps_the_previous_snapshot_and_requires_an
         .list(vec![tool("read", "initial", &["query"])])
         .await;
     let client = harness.client();
+    let original_metadata = discovered(&client).await;
     client.invalidate_tools_cache();
     let task_client = client.clone();
-    let task = tokio::spawn(async move { listed(&task_client).await });
+    let task = tokio::spawn(async move { discovered(&task_client).await });
     let request = harness.request().await;
     client.invalidate_tools_cache();
     let page = ListToolsResult {
@@ -438,7 +656,7 @@ async fn invalidation_during_refresh_keeps_the_previous_snapshot_and_requires_an
     };
     request.reply.send(Ok(page)).unwrap();
     assert_eq!(
-        task.await.unwrap().unwrap()[0].description.as_deref(),
+        task.await.unwrap()[0].info().description_for_ui(),
         Some("stale")
     );
     assert_eq!(client.cached_tools().unwrap(), initial);
@@ -446,6 +664,14 @@ async fn invalidation_during_refresh_keeps_the_previous_snapshot_and_requires_an
     harness
         .list(vec![tool("read", "latest", &["latest"])])
         .await;
+    assert_eq!(
+        discovered(&client).await[0].info().description_for_model(),
+        "latest"
+    );
+    assert_eq!(
+        original_metadata[0].info().description_for_model(),
+        "initial"
+    );
     assert!(
         client
             .call_tool("read", None, None)

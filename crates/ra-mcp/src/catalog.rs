@@ -5,12 +5,14 @@
 //! original MCP names, or `mcp_{server}__{tool}` when server names are included. Codex's
 //! namespaced names are an explicitly selected extension for endpoints that carry namespaces.
 
+use crate::metadata::{CachedTool, McpToolMetadata};
 use ra_core::error::{Error, Result};
 use rmcp::model::Tool;
 use sha1::{Digest, Sha1};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt::Write as _,
+    sync::Arc,
 };
 use tracing::warn;
 
@@ -26,21 +28,26 @@ pub struct McpToolInfo {
     pub(crate) namespaced: bool,
     pub(crate) namespace_description: Option<String>,
     pub(crate) tool: Tool,
+    metadata: Arc<McpToolMetadata>,
     pub(crate) connector_id: Option<String>,
 }
 
 impl McpToolInfo {
     /// Starts with the protocol name as callable name and no model-facing namespace.
     pub fn new(server_name: impl Into<String>, tool: Tool) -> Self {
+        Self::from_cached(server_name, tool.into())
+    }
+    pub(crate) fn from_cached(server_name: impl Into<String>, cached: CachedTool) -> Self {
         let server_name = server_name.into();
         Self {
             callable_namespace: safe_server_name(&server_name),
-            callable_name: tool.name.to_string(),
+            callable_name: cached.tool.name.to_string(),
             server_name,
             server_index: 0,
             namespaced: false,
             namespace_description: None,
-            tool,
+            tool: cached.tool,
+            metadata: cached.metadata,
             connector_id: None,
         }
     }
@@ -68,32 +75,25 @@ impl McpToolInfo {
     pub const fn tool(&self) -> &Tool {
         &self.tool
     }
+    /// Immutable display metadata resolved with this declaration's unfiltered catalog snapshot.
+    #[must_use]
+    pub fn metadata(&self) -> &McpToolMetadata {
+        &self.metadata
+    }
     /// UI title, preferring explicit title over annotations.title, as in Python's metadata helper.
     #[must_use]
     pub fn title(&self) -> Option<&str> {
-        self.tool
-            .title
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                self.tool
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.title.as_deref())
-                    .filter(|s| !s.is_empty())
-            })
+        self.metadata.title()
     }
     /// Long-form UI description without a title fallback.
     #[must_use]
     pub fn description_for_ui(&self) -> Option<&str> {
-        self.tool.description.as_deref().filter(|s| !s.is_empty())
+        self.metadata.description()
     }
     /// Model description follows Python's description, title, then empty-string precedence.
     #[must_use]
     pub fn description_for_model(&self) -> &str {
-        self.description_for_ui()
-            .or_else(|| self.title())
-            .unwrap_or_default()
+        self.metadata.description_for_model()
     }
     /// Allocated model-facing name.
     #[must_use]

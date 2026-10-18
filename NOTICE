@@ -61,6 +61,33 @@ src/agents/_mcp_tool_metadata.py, src/agents/mcp/_logging.py, src/agents/mcp/uti
 tests/mcp/test_mcp_util.py (MIT).
 Its original license is retained in third_party/openai-agents-python.LICENSE.
 
+The resolved metadata value in crates/ra-mcp/src/metadata.rs, its immutable catalog cache in
+crates/ra-mcp/src/{catalog,client,filter,tool}.rs and src/server/tools.rs, and cases in
+tests/it-mcp/tests/{metadata,filtering_caching,providers,runner}.rs also adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/_mcp_tool_metadata.py, src/agents/mcp/{server,util}.py,
+src/agents/run_internal/turn_resolution.py, tests/test_mcp_tool_metadata.py and
+tests/mcp/{test_mcp_util,test_caching}.py (MIT). See the retained license above.
+
+The tool-call display fields and title callback in crates/ra-core/src/{item,tool}.rs,
+call-item creation and validation in crates/ra-core/src/step/{processed,single}.rs,
+the normalized MCP history collector in crates/ra-runtime/src/turn/mcp_metadata.rs and
+its classification/settlement call sites, and cases in
+tests/it-core/tests/{tool_call_metadata,single_step_result}.rs,
+tests/it-mcp/tests/runner.rs, tests/it-model/tests/mcp_metadata.rs and
+tests/it-runtime/tests/turn_preparation.rs adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/{items,run_state,_mcp_tool_metadata}.py, src/agents/mcp/util.py,
+src/agents/run_internal/turn_resolution.py, and
+tests/{test_process_model_response,test_stream_events,test_server_conversation_tracker,
+test_run_state,test_items_helpers}.py (MIT). See the retained license above.
+
+The hosted MCP value fields in crates/ra-core/src/item/mcp.rs and wire conversion in
+crates/ra-model/src/openai/responses/mcp.rs follow openai/openai-python,
+revision 0c09a3fe815184f0a46fbf18b1aba84a467c854e,
+src/openai/types/responses/{response_output_item,response_input_param}.py (Apache-2.0).
+The repository LICENSE retains the Apache License, Version 2.0.
+
 The server protocol surface and configured stdio lifecycle in crates/ra-mcp/src/server.rs
 and crates/ra-mcp/src/client/stdio.rs, prompt aggregation and resource operations in
 crates/ra-mcp/src/client.rs, and cases in tests/it-mcp/tests/server.rs also adapt

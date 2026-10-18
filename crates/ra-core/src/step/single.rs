@@ -367,15 +367,27 @@ impl SingleStepResultBuilder {
 /// Nothing else in the struct can catch a mismatch: usage accounting would come from one call, the
 /// bound actions from another, and resume would replay a third story.
 ///
-/// The comparison is whole records, not just IDs. Classification copies the adapter's records
-/// verbatim, so full equality is what actually holds — and matching IDs over different payloads is
-/// exactly the case an ID check waves through while re-introducing the mismatch it was added to
-/// stop. If classification ever stops being non-destructive, this is the line that says so.
+/// Compare complete records, allowing only the display metadata attached to tool-call envelopes.
+/// Provider payload, provenance, identity, session data and ordering must remain unchanged; an
+/// ID-only comparison would silently accept a rewritten invocation or result.
 fn check_classifies_this_response(
     processed_response: &ProcessedResponse,
     model_response: &ModelResponse,
 ) -> Result<()> {
-    if processed_response.new_items() == model_response.output() {
+    if processed_response.new_items().len() == model_response.output().len()
+        && processed_response
+            .new_items()
+            .iter()
+            .zip(model_response.output())
+            .all(|(classified, original)| {
+                classified == original
+                    || (matches!(
+                        original.kind(),
+                        RunItemKind::ToolCall(_) | RunItemKind::McpCall(_)
+                    ) && classified.clone().with_tool_call_metadata(None, None)
+                        == original.clone().with_tool_call_metadata(None, None))
+            })
+    {
         return Ok(());
     }
     let same_identities = processed_response
@@ -385,7 +397,7 @@ fn check_classifies_this_response(
         .eq(model_response.output().iter().map(RunItem::id));
     Err(Error::caller(if same_identities {
         "`processed_response` and `model_response` hold the same item ids but different content; \
-         classification copies records unchanged, so one of them was rewritten"
+         classification may only attach tool-call display metadata, so a provider record was rewritten"
     } else {
         "`processed_response` classifies a different response than `model_response`; the two must \
          be the same records in the same order"

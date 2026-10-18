@@ -1,6 +1,7 @@
 //! Complete, unfiltered tool snapshots with generation-safe concurrent refreshes.
 
 use crate::filter::ToolFilter;
+use crate::metadata::CachedTool;
 use ra_core::error::{Error, Result, ToolErrorKind};
 use rmcp::model::{JsonObject, Tool};
 use std::{
@@ -15,7 +16,7 @@ pub(crate) struct ToolsCache(Mutex<CacheState>);
 struct CacheState {
     cache_tools_list: bool,
     filter: ToolFilter,
-    tools: Option<Vec<Tool>>,
+    tools: Option<Vec<CachedTool>>,
     dirty: bool,
     generation: u64,
     refresh_sequence: u64,
@@ -51,7 +52,10 @@ impl ToolsCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     pub(crate) fn snapshot(&self) -> Option<Vec<Tool>> {
-        self.state().tools.clone()
+        self.state()
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|cached| cached.tool.clone()).collect())
     }
     pub(crate) fn invalidate(&self) {
         let mut state = self.state();
@@ -61,7 +65,7 @@ impl ToolsCache {
     pub(crate) async fn list(
         &self,
         fetch: impl Future<Output = Result<Vec<Tool>>>,
-    ) -> Result<Vec<Tool>> {
+    ) -> Result<Vec<CachedTool>> {
         let (generation, sequence) = {
             let mut state = self.state();
             if state.cache_tools_list
@@ -74,7 +78,7 @@ impl ToolsCache {
             state.refresh_sequence += 1;
             (state.generation, state.refresh_sequence)
         };
-        let tools = fetch.await?;
+        let tools: Vec<CachedTool> = fetch.await?.into_iter().map(CachedTool::from).collect();
         let mut state = self.state();
         if generation == state.generation && sequence > state.last_published_sequence {
             state.tools = Some(tools.clone());
@@ -96,11 +100,12 @@ impl ToolsCache {
         let Some(tool) = state
             .tools
             .as_ref()
-            .and_then(|tools| tools.iter().find(|tool| tool.name == name))
+            .and_then(|tools| tools.iter().find(|cached| cached.tool.name == name))
         else {
             return Ok(());
         };
         let Some(required) = tool
+            .tool
             .input_schema
             .get("required")
             .and_then(serde_json::Value::as_array)

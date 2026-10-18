@@ -169,6 +169,10 @@ pub(crate) fn lift_history_item(
         }
         "mcp_approval_request" => RunItemKind::McpApprovalRequest(lift_mcp_request(item)?),
         "mcp_approval_response" => RunItemKind::McpApprovalResponse(lift_mcp_response(item)?),
+        "mcp_list_tools" => {
+            RunItemKind::McpListTools(super::super::responses::mcp::lift_list(item))
+        }
+        "mcp_call" => RunItemKind::McpCall(super::super::responses::mcp::lift_call(item)?),
         "compaction" => RunItemKind::ProviderCompaction(convert_compaction(item, provider)),
         other => {
             return Err(behavior_error(format!(

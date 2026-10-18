@@ -327,6 +327,50 @@ fn test_single_step_result_09() {
 }
 
 #[test]
+fn classification_may_attach_display_metadata_but_cannot_rewrite_hosted_call_payloads() {
+    use ra_core::item::McpCall;
+    let original = item(
+        "hosted",
+        RunItemKind::McpCall(McpCall::new("hosted", "docs", "search", "{}")),
+    );
+    let decorated = original
+        .clone()
+        .with_tool_call_metadata(Some("Search docs".into()), Some("Search".into()));
+    let processed = ProcessedResponse::builder()
+        .item(decorated.clone())
+        .build()
+        .unwrap();
+    SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![original.clone()]))
+        .processed_response(processed)
+        .next_step(NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        })
+        .session_step_items(vec![decorated])
+        .build()
+        .unwrap();
+    let rewritten = item(
+        "hosted",
+        RunItemKind::McpCall(McpCall::new("hosted", "other-server", "search", "{}")),
+    )
+    .with_tool_call_metadata(Some("Search docs".into()), Some("Search".into()));
+    let processed = ProcessedResponse::builder()
+        .item(rewritten.clone())
+        .build()
+        .unwrap();
+    let error = SingleStepResult::builder()
+        .model_response(ModelResponse::new(vec![original]))
+        .processed_response(processed)
+        .next_step(NextStep::FinalOutput {
+            reason: FinishReason::Final,
+        })
+        .session_step_items(vec![rewritten])
+        .build()
+        .unwrap_err();
+    assert!(error.to_string().contains("different content"));
+}
+
+#[test]
 fn test_single_step_result_10() {
     // The channel is a conclusion about how this turn ended, and the provider does not decide it — it
     // is free to ask for a tool and mark the message `final` in the same breath. So settlement may

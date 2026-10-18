@@ -180,6 +180,9 @@ impl Tool for McpTool {
     fn schema(&self) -> &ToolSchema {
         &self.schema
     }
+    fn title(&self) -> Option<&str> {
+        self.info.title()
+    }
     fn options(&self) -> ToolOptions {
         self.options.clone()
     }
@@ -220,14 +223,16 @@ pub async fn discover_tools_with_context(
             return Err(Error::config("duplicate MCP server name"));
         }
         let instructions = client.server_instructions().map(str::to_owned);
-        let tools = client.list_tools_with_context(run_context, agent).await?;
+        let tools = client
+            .list_cached_tools_with_context(run_context, agent)
+            .await?;
         infos.extend(
             filter
                 .apply(tools, run_context, agent, client.server_name())
                 .await?
                 .into_iter()
                 .map(|tool| {
-                    McpToolInfo::new(client.server_name(), tool)
+                    McpToolInfo::from_cached(client.server_name(), tool)
                         .with_server_index(server_index)
                         .with_namespace_description(instructions.clone())
                 }),
