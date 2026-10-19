@@ -12,9 +12,10 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-tools/src/mcp_ns.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp_resource.rs; mcp_resource_spec.rs; mcp_resource/*.rs; codex-rs/codex-mcp/src/connection_manager/resources.rs |
 | `crates/ra-coding/src/mcp/startup.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager/startup.rs; src/connection_manager.rs; src/rmcp_client.rs |
 | `crates/ra-mcp/src/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/mcp/mod.rs |
-| `crates/ra-mcp/src/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/pagination.rs; codex-rs/rmcp-client/src/rmcp_client.rs |
+| `crates/ra-mcp/src/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/pagination.rs; src/connection_manager/resources.rs; codex-rs/rmcp-client/src/rmcp_client.rs |
 | `crates/ra-mcp/src/client/stdio.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/stdio_server_launcher.rs; src/utils.rs; codex-rs/protocol/src/shell_environment.rs |
 | `crates/ra-mcp/src/client/stdio/encoding.rs` | modelcontextprotocol/rust-sdk | 79437f291b2c44053d00dcd5db969fd0cca7c887 | crates/rmcp/src/transport/child_process.rs |
 | `crates/ra-mcp/src/client/http.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/rmcp_client.rs; src/http_headers.rs |

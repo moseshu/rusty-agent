@@ -98,6 +98,19 @@ impl ServerHandler for Catalog {
         self.2.fetch_add(1, Ordering::SeqCst);
         Ok(ListResourceTemplatesResult::default())
     }
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<ReadResourceResponse, rmcp::ErrorData> {
+        Ok(
+            serde_json::from_value::<ReadResourceResult>(json!({"contents":[{
+                "uri":request.uri,"text":format!("session generation {}",self.0)
+            }]}))
+            .unwrap()
+            .into(),
+        )
+    }
 }
 struct Probe {
     name: String,
@@ -253,6 +266,12 @@ async fn names(runtime: &CodingMcpRuntime) -> Vec<String> {
         .await
         .unwrap()
         .into_iter()
+        .filter(|tool| {
+            !matches!(
+                tool.schema().name(),
+                "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource"
+            )
+        })
         .map(|tool| tool.schema().name().to_owned())
         .collect()
 }
@@ -913,3 +932,6 @@ mod thread_preparation;
 
 #[path = "runtime_controls/shared_startup.rs"]
 mod shared_startup;
+
+#[path = "runtime_controls/resources.rs"]
+mod resources;

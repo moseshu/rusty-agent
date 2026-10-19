@@ -52,7 +52,12 @@ async fn failed_listing_does_not_abort_the_runners_model_call() {
                     .iter()
                     .map(|tool| tool.name())
                     .collect::<Vec<_>>(),
-                ["echo_1"]
+                [
+                    "echo_1",
+                    "list_mcp_resources",
+                    "list_mcp_resource_templates",
+                    "read_mcp_resource"
+                ]
             );
             Ok(ModelResponse::new(vec![RunItem::new(
                 ItemId::new("final"),

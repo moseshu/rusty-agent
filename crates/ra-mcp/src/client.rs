@@ -56,8 +56,9 @@ pub const MAX_MCP_CATALOG_ITEMS: usize = 2_048;
 /// Server options shared by all transports, including discovery, approval and tool guardrails.
 ///
 /// As in Python, an enabled session timeout bounds every request: initialize, each tools/list
-/// or prompts/list page, and resource requests. Catalog bounds are opt-in product policy.
-/// Codex's per-server tool timeout can replace the session timeout for calls.
+/// or prompts/list page, and the single-page resource requests. Catalog bounds are opt-in product
+/// policy. Codex's per-server tool timeout can replace the session timeout for calls, including
+/// the Codex-style resource aggregation and the model-facing resource tools.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_field_names)] // Each timeout bounds a different protocol scope.
 pub struct McpClientOptions {
@@ -471,23 +472,90 @@ impl McpClient {
     }
     /// Fetches one resource page; the caller owns pagination, including empty cursors.
     pub async fn list_resources(&self, cursor: Option<String>) -> Result<ListResourcesResult> {
+        self.list_resources_with_timeout(cursor, self.options().session_timeout)
+            .await
+    }
+    /// Fetches one resource page with an explicit per-request deadline, as Codex's resource tools
+    /// apply the server's tool timeout. `None` disables the deadline.
+    pub async fn list_resources_with_timeout(
+        &self,
+        cursor: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<ListResourcesResult> {
         let request = cursor.map_or_else(ListResourcesRequest::default, |cursor| {
             ListResourcesRequest::with_param(
                 PaginatedRequestParams::default().with_cursor(Some(cursor)),
             )
         });
         match self
-            .request(ClientRequest::ListResourcesRequest(request))
+            .request_with_timeout(ClientRequest::ListResourcesRequest(request), timeout)
             .await?
         {
             ServerResult::ListResourcesResult(result) => Ok(result),
             _ => Err(unexpected_response()),
         }
     }
+    /// Collects all resource pages with Codex's aggregation defaults: 100 pages, 2048 items,
+    /// 64 KiB cursors and a 30-second deadline. Explicit catalog settings override these defaults;
+    /// an explicit tool timeout supplies the overall deadline when no catalog timeout is set.
+    /// As in Codex, each page uses the tool-call deadline ([`McpClientOptions::tool_timeout`]).
+    /// Python-compatible single-page requests and other catalog defaults remain unchanged.
+    pub async fn list_all_resources(&self) -> Result<Vec<rmcp::model::Resource>> {
+        collect_paginated(
+            &self.resource_catalog_options(),
+            "resources/list",
+            |params| async move {
+                let page = self
+                    .list_resources_with_timeout(
+                        params.and_then(|params| params.cursor),
+                        self.options().tool_timeout(),
+                    )
+                    .await?;
+                Ok((page.resources, page.next_cursor))
+            },
+        )
+        .await
+    }
+    /// Collects all resource-template pages with the same policy as [`Self::list_all_resources`].
+    pub async fn list_all_resource_templates(&self) -> Result<Vec<rmcp::model::ResourceTemplate>> {
+        collect_paginated(
+            &self.resource_catalog_options(),
+            "resources/templates/list",
+            |params| async move {
+                let page = self
+                    .list_resource_templates_with_timeout(
+                        params.and_then(|params| params.cursor),
+                        self.options().tool_timeout(),
+                    )
+                    .await?;
+                Ok((page.resource_templates, page.next_cursor))
+            },
+        )
+        .await
+    }
+    fn resource_catalog_options(&self) -> McpClientOptions {
+        let mut options = self.options().clone();
+        options.max_list_pages = options.max_list_pages.or(NonZeroUsize::new(100));
+        options.max_catalog_items = options.max_catalog_items.or(Some(MAX_MCP_CATALOG_ITEMS));
+        options.catalog_timeout = options
+            .catalog_timeout
+            .or(options.tool_timeout)
+            .or(Some(DEFAULT_CATALOG_TIMEOUT));
+        options
+    }
     /// Fetches one resource-template page without aggregating or clearing its cursor.
     pub async fn list_resource_templates(
         &self,
         cursor: Option<String>,
+    ) -> Result<ListResourceTemplatesResult> {
+        self.list_resource_templates_with_timeout(cursor, self.options().session_timeout)
+            .await
+    }
+    /// Fetches one resource-template page with an explicit per-request deadline.
+    pub async fn list_resource_templates_with_timeout(
+        &self,
+        cursor: Option<String>,
+        timeout: Option<Duration>,
     ) -> Result<ListResourceTemplatesResult> {
         let request = cursor.map_or_else(ListResourceTemplatesRequest::default, |cursor| {
             ListResourceTemplatesRequest::with_param(
@@ -495,7 +563,10 @@ impl McpClient {
             )
         });
         match self
-            .request(ClientRequest::ListResourceTemplatesRequest(request))
+            .request_with_timeout(
+                ClientRequest::ListResourceTemplatesRequest(request),
+                timeout,
+            )
             .await?
         {
             ServerResult::ListResourceTemplatesResult(result) => Ok(result),
@@ -504,10 +575,22 @@ impl McpClient {
     }
     /// Reads a resource URI through MCP; the URI is not treated as a host file or URL.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
+        self.read_resource_with_timeout(uri, self.options().session_timeout)
+            .await
+    }
+    /// Reads a resource URI with an explicit per-request deadline.
+    pub async fn read_resource_with_timeout(
+        &self,
+        uri: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ReadResourceResult> {
         match self
-            .request(ClientRequest::ReadResourceRequest(
-                ReadResourceRequest::new(ReadResourceRequestParams::new(uri)),
-            ))
+            .request_with_timeout(
+                ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
+                    ReadResourceRequestParams::new(uri),
+                )),
+                timeout,
+            )
             .await?
         {
             ServerResult::ReadResourceResult(result) => Ok(result),
@@ -515,13 +598,16 @@ impl McpClient {
         }
     }
     async fn request(&self, request: ClientRequest) -> Result<ServerResult> {
-        self.send_request(
-            self.peer().await?,
-            request,
-            self.options().session_timeout,
-            None,
-        )
-        .await
+        self.request_with_timeout(request, self.options().session_timeout)
+            .await
+    }
+    async fn request_with_timeout(
+        &self,
+        request: ClientRequest,
+        timeout: Option<Duration>,
+    ) -> Result<ServerResult> {
+        self.send_request(self.peer().await?, request, timeout, None)
+            .await
     }
     async fn send_request(
         &self,

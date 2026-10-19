@@ -19,6 +19,7 @@ ra-protocol = { path = "../../crates/ra-protocol", features = ["test-api"] }
 ra-mcp = { path = "../../crates/ra-mcp", features = ["http"] }
 ra-core = { path = "../../crates/ra-core" }
 ra-runtime = { path = "../../crates/ra-runtime" }
+ra-tools = { path = "../../crates/ra-tools" }
 ra-model = { path = "../../crates/ra-model", features = ["anthropic"] }
 wiremock = "0.6"
 axum = "0.8"

@@ -5,6 +5,13 @@ and initialize-error fix verification on 2026-10-17; both roadmap tasks are DONE
 Streamable HTTP follow-up has also passed its recorded review. The shared session supports
 tools, prompts and resources. Other MCP roadmap slices remain separate.
 
+The model-facing resource tools are implemented in `ra-tools::mcp_ns::resource_tools` and installed
+by the coding MCP runtime for each model call with enabled servers; a request waits for a server
+that is still starting. They preserve the separate `list_mcp_resources`,
+`list_mcp_resource_templates` and `read_mcp_resource` contracts. Implementation, upstream mapping,
+adaptations and review status are recorded in
+[the resource tool notes](../../Docs/MCP_Resource_Tools_Contract.md).
+
 Tool filtering/cache passed re-review on 2026-10-18. The contract and validation record is in
 [the filtering/cache notes](../../Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md).
 Metadata resolution, caching and tool-call display metadata passed re-review on 2026-10-18; see

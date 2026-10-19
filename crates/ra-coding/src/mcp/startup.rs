@@ -261,6 +261,31 @@ pub(super) struct DeferredClient {
     pub(super) epoch: u64,
     pub(super) resolved: tokio::sync::OnceCell<ra_mcp::client::McpClient>,
 }
+
+// Adapter primary messages are already sanitized. Keep host display labels and the original
+// source chain out of the model's diagnostic, while retaining that chain for the host.
+fn startup_failure(error: Arc<Error>) -> Error {
+    let mut primary = error.as_ref();
+    while let Error::Run { error, .. } = primary {
+        primary = error;
+    }
+    let message = match primary {
+        Error::Config { message, .. }
+        | Error::Caller { message, .. }
+        | Error::Provider { message, .. }
+        | Error::Tool { message, .. }
+        | Error::Sandbox { message, .. }
+        | Error::Session { message, .. }
+        | Error::Protocol { message, .. }
+        | Error::Budget { message, .. }
+        | Error::Guardrail { message, .. }
+        | Error::InvalidFinalOutput { message, .. } => format!("MCP startup failed: {message}"),
+        Error::Cancelled { .. } => "MCP startup cancelled".to_owned(),
+        _ => "MCP startup failed".to_owned(),
+    };
+    Error::config(message).with_source(error)
+}
+
 #[async_trait]
 impl McpToolClientSource for DeferredClient {
     async fn client(&self) -> Result<ra_mcp::client::McpClient> {
@@ -297,7 +322,15 @@ impl McpToolClientSource for DeferredClient {
                 let mut attempt = pending
                     .or_else(|| self.entry.launch_startup(false, recovery))
                     .ok_or_else(|| {
-                        Error::config("MCP startup recovery is unavailable or cooling down")
+                        let state = self
+                            .entry
+                            .state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        state.failure.as_ref().map_or_else(
+                            || Error::config("MCP startup recovery is unavailable or cooling down"),
+                            |(_, error)| startup_failure(error.clone()),
+                        )
                     })?;
                 let result = loop {
                     if let Some(result) = attempt.borrow().clone() {
@@ -319,7 +352,7 @@ impl McpToolClientSource for DeferredClient {
                         "MCP tool binding was replaced",
                     ));
                 }
-                result.map_err(|error| Error::config("MCP startup failed").with_source(error))
+                result.map_err(startup_failure)
             })
             .await?;
         Ok(client.clone())

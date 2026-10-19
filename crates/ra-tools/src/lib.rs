@@ -30,7 +30,7 @@
 //!
 //! **The module list is the complete advertised tool set**, and it is complete before the tools
 //! are: a module that does not exist yet is a module the next implementer fills in somewhere else.
-//! [`mcp_ns`] remains a placeholder. [`tool_search`] is assembled by the runtime from its enabled
+//! [`mcp_ns`] supplies three independent resource tools. [`tool_search`] is assembled by the runtime from its enabled
 //! registry snapshot, which owns the discovery index and invocation lifecycle.
 //!
 //! [`capability`] is the one module that advertises nothing. It packages the tools below into the

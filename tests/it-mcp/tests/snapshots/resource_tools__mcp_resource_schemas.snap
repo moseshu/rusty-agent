@@ -1,0 +1,67 @@
+---
+source: it-mcp/tests/resource_tools.rs
+expression: definitions
+---
+[
+  {
+    "description": "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.",
+    "name": "list_mcp_resources",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor from a previous list_mcp_resources call; omit for the first page.",
+          "type": "string"
+        },
+        "server": {
+          "description": "MCP server name. Omit to list resources from every configured server.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "strict": false
+  },
+  {
+    "description": "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.",
+    "name": "list_mcp_resource_templates",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor from a previous list_mcp_resource_templates call; omit for the first page.",
+          "type": "string"
+        },
+        "server": {
+          "description": "MCP server name. Omit to list resource templates from every configured server.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "strict": false
+  },
+  {
+    "description": "Read a specific resource from an MCP server given the server name and resource URI.",
+    "name": "read_mcp_resource",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "description": "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources.",
+          "type": "string"
+        },
+        "uri": {
+          "description": "Resource URI to read. Must be one of the URIs returned by list_mcp_resources.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "uri"
+      ],
+      "type": "object"
+    },
+    "strict": false
+  }
+]

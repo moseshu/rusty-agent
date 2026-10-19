@@ -90,7 +90,7 @@ fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
     let exec_command = host.exec_command_tool().expect("exec_command builds");
     let write_stdin = host.write_stdin_tool().expect("write_stdin builds");
     let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
-    vec![
+    let mut definitions = vec![
         read_file.model_definition(),
         grep.model_definition(),
         glob.model_definition(),
@@ -99,7 +99,14 @@ fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
         exec_command.model_definition(),
         write_stdin.model_definition(),
         apply_patch.model_definition(),
-    ]
+    ];
+    definitions.extend(
+        ra_tools::mcp_ns::resource_tools(Vec::new())
+            .expect("resource tool schemas need no live connection")
+            .into_iter()
+            .map(|tool| tool.model_definition()),
+    );
+    definitions
 }
 
 fn handoff_definition() -> ModelHandoffDefinition {

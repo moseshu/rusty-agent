@@ -597,6 +597,36 @@ impl Drop for CodingMcpRuntime {
     }
 }
 
+impl CodingMcpRuntime {
+    /// Resource-helper sources for one model call.
+    fn resource_sources(&self) -> Vec<(String, Arc<dyn McpToolClientSource>)> {
+        // Codex advertises resource helpers whenever MCP servers are configured and lets each
+        // request wait for its connection. A connected session is captured as is; any other
+        // enabled server gets the same deferred binding as cached function tools.
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if !state.enabled || state.stopped {
+                    return None;
+                }
+                let connected = (state.status == Status::Connected)
+                    .then(|| entry.server.current_client().ok())
+                    .flatten();
+                let source = match connected {
+                    Some(client) => Arc::new(client) as Arc<dyn McpToolClientSource>,
+                    None => Arc::new(DeferredClient {
+                        entry: entry.clone(),
+                        epoch: state.epoch,
+                        resolved: tokio::sync::OnceCell::new(),
+                    }),
+                };
+                Some((entry.server.name().to_owned(), source))
+            })
+            .collect()
+    }
+}
+
 #[async_trait]
 impl ToolResolver for CodingMcpRuntime {
     fn requires_reserved_tool_names(&self) -> bool {
@@ -679,7 +709,8 @@ impl ToolResolver for CodingMcpRuntime {
         .into_iter()
         .flatten()
         .collect::<Vec<McpToolCatalogSource>>();
-        Ok(discover_catalog_tools(
+        let resource_sources = self.resource_sources();
+        let mut tools = discover_catalog_tools(
             &catalogs,
             &self.discovery,
             reserved,
@@ -689,7 +720,15 @@ impl ToolResolver for CodingMcpRuntime {
         .await?
         .into_iter()
         .map(|tool| tool as Arc<dyn Tool>)
-        .collect())
+        .collect::<Vec<_>>();
+        // Resource helpers are ordinary advertised tools, independent of server tool filtering,
+        // tools/list failures and deferred function discovery. Their sessions share the same owner.
+        if !resource_sources.is_empty() {
+            tools.extend(ra_tools::mcp_ns::resource_tools_from_sources(
+                resource_sources,
+            )?);
+        }
+        Ok(tools)
     }
 }
 
