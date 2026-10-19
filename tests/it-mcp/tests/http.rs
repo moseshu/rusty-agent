@@ -112,6 +112,30 @@ impl Drop for Server {
         self.task.abort();
     }
 }
+
+#[tokio::test]
+async fn manager_reconnect_replaces_http_session_and_cleanup_deletes_it_once() {
+    use ra_mcp::{McpServerManager, McpServerManagerOptions};
+    let fixture = Server::new().await;
+    let server = Arc::new(McpServerStreamableHttp::new(fixture.params()));
+    let manager = McpServerManager::with_options(
+        [server.clone() as Arc<dyn McpServer>],
+        McpServerManagerOptions::default().with_connect_in_parallel(true),
+    );
+    assert_eq!(manager.connect_all().await.unwrap().len(), 1);
+    assert_eq!(server.session_id().as_deref(), Some("session-0"));
+    server.list_tools().await.unwrap();
+    assert_eq!(manager.reconnect(true).await.unwrap().len(), 1);
+    assert_eq!(fixture.requests("initialize").len(), 1);
+    assert_eq!(manager.reconnect(false).await.unwrap().len(), 1);
+    assert_eq!(server.session_id().as_deref(), Some("session-1"));
+    assert_eq!(fixture.requests("DELETE").len(), 1);
+    manager.cleanup_all().await.unwrap();
+    assert_eq!(fixture.requests("DELETE").len(), 2);
+    assert!(manager.active_servers().is_empty());
+    assert!(!server.is_connected().await);
+}
+
 async fn handle(
     State(state): State<Arc<Fixture>>,
     method: Method,

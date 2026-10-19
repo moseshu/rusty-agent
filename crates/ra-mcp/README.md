@@ -11,6 +11,10 @@ Metadata resolution, caching and tool-call display metadata passed re-review on 
 [the metadata notes](../../Docs/R11-12_MCP_工具元数据解析_契约与验证.md).
 Local tool approval and server tool guardrails passed review and re-review on 2026-10-19; see
 [the approval notes](../../Docs/R11-5_MCP_工具审批_契约与验证.md).
+Lifecycle task affinity passed review, re-review of its fixes, and final verification on
+2026-10-19.
+The manager, upstream mapping, Rust adaptations and validation are recorded in
+[the lifecycle notes](../../Docs/R11-6b_MCP_生命周期_task_affinity_契约与验证.md).
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -24,6 +28,43 @@ path or its git-only changes.
 
 Enable `ra-mcp/http` for Streamable HTTP; stdio is enabled by default.
 The common session and in-process server also compile with default features off.
+
+`McpServerManager` owns one lifecycle worker per server. Configure connect/cleanup deadlines
+and scheduling through `McpServerManagerOptions`, then await `connect_all()` and
+`cleanup_all()` around the host's run. Both sequential and parallel connections keep cleanup
+on the owning task, even when host calls originate from different tasks. The active/failed
+server and error views are detached snapshots; server identity is the `Arc` instance, not its
+name. The active view is published at lifecycle boundaries; reading it or changing its filter
+does not publish intermediate connected state. `reconnect(true)` retries failures after cleanup;
+`reconnect(false)` cleans and retries all.
+Parallel workers retain a failed cleanup outcome and block reconnection. Sequential cleanup
+may be retried on the original task, following Python's sequential semantics.
+Worker panics retain their original `JoinError` and propagate even when cancellation is
+suppressed. A private source marker distinguishes the manager worker's panic from an ordinary
+server-returned error carrying its own child task's `JoinError`. Finished workers without cleanup
+failures can be replaced; cleanup panic results remain recorded and block reconnection.
+
+```rust,no_run
+use std::sync::Arc;
+use ra_mcp::{McpServer, McpServerManager, McpServerManagerOptions};
+
+async fn manage(servers: Vec<Arc<dyn McpServer>>) -> ra_mcp::manager::McpLifecycleResult<()> {
+    let manager = McpServerManager::with_options(
+        servers,
+        McpServerManagerOptions::default().with_connect_in_parallel(true),
+    );
+    let _available = manager.connect_all().await?;
+    // Run the host's agent with the available servers here.
+    manager.cleanup_all().await
+}
+```
+
+Dropping a cleanup waiter leaves its worker and outcome alive. A server-returned cancellation
+is recorded and can be suppressed by configuration; Rust cannot suppress the caller dropping
+its future. Dropping the manager signals emergency cleanup on the owning tasks, bounded by
+the current cleanup timeout. Keep the Tokio runtime alive and explicitly await `cleanup_all()`
+when completion must be observed. Do not mix manager-owned lifecycle calls with direct
+`server.connect()` / `server.cleanup()` calls on the same instance.
 
 ```rust,no_run
 use std::sync::Arc;

@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod client;
 pub mod filter;
 pub mod in_process;
+pub mod manager;
 pub mod metadata;
 pub mod resolver;
 #[cfg(feature = "http")]
@@ -22,6 +23,7 @@ mod rustls_provider;
 pub mod server;
 pub mod tool;
 
+pub use manager::{McpServerManager, McpServerManagerOptions};
 pub use server::McpServer;
 
 // Protocol types stay in this adapter crate; hosts can implement an in-process MCP handler.
