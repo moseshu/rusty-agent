@@ -107,7 +107,10 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::{
-    agent::{AgentBinding, control::partial_history},
+    agent::{
+        AgentBinding,
+        control::{AgentControl, partial_history},
+    },
     runner::{
         ContinuationInput, LiveRunSettings, PendingInput, RunConfig, RunOutcome, RunRequest,
         RunStreamEvent, Runner,
@@ -498,6 +501,7 @@ pub struct AgentThreadBuilder {
     services: ToolServices,
     history: Vec<ModelInputItem>,
     rollout: Option<Arc<dyn RolloutRecorder>>,
+    agent_control: Option<AgentControl>,
 }
 
 impl AgentThreadBuilder {
@@ -516,6 +520,14 @@ impl AgentThreadBuilder {
     /// Gives every turn `services`.
     pub fn with_services(mut self, services: ToolServices) -> Self {
         self.services = services;
+        self
+    }
+
+    /// Owns this thread's collaboration tree and binds every turn, including approval resumes,
+    /// to its root. Shutdown cancels and waits for the tree's background agents; interrupting a
+    /// turn leaves them alive, following the control tree's cancellation policy.
+    pub fn with_agent_control(mut self, control: AgentControl) -> Self {
+        self.agent_control = Some(control);
         self
     }
 
@@ -596,6 +608,7 @@ impl AgentThreadBuilder {
                 model_resolver: self.model_resolver,
                 services: self.services,
                 rollout: self.rollout,
+                agent_control: self.agent_control,
                 state: Mutex::new(ThreadState {
                     history: self.history,
                     config: self.config,
@@ -633,6 +646,7 @@ struct ThreadInner {
     model_resolver: Arc<dyn ModelResolver>,
     services: ToolServices,
     rollout: Option<Arc<dyn RolloutRecorder>>,
+    agent_control: Option<AgentControl>,
     state: Mutex<ThreadState>,
     /// Woken when a turn ends, for a start that waits for a finishing turn to be gone.
     turn_ended: Notify,
@@ -677,6 +691,12 @@ struct PausedTurn {
 }
 
 impl AgentThread {
+    /// The collaboration tree owned by this thread, when it has one. Hosts use it to route
+    /// spawned agents' approval checkpoints independently of the parent turn's lifecycle.
+    #[must_use]
+    pub fn agent_control(&self) -> Option<&AgentControl> {
+        self.inner.agent_control.as_ref()
+    }
     /// A thread of `thread_id` whose turns `agent` runs on models `model_resolver` resolves.
     pub fn builder(
         thread_id: SessionId,
@@ -692,6 +712,7 @@ impl AgentThread {
             services: ToolServices::new(),
             history: Vec::new(),
             rollout: None,
+            agent_control: None,
         }
     }
 
@@ -1096,6 +1117,9 @@ impl AgentThread {
             };
             ended.await;
         }
+        if let Some(control) = &self.inner.agent_control {
+            control.shutdown().await;
+        }
         if let Some(rollout) = &self.inner.rollout
             && let Err(error) = rollout.flush().await
         {
@@ -1475,6 +1499,9 @@ async fn run_to_end(
             .with_services(inner.services.clone())
             .with_pending_input(pending.clone());
         request = request.with_live_settings(settings.clone());
+        if let Some(control) = &inner.agent_control {
+            request = request.with_agent_control(control.root());
+        }
         request = request.with_rollout_recorder(recorder.clone());
         request = request.with_model_stream_sink(recorder.clone());
         if let Some(output_schema) = output_schema {
@@ -1577,7 +1604,7 @@ fn cancel_paused(
 }
 
 /// Repeated stops of one run still have distinct approval item identities.
-fn same_approval_pause(left: &RunState, right: &RunState) -> bool {
+pub(crate) fn same_approval_pause(left: &RunState, right: &RunState) -> bool {
     left.run_id() == right.run_id()
         && left
             .pending_interruption_items()

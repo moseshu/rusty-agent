@@ -54,8 +54,14 @@ struct StubTool {
 
 impl StubTool {
     fn shared(name: &str) -> Arc<dyn Tool> {
+        Self::for_key(&ToolLookupKey::bare(name).expect("a valid tool name"))
+    }
+
+    /// A stub registered under `key`, namespace included.
+    fn for_key(key: &ToolLookupKey) -> Arc<dyn Tool> {
+        let name = key.name();
         Arc::new(Self {
-            origin: ToolOrigin::new(name).expect("a valid tool name"),
+            origin: ToolOrigin::from_lookup_key(key.clone()).expect("a valid lookup key"),
             schema: ToolSchema::new(
                 name,
                 json!({
@@ -251,17 +257,16 @@ fn implemented_core_tools(workspace: &TempDir) -> Vec<Arc<dyn Tool>> {
 fn registry_for(profile: CodingProfile) -> ToolRegistry {
     let mut builder = ToolRegistry::builder();
     for key in selected_keys(profile) {
-        builder = builder.register(StubTool::shared(key.name()));
+        builder = builder.register(StubTool::for_key(&key));
     }
     builder.build().expect("a valid registry")
 }
 
 #[test]
 fn test_the_default_surface_is_the_codex_like_one() {
-    // Fifteen entries against Codex's measured sixteen. The default is the tier the product is
-    // actually sized for, not the smallest one it can run.
+    // The standard tier preserves all six independent collaboration tools.
     assert_eq!(CodingProfile::default(), CodingProfile::CodexLike);
-    assert_eq!(selected_keys(CodingProfile::CodexLike).len(), 15);
+    assert_eq!(selected_keys(CodingProfile::CodexLike).len(), 18);
 }
 
 #[test]
@@ -293,8 +298,8 @@ fn test_the_tiers_hold_the_measured_bounds() {
         .to_tool_profile()
         .expect("a valid profile");
     assert_eq!(codex_like.id().as_str(), "codex_like");
-    assert_eq!(codex_like.budget().min_advertised(), 14);
-    assert_eq!(codex_like.budget().max_advertised(), 16);
+    assert_eq!(codex_like.budget().min_advertised(), 17);
+    assert_eq!(codex_like.budget().max_advertised(), 20);
 
     // The ceiling is Claude Code's 24; the floor stays the standard surface's, because `full` is
     // that surface plus whatever else the host installed.
@@ -302,7 +307,7 @@ fn test_the_tiers_hold_the_measured_bounds() {
         .to_tool_profile()
         .expect("a valid profile");
     assert_eq!(full.id().as_str(), "full");
-    assert_eq!(full.budget().min_advertised(), 14);
+    assert_eq!(full.budget().min_advertised(), 17);
     assert_eq!(full.budget().max_advertised(), 24);
     assert_eq!(full.selection(), &ToolSelection::AllRegistered);
 
@@ -339,7 +344,7 @@ fn test_the_standard_surface_contains_the_core_one() {
         );
     }
     // Widening a tier must not swap tools out from under the prompt that describes them.
-    assert_eq!(codex_like.len(), core.len() + 9);
+    assert_eq!(codex_like.len(), core.len() + 12);
 }
 
 #[test]
@@ -621,7 +626,10 @@ fn test_switching_the_tier_switches_the_tools_and_the_inventory_together() {
         let surface = registry
             .assemble(&tier.to_tool_profile().expect("a valid profile"))
             .expect("a declared tier assembles");
-        let advertised: Vec<String> = surface.advertised_names().map(str::to_owned).collect();
+        // The surface is ordered by routing identity, which puts namespaced entries after bare
+        // ones; the inventory is ordered by the name the model calls.
+        let mut advertised: Vec<String> = surface.advertised_names().map(str::to_owned).collect();
+        advertised.sort();
         let prefix = assemble_stable_prefix_for_surface(&PromptRole::Main, &surface, &[])
             .expect("the prefix assembles for an assembled surface");
         let instructions = prefix.system_instructions().to_owned();
@@ -635,14 +643,14 @@ fn test_switching_the_tier_switches_the_tools_and_the_inventory_together() {
 
     let [(core, core_prefix), (codex_like, _)] = assembled;
     assert_eq!(core.len(), 6);
-    assert_eq!(codex_like.len(), 15);
+    assert_eq!(codex_like.len(), 18);
     for name in &core {
         assert!(
             codex_like.contains(name),
             "widening the tier dropped `{name}` from the inventory"
         );
     }
-    // The narrower tier does not merely inventory less. The nine entries it drops are absent from
+    // The narrower tier does not merely inventory less. The additional entries are absent from
     // the whole prefix, which is the failure this path exists to prevent: a section elsewhere in
     // the text still telling the model to reach for a tool the request no longer carries.
     for name in codex_like.iter().filter(|name| !core.contains(name)) {
@@ -1003,8 +1011,8 @@ fn backticked(content: &str) -> Vec<String> {
 
 /// A tier the installed capabilities cannot satisfy fails before an agent exists.
 ///
-/// The default tier names nine entries nobody has written, and this is what that costs: no agent,
-/// rather than one whose prompt describes a surface the provider was never sent.
+/// The standard tier requires configured backend services. Missing services fail before an agent
+/// can advertise their tools.
 #[tokio::test]
 async fn test_a_tier_the_host_cannot_satisfy_refuses_to_build_an_agent() {
     let workspace = TempDir::new().expect("a workspace");
@@ -1018,7 +1026,7 @@ async fn test_a_tier_the_host_cannot_satisfy_refuses_to_build_an_agent() {
         CodingProfile::default(),
     )
     .await
-    .expect_err("the default tier must not build while its entries are unwritten");
+    .expect_err("the standard tier requires configured services");
 
     let message = error.to_string();
     assert!(message.contains("codex_like"), "{message}");

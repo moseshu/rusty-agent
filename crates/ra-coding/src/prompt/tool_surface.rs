@@ -50,14 +50,16 @@ const TOKEN_BUDGET: usize = 512;
 pub(crate) struct ToolSurfacePromptBuilder;
 
 impl ToolSurfacePromptBuilder {
-    /// Returns whether an advertised tool has the given model-facing name.
+    /// Returns whether an advertised tool has the given model-facing name, qualified by its
+    /// namespace when it has one.
     ///
     /// This is deliberately the same exposure predicate used by the stable inventory. Prompt
     /// sections that give tool-specific advice must not infer availability from an agent role:
     /// the agent construction path is the only place that knows which tools the provider receives.
     pub(crate) fn contains_advertised_tool(tools: &[Arc<dyn Tool>], name: &str) -> bool {
         tools.iter().any(|tool| {
-            tool.options().is_advertised_to_model() && tool.model_definition().name() == name
+            tool.options().is_advertised_to_model()
+                && tool.model_definition().qualified_name() == name
         })
     }
 
@@ -176,7 +178,8 @@ fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, Conten
         }
 
         let definition = tool.model_definition();
-        let name = definition.name().to_owned();
+        // Qualified, as the model calls it: a namespaced tool is `namespace.name`.
+        let name = definition.qualified_name();
         let fingerprint = definition_fingerprint(&definition)?;
         if entries.insert(name.clone(), fingerprint).is_some() {
             return Err(Error::config(format!(

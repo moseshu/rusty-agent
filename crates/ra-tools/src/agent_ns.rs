@@ -19,12 +19,16 @@
 //!
 //! # Deviations from Codex
 //!
-//! - `spawn_agent` takes no `model` or `reasoning_effort`; Codex also hides those behind
-//!   configuration.
+//! - `spawn_agent` takes no `model` or `reasoning_effort`. Codex's default configuration
+//!   (`expose_spawn_agent_model_overrides`) offers both; per-spawn model and reasoning overrides
+//!   are not ported (see `ra_runtime::agent::control`), so the tool does not offer arguments the
+//!   tree could not honor.
 //! - The argument schemas are non-strict, as Codex declares them, so optional arguments may be
 //!   omitted rather than sent as `null`.
-//! - The tools are offered under their bare names; Codex's optional `collaboration` namespace is a
-//!   product setting.
+//! - The tools are built under their bare names, as Codex's handlers are. Codex's configuration
+//!   then places them in a namespace, `collaboration` by default
+//!   (`multi_agent_v2.tool_namespace`); the assembling host does the same with
+//!   [`CollaborationTool::in_namespace`] and [`COLLABORATION_NAMESPACE`].
 //! - In a tree given a depth limit, an agent at the limit is not offered the tools, as Codex's first
 //!   multi-agent version hides them; the version these tools port has no depth limit.
 
@@ -45,7 +49,7 @@ use ra_core::{
     permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, Tool, ToolAvailability, ToolContext, ToolFailureHandling,
-        ToolInput, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
+        ToolInput, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
     },
 };
 use ra_macros::ToolInput;
@@ -113,6 +117,13 @@ impl Default for WaitAgentTimeoutOptions {
         Self::new()
     }
 }
+
+/// Codex's default namespace for the collaboration tools (`multi_agent_v2.tool_namespace`).
+pub const COLLABORATION_NAMESPACE: &str = "collaboration";
+
+/// What the collaboration namespace is described as: Codex's
+/// `MULTI_AGENT_V2_NAMESPACE_DESCRIPTION`, whatever the namespace is called.
+pub const COLLABORATION_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
 /// The six collaboration tools, with Codex's default `wait_agent` timeouts.
 ///
@@ -360,6 +371,21 @@ impl CollaborationTool {
                 .with_permission_scope(scope),
             wait,
         })
+    }
+
+    /// Advertises the tool in `namespace`, as Codex's configuration wraps each collaboration
+    /// handler in its `tool_namespace`: the model calls it as `namespace.name`, and calls route by
+    /// that namespaced identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when `namespace` cannot hold the tool's name.
+    pub fn in_namespace(mut self, namespace: ToolNamespace) -> Result<Self> {
+        self.origin = ToolOrigin::namespaced(namespace, self.kind.name())?;
+        self.schema = self
+            .schema
+            .with_namespace_description(COLLABORATION_NAMESPACE_DESCRIPTION);
+        Ok(self)
     }
 
     /// Which tool this is.

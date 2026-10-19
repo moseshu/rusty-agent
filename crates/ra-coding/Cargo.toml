@@ -1,6 +1,6 @@
 [package]
 name = "ra-coding"
-description = "编码 agent（产品层）：15 个工具 + 提示词内容 + 编码纪律 + 装配。"
+description = "编码 agent（产品层）：工具面 + 提示词内容 + 编码纪律 + 宿主装配。"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

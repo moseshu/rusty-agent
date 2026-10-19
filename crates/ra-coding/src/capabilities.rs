@@ -1,4 +1,4 @@
-//! Composition of Filesystem / Search / `ViewImage` / Todo / `ApplyPatch` / Shell / Compaction.
+//! Role-aware composition of workspace capabilities and explicitly configured host services.
 //!
 //! The built-in capability types live in [`ra_tools::capability`]; what this module decides is
 //! which of them a coding agent installs for a given role, and in what order. That is the product
@@ -43,7 +43,7 @@
 //! installed there contributes its tools at run assembly and the agent already declares them, so
 //! installing in both places declares one tool twice and fails the build.
 //!
-//! Nor could these four go there *instead*: every one of them contributes
+//! Nor could these tool-bearing capabilities go there *instead*: each contributes
 //! [`Capability::static_instructions`](ra_core::capability::Capability::static_instructions), and
 //! run assembly refuses a capability carrying static prefix text. The framework-level statement of
 //! which route carries which contribution is the table on [`ra_core::capability`]; what follows is
@@ -78,7 +78,7 @@
 //!
 //! [`Capability::deferred_instructions`](ra_core::capability::Capability::deferred_instructions) is
 //! delivered by the turn loop, from the capabilities installed on the run — so a capability that
-//! arrives here instead has no deferred channel. The four below contribute none, and the split
+//! arrives here instead has no deferred channel. The capabilities below contribute none, and the split
 //! costs nothing today; a capability installed on the run configuration, like `compaction`, has the
 //! channel in full, which is the route for a heavy section that ships no tools of its own.
 //!
@@ -91,14 +91,19 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
+use async_trait::async_trait;
 use ra_core::{
     capability::{Capability, CapabilityFamily},
     error::{Error, Result},
     permission::PermissionScope,
     prompt::{PromptRole, PromptSection},
-    tool::{Tool, ToolLookupKey},
+    tool::{Tool, ToolLookupKey, ToolNamespace},
 };
 use ra_runtime::{capability::CapabilityPlan, tool::profile::ToolSurface};
+use ra_tools::{
+    agent_ns::collaboration_tools,
+    request_user_input::{RequestUserInputTool, request_user_input_available_modes},
+};
 
 use crate::{agent::InstalledCapability, host::CodingHost};
 
@@ -124,11 +129,8 @@ impl RoleCapabilities {
     /// naming them: the profile has to be told that an empty surface is this role's shape and not a
     /// tier that lost every entry it declared.
     ///
-    /// **`web` and `skills` are absent here rather than withheld.** Both are constructed from
-    /// something this host does not have — a web backend, a skill catalog — and a role cannot
-    /// withhold a capability nobody could build. The tier still names their entries, so a surface
-    /// missing them fails assembly by name, which is the difference between "this deployment has no
-    /// web access" and "this role does not get it".
+    /// Optional services are installed only when configured on the host. A tier that requires an
+    /// unconfigured service still fails by name; the role filter cannot disguise its absence.
     ///
     /// # Errors
     ///
@@ -136,7 +138,7 @@ impl RoleCapabilities {
     /// set — two capabilities claiming one family, a dependency nothing installs, or a capability
     /// requiring its own family.
     pub(crate) fn resolve(role: &PromptRole, host: &CodingHost) -> Result<Self> {
-        let declared: Vec<Arc<dyn Capability>> = vec![
+        let mut declared: Vec<Arc<dyn Capability>> = vec![
             Arc::new(host.filesystem_capability()?),
             Arc::new(host.search_capability()?),
             Arc::new(host.view_image_capability()?),
@@ -144,14 +146,38 @@ impl RoleCapabilities {
             Arc::new(host.apply_patch_capability()?),
             Arc::new(host.shell_capability()?),
         ];
+        if let Some(capability) = host.web_capability()? {
+            declared.push(Arc::new(capability));
+        }
+        if let Some(capability) = host.skills_capability()? {
+            declared.push(Arc::new(capability));
+        }
+        if host.request_user_input_enabled() {
+            declared.push(Arc::new(ControlCapability::user_input()?));
+        }
+        // A spawned agent is assembled without the collaboration tools unless the host says its
+        // model takes them, as Codex plans a sub-agent session's tools; the family is then
+        // withheld, so the tier's band shrinks with it rather than failing its floor.
+        let mut not_offered: Vec<Arc<dyn Capability>> = Vec::new();
+        if host.collaboration_enabled() {
+            let capability = Arc::new(ControlCapability::collaboration(
+                host.collaboration_namespace()?.as_ref(),
+            )?);
+            if host.collaboration_offered() {
+                declared.push(capability);
+            } else {
+                not_offered.push(capability);
+            }
+        }
 
-        let (installed, withheld) = if role.is_one_off() {
+        let (installed, mut withheld): (Vec<_>, Vec<_>) = if role.is_one_off() {
             (Vec::new(), declared)
         } else if role.is_read_only() {
             declared.into_iter().partition(only_observes)
         } else {
             (declared, Vec::new())
         };
+        withheld.extend(not_offered);
 
         Ok(Self {
             installed: CapabilityPlan::resolve(installed)?,
@@ -242,12 +268,30 @@ impl RoleCapabilities {
         surface: &ToolSurface,
     ) -> Result<(Vec<PromptSection>, Vec<InstalledCapability>)> {
         let charged: BTreeSet<&str> = surface.advertised_names().collect();
-        let mut fragments = self.installed.static_prompt_sections().await?;
+        let contributions: Vec<_> = self
+            .installed
+            .capabilities()
+            .iter()
+            .map(|capability| {
+                let (present, absent) = split_advertised(capability, &charged);
+                (capability, present, absent)
+            })
+            .collect();
+        // Resolve only fragments the tier can use. In particular, a Core agent must not load a
+        // remote skill catalog that its selected tools cannot reach. The installed product
+        // families have no dependencies on each other; the original plan validated their set.
+        let described: Vec<_> = contributions
+            .iter()
+            .filter(|(_, present, absent)| !present.is_empty() || absent.is_empty())
+            .map(|(capability, _, _)| Arc::clone(capability))
+            .collect();
+        let mut fragments = CapabilityPlan::resolve(described)?
+            .static_prompt_sections()
+            .await?;
         let mut kept = Vec::new();
         let mut installed = Vec::new();
 
-        for capability in self.installed.capabilities() {
-            let (present, absent) = split_advertised(capability, &charged);
+        for (capability, present, absent) in contributions {
             // Located by provenance rather than by position: a capability that contributes no
             // fragment leaves no row, so pairing by index would attribute every later fragment to
             // the wrong family. Resolution already refused a fragment whose source is not its own
@@ -289,6 +333,58 @@ impl RoleCapabilities {
     }
 }
 
+/// The capability family of the collaboration tools.
+pub(crate) const COLLABORATION_FAMILY: &str = "collaboration";
+
+/// Product assembly of control tools that already obtain their runtime ports from tool services.
+///
+/// No handler or schema is redefined here, and no prompt text is added: Codex carries the guidance
+/// for these tools in their own descriptions, and the capability only attributes them to a family
+/// a role can withhold as a unit.
+struct ControlCapability {
+    family: CapabilityFamily,
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl ControlCapability {
+    fn user_input() -> Result<Self> {
+        Ok(Self {
+            family: CapabilityFamily::new("user_input")?,
+            tools: vec![Arc::new(RequestUserInputTool::new(
+                request_user_input_available_modes(true),
+            )?)],
+        })
+    }
+
+    /// The six tools, in `namespace` when the host gives one, as Codex's configuration places
+    /// them.
+    fn collaboration(namespace: Option<&ToolNamespace>) -> Result<Self> {
+        let tools = collaboration_tools()?
+            .into_iter()
+            .map(|tool| match namespace {
+                Some(namespace) => tool.in_namespace(namespace.clone()),
+                None => Ok(tool),
+            })
+            .map(|tool| tool.map(|tool| Arc::new(tool) as Arc<dyn Tool>))
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            family: CapabilityFamily::new(COLLABORATION_FAMILY)?,
+            tools,
+        })
+    }
+}
+
+#[async_trait]
+impl Capability for ControlCapability {
+    fn kind(&self) -> CapabilityFamily {
+        self.family.clone()
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.clone()
+    }
+}
+
 /// One capability's advertised entries, split by whether the assembled surface carries them.
 ///
 /// Read once and used for both answers a caller needs — which fragments survive, and which entries
@@ -306,7 +402,7 @@ fn split_advertised(
         .tools()
         .iter()
         .filter(|tool| tool.options().is_advertised_to_model())
-        .map(|tool| tool.model_definition().name().to_owned())
+        .map(|tool| tool.model_definition().qualified_name())
         .collect();
     names.sort();
     names

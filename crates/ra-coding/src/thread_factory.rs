@@ -15,9 +15,10 @@ use ra_protocol::server::{PreparedThread, ThreadFactory, ThreadFactoryRequest};
 use ra_runtime::{agent::AgentBinding, thread::AgentThread};
 
 use crate::{
-    agent::{HOST_BACKED_PROFILE, build_agent_with_profile},
+    agent::{HOST_BACKED_PROFILE, assemble_agent},
     host::CodingHost,
     profile::CodingProfile,
+    spawned,
     thread_settings::CodingThreadSettingsAdapter,
 };
 
@@ -79,6 +80,14 @@ impl CodingThreadFactory {
         self
     }
 
+    /// Enables Codex's optional Default-mode user questions. The app server supplies the port
+    /// that routes each thread's questions to its own client, including after resume or fork.
+    #[must_use]
+    pub fn with_request_user_input(mut self) -> Self {
+        self.host = self.host.with_client_user_input();
+        self
+    }
+
     /// Names the agent.
     #[must_use]
     pub fn with_agent(mut self, id: AgentId, name: impl Into<String>) -> Self {
@@ -98,7 +107,7 @@ impl ThreadFactory for CodingThreadFactory {
 
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
         let host = self.host.with_new_process_manager();
-        let agent = build_agent_with_profile(
+        let assembled = assemble_agent(
             self.agent_id.clone(),
             self.agent_name.clone(),
             &self.role,
@@ -106,13 +115,24 @@ impl ThreadFactory for CodingThreadFactory {
             self.profile,
         )
         .await?;
-        let builder = AgentThread::builder(
+        let mut builder = AgentThread::builder(
             request.thread_id().clone(),
-            AgentBinding::direct(agent),
+            AgentBinding::direct(assembled.agent),
             Arc::clone(&self.models),
         )
         .with_config(self.settings.initialize(host.build_run_config()))
         .with_services(host.build_tool_services());
+        // Each thread owns a tree of its own, as each Codex session owns its agents; the thread
+        // shuts it down when it closes.
+        if assembled.collaborates {
+            builder = builder.with_agent_control(spawned::agent_control(
+                &host,
+                self.agent_id.clone(),
+                self.agent_name.clone(),
+                &self.role,
+                self.profile,
+            )?);
+        }
         Ok(PreparedThread::new(builder)
             .with_settings_adapter(Arc::new(self.settings.clone()))
             .with_background_terminals(Arc::new(host.background_terminals())))

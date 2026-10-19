@@ -1,6 +1,9 @@
 //! Provider-wire tool-schema snapshot and byte-stability contract.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
+
+#[path = "../../support/configured_coding_host.rs"]
+mod configured_host;
 
 use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
@@ -74,32 +77,39 @@ fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
     )
 }
 
-/// Every entry this product can actually build, in the order the host installs them.
-///
-/// The list is the implemented half of the advertised set, not the whole of it: a tier still names
-/// entries nobody has written, and a schema cannot be measured for one of those. It grows as they
-/// land, which is the point — a schema is a wire format the moment a model sees it, and this is
-/// where its bytes are written down and diffed.
-fn tool_definitions(workspace: &TempDir) -> Vec<ModelToolDefinition> {
-    let host = CodingHost::open(workspace.path()).expect("coding host builds");
-    let read_file = host.read_file_tool().expect("read_file builds");
-    let grep = host.grep_tool().expect("grep builds");
-    let glob = host.glob_tool().expect("glob builds");
-    let view_image = host.view_image_tool().expect("view_image builds");
-    let update_plan = host.update_plan_tool().expect("update_plan builds");
-    let exec_command = host.exec_command_tool().expect("exec_command builds");
-    let write_stdin = host.write_stdin_tool().expect("write_stdin builds");
-    let apply_patch = host.apply_patch_tool().expect("apply_patch builds");
-    let mut definitions = vec![
-        read_file.model_definition(),
-        grep.model_definition(),
-        glob.model_definition(),
-        view_image.model_definition(),
-        update_plan.model_definition(),
-        exec_command.model_definition(),
-        write_stdin.model_definition(),
-        apply_patch.model_definition(),
-    ];
+/// How the host advertises the collaboration tools for one provider path.
+#[derive(Clone, Copy)]
+enum Collaboration {
+    /// Codex's default `collaboration` namespace, which only OpenAI Responses carries.
+    Namespaced,
+    /// Bare names, which a host serving Chat Completions or Anthropic selects.
+    Bare,
+}
+
+/// The standard tier assembled from real tools and explicitly installed host services.
+async fn tool_definitions(
+    workspace: &TempDir,
+    collaboration: Collaboration,
+) -> Vec<ModelToolDefinition> {
+    let services = Arc::new(configured_host::Services::default());
+    let mut host =
+        services.install(CodingHost::open(workspace.path()).expect("coding host builds"));
+    if matches!(collaboration, Collaboration::Bare) {
+        host = host.with_collaboration_namespace(None);
+    }
+    let assembled = ra_coding::host_backed_surface(
+        &ra_core::prompt::PromptRole::Main,
+        &host,
+        CodingProfile::CodexLike,
+    )
+    .await
+    .expect("the configured standard tier assembles");
+    let mut definitions: Vec<_> = assembled
+        .into_tool_surface()
+        .into_tools()
+        .iter()
+        .map(|tool| tool.model_definition())
+        .collect();
     definitions.extend(
         ra_tools::mcp_ns::resource_tools(Vec::new())
             .expect("resource tool schemas need no live connection")
@@ -126,12 +136,12 @@ fn handoff_definition() -> ModelHandoffDefinition {
     .with_strict(true)
 }
 
-fn model_request(workspace: &TempDir) -> ModelRequest {
+async fn model_request(workspace: &TempDir, collaboration: Collaboration) -> ModelRequest {
     ModelRequest::new(
         vec![ModelInputItem::Message(Message::user("inspect schemas"))],
         resolved_settings(),
     )
-    .with_tools(tool_definitions(workspace))
+    .with_tools(tool_definitions(workspace, collaboration).await)
     .with_handoffs(vec![handoff_definition()])
 }
 
@@ -194,10 +204,14 @@ async fn chat_tools(request: ModelRequest) -> Value {
 
 async fn render_snapshot() -> String {
     let workspace = tempfile::tempdir().expect("workspace");
-    let responses = responses_tools(model_request(&workspace)).await;
-    let chat = chat_tools(model_request(&workspace)).await;
-    let anthropic = preview_request_payload("schema-test", &model_request(&workspace))
-        .expect("Anthropic preview lowers")["tools"]
+    let responses =
+        responses_tools(model_request(&workspace, Collaboration::Namespaced).await).await;
+    let chat = chat_tools(model_request(&workspace, Collaboration::Bare).await).await;
+    let anthropic = preview_request_payload(
+        "schema-test",
+        &model_request(&workspace, Collaboration::Bare).await,
+    )
+    .expect("Anthropic preview lowers")["tools"]
         .clone();
 
     [
@@ -217,16 +231,19 @@ async fn render_snapshot() -> String {
 ///
 /// The profile's provider-neutral budget deliberately excludes envelopes because they differ by
 /// endpoint. This complementary check keeps that abstraction honest: a provider serializer cannot
-/// grow the current product's wire table past the product ceiling unnoticed. The complete default
-/// profile is intentionally not constructible until every declared tool exists; as each real tool
-/// joins this factory, it is measured here on every supported provider path.
+/// grow the configured product's wire table past the product ceiling unnoticed. Every static
+/// standard tool and all three MCP resource schemas are measured on each provider path.
 #[tokio::test]
 async fn test_current_provider_tool_tables_fit_the_coding_byte_budget() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let responses = responses_tools(model_request(&workspace)).await;
-    let chat = chat_tools(model_request(&workspace)).await;
-    let anthropic = preview_request_payload("schema-test", &model_request(&workspace))
-        .expect("Anthropic preview lowers")["tools"]
+    let responses =
+        responses_tools(model_request(&workspace, Collaboration::Namespaced).await).await;
+    let chat = chat_tools(model_request(&workspace, Collaboration::Bare).await).await;
+    let anthropic = preview_request_payload(
+        "schema-test",
+        &model_request(&workspace, Collaboration::Bare).await,
+    )
+    .expect("Anthropic preview lowers")["tools"]
         .clone();
 
     let ceiling = coding_tool_table_ceiling();
@@ -262,6 +279,7 @@ async fn test_current_provider_tool_tables_fit_the_coding_byte_budget() {
 #[tokio::test]
 async fn test_tool_schema_dump_01() {
     let rendered = render_snapshot().await;
+    insta::assert_snapshot!("configured_provider_tools", rendered);
     let path = snapshot_path();
     if std::env::var_os("BLESS_TOOL_SCHEMA_DUMP").is_some() {
         std::fs::write(&path, rendered).expect("snapshot must be writable");

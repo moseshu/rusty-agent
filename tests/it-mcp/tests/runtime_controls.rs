@@ -935,3 +935,6 @@ mod shared_startup;
 
 #[path = "runtime_controls/resources.rs"]
 mod resources;
+
+#[path = "runtime_controls/configured_host.rs"]
+mod configured_host;

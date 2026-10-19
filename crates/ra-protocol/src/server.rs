@@ -79,6 +79,7 @@ mod request_serialization;
 mod router;
 mod session_source;
 mod settings_adapter;
+mod spawned_approvals;
 mod thread_factory;
 mod thread_history;
 mod thread_listener;
@@ -1077,6 +1078,12 @@ pub mod test_api {
         /// Withdraws the thread's requests, as a turn starting, completing or being aborted does.
         pub fn abort_pending_server_requests(&self) {
             self.thread.abort_pending_server_requests();
+        }
+
+        /// Withdraws only those of `request_ids` still waiting, as a spawned agent's approval
+        /// batch withdraws what it asked when its own run moves on.
+        pub fn abort_server_requests(&self, request_ids: &[RequestId]) {
+            self.thread.abort_server_requests(request_ids);
         }
 
         /// Sends `connection_id` the thread's requests still waiting, as attaching to the thread

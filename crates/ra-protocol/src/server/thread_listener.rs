@@ -73,6 +73,7 @@ use super::{
         TurnInterruptResponse, TurnItemsView, TurnStartedNotification, TurnStatus,
     },
     settings_adapter::settings_snapshot,
+    spawned_approvals::{self, SpawnedApprovals},
     thread_history::{HistorySources, ItemChange},
     thread_manager::{LoadedThread, ThreadManager},
     thread_processor::{set_thread_status_and_interrupt_stale_turns, turns_page},
@@ -229,6 +230,7 @@ pub(crate) async fn ensure_listener_task_running(
     let context = context.clone();
     let loaded = loaded.clone();
     tokio::spawn(async move {
+        let mut agent_approvals = SpawnedApprovals::new(&loaded);
         let outgoing = &context.outgoing;
         let thread = &loaded.thread;
         loop {
@@ -259,6 +261,11 @@ pub(crate) async fn ensure_listener_task_running(
                 Some(command) = command_rx.recv() => {
                     handle_thread_listener_command(&context, &loaded, &thread_state, command)
                         .await;
+                }
+                true = spawned_approvals::changed(&mut agent_approvals) => {
+                    if let Some(approvals) = &mut agent_approvals {
+                        approvals.start_batches(&loaded, outgoing, &context.thread_watch);
+                    }
                 }
                 unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
                     if !unloading_watchers_open {
@@ -731,6 +738,7 @@ async fn handle_pending_thread_resume_request(
         .outgoing
         .replay_requests_to_connection_for_thread(connection_id, &thread_id)
         .await;
+    spawned_approvals::replay(loaded, &context.outgoing, connection_id).await;
 }
 
 /// Tells the thread's connections what one event means: the turn arms of Codex's

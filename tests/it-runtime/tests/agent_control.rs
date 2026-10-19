@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -45,7 +45,10 @@ use ra_core::{
 use ra_runtime::{
     agent::{
         AgentBinding, AgentRegistry,
-        control::{AgentControl, PausedAgentRun, RolloutBudgetConfig},
+        control::{
+            AgentControl, PausedAgentRun, PreparedSpawnedAgent, RolloutBudgetConfig,
+            SpawnedAgentFactory, SpawnedAgentRequest, SpawnedAgentResources,
+        },
         tool::AgentAsTool,
     },
     runner::{
@@ -1094,6 +1097,159 @@ async fn shutdown_stops_running_children() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Spawned-agent factory
+// ---------------------------------------------------------------------------------------------
+
+/// Prepares every spawned agent as `prepared`, recording what each spawn asked for, or refuses.
+struct PreparingFactory {
+    prepared: Arc<AgentSpec>,
+    requests: Mutex<Vec<(String, Option<String>, String)>>,
+    released: Arc<AtomicUsize>,
+    refuse: bool,
+}
+
+impl PreparingFactory {
+    fn new(prepared: Arc<AgentSpec>, refuse: bool) -> Self {
+        Self {
+            prepared,
+            requests: Mutex::new(Vec::new()),
+            released: Arc::new(AtomicUsize::new(0)),
+            refuse,
+        }
+    }
+}
+
+struct CountedRelease(Arc<AtomicUsize>);
+
+#[async_trait]
+impl SpawnedAgentResources for CountedRelease {
+    async fn shutdown(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl SpawnedAgentFactory for PreparingFactory {
+    async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        if self.refuse {
+            return Err(Error::config("no host resources left"));
+        }
+        self.requests.lock().unwrap().push((
+            request.path().to_string(),
+            request.agent_type().map(ToString::to_string),
+            request.agent().id().to_string(),
+        ));
+        Ok(PreparedSpawnedAgent::new(Arc::clone(&self.prepared))
+            .with_resources(Arc::new(CountedRelease(Arc::clone(&self.released)))))
+    }
+}
+
+fn prepared_worker() -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new("prepared-worker"))
+        .name("Prepared worker")
+        .instructions("prepared")
+        .build()
+        .unwrap()
+}
+
+/// Codex builds each spawned thread as a session of its own; the factory is where a host does the
+/// same, and what it gives the agent is released once, after the agent's run has ended.
+#[tokio::test]
+async fn a_spawned_agent_factory_prepares_the_agent_and_releases_its_resources_once() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(Arc::clone(&factory) as Arc<dyn SpawnedAgentFactory>)
+        .unwrap();
+    assert!(
+        AgentControl::new()
+            .with_spawned_agent_factory(Arc::clone(&factory) as Arc<dyn SpawnedAgentFactory>)
+            .unwrap()
+            .with_spawned_agent_factory(factory.clone())
+            .is_err(),
+        "a tree takes one factory"
+    );
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "work")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "prepared",
+        Step::Respond(final_message("p-1", "prepared done")),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    // The spawn resolved the registered worker; the agent that ran is the one the factory made.
+    assert_eq!(
+        *factory.requests.lock().unwrap(),
+        [(
+            "/root/worker".to_owned(),
+            Some("worker".to_owned()),
+            "worker".to_owned()
+        )]
+    );
+    assert!(scripts.tools("worker").is_empty());
+    assert_eq!(scripts.tools("prepared").len(), 1);
+    assert_eq!(factory.released.load(Ordering::SeqCst), 0);
+
+    control.close(&worker_path()).await.unwrap();
+    assert_eq!(factory.released.load(Ordering::SeqCst), 1);
+    control.shutdown().await;
+    assert_eq!(factory.released.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn shutting_the_tree_down_releases_each_prepared_agent() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(Arc::clone(&factory) as Arc<dyn SpawnedAgentFactory>)
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "forever")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "left running")));
+    scripts.push("prepared", Step::Hang);
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Running
+    })
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(10), control.shutdown())
+        .await
+        .expect("shutdown drains in time");
+    assert_eq!(factory.released.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_factory_that_cannot_prepare_the_agent_refuses_the_spawn() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), true));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory as Arc<dyn SpawnedAgentFactory>)
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "work")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "refused")));
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+
+    let refusal = texts(&scripts.inputs("lead")[1]).last().unwrap().clone();
+    assert!(
+        refusal.starts_with("agent `/root/worker` could not be prepared: ")
+            && refusal.ends_with("no host resources left"),
+        "{refusal}"
+    );
+    assert_eq!(paths(&control), ["/root"]);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Forked history, handoffs and approvals
 // ---------------------------------------------------------------------------------------------
 
@@ -1499,6 +1655,97 @@ async fn a_paused_run_is_resumed_only_from_its_own_checkpoint_and_ends_on_interr
         .resume(&worker_path(), paused.state().clone())
         .unwrap_err();
     assert_eq!(late.to_string(), "agent `/root/worker` has no paused run");
+}
+
+#[tokio::test]
+async fn spawned_approval_records_share_the_run_sequence_and_refuse_stale_batches() {
+    use ra_core::event::{ApprovalEvent, ApprovalResolution};
+
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let sink = InMemoryHostEventSink::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "first", "deploy", json!({}))),
+    );
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-2", "second", "deploy", json!({}))),
+    );
+    scripts.push("worker", Step::Respond(final_message("w-3", "deployed")));
+    Runner::run(with_sink(
+        root_request(
+            &scripts,
+            &control,
+            worker_agent(vec![Arc::new(GuardedTool::new())]),
+        ),
+        &sink,
+    ))
+    .await
+    .unwrap();
+    let mut changes = control.subscribe_paused_runs();
+    let first = control.wait_for_paused_run().await;
+    let mut state = first.state().clone();
+    let item = state.pending_interruption_items().next().unwrap().clone();
+    control
+        .record_approval(
+            first.path(),
+            &mut state,
+            ApprovalEvent::resolved(CallId::new("first"), ApprovalResolution::Approved),
+        )
+        .unwrap();
+    state.approve(&item, false).unwrap();
+    control.resume(first.path(), state).unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(paused) = control.paused_runs().into_iter().find(|paused| {
+                paused.state().pending_interruption_items().any(|item| matches!(
+                    item.kind(), RunItemKind::ToolApproval(approval) if approval.call_id().as_str() == "second"
+                ))
+            }) { break paused; }
+            changes.changed().await.unwrap();
+        }
+    }).await.unwrap();
+    assert_eq!(first.state().run_id(), second.state().run_id());
+    assert!(
+        control
+            .record_approval(
+                first.path(),
+                &mut first.state().clone(),
+                ApprovalEvent::resolved(CallId::new("first"), ApprovalResolution::Approved)
+            )
+            .is_err()
+    );
+    let mut state = second.state().clone();
+    let item = state.pending_interruption_items().next().unwrap().clone();
+    control
+        .record_approval(
+            second.path(),
+            &mut state,
+            ApprovalEvent::resolved(CallId::new("second"), ApprovalResolution::Approved),
+        )
+        .unwrap();
+    state.approve(&item, false).unwrap();
+    control.resume(second.path(), state).unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let approvals: Vec<_> = sink
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event.body(), HostEventBody::Approval(_)))
+        .collect();
+    assert_eq!(approvals.len(), 2);
+    assert!(
+        approvals
+            .iter()
+            .all(|event| event.run_id() == first.state().run_id())
+    );
+    assert_unique_and_rising(&seqs_of(&sink, first.state().run_id().as_str()));
+    control.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3613,4 +3860,179 @@ async fn a_continuation_resumed_past_a_persisted_log_raises_the_shared_sequence(
         "noted"
     );
     assert_eq!(seqs_of(&sink, "run-root"), vec![0, 1, 41]);
+}
+
+struct GatedFactory {
+    inner: PreparingFactory,
+    entered: Notify,
+    proceed: Notify,
+}
+
+#[async_trait]
+impl SpawnedAgentFactory for GatedFactory {
+    async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        self.entered.notify_one();
+        self.proceed.notified().await;
+        self.inner.prepare(request).await
+    }
+}
+
+#[tokio::test]
+async fn shutdown_during_preparation_refuses_spawn_and_releases_resources() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(GatedFactory {
+        inner: PreparingFactory::new(prepared_worker(), false),
+        entered: Notify::new(),
+        proceed: Notify::new(),
+    });
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    let request = root_request(&scripts, &control, worker_agent(Vec::new()));
+    let run = tokio::spawn(Runner::run(request));
+    tokio::time::timeout(Duration::from_secs(5), factory.entered.notified())
+        .await
+        .unwrap();
+    control.shutdown().await;
+    factory.proceed.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let remaining = paths(&control);
+    let releases = factory.inner.released.load(Ordering::SeqCst);
+    control.shutdown().await;
+    assert_eq!(
+        remaining,
+        ["/root"],
+        "late spawn was admitted after shutdown, releases={releases}"
+    );
+    assert_eq!(
+        releases, 1,
+        "prepared resources were not released on refusal"
+    );
+}
+
+struct BlockingRelease {
+    entered: Notify,
+    proceed: Notify,
+    released: AtomicBool,
+}
+
+#[async_trait]
+impl SpawnedAgentResources for BlockingRelease {
+    async fn shutdown(&self) {
+        self.entered.notify_one();
+        self.proceed.notified().await;
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+struct BlockingReleaseFactory(Arc<BlockingRelease>);
+#[async_trait]
+impl SpawnedAgentFactory for BlockingReleaseFactory {
+    async fn prepare(&self, _: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        Ok(PreparedSpawnedAgent::new(prepared_worker()).with_resources(self.0.clone()))
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_shutdown_waiter_does_not_abandon_resource_cleanup() {
+    let scripts = Arc::new(Scripts::default());
+    let resource = Arc::new(BlockingRelease {
+        entered: Notify::new(),
+        proceed: Notify::new(),
+        released: AtomicBool::new(false),
+    });
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(Arc::new(BlockingReleaseFactory(resource.clone())))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    scripts.push(
+        "prepared",
+        Step::Respond(final_message("r-child-1", "finished")),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let closing = tokio::spawn({
+        let control = control.clone();
+        async move { control.shutdown().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), resource.entered.notified())
+        .await
+        .unwrap();
+    closing.abort();
+    let _ = closing.await;
+    resource.proceed.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), control.shutdown())
+        .await
+        .unwrap();
+    let released = resource.released.load(Ordering::SeqCst);
+    if !released {
+        resource.shutdown().await;
+    }
+    assert!(
+        released,
+        "shutdown returned while the resource cleanup was permanently skipped"
+    );
+}
+
+#[tokio::test]
+async fn every_shutdown_waiter_waits_for_resource_cleanup() {
+    let scripts = Arc::new(Scripts::default());
+    let resource = Arc::new(BlockingRelease {
+        entered: Notify::new(),
+        proceed: Notify::new(),
+        released: AtomicBool::new(false),
+    });
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(Arc::new(BlockingReleaseFactory(resource.clone())))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    scripts.push(
+        "prepared",
+        Step::Respond(final_message("r-child-1", "finished")),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let first = tokio::spawn({
+        let control = control.clone();
+        async move { control.shutdown().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), resource.entered.notified())
+        .await
+        .unwrap();
+    let second_returned_early = tokio::time::timeout(Duration::from_millis(50), control.shutdown())
+        .await
+        .is_ok();
+    let was_released = resource.released.load(Ordering::SeqCst);
+    resource.proceed.notify_one();
+    first.await.unwrap();
+    assert!(
+        !second_returned_early || was_released,
+        "second shutdown returned before the first cleanup completed"
+    );
 }

@@ -46,6 +46,7 @@ target
 !/Docs/R9-14_Responses_Compaction_Session.md
 !/Docs/Deferred_Dynamic_Tools_Contract.md
 !/Docs/MCP_Resource_Tools_Contract.md
+!/Docs/R2-8_Host_Assembly_Contract.md
 !/Docs/Handoff_Contract.md
 !/Docs/Function_Tool_Contract.md
 !/Docs/Structured_Output_Contract.md

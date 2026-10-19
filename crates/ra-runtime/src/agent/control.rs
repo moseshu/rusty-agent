@@ -48,6 +48,11 @@
 //! from the caller's history projected as Codex forks it (see
 //! [`fork_history`]), followed by its task.
 //!
+//! Codex builds each spawned agent as a session of its own, with its own services and tool plan.
+//! A host whose tools hold per-thread resources, such as a process manager, gives the tree a
+//! [`SpawnedAgentFactory`] that prepares each spawned agent the same way; without one, the agent
+//! shares the resolved declaration's tool instances with the agent that spawned it.
+//!
 //! # Closing
 //!
 //! [`AgentControl::close`] shuts an agent down together with every live agent below it, as Codex's
@@ -121,6 +126,7 @@
 //!   rollouts, nor keep Codex's separate store of open and closed spawn edges that its resume reads.
 
 mod budget;
+mod spawn;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -133,6 +139,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use ra_core::{
     agent::{
         AgentId, AgentSpec,
@@ -144,7 +154,10 @@ use ra_core::{
     },
     cancel::{CancelReason, CancelScope, ScopeKind},
     error::{Error, Result},
-    event::{AgentEvent, HostEventEmitter, SubAgentActivityEvent, SubAgentActivityKind},
+    event::{
+        AgentEvent, ApprovalEvent, HostEvent, HostEventEmitter, SubAgentActivityEvent,
+        SubAgentActivityKind,
+    },
     finish::FinishReason,
     item::{InputItemNormalizer, ModelInputItem, NormalizedInput, RunItem},
     model::ModelResolver,
@@ -166,6 +179,9 @@ use tokio::{
 
 pub use budget::RolloutBudgetConfig;
 pub(crate) use budget::{RolloutBudget, RolloutBudgetReminder};
+pub use spawn::{
+    PreparedSpawnedAgent, SpawnedAgentFactory, SpawnedAgentRequest, SpawnedAgentResources,
+};
 
 use super::{AgentBinding, tool::ParentRun};
 use crate::runner::{
@@ -213,6 +229,8 @@ impl AgentControl {
             max_depth: AtomicUsize::new(usize::MAX),
             rollout_budget: OnceLock::new(),
             rollout_store: OnceLock::new(),
+            spawned_agent_factory: OnceLock::new(),
+            shutdown: Mutex::new(None),
             paused_activity: watch::Sender::new(0),
             event_seqs: Mutex::new(HashMap::new()),
         });
@@ -293,6 +311,25 @@ impl AgentControl {
         Ok(self)
     }
 
+    /// Prepares every agent the tree spawns with `factory`, as Codex's thread manager prepares each
+    /// spawned thread as a session of its own (see [`SpawnedAgentFactory`]).
+    ///
+    /// Without a factory a spawned agent runs the declaration the spawn resolved and shares its
+    /// tool instances with the agent that spawned it. With one, the factory decides what the agent
+    /// runs and may give it resources of its own, which the tree releases once the agent is closed
+    /// or the tree shuts down.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a second factory for the same tree.
+    pub fn with_spawned_agent_factory(self, factory: Arc<dyn SpawnedAgentFactory>) -> Result<Self> {
+        self.tree
+            .spawned_agent_factory
+            .set(factory)
+            .map_err(|_| Error::config("the agent tree already has a spawned-agent factory"))?;
+        Ok(self)
+    }
+
     /// Sets whether a cancelled run closes the agents below the agent it is bound to.
     ///
     /// Off by default, as in Codex, where interrupting an agent leaves its children running. When
@@ -359,13 +396,83 @@ impl AgentControl {
             .filter_map(|node| {
                 let child = node.child.as_ref()?;
                 let state = lock(&child.state);
+                if node.is_closed()
+                    || state
+                        .current_run
+                        .as_ref()
+                        .is_none_or(CancelScope::is_cancelled)
+                {
+                    return None;
+                }
                 let paused = state.paused.as_ref()?;
                 Some(PausedAgentRun {
                     path: node.path.clone(),
+                    session_id: node.session_id.get()?.clone(),
                     state: paused.state.clone(),
+                    config: match (&child.environment.config, &child.environment.app_context) {
+                        (config, Some(context)) if config.app_context().is_none() => {
+                            config.clone().with_app_context(Arc::clone(context))
+                        }
+                        (config, _) => config.clone(),
+                    },
                 })
             })
             .collect()
+    }
+
+    /// Subscribes before inspecting [`Self::paused_runs`], so a host can discover and withdraw
+    /// approval batches without missing a pause, resume or cancellation between snapshots.
+    #[must_use]
+    pub fn subscribe_paused_runs(&self) -> watch::Receiver<u64> {
+        self.tree.paused_activity.subscribe()
+    }
+
+    /// Records an approval on a spawned run's own event sequence and rollout before it resumes.
+    /// Stale checkpoints are refused, including an earlier approval stop of the same run.
+    pub fn record_approval(
+        &self,
+        path: &AgentPath,
+        state: &mut RunState,
+        event: ApprovalEvent,
+    ) -> Result<()> {
+        let node = self
+            .tree
+            .node(path)
+            .ok_or_else(|| Error::caller("the agent is no longer live"))?;
+        let child = node
+            .child
+            .as_ref()
+            .ok_or_else(|| Error::caller("the root's approvals belong to its host"))?;
+        let mut guard = lock(&child.state);
+        let live = !node.is_closed()
+            && guard
+                .current_run
+                .as_ref()
+                .is_some_and(|scope| !scope.is_cancelled());
+        let paused = guard
+            .paused
+            .as_mut()
+            .filter(|paused| live && crate::thread::same_approval_pause(&paused.state, state))
+            .ok_or_else(|| {
+                Error::caller("the agent is no longer waiting on this approval batch")
+            })?;
+        let allocator = &paused.event_seqs;
+        allocator.advance_past(&state.restore_event_seq_allocator(None));
+        let event = HostEvent::allocate(
+            allocator,
+            child.environment.agent.id().clone(),
+            event.into(),
+        )?;
+        state.snapshot_event_seq(allocator);
+        paused.state.snapshot_event_seq(allocator);
+        drop(guard);
+        if let Some(rollout) = &child.environment.rollout {
+            rollout.record(RolloutItem::Event(event.clone()));
+        }
+        if let Some(sink) = child.environment.services.event_sink() {
+            sink.emit(event);
+        }
+        Ok(())
     }
 
     /// Waits until some spawned agent's run is paused for approval, and returns the first in path
@@ -407,6 +514,9 @@ impl AgentControl {
             )));
         }
         drop(child_state);
+        self.tree
+            .paused_activity
+            .send_modify(|count| *count = count.wrapping_add(1));
         paused
             .resume
             .send(state)
@@ -445,10 +555,46 @@ impl AgentControl {
     /// refused. A rollout that cannot be shut down is logged and kept, and shutting the tree down
     /// again tries it again.
     pub async fn shutdown(&self) {
-        self.tree.shut_down.store(true, Ordering::Release);
-        self.tree.cancel.cancel(CancelReason::Shutdown);
+        let finished = {
+            let mut shutdown = lock(&self.tree.shutdown);
+            if shutdown
+                .as_ref()
+                .is_none_or(|pending| pending.peek() == Some(&false))
+            {
+                // Admission and shutdown observe the same lock. A preparation already in flight
+                // may finish, but cannot add an agent after shutdown has taken its snapshot.
+                {
+                    let _agents = lock(&self.tree.agents);
+                    self.tree.shut_down.store(true, Ordering::Release);
+                }
+                self.tree.cancel.cancel(CancelReason::Shutdown);
+                let tree = Arc::clone(&self.tree);
+                let task = tokio::spawn(async move { tree.finish_shutdown().await });
+                *shutdown = Some(
+                    async move {
+                        task.await.unwrap_or_else(|error| {
+                            tracing::error!(%error, "the agent tree's shutdown task failed");
+                            false
+                        })
+                    }
+                    .boxed()
+                    .shared(),
+                );
+            }
+            shutdown.as_ref().cloned()
+        };
+        if let Some(finished) = finished {
+            finished.await;
+        }
+    }
+}
+
+impl Tree {
+    /// The tree owns shutdown so cancelling any waiter leaves cleanup running for other waiters.
+    /// A failed rollout close permits another shutdown attempt after this task completes.
+    async fn finish_shutdown(&self) -> bool {
         loop {
-            let tasks = std::mem::take(&mut *lock(&self.tree.tasks));
+            let tasks = std::mem::take(&mut *lock(&self.tasks));
             if tasks.is_empty() {
                 break;
             }
@@ -456,17 +602,25 @@ impl AgentControl {
                 drop(task.await);
             }
         }
-        let spawned: Vec<Arc<AgentNode>> = lock(&self.tree.agents)
+        let spawned: Vec<Arc<AgentNode>> = lock(&self.agents)
             .values()
             .filter(|node| !node.path.is_root())
             .map(Arc::clone)
             .collect();
+        let mut complete = true;
         for node in spawned {
+            if let Some(child) = &node.child {
+                drop(lock(&child.state));
+                let mut idle = child.idle.subscribe();
+                drop(idle.wait_for(|idle| *idle).await);
+            }
             // Logged by the node; a rollout that could not be shut down is tried again by the next
             // shutdown.
-            let _ = node.shut_down_rollout().await;
+            complete &= node.shut_down_rollout().await.is_ok();
+            node.release_resources().await;
             node.status.send_replace(AgentStatus::Shutdown);
         }
+        complete
     }
 }
 
@@ -491,10 +645,22 @@ impl fmt::Debug for AgentControl {
 #[derive(Debug, Clone)]
 pub struct PausedAgentRun {
     path: AgentPath,
+    session_id: SessionId,
     state: RunState,
+    config: RunConfig,
 }
 
 impl PausedAgentRun {
+    /// The spawned agent's session, which owns its requests and approval records.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// The run configuration used by the issuing step.
+    pub const fn config(&self) -> &RunConfig {
+        &self.config
+    }
     /// The agent whose run is paused.
     #[must_use]
     pub const fn path(&self) -> &AgentPath {
@@ -723,22 +889,7 @@ impl AgentControlPort for AgentHandle {
             .path
             .join(request.task_name())
             .map_err(AgentControlError::Unsupported)?;
-        let agent = match request.agent_type() {
-            Some(agent_type) => Arc::clone(
-                parent
-                    .config()
-                    .agent_registry()
-                    .get(agent_type)
-                    .ok_or_else(|| {
-                        AgentControlError::InvalidRequest(format!(
-                            "unknown agent_type `{agent_type}`"
-                        ))
-                    })?,
-            ),
-            // The agent running the caller's current turn, which a handoff may have changed
-            // since the run started.
-            None => parent.current_agent(),
-        };
+        let agent = spawned_declaration(&parent, request.agent_type())?;
         let history = request.fork_mode().map_or_else(Vec::new, |mode| {
             fork_history(&parent.current_history(), *mode)
         });
@@ -750,9 +901,19 @@ impl AgentControlPort for AgentHandle {
         if lock(&tree.agents).contains_key(&path) {
             return Err(path_taken(&path));
         }
+        let (agent, resources) = tree
+            .prepare_spawned(&path, agent, request.agent_type())
+            .await?;
         let session_id = SessionId::generate();
         let rollout =
-            create_rollout(&tree, &self.node, &session_id, &path, request.agent_type()).await?;
+            match create_rollout(&tree, &self.node, &session_id, &path, request.agent_type()).await
+            {
+                Ok(rollout) => rollout,
+                Err(error) => {
+                    release(resources.as_ref()).await;
+                    return Err(error);
+                }
+            };
 
         let environment = ChildEnvironment {
             agent: Arc::clone(&agent),
@@ -762,6 +923,7 @@ impl AgentControlPort for AgentHandle {
             services: parent.services().clone(),
             spawned_by: parent.run_id().clone(),
             rollout,
+            resources: resources.clone(),
         };
         let child = ChildRuntime::new(
             environment,
@@ -774,21 +936,10 @@ impl AgentControlPort for AgentHandle {
             Some(child),
         ));
         let _ = node.session_id.set(session_id);
-        {
-            let mut agents = lock(&tree.agents);
-            // Checked again under the lock a close marks its subtree under, so a spawn racing a
-            // close cannot leave a child below an agent that is going away, or add one to a
-            // subtree being emptied.
-            if self.node.is_closed() {
-                return Err(closed_error(&self.node.path));
-            }
-            if self.node.is_closing_subtree() {
-                return Err(closing_error(&self.node.path));
-            }
-            if agents.contains_key(&path) {
-                return Err(path_taken(&path));
-            }
-            agents.insert(path.clone(), Arc::clone(&node));
+        if let Err(refusal) = tree.admit(&self.node, &node) {
+            let _ = node.shut_down_rollout().await;
+            node.release_resources().await;
+            return Err(refusal);
         }
         node.mailbox.push_from(
             InterAgentCommunication::from_agent(
@@ -906,6 +1057,32 @@ impl AgentControlPort for AgentHandle {
     }
 }
 
+/// The declaration a spawn resolves: the registered agent named by `agent_type`, or the agent
+/// running the caller's current turn, which a handoff may have changed since the run started.
+fn spawned_declaration(
+    parent: &ParentRun,
+    agent_type: Option<&AgentId>,
+) -> Result<Arc<AgentSpec>, AgentControlError> {
+    match agent_type {
+        Some(agent_type) => parent
+            .config()
+            .agent_registry()
+            .get(agent_type)
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                AgentControlError::InvalidRequest(format!("unknown agent_type `{agent_type}`"))
+            }),
+        None => Ok(parent.current_agent()),
+    }
+}
+
+/// Releases a spawned agent's own resources, if it was given any.
+async fn release(resources: Option<&Arc<dyn SpawnedAgentResources>>) {
+    if let Some(resources) = resources {
+        resources.shutdown().await;
+    }
+}
+
 fn path_taken(path: &AgentPath) -> AgentControlError {
     AgentControlError::Unsupported(format!("agent path `{path}` already exists"))
 }
@@ -996,6 +1173,10 @@ struct Tree {
     rollout_budget: OnceLock<Arc<RolloutBudget>>,
     /// Where the spawned agents' rollouts are created, once the host has given the tree a store.
     rollout_store: OnceLock<Arc<dyn RolloutThreadStore>>,
+    /// How each spawned agent is prepared, once the host has given the tree a factory.
+    spawned_agent_factory: OnceLock<Arc<dyn SpawnedAgentFactory>>,
+    /// The shared shutdown task; a failed rollout close can replace a completed attempt.
+    shutdown: Mutex<Option<Shared<BoxFuture<'static, bool>>>>,
     /// Ticks whenever an agent's run pauses for approval.
     paused_activity: watch::Sender<u64>,
     /// The host event sequence of every run that has named itself as the origin of another run,
@@ -1005,6 +1186,51 @@ struct Tree {
 }
 
 impl Tree {
+    /// What the agent spawned at `path` runs, and what it holds of its own: the tree's
+    /// spawned-agent factory's answer, or the resolved declaration as it is without one.
+    async fn prepare_spawned(
+        &self,
+        path: &AgentPath,
+        agent: Arc<AgentSpec>,
+        agent_type: Option<&AgentId>,
+    ) -> Result<(Arc<AgentSpec>, Option<Arc<dyn SpawnedAgentResources>>), AgentControlError> {
+        let Some(factory) = self.spawned_agent_factory.get() else {
+            return Ok((agent, None));
+        };
+        factory
+            .prepare(SpawnedAgentRequest::new(path, &agent, agent_type))
+            .await
+            .map(PreparedSpawnedAgent::into_parts)
+            .map_err(|error| {
+                AgentControlError::Unsupported(format!(
+                    "agent `{path}` could not be prepared: {error}"
+                ))
+            })
+    }
+
+    /// Adds `node` below `caller`, unless the caller or its subtree is being closed or the path is
+    /// taken.
+    ///
+    /// Checked under the lock a close marks its subtree under, so a spawn racing a close cannot
+    /// leave a child below an agent that is going away, or add one to a subtree being emptied.
+    fn admit(&self, caller: &AgentNode, node: &Arc<AgentNode>) -> Result<(), AgentControlError> {
+        let mut agents = lock(&self.agents);
+        if self.shut_down.load(Ordering::Acquire) {
+            return Err(AgentControlError::Unavailable);
+        }
+        if caller.is_closed() {
+            return Err(closed_error(&caller.path));
+        }
+        if caller.is_closing_subtree() {
+            return Err(closing_error(&caller.path));
+        }
+        if agents.contains_key(&node.path) {
+            return Err(path_taken(&node.path));
+        }
+        agents.insert(node.path.clone(), Arc::clone(node));
+        Ok(())
+    }
+
     /// The authoritative sequence of `allocator`'s run, registering `allocator` as that sequence
     /// when the run has none yet.
     fn share_event_seqs(&self, allocator: &EventSeqAllocator) -> EventSeqAllocator {
@@ -1168,6 +1394,7 @@ impl Tree {
                 node.path
             ))
         })?;
+        node.release_resources().await;
         node.status.send_replace(AgentStatus::Shutdown);
         let mut agents = lock(&self.agents);
         if agents
@@ -1192,7 +1419,11 @@ impl Tree {
             // Checked under the state lock too, which a close takes before it waits for the agent
             // to go idle: a run claimed before the close marked the agent is waited for, and none
             // is claimed after.
-            if state.current_run.is_some() || node.is_closed() || !node.mailbox.has_trigger() {
+            if self.shut_down.load(Ordering::Acquire)
+                || state.current_run.is_some()
+                || node.is_closed()
+                || !node.mailbox.has_trigger()
+            {
                 return;
             }
             let scope = child.scope.child(ScopeKind::Run);
@@ -1297,7 +1528,7 @@ async fn run_to_end(
         parent_run_id,
     };
     loop {
-        let (state, history) = match run_once(
+        let (state, history, event_seqs) = match run_once(
             &child.environment,
             handle.clone(),
             scope.clone(),
@@ -1308,13 +1539,18 @@ async fn run_to_end(
         {
             RunEnd::NotStarted(history) => return (history, false),
             RunEnd::Finished(history) => return (history, true),
-            RunEnd::Paused { state, history } => (state, history),
+            RunEnd::Paused {
+                state,
+                history,
+                event_seqs,
+            } => (state, history, event_seqs),
         };
         let run_id = state.run_id().clone();
         let (resume, answered) = oneshot::channel();
         lock(&child.state).paused = Some(PausedRun {
             state: *state,
             resume,
+            event_seqs,
         });
         if let Some(tree) = tree.upgrade() {
             tree.paused_activity
@@ -1325,6 +1561,10 @@ async fn run_to_end(
             () = scope.cancelled() => None,
         };
         lock(&child.state).paused = None;
+        if let Some(tree) = tree.upgrade() {
+            tree.paused_activity
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
         let Some(state) = answered else {
             let mut history = history;
             if let Err(error) = scope.ensure_not_cancelled() {
@@ -1391,6 +1631,7 @@ enum RunEnd {
     Paused {
         state: Box<RunState>,
         history: Vec<ModelInputItem>,
+        event_seqs: EventSeqAllocator,
     },
 }
 
@@ -1439,7 +1680,7 @@ async fn run_once(
         Ok(request) => request
             .with_config(environment.config.clone())
             .with_services(environment.services.clone())
-            .with_agent_control(handle),
+            .with_agent_control(handle.clone()),
         Err(error) => {
             handle.run_finished(&Err(error));
             return RunEnd::NotStarted(fallback);
@@ -1452,6 +1693,10 @@ async fn run_once(
         request = request.with_rollout_recorder(Arc::clone(rollout));
     }
 
+    let event_seqs = handle.tree().map_or_else(
+        |_| request.event_seq_allocator().clone(),
+        |tree| tree.share_event_seqs(request.event_seq_allocator()),
+    );
     let mut stream = Runner::run_streamed(request);
     let mut produced = Vec::new();
     while let Some(event) = stream.next_event().await {
@@ -1463,6 +1708,7 @@ async fn run_once(
         Ok(result) if !result.outcome().interruptions().is_empty() => RunEnd::Paused {
             history: result.continuation_input(ContinuationInput::Normalized),
             state: Box::new(result.state().clone()),
+            event_seqs,
         },
         Ok(result) => RunEnd::Finished(result.continuation_input(ContinuationInput::Normalized)),
         Err(_) => RunEnd::Finished(partial_history(fallback, &produced)),
@@ -1496,6 +1742,8 @@ struct AgentNode {
     child: Option<ChildRuntime>,
     /// Set once the agent's rollout has been shut down.
     rollout_shut_down: AtomicBool,
+    /// Shared completion of the agent's resource cleanup, independent of any caller's wait.
+    resources_released: OnceLock<Shared<BoxFuture<'static, ()>>>,
     /// How many thresholds of the tree's rollout budget the agent has been told about.
     budget_reminder_delivered: Mutex<Option<usize>>,
 }
@@ -1512,6 +1760,7 @@ impl AgentNode {
             closing_subtree: AtomicUsize::new(0),
             child,
             rollout_shut_down: AtomicBool::new(false),
+            resources_released: OnceLock::new(),
             budget_reminder_delivered: Mutex::new(None),
         }
     }
@@ -1565,6 +1814,29 @@ impl AgentNode {
         }
     }
 
+    /// Releases what the tree's spawned-agent factory gave the agent, once its runs have stopped:
+    /// Codex's session shutdown of the thread's own processes. Released at most once.
+    async fn release_resources(&self) {
+        let resources = self
+            .child
+            .as_ref()
+            .and_then(|child| child.environment.resources.as_ref());
+        if let Some(resources) = resources {
+            let finished = self.resources_released.get_or_init(|| {
+                let resources = Arc::clone(resources);
+                let task = tokio::spawn(async move { resources.shutdown().await });
+                async move {
+                    if let Err(error) = task.await {
+                        tracing::error!(%error, "a spawned agent's resource cleanup failed");
+                    }
+                }
+                .boxed()
+                .shared()
+            });
+            finished.clone().await;
+        }
+    }
+
     fn snapshot(&self) -> LiveAgent {
         let agent = LiveAgent::new(
             self.path.clone(),
@@ -1605,6 +1877,8 @@ struct ChildEnvironment {
     spawned_by: RunId,
     /// The agent's own rollout, when the tree records its agents.
     rollout: Option<Arc<dyn RolloutRecorder>>,
+    /// What the tree's spawned-agent factory gave the agent to hold apart from the tree.
+    resources: Option<Arc<dyn SpawnedAgentResources>>,
 }
 
 struct ChildRuntime {
@@ -1656,6 +1930,7 @@ struct ChildState {
 struct PausedRun {
     state: RunState,
     resume: oneshot::Sender<RunState>,
+    event_seqs: EventSeqAllocator,
 }
 
 /// An agent's pending mail, with a counter that ticks on every delivery for waiters.

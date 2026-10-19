@@ -15,15 +15,19 @@ use std::sync::Arc;
 
 use ra_core::agent::{AgentId, AgentSpec};
 use ra_core::capability::CapabilityFamily;
-use ra_core::error::Result;
+use ra_core::error::{Error, Result};
 use ra_core::prompt::{PromptRole, PromptSection};
-use ra_runtime::tool::{
-    profile::{ToolSurface, ToolSurfaceBudget},
-    registry::ToolRegistry,
+use ra_runtime::{
+    agent::control::AgentControl,
+    runner::RunRequest,
+    tool::{
+        profile::{ToolSurface, ToolSurfaceBudget},
+        registry::ToolRegistry,
+    },
 };
 
 use crate::{
-    capabilities::RoleCapabilities,
+    capabilities::{COLLABORATION_FAMILY, RoleCapabilities},
     host::CodingHost,
     profile::CodingProfile,
     prompt::{assemble_stable_prefix, assemble_stable_prefix_for_surface},
@@ -31,11 +35,9 @@ use crate::{
 
 /// The tier a host-backed agent assembles when the caller does not name one.
 ///
-/// Deliberately not [`CodingProfile::default`]. The default tier is `codex_like`, and nine of its
-/// fifteen entries have no implementation yet, so assembling it fails — which is the behaviour that
-/// tier is there for: the list is the specification, and a surface quietly smaller than the prompt
-/// describing it is the outcome the failure prevents. `core` is the widest tier that assembles from
-/// what exists today, and this constant is what moves when that stops being true.
+/// Deliberately not [`CodingProfile::default`]: the standard tier requires web, skills, user input
+/// and collaboration services. A minimal host has only its workspace and process manager, so it
+/// starts on Core. Selecting the standard tier without its services fails during assembly.
 pub const HOST_BACKED_PROFILE: CodingProfile = CodingProfile::Core;
 
 /// Builds the coding agent's declaration with an assembled stable prefix.
@@ -78,11 +80,15 @@ pub async fn build_agent_with_host(
 /// contributed them. A tier the registry cannot satisfy fails here rather than shipping an agent
 /// whose prompt describes tools the provider was never sent.
 ///
+/// An agent offered the collaboration tools is refused here: those tools act on an agent tree the
+/// caller has to own and bind every run to. Build it with [`build_agent_with_control`] instead,
+/// which returns the tree along with the agent.
+///
 /// # Errors
 ///
 /// Propagates tool construction, registry, and profile-assembly failures — including a tier naming
 /// an entry no capability provides — plus fragment resolution, prompt assembly, and agent
-/// validation failures.
+/// validation failures, and refuses an agent offered the collaboration tools.
 pub async fn build_agent_with_profile(
     id: AgentId,
     name: impl Into<String> + Send,
@@ -90,12 +96,111 @@ pub async fn build_agent_with_profile(
     host: &CodingHost,
     profile: CodingProfile,
 ) -> Result<Arc<AgentSpec>> {
+    let assembled = assemble_agent(id, name, role, host, profile).await?;
+    if assembled.collaborates {
+        return Err(Error::config(
+            "the assembled coding agent is offered the collaboration tools, which act on an agent \
+             tree its runs must be bound to; build it with `build_agent_with_control`, which \
+             returns that tree",
+        ));
+    }
+    Ok(assembled.agent)
+}
+
+/// Builds the coding agent as [`build_agent_with_profile`] does, together with the agent tree its
+/// collaboration tools act on when the role and tier offer them.
+///
+/// The tree prepares every agent it spawns from `host` again, with a process manager of its own,
+/// as Codex starts each spawned agent as a session of its own. The caller owns the tree: it binds
+/// each run to it with [`StandaloneCodingAgent::bind`], or hands it to an
+/// [`AgentThreadBuilder`](ra_runtime::thread::AgentThreadBuilder), and shuts it down when done.
+///
+/// # Errors
+///
+/// Propagates the failures described on [`build_agent_with_profile`], other than its refusal of
+/// the collaboration tools.
+pub async fn build_agent_with_control(
+    id: AgentId,
+    name: impl Into<String> + Send,
+    role: &PromptRole,
+    host: &CodingHost,
+    profile: CodingProfile,
+) -> Result<StandaloneCodingAgent> {
+    let name = name.into();
+    let assembled = assemble_agent(id.clone(), name.clone(), role, host, profile).await?;
+    let control = if assembled.collaborates {
+        Some(crate::spawned::agent_control(
+            host, id, name, role, profile,
+        )?)
+    } else {
+        None
+    };
+    Ok(StandaloneCodingAgent {
+        agent: assembled.agent,
+        control,
+    })
+}
+
+/// A coding agent built for standalone runs, with the agent tree its collaboration tools act on.
+#[derive(Debug)]
+pub struct StandaloneCodingAgent {
+    agent: Arc<AgentSpec>,
+    control: Option<AgentControl>,
+}
+
+impl StandaloneCodingAgent {
+    /// The agent's declaration.
+    #[must_use]
+    pub const fn agent(&self) -> &Arc<AgentSpec> {
+        &self.agent
+    }
+
+    /// The agent's tree, when the agent is offered the collaboration tools.
+    #[must_use]
+    pub const fn agent_control(&self) -> Option<&AgentControl> {
+        self.control.as_ref()
+    }
+
+    /// Binds `request` to the root of the agent's tree, when it has one.
+    pub fn bind(&self, request: RunRequest) -> RunRequest {
+        match &self.control {
+            Some(control) => request.with_agent_control(control.root()),
+            None => request,
+        }
+    }
+
+    /// The declaration and the tree, for a caller that keeps them apart.
+    #[must_use]
+    pub fn into_parts(self) -> (Arc<AgentSpec>, Option<AgentControl>) {
+        (self.agent, self.control)
+    }
+}
+
+/// A coding agent as assembled, and whether it is offered the collaboration tools.
+pub(crate) struct AssembledAgent {
+    pub(crate) agent: Arc<AgentSpec>,
+    pub(crate) collaborates: bool,
+}
+
+/// Assembles the coding agent for one role and tier from `host`.
+pub(crate) async fn assemble_agent(
+    id: AgentId,
+    name: impl Into<String> + Send,
+    role: &PromptRole,
+    host: &CodingHost,
+    profile: CodingProfile,
+) -> Result<AssembledAgent> {
     let assembled = host_backed_surface(role, host, profile).await?;
     let prefix = assemble_stable_prefix_for_surface(
         role,
         assembled.tool_surface(),
         assembled.capability_sections(),
     )?;
+    // Read off the families installed on the surface rather than a tool's model-facing name,
+    // which the host's namespace choice changes.
+    let collaborates = assembled.installed().iter().any(|capability| {
+        capability.family().as_str() == COLLABORATION_FAMILY && !capability.advertised().is_empty()
+    });
     let mut builder = AgentSpec::builder()
         .id(id)
         .name(name)
@@ -105,7 +210,10 @@ pub async fn build_agent_with_profile(
         runtime.start_background();
         builder = builder.tool_resolver(runtime.clone());
     }
-    builder.build()
+    Ok(AssembledAgent {
+        agent: builder.build()?,
+        collaborates,
+    })
 }
 
 /// What one role installs at one tier: the entries, and the prompt text that describes them.
@@ -240,6 +348,7 @@ pub async fn host_backed_surface(
         role,
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
+        host.collaboration_namespace()?.as_ref(),
     )?;
     let budget = *profile.budget();
     let tool_surface = registry.assemble(&profile)?;

@@ -1012,6 +1012,44 @@ async fn a_turn_transition_withdraws_the_threads_requests() {
     drop(other_waiter);
 }
 
+/// Withdrawing a batch's own requests leaves every other request of the same thread waiting,
+/// including one raised after the batch: the owner may already have asked again.
+#[tokio::test]
+async fn withdrawing_named_requests_leaves_the_threads_other_requests_waiting() {
+    let (server, requester) =
+        Server::start(|server| ThreadRequester::new(server, &[ConnectionId::new(1)], thread()));
+    let mut connection = server.open(1).await;
+    server.initialize(&mut connection, false).await;
+
+    let (asked, asked_waiter) = requester
+        .send_request(ServerRequestPayload::FileChangeRequestApproval(
+            file_change_approval("call-1"),
+        ))
+        .await;
+    let (later, later_waiter) = requester
+        .send_request(ServerRequestPayload::FileChangeRequestApproval(
+            file_change_approval("call-2"),
+        ))
+        .await;
+    for _ in 0..2 {
+        connection.next().await;
+    }
+
+    requester.abort_server_requests(std::slice::from_ref(&asked));
+    // A second withdrawal of the same request finds nothing waiting and changes nothing.
+    requester.abort_server_requests(&[asked]);
+
+    let error = JsonRpcErrorObject::internal_error(
+        "client request resolved because the turn state was changed",
+    )
+    .with_data(json!({"reason": "turnTransition"}));
+    assert_eq!(answer_of(asked_waiter).await, Ok(Err(error)));
+    let pending = requester.pending_requests();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id(), &later);
+    drop(later_waiter);
+}
+
 /// Codex's `command_execution_request_approval_strips_additional_permissions_without_capability`
 /// and `..._keeps_additional_permissions_with_capability`, through the server: each connection is
 /// sent what its own handshake allows, and `availableDecisions` is sent to both, as Codex sends it.

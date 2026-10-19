@@ -17,6 +17,9 @@ mod thread_list;
 #[path = "threads/thread_read_state.rs"]
 mod thread_read_state;
 
+#[path = "threads/coding_tools.rs"]
+mod coding_tools;
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},

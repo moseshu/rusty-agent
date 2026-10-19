@@ -41,11 +41,9 @@
 //!
 //! # Why the tiers that cannot be assembled are rows too
 //!
-//! Two of the three tiers name entries nobody has written yet, so they refuse to assemble. Recording
-//! the refusal — in the product's own words, which name every entry the registry could not
-//! provide — is the point rather than an omission: the list is the specification, the refusal is how
-//! far the specification is from being met, and the day it shrinks to nothing those rows fill in with
-//! a surface that has to be reviewed like any other.
+//! A minimal host cannot assemble tiers requiring optional backend services. Recording the refusal
+//! keeps the deployment requirements visible. A configured host produces measurable surfaces for
+//! these same tiers; a missing service never becomes a fabricated zero-cost tool.
 
 use std::fmt::Write as _;
 
@@ -80,7 +78,7 @@ const LABEL_WIDTH: usize = 22;
 /// The rows come from [`host_backed_surface`] and the prefix from the same assembler the agent
 /// builder uses, so what is recorded is what the product installs rather than a second reading of
 /// the same capabilities. A tier the host cannot satisfy records both the surface it declared and
-/// the refusal it produced. The declaration keeps an unwritten profile reviewable without
+/// the refusal it produced. The declaration keeps an unavailable profile reviewable without
 /// inventing schema, prompt, or token measurements that no assembled request has.
 ///
 /// # Errors
@@ -136,6 +134,7 @@ fn declared_surface(
         role,
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
+        host.collaboration_namespace()?.as_ref(),
     )?;
     let registry = ToolRegistry::builder()
         .register_all(capabilities.tools())

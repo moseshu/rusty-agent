@@ -24,15 +24,22 @@
 //! request withdrawn because its turn moved on passes nothing on, and answers that arrive for a
 //! checkpoint that is no longer the one waiting are dropped, so they cannot settle a later stop.
 //!
+//! Spawned agents use the same batch handling. Their session owns each pending request, while
+//! the parent thread's connections carry it; parent turn transitions leave these requests alive.
+//! The control tree's pause notifications withdraw a child's requests when its own run ends.
+//!
 //! A call the product asks nothing for — or any call of a thread loaded without a product
 //! adapter — is refused as Codex refuses a call whose approval could not be obtained.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
+
+mod target;
+use target::ApprovalTarget;
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use ra_core::{
     event::{ApprovalEvent, ApprovalResolution},
-    item::{ItemId, RunItem, RunItemKind},
+    item::{RunItem, RunItemKind},
     state::RunState,
 };
 use ra_runtime::thread::ThreadEvent;
@@ -63,7 +70,33 @@ pub(crate) fn start_approval_batch(
     turn_id: String,
 ) {
     tokio::spawn(async move {
-        run_approval_batch(&loaded, &outgoing, &thread_watch, &turn_id).await;
+        run_approval_batch(
+            &loaded,
+            &outgoing,
+            &thread_watch,
+            &turn_id,
+            &ApprovalTarget::Parent,
+        )
+        .await;
+    });
+}
+
+/// Child requests retain the child's session ownership while going to the parent's connections.
+pub(crate) fn start_spawned_approval_batch(
+    loaded: LoadedThread,
+    outgoing: ThreadScopedOutgoingMessageSender,
+    thread_watch: Arc<ThreadWatchManager>,
+    control: ra_runtime::agent::control::AgentControl,
+    paused: ra_runtime::agent::control::PausedAgentRun,
+) {
+    let outgoing = outgoing.with_request_owner(paused.session_id().clone());
+    tokio::spawn(async move {
+        let turn_id = paused.state().run_id().as_str().to_owned();
+        let target = ApprovalTarget::Spawned {
+            control,
+            paused: Box::new(paused),
+        };
+        run_approval_batch(&loaded, &outgoing, &thread_watch, &turn_id, &target).await;
     });
 }
 
@@ -72,44 +105,37 @@ async fn run_approval_batch(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_watch: &Arc<ThreadWatchManager>,
     turn_id: &str,
+    target: &ApprovalTarget,
 ) {
-    let Some((mut state, config)) = loaded.thread.paused_run_with_config(turn_id) else {
+    let Some((mut state, config)) = target.checkpoint(loaded, turn_id) else {
         return;
     };
     let batch: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
-    let thread_id = loaded.thread_id().clone();
+    let thread_id = match target {
+        ApprovalTarget::Parent => loaded.thread_id().clone(),
+        ApprovalTarget::Spawned { paused, .. } => paused.session_id().clone(),
+    };
 
     let mut answers = Vec::with_capacity(batch.len());
+    let mut asked = Vec::with_capacity(batch.len());
     let mut waiting = FuturesUnordered::new();
     for item in &batch {
-        let RunItemKind::ToolApproval(approval) = item.kind() else {
+        let Some((method, request)) =
+            approval_request(loaded, &config, thread_id.as_str(), turn_id, item)
+        else {
             answers.push((item.clone(), ApprovalAnswer::failed()));
             continue;
         };
-        let pending = PendingApproval::new(
-            thread_id.as_str(),
-            turn_id,
-            now_unix_timestamp_ms(),
-            approval,
-        );
-        let request = loaded
-            .adapter
-            .as_ref()
-            .and_then(|adapter| adapter.approval_request(&config, pending));
-        let (method, request) = match request {
-            Some(request @ ServerRequestPayload::CommandExecutionRequestApproval(_)) => {
-                (ApprovalMethod::CommandExecution, request)
-            }
-            Some(request @ ServerRequestPayload::FileChangeRequestApproval(_)) => {
-                (ApprovalMethod::FileChange, request)
-            }
-            _ => {
-                answers.push((item.clone(), ApprovalAnswer::failed()));
-                continue;
-            }
+        let guard = match target {
+            ApprovalTarget::Parent => Some(
+                thread_watch
+                    .note_permission_requested(loaded.thread_id())
+                    .await,
+            ),
+            ApprovalTarget::Spawned { .. } => None,
         };
-        let guard = thread_watch.note_permission_requested(&thread_id).await;
         let (request_id, answer) = outgoing.send_request(request).await;
+        asked.push(request_id.clone());
         let item = item.clone();
         waiting.push(async move {
             let answer = outgoing.wait_for_answer(request_id, answer).await;
@@ -125,7 +151,7 @@ async fn run_approval_batch(
     let mut ended = false;
     let mut effects = FuturesUnordered::new();
     for (item, answer) in answers {
-        if !apply_answer(loaded, turn_id, &batch, &mut state, &item, &answer) {
+        if !apply_answer(loaded, turn_id, &batch, &mut state, &item, &answer, target).await {
             ended = true;
             break;
         }
@@ -140,8 +166,18 @@ async fn run_approval_batch(
 
     // Once the turn has moved on, the requests still waiting are only waited for, so each is
     // resolved as its turn's end withdraws it, as Codex's handler of each request resolves it.
+    // The parent's listener withdraws them at its turn transition. A spawned agent's run has no
+    // such transition, so its batch withdraws exactly the requests it asked, once.
+    let mut withdrawn = false;
     while !waiting.is_empty() || !effects.is_empty() {
+        if ended && !withdrawn {
+            withdrawn = true;
+            if target.withdraws_own_requests() {
+                outgoing.abort_server_requests(&asked);
+            }
+        }
         tokio::select! {
+            () = target.changed(loaded, turn_id, &batch), if !ended => ended = true,
             Some((item, answer)) = waiting.next(), if !waiting.is_empty() => {
                 if ended {
                     continue;
@@ -150,7 +186,7 @@ async fn run_approval_batch(
                     // Withdrawn because the turn moved on: nothing is passed on.
                     None => ended = true,
                     Some(answer) => {
-                        ended = !apply_answer(loaded, turn_id, &batch, &mut state, &item, &answer);
+                        ended = !apply_answer(loaded, turn_id, &batch, &mut state, &item, &answer, target).await;
                         if !ended {
                             effects.push(apply_product_decision(loaded, outgoing, &config, item, answer.decision));
                         }
@@ -160,8 +196,7 @@ async fn run_approval_batch(
             Some(()) = effects.next(), if !effects.is_empty() => {}
         }
     }
-    if !ended && current_batch(loaded, turn_id, &batch) && loaded.thread.resume_turn(state).is_err()
-    {
+    if !ended && target.current_batch(loaded, turn_id, &batch) && !target.resume(loaded, state) {
         tracing::warn!(
             turn_id,
             "the run answered for approval was no longer waiting"
@@ -169,27 +204,51 @@ async fn run_approval_batch(
     }
 }
 
+fn approval_request(
+    loaded: &LoadedThread,
+    config: &ra_runtime::runner::RunConfig,
+    thread_id: &str,
+    turn_id: &str,
+    item: &RunItem,
+) -> Option<(ApprovalMethod, ServerRequestPayload)> {
+    let RunItemKind::ToolApproval(approval) = item.kind() else {
+        return None;
+    };
+    let pending = PendingApproval::new(thread_id, turn_id, now_unix_timestamp_ms(), approval);
+    let request = loaded.adapter.as_ref()?.approval_request(config, pending)?;
+    match request {
+        request @ ServerRequestPayload::CommandExecutionRequestApproval(_) => {
+            Some((ApprovalMethod::CommandExecution, request))
+        }
+        request @ ServerRequestPayload::FileChangeRequestApproval(_) => {
+            Some((ApprovalMethod::FileChange, request))
+        }
+        _ => None,
+    }
+}
+
 /// Settles one answer immediately, preserving its event and product effects even if another
 /// request later cancels the batch. Returns whether the remaining answers may still be applied.
-fn apply_answer(
+async fn apply_answer(
     loaded: &LoadedThread,
     turn_id: &str,
     batch: &[RunItem],
     state: &mut RunState,
     item: &RunItem,
     answer: &ApprovalAnswer,
+    target: &ApprovalTarget,
 ) -> bool {
-    if !current_batch(loaded, turn_id, batch) {
+    if !target.current_batch(loaded, turn_id, batch) {
         return false;
     }
-    if !record(loaded, state, item, answer.resolution) {
+    if !record(loaded, state, item, answer.resolution, target) {
         return false;
     }
     let settled = match answer.decision.run_answer() {
         RunAnswer::Approve => state.approve(item, false),
         RunAnswer::Reject(message) => state.reject_with_message(item, false, message),
         RunAnswer::Abort => {
-            let _ = loaded.thread.interrupt();
+            target.interrupt(loaded).await;
             return false;
         }
     };
@@ -242,31 +301,19 @@ async fn apply_product_decision(
     }
 }
 
-/// A repeated stop of the same turn can ask new questions, even about the same call.
-fn current_batch(loaded: &LoadedThread, turn_id: &str, batch: &[RunItem]) -> bool {
-    let Some((state, _)) = loaded.thread.paused_run_with_config(turn_id) else {
-        return false;
-    };
-    let asked: HashSet<&ItemId> = batch.iter().map(RunItem::id).collect();
-    let waiting: HashSet<&ItemId> = state
-        .pending_interruption_items()
-        .map(RunItem::id)
-        .collect();
-    asked == waiting
-}
-
 /// Records how the approval of `item`'s call was settled.
 fn record(
     loaded: &LoadedThread,
     state: &mut RunState,
     item: &RunItem,
     resolution: ApprovalResolution,
+    target: &ApprovalTarget,
 ) -> bool {
     let RunItemKind::ToolApproval(approval) = item.kind() else {
         return false;
     };
     let event = ApprovalEvent::resolved(approval.call_id().clone(), resolution);
-    if let Err(error) = loaded.thread.record_approval(state, event) {
+    if let Err(error) = target.record(loaded, state, event) {
         tracing::warn!(%error, "an approval answer could not be recorded");
         return false;
     }

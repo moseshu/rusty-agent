@@ -34,12 +34,14 @@ pub mod profile;
 pub mod prompt;
 pub(crate) mod request_permissions;
 pub mod shell_command;
+pub(crate) mod spawned;
 pub mod thread_factory;
 pub mod thread_items;
 
 pub use agent::{
-    HOST_BACKED_PROFILE, HostBackedSurface, InstalledCapability, build_agent,
-    build_agent_with_host, build_agent_with_profile, host_backed_surface,
+    HOST_BACKED_PROFILE, HostBackedSurface, InstalledCapability, StandaloneCodingAgent,
+    build_agent, build_agent_with_control, build_agent_with_host, build_agent_with_profile,
+    host_backed_surface,
 };
 pub use assembly::render_capability_assembly;
 pub use host::CodingHost;

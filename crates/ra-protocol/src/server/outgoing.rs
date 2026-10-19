@@ -428,6 +428,8 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
     outgoing: Arc<OutgoingMessageSender>,
     connection_ids: Arc<Vec<ConnectionId>>,
     thread_id: SessionId,
+    /// Requests of a spawned session use its lifecycle while sharing the parent's connections.
+    request_owner: SessionId,
 }
 
 #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
@@ -440,8 +442,14 @@ impl ThreadScopedOutgoingMessageSender {
         Self {
             outgoing,
             connection_ids: Arc::new(connection_ids),
+            request_owner: thread_id.clone(),
             thread_id,
         }
+    }
+
+    pub(crate) fn with_request_owner(mut self, owner: SessionId) -> Self {
+        self.request_owner = owner;
+        self
     }
 
     /// Sends `payload` to the thread's connections and keeps it for the thread: Codex's
@@ -454,7 +462,7 @@ impl ThreadScopedOutgoingMessageSender {
             .send_request_to_connections(
                 &self.connection_ids,
                 payload,
-                Some(self.thread_id.clone()),
+                Some(self.request_owner.clone()),
             )
             .await
     }
@@ -507,7 +515,28 @@ impl ThreadScopedOutgoingMessageSender {
     /// or is aborted, since every request of a thread belongs to a turn.
     pub(crate) fn abort_pending_server_requests(&self) {
         self.outgoing
-            .cancel_requests_for_thread(&self.thread_id, Some(&turn_transition_error()));
+            .cancel_requests_for_thread(&self.request_owner, Some(&turn_transition_error()));
+    }
+
+    /// Withdraws those of `request_ids` still waiting, completing each with the turn transition
+    /// error, and leaves every other request of the same owner alone.
+    ///
+    /// A spawned agent's approval batch has no listener withdrawing it at a parent turn
+    /// transition, so it withdraws what it asked itself once its own run moves on. Withdrawing by
+    /// owner instead would also take a later batch the same agent had already raised.
+    pub(crate) fn abort_server_requests(&self, request_ids: &[RequestId]) {
+        let waiting: std::collections::HashSet<RequestId> = self
+            .outgoing
+            .pending
+            .pending_for_thread(&self.request_owner)
+            .into_iter()
+            .map(|request| request.id().clone())
+            .collect();
+        for id in request_ids.iter().filter(|id| waiting.contains(*id)) {
+            self.outgoing
+                .pending
+                .notify_error(id, turn_transition_error());
+        }
     }
 
     /// Tells the thread's connections that the request `request_id` needs no answer any more:
@@ -518,7 +547,7 @@ impl ThreadScopedOutgoingMessageSender {
     /// connections attached after this sender was made receive the resolution too.
     pub(crate) async fn resolve_server_request(&self, request_id: RequestId) {
         let notification =
-            ServerRequestResolvedNotification::new(self.thread_id.as_str(), request_id);
+            ServerRequestResolvedNotification::new(self.request_owner.as_str(), request_id);
         match serde_json::to_value(notification) {
             Ok(params) => {
                 let connections = self

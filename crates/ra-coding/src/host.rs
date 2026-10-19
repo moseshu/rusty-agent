@@ -9,8 +9,11 @@ use ra_context::{
 use ra_core::{
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
+    skill::SkillCatalog,
     state::EventSeqAllocator,
-    tool::{Tool, ToolServices},
+    tool::{Tool, ToolNamespace, ToolServices},
+    user_input::UserInputPort,
+    web::WebAccess,
 };
 
 use ra_exec::{
@@ -18,9 +21,10 @@ use ra_exec::{
     session::ProcessManager,
 };
 use ra_runtime::runner::RunConfig;
+use ra_tools::agent_ns::COLLABORATION_NAMESPACE;
 use ra_tools::capability::{
-    ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability, TodoCapability,
-    ViewImageCapability,
+    ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability,
+    SkillsCapability, TodoCapability, ViewImageCapability, WebCapability,
 };
 
 /// The host runtime context and capabilities for the coding agent.
@@ -40,6 +44,38 @@ pub struct CodingHost {
     process_manager: Arc<ProcessManager>,
     event_sink: Arc<dyn HostEventSink>,
     exec_permission_approvals: bool,
+    web: Option<Arc<dyn WebAccess>>,
+    skills: Option<Arc<dyn SkillCatalog>>,
+    user_input: Option<Arc<dyn UserInputPort>>,
+    request_user_input: bool,
+    collaboration: Option<Collaboration>,
+    /// Set on the host a spawned agent is assembled from.
+    spawned_agent: bool,
+}
+
+/// Codex's default namespace for the collaboration tools.
+pub(crate) fn default_collaboration_namespace() -> ra_core::error::Result<ToolNamespace> {
+    ToolNamespace::new(COLLABORATION_NAMESPACE)
+}
+
+/// Where the collaboration tools are advertised.
+#[derive(Clone)]
+enum CollaborationNamespace {
+    /// Codex's default, [`COLLABORATION_NAMESPACE`].
+    Default,
+    /// A namespace the host chose, or bare names with `None`.
+    Chosen(Option<ToolNamespace>),
+}
+
+/// How the collaboration tools are offered: the host's counterpart of Codex's
+/// `multi_agent_v2` configuration.
+#[derive(Clone)]
+struct Collaboration {
+    /// Codex's `tool_namespace`.
+    namespace: CollaborationNamespace,
+    /// Whether spawned agents are offered the tools as well (see
+    /// [`CodingHost::with_spawned_agent_collaboration`]).
+    spawned_agents: bool,
 }
 
 impl fmt::Debug for CodingHost {
@@ -65,6 +101,12 @@ impl CodingHost {
             process_manager: Arc::new(ProcessManager::default()),
             event_sink: Arc::new(NoopHostEventSink),
             exec_permission_approvals: false,
+            web: None,
+            skills: None,
+            user_input: None,
+            request_user_input: false,
+            collaboration: None,
+            spawned_agent: false,
         })
     }
 
@@ -74,12 +116,127 @@ impl CodingHost {
     #[must_use]
     pub fn with_new_process_manager(&self) -> Self {
         Self {
-            workspace: self.workspace.clone(),
-            mcp: self.mcp.clone(),
             process_manager: Arc::new(ProcessManager::default()),
-            event_sink: Arc::clone(&self.event_sink),
-            exec_permission_approvals: self.exec_permission_approvals,
+            ..self.clone()
         }
+    }
+
+    /// Installs the shared backend used by both web tools.
+    #[must_use]
+    pub fn with_web_access(mut self, access: Arc<dyn WebAccess>) -> Self {
+        self.web = Some(access);
+        self
+    }
+
+    /// Installs the catalog used by the skills listing and the skill-loading tool.
+    #[must_use]
+    pub fn with_skill_catalog(mut self, catalog: Arc<dyn SkillCatalog>) -> Self {
+        self.skills = Some(catalog);
+        self
+    }
+
+    /// Enables questions in Default mode and routes them to `port` for standalone runs.
+    /// App-server threads replace this port with their own client connection.
+    #[must_use]
+    pub fn with_user_input(mut self, port: Arc<dyn UserInputPort>) -> Self {
+        self.user_input = Some(port);
+        self.request_user_input = true;
+        self
+    }
+
+    pub(crate) const fn with_client_user_input(mut self) -> Self {
+        self.request_user_input = true;
+        self
+    }
+
+    pub(crate) const fn request_user_input_enabled(&self) -> bool {
+        self.request_user_input
+    }
+
+    /// Enables the six collaboration tools in Codex's default `collaboration` namespace.
+    ///
+    /// The tools act on an agent tree. The thread factory gives each thread a tree of its own;
+    /// a standalone caller builds the agent with
+    /// [`build_agent_with_control`](crate::build_agent_with_control), which returns the tree to
+    /// bind its runs to. Each spawned agent is assembled again from this host with a process
+    /// manager of its own, as Codex starts each spawned agent as a session of its own.
+    #[must_use]
+    pub fn with_collaboration(mut self) -> Self {
+        self.collaboration = Some(Collaboration {
+            namespace: CollaborationNamespace::Default,
+            spawned_agents: false,
+        });
+        self
+    }
+
+    /// Advertises the collaboration tools in `namespace`, or under their bare names with `None`:
+    /// Codex's `multi_agent_v2.tool_namespace`.
+    ///
+    /// Namespaces are an `OpenAI` Responses feature. Chat Completions and Anthropic adapters
+    /// refuse a namespaced tool, so a host serving those providers selects bare names here.
+    /// Has no effect until collaboration is enabled with [`Self::with_collaboration`].
+    #[must_use]
+    pub fn with_collaboration_namespace(mut self, namespace: Option<ToolNamespace>) -> Self {
+        if let Some(collaboration) = &mut self.collaboration {
+            collaboration.namespace = CollaborationNamespace::Chosen(namespace);
+        }
+        self
+    }
+
+    /// Offers the collaboration tools to spawned agents too.
+    ///
+    /// Codex offers them to a spawned agent only when the agent's model declares native support
+    /// for its second multi-agent version in the model catalog. This framework has no model
+    /// catalog, so the host states that fact here; without it a spawned agent is assembled without
+    /// the tools, as Codex assembles one whose model declares nothing. Has no effect until
+    /// collaboration is enabled with [`Self::with_collaboration`].
+    #[must_use]
+    pub fn with_spawned_agent_collaboration(mut self) -> Self {
+        if let Some(collaboration) = &mut self.collaboration {
+            collaboration.spawned_agents = true;
+        }
+        self
+    }
+
+    /// The host a spawned agent is assembled from: this host, with a process manager of its own.
+    pub(crate) fn for_spawned_agent(&self) -> Self {
+        Self {
+            spawned_agent: true,
+            ..self.with_new_process_manager()
+        }
+    }
+
+    pub(crate) const fn collaboration_enabled(&self) -> bool {
+        self.collaboration.is_some()
+    }
+
+    /// Whether the agent assembled from this host is offered the collaboration tools.
+    pub(crate) fn collaboration_offered(&self) -> bool {
+        self.collaboration
+            .as_ref()
+            .is_some_and(|collaboration| !self.spawned_agent || collaboration.spawned_agents)
+    }
+
+    /// The namespace the collaboration tools are advertised in, if any.
+    pub(crate) fn collaboration_namespace(&self) -> ra_core::error::Result<Option<ToolNamespace>> {
+        match self
+            .collaboration
+            .as_ref()
+            .map(|collaboration| &collaboration.namespace)
+        {
+            Some(CollaborationNamespace::Chosen(namespace)) => Ok(namespace.clone()),
+            Some(CollaborationNamespace::Default) | None => {
+                default_collaboration_namespace().map(Some)
+            }
+        }
+    }
+
+    pub(crate) fn web_capability(&self) -> ra_core::error::Result<Option<WebCapability>> {
+        self.web.clone().map(WebCapability::new).transpose()
+    }
+
+    pub(crate) fn skills_capability(&self) -> ra_core::error::Result<Option<SkillsCapability>> {
+        self.skills.clone().map(SkillsCapability::new).transpose()
     }
 
     /// Lets `exec_command` ask for permissions of its own: Codex's `exec_permission_approvals`
@@ -157,9 +314,13 @@ impl CodingHost {
     /// The result budget is a host policy, not a tool setting: all completed observations keep
     /// their full session form, while the runtime projects only an oversized model-facing excerpt.
     pub fn build_tool_services(&self) -> ToolServices {
-        ToolServices::new()
+        let services = ToolServices::new()
             .with_event_sink(Arc::clone(&self.event_sink))
-            .with_output_projector(Arc::new(ToolResultBudget::default()))
+            .with_output_projector(Arc::new(ToolResultBudget::default()));
+        match &self.user_input {
+            Some(port) => services.with_user_input(Arc::clone(port)),
+            None => services,
+        }
     }
 
     /// Constructs the coding product's run policy, including reference-aware tool-output eviction

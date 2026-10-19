@@ -1325,3 +1325,85 @@ async fn cancelling_does_not_wait_for_a_products_pending_effect() {
         ReviewDecision::ApprovedForSession
     ));
 }
+
+/// A batch whose turn has ended keeps waiting only for its products' effects; it must not withdraw
+/// the requests the thread's next turn has raised meanwhile. Withdrawing by thread would leave that
+/// turn waiting on an approval no client can answer any more.
+#[tokio::test]
+async fn an_ended_batch_leaves_the_next_turns_requests_alone() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    let thread = server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    script.push(calls("run", &["call-1", "call-2", "call-3"]));
+    server.turn_start(&mut connection, "three").await;
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        requests.push(connection.server_request().await);
+    }
+    requests.sort_by_key(|request| request["params"]["itemId"].as_str().unwrap().to_owned());
+
+    // Two accepted answers whose product effects are still being applied when the third cancels.
+    let first_gate = Arc::new(Notify::new());
+    *product.decision_gate.lock().unwrap() = Some(Arc::clone(&first_gate));
+    server
+        .answer(
+            &connection,
+            &requests[0],
+            json!({"decision": "acceptForSession"}),
+        )
+        .await;
+    product.wait_for_started_decision().await;
+    let second_gate = Arc::new(Notify::new());
+    *product.decision_gate.lock().unwrap() = Some(Arc::clone(&second_gate));
+    server
+        .answer(
+            &connection,
+            &requests[1],
+            json!({"decision": "acceptForSession"}),
+        )
+        .await;
+    timeout(PATIENCE, async {
+        while product.decision_models.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second effect starts");
+    server
+        .answer(&connection, &requests[2], json!({"decision": "cancel"}))
+        .await;
+    let turn = connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "interrupted");
+
+    // The next turn raises a request while the ended batch still waits on both effects.
+    script.push(calls("run", &["call-4"]));
+    script.push(final_message("answer", "done"));
+    server.turn_start(&mut connection, "again").await;
+    let next = connection.server_request().await;
+    assert_eq!(next["params"]["itemId"], "call-4");
+
+    // One effect finishes, which wakes the ended batch while the other is still pending.
+    first_gate.notify_one();
+    product.wait_for_decisions(1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !connection.passed.iter().any(|message| {
+            message["method"] == "serverRequest/resolved"
+                && message["params"]["requestId"] == next["id"]
+        }),
+        "the ended batch withdrew the next turn's request"
+    );
+    second_gate.notify_one();
+    product.wait_for_decisions(2).await;
+
+    server
+        .answer(&connection, &next, json!({"decision": "accept"}))
+        .await;
+    let turn = connection.notification("turn/completed").await;
+    assert_eq!(turn["turn"]["status"], "completed");
+    assert_eq!(thread.runs(), ["call-4"]);
+}
