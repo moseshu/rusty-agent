@@ -88,9 +88,15 @@ pub struct McpTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     options: ToolOptions,
+    approval_agent: Option<ra_core::context::RunAgent>,
 }
 impl McpTool {
-    fn new(info: McpToolInfo, client: McpClient, tool_search_enabled: bool) -> Result<Self> {
+    fn new(
+        info: McpToolInfo,
+        client: McpClient,
+        tool_search_enabled: bool,
+        agent: Option<&ra_core::context::RunAgent>,
+    ) -> Result<Self> {
         let origin = match info.callable_namespace() {
             Some(namespace) => {
                 ToolOrigin::namespaced(ToolNamespace::new(namespace)?, info.callable_name())?
@@ -135,10 +141,21 @@ impl McpTool {
         } else {
             ToolConcurrency::Exclusive
         };
-        let options = ToolOptions::new()
+        let mut options = ToolOptions::new()
+            .with_approval(
+                client
+                    .require_approval()
+                    .for_tool(&info.tool.name, agent.is_some()),
+            )
             .with_exposure(exposure)
             .with_concurrency(concurrency)
             .with_failure_handling(ToolFailureHandling::ModelVisible);
+        for guardrail in client.tool_input_guardrails() {
+            options = options.with_input_guardrail(guardrail.clone());
+        }
+        for guardrail in client.tool_output_guardrails() {
+            options = options.with_output_guardrail(guardrail.clone());
+        }
         // The MCP client owns the deadline so it can send the protocol cancellation before
         // returning. A competing runner timer could drop it before that notification is sent.
         Ok(Self {
@@ -147,6 +164,7 @@ impl McpTool {
             origin,
             schema,
             options,
+            approval_agent: agent.cloned(),
         })
     }
     /// Original MCP identity and normalized model names.
@@ -156,6 +174,7 @@ impl McpTool {
     }
     /// Calls the original tool name on the connection retained by this declaration.
     /// The declaration's `_meta` is sent as request metadata, as Python's static tool meta is.
+    /// This is a raw protocol call; local approval is enforced by runtime dispatch through [`Tool`].
     pub async fn invoke(&self, arguments: serde_json::Value) -> Result<ToolOutput> {
         let meta = self.info.tool.meta.as_ref().map(|meta| meta.0.clone());
         map_tool_result(
@@ -185,6 +204,24 @@ impl Tool for McpTool {
     }
     fn options(&self) -> ToolOptions {
         self.options.clone()
+    }
+    async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
+        match self.options.approval() {
+            ra_core::tool::ToolApprovalPolicy::Never => Ok(false),
+            ra_core::tool::ToolApprovalPolicy::Always => Ok(true),
+            ra_core::tool::ToolApprovalPolicy::Dynamic => {
+                if let (crate::approval::RequireApprovalSetting::Dynamic(policy), Some(agent)) =
+                    (self.client.require_approval(), self.approval_agent.as_ref())
+                {
+                    policy(context.run(), agent, self.info.tool.clone()).await
+                } else {
+                    Err(Error::config(
+                        "dynamic MCP approval requires a policy and agent",
+                    ))
+                }
+            }
+            _ => Err(Error::config("unsupported MCP tool approval policy")),
+        }
     }
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         self.invoke(context.arguments().clone()).await
@@ -252,7 +289,7 @@ pub async fn discover_tools_with_context(
         .filter_map(|info| {
             let client = servers[info.server_index].0.clone();
             let name = info.tool.name.to_string();
-            McpTool::new(info, client, options.tool_search_enabled)
+            McpTool::new(info, client, options.tool_search_enabled, agent)
                 .map(Arc::new)
                 .inspect_err(|error| warn!("skipping MCP tool {name:?}: {error}"))
                 .ok()

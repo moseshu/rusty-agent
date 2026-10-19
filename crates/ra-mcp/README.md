@@ -9,6 +9,8 @@ Tool filtering/cache passed re-review on 2026-10-18. The contract and validation
 [the filtering/cache notes](../../Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md).
 Metadata resolution, caching and tool-call display metadata passed re-review on 2026-10-18; see
 [the metadata notes](../../Docs/R11-12_MCP_工具元数据解析_契约与验证.md).
+Local tool approval and server tool guardrails passed review and re-review on 2026-10-19; see
+[the approval notes](../../Docs/R11-5_MCP_工具审批_契约与验证.md).
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -75,6 +77,61 @@ Completions and Anthropic adapters refuse namespaced tools, as the Python SDK do
 initialized client used above; `server.cleanup()` closes both sides and joins the
 server task. Its bounded memory stream performs no OS IPC or networking. The
 host tool registration facade and typed registration helpers remain follow-up work.
+
+## Local tool approval
+
+`McpClientOptions::with_require_approval` configures the server policy for stdio, HTTP and
+in-process sessions. The default is `RequireApprovalSetting::Never`, as in Python.
+Use `Always`, a tool-name map, or `dynamic_sync` / `dynamic` callbacks. JSON settings follow
+Python's `require_approval` forms, including booleans and nested tool lists:
+
+```rust
+use ra_mcp::{approval::RequireApprovalSetting, client::McpClientOptions};
+use serde_json::json;
+
+let policy = RequireApprovalSetting::try_from(json!({
+    "always": {"tool_names": ["delete_document"]},
+    "never": {"tool_names": ["search"]}
+}))?;
+let options = McpClientOptions::default().with_require_approval(policy);
+# Ok::<(), ra_core::error::Error>(())
+```
+
+Lists and maps match original protocol names; unlisted tools do not require approval.
+Malformed values and conflicting lists fail during configuration. Callbacks receive the live
+`RunContext`, the public agent captured during discovery, and an owned copy of the original
+MCP declaration. Callback failures propagate; cancellation stops the callback through normal
+dispatch. Discovery without an agent requires approval for callable policies without evaluating
+them, matching Python's legacy conversion.
+
+Runner uses the existing tool-approval interruption and `RunState::approve` / `reject` flow,
+including remembered decisions and serialized recovery. MCP recipient binding is checked on
+resume. Deferred tools retain their approval policy after tool search. Direct protocol calls
+through `McpClient::call_tool` or `McpTool::invoke` remain host-controlled, as in Python;
+runtime dispatch enforces approval when the model invokes a tool.
+
+Server-wide `with_tool_input_guardrails` and `with_tool_output_guardrails` select the checks
+that every discovered MCP tool declares. Both default to empty. They use the existing
+`ToolGuardrailId` registry contract: register the corresponding implementations with
+`RunConfig::with_tool_input_guardrails` / `with_tool_output_guardrails`. Each discovered tool
+gets its own declaration lists, in server order; filters and other servers do not inherit them.
+An unresolved ID fails preparation before the model call.
+
+```rust
+use ra_core::tool::ToolGuardrailId;
+use ra_mcp::client::McpClientOptions;
+
+let options = McpClientOptions::default()
+    .with_require_approval(true)
+    .with_tool_input_guardrails([ToolGuardrailId::new("validate_arguments")?])
+    .with_tool_output_guardrails([ToolGuardrailId::new("validate_result")?]);
+# Ok::<(), ra_core::error::Error>(())
+```
+
+The runtime's optional pre-approval input pass runs before an interruption. Approved calls
+are checked again after serialized recovery, followed by invocation and output checks.
+Remembered approval decisions skip the dynamic approval callback, while the call's guardrails
+continue to apply. Raw protocol invocation remains outside the runtime guardrail chain.
 
 ## Reusable stdio lifecycle
 
@@ -386,8 +443,8 @@ SDK connector. No transparent session recovery or tool replay is enabled. See th
 | Cancellation | Python's outer-cancellation propagation and Codex's cancellable SDK requests: dropped tool/list futures send a bounded best-effort protocol cancellation. Normal timeout uses the SDK's cancellation notification. Remote cancellation remains cooperative. In-process cleanup also cancels the owned server token, joins its task, and reports unconfirmed cleanup. |
 | Cleanup | Client clones share closure. Normal client cleanup is idempotent; SDK close timeout or worker failure is reported by `McpClient::cleanup` and later client cleanup does not claim confirmed success. The configured `McpServer` cleanup follows Python instead: it always clears its session and logs such failures. Stdio byte I/O is transcoded around the SDK's `AsyncRwTransport`; its owner closes the pipes, waits up to 3 s, then kills and reaps the child, following the SDK child transport's shutdown mechanism. A shared failure flag carries transcoder/shutdown errors that the SDK otherwise only logs. Full Codex process-group/executor launcher behavior, sandbox authorization, and lifecycle recovery are not implemented by this slice. |
 
-No MCP transport or provider wire types were added to `ra-core`. Approval
-configuration, OAuth,
+No MCP transport or provider wire types were added to `ra-core`. Local approval configuration
+is described above. OAuth,
 connection pools/lazy startup, manager workers and runtime control remain later
 slices. The obsolete empty `sse` feature and module have been removed in the HTTP follow-up,
 as selected by the roadmap; legacy HTTP+SSE servers are not supported. Streamable HTTP's

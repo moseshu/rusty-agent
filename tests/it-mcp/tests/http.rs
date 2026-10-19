@@ -302,10 +302,17 @@ async fn initialize_protocol_errors_keep_details_and_cleanup_http_sessions() {
 
 #[tokio::test]
 async fn reusable_http_server_tracks_sessions_reconnects_and_reuses_shared_operations() {
+    let input_guardrails = [ra_core::tool::ToolGuardrailId::new("input").unwrap()];
+    let output_guardrails = [ra_core::tool::ToolGuardrailId::new("output").unwrap()];
     for sse in [false, true] {
         let fixture = Server::new().await;
         fixture.state.behavior.lock().unwrap().sse = sse;
-        let server = McpServerStreamableHttp::new(fixture.params());
+        let server = McpServerStreamableHttp::new(fixture.params()).with_options(
+            McpClientOptions::default()
+                .with_require_approval(true)
+                .with_tool_input_guardrails(input_guardrails.clone())
+                .with_tool_output_guardrails(output_guardrails.clone()),
+        );
         assert_eq!(server.name(), format!("streamable_http: {}", fixture.url));
         assert_eq!(server.session_id(), None);
         assert!(!server.is_connected().await);
@@ -315,6 +322,12 @@ async fn reusable_http_server_tracks_sessions_reconnects_and_reuses_shared_opera
         assert_eq!(fixture.requests("initialize").len(), 1);
         assert_eq!(server.session_id().as_deref(), Some("session-0"));
         let old = server.client().unwrap();
+        assert_eq!(old.tool_input_guardrails(), input_guardrails);
+        assert_eq!(old.tool_output_guardrails(), output_guardrails);
+        assert!(matches!(
+            old.require_approval(),
+            ra_mcp::approval::RequireApprovalSetting::Always
+        ));
         assert!(server.list_tools().await.unwrap().is_empty());
         assert!(server.list_prompts().await.unwrap().prompts.is_empty());
         assert!(server.get_prompt("review", None).await.is_ok());
@@ -334,6 +347,18 @@ async fn reusable_http_server_tracks_sessions_reconnects_and_reuses_shared_opera
         assert_eq!(fixture.requests("DELETE").len(), 1);
         server.connect().await.unwrap();
         assert_eq!(server.session_id().as_deref(), Some("session-1"));
+        assert_eq!(
+            server.client().unwrap().tool_input_guardrails(),
+            input_guardrails
+        );
+        assert_eq!(
+            server.client().unwrap().tool_output_guardrails(),
+            output_guardrails
+        );
+        assert!(matches!(
+            server.client().unwrap().require_approval(),
+            ra_mcp::approval::RequireApprovalSetting::Always
+        ));
         server.cleanup().await.unwrap();
         assert_eq!(fixture.requests("DELETE").len(), 2);
     }

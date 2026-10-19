@@ -1,5 +1,7 @@
 //! MCP discovery uses the real runner context before every ordinary or streamed model call.
 
+mod runtime_approvals;
+
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use ra_core::{
@@ -18,6 +20,7 @@ use ra_core::{
 };
 use ra_mcp::{
     McpServer,
+    approval::RequireApprovalSetting,
     client::{
         McpClient, McpClientOptions,
         stdio::{McpServerStdio, McpStdioParams},

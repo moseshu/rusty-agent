@@ -53,7 +53,7 @@ pub const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum catalog size selected by Codex's explicit catalog policy.
 pub const MAX_MCP_CATALOG_ITEMS: usize = 2_048;
 
-/// Timeouts shared by all transports.
+/// Server options shared by all transports, including discovery, approval and tool guardrails.
 ///
 /// As in Python, an enabled session timeout bounds every request: initialize, each tools/list
 /// or prompts/list page, and resource requests. Catalog bounds are opt-in product policy.
@@ -68,6 +68,9 @@ pub struct McpClientOptions {
     tool_timeout: Option<Duration>,
     cache_tools_list: bool,
     tool_filter: crate::filter::ToolFilter,
+    require_approval: crate::approval::RequireApprovalSetting,
+    tool_input_guardrails: Vec<ra_core::tool::ToolGuardrailId>,
+    tool_output_guardrails: Vec<ra_core::tool::ToolGuardrailId>,
 }
 impl Default for McpClientOptions {
     fn default() -> Self {
@@ -79,10 +82,42 @@ impl Default for McpClientOptions {
             tool_timeout: None,
             cache_tools_list: false,
             tool_filter: crate::filter::ToolFilter::default(),
+            require_approval: crate::approval::RequireApprovalSetting::default(),
+            tool_input_guardrails: Vec::new(),
+            tool_output_guardrails: Vec::new(),
         }
     }
 }
 impl McpClientOptions {
+    /// Sets input checks declared by every discovered tool on this server, in order.
+    /// The host installs their implementations through `RunConfig::with_tool_input_guardrails`.
+    #[must_use]
+    pub fn with_tool_input_guardrails(
+        mut self,
+        guardrails: impl IntoIterator<Item = ra_core::tool::ToolGuardrailId>,
+    ) -> Self {
+        self.tool_input_guardrails = guardrails.into_iter().collect();
+        self
+    }
+    /// Sets output checks declared by every discovered tool on this server, in order.
+    /// The host installs their implementations through `RunConfig::with_tool_output_guardrails`.
+    #[must_use]
+    pub fn with_tool_output_guardrails(
+        mut self,
+        guardrails: impl IntoIterator<Item = ra_core::tool::ToolGuardrailId>,
+    ) -> Self {
+        self.tool_output_guardrails = guardrails.into_iter().collect();
+        self
+    }
+    /// Sets Python's server-owned local tool approval policy. Defaults to never.
+    #[must_use]
+    pub fn with_require_approval(
+        mut self,
+        policy: impl Into<crate::approval::RequireApprovalSetting>,
+    ) -> Self {
+        self.require_approval = policy.into();
+        self
+    }
     /// Reuses clean, nonempty tool lists. Defaults to false, as in Python.
     #[must_use]
     pub const fn with_cache_tools_list(mut self, enabled: bool) -> Self {
@@ -162,6 +197,21 @@ pub struct McpClient {
 }
 
 impl McpClient {
+    /// Server-wide input guardrail declarations, copied into each discovered tool.
+    #[must_use]
+    pub fn tool_input_guardrails(&self) -> &[ra_core::tool::ToolGuardrailId] {
+        &self.session.options.tool_input_guardrails
+    }
+    /// Server-wide output guardrail declarations, copied into each discovered tool.
+    #[must_use]
+    pub fn tool_output_guardrails(&self) -> &[ra_core::tool::ToolGuardrailId] {
+        &self.session.options.tool_output_guardrails
+    }
+    /// The server's local approval policy, shared by every discovered tool on this session.
+    #[must_use]
+    pub fn require_approval(&self) -> &crate::approval::RequireApprovalSetting {
+        &self.session.options.require_approval
+    }
     #[cfg(any(feature = "stdio", feature = "http"))]
     /// Connects a configured transport through the same initialized session implementation.
     pub async fn connect_transport(

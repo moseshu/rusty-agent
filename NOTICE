@@ -114,6 +114,12 @@ openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/mcp/{server,util}.py and tests/mcp/{test_tool_filtering,test_caching,
 test_list_page_limits}.py (MIT). See the retained license above.
 
+Local MCP approval and server guardrail configuration in crates/ra-mcp/src/{approval,client,tool}.rs and
+tests/it-mcp/tests/approvals.rs and tests/it-mcp/tests/runtime_approvals/{mod,guardrails}.rs also adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/mcp/{server,util}.py and tests/mcp/{test_mcp_approval,test_mcp_util}.py
+(MIT). See the retained license above.
+
 The per-model-call resolver and approval recipient binding in crates/ra-core/src/{agent,tool}.rs,
 crates/ra-core/src/item/tool.rs, crates/ra-runtime/src/turn/prepare.rs,
 crates/ra-runtime/src/{runner,tool/dispatch}.rs, crates/ra-mcp/src/{resolver,tool}.rs,
