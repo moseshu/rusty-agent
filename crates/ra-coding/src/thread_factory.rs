@@ -90,6 +90,12 @@ impl CodingThreadFactory {
 
 #[async_trait]
 impl ThreadFactory for CodingThreadFactory {
+    fn mcp_runtime(&self) -> Option<Arc<dyn ra_protocol::server::McpRuntimeControl>> {
+        self.host
+            .mcp_runtime()
+            .map(|runtime| runtime.clone() as Arc<dyn ra_protocol::server::McpRuntimeControl>)
+    }
+
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
         let host = self.host.with_new_process_manager();
         let agent = build_agent_with_profile(

@@ -2842,6 +2842,7 @@ name = "ra-coding"
 version = "0.2.2"
 dependencies = [
  "async-trait",
+ "futures",
  "globset",
  "ra-context",
  "ra-core",
@@ -2860,6 +2861,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "tracing",
  "tree-sitter",
  "tree-sitter-bash",

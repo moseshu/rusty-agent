@@ -5,7 +5,7 @@ use crate::{
     catalog::{
         McpToolInfo, name_tools_for_function_calling, normalize_tools_for_model_with_prefix,
     },
-    client::McpClient,
+    client::{McpClient, McpClientOptions},
     filter::{ToolFilter, tool_is_model_visible},
 };
 use async_trait::async_trait;
@@ -24,6 +24,11 @@ use std::{
     sync::Arc,
 };
 use tracing::warn;
+
+mod prepared;
+pub use prepared::{
+    McpToolCatalog, McpToolCatalogSource, McpToolClientSource, discover_catalog_tools,
+};
 
 /// How discovered tools are named for the model.
 #[non_exhaustive]
@@ -81,10 +86,11 @@ impl McpDiscoveryOptions {
     }
 }
 
-/// Immutable metadata and the connection selected when discovering this tool.
+/// Immutable metadata and a fixed or explicitly deferred connection binding.
 pub struct McpTool {
     info: McpToolInfo,
-    client: McpClient,
+    client_source: Arc<dyn McpToolClientSource>,
+    approval: crate::approval::RequireApprovalSetting,
     origin: ToolOrigin,
     schema: ToolSchema,
     options: ToolOptions,
@@ -93,7 +99,8 @@ pub struct McpTool {
 impl McpTool {
     fn new(
         info: McpToolInfo,
-        client: McpClient,
+        policy: &McpClientOptions,
+        client_source: Arc<dyn McpToolClientSource>,
         tool_search_enabled: bool,
         agent: Option<&ra_core::context::RunAgent>,
     ) -> Result<Self> {
@@ -143,24 +150,25 @@ impl McpTool {
         };
         let mut options = ToolOptions::new()
             .with_approval(
-                client
+                policy
                     .require_approval()
                     .for_tool(&info.tool.name, agent.is_some()),
             )
             .with_exposure(exposure)
             .with_concurrency(concurrency)
             .with_failure_handling(ToolFailureHandling::ModelVisible);
-        for guardrail in client.tool_input_guardrails() {
+        for guardrail in policy.tool_input_guardrails() {
             options = options.with_input_guardrail(guardrail.clone());
         }
-        for guardrail in client.tool_output_guardrails() {
+        for guardrail in policy.tool_output_guardrails() {
             options = options.with_output_guardrail(guardrail.clone());
         }
         // The MCP client owns the deadline so it can send the protocol cancellation before
         // returning. A competing runner timer could drop it before that notification is sent.
         Ok(Self {
             info,
-            client,
+            client_source,
+            approval: policy.require_approval().clone(),
             origin,
             schema,
             options,
@@ -172,13 +180,15 @@ impl McpTool {
     pub const fn info(&self) -> &McpToolInfo {
         &self.info
     }
-    /// Calls the original tool name on the connection retained by this declaration.
+    /// Calls the original tool name on this declaration's fixed session or deferred startup binding.
     /// The declaration's `_meta` is sent as request metadata, as Python's static tool meta is.
     /// This is a raw protocol call; local approval is enforced by runtime dispatch through [`Tool`].
     pub async fn invoke(&self, arguments: serde_json::Value) -> Result<ToolOutput> {
         let meta = self.info.tool.meta.as_ref().map(|meta| meta.0.clone());
         map_tool_result(
-            self.client
+            self.client_source
+                .client()
+                .await?
                 .call_tool(&self.info.tool.name, arguments, meta)
                 .await?,
         )
@@ -211,7 +221,7 @@ impl Tool for McpTool {
             ra_core::tool::ToolApprovalPolicy::Always => Ok(true),
             ra_core::tool::ToolApprovalPolicy::Dynamic => {
                 if let (crate::approval::RequireApprovalSetting::Dynamic(policy), Some(agent)) =
-                    (self.client.require_approval(), self.approval_agent.as_ref())
+                    (&self.approval, self.approval_agent.as_ref())
                 {
                     policy(context.run(), agent, self.info.tool.clone()).await
                 } else {
@@ -251,50 +261,24 @@ pub async fn discover_tools_with_context(
     run_context: Option<&ra_core::context::RunContext>,
     agent: Option<&ra_core::context::RunAgent>,
 ) -> Result<Vec<Arc<McpTool>>> {
-    let mut infos = Vec::new();
+    let mut catalogs = Vec::new();
     let mut server_names = HashSet::new();
-    for (server_index, (client, filter)) in servers.iter().enumerate() {
+    for (client, filter) in servers {
         if options.naming == McpToolNaming::Namespaced
             && !server_names.insert(client.server_name().to_owned())
         {
             return Err(Error::config("duplicate MCP server name"));
         }
-        let instructions = client.server_instructions().map(str::to_owned);
-        let tools = client
-            .list_cached_tools_with_context(run_context, agent)
-            .await?;
-        infos.extend(
-            filter
-                .apply(tools, run_context, agent, client.server_name())
+        catalogs.push((
+            McpToolCatalog::fetch(client)
                 .await?
-                .into_iter()
-                .map(|tool| {
-                    McpToolInfo::from_cached(client.server_name(), tool)
-                        .with_server_index(server_index)
-                        .with_namespace_description(instructions.clone())
-                }),
-        );
+                .filtered(filter, run_context, agent)
+                .await?,
+            Arc::new(client.clone()) as Arc<dyn McpToolClientSource>,
+            ToolFilter::default(),
+        ));
     }
-    let infos = match options.naming {
-        McpToolNaming::Original => {
-            name_tools_for_function_calling(infos, false, &options.reserved_tool_names)?
-        }
-        McpToolNaming::ServerPrefixed => {
-            name_tools_for_function_calling(infos, true, &options.reserved_tool_names)?
-        }
-        McpToolNaming::Namespaced => normalize_tools_for_model_with_prefix(infos, true, &[]),
-    };
-    Ok(infos
-        .into_iter()
-        .filter_map(|info| {
-            let client = servers[info.server_index].0.clone();
-            let name = info.tool.name.to_string();
-            McpTool::new(info, client, options.tool_search_enabled, agent)
-                .map(Arc::new)
-                .inspect_err(|error| warn!("skipping MCP tool {name:?}: {error}"))
-                .ok()
-        })
-        .collect())
+    discover_catalog_tools(&catalogs, options, &BTreeSet::new(), run_context, agent).await
 }
 
 /// Maps protocol content in order. Like Python's default `use_structured_content=false`,

@@ -57,6 +57,7 @@ target
 !/Docs/R11-2_MCP_HTTP_契约与验证.md
 !/Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md
 !/Docs/R11-5_MCP_工具审批_契约与验证.md
+!/Docs/R11-6_MCP_运行时控制_契约与验证.md
 !/Docs/R11-6b_MCP_生命周期_task_affinity_契约与验证.md
 !/Docs/R11-12_MCP_工具元数据解析_契约与验证.md
 !/Docs/Rustls_Provider_Initialization.md

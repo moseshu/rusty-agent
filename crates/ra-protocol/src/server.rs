@@ -70,6 +70,7 @@ mod dynamic_tool_calls;
 mod dynamic_tools;
 mod image_url;
 mod json_schema;
+mod mcp;
 mod outgoing;
 mod permission_requests;
 mod processor;
@@ -94,6 +95,7 @@ mod user_input_requests;
 
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
+pub use self::mcp::McpRuntimeControl;
 pub use self::permission_requests::ThreadServerRequests;
 pub use self::session_source::{
     InternalSessionSource, SessionSource, SessionSourceArgs, SubAgentSource,
@@ -370,7 +372,17 @@ impl AppServer {
     /// Without one, those methods answer that they are not supported.
     #[must_use]
     pub fn with_thread_factory(self, factory: Arc<dyn ThreadFactory>) -> Self {
+        if let Some(control) = factory.mcp_runtime() {
+            self.processor.mcp.set(control);
+        }
         self.processor.set_thread_factory(factory);
+        self
+    }
+
+    /// Installs the host's MCP controls and broadcasts their status changes to initialized clients.
+    #[must_use]
+    pub fn with_mcp_runtime(self, control: Arc<dyn McpRuntimeControl>) -> Self {
+        self.processor.mcp.set(control);
         self
     }
 
@@ -429,6 +441,7 @@ impl AppServer {
             mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
 
         let outbound_handle = tokio::spawn(run_outbound_router(outbound_control_rx, outgoing_rx));
+        let mcp_forwarder = processor.mcp.forward(Arc::clone(processor.outgoing()));
 
         let (transport_shutdown, mut signals) = match graceful_restart {
             Some(GracefulRestart {
@@ -580,6 +593,10 @@ impl AppServer {
             shutdown_forced = shutdown_state.forced(),
             "processor task exited"
         );
+        if let Ok(control) = processor.mcp.get() {
+            control.shutdown().await;
+        }
+        drop(mcp_forwarder);
         drop(outbound_control_tx);
         let _ = outbound_handle.await;
     }

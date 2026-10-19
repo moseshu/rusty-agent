@@ -46,6 +46,16 @@ impl ConnectionRpcGate {
         drop(token);
     }
 
+    /// Transfers work from a running handler to its own task without losing drain ownership.
+    /// The caller must already hold this gate's admission through `run`.
+    pub(crate) fn spawn_admitted(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let token = self.tasks.token();
+        tokio::spawn(async move {
+            future.await;
+            drop(token);
+        });
+    }
+
     /// Whether the gate has been closed.
     pub(crate) fn is_closed(&self) -> bool {
         self.tasks.is_closed()

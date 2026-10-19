@@ -147,6 +147,7 @@ impl std::fmt::Debug for ThreadFactorySlot {
 #[derive(Debug)]
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
+    pub(crate) mcp: super::mcp::McpControlSlot,
     codex_home: PathBuf,
     thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
@@ -181,6 +182,7 @@ impl MessageProcessor {
                 Arc::clone(&thread_watch),
             ),
             outgoing,
+            mcp: super::mcp::McpControlSlot::default(),
             codex_home,
             thread_manager,
             request_serialization_queues: RequestSerializationQueues::default(),
@@ -413,9 +415,12 @@ impl MessageProcessor {
             _ => (None, false),
         };
 
-        let serialization_thread = client_request.serialization_thread().map(str::to_owned);
+        let serialization_key = client_request
+            .serialization_scope()
+            .map(RequestSerializationQueueKey::from);
         let error_request_id = request_id.clone();
         let processor = Arc::clone(self);
+        let rpc_gate = Arc::clone(&session.rpc_gate);
         let request = QueuedInitializedRequest::new(Arc::clone(&session.rpc_gate), async move {
             let _turn_permit = turn_permit;
             // Settings changes admitted before the drain finish normally; turn work still waiting
@@ -425,13 +430,13 @@ impl MessageProcessor {
                 return;
             }
             processor
-                .handle_initialized_client_request(request_id, client_request)
+                .handle_initialized_client_request(request_id, client_request, rpc_gate)
                 .await;
         });
 
-        if let Some(thread_id) = serialization_thread {
+        if let Some(key) = serialization_key {
             self.request_serialization_queues
-                .enqueue(RequestSerializationQueueKey::Thread { thread_id }, request)
+                .enqueue(key, request)
                 .await;
         } else {
             tokio::spawn(request.run());
@@ -444,8 +449,53 @@ impl MessageProcessor {
         &self,
         request_id: ConnectionRequestId,
         client_request: ClientRequest,
+        rpc_gate: Arc<ConnectionRpcGate>,
     ) {
         match client_request {
+            ClientRequest::McpServerStatusList { params, .. } => {
+                let result = match self.mcp.get() {
+                    Ok(control) => super::mcp::prepare_list(control.as_ref(), params),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(inventory) => {
+                        let outgoing = Arc::clone(&self.outgoing);
+                        rpc_gate.spawn_admitted(async move {
+                            outgoing
+                                .send_serialized_response(request_id, inventory.await)
+                                .await;
+                        });
+                    }
+                    Err(error) => self.outgoing.send_error(request_id, error).await,
+                }
+            }
+            ClientRequest::McpServerRefresh { .. }
+            | ClientRequest::McpServerReconnect { .. }
+            | ClientRequest::McpServerToggle { .. } => {
+                let result = match self.mcp.get() {
+                    Ok(control) => match client_request {
+                        ClientRequest::McpServerRefresh { .. } => {
+                            control.reload_mcp_servers().await
+                        }
+                        ClientRequest::McpServerReconnect { params, .. } => {
+                            control
+                                .reconnect_mcp_server(params.name.as_deref(), params.failed_only)
+                                .await
+                        }
+                        ClientRequest::McpServerToggle { params, .. } => {
+                            control
+                                .toggle_mcp_server(&params.name, params.enabled)
+                                .await
+                        }
+                        _ => unreachable!(),
+                    },
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => self.send_response(request_id, serde_json::json!({})).await,
+                    Err(error) => self.outgoing.send_error(request_id, error).await,
+                }
+            }
             ClientRequest::Initialize { .. } => {
                 // `handle_client_request` answers `initialize` before anything is dispatched.
                 unreachable!("initialize is handled before initialized request dispatch")

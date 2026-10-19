@@ -36,6 +36,7 @@ use ra_tools::capability::{
 #[derive(Clone)]
 pub struct CodingHost {
     workspace: Workspace,
+    mcp: Option<Arc<crate::mcp::CodingMcpRuntime>>,
     process_manager: Arc<ProcessManager>,
     event_sink: Arc<dyn HostEventSink>,
     exec_permission_approvals: bool,
@@ -60,6 +61,7 @@ impl CodingHost {
         let workspace = Workspace::open(workspace_root)?;
         Ok(Self {
             workspace,
+            mcp: None,
             process_manager: Arc::new(ProcessManager::default()),
             event_sink: Arc::new(NoopHostEventSink),
             exec_permission_approvals: false,
@@ -73,6 +75,7 @@ impl CodingHost {
     pub fn with_new_process_manager(&self) -> Self {
         Self {
             workspace: self.workspace.clone(),
+            mcp: self.mcp.clone(),
             process_manager: Arc::new(ProcessManager::default()),
             event_sink: Arc::clone(&self.event_sink),
             exec_permission_approvals: self.exec_permission_approvals,
@@ -87,6 +90,19 @@ impl CodingHost {
     pub const fn with_exec_permission_approvals(mut self) -> Self {
         self.exec_permission_approvals = true;
         self
+    }
+
+    /// Installs an explicitly configured MCP runtime shared by this host's threads.
+    #[must_use]
+    pub fn with_mcp_runtime(mut self, runtime: Arc<crate::mcp::CodingMcpRuntime>) -> Self {
+        self.mcp = Some(runtime);
+        self
+    }
+
+    /// The runtime used by tool discovery and the app server's control port.
+    #[must_use]
+    pub fn mcp_runtime(&self) -> Option<&Arc<crate::mcp::CodingMcpRuntime>> {
+        self.mcp.as_ref()
     }
 
     /// Sets the host event sink.

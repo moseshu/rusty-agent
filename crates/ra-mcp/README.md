@@ -119,6 +119,25 @@ initialized client used above; `server.cleanup()` closes both sides and joins th
 server task. Its bounded memory stream performs no OS IPC or networking. The
 host tool registration facade and typed registration helpers remain follow-up work.
 
+## Product runtime controls
+
+`ra-coding::mcp::CodingMcpRuntime` explicitly selects shared-host connection controls on top of
+this crate's lifecycle manager. `CodingHost::with_mcp_runtime` installs live tool discovery;
+`CodingThreadFactory` also supplies the control port to the app server. The product offers
+reconnect, toggle and detached status snapshots, with startup/status notifications for UI clients.
+The runtime isolates per-server catalog failures, preserves healthy connections on reload,
+and provides opt-in cached lazy startup and shared recovery with exponential backoff.
+Both extensions default off; generic servers remain failed until an explicit retry or reload,
+and their cached tools disappear after failed startup or disconnection. The recovery mechanism
+is adapted from Codex Apps, with subsequent discovery/invocation triggering attempts. Thread preparation
+schedules startup in the background; discovery waits when no usable cache exists. Registry
+requests prepare snapshots in Codex's global serialization scope; inventory I/O runs outside
+the queue with generation checks and connection-drain tracking. Startup notifications include specific
+failure details and timeout recovery hints. Default framework
+resolver failures still propagate. Review is complete; fixed-registry configuration
+loading and unsupported thread scope remain recorded differences in
+[the runtime-control notes](../../Docs/R11-6_MCP_运行时控制_契约与验证.md).
+
 ## Local tool approval
 
 `McpClientOptions::with_require_approval` configures the server policy for stdio, HTTP and

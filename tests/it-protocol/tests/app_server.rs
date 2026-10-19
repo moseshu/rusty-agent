@@ -489,6 +489,8 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
     let server = Server::start();
     let mut connection = server.open(1).await;
     let unknown = "Invalid request: unknown variant `config/read`, expected one of \
+                   `mcpServerStatus/list`, `config/mcpServer/reload`, \
+                   `mcpServer/reconnect`, `mcpServer/toggle`, \
                    `initialize`, `thread/start`, `thread/resume`, `thread/fork`, \
                    `thread/archive`, `thread/delete`, `thread/unarchive`, \
                    `thread/name/set`, `thread/metadata/update`, `thread/list`, \

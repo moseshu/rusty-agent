@@ -96,12 +96,16 @@ pub async fn build_agent_with_profile(
         assembled.tool_surface(),
         assembled.capability_sections(),
     )?;
-    AgentSpec::builder()
+    let mut builder = AgentSpec::builder()
         .id(id)
         .name(name)
         .instructions(prefix.system_instructions())
-        .tools(assembled.into_tool_surface().into_tools())
-        .build()
+        .tools(assembled.into_tool_surface().into_tools());
+    if let Some(runtime) = host.mcp_runtime() {
+        runtime.start_background();
+        builder = builder.tool_resolver(runtime.clone());
+    }
+    builder.build()
 }
 
 /// What one role installs at one tier: the entries, and the prompt text that describes them.

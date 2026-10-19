@@ -40,6 +40,7 @@
 
 mod dynamic_tools;
 mod item;
+mod mcp;
 mod permissions;
 mod server_request;
 mod settings;
@@ -55,6 +56,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
+pub use self::mcp::*;
 pub use self::streaming::*;
 pub(crate) use self::thread_lifecycle::ThreadPolicyFields;
 pub use self::thread_management::*;
@@ -149,6 +151,43 @@ pub fn experimental_required_message(reason: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum ClientRequest {
+    /// Lists configured servers and their current inventory.
+    #[serde(rename = "mcpServerStatus/list")]
+    McpServerStatusList {
+        /// The request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// MCP control parameters.
+        params: ListMcpServerStatusParams,
+    },
+    /// Reconciles the installed registry while retaining unchanged connections.
+    #[serde(rename = "config/mcpServer/reload")]
+    McpServerRefresh {
+        /// The request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// MCP control parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<()>,
+    },
+    /// Retries one or all enabled servers.
+    #[serde(rename = "mcpServer/reconnect")]
+    McpServerReconnect {
+        /// The request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// MCP control parameters.
+        params: McpServerReconnectParams,
+    },
+    /// Enables or disables one configured server.
+    #[serde(rename = "mcpServer/toggle")]
+    McpServerToggle {
+        /// The request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// MCP control parameters.
+        params: McpServerToggleParams,
+    },
     /// Opens the connection; nothing else is answered before it succeeds.
     #[serde(rename = "initialize")]
     Initialize {
@@ -381,7 +420,11 @@ impl ClientRequest {
     #[must_use]
     pub const fn id(&self) -> &RequestId {
         match self {
-            Self::Initialize { request_id, .. }
+            Self::McpServerStatusList { request_id, .. }
+            | Self::McpServerRefresh { request_id, .. }
+            | Self::McpServerReconnect { request_id, .. }
+            | Self::McpServerToggle { request_id, .. }
+            | Self::Initialize { request_id, .. }
             | Self::ThreadArchive { request_id, .. }
             | Self::ThreadDelete { request_id, .. }
             | Self::ThreadUnarchive { request_id, .. }
@@ -413,6 +456,10 @@ impl ClientRequest {
     #[must_use]
     pub const fn method_name(&self) -> &'static str {
         match self {
+            Self::McpServerStatusList { .. } => "mcpServerStatus/list",
+            Self::McpServerRefresh { .. } => "config/mcpServer/reload",
+            Self::McpServerReconnect { .. } => "mcpServer/reconnect",
+            Self::McpServerToggle { .. } => "mcpServer/toggle",
             Self::Initialize { .. } => "initialize",
             Self::ThreadArchive { .. } => "thread/archive",
             Self::ThreadDelete { .. } => "thread/delete",
@@ -452,7 +499,11 @@ impl ClientRequest {
     #[must_use]
     pub fn experimental_reason(&self) -> Option<&'static str> {
         match self {
-            Self::Initialize { .. }
+            Self::McpServerStatusList { .. }
+            | Self::McpServerRefresh { .. }
+            | Self::McpServerReconnect { .. }
+            | Self::McpServerToggle { .. }
+            | Self::Initialize { .. }
             | Self::ThreadArchive { .. }
             | Self::ThreadDelete { .. }
             | Self::ThreadUnarchive { .. }
@@ -483,11 +534,29 @@ impl ClientRequest {
     }
 }
 
+/// The state a request accesses in arrival order, as in Codex's serialization scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientRequestSerializationScope {
+    /// One exclusive registry shared by all client connections.
+    Global(&'static str),
+    /// One thread shared by all client connections.
+    Thread {
+        /// The thread's protocol identity.
+        thread_id: String,
+    },
+}
+
 impl ClientRequest {
-    /// The thread whose requests this one runs in order with, or `None` if it runs alongside any:
-    /// Codex's `serialization_scope`, for the thread scope its methods declare.
-    pub(crate) fn serialization_thread(&self) -> Option<&str> {
-        match self {
+    /// The state whose requests this method runs in arrival order with.
+    #[must_use]
+    pub(crate) fn serialization_scope(&self) -> Option<ClientRequestSerializationScope> {
+        let thread_id = match self {
+            Self::McpServerStatusList { .. }
+            | Self::McpServerRefresh { .. }
+            | Self::McpServerReconnect { .. }
+            | Self::McpServerToggle { .. } => {
+                return Some(ClientRequestSerializationScope::Global("mcp-registry"));
+            }
             // Codex reads history alongside anything, as it reads append-only rollouts.
             Self::Initialize { .. }
             | Self::ThreadStart { .. }
@@ -505,7 +574,7 @@ impl ClientRequest {
             Self::ThreadResume { params, .. } => Some(params.thread_id()),
             Self::ThreadFork { params, .. } => Some(params.thread_id()),
             Self::ThreadRead { params, .. } => Some(params.thread_id()),
-            Self::ThreadReadStateUpdate { params, .. } => Some(&params.thread_id),
+            Self::ThreadReadStateUpdate { params, .. } => Some(params.thread_id.as_str()),
             Self::ThreadUnsubscribe { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsClean { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsList { params, .. } => Some(params.thread_id()),
@@ -515,7 +584,10 @@ impl ClientRequest {
             Self::TurnStart { params, .. } => Some(params.thread_id()),
             Self::TurnSteer { params, .. } => Some(params.thread_id()),
             Self::TurnInterrupt { params, .. } => Some(params.thread_id()),
-        }
+        }?;
+        Some(ClientRequestSerializationScope::Thread {
+            thread_id: thread_id.to_owned(),
+        })
     }
 }
 

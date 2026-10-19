@@ -89,6 +89,25 @@ impl Default for McpClientOptions {
     }
 }
 impl McpClientOptions {
+    /// Approval policy retained with cached tool declarations.
+    #[must_use]
+    pub fn require_approval(&self) -> &crate::approval::RequireApprovalSetting {
+        &self.require_approval
+    }
+    /// Input guardrails retained with cached tool declarations.
+    #[must_use]
+    pub fn tool_input_guardrails(&self) -> &[ra_core::tool::ToolGuardrailId] {
+        &self.tool_input_guardrails
+    }
+    /// Output guardrails retained with cached tool declarations.
+    #[must_use]
+    pub fn tool_output_guardrails(&self) -> &[ra_core::tool::ToolGuardrailId] {
+        &self.tool_output_guardrails
+    }
+    pub(crate) fn tool_filter(&self) -> &crate::filter::ToolFilter {
+        &self.tool_filter
+    }
+
     /// Sets input checks declared by every discovered tool on this server, in order.
     /// The host installs their implementations through `RunConfig::with_tool_input_guardrails`.
     #[must_use]
@@ -295,6 +314,16 @@ impl McpClient {
             .as_ref()
             .is_some_and(|service| !service.is_closed() && !service.peer().is_transport_closed())
     }
+    /// Whether the session is confirmed closed, without waiting for its service lock.
+    /// A temporarily locked service is not treated as evidence of disconnection.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.session.service.try_lock().is_ok_and(|service| {
+            service
+                .as_ref()
+                .is_none_or(|service| service.is_closed() || service.peer().is_transport_closed())
+        })
+    }
     /// Session timeouts captured when connecting.
     #[must_use]
     pub fn options(&self) -> &McpClientOptions {
@@ -331,12 +360,17 @@ impl McpClient {
         run_context: Option<&ra_core::context::RunContext>,
         agent: Option<&ra_core::context::RunAgent>,
     ) -> Result<Vec<crate::metadata::CachedTool>> {
-        self.peer().await?;
-        let tools = self.tools.list(self.fetch_tools()).await?;
+        let tools = self.list_unfiltered_cached_tools().await?;
         self.tools
             .filter()
             .apply(tools, run_context, agent, self.server_name())
             .await
+    }
+    pub(crate) async fn list_unfiltered_cached_tools(
+        &self,
+    ) -> Result<Vec<crate::metadata::CachedTool>> {
+        self.peer().await?;
+        self.tools.list(self.fetch_tools()).await
     }
     /// Replaces the active discovery filter without invalidating the unfiltered cache.
     pub fn set_tool_filter(&self, filter: crate::filter::ToolFilter) {

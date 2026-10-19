@@ -46,6 +46,17 @@ struct Entry {
 }
 
 impl McpServerManager {
+    /// Signals the existing workers to cancel startup and perform same-task emergency cleanup.
+    /// This is the manager-drop signal without releasing diagnostic ownership; it does not wait
+    /// for teardown. Hosts that need observed completion must still await lifecycle cleanup.
+    pub fn request_shutdown(&self) {
+        for entry in &lock(&self.state).entries {
+            if let Some(worker) = &entry.worker {
+                worker.request_shutdown();
+            }
+        }
+    }
+
     /// Owns each distinct server instance once. Same-named instances remain distinct.
     pub fn new(servers: impl IntoIterator<Item = Arc<dyn McpServer>>) -> Self {
         Self::with_options(servers, McpServerManagerOptions::default())

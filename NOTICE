@@ -12,6 +12,7 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/mcp/startup.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager/startup.rs; src/connection_manager.rs; src/rmcp_client.rs |
 | `crates/ra-mcp/src/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/mcp/mod.rs |
 | `crates/ra-mcp/src/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/pagination.rs; codex-rs/rmcp-client/src/rmcp_client.rs |
 | `crates/ra-mcp/src/client/stdio.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/stdio_server_launcher.rs; src/utils.rs; codex-rs/protocol/src/shell_environment.rs |

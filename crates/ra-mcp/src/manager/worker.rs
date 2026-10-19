@@ -63,6 +63,10 @@ pub(super) struct Worker {
 }
 
 impl Worker {
+    pub(super) fn request_shutdown(&self) {
+        self.stop.cancel();
+    }
+
     pub(super) fn new(server: Arc<dyn McpServer>, options: Options) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         let stop = CancellationToken::new();

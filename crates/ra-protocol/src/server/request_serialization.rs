@@ -1,7 +1,8 @@
 //! The order in which requests touching the same state run: Codex's `RequestSerializationQueues`
 //! (`app-server/src/request_serialization.rs`).
 //!
-//! A method that changes a thread names the thread as its serialization scope (Codex's
+//! MCP registry methods share one exclusive global queue. A method that changes a thread
+//! names the thread as its serialization scope (Codex's
 //! `serialization_scope`); its requests then run one after another, in the order they arrived,
 //! whichever connection sent them, while requests for other threads and unscoped ones run
 //! alongside. Each request still passes its connection's gate
@@ -12,21 +13,32 @@
 //!
 //! Codex's scopes also cover global settings, thread paths, processes, file watches, fuzzy file
 //! search sessions and MCP logins, and its global reads may run together; those come with the
-//! methods that use them. Only the thread scope, always exclusive, is ported.
+//! methods that use them. Thread and MCP registry scopes are exclusive here.
 
 use std::{collections::HashMap, collections::VecDeque, future::Future, pin::Pin, sync::Arc};
 
 use tokio::sync::Mutex;
 
-use super::connection_rpc_gate::ConnectionRpcGate;
+use super::{connection_rpc_gate::ConnectionRpcGate, protocol::ClientRequestSerializationScope};
 
 type BoxFutureUnit = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// What a request is ordered by: Codex's `RequestSerializationQueueKey`, for threads.
+/// What a request is ordered by: Codex's `RequestSerializationQueueKey`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RequestSerializationQueueKey {
     /// The requests that change one thread.
     Thread { thread_id: String },
+    /// An exclusive global registry, shared across connections.
+    Global(&'static str),
+}
+
+impl From<ClientRequestSerializationScope> for RequestSerializationQueueKey {
+    fn from(scope: ClientRequestSerializationScope) -> Self {
+        match scope {
+            ClientRequestSerializationScope::Global(name) => Self::Global(name),
+            ClientRequestSerializationScope::Thread { thread_id } => Self::Thread { thread_id },
+        }
+    }
 }
 
 /// A request waiting for its turn, with the gate of the connection that sent it.

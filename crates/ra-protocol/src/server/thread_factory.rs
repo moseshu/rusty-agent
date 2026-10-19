@@ -188,6 +188,11 @@ pub(crate) type PreparedParts = (
 /// Prepares the threads the server loads (see the module's documentation).
 #[async_trait]
 pub trait ThreadFactory: Send + Sync + 'static {
+    /// An optional shared host MCP control port, installed alongside the factory.
+    fn mcp_runtime(&self) -> Option<Arc<dyn super::McpRuntimeControl>> {
+        None
+    }
+
     /// Prepares the thread `request` describes. Its builder must be for
     /// [`ThreadFactoryRequest::thread_id`].
     ///
