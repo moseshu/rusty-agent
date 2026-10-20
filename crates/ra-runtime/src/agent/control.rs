@@ -924,7 +924,8 @@ impl AgentControlPort for AgentHandle {
             app_context: parent.app_context().map(Arc::clone),
             services: parent.services().clone(),
             spawned_by: parent.run_id().clone(),
-            rollout,
+            rollout: parent.child_rollout(rollout),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
             resources: resources.clone(),
         };
         let child = ChildRuntime::new(
@@ -1432,7 +1433,10 @@ impl Tree {
             child.idle.send_replace(false);
             scope
         };
-        let task = tokio::spawn(drive(Arc::downgrade(self), Arc::clone(node), scope));
+        let task = tokio::spawn(crate::runner::with_dispatch(
+            Box::pin(drive(Arc::downgrade(self), Arc::clone(node), scope)),
+            child.environment.dispatch.clone(),
+        ));
         let mut tasks = lock(&self.tasks);
         tasks.retain(|task| !task.is_finished());
         tasks.push(task);
@@ -1869,6 +1873,7 @@ impl Drop for ClosingSubtree {
 
 /// What a spawned agent's runs start from, captured from the run that spawned it.
 struct ChildEnvironment {
+    dispatch: tracing::Dispatch,
     agent: Arc<AgentSpec>,
     model_resolver: Arc<dyn ModelResolver>,
     config: RunConfig,

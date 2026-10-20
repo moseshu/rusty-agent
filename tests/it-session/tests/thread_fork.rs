@@ -20,6 +20,7 @@ use ra_core::{
         InterruptedTurnHistoryMarker, SessionId,
         rollout::{
             RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded, RolloutRunStarted,
+            RolloutTraceEvent, RolloutTraceRecord,
         },
     },
     state::{RunId, RunState},
@@ -671,6 +672,18 @@ async fn a_fork_in_the_directory_is_materialized_with_its_metadata_first_and_the
     )
     .unwrap();
     writer.append_event(exec).await.unwrap();
+    writer
+        .append(RolloutItem::Trace(RolloutTraceRecord::new(
+            "source-capture".into(),
+            1,
+            0,
+            "source-trace".into(),
+            None,
+            None,
+            RolloutTraceEvent::new("source_observation", json!({}), None),
+        )))
+        .await
+        .unwrap();
     writer.append_item(said("a-1", "a1")).await.unwrap();
     writer.write_checkpoint().await.unwrap();
     writer
@@ -703,7 +716,7 @@ async fn a_fork_in_the_directory_is_materialized_with_its_metadata_first_and_the
     assert_eq!(meta.forked_from_id(), Some(&source));
     let kept: Vec<_> = source_records
         .iter()
-        .filter(|record| !matches!(record.type_name(), "checkpoint" | "event"))
+        .filter(|record| !matches!(record.type_name(), "checkpoint" | "event" | "trace"))
         .cloned()
         .collect();
     assert_eq!(payloads(&records[1..]), payloads(&kept));

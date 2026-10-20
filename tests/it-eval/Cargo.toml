@@ -9,6 +9,8 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+ra-session = { path = "../../crates/ra-session" }
+tempfile = "3"
 ra-core = { path = "../../crates/ra-core" }
 ra-model = { path = "../../crates/ra-model" }
 ra-runtime = { path = "../../crates/ra-runtime" }

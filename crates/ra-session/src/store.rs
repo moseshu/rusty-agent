@@ -872,13 +872,15 @@ pub(crate) fn first_session_meta(records: &[RolloutRecord]) -> Result<Option<Rol
 }
 
 /// What a thread created with `history` writes after its session metadata: each record's payload,
-/// in order, without the checkpoints another file's writer left and without host events the
-/// persistence policy drops, as Codex's `append_items` applies its policy.
+/// in order, without another file's checkpoints or diagnostic traces and without host events the
+/// persistence policy drops, as Codex's `append_items` applies its policy. Diagnostics stay with
+/// their source capture rather than reusing its identities in a new thread.
 pub(crate) fn initial_payloads(history: &[RolloutRecord]) -> Result<Vec<RolloutPayload>> {
     let mut payloads = Vec::with_capacity(history.len());
     for record in history {
         match record.payload()? {
-            RolloutPayload::Checkpoint(_) => {}
+            // A fork starts fresh diagnostic capture; the source's IDs and sequence stay there.
+            RolloutPayload::Checkpoint(_) | RolloutPayload::Trace(_) => {}
             RolloutPayload::Event(event) => {
                 let item = RolloutItem::Event(event);
                 if is_persisted_rollout_item(&item) {

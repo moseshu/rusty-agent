@@ -107,6 +107,8 @@ pub mod field {
 
     /// Agent name.
     pub const AGENT_NAME: &str = "agent.name";
+    /// Runtime run identity, independent of trace and grouping identities.
+    pub const RUN_ID: &str = "run.id";
 
     // -- turn --------------------------------------------------------------
 
@@ -241,6 +243,7 @@ pub mod field {
     /// The complete set. Eval and the gates use it to check that every field name is in the
     /// vocabulary.
     pub const ALL: &[&str] = &[
+        RUN_ID,
         SPAN_KIND,
         SPAN_LABEL,
         OUTCOME,

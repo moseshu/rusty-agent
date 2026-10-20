@@ -29,6 +29,7 @@ use ra_core::{
     cancel::CancelScope,
     item::ModelInputItem,
     model::ModelResolver,
+    session::rollout::RolloutRecorder,
     state::{EventSeqAllocator, RunId, RunState},
     tool::ToolServices,
 };
@@ -57,6 +58,7 @@ struct ParentRunEnvironment {
     run_id: RunId,
     root_run_id: RunId,
     services: ToolServices,
+    rollout: Option<Arc<dyn RolloutRecorder>>,
     /// The run's host event sequence, which events the control plane records for it draw from.
     event_seqs: EventSeqAllocator,
     agent_tree: Option<AgentTreeRef>,
@@ -90,6 +92,7 @@ impl ParentRun {
         parent_run_id: Option<&RunId>,
         agent: Arc<AgentSpec>,
         services: ToolServices,
+        rollout: Option<Arc<dyn RolloutRecorder>>,
         event_seqs: EventSeqAllocator,
         agent_tree: Option<AgentTreeRef>,
         spend: Arc<RunSpend>,
@@ -108,6 +111,7 @@ impl ParentRun {
                 run_id,
                 root_run_id,
                 services,
+                rollout,
                 event_seqs,
                 agent_tree,
                 spend,
@@ -193,6 +197,17 @@ impl ParentRun {
 
     pub(crate) fn services(&self) -> &ToolServices {
         &self.run.services
+    }
+
+    pub(crate) fn child_rollout(
+        &self,
+        recorder: Option<Arc<dyn RolloutRecorder>>,
+    ) -> Option<Arc<dyn RolloutRecorder>> {
+        self.run
+            .rollout
+            .as_ref()
+            .and_then(|parent| parent.child_trace(recorder.clone()))
+            .or(recorder)
     }
 
     /// The run's host event sequence.

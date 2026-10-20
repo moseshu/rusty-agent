@@ -902,7 +902,7 @@ fn spawn_dispatch_task(
     // Carried across the spawn for the reason the span is: a task-local does not follow it, and a
     // nested agent dispatched from here would otherwise find no parent run.
     dispatches
-        .spawn(
+        .spawn(crate::runner::carry_subscriber(Box::pin(
             crate::agent::tool::parent::carry(async move {
                 let started = Instant::now();
                 let committer = Arc::new(std::sync::Mutex::new(None));
@@ -939,7 +939,7 @@ fn spawn_dispatch_task(
                 }
             })
             .instrument(task_span),
-        )
+        )))
         .id()
 }
 

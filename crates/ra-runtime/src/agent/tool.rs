@@ -627,6 +627,9 @@ impl AgentTool {
         if let Some(session) = &self.session {
             request = request.with_session(Arc::clone(session));
         }
+        if let Some(recorder) = parent.child_rollout(None) {
+            request = request.with_rollout_recorder(recorder);
+        }
         request = match resume {
             Some(state) => request.with_state(state),
             None => request.with_parent_run_id(context.run().run_id().clone())?,

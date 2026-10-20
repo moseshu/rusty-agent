@@ -20,6 +20,9 @@
 
 use std::sync::Arc;
 
+pub mod trace;
+pub use trace::{RolloutTraceEvent, RolloutTraceMode, RolloutTraceRecord};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +55,25 @@ const fn default_schema_version() -> SchemaVersion {
 pub trait RolloutRecorder: Send + Sync + 'static {
     /// Queues `item` to be recorded.
     fn record(&self, item: RolloutItem);
+
+    /// Selects local trace observations. Ordinary recorders do not capture them.
+    fn trace_mode(&self) -> RolloutTraceMode {
+        RolloutTraceMode::Disabled
+    }
+
+    /// Receives an observation in its current tracing span, without blocking the run.
+    /// A capturing recorder assigns persistent trace/span IDs and stores it as [`RolloutItem::Trace`].
+    fn record_trace(&self, _event: RolloutTraceEvent) {}
+
+    /// Shares diagnostic capture with a child run while preserving its own authoritative recorder.
+    /// Returns `None` when this recorder has no shared diagnostic capture. Closing the returned
+    /// recorder closes only the child's storage, never the parent's capture.
+    fn child_trace(
+        &self,
+        _recorder: Option<Arc<dyn RolloutRecorder>>,
+    ) -> Option<Arc<dyn RolloutRecorder>> {
+        None
+    }
 
     /// Waits until everything recorded so far is written.
     ///
@@ -287,6 +309,8 @@ pub enum RolloutItem {
     ModelUsage(RolloutModelUsage),
     /// A run, or the segment of it that started last, ended.
     RunEnded(RolloutRunEnded),
+    /// Explicit local trace observation; it does not contribute conversation history or usage.
+    Trace(RolloutTraceRecord),
 }
 
 /// A run or a segment of it started: Codex's `TurnStarted` with the user input of the turn.

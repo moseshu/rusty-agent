@@ -16,7 +16,9 @@ use ra_core::{
     item::{AgentId, CallId, RunItem},
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRunEnded, RolloutRunStarted, RolloutThreadSpawn},
+        rollout::{
+            RolloutItem, RolloutRunEnded, RolloutRunStarted, RolloutThreadSpawn, RolloutTraceRecord,
+        },
     },
     state::RunId,
     usage::Usage,
@@ -613,6 +615,8 @@ pub enum RolloutPayload {
     RunStarted(RolloutRunStarted),
     /// A run, or its latest segment, ended.
     RunEnded(RolloutRunEnded),
+    /// Explicit local trace observation, excluded from conversation and usage reconstruction.
+    Trace(RolloutTraceRecord),
     /// Forward-compatible unknown payload.
     Unknown {
         /// Type name identifier.
@@ -685,6 +689,7 @@ impl From<RolloutItem> for RolloutPayload {
             RolloutItem::Event(event) => Self::Event(event),
             RolloutItem::ModelUsage(usage) => Self::ModelUsage(usage),
             RolloutItem::RunEnded(ended) => Self::RunEnded(ended),
+            RolloutItem::Trace(trace) => Self::Trace(trace),
             // A kind this build cannot name has no payload to be written as.
             other => Self::Unknown {
                 type_name: "unknown_rollout_item".to_owned(),
@@ -717,6 +722,13 @@ impl RolloutRecord {
     /// Returns [`Error`] if the payload cannot be serialized into the envelope.
     pub fn new(timeline_seq: u64, at: EventTimestamp, payload: RolloutPayload) -> Result<Self> {
         let (type_name, payload_val) = match payload {
+            RolloutPayload::Trace(trace) => (
+                "trace".to_owned(),
+                serde_json::to_value(trace).map_err(|error| {
+                    Error::session(SessionErrorKind::Corrupted, "failed to serialize trace")
+                        .with_source(error)
+                })?,
+            ),
             RolloutPayload::SessionMeta(meta) => (
                 "session_meta".to_string(),
                 serde_json::to_value(meta).map_err(|e| {
@@ -857,6 +869,12 @@ impl RolloutRecord {
     /// Returns [`Error`] if deserialization of a known type fails.
     pub fn payload(&self) -> Result<RolloutPayload> {
         match self.type_name.as_str() {
+            "trace" => serde_json::from_value::<RolloutTraceRecord>(self.payload.clone())
+                .map(RolloutPayload::Trace)
+                .map_err(|error| {
+                    Error::session(SessionErrorKind::Corrupted, "corrupted trace payload")
+                        .with_source(error)
+                }),
             "session_meta" => serde_json::from_value::<RolloutSessionMeta>(self.payload.clone())
                 .map(RolloutPayload::SessionMeta)
                 .map_err(|e| {

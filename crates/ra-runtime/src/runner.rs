@@ -106,6 +106,8 @@ pub mod result;
 #[doc(hidden)]
 pub mod session_persistence;
 pub mod stream;
+mod trace;
+pub(crate) use trace::{carry_subscriber, with_dispatch};
 
 pub use crate::turn::prepare::ActionSurfaceBudget;
 pub use entry::{AgentRunner, RunInput};
@@ -1329,7 +1331,7 @@ impl Runner {
     pub async fn run(request: RunRequest) -> Result<RunResult> {
         let sandbox = sandbox_runtime(&request);
         let mut abandoned = ReleaseSandboxOnDrop(Some(Arc::clone(&sandbox)));
-        let result = Box::pin(run_loop(request, None, sandbox)).await;
+        let result = carry_subscriber(Box::pin(run_loop(request, None, sandbox))).await;
         abandoned.0 = None;
         result
     }
@@ -1367,12 +1369,12 @@ impl Runner {
         let guard = scope.cancel_on_drop(CancelReason::UserInterrupt);
         let sandbox = sandbox_runtime(&request);
         let supervised = sandbox.enabled().then(|| Arc::clone(&sandbox));
-        let task = tokio::spawn(
+        let task = tokio::spawn(carry_subscriber(Box::pin(
             crate::agent::tool::parent::carry(async move {
                 Box::pin(run_loop(request, Some(sender), sandbox)).await
             })
             .instrument(span),
-        );
+        )));
         RunStream::new(receiver, task, guard, supervised)
     }
 }
@@ -1522,13 +1524,6 @@ async fn run_loop(
     if let Some(tree) = &agent_tree {
         request.event_seqs = tree.adopt_event_seqs(request.event_seqs.clone());
     }
-    let rollout = start_recording(&mut request);
-    let rollout_run_id = request.run_id.clone();
-    // As Codex's turn persists its thread once its input is recorded, so the input is on disk
-    // before the model is asked to answer it.
-    if let Some(rollout) = &rollout {
-        persist_rollout(rollout.as_ref(), &rollout_run_id, PersistContext::TurnStart).await;
-    }
     let interruption = Interruption::new(&request, agent_tree.is_some(), events.as_ref());
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
@@ -1539,6 +1534,7 @@ async fn run_loop(
         "agent",
         span.kind = SpanKind::Agent.label(),
         agent.name = %agent_name,
+        run.id = %request.run_id,
         outcome = tracing::field::Empty,
         error.code = tracing::field::Empty,
         cancel.reason = tracing::field::Empty,
@@ -1553,6 +1549,11 @@ async fn run_loop(
         usage.output_tokens = tracing::field::Empty,
         usage.reasoning_tokens = tracing::field::Empty,
     );
+    let rollout = agent_span.in_scope(|| start_recording(&mut request));
+    let rollout_run_id = request.run_id.clone();
+    if let Some(rollout) = &rollout {
+        persist_rollout(rollout.as_ref(), &rollout_run_id, PersistContext::TurnStart).await;
+    }
     let started = Instant::now();
     // Everything a cancellation notification needs, captured before the loop consumes the request
     // — and only when someone is listening, so the default run pays nothing for it.
@@ -1585,6 +1586,7 @@ async fn run_loop(
             .filter(|_| request.nested_spend.is_some()),
         Arc::clone(request.agent.public()),
         request.services.clone(),
+        request.rollout.clone(),
         request.event_seqs.clone(),
         agent_tree,
         Arc::clone(&spend),
@@ -1607,7 +1609,9 @@ async fn run_loop(
         .await;
     // Written before the agent's status is published, so whoever that wakes — the host, or a
     // parent waiting on the agent — finds the run's end in its rollout.
-    finish_recording(&interruption, &result, rollout.as_deref(), &rollout_run_id).await;
+    finish_recording(&interruption, &result, rollout.as_deref(), &rollout_run_id)
+        .instrument(agent_span.clone())
+        .await;
     if let Some(handle) = &agent_handle {
         handle.run_ended(&result).await;
     }
@@ -4200,14 +4204,13 @@ async fn run_turns(
     lifecycle: &mut LifecycleHooks,
     mut input_check: Option<InputGuardrailCheck>,
 ) -> Result<RunOutcome> {
-    let config = context.config;
     let outcome = loop {
         progress.clear_final_output();
         // Checked before the budget so a cancelled run reports as cancelled rather than as having
         // exhausted its turns — the reason a host reacts to is different for each.
         context.cancel.ensure_not_cancelled()?;
 
-        if let Some(kind) = exhausted_budget_kind(state, config.budget(), context.spend) {
+        if let Some(kind) = exhausted_budget_kind(state, context.config.budget(), context.spend) {
             progress.budget_stop = Some(kind);
             break RunOutcome::Completed {
                 reason: FinishReason::from_budget_kind(kind),
@@ -4311,7 +4314,7 @@ async fn run_turns(
         // The one thing that can overrule a conclusion is a stop hook asking for more work, and
         // it is asked here rather than inside the turn because the question is about the run's
         // delivery: a turn does not know whether its own answer is the one being handed over.
-        let step = step?;
+        let mut step = step?;
         // A turn that continues is appended as soon as its input checks have cleared it, as the
         // reference saves each turn that runs again or hands off. A turn that ended the run is
         // appended after delivery has been decided, by the loop's caller.
@@ -4324,11 +4327,16 @@ async fn run_turns(
             })
             .await?;
         }
-        if let Some(outcome) = step
-            && !continue_for_pending_input(context, progress, &outcome)
-            && !continue_from_stop_hook(context, agent, state, progress, &outcome).await?
-            && !continue_for_late_pending_input(context, progress, &outcome)
+        if let Some(outcome) = &step
+            && (continue_for_pending_input(context, progress, outcome)
+                || continue_from_stop_hook(context, agent, state, progress, outcome).await?
+                || continue_for_late_pending_input(context, progress, outcome))
         {
+            step = None;
+        }
+        turn_span
+            .in_scope(|| trace::next_step(context.events.rollout, progress.turn_records.last()));
+        if let Some(outcome) = step {
             break outcome;
         }
         state.snapshot_event_seq(context.event_seqs);
@@ -5885,6 +5893,7 @@ fn live_context(
 }
 
 struct ModelCallAttempt<'a> {
+    rollout: Option<&'a dyn RolloutRecorder>,
     turn_scope: &'a CancelScope,
     model: &'a Arc<dyn Model>,
     selector: &'a ra_core::model::ModelSelector,
@@ -6024,8 +6033,11 @@ async fn call_model(
 
     loop {
         let mut consumed = CallConsumption::default();
-        let response = call_model_attempt(
+        // Keep each attempt's stream and observation state off the enclosing future's stack;
+        // resumed agent tools can poll several nested model calls on the same thread.
+        let response = Box::pin(call_model_attempt(
             ModelCallAttempt {
+                rollout: context.events.rollout,
                 turn_scope,
                 model: &model,
                 selector: &selector,
@@ -6039,7 +6051,7 @@ async fn call_model(
             &surface,
             &mut consumed,
             early,
-        )
+        ))
         .await;
         match response {
             Ok((mut response, streamed_dispatches)) => {
@@ -6130,6 +6142,15 @@ async fn call_model_attempt(
             generation_span.record(ra_core::trace::field::RETRY_REASON, reason.as_str());
         }
     }
+    generation_span.in_scope(|| {
+        trace::observe(
+            attempt.rollout,
+            "model_request",
+            serde_json::json!({"retry.attempt": attempt.attempt}),
+            || trace::request_payload(&model_request),
+        );
+    });
+    let mut observation = trace::AttemptObservation::new(attempt.rollout, generation_span.clone());
     let started = Instant::now();
     let response = stream_model_call(
         attempt.model,
@@ -6143,17 +6164,37 @@ async fn call_model_attempt(
     )
     .instrument(generation_span.clone())
     .await;
+    observation.finish();
     generation_span.record(
         ra_core::trace::field::DURATION_MS,
         duration_ms(started.elapsed()),
     );
     match response {
         Ok((response, streamed_dispatches)) => {
+            generation_span.in_scope(|| {
+                trace::observe(
+                    attempt.rollout,
+                    "model_response",
+                    serde_json::json!({"outcome": "ok"}),
+                    || serde_json::to_value(&response),
+                );
+            });
             record_generation_usage(&generation_span, response.usage());
             ra_core::trace::record_outcome(&generation_span, ra_core::trace::SpanOutcome::Ok);
             Ok((response, streamed_dispatches))
         }
         Err(error) => {
+            generation_span.in_scope(|| {
+                trace::observe(
+                    attempt.rollout,
+                    "model_error",
+                    serde_json::json!({
+                        "outcome": if error.is_cancelled() { "cancelled" } else { "error" },
+                        "error.code": error.code(),
+                    }),
+                    || Ok(serde_json::Value::Null),
+                );
+            });
             record_terminal_error(&generation_span, &error, attempt.turn_scope);
             Err(error)
         }

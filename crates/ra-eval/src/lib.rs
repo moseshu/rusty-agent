@@ -14,3 +14,4 @@ pub mod assert;
 pub mod fixture;
 pub mod replay;
 pub mod report;
+pub mod trace;

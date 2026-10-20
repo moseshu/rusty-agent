@@ -12,6 +12,12 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-core/src/session/rollout/trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/raw_event.rs; bundle.rs |
+| `crates/ra-runtime/src/runner/trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/inference.rs |
+| `crates/ra-eval/src/trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/writer.rs; raw_event.rs |
+| `crates/ra-eval/src/trace/io.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/writer.rs; reducer/mod.rs |
+| `crates/ra-eval/src/replay.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/reducer/mod.rs |
+| `tests/it-eval/tests/local_trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/writer.rs tests; reducer/mod.rs tests |
 | `crates/ra-tools/src/mcp_ns.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp_resource.rs; mcp_resource_spec.rs; mcp_resource/*.rs; codex-rs/codex-mcp/src/connection_manager/resources.rs |
 | `crates/ra-coding/src/mcp/startup.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager/startup.rs; src/connection_manager.rs; src/rmcp_client.rs |
 | `crates/ra-mcp/src/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/mcp/mod.rs |
@@ -145,3 +151,9 @@ tests/it-mcp/tests/manager.rs and tests/it-mcp/tests/manager/support.rs adapt
 openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/mcp/manager.py and tests/mcp/{test_mcp_server_manager,
 test_mcp_server_manager_cleanup_state}.py (MIT). See the retained license above.
+
+The local tracing lifecycle, parent identities, metadata-only export and tests in
+crates/ra-eval/src/{trace,replay}.rs and tests/it-eval/tests/local_trace.rs also adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/tracing/{processor_interface,spans,traces,span_data}.py and
+tests/test_tracing.py (MIT). See the retained license above.

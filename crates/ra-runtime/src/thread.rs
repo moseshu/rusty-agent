@@ -1229,7 +1229,10 @@ impl AgentThread {
             settings,
             cancel,
         };
-        tokio::spawn(run_turn(Arc::clone(&self.inner), turn));
+        tokio::spawn(crate::runner::carry_subscriber(Box::pin(run_turn(
+            Arc::clone(&self.inner),
+            turn,
+        ))));
         turn_id
     }
 }
@@ -1326,6 +1329,27 @@ impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
 
 #[async_trait::async_trait]
 impl RolloutRecorder for ThreadRecorder {
+    fn trace_mode(&self) -> ra_core::session::rollout::RolloutTraceMode {
+        self.store
+            .as_ref()
+            .map_or_else(Default::default, |store| store.trace_mode())
+    }
+
+    fn record_trace(&self, event: ra_core::session::rollout::RolloutTraceEvent) {
+        if let Some(store) = &self.store {
+            store.record_trace(event);
+        }
+    }
+
+    fn child_trace(
+        &self,
+        recorder: Option<Arc<dyn RolloutRecorder>>,
+    ) -> Option<Arc<dyn RolloutRecorder>> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.child_trace(recorder))
+    }
+
     fn record(&self, item: RolloutItem) {
         if matches!(&item, RolloutItem::RunEnded(end) if end.end() != RolloutRunEnd::Interrupted) {
             *self.ending.lock().unwrap_or_else(PoisonError::into_inner) = Some(item);
