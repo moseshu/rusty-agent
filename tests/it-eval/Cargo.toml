@@ -9,6 +9,13 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+ra-core = { path = "../../crates/ra-core" }
+ra-model = { path = "../../crates/ra-model" }
+ra-runtime = { path = "../../crates/ra-runtime" }
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 ra-eval = { path = "../../crates/ra-eval" }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"

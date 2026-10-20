@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
 ra-core = { workspace = true }
 ra-runtime = { workspace = true }
 ra-model = { workspace = true }

@@ -1,0 +1,41 @@
+[
+  {
+    "schema_version": 1,
+    "output": [
+      {
+        "schema_version": 1,
+        "id": "tool-item-1",
+        "kind": {
+          "type": "tool_call",
+          "data": {
+            "schema_version": 1,
+            "call_id": "call-1",
+            "name": "echo",
+            "arguments": { "value": 7 }
+          }
+        }
+      }
+    ],
+    "usage": { "requests": 1, "input_tokens": 10, "output_tokens": 4 },
+    "response_id": "response-1"
+  },
+  {
+    "schema_version": 1,
+    "output": [
+      {
+        "schema_version": 1,
+        "id": "message-1",
+        "kind": {
+          "type": "message",
+          "data": {
+            "schema_version": 1,
+            "role": "assistant",
+            "content": [ { "type": "text", "data": { "schema_version": 1, "text": "Echo result: 7" } } ]
+          }
+        }
+      }
+    ],
+    "usage": { "requests": 1, "input_tokens": 20, "output_tokens": 6 },
+    "response_id": "response-2"
+  }
+]

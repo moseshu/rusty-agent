@@ -56,6 +56,7 @@ target
 !/Docs/Capability_Assembly_Contract.md
 !/Docs/Unix_Socket_Transport_Contract.md
 !/Docs/Streaming_Deltas_Contract.md
+!/Docs/Deterministic_Fixtures_Contract.md
 !/Docs/R11-1_MCP_stdio_契约与验证.md
 !/Docs/R11-2_MCP_HTTP_契约与验证.md
 !/Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md

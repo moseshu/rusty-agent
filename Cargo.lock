@@ -2902,6 +2902,8 @@ dependencies = [
 name = "ra-eval"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
+ "futures",
  "ra-core",
  "ra-model",
  "ra-protocol",
