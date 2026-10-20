@@ -50,6 +50,9 @@ pub(crate) struct ParentRun {
 struct ParentRunEnvironment {
     model_resolver: Arc<dyn ModelResolver>,
     config: RunConfig,
+    /// The declaration supplied with the run configuration, including any prepared surface.
+    /// Handoffs update the current turn without transferring ownership of that surface.
+    initial_agent: Arc<AgentSpec>,
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     run_id: RunId,
     root_run_id: RunId,
@@ -73,7 +76,8 @@ struct TurnView {
 impl ParentRun {
     /// Captures a run's environment before its loop consumes the request.
     ///
-    /// `agent` is the agent the run starts with, until the loop reports the agent of each turn;
+    /// `agent` owns any prepared surface in `config` and initially runs the current turn. The loop
+    /// reports each turn's agent separately, so a handoff preserves that original ownership.
     /// `services` are the ports the run was given. An agent spawned into the background from this
     /// run starts from both. `event_seqs` is the run's host event sequence, `agent_tree` the agent
     /// tree it executes in, and `spend` its live spend.
@@ -99,6 +103,7 @@ impl ParentRun {
             run: Arc::new(ParentRunEnvironment {
                 model_resolver,
                 config,
+                initial_agent: Arc::clone(&agent),
                 app_context,
                 run_id,
                 root_run_id,
@@ -145,6 +150,11 @@ impl ParentRun {
 
     pub(crate) fn config(&self) -> &RunConfig {
         &self.run.config
+    }
+
+    /// The original declaration supplied with the run configuration, before any handoff.
+    pub(crate) fn initial_agent(&self) -> &Arc<AgentSpec> {
+        &self.run.initial_agent
     }
 
     pub(crate) fn app_context(&self) -> Option<&Arc<dyn Any + Send + Sync>> {

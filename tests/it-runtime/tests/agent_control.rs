@@ -24,6 +24,7 @@ use ra_core::{
         },
     },
     cancel::CancelScope,
+    capability::{Capability, CapabilityFamily},
     error::{Error, Result},
     event::{AgentEvent, HostEventBody, InMemoryHostEventSink, SubAgentActivityKind},
     finish::FinishReason,
@@ -81,6 +82,8 @@ struct Scripts {
     calls: Mutex<Vec<(String, Vec<ModelInputItem>)>>,
     /// The tool names each call advertised, per agent.
     tools: Mutex<Vec<(String, Vec<String>)>>,
+    /// The temperature each call was sent with, per agent.
+    temperatures: Mutex<Vec<(String, Option<f64>)>>,
 }
 
 impl Scripts {
@@ -100,6 +103,16 @@ impl Scripts {
             .iter()
             .filter(|(key, _)| key == agent)
             .map(|(_, tools)| tools.clone())
+            .collect()
+    }
+
+    fn temperatures(&self, agent: &str) -> Vec<Option<f64>> {
+        self.temperatures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key == agent)
+            .map(|(_, temperature)| *temperature)
             .collect()
     }
 
@@ -150,6 +163,11 @@ impl Model for ScriptedModel {
                 .map(|tool| tool.name().to_owned())
                 .collect(),
         ));
+        self.0
+            .temperatures
+            .lock()
+            .unwrap()
+            .push((agent.clone(), request.model_settings().temperature()));
         let step = self
             .0
             .steps
@@ -1431,20 +1449,26 @@ fn a_fork_keeps_the_conversation_and_counts_turns_from_user_input_and_new_tasks(
 
 #[tokio::test]
 async fn a_child_spawned_after_a_handoff_runs_the_agent_handed_to() {
+    spawn_after_handoff(None).await;
+}
+
+async fn spawn_after_handoff(surface: Option<Vec<Arc<dyn Tool>>>) -> Arc<Scripts> {
     let scripts = Arc::new(Scripts::default());
     let control = AgentControl::new();
+    let mut tools = collaboration();
+    tools.extend(surface.iter().flatten().cloned());
     let specialist = AgentSpec::builder()
         .id(AgentId::new("specialist"))
         .name("Specialist")
         .instructions("specialist")
-        .tools(collaboration())
+        .tools(tools.clone())
         .build()
         .unwrap();
     let lead = AgentSpec::builder()
         .id(AgentId::new("lead"))
         .name("Lead")
         .instructions("lead")
-        .tools(collaboration())
+        .tools(tools)
         .handoff(HandoffSpec::new(
             AgentId::new("specialist"),
             ToolSchema::new(
@@ -1484,7 +1508,7 @@ async fn a_child_spawned_after_a_handoff_runs_the_agent_handed_to() {
         .register(specialist)
         .build()
         .unwrap();
-    let request = RunRequest::new(
+    let mut request = RunRequest::new(
         AgentBinding::direct(lead),
         Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
         RunId::new("run-root"),
@@ -1493,6 +1517,12 @@ async fn a_child_spawned_after_a_handoff_runs_the_agent_handed_to() {
     )
     .with_config(RunConfig::new().with_agent_registry(registry))
     .with_agent_control(control.root());
+    if let Some(surface) = surface {
+        request = request.with_prepared_capabilities(
+            [Arc::new(LeadSurface(surface.clone())) as Arc<dyn Capability>],
+            surface,
+        );
+    }
     assert_eq!(Runner::run(request).await.unwrap().final_text(), "done");
 
     let helper = AgentPath::root().join("helper").unwrap();
@@ -1516,6 +1546,286 @@ async fn a_child_spawned_after_a_handoff_runs_the_agent_handed_to() {
     assert_eq!(
         control.agents()[1].agent_id(),
         Some(&AgentId::new("specialist"))
+    );
+    scripts
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prepared capability surfaces across spawns
+// ---------------------------------------------------------------------------------------------
+
+/// A surface a host prepared for the lead: its tools are already on the lead's declaration, and it
+/// contributes a sampling setting at run assembly.
+struct LeadSurface(Vec<Arc<dyn Tool>>);
+
+#[async_trait]
+impl Capability for LeadSurface {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new("lead_surface").unwrap()
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.0.clone()
+    }
+
+    fn sampling_params(&self, settings: ModelSettings) -> ModelSettings {
+        settings.with_temperature(0.31)
+    }
+}
+
+/// The lead with `extra` installed beside its collaboration tools.
+fn lead_with(extra: &[Arc<dyn Tool>]) -> Arc<AgentSpec> {
+    let mut tools = collaboration();
+    tools.extend(extra.iter().cloned());
+    AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .instructions("lead")
+        .tools(tools)
+        .build()
+        .unwrap()
+}
+
+/// Runs the lead with `surface` prepared on it, spawning a worker by `agent_type`.
+async fn spawn_worker_beside(surface: Vec<Arc<dyn Tool>>) -> Arc<Scripts> {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "check")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "done")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "checked")));
+
+    let registry = AgentRegistry::builder()
+        .register(worker_agent(Vec::new()))
+        .build()
+        .unwrap();
+    let request = RunRequest::new(
+        AgentBinding::direct(lead_with(&surface)),
+        Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+        RunId::new("run-root"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("do the work"))],
+    )
+    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_agent_control(control.root())
+    .with_prepared_capabilities(
+        [Arc::new(LeadSurface(surface.clone())) as Arc<dyn Capability>],
+        surface,
+    );
+    assert_eq!(Runner::run(request).await.unwrap().final_text(), "done");
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    scripts
+}
+
+/// Codex plans a sub-agent's tools for that sub-agent; a registered agent named by `agent_type`
+/// does not hold the lead's prepared tool objects, so it runs without the lead's surface instead
+/// of failing to bind it.
+#[tokio::test]
+async fn an_agent_spawned_by_type_does_not_inherit_the_parents_prepared_tools() {
+    let quick: Arc<dyn Tool> = Arc::new(QuickTool::new());
+    let scripts = spawn_worker_beside(vec![quick]).await;
+
+    for tools in scripts.tools("lead") {
+        assert!(tools.contains(&"quick_look".to_owned()));
+    }
+    assert_eq!(scripts.temperatures("lead"), vec![Some(0.31), Some(0.31)]);
+    let worker = scripts.tools("worker");
+    assert_eq!(worker.len(), 1);
+    assert!(!worker[0].contains(&"quick_look".to_owned()));
+    assert_eq!(scripts.temperatures("worker"), vec![None]);
+}
+
+/// A surface without tools has no tool identity to check, and the declaration decides: another
+/// agent does not receive the lead's runtime contributions.
+#[tokio::test]
+async fn an_agent_spawned_by_type_does_not_inherit_a_tool_less_prepared_surface() {
+    let scripts = spawn_worker_beside(Vec::new()).await;
+
+    assert_eq!(scripts.temperatures("lead"), vec![Some(0.31), Some(0.31)]);
+    assert_eq!(scripts.temperatures("worker"), vec![None]);
+}
+
+/// A handoff changes the current declaration without transferring ownership of the run's
+/// prepared surface. Even shared tool objects do not make that surface the specialist's own.
+#[tokio::test]
+async fn a_child_spawned_after_a_handoff_does_not_inherit_the_initial_prepared_surface() {
+    let quick: Arc<dyn Tool> = Arc::new(QuickTool::new());
+    for surface in [Vec::new(), vec![quick]] {
+        let scripts = spawn_after_handoff(Some(surface)).await;
+
+        assert_eq!(scripts.temperatures("lead"), vec![Some(0.31)]);
+        assert_eq!(scripts.temperatures("specialist"), vec![None; 3]);
+    }
+}
+
+/// A factory can return a new declaration with the same ID and tool objects. The host must
+/// explicitly select a prepared surface for that declaration rather than inheriting by ID.
+#[tokio::test]
+async fn a_factorys_new_declaration_with_the_same_id_does_not_inherit_the_prepared_surface() {
+    let quick: Arc<dyn Tool> = Arc::new(QuickTool::new());
+    for surface in [Vec::new(), vec![quick]] {
+        let scripts = Arc::new(Scripts::default());
+        let lead = lead_with(&surface);
+        let other = lead.to_builder().instructions("other").build().unwrap();
+        let control = AgentControl::new()
+            .with_spawned_agent_factory(Arc::new(PreparingFactory::new(other, false)))
+            .unwrap();
+        scripts.push(
+            "lead",
+            Step::Respond(tool_call(
+                "l-1",
+                "l-1-call",
+                "spawn_agent",
+                json!({"task_name": "helper", "message": "help", "fork_turns": "none"}),
+            )),
+        );
+        scripts.push("lead", Step::Respond(final_message("l-2", "done")));
+        scripts.push("other", Step::Respond(final_message("h-1", "done")));
+
+        let request = RunRequest::new(
+            AgentBinding::direct(lead),
+            Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+            RunId::new("run-root"),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("do the work"))],
+        )
+        .with_agent_control(control.root())
+        .with_prepared_capabilities(
+            [Arc::new(LeadSurface(surface.clone())) as Arc<dyn Capability>],
+            surface,
+        );
+        assert_eq!(Runner::run(request).await.unwrap().final_text(), "done");
+        let helper = AgentPath::root().join("helper").unwrap();
+        eventually_status(&control, &helper, |status| {
+            matches!(status, AgentStatus::Completed(_))
+        })
+        .await;
+
+        assert_eq!(scripts.temperatures("lead"), vec![Some(0.31), Some(0.31)]);
+        assert_eq!(scripts.temperatures("other"), vec![None]);
+    }
+}
+
+/// Runs the lead with `surface` prepared on it and a worker installed as an agent tool, which
+/// inherits the lead's run configuration.
+async fn ask_worker_tool_beside(surface: Vec<Arc<dyn Tool>>) -> Arc<Scripts> {
+    let scripts = Arc::new(Scripts::default());
+    let worker = worker_agent(Vec::new());
+    let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
+        worker.as_tool().tool_name("ask_worker").build().unwrap(),
+    )];
+    tools.extend(surface.iter().cloned());
+    let lead = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .instructions("lead")
+        .tools(tools)
+        .build()
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-1",
+            "l-1-call",
+            "ask_worker",
+            json!({"input": "check"}),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2", "done")));
+    scripts.push("worker", Step::Respond(final_message("w-1", "checked")));
+
+    let request = RunRequest::new(
+        AgentBinding::direct(lead),
+        Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+        RunId::new("run-root"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("do the work"))],
+    )
+    .with_prepared_capabilities(
+        [Arc::new(LeadSurface(surface.clone())) as Arc<dyn Capability>],
+        surface,
+    );
+    assert_eq!(Runner::run(request).await.unwrap().final_text(), "done");
+    // The nested run answered the call rather than failing to bind the lead's surface.
+    let lead = scripts.inputs("lead");
+    assert_eq!(texts(&lead[1]).last().map(String::as_str), Some("checked"));
+    assert_eq!(scripts.temperatures("lead"), vec![Some(0.31), Some(0.31)]);
+    assert_eq!(scripts.temperatures("worker"), vec![None]);
+    scripts
+}
+
+/// An agent tool inherits its parent's run configuration, as the reference's nested run reads the
+/// tool context's `run_config`; the lead's prepared tool objects still belong to the lead, so the
+/// nested worker runs without them instead of failing to bind them.
+#[tokio::test]
+async fn an_agent_tool_does_not_inherit_the_parents_prepared_tools() {
+    let quick: Arc<dyn Tool> = Arc::new(QuickTool::new());
+    let scripts = ask_worker_tool_beside(vec![quick]).await;
+
+    for tools in scripts.tools("lead") {
+        assert!(tools.contains(&"quick_look".to_owned()));
+    }
+    let worker = scripts.tools("worker");
+    assert_eq!(worker.len(), 1);
+    assert!(!worker[0].contains(&"quick_look".to_owned()));
+}
+
+/// Without tools the declaration alone decides, and the nested worker does not receive the lead's
+/// runtime contributions.
+#[tokio::test]
+async fn an_agent_tool_does_not_inherit_a_tool_less_prepared_surface() {
+    ask_worker_tool_beside(Vec::new()).await;
+}
+
+/// A child that runs the lead's own declaration holds the prepared tool objects, and keeps the
+/// surface with its runtime contributions.
+#[tokio::test]
+async fn a_child_of_the_same_declaration_keeps_the_prepared_surface() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let quick: Arc<dyn Tool> = Arc::new(QuickTool::new());
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-1",
+            "l-1-call",
+            "spawn_agent",
+            json!({"task_name": "helper", "message": "help", "fork_turns": "none"}),
+        )),
+    );
+    // The lead's next turn and the helper's first both read this script; both conclude.
+    scripts.push("lead", Step::Respond(final_message("l-2", "done")));
+    scripts.push("lead", Step::Respond(final_message("h-1", "done")));
+
+    let request = RunRequest::new(
+        AgentBinding::direct(lead_with(std::slice::from_ref(&quick))),
+        Arc::new(ScriptedResolver(Arc::clone(&scripts))) as Arc<dyn ModelResolver>,
+        RunId::new("run-root"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("do the work"))],
+    )
+    .with_agent_control(control.root())
+    .with_prepared_capabilities(
+        [Arc::new(LeadSurface(vec![Arc::clone(&quick)])) as Arc<dyn Capability>],
+        [quick],
+    );
+    assert_eq!(Runner::run(request).await.unwrap().final_text(), "done");
+    let helper = AgentPath::root().join("helper").unwrap();
+    eventually_status(&control, &helper, |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+
+    let tools = scripts.tools("lead");
+    assert_eq!(tools.len(), 3);
+    for advertised in tools {
+        assert!(advertised.contains(&"quick_look".to_owned()));
+    }
+    assert_eq!(
+        scripts.temperatures("lead"),
+        vec![Some(0.31), Some(0.31), Some(0.31)]
     );
 }
 

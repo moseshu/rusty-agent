@@ -606,6 +606,26 @@ impl RunConfig {
         self
     }
 
+    /// The configuration a run of `agent` inherits from a run that was configured for `owner`.
+    ///
+    /// A prepared surface belongs to the declaration object it was installed on. A run of any
+    /// other declaration, including one reached by a handoff or a new one with the same ID, plans
+    /// its own tools, so the surface is withdrawn while every other inherited setting is kept.
+    pub(crate) fn inherited_by(self, agent: &Arc<AgentSpec>, owner: &Arc<AgentSpec>) -> Self {
+        let installed_on_agent = Arc::ptr_eq(agent, owner)
+            && self.preinstalled_capability_tools.iter().all(|installed| {
+                agent
+                    .tools()
+                    .iter()
+                    .any(|tool| Arc::ptr_eq(tool, &installed.handler))
+            });
+        if installed_on_agent {
+            self
+        } else {
+            self.with_prepared_capabilities([], [])
+        }
+    }
+
     /// Selects the base permission mode used for every tool call in this run.
     pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission = self.permission.with_mode(mode);

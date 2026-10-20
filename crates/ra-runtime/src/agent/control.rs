@@ -904,7 +904,7 @@ impl AgentControlPort for AgentHandle {
         let prepared = tree
             .prepare_spawned(&path, agent, request.agent_type())
             .await?;
-        let config = prepared.configure_run(parent.config().clone());
+        let config = prepared.configure_run(parent.config().clone(), parent.initial_agent());
         let (agent, resources) = prepared.into_parts();
         let session_id = SessionId::generate();
         let rollout =

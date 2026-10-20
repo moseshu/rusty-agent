@@ -109,6 +109,9 @@ impl PreparedSpawnedAgent {
 
     /// Replaces the parent's prepared capability surface with this spawned agent's own, while
     /// retaining the other inherited run settings. Empty collections explicitly withdraw it.
+    /// Without this call, the surface is inherited only by a child running the exact declaration
+    /// supplied with the parent's run configuration, with the surface's tools installed. A handoff
+    /// or a new declaration with the same agent ID does not transfer that ownership.
     ///
     /// The agent must already contain the static instructions and exact shared tools. Runtime
     /// assembly skips that static channel, checks bound declarations and replaces handlers at
@@ -126,13 +129,20 @@ impl PreparedSpawnedAgent {
         self
     }
 
-    pub(super) fn configure_run(&self, config: RunConfig) -> RunConfig {
+    /// Without an explicit choice, the child keeps the parent's prepared surface only when it runs
+    /// the declaration that surface was installed on. A different agent, such as one named by
+    /// `agent_type`, plans its own tools as a Codex sub-agent does, so the surface is withdrawn.
+    pub(super) fn configure_run(
+        &self,
+        config: RunConfig,
+        initial_agent: &Arc<AgentSpec>,
+    ) -> RunConfig {
         match &self.capabilities {
             Some(prepared) => config.with_prepared_capabilities(
                 prepared.capabilities.iter().cloned(),
                 prepared.tools.iter().cloned(),
             ),
-            None => config,
+            None => config.inherited_by(&self.agent, initial_agent),
         }
     }
 

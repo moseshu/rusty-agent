@@ -580,10 +580,17 @@ impl AgentTool {
             ))
         })?;
 
+        // An inherited configuration keeps the parent's prepared capability surface only for the
+        // declaration that surface was installed on; an explicit configuration is used as given.
         let config = self
             .run_config
             .clone()
-            .unwrap_or_else(|| parent.config().clone())
+            .unwrap_or_else(|| {
+                parent
+                    .config()
+                    .clone()
+                    .inherited_by(&self.agent, parent.initial_agent())
+            })
             .with_max_turns(self.max_turns.unwrap_or(DEFAULT_MAX_TURNS));
         // A resumed call continues the nested run it paused on, from that run's checkpoint and
         // with its history, as the reference passes the saved state where a fresh call passes
