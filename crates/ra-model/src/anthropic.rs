@@ -34,7 +34,7 @@ use crate::retry::unstarted_replay_safety;
 /// Named once because the bare literal is also a product alias the repository's layering gate
 /// watches for. The collision is genuine and belongs to Anthropic's vocabulary, so it is declared
 /// here and referred to everywhere else.
-pub(crate) const ASSISTANT_ROLE: &str = "assistant"; // layering-allow: assistant = Anthropic wire message role
+pub(crate) const ASSISTANT_ROLE: &str = "assistant";
 
 /// Beta identifier that gates `output_config.format`.
 ///

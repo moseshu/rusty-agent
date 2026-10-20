@@ -3,8 +3,9 @@
 //! # Three boundaries
 //!
 //! 1. **This module defines vocabulary only**: span names, field names, level conventions. It
-//!    implements no subscriber and wires up no external reporting backend — assembling a
-//!    subscriber is `ra-cli`'s job, and choosing a backend is the user's.
+//!    implements no subscriber and wires up no external reporting backend. The embedding host or
+//!    `ra-cli` installs subscribers and chooses any optional exporters independently of the model
+//!    provider. The framework does not install an `OpenAI` trace uploader or require its credentials.
 //! 2. **The tracing channel serves developers and eval, not the UI event stream.** User-visible
 //!    events go through the rollout's `event_msg` channel. The two are not interchangeable: logs
 //!    can change level or be dropped at any time, the event stream cannot.

@@ -1,6 +1,6 @@
 # rusty-agent
 
-An agent framework written in Rust, plus the reference products built with it.
+An agent framework written in Rust.
 
 > **Status.** The kernel contracts, provider implementations, prompt assembly, and
 > context management (budgeting, compaction, tool-output trimming) are in place,
@@ -12,12 +12,10 @@ An agent framework written in Rust, plus the reference products built with it.
 
 ## What this is
 
-Two things, not one:
-
-1. **A general-purpose agent framework** — for building ReAct, graph-engineering,
-   plan-and-execute, and multi-agent systems;
-2. **Reference products built on that framework** — their job is to force the
-   framework's abstractions into the right shape.
+A general-purpose framework for building ReAct, graph, plan-and-execute, and multi-agent
+systems. The existing `ra-coding` application consumes the framework, and `examples/`
+demonstrates its public APIs. Additional product lines are developed separately after the
+framework is complete; building a second product is outside the framework's delivery scope.
 
 The goal is a high-performance agent runtime: a single-binary deployment, no
 interpreter or GC in the hot path, bounded and predictable memory under long
@@ -44,6 +42,10 @@ graph agents, long-running tool-using assistants, and embedded or self-hosted pr
 9. **Approvals**: First-class permission checks and interrupts for human-in-the-loop flows.
 10. **Evaluation and protocol**: Replay fixtures and trace assertions, together with control
    protocol frames and an application-server transport.
+
+Observability uses Rust `tracing` across model providers. The framework does not automatically
+send traces to OpenAI or another external service. The host application configures subscribers
+and any optional exporters; choosing a model provider does not select an observability backend.
 
 ## Why Rust
 

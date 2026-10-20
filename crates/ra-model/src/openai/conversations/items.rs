@@ -187,7 +187,7 @@ pub(crate) fn lift_history_item(
 fn lift_message(item: &Value) -> Result<Message> {
     let role = match required_str(item, "role", "conversation message")? {
         "user" => MessageRole::User,
-        "assistant" => MessageRole::Assistant, // layering-allow: assistant = OpenAI wire message role
+        "assistant" => MessageRole::Assistant,
         // The neutral model has one instruction role; `developer` is the newer name for it.
         "system" | "developer" => MessageRole::System,
         other => {

@@ -14,7 +14,7 @@ use ra_core::{
 };
 use serde_json::{Map, Value, json};
 
-const ANTHROPIC_ASSISTANT_ROLE: &str = "assistant"; // layering-allow: assistant = Anthropic wire message role
+const ANTHROPIC_ASSISTANT_ROLE: &str = "assistant";
 
 /// Smallest explicit thinking budget Anthropic accepts on the models that still take one.
 const MIN_THINKING_BUDGET_TOKENS: u64 = 1024;

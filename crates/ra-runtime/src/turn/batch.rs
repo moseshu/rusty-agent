@@ -1481,7 +1481,7 @@ async fn execute_handoffs(
 
 /// What the agent receiving control reads as the answer to the call that moved it.
 fn transfer_message(agent_name: &str) -> String {
-    json!({ "assistant": agent_name }).to_string() // layering-allow: assistant = model role, not a product
+    json!({ "assistant": agent_name }).to_string()
 }
 
 fn output_item(call_id: &CallId, output: ToolCallOutput) -> RunItem {

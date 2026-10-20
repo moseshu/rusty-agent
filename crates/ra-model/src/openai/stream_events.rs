@@ -8,7 +8,7 @@ use ra_core::{
 };
 use serde_json::Value;
 
-const ASSISTANT_ROLE: &str = "assistant"; // layering-allow: assistant = OpenAI wire message role
+const ASSISTANT_ROLE: &str = "assistant";
 
 pub(super) fn text_delta(
     event_type: &str,

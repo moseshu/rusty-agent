@@ -11,7 +11,7 @@
 //! 3. **reusable pieces** do not depend on products;
 //! 4. **products depend on no other product**, and no framework crate references a product
 //!    implementation;
-//! 5. **no framework crate branches on a product name** (R18-8).
+//! 5. **no framework crate branches on a registered product name**.
 //!
 //! The first four inspect the dependency graph (**including transitive edges** — `ra-core -> X ->
 //! ra-coding` is equally a violation, and checking direct dependencies alone would miss it); the
@@ -60,8 +60,8 @@ impl Layer {
     }
 }
 
-/// The layer allowlist. The ones not yet created (`ra-flow`,
-/// `ra-assistant`) are registered in advance so the gate binds them the day they appear.
+/// The layer allowlist. The planned orchestration crate (`ra-flow`) is registered in advance
+/// so its dependency boundary applies when it is created.
 const LAYERS: &[(&str, Layer)] = &[
     ("ra-core", Layer::Kernel),
     ("ra-macros", Layer::Kernel),
@@ -82,7 +82,6 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-patch", Layer::Reusable),
     ("rusty-agent", Layer::Reusable),
     ("ra-coding", Layer::Product),
-    ("ra-assistant", Layer::Product),
     ("ra-cli", Layer::Binary),
     ("xtask", Layer::Binary),
     // A binary by shape, but the layer rule is not what constrains it — a `Binary` may depend on a
@@ -106,7 +105,7 @@ const LAYERS: &[(&str, Layer)] = &[
 /// Layer rules catch an obvious inversion but not an edge like `ra-core -> ra-model`, where both
 /// sides are framework yet the responsibilities are already backwards. This turns the development
 /// plan's crate table into an allowlist; a new dependency has to answer why it belongs on that
-/// boundary first. The two not-yet-created crates are pre-registered and bound from day one.
+/// boundary first. The planned orchestration crate is pre-registered and bound from day one.
 ///
 /// **This table is the single source of truth for the dependency graph**; the graph in
 /// [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §1 has to agree with it.
@@ -205,14 +204,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-execpolicy",
         ],
     ),
-    (
-        "ra-assistant",
-        &["ra-core", "ra-runtime", "ra-tools", "ra-flow", "ra-prompt"],
-    ),
-    (
-        "ra-cli",
-        &["ra-coding", "ra-assistant", "ra-protocol", "ra-eval"],
-    ),
+    ("ra-cli", &["ra-coding", "ra-protocol", "ra-eval"]),
     ("xtask", &[]),
     // `examples/minimal_agent` claims that a third party can build a working agent out of the
     // kernel alone. This row is what makes the claim mechanical rather than aspirational: the day

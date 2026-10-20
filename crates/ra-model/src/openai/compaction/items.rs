@@ -180,7 +180,7 @@ pub(super) fn lift_output(payload: &Value, provider: &ProviderKey) -> Result<Vec
                 .as_object_mut()
                 .ok_or_else(|| behavior_error("OpenAI compaction output item must be an object"))?;
             fields.remove("created_by");
-            let assistant_role = "assistant"; // layering-allow: assistant = OpenAI wire message role
+            let assistant_role = "assistant";
             if !has_reasoning && fields.get("role").and_then(Value::as_str) == Some(assistant_role)
             {
                 fields.remove("id");

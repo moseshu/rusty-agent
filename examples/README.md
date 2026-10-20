@@ -44,3 +44,19 @@ demonstrate extension points; applications using a shipped provider start with `
 
 MCP integration is available in the framework but a dedicated MCP tutorial remains future
 work outside this quickstart scope; there is no `mcp_integration` example crate yet.
+
+## Future examples
+
+After the framework is complete, optional examples may demonstrate:
+
+- Read-only research using retrieval tools and reports with source references.
+- Plan-and-execute workflows using the orchestration APIs.
+- Parallel specialist agents that return results for synthesis.
+- A host-supplied memory store connected through the public memory contracts.
+
+These are candidate tutorials, with no implementation or example crates added yet. Keep each
+example focused on public API usage and reuse the framework's tools and runtime. Data sources,
+memory backends, prompts, and report policies belong to the example or its host application.
+A general assistant product and comparisons between product lines are outside the framework's
+development and release requirements. New product lines can be built separately on the
+completed framework.

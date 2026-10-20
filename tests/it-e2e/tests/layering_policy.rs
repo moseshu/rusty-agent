@@ -2,6 +2,7 @@
 
 use xtask::layering_policy::scan_product_references;
 
+// A synthetic catalog exercises collisions with protocol roles independently of workspace products.
 const PRODUCTS: &[&str] = &["ra-coding", "ra-assistant"];
 
 fn messages(source: &str) -> Vec<String> {

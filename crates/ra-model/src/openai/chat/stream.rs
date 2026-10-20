@@ -1407,7 +1407,7 @@ impl StreamDriver {
         let payload = json!({
             "id": FAKE_ITEM_ID,
             "type": "message",
-            "role": "assistant", // layering-allow: assistant = OpenAI wire message role
+            "role": "assistant",
             "status": "completed",
             "content": parts.iter().map(|(_, block)| responses_content_part(block)).collect::<Vec<_>>()
         });
@@ -1533,7 +1533,7 @@ fn in_progress_message() -> Value {
     json!({
         "id": FAKE_ITEM_ID,
         "type": "message",
-        "role": "assistant", // layering-allow: assistant = OpenAI wire message role
+        "role": "assistant",
         "status": "in_progress",
         "content": []
     })

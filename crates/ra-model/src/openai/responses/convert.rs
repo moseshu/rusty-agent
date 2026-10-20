@@ -248,7 +248,7 @@ pub(crate) fn convert_compaction(item: &Value, provider: &ProviderKey) -> Provid
 
 fn convert_message(item: &Value) -> Result<Message> {
     let role = match required_str(item, "role", "response message")? {
-        "assistant" => MessageRole::Assistant, // layering-allow: assistant = OpenAI wire message role
+        "assistant" => MessageRole::Assistant,
         other => {
             return Err(behavior_error(format!(
                 "unexpected OpenAI response message role `{other}`"
