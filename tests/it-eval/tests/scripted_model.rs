@@ -13,7 +13,8 @@ use futures::{StreamExt, TryStreamExt, stream};
 use ra_core::{
     error::{Error, ProviderErrorKind},
     item::{
-        ItemId, Message, ModelInputItem, ModelResponse, Reasoning, RunItem, RunItemKind, ToolCall,
+        AgentId, CallId, HandoffCall, ItemId, McpListTools, Message, ModelInputItem, ModelResponse,
+        Reasoning, RunItem, RunItemKind, ToolCall, ToolCallKind,
     },
     model::{
         ConversationContinuation, Model, ModelProvider, ModelRequest, ModelRetryAdviceRequest,
@@ -459,6 +460,35 @@ async fn automatic_streams_emit_empty_added_items_deltas_completed_items_and_ter
         reasoning.clone(),
         assistant_message("answer", Some("message")),
         function_call("echo", json!({"value": 7}), "call", None, Some("tools")),
+        RunItem::new(
+            ItemId::new("handoff"),
+            RunItemKind::HandoffCall(
+                HandoffCall::new(CallId::new("transfer"), AgentId::new("reviewer"), json!({}))
+                    .with_tool_name("transfer_to_reviewer"),
+            ),
+        ),
+        RunItem::new(
+            ItemId::new("patch"),
+            RunItemKind::ToolCall(
+                ToolCall::custom(
+                    CallId::new("patch-call"),
+                    "apply_patch",
+                    "*** Begin Patch\n*** End Patch",
+                )
+                .with_namespace("tools"),
+            ),
+        ),
+        RunItem::new(
+            ItemId::new("search"),
+            RunItemKind::ToolCall(
+                ToolCall::new(
+                    CallId::new("search-call"),
+                    "tool_search",
+                    json!({"query": "echo"}),
+                )
+                .with_kind(ToolCallKind::ToolSearch),
+            ),
+        ),
     ];
     let response = ModelResponse::new(items.clone())
         .with_response_id("stable-response")
@@ -480,7 +510,16 @@ async fn automatic_streams_emit_empty_added_items_deltas_completed_items_and_ter
         .collect();
     assert_eq!(
         names,
-        ["reasoning", "reasoning", "message", "message", "tool_call"]
+        [
+            "reasoning",
+            "reasoning",
+            "message",
+            "message",
+            "tool_call",
+            "handoff_call",
+            "tool_call",
+            "tool_call",
+        ]
     );
     let ModelStreamEvent::OutputItemAdded(added) = &events[0] else {
         panic!("missing reasoning opening")
@@ -527,24 +566,16 @@ async fn automatic_streams_emit_empty_added_items_deltas_completed_items_and_ter
 
 #[tokio::test]
 async fn unsupported_automatic_items_fail_only_on_the_streaming_entry_point() {
-    let custom = RunItem::new(
-        ItemId::new("custom"),
-        RunItemKind::ToolCall(ToolCall::custom(
-            ra_core::item::CallId::new("call"),
-            "custom",
-            "raw",
-        )),
+    let hosted = RunItem::new(
+        ItemId::new("hosted"),
+        RunItemKind::McpListTools(McpListTools::new("docs", Vec::new())),
     );
-    let model = ScriptedModel::new([vec![custom.clone()], vec![custom.clone()]]);
-    assert_eq!(
-        model.get_response(request()).await.unwrap().output(),
-        &[custom]
-    );
-    let error = model
-        .stream_response(request())
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap_err();
+    let items = vec![assistant_message("before unsupported item", None), hosted];
+    let model = ScriptedModel::new([items.clone(), items.clone()]);
+    assert_eq!(model.get_response(request()).await.unwrap().output(), items);
+    let mut stream = model.stream_response(request());
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(stream.next().await.is_none());
     assert!(matches!(
         error,
         Error::Provider {
@@ -559,6 +590,7 @@ async fn unsupported_automatic_items_fail_only_on_the_streaming_entry_point() {
             .to_string()
             .contains("ModelStep::stream")
     );
+    assert!(error.to_string().contains("mcp_list_tools"));
     model.assert_complete().unwrap();
 }
 

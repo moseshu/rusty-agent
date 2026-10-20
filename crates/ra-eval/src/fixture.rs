@@ -268,7 +268,9 @@ impl Model for ScriptedModel {
 
 /// Returns the same injected model for every requested name, including the provider default.
 ///
-/// This ports the upstream single-model provider used to run scripted models through a resolver.
+/// The upstream single-model provider is a private test helper. This public Rust adaptation is
+/// needed because agent specifications resolve models through the provider registry rather than
+/// accepting a model instance directly.
 /// Register it with the host's existing provider registry; it owns no protocol or credentials.
 #[non_exhaustive]
 #[derive(Clone)]

@@ -145,6 +145,7 @@ pub(super) fn generation_span(emit_traces: bool, streamed: bool) -> tracing::Spa
 ///
 /// Semantic names such as `message_output_created` belong to the runner's mapping of step items,
 /// not to the model stream.
+/// Tool and handoff calls emit only their completed item, matching the adapters' neutral events.
 pub(super) fn automatic_events(response: ModelResponse) -> Result<Vec<ModelStreamEvent>> {
     let mut events = Vec::new();
     for item in response.output() {
@@ -210,7 +211,7 @@ pub(super) fn automatic_events(response: ModelResponse) -> Result<Vec<ModelStrea
                     )));
                 }
             }
-            RunItemKind::ToolCall(call) if call.kind().is_function() => {}
+            RunItemKind::ToolCall(_) | RunItemKind::HandoffCall(_) => {}
             _ => {
                 let error = UnsupportedAutomaticStream::new(item.kind().label());
                 return Err(
