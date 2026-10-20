@@ -44,6 +44,7 @@ pub use io::{TraceError, read_jsonl, read_rollout, write_jsonl};
 #[derive(Clone)]
 struct Identity {
     trace: String,
+    group: Option<String>,
     span: String,
     parent: Option<String>,
 }
@@ -160,7 +161,7 @@ impl LocalTrace {
             return;
         }
         state.serialization_failed |= event.fields().get("capture_error").is_some();
-        let record = RolloutTraceRecord::new(
+        let mut record = RolloutTraceRecord::new(
             self.unscoped_trace.clone(),
             state.records.len() as u64 + 1,
             u64::try_from(
@@ -175,6 +176,9 @@ impl LocalTrace {
             identity.and_then(|id| id.parent.clone()),
             event,
         );
+        if let Some(group) = identity.and_then(|id| id.group.as_ref()) {
+            record = record.with_group_id(group);
+        }
         if self.recorder.is_some() {
             state.pending.push_back(RolloutItem::Trace(record.clone()));
         }
@@ -516,6 +520,12 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LocalTrace {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
         let mut fields = Fields::default();
         attrs.record(&mut fields);
+        // Grouping belongs to the trace, not to each span. An active parent owns the value even
+        // when it is absent, just as the reference reuses the current trace for a nested run.
+        let group = fields
+            .0
+            .remove(ra_core::trace::field::GROUP_ID)
+            .and_then(|value| value.as_str().map(str::to_owned));
         let mut state = self.lock();
         let mut parent = context.span(id).and_then(|span| span.parent());
         let mut parent_identity = None;
@@ -544,6 +554,9 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LocalTrace {
             trace: parent_identity
                 .as_ref()
                 .map_or_else(new_trace_id, |id| id.trace.clone()),
+            group: parent_identity
+                .as_ref()
+                .map_or(group, |id| id.group.clone()),
             span: format!("span_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]),
             parent: parent_identity.map(|id| id.span),
         };
@@ -567,6 +580,8 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LocalTrace {
     fn on_record(&self, id: &Id, values: &Record<'_>, _: Context<'_, S>) {
         let mut fields = Fields::default();
         values.record(&mut fields);
+        // Trace grouping is fixed at creation and cannot be changed by recording a span field.
+        fields.0.remove(ra_core::trace::field::GROUP_ID);
         if fields.0.is_empty() {
             return;
         }

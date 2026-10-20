@@ -157,3 +157,14 @@ crates/ra-eval/src/{trace,replay}.rs and tests/it-eval/tests/local_trace.rs also
 openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/tracing/{processor_interface,spans,traces,span_data}.py and
 tests/test_tracing.py (MIT). See the retained license above.
+
+The trace group propagation and checkpoint fallback in crates/ra-runtime/src/runner.rs,
+crates/ra-runtime/src/agent/tool/parent.rs, crates/ra-core/src/state/run.rs,
+crates/ra-core/src/{trace,session/rollout/trace}.rs,
+crates/ra-eval/src/{trace,replay}.rs, and cases in tests/it-eval/tests/local_trace.rs
+and tests/it-core/tests/run_state.rs also adapt openai/openai-agents-python,
+revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/{run,run_config,run_state}.py, src/agents/run_internal/agent_runner_helpers.py,
+src/agents/tracing/{context,traces}.py, tests/test_agent_tracing.py,
+tests/tracing/test_traces_impl.py and tests/tracing/test_trace_context.py (MIT).
+See the retained license above.

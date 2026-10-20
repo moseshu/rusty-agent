@@ -57,6 +57,8 @@ struct ParentRunEnvironment {
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     run_id: RunId,
     root_run_id: RunId,
+    /// The group of the trace the run executes in, which a nested run's trace shares.
+    trace_group_id: Option<String>,
     services: ToolServices,
     rollout: Option<Arc<dyn RolloutRecorder>>,
     /// The run's host event sequence, which events the control plane records for it draw from.
@@ -82,7 +84,8 @@ impl ParentRun {
     /// reports each turn's agent separately, so a handoff preserves that original ownership.
     /// `services` are the ports the run was given. An agent spawned into the background from this
     /// run starts from both. `event_seqs` is the run's host event sequence, `agent_tree` the agent
-    /// tree it executes in, and `spend` its live spend.
+    /// tree it executes in, and `spend` its live spend. `trace_group_id` is the group of the trace
+    /// the run executes in.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model_resolver: Arc<dyn ModelResolver>,
@@ -90,6 +93,7 @@ impl ParentRun {
         app_context: Option<Arc<dyn Any + Send + Sync>>,
         run_id: RunId,
         parent_run_id: Option<&RunId>,
+        trace_group_id: Option<String>,
         agent: Arc<AgentSpec>,
         services: ToolServices,
         rollout: Option<Arc<dyn RolloutRecorder>>,
@@ -97,10 +101,8 @@ impl ParentRun {
         agent_tree: Option<AgentTreeRef>,
         spend: Arc<RunSpend>,
     ) -> Self {
-        // Only agent-tool runs inherit this identity. Background agents have independent runs,
-        // even when their checkpoints record a parent for hooks and communication.
-        let root_run_id = Self::current()
-            .filter(|parent| Some(parent.run_id()) == parent_run_id)
+        // Only agent-tool runs inherit this identity; see `enclosing`.
+        let root_run_id = Self::enclosing(parent_run_id)
             .map_or_else(|| run_id.clone(), |parent| parent.run.root_run_id.clone());
         Self {
             run: Arc::new(ParentRunEnvironment {
@@ -110,6 +112,7 @@ impl ParentRun {
                 app_context,
                 run_id,
                 root_run_id,
+                trace_group_id,
                 services,
                 rollout,
                 event_seqs,
@@ -128,6 +131,14 @@ impl ParentRun {
     /// The environment of the run whose code is executing, if a runner installed one.
     pub(crate) fn current() -> Option<Self> {
         CURRENT.try_with(Clone::clone).ok()
+    }
+
+    /// The agent-tool run that started a nested run with `parent_run_id`, if one is executing.
+    ///
+    /// Only agent-tool runs have one. Background agents have independent runs, even when their
+    /// checkpoints record a parent for hooks and communication.
+    pub(crate) fn enclosing(parent_run_id: Option<&RunId>) -> Option<Self> {
+        Self::current().filter(|parent| Some(parent.run_id()) == parent_run_id)
     }
 
     /// Runs `future` as code belonging to this run.
@@ -167,6 +178,11 @@ impl ParentRun {
 
     pub(crate) fn run_id(&self) -> &RunId {
         &self.run.run_id
+    }
+
+    /// The group of the trace this run executes in.
+    pub(crate) fn trace_group_id(&self) -> Option<&str> {
+        self.run.trace_group_id.as_deref()
     }
 
     /// Records the agent running this turn and the history its request was built from.

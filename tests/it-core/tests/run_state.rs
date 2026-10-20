@@ -208,6 +208,109 @@ fn test_run_state_extension_slots_roundtrip() {
     assert_eq!(restored.sandbox_resume_state(), Some(&sandbox));
 }
 
+/// The checkpoint records the trace group under the reference's `trace` key, exactly as configured,
+/// and a later segment replaces it.
+#[test]
+fn test_run_state_trace_group_roundtrips_and_retains_unread_trace_settings() {
+    let mut state = RunState::start(RunId::new("run-trace"));
+    assert_eq!(state.trace_group_id(), None);
+    assert!(serde_json::to_value(&state).unwrap().get("trace").is_none());
+    for group in ["chat-1", "", " \t "] {
+        state.set_trace_group_id(Some(group.to_owned()));
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["trace"], json!({"group_id": group}));
+        let restored: RunState = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.trace_group_id(), Some(group));
+    }
+    state.set_trace_group_id(None);
+    assert_eq!(state.trace_group_id(), None);
+    assert!(serde_json::to_value(&state).unwrap().get("trace").is_none());
+
+    // A build that ports the reference's other trace settings writes them beside the group.
+    let mut value = serde_json::to_value(RunState::start(RunId::new("run-trace"))).unwrap();
+    value["trace"] = json!({
+        "group_id": "chat-1",
+        "id": "trace_123",
+        "workflow_name": "Agent workflow",
+    });
+    let mut restored: RunState = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(restored.trace_group_id(), Some("chat-1"));
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["trace"],
+        value["trace"]
+    );
+    restored.set_trace_group_id(Some("next-segment".to_owned()));
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["trace"],
+        json!({"group_id": "next-segment"})
+    );
+    value["trace"] = json!({"id": "trace_123"});
+    let mut restored: RunState = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.trace_group_id(), None);
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["trace"],
+        json!({"id": "trace_123"})
+    );
+    restored.set_trace_group_id(None);
+    assert!(
+        serde_json::to_value(&restored)
+            .unwrap()
+            .get("trace")
+            .is_none()
+    );
+}
+
+/// Malformed diagnostic trace settings cannot prevent a valid checkpoint from being restored.
+#[test]
+fn test_run_state_ignores_invalid_trace_settings() {
+    for trace in [
+        json!(null),
+        json!("garbage"),
+        json!(5),
+        json!(false),
+        json!([]),
+        json!([{"group_id": "ignored"}]),
+        json!({}),
+        json!({"group_id": null}),
+        json!({"group_id": 5}),
+        json!({"group_id": false}),
+        json!({"group_id": []}),
+        json!({"group_id": {"value": "ignored"}}),
+    ] {
+        let mut value = serde_json::to_value(RunState::start(RunId::new("run-trace"))).unwrap();
+        value["trace"] = trace.clone();
+        let restored: RunState = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored,
+            RunState::start(RunId::new("run-trace")),
+            "{trace}"
+        );
+        assert!(
+            serde_json::to_value(&restored)
+                .unwrap()
+                .get("trace")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn test_run_state_drops_invalid_trace_group_and_preserves_unknown_settings() {
+    let mut value = serde_json::to_value(RunState::start(RunId::new("run-trace"))).unwrap();
+    value["trace"] = json!({
+        "group_id": 5,
+        "id": "trace_123",
+        "future_setting": {"enabled": true},
+    });
+    let restored: RunState = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.trace_group_id(), None);
+    assert_eq!(
+        serde_json::to_value(restored).unwrap()["trace"],
+        json!({"id": "trace_123", "future_setting": {"enabled": true}})
+    );
+}
+
 fn approval_item(id: &str, call: &str) -> RunItem {
     RunItem::new(
         ItemId::new(id),

@@ -50,6 +50,10 @@ pub struct RolloutTraceRecord {
     at_unix_ms: u64,
     /// Stable trace identity shared by descendants of a captured root span.
     trace_id: String,
+    /// Optional host grouping shared by the trace, without trimming or generated fallbacks.
+    /// Missing in older version-one records and defaults to no group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_id: Option<String>,
     /// Stable span identity, absent for run boundaries outside a span.
     span_id: Option<String>,
     /// Nearest captured parent, absent for root spans.
@@ -114,6 +118,7 @@ impl RolloutTraceRecord {
             seq,
             at_unix_ms,
             trace_id,
+            group_id: None,
             span_id,
             parent_id,
             event,
@@ -144,6 +149,17 @@ impl RolloutTraceRecord {
     #[must_use]
     pub fn trace_id(&self) -> &str {
         &self.trace_id
+    }
+    /// Sets the trace's host-supplied grouping, preserving even empty or whitespace-only values.
+    #[must_use]
+    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
+    }
+    /// Optional trace grouping, independent of the trace identity.
+    #[must_use]
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
     }
     /// Stable span identity, if attributed.
     #[must_use]

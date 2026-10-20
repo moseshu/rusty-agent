@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(12);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(13);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -180,10 +180,16 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          and refuses a projection whose boundary record a filter removed.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(12),
         "Persisted pending settlement of committed tool outputs after a post-output callback \
          fails. An older runtime may skip the tool stop policy once the last nested approval \
          has been removed and call the model instead of concluding from the saved output.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the trace settings a resumed run falls back to, currently its trace group. An \
+         older runtime keeps them as an unknown field but resumes without a trace group unless \
+         the host supplies the group again.",
     ),
 ];
 
@@ -942,6 +948,42 @@ impl PendingControlRequest {
     }
 }
 
+/// Trace settings captured from the trace a run segment executed in, under the reference's
+/// `trace` key.
+///
+/// The reference stores its whole `TraceState` here and falls back to each value a resumed run's
+/// configuration leaves unset. This runtime has no configurable trace ID, workflow name or trace
+/// metadata yet, so only the group is captured; fields written by a build that ports the others
+/// are retained until the next segment captures its current trace.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct RunTraceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_id: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+/// Matches the reference's tolerant parsing of diagnostic trace settings without weakening the
+/// validation of resumable execution state.
+fn deserialize_run_trace_state<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RunTraceState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let serde_json::Value::Object(mut fields) = serde_json::Value::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let group_id = match fields.remove("group_id") {
+        Some(serde_json::Value::String(group)) => Some(group),
+        _ => None,
+    };
+    let unknown = Unknown::deserialize(serde_json::Value::Object(fields))
+        .map_err(serde::de::Error::custom)?;
+    Ok((group_id.is_some() || !unknown.is_empty()).then_some(RunTraceState { group_id, unknown }))
+}
+
 /// All mutable, framework-owned facts one run carries between its segments.
 ///
 /// This is not host application context. Host context is an arbitrary live object read through
@@ -1045,6 +1087,8 @@ pub struct RunState {
     pending_session_write: Option<PendingSessionWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_compaction: Option<SessionCompactionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace: Option<RunTraceState>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     terminal_unrecoverable: bool,
     #[serde(
@@ -1158,6 +1202,8 @@ struct RunStateRecord {
     pending_session_write: Option<PendingSessionWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_compaction: Option<SessionCompactionContext>,
+    #[serde(default, deserialize_with = "deserialize_run_trace_state")]
+    trace: Option<RunTraceState>,
     #[serde(default)]
     terminal_unrecoverable: bool,
     #[serde(default)]
@@ -1214,6 +1260,7 @@ impl TryFrom<RunStateRecord> for RunState {
             session_persisted_item_count,
             pending_session_write,
             session_compaction,
+            trace,
             terminal_unrecoverable,
             sandbox,
             unknown,
@@ -1356,6 +1403,7 @@ impl TryFrom<RunStateRecord> for RunState {
             session_persisted_item_count,
             pending_session_write,
             session_compaction,
+            trace,
             terminal_unrecoverable,
             sandbox,
             unknown,
@@ -1408,6 +1456,7 @@ impl RunState {
             session_persisted_item_count: None,
             pending_session_write: None,
             session_compaction: None,
+            trace: None,
             terminal_unrecoverable: false,
             sandbox: None,
             unknown: Unknown::new(),
@@ -1944,6 +1993,25 @@ impl RunState {
     #[doc(hidden)]
     pub fn set_session_compaction(&mut self, context: SessionCompactionContext) {
         self.session_compaction = Some(context);
+    }
+
+    /// The trace group captured from the trace this run last executed in, exactly as configured.
+    ///
+    /// A resumed run whose configuration sets no group uses this one, as the reference resolves
+    /// trace settings from its checkpointed `TraceState`.
+    #[must_use]
+    pub fn trace_group_id(&self) -> Option<&str> {
+        self.trace.as_ref()?.group_id.as_deref()
+    }
+
+    /// Captures the trace a run segment executes in, replacing any settings an earlier segment
+    /// recorded, as the reference's `RunState.set_trace` does.
+    #[doc(hidden)]
+    pub fn set_trace_group_id(&mut self, group_id: Option<String>) {
+        self.trace = group_id.map(|group_id| RunTraceState {
+            group_id: Some(group_id),
+            unknown: Unknown::new(),
+        });
     }
 
     /// The append that must settle before further model or tool work.

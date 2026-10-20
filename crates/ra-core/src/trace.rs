@@ -109,6 +109,11 @@ pub mod field {
     pub const AGENT_NAME: &str = "agent.name";
     /// Runtime run identity, independent of trace and grouping identities.
     pub const RUN_ID: &str = "run.id";
+    /// Optional trace grouping supplied by the host, independent of run and trace identities.
+    /// Recorded only on the agent span of a run that starts its own trace; a nested agent-tool run
+    /// omits it because it executes in its parent's trace. Local capture promotes the value to the
+    /// trace envelope, where every descendant record carries it.
+    pub const GROUP_ID: &str = "group_id";
 
     // -- turn --------------------------------------------------------------
 
@@ -244,6 +249,7 @@ pub mod field {
     /// vocabulary.
     pub const ALL: &[&str] = &[
         RUN_ID,
+        GROUP_ID,
         SPAN_KIND,
         SPAN_LABEL,
         OUTCOME,

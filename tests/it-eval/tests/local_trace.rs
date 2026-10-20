@@ -23,8 +23,10 @@ use ra_core::{
             PersistContext, RolloutItem, RolloutRecorder, RolloutRunStarted, RolloutTraceEvent,
         },
     },
-    state::RunId,
-    tool::{Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
+    state::{RunId, RunState},
+    tool::{
+        Tool, ToolApprovalPolicy, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+    },
 };
 use ra_eval::{
     fixture::{ModelStep, ScriptedModel, ScriptedProvider, assistant_message, function_call},
@@ -34,7 +36,7 @@ use ra_eval::{
 use ra_model::provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks};
 use ra_runtime::{
     agent::{AgentBinding, AgentRegistry, control::AgentControl, tool::AgentAsTool},
-    runner::{RunConfig, RunRequest, Runner},
+    runner::{RunConfig, RunOutcome, RunRequest, RunResult, Runner},
     thread::{AgentThread, ThreadEvent, TurnInputRequest},
 };
 use ra_session::rollout::{RolloutFileRecorder, RolloutReader, reconstruct_history};
@@ -67,6 +69,50 @@ impl Tool for Echo {
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(ToolOutput::text(context.arguments()["value"].to_string()))
+    }
+}
+
+struct GatedEcho(Echo);
+#[async_trait]
+impl Tool for GatedEcho {
+    fn origin(&self) -> &ToolOrigin {
+        self.0.origin()
+    }
+    fn schema(&self) -> &ToolSchema {
+        self.0.schema()
+    }
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_approval(ToolApprovalPolicy::Always)
+    }
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.0.call(context).await
+    }
+}
+
+/// Collects the `group_id` each agent span declares, as subscribers other than local capture see it.
+#[derive(Clone, Default)]
+struct AgentSpanGroups(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AgentSpanGroups {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Group(Option<String>);
+        impl tracing::field::Visit for Group {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "group_id" {
+                    self.0 = Some(value.to_owned());
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        if attrs.metadata().name() == "agent" {
+            let mut group = Group(None);
+            attrs.record(&mut group);
+            self.0.lock().unwrap().push(group.0);
+        }
     }
 }
 
@@ -103,13 +149,8 @@ fn registry(model: Arc<ScriptedModel>) -> Arc<ProviderRegistry> {
     )
 }
 
-fn request(
-    model: Arc<ScriptedModel>,
-    trace: &LocalTrace,
-    tools: Vec<Arc<dyn Tool>>,
-    tripwire: bool,
-) -> RunRequest {
-    let agent = AgentBinding::direct(
+fn trace_agent(tools: Vec<Arc<dyn Tool>>, tripwire: bool) -> AgentBinding {
+    AgentBinding::direct(
         AgentSpec::builder()
             .id(AgentId::new("trace-agent"))
             .name("Trace agent")
@@ -119,9 +160,17 @@ fn request(
             .input_guardrail(Arc::new(Guard(tripwire)))
             .build()
             .unwrap(),
-    );
+    )
+}
+
+fn request(
+    model: Arc<ScriptedModel>,
+    trace: &LocalTrace,
+    tools: Vec<Arc<dyn Tool>>,
+    tripwire: bool,
+) -> RunRequest {
     RunRequest::new(
-        agent,
+        trace_agent(tools, tripwire),
         registry(model),
         RunId::new("run-local"),
         CancelScope::root(),
@@ -131,6 +180,40 @@ fn request(
     .with_config(RunConfig::new().with_model_settings(
         ModelSettings::new().with_extra_header("authorization", "private transport credential"),
     ))
+}
+
+/// Continues a checkpoint with the projection of its own history.
+fn resume_request(
+    model: Arc<ScriptedModel>,
+    trace: &LocalTrace,
+    tools: Vec<Arc<dyn Tool>>,
+    state: RunState,
+) -> RunRequest {
+    RunRequest::new(
+        trace_agent(tools, false),
+        registry(model),
+        RunId::new("run-local"),
+        CancelScope::root(),
+        Vec::new(),
+    )
+    .with_rollout_recorder(Arc::new(trace.clone()))
+    .with_state(state)
+}
+
+fn group_config(group: Option<&str>) -> RunConfig {
+    group.map_or_else(RunConfig::new, |group| {
+        RunConfig::new().with_group_id(group)
+    })
+}
+
+async fn run_to_end(request: RunRequest, streamed: bool) -> RunResult {
+    if streamed {
+        let mut stream = Runner::run_streamed(request);
+        while stream.next_event().await.is_some() {}
+        stream.finish().await.unwrap()
+    } else {
+        Runner::run(request).await.unwrap()
+    }
 }
 
 #[tokio::test]
@@ -156,6 +239,14 @@ async fn tool_workflow_roundtrips_with_payloads_in_both_runner_modes() {
             &trace,
             vec![Arc::new(Echo(calls.clone()))],
             false,
+        )
+        .with_config(
+            RunConfig::new()
+                .with_group_id("  workflow-group  ")
+                .with_model_settings(
+                    ModelSettings::new()
+                        .with_extra_header("authorization", "private transport credential"),
+                ),
         );
         let result = if streamed {
             let mut stream = Runner::run_streamed(request);
@@ -166,6 +257,11 @@ async fn tool_workflow_roundtrips_with_payloads_in_both_runner_modes() {
         };
         trace.shutdown().await.unwrap();
         let records = trace.snapshot();
+        assert!(
+            records
+                .iter()
+                .all(|record| record.group_id() == Some("  workflow-group  "))
+        );
         let mut bytes = Vec::new();
         write_jsonl(&records, &mut bytes).unwrap();
         let encoded = String::from_utf8(bytes.clone()).unwrap();
@@ -240,6 +336,287 @@ async fn tool_workflow_roundtrips_with_payloads_in_both_runner_modes() {
         let persisted = RolloutReader::open(&path).read_all().await.unwrap();
         let history = reconstruct_history(&persisted).unwrap();
         assert_eq!(history.history().len(), result.new_items().len() + 1);
+    }
+}
+
+#[tokio::test]
+async fn trace_group_preserves_config_values_without_session_or_generated_fallbacks() {
+    for streamed in [false, true] {
+        for payloads in [false, true] {
+            let trace = if payloads {
+                LocalTrace::new().with_payloads()
+            } else {
+                LocalTrace::new()
+            };
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(trace.clone()),
+            );
+            let mut trace_ids = std::collections::BTreeSet::new();
+            for with_session in [false, true] {
+                for group in [Some("  shared-group  "), Some(""), Some(" \t "), None] {
+                    let start = trace.snapshot().len();
+                    let model = Arc::new(ScriptedModel::new([ModelStep::new(vec![
+                        assistant_message("answer", None),
+                    ])]));
+                    let config = group.map_or_else(RunConfig::new, |group| {
+                        RunConfig::new().with_group_id(group)
+                    });
+                    let mut request =
+                        request(model.clone(), &trace, Vec::new(), false).with_config(config);
+                    if with_session {
+                        request = request.with_session(Arc::new(ra_session::InMemorySession::new(
+                            "unrelated-session",
+                        )));
+                    }
+                    if streamed {
+                        let mut stream = Runner::run_streamed(request);
+                        while stream.next_event().await.is_some() {}
+                        stream.finish().await.unwrap();
+                    } else {
+                        Runner::run(request).await.unwrap();
+                    }
+                    let records = trace.snapshot();
+                    let run = &records[start..];
+                    assert!(!run.is_empty());
+                    assert!(run.iter().all(|record| record.group_id() == group));
+                    let id = run[0].trace_id();
+                    assert!(run.iter().all(|record| record.trace_id() == id));
+                    assert!(trace_ids.insert(id.to_owned()));
+                    assert_ne!(Some(id), group);
+                    model.assert_complete().unwrap();
+                }
+            }
+            trace.shutdown().await.unwrap();
+            let records = trace.snapshot();
+            let mut bytes = Vec::new();
+            write_jsonl(&records, &mut bytes).unwrap();
+            let restored = read_jsonl(bytes.as_slice()).unwrap();
+            assert_eq!(restored, records);
+            let replayed = replay(&restored).unwrap();
+            for span in replayed.spans().values() {
+                let start = restored
+                    .iter()
+                    .find(|record| record.seq() == span.started_seq())
+                    .unwrap();
+                assert_eq!(span.group_id(), start.group_id());
+                assert!(!span.fields().contains_key("group_id"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrent_runs_keep_distinct_trace_ids_with_a_shared_group() {
+    let trace = LocalTrace::new();
+    let model = Arc::new(ScriptedModel::new([
+        ModelStep::new(vec![assistant_message("first", None)]),
+        ModelStep::new(vec![assistant_message("second", None)]),
+    ]));
+    let first = request(model.clone(), &trace, Vec::new(), false)
+        .with_config(RunConfig::new().with_group_id("shared"));
+    let second = request(model.clone(), &trace, Vec::new(), false)
+        .with_config(RunConfig::new().with_group_id("shared"));
+    async {
+        let first = tokio::spawn(Runner::run(first).with_current_subscriber());
+        let mut second = Runner::run_streamed(second);
+        while second.next_event().await.is_some() {}
+        second.finish().await.unwrap();
+        first.await.unwrap().unwrap();
+    }
+    .with_subscriber(tracing_subscriber::registry().with(trace.clone()))
+    .await;
+    trace.shutdown().await.unwrap();
+    let records = trace.snapshot();
+    let replayed = replay(&records).unwrap();
+    let roots = replayed
+        .spans()
+        .values()
+        .filter(|span| span.parent_id().is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(roots.len(), 2);
+    assert_ne!(roots[0].trace_id(), roots[1].trace_id());
+    assert!(
+        records
+            .iter()
+            .all(|record| record.group_id() == Some("shared"))
+    );
+    model.assert_complete().unwrap();
+}
+
+/// Ported from the reference's `resolve_trace_settings`: a resumed run whose configuration sets no
+/// group uses the one its checkpoint captured, an explicit group overrides it, and the resumed
+/// checkpoint records the group its segment used.
+#[tokio::test]
+async fn resumed_runs_fall_back_to_the_checkpoint_trace_group() {
+    for (first, resumed, expected) in [
+        (Some("group-1"), None, Some("group-1")),
+        (Some("group-1"), Some("override"), Some("override")),
+        (Some(""), None, Some("")),
+        (None, Some("late"), Some("late")),
+        (None, None, None),
+    ] {
+        for streamed in [false, true] {
+            let trace = LocalTrace::new();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(trace.clone()),
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(GatedEcho(Echo(calls.clone())))];
+            let model = Arc::new(ScriptedModel::new([
+                ModelStep::new(vec![function_call(
+                    "echo",
+                    json!({"value": 1}),
+                    "gated-call",
+                    None,
+                    None,
+                )]),
+                ModelStep::new(vec![assistant_message("done", None)]),
+            ]));
+            let interrupted = run_to_end(
+                request(model.clone(), &trace, tools.clone(), false)
+                    .with_config(group_config(first)),
+                streamed,
+            )
+            .await;
+            let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+                panic!("the gated call must pause the run");
+            };
+            assert_eq!(interrupted.state().trace_group_id(), first);
+            // Through the wire format, as a host restoring a paused run reads it.
+            let mut state: RunState =
+                serde_json::from_value(serde_json::to_value(interrupted.state()).unwrap()).unwrap();
+            state.approve(&items[0], false).unwrap();
+            let start = trace.snapshot().len();
+            let result = run_to_end(
+                resume_request(model.clone(), &trace, tools, state)
+                    .with_config(group_config(resumed)),
+                streamed,
+            )
+            .await;
+            assert!(matches!(result.outcome(), RunOutcome::Completed { .. }));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.state().trace_group_id(), expected);
+            trace.shutdown().await.unwrap();
+            let records = trace.snapshot();
+            let (paused, continued) = records.split_at(start);
+            assert!(!paused.is_empty() && !continued.is_empty());
+            assert!(paused.iter().all(|record| record.group_id() == first));
+            assert!(continued.iter().all(|record| record.group_id() == expected));
+            assert_ne!(paused[0].trace_id(), continued[0].trace_id());
+            replay(&records).unwrap();
+            model.assert_complete().unwrap();
+        }
+    }
+}
+
+#[test]
+fn trace_group_is_fixed_when_its_root_span_is_created() {
+    let trace = LocalTrace::new();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(trace.clone()), || {
+        let grouped = tracing::info_span!(
+            "custom",
+            span.kind = "custom",
+            group_id = "original",
+            outcome = tracing::field::Empty,
+        );
+        grouped.in_scope(|| {
+            drop(tracing::info_span!(
+                "custom",
+                span.kind = "custom",
+                group_id = "child"
+            ));
+        });
+        grouped.record("group_id", "changed");
+        grouped.record("outcome", "ok");
+        drop(grouped);
+        let late = tracing::info_span!(
+            "custom",
+            span.kind = "custom",
+            group_id = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        late.record("group_id", "late");
+        late.record("outcome", "ok");
+        drop(late);
+    });
+    let records = trace.snapshot();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.event().kind(), record.group_id()))
+            .collect::<Vec<_>>(),
+        [
+            ("span_started", Some("original")),
+            ("span_started", Some("original")),
+            ("span_ended", Some("original")),
+            ("span_updated", Some("original")),
+            ("span_ended", Some("original")),
+            ("span_started", None),
+            ("span_updated", None),
+            ("span_ended", None),
+        ]
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.event().fields().get("group_id").is_none())
+    );
+    replay(&records).unwrap();
+}
+
+#[test]
+fn trace_group_replay_accepts_legacy_records_and_rejects_inconsistent_groups() {
+    use ra_eval::trace::RolloutTraceRecord;
+    let records = [
+        RolloutTraceRecord::new(
+            "capture".into(),
+            1,
+            0,
+            "trace".into(),
+            Some("root".into()),
+            None,
+            RolloutTraceEvent::new("span_started", json!({"span.kind":"agent"}), None),
+        ),
+        RolloutTraceRecord::new(
+            "capture".into(),
+            2,
+            0,
+            "trace".into(),
+            Some("root".into()),
+            None,
+            RolloutTraceEvent::new("span_ended", json!({}), None),
+        ),
+    ];
+    let mut bytes = Vec::new();
+    write_jsonl(&records, &mut bytes).unwrap();
+    assert!(
+        !String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains("group_id")
+    );
+    let legacy = read_jsonl(bytes.as_slice()).unwrap();
+    assert_eq!(replay(&legacy).unwrap().spans()["root"].group_id(), None);
+    for group in ["", " \t ", "group"] {
+        let grouped = records.clone().map(|record| record.with_group_id(group));
+        assert_eq!(
+            replay(&grouped).unwrap().spans()["root"].group_id(),
+            Some(group)
+        );
+        for corrupt in [
+            [grouped[0].clone(), records[1].clone()],
+            [records[0].clone(), grouped[1].clone()],
+            [
+                grouped[0].clone(),
+                records[1].clone().with_group_id("different"),
+            ],
+        ] {
+            assert!(
+                replay(&corrupt)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inconsistent trace group ID")
+            );
+        }
     }
 }
 
@@ -1129,7 +1506,14 @@ async fn trace_host_events_follow_session_retention_in_both_content_modes() {
 
 #[tokio::test]
 async fn nested_agent_tools_share_trace_evidence_without_copying_child_history() {
-    for streamed in [false, true] {
+    for (streamed, group, child_group) in [
+        (false, None, None),
+        (true, None, None),
+        (false, None, Some("child")),
+        (true, None, Some("child")),
+        (false, Some("parent"), Some("child")),
+        (true, Some("parent"), Some("child")),
+    ] {
         let storage = Arc::new(LifecycleRecorder::default());
         let trace = LocalTrace::new()
             .with_payloads()
@@ -1141,6 +1525,9 @@ async fn nested_agent_tools_share_trace_evidence_without_copying_child_history()
             .build()
             .unwrap();
         let mut builder = nested.as_tool();
+        if let Some(child_group) = child_group {
+            builder = builder.run_config(RunConfig::new().with_group_id(child_group));
+        }
         if streamed {
             builder = builder.on_stream(Arc::new(
                 |_: ra_runtime::agent::tool::AgentToolStreamEvent| Ok(()),
@@ -1163,17 +1550,36 @@ async fn nested_agent_tools_share_trace_evidence_without_copying_child_history()
                 Some("parent-message"),
             )]),
         ]));
-        Runner::run(request(
-            model.clone(),
-            &trace,
-            vec![Arc::new(builder.build().unwrap())],
-            false,
-        ))
-        .with_subscriber(tracing_subscriber::registry().with(trace.clone()))
+        let config = group.map_or_else(RunConfig::new, |group| {
+            RunConfig::new().with_group_id(group)
+        });
+        let raw = AgentSpanGroups::default();
+        Runner::run(
+            request(
+                model.clone(),
+                &trace,
+                vec![Arc::new(builder.build().unwrap())],
+                false,
+            )
+            .with_config(config),
+        )
+        .with_subscriber(
+            tracing_subscriber::registry()
+                .with(trace.clone())
+                .with(raw.clone()),
+        )
         .await
         .unwrap();
         trace.shutdown().await.unwrap();
+        // The nested run executes in its parent's trace, so its span names no group of its own.
+        assert_eq!(*raw.0.lock().unwrap(), [group.map(str::to_owned), None]);
         let records = trace.snapshot();
+        assert!(records.iter().all(|record| record.group_id() == group));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.trace_id() == records[0].trace_id())
+        );
         let replayed = replay(&records).unwrap();
         assert_eq!(replayed.events_of_kind("model_request").count(), 3);
         assert_eq!(replayed.events_of_kind("model_response").count(), 3);
@@ -1207,6 +1613,110 @@ async fn nested_agent_tools_share_trace_evidence_without_copying_child_history()
             |item| matches!(item, RolloutItem::Item(item) if item.id().as_str() == "child-message")
         ));
         model.assert_complete().unwrap();
+    }
+}
+
+/// A nested pause captures its enclosing trace, even when the child's configuration differs.
+#[tokio::test]
+async fn nested_approval_checkpoint_captures_parent_trace_group_and_resumes() {
+    for group in [Some("parent"), None] {
+        for (streamed, child_streamed) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let trace = LocalTrace::new();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(trace.clone()),
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let nested = AgentSpec::builder()
+                .id(AgentId::new("nested"))
+                .name("Nested")
+                .model("fixture/scripted")
+                .tool(Arc::new(GatedEcho(Echo(calls.clone()))))
+                .build()
+                .unwrap();
+            let mut builder = nested
+                .as_tool()
+                .run_config(RunConfig::new().with_group_id("child"));
+            if child_streamed {
+                builder = builder.on_stream(Arc::new(
+                    |_: ra_runtime::agent::tool::AgentToolStreamEvent| Ok(()),
+                ));
+            }
+            let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(builder.build().unwrap())];
+            let model = Arc::new(ScriptedModel::new([
+                ModelStep::new(vec![function_call(
+                    "nested",
+                    json!({"input": "child task"}),
+                    "nested-call",
+                    None,
+                    None,
+                )]),
+                ModelStep::new(vec![function_call(
+                    "echo",
+                    json!({"value": 1}),
+                    "gated-call",
+                    None,
+                    None,
+                )]),
+                ModelStep::new(vec![assistant_message("child answer", None)]),
+                ModelStep::new(vec![assistant_message("parent answer", None)]),
+            ]));
+            let interrupted = run_to_end(
+                request(model.clone(), &trace, tools.clone(), false)
+                    .with_config(group_config(group)),
+                streamed,
+            )
+            .await;
+            let RunOutcome::Interrupted { items } = interrupted.outcome() else {
+                panic!("the nested gated call must pause both runs");
+            };
+            assert_eq!(items.len(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(interrupted.state().trace_group_id(), group);
+            assert_eq!(interrupted.state().nested_runs().len(), 1);
+            assert_eq!(
+                interrupted.state().nested_runs()[0]
+                    .state()
+                    .unwrap()
+                    .trace_group_id(),
+                group
+            );
+            let mut state: RunState =
+                serde_json::from_value(serde_json::to_value(interrupted.state()).unwrap()).unwrap();
+            assert_eq!(
+                state.nested_runs()[0].state().unwrap().trace_group_id(),
+                group
+            );
+            state.approve(&items[0], false).unwrap();
+            let start = trace.snapshot().len();
+            // No parent config is supplied: the resumed segment uses its checkpoint's group.
+            let result = run_to_end(
+                resume_request(model.clone(), &trace, tools, state),
+                streamed,
+            )
+            .await;
+            assert!(matches!(result.outcome(), RunOutcome::Completed { .. }));
+            assert_eq!(result.final_text(), "parent answer");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.state().trace_group_id(), group);
+            assert!(result.state().nested_runs().is_empty());
+            trace.shutdown().await.unwrap();
+            let records = trace.snapshot();
+            let (paused, continued) = records.split_at(start);
+            assert!(!paused.is_empty() && !continued.is_empty());
+            assert!(records.iter().all(|record| record.group_id() == group));
+            assert_ne!(paused[0].trace_id(), continued[0].trace_id());
+            assert_eq!(
+                continued
+                    .iter()
+                    .filter(|record| record.event().kind() == "run_started")
+                    .count(),
+                2
+            );
+            replay(&records).unwrap();
+            model.assert_complete().unwrap();
+        }
     }
 }
 
@@ -1366,7 +1876,11 @@ async fn spawned_agents_share_evidence_and_preserve_their_own_rollout() {
     ]));
     let registry_agents = AgentRegistry::builder().register(worker).build().unwrap();
     let run = request(model.clone(), &trace, vec![Arc::new(SpawnWorker)], false)
-        .with_config(RunConfig::new().with_agent_registry(registry_agents))
+        .with_config(
+            RunConfig::new()
+                .with_group_id("agent-tree")
+                .with_agent_registry(registry_agents),
+        )
         .with_agent_control(control.root());
     Runner::run(run)
         .with_subscriber(tracing_subscriber::registry().with(trace.clone()))
@@ -1394,6 +1908,18 @@ async fn spawned_agents_share_evidence_and_preserve_their_own_rollout() {
     control.shutdown().await;
     trace.shutdown().await.unwrap();
     let records = trace.snapshot();
+    assert!(
+        records
+            .iter()
+            .filter(|record| record.span_id().is_some())
+            .all(|record| record.group_id() == Some("agent-tree")),
+    );
+    assert!(
+        records
+            .iter()
+            .filter(|record| record.span_id().is_none())
+            .all(|record| record.group_id().is_none())
+    );
     let replayed = replay(&records).unwrap();
     assert_eq!(replayed.events_of_kind("model_request").count(), 3);
     assert_eq!(replayed.events_of_kind("model_response").count(), 3);
@@ -1506,6 +2032,7 @@ async fn thread_background_turn_forwards_trace_observations_and_subscriber() {
         AgentBinding::direct(agent),
         registry(model.clone()),
     )
+    .with_config(RunConfig::new().with_group_id("thread-group"))
     .with_rollout_recorder(Arc::new(trace.clone()))
     .build();
     thread
@@ -1525,7 +2052,20 @@ async fn thread_background_turn_forwards_trace_observations_and_subscriber() {
     .unwrap();
     thread.shutdown().await;
     trace.shutdown().await.unwrap();
-    let replayed = replay(&trace.snapshot()).unwrap();
+    let records = trace.snapshot();
+    assert!(
+        records
+            .iter()
+            .filter(|record| record.span_id().is_some())
+            .all(|record| record.group_id() == Some("thread-group")),
+    );
+    assert!(
+        records
+            .iter()
+            .filter(|record| record.span_id().is_none())
+            .all(|record| record.group_id().is_none())
+    );
+    let replayed = replay(&records).unwrap();
     assert_eq!(replayed.events_of_kind("model_request").count(), 1);
     assert_eq!(replayed.events_of_kind("model_response").count(), 1);
     assert_eq!(replayed.events_of_kind("next_step").count(), 1);

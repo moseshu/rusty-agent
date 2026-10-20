@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 pub struct ReplayedSpan {
     /// Stable trace identity.
     trace_id: String,
+    /// Optional host grouping, independent of trace identity.
+    #[serde(default)]
+    group_id: Option<String>,
     /// Stable span identity.
     span_id: String,
     /// Captured parent span identity.
@@ -57,6 +60,7 @@ impl ReplayedTrace {
 pub fn replay(records: &[RolloutTraceRecord]) -> Result<ReplayedTrace, TraceError> {
     let mut spans: BTreeMap<String, ReplayedSpan> = BTreeMap::new();
     let mut sequences: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut groups: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for record in records {
         let expected = sequences.entry(record.capture_id()).or_insert(1);
         if record.schema_version() != 1
@@ -70,6 +74,13 @@ pub fn replay(records: &[RolloutTraceRecord]) -> Result<ReplayedTrace, TraceErro
             ));
         }
         *expected += 1;
+        if let Some(group) = groups.get(record.trace_id()) {
+            if *group != record.group_id() {
+                return Err(invalid(record, "inconsistent trace group ID"));
+            }
+        } else {
+            groups.insert(record.trace_id(), record.group_id());
+        }
         let fields = record
             .event()
             .fields()
@@ -93,6 +104,7 @@ pub fn replay(records: &[RolloutTraceRecord]) -> Result<ReplayedTrace, TraceErro
                 id.to_owned(),
                 ReplayedSpan {
                     trace_id: record.trace_id().to_owned(),
+                    group_id: record.group_id().map(str::to_owned),
                     span_id: id.to_owned(),
                     parent_id: record.parent_id().map(str::to_owned),
                     started_seq: record.seq(),
@@ -137,6 +149,11 @@ fn invalid(record: &RolloutTraceRecord, reason: &str) -> TraceError {
 }
 
 impl ReplayedSpan {
+    /// Returns the trace's optional host grouping, without session or conversation fallbacks.
+    #[must_use]
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
+    }
     /// Returns the trace id recorded during capture.
     #[must_use]
     pub fn trace_id(&self) -> &str {

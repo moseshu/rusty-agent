@@ -350,9 +350,12 @@ impl RunConfig {
     /// Links this run with others the host considers one conversation or process — a chat
     /// thread's id, for instance.
     ///
-    /// The reference's `RunConfig.group_id`. Sandbox memory appends the runs of one group to one
-    /// rollout; a run with no group, and no conversation or session to take one from, is a
-    /// rollout of its own.
+    /// The reference's `RunConfig.group_id`. A new local trace uses this value verbatim. When it
+    /// is unset, a run continued from a checkpoint uses the group the checkpoint captured, and
+    /// any other run has no group. A run an agent tool starts keeps its parent trace's group.
+    /// Trace grouping never falls back to a conversation or session ID. Sandbox memory separately
+    /// resolves its rollout grouping from conversation, session, this value, then a generated
+    /// per-run value.
     pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
         self.group_id = Some(group_id.into());
         self
@@ -1505,6 +1508,32 @@ impl TurnLoopProgress {
     }
 }
 
+/// Resolves the trace group as the reference resolves trace settings, and captures it on the
+/// checkpoint as the reference's `RunState.set_trace` does.
+///
+/// A run an agent tool starts executes in its parent's trace and captures that trace's group, even
+/// when its own configuration names another. Any other run starts a trace with its configured
+/// group or, when that is unset, the group its checkpoint captured. Returns the agent-tool parent's
+/// run identity, the group, and whether the run starts its own trace.
+fn resolve_trace_group(request: &mut RunRequest) -> (Option<RunId>, Option<String>, bool) {
+    let parent_run_id = request
+        .state
+        .parent_run_id()
+        .filter(|_| request.nested_spend.is_some())
+        .cloned();
+    let enclosing = ParentRun::enclosing(parent_run_id.as_ref());
+    let trace_group_id = match &enclosing {
+        Some(parent) => parent.trace_group_id(),
+        None => request
+            .config
+            .group_id()
+            .or_else(|| request.state.trace_group_id()),
+    }
+    .map(str::to_owned);
+    request.state.set_trace_group_id(trace_group_id.clone());
+    (parent_run_id, trace_group_id, enclosing.is_none())
+}
+
 /// The loop both entry points share.
 ///
 /// `events` is the only difference between them.
@@ -1524,6 +1553,7 @@ async fn run_loop(
     if let Some(tree) = &agent_tree {
         request.event_seqs = tree.adopt_event_seqs(request.event_seqs.clone());
     }
+    let (parent_run_id, trace_group_id, starts_trace) = resolve_trace_group(&mut request);
     let interruption = Interruption::new(&request, agent_tree.is_some(), events.as_ref());
     // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
     // this span keeps the original name because it is the whole run's span. Per-agent attribution
@@ -1535,6 +1565,9 @@ async fn run_loop(
         span.kind = SpanKind::Agent.label(),
         agent.name = %agent_name,
         run.id = %request.run_id,
+        // Only a run that starts its own trace names a group; a nested run's span belongs to its
+        // parent's trace.
+        group_id = trace_group_id.as_deref().filter(|_| starts_trace),
         outcome = tracing::field::Empty,
         error.code = tracing::field::Empty,
         cancel.reason = tracing::field::Empty,
@@ -1580,10 +1613,8 @@ async fn run_loop(
         request.config.clone(),
         request.app_context.clone(),
         request.run_id.clone(),
-        request
-            .state
-            .parent_run_id()
-            .filter(|_| request.nested_spend.is_some()),
+        parent_run_id.as_ref(),
+        trace_group_id,
         Arc::clone(request.agent.public()),
         request.services.clone(),
         request.rollout.clone(),
