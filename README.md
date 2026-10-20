@@ -80,7 +80,7 @@ Deciding where a piece of code belongs takes two questions:
 
 ```
 Product          ra-coding (coding agent) · third-party products
-Reusable         ra-flow (orchestration and graph engine, planned) · ra-tools (general tools) · ra-patch (V4A patches)
+Reusable         ra-tools (general tools) · ra-patch (V4A patches)
 Kernel           ra-runtime (loop kernel) · ra-core (types and contracts)
 Shared services  ra-model · ra-prompt · ra-context · ra-session · ra-exec · ra-mcp
 ```

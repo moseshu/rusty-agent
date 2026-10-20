@@ -972,9 +972,9 @@ impl std::fmt::Debug for RunConfig {
 /// Everything one run needs.
 ///
 /// The fields are owned rather than borrowed because a run has to be **spawnable**: the streaming
-/// entry drives it on a background task, and R12's sub-agents and R17's graph nodes will each want
-/// a run they can hold. A borrowed request would make those callers restructure around a lifetime
-/// that exists only to save one `Arc`.
+/// entry drives it on a background task, and spawned sub-agents each want a run they can hold. A
+/// borrowed request would make those callers restructure around a lifetime that exists only to
+/// save one `Arc`.
 #[must_use]
 #[non_exhaustive]
 pub struct RunRequest {

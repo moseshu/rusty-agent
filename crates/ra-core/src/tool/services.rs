@@ -9,9 +9,8 @@
 //! people's code. Carrying one value instead means the next port is a field on this struct and
 //! nothing else moves.
 //!
-//! The task-state handle is the first port; a control plane for sub-agents, a workspace lease and a
-//! budget reservation are the ones already visible. Migrating while there is exactly one is the
-//! cheapest this will ever be.
+//! The event sink, output projector, sub-agent control plane and user-input port all travel this
+//! way.
 //!
 //! # Why named accessors and not a lookup
 //!
@@ -26,8 +25,8 @@ use core::fmt;
 use std::sync::Arc;
 
 use crate::{
-    agent::control::AgentControlPort, event::HostEventSink, state::WorkStateHandle,
-    tool::ToolOutputProjector, user_input::UserInputPort,
+    agent::control::AgentControlPort, event::HostEventSink, tool::ToolOutputProjector,
+    user_input::UserInputPort,
 };
 
 /// Framework-owned ports handed to a tool, each behind its own accessor.
@@ -39,7 +38,6 @@ use crate::{
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct ToolServices {
-    work_state: Option<Arc<dyn WorkStateHandle>>,
     event_sink: Option<Arc<dyn HostEventSink>>,
     output_projector: Option<Arc<dyn ToolOutputProjector>>,
     agent_control: Option<Arc<dyn AgentControlPort>>,
@@ -50,7 +48,6 @@ impl ToolServices {
     /// Creates a bag with no ports installed.
     pub const fn new() -> Self {
         Self {
-            work_state: None,
             event_sink: None,
             output_projector: None,
             agent_control: None,
@@ -66,12 +63,6 @@ impl ToolServices {
     pub fn none() -> &'static Self {
         static NONE: ToolServices = ToolServices::new();
         &NONE
-    }
-
-    /// Installs the task state the run participates in.
-    pub fn with_work_state(mut self, work_state: Arc<dyn WorkStateHandle>) -> Self {
-        self.work_state = Some(work_state);
-        self
     }
 
     /// Installs the host event sink for granular observability and UI streaming.
@@ -96,16 +87,6 @@ impl ToolServices {
     pub fn with_user_input(mut self, user_input: Arc<dyn UserInputPort>) -> Self {
         self.user_input = Some(user_input);
         self
-    }
-
-    /// The task state spanning this run, when the host attached one.
-    ///
-    /// `None` is not a failure: a run belongs to a task only when something above it says so. A
-    /// future milestone puts typed channel operations on [`WorkStateHandle`]; this accessor does not
-    /// change when it does, which is the whole reason the port exists now.
-    #[must_use]
-    pub fn work_state(&self) -> Option<&dyn WorkStateHandle> {
-        self.work_state.as_deref()
     }
 
     /// The host event sink for this run, when the host installed one.
@@ -146,7 +127,6 @@ impl fmt::Debug for ToolServices {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolServices")
-            .field("work_state", &self.work_state.is_some())
             .field("event_sink", &self.event_sink.is_some())
             .field("output_projector", &self.output_projector.is_some())
             .field("agent_control", &self.agent_control.is_some())

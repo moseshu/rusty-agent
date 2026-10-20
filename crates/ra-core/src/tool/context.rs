@@ -27,7 +27,7 @@ pub enum ToolCaller {
 
 /// The empty bag a call that installs no ports is given.
 ///
-/// A borrowed empty value rather than an `Option`, so `context.services().work_state()` reads the
+/// A borrowed empty value rather than an `Option`, so `context.services().event_sink()` reads the
 /// same whether or not the host installed anything.
 static NO_SERVICES: ToolServices = ToolServices::new();
 

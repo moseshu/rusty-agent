@@ -251,7 +251,7 @@ use ra_core::{
         ReplaySafety, ResolvedModel, RetryAdvice, RetryBackoffSettings, ToolChoice,
     },
     permission::{PermissionDecision, PermissionRule},
-    state::{PendingControlRequest, RunId, RunState, ToolOutcome, ToolUse, WorkStateHandle},
+    state::{PendingControlRequest, RunId, RunState, ToolOutcome, ToolUse},
     tool::{
         Tool, ToolApprovalPolicy, ToolAvailability, ToolCaller, ToolContext, ToolLookupKey,
         ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
@@ -680,7 +680,6 @@ struct ScriptedTool {
     schema: ToolSchema,
     options: ToolOptions,
     calls: Arc<AtomicUsize>,
-    work_states: Arc<Mutex<Vec<Option<String>>>>,
     /// What each call was told about the run it belongs to: its ID, its public agent, and the
     /// host's own state.
     runs: Arc<Mutex<Vec<String>>>,
@@ -702,7 +701,6 @@ impl ScriptedTool {
             .unwrap(),
             options: ToolOptions::new(),
             calls: Arc::new(AtomicUsize::new(0)),
-            work_states: Arc::new(Mutex::new(Vec::new())),
             runs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -735,13 +733,6 @@ impl Tool for ScriptedTool {
 
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.work_states.lock().unwrap().push(
-            context
-                .services()
-                .work_state()
-                .and_then(|state| state.as_any().downcast_ref::<TaskState>())
-                .map(|state| state.plan.to_owned()),
-        );
         self.runs
             .lock()
             .unwrap()
@@ -983,17 +974,6 @@ impl Tool for SlowTool {
 
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
         self.inner.needs_approval(context).await
-    }
-}
-
-/// Stand-in for the cross-run task state R17-1 will supply (R3-13).
-struct TaskState {
-    plan: &'static str,
-}
-
-impl WorkStateHandle for TaskState {
-    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
-        self
     }
 }
 
@@ -3556,8 +3536,7 @@ async fn cancellation_is_not_treated_as_normal_completion() {
         .await
         .unwrap_err();
 
-    // Reporting `FinalOutput { Final }` would tell R15 that no closeout is owed and send R17-3
-    // down the success path.
+    // Reporting `FinalOutput { Final }` would tell R15 that no closeout is owed.
     assert!(matches!(error, Error::Cancelled { .. }));
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }
@@ -4659,47 +4638,6 @@ async fn resuming_a_checkpoint_uses_the_caller_supplied_continuation_base() {
     .expect_err("automatic projection cannot omit a caller-managed input");
     assert!(error.to_string().contains("cannot project input"));
     assert_eq!(third_model.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn work_state_handle_is_propagated_all_the_way_to_tools() {
-    // This chain is what R3-13 buys: attached once on the run, it reaches the tool through
-    // settlement, batch, and dispatch, so R17 adds channel operations to the handle rather than a
-    // parameter to four layers and to every third-party `Tool::call`.
-    let tool = Arc::new(ScriptedTool::new("write_file"));
-    let seen = Arc::clone(&tool.work_states);
-    let model = ScriptedModel::new(vec![
-        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
-        ModelResponse::new(vec![message("msg-1", "改完了")]),
-    ]);
-    let cancel = CancelScope::root();
-    let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "第三步" });
-
-    Runner::run(
-        request(vec![tool], &model, &cancel)
-            .with_services(ToolServices::new().with_work_state(task_state)),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(seen.lock().unwrap().as_slice(), [Some("第三步".to_owned())]);
-}
-
-#[tokio::test]
-async fn run_without_work_state_lets_tools_observe_none_not_empty_shell() {
-    let tool = Arc::new(ScriptedTool::new("write_file"));
-    let seen = Arc::clone(&tool.work_states);
-    let model = ScriptedModel::new(vec![
-        ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
-        ModelResponse::new(vec![message("msg-1", "改完了")]),
-    ]);
-    let cancel = CancelScope::root();
-
-    Runner::run(request(vec![tool], &model, &cancel))
-        .await
-        .unwrap();
-
-    assert_eq!(seen.lock().unwrap().as_slice(), [None]);
 }
 
 #[tokio::test]

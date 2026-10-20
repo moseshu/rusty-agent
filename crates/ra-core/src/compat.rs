@@ -3,9 +3,7 @@
 //! # The problem
 //!
 //! [`RunState`](crate::state::RunState) and rollout lines are read and written across versions
-//! today, and a future cross-run task state will join them when it lands. Its mount point,
-//! [`WorkStateHandle`](crate::state::WorkStateHandle), is deliberately **not** one of them: it
-//! reaches task state that lives outside the run, so nothing here ever serializes it.
+//! today.
 //!
 //! **Downgrade reads are the hard half**: a record written by a newer build reaches an older one
 //! carrying fields it does not know. serde's default is to **drop them silently**, which turns

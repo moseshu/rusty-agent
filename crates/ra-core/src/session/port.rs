@@ -6,9 +6,8 @@
 //! # Authority and separation
 //!
 //! A session manages only conversation history. It does not own live host context
-//! ([`RunContext`](crate::context::RunContext)), recoverable run state
-//! ([`RunState`](crate::state::RunState)), or cross-run task state
-//! ([`WorkState`](crate::state::WorkStateHandle)).
+//! ([`RunContext`](crate::context::RunContext)) or recoverable run state
+//! ([`RunState`](crate::state::RunState)).
 //!
 //! Model requests must not read this history directly; model input items are projected from
 //! authoritative [`RunItem`] records via input normalization.

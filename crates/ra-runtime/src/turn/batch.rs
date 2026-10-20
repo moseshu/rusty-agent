@@ -368,9 +368,9 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
     // The checkpoint belongs at the entry, not only in the loop below. A response that bound no
     // executable call still *settles* — into another turn, into a question for the host, or into
     // `FinishReason::Final` — and settling a cancelled run as `Final` is the worst of the three:
-    // `is_complete()` would say the agent reached its own conclusion, so R15 sees no closeout owed
-    // and R17-3 takes the success edge. Whether a cancelled turn reports as cancelled must not
-    // depend on whether the model happened to name a tool that resolved.
+    // `is_complete()` would say the agent reached its own conclusion, so R15 sees no closeout
+    // owed. Whether a cancelled turn reports as cancelled must not depend on whether the model
+    // happened to name a tool that resolved.
     if let Err(error) = request.cancel.ensure_not_cancelled() {
         if let Some(dispatches) = streamed_dispatches.take() {
             dispatches.cancel_and_drain().await;

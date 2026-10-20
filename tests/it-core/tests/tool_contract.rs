@@ -9,12 +9,12 @@ use ra_core::{
     error::{Error, Result},
     item::{AgentId, CallId},
     permission::{PermissionDecision, PermissionRule},
-    state::{RunId, WorkStateHandle},
+    state::RunId,
     tool::{
         DEFAULT_MAX_NO_PROGRESS_STREAK, DEFAULT_MAX_REPEAT_STREAK, Tool, ToolApprovalPolicy,
         ToolAvailability, ToolCaller, ToolConcurrency, ToolContext, ToolExposure,
         ToolFailureHandling, ToolGuardrailId, ToolLookupKey, ToolLookupKind, ToolNamespace,
-        ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices, ToolTimeoutBehavior,
+        ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolTimeoutBehavior,
     },
 };
 use serde_json::{Value, json};
@@ -499,42 +499,6 @@ async fn test_tool_contract_12() {
 
     let output = tool.call(context).await.unwrap();
     assert_eq!(output.as_text(), Some("host:hello"));
-}
-
-#[tokio::test]
-async fn test_tool_contract_13() {
-    struct TaskState {
-        plan: &'static str,
-    }
-    impl WorkStateHandle for TaskState {
-        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
-            self
-        }
-    }
-
-    let call_id = CallId::new("call_work_state");
-    let arguments = json!({"text": "hello"});
-    let run = run_context();
-    let tool = EchoTool::new();
-    let task_state: Arc<dyn WorkStateHandle> = Arc::new(TaskState { plan: "step three" });
-    let services = ToolServices::new().with_work_state(task_state);
-
-    // The task-state port: a tool reads what the host mounted and gets its own type back.
-    let context = ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services);
-    let seen = context
-        .services()
-        .work_state()
-        .expect("an attached task state has to be readable")
-        .as_any()
-        .downcast_ref::<TaskState>()
-        .expect("the host has to get its own type back")
-        .plan;
-    assert_eq!(seen, "step three");
-    assert!(format!("{context:?}").contains("work_state: true"));
-
-    // A run that belongs to no task is the ordinary case, not a missing port.
-    let bare = ToolContext::new(&run, &tool, &call_id, &arguments);
-    assert!(bare.services().work_state().is_none());
 }
 
 #[tokio::test]

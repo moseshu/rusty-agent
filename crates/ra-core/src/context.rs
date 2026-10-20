@@ -29,9 +29,6 @@
 //! host types can then no longer be registered together. Type erasure plus one checked read keeps
 //! the tool surface heterogeneous, and the framework's own ports stay named accessors on
 //! [`ToolServices`](crate::tool::ToolServices) rather than anonymous lookups.
-//!
-//! [`WorkStateHandle::as_any`](crate::state::WorkStateHandle::as_any) is **not** a second door: it
-//! reaches the cross-run task state, which is a different thing owned by a different party.
 
 use std::{any::Any, fmt, sync::Arc};
 

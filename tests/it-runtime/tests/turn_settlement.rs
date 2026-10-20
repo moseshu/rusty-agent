@@ -1760,7 +1760,7 @@ async fn test_turn_settlement_20() {
             )],
         ),
         // 纯消息、无动作：最糟的一格——会settle成 `FinalOutput{Final}`，而 `is_complete()`
-        // 为真意味着 R15 认为不欠收尾、R17-3 走成功边。取消被报成了「agent 自己做完了」。
+        // 为真意味着 R15 认为不欠收尾。取消被报成了「agent 自己做完了」。
         ("no_action", vec![message("msg-1", "完事了")]),
     ];
 

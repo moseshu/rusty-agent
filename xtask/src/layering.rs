@@ -60,8 +60,7 @@ impl Layer {
     }
 }
 
-/// The layer allowlist. The planned orchestration crate (`ra-flow`) is registered in advance
-/// so its dependency boundary applies when it is created.
+/// The layer allowlist.
 const LAYERS: &[(&str, Layer)] = &[
     ("ra-core", Layer::Kernel),
     ("ra-macros", Layer::Kernel),
@@ -78,7 +77,6 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-protocol", Layer::Service),
     ("ra-eval", Layer::Service),
     ("ra-tools", Layer::Reusable),
-    ("ra-flow", Layer::Reusable),
     ("ra-patch", Layer::Reusable),
     ("rusty-agent", Layer::Reusable),
     ("ra-coding", Layer::Product),
@@ -184,7 +182,6 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
         "ra-tools",
         &["ra-core", "ra-exec", "ra-mcp", "ra-macros", "ra-patch"],
     ),
-    ("ra-flow", &["ra-core", "ra-runtime"]),
     // `ra-patch` parses and applies a text format and needs nothing from the framework to do it.
     // What it does need is `ra-core::compat`: a `PatchPlan` and a `CommittedPatchDelta` are records
     // that get persisted and read back by a build that may be older or newer, and a second

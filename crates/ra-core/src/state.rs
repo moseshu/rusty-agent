@@ -5,16 +5,11 @@
 //! [`step`](crate::step) are graded `Internal` and may be refactored at any time; a value a saved
 //! checkpoint has to remain readable with cannot be, so it takes this module's `Evolving` grade
 //! instead. A future migration grows [`RunState`] into the full checkpoint by adding fields to it.
-//!
-//! [`work`] is the other half of that separation and holds no state at all: the task that spans
-//! runs is reached through a handle, so a run's checkpoint cannot come to contain a private copy of
-//! it.
 
 pub mod run;
 pub mod tool_failure;
 pub mod tool_output_reference;
 pub mod tool_use;
-pub mod work;
 
 pub use run::{
     EventSeqAllocator, GraphCursor, HandoffProjection, InterruptionResolution, NestedRunRef,
@@ -31,4 +26,3 @@ pub use tool_use::{
     AgentToolUse, ArgumentFingerprint, TOOL_USE_RECENT_LIMIT, TOOL_USE_SCHEMA_VERSION, ToolUse,
     ToolUseAttempt, ToolUseEntry, ToolUseRecord, ToolUseTracker,
 };
-pub use work::WorkStateHandle;

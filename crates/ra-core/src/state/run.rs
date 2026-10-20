@@ -10,14 +10,12 @@
 //! items, model responses, pending approvals, and the verdicts its guardrails reached — and a
 //! persisted wire type cannot live in `ra-runtime` without reversing the dependency direction.
 //!
-//! # Not to be confused with `WorkState`
+//! # Not to be confused with task state
 //!
-//! This is a **single run's** recoverable state. A future cross-run `WorkState`, reached through
-//! [`WorkStateHandle`](crate::state::work::WorkStateHandle), is the **cross-run, cross-node task**
-//! state — owned by whoever spans those runs, not by this value. Mixing them is forbidden, and the
-//! reason is concrete: a checkpoint of this value is scoped to one run's resume, while task state
-//! outlives every run that touches it. Folding the second into the first would make a resumed run
-//! restore a stale copy of state another node has since advanced.
+//! This is a **single run's** recoverable state. State that spans several runs belongs to whatever
+//! spans them, not to this value: a checkpoint of this value is scoped to one run's resume, while
+//! such state outlives every run that touches it. Folding the second into the first would make a
+//! resumed run restore a stale copy of state another run has since advanced.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
