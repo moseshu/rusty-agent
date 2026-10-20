@@ -48,11 +48,12 @@ use ra_core::{
     agent::{AgentInstructions, AgentSpec, ResolvedInstructions},
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
-        ContextProcessorResult, ContextSummarizer, LoadSignal,
+        ContextProcessorResult, ContextSummarizer, LoadSignal, SamplingContext,
     },
     context::RunContext,
     error::{Error, Result},
     item::{ItemId, Message, RunItem, RunItemKind},
+    model::ModelSettings,
     prompt::{
         DynamicPromptHandler, PromptSection, PromptSectionName, PromptSource, ResolvedPrompt,
         SectionPosition,
@@ -133,8 +134,8 @@ impl CapabilityPlan {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error when two capabilities claim one family, when a declared
-    /// dependency names a family nothing installs, or when a capability declares its own family.
+    /// Returns a configuration error when two capabilities claim one family or a declared
+    /// dependency names a family nothing installs.
     /// Every message names the capabilities involved, because the fix is always to install or
     /// remove one of them.
     pub fn resolve(installed: impl IntoIterator<Item = Arc<dyn Capability>>) -> Result<Self> {
@@ -183,19 +184,6 @@ impl CapabilityPlan {
                  capability for each named family, or remove the capability that needs it",
                 unsatisfied.join("; ")
             )));
-        }
-
-        // Refused rather than satisfied by the capability itself. Under a presence check it would
-        // pass trivially, and passing is the problem: a capability naming its own family meant a
-        // different one, and the dependency it intended would go unchecked with nothing said.
-        for (family, required) in families.iter().zip(&requirements) {
-            if required.contains(family) {
-                return Err(Error::config(format!(
-                    "capability `{family}` declares its own family as a dependency; it would be \
-                     satisfied by itself and check nothing. Name the family it actually needs, or \
-                     drop the declaration"
-                )));
-            }
         }
 
         Ok(Self { ordered: installed })
@@ -261,8 +249,8 @@ impl CapabilityPlan {
 
     /// Binds every capability to this run and collects what the bound forms contribute.
     ///
-    /// After rejecting installed static prompt fragments, binding happens for the whole set before
-    /// any run contribution is read, because
+    /// Static fragments are read from the installed values before binding. Binding then happens
+    /// for the whole set before any run contribution is read, because
     /// [`Capability::bind`] is what gives a capability the run it serves — a fragment or a tool
     /// read from the unbound value would describe a different run than the one about to start.
     ///
@@ -270,9 +258,28 @@ impl CapabilityPlan {
     ///
     /// Propagates a binding failure, a failure to resolve a prompt fragment, a bound form that
     /// changed its family, and a fragment that asks for a placement outside the cached prefix.
-    /// Rejects installed capabilities that contribute static prompt text.
     pub async fn assemble(&self, context: &RunContext) -> Result<AssembledCapabilities> {
-        refuse_static_prefix_text(&self.ordered).await?;
+        let (assembled, _) = self.assemble_with_prepared(context, &[]).await?;
+        Ok(assembled)
+    }
+
+    /// Leaves preinstalled static text in the agent and returns its bound tools separately for
+    /// replacement. Ordinary contributions retain upstream's append order.
+    pub(crate) async fn assemble_with_prepared(
+        &self,
+        context: &RunContext,
+        prepared: &[Arc<dyn Capability>],
+    ) -> Result<(AssembledCapabilities, Vec<Arc<dyn Tool>>)> {
+        let is_prepared = |capability: &Arc<dyn Capability>| {
+            prepared.iter().any(|owned| Arc::ptr_eq(capability, owned))
+        };
+        let unprepared: Vec<_> = self
+            .ordered
+            .iter()
+            .filter(|capability| !is_prepared(capability))
+            .cloned()
+            .collect();
+        let static_sections = collect_static_prompt_sections(&unprepared).await?;
 
         let mut capabilities: Vec<Arc<dyn Capability>> = Vec::with_capacity(self.ordered.len());
         for installed in &self.ordered {
@@ -295,10 +302,15 @@ impl CapabilityPlan {
         }
 
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut replacements: Vec<Arc<dyn Tool>> = Vec::new();
         let mut context_processors: Vec<Arc<dyn ContextProcessor>> = Vec::new();
 
-        for capability in &capabilities {
-            tools.extend(capability.tools());
+        for (installed, capability) in self.ordered.iter().zip(&capabilities) {
+            if is_prepared(installed) {
+                replacements.extend(capability.tools());
+            } else {
+                tools.extend(capability.tools());
+            }
             if capability.context_processor().is_some() {
                 context_processors.push(Arc::new(CapabilityContextProcessor {
                     capability: Arc::clone(capability),
@@ -306,56 +318,31 @@ impl CapabilityPlan {
             }
         }
 
-        let prompt_sections = collect_run_prompt_sections(&capabilities).await?;
+        let run_sections = collect_run_prompt_sections(&capabilities).await?;
+        let mut prompt_sections = Vec::new();
+        for capability in &capabilities {
+            let source = capability.kind().prompt_source();
+            prompt_sections.extend(
+                static_sections
+                    .iter()
+                    .chain(&run_sections)
+                    .filter(|section| section.source() == &source)
+                    .cloned(),
+            );
+        }
         let deferred_prompts = collect_deferred_prompts(&capabilities).await?;
 
-        Ok(AssembledCapabilities {
-            capabilities,
-            tools,
-            prompt_sections,
-            deferred_prompts,
-            context_processors,
-        })
+        Ok((
+            AssembledCapabilities {
+                capabilities,
+                tools,
+                prompt_sections,
+                deferred_prompts,
+                context_processors,
+            },
+            replacements,
+        ))
     }
-}
-
-/// Refuses a capability whose prompt text only the agent-construction path can place.
-///
-/// [`Capability::static_instructions`] is resolved before any run exists and belongs in the cached
-/// prefix, which is assembled where the agent is built. Nothing on this path reads it: run assembly
-/// reads [`Capability::instructions`] and [`Capability::deferred_instructions`], and appends what
-/// they return to the agent that already exists.
-///
-/// So a capability installed here carrying static text would contribute its tools and lose its
-/// paragraph — the model would receive an entry nothing in the prefix declares, which is the one
-/// outcome the four-contributions-on-one-trait design exists to prevent. It fails here instead,
-/// naming the two ways out.
-///
-/// The check reads the **installed** capabilities rather than the bound ones, matching the
-/// lifecycle the method is declared at, and it runs before any binding so a misconfiguration costs
-/// nothing that has to be undone.
-async fn refuse_static_prefix_text(capabilities: &[Arc<dyn Capability>]) -> Result<()> {
-    for capability in capabilities {
-        let family = capability.kind();
-        let section = capability.static_instructions().await.map_err(|error| {
-            error.with_context(format!(
-                "resolving the static prompt fragment of capability `{family}`"
-            ))
-        })?;
-        if let Some(section) = section {
-            return Err(Error::config(format!(
-                "capability `{family}` contributes the static prefix section `{}`, and it is \
-                 installed on the run configuration; static text is resolved before a run exists \
-                 and is placed where the agent's cached prefix is assembled, so nothing on this \
-                 path would carry it and the capability's tools would reach the model with no \
-                 paragraph declaring them. Install it where the agent is built instead, or move \
-                 the text to `instructions` (per run, into the prefix) or \
-                 `deferred_instructions` (delivered into history on a signal)",
-                section.name()
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Resolves one ordered capability list's installed, static prompt fragments.
@@ -706,8 +693,8 @@ impl AssembledCapabilities {
     /// follow the agent's instructions in assembly order. Generated instructions are evaluated on
     /// every turn and the fragments appended to that turn's text, as upstream
     /// `build_sandbox_instructions` composes a callable base with capability instructions. The
-    /// fourth — context processing — is not the agent's to hold and is installed on the run
-    /// configuration instead.
+    /// fourth — context processing — is retained by the run separately from declarative settings
+    /// snapshots.
     ///
     /// # Errors
     ///
@@ -716,11 +703,27 @@ impl AssembledCapabilities {
     /// instructions are resolved, because capability fragments are system text and the two
     /// placements cannot be merged.
     pub fn prepare_agent(&self, agent: &AgentSpec) -> Result<Arc<AgentSpec>> {
+        let sampling = agent
+            .model()
+            .map_or_else(SamplingContext::default, |model| {
+                SamplingContext::default().with_model(model)
+            });
+        self.prepare_agent_with_sampling_context(agent, &sampling)
+    }
+
+    /// Prepares the execution instance with the effective model and provider available to each
+    /// capability's sampling fold. Model selection is a runtime concern and is not written into
+    /// the provider parameter buckets.
+    pub fn prepare_agent_with_sampling_context(
+        &self,
+        agent: &AgentSpec,
+        sampling: &SamplingContext,
+    ) -> Result<Arc<AgentSpec>> {
         let settings = self
             .capabilities
             .iter()
             .fold(agent.model_settings().clone(), |settings, capability| {
-                capability.sampling_params(settings)
+                fold_sampling_params(settings, capability.as_ref(), sampling)
             });
 
         let mut builder = agent
@@ -758,7 +761,7 @@ impl AssembledCapabilities {
         let fragments: Vec<&str> = self
             .prompt_sections
             .iter()
-            .map(|section| section.content().trim())
+            .map(PromptSection::content)
             .filter(|content| !content.is_empty())
             .collect();
         (!fragments.is_empty()).then(|| fragments.join("\n\n"))
@@ -789,6 +792,47 @@ impl AssembledCapabilities {
             .map(|family| format!("`{family}`"))
             .collect();
         families.join(", ")
+    }
+}
+
+/// Folds typed settings and deep-merges provider buckets in upstream installation order.
+pub(crate) fn fold_sampling_params(
+    settings: ModelSettings,
+    capability: &dyn Capability,
+    sampling: &SamplingContext,
+) -> ModelSettings {
+    let before = settings.extra_body().clone();
+    let mut after = capability.sampling_params_for(settings, sampling);
+    let written = after.extra_body().clone();
+    let providers: BTreeSet<_> = before.keys().chain(written.keys()).cloned().collect();
+    for provider in providers {
+        let mut merged = before.get(&provider).cloned().unwrap_or_default();
+        for (key, value) in written.get(&provider).cloned().unwrap_or_default() {
+            match merged.get_mut(&key) {
+                Some(existing) => deep_merge(existing, value),
+                None => {
+                    merged.insert(key, value);
+                }
+            }
+        }
+        after = after.with_extra_body(provider, merged);
+    }
+    after
+}
+
+fn deep_merge(target: &mut serde_json::Value, incoming: serde_json::Value) {
+    match (target, incoming) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                match target.get_mut(&key) {
+                    Some(existing) => deep_merge(existing, value),
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, incoming) => *target = incoming,
     }
 }
 

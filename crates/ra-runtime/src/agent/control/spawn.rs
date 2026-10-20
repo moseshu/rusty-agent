@@ -11,10 +11,13 @@
 
 use std::sync::Arc;
 
+use crate::runner::RunConfig;
 use async_trait::async_trait;
 use ra_core::{
     agent::{AgentId, AgentSpec, control::AgentPath},
+    capability::Capability,
     error::Result,
+    tool::Tool,
 };
 
 /// Prepares each agent a tree spawns, as Codex's thread manager prepares each spawned thread.
@@ -76,6 +79,12 @@ impl<'a> SpawnedAgentRequest<'a> {
 pub struct PreparedSpawnedAgent {
     agent: Arc<AgentSpec>,
     resources: Option<Arc<dyn SpawnedAgentResources>>,
+    capabilities: Option<PreparedCapabilities>,
+}
+
+struct PreparedCapabilities {
+    capabilities: Vec<Arc<dyn Capability>>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl PreparedSpawnedAgent {
@@ -85,6 +94,7 @@ impl PreparedSpawnedAgent {
         Self {
             agent,
             resources: None,
+            capabilities: None,
         }
     }
 
@@ -95,6 +105,35 @@ impl PreparedSpawnedAgent {
     pub fn with_resources(mut self, resources: Arc<dyn SpawnedAgentResources>) -> Self {
         self.resources = Some(resources);
         self
+    }
+
+    /// Replaces the parent's prepared capability surface with this spawned agent's own, while
+    /// retaining the other inherited run settings. Empty collections explicitly withdraw it.
+    ///
+    /// The agent must already contain the static instructions and exact shared tools. Runtime
+    /// assembly skips that static channel, checks bound declarations and replaces handlers at
+    /// their original positions, as in [`RunConfig::with_prepared_capabilities`].
+    #[must_use]
+    pub fn with_prepared_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
+        tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+    ) -> Self {
+        self.capabilities = Some(PreparedCapabilities {
+            capabilities: capabilities.into_iter().collect(),
+            tools: tools.into_iter().collect(),
+        });
+        self
+    }
+
+    pub(super) fn configure_run(&self, config: RunConfig) -> RunConfig {
+        match &self.capabilities {
+            Some(prepared) => config.with_prepared_capabilities(
+                prepared.capabilities.iter().cloned(),
+                prepared.tools.iter().cloned(),
+            ),
+            None => config,
+        }
     }
 
     pub(super) fn into_parts(self) -> (Arc<AgentSpec>, Option<Arc<dyn SpawnedAgentResources>>) {
@@ -108,6 +147,7 @@ impl std::fmt::Debug for PreparedSpawnedAgent {
             .debug_struct("PreparedSpawnedAgent")
             .field("agent", &self.agent.id())
             .field("has_resources", &self.resources.is_some())
+            .field("has_prepared_capabilities", &self.capabilities.is_some())
             .finish()
     }
 }

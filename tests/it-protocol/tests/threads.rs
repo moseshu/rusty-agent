@@ -2031,6 +2031,20 @@ async fn coding_thread_factory_starts_coding_threads() {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().canonicalize().unwrap();
     let host = CodingHost::open(&root).unwrap();
+    let agent = ra_coding::build_agent_with_host(
+        AgentId::new("coding"),
+        "Coding agent",
+        &ra_core::prompt::PromptRole::Main,
+        &host,
+    )
+    .await
+    .unwrap();
+    let expected_tools: Vec<_> = agent
+        .tools()
+        .iter()
+        .filter(|tool| tool.options().is_advertised_to_model())
+        .map(|tool| tool.model_definition())
+        .collect();
     let script = Arc::new(Script::default());
     let settings = CodingThreadSettingsAdapter::new(
         &root,
@@ -2056,6 +2070,7 @@ async fn coding_thread_factory_starts_coding_threads() {
     script.answer("Done");
     server.run_turn(&mut connection, &thread_id, "hello").await;
     let request = script.last_request();
+    assert_eq!(request.tools(), expected_tools);
     assert!(
         request
             .tools()

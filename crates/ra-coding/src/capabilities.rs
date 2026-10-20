@@ -39,55 +39,17 @@
 //! describe them, which join the product's own sections in the same stable prefix. One switch moves
 //! both because one object produced both.
 //!
-//! It is not additionally installed on [`RunConfig`](ra_runtime::runner::RunConfig). A capability
-//! installed there contributes its tools at run assembly and the agent already declares them, so
-//! installing in both places declares one tool twice and fails the build.
+//! The selected set also retains each original capability for runtime binding. The surface records
+//! the exact shared tools already installed on the agent; runtime assembly replaces those with the
+//! bound handlers and rejects unrelated collisions. Static fragments are kept in the reviewed
+//! prefix, while binding, per-run and deferred instructions, sampling and context processing follow
+//! the ordinary run lifecycle. A bound handler may change its implementation, but its declaration
+//! must still match the tool surface the prefix describes.
 //!
-//! Nor could these tool-bearing capabilities go there *instead*: each contributes
-//! [`Capability::static_instructions`](ra_core::capability::Capability::static_instructions), and
-//! run assembly refuses a capability carrying static prefix text. The framework-level statement of
-//! which route carries which contribution is the table on [`ra_core::capability`]; what follows is
-//! why this product's split lands where it does.
-//!
-//! # Why the fragments arrive here and not at run assembly
-//!
-//! The obvious symmetry would be the other one: move the tools to `RunConfig` and let both halves
-//! arrive when the run does. Two facts rule it out, and both are about the *inventory* section
-//! rather than about the capability fragments.
-//!
-//! The inventory is product text rendered from the assembled surface — it names the entries this
-//! profile advertises — and `ra-runtime` can neither write product text nor reach the assembler
-//! that would place it. So the inventory cannot arrive at run assembly, and a fragment describing
-//! `apply_patch` that arrived without the list saying the agent has it would be describing a
-//! surface nothing in the prefix declares. Second, contributions collected at run assembly are
-//! appended to the agent's instructions in assembly order, downstream of the canonical section
-//! ranking and of the committed prompt dump — so a prefix half-assembled there is a prefix the
-//! snapshot gate no longer covers.
-//!
-//! The direction that satisfies "the fragment cannot arrive without its tools" is therefore this
-//! one: the single place that already turns capabilities into a tool surface also turns them into
-//! prompt sections. [`CapabilityPlan::static_prompt_sections`] is what makes it possible before a run
-//! exists, and it is the same rule the runtime applies to a host's own capabilities.
-//!
-//! `compaction` is installed on the run configuration by
-//! [`CodingHost::build_run_config`](crate::host::CodingHost::build_run_config), and it is the case
-//! that shows the split is about tools rather than about ownership: it contributes no tool and no
-//! prefix text, so it has nothing to declare twice and nothing to place.
-//!
-//! # What the split costs: deferred fragments from a tool-bearing capability
-//!
-//! [`Capability::deferred_instructions`](ra_core::capability::Capability::deferred_instructions) is
-//! delivered by the turn loop, from the capabilities installed on the run — so a capability that
-//! arrives here instead has no deferred channel. The capabilities below contribute none, and the split
-//! costs nothing today; a capability installed on the run configuration, like `compaction`, has the
-//! channel in full, which is the route for a heavy section that ships no tools of its own.
-//!
-//! It becomes a real limit the first time this product installs a capability that has both tools
-//! and a heavy fragment — a browser, most likely. Resolving it then is the right time, because the
-//! resolution is a choice between things that only that capability can weigh: installing it on the
-//! run as well means teaching assembly to tell "the agent already declares this capability's tools"
-//! apart from "the agent declares a colliding tool of its own", and that distinction is the one
-//! thing the current collision check exists to make.
+//! Standalone callers use the complete agent builder and bind their requests through its result,
+//! or configure their thread from it. The app-server thread factory does this automatically, and
+//! spawned agents replace the inherited prepared surface with their own. Directly installed run
+//! capabilities, including compaction, retain their order and configuration.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -116,6 +78,12 @@ pub(crate) struct RoleCapabilities {
     withheld: Vec<Arc<dyn Capability>>,
 }
 
+pub(crate) struct SurfaceContributions {
+    pub(crate) sections: Vec<PromptSection>,
+    pub(crate) installed: Vec<InstalledCapability>,
+    pub(crate) runtime: Vec<Arc<dyn Capability>>,
+}
+
 impl RoleCapabilities {
     /// Resolves the tool-bearing capabilities a coding agent installs for one role.
     ///
@@ -135,8 +103,7 @@ impl RoleCapabilities {
     /// # Errors
     ///
     /// Propagates tool construction failures, and any incoherence the plan finds in the installed
-    /// set — two capabilities claiming one family, a dependency nothing installs, or a capability
-    /// requiring its own family.
+    /// set — two capabilities claiming one family or a dependency nothing installs.
     pub(crate) fn resolve(role: &PromptRole, host: &CodingHost) -> Result<Self> {
         let mut declared: Vec<Arc<dyn Capability>> = vec![
             Arc::new(host.filesystem_capability()?),
@@ -155,6 +122,7 @@ impl RoleCapabilities {
         if host.request_user_input_enabled() {
             declared.push(Arc::new(ControlCapability::user_input()?));
         }
+        declared.extend(host.capabilities().iter().cloned());
         // A spawned agent is assembled without the collaboration tools unless the host says its
         // model takes them, as Codex plans a sub-agent session's tools; the family is then
         // withheld, so the tier's band shrinks with it rather than failing its floor.
@@ -247,7 +215,7 @@ impl RoleCapabilities {
     /// leaves text naming an entry the request does not carry with no way to tell which half the
     /// text meant.
     ///
-    /// A capability with nothing advertised at all keeps its fragment. Not every capability speaks
+    /// A capability with no tools keeps its fragment. Not every capability speaks
     /// for tools; one that contributes none has nothing for a tier to drop, and gating it on an
     /// empty intersection would silence exactly the fragments that are pure policy.
     ///
@@ -266,7 +234,7 @@ impl RoleCapabilities {
     pub(crate) async fn contributions_for(
         &self,
         surface: &ToolSurface,
-    ) -> Result<(Vec<PromptSection>, Vec<InstalledCapability>)> {
+    ) -> Result<SurfaceContributions> {
         let charged: BTreeSet<&str> = surface.advertised_names().collect();
         let contributions: Vec<_> = self
             .installed
@@ -277,14 +245,40 @@ impl RoleCapabilities {
                 (capability, present, absent)
             })
             .collect();
+        let selected: BTreeSet<_> = surface
+            .tools()
+            .iter()
+            .map(|tool| tool.origin().lookup_key().clone())
+            .collect();
+        for capability in self.installed.capabilities() {
+            let tools = capability.tools();
+            let count = tools
+                .iter()
+                .filter(|tool| selected.contains(tool.origin().lookup_key()))
+                .count();
+            if count != 0 && count != tools.len() {
+                return Err(Error::config(format!(
+                    "tool surface `{}` selects only part of capability `{}`; select its tools together",
+                    surface.profile(),
+                    capability.kind()
+                )));
+            }
+        }
         // Resolve only fragments the tier can use. In particular, a Core agent must not load a
         // remote skill catalog that its selected tools cannot reach. The installed product
         // families have no dependencies on each other; the original plan validated their set.
         let described: Vec<_> = contributions
             .iter()
-            .filter(|(_, present, absent)| !present.is_empty() || absent.is_empty())
+            .filter(|(capability, _, _)| {
+                let tools = capability.tools();
+                tools.is_empty()
+                    || tools
+                        .iter()
+                        .any(|tool| selected.contains(tool.origin().lookup_key()))
+            })
             .map(|(capability, _, _)| Arc::clone(capability))
             .collect();
+        let runtime = described.clone();
         let mut fragments = CapabilityPlan::resolve(described)?
             .static_prompt_sections()
             .await?;
@@ -329,7 +323,11 @@ impl RoleCapabilities {
                 orphan.source()
             )));
         }
-        Ok((kept, installed))
+        Ok(SurfaceContributions {
+            sections: kept,
+            installed,
+            runtime,
+        })
     }
 }
 

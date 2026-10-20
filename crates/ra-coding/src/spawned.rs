@@ -52,7 +52,8 @@ struct CodingSpawnedAgents {
 impl SpawnedAgentFactory for CodingSpawnedAgents {
     async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
         if request.agent_type().is_some() || request.agent().id() != &self.id {
-            return Ok(PreparedSpawnedAgent::new(Arc::clone(request.agent())));
+            return Ok(PreparedSpawnedAgent::new(Arc::clone(request.agent()))
+                .with_prepared_capabilities([], []));
         }
         let host = self.host.for_spawned_agent();
         let assembled = assemble_agent(
@@ -63,11 +64,11 @@ impl SpawnedAgentFactory for CodingSpawnedAgents {
             self.profile,
         )
         .await?;
-        Ok(
-            PreparedSpawnedAgent::new(assembled.agent).with_resources(Arc::new(SpawnedProcesses(
-                Arc::clone(host.process_manager()),
-            ))),
-        )
+        Ok(PreparedSpawnedAgent::new(assembled.agent)
+            .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools)
+            .with_resources(Arc::new(SpawnedProcesses(Arc::clone(
+                host.process_manager(),
+            )))))
     }
 }
 

@@ -14,12 +14,12 @@
 use std::sync::Arc;
 
 use ra_core::agent::{AgentId, AgentSpec};
-use ra_core::capability::CapabilityFamily;
+use ra_core::capability::{Capability, CapabilityFamily};
 use ra_core::error::{Error, Result};
 use ra_core::prompt::{PromptRole, PromptSection};
 use ra_runtime::{
     agent::control::AgentControl,
-    runner::RunRequest,
+    runner::{RunConfig, RunRequest},
     tool::{
         profile::{ToolSurface, ToolSurfaceBudget},
         registry::ToolRegistry,
@@ -96,6 +96,12 @@ pub async fn build_agent_with_profile(
     host: &CodingHost,
     profile: CodingProfile,
 ) -> Result<Arc<AgentSpec>> {
+    if !host.capabilities().is_empty() {
+        return Err(Error::config(
+            "a coding host with additional capabilities must be built with \
+             `build_agent_with_control` so its runtime contributions travel with the agent",
+        ));
+    }
     let assembled = assemble_agent(id, name, role, host, profile).await?;
     if assembled.collaborates {
         return Err(Error::config(
@@ -138,14 +144,26 @@ pub async fn build_agent_with_control(
     Ok(StandaloneCodingAgent {
         agent: assembled.agent,
         control,
+        capabilities: assembled.capabilities,
+        capability_tools: assembled.capability_tools,
     })
 }
 
 /// A coding agent built for standalone runs, with the agent tree its collaboration tools act on.
-#[derive(Debug)]
 pub struct StandaloneCodingAgent {
     agent: Arc<AgentSpec>,
     control: Option<AgentControl>,
+    capabilities: Vec<Arc<dyn Capability>>,
+    capability_tools: Vec<Arc<dyn ra_core::tool::Tool>>,
+}
+
+impl std::fmt::Debug for StandaloneCodingAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StandaloneCodingAgent")
+            .field("agent", &self.agent)
+            .field("control", &self.control)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StandaloneCodingAgent {
@@ -161,18 +179,36 @@ impl StandaloneCodingAgent {
         self.control.as_ref()
     }
 
-    /// Binds `request` to the root of the agent's tree, when it has one.
+    /// Installs the selected runtime contributions and binds `request` to the root of the agent's
+    /// tree, when it has one.
     pub fn bind(&self, request: RunRequest) -> RunRequest {
+        let request = request.with_prepared_capabilities(
+            self.capabilities.iter().cloned(),
+            self.capability_tools.iter().cloned(),
+        );
         match &self.control {
             Some(control) => request.with_agent_control(control.root()),
             None => request,
         }
     }
 
-    /// The declaration and the tree, for a caller that keeps them apart.
-    #[must_use]
-    pub fn into_parts(self) -> (Arc<AgentSpec>, Option<AgentControl>) {
-        (self.agent, self.control)
+    /// Appends the runtime contributions selected by this agent's role and tier to `config`.
+    /// Use this for an `AgentThread`; standalone requests receive them through [`Self::bind`].
+    pub fn configure_run(&self, config: RunConfig) -> RunConfig {
+        config.with_prepared_capabilities(
+            self.capabilities.iter().cloned(),
+            self.capability_tools.iter().cloned(),
+        )
+    }
+
+    /// The declaration, tree and configured run settings, retaining the selected runtime
+    /// contributions for a caller that stores the pieces separately.
+    pub fn into_parts(
+        self,
+        config: RunConfig,
+    ) -> (Arc<AgentSpec>, Option<AgentControl>, RunConfig) {
+        let config = self.configure_run(config);
+        (self.agent, self.control, config)
     }
 }
 
@@ -180,6 +216,8 @@ impl StandaloneCodingAgent {
 pub(crate) struct AssembledAgent {
     pub(crate) agent: Arc<AgentSpec>,
     pub(crate) collaborates: bool,
+    pub(crate) capabilities: Vec<Arc<dyn Capability>>,
+    pub(crate) capability_tools: Vec<Arc<dyn ra_core::tool::Tool>>,
 }
 
 /// Assembles the coding agent for one role and tier from `host`.
@@ -201,6 +239,8 @@ pub(crate) async fn assemble_agent(
     let collaborates = assembled.installed().iter().any(|capability| {
         capability.family().as_str() == COLLABORATION_FAMILY && !capability.advertised().is_empty()
     });
+    let capabilities = assembled.runtime_capabilities.clone();
+    let capability_tools = assembled.tool_surface().tools().to_vec();
     let mut builder = AgentSpec::builder()
         .id(id)
         .name(name)
@@ -213,6 +253,8 @@ pub(crate) async fn assemble_agent(
     Ok(AssembledAgent {
         agent: builder.build()?,
         collaborates,
+        capabilities,
+        capability_tools,
     })
 }
 
@@ -229,13 +271,25 @@ pub(crate) async fn assemble_agent(
 /// assembled surface.
 #[must_use]
 #[non_exhaustive]
-#[derive(Debug)]
 pub struct HostBackedSurface {
     tool_surface: ToolSurface,
     capability_sections: Vec<PromptSection>,
     installed: Vec<InstalledCapability>,
     withheld: Vec<CapabilityFamily>,
     budget: ToolSurfaceBudget,
+    runtime_capabilities: Vec<Arc<dyn Capability>>,
+}
+
+impl std::fmt::Debug for HostBackedSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostBackedSurface")
+            .field("tool_surface", &self.tool_surface)
+            .field("capability_sections", &self.capability_sections)
+            .field("installed", &self.installed)
+            .field("withheld", &self.withheld)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HostBackedSurface {
@@ -270,6 +324,16 @@ impl HostBackedSurface {
         &self.budget
     }
 
+    /// Appends the runtime half of the capabilities selected by this same surface. Their tools
+    /// and static fragments have already been placed; binding, per-run and deferred text,
+    /// sampling settings and context processing remain on the run lifecycle.
+    pub fn configure_run(&self, config: RunConfig) -> RunConfig {
+        config.with_prepared_capabilities(
+            self.runtime_capabilities.iter().cloned(),
+            self.tool_surface.tools().iter().cloned(),
+        )
+    }
+
     /// Takes the surface, for the caller that installs its tools on an agent.
     #[must_use]
     pub fn into_tool_surface(self) -> ToolSurface {
@@ -283,10 +347,8 @@ impl HostBackedSurface {
 /// tier dropped entirely is still installed and still owns its prefix paragraph, so it is present
 /// here with nothing advertised rather than absent.
 ///
-/// It contributes **only** its tools and its static prompt text on this path. Sampling settings and
-/// context transforms are read where capabilities are installed on the run configuration, and
-/// nothing on the agent-construction path reads them — see the installation table on
-/// [`ra_core::capability`].
+/// Tools and static text are placed during construction. The enclosing surface retains the same
+/// selection's runtime contributions for [`HostBackedSurface::configure_run`].
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InstalledCapability {
@@ -352,12 +414,13 @@ pub async fn host_backed_surface(
     )?;
     let budget = *profile.budget();
     let tool_surface = registry.assemble(&profile)?;
-    let (capability_sections, installed) = capabilities.contributions_for(&tool_surface).await?;
+    let contributions = capabilities.contributions_for(&tool_surface).await?;
     Ok(HostBackedSurface {
         tool_surface,
-        capability_sections,
-        installed,
+        capability_sections: contributions.sections,
+        installed: contributions.installed,
         withheld: capabilities.withheld_families(),
         budget,
+        runtime_capabilities: contributions.runtime,
     })
 }

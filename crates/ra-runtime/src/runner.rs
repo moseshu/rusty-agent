@@ -29,7 +29,14 @@
 //! **Session persistence and resume.** R6-6 turns a run into a `RunState`; R9 stores the items.
 //! This produces the values both will read.
 
-use std::{any::Any, collections::BTreeSet, future::Future, ops::Range, sync::Arc, time::Instant};
+use std::{
+    any::Any,
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    ops::Range,
+    sync::Arc,
+    time::Instant,
+};
 
 use futures::StreamExt;
 use ra_core::{
@@ -64,8 +71,8 @@ use ra_core::{
     },
     model::{
         Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
-        ModelStreamEvent, ModelTracing, ReplaySafety, RetryAdvice, RetryBackoff, RetryDecision,
-        RetryPolicyContext, replay_safety_of, stamp_replay_safety,
+        ModelStreamEvent, ModelToolDefinition, ModelTracing, ReplaySafety, RetryAdvice,
+        RetryBackoff, RetryDecision, RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
     output::{OutputSchema, OutputValue},
     permission::{PermissionMode, PermissionRule},
@@ -83,7 +90,7 @@ use ra_core::{
         RunId, RunState, ToolOutcome, ToolUse,
     },
     step::NextStep,
-    tool::{Tool, ToolLookupKey, ToolOutputReferenceExtractor, ToolServices},
+    tool::{Tool, ToolLookupKey, ToolOptions, ToolOutputReferenceExtractor, ToolServices},
     trace::SpanKind,
     usage::{RequestUsage, Usage},
 };
@@ -146,6 +153,26 @@ use crate::sandbox::{SandboxRunConfig, SandboxRuntime};
 /// hit something. Sizing the work is what the rest of [`BudgetLimit`] is for.
 pub const DEFAULT_MAX_TURNS: u32 = 32;
 
+/// Freezes a reviewed declaration while retaining the exact handler whose slot may be replaced.
+#[derive(Clone)]
+struct PreinstalledCapabilityTool {
+    handler: Arc<dyn Tool>,
+    key: ToolLookupKey,
+    definition: ModelToolDefinition,
+    options: ToolOptions,
+}
+
+impl PreinstalledCapabilityTool {
+    fn new(handler: Arc<dyn Tool>) -> Self {
+        Self {
+            key: handler.origin().lookup_key().clone(),
+            definition: handler.model_definition(),
+            options: handler.options(),
+            handler,
+        }
+    }
+}
+
 /// Run-level settings applied to every turn.
 ///
 /// These are the outermost layer of the four-layer model-settings merge and the run-level model
@@ -172,6 +199,8 @@ pub struct RunConfig {
     memory_usage_sink: Option<Arc<dyn ra_core::memory::MemoryUsageSink>>,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
     capabilities: Vec<Arc<dyn Capability>>,
+    preinstalled_capability_tools: Vec<PreinstalledCapabilityTool>,
+    prepared_capabilities: Vec<Arc<dyn Capability>>,
     permission: PermissionEngine,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
@@ -214,6 +243,8 @@ impl RunConfig {
             memory_usage_sink: None,
             context_processors: Vec::new(),
             capabilities: Vec::new(),
+            preinstalled_capability_tools: Vec::new(),
+            prepared_capabilities: Vec::new(),
             permission: PermissionEngine::default(),
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
@@ -526,8 +557,8 @@ impl RunConfig {
     /// order; dependencies check presence without reordering capabilities — see
     /// [`CapabilityPlan`] for the whole rule.
     ///
-    /// A missing dependency, two capabilities claiming one family, or a capability requiring its
-    /// own family fails the run before its first model call. Mutually dependent capabilities are
+    /// A missing dependency or two capabilities claiming one family fails the run before its
+    /// first model call. Self requirements and mutually dependent capabilities are
     /// accepted when every required family is installed.
     ///
     /// A sandbox agent's own capabilities may not claim a family installed here: the built-in
@@ -544,6 +575,34 @@ impl RunConfig {
         capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
     ) -> Self {
         self.capabilities.extend(capabilities);
+        self
+    }
+
+    /// Installs runtime contributions from a capability surface that already placed its tools
+    /// and static text on the agent. Replaces the previous prepared surface while preserving
+    /// capabilities installed directly on this configuration. Only the supplied shared tool
+    /// objects may be replaced during binding, at their original positions. Their lookup keys,
+    /// model definitions and options are frozen here and must match the bound tools. Static
+    /// instructions are not read again for these capabilities; the agent must already contain
+    /// them. Unrelated duplicate names still fail validation, and ordinary capabilities append.
+    pub fn with_prepared_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
+        tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+    ) -> Self {
+        self.capabilities.retain(|capability| {
+            !self
+                .prepared_capabilities
+                .iter()
+                .any(|prepared| Arc::ptr_eq(capability, prepared))
+        });
+        self.prepared_capabilities = capabilities.into_iter().collect();
+        self.preinstalled_capability_tools = tools
+            .into_iter()
+            .map(PreinstalledCapabilityTool::new)
+            .collect();
+        self.capabilities
+            .extend(self.prepared_capabilities.iter().cloned());
         self
     }
 
@@ -645,8 +704,7 @@ impl RunConfig {
 
     /// Capabilities installed for this run, in installation order.
     ///
-    /// Installation order, not assembly order: the two differ wherever a declared dependency moves
-    /// a capability, and this accessor reports what the host asked for.
+    /// Dependencies check presence without changing the installation order.
     #[must_use]
     pub fn capabilities(&self) -> &[Arc<dyn Capability>] {
         &self.capabilities
@@ -787,19 +845,6 @@ impl RunConfig {
     pub const fn pre_approval_tool_input_guardrails(&self) -> bool {
         self.pre_approval_tool_input_guardrails
     }
-
-    /// Appends the context transforms an assembled capability set contributed.
-    ///
-    /// Appended rather than merged in front: a processor installed through
-    /// [`Self::with_context_processor`] was put there by the host directly, before any capability
-    /// was resolved, and running the capability chain ahead of it would change what that host
-    /// already had working.
-    pub(crate) fn extend_context_processors(
-        &mut self,
-        context_processors: impl IntoIterator<Item = Arc<dyn ContextProcessor>>,
-    ) {
-        self.context_processors.extend(context_processors);
-    }
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -831,6 +876,11 @@ impl std::fmt::Debug for RunConfig {
                 &self.tool_output_reference_extractor.is_some(),
             )
             .field("context_processor_count", &self.context_processors.len())
+            .field(
+                "preinstalled_capability_tools",
+                &self.preinstalled_capability_tools.len(),
+            )
+            .field("prepared_capabilities", &self.prepared_capabilities.len())
             .field(
                 "capabilities",
                 &self
@@ -1111,6 +1161,20 @@ impl RunRequest {
         self
     }
 
+    /// Binds the runtime half of a previously assembled capability surface, preserving the
+    /// request's other settings and replacing any earlier prepared surface.
+    ///
+    /// As in [`RunConfig::with_prepared_capabilities`], static instructions are already in the
+    /// agent; binding must preserve the supplied tools' declarations and original positions.
+    pub fn with_prepared_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
+        tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+    ) -> Self {
+        self.config = self.config.with_prepared_capabilities(capabilities, tools);
+        self
+    }
+
     /// Marks a fresh run as a child of another run. The parent is persisted in [`RunState`] so
     /// approval resume uses `SubagentStop` without relying on the host to repeat this setting.
     pub fn with_parent_run_id(mut self, parent: RunId) -> Result<Self> {
@@ -1326,6 +1390,8 @@ struct TurnLoopContext<'a> {
     event_seqs: &'a EventSeqAllocator,
     /// Capability fragments resolved at assembly and still waiting for the signal that earns them.
     deferred_prompts: &'a [DeferredPrompt],
+    /// Run-bound processors remain separate from declarative settings snapshots.
+    capability_processors: &'a [Arc<dyn ContextProcessor>],
     /// Prepares sandbox agents before their turns.
     sandbox: &'a SandboxRuntime,
     /// The agent this run is bound to in its tree: the mailbox it delivers at model-call
@@ -1765,7 +1831,7 @@ async fn run_loop_inner(
         app_context,
         cancel,
         input: requested_input,
-        mut config,
+        config,
         mut state,
         services,
         event_seqs,
@@ -1923,23 +1989,26 @@ async fn run_loop_inner(
     let authoritative_history_complete = state.input_history_is_complete();
     let input_base = segment_input_base(&state, resuming, requested_input);
     let mut deferred_prompts: Vec<DeferredPrompt> = Vec::new();
+    let mut capability_processors: Vec<Arc<dyn ContextProcessor>> = Vec::new();
     // Under the run scope rather than ahead of it: a capability resolves its prompt fragment with
     // third-party asynchronous code, and a run whose assembly reads a slow source is one the
     // deadline and the caller's interrupt still have to reach.
-    if !capability_plan.is_empty() {
-        let assembly = assemble_capabilities(
-            &capability_plan,
-            &agent,
-            &run_id,
-            app_context.as_ref(),
-            tool_input.as_ref(),
-            &state,
-            &event_seqs,
-        );
+    if !capability_plan.is_empty() || !config.preinstalled_capability_tools.is_empty() {
+        let assembly = assemble_capabilities(CapabilityAssemblyRequest {
+            plan: &capability_plan,
+            agent: &agent,
+            run_id: &run_id,
+            app_context: app_context.as_ref(),
+            tool_input: tool_input.as_ref(),
+            state: &state,
+            event_seqs: &event_seqs,
+            models: model_resolver.as_ref(),
+            config: &config,
+        });
         match cancel.run(assembly).await.and_then(|result| result) {
             Ok((execution, context_processors, deferred)) => {
                 agent = execution;
-                config.extend_context_processors(context_processors);
+                capability_processors = context_processors;
                 deferred_prompts = deferred;
             }
             Err(error) => {
@@ -2013,6 +2082,7 @@ async fn run_loop_inner(
         },
         event_seqs: &event_seqs,
         deferred_prompts: &deferred_prompts,
+        capability_processors: &capability_processors,
         sandbox,
         agent_mail: agent_handle.as_ref(),
         deliver_mail_first,
@@ -2522,6 +2592,18 @@ async fn run_loop_inner(
     Ok(result)
 }
 
+struct CapabilityAssemblyRequest<'a> {
+    plan: &'a CapabilityPlan,
+    agent: &'a AgentBinding,
+    run_id: &'a RunId,
+    app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
+    tool_input: Option<&'a Arc<serde_json::Value>>,
+    state: &'a RunState,
+    event_seqs: &'a EventSeqAllocator,
+    models: &'a dyn ModelResolver,
+    config: &'a RunConfig,
+}
+
 /// Binds the run's capabilities and splits what they contribute between the two places it goes.
 ///
 /// The agent instance comes back paired with the context processors and the deferred prompts
@@ -2534,18 +2616,24 @@ async fn run_loop_inner(
 /// already prepared its own execution instance keeps it, and the identity every record is filed
 /// under stays the one the user configured.
 async fn assemble_capabilities(
-    plan: &CapabilityPlan,
-    agent: &AgentBinding,
-    run_id: &RunId,
-    app_context: Option<&Arc<dyn Any + Send + Sync>>,
-    tool_input: Option<&Arc<serde_json::Value>>,
-    state: &RunState,
-    event_seqs: &EventSeqAllocator,
+    request: CapabilityAssemblyRequest<'_>,
 ) -> Result<(
     AgentBinding,
     Vec<Arc<dyn ContextProcessor>>,
     Vec<DeferredPrompt>,
 )> {
+    let CapabilityAssemblyRequest {
+        plan,
+        agent,
+        run_id,
+        app_context,
+        tool_input,
+        state,
+        event_seqs,
+        models,
+        config,
+    } = request;
+    let model_override = config.model();
     // The public agent, because binding is told who is running rather than what was assembled —
     // and what was assembled is precisely what does not exist yet at this point.
     let mut context = RunContext::new(run_id.clone(), agent.public())
@@ -2563,15 +2651,97 @@ async fn assemble_capabilities(
         context = context.with_tool_input(Arc::clone(tool_input));
     }
 
-    let assembled = plan.assemble(&context).await?;
+    let (assembled, replacements) = plan
+        .assemble_with_prepared(&context, &config.prepared_capabilities)
+        .await?;
     let base = agent.execution_without_external_tools()?;
-    let execution = assembled.prepare_agent(&base)?;
+    let base = replace_preinstalled_capability_tools(
+        base,
+        &config.preinstalled_capability_tools,
+        replacements,
+    )?;
+    let resolved = models.resolve_model(model_override.or(base.model()))?;
+    let mut sampling = ra_core::capability::SamplingContext::default()
+        .with_provider(resolved.selector().provider().clone());
+    if let Some(model) = resolved.selector().model() {
+        sampling = sampling.with_model(model);
+    }
+    let execution = assembled.prepare_agent_with_sampling_context(&base, &sampling)?;
     let execution = agent.with_prepared_execution(execution)?;
     Ok((
         execution,
         assembled.context_processors().to_vec(),
         assembled.deferred_prompts().to_vec(),
     ))
+}
+
+/// Checks the frozen preinstalled surface, then replaces only its owned handler slots. Directly
+/// installed capabilities are appended later, so their collisions still reach normal validation.
+fn replace_preinstalled_capability_tools(
+    agent: Arc<AgentSpec>,
+    preinstalled: &[PreinstalledCapabilityTool],
+    replacements: Vec<Arc<dyn Tool>>,
+) -> Result<Arc<AgentSpec>> {
+    let mut bound = BTreeMap::new();
+    for tool in replacements {
+        let key = tool.origin().lookup_key().clone();
+        if bound.insert(key.clone(), tool).is_some() {
+            return Err(Error::config(format!(
+                "prepared capabilities contribute duplicate bound tool `{key:?}`"
+            )));
+        }
+    }
+    let mut expected = BTreeSet::new();
+    for installed in preinstalled {
+        if !expected.insert(&installed.key) {
+            return Err(Error::config(format!(
+                "prepared capabilities claim preinstalled tool `{:?}` twice",
+                installed.key
+            )));
+        }
+        if !bound.get(&installed.key).is_some_and(|tool| {
+            tool.model_definition() == installed.definition && tool.options() == installed.options
+        }) {
+            return Err(Error::config(format!(
+                "binding prepared capabilities changes the tool surface at `{:?}`; bound lookup \
+                 keys, model definitions and options must match the preinstalled surface",
+                installed.key
+            )));
+        }
+    }
+    if bound.len() != preinstalled.len() {
+        return Err(Error::config(
+            "binding prepared capabilities changes the tool surface by adding tools; install \
+             capabilities that change their declarations directly on the run configuration",
+        ));
+    }
+    if preinstalled.is_empty() {
+        return Ok(agent);
+    }
+
+    let mut replaced = 0;
+    let tools: Vec<_> = agent
+        .tools()
+        .iter()
+        .map(|tool| {
+            if let Some(installed) = preinstalled
+                .iter()
+                .find(|installed| Arc::ptr_eq(tool, &installed.handler))
+            {
+                replaced += 1;
+                Arc::clone(&bound[&installed.key])
+            } else {
+                Arc::clone(tool)
+            }
+        })
+        .collect();
+    if replaced != preinstalled.len() {
+        return Err(Error::config(
+            "prepared capability tools do not belong to this agent; supply the exact shared \
+             tool objects already installed on its execution surface",
+        ));
+    }
+    agent.to_builder().clear_tools().tools(tools).build()
 }
 
 /// Settles host answers that were checkpointed with an interrupted run before another model call.
@@ -5289,6 +5459,7 @@ async fn process_context_processors(
                 .config
                 .context_processors()
                 .iter()
+                .chain(context.capability_processors)
                 .filter(|_| decomposition.is_some()),
         )
         .collect();

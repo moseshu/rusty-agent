@@ -20,7 +20,7 @@
 //!
 //! | Method | Resolved | Lands in | Charged |
 //! | --- | --- | --- | --- |
-//! | [`Capability::static_instructions`] | before any run exists | cached prefix | every turn, at the cache rate |
+//! | [`Capability::static_instructions`] | before binding; optionally before a run exists | cached prefix | every turn, at the cache rate |
 //! | [`Capability::instructions`] | once per run, at assembly | cached prefix | every turn of that run, at the cache rate |
 //! | [`Capability::deferred_instructions`] | once per run, at assembly | run history, once a signal fires | once, in full, and only in the runs that fire |
 //!
@@ -36,42 +36,24 @@
 //! deferring is for. Sending it once and letting it stay in history means the model keeps it, and
 //! every turn after the first carries it inside the span a cache read already covers.
 //!
-//! # Two installation points, and which contributions each one carries
+//! # Runtime installation and preassembled product surfaces
 //!
-//! A capability reaches an agent by one of two routes, and **they do not carry the same
-//! contributions**. Choose a route that carries every contribution the implementation needs:
+//! Installing a capability on the run configuration carries every contribution. Static text is
+//! resolved from the installed value before binding; per-run text, tools, sampling settings,
+//! deferred instructions and context processing come from the bound value. Static and per-run
+//! fragments follow the agent's instructions in capability installation order.
 //!
-//! | Contribution | Installed where the agent is built | Installed on the run configuration |
-//! | --- | --- | --- |
-//! | [`Capability::tools`] | yes — through the product's registry and tier | yes — appended to the agent's own |
-//! | [`Capability::static_instructions`] | yes | **no** — refused at assembly |
-//! | [`Capability::instructions`] | no — there is no run to bind to yet | yes |
-//! | [`Capability::deferred_instructions`] | no — delivery is the turn loop's | yes |
-//! | [`Capability::sampling_params`] | no | yes |
-//! | [`Capability::context_processor`] | no | yes |
-//! | [`Capability::bind`] | no — binding takes a run | yes, after static-text validation and before run contributions are read |
+//! A product may instead assemble its tool registry and reviewed static prefix before a run exists.
+//! That surface must retain the selected capabilities and install their runtime contributions with
+//! the run configuration's prepared-capability entry point. The configuration records the exact
+//! shared tools it owns and freezes their declarations. Runtime assembly skips the static channel
+//! already placed in the prefix and replaces bound handlers at their original positions, leaving
+//! unrelated same-name tools to normal collision validation. A bound handler must preserve the
+//! tool declaration the product prefix names.
 //!
-//! **A capability whose text is static belongs where the agent is built.** Static text is resolved
-//! before any run exists precisely so it can sit in the cached prefix, and the prefix is assembled
-//! once, with a section order and a committed dump behind it. Run assembly happens after the agent
-//! exists and can only append, downstream of that ranking — so a static fragment arriving there has
-//! nowhere to land. Installing one on the run configuration is a configuration error rather than a
-//! silent drop: the tools would arrive and the paragraph declaring them would not, which is the
-//! exact failure carrying four contributions on one trait exists to prevent.
-//!
-//! **A capability that needs binding, per-run or deferred instructions, sampling settings, or
-//! context processing belongs on the run configuration.** This applies whether or not it has
-//! tools. The agent-construction path does not consume these contributions; installing compaction
-//! there, for example, would lose its runtime behavior. A capability contributing only tools can
-//! use either route.
-//!
-//! A capability that combines static text with runtime contributions has no route that carries
-//! everything today. The host must explicitly adapt its composition, for example by moving the
-//! text to the per-run instruction channel, before installing it on the run configuration.
-//!
-//! **Declaring the same tool on both routes fails validation by lookup key.** The routes do not
-//! merge duplicate tools. A capability with no tools does not cause that collision, though static
-//! text is still refused on the run configuration.
+//! The agent-construction route alone carries only tools and static text. A caller using it without
+//! the accompanying runtime configuration must restrict itself to capabilities with no runtime
+//! contributions. Ordinary agents and tools remain usable without capability assembly.
 //!
 //! Implementations live in service or product crates; the kernel only carries the contracts.
 
@@ -297,7 +279,7 @@ impl<'de> Deserialize<'de> for CapabilityFamily {
 /// 4. [`Self::tools`] contributes to the agent's tool set, which a tool profile then selects from.
 /// 5. [`Self::instructions`] contributes prompt sections, and [`Self::deferred_instructions`]
 ///    contributes the ones that wait for a signal.
-/// 6. [`Self::sampling_params`] folds over the agent's model-settings layer, in installation order.
+/// 6. [`Self::sampling_params_for`] folds over the agent's model-settings layer, in installation order.
 /// 7. [`Self::context_processor`] is installed on the run configuration and runs before each
 ///    ordinary model call.
 /// 8. [`Self::wants_deferred_instructions`] is asked before each turn, until the deferred text has
@@ -347,7 +329,7 @@ pub trait Capability: Send + Sync + 'static {
 
     /// The prompt section this installed capability contributes to an agent's static prefix.
     ///
-    /// This method runs before any [`RunContext`] exists, so its answer must depend only on the
+    /// This method may run before any [`RunContext`] exists, so its answer must depend only on the
     /// installed capability and host configuration. It is for an agent builder or prompt dump that
     /// needs to construct one cached prefix shared by many runs. A capability bound to a run must
     /// not use this method for text it derives from that run; that text belongs to

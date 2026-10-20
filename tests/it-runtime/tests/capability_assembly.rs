@@ -15,7 +15,7 @@ use ra_core::{
     cancel::CancelScope,
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
-        ContextProcessorResult, ContextSummarizer, LoadSignal,
+        ContextProcessorResult, ContextSummarizer, LoadSignal, SamplingContext,
     },
     context::RunContext,
     error::Result,
@@ -32,7 +32,7 @@ use ra_core::{
         SectionStability,
     },
     state::RunId,
-    tool::{Tool, ToolContext, ToolOrigin, ToolOutput, ToolSchema},
+    tool::{Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use ra_runtime::{
     agent::AgentBinding,
@@ -50,6 +50,7 @@ struct TestCapability {
     tools: Vec<Arc<dyn Tool>>,
     section: Option<PromptSection>,
     static_section: Option<PromptSection>,
+    static_resolutions: Arc<AtomicUsize>,
     deferred_section: Option<PromptSection>,
     /// How many times the deferred fragment's source material was read.
     deferred_resolutions: Arc<AtomicUsize>,
@@ -61,6 +62,7 @@ struct TestCapability {
     binds: bool,
     /// The family a bound form reports, when it disagrees with the installed one.
     bound_kind: Option<CapabilityFamily>,
+    bound_tools: Vec<Arc<dyn Tool>>,
     bound_to: Arc<Mutex<Vec<String>>>,
 }
 
@@ -72,6 +74,7 @@ impl TestCapability {
             tools: Vec::new(),
             section: None,
             static_section: None,
+            static_resolutions: Arc::new(AtomicUsize::new(0)),
             deferred_section: None,
             deferred_resolutions: Arc::new(AtomicUsize::new(0)),
             temperature: None,
@@ -79,6 +82,7 @@ impl TestCapability {
             processor: false,
             binds: false,
             bound_kind: None,
+            bound_tools: Vec::new(),
             bound_to: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -240,6 +244,12 @@ impl TestCapability {
         self
     }
 
+    fn binding_with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.binds = true;
+        self.bound_tools = tools;
+        self
+    }
+
     fn into_shared(self) -> Arc<dyn Capability> {
         Arc::new(self)
     }
@@ -264,6 +274,7 @@ impl Capability for TestCapability {
     }
 
     async fn static_instructions(&self) -> Result<Option<PromptSection>> {
+        self.static_resolutions.fetch_add(1, Ordering::SeqCst);
         Ok(self.static_section.clone())
     }
 
@@ -297,6 +308,7 @@ impl Capability for TestCapability {
         Ok(Some(Arc::new(BoundCapability {
             kind: self.bound_kind.clone().unwrap_or_else(|| self.kind.clone()),
             run_id: context.run_id().as_str().to_owned(),
+            tools: self.bound_tools.clone(),
         })))
     }
 }
@@ -321,6 +333,7 @@ impl ContextProcessor for TestCapability {
 struct BoundCapability {
     kind: CapabilityFamily,
     run_id: String,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl Capability for BoundCapability {
@@ -331,11 +344,17 @@ impl Capability for BoundCapability {
     fn sampling_params(&self, settings: ModelSettings) -> ModelSettings {
         settings.with_metadata("bound_run", self.run_id.clone())
     }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.clone()
+    }
 }
 
 struct NamedTool {
     origin: ToolOrigin,
     schema: ToolSchema,
+    options: ToolOptions,
+    output: &'static str,
 }
 
 impl NamedTool {
@@ -352,6 +371,8 @@ impl NamedTool {
                 }),
             )
             .unwrap(),
+            options: ToolOptions::new(),
+            output: "done",
         }
     }
 }
@@ -366,8 +387,12 @@ impl Tool for NamedTool {
         &self.schema
     }
 
+    fn options(&self) -> ToolOptions {
+        self.options.clone()
+    }
+
     async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
-        Ok(ToolOutput::text("done"))
+        Ok(ToolOutput::text(self.output))
     }
 }
 
@@ -594,17 +619,12 @@ fn one_family_may_name_only_one_installed_capability() {
 }
 
 #[test]
-fn a_capability_cannot_depend_on_its_own_family() {
-    let error = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::MEMORY)
+fn a_self_requirement_is_satisfied_by_the_installed_set() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::MEMORY)
         .requiring(CapabilityFamily::MEMORY)
         .into_shared()])
-    .unwrap_err();
-
-    assert!(
-        error.to_string().contains("its own family"),
-        "a presence check would satisfy this declaration with the capability itself and verify \
-         nothing; the family it actually meant would go unchecked with nothing said: {error}"
-    );
+    .unwrap();
+    assert_eq!(families(&plan), ["memory"]);
 }
 
 #[test]
@@ -745,6 +765,75 @@ async fn the_sampling_fold_hands_each_capability_what_the_ones_before_it_produce
 }
 
 #[tokio::test]
+async fn sampling_preserves_nested_provider_parameters_and_receives_the_resolved_model() {
+    struct NestedSampling {
+        family: CapabilityFamily,
+        nested: serde_json::Value,
+        seen: Arc<Mutex<Vec<SamplingContext>>>,
+    }
+    impl Capability for NestedSampling {
+        fn kind(&self) -> CapabilityFamily {
+            self.family.clone()
+        }
+        fn sampling_params_for(
+            &self,
+            settings: ModelSettings,
+            context: &SamplingContext,
+        ) -> ModelSettings {
+            self.seen.lock().unwrap().push(context.clone());
+            settings.with_extra_body_value(
+                ProviderKey::new("test-provider"),
+                "nested",
+                self.nested.clone(),
+            )
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capabilities: Vec<Arc<dyn Capability>> = vec![
+        Arc::new(NestedSampling {
+            family: CapabilityFamily::SHELL,
+            nested: json!({"first":true,"list":[1]}),
+            seen: seen.clone(),
+        }),
+        Arc::new(NestedSampling {
+            family: CapabilityFamily::SEARCH,
+            nested: json!({"second":true,"list":[2]}),
+            seen: seen.clone(),
+        }),
+    ];
+    let plan = CapabilityPlan::resolve(capabilities.clone()).unwrap();
+    let prepared = plan
+        .assemble(&run_context("nested"))
+        .await
+        .unwrap()
+        .prepare_agent(&agent())
+        .unwrap();
+    assert_eq!(
+        prepared.model_settings().extra_body()[&ProviderKey::new("test-provider")]["nested"],
+        json!({"first":true,"second":true,"list":[2]})
+    );
+    seen.lock().unwrap().clear();
+    Runner::run(run_request(
+        &RecordingModel::new(),
+        RunConfig::new()
+            .with_model("alias")
+            .with_capabilities(capabilities),
+        &CancelScope::root(),
+    ))
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for sampling in seen.iter() {
+        assert_eq!(sampling.model(), Some("canonical-model"));
+        assert_eq!(
+            sampling.provider(),
+            Some(&ProviderKey::new("test-provider"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_fragment_that_asks_for_the_tail_is_refused_rather_than_placed_in_the_prefix() {
     let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::WEB)
         .with_tail_section("web")
@@ -816,8 +905,6 @@ async fn a_plan_resolves_its_static_fragments_before_a_run_exists() {
 /// method for both would call it once before binding and again after binding, which makes a dump
 /// disagree with the request a run sends.
 ///
-/// Read from the run-free side, because the other side now refuses the arrangement outright — see
-/// the test below.
 #[tokio::test]
 async fn a_static_fragment_does_not_cross_the_binding_boundary() {
     let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::MEMORY)
@@ -837,42 +924,240 @@ async fn a_static_fragment_does_not_cross_the_binding_boundary() {
     );
 }
 
-/// Run assembly refuses a capability that carries static prefix text.
-///
-/// Static text exists to sit in the cached prefix, and the prefix is assembled where the agent is
-/// built — with a section order and a committed dump behind it. Run assembly happens afterwards and
-/// can only append, so a static fragment arriving here has nowhere to land. Accepting it silently
-/// would install the capability's tools and drop the paragraph declaring them, which is the one
-/// outcome packing four contributions onto one trait exists to prevent.
+/// One runtime installation carries static text and runtime behavior together.
 #[tokio::test]
-async fn run_assembly_refuses_a_capability_carrying_static_prefix_text() {
-    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
-        .with_tool("exec_command")
-        .with_static_section("shell", "static fragment")
-        .into_shared()])
-    .unwrap();
+async fn run_assembly_carries_static_text_and_all_runtime_contributions() {
+    let model = RecordingModel::new();
+    let config = RunConfig::new().with_capability(
+        TestCapability::new(CapabilityFamily::SHELL)
+            .with_tool("exec_command")
+            .with_static_section("shell", "static fragment")
+            .with_section("shell", "per-run fragment")
+            .with_temperature(0.3)
+            .with_processor()
+            .into_shared(),
+    );
+    Runner::run(run_request(&model, config, &CancelScope::root()))
+        .await
+        .unwrap();
+    assert_eq!(model.tools.lock().unwrap()[0], ["exec_command"]);
+    assert_eq!(model.temperatures.lock().unwrap()[0], Some(0.3));
+    assert_eq!(
+        model.instructions.lock().unwrap()[0].as_deref(),
+        Some("do the thing\n\nstatic fragment\n\nper-run fragment")
+    );
+    assert!(model.inputs.lock().unwrap()[0].iter().any(|item| {
+        matches!(item, ModelInputItem::Message(message)
+            if message.text_content() == "processed by shell")
+    }));
+}
 
-    let error = plan.assemble(&run_context("run-1")).await.unwrap_err();
-    let message = error.to_string();
+#[tokio::test]
+async fn a_raw_prepared_capability_keeps_its_static_prefix_and_all_runtime_channels() {
+    let capability = TestCapability::new(CapabilityFamily::SHELL)
+        .with_tool("exec_command")
+        .with_static_section("shell", "already prepared static fragment")
+        .with_section("shell", "per-run fragment")
+        .with_deferred_section("deferred fragment")
+        .with_temperature(0.3)
+        .with_processor();
+    let static_reads = capability.static_resolutions.clone();
+    let tools = capability.tools();
+    let prepared = agent()
+        .to_builder()
+        .instructions("do the thing\n\nalready prepared static fragment")
+        .tools(tools.iter().cloned())
+        .build()
+        .unwrap();
+    let model = RecordingModel::scripted(&["exec_command"]);
+    let request = RunRequest::new(
+        AgentBinding::direct(prepared),
+        Arc::new(FixedResolver {
+            model: model.clone(),
+        }),
+        RunId::generate(),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("go"))],
+    )
+    .with_prepared_capabilities([capability.into_shared()], tools);
+    Runner::run(request).await.unwrap();
+    assert_eq!(static_reads.load(Ordering::SeqCst), 0);
+    for instructions in model.instructions.lock().unwrap().iter() {
+        assert_eq!(
+            instructions.as_deref(),
+            Some("do the thing\n\nalready prepared static fragment\n\nper-run fragment")
+        );
+    }
+    assert_eq!(model.temperatures.lock().unwrap()[0], Some(0.3));
+    assert!(model.messages(0).contains(&"processed by shell".to_owned()));
+    assert!(!model.messages(0).contains(&"deferred fragment".to_owned()));
+    assert!(model.messages(1).contains(&"deferred fragment".to_owned()));
+}
+
+#[tokio::test]
+async fn prepared_handlers_replace_their_original_slots_and_direct_tools_append() {
+    let zeta: Arc<dyn Tool> = Arc::new(NamedTool::new("zeta"));
+    let alpha: Arc<dyn Tool> = Arc::new(NamedTool::new("alpha"));
+    let mut bound_alpha = NamedTool::new("alpha");
+    bound_alpha.output = "bound handler result";
+    let mut capability = TestCapability::new(CapabilityFamily::SHELL).binding_with_tools(vec![
+        Arc::new(bound_alpha),
+        Arc::new(NamedTool::new("zeta")),
+    ]);
+    capability.tools = vec![zeta.clone(), alpha.clone()];
+    let prepared = agent()
+        .to_builder()
+        .tools([
+            zeta.clone(),
+            Arc::new(NamedTool::new("base")),
+            alpha.clone(),
+        ])
+        .build()
+        .unwrap();
+    let config = RunConfig::new()
+        .with_capability(
+            TestCapability::new(CapabilityFamily::MEMORY)
+                .with_tool("appended")
+                .into_shared(),
+        )
+        .with_prepared_capabilities([capability.into_shared()], [zeta, alpha]);
+    let model = RecordingModel::scripted(&["alpha"]);
+    let request = RunRequest::new(
+        AgentBinding::direct(prepared),
+        Arc::new(FixedResolver {
+            model: model.clone(),
+        }),
+        RunId::generate(),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("go"))],
+    )
+    .with_config(config);
+    Runner::run(request).await.unwrap();
+    for tools in model.tools.lock().unwrap().iter() {
+        assert_eq!(tools, &["zeta", "base", "alpha", "appended"]);
+    }
     assert!(
-        message.contains("capability `shell`") && message.contains("section `shell`"),
-        "the refusal names the capability and its section: {message}"
-    );
-    assert!(
-        message.contains("where the agent is built"),
-        "the refusal names the route that does carry static text: {message}"
-    );
-    assert!(
-        message.contains("deferred_instructions"),
-        "the refusal names the other way out — moving the text to a channel this route reads: \
-         {message}"
+        serde_json::to_string(&model.inputs.lock().unwrap()[1])
+            .unwrap()
+            .contains("bound handler result")
     );
 }
 
-/// A capability with no static text assembles on the run path with everything else intact.
-///
-/// The counterpart to the refusal above: the check is about one channel, not about tools. A
-/// capability that keeps its text in the per-run channel contributes on this route in full.
+#[tokio::test]
+async fn raw_prepared_capabilities_reject_changed_or_duplicate_bound_declarations() {
+    for change in ["key", "schema", "options", "added", "removed", "duplicate"] {
+        let original: Arc<dyn Tool> = Arc::new(NamedTool::new("prepared"));
+        let mut bound = NamedTool::new(if change == "key" {
+            "renamed"
+        } else {
+            "prepared"
+        });
+        if change == "schema" {
+            bound.schema = ToolSchema::new(
+                "prepared",
+                json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}),
+            )
+            .unwrap();
+        }
+        if change == "options" {
+            bound.options = ToolOptions::new()
+                .with_permission_scope(ra_core::permission::PermissionScope::Edit);
+        }
+        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(bound)];
+        if change == "removed" {
+            tools.clear();
+        } else if change == "added" {
+            tools.push(Arc::new(NamedTool::new("extra")));
+        } else if change == "duplicate" {
+            tools.push(Arc::new(NamedTool::new("prepared")));
+        }
+        let mut capability = TestCapability::new(CapabilityFamily::SHELL).binding_with_tools(tools);
+        capability.tools = vec![original.clone()];
+        let prepared = agent().to_builder().tool(original.clone()).build().unwrap();
+        let model = RecordingModel::new();
+        let request = RunRequest::new(
+            AgentBinding::direct(prepared),
+            Arc::new(FixedResolver {
+                model: model.clone(),
+            }),
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("go"))],
+        )
+        .with_prepared_capabilities([capability.into_shared()], [original]);
+        let error = Runner::run(request).await.unwrap_err();
+        assert!(
+            error.to_string().contains("tool surface")
+                || error.to_string().contains("duplicate bound tool"),
+            "{change}: {error}"
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0, "{change}");
+    }
+}
+
+#[tokio::test]
+async fn prepared_tools_require_exact_ownership_and_do_not_hide_direct_collisions() {
+    for owns_handler in [false, true] {
+        let original: Arc<dyn Tool> = Arc::new(NamedTool::new("prepared"));
+        let mut capability = TestCapability::new(CapabilityFamily::SHELL);
+        capability.tools = vec![original.clone()];
+        let tool = if owns_handler {
+            original.clone()
+        } else {
+            Arc::new(NamedTool::new("prepared"))
+        };
+        let prepared = agent().to_builder().tool(tool).build().unwrap();
+        let mut config =
+            RunConfig::new().with_prepared_capabilities([capability.into_shared()], [original]);
+        if owns_handler {
+            config = config.with_capability(
+                TestCapability::new(CapabilityFamily::MEMORY)
+                    .with_tool("prepared")
+                    .into_shared(),
+            );
+        }
+        let model = RecordingModel::new();
+        let request = RunRequest::new(
+            AgentBinding::direct(prepared),
+            Arc::new(FixedResolver {
+                model: model.clone(),
+            }),
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("go"))],
+        )
+        .with_config(config);
+        let error = Runner::run(request).await.unwrap_err();
+        assert!(
+            error.to_string().contains(if owns_handler {
+                "more than once"
+            } else {
+                "exact shared"
+            }),
+            "{error}"
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_capabilities_may_still_change_their_bound_tool_declarations() {
+    let capability = TestCapability::new(CapabilityFamily::SHELL)
+        .with_tool("declared")
+        .binding_with_tools(vec![Arc::new(NamedTool::new("bound"))])
+        .into_shared();
+    let model = RecordingModel::new();
+    Runner::run(run_request(
+        &model,
+        RunConfig::new().with_capability(capability),
+        &CancelScope::root(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(model.tools.lock().unwrap()[0], ["bound"]);
+}
+
+/// The per-run instruction channel remains independently usable.
 #[tokio::test]
 async fn run_assembly_accepts_a_capability_whose_text_is_per_run() {
     let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
@@ -889,6 +1174,25 @@ async fn run_assembly_accepts_a_capability_whose_text_is_per_run() {
         .map(|section| section.content())
         .collect();
     assert_eq!(sections, ["per-run fragment"]);
+}
+
+#[tokio::test]
+async fn capability_instruction_fragments_preserve_their_original_whitespace() {
+    let plan = CapabilityPlan::resolve([TestCapability::new(CapabilityFamily::SHELL)
+        .with_static_section("shell", "\n static text \n")
+        .with_section("shell", " \n")
+        .into_shared()])
+    .unwrap();
+    let prepared = plan
+        .assemble(&run_context("whitespace"))
+        .await
+        .unwrap()
+        .prepare_agent(&agent())
+        .unwrap();
+    assert_eq!(
+        prepared.instructions().unwrap().as_static(),
+        Some("do the thing\n\n\n static text \n\n\n \n")
+    );
 }
 
 /// The run-free reading enforces the same structural prefix rules as the runtime path.

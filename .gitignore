@@ -53,6 +53,7 @@ target
 !/Docs/Run_Entry_Contract.md
 !/Docs/Framework_Quickstart.md
 !/Docs/Dynamic_Instructions_Contract.md
+!/Docs/Capability_Assembly_Contract.md
 !/Docs/Unix_Socket_Transport_Contract.md
 !/Docs/Streaming_Deltas_Contract.md
 !/Docs/R11-1_MCP_stdio_契约与验证.md

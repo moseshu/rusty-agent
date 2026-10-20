@@ -7,6 +7,7 @@ use ra_context::{
     eviction::ToolOutputReferenceTrimmer,
 };
 use ra_core::{
+    capability::Capability,
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
     skill::SkillCatalog,
@@ -51,6 +52,7 @@ pub struct CodingHost {
     collaboration: Option<Collaboration>,
     /// Set on the host a spawned agent is assembled from.
     spawned_agent: bool,
+    capabilities: Vec<Arc<dyn Capability>>,
 }
 
 /// Codex's default namespace for the collaboration tools.
@@ -107,6 +109,7 @@ impl CodingHost {
             request_user_input: false,
             collaboration: None,
             spawned_agent: false,
+            capabilities: Vec::new(),
         })
     }
 
@@ -133,6 +136,19 @@ impl CodingHost {
     pub fn with_skill_catalog(mut self, catalog: Arc<dyn SkillCatalog>) -> Self {
         self.skills = Some(catalog);
         self
+    }
+
+    /// Adds an explicitly selected product capability. Roles and tiers select its tools together
+    /// with its prompt and runtime behavior. Use `build_agent_with_control` for standalone runs
+    /// and bind each request through the returned agent so its runtime contributions are installed.
+    #[must_use]
+    pub fn with_capability(mut self, capability: Arc<dyn Capability>) -> Self {
+        self.capabilities.push(capability);
+        self
+    }
+
+    pub(crate) fn capabilities(&self) -> &[Arc<dyn Capability>] {
+        &self.capabilities
     }
 
     /// Enables questions in Default mode and routes them to `port` for standalone runs.

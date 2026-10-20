@@ -901,9 +901,11 @@ impl AgentControlPort for AgentHandle {
         if lock(&tree.agents).contains_key(&path) {
             return Err(path_taken(&path));
         }
-        let (agent, resources) = tree
+        let prepared = tree
             .prepare_spawned(&path, agent, request.agent_type())
             .await?;
+        let config = prepared.configure_run(parent.config().clone());
+        let (agent, resources) = prepared.into_parts();
         let session_id = SessionId::generate();
         let rollout =
             match create_rollout(&tree, &self.node, &session_id, &path, request.agent_type()).await
@@ -918,7 +920,7 @@ impl AgentControlPort for AgentHandle {
         let environment = ChildEnvironment {
             agent: Arc::clone(&agent),
             model_resolver: Arc::clone(parent.model_resolver()),
-            config: parent.config().clone(),
+            config,
             app_context: parent.app_context().map(Arc::clone),
             services: parent.services().clone(),
             spawned_by: parent.run_id().clone(),
@@ -1193,14 +1195,13 @@ impl Tree {
         path: &AgentPath,
         agent: Arc<AgentSpec>,
         agent_type: Option<&AgentId>,
-    ) -> Result<(Arc<AgentSpec>, Option<Arc<dyn SpawnedAgentResources>>), AgentControlError> {
+    ) -> Result<PreparedSpawnedAgent, AgentControlError> {
         let Some(factory) = self.spawned_agent_factory.get() else {
-            return Ok((agent, None));
+            return Ok(PreparedSpawnedAgent::new(agent));
         };
         factory
             .prepare(SpawnedAgentRequest::new(path, &agent, agent_type))
             .await
-            .map(PreparedSpawnedAgent::into_parts)
             .map_err(|error| {
                 AgentControlError::Unsupported(format!(
                     "agent `{path}` could not be prepared: {error}"

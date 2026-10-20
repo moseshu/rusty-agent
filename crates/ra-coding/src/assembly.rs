@@ -25,19 +25,12 @@
 //! the reviewed prefix snapshots; recording them here as well would make one edit move two artifacts
 //! that answer for the same fact, and the second one would be the copy nobody reads.
 //!
-//! # Why there is no deferred column
+//! # Runtime costs
 //!
-//! A capability's third prompt channel is delivered by the turn loop from the capabilities installed
-//! on the *run configuration*, and every capability a tier assembles is installed on the agent
-//! instead. So the deferred cost of every row here is not zero-for-now but zero-by-construction, and
-//! a column of structural zeroes reads as a measurement. What holds it is an assertion rather than a
-//! number: the coding host's capabilities are checked to declare no deferred text, which fails on
-//! the day one of them wants some — and that is the day this product has to decide how such a
-//! fragment reaches a run at all.
-//!
-//! Reporting the run configuration's own capabilities here instead would report the wrong number:
-//! a deferred fragment is resolved from the capability *bound to a run*, and no run exists while a
-//! record is being rendered.
+//! Deferred fragments and per-run instructions are resolved only after a capability is bound to a
+//! run. This construction-time record therefore measures static sections rather than fabricating
+//! runtime token counts. Selected capabilities now retain their runtime channels; integration tests
+//! verify that profile withdrawal removes their sampling, processing and deferred behavior too.
 //!
 //! # Why the tiers that cannot be assembled are rows too
 //!

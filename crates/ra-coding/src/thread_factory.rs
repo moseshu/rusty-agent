@@ -120,7 +120,12 @@ impl ThreadFactory for CodingThreadFactory {
             AgentBinding::direct(assembled.agent),
             Arc::clone(&self.models),
         )
-        .with_config(self.settings.initialize(host.build_run_config()))
+        .with_config(
+            self.settings.initialize(
+                host.build_run_config()
+                    .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
+            ),
+        )
         .with_services(host.build_tool_services());
         // Each thread owns a tree of its own, as each Codex session owns its agents; the thread
         // shuts it down when it closes.
