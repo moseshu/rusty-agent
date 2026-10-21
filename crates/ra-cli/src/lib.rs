@@ -37,6 +37,43 @@ const EXIT_PREFIX_CHANGED: u8 = 1;
 /// scripts to treat one of them as success.
 const EXIT_CHECK_FAILED: u8 = 2;
 
+/// Stack budget for the threads that poll a command: Codex's `THREAD_STACK_SIZE_BYTES`, 16 MiB.
+///
+/// The same value as `ra_runtime::runner::THREAD_STACK_SIZE_BYTES`, which this crate cannot name
+/// because its dependency allowlist stops at the product crates; the test workspace holds the two
+/// equal. Nested agent runs need it in debug builds, where each level costs hundreds of KiB.
+pub const THREAD_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Runs the binary's async entry point as Codex's `arg0` runs its own.
+///
+/// `Runtime::block_on` polls its future on the calling thread, so the entry point gets a thread of
+/// its own with [`THREAD_STACK_SIZE_BYTES`] of stack, and the multi-thread runtime's workers get
+/// the same budget. The future is built on that thread. A panic in it is resumed on the caller.
+///
+/// # Errors
+///
+/// Returns an error when the thread or the runtime cannot be started.
+pub fn run_with_stack_budget<F, Fut, T>(main: F) -> std::io::Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T>,
+    T: Send + 'static,
+{
+    let thread = std::thread::Builder::new()
+        .name("ra-main".to_owned())
+        .stack_size(THREAD_STACK_SIZE_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(THREAD_STACK_SIZE_BYTES)
+                .build()?;
+            Ok(runtime.block_on(main()))
+        })?;
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// How a command concluded, before it becomes a process exit code.
 ///
 /// [`ExitCode`] is neither comparable nor constructible back into a number, so a command that only

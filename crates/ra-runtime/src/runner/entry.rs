@@ -161,6 +161,39 @@ thread_local! {
     static SYNC_RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
+/// Drives the run `start` builds on `runtime` from a scoped thread with Codex's stack budget.
+///
+/// The runtime stays the calling thread's: a current-thread runtime may be entered from any
+/// thread, one at a time, and the scope joins before the caller's borrow of it ends. The future
+/// is built on the new thread, so it need not be `Send`. The caller's tracing dispatcher and
+/// current span are installed there first, because a thread-local default subscriber and the
+/// current-span stack would otherwise stay behind on the calling thread.
+fn block_on_with_stack_budget<F, Fut>(runtime: &Runtime, start: F) -> Result<RunResult>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<RunResult>>,
+{
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let span = tracing::Span::current();
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("ra-sync-run".to_owned())
+            .stack_size(super::THREAD_STACK_SIZE_BYTES)
+            .spawn_scoped(scope, move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let _entered = span.enter();
+                    runtime.block_on(start())
+                })
+            })
+            .map_err(|error| {
+                Error::caller("failed to start the sync run thread").with_source(error)
+            })?;
+        worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 impl Runner {
     /// Runs an explicit request synchronously outside a Tokio runtime.
     ///
@@ -168,6 +201,15 @@ impl Runner {
     /// It only progresses while this thread is inside `run_sync`. Hosts needing background work
     /// between calls should own a Tokio runtime and await [`Self::run`] instead. No signal handler
     /// is installed; a host can cancel from another thread using the request's explicit scope.
+    ///
+    /// The run is polled on a library-owned thread with
+    /// [`super::THREAD_STACK_SIZE_BYTES`] of stack, started for the call and joined before it
+    /// returns, as Codex runs its entry point on a thread with that budget instead of the
+    /// caller's stack. Nested agent runs need it in debug builds; the caller's thread may have a
+    /// far smaller stack. The caller's tracing dispatcher and current span are carried over, so
+    /// the run's spans reach the same subscriber with the same parent. Other thread-local state
+    /// of the caller is not visible to the run's callbacks. A panic in the run is resumed on the
+    /// caller.
     pub fn run_sync(request: RunRequest) -> Result<RunResult> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::caller(
@@ -188,7 +230,7 @@ impl Runner {
                 );
             }
             match runtime.as_ref() {
-                Some(runtime) => runtime.block_on(Self::run(request)),
+                Some(runtime) => block_on_with_stack_budget(runtime, move || Self::run(request)),
                 None => Err(Error::caller("the sync run runtime was not initialized")),
             }
         })

@@ -7,17 +7,22 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
-    match ra_cli::execute(ra_cli::Cli::parse()).await {
-        Ok(output) => {
-            print!("{}", output.stdout());
-            output.outcome().exit_code()
+    let status = ra_cli::run_with_stack_budget(|| async {
+        match ra_cli::execute(ra_cli::Cli::parse()).await {
+            Ok(output) => {
+                print!("{}", output.stdout());
+                output.outcome().exit_code()
+            }
+            Err(error) => {
+                tracing::error!("{error:#}");
+                ExitCode::FAILURE
+            }
         }
-        Err(error) => {
-            tracing::error!("{error:#}");
-            ExitCode::FAILURE
-        }
-    }
+    });
+    status.unwrap_or_else(|error| {
+        tracing::error!("cannot start the command's runtime: {error}");
+        ExitCode::FAILURE
+    })
 }

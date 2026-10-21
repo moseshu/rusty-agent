@@ -155,6 +155,29 @@ use crate::sandbox::{SandboxRunConfig, SandboxRuntime};
 /// hit something. Sizing the work is what the rest of [`BudgetLimit`] is for.
 pub const DEFAULT_MAX_TURNS: u32 = 32;
 
+/// Stack budget for a thread that polls agent runs: Codex's `THREAD_STACK_SIZE_BYTES`, 16 MiB.
+///
+/// Each nested agent run (an agent tool, or a spawned agent driven on the same task) adds the
+/// runner's poll frames to the stack of the thread polling it. In a debug build those frames are
+/// large: about 670 KiB per nesting level has been measured on macOS aarch64, so three levels need
+/// about 2 MiB — all of Tokio's default worker stack and of the default for spawned threads.
+/// [`Runner::run_sync`] runs on a thread with this budget. A host that owns its runtime should
+/// give its worker threads the same, as Codex does:
+///
+/// ```no_run
+/// use ra_runtime::runner::THREAD_STACK_SIZE_BYTES;
+///
+/// let runtime = tokio::runtime::Builder::new_multi_thread()
+///     .enable_all()
+///     .thread_stack_size(THREAD_STACK_SIZE_BYTES)
+///     .build()
+///     .unwrap();
+/// ```
+///
+/// `Runtime::block_on` polls its future on the calling thread, so that thread needs the budget
+/// too.
+pub const THREAD_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Freezes a reviewed declaration while retaining the exact handler whose slot may be replaced.
 #[derive(Clone)]
 struct PreinstalledCapabilityTool {
@@ -1331,6 +1354,11 @@ impl Runner {
     /// Boxed because the loop's future carries a whole turn — preparation, the model call, and the
     /// dispatcher its stream starts tools through — and a caller that composes runs should not
     /// have to hold all of it inline on the stack.
+    ///
+    /// Boxing moves the future to the heap, but polling it still uses the stack of the thread that
+    /// polls, and every nested agent run deepens it. Poll this on a thread with
+    /// [`THREAD_STACK_SIZE_BYTES`] of stack, as Codex does: Tokio's default worker stack is
+    /// exhausted by about three levels of nesting in a debug build.
     pub async fn run(request: RunRequest) -> Result<RunResult> {
         let sandbox = sandbox_runtime(&request);
         let mut abandoned = ReleaseSandboxOnDrop(Some(Arc::clone(&sandbox)));

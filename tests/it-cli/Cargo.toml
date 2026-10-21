@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 ra-cli = { path = "../../crates/ra-cli" }
 ra-coding = { path = "../../crates/ra-coding" }
+ra-runtime = { path = "../../crates/ra-runtime" }
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 tempfile = "3"

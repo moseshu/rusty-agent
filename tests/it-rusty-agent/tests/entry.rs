@@ -778,6 +778,66 @@ fn sync_call_cancelled_from_another_thread_leaves_the_runtime_reusable() {
     assert_eq!(model.requests.lock().unwrap().len(), 1);
 }
 
+fn agent_tool_call(id: &str, tool: &str) -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new(id),
+        RunItemKind::ToolCall(ToolCall::new(
+            CallId::new(id),
+            tool,
+            json!({"input": "x"}),
+        )),
+    )])
+}
+
+/// An agent that hands its work to `delegate` through an agent tool of that name.
+fn delegating_agent(id: &str, delegate: &Arc<AgentSpec>) -> Arc<AgentSpec> {
+    AgentSpec::builder()
+        .id(AgentId::new(id))
+        .name(id)
+        .instructions("Delegate.")
+        .tool(Arc::new(
+            delegate
+                .as_tool()
+                .tool_name(delegate.id().as_str())
+                .tool_description("Delegate the work.")
+                .build()
+                .unwrap(),
+        ))
+        .build()
+        .unwrap()
+}
+
+// Codex runs its entry point on a thread with its own stack budget because `block_on` polls on the
+// caller's stack. Three nested agent runs need about 2 MiB in a debug build; the caller here has a
+// quarter of a mebibyte, so the run only completes if `run_sync` polls it elsewhere.
+#[test]
+fn sync_runs_nested_agents_on_a_caller_with_a_small_stack() {
+    let inner = AgentSpec::builder()
+        .id(AgentId::new("inner"))
+        .name("inner")
+        .instructions("Answer.")
+        .build()
+        .unwrap();
+    let middle = delegating_agent("middle", &inner);
+    let outer = delegating_agent("outer", &middle);
+    let model = ScriptedModel::new(vec![
+        agent_tool_call("outer-call", "middle"),
+        agent_tool_call("middle-call", "inner"),
+        answer("inner done"),
+        answer("middle done"),
+        answer("outer done"),
+    ]);
+    let runner = AgentRunner::new(registry(model.clone()));
+    let text = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || runner.run_sync(outer, "go").unwrap().final_text().to_owned())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(text, "outer done");
+    assert_eq!(model.requests.lock().unwrap().len(), 5);
+}
+
 #[tokio::test]
 async fn cancelling_borrowed_async_callbacks_stops_without_calling_the_model() {
     let model = ScriptedModel::new(vec![answer("unused")]);
