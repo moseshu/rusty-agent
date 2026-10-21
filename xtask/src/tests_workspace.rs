@@ -1,7 +1,7 @@
 //! The `test` gate: runs the separate test workspace.
 //!
 //! Tests do not live in the main workspace (see
-//! [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §5.5), so
+//! the project structure §5.5), so
 //! `cargo test --workspace` reaches no behavioral assertion at all. This gate is that entry point.
 //!
 //! `tests/` **is committed**, so its absence does not mean "not on this machine" but a broken

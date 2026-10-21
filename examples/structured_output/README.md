@@ -24,4 +24,4 @@ cargo run -p structured_output
 
 For sequences or scalar types, the wire object contains `response`; the returned Rust value is
 unwrapped. Use `OutputSchema::for_type_with_strict::<T>(false)` for open maps or loose schemas.
-See [the output contract](../../Docs/Structured_Output_Contract.md) for recovery and tool-stop semantics.
+See the output contract for recovery and tool-stop semantics.

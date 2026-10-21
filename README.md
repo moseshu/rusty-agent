@@ -121,13 +121,13 @@ On the current checkout, `rusty-agent` provides a unified import surface and a c
 `runner.run(agent, "Hello").await?`. Optional session, context, or configuration goes through
 `runner.request(agent, input).with_session(session).run().await?`. The explicit `RunRequest`
 entry remains available. See the [basic agent example](examples/basic_agent/README.md) and
-[run entry contract](Docs/Run_Entry_Contract.md) for sync, streaming, recovery, and feature options.
+run entry contract for sync, streaming, recovery, and feature options.
 
 ```bash
 cargo run -p basic_agent -- --check
 ```
 
-Continue with the [framework quickstart](Docs/Framework_Quickstart.md) for runnable
+Continue with the framework quickstart for runnable
 sessions, streaming, application context, handoffs, agents as tools, approval recovery,
 guardrails, and lifecycle callbacks. The [example index](examples/README.md) distinguishes
 live provider runs from the offline checks executed in CI.
@@ -146,7 +146,7 @@ cargo run -p custom_tools -- --check
 ```
 
 The same example supports a shipped provider for live runs. See the
-[function-tool contract](Docs/Function_Tool_Contract.md) for options, supported types,
+function-tool contract for options, supported types,
 Rust adaptations, and remaining upstream gaps. Handwritten `Tool` implementations
 remain available for custom behavior.
 
@@ -155,7 +155,7 @@ remain available for custom behavior.
 0.2.0 changes the public API. Session I/O takes `SessionPath` in place of `&str`, and several
 sandbox request types are built through constructors and read through accessors instead of
 public fields. Section 13.6 of the
-[R8-P0 checklist](Docs/R8-P0_上游沙箱契约与差异清单.md) (in Chinese) lists each change and
+R8-P0 checklist (in Chinese) lists each change and
 how to adapt.
 
 ## Building

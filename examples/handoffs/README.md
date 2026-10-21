@@ -33,5 +33,5 @@ server-managed conversations reject handoff input filters.
 
 Targets remain registered through `AgentRegistry`. Declaration or registry errors
 stop before a model call; invalid typed parameters and callback failures stop the
-transfer before the target runs. See [the handoff contract](../../Docs/Handoff_Contract.md)
+transfer before the target runs. See the handoff contract
 for recovery, migration, and the deferred beta history options.

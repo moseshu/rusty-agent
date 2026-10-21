@@ -1,6 +1,6 @@
 # Framework examples
 
-Start with the [framework quickstart](../Docs/Framework_Quickstart.md) and
+Start with the framework quickstart and
 [basic_agent](basic_agent/README.md). Each directory below is an independently compiled
 workspace binary. Run it with `cargo run -p NAME`, not `--example`.
 

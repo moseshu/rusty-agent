@@ -1,6 +1,6 @@
 //! The `no-inline-tests` gate: no test code is allowed under `crates/`.
 //!
-//! The constraint itself is in [the project structure](../../Docs/Rusty_Agent_Project_Structure.md)
+//! The constraint itself is in the project structure
 //! §5.5: behavioral tests all live in the separate `tests/` workspace. **Discipline alone cannot
 //! hold this** — dropping a `#[cfg(test)] mod tests` next to the implementation is the most
 //! natural thing to do while writing it, which is why there is a gate.

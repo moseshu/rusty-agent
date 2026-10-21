@@ -35,39 +35,10 @@ target
 # eval fixture 输出
 /fixtures/out/
 
-# 开发文档——一次性分析不上传；开发计划与持续维护的移植契约清单进库。
-# 计划文档是执行依据，它的每次修订理由（尤其撤销记录）需要可追溯；
-# 一次性分析文档没有这个需要，继续忽略。
-# 用 `/Docs/*` 而不是 `/Docs/`：git 无法重新纳入一个被排除的目录下的文件，
-# 排除目录内容才能让下面这条否定生效。
-/Docs/*
-!/Docs/Rusty_Agent_Framework_Development_Plan.md
-!/Docs/R8-P0_上游沙箱契约与差异清单.md
-!/Docs/R9-14_Responses_Compaction_Session.md
-!/Docs/Deferred_Dynamic_Tools_Contract.md
-!/Docs/MCP_Resource_Tools_Contract.md
-!/Docs/R2-8_Host_Assembly_Contract.md
-!/Docs/Handoff_Contract.md
-!/Docs/Function_Tool_Contract.md
-!/Docs/Structured_Output_Contract.md
-!/Docs/Run_Entry_Contract.md
-!/Docs/Framework_Quickstart.md
-!/Docs/Dynamic_Instructions_Contract.md
-!/Docs/Capability_Assembly_Contract.md
-!/Docs/Unix_Socket_Transport_Contract.md
-!/Docs/Streaming_Deltas_Contract.md
-!/Docs/Deterministic_Fixtures_Contract.md
-!/Docs/Local_Trace_Replay_Contract.md
-!/Docs/R11-1_MCP_stdio_契约与验证.md
-!/Docs/R11-2_MCP_HTTP_契约与验证.md
-!/Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md
-!/Docs/R11-5_MCP_工具审批_契约与验证.md
-!/Docs/R11-6_MCP_运行时控制_契约与验证.md
-!/Docs/R11-6b_MCP_生命周期_task_affinity_契约与验证.md
-!/Docs/R11-12_MCP_工具元数据解析_契约与验证.md
-!/Docs/Rustls_Provider_Initialization.md
-!/Docs/Thread_List_Contract.md
-!/Docs/Thread_Read_State_Review.md
+# 开发文档（不上传 GitHub）——开发计划、契约与分析文档都只留在本地。
+# 代价：`scripts/check_examples.py` 的快速入门摘录校验只能在有 Docs/ 的本地 checkout 上跑，
+# CI 与全新 clone 上报 SKIP。
+/Docs/
 
 # 门禁基线与快照（不上传 GitHub）——本地产物，`cargo xtask <gate> --bless` 生成。
 # 注意代价：它们是 `public-api` / `schema-stability` / `prompt-dump` 三条门禁的对账对象，

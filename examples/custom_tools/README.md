@@ -24,6 +24,6 @@ endpoint, then run `cargo run -p custom_tools`. `OPENAI_BASE_URL` selects a cust
 Responses endpoint and `RA_REQUEST` overrides the question. Live runs consume the
 configured provider; they are not part of the offline check.
 
-See [function tool contracts](../../Docs/Function_Tool_Contract.md) for callbacks,
+See function tool contracts for callbacks,
 policies, argument semantics, supported types, and remaining upstream gaps.
 Handwritten `Tool` implementations remain available for custom execution behavior.

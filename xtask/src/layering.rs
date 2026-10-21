@@ -2,8 +2,8 @@
 //! the modern module layout.
 //!
 //! The rules come from the crate table in
-//! [the development plan](../../Docs/Rusty_Agent_Framework_Development_Plan.md) and from
-//! [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §1:
+//! the development plan and from
+//! the project structure §1:
 //!
 //! 1. every crate may depend only on the internal crates its responsibility table allows;
 //! 2. the **kernel** (`ra-core`, `ra-macros`, `ra-runtime`) depends on no reusable piece and no
@@ -106,7 +106,7 @@ const LAYERS: &[(&str, Layer)] = &[
 /// boundary first. The planned orchestration crate is pre-registered and bound from day one.
 ///
 /// **This table is the single source of truth for the dependency graph**; the graph in
-/// [the project structure](../../Docs/Rusty_Agent_Project_Structure.md) §1 has to agree with it.
+/// the project structure §1 has to agree with it.
 /// When they disagree this wins and the document is fixed on the spot — the whole point of an
 /// allowlist is to eliminate the drift where the diagram says one thing and `Cargo.toml` another.
 ///

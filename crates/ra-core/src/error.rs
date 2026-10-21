@@ -642,7 +642,7 @@ impl Error {
     /// have to go through `Error::config(format!("...: {err}"))`. That idiom silently reclassifies
     /// everything it touches: a retryable provider timeout becomes a configuration problem needing
     /// a human, and a cancellation stops answering `true` to [`Self::is_cancelled`] — the one test
-    /// the [cancellation contract](../../../Docs/Cancellation_Contract.md) permits. It also drops
+    /// the cancellation contract permits. It also drops
     /// the original error entirely, leaving nothing in the `source` chain.
     ///
     /// [`Self::Cancelled`] is returned untouched. Its reason is a fixed vocabulary that attribution

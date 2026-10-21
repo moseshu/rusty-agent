@@ -32,7 +32,14 @@ def check_docs(cases):
             if command not in readme.splitlines():
                 raise ValueError(f"{package}: document this exact command: {command}")
 
-    guide = (ROOT / "Docs/Framework_Quickstart.md").read_text()
+    # The quickstart is a local development document that is never pushed, so CI and fresh clones
+    # skip the excerpt check instead of failing on a file they cannot have.
+    guide_path = ROOT / "Docs/Framework_Quickstart.md"
+    if not guide_path.is_file():
+        print(f"Documentation checked: {len(packages)} crates; quickstart excerpts SKIP "
+              f"({guide_path.relative_to(ROOT)} is not in this checkout).", flush=True)
+        return
+    guide = guide_path.read_text()
     snippets = re.findall(
         r"<!-- source: ([^#\s]+)#([^\s]+) -->\n```rust\n(.*?)\n```", guide, re.DOTALL
     )

@@ -10,18 +10,18 @@ by the coding MCP runtime for each model call with enabled servers; a request wa
 that is still starting. They preserve the separate `list_mcp_resources`,
 `list_mcp_resource_templates` and `read_mcp_resource` contracts. Implementation, upstream mapping,
 adaptations and review status are recorded in
-[the resource tool notes](../../Docs/MCP_Resource_Tools_Contract.md).
+the resource tool notes.
 
 Tool filtering/cache passed re-review on 2026-10-18. The contract and validation record is in
-[the filtering/cache notes](../../Docs/R11-4_MCP_工具过滤与缓存_契约与验证.md).
+the filtering/cache notes.
 Metadata resolution, caching and tool-call display metadata passed re-review on 2026-10-18; see
-[the metadata notes](../../Docs/R11-12_MCP_工具元数据解析_契约与验证.md).
+the metadata notes.
 Local tool approval and server tool guardrails passed review and re-review on 2026-10-19; see
-[the approval notes](../../Docs/R11-5_MCP_工具审批_契约与验证.md).
+the approval notes.
 Lifecycle task affinity passed review, re-review of its fixes, and final verification on
 2026-10-19.
 The manager, upstream mapping, Rust adaptations and validation are recorded in
-[the lifecycle notes](../../Docs/R11-6b_MCP_生命周期_task_affinity_契约与验证.md).
+the lifecycle notes.
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -143,7 +143,7 @@ the queue with generation checks and connection-drain tracking. Startup notifica
 failure details and timeout recovery hints. Default framework
 resolver failures still propagate. Review is complete; fixed-registry configuration
 loading and unsupported thread scope remain recorded differences in
-[the runtime-control notes](../../Docs/R11-6_MCP_运行时控制_契约与验证.md).
+the runtime-control notes.
 
 ## Local tool approval
 
@@ -266,7 +266,7 @@ spawned with tokio directly and JSON-RPC stays in the official SDK.
 `cached_tools()` is `None` before the first complete listing. It subsequently returns the
 unfiltered snapshot even when cache reuse is disabled. Approval integration remains follow-up
 work; the runner receives no server lifecycle or MCP-specific policy. See
-[the stdio contract and validation record](../../Docs/R11-1_MCP_stdio_契约与验证.md).
+the stdio contract and validation record.
 
 ## Tool filtering and caching
 
@@ -423,7 +423,7 @@ Custom call items do not inherit the tool declaration's description or title.
 The Responses adapter owns wire conversion and replay of both hosted item kinds. Existing schema
 and model-input projections never acquire the run item's display fields. The source contract,
 Rust representation adaptations and validation are recorded in
-[the metadata notes](../../Docs/R11-12_MCP_工具元数据解析_契约与验证.md).
+the metadata notes.
 
 ## Reusable Streamable HTTP lifecycle
 
@@ -487,7 +487,7 @@ A JSON-RPC error body is a server answer at any HTTP status, as in the MCP Pytho
 its code and message and is correlated to the request. SSE validation applies only to message
 events. Initialize filters control frames before the SDK's separate initialize reader, which
 otherwise parses their data as JSON. Established streams retain their control frames for the
-SDK connector. No transparent session recovery or tool replay is enabled. See the [HTTP contract and validation record](../../Docs/R11-2_MCP_HTTP_契约与验证.md).
+SDK connector. No transparent session recovery or tool replay is enabled. See the HTTP contract and validation record.
 
 ## Contract and adaptations
 
