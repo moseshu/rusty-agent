@@ -1,5 +1,8 @@
 //! Contracts for validating an installed capability set and folding it into one agent.
 
+#[path = "capability_assembly/handoff.rs"]
+mod handoff;
+
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::{

@@ -65,9 +65,10 @@ struct FailedSegment {
 /// Sandbox execution for one run.
 pub(crate) struct SandboxRuntime {
     workspace_scope: SandboxWorkspaceScope,
-    /// The families of the capabilities the run installs for every agent, which a sandbox agent's
-    /// own capabilities must not claim again.
+    /// The families installed on the run's starting declaration, which its sandbox capabilities
+    /// must not claim again.
     run_capability_families: BTreeSet<CapabilityFamily>,
+    run_capability_owner: Option<Arc<AgentSpec>>,
     /// `None` when the run has no sandbox configuration, which is a run that refuses sandbox
     /// agents rather than one that ignores them.
     inner: Option<Mutex<Inner>>,
@@ -93,13 +94,14 @@ impl SandboxRuntime {
     /// Sandbox execution for a run configured with `config`, continued from `resumed` if the run's
     /// checkpoint carried a resume payload.
     ///
-    /// `run_capabilities` are the capabilities the run installs for every agent, `model_resolver`
+    /// `run_capabilities` are installed on `run_capability_owner`, while `model_resolver`
     /// resolves the models sandbox memory runs with, and `rollout_id` names the rollout the run is
     /// recorded under.
     pub(crate) fn new(
         config: Option<SandboxRunConfig>,
         resumed: Option<Value>,
         run_capabilities: &[Arc<dyn Capability>],
+        run_capability_owner: Option<Arc<AgentSpec>>,
         model_resolver: Arc<dyn ModelResolver>,
         rollout_id: Option<String>,
     ) -> Self {
@@ -121,6 +123,7 @@ impl SandboxRuntime {
                 .iter()
                 .map(|capability| capability.kind())
                 .collect(),
+            run_capability_owner,
             inner: config.map(|config| {
                 Mutex::new(Inner {
                     manager: SessionManager::new(config, resumed),
@@ -178,19 +181,18 @@ impl SandboxRuntime {
     }
 
     /// Refuses a sandbox agent in a run that has no sandbox configuration, and one whose own
-    /// capabilities claim a family the run already installs for every agent.
+    /// capabilities claim a family the run already installs on that declaration.
     ///
     /// The second refusal has no counterpart in the reference, which installs capabilities only on
-    /// a sandbox agent. Here a run can also install them for every agent, and the built-in set for
-    /// that route shares its family names with the sandbox set while meaning something else: the
-    /// run-level `shell` and `filesystem` act on the host's workspace, the sandbox ones on the
-    /// session's; the run-level `memory` reads a store, the sandbox one the session's files; the
-    /// run-level `compaction` summarizes locally, the sandbox one asks the provider. Installed
-    /// together, one agent would hold two meanings under one name, so the run is refused before a
-    /// session exists rather than left to whichever tool the model happens to call. The check
-    /// covers every sandbox agent the run prepares, a handoff target included: run-level tools and
-    /// prompt text reach the starting agent only, but run-level context processing runs on every
-    /// turn.
+    /// a sandbox agent. Here a run can also install them on its starting agent, and the built-in
+    /// set for that route shares its family names with the sandbox set while meaning something
+    /// else: the run-level `shell` and `filesystem` act on the host's workspace, the sandbox ones
+    /// on the session's; the run-level `memory` reads a store, the sandbox one the session's
+    /// files; the run-level `compaction` summarizes locally, the sandbox one asks the provider.
+    /// Installed together, one agent would hold two meanings under one name, so the run is refused
+    /// before a session exists rather than left to whichever tool the model happens to call. The
+    /// check covers the starting declaration only: a handoff target receives its own
+    /// capabilities.
     pub(crate) fn assert_agent_supported(&self, agent: &AgentSpec) -> Result<()> {
         if agent.sandbox().is_none() {
             return Ok(());
@@ -207,7 +209,12 @@ impl SandboxRuntime {
             .capabilities()
             .iter()
             .map(|capability| capability.kind())
-            .filter(|family| self.run_capability_families.contains(family))
+            .filter(|family| {
+                self.run_capability_owner
+                    .as_ref()
+                    .is_some_and(|owner| std::ptr::eq(owner.as_ref(), agent))
+                    && self.run_capability_families.contains(family)
+            })
             .collect();
         if !shared.is_empty() {
             let families = shared
@@ -217,9 +224,9 @@ impl SandboxRuntime {
                 .join(", ");
             return Err(Error::config(format!(
                 "sandbox agent `{}` installs capability families {families} that the run also \
-                 installs for every agent; a run-level capability and a sandbox capability of one \
-                 family are two different capabilities under one name, so the agent would hold \
-                 both meanings at once. Install each family in one place: remove it from the \
+                 installs on this declaration; a run-level capability and a sandbox capability of \
+                 one family are two different capabilities under one name, so the agent would \
+                 hold both meanings at once. Install each family in one place: remove it from the \
                  run's capabilities or from the sandbox agent's",
                 agent.id()
             )));

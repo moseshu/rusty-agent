@@ -53,7 +53,7 @@ struct ParentRunEnvironment {
     config: RunConfig,
     /// The declaration supplied with the run configuration, including any prepared surface.
     /// Handoffs update the current turn without transferring ownership of that surface.
-    initial_agent: Arc<AgentSpec>,
+    initial_agent: Option<Arc<AgentSpec>>,
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     run_id: RunId,
     root_run_id: RunId,
@@ -80,8 +80,10 @@ struct TurnView {
 impl ParentRun {
     /// Captures a run's environment before its loop consumes the request.
     ///
-    /// `agent` owns any prepared surface in `config` and initially runs the current turn. The loop
-    /// reports each turn's agent separately, so a handoff preserves that original ownership.
+    /// `agent` initially runs the current turn. `initial_agent` owns any prepared surface in
+    /// `config`, recovered from the checkpoint's starting agent on a continuation. It is absent
+    /// when that declaration is unavailable; the current agent never acquires it by default.
+    /// The loop reports each turn's agent separately, preserving the original ownership.
     /// `services` are the ports the run was given. An agent spawned into the background from this
     /// run starts from both. `event_seqs` is the run's host event sequence, `agent_tree` the agent
     /// tree it executes in, and `spend` its live spend. `trace_group_id` is the group of the trace
@@ -95,6 +97,7 @@ impl ParentRun {
         parent_run_id: Option<&RunId>,
         trace_group_id: Option<String>,
         agent: Arc<AgentSpec>,
+        initial_agent: Option<Arc<AgentSpec>>,
         services: ToolServices,
         rollout: Option<Arc<dyn RolloutRecorder>>,
         event_seqs: EventSeqAllocator,
@@ -108,7 +111,7 @@ impl ParentRun {
             run: Arc::new(ParentRunEnvironment {
                 model_resolver,
                 config,
-                initial_agent: Arc::clone(&agent),
+                initial_agent,
                 app_context,
                 run_id,
                 root_run_id,
@@ -168,8 +171,8 @@ impl ParentRun {
     }
 
     /// The original declaration supplied with the run configuration, before any handoff.
-    pub(crate) fn initial_agent(&self) -> &Arc<AgentSpec> {
-        &self.run.initial_agent
+    pub(crate) fn initial_agent(&self) -> Option<&Arc<AgentSpec>> {
+        self.run.initial_agent.as_ref()
     }
 
     pub(crate) fn app_context(&self) -> Option<&Arc<dyn Any + Send + Sync>> {

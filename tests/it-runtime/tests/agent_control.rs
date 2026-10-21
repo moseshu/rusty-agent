@@ -1660,6 +1660,110 @@ async fn a_child_spawned_after_a_handoff_does_not_inherit_the_initial_prepared_s
     }
 }
 
+/// Resuming the receiving agent must preserve the original surface owner for later spawns.
+#[tokio::test]
+async fn a_child_spawned_after_handoff_approval_resume_does_not_inherit_the_initial_surface() {
+    let quick: Arc<dyn Tool> = Arc::new(QuickTool::new());
+    for surface in [Vec::new(), vec![quick]] {
+        let scripts = Arc::new(Scripts::default());
+        let control = AgentControl::new();
+        let mut tools = collaboration();
+        tools.extend(surface.iter().cloned());
+        let lead = lead_with(&surface)
+            .to_builder()
+            .handoff(HandoffSpec::new(
+                AgentId::new("specialist"),
+                ToolSchema::new(
+                    "transfer_to_specialist",
+                    json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+                ).unwrap(),
+            ))
+            .build().unwrap();
+        let specialist = AgentSpec::builder()
+            .id(AgentId::new("specialist"))
+            .name("Specialist")
+            .instructions("specialist")
+            .tools(tools)
+            .tool(Arc::new(GuardedTool::new()))
+            .build()
+            .unwrap();
+        let config = RunConfig::new()
+            .with_agent_registry(
+                AgentRegistry::builder()
+                    .register(lead.clone())
+                    .register(specialist.clone())
+                    .build()
+                    .unwrap(),
+            )
+            .with_prepared_capabilities(
+                [Arc::new(LeadSurface(surface.clone())) as Arc<dyn Capability>],
+                surface,
+            );
+        scripts.push(
+            "lead",
+            Step::Respond(tool_call(
+                "l-1",
+                "l-call-1",
+                "transfer_to_specialist",
+                json!({}),
+            )),
+        );
+        scripts.push(
+            "specialist",
+            Step::Respond(tool_call("s-1", "s-call-1", "deploy", json!({}))),
+        );
+        let paused = Runner::run(
+            RunRequest::new(
+                AgentBinding::direct(lead),
+                Arc::new(ScriptedResolver(scripts.clone())),
+                RunId::new("run-handoff-resume-spawn"),
+                CancelScope::root(),
+                vec![ModelInputItem::Message(Message::user("go"))],
+            )
+            .with_config(config.clone())
+            .with_agent_control(control.root()),
+        )
+        .await
+        .unwrap();
+        let mut state: RunState =
+            serde_json::from_value(serde_json::to_value(paused.state()).unwrap()).unwrap();
+        let approval = state.pending_interruption_items().next().unwrap().clone();
+        state.approve(&approval, false).unwrap();
+        scripts.push(
+            "specialist",
+            Step::Respond(tool_call(
+                "s-2",
+                "s-call-2",
+                "spawn_agent",
+                json!({"task_name": "helper", "message": "help", "fork_turns": "none"}),
+            )),
+        );
+        scripts.push("specialist", Step::Respond(final_message("s-3", "done")));
+        scripts.push("specialist", Step::Respond(final_message("h-1", "done")));
+        Runner::run(
+            RunRequest::new(
+                AgentBinding::direct(specialist),
+                Arc::new(ScriptedResolver(scripts.clone())),
+                state.run_id().clone(),
+                CancelScope::root(),
+                Vec::new(),
+            )
+            .with_config(config)
+            .with_state(state)
+            .with_agent_control(control.root()),
+        )
+        .await
+        .unwrap();
+        let helper = AgentPath::root().join("helper").unwrap();
+        eventually_status(&control, &helper, |status| {
+            matches!(status, AgentStatus::Completed(_))
+        })
+        .await;
+        assert_eq!(scripts.temperatures("lead"), vec![Some(0.31)]);
+        assert_eq!(scripts.temperatures("specialist"), vec![None; 4]);
+    }
+}
+
 /// A factory can return a new declaration with the same ID and tool objects. The host must
 /// explicitly select a prepared surface for that declaration rather than inheriting by ID.
 #[tokio::test]

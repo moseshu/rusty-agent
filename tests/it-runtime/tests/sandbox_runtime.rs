@@ -1697,10 +1697,10 @@ async fn a_capability_missing_its_dependency_is_refused() {
     );
 }
 
-/// A family the run installs for every agent cannot be installed again on a sandbox agent. The
-/// run-level and the sandbox capability of one family are two different capabilities under one
-/// name, so the run is refused before a session exists, on both entry points, naming every shared
-/// family and only those.
+/// A family the run installs on its starting agent cannot be installed again on that sandbox
+/// agent. The run-level and the sandbox capability of one family are two different capabilities
+/// under one name, so the run is refused before a session exists, on both entry points, naming
+/// every shared family and only those.
 #[tokio::test]
 async fn a_family_the_run_installs_cannot_be_installed_again_on_a_sandbox_agent() {
     for streamed in [false, true] {
@@ -1731,7 +1731,7 @@ async fn a_family_the_run_installs_cannot_be_installed_again_on_a_sandbox_agent(
         assert!(
             message.contains(
                 "sandbox agent `coder` installs capability families `filesystem`, `shell` that \
-                 the run also installs for every agent"
+                 the run also installs on this declaration"
             ),
             "{message}"
         );
@@ -1794,19 +1794,22 @@ async fn local_compaction_for_the_run_and_the_default_sandbox_set_are_refused_to
     assert_eq!(result.final_text(), "done");
 }
 
-/// Run-level context processing runs on a handoff target's turns too, so a sandbox agent reached by
-/// a handoff is held to the same rule, at the turn it would take over and before its session exists.
+/// A handoff target uses its own capabilities, even when the starting declaration installed
+/// capabilities from the same family on the run configuration.
 #[tokio::test]
-async fn a_handoff_into_a_sandbox_agent_sharing_a_run_family_is_refused() {
+async fn a_handoff_into_a_sandbox_agent_uses_its_own_capability_family() {
     let model = ScriptedModel::new(vec![
         tool_call("call-1", "transfer_to_coder"),
         final_answer("msg-2", "done"),
     ]);
+    let mut target_capability = WorkspaceCapability::new("compaction");
+    target_capability.fragment = Some("target capability");
+    target_capability.temperature = Some(0.7);
+    let target_bindings = target_capability.bindings.clone();
     let coder = sandbox_agent(
         "coder",
         "Coder",
-        SandboxAgentConfig::empty()
-            .with_capability(Arc::new(WorkspaceCapability::new("compaction"))),
+        SandboxAgentConfig::empty().with_capability(Arc::new(target_capability)),
     );
     let planner = AgentSpec::builder()
         .id(AgentId::new("planner"))
@@ -1824,25 +1827,28 @@ async fn a_handoff_into_a_sandbox_agent_sharing_a_run_family_is_refused() {
         .unwrap();
     let client = FakeClient::new();
 
-    let error = Runner::run(request(
+    let mut source_capability = WorkspaceCapability::new("compaction");
+    source_capability.fragment = Some("source capability");
+    source_capability.temperature = Some(0.2);
+    let result = Runner::run(request(
         planner,
         &model,
         RunConfig::new()
             .with_agent_registry(registry)
             .with_sandbox(with_client(&client))
-            .with_capability(Arc::new(WorkspaceCapability::new("compaction"))),
+            .with_capability(Arc::new(source_capability)),
     ))
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("sandbox agent `coder` installs capability families `compaction`"),
-        "{error}"
-    );
-    assert_eq!(model.inputs.lock().unwrap().len(), 1);
-    assert!(client.log().is_empty(), "{:?}", client.log());
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(model.inputs.lock().unwrap().len(), 2);
+    assert_eq!(target_bindings.load(Ordering::SeqCst), 1);
+    assert!(model.instructions(0).contains("source capability"));
+    assert!(!model.instructions(1).contains("source capability"));
+    assert!(model.instructions(1).contains("target capability"));
+    assert_eq!(model.temperatures.lock().unwrap()[1], Some(0.7));
+    assert_eq!(client.created_ids.lock().unwrap().len(), 1);
 }
 
 /// `test_prepare_agent_binds_and_validates_run_workspace_scope` and

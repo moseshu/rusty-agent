@@ -576,22 +576,29 @@ impl RunConfig {
         self
     }
 
-    /// Installs one capability for this run.
+    /// Installs one capability for this run's starting declaration.
     ///
-    /// A capability is assembled once, when the run starts: its declared dependencies are checked
-    /// against the rest of the installed set, its tools and prompt fragment join the agent instance
-    /// that executes, its settings fold onto that instance's settings layer, and its context
-    /// transform is appended to the processors installed above. Installation order is the assembly
-    /// order; dependencies check presence without reordering capabilities — see
-    /// [`CapabilityPlan`] for the whole rule.
+    /// A capability is assembled once per segment, when its owning declaration first runs: its
+    /// declared dependencies are checked against the rest of the installed set, its tools and
+    /// prompt fragment join the agent instance that executes, its settings fold onto that
+    /// instance's settings layer, and its context transform is appended to the processors
+    /// installed above. Installation order is the assembly order; dependencies check presence
+    /// without reordering capabilities — see [`CapabilityPlan`] for the whole rule.
+    ///
+    /// All contributions are withdrawn while another declaration runs after a handoff. Returning
+    /// to the original declaration reuses its bound preparation. Checkpoint recovery uses the
+    /// recorded starting agent and the registry to preserve this ownership across segments.
+    /// A nested or spawned run that inherits ordinary capabilities starts a separate ownership
+    /// scope: those capabilities belong to that run's starting declaration. Prepared surfaces
+    /// instead retain their declaration ownership; see [`Self::with_prepared_capabilities`].
     ///
     /// A missing dependency or two capabilities claiming one family fails the run before its
     /// first model call. Self requirements and mutually dependent capabilities are
     /// accepted when every required family is installed.
     ///
-    /// A sandbox agent's own capabilities may not claim a family installed here: the built-in
-    /// sandbox capabilities share family names with the host-side ones while meaning something
-    /// else, so the run fails before that agent's session is created.
+    /// The starting sandbox agent's own capabilities may not claim a family installed here: the
+    /// built-in sandbox capabilities share family names with the host-side ones while meaning
+    /// something else, so the run fails before that agent's session is created.
     pub fn with_capability(mut self, capability: Arc<dyn Capability>) -> Self {
         self.capabilities.push(capability);
         self
@@ -613,6 +620,15 @@ impl RunConfig {
     /// model definitions and options are frozen here and must match the bound tools. Static
     /// instructions are not read again for these capabilities; the agent must already contain
     /// them. Unrelated duplicate names still fail validation, and ordinary capabilities append.
+    ///
+    /// The surface belongs to the run's starting declaration. After a handoff, resuming requires
+    /// the current declaration as the request agent; register the starting declaration with
+    /// [`Self::with_agent_registry`] to make its surface available when control returns to it.
+    /// Register and activate the same shared declaration object, holding the exact tool objects
+    /// supplied here. A matching agent ID alone does not establish in-memory ownership.
+    /// If the starting declaration is absent, its contributions stay inactive rather than
+    /// transferring to the current agent. Checkpoints serialize neither declarations nor tools;
+    /// after a process restart, rebuild the declarations, registry and surface together.
     pub fn with_prepared_capabilities(
         mut self,
         capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
@@ -639,8 +655,12 @@ impl RunConfig {
     /// A prepared surface belongs to the declaration object it was installed on. A run of any
     /// other declaration, including one reached by a handoff or a new one with the same ID, plans
     /// its own tools, so the surface is withdrawn while every other inherited setting is kept.
-    pub(crate) fn inherited_by(self, agent: &Arc<AgentSpec>, owner: &Arc<AgentSpec>) -> Self {
-        let installed_on_agent = Arc::ptr_eq(agent, owner)
+    pub(crate) fn inherited_by(
+        self,
+        agent: &Arc<AgentSpec>,
+        owner: Option<&Arc<AgentSpec>>,
+    ) -> Self {
+        let installed_on_agent = owner.is_some_and(|owner| Arc::ptr_eq(agent, owner))
             && self.preinstalled_capability_tools.iter().all(|installed| {
                 agent
                     .tools()
@@ -1214,6 +1234,7 @@ impl RunRequest {
     ///
     /// As in [`RunConfig::with_prepared_capabilities`], static instructions are already in the
     /// agent; binding must preserve the supplied tools' declarations and original positions.
+    /// Approval recovery also follows that method's starting-declaration and registry rules.
     pub fn with_prepared_capabilities(
         mut self,
         capabilities: impl IntoIterator<Item = Arc<dyn Capability>>,
@@ -1278,6 +1299,11 @@ impl RunRequest {
     /// continues, so the `run_id` given to [`Self::new`] is replaced by the state's — an identity
     /// the caller passed separately could disagree with the one every already-persisted event was
     /// written under, and the state is the side that survived the restart.
+    ///
+    /// The request agent must be the checkpoint's current agent. Capability ownership remains
+    /// with its starting declaration, resolved through the configured registry after a handoff.
+    /// Keep the registered declaration and prepared tool objects consistent with the supplied
+    /// configuration; see [`RunConfig::with_prepared_capabilities`] for identity and restart rules.
     ///
     /// **Input selects the continuation base.** Supplying input preserves the caller-managed
     /// continuation behavior: that input is the base for this segment's model calls. Passing an
@@ -1445,6 +1471,8 @@ struct TurnLoopContext<'a> {
     deferred_prompts: &'a [DeferredPrompt],
     /// Run-bound processors remain separate from declarative settings snapshots.
     capability_processors: &'a [Arc<dyn ContextProcessor>],
+    /// Declaration-owned preparation, reused when control returns to that declaration.
+    capabilities: &'a RunCapabilities,
     /// Prepares sandbox agents before their turns.
     sandbox: &'a SandboxRuntime,
     /// The agent this run is bound to in its tree: the mailbox it delivers at model-call
@@ -1644,6 +1672,7 @@ async fn run_loop(
         parent_run_id.as_ref(),
         trace_group_id,
         Arc::clone(request.agent.public()),
+        initial_capability_agent(request.agent.public(), &request.config, &request.state),
         request.services.clone(),
         request.rollout.clone(),
         request.event_seqs.clone(),
@@ -2071,34 +2100,33 @@ async fn run_loop_inner(
     // here would have to be kept true by hand across resume paths that never meet.
     let authoritative_history_complete = state.input_history_is_complete();
     let input_base = segment_input_base(&state, resuming, requested_input);
-    let mut deferred_prompts: Vec<DeferredPrompt> = Vec::new();
-    let mut capability_processors: Vec<Arc<dyn ContextProcessor>> = Vec::new();
+    let capabilities = RunCapabilities {
+        owner: initial_capability_agent(agent.public(), &config, &state),
+        plan: capability_plan,
+        prepared: tokio::sync::Mutex::new(None),
+    };
     // Under the run scope rather than ahead of it: a capability resolves its prompt fragment with
     // third-party asynchronous code, and a run whose assembly reads a slow source is one the
     // deadline and the caller's interrupt still have to reach.
-    if !capability_plan.is_empty() || !config.preinstalled_capability_tools.is_empty() {
-        let assembly = assemble_capabilities(CapabilityAssemblyRequest {
-            plan: &capability_plan,
-            agent: &agent,
-            run_id: &run_id,
-            app_context: app_context.as_ref(),
-            tool_input: tool_input.as_ref(),
-            state: &state,
-            event_seqs: &event_seqs,
-            models: model_resolver.as_ref(),
-            config: &config,
-        });
-        match cancel.run(assembly).await.and_then(|result| result) {
-            Ok((execution, context_processors, deferred)) => {
-                agent = execution;
-                capability_processors = context_processors;
-                deferred_prompts = deferred;
-            }
-            Err(error) => {
-                record_terminal_error(span, &error, &cancel);
-                return Err(error);
-            }
+    let assembly = capabilities.prepare(CapabilityAssemblyRequest {
+        agent: &agent,
+        run_id: &run_id,
+        app_context: app_context.as_ref(),
+        tool_input: tool_input.as_ref(),
+        state: &state,
+        event_seqs: &event_seqs,
+        models: model_resolver.as_ref(),
+        config: &config,
+    });
+    let prepared_capabilities = match cancel.run(assembly).await.and_then(|result| result) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            record_terminal_error(span, &error, &cancel);
+            return Err(error);
         }
+    };
+    if let Some(prepared) = &prepared_capabilities {
+        agent = prepared.agent.clone();
     }
 
     // Indexed and checked after assembly, because a capability contributes tools of its own and a
@@ -2164,8 +2192,13 @@ async fn run_loop_inner(
             model_stream_sink: model_stream_sink.as_deref(),
         },
         event_seqs: &event_seqs,
-        deferred_prompts: &deferred_prompts,
-        capability_processors: &capability_processors,
+        deferred_prompts: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.deferred_prompts),
+        capability_processors: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.context_processors),
+        capabilities: &capabilities,
         sandbox,
         agent_mail: agent_handle.as_ref(),
         deliver_mail_first,
@@ -2675,8 +2708,57 @@ async fn run_loop_inner(
     Ok(result)
 }
 
+/// Reconstructs declaration ownership from the checkpoint without persisting process pointers.
+/// A missing starting declaration never makes the receiving agent the owner.
+fn initial_capability_agent(
+    agent: &Arc<AgentSpec>,
+    config: &RunConfig,
+    state: &RunState,
+) -> Option<Arc<AgentSpec>> {
+    match state.starting_agent() {
+        None => Some(Arc::clone(agent)),
+        Some(starting) if starting == agent.id() => Some(Arc::clone(agent)),
+        Some(starting) => config.agent_registry().get(starting).cloned(),
+    }
+}
+
+/// The complete contribution of the run configuration to its starting declaration.
+struct PreparedRunCapabilities {
+    agent: AgentBinding,
+    context_processors: Vec<Arc<dyn ContextProcessor>>,
+    deferred_prompts: Vec<DeferredPrompt>,
+}
+
+/// Like the SDK's agent-instance cache, all contribution channels share one preparation.
+/// Other declarations use their own tools and sandbox capabilities.
+struct RunCapabilities {
+    owner: Option<Arc<AgentSpec>>,
+    plan: CapabilityPlan,
+    prepared: tokio::sync::Mutex<Option<Arc<PreparedRunCapabilities>>>,
+}
+
+impl RunCapabilities {
+    async fn prepare(
+        &self,
+        request: CapabilityAssemblyRequest<'_>,
+    ) -> Result<Option<Arc<PreparedRunCapabilities>>> {
+        if !self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, request.agent.public()))
+            || (self.plan.is_empty() && request.config.preinstalled_capability_tools.is_empty())
+        {
+            return Ok(None);
+        }
+        let mut cached = self.prepared.lock().await;
+        if cached.is_none() {
+            *cached = Some(Arc::new(assemble_capabilities(&self.plan, request).await?));
+        }
+        Ok(cached.clone())
+    }
+}
+
 struct CapabilityAssemblyRequest<'a> {
-    plan: &'a CapabilityPlan,
     agent: &'a AgentBinding,
     run_id: &'a RunId,
     app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
@@ -2687,26 +2769,16 @@ struct CapabilityAssemblyRequest<'a> {
     config: &'a RunConfig,
 }
 
-/// Binds the run's capabilities and splits what they contribute between the two places it goes.
-///
-/// The agent instance comes back paired with the context processors and the deferred prompts
-/// deliberately. Tools, prompt text, and sampling settings describe the thing that executes, while
-/// a context transform is a property of the run and a deferred fragment belongs to the turn loop
-/// that waits for its signal — and a single "prepared" value carrying all three would be a home for
-/// a group that has no other reason to be one object.
+/// Binds every contribution to the same public declaration and caches them together.
 ///
 /// The instance is assembled onto [`AgentBinding::execution`], not the public agent: a host that
 /// already prepared its own execution instance keeps it, and the identity every record is filed
 /// under stays the one the user configured.
 async fn assemble_capabilities(
+    plan: &CapabilityPlan,
     request: CapabilityAssemblyRequest<'_>,
-) -> Result<(
-    AgentBinding,
-    Vec<Arc<dyn ContextProcessor>>,
-    Vec<DeferredPrompt>,
-)> {
+) -> Result<PreparedRunCapabilities> {
     let CapabilityAssemblyRequest {
-        plan,
         agent,
         run_id,
         app_context,
@@ -2751,11 +2823,11 @@ async fn assemble_capabilities(
     }
     let execution = assembled.prepare_agent_with_sampling_context(&base, &sampling)?;
     let execution = agent.with_prepared_execution(execution)?;
-    Ok((
-        execution,
-        assembled.context_processors().to_vec(),
-        assembled.deferred_prompts().to_vec(),
-    ))
+    Ok(PreparedRunCapabilities {
+        agent: execution,
+        context_processors: assembled.context_processors().to_vec(),
+        deferred_prompts: assembled.deferred_prompts().to_vec(),
+    })
 }
 
 /// Checks the frozen preinstalled surface, then replaces only its owned handler slots. Directly
@@ -4132,6 +4204,7 @@ fn sandbox_runtime(request: &RunRequest) -> Arc<SandboxRuntime> {
         request.config.sandbox().cloned(),
         request.state.sandbox_resume_state().cloned(),
         request.config.capabilities(),
+        initial_capability_agent(request.agent.public(), &request.config, &request.state),
         Arc::clone(&request.model_resolver),
         rollout_id,
     ))
@@ -4631,13 +4704,39 @@ async fn run_one_turn(
             .clone()
             .with_answered_rules(state.permission_rules().iter().cloned())
     });
+    let step_config = captured.as_ref().unwrap_or(context.config);
+    let step_app_context = captured
+        .as_ref()
+        .and_then(RunConfig::app_context)
+        .or(context.app_context);
+    // The step's captured settings, so a declaration first prepared after a live model change
+    // folds its capabilities' sampling for the model this step actually calls.
+    let prepared_capabilities = turn_scope
+        .run(context.capabilities.prepare(CapabilityAssemblyRequest {
+            agent,
+            run_id: context.run_id,
+            app_context: step_app_context,
+            tool_input: context.tool_input,
+            state,
+            event_seqs: context.event_seqs,
+            models: context.model_resolver.as_ref(),
+            config: step_config,
+        }))
+        .await
+        .and_then(|prepared| prepared)?;
+    if let Some(prepared) = &prepared_capabilities {
+        *agent = prepared.agent.clone();
+    }
     let step_context = TurnLoopContext {
-        config: captured.as_ref().unwrap_or(context.config),
-        app_context: captured
-            .as_ref()
-            .and_then(RunConfig::app_context)
-            .or(context.app_context),
+        config: step_config,
+        app_context: step_app_context,
         permission: permission.as_ref().unwrap_or(context.permission),
+        deferred_prompts: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.deferred_prompts),
+        capability_processors: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.context_processors),
         ..*context
     };
     let context = &step_context;

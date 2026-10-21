@@ -135,7 +135,7 @@ impl PreparedSpawnedAgent {
     pub(super) fn configure_run(
         &self,
         config: RunConfig,
-        initial_agent: &Arc<AgentSpec>,
+        initial_agent: Option<&Arc<AgentSpec>>,
     ) -> RunConfig {
         match &self.capabilities {
             Some(prepared) => config.with_prepared_capabilities(
