@@ -2,3 +2,11 @@
 # 于是没人会跑门禁——入口的摩擦决定它是否被使用。
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# 测试线程的默认栈：8 MiB，与 Codex 给深层测试的栈预算相同（`run_test_with_large_stack`）。
+# 每嵌套一层 agent 运行，debug 构建要多占约 670 KiB 栈；三层嵌套的测试在 macOS 上要约 2 MiB，
+# 在 x86_64 Linux CI 上超过 libtest 的 2 MiB 默认值而溢出。`#[tokio::test]` 不能指定栈大小，
+# 所以在这里统一设。cargo 也会把它传给 rustc，而 rustc 自己的默认栈就是 8 MiB，编译不受影响。
+# 已设置 RUST_MIN_STACK 的环境不会被覆盖。
+[env]
+RUST_MIN_STACK = "8388608"
