@@ -4,6 +4,10 @@ use super::*;
 
 #[path = "../../../support/configured_coding_host.rs"]
 mod configured_host;
+#[path = "../../../support/marked_sleep.rs"]
+mod marked_sleep;
+
+use marked_sleep::MarkedSleep;
 
 /// The namespace the collaboration tools are advertised in by default.
 const COLLABORATION: &str = "collaboration";
@@ -218,15 +222,6 @@ async fn configured_coding_factory_routes_controls_and_questions_after_start_for
     );
 }
 
-/// Whether process `pid` is still running.
-fn is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 /// Each thread owns its agent tree, as each Codex session owns its spawned agents: another
 /// thread's tree does not list them, and unloading the thread stops them and their processes.
 #[tokio::test]
@@ -245,10 +240,11 @@ async fn each_coding_thread_owns_its_tree_and_unloading_it_stops_the_agents_belo
         .await;
 
     // The worker starts a command that outlives its turn, then finishes.
+    let sleep = MarkedSleep::new();
     agents.children.lock().unwrap().push_back(call(
         "exec_command",
         json!({
-            "cmd": "echo worker-pid=$$; exec sleep 30",
+            "cmd": format!("echo worker-ready-$((6 * 7)); {}", sleep.command()),
             "justification": null,
             "prefix_rule": null,
             "sandbox_permissions": null,
@@ -272,24 +268,17 @@ async fn each_coding_thread_owns_its_tree_and_unloading_it_stops_the_agents_belo
     server
         .run_turn(&mut connection, first.id(), "delegate a command")
         .await;
-    // The worker's second call carries its command's output, which names the process.
-    let pid = timeout(PATIENCE, async {
+    // The worker's second call carries its command's output; the arithmetic keeps the marker out
+    // of the call's own arguments, so only the output can match.
+    timeout(PATIENCE, async {
         loop {
-            let found = agents
-                .child_requests
-                .lock()
-                .unwrap()
-                .iter()
-                .find_map(|request| {
-                    let input = serde_json::to_string(request.input()).unwrap();
-                    let (_, rest) = input.rsplit_once("worker-pid=")?;
-                    rest.split(|c: char| !c.is_ascii_digit())
-                        .next()?
-                        .parse::<u32>()
-                        .ok()
-                });
-            if let Some(pid) = found {
-                return pid;
+            let started = agents.child_requests.lock().unwrap().iter().any(|request| {
+                serde_json::to_string(request.input())
+                    .unwrap()
+                    .contains("worker-ready-42")
+            });
+            if started {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -305,7 +294,7 @@ async fn each_coding_thread_owns_its_tree_and_unloading_it_stops_the_agents_belo
                 .unwrap_or_default()
         )
     });
-    assert!(is_alive(pid));
+    assert!(sleep.is_alive());
 
     script.push(Step::Respond(collab("list_agents", json!({}))));
     script.answer("listed");
@@ -329,7 +318,7 @@ async fn each_coding_thread_owns_its_tree_and_unloading_it_stops_the_agents_belo
 
     unload(&server, &mut connection, first.id()).await;
     timeout(PATIENCE, async {
-        while is_alive(pid) {
+        while sleep.is_alive() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })

@@ -2,6 +2,8 @@
 
 #[path = "../../support/configured_coding_host.rs"]
 mod configured_host;
+#[path = "../../support/marked_sleep.rs"]
+mod marked_sleep;
 
 use std::{
     collections::VecDeque,
@@ -10,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use marked_sleep::MarkedSleep;
 use ra_coding::{
     CodingHost, CodingProfile, build_agent_with_control, build_agent_with_profile,
     host_backed_surface,
@@ -861,15 +864,6 @@ async fn thread_control_keeps_children_across_turns_and_isolates_other_threads()
     other.shutdown().await;
 }
 
-/// Whether process `pid` is still running.
-fn is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 /// Codex starts a spawned agent as a session of its own, with its own unified-exec process manager
 /// and its own tool plan: the child's commands are not the parent's sessions, they stop when the
 /// tree shuts down, and the child is not offered the collaboration tools unless its model takes
@@ -882,10 +876,11 @@ async fn a_spawned_agent_is_assembled_with_its_own_processes_and_tool_plan() {
     let host = Arc::new(configured_host::Services::default())
         .install(CodingHost::open(workspace.path()).unwrap());
     let script = Arc::new(Script::default());
+    let sleep = MarkedSleep::new();
     script.child_responses.lock().unwrap().push_back(call(
         "exec_command",
         json!({
-            "cmd": "echo $$ > child.pid; exec sleep 30",
+            "cmd": format!("echo ready > child.ready; {}", sleep.command()),
             "justification": null,
             "prefix_rule": null,
             "sandbox_permissions": null,
@@ -936,18 +931,14 @@ async fn a_spawned_agent_is_assembled_with_its_own_processes_and_tool_plan() {
     .await
     .expect("the worker completes");
 
-    let pid: u32 = std::fs::read_to_string(workspace.path().join("child.pid"))
-        .unwrap_or_else(|error| {
-            let requests = script.child_requests.lock().unwrap();
-            panic!(
-                "the worker did not run its command ({error}): {}",
-                serde_json::to_string(requests.last().unwrap().input()).unwrap()
-            )
-        })
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(is_alive(pid));
+    std::fs::read_to_string(workspace.path().join("child.ready")).unwrap_or_else(|error| {
+        let requests = script.child_requests.lock().unwrap();
+        panic!(
+            "the worker did not run its command ({error}): {}",
+            serde_json::to_string(requests.last().unwrap().input()).unwrap()
+        )
+    });
+    assert!(sleep.is_alive());
     // The worker's command lives in the worker's manager, not in the one the parent's tools use.
     assert!(host.process_manager().active_sessions().await.is_empty());
     let child_tools = request_tools(&script.child_requests.lock().unwrap()[0]);
@@ -963,7 +954,7 @@ async fn a_spawned_agent_is_assembled_with_its_own_processes_and_tool_plan() {
 
     timeout(PATIENCE, thread.shutdown()).await.unwrap();
     timeout(PATIENCE, async {
-        while is_alive(pid) {
+        while sleep.is_alive() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
