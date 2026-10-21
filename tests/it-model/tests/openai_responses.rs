@@ -10,7 +10,7 @@ use ra_core::{
     },
     model::{
         Effort, Model, ModelHandoffDefinition, ModelProvider, ModelRequest, ModelSettings,
-        ModelStreamEvent, ModelToolDefinition, ProviderKey, ToolChoice,
+        ModelStreamEvent, ModelToolDefinition, ProviderKey, SettingsLayers, ToolChoice,
     },
     prompt::{CachePlan, ContentHash},
     tool::{ObservationMetadata, ToolOutput, ToolOutputBlock, Truncation, TruncationStage},
@@ -28,12 +28,9 @@ use wiremock::{
 };
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("openai"))
 }
 
 fn success_payload() -> Value {

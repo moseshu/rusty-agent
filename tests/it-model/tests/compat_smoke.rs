@@ -8,7 +8,7 @@ use ra_core::{
     item::{AgentId, CallId, Message, ModelInputItem, OutputPhase, ToolCall, ToolCallOutput},
     model::{
         Effort, Model, ModelHandoffDefinition, ModelProvider, ModelRequest, ModelSettings,
-        ModelToolDefinition, ProviderKey, ThinkingConfig, ToolChoice,
+        ModelToolDefinition, ProviderKey, SettingsLayers, ThinkingConfig, ToolChoice,
     },
     tool::ToolOutput,
 };
@@ -27,12 +27,9 @@ use wiremock::{
 const MODEL: &str = "matrix-model";
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("compat-matrix"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("compat-matrix"))
 }
 
 fn matrix_request() -> ModelRequest {

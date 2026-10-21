@@ -821,6 +821,12 @@ impl AgentThread {
         self.inner.model_resolver.resolve_model(model)
     }
 
+    /// The model settings declared by the agent instance that executes this thread.
+    #[must_use]
+    pub fn agent_model_settings(&self) -> &ModelSettings {
+        self.inner.agent.execution().model_settings()
+    }
+
     /// The thread's history: what the next turn starts from.
     #[must_use]
     pub fn history(&self) -> Vec<ModelInputItem> {

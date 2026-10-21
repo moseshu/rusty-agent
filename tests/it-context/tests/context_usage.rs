@@ -14,15 +14,14 @@ use ra_core::{
         ToolCallOutput,
     },
     model::{
-        ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelSettings,
-        ModelToolDefinition, ProviderKey, ResolvedModelSettings,
+        ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelToolDefinition, ProviderKey,
+        ResolvedModelSettings, SettingsLayers,
     },
 };
 use serde_json::json;
 
 fn settings() -> ResolvedModelSettings {
-    let empty = ModelSettings::new();
-    empty.resolve(&ProviderKey::new("test"), &empty, &empty, &empty)
+    SettingsLayers::new().resolve(&ProviderKey::new("test"))
 }
 
 /// The model receives a shared namespace description once, including when it holds several

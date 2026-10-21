@@ -5,7 +5,7 @@ use ra_core::{
     item::{CallId, Message, ModelInputItem, RunItemKind, ToolCall, ToolCallOutput},
     model::{
         Effort, Model, ModelOutputSchema, ModelRequest, ModelSettings, ModelStreamEvent,
-        ModelToolDefinition, ProviderKey, ToolChoice,
+        ModelToolDefinition, ProviderKey, SettingsLayers, ToolChoice,
     },
 };
 use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel};
@@ -18,12 +18,9 @@ use wiremock::{
 const MODEL: &str = "claude-test";
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("anthropic"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("anthropic"))
 }
 
 fn request() -> ModelRequest {

@@ -19,7 +19,7 @@ use ra_core::{
     event::exec::ExecSessionId,
     item::{ItemId, Message, OutputPhase, RunItem, RunItemKind},
     model::{
-        ConversationContinuation, ModelRequest, ModelSettings, ProviderConversationId, ProviderKey,
+        ConversationContinuation, ModelRequest, ProviderConversationId, ProviderKey, SettingsLayers,
     },
     session::{Session, SessionId},
 };
@@ -159,9 +159,7 @@ fn test_session_identity_tripartite_separation() {
     // nothing else, so a local session identifier cannot be assigned into it.
     let continuation = ConversationContinuation::ConversationId(provider_conv_id.clone());
     assert_eq!(continuation.conversation_id(), Some(&provider_conv_id));
-
-    let empty = ModelSettings::new();
-    let settings = empty.resolve(&ProviderKey::new("test"), &empty, &empty, &empty);
+    let settings = SettingsLayers::new().resolve(&ProviderKey::new("test"));
     let request =
         ModelRequest::new(vec![], settings).with_conversation_id(provider_conv_id.clone());
     assert_eq!(

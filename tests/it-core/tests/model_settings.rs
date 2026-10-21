@@ -1,11 +1,11 @@
-//! R1-2b contracts for provider-neutral model settings and four-layer resolution.
+//! Contracts for provider-neutral model settings and four-layer resolution.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use insta::assert_snapshot;
 use ra_core::model::{
     Effort, JsonMap, McpToolChoice, ModelRetrySettings, ModelSettings, ProviderKey,
-    RetryBackoffSettings, ThinkingConfig, ToolChoice,
+    ResolvedModelSettings, RetryBackoffSettings, SettingsLayers, ThinkingConfig, ToolChoice,
 };
 use serde_json::{Value, json};
 
@@ -16,10 +16,25 @@ fn provider(name: &str) -> ProviderKey {
 fn object(value: Value) -> JsonMap {
     value
         .as_object()
-        .expect("fixture 应是 JSON object")
+        .expect("fixture should be a JSON object")
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn resolve(
+    key: &ProviderKey,
+    provider: &ModelSettings,
+    model: &ModelSettings,
+    agent: &ModelSettings,
+    run: &ModelSettings,
+) -> ResolvedModelSettings {
+    SettingsLayers::new()
+        .with_provider(provider)
+        .with_model(model)
+        .with_agent(agent)
+        .with_run(run)
+        .resolve(key)
 }
 
 #[test]
@@ -80,23 +95,29 @@ fn test_model_settings_01() {
             ),
         );
 
-    let resolved =
-        provider_defaults.resolve(&key, &agent_defaults, &model_defaults, &run_overrides);
+    let resolved = resolve(
+        &key,
+        &provider_defaults,
+        &model_defaults,
+        &agent_defaults,
+        &run_overrides,
+    );
 
     assert_eq!(resolved.provider(), &key);
-    assert_eq!(resolved.max_tokens(), Some(2_048));
-    assert_eq!(resolved.timeout(), Some(Duration::from_secs(30)));
+    assert_eq!(resolved.max_tokens(), Some(3_000));
+    assert_eq!(resolved.timeout(), Some(Duration::from_secs(45)));
     assert_eq!(resolved.extra_headers()["x-layer"], "run");
-    assert_eq!(resolved.extra_headers()["x-agent"], "yes");
+    assert!(!resolved.extra_headers().contains_key("x-agent"));
     assert_eq!(resolved.extra_query()["api-version"], "v2");
+    assert_eq!(resolved.metadata().len(), 1);
+    assert_eq!(resolved.metadata()["source"], "run");
 
-    assert_snapshot!(serde_json::to_string_pretty(&resolved.to_traceable_value().expect("trace 投影应可序列化")).unwrap(), @r###"
+    assert_snapshot!(serde_json::to_string_pretty(&resolved.to_traceable_value().expect("trace projection should serialize")).unwrap(), @r###"
     {
       "effort": "xhigh",
       "frequency_penalty": 0.2,
-      "max_tokens": 2048,
+      "max_tokens": 3000,
       "metadata": {
-        "provider_only": "yes",
         "source": "run"
       },
       "parallel_tool_calls": false,
@@ -117,7 +138,7 @@ fn test_model_settings_01() {
       "thinking": {
         "type": "adaptive"
       },
-      "timeout": 30000,
+      "timeout": 45000,
       "tool_choice": {
         "type": "required"
       },
@@ -137,59 +158,54 @@ fn test_model_settings_02() {
         .with_temperature(0.0)
         .with_parallel_tool_calls(false);
 
-    let inherited = base.resolve(&key, &unset, &unset, &unset);
+    let inherited = resolve(&key, &base, &unset, &unset, &unset);
     assert_eq!(inherited.temperature(), Some(0.7));
     assert_eq!(inherited.parallel_tool_calls(), Some(true));
 
-    let overridden = base.resolve(&key, &unset, &unset, &explicit);
+    let overridden = resolve(&key, &base, &unset, &unset, &explicit);
     assert_eq!(overridden.temperature(), Some(0.0));
     assert_eq!(overridden.parallel_tool_calls(), Some(false));
 }
 
 #[test]
 fn test_model_settings_03() {
-    // Turn preparation resolves settings after tools precisely so this can happen: a selector that
-    // survived the four-layer merge may name something this turn no longer advertises. Dynamic
-    // availability is a feature, so an unsatisfiable selection degrades instead of ending the run.
+    // Turn preparation resolves settings after tools so a selector may name something this turn
+    // no longer advertises. Dynamic availability is a feature, so an unsatisfiable selection
+    // degrades instead of ending the run.
     let key = provider("openai");
     let unset = ModelSettings::new();
     let required = ModelSettings::new()
         .with_tool_choice(ToolChoice::Required)
         .with_parallel_tool_calls(true);
 
-    let empty_surface = required
-        .resolve(&key, &unset, &unset, &unset)
-        .reconcile_tool_surface([]);
+    let empty_surface = resolve(&key, &unset, &unset, &required, &unset).reconcile_tool_surface([]);
     assert_eq!(empty_surface.tool_choice(), None);
     assert_eq!(empty_surface.parallel_tool_calls(), None);
 
-    let live_surface = required
-        .resolve(&key, &unset, &unset, &unset)
-        .reconcile_tool_surface(["read_file"]);
+    let live_surface =
+        resolve(&key, &unset, &unset, &required, &unset).reconcile_tool_surface(["read_file"]);
     assert_eq!(live_surface.tool_choice(), Some(&ToolChoice::Required));
     assert_eq!(live_surface.parallel_tool_calls(), Some(true));
 
     let pinned = ModelSettings::new().with_tool_choice(ToolChoice::Tool("read_file".to_owned()));
     assert_eq!(
-        pinned
-            .resolve(&key, &unset, &unset, &unset)
+        resolve(&key, &unset, &unset, &pinned, &unset)
             .reconcile_tool_surface(["read_file", "write_file"])
             .tool_choice(),
         Some(&ToolChoice::Tool("read_file".to_owned()))
     );
     assert_eq!(
-        pinned
-            .resolve(&key, &unset, &unset, &unset)
+        resolve(&key, &unset, &unset, &pinned, &unset)
             .reconcile_tool_surface(["write_file"])
             .tool_choice(),
         None
     );
 
-    // Two selections outlive an empty surface: "no tools" stays true, and a server-hosted tool
-    // never shows up in the neutral surface to begin with.
+    // Two selections outlive an empty surface: "no tools" remains true, and a server-hosted tool
+    // never appears in the neutral surface.
     let none = ModelSettings::new().with_tool_choice(ToolChoice::None);
     assert_eq!(
-        none.resolve(&key, &unset, &unset, &unset)
+        resolve(&key, &unset, &unset, &none, &unset)
             .reconcile_tool_surface([])
             .tool_choice(),
         Some(&ToolChoice::None)
@@ -197,8 +213,7 @@ fn test_model_settings_03() {
     let hosted = ModelSettings::new()
         .with_tool_choice(ToolChoice::Mcp(McpToolChoice::new("docs", "search")));
     assert_eq!(
-        hosted
-            .resolve(&key, &unset, &unset, &unset)
+        resolve(&key, &unset, &unset, &hosted, &unset)
             .reconcile_tool_surface([])
             .tool_choice(),
         Some(&ToolChoice::Mcp(McpToolChoice::new("docs", "search")))
@@ -207,91 +222,85 @@ fn test_model_settings_03() {
 
 #[test]
 fn test_model_settings_04() {
-    // A timeout is a latency bound, not a capability: any layer wanting to wait less has standing,
-    // and the request is simply abandoned sooner.
+    // Run settings override the agent timeout; the run deadline remains a separate budget.
     let key = provider("anthropic");
     let provider_defaults = ModelSettings::new().with_timeout(Duration::from_secs(60));
     let agent_defaults = ModelSettings::new().with_timeout(Duration::from_secs(15));
     let model_defaults = ModelSettings::new();
     let run_overrides = ModelSettings::new().with_timeout(Duration::from_secs(30));
 
-    let resolved =
-        provider_defaults.resolve(&key, &agent_defaults, &model_defaults, &run_overrides);
-    assert_eq!(resolved.timeout(), Some(Duration::from_secs(15)));
+    let resolved = resolve(
+        &key,
+        &provider_defaults,
+        &model_defaults,
+        &agent_defaults,
+        &run_overrides,
+    );
+    assert_eq!(resolved.timeout(), Some(Duration::from_secs(30)));
 }
 
 #[test]
 fn test_model_settings_05() {
-    // Only the model layer states a hard fact. An agent writing max_tokens means "usually enough",
-    // not "never more"; taking the min across all four layers would silently erase the value a run
-    // set explicitly because it wanted a long answer.
+    // max_tokens is a default or request override; the selected model's hard limit is separate.
     let key = provider("anthropic");
     let empty = ModelSettings::new();
     let model_limit = ModelSettings::new().with_max_tokens(8_192);
     let agent_preference = ModelSettings::new().with_max_tokens(1_000);
 
-    let raised = empty.resolve(
-        &key,
-        &agent_preference,
-        &model_limit,
-        &ModelSettings::new().with_max_tokens(4_000),
-    );
-    assert_eq!(raised.max_tokens(), Some(4_000), "run 应能高于 agent 默认");
-
-    let capped = empty.resolve(
+    let raised = resolve(
         &key,
         &empty,
         &model_limit,
+        &agent_preference,
+        &ModelSettings::new().with_max_tokens(4_000),
+    );
+    assert_eq!(raised.max_tokens(), Some(4_000));
+
+    let override_above_default = resolve(
+        &key,
+        &empty,
+        &model_limit,
+        &empty,
         &ModelSettings::new().with_max_tokens(16_384),
     );
-    assert_eq!(capped.max_tokens(), Some(8_192), "超过模型上限必须被截住");
+    assert_eq!(override_above_default.max_tokens(), Some(16_384));
 
-    let inherited = empty.resolve(&key, &agent_preference, &model_limit, &empty);
-    assert_eq!(
-        inherited.max_tokens(),
-        Some(1_000),
-        "run 未设时沿用 agent 默认"
-    );
+    let inherited = resolve(&key, &empty, &model_limit, &agent_preference, &empty);
+    assert_eq!(inherited.max_tokens(), Some(1_000));
 
-    let uncapped = empty.resolve(&key, &agent_preference, &empty, &empty);
-    assert_eq!(uncapped.max_tokens(), Some(1_000), "没有模型上限就不封顶");
+    let model_default = resolve(&key, &empty, &model_limit, &empty, &empty);
+    assert_eq!(model_default.max_tokens(), Some(8_192));
 }
 
 #[test]
 fn test_model_settings_06() {
-    // The provider fallback exists because "some endpoints require this field" (Anthropic does),
-    // which is no reason to override a per-model value written precisely because that model
-    // differs — the coarsest layer beating the most specific one is backwards.
+    // Provider-required defaults remain available, and model defaults override provider defaults.
     let key = provider("anthropic");
     let empty = ModelSettings::new();
     let provider_fallback = ModelSettings::new().with_max_tokens(4_096);
     let model_limit = ModelSettings::new().with_max_tokens(64_000);
 
     assert_eq!(
-        provider_fallback
-            .resolve(&key, &empty, &model_limit, &empty)
-            .max_tokens(),
+        resolve(&key, &provider_fallback, &model_limit, &empty, &empty).max_tokens(),
         Some(64_000),
         "更具体的模型注册应胜出"
     );
     assert_eq!(
-        provider_fallback
-            .resolve(&key, &empty, &empty, &empty)
-            .max_tokens(),
+        resolve(&key, &provider_fallback, &empty, &empty, &empty).max_tokens(),
         Some(4_096),
         "模型没自己说时兜底才生效"
     );
     assert_eq!(
-        provider_fallback
-            .resolve(
-                &key,
-                &ModelSettings::new().with_max_tokens(1_000),
-                &model_limit,
-                &empty
-            )
-            .max_tokens(),
+        resolve(
+            &key,
+            &provider_fallback,
+            &model_limit,
+            &ModelSettings::new().with_max_tokens(1_000),
+            &empty,
+        )
+        .max_tokens(),
         Some(1_000),
-        "用户意图压过两种注册方默认"
+        "agent settings override provider and model defaults"
     );
 }
 
@@ -333,17 +342,18 @@ fn test_model_settings_07() {
         run_overrides.clone(),
     ];
 
-    let resolved =
-        provider_defaults.resolve(&key, &agent_defaults, &model_defaults, &run_overrides);
+    let resolved = resolve(
+        &key,
+        &provider_defaults,
+        &model_defaults,
+        &agent_defaults,
+        &run_overrides,
+    );
 
     assert_eq!(
         resolved.extra_body(),
         &object(json!({
-            "sampling": {
-                "top_k": 20,
-                "min_p": 0.2,
-                "nested": {"a": 3, "b": 2, "c": 4}
-            },
+            "sampling": {"min_p": 0.2},
             "provider_only": true,
             "agent_only": true,
             "model_only": true,
@@ -377,8 +387,8 @@ fn test_model_settings_08() {
         );
     let empty = ModelSettings::new();
 
-    let for_vllm = settings.resolve(&vllm, &empty, &empty, &empty);
-    let for_openrouter = settings.resolve(&openrouter, &empty, &empty, &empty);
+    let for_vllm = resolve(&vllm, &settings, &empty, &empty, &empty);
+    let for_openrouter = resolve(&openrouter, &settings, &empty, &empty, &empty);
 
     assert!(for_vllm.extra_body().contains_key("guided_json"));
     assert!(!for_vllm.extra_body().contains_key("provider"));
@@ -396,7 +406,7 @@ fn test_model_settings_09() {
         .with_extra_query("api-key", "query-secret")
         .with_extra_body(key.clone(), object(json!({"private_token": "body-secret"})));
     let empty = ModelSettings::new();
-    let resolved = settings.resolve(&key, &empty, &empty, &empty);
+    let resolved = resolve(&key, &settings, &empty, &empty, &empty);
 
     let trace = resolved.to_traceable_value().expect("trace 投影应可序列化");
     let encoded = serde_json::to_string(&trace).expect("trace JSON 应可序列化");
@@ -433,7 +443,7 @@ fn test_model_settings_10() {
         ),
     );
     let empty = ModelSettings::new();
-    let resolved = provider_defaults.resolve(&key, &empty, &empty, &run_overrides);
+    let resolved = resolve(&key, &provider_defaults, &empty, &empty, &run_overrides);
     let retry = resolved.retry().expect("retry 应存在");
     let backoff = retry.backoff().expect("backoff 应存在");
 
@@ -458,7 +468,7 @@ fn test_model_settings_11() {
     let settings = ModelSettings::new().with_retry(newer_layer);
     let empty = ModelSettings::new();
 
-    let resolved = settings.resolve(&key, &empty, &empty, &empty);
+    let resolved = resolve(&key, &settings, &empty, &empty, &empty);
     let retry = resolved.retry().expect("retry 应存在");
 
     assert_eq!(retry.max_retries(), Some(2));
@@ -509,4 +519,89 @@ fn test_model_settings_13() {
     let first = serde_json::to_string(&rewritten).expect("应可序列化");
     let second = serde_json::to_string(&rewritten).expect("应可再次序列化");
     assert_eq!(first, second);
+}
+
+#[test]
+fn test_model_settings_14() {
+    let key = provider("compat");
+    let legacy: ModelSettings = serde_json::from_value(json!({
+        "schema_version": 1,
+        "metadata": {"legacy": "kept"},
+        "extra_headers": {},
+        "extra_query": {"legacy": true}
+    }))
+    .expect("version 1 maps should remain readable");
+    assert_eq!(legacy.metadata()["legacy"], "kept");
+    assert!(legacy.extra_headers().is_empty());
+    assert_eq!(legacy.extra_query()["legacy"], true);
+
+    let legacy_empty_maps: ModelSettings = serde_json::from_value(json!({
+        "schema_version": 1,
+        "metadata": {},
+        "extra_headers": {},
+        "extra_query": {}
+    }))
+    .expect("version 1 empty maps should remain readable");
+    let rewritten_legacy = serde_json::to_value(&legacy_empty_maps)
+        .expect("legacy settings should be upgraded to the current schema version");
+    assert_eq!(rewritten_legacy["schema_version"], 2);
+    assert!(rewritten_legacy.get("metadata").is_none());
+    assert!(rewritten_legacy.get("extra_headers").is_none());
+    assert!(rewritten_legacy.get("extra_query").is_none());
+
+    let defaults = ModelSettings::new()
+        .with_metadata("source", "provider")
+        .with_extra_header("x-provider", "yes")
+        .with_extra_query("version", 1);
+    let legacy_resolved = resolve(
+        &key,
+        &defaults,
+        &ModelSettings::new(),
+        &legacy_empty_maps,
+        &ModelSettings::new(),
+    );
+    assert_eq!(legacy_resolved.metadata()["source"], "provider");
+    assert_eq!(legacy_resolved.extra_headers()["x-provider"], "yes");
+    assert_eq!(legacy_resolved.extra_query()["version"], 1);
+
+    let legacy_clears = legacy_empty_maps
+        .with_metadata_map(BTreeMap::new())
+        .with_extra_headers_map(BTreeMap::new())
+        .with_extra_query_map(JsonMap::new());
+    let encoded_legacy_clears =
+        serde_json::to_value(&legacy_clears).expect("clears should serialize as schema version 2");
+    assert_eq!(encoded_legacy_clears["schema_version"], 2);
+    let decoded_legacy_clears: ModelSettings = serde_json::from_value(encoded_legacy_clears)
+        .expect("schema version 2 empty maps should remain explicit");
+    let resolved_legacy_clears = resolve(
+        &key,
+        &defaults,
+        &ModelSettings::new(),
+        &decoded_legacy_clears,
+        &ModelSettings::new(),
+    );
+    assert!(resolved_legacy_clears.metadata().is_empty());
+    assert!(resolved_legacy_clears.extra_headers().is_empty());
+    assert!(resolved_legacy_clears.extra_query().is_empty());
+
+    let empty_maps = ModelSettings::new()
+        .with_metadata_map(BTreeMap::new())
+        .with_extra_headers_map(BTreeMap::new())
+        .with_extra_query_map(JsonMap::new());
+    let encoded = serde_json::to_value(&empty_maps).expect("version 2 settings should serialize");
+    assert_eq!(encoded["schema_version"], 2);
+    assert_eq!(encoded["metadata"], json!({}));
+    assert_eq!(encoded["extra_headers"], json!({}));
+    assert_eq!(encoded["extra_query"], json!({}));
+
+    let resolved = resolve(
+        &key,
+        &defaults,
+        &ModelSettings::new(),
+        &empty_maps,
+        &ModelSettings::new(),
+    );
+    assert!(resolved.metadata().is_empty());
+    assert!(resolved.extra_headers().is_empty());
+    assert!(resolved.extra_query().is_empty());
 }

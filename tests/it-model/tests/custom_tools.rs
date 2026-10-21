@@ -11,7 +11,7 @@ use ra_core::{
     item::{CallId, Message, ModelInputItem, RunItemKind, ToolCall, ToolCallKind, ToolCallOutput},
     model::{
         CustomToolFormat, CustomToolGrammarSyntax, Model, ModelProvider, ModelRequest,
-        ModelSettings, ModelToolDefinition, ProviderKey, ToolChoice,
+        ModelSettings, ModelToolDefinition, ProviderKey, SettingsLayers, ToolChoice,
     },
 };
 use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel, AnthropicMessagesProvider};
@@ -29,12 +29,9 @@ use wiremock::{
 const PATCH: &str = "*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch\n";
 
 fn settings(provider: &str, settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new(provider),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new(provider))
 }
 
 fn grammar_tool() -> ModelToolDefinition {

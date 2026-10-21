@@ -16,7 +16,7 @@ use ra_core::{
     },
     model::{
         Effort, Model, ModelHandoffDefinition, ModelRequest, ModelSettings, ModelStreamEvent,
-        ModelToolDefinition, ProviderKey, ToolChoice,
+        ModelToolDefinition, ProviderKey, SettingsLayers, ToolChoice,
     },
     prompt::{CachePlan, ContentHash},
     tool::{ToolOutput, ToolOutputBlock},
@@ -36,12 +36,9 @@ use wiremock::{
 const MODEL: &str = "chat-test";
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("openai"))
 }
 
 fn request(input: Vec<ModelInputItem>) -> ModelRequest {

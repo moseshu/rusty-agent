@@ -675,6 +675,27 @@ impl ModelResolver for SingleModelResolver {
     }
 }
 
+struct OutputLimitedResolver {
+    model: Arc<ScriptedModel>,
+    limit: u64,
+}
+
+impl ModelResolver for OutputLimitedResolver {
+    fn resolve_model(&self, _model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some("canonical-model".to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.model) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        )
+        .with_output_token_limit(self.limit))
+    }
+}
+
 struct ScriptedTool {
     origin: ToolOrigin,
     schema: ToolSchema,
@@ -1190,6 +1211,31 @@ fn pending_request(model: Arc<PendingModel>, cancel: &CancelScope) -> RunRequest
         cancel.clone(),
         vec![ModelInputItem::Message(Message::user("帮我改一下文件"))],
     )
+}
+
+#[tokio::test]
+async fn rejects_output_tokens_above_the_model_limit_before_calling_the_model() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("final", "done")])]);
+    let request = RunRequest::new(
+        agent(Vec::new()),
+        Arc::new(OutputLimitedResolver {
+            model: Arc::clone(&model),
+            limit: 128,
+        }),
+        RunId::new("run-output-limit"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("answer"))],
+    )
+    .with_config(RunConfig::new().with_model_settings(ModelSettings::new().with_max_tokens(129)));
+
+    let error = match Runner::run(request).await {
+        Err(error) => error,
+        Ok(_) => panic!("an output request above the registered limit must fail"),
+    };
+
+    assert_eq!(error.code(), "config");
+    assert!(error.to_string().contains("output limit (128)"));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@ use ra_core::{
     item::{AgentId, Message, ModelInputItem},
     model::{
         Model, ModelHandoffDefinition, ModelRequest, ModelSettings, ModelToolDefinition,
-        ProviderKey,
+        ProviderKey, SettingsLayers,
     },
 };
 use ra_model::{
@@ -69,12 +69,9 @@ fn baselines_present() -> bool {
 
 fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
     let settings = ModelSettings::new().with_max_tokens(256);
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("openai"))
 }
 
 /// How the host advertises the collaboration tools for one provider path.

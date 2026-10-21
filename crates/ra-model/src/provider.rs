@@ -63,18 +63,17 @@ where
     }
 }
 
-/// A canonical provider model plus local aliases and resolved-model defaults.
+/// A canonical provider model plus local aliases, defaults, and an optional output-token limit.
 ///
-/// The defaults are the model layer of the four-layer settings merge — typically this model's
-/// output-token ceiling. Provider-wide mandatory fallbacks, such as the `max_tokens` Anthropic
-/// requires on every request, belong to [`ProviderRegistration::with_defaults`]; a model that
-/// states its own limit overrides that fallback, because it is the more specific of the two.
+/// The defaults are the model layer of the four-layer settings merge. A hard output-token limit is
+/// declared separately so it cannot silently replace a request default or truncate user intent.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct ModelRegistration {
     name: String,
     aliases: Vec<String>,
     defaults: ModelSettings,
+    max_output_tokens: Option<u64>,
 }
 
 impl ModelRegistration {
@@ -85,6 +84,7 @@ impl ModelRegistration {
             name: name.into(),
             aliases: Vec::new(),
             defaults: ModelSettings::new(),
+            max_output_tokens: None,
         }
     }
 
@@ -95,14 +95,23 @@ impl ModelRegistration {
         self
     }
 
-    /// Sets this model's settings layer.
+    /// Sets this model's default settings layer.
     ///
-    /// For `max_tokens` this is read as a ceiling as well as a default: user intent from the agent
-    /// or run layer overrides the number, but is then clamped by it. It does beat a provider-wide
-    /// fallback, being the more specific registration of the two.
+    /// `max_tokens` is a default that later agent and run layers may override. Use
+    /// [`Self::with_max_output_tokens`] to declare a hard output-token limit.
     #[must_use]
     pub fn with_defaults(mut self, defaults: ModelSettings) -> Self {
         self.defaults = defaults;
+        self
+    }
+
+    /// Declares the largest output-token request this model accepts.
+    ///
+    /// A larger resolved `max_tokens` value is rejected before a model call. This limit does not
+    /// provide a default when no layer sets `max_tokens`.
+    #[must_use]
+    pub const fn with_max_output_tokens(mut self, limit: u64) -> Self {
+        self.max_output_tokens = Some(limit);
         self
     }
 
@@ -122,6 +131,12 @@ impl ModelRegistration {
     #[must_use]
     pub const fn defaults(&self) -> &ModelSettings {
         &self.defaults
+    }
+
+    /// Hard output-token limit declared for this model.
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
     }
 
     fn accepts(&self, name: &str) -> bool {
@@ -257,17 +272,23 @@ impl ProviderRegistration {
         &self.models
     }
 
-    fn resolve_model(&self, name: Option<&str>) -> (Option<String>, ModelSettings) {
+    fn resolve_model(&self, name: Option<&str>) -> (Option<String>, ModelSettings, Option<u64>) {
         let Some(name) = name else {
-            return (None, ModelSettings::new());
+            return (None, ModelSettings::new(), None);
         };
 
         self.models
             .iter()
             .find(|model| model.accepts(name))
             .map_or_else(
-                || (Some(name.to_owned()), ModelSettings::new()),
-                |model| (Some(model.name.clone()), model.defaults.clone()),
+                || (Some(name.to_owned()), ModelSettings::new(), None),
+                |model| {
+                    (
+                        Some(model.name.clone()),
+                        model.defaults.clone(),
+                        model.max_output_tokens,
+                    )
+                },
             )
     }
 }
@@ -433,7 +454,7 @@ impl ProviderRegistry {
     /// Parses and canonicalizes a provider/model selector without instantiating a provider.
     pub fn select_model(&self, model_name: Option<&str>) -> Result<ModelSelector> {
         self.select_with_defaults(model_name)
-            .map(|(selector, _)| selector)
+            .map(|(selector, _, _)| selector)
     }
 
     /// Resolves a selector through a cached provider instance.
@@ -442,7 +463,8 @@ impl ProviderRegistry {
     /// implements so the loop kernel can take a resolver without depending on this crate. Both
     /// return the same [`ResolvedModel`], so which one a call site picks is not observable.
     pub fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
-        let (selector, model_defaults) = self.select_with_defaults(model_name)?;
+        let (selector, model_defaults, max_output_tokens) =
+            self.select_with_defaults(model_name)?;
         let registration = self
             .registrations
             .get(selector.provider())
@@ -450,12 +472,16 @@ impl ProviderRegistry {
         let provider = self.provider_instance(registration)?;
         let model = provider.get_model(selector.model())?;
 
-        Ok(ResolvedModel::new(
+        let resolved = ResolvedModel::new(
             selector,
             model,
             registration.defaults.clone(),
             model_defaults,
-        ))
+        );
+        Ok(match max_output_tokens {
+            Some(limit) => resolved.with_output_token_limit(limit),
+            None => resolved,
+        })
     }
 
     /// Closes every cached provider instance exactly once.
@@ -487,17 +513,19 @@ impl ProviderRegistry {
     fn select_with_defaults(
         &self,
         model_name: Option<&str>,
-    ) -> Result<(ModelSelector, ModelSettings)> {
+    ) -> Result<(ModelSelector, ModelSettings, Option<u64>)> {
         let (provider, routed_model) = self.route(model_name)?;
         let registration = self
             .registrations
             .get(&provider)
             .ok_or_else(|| Error::caller("routed provider registration disappeared"))?;
-        let (model, model_defaults) = registration.resolve_model(routed_model.as_deref());
+        let (model, model_defaults, max_output_tokens) =
+            registration.resolve_model(routed_model.as_deref());
 
         Ok((
             ModelSelector::new(provider, model, registration.protocol),
             model_defaults,
+            max_output_tokens,
         ))
     }
 
@@ -607,6 +635,30 @@ fn validate_registration(registration: &ProviderRegistration) -> Result<()> {
     let mut model_names = BTreeSet::new();
     for model in &registration.models {
         validate_model_name(&model.name)?;
+        if model.max_output_tokens == Some(0) {
+            return Err(Error::config(format!(
+                "model `{}` max_output_tokens must be greater than zero",
+                model.name
+            )));
+        }
+        if let (Some(default), Some(limit)) = (model.defaults.max_tokens(), model.max_output_tokens)
+            && default > limit
+        {
+            return Err(Error::config(format!(
+                "model `{}` default max_tokens ({default}) exceeds max_output_tokens ({limit})",
+                model.name
+            )));
+        }
+        if model.defaults.max_tokens().is_none()
+            && let (Some(default), Some(limit)) =
+                (registration.defaults.max_tokens(), model.max_output_tokens)
+            && default > limit
+        {
+            return Err(Error::config(format!(
+                "provider `{}` default max_tokens ({default}) exceeds model `{}` max_output_tokens ({limit})",
+                registration.key, model.name
+            )));
+        }
         insert_model_name(&mut model_names, &model.name, &registration.key)?;
         for alias in &model.aliases {
             validate_model_name(alias)?;

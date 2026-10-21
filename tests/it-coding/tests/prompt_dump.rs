@@ -33,7 +33,7 @@ use ra_coding::{
     },
 };
 use ra_core::item::{Message, ModelInputItem, OutputPhase};
-use ra_core::model::{Model, ModelRequest, ModelSettings, ProviderKey};
+use ra_core::model::{Model, ModelRequest, ModelSettings, ProviderKey, SettingsLayers};
 use ra_core::prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, PromptRole};
 use ra_core::tool::{DEFAULT_MAX_NO_PROGRESS_STREAK, Tool};
 use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel};
@@ -1160,12 +1160,9 @@ async fn anthropic_system_block(instructions: &str) -> serde_json::Value {
     .expect("anthropic model builds");
 
     let settings = ModelSettings::new().with_max_tokens(256);
-    let resolved = ModelSettings::new().resolve(
-        &ProviderKey::new("anthropic"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    );
+    let resolved = SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("anthropic"));
     // The same two moves the runtime's turn preparation makes: name the stable prefix in a plan,
     // then hand the adapter the prefix that plan names.
     let request = ModelRequest::new(vec![ModelInputItem::Message(Message::user("go"))], resolved)

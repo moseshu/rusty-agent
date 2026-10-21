@@ -38,7 +38,7 @@ pub use retry::{
 };
 pub use settings::{
     Effort, JsonMap, McpToolChoice, ModelSettings, ProviderKey, ResolvedModelSettings,
-    ThinkingConfig, ToolChoice,
+    SettingsLayers, ThinkingConfig, ToolChoice,
 };
 pub use stream::{
     ModelStreamDelta, ModelStreamDeltaKind, ModelStreamEvent, RawResponseEvent, RunItemStreamEvent,

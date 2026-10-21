@@ -26,8 +26,8 @@ use ra_core::{
     error::{Error, Result},
     item::{ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind},
     model::{
-        ApiProtocol, Effort, Model, ModelOutputSchema, ModelRequest, ModelResolver, ModelSelector,
-        ModelSettings, ProviderKey, ResolvedModel,
+        ApiProtocol, Effort, JsonMap, Model, ModelOutputSchema, ModelRequest, ModelResolver,
+        ModelSelector, ModelSettings, ProviderKey, ResolvedModel,
     },
     output::OutputSchema,
     session::SessionId,
@@ -38,7 +38,7 @@ use ra_protocol::{
         AppServer,
         protocol::{
             ClientInfo, ClientRequest, CommandExecutionRequestApprovalParams, ImageDetail,
-            InitializeCapabilities, InitializeParams, ServerRequestPayload,
+            InitializeCapabilities, InitializeParams, ReasoningSummary, ServerRequestPayload,
             ThreadSettingsUpdateParams, Turn, TurnInterruptParams, TurnStartParams, TurnStatus,
             TurnSteerParams, UserInput,
         },
@@ -80,6 +80,7 @@ enum Step {
 struct Call {
     model: Option<String>,
     effort: Option<Effort>,
+    extra_body: JsonMap,
     input: Vec<ModelInputItem>,
     output_schema: Option<ModelOutputSchema>,
 }
@@ -135,6 +136,30 @@ impl ModelResolver for Resolver {
     }
 }
 
+struct ReasoningResolver {
+    script: Arc<Script>,
+    provider_defaults: ModelSettings,
+    model_defaults: ModelSettings,
+}
+
+impl ModelResolver for ReasoningResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some(model_name.unwrap_or("mock-model").to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::new(ScriptedModel {
+                script: Arc::clone(&self.script),
+                model: model_name.map(str::to_owned),
+            }) as Arc<dyn Model>,
+            self.provider_defaults.clone(),
+            self.model_defaults.clone(),
+        ))
+    }
+}
+
 struct ScriptedModel {
     script: Arc<Script>,
     model: Option<String>,
@@ -146,6 +171,7 @@ impl Model for ScriptedModel {
         self.script.calls.lock().unwrap().push(Call {
             model: self.model.clone(),
             effort: request.model_settings().effort(),
+            extra_body: request.model_settings().extra_body().clone(),
             input: request.input().to_vec(),
             output_schema: request.output_schema().cloned(),
         });
@@ -641,6 +667,53 @@ async fn turn_start_emits_notifications_and_accepts_model_override() {
     let calls = script.calls();
     assert_eq!(calls[0].model.as_deref(), Some("mock-model-override"));
     assert_eq!(texts(&calls[0].input), vec!["hello"]);
+}
+
+#[tokio::test]
+async fn reasoning_summary_preserves_resolved_lower_layer_fields() {
+    let server = Server::start();
+    let mut connection = server.connect(1, false).await;
+    let script = Arc::new(Script::default());
+    let provider = ProviderKey::new("test-provider");
+    let resolver = ReasoningResolver {
+        script: Arc::clone(&script),
+        provider_defaults: ModelSettings::new().with_extra_body_value(
+            provider.clone(),
+            "reasoning",
+            json!({"context": "provider-context", "mode": "provider-mode"}),
+        ),
+        model_defaults: ModelSettings::new(),
+    };
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .build()
+        .unwrap();
+    let thread = AgentThread::builder(
+        SessionId::new(THREAD),
+        AgentBinding::direct(agent),
+        Arc::new(resolver),
+    )
+    .build();
+    server.load_thread(thread, &[&connection]).await;
+    script.push(Step::Respond(final_message("m-1", "Done")));
+
+    let mut turn = serde_json::to_value(text_turn("hello")).unwrap();
+    turn["summary"] = serde_json::to_value(ReasoningSummary::Concise).unwrap();
+    let turn = serde_json::from_value(turn).unwrap();
+    let id = server.turn_start(&mut connection, &turn).await;
+    connection.response(id).await;
+    connection.notification("turn/completed").await;
+
+    let calls = script.calls();
+    assert_eq!(
+        calls[0].extra_body["reasoning"],
+        json!({
+            "context": "provider-context",
+            "mode": "provider-mode",
+            "summary": "concise"
+        })
+    );
 }
 
 /// Codex's `turn_start_with_empty_input_runs_model_request`.

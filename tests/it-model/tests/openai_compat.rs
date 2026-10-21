@@ -11,7 +11,10 @@ use std::sync::Arc;
 use futures::StreamExt;
 use ra_core::{
     item::{Message, ModelInputItem},
-    model::{Model, ModelProvider, ModelRequest, ModelSettings, ModelStreamEvent, ProviderKey},
+    model::{
+        Model, ModelProvider, ModelRequest, ModelSettings, ModelStreamEvent, ProviderKey,
+        SettingsLayers,
+    },
     prompt::{CachePlan, ContentHash},
 };
 use ra_model::{
@@ -33,12 +36,7 @@ fn endpoint(server: &MockServer) -> CompatEndpoint {
 }
 
 fn request(input: Vec<ModelInputItem>) -> ModelRequest {
-    let settings = ModelSettings::new().resolve(
-        &ProviderKey::new(PROVIDER),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-    );
+    let settings = SettingsLayers::new().resolve(&ProviderKey::new(PROVIDER));
     ModelRequest::new(input, settings)
 }
 
@@ -222,14 +220,10 @@ async fn request_headers_override_endpoint_default_headers() {
     .await;
     let endpoint = endpoint(&server).with_default_header("x-router-route", "endpoint");
     let model = model_of(&endpoint);
-    let settings = ModelSettings::new()
-        .with_extra_header("x-router-route", "request")
-        .resolve(
-            &ProviderKey::new(PROVIDER),
-            &ModelSettings::new(),
-            &ModelSettings::new(),
-            &ModelSettings::new(),
-        );
+    let request_settings = ModelSettings::new().with_extra_header("x-router-route", "request");
+    let settings = SettingsLayers::new()
+        .with_run(&request_settings)
+        .resolve(&ProviderKey::new(PROVIDER));
 
     model
         .get_response(ModelRequest::new(user_turn(), settings))

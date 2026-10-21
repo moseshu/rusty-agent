@@ -1,47 +1,23 @@
 //! Provider-neutral model settings and immutable four-layer resolution.
 //!
-//! Resolution order is provider registration, agent defaults, resolved-model defaults, then run
+//! Resolution order is provider registration, resolved-model defaults, agent defaults, then run
 //! overrides. Scalar settings use an explicit `Option<T>` so an unset value remains distinct from
-//! an explicit `0`, `false`, or enum default. Transport extras merge without entering the
-//! trace-safe projection.
+//! an explicit `0`, `false`, or enum default. Metadata, headers, and query maps are optional
+//! whole-map overrides; request-body extras merge at the top level for the active provider.
+//! Transport extras stay out of the trace-safe projection.
 //!
-//! # `max_tokens` and `timeout` are constrained differently
+//! Model defaults fill fields that agent and run settings leave unset. This is a deliberate Rust
+//! registry adaptation: model registrations carry explicit per-model defaults, and dropping all
+//! of them because an agent set one unrelated field would discard settings such as that model's
+//! reasoning default. Codex follows the same field-by-field pattern for explicit reasoning effort
+//! and model metadata defaults. The `OpenAI` Agents SDK instead drops all implicit model-specific
+//! defaults when any agent model setting is explicit.
 //!
-//! `max_tokens` is the one setting where the four layers do not simply stack, because three
-//! different kinds of statement share the field:
-//!
-//! | Role | Layers | Rule |
-//! | --- | --- | --- |
-//! | registry default — "use this unless told otherwise" | provider, then model | later wins, so the model-specific value beats the provider-wide one |
-//! | user intent — "I want this much" | agent, then run | later wins, and any intent beats a registry default |
-//! | hard ceiling — "more than this only buys a 400" | model | clamps whatever the two rules above produced |
-//!
-//! Two failure modes this avoids, both of which silently discard a value someone wrote down:
-//!
-//! - Clamping to the minimum of every layer would make an agent's short-answer default an
-//!   unraisable ceiling, so a run that legitimately needs a long answer could never ask for one.
-//! - Letting the provider layer supply the value would make the coarsest registration beat the most
-//!   specific one. A provider-wide fallback exists because some endpoints require the field at all
-//!   — Anthropic does — and it must not override a per-model limit that was registered precisely
-//!   because that model is different.
-//!
-//! `timeout` is the opposite and does take the minimum of all four layers. It is a latency bound
-//! rather than a capability: any layer that wants to wait less has standing to say so, and a
-//! longer request still completes — it is just abandoned earlier.
-//!
-//! # Two `max_tokens` obligations that land outside this module
-//!
-//! - **Anthropic requires it.** Both `OpenAI` protocols treat the output limit as optional and
-//!   omit the field when unset, but Anthropic Messages rejects a request without `max_tokens`. So
-//!   for that provider the resolved-model layer is not only a ceiling, it is a mandatory fallback:
-//!   all four layers resolving to `None` must still produce a value. Supplying it belongs to
-//!   provider registration, not here — `ra-core` does not know which endpoint is in play.
-//! - **It is coupled to the thinking budget.** Anthropic requires `max_tokens` to exceed
-//!   `thinking.budget_tokens`, so [`ThinkingConfig::Enabled`] with a large budget and a small
-//!   `max_tokens` is a request that can only 400. The check is not performed here on purpose: the
-//!   constraint is Anthropic's, `OpenAI`'s `Effort` has no equivalent relationship, and encoding it
-//!   in a protocol-neutral type would violate the rule that protocol-specific facts stay out of
-//!   the neutral layer. It belongs to the adapter.
+//! `max_tokens` is a request default and follows the same layer order. A model's hard output limit
+//! is registered separately, so exceeding it is a configuration error rather than silent
+//! truncation. Provider-required defaults, such as Anthropic's mandatory `max_tokens`, remain in
+//! the provider layer. The Anthropic constraint that `max_tokens` exceed `thinking.budget_tokens`
+//! stays in its adapter because it is not shared by the other protocols.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -57,12 +33,17 @@ use super::retry::ModelRetrySettings;
 use crate::compat::{SchemaVersion, Unknown};
 
 /// Current model-settings schema version.
-pub const MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+pub const MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+/// Current trace projection schema version for resolved model settings.
+const TRACE_MODEL_SETTINGS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 /// Current MCP-tool-choice schema version.
 pub const MCP_TOOL_CHOICE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
 /// A deterministic JSON object used by request extras.
 pub type JsonMap = BTreeMap<String, Value>;
+
+static EMPTY_METADATA: BTreeMap<String, String> = BTreeMap::new();
+static EMPTY_JSON_MAP: JsonMap = BTreeMap::new();
 
 /// Provider registration identity used to isolate provider-specific request fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -211,9 +192,9 @@ impl fmt::Display for Effort {
 /// Optional settings contributed by one resolution layer.
 ///
 /// The same type represents provider registration defaults, agent defaults, resolved-model
-/// defaults, and run overrides. Call [`Self::resolve`] on the provider layer.
+/// defaults, and run overrides. Resolve them with [`SettingsLayers`].
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ModelSettings {
     schema_version: SchemaVersion,
@@ -237,18 +218,80 @@ pub struct ModelSettings {
     thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<Effort>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    metadata: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    extra_headers: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    extra_query: JsonMap,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_headers: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_query: Option<JsonMap>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     extra_body: BTreeMap<ProviderKey, JsonMap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry: Option<ModelRetrySettings>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ModelSettingsData {
+    schema_version: Option<SchemaVersion>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    max_tokens: Option<u64>,
+    #[serde(with = "option_millis")]
+    timeout: Option<Duration>,
+    tool_choice: Option<ToolChoice>,
+    parallel_tool_calls: Option<bool>,
+    thinking: Option<ThinkingConfig>,
+    effort: Option<Effort>,
+    metadata: Option<BTreeMap<String, String>>,
+    extra_headers: Option<BTreeMap<String, String>>,
+    extra_query: Option<JsonMap>,
+    extra_body: BTreeMap<ProviderKey, JsonMap>,
+    retry: Option<ModelRetrySettings>,
+    #[serde(flatten)]
+    unknown: Unknown,
+}
+
+impl<'de> Deserialize<'de> for ModelSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let data = ModelSettingsData::deserialize(deserializer)?;
+        let schema_version = data.schema_version.unwrap_or(MODEL_SETTINGS_SCHEMA_VERSION);
+        let is_legacy = schema_version.get() == 1;
+        Ok(Self {
+            // Legacy empty maps are normalized to unset below, so subsequent writes must use the
+            // schema whose empty-map semantics match the normalized in-memory representation.
+            schema_version: if is_legacy {
+                MODEL_SETTINGS_SCHEMA_VERSION
+            } else {
+                schema_version
+            },
+            temperature: data.temperature,
+            top_p: data.top_p,
+            frequency_penalty: data.frequency_penalty,
+            presence_penalty: data.presence_penalty,
+            max_tokens: data.max_tokens,
+            timeout: data.timeout,
+            tool_choice: data.tool_choice,
+            parallel_tool_calls: data.parallel_tool_calls,
+            thinking: data.thinking,
+            effort: data.effort,
+            metadata: data.metadata.filter(|map| !is_legacy || !map.is_empty()),
+            extra_headers: data
+                .extra_headers
+                .filter(|map| !is_legacy || !map.is_empty()),
+            extra_query: data.extra_query.filter(|map| !is_legacy || !map.is_empty()),
+            extra_body: data.extra_body,
+            retry: data.retry,
+            unknown: data.unknown,
+        })
+    }
 }
 
 impl ModelSettings {
@@ -267,9 +310,9 @@ impl ModelSettings {
             parallel_tool_calls: None,
             thinking: None,
             effort: None,
-            metadata: BTreeMap::new(),
-            extra_headers: BTreeMap::new(),
-            extra_query: BTreeMap::new(),
+            metadata: None,
+            extra_headers: None,
+            extra_query: None,
             extra_body: BTreeMap::new(),
             retry: None,
             unknown: Unknown::new(),
@@ -349,21 +392,48 @@ impl ModelSettings {
     /// Adds or replaces one metadata entry in this layer.
     #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.insert(key.into(), value.into());
+        self.metadata
+            .get_or_insert_with(BTreeMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Replaces this layer's metadata map, including with an empty map to clear inherited values.
+    #[must_use]
+    pub fn with_metadata_map(mut self, metadata: BTreeMap<String, String>) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 
     /// Adds or replaces one transport header in this layer.
     #[must_use]
     pub fn with_extra_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.extra_headers.insert(key.into(), value.into());
+        self.extra_headers
+            .get_or_insert_with(BTreeMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Replaces this layer's transport headers, including with an empty map to clear inherited values.
+    #[must_use]
+    pub fn with_extra_headers_map(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.extra_headers = Some(headers);
         self
     }
 
     /// Adds or replaces one query parameter in this layer.
     #[must_use]
     pub fn with_extra_query(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.extra_query.insert(key.into(), value.into());
+        self.extra_query
+            .get_or_insert_with(JsonMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Replaces this layer's query parameters, including with an empty map to clear inherited values.
+    #[must_use]
+    pub fn with_extra_query_map(mut self, query: JsonMap) -> Self {
+        self.extra_query = Some(query);
         self
     }
 
@@ -394,55 +464,6 @@ impl ModelSettings {
     pub fn with_retry(mut self, retry: ModelRetrySettings) -> Self {
         self.retry = Some(retry);
         self
-    }
-
-    /// Resolves four immutable layers for one active provider.
-    ///
-    /// `self` is the provider-registration layer. Later arguments have increasing precedence.
-    /// Only the active provider's request-body bucket is copied into the result.
-    ///
-    /// `max_tokens` resolves through three roles rather than plain layer stacking, and `timeout`
-    /// takes the shortest of all four; see the module documentation for both rules.
-    #[must_use]
-    pub fn resolve(
-        &self,
-        provider: &ProviderKey,
-        agent_defaults: &Self,
-        model_defaults: &Self,
-        run_overrides: &Self,
-    ) -> ResolvedModelSettings {
-        let layers = [self, agent_defaults, model_defaults, run_overrides];
-        // See the module docs: registry defaults and user intent are separate lanes, and the model
-        // layer additionally clamps whichever of them produced a value.
-        let registry_default = last_some([self, model_defaults].map(|layer| layer.max_tokens));
-        let user_intent = last_some([agent_defaults, run_overrides].map(|layer| layer.max_tokens));
-
-        ResolvedModelSettings {
-            provider: provider.clone(),
-            temperature: last_some(layers.map(|layer| layer.temperature)),
-            top_p: last_some(layers.map(|layer| layer.top_p)),
-            frequency_penalty: last_some(layers.map(|layer| layer.frequency_penalty)),
-            presence_penalty: last_some(layers.map(|layer| layer.presence_penalty)),
-            max_tokens: clamp_to_limit(user_intent.or(registry_default), model_defaults.max_tokens),
-            timeout: strictest(layers.map(|layer| layer.timeout)),
-            tool_choice: layers
-                .iter()
-                .rev()
-                .find_map(|layer| layer.tool_choice.clone()),
-            parallel_tool_calls: last_some(layers.map(|layer| layer.parallel_tool_calls)),
-            thinking: last_some(layers.map(|layer| layer.thinking)),
-            effort: last_some(layers.map(|layer| layer.effort)),
-            metadata: merge_string_maps(layers.map(|layer| &layer.metadata)),
-            extra_headers: merge_string_maps(layers.map(|layer| &layer.extra_headers)),
-            extra_query: merge_json_maps(layers.map(|layer| &layer.extra_query), false),
-            extra_body: merge_json_maps(
-                layers
-                    .iter()
-                    .filter_map(|layer| layer.extra_body.get(provider)),
-                true,
-            ),
-            retry: ModelRetrySettings::merge(layers.map(|layer| layer.retry.as_ref())),
-        }
     }
 
     /// Schema version.
@@ -513,20 +534,20 @@ impl ModelSettings {
 
     /// Response metadata in this unresolved layer.
     #[must_use]
-    pub const fn metadata(&self) -> &BTreeMap<String, String> {
-        &self.metadata
+    pub fn metadata(&self) -> &BTreeMap<String, String> {
+        self.metadata.as_ref().unwrap_or(&EMPTY_METADATA)
     }
 
     /// Transport headers in this unresolved layer.
     #[must_use]
-    pub const fn extra_headers(&self) -> &BTreeMap<String, String> {
-        &self.extra_headers
+    pub fn extra_headers(&self) -> &BTreeMap<String, String> {
+        self.extra_headers.as_ref().unwrap_or(&EMPTY_METADATA)
     }
 
     /// Transport query in this unresolved layer.
     #[must_use]
-    pub const fn extra_query(&self) -> &JsonMap {
-        &self.extra_query
+    pub fn extra_query(&self) -> &JsonMap {
+        self.extra_query.as_ref().unwrap_or(&EMPTY_JSON_MAP)
     }
 
     /// Per-provider request-body buckets in this unresolved layer.
@@ -551,6 +572,103 @@ impl ModelSettings {
 impl Default for ModelSettings {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The four named settings layers for one model-resolution operation.
+///
+/// Start with [`Self::new`] and set only the named layers that have values. Unset layers resolve as
+/// empty settings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettingsLayers<'a> {
+    provider: Option<&'a ModelSettings>,
+    model: Option<&'a ModelSettings>,
+    agent: Option<&'a ModelSettings>,
+    run: Option<&'a ModelSettings>,
+}
+
+impl<'a> SettingsLayers<'a> {
+    /// Creates empty provider, model, agent, and run settings layers.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            agent: None,
+            run: None,
+        }
+    }
+
+    /// Sets provider registration defaults.
+    #[must_use]
+    pub const fn with_provider(mut self, provider: &'a ModelSettings) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Sets defaults registered for the selected model.
+    #[must_use]
+    pub const fn with_model(mut self, model: &'a ModelSettings) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Sets agent-level settings.
+    #[must_use]
+    pub const fn with_agent(mut self, agent: &'a ModelSettings) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    /// Sets settings for this run.
+    #[must_use]
+    pub const fn with_run(mut self, run: &'a ModelSettings) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    /// Resolves the named layers for the active provider.
+    #[must_use]
+    pub fn resolve(self, provider: &ProviderKey) -> ResolvedModelSettings {
+        let empty = ModelSettings::new();
+        let layers = [
+            self.provider.unwrap_or(&empty),
+            self.model.unwrap_or(&empty),
+            self.agent.unwrap_or(&empty),
+            self.run.unwrap_or(&empty),
+        ];
+
+        ResolvedModelSettings {
+            provider: provider.clone(),
+            temperature: last_some(layers.map(|layer| layer.temperature)),
+            top_p: last_some(layers.map(|layer| layer.top_p)),
+            frequency_penalty: last_some(layers.map(|layer| layer.frequency_penalty)),
+            presence_penalty: last_some(layers.map(|layer| layer.presence_penalty)),
+            max_tokens: last_some(layers.map(|layer| layer.max_tokens)),
+            timeout: last_some(layers.map(|layer| layer.timeout)),
+            tool_choice: layers
+                .iter()
+                .rev()
+                .find_map(|layer| layer.tool_choice.clone()),
+            parallel_tool_calls: last_some(layers.map(|layer| layer.parallel_tool_calls)),
+            thinking: last_some(layers.map(|layer| layer.thinking)),
+            effort: last_some(layers.map(|layer| layer.effort)),
+            metadata: last_some(layers.map(|layer| layer.metadata.as_ref()))
+                .cloned()
+                .unwrap_or_default(),
+            extra_headers: last_some(layers.map(|layer| layer.extra_headers.as_ref()))
+                .cloned()
+                .unwrap_or_default(),
+            extra_query: last_some(layers.map(|layer| layer.extra_query.as_ref()))
+                .cloned()
+                .unwrap_or_default(),
+            extra_body: merge_json_maps(
+                layers
+                    .iter()
+                    .filter_map(|layer| layer.extra_body.get(provider)),
+            ),
+            retry: ModelRetrySettings::merge(layers.map(|layer| layer.retry.as_ref())),
+        }
     }
 }
 
@@ -672,13 +790,13 @@ impl ResolvedModelSettings {
         self.presence_penalty
     }
 
-    /// Strictest output-token limit across all layers.
+    /// Effective output-token default or override.
     #[must_use]
     pub const fn max_tokens(&self) -> Option<u64> {
         self.max_tokens
     }
 
-    /// Shortest timeout across all layers.
+    /// Effective timeout after layer precedence.
     #[must_use]
     pub const fn timeout(&self) -> Option<Duration> {
         self.timeout
@@ -708,25 +826,25 @@ impl ResolvedModelSettings {
         self.effort
     }
 
-    /// Merged response metadata.
+    /// Effective response metadata map.
     #[must_use]
     pub const fn metadata(&self) -> &BTreeMap<String, String> {
         &self.metadata
     }
 
-    /// Merged transport headers. These are excluded from trace projection.
+    /// Effective transport headers. These are excluded from trace projection.
     #[must_use]
     pub const fn extra_headers(&self) -> &BTreeMap<String, String> {
         &self.extra_headers
     }
 
-    /// Merged transport query. This is excluded from trace projection.
+    /// Effective transport query. This is excluded from trace projection.
     #[must_use]
     pub const fn extra_query(&self) -> &JsonMap {
         &self.extra_query
     }
 
-    /// Deep-merged request extras for only the active provider.
+    /// Top-level merged request extras for only the active provider.
     #[must_use]
     pub const fn extra_body(&self) -> &JsonMap {
         &self.extra_body
@@ -776,7 +894,7 @@ impl ResolvedModelSettings {
         }
 
         serde_json::to_value(Traceable {
-            schema_version: MODEL_SETTINGS_SCHEMA_VERSION,
+            schema_version: TRACE_MODEL_SETTINGS_SCHEMA_VERSION,
             temperature: self.temperature,
             top_p: self.top_p,
             frequency_penalty: self.frequency_penalty,
@@ -797,56 +915,10 @@ fn last_some<T>(values: impl IntoIterator<Item = Option<T>>) -> Option<T> {
     values.into_iter().flatten().last()
 }
 
-fn strictest<T: Ord>(values: impl IntoIterator<Item = Option<T>>) -> Option<T> {
-    values.into_iter().flatten().min()
-}
-
-/// Applies a hard capability limit to a requested value.
-///
-/// An absent limit leaves the request alone, and an absent request falls back to the limit, so a
-/// model registration that states only a ceiling still supplies a usable value.
-fn clamp_to_limit<T: Ord>(requested: Option<T>, limit: Option<T>) -> Option<T> {
-    match (requested, limit) {
-        (Some(requested), Some(limit)) => Some(requested.min(limit)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
-fn merge_string_maps<'a>(
-    maps: impl IntoIterator<Item = &'a BTreeMap<String, String>>,
-) -> BTreeMap<String, String> {
-    let mut merged = BTreeMap::new();
+fn merge_json_maps<'a>(maps: impl IntoIterator<Item = &'a JsonMap>) -> JsonMap {
+    let mut merged = JsonMap::new();
     for map in maps {
         merged.extend(map.iter().map(|(key, value)| (key.clone(), value.clone())));
     }
     merged
-}
-
-fn merge_json_maps<'a>(maps: impl IntoIterator<Item = &'a JsonMap>, deep: bool) -> JsonMap {
-    let mut merged = JsonMap::new();
-    for map in maps {
-        for (key, value) in map {
-            if deep && let Some(existing) = merged.get_mut(key) {
-                deep_merge_value(existing, value);
-                continue;
-            }
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    merged
-}
-
-fn deep_merge_value(target: &mut Value, incoming: &Value) {
-    if let (Value::Object(target), Value::Object(incoming)) = (&mut *target, incoming) {
-        for (key, value) in incoming {
-            if let Some(existing) = target.get_mut(key) {
-                deep_merge_value(existing, value);
-            } else {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-    } else {
-        *target = incoming.clone();
-    }
 }

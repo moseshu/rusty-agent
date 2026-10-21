@@ -16,6 +16,7 @@ use ra_core::{
         ApiProtocol, ConversationContinuation, Model, ModelRequest, ModelResolver,
         ModelRetryAdviceRequest, ModelRetrySettings, ModelSelector, ModelSettings,
         NetworkErrorRetryPolicy, ProviderKey, ReplaySafety, ResolvedModel, RetryBackoffSettings,
+        SettingsLayers,
     },
     session::SessionId,
     state::RunId,
@@ -327,12 +328,7 @@ async fn interrupted_stateful_responses_keep_replay_safety_unknown(
 ) {
     let (endpoint, calls) = endpoint(Protocol::Responses).await;
     let model = Protocol::Responses.model(&endpoint);
-    let settings = ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-    );
+    let settings = SettingsLayers::new().resolve(&ProviderKey::new("openai"));
     let request = ModelRequest::new(
         vec![ModelInputItem::Message(Message::user("hello"))],
         settings,

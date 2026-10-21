@@ -405,6 +405,7 @@ struct RecordingModel {
     instructions: Mutex<Vec<Option<String>>>,
     tools: Mutex<Vec<Vec<String>>>,
     temperatures: Mutex<Vec<Option<f64>>>,
+    top_ps: Mutex<Vec<Option<f64>>>,
     inputs: Mutex<Vec<Vec<ModelInputItem>>>,
     /// One tool name per turn to call before answering; turns past the end answer for good.
     script: Mutex<VecDeque<String>>,
@@ -422,6 +423,7 @@ impl RecordingModel {
             instructions: Mutex::new(Vec::new()),
             tools: Mutex::new(Vec::new()),
             temperatures: Mutex::new(Vec::new()),
+            top_ps: Mutex::new(Vec::new()),
             inputs: Mutex::new(Vec::new()),
             script: Mutex::new(calls.iter().map(|name| (*name).to_owned()).collect()),
         })
@@ -455,6 +457,10 @@ impl RecordingModel {
             .lock()
             .unwrap()
             .push(request.model_settings().temperature());
+        self.top_ps
+            .lock()
+            .unwrap()
+            .push(request.model_settings().top_p());
         self.inputs.lock().unwrap().push(request.input().to_vec());
         let scripted = self.script.lock().unwrap().pop_front();
         match scripted {
@@ -488,6 +494,26 @@ impl Model for RecordingModel {
 
 struct FixedResolver {
     model: Arc<RecordingModel>,
+}
+
+struct ModelDefaultsResolver {
+    model: Arc<RecordingModel>,
+    model_defaults: ModelSettings,
+}
+
+impl ModelResolver for ModelDefaultsResolver {
+    fn resolve_model(&self, _model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some("canonical-model".to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.model) as Arc<dyn Model>,
+            ModelSettings::new(),
+            self.model_defaults.clone(),
+        ))
+    }
 }
 
 impl ModelResolver for FixedResolver {
@@ -765,6 +791,31 @@ async fn the_sampling_fold_hands_each_capability_what_the_ones_before_it_produce
          Which capability that is, is the host's own install order — no declaration reorders it"
     );
     assert_eq!(prepared.model_settings().temperature(), Some(0.9));
+}
+
+#[tokio::test]
+async fn capability_sampling_overrides_a_model_default_while_other_defaults_fill_in() {
+    let model = RecordingModel::new();
+    let resolver = Arc::new(ModelDefaultsResolver {
+        model: Arc::clone(&model),
+        model_defaults: ModelSettings::new().with_temperature(0.2).with_top_p(0.6),
+    });
+    let capability = TestCapability::new(CapabilityFamily::SHELL)
+        .with_temperature(0.9)
+        .into_shared();
+    let request = RunRequest::new(
+        AgentBinding::direct(agent()),
+        resolver,
+        RunId::new("run-capability-model-defaults"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("go"))],
+    )
+    .with_config(RunConfig::new().with_capability(capability));
+
+    Runner::run(request).await.unwrap();
+
+    assert_eq!(model.temperatures.lock().unwrap().as_slice(), &[Some(0.9)]);
+    assert_eq!(model.top_ps.lock().unwrap().as_slice(), &[Some(0.6)]);
 }
 
 #[tokio::test]

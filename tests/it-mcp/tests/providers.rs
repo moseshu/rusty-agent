@@ -3,7 +3,9 @@
 mod support;
 use ra_core::{
     item::{CallId, ModelInputItem, ToolCall, ToolCallOutput},
-    model::{Model, ModelRequest, ModelSettings, ProviderKey, ResolvedModelSettings},
+    model::{
+        Model, ModelRequest, ModelSettings, ProviderKey, ResolvedModelSettings, SettingsLayers,
+    },
     tool::Tool,
 };
 use ra_mcp::{
@@ -20,12 +22,10 @@ use serde_json::{Value, json};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 fn resolved() -> ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &ModelSettings::new().with_max_tokens(64),
-    )
+    let run = ModelSettings::new().with_max_tokens(64);
+    SettingsLayers::new()
+        .with_run(&run)
+        .resolve(&ProviderKey::new("openai"))
 }
 
 async fn request_tools(model: &dyn Model, server: &MockServer, request: ModelRequest) -> Value {

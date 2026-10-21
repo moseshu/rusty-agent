@@ -3,7 +3,8 @@
 use ra_core::{
     item::{CallId, ModelInputItem, RunItemKind, ToolCall, ToolCallKind, ToolCallOutput},
     model::{
-        Model, ModelRequest, ModelSettings, ModelToolDefinition, ProviderKey, ResolvedModelSettings,
+        Model, ModelRequest, ModelSettings, ModelToolDefinition, ProviderKey,
+        ResolvedModelSettings, SettingsLayers,
     },
     tool::{ToolOutput, ToolOutputBlock},
 };
@@ -18,12 +19,10 @@ use wiremock::{
 };
 
 fn settings() -> ResolvedModelSettings {
-    ModelSettings::new().with_max_tokens(64).resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-    )
+    let request = ModelSettings::new().with_max_tokens(64);
+    SettingsLayers::new()
+        .with_run(&request)
+        .resolve(&ProviderKey::new("openai"))
 }
 fn search_definition() -> ModelToolDefinition {
     ModelToolDefinition::tool_search(

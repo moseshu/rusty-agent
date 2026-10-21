@@ -10,6 +10,56 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 0.3.0 is in development on `main`. This section lists the incompatible changes that have
 landed so far; further changes planned for this release are added here as they land.
 
+### Model settings resolve by named layer
+
+Model settings now resolve in provider → model → agent → run order. For scalar settings, the last
+layer that sets a value wins. Model registration defaults fill fields the agent and run leave
+unset; this is a deliberate registry extension and differs from the OpenAI Agents SDK, which
+discards all implicit model-specific defaults when the agent has any explicit model setting.
+`retry` continues to merge across layers.
+
+`metadata`, `extra_headers`, and `extra_query` replace the whole map. Use
+`with_metadata_map`, `with_extra_headers_map`, or `with_extra_query_map` with an empty map to clear
+an inherited value. Provider-bucketed `extra_body` uses a local shallow merge of top-level keys:
+later layers replace the complete value for a matching key, including nested objects. This is not
+the SDK's `extra_body` behavior (which replaces the map); the SDK's `extra_args` uses a shallow
+top-level merge, but it is a separate API.
+
+`timeout` follows the same later-layer-wins rule; the run deadline remains controlled by
+`BudgetLimit`. `max_tokens` in `ModelRegistration::with_defaults` is only a default. Declare a hard
+model limit with `ModelRegistration::with_max_output_tokens`; requests above it now fail with a
+configuration error before calling the model instead of being silently truncated. Provider
+requirements such as Anthropic's fallback `max_tokens` remain in provider defaults.
+
+Custom `ModelResolver` implementations that know a model's hard output limit must attach it to the
+resolved model. After constructing `ResolvedModel`, call `with_output_token_limit(limit)`:
+
+```rust,ignore
+ResolvedModel::new(selector, model, provider_defaults, model_defaults)
+    .with_output_token_limit(4_096)
+```
+
+Without this declaration, the runtime cannot enforce that model's hard limit.
+
+`ModelSettings::resolve` has been removed because its four same-typed positional layers were easy
+to pass in the wrong order. Build the layers by name; any layer you omit is treated as empty:
+
+```rust,ignore
+SettingsLayers::new()
+    .with_provider(&provider_defaults)
+    .with_model(&model_defaults)
+    .with_agent(&agent_settings)
+    .with_run(&run_overrides)
+    .resolve(&provider_key)
+```
+
+The `ModelSettings` serialized schema is now version 2 so an explicitly empty map remains distinct
+from an unset map. When reading schema version 1 settings, empty `metadata`, `extra_headers`, and
+`extra_query` maps are treated as unset to preserve the old format's meaning, and the in-memory
+settings are upgraded to version 2 for subsequent writes. Schema version 2 empty maps continue to
+clear inherited values. Resolved trace settings retain their own schema version because their
+shape did not change.
+
 ### Dynamic instructions are system instructions
 
 Static, synchronous, and asynchronous instruction callbacks now all supply the model's system

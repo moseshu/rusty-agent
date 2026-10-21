@@ -14,16 +14,14 @@ use ra_core::{
     },
     model::{
         ConversationContinuation, Model, ModelHandoffDefinition, ModelOutputSchema, ModelProvider,
-        ModelRequest, ModelRetryAdviceRequest, ModelSettings, ModelStream, ModelStreamEvent,
-        ModelToolDefinition, ModelTracing, ProviderKey, RawResponseEvent, ReplaySafety,
-        RetryAdvice,
+        ModelRequest, ModelRetryAdviceRequest, ModelStream, ModelStreamEvent, ModelToolDefinition,
+        ModelTracing, ProviderKey, RawResponseEvent, ReplaySafety, RetryAdvice, SettingsLayers,
     },
 };
 use serde_json::json;
 
 fn resolved_settings() -> ra_core::model::ResolvedModelSettings {
-    let empty = ModelSettings::new();
-    empty.resolve(&ProviderKey::new("test"), &empty, &empty, &empty)
+    SettingsLayers::new().resolve(&ProviderKey::new("test"))
 }
 
 fn request() -> ModelRequest {

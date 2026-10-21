@@ -11,8 +11,8 @@ use ra_core::{
     item::{Message, ModelInputItem},
     model::{
         ConversationContinuation, JitterSample, Model, ModelRequest, ModelRetryAdviceRequest,
-        ModelSettings, ModelStream, NormalizedProviderError, ProviderKey, ReplaySafety,
-        ResolvedModelSettings, RetryAdvice, RetryBackoff,
+        ModelStream, NormalizedProviderError, ProviderKey, ReplaySafety, ResolvedModelSettings,
+        RetryAdvice, RetryBackoff, SettingsLayers,
     },
 };
 use ra_model::openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel};
@@ -30,12 +30,7 @@ use wiremock::{
 const MODEL: &str = "retry-test";
 
 fn resolved() -> ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-    )
+    SettingsLayers::new().resolve(&ProviderKey::new("openai"))
 }
 
 fn request() -> ModelRequest {

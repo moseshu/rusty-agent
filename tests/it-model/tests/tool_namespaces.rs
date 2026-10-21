@@ -9,7 +9,7 @@ use ra_core::{
     item::{CallId, Message, ModelInputItem, RunItemKind, ToolCall, ToolCallOutput},
     model::{
         Model, ModelHandoffDefinition, ModelRequest, ModelSettings, ModelToolDefinition,
-        ProviderKey, ResolvedModelSettings, ToolChoice,
+        ProviderKey, ResolvedModelSettings, SettingsLayers, ToolChoice,
     },
 };
 use ra_model::{
@@ -23,12 +23,9 @@ use wiremock::{
 };
 
 fn resolved(settings: ModelSettings) -> ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("openai"))
 }
 
 async fn responses_model(server: &MockServer, body: Value) -> OpenAiResponsesModel {

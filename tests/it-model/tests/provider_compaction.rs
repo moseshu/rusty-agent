@@ -9,7 +9,7 @@
 use futures::StreamExt as _;
 use ra_core::{
     item::{Message, ModelInputItem, ProviderCompaction, RunItemKind},
-    model::{Model, ModelRequest, ModelSettings, ModelStreamEvent, ProviderKey},
+    model::{Model, ModelRequest, ModelSettings, ModelStreamEvent, ProviderKey, SettingsLayers},
 };
 use ra_model::anthropic::{AnthropicAuth, AnthropicMessagesModel};
 use ra_model::openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel};
@@ -20,12 +20,9 @@ use wiremock::{
 };
 
 fn settings(provider: &str, settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new(provider),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new(provider))
 }
 
 fn compaction_output() -> Value {

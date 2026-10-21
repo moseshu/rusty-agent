@@ -15,7 +15,10 @@
 
 use ra_core::{
     item::{ModelInputItem, RunItemKind, ToolCallOutput},
-    model::{Effort, Model, ModelRequest, ModelSettings, ModelToolDefinition, ProviderKey},
+    model::{
+        Effort, Model, ModelRequest, ModelSettings, ModelToolDefinition, ProviderKey,
+        SettingsLayers,
+    },
 };
 use ra_model::openai::{auth::OpenAiAuth, responses::OpenAiResponsesModel};
 use serde_json::json;
@@ -36,12 +39,9 @@ fn live_model() -> OpenAiResponsesModel {
 }
 
 fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
-    ModelSettings::new().resolve(
-        &ProviderKey::new("openai"),
-        &ModelSettings::new(),
-        &ModelSettings::new(),
-        &settings,
-    )
+    SettingsLayers::new()
+        .with_run(&settings)
+        .resolve(&ProviderKey::new("openai"))
 }
 
 fn report(label: &str, response: &ra_core::item::ModelResponse) {

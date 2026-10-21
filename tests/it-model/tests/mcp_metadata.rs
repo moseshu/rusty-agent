@@ -14,7 +14,7 @@ use ra_core::{
     item::{ModelInputItem, RunItem, RunItemKind},
     model::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
-        ResolvedModel,
+        ResolvedModel, SettingsLayers,
     },
     state::{RunId, RunState, ToolUse},
     tool::{
@@ -241,12 +241,8 @@ async fn current_response_metadata_wins_for_every_hosted_call_and_replay_drops_d
             .filter_map(RunItem::to_model_input)
             .collect();
         let provider = ProviderKey::new("openai");
-        let resolved = settings().resolve(
-            &provider,
-            &ModelSettings::new(),
-            &ModelSettings::new(),
-            &ModelSettings::new(),
-        );
+        let settings = settings();
+        let resolved = SettingsLayers::new().with_run(&settings).resolve(&provider);
         model
             .get_response(ModelRequest::new(input, resolved))
             .await

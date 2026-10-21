@@ -843,7 +843,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let model_name = request.model_override.as_deref().or(agent.model());
     let resolved_model = request.model_resolver.resolve_model(model_name)?;
 
-    // 5. Complete provider -> agent -> model -> run settings resolution, then reconcile the result
+    // 5. Complete provider -> model -> agent -> run settings resolution, then reconcile the result
     // against the surface stages 1 and 2 produced. This is the stage that makes the order load
     // bearing rather than merely conventional: `tool_choice` and `parallel_tool_calls` cannot be
     // settled before the turn knows which tools it will advertise.
@@ -855,6 +855,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let mut model_settings = resolved_model
         .resolve_settings(agent.model_settings(), &request.model_settings)
         .reconcile_tool_surface(surface.advertised_names());
+    resolved_model.validate_settings(&model_settings)?;
     if request
         .tool_use
         .used_any_this_turn(request.agent.public_id())

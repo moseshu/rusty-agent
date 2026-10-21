@@ -18,9 +18,9 @@ use ra_core::{
     },
     model::{
         ConversationContinuation, Model, ModelProvider, ModelRequest, ModelRetryAdviceRequest,
-        ModelSettings, ModelStreamDelta, ModelStreamDeltaKind, ModelStreamEvent,
-        ModelToolDefinition, ModelTracing, NormalizedProviderError, ProviderKey, ReplaySafety,
-        RetryAdvice, stamp_replay_safety,
+        ModelStreamDelta, ModelStreamDeltaKind, ModelStreamEvent, ModelToolDefinition,
+        ModelTracing, NormalizedProviderError, ProviderKey, ReplaySafety, RetryAdvice,
+        SettingsLayers, stamp_replay_safety,
     },
     usage::{RequestUsage, Usage},
 };
@@ -33,12 +33,7 @@ use serde_json::json;
 fn request() -> ModelRequest {
     ModelRequest::new(
         vec![ModelInputItem::Message(Message::user("fixture input"))],
-        ModelSettings::new().resolve(
-            &ProviderKey::new("fixture"),
-            &ModelSettings::new(),
-            &ModelSettings::new(),
-            &ModelSettings::new(),
-        ),
+        SettingsLayers::new().resolve(&ProviderKey::new("fixture")),
     )
     .with_system_instructions("system fixture")
     .with_tools(vec![ModelToolDefinition::new(

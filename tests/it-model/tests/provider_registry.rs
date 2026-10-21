@@ -218,7 +218,8 @@ fn test_provider_registry_04() {
     .with_model(
         ModelRegistration::new("claude-sonnet-current")
             .with_alias("sonnet")
-            .with_defaults(ModelSettings::new().with_max_tokens(8_192)),
+            .with_defaults(ModelSettings::new().with_max_tokens(8_192))
+            .with_max_output_tokens(8_192),
     );
     let registry = ProviderRegistry::builder(ProviderKey::new("anthropic"))
         .register(registration)
@@ -235,21 +236,38 @@ fn test_provider_registry_04() {
         vec![Some("claude-sonnet-current".to_owned())]
     );
 
-    // The model registration says this model can emit 8192, so 8192 it is. 4096 is only the
-    // provider fallback for "models that did not say", and the coarsest layer must not beat the
-    // most specific one.
+    // The model default overrides the provider's required fallback, and its hard limit is separate.
     let settings = resolved.resolve_settings(&ModelSettings::new(), &ModelSettings::new());
     assert_eq!(settings.max_tokens(), Some(8_192));
+    assert_eq!(resolved.output_token_limit(), Some(8_192));
+    resolved
+        .validate_settings(&settings)
+        .expect("the registered default is within the model limit");
     assert_eq!(
         settings.extra_body().get("routing"),
         Some(&json!({"region": "us"}))
     );
 
-    let capped = resolved.resolve_settings(
+    let over_limit = resolved.resolve_settings(
         &ModelSettings::new(),
         &ModelSettings::new().with_max_tokens(16_384),
     );
-    assert_eq!(capped.max_tokens(), Some(8_192));
+    assert_eq!(over_limit.max_tokens(), Some(16_384));
+    assert_eq!(
+        resolved
+            .validate_settings(&over_limit)
+            .expect_err("a request above the hard limit must fail")
+            .code(),
+        "config"
+    );
+
+    let unregistered_model = registry
+        .resolve_model(Some("anthropic/other-model"))
+        .expect("unregistered names still route to the provider");
+    let fallback =
+        unregistered_model.resolve_settings(&ModelSettings::new(), &ModelSettings::new());
+    assert_eq!(fallback.max_tokens(), Some(4_096));
+    assert_eq!(unregistered_model.output_token_limit(), None);
 }
 
 #[test]
@@ -417,4 +435,88 @@ fn test_provider_registry_09() {
         .build()
         .expect_err("registration must own only its canonical bucket");
     assert_eq!(misplaced.code(), "config");
+
+    let zero_limit = ProviderRegistry::builder(ProviderKey::new("zero-limit"))
+        .register(
+            registration(
+                "zero-limit",
+                ApiProtocol::OpenAiResponses,
+                Arc::new(FakeProvider::new(false)),
+            )
+            .with_model(ModelRegistration::new("model").with_max_output_tokens(0)),
+        )
+        .build()
+        .expect_err("a model output limit must be positive");
+    assert_eq!(zero_limit.code(), "config");
+}
+
+#[test]
+fn test_provider_registry_10() {
+    let provider_default_above_limit =
+        ProviderRegistry::builder(ProviderKey::new("provider-default"))
+            .register(
+                registration(
+                    "provider-default",
+                    ApiProtocol::OpenAiResponses,
+                    Arc::new(FakeProvider::new(false)),
+                )
+                .with_defaults(ModelSettings::new().with_max_tokens(8_192))
+                .with_model(ModelRegistration::new("limited-model").with_max_output_tokens(4_096)),
+            )
+            .build()
+            .expect_err("a provider fallback above a model limit must fail registration");
+    assert_eq!(provider_default_above_limit.code(), "config");
+    assert!(
+        provider_default_above_limit
+            .to_string()
+            .contains("limited-model")
+    );
+
+    let model_default_above_limit = ProviderRegistry::builder(ProviderKey::new("model-default"))
+        .register(
+            registration(
+                "model-default",
+                ApiProtocol::OpenAiResponses,
+                Arc::new(FakeProvider::new(false)),
+            )
+            .with_model(
+                ModelRegistration::new("limited-model")
+                    .with_defaults(ModelSettings::new().with_max_tokens(16_000))
+                    .with_max_output_tokens(8_000),
+            ),
+        )
+        .build()
+        .expect_err("a model default above its limit must fail registration");
+    assert_eq!(model_default_above_limit.code(), "config");
+    assert!(
+        model_default_above_limit
+            .to_string()
+            .contains("limited-model")
+    );
+
+    let model_default_overrides_provider = ProviderRegistry::builder(ProviderKey::new("override"))
+        .register(
+            registration(
+                "override",
+                ApiProtocol::OpenAiResponses,
+                Arc::new(FakeProvider::new(false)),
+            )
+            .with_defaults(ModelSettings::new().with_max_tokens(8_192))
+            .with_model(
+                ModelRegistration::new("limited-model")
+                    .with_defaults(ModelSettings::new().with_max_tokens(2_048))
+                    .with_max_output_tokens(4_096),
+            ),
+        )
+        .build()
+        .expect("a valid model default overrides the provider fallback");
+    let resolved = model_default_overrides_provider
+        .resolve_model(Some("limited-model"))
+        .expect("registered model should resolve");
+    assert_eq!(
+        resolved
+            .resolve_settings(&ModelSettings::new(), &ModelSettings::new())
+            .max_tokens(),
+        Some(2_048)
+    );
 }

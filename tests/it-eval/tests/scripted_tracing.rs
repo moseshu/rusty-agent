@@ -8,7 +8,7 @@ use std::sync::{
 use futures::{StreamExt, stream};
 use ra_core::{
     error::{Error, ProviderErrorKind},
-    model::{Model, ModelRequest, ModelSettings, ModelTracing, ProviderKey},
+    model::{Model, ModelRequest, ModelSettings, ModelTracing, ProviderKey, SettingsLayers},
 };
 use ra_eval::fixture::{ModelStep, ScriptedModel, assistant_message};
 use tracing::{
@@ -57,12 +57,9 @@ fn request() -> ModelRequest {
     let settings = ModelSettings::new();
     ModelRequest::new(
         Vec::new(),
-        settings.resolve(
-            &ProviderKey::new("fixture"),
-            &settings,
-            &settings,
-            &settings,
-        ),
+        SettingsLayers::new()
+            .with_provider(&settings)
+            .resolve(&ProviderKey::new("fixture")),
     )
     .with_system_instructions("secret fixture instructions")
     .with_tracing(ModelTracing::Enabled)

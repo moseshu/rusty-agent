@@ -2,7 +2,10 @@
 
 use std::{fmt, sync::Arc};
 
-use super::{ApiProtocol, Model, ModelSettings, ProviderKey, ResolvedModelSettings};
+use super::{
+    ApiProtocol, Model, ModelSettings, ProviderKey, ResolvedModelSettings, SettingsLayers,
+};
+use crate::error::{Error, Result};
 
 /// Canonical provider/model selection produced by a model resolver.
 ///
@@ -52,6 +55,7 @@ pub struct ResolvedModel {
     model: Arc<dyn Model>,
     provider_defaults: ModelSettings,
     model_defaults: ModelSettings,
+    output_token_limit: Option<u64>,
 }
 
 impl ResolvedModel {
@@ -68,7 +72,15 @@ impl ResolvedModel {
             model,
             provider_defaults,
             model_defaults,
+            output_token_limit: None,
         }
+    }
+
+    /// Sets the selected model's hard output-token limit.
+    #[must_use]
+    pub const fn with_output_token_limit(mut self, limit: u64) -> Self {
+        self.output_token_limit = Some(limit);
+        self
     }
 
     /// Canonical provider/model selection used for this instance.
@@ -95,6 +107,12 @@ impl ResolvedModel {
         &self.model_defaults
     }
 
+    /// Selected model's hard output-token limit, when the resolver knows it.
+    #[must_use]
+    pub const fn output_token_limit(&self) -> Option<u64> {
+        self.output_token_limit
+    }
+
     /// Completes the four-layer immutable settings merge for this selected model.
     #[must_use]
     pub fn resolve_settings(
@@ -102,12 +120,24 @@ impl ResolvedModel {
         agent_defaults: &ModelSettings,
         run_overrides: &ModelSettings,
     ) -> ResolvedModelSettings {
-        self.provider_defaults.resolve(
-            self.selector.provider(),
-            agent_defaults,
-            &self.model_defaults,
-            run_overrides,
-        )
+        SettingsLayers::new()
+            .with_provider(&self.provider_defaults)
+            .with_model(&self.model_defaults)
+            .with_agent(agent_defaults)
+            .with_run(run_overrides)
+            .resolve(self.selector.provider())
+    }
+
+    /// Rejects a resolved request setting that exceeds the selected model's hard limit.
+    pub fn validate_settings(&self, settings: &ResolvedModelSettings) -> Result<()> {
+        if let (Some(requested), Some(limit)) = (settings.max_tokens(), self.output_token_limit)
+            && requested > limit
+        {
+            return Err(Error::config(format!(
+                "max_tokens ({requested}) exceeds the selected model's output limit ({limit})"
+            )));
+        }
+        Ok(())
     }
 
     /// Consumes the resolution and returns the model trait object.

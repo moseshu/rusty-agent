@@ -355,14 +355,11 @@ pub(crate) fn prepare_overrides(
             .resolve(Some(model))
             .map_err(|error| JsonRpcErrorObject::invalid_request(error.to_string()))?;
     }
-    let target_provider = if summary.is_some() || service_tier.is_some() {
+    let target_model = if summary.is_some() || service_tier.is_some() {
         Some(
             target
                 .resolve(model.as_deref().or(config.model()))
-                .map_err(|error| JsonRpcErrorObject::invalid_request(error.to_string()))?
-                .selector()
-                .provider()
-                .clone(),
+                .map_err(|error| JsonRpcErrorObject::invalid_request(error.to_string()))?,
         )
     } else {
         None
@@ -382,14 +379,17 @@ pub(crate) fn prepare_overrides(
         })?;
     }
     if summary.is_some() || service_tier.is_some() {
-        let provider = target_provider
-            .ok_or_else(|| JsonRpcErrorObject::internal_error("missing target provider"))?;
+        let resolved_model = target_model
+            .as_ref()
+            .ok_or_else(|| JsonRpcErrorObject::internal_error("missing target model"))?;
+        let provider = resolved_model.selector().provider();
         let mut settings = config.model_settings().clone();
         if let Some(summary) = summary {
-            let mut reasoning = settings
+            let effective = resolved_model
+                .resolve_settings(target.models.agent_settings(), config.model_settings());
+            let mut reasoning = effective
                 .extra_body()
-                .get(&provider)
-                .and_then(|body| body.get("reasoning"))
+                .get("reasoning")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             let object = reasoning.as_object_mut().ok_or_else(|| {
@@ -402,11 +402,15 @@ pub(crate) fn prepare_overrides(
                 serde_json::to_value(summary)
                     .map_err(|error| JsonRpcErrorObject::internal_error(error.to_string()))?,
             );
+            // This run-layer override copies effective reasoning defaults so the summary reaches
+            // the current request. It also pins those values across later model switches within
+            // this provider. Agent settings here are the declared settings; capability-folded
+            // reasoning settings are not included (no current capability contributes this field).
             settings = settings.with_extra_body_value(provider.clone(), "reasoning", reasoning);
         }
         if let Some(tier) = service_tier {
             settings = settings.with_extra_body_value(
-                provider,
+                provider.clone(),
                 "service_tier",
                 tier.map_or(Value::Null, Value::String),
             );
@@ -442,17 +446,27 @@ impl<'a> SettingsTarget<'a> {
 /// Resolves models as a thread does, built or not.
 pub(crate) trait ResolveModel {
     fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel>;
+
+    fn agent_settings(&self) -> &ra_core::model::ModelSettings;
 }
 
 impl ResolveModel for AgentThread {
     fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
         self.resolve_model(model)
     }
+
+    fn agent_settings(&self) -> &ra_core::model::ModelSettings {
+        self.agent_model_settings()
+    }
 }
 
 impl ResolveModel for AgentThreadBuilder {
     fn resolve(&self, model: Option<&str>) -> ra_core::error::Result<ResolvedModel> {
         self.resolve_model(model)
+    }
+
+    fn agent_settings(&self) -> &ra_core::model::ModelSettings {
+        self.agent().execution().model_settings()
     }
 }
 
