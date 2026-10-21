@@ -1,7 +1,6 @@
 # Framework examples
 
-Start with the framework quickstart and
-[basic_agent](basic_agent/README.md). Each directory below is an independently compiled
+Start with [basic_agent](basic_agent/README.md). Each directory below is an independently compiled
 workspace binary. Run it with `cargo run -p NAME`, not `--example`.
 
 | Example | What it demonstrates | Offline mode |
@@ -42,8 +41,8 @@ endpoint is included in this command.
 `ra-core` and `ra-runtime`, enforced by `cargo xtask layering`. Its custom model and resolver
 demonstrate extension points; applications using a shipped provider start with `basic_agent`.
 
-MCP integration is available in the framework but a dedicated MCP tutorial remains future
-work outside this quickstart scope; there is no `mcp_integration` example crate yet.
+MCP integration is available in the framework, described in the `ra-mcp` README, but there is
+no dedicated MCP example crate yet.
 
 ## Future examples
 

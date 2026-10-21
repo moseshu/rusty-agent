@@ -2,26 +2,13 @@
 
 Status: the minimum tool integration and reusable stdio server passed their full re-review
 and initialize-error fix verification on 2026-10-17; both roadmap tasks are DONE. The
-Streamable HTTP follow-up has also passed its recorded review. The shared session supports
+Streamable HTTP follow-up has also passed review. The shared session supports
 tools, prompts and resources. Other MCP roadmap slices remain separate.
 
 The model-facing resource tools are implemented in `ra-tools::mcp_ns::resource_tools` and installed
 by the coding MCP runtime for each model call with enabled servers; a request waits for a server
 that is still starting. They preserve the separate `list_mcp_resources`,
-`list_mcp_resource_templates` and `read_mcp_resource` contracts. Implementation, upstream mapping,
-adaptations and review status are recorded in
-the resource tool notes.
-
-Tool filtering/cache passed re-review on 2026-10-18. The contract and validation record is in
-the filtering/cache notes.
-Metadata resolution, caching and tool-call display metadata passed re-review on 2026-10-18; see
-the metadata notes.
-Local tool approval and server tool guardrails passed review and re-review on 2026-10-19; see
-the approval notes.
-Lifecycle task affinity passed review, re-review of its fixes, and final verification on
-2026-10-19.
-The manager, upstream mapping, Rust adaptations and validation are recorded in
-the lifecycle notes.
+`list_mcp_resource_templates` and `read_mcp_resource` contracts.
 
 The framework contract was read from local `openai-agents-python`
 `f53c62451c7f34c15f0c87fa745e05404025420f`. The implementation reference was
@@ -141,9 +128,8 @@ schedules startup in the background; discovery waits when no usable cache exists
 requests prepare snapshots in Codex's global serialization scope; inventory I/O runs outside
 the queue with generation checks and connection-drain tracking. Startup notifications include specific
 failure details and timeout recovery hints. Default framework
-resolver failures still propagate. Review is complete; fixed-registry configuration
-loading and unsupported thread scope remain recorded differences in
-the runtime-control notes.
+resolver failures still propagate. Fixed-registry configuration loading and unsupported thread
+scope remain known differences from Codex.
 
 ## Local tool approval
 
@@ -265,8 +251,7 @@ spawned with tokio directly and JSON-RPC stays in the official SDK.
 
 `cached_tools()` is `None` before the first complete listing. It subsequently returns the
 unfiltered snapshot even when cache reuse is disabled. Approval integration remains follow-up
-work; the runner receives no server lifecycle or MCP-specific policy. See
-the stdio contract and validation record.
+work; the runner receives no server lifecycle or MCP-specific policy.
 
 ## Tool filtering and caching
 
@@ -421,9 +406,7 @@ stores its output/error on that same record and schedules no local tool executio
 Custom call items do not inherit the tool declaration's description or title.
 
 The Responses adapter owns wire conversion and replay of both hosted item kinds. Existing schema
-and model-input projections never acquire the run item's display fields. The source contract,
-Rust representation adaptations and validation are recorded in
-the metadata notes.
+and model-input projections never acquire the run item's display fields.
 
 ## Reusable Streamable HTTP lifecycle
 
@@ -487,7 +470,7 @@ A JSON-RPC error body is a server answer at any HTTP status, as in the MCP Pytho
 its code and message and is correlated to the request. SSE validation applies only to message
 events. Initialize filters control frames before the SDK's separate initialize reader, which
 otherwise parses their data as JSON. Established streams retain their control frames for the
-SDK connector. No transparent session recovery or tool replay is enabled. See the HTTP contract and validation record.
+SDK connector. No transparent session recovery or tool replay is enabled.
 
 ## Contract and adaptations
 

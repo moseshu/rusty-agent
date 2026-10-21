@@ -33,5 +33,5 @@ server-managed conversations reject handoff input filters.
 
 Targets remain registered through `AgentRegistry`. Declaration or registry errors
 stop before a model call; invalid typed parameters and callback failures stop the
-transfer before the target runs. See the handoff contract
-for recovery, migration, and the deferred beta history options.
+transfer before the target runs. The rustdoc of `ra_core::agent::HistoryProjection` and
+`HandoffInputFilter` describes how history is projected and filtered for the target.

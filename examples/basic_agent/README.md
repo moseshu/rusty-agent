@@ -32,10 +32,10 @@ skip events outside their selected view. They never append raw deltas to settled
 
 The generated `ResolvedPrompt` supplies system instructions on each model turn, matching
 Python's instruction callback. It does not add a user message or enter session history.
-See the instruction contract.
+The `ra_core::agent::AgentInstructions` rustdoc describes every instruction source.
 
 `--sync` runs twice on the same thread to demonstrate executor and provider reuse. Call it
 outside a Tokio runtime. In async applications await `run` instead.
 
-Advanced configuration and checkpoint recovery are described in the
-run entry contract.
+Advanced configuration and checkpoint recovery are described in the rustdoc of `AgentRunner`
+and `RunRequest`.

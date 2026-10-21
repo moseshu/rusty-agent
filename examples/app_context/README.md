@@ -9,7 +9,8 @@ requests while the explicitly selected language and project name reach the model
 The `dynamic_instructions_async_fn` callback returns `ResolvedPrompt`; its complete text
 becomes system instructions on each model turn, matching Python's dynamic instructions.
 The offline check asserts the Responses `instructions` field and rejects a duplicate in
-conversation input. See the instruction contract.
+conversation input. The `ra_core::agent::AgentInstructions` rustdoc describes every instruction
+source.
 
 ```bash
 cargo run -p app_context -- --check

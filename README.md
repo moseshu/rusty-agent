@@ -120,17 +120,17 @@ On the current checkout, `rusty-agent` provides a unified import surface and a c
 `AgentRunner`: configure a shipped `ProviderRegistry` once, then call
 `runner.run(agent, "Hello").await?`. Optional session, context, or configuration goes through
 `runner.request(agent, input).with_session(session).run().await?`. The explicit `RunRequest`
-entry remains available. See the [basic agent example](examples/basic_agent/README.md) and
-run entry contract for sync, streaming, recovery, and feature options.
+entry remains available. See the [basic agent example](examples/basic_agent/README.md) for
+sync, streaming, and settled-item views; the rustdoc of `AgentRunner` and `RunRequest` describes
+every entry option, including checkpoint recovery.
 
 ```bash
 cargo run -p basic_agent -- --check
 ```
 
-Continue with the framework quickstart for runnable
-sessions, streaming, application context, handoffs, agents as tools, approval recovery,
-guardrails, and lifecycle callbacks. The [example index](examples/README.md) distinguishes
-live provider runs from the offline checks executed in CI.
+The [example index](examples/README.md) continues with runnable sessions, streaming,
+application context and lifecycle callbacks, handoffs, agents as tools, approval recovery, and
+guardrails, and distinguishes live provider runs from the offline checks executed in CI.
 
 ### Function tools
 
@@ -145,18 +145,16 @@ Run the [function-tool example](examples/custom_tools/README.md) without credent
 cargo run -p custom_tools -- --check
 ```
 
-The same example supports a shipped provider for live runs. See the
-function-tool contract for options, supported types,
-Rust adaptations, and remaining upstream gaps. Handwritten `Tool` implementations
-remain available for custom behavior.
+The same example supports a shipped provider for live runs. The rustdoc of `ra_macros::tool`
+describes its options and supported types. Handwritten `Tool` implementations remain available
+for custom behavior.
 
-### Upgrading from v0.1.0
+### Upgrading
 
-0.2.0 changes the public API. Session I/O takes `SessionPath` in place of `&str`, and several
-sandbox request types are built through constructors and read through accessors instead of
-public fields. Section 13.6 of the
-R8-P0 checklist (in Chinese) lists each change and
-how to adapt.
+[MIGRATION.md](MIGRATION.md) lists every incompatible change to a `Stable` surface and how to
+adapt, release by release. 0.2.0 takes `SessionPath` in place of `&str` for session I/O and
+builds several sandbox request types through constructors and accessors instead of public
+fields. 0.3.0, in development on `main`, is collecting further changes there as they land.
 
 ## Building
 
