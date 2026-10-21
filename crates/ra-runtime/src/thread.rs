@@ -681,7 +681,7 @@ struct ActiveTurn {
 
 struct PausedTurn {
     state: RunState,
-    resume: oneshot::Sender<RunState>,
+    resume: oneshot::Sender<(AgentBinding, RunState)>,
     /// The step configuration that issued the calls waiting on approval.
     config: RunConfig,
     /// Shared with live tool emitters and every continuation of this run.
@@ -1027,29 +1027,46 @@ impl AgentThread {
     }
 
     /// Continues the running turn's run from `state`, its checkpoint with the approvals answered.
+    /// Handoff targets are resolved through the issuing step's agent registry because checkpoints
+    /// store stable identities rather than the SDK's current-agent object.
+    /// The starting agent reuses the thread's binding, including its prepared execution surface.
     ///
     /// # Errors
     ///
-    /// Returns `state` unchanged if the running turn is not waiting for approval, or `state` is
-    /// not the checkpoint of its run.
+    /// Returns `state` unchanged if the running turn is not waiting for approval, `state` is not
+    /// the checkpoint of its run, or its current agent is absent or cannot be resolved. Resolution
+    /// failure leaves the turn waiting for approval so the caller can retry.
     pub fn resume_turn(&self, state: RunState) -> std::result::Result<(), Box<RunState>> {
         let mut state = state;
         let mut guard = self.inner.lock();
         let Some(active) = guard.active_turn.as_mut() else {
             return Err(Box::new(state));
         };
-        let matches = active
+        let Some(paused) = active
             .paused
             .as_ref()
-            .is_some_and(|paused| same_approval_pause(&paused.state, &state));
-        if !matches {
+            .filter(|paused| same_approval_pause(&paused.state, &state))
+        else {
             return Err(Box::new(state));
-        }
+        };
+        let agent = match state.current_agent() {
+            Some(current) if current == self.inner.agent.public_id() => self.inner.agent.clone(),
+            Some(current) => {
+                let Some(agent) = paused.config.agent_registry().get(current) else {
+                    return Err(Box::new(state));
+                };
+                AgentBinding::direct(Arc::clone(agent))
+            }
+            None => return Err(Box::new(state)),
+        };
         let Some(paused) = active.paused.take() else {
             return Err(Box::new(state));
         };
         state.snapshot_event_seq(&paused.event_seqs);
-        paused.resume.send(state).map_err(Box::new)
+        paused
+            .resume
+            .send((agent, state))
+            .map_err(|(_, state)| Box::new(state))
     }
 
     /// Records how the host answered the approval of a call of the running turn's paused run,
@@ -1581,13 +1598,13 @@ async fn run_to_end(
         if let Some(active) = inner.lock().active_turn.as_mut() {
             active.paused = None;
         }
-        let Some(state) = answered else {
+        let Some((agent, state)) = answered else {
             let history = cancel_paused(recorder.as_ref(), &config, cancel, run_id, history);
             return (TurnEnd::Cancelled, history);
         };
         fallback = history;
         request = RunRequest::new(
-            inner.agent.clone(),
+            agent,
             Arc::clone(&inner.model_resolver),
             state.run_id().clone(),
             cancel.clone(),

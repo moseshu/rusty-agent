@@ -17,8 +17,9 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use ra_core::{
-    agent::AgentSpec,
+    agent::{AgentId, AgentSpec, HandoffSpec},
     cancel::CancelScope,
+    capability::{Capability, CapabilityFamily, SamplingContext},
     error::{Error, Result},
     hook::{HookDecision, HookEvent, HookEventName, UserHook, UserHookContext},
     item::{
@@ -31,6 +32,7 @@ use ra_core::{
         ModelSettings, ProviderKey, ResolvedModel,
     },
     output::OutputSchema,
+    prompt::{PromptSection, SectionPosition, SectionStability},
     session::{SessionId, interrupt::is_interrupted_turn_marker},
     state::{RunId, RunState},
     tool::{
@@ -38,7 +40,7 @@ use ra_core::{
     },
 };
 use ra_runtime::{
-    agent::AgentBinding,
+    agent::{AgentBinding, AgentRegistry},
     hook::UserHookRegistration,
     runner::{PendingInput, RunConfig, RunRequest, Runner},
     thread::{
@@ -73,6 +75,9 @@ enum Step {
 struct Call {
     model: Option<String>,
     effort: Option<Effort>,
+    temperature: Option<f64>,
+    instructions: Option<String>,
+    tools: Vec<String>,
     input: Vec<ModelInputItem>,
     output_schema: Option<ModelOutputSchema>,
 }
@@ -148,6 +153,13 @@ impl Model for ScriptedModel {
         self.script.calls.lock().unwrap().push(Call {
             model: self.model.clone(),
             effort: request.model_settings().effort(),
+            temperature: request.model_settings().temperature(),
+            instructions: request.system_instructions().map(str::to_owned),
+            tools: request
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect(),
             input: request.input().to_vec(),
             output_schema: request.output_schema().cloned(),
         });
@@ -297,6 +309,120 @@ fn thread_with(script: &Arc<Script>, config: RunConfig) -> AgentThread {
     .with_config(config)
     .with_step_model_switching(true)
     .build()
+}
+
+struct ThreadCapability {
+    tool: Arc<dyn Tool>,
+    sampling: Mutex<Vec<SamplingContext>>,
+}
+
+#[async_trait]
+impl Capability for ThreadCapability {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::SHELL
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![self.tool.clone()]
+    }
+
+    async fn instructions(&self) -> Result<Option<PromptSection>> {
+        Ok(Some(PromptSection::new(
+            self.kind().prompt_section_name(),
+            "thread capability instructions",
+            self.kind().prompt_source(),
+            SectionStability::Stable,
+            SectionPosition::Prefix,
+            "thread capability instructions",
+        )?))
+    }
+
+    fn sampling_params_for(
+        &self,
+        settings: ModelSettings,
+        context: &SamplingContext,
+    ) -> ModelSettings {
+        self.sampling.lock().unwrap().push(context.clone());
+        settings.with_temperature(if context.model() == Some("next-model") {
+            0.8
+        } else {
+            0.2
+        })
+    }
+}
+
+fn transfer(target: &str) -> HandoffSpec {
+    HandoffSpec::new(
+        AgentId::new(target),
+        ToolSchema::new(
+            format!("transfer_to_{target}"),
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+fn handoff_thread(script: &Arc<Script>, prepared: bool) -> (AgentThread, Arc<ThreadCapability>) {
+    let capability = Arc::new(ThreadCapability {
+        tool: QuickTool::shared("capability_look", ToolApprovalPolicy::Never),
+        sampling: Mutex::new(Vec::new()),
+    });
+    let mut lead = agent().to_builder().handoff(transfer("reviewer"));
+    let config = if prepared {
+        lead = lead.tools(capability.tools());
+        RunConfig::new().with_prepared_capabilities(
+            [capability.clone() as Arc<dyn Capability>],
+            capability.tools(),
+        )
+    } else {
+        RunConfig::new().with_capability(capability.clone())
+    };
+    let lead = lead.build().unwrap();
+    let reviewer = AgentSpec::builder()
+        .id(AgentId::new("reviewer"))
+        .name("Reviewer")
+        .instructions("reviewer")
+        .tool(QuickTool::shared(
+            "guarded_look",
+            ToolApprovalPolicy::Always,
+        ))
+        .handoff(transfer("lead"))
+        .build()
+        .unwrap();
+    let registry = AgentRegistry::builder()
+        .register(lead.clone())
+        .register(reviewer)
+        .build()
+        .unwrap();
+    let thread = AgentThread::builder(
+        SessionId::new("handoff-thread"),
+        AgentBinding::direct(lead),
+        Arc::new(Resolver(script.clone())),
+    )
+    .with_config(config.with_agent_registry(registry))
+    .with_step_model_switching(true)
+    .build();
+    (thread, capability)
+}
+
+fn assert_lead_capabilities(call: &Call, temperature: f64) {
+    assert_eq!(
+        call.instructions.as_deref(),
+        Some("lead\n\nthread capability instructions")
+    );
+    assert!(call.tools.contains(&"capability_look".to_owned()));
+    assert_eq!(call.temperature, Some(temperature));
+}
+
+fn assert_reviewer_without_capabilities(call: &Call) {
+    assert_eq!(call.instructions.as_deref(), Some("reviewer"));
+    assert_eq!(call.tools, ["guarded_look"]);
+    assert_eq!(call.temperature, None);
 }
 
 fn text(text: &str) -> TurnInputRequest {
@@ -844,6 +970,172 @@ async fn a_turn_waiting_for_approval_stays_active_until_answered() {
         "{:?}",
         script.calls()[1].input
     );
+}
+
+#[tokio::test]
+async fn approval_after_handoff_resumes_the_target_and_preserves_capability_ownership() {
+    for prepared in [false, true] {
+        for hand_back in [false, true] {
+            let script = Arc::new(Script::default());
+            let (thread, _) = handoff_thread(&script, prepared);
+            script.push(Step::Respond(tool_call(
+                "handoff",
+                "handoff",
+                "transfer_to_reviewer",
+            )));
+            script.push(Step::Respond(tool_call(
+                "guarded",
+                "guarded",
+                "guarded_look",
+            )));
+            if hand_back {
+                script.push(Step::Respond(tool_call(
+                    "return",
+                    "return",
+                    "transfer_to_lead",
+                )));
+                script.push(Step::Respond(tool_call("look", "look", "capability_look")));
+            }
+            script.push(Step::Respond(final_message("done", "done")));
+
+            let turn_id = started(&thread, text("review")).await;
+            assert!(matches!(
+                next_event(&thread).await,
+                ThreadEvent::TurnStarted { .. }
+            ));
+            awaits_approval(&thread, &turn_id).await;
+            let mut state: RunState =
+                serde_json::from_value(serde_json::to_value(thread.paused_run().unwrap()).unwrap())
+                    .unwrap();
+            assert_eq!(state.starting_agent(), Some(&AgentId::new("lead")));
+            assert_eq!(state.current_agent(), Some(&AgentId::new("reviewer")));
+            let approval = state.pending_interruption_items().next().unwrap().clone();
+            state.approve(&approval, false).unwrap();
+            thread.resume_turn(state).unwrap();
+            let ending = next_event(&thread).await;
+            assert!(matches!(ending,
+                ThreadEvent::TurnComplete { turn_id: id, last_agent_message: Some(message), .. }
+                    if id == turn_id && message == "done"));
+
+            let calls = script.calls();
+            assert_eq!(calls.len(), if hand_back { 5 } else { 3 });
+            assert_lead_capabilities(&calls[0], 0.2);
+            assert_reviewer_without_capabilities(&calls[1]);
+            assert_reviewer_without_capabilities(&calls[2]);
+            assert!(texts(&calls[2].input).contains(&"<tool output>".to_owned()));
+            if hand_back {
+                assert_lead_capabilities(&calls[3], 0.2);
+                assert_lead_capabilities(&calls[4], 0.2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn approval_resume_rejects_an_unregistered_current_agent_without_consuming_the_pause() {
+    let script = Arc::new(Script::default());
+    let (thread, _) = handoff_thread(&script, true);
+    script.push(Step::Respond(tool_call(
+        "handoff",
+        "handoff",
+        "transfer_to_reviewer",
+    )));
+    script.push(Step::Respond(tool_call(
+        "guarded",
+        "guarded",
+        "guarded_look",
+    )));
+    script.push(Step::Respond(final_message("done", "done")));
+    let turn_id = started(&thread, text("review")).await;
+    next_event(&thread).await;
+    awaits_approval(&thread, &turn_id).await;
+    let mut state = thread.paused_run().unwrap();
+    let approval = state.pending_interruption_items().next().unwrap().clone();
+    state.approve(&approval, false).unwrap();
+    let mut unknown = state.clone();
+    unknown.set_current_agent(AgentId::new("unregistered"));
+    let expected = serde_json::to_value(&unknown).unwrap();
+    let rejected = thread.resume_turn(unknown).unwrap_err();
+    assert_eq!(serde_json::to_value(*rejected).unwrap(), expected);
+    assert_eq!(thread.active_turn_id().as_deref(), Some(turn_id.as_str()));
+    assert_eq!(
+        thread.paused_run().unwrap().current_agent(),
+        Some(&AgentId::new("reviewer"))
+    );
+    assert_eq!(script.calls().len(), 2);
+
+    thread.resume_turn(state).unwrap();
+    assert!(matches!(
+        next_event(&thread).await,
+        ThreadEvent::TurnComplete { last_agent_message: Some(message), .. }
+            if message == "done"
+    ));
+}
+
+#[tokio::test]
+async fn first_capability_preparation_after_approval_uses_the_live_model_on_hand_back() {
+    use ra_runtime::thread::TurnSettingsUpdateOutcome;
+    for prepared in [false, true] {
+        let script = Arc::new(Script::default());
+        let (thread, capability) = handoff_thread(&script, prepared);
+        let (release, wait) = gate();
+        script.push(Step::Respond(tool_call(
+            "handoff",
+            "handoff",
+            "transfer_to_reviewer",
+        )));
+        script.push(Step::Respond(tool_call(
+            "guarded",
+            "guarded",
+            "guarded_look",
+        )));
+        script.push(Step::After(
+            wait,
+            tool_call("return", "return", "transfer_to_lead"),
+        ));
+        script.push(Step::Respond(final_message("done", "done")));
+        let turn_id = started(&thread, text("review")).await;
+        next_event(&thread).await;
+        awaits_approval(&thread, &turn_id).await;
+        let mut state = thread.paused_run().unwrap();
+        let approval = state.pending_interruption_items().next().unwrap().clone();
+        state.approve(&approval, false).unwrap();
+        thread.resume_turn(state).unwrap();
+        script.wait_for_calls(3).await;
+        assert_eq!(
+            capability.sampling.lock().unwrap().len(),
+            1,
+            "the resumed segment has not prepared the starting declaration yet"
+        );
+        assert_eq!(
+            thread.update_turn_settings(
+                &turn_id,
+                &ThreadSettingsOverrides::new().with_model("next-model"),
+            ),
+            TurnSettingsUpdateOutcome::Applied
+        );
+        release.notify_one();
+        assert!(matches!(
+            next_event(&thread).await,
+            ThreadEvent::TurnComplete { last_agent_message: Some(message), .. }
+                if message == "done"
+        ));
+
+        let calls = script.calls();
+        assert_eq!(calls.len(), 4);
+        assert_reviewer_without_capabilities(&calls[2]);
+        assert_eq!(calls[2].model, None);
+        assert_eq!(calls[3].model.as_deref(), Some("next-model"));
+        assert_lead_capabilities(&calls[3], 0.8);
+        let sampling = capability.sampling.lock().unwrap();
+        assert_eq!(sampling.len(), 2);
+        assert_eq!(sampling[0].model(), Some("canonical-model"));
+        assert_eq!(sampling[1].model(), Some("next-model"));
+        assert_eq!(
+            sampling[1].provider(),
+            Some(&ProviderKey::new("test-provider"))
+        );
+    }
 }
 
 #[tokio::test]

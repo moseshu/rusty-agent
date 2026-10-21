@@ -197,10 +197,21 @@ async fn run_approval_batch(
         }
     }
     if !ended && target.current_batch(loaded, turn_id, &batch) && !target.resume(loaded, state) {
-        tracing::warn!(
-            turn_id,
-            "the run answered for approval was no longer waiting"
-        );
+        // A refused continuation that leaves the same batch waiting did not lose a race: the
+        // thread could not continue the checkpoint, such as one whose current agent its registry
+        // no longer resolves. The pause is kept, so only an interrupt ends that turn.
+        if target.current_batch(loaded, turn_id, &batch) {
+            tracing::warn!(
+                turn_id,
+                "the run answered for approval could not be continued and stays paused until \
+                 interrupted; its checkpoint's current agent may not be resolvable"
+            );
+        } else {
+            tracing::warn!(
+                turn_id,
+                "the run answered for approval was no longer waiting"
+            );
+        }
     }
 }
 
