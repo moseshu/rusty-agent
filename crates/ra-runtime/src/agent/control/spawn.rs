@@ -80,6 +80,7 @@ pub struct PreparedSpawnedAgent {
     agent: Arc<AgentSpec>,
     resources: Option<Arc<dyn SpawnedAgentResources>>,
     capabilities: Option<PreparedCapabilities>,
+    prompt_cache_key_override: Option<String>,
 }
 
 struct PreparedCapabilities {
@@ -95,6 +96,7 @@ impl PreparedSpawnedAgent {
             agent,
             resources: None,
             capabilities: None,
+            prompt_cache_key_override: None,
         }
     }
 
@@ -104,6 +106,16 @@ impl PreparedSpawnedAgent {
     #[must_use]
     pub fn with_resources(mut self, resources: Arc<dyn SpawnedAgentResources>) -> Self {
         self.resources = Some(resources);
+        self
+    }
+
+    /// Selects this spawned agent's cache route instead of inheriting the parent's route.
+    ///
+    /// Codex ephemeral forks reuse the source route for the fork itself, while their descendants
+    /// route by the fork's own session identity. Other run configuration stays inherited.
+    #[must_use]
+    pub fn with_prompt_cache_key_override(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key_override = Some(key.into());
         self
     }
 
@@ -137,6 +149,11 @@ impl PreparedSpawnedAgent {
         config: RunConfig,
         initial_agent: Option<&Arc<AgentSpec>>,
     ) -> RunConfig {
+        let config = if let Some(key) = &self.prompt_cache_key_override {
+            config.with_prompt_cache_key_override(key)
+        } else {
+            config
+        };
         match &self.capabilities {
             Some(prepared) => config.with_prepared_capabilities(
                 prepared.capabilities.iter().cloned(),
@@ -158,6 +175,7 @@ impl std::fmt::Debug for PreparedSpawnedAgent {
             .field("agent", &self.agent.id())
             .field("has_resources", &self.resources.is_some())
             .field("has_prepared_capabilities", &self.capabilities.is_some())
+            .field("prompt_cache_key_override", &self.prompt_cache_key_override)
             .finish()
     }
 }

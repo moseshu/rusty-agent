@@ -433,6 +433,14 @@ impl fmt::Debug for OpenAiChatModel {
 
 #[async_trait]
 impl Model for OpenAiChatModel {
+    fn supports_default_prompt_cache_key(
+        &self,
+        settings: &ra_core::model::ResolvedModelSettings,
+    ) -> bool {
+        self.codec.quirks.prompt_cache_key()
+            && !settings.extra_body().contains_key("prompt_cache_key")
+    }
+
     async fn get_response(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
         // A non-streaming call publishes nothing until it returns, so no consumer saw a partial
         // turn. What the endpoint may have recorded on its own side is the other half of the

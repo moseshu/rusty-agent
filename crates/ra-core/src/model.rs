@@ -88,6 +88,14 @@ pub trait Model: Send + Sync + 'static {
         }))
     }
 
+    /// Whether this request may receive a runner-generated prompt cache key.
+    ///
+    /// Adapters opt in for confirmed endpoints and return false when the effective settings
+    /// already supply an explicit key, including null. The default leaves custom models alone.
+    fn supports_default_prompt_cache_key(&self, _settings: &ResolvedModelSettings) -> bool {
+        false
+    }
+
     /// Returns provider-specific evidence for the runtime retry policy.
     fn get_retry_advice(&self, _request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
         None

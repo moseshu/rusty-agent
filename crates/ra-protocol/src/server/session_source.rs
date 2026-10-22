@@ -74,6 +74,12 @@ pub enum SubAgentSource {
 }
 
 impl SessionSource {
+    /// Whether this source represents an internal session or a subagent, as in Codex.
+    #[must_use]
+    pub const fn is_non_root_agent(&self) -> bool {
+        matches!(self, Self::Internal(_) | Self::SubAgent(_))
+    }
+
     /// Parses the server startup argument using Codex's aliases and normalization.
     ///
     /// # Errors

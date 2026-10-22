@@ -50,7 +50,8 @@ impl ProviderQuirks {
     ///
     /// Enable it for first-party `OpenAI`. A gateway that merely speaks the same protocol may
     /// reject the field outright, and one that ignores it is no better off for receiving it, so a
-    /// cache scope is sent only where it is known to mean something.
+    /// generated or product-supplied key is sent only where it is known to mean something.
+    /// Caller-supplied `extra_body` values, including null, remain explicit wire overrides.
     #[must_use]
     pub const fn with_prompt_cache_key(mut self, supported: bool) -> Self {
         self.prompt_cache_key = supported;

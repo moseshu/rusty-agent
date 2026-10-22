@@ -102,6 +102,26 @@ mod grouping;
 mod live_settings;
 mod output;
 mod pending_input;
+mod prompt_cache_key;
+
+/// Pure upstream grouping calculation for the external parity-test workspace.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod prompt_cache_key_test_api {
+    use ra_core::session::Session;
+
+    /// Resolves and encodes a cache group, including the not-yet-wired conversation input.
+    #[must_use]
+    pub fn resolve(
+        conversation: Option<&str>,
+        session: Option<&dyn Session>,
+        group: Option<&str>,
+    ) -> String {
+        let (kind, value) = super::grouping::resolve_run_grouping(conversation, session, group);
+        super::prompt_cache_key::key_for_grouping(kind, &value)
+    }
+}
+
 pub mod result;
 #[doc(hidden)]
 pub mod session_persistence;
@@ -236,6 +256,7 @@ pub struct RunConfig {
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
     sandbox: Option<SandboxRunConfig>,
     group_id: Option<String>,
+    prompt_cache_key_override: Option<String>,
     session_input_callback: Option<Arc<dyn SessionInputCallback>>,
     session_settings: Option<SessionSettings>,
     interrupt_message: bool,
@@ -280,6 +301,7 @@ impl RunConfig {
             lifecycle_hooks: Vec::new(),
             sandbox: None,
             group_id: None,
+            prompt_cache_key_override: None,
             session_input_callback: None,
             session_settings: None,
             interrupt_message: true,
@@ -388,6 +410,21 @@ impl RunConfig {
     #[must_use]
     pub fn group_id(&self) -> Option<&str> {
         self.group_id.as_deref()
+    }
+
+    /// Overrides generated cache grouping, as Codex's product session context does.
+    ///
+    /// Inherited by nested and spawned agents. Adapters still apply endpoint capabilities and
+    /// explicit provider extras; this value is not persisted as a generated key in run state.
+    pub fn with_prompt_cache_key_override(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key_override = Some(key.into());
+        self
+    }
+
+    /// Product-supplied cache routing override, if one was selected.
+    #[must_use]
+    pub fn prompt_cache_key_override(&self) -> Option<&str> {
+        self.prompt_cache_key_override.as_deref()
     }
 
     /// Sets the turn limit, or removes it with `None`. Zero exhausts before any model call.
@@ -957,6 +994,7 @@ impl std::fmt::Debug for RunConfig {
             .field("permission", &self.permission)
             .field("sandbox", &self.sandbox)
             .field("group_id", &self.group_id)
+            .field("prompt_cache_key_override", &self.prompt_cache_key_override)
             .field(
                 "has_session_input_callback",
                 &self.session_input_callback.is_some(),
@@ -4839,6 +4877,7 @@ async fn run_one_turn(
     // processor's own output then replaced with the untouched originals.
     let (prepared, context_filter_reports) =
         apply_context_filters(config, state, progress.reference_turn(), prepared)?;
+    let prepared = prompt_cache_key::attach(prepared, config, state, context.session);
 
     let first_item = progress.segment_items(state).len();
     let context_usage = context_responses

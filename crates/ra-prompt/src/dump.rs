@@ -143,6 +143,10 @@ pub struct PromptDump {
     total_prefix_tokens: usize,
     sections: Vec<PromptDumpSection>,
     cache_plan: Option<CachePlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_cache_key_source: Option<String>,
 }
 
 impl PromptDump {
@@ -177,7 +181,33 @@ impl PromptDump {
             total_prefix_tokens: prefix.token_estimate(),
             sections,
             cache_plan,
+            prompt_cache_key: None,
+            prompt_cache_key_source: None,
         }
+    }
+
+    /// Records the runtime routing key and its origin without tying it to the instruction plan.
+    #[must_use]
+    pub fn with_prompt_cache_key(
+        mut self,
+        key: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        self.prompt_cache_key = Some(key.into());
+        self.prompt_cache_key_source = Some(source.into());
+        self
+    }
+
+    /// Runtime routing key, or a placeholder when the report was built outside a thread.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
+    }
+
+    /// Origin of the routing key, independently of the stable prefix hash.
+    #[must_use]
+    pub fn prompt_cache_key_source(&self) -> Option<&str> {
+        self.prompt_cache_key_source.as_deref()
     }
 
     /// Target provider name if known.
@@ -275,11 +305,18 @@ impl PromptDump {
                 plan.cache_scope().unwrap_or("<none>")
             );
         }
-        // Whether the request is cached is deliberately *not* claimed here. The floor applies to
-        // the instructions plus the whole tool table, and this report only ever sees the prompt.
-        // Stating the prompt-side half is still worth doing — a prompt this far below the floor
-        // will not carry the request on its own — but stating it as a verdict would be the same
-        // under-measurement this layer is not in a position to correct.
+        if let Some(key) = &self.prompt_cache_key {
+            let _ = writeln!(out, "Prompt Cache Key:     {key}");
+            let _ = writeln!(
+                out,
+                "Cache Key Source:     {}",
+                self.prompt_cache_key_source
+                    .as_deref()
+                    .unwrap_or("<unknown>")
+            );
+        }
+        // This estimate applies to Anthropic cache_control eligibility. OpenAI key routing
+        // does not depend on prefix size; actual cache hits remain a server-side decision.
         let verdict = if self.total_prefix_tokens >= MIN_CACHEABLE_PREFIX_TOKENS {
             "yes"
         } else {
@@ -287,7 +324,8 @@ impl PromptDump {
         };
         let _ = writeln!(
             out,
-            "Prompt Clears Floor:  {verdict} (~{} vs {MIN_CACHEABLE_PREFIX_TOKENS}; the request's \
+            "Anthropic Floor:      {verdict} (~{} vs {MIN_CACHEABLE_PREFIX_TOKENS}; \
+             cache_control only; \
              tool table also counts)",
             self.total_prefix_tokens
         );

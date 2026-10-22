@@ -344,3 +344,44 @@ async fn normalized_retry_after_is_honored_without_adapter_advice() {
         "the retry must honor the normalized retry-after rather than the zero configured backoff"
     );
 }
+
+struct CacheRetryModel {
+    inner: Arc<RetryingModel>,
+    keys: Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait]
+impl Model for CacheRetryModel {
+    fn supports_default_prompt_cache_key(&self, _: &ra_core::model::ResolvedModelSettings) -> bool {
+        true
+    }
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.keys
+            .lock()
+            .unwrap()
+            .push(request.prompt_cache_key().map(str::to_owned));
+        self.inner.get_response(request).await
+    }
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        self.keys
+            .lock()
+            .unwrap()
+            .push(request.prompt_cache_key().map(str::to_owned));
+        self.inner.stream_response(request)
+    }
+}
+
+#[tokio::test]
+async fn retries_reuse_the_same_generated_cache_key() {
+    for streaming in [false, true] {
+        let model = Arc::new(CacheRetryModel {
+            inner: RetryingModel::new(vec![Err(network_error()), Ok(answer())], None),
+            keys: Mutex::default(),
+        });
+        let result = Runner::run(request(model.clone(), &CancelScope::root(), streaming, 1))
+            .await
+            .unwrap();
+        let key = result.state().generated_prompt_cache_key().unwrap();
+        assert_eq!(*model.keys.lock().unwrap(), vec![Some(key.to_owned()); 2]);
+    }
+}

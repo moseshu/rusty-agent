@@ -12,7 +12,7 @@ use ra_core::{
         ApiProtocol, ConversationContinuation, CustomToolFormat, Effort, ModelHandoffDefinition,
         ModelRequest, ModelToolDefinition, ModelToolKind, ToolChoice,
     },
-    prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
+    prompt::CachePlan,
     tool::{ToolCaller, ToolOutput, ToolOutputBlock},
 };
 use serde_json::{Map, Value, json};
@@ -130,52 +130,22 @@ pub(crate) async fn build_request_body(
     Ok(Value::Object(body))
 }
 
-/// Lowers a cache scope onto the wire, where the endpoint honours it and the span is worth caching.
-///
-/// **Called after the tool table is merged, and that ordering is load bearing.** The cached prefix
-/// is the instructions *plus the whole tool table*, and the table is only complete here: hosted
-/// tools include formal opaque declarations and legacy `extra_body` entries. Only this adapter
-/// sees their final merged wire form. Measuring before the merge would judge a
-/// short instruction block sitting in front of a large tool table as not worth caching, denying the
-/// discount to precisely the requests that most need it.
-///
-/// Neither an unsupported endpoint nor a short span is an error. Caching is a discount; refusing to
-/// issue the request rather than issuing it uncached would trade the call for the saving. Model
-/// fallback makes that concrete: it retries a prepared request against a different provider, so a
-/// plan built for an opted-in endpoint routinely arrives at one that is not.
+/// Sends a runtime key, falling back to the published cache-plan scope for older callers.
+/// Explicit extras, including null, always win. Prefix length does not govern cache routing.
 fn insert_cache_scope(
     body: &mut Map<String, Value>,
     request: &ModelRequest,
     quirks: ProviderQuirks,
 ) {
-    if !quirks.prompt_cache_key() {
+    if body.contains_key("prompt_cache_key") || !quirks.prompt_cache_key() {
         return;
     }
-    let Some(scope) = request.cache_plan().and_then(CachePlan::cache_scope) else {
-        return;
-    };
-    if stable_span_tokens(body, request) < MIN_CACHEABLE_PREFIX_TOKENS {
-        return;
+    if let Some(key) = request
+        .prompt_cache_key()
+        .or_else(|| request.cache_plan().and_then(CachePlan::cache_scope))
+    {
+        body.insert("prompt_cache_key".to_owned(), Value::String(key.to_owned()));
     }
-    body.insert(
-        "prompt_cache_key".to_owned(),
-        Value::String(scope.to_owned()),
-    );
-}
-
-/// Estimates the cached prefix: the stable instructions plus the merged tool table.
-///
-/// The table is measured from its serialized wire form rather than from the neutral definitions,
-/// which is the point — that form is what the provider caches, and it is the only form that
-/// includes hosted tools and handoffs. A table that cannot be serialized contributes nothing: an
-/// unmeasurable schema is a reason to under-count, never a reason to fail a request over a caching
-/// hint.
-fn stable_span_tokens(body: &Map<String, Value>, request: &ModelRequest) -> usize {
-    let instructions = request.system_instructions().map_or(0, estimate_tokens);
-    let tools = body.get("tools").map_or(0, |tools| {
-        serde_json::to_string(tools).map_or(0, |wire| estimate_tokens(&wire))
-    });
-    instructions + tools
 }
 
 /// Applies server-side conversation continuation parameters to the request body.
@@ -265,22 +235,6 @@ fn merge_effort(body: &mut Map<String, Value>, effort: Option<Effort>) -> Result
 }
 
 fn reject_unsupported_settings(request: &ModelRequest) -> Result<()> {
-    // The framework owns this field whenever it can send one, so a static value underneath it is
-    // rejected rather than silently overridden — in either direction. `extra_body` is provider
-    // *registration* data, shared by every run of that provider, while a cache scope has a session
-    // lifetime; a static key there quietly routes every run onto one bucket, which reads as
-    // configured caching while defeating the scoping it appears to configure.
-    if request
-        .model_settings()
-        .extra_body()
-        .contains_key("prompt_cache_key")
-    {
-        return Err(Error::caller(
-            "OpenAI extra_body must not set prompt_cache_key: it is static provider registration \
-             data shared by every run, while the cache scope on the request has a session \
-             lifetime; set the scope on the request instead",
-        ));
-    }
     if request.model_settings().frequency_penalty().is_some()
         || request.model_settings().presence_penalty().is_some()
     {

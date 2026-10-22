@@ -835,6 +835,7 @@ struct ScriptedModel {
     inputs: Mutex<Vec<Vec<ModelInputItem>>>,
     instructions: Mutex<Vec<Option<String>>>,
     handoff_names: Mutex<Vec<Vec<String>>>,
+    cache_keys: Mutex<Vec<Option<String>>>,
     calls: AtomicUsize,
 }
 
@@ -845,11 +846,16 @@ impl ScriptedModel {
             inputs: Mutex::new(Vec::new()),
             instructions: Mutex::new(Vec::new()),
             handoff_names: Mutex::new(Vec::new()),
+            cache_keys: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         })
     }
 
     fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.cache_keys
+            .lock()
+            .unwrap()
+            .push(request.prompt_cache_key().map(str::to_owned));
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inputs.lock().unwrap().push(request.input().to_vec());
         self.instructions
@@ -2150,4 +2156,23 @@ impl ra_runtime::runner::result::RunErrorHandler for CheckpointCloseout {
             .with_write_to_history(false),
         ))
     }
+}
+
+#[tokio::test]
+async fn handoffs_keep_the_product_cache_override_on_the_receiving_agent() {
+    let model = script();
+    let target = reviewer(vec![]);
+    let result = Runner::run(run_request(
+        planner(target.as_handoff().unwrap(), vec![]),
+        target,
+        &model,
+        RunConfig::new().with_prompt_cache_key_override("root-thread"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        *model.cache_keys.lock().unwrap(),
+        vec![Some("root-thread".to_owned()); 2]
+    );
+    assert_eq!(result.state().generated_prompt_cache_key(), None);
 }

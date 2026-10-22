@@ -1,5 +1,8 @@
 //! Contracts for the agent loop and its two entry points.
 
+#[path = "runner_loop/prompt_cache_key.rs"]
+mod prompt_cache_key;
+
 #[path = "runner_loop/structured_output.rs"]
 mod structured_output;
 
@@ -1344,9 +1347,8 @@ async fn a_filter_that_replaces_the_prefix_has_it_sent_with_the_plan_rebuilt_on_
          hash would be refused at the dispatch boundary"
     );
     assert!(
-        scope.is_some(),
-        "the cache scope identifies the conversation rather than the text, so replacing the prefix \
-         does not drop it"
+        scope.is_none(),
+        "preparation leaves routing to the runner instead of assigning a run-scoped plan key"
     );
 
     let changed: Vec<bool> = result

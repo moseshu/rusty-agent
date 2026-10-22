@@ -1668,15 +1668,15 @@ async fn test_cacheable_prefix_carries_a_run_scoped_cache_plan() {
     );
     assert_eq!(
         plan.cache_scope(),
-        Some("run-preparation"),
-        "the cache scope is the run, so every turn of one run shares a cache entry"
+        None,
+        "preparation leaves cache routing to the runner after input filters"
     );
 
-    // The scope is stable across turns; that is the whole point of naming one.
+    // Repeated preparation preserves the prefix hash without assigning a routing key.
     let second = prepare().await.unwrap();
     assert_eq!(
         second.request().cache_plan().and_then(|p| p.cache_scope()),
-        Some("run-preparation")
+        None
     );
     assert_eq!(
         second.request().cache_plan().map(|p| p.prefix_hash()),
@@ -1741,7 +1741,7 @@ async fn test_short_instructions_with_a_large_tool_table_still_carry_a_cache_pla
         &ra_core::prompt::ContentHash::compute(instructions),
         "the plan must name the instructions the request actually carries"
     );
-    assert_eq!(plan.cache_scope(), Some("run-preparation"));
+    assert_eq!(plan.cache_scope(), None);
     assert_eq!(prepared.request().tools().len(), 12);
 }
 

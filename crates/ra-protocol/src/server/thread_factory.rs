@@ -21,13 +21,14 @@ use std::{collections::BTreeSet, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     permission::PermissionDecision,
-    session::SessionId,
+    session::{SessionId, rollout::RolloutThreadSpawn},
     tool::{Tool, ToolApprovalPolicy, ToolAvailability},
 };
 use ra_runtime::thread::AgentThreadBuilder;
 
 use super::{
-    background_terminals::ThreadBackgroundTerminals, settings_adapter::ThreadSettingsAdapter,
+    SessionSource, background_terminals::ThreadBackgroundTerminals,
+    settings_adapter::ThreadSettingsAdapter,
 };
 
 /// Why a thread is being loaded.
@@ -51,11 +52,60 @@ pub enum ThreadOrigin {
 pub struct ThreadFactoryRequest {
     thread_id: SessionId,
     origin: ThreadOrigin,
+    session_source: SessionSource,
+    thread_spawn: Option<RolloutThreadSpawn>,
+    ephemeral: bool,
+    fork_session_id: Option<SessionId>,
 }
 
 impl ThreadFactoryRequest {
     pub(crate) const fn new(thread_id: SessionId, origin: ThreadOrigin) -> Self {
-        Self { thread_id, origin }
+        Self {
+            thread_id,
+            origin,
+            session_source: SessionSource::Unknown,
+            thread_spawn: None,
+            ephemeral: false,
+            fork_session_id: None,
+        }
+    }
+
+    pub(crate) fn with_session_context(
+        mut self,
+        source: SessionSource,
+        spawn: Option<RolloutThreadSpawn>,
+        ephemeral: bool,
+        fork_session_id: Option<SessionId>,
+    ) -> Self {
+        self.session_source = source;
+        self.thread_spawn = spawn;
+        self.ephemeral = ephemeral;
+        self.fork_session_id = fork_session_id;
+        self
+    }
+
+    /// The server-selected source, restored from metadata when resuming a stored thread.
+    #[must_use]
+    pub const fn session_source(&self) -> &SessionSource {
+        &self.session_source
+    }
+
+    /// The current thread's spawn ancestry, including its root cache-session identity.
+    #[must_use]
+    pub const fn thread_spawn(&self) -> Option<&RolloutThreadSpawn> {
+        self.thread_spawn.as_ref()
+    }
+
+    /// Whether this thread is loaded without a persistent rollout of its own.
+    #[must_use]
+    pub const fn ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    /// Codex session identity of the fork source: its spawn root, or its own thread ID.
+    #[must_use]
+    pub const fn fork_session_id(&self) -> Option<&SessionId> {
+        self.fork_session_id.as_ref()
     }
 
     /// The thread's id, which its builder must carry.

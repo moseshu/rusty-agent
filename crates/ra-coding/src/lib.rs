@@ -33,6 +33,7 @@ pub mod permission_mode;
 pub mod permissions;
 pub mod profile;
 pub mod prompt;
+pub mod prompt_cache_key;
 pub(crate) mod request_permissions;
 pub mod shell_command;
 pub(crate) mod spawned;

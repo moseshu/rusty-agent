@@ -8,7 +8,7 @@ use ra_core::{
         ConversationContinuation, ModelHandoffDefinition, ModelRequest, ModelToolDefinition,
         ToolChoice,
     },
-    prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
+    prompt::CachePlan,
 };
 use serde_json::{Map, Value, json};
 
@@ -113,21 +113,6 @@ fn reject_unsupported_settings(codec: &ChatCodec, request: &ModelRequest) -> Res
             "Responses hosted tools are not supported by this model protocol",
         ));
     }
-    // The framework owns this field whenever it can send one, so a static value underneath it is
-    // rejected rather than silently overridden. `extra_body` is provider *registration* data,
-    // shared by every run of that provider, while a cache scope has a session lifetime; a static
-    // key there quietly routes every run onto one bucket.
-    if request
-        .model_settings()
-        .extra_body()
-        .contains_key("prompt_cache_key")
-    {
-        return Err(Error::caller(
-            "OpenAI extra_body must not set prompt_cache_key: it is static provider registration \
-             data shared by every run, while the cache scope on the request has a session \
-             lifetime; set the scope on the request instead",
-        ));
-    }
     // Every shape is refused, `Disabled` included. This protocol has no thinking switch at all, so
     // accepting an explicit "off" and then sending nothing leaves a reasoning model thinking at its
     // default effort with no trace of the setting anywhere in the request.
@@ -176,32 +161,18 @@ fn apply_store(body: &mut Map<String, Value>, codec: &ChatCodec) {
     body.insert("store".to_owned(), Value::Bool(true));
 }
 
-/// Lowers a cache scope onto the wire, where the endpoint honours it and the span is worth caching.
-///
-/// Called after the tool table is merged, and that ordering is load bearing: the cached prefix is
-/// the system message *plus the whole tool table*, and measuring before the merge would judge a
-/// short instruction block sitting in front of a large tool table as not worth caching.
-///
-/// Neither an unsupported endpoint nor a short span is an error. Caching is a discount; refusing to
-/// issue the request rather than issuing it uncached would trade the call for the saving.
+/// Sends a runtime key, falling back to the published cache-plan scope for older callers.
+/// Explicit extras, including null, always win. Prefix length does not govern cache routing.
 fn insert_cache_scope(body: &mut Map<String, Value>, codec: &ChatCodec, request: &ModelRequest) {
-    if !codec.quirks.prompt_cache_key() {
+    if body.contains_key("prompt_cache_key") || !codec.quirks.prompt_cache_key() {
         return;
     }
-    let Some(scope) = request.cache_plan().and_then(CachePlan::cache_scope) else {
-        return;
-    };
-    let instructions = request.system_instructions().map_or(0, estimate_tokens);
-    let tools = body.get("tools").map_or(0, |tools| {
-        serde_json::to_string(tools).map_or(0, |wire| estimate_tokens(&wire))
-    });
-    if instructions + tools < MIN_CACHEABLE_PREFIX_TOKENS {
-        return;
+    if let Some(key) = request
+        .prompt_cache_key()
+        .or_else(|| request.cache_plan().and_then(CachePlan::cache_scope))
+    {
+        body.insert("prompt_cache_key".to_owned(), Value::String(key.to_owned()));
     }
-    body.insert(
-        "prompt_cache_key".to_owned(),
-        Value::String(scope.to_owned()),
-    );
 }
 
 fn insert_optional_number(body: &mut Map<String, Value>, name: &str, value: Option<f64>) {

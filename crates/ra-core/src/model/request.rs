@@ -816,17 +816,11 @@ impl ModelOutputSchema {
 /// rather than here — the same treatment as `store` and `response_include`. Its absence is a
 /// decision, not an oversight.
 ///
-/// **Provider cache wire fields.** [`CachePlan`] states which bytes form the stable prefix and
-/// which span of calls should share a cache entry. It stops there. `cache_control` breakpoints and
-/// `prompt_cache_key` are wire vocabulary of one vendor each, and *whether a given endpoint honours
-/// them* is a provider fact — not a protocol one — so both the field names and the decision to send
-/// them belong to the adapter and to `ProviderQuirks`.
-///
-/// In particular `extra_body` is still the wrong home for a session cache key: that bucket is
-/// static provider registration data, shared by every run of that provider, while a cache scope is
-/// a runtime value with a session lifetime. A key placed there silently collapses every run onto
-/// one routing bucket. When the typed runtime override lands it belongs on this type as a new
-/// field; it is `#[non_exhaustive]` precisely so adding one is not a breaking change.
+/// **Provider cache breakpoints.** [`CachePlan`] identifies the stable instruction prefix.
+/// Provider breakpoint formats remain in adapters. The request-level prompt cache key follows
+/// the runner contract independently of instructions; adapters decide whether their endpoint
+/// accepts it. Explicit provider extras, merged from provider, model, agent and run settings,
+/// take precedence over the runner's key, including an explicit null.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
@@ -839,6 +833,7 @@ pub struct ModelRequest {
     tracing: ModelTracing,
     continuation: ConversationContinuation,
     cache_plan: Option<CachePlan>,
+    prompt_cache_key: Option<String>,
 }
 
 impl ModelRequest {
@@ -855,6 +850,7 @@ impl ModelRequest {
             tracing: ModelTracing::Disabled,
             continuation: ConversationContinuation::None,
             cache_plan: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -883,6 +879,19 @@ impl ModelRequest {
     pub fn with_cache_plan(mut self, cache_plan: CachePlan) -> Self {
         self.cache_plan = Some(cache_plan);
         self
+    }
+
+    /// Sets the runner's cache routing key independently of instructions and the cache plan.
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(key.into());
+        self
+    }
+
+    /// Runner-supplied cache routing key. Explicit provider extras take precedence on the wire.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
     }
 
     /// Sets model-facing tool definitions.

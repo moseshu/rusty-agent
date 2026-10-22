@@ -197,9 +197,9 @@ struct DumpArgs {
     #[arg(long)]
     model: Option<String>,
 
-    /// Cache scope to record; defaults to a placeholder, since no run produced this report.
-    #[arg(long)]
-    cache_scope: Option<String>,
+    /// Prompt cache key override to report; defaults to the Codex session placeholder.
+    #[arg(long, alias = "cache-scope")]
+    prompt_cache_key: Option<String>,
 
     /// Emit JSON, the form `--baseline` reads back.
     #[arg(long, conflicts_with = "baseline")]
@@ -222,8 +222,8 @@ impl DumpArgs {
         if let Some(model) = &self.model {
             request = request.with_model(model);
         }
-        if let Some(scope) = &self.cache_scope {
-            request = request.with_cache_scope(scope);
+        if let Some(key) = &self.prompt_cache_key {
+            request = request.with_prompt_cache_key_override(key);
         }
         request
     }

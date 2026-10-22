@@ -230,11 +230,7 @@ async fn request_shape_locks_store_replay_tools_and_stable_instructions() {
         serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["instructions"], "stable instructions");
-    assert!(
-        body.get("prompt_cache_key").is_none(),
-        "this fixture's instructions and single tool are far below the caching floor, so the \
-         declared capability alone does not put a key on the wire"
-    );
+    assert_eq!(body["prompt_cache_key"], "thread_123");
     assert_eq!(body["previous_response_id"], "resp_previous");
     assert!(body.get("conversation").is_none());
     assert_eq!(body["service_tier"], "flex");
@@ -1291,14 +1287,9 @@ async fn a_cache_plan_naming_other_bytes_fails_the_request() {
     );
 }
 
-/// A static `extra_body` cache key is rejected rather than silently winning or losing.
-///
-/// `extra_body` is provider *registration* data, shared by every run of that provider, while a
-/// cache scope has a session lifetime. A key placed there routes every run onto one bucket — which
-/// reads as configured caching while defeating the very scoping it appears to configure. Failing
-/// names the conflict at the one moment someone can fix it.
+/// Explicit extras take precedence over runtime and legacy cache-plan keys.
 #[tokio::test]
-async fn a_static_extra_body_cache_key_is_rejected() {
+async fn an_explicit_extra_body_cache_key_wins() {
     let server = MockServer::start().await;
     let model = mounted_model_with_quirks(
         &server,
@@ -1306,49 +1297,25 @@ async fn a_static_extra_body_cache_key_is_rejected() {
         ProviderQuirks::new().with_prompt_cache_key(true),
     )
     .await;
-
-    let extra_body = Map::from_iter([("prompt_cache_key".to_owned(), json!("static_key"))]);
-    let settings = ModelSettings::new()
-        .with_extra_body(ProviderKey::new("openai"), extra_body.into_iter().collect());
-
-    let request = ModelRequest::new(
-        vec![ModelInputItem::Message(Message::new(
-            MessageRole::User,
-            vec![ContentBlock::text("hello")],
-        ))],
-        resolved(settings),
-    )
-    .with_system_instructions("stable instructions")
-    .with_cache_plan(
-        CachePlan::new(ContentHash::compute("stable instructions")).with_cache_scope("run-7"),
+    let settings = ModelSettings::new().with_extra_body_value(
+        ProviderKey::new("openai"),
+        "prompt_cache_key",
+        json!("explicit-key"),
     );
-
-    let err = model
-        .get_response(request)
-        .await
-        .expect_err("a static cache key must not silently replace the run scope");
-    assert!(
-        err.to_string().contains("prompt_cache_key"),
-        "the error must name the offending field: {err}"
-    );
-    assert!(
-        server
-            .received_requests()
-            .await
-            .expect("recorded requests")
-            .is_empty(),
-        "the conflict must be reported before the request is paid for"
-    );
+    let request = ModelRequest::new(vec![], resolved(settings))
+        .with_prompt_cache_key("runtime-key")
+        .with_system_instructions("short")
+        .with_cache_plan(CachePlan::for_prefix("short", Some("legacy-key")));
+    model.get_response(request).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["prompt_cache_key"], "explicit-key");
 }
 
-/// Hosted tools from `extra_body` count toward the caching floor, exactly as neutral ones do.
+/// Hosted tools remain merged when a legacy cache scope supplies routing.
 ///
-/// This is the case no earlier layer can decide. Hosted tools — web search, file search, hosted MCP
-/// — have no protocol-neutral representation and arrive only through `extra_body`, so preparation
-/// cannot see them. A short instruction block in front of a large hosted-tool table is well past
-/// the floor, and measuring before the merge would silently deny it the discount.
 #[tokio::test]
-async fn hosted_tools_count_toward_the_caching_floor() {
+async fn hosted_tools_preserve_legacy_cache_routing() {
     let server = MockServer::start().await;
     let model = mounted_model_with_quirks(
         &server,
@@ -1390,13 +1357,13 @@ async fn hosted_tools_count_toward_the_caching_floor() {
         serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
     assert_eq!(
         body["prompt_cache_key"], "run-7",
-        "the hosted tool table puts the cached prefix past the floor, so the scope is sent"
+        "legacy routing remains available alongside hosted tools"
     );
 }
 
-/// A short prefix with nothing else in front of it is not worth a cache key.
+/// A short prefix still carries its routing key.
 #[tokio::test]
-async fn a_short_span_with_no_tool_table_gets_no_cache_key() {
+async fn a_short_span_with_no_tool_table_still_gets_its_cache_key() {
     let server = MockServer::start().await;
     let model = mounted_model_with_quirks(
         &server,
@@ -1426,10 +1393,7 @@ async fn a_short_span_with_no_tool_table_gets_no_cache_key() {
     let requests = server.received_requests().await.expect("recorded requests");
     let body: serde_json::Value =
         serde_json::from_slice(&requests[0].body).expect("request should contain JSON");
-    assert!(
-        body.get("prompt_cache_key").is_none(),
-        "no provider caches a span this short, so asking buys nothing"
-    );
+    assert_eq!(body["prompt_cache_key"], "run-7");
 }
 
 /// The neutral stream retains canonical item identities and each reasoning part's own index.

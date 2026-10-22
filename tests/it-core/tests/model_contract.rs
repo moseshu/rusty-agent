@@ -478,3 +478,14 @@ fn model_stream_delta_is_versioned_and_keeps_unknown_fields() {
     assert_eq!(read.unknown().get("obfuscation"), Some(&json!("pad")));
     assert_eq!(serde_json::to_value(&read).unwrap(), newer);
 }
+
+#[test]
+fn request_cache_key_survives_input_projection_and_instruction_removal() {
+    let request = request()
+        .with_system_instructions("prefix")
+        .with_prompt_cache_key("session");
+    let projected = request.with_input(vec![]).without_system_instructions();
+    assert_eq!(projected.prompt_cache_key(), Some("session"));
+    assert!(projected.cache_plan().is_none());
+    assert!(projected.validate_cache_plan().is_ok());
+}

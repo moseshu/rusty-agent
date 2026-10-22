@@ -8,8 +8,8 @@
 //! the snapshot gate composes the same report — and the two would have drifted at the first edit.
 //!
 //! The report the CLI prints is therefore the report the gate commits: the same entry point renders
-//! both, and [`PLACEHOLDER_CACHE_SCOPE`] is what makes the bytes comparable, since no cache scope a
-//! real run would produce is reproducible from a command line.
+//! both. [`PLACEHOLDER_CACHE_SCOPE`] stands in for the session routing key that a command run
+//! outside a thread cannot know, so the report remains reproducible.
 //!
 //! # Why the comparison is here too
 //!
@@ -29,12 +29,13 @@ use super::{assemble_stable_prefix, assemble_stable_prefix_for_surface};
 use crate::agent::{HOST_BACKED_PROFILE, host_backed_surface};
 use crate::host::CodingHost;
 
-/// Cache scope recorded in a report that no run produced.
+/// Placeholder for the Codex session key when a dump is built outside a thread.
 ///
-/// A dump is rendered outside any run, so there is no run id to name. Writing a placeholder rather
-/// than omitting the scope keeps the report's shape identical to the one a run would produce, and
-/// keeps the committed snapshot byte-comparable with what the command prints.
-pub const PLACEHOLDER_CACHE_SCOPE: &str = "<run>";
+/// The published name is retained for compatibility. A real coding root uses its thread ID;
+/// the dump cannot invent a session identity and remains reproducible.
+/// The diagnostic value was changed from `<run>` to `<thread>` to reflect that session lifetime;
+/// despite its legacy name, this constant now describes a routing key, not a cache-plan scope.
+pub const PLACEHOLDER_CACHE_SCOPE: &str = "<thread>";
 
 /// The role a dump covers when the caller does not choose one.
 pub const DEFAULT_ROLE: &str = "main";
@@ -137,11 +138,17 @@ impl PromptDumpRequest {
         self
     }
 
-    /// Names the cache scope instead of [`PLACEHOLDER_CACHE_SCOPE`].
+    /// Records a prompt cache key override instead of the Codex session placeholder.
     #[must_use]
-    pub fn with_cache_scope(mut self, scope: impl Into<String>) -> Self {
-        self.cache_scope = Some(scope.into());
+    pub fn with_prompt_cache_key_override(mut self, key: impl Into<String>) -> Self {
+        self.cache_scope = Some(key.into());
         self
+    }
+
+    /// Compatibility alias for [`Self::with_prompt_cache_key_override`].
+    #[must_use]
+    pub fn with_cache_scope(self, scope: impl Into<String>) -> Self {
+        self.with_prompt_cache_key_override(scope)
     }
 
     /// Assembles the prefix this request describes and summarizes it.
@@ -175,12 +182,20 @@ impl PromptDumpRequest {
             .cache_scope
             .as_deref()
             .unwrap_or(PLACEHOLDER_CACHE_SCOPE);
-        let plan = CachePlan::for_prefix(prefix.system_instructions(), Some(scope));
+        let plan = CachePlan::for_prefix(prefix.system_instructions(), None);
         Ok(PromptDump::from_assembled(
             &prefix,
             Some(plan),
             self.provider.as_deref(),
             self.model.as_deref(),
+        )
+        .with_prompt_cache_key(
+            scope,
+            if self.cache_scope.is_some() {
+                "RunConfig override (endpoint Quirk required)"
+            } else {
+                "Codex session_id (root thread_id; endpoint Quirk required)"
+            },
         ))
     }
 }

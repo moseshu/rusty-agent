@@ -53,9 +53,9 @@
 //!
 //! Their sum is the ceiling on the assembled prefix: 2912 estimated tokens, more than twice
 //! [`MIN_CACHEABLE_PREFIX_TOKENS`](ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS). The floor and the
-//! ceiling are different kinds of fact — below the floor no provider caches the span at all, while
-//! above the ceiling it is cached and simply costs more every turn than this product has decided a
-//! system prompt is worth — but the pair is what makes the prefix a governed size rather than
+//! ceiling are different kinds of fact — below the floor Anthropic does not receive
+//! `cache_control`, while above the ceiling it costs more every turn than this product has decided
+//! a system prompt is worth — but the pair is what makes the prefix a governed size rather than
 //! whatever the last edit left behind.
 
 pub(crate) mod autonomy;

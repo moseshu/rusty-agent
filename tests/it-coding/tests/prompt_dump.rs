@@ -279,16 +279,16 @@ async fn test_a_role_the_product_does_not_ship_is_refused() {
 /// This is what makes the committed snapshot reproducible from a command line: a real run id would
 /// differ on every invocation and the bytes would never match.
 #[tokio::test]
-async fn test_a_dump_records_a_placeholder_cache_scope_until_a_run_names_one() {
+async fn test_a_dump_records_the_codex_session_key_source_and_explicit_override() {
     let default = render_prompt_dump(&PromptDumpRequest::new())
         .await
         .expect("dump renders");
-    assert!(default.contains(&format!("Cache Scope:          {PLACEHOLDER_CACHE_SCOPE}")));
+    assert!(default.contains(&format!("Prompt Cache Key:     {PLACEHOLDER_CACHE_SCOPE}")));
 
     let named = render_prompt_dump(&PromptDumpRequest::new().with_cache_scope("session-42"))
         .await
         .expect("dump renders");
-    assert!(named.contains("Cache Scope:          session-42"));
+    assert!(named.contains("Prompt Cache Key:     session-42"));
 }
 
 /// Comparing a build against its own recorded dump reports nothing, and says the cache survives.
@@ -1182,7 +1182,7 @@ async fn anthropic_system_block(instructions: &str) -> serde_json::Value {
         .clone()
 }
 
-/// The product's assembled prefix now clears the common caching floor, and spends a breakpoint.
+/// The product's assembled prefix clears the Anthropic cache-control floor and spends a breakpoint.
 ///
 /// Crossing 1024 estimated tokens is not a number in a report; it switches on provider cache
 /// directives for every real request. So the assertion is made where that switch is observable —
@@ -1196,7 +1196,7 @@ async fn anthropic_system_block(instructions: &str) -> serde_json::Value {
 /// Measured on the host-backed prefix, the version actually installed on an agent with tools. A
 /// prefix that only cleared the floor after tools were attached would otherwise go unnoticed.
 #[tokio::test]
-async fn test_the_product_prefix_reaches_the_caching_floor_and_earns_a_breakpoint() {
+async fn test_the_product_prefix_reaches_the_anthropic_floor_and_earns_a_breakpoint() {
     let prefix = host_backed_prefix().await;
     let tokens = prefix.token_estimate();
 

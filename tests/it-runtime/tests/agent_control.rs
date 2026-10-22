@@ -84,6 +84,7 @@ struct Scripts {
     tools: Mutex<Vec<(String, Vec<String>)>>,
     /// The temperature each call was sent with, per agent.
     temperatures: Mutex<Vec<(String, Option<f64>)>>,
+    cache_keys: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl Scripts {
@@ -150,6 +151,11 @@ struct ScriptedModel(Arc<Scripts>);
 impl Model for ScriptedModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let agent = request.system_instructions().unwrap_or_default().to_owned();
+        self.0
+            .cache_keys
+            .lock()
+            .unwrap()
+            .push((agent.clone(), request.prompt_cache_key().map(str::to_owned)));
         self.0
             .calls
             .lock()
@@ -4458,4 +4464,56 @@ async fn every_shutdown_waiter_waits_for_resource_cleanup() {
         !second_returned_early || was_released,
         "second shutdown returned before the first cleanup completed"
     );
+}
+
+#[tokio::test]
+async fn children_and_grandchildren_inherit_the_root_cache_override() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push("lead", Step::Respond(spawn_worker("l1", "go")));
+    scripts.push("lead", Step::Respond(final_message("l2", "started")));
+    scripts.push(
+        "worker",
+        Step::Respond(spawn_call("w1", "helper", "helper", "help")),
+    );
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w2", "started helper")),
+    );
+    scripts.push("helper", Step::Respond(final_message("h1", "done")));
+    let registry = AgentRegistry::builder()
+        .register(worker_agent(vec![]))
+        .register(helper_agent(vec![]))
+        .build()
+        .unwrap();
+    let request = RunRequest::new(
+        AgentBinding::direct(parent_agent()),
+        Arc::new(ScriptedResolver(scripts.clone())),
+        RunId::generate(),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("go"))],
+    )
+    .with_config(
+        RunConfig::new()
+            .with_agent_registry(registry)
+            .with_prompt_cache_key_override("root-thread"),
+    )
+    .with_agent_control(control.root());
+
+    let result = Runner::run(request).await.unwrap();
+    assert_eq!(result.state().generated_prompt_cache_key(), None);
+    eventually_status(&control, &helper_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let keys = scripts.cache_keys.lock().unwrap();
+    for name in ["lead", "worker", "helper"] {
+        let found: Vec<_> = keys.iter().filter(|(agent, _)| agent == name).collect();
+        assert!(!found.is_empty(), "{name} must have run");
+        assert!(
+            found
+                .iter()
+                .all(|(_, key)| key.as_deref() == Some("root-thread"))
+        );
+    }
 }

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ra_core::{agent::AgentId, error::Result, prompt::PromptRole};
+use ra_core::{agent::AgentId, error::Result, prompt::PromptRole, session::SessionId};
 use ra_exec::session::ProcessManager;
 use ra_runtime::agent::control::{
     AgentControl, PreparedSpawnedAgent, SpawnedAgentFactory, SpawnedAgentRequest,
@@ -30,6 +30,7 @@ pub(crate) fn agent_control(
     name: String,
     role: &PromptRole,
     profile: CodingProfile,
+    cache_session_id: Option<SessionId>,
 ) -> Result<AgentControl> {
     AgentControl::new().with_spawned_agent_factory(Arc::new(CodingSpawnedAgents {
         host: host.clone(),
@@ -37,6 +38,7 @@ pub(crate) fn agent_control(
         name,
         role: role.clone(),
         profile,
+        cache_session_id,
     }))
 }
 
@@ -46,29 +48,36 @@ struct CodingSpawnedAgents {
     name: String,
     role: PromptRole,
     profile: CodingProfile,
+    cache_session_id: Option<SessionId>,
 }
 
 #[async_trait]
 impl SpawnedAgentFactory for CodingSpawnedAgents {
     async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
-        if request.agent_type().is_some() || request.agent().id() != &self.id {
-            return Ok(PreparedSpawnedAgent::new(Arc::clone(request.agent()))
-                .with_prepared_capabilities([], []));
-        }
-        let host = self.host.for_spawned_agent();
-        let assembled = assemble_agent(
-            self.id.clone(),
-            self.name.clone(),
-            &self.role,
-            &host,
-            self.profile,
-        )
-        .await?;
-        Ok(PreparedSpawnedAgent::new(assembled.agent)
-            .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools)
-            .with_resources(Arc::new(SpawnedProcesses(Arc::clone(
-                host.process_manager(),
-            )))))
+        let prepared = if request.agent_type().is_some() || request.agent().id() != &self.id {
+            PreparedSpawnedAgent::new(Arc::clone(request.agent()))
+                .with_prepared_capabilities([], [])
+        } else {
+            let host = self.host.for_spawned_agent();
+            let assembled = assemble_agent(
+                self.id.clone(),
+                self.name.clone(),
+                &self.role,
+                &host,
+                self.profile,
+            )
+            .await?;
+            PreparedSpawnedAgent::new(assembled.agent)
+                .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools)
+                .with_resources(Arc::new(SpawnedProcesses(Arc::clone(
+                    host.process_manager(),
+                ))))
+        };
+        Ok(if let Some(session) = &self.cache_session_id {
+            prepared.with_prompt_cache_key_override(session.as_str())
+        } else {
+            prepared
+        })
     }
 }
 

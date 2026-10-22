@@ -123,6 +123,7 @@ impl ThreadFactory for CodingThreadFactory {
         .with_config(
             self.settings.initialize(
                 host.build_run_config()
+                    .with_prompt_cache_key_override(crate::prompt_cache_key::for_thread(request))
                     .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
             ),
         )
@@ -136,6 +137,7 @@ impl ThreadFactory for CodingThreadFactory {
                 self.agent_name.clone(),
                 &self.role,
                 self.profile,
+                Some(crate::prompt_cache_key::session_id(request).clone()),
             )?);
         }
         Ok(PreparedThread::new(builder)

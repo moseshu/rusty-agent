@@ -1111,6 +1111,8 @@ pub struct RunState {
     session_compaction: Option<SessionCompactionContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trace: Option<RunTraceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generated_prompt_cache_key: Option<String>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     terminal_unrecoverable: bool,
     #[serde(
@@ -1236,12 +1238,25 @@ struct RunStateRecord {
     session_compaction: Option<SessionCompactionContext>,
     #[serde(default, deserialize_with = "deserialize_run_trace_state")]
     trace: Option<RunTraceState>,
+    #[serde(default, deserialize_with = "deserialize_generated_prompt_cache_key")]
+    generated_prompt_cache_key: Option<String>,
     #[serde(default)]
     terminal_unrecoverable: bool,
     #[serde(default)]
     sandbox: Option<serde_json::Value>,
     #[serde(flatten, default)]
     unknown: Unknown,
+}
+
+fn deserialize_generated_prompt_cache_key<'de, D>(
+    deserializer: D,
+) -> core::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // The reference restores only strings; an invalid optional cache hint does not block resume.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
 }
 
 impl TryFrom<RunStateRecord> for RunState {
@@ -1294,6 +1309,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_session_write,
             session_compaction,
             trace,
+            generated_prompt_cache_key,
             terminal_unrecoverable,
             sandbox,
             unknown,
@@ -1442,6 +1458,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_session_write,
             session_compaction,
             trace,
+            generated_prompt_cache_key,
             terminal_unrecoverable,
             sandbox,
             unknown,
@@ -1509,6 +1526,7 @@ impl RunState {
             pending_session_write: None,
             session_compaction: None,
             trace: None,
+            generated_prompt_cache_key: None,
             terminal_unrecoverable: false,
             sandbox: None,
             unknown: Unknown::new(),
@@ -1541,6 +1559,18 @@ impl RunState {
     #[must_use]
     pub const fn run_id(&self) -> &RunId {
         &self.run_id
+    }
+
+    /// Generated prompt cache key retained across turns and serialized continuations.
+    #[must_use]
+    pub fn generated_prompt_cache_key(&self) -> Option<&str> {
+        self.generated_prompt_cache_key.as_deref()
+    }
+
+    /// Saves the runner-generated key. Product overrides are not saved here.
+    #[doc(hidden)]
+    pub fn set_generated_prompt_cache_key(&mut self, key: impl Into<String>) {
+        self.generated_prompt_cache_key = Some(key.into());
     }
 
     /// Next candidate host event sequence number (exclusive upper bound).

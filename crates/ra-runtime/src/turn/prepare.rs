@@ -969,31 +969,9 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         .with_handoffs(surface.handoff_definitions())
         .with_tracing(request.tracing);
     if let Some(instructions) = instructions {
-        // The cache scope is the run for now. It wants to be the session id, so that a resumed or
-        // follow-up run reuses the same cache entry; until sessions exist, the run is the widest
-        // span this stage can name, and naming a narrower one would partition the cache rather
-        // than share it.
-        //
-        // Generated system instructions also carry a plan whose hash names this turn's text.
-        // When a generator returns the same bytes every turn, as context-derived settings usually
-        // do, that prefix caches like static text. When it changes every turn, an adapter that
-        // writes explicit breakpoints (Anthropic `cache_control`) pays a cache write per turn
-        // without a later read. The plan does not suppress that: the runtime cannot predict the
-        // next turn's bytes, and dropping the plan would also drop the shared scope that
-        // `prompt_cache_key` relies on. Cache preferences never change the instruction role.
-        //
-        // The plan says only which bytes form this request's instruction prefix and which calls
-        // should share an entry. Whether
-        // that becomes `cache_control` marks, a `prompt_cache_key`, or nothing is the adapter's
-        // decision, and depends on the endpoint rather than on the protocol.
-        //
-        // The plan is attached unconditionally, with no judgement about whether it is worth
-        // acting on. That judgement needs the whole cached prefix — instructions plus the final
-        // tool table, including formal hosted declarations and legacy adapter entries. Only the
-        // adapter sees their final merged wire form. Deciding here would mean
-        // deciding on the instructions alone, which denies caching to precisely the requests that
-        // most need it.
-        let cache_plan = CachePlan::for_prefix(&instructions, Some(request.run.run_id().as_str()));
+        // Prefix validation is independent of request-level cache routing. The runner attaches
+        // its key after model-input filters have finished, even when no instructions remain.
+        let cache_plan = CachePlan::for_prefix(&instructions, None);
         model_request = model_request.with_cache_plan(cache_plan);
         model_request = model_request.with_system_instructions(instructions);
     }

@@ -867,18 +867,10 @@ pub trait DynamicPromptHandler: Send + Sync {
     async fn resolve(&self, context: &RunContext) -> Result<ResolvedPrompt>;
 }
 
-/// Shortest cached span worth asking a provider to cache, in estimated tokens.
+/// Common estimated prefix floor used by Anthropic cache-control lowering.
 ///
-/// Every provider family that caches at all ignores a shorter span, so asking buys nothing and may
-/// cost a breakpoint on providers that ration them.
-///
-/// **The span is the whole cached prefix, not the instructions.** The tool table sits in the same
-/// prefix and is frequently the larger half of it, and hosted tools appear only once an adapter has
-/// merged them — which is why this constant is applied by the adapter, the one place that sees the
-/// final wire form, rather than by whoever assembled the prompt.
-///
-/// The exact floor is per model rather than universal (Anthropic's Haiku models want twice this).
-/// This is the common lower bound; refining it belongs with the model capability matrix.
+/// Includes instructions and the merged tool table. Model-specific Anthropic floors may be
+/// higher. `OpenAI` prompt-cache routing keys are sent independently of this estimate.
 pub const MIN_CACHEABLE_PREFIX_TOKENS: usize = 1024;
 
 /// A protocol-neutral statement of **what** should be cached, carrying no opinion on **how**.
@@ -899,18 +891,11 @@ pub const MIN_CACHEABLE_PREFIX_TOKENS: usize = 1024;
 /// would have been sent a field it may reject. Lowering this plan is the adapter's job, and
 /// whether a given endpoint supports a mechanism is a provider fact, declared on its registration.
 ///
-/// `cache_scope` identifies the span of calls that should share a cache entry — a session, or
-/// failing that a run. A value that changes every turn is worse than `None`, because it partitions
-/// the cache instead of sharing it.
-///
-/// # Why there is no "is this worth caching" verdict here
-///
-/// Because nothing at this layer can reach one. The floor applies to the whole cached prefix, and
-/// the prefix is the instructions *plus the tool table* — including provider-hosted tools that have
-/// no protocol-neutral representation and exist only after an adapter has merged them into the wire
-/// request. Judging here would mean judging on the instructions alone, which denies caching to
-/// exactly the requests that would benefit most: a short instruction block in front of a dozen tool
-/// schemas is well past the floor while looking, on its own, far below it.
+/// `cache_scope` is the published compatibility route for older callers. New runtimes attach
+/// [`ModelRequest::prompt_cache_key`](crate::model::ModelRequest::prompt_cache_key) after input
+/// filters; that key takes precedence and survives instruction removal. The prefix hash still
+/// validates the instructions actually sent. Anthropic breakpoint eligibility is decided by its
+/// adapter using the final prefix, including tools; `OpenAI` key routing has no local token floor.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachePlan {

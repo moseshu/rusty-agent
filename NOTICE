@@ -65,6 +65,10 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/hosted_spec.rs; codex-rs/protocol/src/config_types.rs; codex-rs/core/src/config/mod.rs (resolve_web_search_mode_for_turn) |
 | `tests/it-model/tests/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/tools/src/tool_spec_tests.rs (web_search wire); Agents SDK tests/models/test_openai_responses_converter.py and test_openai_responses.py |
 | `tests/it-coding/tests/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/web_search.rs; codex-rs/core/src/tools/hosted_spec_tests.rs; codex-rs/core/src/config/config_tests.rs (web search mode) |
+| `crates/ra-coding/src/prompt_cache_key.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/client.rs::prompt_cache_key; session/session.rs |
+| `tests/it-coding/tests/prompt_cache_key.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/client_tests.rs (internal_session_prompt_cache_key_is_scoped_to_parent_thread); codex-rs/core/src/client.rs::prompt_cache_key |
+| `tests/it-protocol/tests/threads/prompt_cache_key.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/prompt_cache_key.rs; codex-rs/core/src/session/session.rs (fork_cache_key) |
+| `tests/it-protocol/tests/threads/coding_tools.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/prompt_cache_key.rs; codex-rs/core/src/session/session.rs (fork routing and agent-control session identity) |
 
 The metadata/title resolution, URL display-name behavior, and bare function-tool naming
 (original names and include_server_in_tool_names prefixes) in crates/ra-mcp/src/catalog.rs,
@@ -182,4 +186,12 @@ also adapt openai/openai-agents-python, revision
 f53c62451c7f34c15f0c87fa745e05404025420f, src/agents/{agent,tool,items}.py,
 src/agents/models/openai_responses.py, tests/models/test_openai_responses_converter.py,
 tests/models/test_openai_responses.py and tests/test_run_step_processing.py (MIT).
+See third_party/openai-agents-python.LICENSE for the retained license.
+
+The cache-key resolver in crates/ra-runtime/src/runner/prompt_cache_key.rs,
+the request and checkpoint fields in crates/ra-core/src/{model/request,state/run}.rs,
+and cache-key tests in tests/it-runtime, tests/it-core and tests/it-model adapt
+openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/run_internal/{prompt_cache_key,run_grouping,run_loop}.py,
+src/agents/{run_state,result}.py and tests/test_prompt_cache_key.py (MIT).
 See third_party/openai-agents-python.LICENSE for the retained license.

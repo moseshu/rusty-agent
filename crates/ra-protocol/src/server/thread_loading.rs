@@ -165,10 +165,10 @@ impl ThreadRequestProcessor {
 
         let thread_id = new_thread_id();
         let prepared = factory
-            .prepare_thread(&ThreadFactoryRequest::new(
-                thread_id.clone(),
-                ThreadOrigin::Start,
-            ))
+            .prepare_thread(
+                &ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Start)
+                    .with_session_context(context.session_source.clone(), None, ephemeral, None),
+            )
             .await
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
@@ -290,10 +290,15 @@ impl ThreadRequestProcessor {
         }
 
         let prepared = match factory
-            .prepare_thread(&ThreadFactoryRequest::new(
-                thread_id.clone(),
-                ThreadOrigin::Resume,
-            ))
+            .prepare_thread(
+                &ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Resume)
+                    .with_session_context(
+                        SessionSource::from_metadata(stored.source()),
+                        stored.thread_spawn().cloned(),
+                        false,
+                        None,
+                    ),
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -442,12 +447,23 @@ impl ThreadRequestProcessor {
 
         let thread_id = new_thread_id();
         let prepared = factory
-            .prepare_thread(&ThreadFactoryRequest::new(
-                thread_id.clone(),
-                ThreadOrigin::Fork {
-                    source: source_id.clone(),
-                },
-            ))
+            .prepare_thread(
+                &ThreadFactoryRequest::new(
+                    thread_id.clone(),
+                    ThreadOrigin::Fork {
+                        source: source_id.clone(),
+                    },
+                )
+                .with_session_context(
+                    context.session_source.clone(),
+                    None,
+                    params.ephemeral,
+                    Some(source.thread_spawn().map_or_else(
+                        || source_id.clone(),
+                        |spawn| spawn.root_session_id().clone(),
+                    )),
+                ),
+            )
             .await
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))

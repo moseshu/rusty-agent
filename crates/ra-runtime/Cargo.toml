@@ -10,6 +10,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes only the pure grouping calculation for external upstream-parity tests.
+test-api = []
+
 [dependencies]
 ra-core = { workspace = true }
 tokio = { workspace = true }

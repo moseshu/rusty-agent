@@ -93,6 +93,7 @@ async fn lowers_a_messages_request_and_lifts_thinking_text_tools_and_usage() {
     let response = model
         .get_response(
             request()
+                .with_prompt_cache_key("openai-routing")
                 .with_system_instructions("stable system")
                 .with_tools(vec![ModelToolDefinition::new(
                     "lookup",
@@ -121,6 +122,7 @@ async fn lowers_a_messages_request_and_lifts_thinking_text_tools_and_usage() {
 
     let requests = server.received_requests().await.expect("requests retained");
     let sent: Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
+    assert!(sent.get("prompt_cache_key").is_none());
     assert_eq!(
         requests[0]
             .headers

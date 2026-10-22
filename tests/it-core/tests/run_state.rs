@@ -2194,3 +2194,38 @@ fn saved_turn_limits_distinguish_legacy_and_explicitly_unlimited_checkpoints() {
     assert_eq!(restored.max_turns(), None);
     assert_eq!(restored.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }
+
+#[test]
+fn generated_prompt_cache_key_roundtrips_and_old_states_omit_it() {
+    let mut state = RunState::start(RunId::new("cache-run"));
+    let legacy = serde_json::to_value(&state).unwrap();
+    assert!(legacy.get("generated_prompt_cache_key").is_none());
+    let restored: RunState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.generated_prompt_cache_key(), None);
+    state.set_generated_prompt_cache_key("agents-sdk:run:1234567890abcdef1234567890abcdef");
+    let serialized = serde_json::to_value(&state).unwrap();
+    assert_eq!(
+        serialized["generated_prompt_cache_key"],
+        state.generated_prompt_cache_key().unwrap()
+    );
+    let restored: RunState = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored, state);
+}
+
+#[test]
+fn malformed_optional_generated_cache_hints_follow_the_sdk_restore_behavior() {
+    let state = RunState::start(RunId::new("cache-run"));
+    for value in [json!(null), json!(42), json!({"future":"value"}), json!([])] {
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["generated_prompt_cache_key"] = value;
+        let restored: RunState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.generated_prompt_cache_key(), None);
+    }
+    let mut json = serde_json::to_value(&state).unwrap();
+    json["generated_prompt_cache_key"] = json!("prompt-cache-key-1");
+    let restored: RunState = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        restored.generated_prompt_cache_key(),
+        Some("prompt-cache-key-1")
+    );
+}

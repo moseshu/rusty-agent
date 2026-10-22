@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The configured coding factory reaches the app server's real control and user-input ports.
 
 use super::*;
@@ -615,4 +616,49 @@ async fn spawned_batches_wait_for_all_answers_and_withdraw_on_cancel() {
             assert!(!root.join("second.txt").exists());
         }
     }
+}
+
+#[tokio::test]
+async fn ephemeral_fork_children_use_the_fork_prompt_cache_key() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let script = Arc::new(Script::default());
+    let agents = Agents::new(&script);
+    let (server, _) = coding_server(&agents, Arc::new(InMemoryThreadStore::new()), &root);
+    let mut connection = server.connect(1).await;
+    let parent = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.answer("parent answer");
+    server
+        .run_turn(&mut connection, parent.id(), "parent")
+        .await;
+    let fork = server
+        .fork(
+            &mut connection,
+            ThreadForkParams::new(parent.id()).ephemeral(),
+        )
+        .await;
+    assert_ne!(fork.thread().id(), parent.id());
+
+    script.push(Step::Respond(collab(
+        "spawn_agent",
+        json!({
+            "task_name": "worker", "message": "worker task", "fork_turns": "none"
+        }),
+    )));
+    script.push(Step::Respond(collab(
+        "wait_agent",
+        json!({"timeout_ms":10000}),
+    )));
+    script.answer("delegated");
+    server
+        .run_turn(&mut connection, fork.thread().id(), "delegate")
+        .await;
+    agents.wait_for_child_calls(1).await;
+    assert_eq!(script.last_request().prompt_cache_key(), Some(parent.id()));
+    let children = agents.child_requests.lock().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].prompt_cache_key(), Some(fork.thread().id()));
+    assert_ne!(children[0].prompt_cache_key(), Some(parent.id()));
 }

@@ -17,6 +17,9 @@ mod thread_list;
 #[path = "threads/thread_read_state.rs"]
 mod thread_read_state;
 
+#[path = "threads/prompt_cache_key.rs"]
+mod prompt_cache_key;
+
 #[path = "threads/coding_tools.rs"]
 mod coding_tools;
 
@@ -2071,6 +2074,7 @@ async fn coding_thread_factory_starts_coding_threads() {
     server.run_turn(&mut connection, &thread_id, "hello").await;
     let request = script.last_request();
     assert_eq!(request.tools(), expected_tools);
+    assert_eq!(request.prompt_cache_key(), Some(thread_id.as_str()));
     assert!(
         request
             .tools()

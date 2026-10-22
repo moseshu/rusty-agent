@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 ra-core = { path = "../../crates/ra-core" }
 ra-context = { path = "../../crates/ra-context" }
-ra-runtime = { path = "../../crates/ra-runtime" }
+ra-runtime = { path = "../../crates/ra-runtime", features = ["test-api"] }
 ra-tools = { path = "../../crates/ra-tools" }
 # `docker` for the parity suite, which drives the runner against a real daemon as well as the local
 # backend.

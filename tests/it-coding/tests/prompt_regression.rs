@@ -43,9 +43,8 @@ static SHIPPED_ROLES: [PromptRole; 5] = [
 /// The ceiling on the assembled stable prefix, as the sum of the sections' own allowances.
 ///
 /// The declared sum of the product's section allowances. The floor and the ceiling are different
-/// kinds of fact — below the floor no provider caches the span at all, above the ceiling it is
-/// cached and simply costs more on every turn than this product has decided a system prompt is
-/// worth.
+/// kinds of fact — below the floor Anthropic does not receive `cache_control`; above the
+/// ceiling it costs more on every turn than this product has decided a system prompt is worth.
 const PREFIX_TOKEN_CEILING: usize = 2_912;
 
 /// The capability families whose fragments this repository writes.
@@ -228,9 +227,9 @@ async fn test_the_declared_allowances_sum_to_the_prefix_ceiling() {
     );
 }
 
-/// The largest prefix the product ships sits between the caching floor and the declared ceiling.
+/// Every shipped prefix clears the Anthropic cache-control floor and stays below its ceiling.
 #[tokio::test]
-async fn test_every_shipped_prefix_sits_between_the_caching_floor_and_the_ceiling() {
+async fn test_every_shipped_prefix_clears_the_anthropic_floor_and_stays_below_the_ceiling() {
     for (label, prefix) in shipped_prefixes().await {
         let tokens = prefix.token_estimate();
         assert!(
