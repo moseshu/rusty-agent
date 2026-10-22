@@ -230,10 +230,13 @@ struct FakeTerminals {
 impl FakeTerminals {
     fn with(ids: &[&str]) -> Arc<Self> {
         let terminals = Arc::new(Self::default());
-        terminals.running.lock().unwrap().extend(
-            ids.iter()
-                .map(|id| BackgroundTerminalInfo::new(format!("call-{id}"), *id, "sleep 30", "/w")),
-        );
+        terminals
+            .running
+            .lock()
+            .unwrap()
+            .extend(ids.iter().map(|id| {
+                BackgroundTerminalInfo::new(format!("call-{id}"), *id, "sleep 30", "/w")
+            }));
         terminals
     }
 
@@ -698,22 +701,26 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() {
     server.turn_start(&mut client, THREAD).await;
     client.notification("turn/completed").await;
 
-    assert_eq!(server.unsubscribe(&mut client, THREAD).await, "unsubscribed");
+    assert_eq!(
+        server.unsubscribe(&mut client, THREAD).await,
+        "unsubscribed"
+    );
     tokio::time::advance(Duration::from_millis(250)).await;
     assert!(server.is_loaded(&mut prober, THREAD).await);
     assert!(!prober.has_received_closed());
 
     // Subscribing again cancels the pending unload, even after the original deadline.
-    server
-        .loader
-        .subscribe(&SessionId::new(THREAD), client.id);
+    server.loader.subscribe(&SessionId::new(THREAD), client.id);
     tokio::time::advance(Duration::from_millis(2200)).await;
     settle().await;
     assert!(server.is_loaded(&mut prober, THREAD).await);
     assert!(!prober.has_received_closed());
 
     // Losing the last subscriber starts a fresh countdown.
-    assert_eq!(server.unsubscribe(&mut client, THREAD).await, "unsubscribed");
+    assert_eq!(
+        server.unsubscribe(&mut client, THREAD).await,
+        "unsubscribed"
+    );
     tokio::time::advance(Duration::from_millis(250)).await;
     settle().await;
     assert!(server.is_loaded(&mut prober, THREAD).await);
@@ -757,7 +764,10 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() {
         let id = server.turn_start(&mut client, THREAD).await;
         client.response(id).await;
         script.wait_for_calls(1).await;
-        assert_eq!(server.unsubscribe(&mut client, THREAD).await, "unsubscribed");
+        assert_eq!(
+            server.unsubscribe(&mut client, THREAD).await,
+            "unsubscribed"
+        );
 
         tokio::time::advance(Duration::from_millis(1200)).await;
         settle().await;
@@ -793,7 +803,10 @@ async fn thread_unsubscribe_reports_each_status() {
     let thread = agent_thread(THREAD, &script);
     server.load(&thread, &[&client]).await;
 
-    assert_eq!(server.unsubscribe(&mut client, THREAD).await, "unsubscribed");
+    assert_eq!(
+        server.unsubscribe(&mut client, THREAD).await,
+        "unsubscribed"
+    );
     assert_eq!(
         server.unsubscribe(&mut client, THREAD).await,
         "notSubscribed"
@@ -827,13 +840,18 @@ async fn unloading_withdraws_requests_and_stops_background_terminals() {
         .until(|message| message["method"] == "item/commandExecution/requestApproval")
         .await;
 
-    assert_eq!(server.unsubscribe(&mut client, THREAD).await, "unsubscribed");
+    assert_eq!(
+        server.unsubscribe(&mut client, THREAD).await,
+        "unsubscribed"
+    );
     assert_eq!(
         prober.notification("thread/closed").await,
         json!({"threadId": THREAD})
     );
     // Withdrawn without an answer, which the approval reads as failed, denying the command.
-    let answer = timeout(PATIENCE, answer).await.expect("the request is withdrawn");
+    let answer = timeout(PATIENCE, answer)
+        .await
+        .expect("the request is withdrawn");
     assert!(answer.is_err());
     assert_eq!(
         format!("{:?}", command_execution_approval_decision(answer)),
@@ -882,7 +900,9 @@ async fn a_closed_connection_leaves_its_threads_requests_until_they_unload() {
             )),
         )
         .await;
-    let answer = timeout(PATIENCE, answer).await.expect("the request is answered");
+    let answer = timeout(PATIENCE, answer)
+        .await
+        .expect("the request is answered");
     assert!(command_execution_approval_decision(answer).is_some());
     assert!(!thread.is_shut_down());
 }
@@ -1034,7 +1054,11 @@ async fn requests_for_one_thread_run_in_arrival_order() {
 
     // Neither waits for the held thread.
     let mock = server
-        .call(&mut second, "mock/experimentalMethod", json!({"value": "v"}))
+        .call(
+            &mut second,
+            "mock/experimentalMethod",
+            json!({"value": "v"}),
+        )
         .await;
     assert_eq!(mock["result"], json!({"echoed": "v"}));
     assert_eq!(
@@ -1045,10 +1069,7 @@ async fn requests_for_one_thread_run_in_arrival_order() {
 
     held.notify_one();
     // Listed before it was terminated.
-    assert_eq!(
-        first.response(list).await["data"][0]["processId"],
-        "exec-1"
-    );
+    assert_eq!(first.response(list).await["data"][0]["processId"], "exec-1");
     assert_eq!(
         second.response(terminate).await,
         json!({"terminated": true})
@@ -1169,7 +1190,11 @@ async fn a_drain_refuses_turn_work_and_waits_for_the_running_turn(#[case] daemon
         assert_eq!(answer["error"], draining(), "{method}");
     }
     let mock = server
-        .call(&mut client, "mock/experimentalMethod", json!({"value": "v"}))
+        .call(
+            &mut client,
+            "mock/experimentalMethod",
+            json!({"value": "v"}),
+        )
         .await;
     assert_eq!(mock["result"], json!({"echoed": "v"}));
     assert!(!server.has_stopped().await);
@@ -1235,7 +1260,11 @@ async fn repeated_graceful_only_signals_keep_waiting_for_the_running_turn() {
     assert!(restart.graceful_only().await);
     assert!(!server.has_stopped().await);
     let mock = server
-        .call(&mut client, "mock/experimentalMethod", json!({"value": "v"}))
+        .call(
+            &mut client,
+            "mock/experimentalMethod",
+            json!({"value": "v"}),
+        )
         .await;
     assert_eq!(mock["result"], json!({"echoed": "v"}));
 
@@ -1274,7 +1303,11 @@ async fn a_queued_turn_holds_the_drain_and_is_refused_when_it_runs() {
     let queued = server.turn_start(&mut client, THREAD).await;
     // Answered after the turn was admitted, as the connection's requests are read in order.
     let mock = server
-        .call(&mut client, "mock/experimentalMethod", json!({"value": "v"}))
+        .call(
+            &mut client,
+            "mock/experimentalMethod",
+            json!({"value": "v"}),
+        )
         .await;
     assert_eq!(mock["result"], json!({"echoed": "v"}));
 
@@ -1316,7 +1349,11 @@ async fn a_closed_connections_queued_turn_no_longer_holds_the_drain() {
     server.turn_start(&mut closing, THREAD).await;
     // Answered after the turn was admitted, as the connection's requests are read in order.
     let mock = server
-        .call(&mut closing, "mock/experimentalMethod", json!({"value": "v"}))
+        .call(
+            &mut closing,
+            "mock/experimentalMethod",
+            json!({"value": "v"}),
+        )
         .await;
     assert_eq!(mock["result"], json!({"echoed": "v"}));
     assert!(server.restart.as_ref().unwrap().forceable().await);
@@ -1383,7 +1420,11 @@ async fn background_terminals_are_listed_terminated_and_cleaned() {
         params
     };
     let page = server
-        .call(&mut client, "thread/backgroundTerminals/list", list(json!({})))
+        .call(
+            &mut client,
+            "thread/backgroundTerminals/list",
+            list(json!({})),
+        )
         .await;
     let data: Vec<Value> = ["exec-a", "exec-b", "exec-c"]
         .iter()
@@ -1457,7 +1498,11 @@ async fn background_terminals_are_listed_terminated_and_cleaned() {
     assert_eq!(answer["result"], json!({}));
     assert_eq!(terminals.cleaned(), 1);
     let page = server
-        .call(&mut client, "thread/backgroundTerminals/list", list(json!({})))
+        .call(
+            &mut client,
+            "thread/backgroundTerminals/list",
+            list(json!({})),
+        )
         .await;
     assert_eq!(page["result"], json!({"data": [], "nextCursor": null}));
 
@@ -1587,7 +1632,11 @@ async fn exec_command_terminals_outlive_their_turn() {
         .await;
     assert_eq!(answer["result"], json!({"terminated": true}));
     let answer = server
-        .call(&mut client, "thread/backgroundTerminals/terminate", terminate)
+        .call(
+            &mut client,
+            "thread/backgroundTerminals/terminate",
+            terminate,
+        )
         .await;
     assert_eq!(answer["result"], json!({"terminated": false}));
     let page = server

@@ -781,11 +781,7 @@ fn sync_call_cancelled_from_another_thread_leaves_the_runtime_reusable() {
 fn agent_tool_call(id: &str, tool: &str) -> ModelResponse {
     ModelResponse::new(vec![RunItem::new(
         ItemId::new(id),
-        RunItemKind::ToolCall(ToolCall::new(
-            CallId::new(id),
-            tool,
-            json!({"input": "x"}),
-        )),
+        RunItemKind::ToolCall(ToolCall::new(CallId::new(id), tool, json!({"input": "x"}))),
     )])
 }
 
@@ -830,7 +826,13 @@ fn sync_runs_nested_agents_on_a_caller_with_a_small_stack() {
     let runner = AgentRunner::new(registry(model.clone()));
     let text = std::thread::Builder::new()
         .stack_size(256 * 1024)
-        .spawn(move || runner.run_sync(outer, "go").unwrap().final_text().to_owned())
+        .spawn(move || {
+            runner
+                .run_sync(outer, "go")
+                .unwrap()
+                .final_text()
+                .to_owned()
+        })
         .unwrap()
         .join()
         .unwrap();

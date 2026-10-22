@@ -642,7 +642,7 @@ async fn the_editor_creates_updates_and_deletes() {
         .apply_operation(&create("notes.txt", "+hello\n+world\n"))
         .await
         .unwrap();
-    assert_eq!(created.output_text(), Some("Created notes.txt"));
+    assert_eq!(created.output(), Some("Created notes.txt"));
     assert_eq!(
         session.file("/workspace/notes.txt").unwrap(),
         b"hello\nworld"
@@ -652,14 +652,14 @@ async fn the_editor_creates_updates_and_deletes() {
         .apply_operation(&update("notes.txt", "@@\n-hello\n+hi\n world\n"))
         .await
         .unwrap();
-    assert_eq!(updated.output_text(), Some("Updated notes.txt"));
+    assert_eq!(updated.output(), Some("Updated notes.txt"));
     assert_eq!(session.file("/workspace/notes.txt").unwrap(), b"hi\nworld");
 
     let deleted = editor
         .apply_operation(&ApplyPatchOperation::delete_file("notes.txt"))
         .await
         .unwrap();
-    assert_eq!(deleted.output_text(), Some("Deleted notes.txt"));
+    assert_eq!(deleted.output(), Some("Deleted notes.txt"));
     assert_eq!(session.file("/workspace/notes.txt"), None);
 }
 
@@ -679,9 +679,9 @@ async fn the_editor_measures_paths_and_reports_moves_from_the_working_directory(
         .await
         .unwrap();
 
-    assert_eq!(created.output_text(), Some("Created notes.txt"));
+    assert_eq!(created.output(), Some("Created notes.txt"));
     assert_eq!(
-        moved.output_text(),
+        moved.output(),
         Some("Updated notes.txt\nMoved notes.txt to archive/notes.txt")
     );
     assert_eq!(session.file("/workspace/tasks/a/notes.txt"), None);
@@ -702,7 +702,7 @@ async fn the_editor_takes_an_absolute_path_at_face_value_under_a_working_directo
         .await
         .unwrap();
 
-    assert_eq!(result.output_text(), Some("Created root.txt"));
+    assert_eq!(result.output(), Some("Created root.txt"));
     assert_eq!(session.file("/workspace/root.txt").unwrap(), b"root");
 }
 
@@ -826,7 +826,7 @@ async fn a_move_removes_its_source_as_the_bound_user() {
         .unwrap();
 
     assert_eq!(
-        result.output_text(),
+        result.output(),
         Some("Updated existing.txt\nMoved existing.txt to moved.txt")
     );
     let user = Some("sandbox-user".to_owned());

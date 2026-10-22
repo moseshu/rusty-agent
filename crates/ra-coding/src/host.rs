@@ -339,8 +339,8 @@ impl CodingHost {
         }
     }
 
-    /// Constructs the coding product's run policy, including reference-aware tool-output eviction
-    /// and model-window-driven context compaction.
+    /// Constructs the coding product's run policy with unlimited turns, at most eight concurrent
+    /// function tools, reference-aware tool-output eviction and model-window-driven compaction.
     ///
     /// This affects only future model requests. Complete observations stay in the session and the
     /// `RunState` reference ledger lets a resumed run apply the same policy without rebuilding
@@ -353,7 +353,7 @@ impl CodingHost {
     /// satisfies it.
     pub fn build_run_config(&self) -> RunConfig {
         RunConfig::new()
-            .with_max_turns(32)
+            .with_max_turns(None)
             .with_max_function_tool_concurrency(8)
             .with_context_filter(Arc::new(ToolOutputReferenceTrimmer::default()))
             .with_capability(Arc::new(CompactionCapability::default()))

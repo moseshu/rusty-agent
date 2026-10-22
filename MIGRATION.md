@@ -7,8 +7,8 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## 0.3.0 (unreleased)
 
-0.3.0 is in development on `main`. This section lists the incompatible changes that have
-landed so far; further changes planned for this release are added here as they land.
+This section lists the incompatible changes from 0.2.x. All workspace crates now use 0.3.0;
+the release tag and publication are still pending.
 
 ### Model settings resolve by named layer
 
@@ -86,9 +86,10 @@ accepts a positive number or `None`; its getter now returns `Option<usize>`, and
 is no longer `const fn`. This changes the global dispatch cap only: bare `ToolOptions`
 remain `Exclusive`, while macro-generated function tools remain `Parallel`.
 
-`CodingHost::build_run_config()` explicitly selects the product's 32 turns and concurrency 8.
-Other hosts can select those limits with `with_max_turns(32)` and
-`with_max_function_tool_concurrency(8)`.
+`CodingHost::build_run_config()` explicitly selects unlimited turns, following Codex's coding
+loop, and keeps function-tool concurrency at 8. To retain the previous product turn ceiling,
+apply `with_max_turns(32)` to that config. Other hosts keep the framework defaults unless they
+select their own limits.
 
 RunState schema 14 saves the turn limit, including explicitly unlimited runs. A resumed run
 uses its saved limit and spent turns even if the new request supplies a different limit.
@@ -98,7 +99,9 @@ Checkpoints written before schema 14 carry no turn limit, so they resume under t
 request supplies, which is then saved. With the new default of 10, an older paused run that
 has already used 10 or more turns fails with the turn-limit error as soon as it resumes. To
 resume such a run under its original default, configure `with_max_turns(32)` for that
-continuation.
+continuation. In coding products, a checkpoint that predates schema 14 instead adopts the
+host's new unlimited policy. Checkpoints that already save a finite limit retain it on resume;
+the new host policy does not rewrite an in-progress run's saved limit.
 
 ### Coding permission modes move out of core
 
@@ -174,16 +177,17 @@ checkpoints written by earlier versions still load.
 
 ### `ApplyPatchResult::output` becomes the reader (announced in 0.2.2)
 
-0.2.2 deprecated the `ApplyPatchResult::output` constructor. Before 0.3.0 is released, the
-constructor is removed and the `output_text` reader is renamed `output`, matching the field name
-in the OpenAI Agents SDK.
+The `ApplyPatchResult::output` constructor deprecated in 0.2.2 is removed. The `output_text`
+reader is renamed `output`, matching the field name in the OpenAI Agents SDK. The optional
+status and output values, their defaults, and the `with_output` / `with_status` builders are
+unchanged.
 
 | 0.2.x | 0.3.0 |
 | --- | --- |
 | `ApplyPatchResult::output(text)` | `ApplyPatchResult::default().with_output(text)` |
 | `result.output_text()` | `result.output()` |
 
-Move to `with_output` now; it already exists in 0.2.2.
+Use `with_output` to construct a result; it is also available in 0.2.2.
 
 ## 0.2.0
 

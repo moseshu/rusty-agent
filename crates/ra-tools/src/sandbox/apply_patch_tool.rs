@@ -785,7 +785,7 @@ impl SandboxApplyPatchTool {
                 }
             }
             .map_err(patch_failure)?;
-            if let Some(output) = result.output_text().filter(|output| !output.is_empty()) {
+            if let Some(output) = result.output().filter(|output| !output.is_empty()) {
                 outputs.push(output.to_owned());
             }
         }

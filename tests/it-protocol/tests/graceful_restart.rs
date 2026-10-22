@@ -234,7 +234,9 @@ async fn answer(ws: &mut WsClient, id: i64) -> Value {
 
 /// Connects, initializes, and starts a turn on the child's thread.
 async fn connect_and_start_turn(server: &ChildServer) -> WsClient {
-    let (mut ws, _) = connect_async(format!("ws://{}", server.addr)).await.unwrap();
+    let (mut ws, _) = connect_async(format!("ws://{}", server.addr))
+        .await
+        .unwrap();
     send(
         &mut ws,
         1,

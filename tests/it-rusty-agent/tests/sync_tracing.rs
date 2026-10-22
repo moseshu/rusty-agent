@@ -84,7 +84,11 @@ fn sync_keeps_the_callers_subscriber_and_span() {
     let text = tracing::subscriber::with_default(subscriber, || {
         let host = tracing::info_span!("host_call");
         let _entered = host.enter();
-        runner.run_sync(agent, "hello").unwrap().final_text().to_owned()
+        runner
+            .run_sync(agent, "hello")
+            .unwrap()
+            .final_text()
+            .to_owned()
     });
     assert_eq!(text, "traced");
     let spans = spans.lock().unwrap();

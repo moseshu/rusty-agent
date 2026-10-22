@@ -62,7 +62,9 @@ async fn close_returns_while_started_run_remains_active() {
     assert!(!gate.is_accepting().await);
     assert_eq!(gate.inflight_count(), 1);
 
-    finish_tx.send(()).expect("running future should be waiting");
+    finish_tx
+        .send(())
+        .expect("running future should be waiting");
     run_task.await.expect("run task should complete");
     gate.shutdown().await;
 }
@@ -94,7 +96,9 @@ async fn shutdown_waits_for_started_run_to_finish() {
         .await
         .expect_err("shutdown should wait for the running future");
 
-    finish_tx.send(()).expect("running future should be waiting");
+    finish_tx
+        .send(())
+        .expect("running future should be waiting");
     run_task.await.expect("run task should complete");
     gate.shutdown().await;
     assert_eq!(gate.inflight_count(), 0);

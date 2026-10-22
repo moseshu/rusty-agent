@@ -182,7 +182,7 @@ fn coding_host_explicitly_selects_product_run_limits() {
     let config = CodingHost::open(workspace.path())
         .unwrap()
         .build_run_config();
-    assert_eq!(config.max_turns(), Some(32));
+    assert_eq!(config.max_turns(), None);
     assert_eq!(config.max_function_tool_concurrency(), Some(8));
     assert_eq!(RunConfig::new().max_function_tool_concurrency(), None);
 }

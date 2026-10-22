@@ -415,7 +415,11 @@ protocol. `McpTransportConfig::{Stdio, StreamableHttp}` selects either transport
 `McpClient::connect_transport`. The default HTTP name is `streamable_http: <url>`; diagnostics
 sanitize URL-derived names. Old client handles remain bound to their original session.
 
+Enable the `ra-mcp/http` feature to use this example.
+
 ```rust,no_run
+# #[cfg(feature = "http")]
+# mod example {
 use ra_mcp::{McpServer, client::{McpClientOptions, http::{McpHttpParams, McpServerStreamableHttp}}};
 use std::time::Duration;
 
@@ -435,6 +439,7 @@ async fn remote_server() -> ra_core::error::Result<()> {
     assert!(server.session_id().is_none());
     Ok(())
 }
+# }
 ```
 
 The native authentication hook runs for POST, GET and DELETE. Reqwest configures auth on

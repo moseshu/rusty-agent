@@ -363,6 +363,37 @@ fn thread(
 }
 
 #[tokio::test]
+async fn coding_thread_completes_beyond_the_previous_turn_limit() {
+    let workspace = tempfile::tempdir().unwrap();
+    let host = Arc::new(configured_host::Services::default())
+        .install(CodingHost::open(workspace.path()).unwrap());
+    let (agent, control) = configured_agent(&host, &PromptRole::Main).await;
+    let script = Arc::new(Script::default());
+    let mut responses = VecDeque::new();
+    for index in 0..33 {
+        let path = format!("note-{index}.txt");
+        std::fs::write(workspace.path().join(&path), format!("note {index}\n")).unwrap();
+        responses.push_back(ModelResponse::new(vec![RunItem::new(
+            next_id(),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new(format!("read-{index}")),
+                "read_file",
+                json!({"path": path}),
+            )),
+        )]));
+    }
+    responses.push_back(answer("all notes read"));
+    *script.responses.lock().unwrap() = responses;
+    let thread = thread("unlimited-coding-turn", &host, agent, control, &script);
+
+    complete_turn(&thread, "read all notes").await;
+
+    assert_eq!(script.requests.lock().unwrap().len(), 34);
+    assert!(script.responses.lock().unwrap().is_empty());
+    thread.shutdown().await;
+}
+
+#[tokio::test]
 async fn configured_profiles_preserve_independent_tools_and_role_boundaries() {
     let workspace = tempfile::tempdir().unwrap();
     let host = Arc::new(configured_host::Services::default())

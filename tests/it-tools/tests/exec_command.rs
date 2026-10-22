@@ -451,7 +451,11 @@ async fn test_exec_command_offers_additional_permissions_when_turned_on() {
         );
         assert_eq!(
             schema["definitions"]["SandboxPermissionsArgument"]["enum"],
-            json!(["use_default", "with_additional_permissions", "require_escalated"])
+            json!([
+                "use_default",
+                "with_additional_permissions",
+                "require_escalated"
+            ])
         );
         assert_eq!(
             properties["additional_permissions"]["description"],

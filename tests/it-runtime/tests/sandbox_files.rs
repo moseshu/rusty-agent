@@ -74,7 +74,7 @@ async fn the_editor_creates_moves_and_deletes_files_in_the_workspace() {
         ))
         .await
         .unwrap();
-    assert_eq!(created.output_text(), Some("Created notes/today.txt"));
+    assert_eq!(created.output(), Some("Created notes/today.txt"));
     assert_eq!(
         std::fs::read_to_string(root.join("tasks/a/notes/today.txt")).unwrap(),
         "one\ntwo"
@@ -88,7 +88,7 @@ async fn the_editor_creates_moves_and_deletes_files_in_the_workspace() {
         .await
         .unwrap();
     assert_eq!(
-        moved.output_text(),
+        moved.output(),
         Some("Updated notes/today.txt\nMoved notes/today.txt to archive/today.txt")
     );
     assert!(!root.join("tasks/a/notes/today.txt").exists());
@@ -101,7 +101,7 @@ async fn the_editor_creates_moves_and_deletes_files_in_the_workspace() {
         .apply_operation(&ApplyPatchOperation::delete_file("archive/today.txt"))
         .await
         .unwrap();
-    assert_eq!(deleted.output_text(), Some("Deleted archive/today.txt"));
+    assert_eq!(deleted.output(), Some("Deleted archive/today.txt"));
     assert!(!root.join("tasks/a/archive/today.txt").exists());
 
     let missing = editor
