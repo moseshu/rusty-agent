@@ -2,7 +2,7 @@
 //!
 //! A provider registration is open-ended, but a wire protocol is not. Keeping the protocol set as
 //! a closed enum means every protocol must define the complete matrix in this module before an
-//! adapter can select it. OpenAI-compatible providers therefore select
+//! adapter can select it. `OpenAI`-compatible providers therefore select
 //! [`ApiProtocol::OpenAiChatCompletions`] and layer provider quirks on top; compatibility is not a
 //! fourth wire protocol.
 //!
@@ -191,49 +191,38 @@ pub enum StablePrefixLocation {
 /// Whether a specific endpoint honours the key is a separate, provider-level question for
 /// `Quirks`: a third-party gateway speaking Chat Completions may reject it.
 ///
-/// # Known gap: `OpenAI` explicit breakpoints are not represented yet
+/// `OpenAI` content breakpoints have a separate capability from Anthropic `cache_control`:
+/// `OpenAI` selects the mode and TTL at request level, while Anthropic marks individual spans.
+/// Automatic prefix matching describes the protocol default, not a per-request invariant.
+/// An explicit-only request can disable the implicit breakpoint. Model support is independent
+/// of this wire-format matrix; explicit provider parameters are passed to the endpoint.
 ///
-/// Both `OpenAI` protocols now take a request-level `prompt_cache_options` plus a
-/// `prompt_cache_breakpoint` on content blocks, on the stable surface — `response_create_params`
-/// and `completion_create_params` for the options, `response_input_text_param` and
-/// `chat_completion_content_part_text_param` for the breakpoint.
-///
-/// **Do not express that by setting [`cache_control_breakpoints`](Self::cache_control_breakpoints).**
-/// That flag describes Anthropic's mechanism, and the two differ where it matters:
-///
-/// | | `OpenAI` | Anthropic |
+/// | Mechanism | `OpenAI` | Anthropic |
 /// | --- | --- | --- |
-/// | With no breakpoints | still cached, via an implicit one | nothing is cached |
-/// | Turning automatic off | `prompt_cache_options.mode = "explicit"` | not applicable |
-/// | TTL | request-level, on the options object | per breakpoint |
+/// | No marks | Default implicit mode caches; explicit-only mode does not | Not cached |
+/// | Mode switch | Request `prompt_cache_options.mode = "explicit"` | No implicit mode |
+/// | TTL | Request-level `prompt_cache_options.ttl` | Per `cache_control` mark |
 ///
-/// Reusing the Anthropic flag would tell an adapter both that caching requires marks and that TTL
-/// travels with each mark. Neither holds for `OpenAI`. A separate capability is the right shape.
-///
-/// Two things this gap also exposes, worth settling when the capability lands:
-///
-/// - [`automatic_prefix_matching`](Self::automatic_prefix_matching) is `OpenAI`'s **default mode**,
-///   not an invariant: `mode = "explicit"` disables the implicit breakpoint per request. The flag
-///   currently reads as though the behaviour were fixed.
-/// - The feature is documented as available on `gpt-5.6` and later, so it is gated by **model**,
-///   which is a third axis this matrix does not have. Protocol lives here and provider lives in
-///   `Quirks`; model capability most plausibly belongs to the resolved-model layer of the
-///   four-layer settings stack, a decision still to be made there.
-///
-/// Deliberately not implemented ahead of a consumer: no adapter exists yet, so the shape would be
-/// guessed from documentation rather than from a request that actually round-trips.
+/// These mechanisms need independent capability bits: sharing one would incorrectly imply that
+/// `OpenAI` always requires marks and places TTL on each mark.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Cache mechanisms are independent capabilities that a protocol can combine."
+)]
 pub struct PromptCacheSupport {
     automatic_prefix_matching: bool,
     explicit_cache_key: bool,
-    /// Anthropic `cache_control` only. See the type documentation before reusing this for
-    /// `OpenAI`'s `prompt_cache_breakpoint`.
+    /// Anthropic `cache_control` only; `OpenAI` uses [`Self::openai_explicit_breakpoints`].
     cache_control_breakpoints: bool,
+    openai_explicit_breakpoints: bool,
 }
 
 impl PromptCacheSupport {
-    /// Whether a stable prompt prefix is cached without any request field.
+    /// Whether automatic prefix matching is the default mode.
+    ///
+    /// An individual request can disable the implicit breakpoint with explicit-only options.
     #[must_use]
     pub const fn automatic_prefix_matching(self) -> bool {
         self.automatic_prefix_matching
@@ -251,10 +240,21 @@ impl PromptCacheSupport {
         self.cache_control_breakpoints
     }
 
+    /// Whether the wire format carries `OpenAI` request options and content breakpoints.
+    ///
+    /// This does not describe Anthropic `cache_control` or guarantee endpoint or model support.
+    #[must_use]
+    pub const fn openai_explicit_breakpoints(self) -> bool {
+        self.openai_explicit_breakpoints
+    }
+
     /// Whether the protocol offers any prompt caching.
     #[must_use]
     pub const fn is_supported(self) -> bool {
-        self.automatic_prefix_matching || self.explicit_cache_key || self.cache_control_breakpoints
+        self.automatic_prefix_matching
+            || self.explicit_cache_key
+            || self.cache_control_breakpoints
+            || self.openai_explicit_breakpoints
     }
 
     /// Whether the caller must place breakpoints for caching to happen at all.
@@ -400,6 +400,7 @@ const RESPONSES_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         automatic_prefix_matching: true,
         explicit_cache_key: true,
         cache_control_breakpoints: false,
+        openai_explicit_breakpoints: true,
     },
     tool_call: ToolCallCarrier::FunctionCallItem,
     tool_result: ToolResultCarrier::FunctionCallOutputItem,
@@ -408,16 +409,17 @@ const RESPONSES_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 
 const CHAT_COMPLETIONS_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // No reasoning at the protocol level: `reasoning_content` is a Qwen / DeepSeek / Kimi
-    // gateway convention, not a Chat Completions field, and first-party OpenAI never returns it.
+    // gateway convention, not a Chat Completions field, and first-party `OpenAI` never returns it.
     reasoning_carrier: ReasoningCarrier::None,
     reasoning_replay: ReasoningReplay::None,
     server_conversation: ServerConversationSupport::None,
     stable_prefix: StablePrefixLocation::FirstSystemMessage,
-    // Same two mechanisms as Responses; `prompt_cache_key` is accepted here too.
+    // Same cache mechanisms as Responses; `prompt_cache_key` is accepted here too.
     prompt_cache: PromptCacheSupport {
         automatic_prefix_matching: true,
         explicit_cache_key: true,
         cache_control_breakpoints: false,
+        openai_explicit_breakpoints: true,
     },
     tool_call: ToolCallCarrier::MessageToolCalls,
     tool_result: ToolResultCarrier::ToolRoleMessage,
@@ -434,6 +436,7 @@ const ANTHROPIC_MESSAGES_CAPABILITIES: ProtocolCapabilities = ProtocolCapabiliti
         automatic_prefix_matching: false,
         explicit_cache_key: false,
         cache_control_breakpoints: true,
+        openai_explicit_breakpoints: false,
     },
     tool_call: ToolCallCarrier::ToolUseBlock,
     tool_result: ToolResultCarrier::ToolResultBlock,

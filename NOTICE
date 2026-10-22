@@ -1,5 +1,33 @@
 Third-party attribution
 
+The explicit prompt-cache settings and content marks in
+crates/ra-model/src/openai/prompt_cache.rs, the content lowering in
+crates/ra-model/src/openai/{chat/convert,responses/request}.rs, and tests in
+tests/it-model/tests/prompt_cache_key/options.rs adapt openai/openai-agents-python,
+revision f53c62451c7f34c15f0c87fa745e05404025420f,
+src/agents/model_settings.py, src/agents/models/{openai_responses,openai_chatcompletions,
+chatcmpl_converter}.py and tests/models/{test_openai_responses,
+test_openai_chatcompletions,test_openai_chatcompletions_stream,
+test_openai_chatcompletions_converter}.py (MIT).
+The original MIT license is retained in third_party/openai-agents-python.LICENSE.
+The wire definitions also follow openai/openai-python, revision
+0c09a3fe815184f0a46fbf18b1aba84a467c854e,
+src/openai/types/responses/{response_create_params,response_input_text_param,
+response_input_image_param,response_input_file_param}.py and
+src/openai/types/chat/{completion_create_params,chat_completion_content_part_text_param,
+chat_completion_content_part_image_param,chat_completion_content_part_param}.py
+(Apache-2.0); the repository LICENSE retains that license.
+
+The Conversations cache-mark restoration in
+crates/ra-model/src/openai/conversations/items.rs and regression tests in
+tests/it-model/tests/openai_conversations_session/prompt_cache.rs follow the same
+Agents SDK revision's src/agents/memory/openai_conversations_session.py and
+tests/memory/test_openai_conversations_session.py (MIT), and the same openai-python
+revision's src/openai/types/conversations/message.py and
+src/openai/types/responses/{response_input_text,response_input_image,response_input_file}.py
+(Apache-2.0). See the retained licenses above. The typed round-trip and pending-write
+regressions exercise this port's record conversion, which the Python SDK does not require.
+
 This product includes modified code from openai/codex, Copyright OpenAI,
 licensed under the Apache License, Version 2.0. The repository LICENSE contains
 that license. Source: https://github.com/openai/codex

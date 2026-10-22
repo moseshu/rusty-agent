@@ -8,6 +8,59 @@ use ra_core::item::{
 };
 use serde_json::json;
 
+#[test]
+fn empty_provider_metadata_preserves_the_released_serialized_bytes() {
+    use ra_core::item::{FileBlock, FileSource, ImageBlock, TextBlock};
+
+    assert_eq!(
+        serde_json::to_string(&TextBlock::new("plain")).unwrap(),
+        r#"{"schema_version":1,"text":"plain"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&ImageBlock::new(ImageSource::url("https://example.com/i"))).unwrap(),
+        concat!(
+            r#"{"schema_version":1,"source":{"type":"url","data":{"schema_version":1,"url":"#,
+            r#""https://example.com/i"}}}"#
+        )
+    );
+    assert_eq!(
+        serde_json::to_string(&FileBlock::new(FileSource::provider_file("file-1"))).unwrap(),
+        concat!(
+            r#"{"schema_version":1,"source":{"type":"provider_file","data":{"schema_version":1,"#,
+            r#""file_id":"file-1"}}}"#
+        )
+    );
+}
+
+#[test]
+fn content_metadata_preserves_independent_namespaces_and_replaces_only_one() {
+    use ra_core::item::{FileBlock, FileSource, ImageBlock, TextBlock};
+
+    let text = TextBlock::new("text")
+        .with_provider_metadata("family", json!({"old":true}))
+        .with_provider_metadata("other", json!({"opaque":[1,2]}))
+        .with_provider_metadata("family", json!({"new":true}));
+    let image = ImageBlock::new(ImageSource::url("https://example.com/i"))
+        .with_provider_metadata("other", json!(null));
+    let file = FileBlock::new(FileSource::provider_file("file-1"))
+        .with_provider_metadata("other", json!({"opaque":true}));
+    assert_eq!(text.provider_metadata()["family"], json!({"new":true}));
+    assert_eq!(text.provider_metadata()["other"], json!({"opaque":[1,2]}));
+    assert_eq!(image.provider_metadata()["other"], json!(null));
+    assert_eq!(file.provider_metadata()["other"], json!({"opaque":true}));
+    let blocks = [
+        ContentBlock::Text(text),
+        ContentBlock::Image(image),
+        ContentBlock::File(file),
+    ];
+    for block in blocks {
+        let stored = serde_json::to_vec(&block).unwrap();
+        let restored: ContentBlock = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(restored, block);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), stored);
+    }
+}
+
 fn all_content_blocks() -> Vec<ContentBlock> {
     vec![
         ContentBlock::text("结果"),

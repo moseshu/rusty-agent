@@ -194,7 +194,15 @@ fn lower_assistant_message(
     let mut thinking = Vec::new();
     for block in message.content() {
         match block {
-            ContentBlock::Text(text) => texts.push(text.text().to_owned()),
+            ContentBlock::Text(text) => {
+                if crate::openai::prompt_cache::breakpoint(text.provider_metadata()).is_some() {
+                    codec.degrade(
+                        "OpenAI Chat Completions assistant text cannot preserve content \
+                         cache breakpoints",
+                    )?;
+                }
+                texts.push(text.text().to_owned());
+            }
             ContentBlock::Refusal(refusal) => draft.refusal = Some(refusal.refusal().to_owned()),
             ContentBlock::Thinking(block) => thinking.push(thinking_block(block)),
             _ => {
@@ -226,7 +234,11 @@ fn lower_assistant_message(
 /// Lowers one content block of a user or system message.
 async fn lower_input_block(block: &ContentBlock, role: MessageRole) -> Result<Value> {
     match block {
-        ContentBlock::Text(text) => Ok(json!({"type": "text", "text": text.text()})),
+        ContentBlock::Text(text) => {
+            let mut part = json!({"type": "text", "text": text.text()});
+            crate::openai::prompt_cache::apply_breakpoint(text.provider_metadata(), &mut part);
+            Ok(part)
+        }
         ContentBlock::Image(image) if matches!(role, MessageRole::User) => {
             lower_image_part(image).await
         }
@@ -254,7 +266,9 @@ async fn lower_image_part(image: &ImageBlock) -> Result<Value> {
             if let Some(detail) = image.detail() {
                 payload["detail"] = Value::String(detail.label().to_owned());
             }
-            Ok(json!({"type": "image_url", "image_url": payload}))
+            let mut part = json!({"type": "image_url", "image_url": payload});
+            crate::openai::prompt_cache::apply_breakpoint(image.provider_metadata(), &mut part);
+            Ok(part)
         }
         ResolvedImage::ProviderFile(_) => Err(Error::caller(
             "OpenAI Chat Completions cannot reference an uploaded image by file id",
@@ -264,7 +278,7 @@ async fn lower_image_part(image: &ImageBlock) -> Result<Value> {
 
 /// Lowers one file block to a `file` part.
 fn lower_file_part(file: &FileBlock) -> Result<Value> {
-    match file.source() {
+    let mut part = match file.source() {
         FileSource::Base64(source) => {
             let mut payload = json!({"file_data": source.data()});
             if let Some(filename) = source.filename() {
@@ -278,7 +292,9 @@ fn lower_file_part(file: &FileBlock) -> Result<Value> {
         _ => Err(Error::caller(
             "unsupported file source for OpenAI Chat Completions",
         )),
-    }
+    }?;
+    crate::openai::prompt_cache::apply_breakpoint(file.provider_metadata(), &mut part);
+    Ok(part)
 }
 
 /// Lowers a tool result into what a `role: "tool"` message accepts.
@@ -325,6 +341,7 @@ async fn lower_tool_output(payload: &Value, codec: &ChatCodec) -> Result<Value> 
 /// roles. The two encode exactly the same content, so the more portable one is chosen.
 fn text_or_parts(mut parts: Vec<Value>) -> Value {
     if parts.len() == 1
+        && parts[0].get("prompt_cache_breakpoint").is_none()
         && let Some(text) = parts[0]
             .get("text")
             .filter(|_| parts[0].get("type").and_then(Value::as_str) == Some("text"))

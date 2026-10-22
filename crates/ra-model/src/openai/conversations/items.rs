@@ -6,8 +6,8 @@ use ra_core::{
     item::{
         Base64FileSource, CallId, ContentBlock, FileBlock, FileSource, ImageBlock, ImageDetail,
         ImageSource, InputItemDigest, ItemId, McpApprovalRequest, McpApprovalResponse, Message,
-        MessageRole, OutputPhase, RawProviderItem, Reasoning, RunItem, RunItemKind, ToolCallKind,
-        ToolCallOutput,
+        MessageRole, OutputPhase, RawProviderItem, Reasoning, RunItem, RunItemKind, TextBlock,
+        ToolCallKind, ToolCallOutput,
     },
     model::ProviderKey,
     tool::{ToolOutput, ToolOutputBlock},
@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::openai::{
     chat::FAKE_ITEM_ID,
     error::behavior_error,
+    prompt_cache::{OPENAI_METADATA_NAMESPACE, lift_breakpoint},
     responses::{
         convert::{
             convert_compaction, convert_custom_tool_call, convert_function_call,
@@ -228,11 +229,13 @@ fn lift_message(item: &Value) -> Result<Message> {
 
 fn lift_content(part: &Value) -> Result<ContentBlock> {
     match required_str(part, "type", "conversation message content")? {
-        "input_text" | "output_text" | "text" => Ok(ContentBlock::text(required_str(
-            part,
-            "text",
-            "conversation text",
-        )?)),
+        "input_text" | "output_text" | "text" => {
+            let mut text = TextBlock::new(required_str(part, "text", "conversation text")?);
+            if let Some(metadata) = lift_breakpoint(part) {
+                text = text.with_provider_metadata(OPENAI_METADATA_NAMESPACE, metadata);
+            }
+            Ok(ContentBlock::Text(text))
+        }
         "refusal" => Ok(ContentBlock::refusal(required_str(
             part, "refusal", "refusal",
         )?)),
@@ -267,6 +270,9 @@ fn lift_image(part: &Value) -> Result<ImageBlock> {
                 )));
             }
         });
+    }
+    if let Some(metadata) = lift_breakpoint(part) {
+        image = image.with_provider_metadata(OPENAI_METADATA_NAMESPACE, metadata);
     }
     Ok(image)
 }
@@ -348,7 +354,10 @@ fn lift_file(part: &Value) -> Result<FileBlock> {
             "OpenAI conversation input_file carries no file_data, file_url or file_id",
         ));
     };
-    let file = FileBlock::new(source);
+    let mut file = FileBlock::new(source);
+    if let Some(metadata) = lift_breakpoint(part) {
+        file = file.with_provider_metadata(OPENAI_METADATA_NAMESPACE, metadata);
+    }
     // Replay metadata belongs to this adapter. Carry it in the record's extension envelope,
     // rather than adding Responses-only detail or filename fields to the neutral file source.
     let metadata: serde_json::Map<String, Value> = ["filename", "detail"]

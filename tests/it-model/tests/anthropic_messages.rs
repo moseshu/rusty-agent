@@ -23,6 +23,54 @@ fn resolved(settings: ModelSettings) -> ra_core::model::ResolvedModelSettings {
         .resolve(&ProviderKey::new("anthropic"))
 }
 
+#[tokio::test]
+async fn openai_content_marks_and_other_provider_settings_do_not_cross_into_anthropic() {
+    use ra_core::item::{ContentBlock, ImageBlock, ImageSource, MessageRole, TextBlock};
+    use ra_model::openai::prompt_cache::{
+        PromptCacheBreakpoint, PromptCacheMode, PromptCacheOptions, with_prompt_cache_options,
+    };
+
+    let server = MockServer::start().await;
+    let model = model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id":"msg-test", "type":"message", "role":"assistant",
+            "content":[{"type":"text", "text":"done"}], "stop_reason":"end_turn",
+            "usage":{"input_tokens":1, "output_tokens":1}
+        })),
+    )
+    .await;
+    let metadata = PromptCacheBreakpoint::Explicit.metadata();
+    let blocks = vec![
+        ContentBlock::Text(
+            TextBlock::new("stable").with_provider_metadata("openai", metadata.clone()),
+        ),
+        ContentBlock::Image(
+            ImageBlock::new(ImageSource::base64("image/png", "eA=="))
+                .with_provider_metadata("openai", metadata.clone()),
+        ),
+    ];
+    let layer = with_prompt_cache_options(
+        ModelSettings::new().with_max_tokens(1024),
+        ProviderKey::new("custom"),
+        PromptCacheOptions::new().with_mode(PromptCacheMode::Explicit),
+    );
+    model
+        .get_response(request_items(
+            vec![ModelInputItem::Message(Message::new(
+                MessageRole::User,
+                blocks,
+            ))],
+            layer,
+        ))
+        .await
+        .unwrap();
+    let body =
+        String::from_utf8(server.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(!body.contains("prompt_cache_"));
+    assert!(!body.contains("provider_metadata"));
+}
+
 fn request() -> ModelRequest {
     request_with(ModelSettings::new().with_max_tokens(1024))
 }

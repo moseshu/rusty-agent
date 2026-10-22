@@ -14,6 +14,7 @@ pub mod compaction;
 pub(crate) mod content;
 pub mod conversations;
 pub(crate) mod error;
+pub mod prompt_cache;
 pub mod responses;
 pub(crate) mod sse;
 mod stream_events;

@@ -514,10 +514,18 @@ async fn lower_message(message: &Message) -> Result<Value> {
 
 async fn lower_content(block: &ContentBlock, role: MessageRole) -> Result<Value> {
     match block {
-        ContentBlock::Text(text) => Ok(json!({
-            "type": if matches!(role, MessageRole::Assistant) { "output_text" } else { "input_text" },
-            "text": text.text()
-        })),
+        ContentBlock::Text(text) => {
+            let mut part = json!({
+                "type": if matches!(role, MessageRole::Assistant) {
+                    "output_text"
+                } else {
+                    "input_text"
+                },
+                "text": text.text()
+            });
+            crate::openai::prompt_cache::apply_breakpoint(text.provider_metadata(), &mut part);
+            Ok(part)
+        }
         ContentBlock::Image(image) => {
             if matches!(role, MessageRole::Assistant) {
                 return Err(Error::caller(
@@ -560,6 +568,7 @@ async fn lower_image(image: &ImageBlock) -> Result<Value> {
     if let Some(detail) = image.detail() {
         part["detail"] = Value::String(detail.label().to_owned());
     }
+    crate::openai::prompt_cache::apply_breakpoint(image.provider_metadata(), &mut part);
     Ok(part)
 }
 
@@ -592,6 +601,7 @@ fn lower_file(file: &FileBlock) -> Result<Value> {
             }
         }
     }
+    crate::openai::prompt_cache::apply_breakpoint(file.provider_metadata(), &mut part);
     Ok(part)
 }
 

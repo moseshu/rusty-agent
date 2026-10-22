@@ -27,6 +27,7 @@ fn test_api_protocol_01() {
     );
     assert!(capabilities.prompt_cache().automatic_prefix_matching());
     assert!(capabilities.prompt_cache().explicit_cache_key());
+    assert!(capabilities.prompt_cache().openai_explicit_breakpoints());
     assert!(!capabilities.prompt_cache().cache_control_breakpoints());
     assert!(!capabilities.prompt_cache().requires_explicit_breakpoints());
     assert!(capabilities.reasoning_replay().is_required());
@@ -64,6 +65,7 @@ fn test_api_protocol_02() {
     // protocol matrix.
     assert!(capabilities.prompt_cache().automatic_prefix_matching());
     assert!(capabilities.prompt_cache().explicit_cache_key());
+    assert!(capabilities.prompt_cache().openai_explicit_breakpoints());
     assert!(!capabilities.prompt_cache().cache_control_breakpoints());
     assert_eq!(capabilities.tool_call(), ToolCallCarrier::MessageToolCalls);
     assert_eq!(
@@ -98,6 +100,7 @@ fn test_api_protocol_03() {
     );
     assert!(!capabilities.prompt_cache().automatic_prefix_matching());
     assert!(!capabilities.prompt_cache().explicit_cache_key());
+    assert!(!capabilities.prompt_cache().openai_explicit_breakpoints());
     assert!(capabilities.prompt_cache().cache_control_breakpoints());
     assert!(
         capabilities.prompt_cache().requires_explicit_breakpoints(),

@@ -34,9 +34,13 @@
 //! inert data in `ra-core`; reading and encoding the file belongs to an I/O layer such as
 //! `ra-model` or a tool implementation.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::compat::{SchemaVersion, Unknown};
 
@@ -170,6 +174,8 @@ impl ContentBlock {
 pub struct TextBlock {
     schema_version: SchemaVersion,
     text: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    provider_metadata: BTreeMap<String, Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -181,8 +187,25 @@ impl TextBlock {
         Self {
             schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
             text: text.into(),
+            provider_metadata: BTreeMap::new(),
             unknown: Unknown::new(),
         }
+    }
+
+    /// Attaches opaque metadata under a provider-family namespace.
+    ///
+    /// Adapters interpret only their own namespace. Replaces that namespace's complete value;
+    /// other namespaces remain unchanged. Metadata is preserved in persisted content.
+    #[must_use]
+    pub fn with_provider_metadata(mut self, namespace: impl Into<String>, metadata: Value) -> Self {
+        self.provider_metadata.insert(namespace.into(), metadata);
+        self
+    }
+
+    /// Opaque metadata grouped by provider-family namespace, independent of registration keys.
+    #[must_use]
+    pub const fn provider_metadata(&self) -> &BTreeMap<String, Value> {
+        &self.provider_metadata
     }
 
     /// Schema version.
@@ -299,6 +322,8 @@ pub struct ImageBlock {
     source: ImageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail: Option<ImageDetail>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    provider_metadata: BTreeMap<String, Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -311,6 +336,7 @@ impl ImageBlock {
             schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
             source,
             detail: None,
+            provider_metadata: BTreeMap::new(),
             unknown: Unknown::new(),
         }
     }
@@ -320,6 +346,22 @@ impl ImageBlock {
     pub const fn with_detail(mut self, detail: ImageDetail) -> Self {
         self.detail = Some(detail);
         self
+    }
+
+    /// Attaches opaque metadata under a provider-family namespace.
+    ///
+    /// Adapters interpret only their own namespace. Replaces that namespace's complete value;
+    /// other namespaces remain unchanged. Metadata is preserved in persisted content.
+    #[must_use]
+    pub fn with_provider_metadata(mut self, namespace: impl Into<String>, metadata: Value) -> Self {
+        self.provider_metadata.insert(namespace.into(), metadata);
+        self
+    }
+
+    /// Opaque metadata grouped by provider-family namespace, independent of registration keys.
+    #[must_use]
+    pub const fn provider_metadata(&self) -> &BTreeMap<String, Value> {
+        &self.provider_metadata
     }
 
     /// Schema version.
@@ -644,6 +686,8 @@ impl Base64FileSource {
 pub struct FileBlock {
     schema_version: SchemaVersion,
     source: FileSource,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    provider_metadata: BTreeMap<String, Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -655,8 +699,25 @@ impl FileBlock {
         Self {
             schema_version: CONTENT_BLOCK_SCHEMA_VERSION,
             source,
+            provider_metadata: BTreeMap::new(),
             unknown: Unknown::new(),
         }
+    }
+
+    /// Attaches opaque metadata under a provider-family namespace.
+    ///
+    /// Adapters interpret only their own namespace. Replaces that namespace's complete value;
+    /// other namespaces remain unchanged. Metadata is preserved in persisted content.
+    #[must_use]
+    pub fn with_provider_metadata(mut self, namespace: impl Into<String>, metadata: Value) -> Self {
+        self.provider_metadata.insert(namespace.into(), metadata);
+        self
+    }
+
+    /// Opaque metadata grouped by provider-family namespace, independent of registration keys.
+    #[must_use]
+    pub const fn provider_metadata(&self) -> &BTreeMap<String, Value> {
+        &self.provider_metadata
     }
 
     /// Schema version.

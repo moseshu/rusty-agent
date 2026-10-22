@@ -1,4 +1,7 @@
 //! Cache-key routing on both OpenAI protocols, independent of prefix length and transport mode.
+#[path = "prompt_cache_key/options.rs"]
+mod options;
+
 use futures::StreamExt;
 use ra_core::{
     item::{Message, ModelInputItem},

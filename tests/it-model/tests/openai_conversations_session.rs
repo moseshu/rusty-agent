@@ -8,6 +8,9 @@
 //! wire dicts and lets its runner clean them; this port hands it run records, so the cleaning
 //! cases append through the session itself.
 
+#[path = "openai_conversations_session/prompt_cache.rs"]
+mod prompt_cache;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
