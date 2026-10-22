@@ -34,7 +34,6 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
-    permission::ActionClassPolicy,
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
     sandbox::SandboxRunConfig,
 };
@@ -257,8 +256,13 @@ fn in_session(session: &Arc<dyn SandboxSession>, cwd: &str) -> RunConfig {
     )
 }
 
+/// Only macOS fences a unix-local command (`sandbox-exec`); elsewhere the backend runs it as
+/// written, as the reference does, so there is no boundary for the bypass to keep.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn framework_permission_bypass_keeps_the_sandbox_boundary() {
+    use ra_runtime::permission::ActionClassPolicy;
+
     let (directory, root, session) = live_session().await;
     std::fs::create_dir_all(root.join("tasks")).unwrap();
     let outside = directory.path().join("outside.txt");
