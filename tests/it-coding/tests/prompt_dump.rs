@@ -757,8 +757,7 @@ async fn test_the_product_prefix_includes_the_tool_selection_contract() {
     let host_backed = host_backed_prefix().await;
     let tool_use = section_content(&host_backed, "tool_use");
 
-    assert!(tool_use.contains("Use only the entries listed under Available tools"));
-    assert!(tool_use.contains("any built-in provider tool included in this request"));
+    assert!(tool_use.contains("Use only tools actually declared in this request"));
     assert!(tool_use.contains("do not infer or invoke an unlisted capability"));
     assert!(tool_use.contains("advertised specialist"));
     assert!(tool_use.contains("long-tail command-line work"));

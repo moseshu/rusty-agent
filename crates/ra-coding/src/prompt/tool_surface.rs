@@ -35,7 +35,7 @@ use crate::profile::MAX_ADVERTISED_NAME_CHARS;
 /// Raise this value whenever any model-facing name, description, strictness flag, or input schema
 /// changes. The tool-surface snapshot rejects a changed fingerprint with an unchanged revision,
 /// so a reviewer can distinguish a deliberately invalidated tool table from an accidental edit.
-pub(crate) const TOOL_SCHEMA_REVISION: u32 = 10;
+pub(crate) const TOOL_SCHEMA_REVISION: u32 = 11;
 
 /// Cached-prefix allowance for this section, in estimated tokens.
 ///
@@ -95,7 +95,21 @@ impl ToolSurfacePromptBuilder {
         }
         let charged: BTreeSet<&str> = surface.advertised_names().collect();
         if inventoried == charged {
-            return Ok(rendered);
+            // Protocol-selected candidates are described by the request's tool table. Retain
+            // them in inventory validation and schema digests, but not in the stable prefix.
+            let protocol_names: BTreeSet<_> = surface
+                .tools()
+                .iter()
+                .filter(|tool| {
+                    tool.options().availability()
+                        == ra_core::tool::ToolAvailability::DynamicForProtocol
+                })
+                .map(|tool| tool.model_definition().qualified_name())
+                .collect();
+            return Ok(rendered
+                .into_iter()
+                .filter(|(name, _)| !protocol_names.contains(name))
+                .collect());
         }
 
         Err(Error::config(format!(

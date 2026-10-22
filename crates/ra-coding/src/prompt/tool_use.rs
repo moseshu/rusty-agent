@@ -42,8 +42,8 @@ impl ToolUsePromptBuilder {
             SectionStability::Stable,
             SectionPosition::Prefix,
             "Tool Use:\n\
-             - Use only the entries listed under Available tools and any built-in provider tool \
-             included in this request. Choose the entry whose documented capability and schema \
+             - Use only tools actually declared in this request. Choose the entry whose \
+             documented capability and schema \
              fit the task; do not infer or invoke an unlisted capability.\n\
              - Prefer an advertised specialist that returns the needed structured observation. \
              When the surface offers a command-execution entry, use it for long-tail command-line \

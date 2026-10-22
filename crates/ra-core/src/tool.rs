@@ -30,6 +30,18 @@ pub trait HostedToolResolver: Send + Sync + 'static {
         context: &RunContext,
         protocol: ApiProtocol,
     ) -> Result<Option<ModelToolDefinition>>;
+
+    /// Resolves against the enabled local tools that survived this turn's collision policy.
+    /// The default preserves the ordinary resolver contract. Product adapters can use the exact
+    /// handlers to distinguish their selected backend from an unrelated same-name tool.
+    fn resolve_with_tools(
+        &self,
+        context: &RunContext,
+        protocol: ApiProtocol,
+        _tools: &[Arc<dyn Tool>],
+    ) -> Result<Option<ModelToolDefinition>> {
+        self.resolve(context, protocol)
+    }
 }
 
 pub use crate::permission::ActionClass;
@@ -227,6 +239,9 @@ pub trait Tool: Send + Sync + 'static {
                 "tool `{}` declares dynamic availability but does not implement Tool::is_enabled",
                 self.origin().qualified_name()
             ))),
+            ToolAvailability::DynamicForProtocol => Err(crate::error::Error::caller(
+                "protocol-dependent availability requires a resolved turn protocol",
+            )),
         }
     }
 
@@ -242,6 +257,22 @@ pub trait Tool: Send + Sync + 'static {
         _services: &ToolServices,
     ) -> Result<bool> {
         self.is_enabled(context).await
+    }
+
+    /// Evaluates explicitly selected protocol-dependent availability after model resolution.
+    ///
+    /// This Rusty extension is called once per preparation, within the cancellation scope. It is
+    /// not called when recovering an already-issued local call from an approval checkpoint.
+    async fn is_enabled_for_protocol(
+        &self,
+        _context: &RunContext,
+        _services: &ToolServices,
+        _protocol: ApiProtocol,
+    ) -> Result<bool> {
+        Err(crate::error::Error::caller(format!(
+            "tool `{}` declares protocol-dependent availability but does not implement Tool::is_enabled_for_protocol",
+            self.origin().qualified_name()
+        )))
     }
 
     /// Evaluates whether this call requires host approval.

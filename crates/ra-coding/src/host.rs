@@ -46,6 +46,7 @@ pub struct CodingHost {
     event_sink: Arc<dyn HostEventSink>,
     exec_permission_approvals: bool,
     web: Option<Arc<dyn WebAccess>>,
+    web_fallback: Option<Arc<dyn crate::web_search::WebSearchFallbackAdapter>>,
     web_search: Option<crate::web_search::CodingWebSearch>,
     skills: Option<Arc<dyn SkillCatalog>>,
     user_input: Option<Arc<dyn UserInputPort>>,
@@ -105,6 +106,7 @@ impl CodingHost {
             event_sink: Arc::new(NoopHostEventSink),
             exec_permission_approvals: false,
             web: None,
+            web_fallback: None,
             web_search: Some(crate::web_search::CodingWebSearch::default()),
             skills: None,
             user_input: None,
@@ -131,10 +133,41 @@ impl CodingHost {
     pub fn with_web_access(mut self, access: Arc<dyn WebAccess>) -> Self {
         self.web = Some(access);
         self.web_search = None;
+        self.web_fallback = None;
         self
     }
 
-    /// Selects the native Responses search configuration instead of the `WebAccess` extension.
+    /// Installs a plain `WebAccess` fallback. It supports only Live mode without search options;
+    /// Cached remains the default and therefore does not enable this backend automatically.
+    /// Preserves existing native settings, or restores their defaults after `with_web_access`.
+    #[must_use]
+    pub fn with_web_access_fallback(self, access: Arc<dyn WebAccess>) -> Self {
+        self.with_web_access_fallback_adapter(Arc::new(crate::web_search::UnrestrictedWebAccess(
+            access,
+        )))
+    }
+
+    /// Installs a product adapter that explicitly guarantees the effective search constraints.
+    /// Native settings are preserved; selecting `with_web_search` later updates those settings
+    /// without removing this adapter. Selecting `with_web_access` removes the adapter instead.
+    #[must_use]
+    pub fn with_web_access_fallback_adapter(
+        mut self,
+        adapter: Arc<dyn crate::web_search::WebSearchFallbackAdapter>,
+    ) -> Self {
+        self.web = None;
+        self.web_fallback = Some(adapter);
+        self.web_search
+            .get_or_insert_with(crate::web_search::CodingWebSearch::default);
+        self
+    }
+
+    pub(crate) fn has_web_fallback(&self) -> bool {
+        self.web_fallback.is_some()
+    }
+
+    /// Selects native settings, preserving an installed fallback adapter. Suppresses the legacy
+    /// standalone `WebAccess` extension when no fallback adapter is installed.
     #[must_use]
     pub fn with_web_search(mut self, config: crate::web_search::CodingWebSearch) -> Self {
         self.web_search = Some(config);
@@ -263,11 +296,23 @@ impl CodingHost {
         }
     }
 
-    pub(crate) fn web_capability(&self) -> ra_core::error::Result<Option<WebCapability>> {
+    pub(crate) fn web_capability(&self) -> ra_core::error::Result<Option<Arc<dyn Capability>>> {
+        if let (Some(adapter), Some(config)) = (&self.web_fallback, &self.web_search) {
+            return Ok(Some(Arc::new(crate::web_search::FallbackCapability::new(
+                config.clone(),
+                Arc::clone(adapter),
+            )?)));
+        }
         if self.web_search.is_some() {
             return Ok(None);
         }
-        self.web.clone().map(WebCapability::new).transpose()
+        self.web
+            .clone()
+            .map(|access| {
+                WebCapability::new(access)
+                    .map(|capability| Arc::new(capability) as Arc<dyn Capability>)
+            })
+            .transpose()
     }
 
     pub(crate) fn skills_capability(&self) -> ra_core::error::Result<Option<SkillsCapability>> {

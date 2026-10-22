@@ -51,6 +51,9 @@ pub enum ToolAvailability {
     Disabled,
     /// Ask [`Tool::is_enabled`](super::Tool::is_enabled) for each relevant context.
     Dynamic,
+    /// Evaluate after model resolution, using [`Tool::is_enabled_for_protocol`](super::Tool::is_enabled_for_protocol).
+    /// This opt-in extension leaves ordinary dynamic callbacks in their original preparation phase.
+    DynamicForProtocol,
 }
 
 /// How much of the model's tool surface a registered tool occupies.
@@ -635,7 +638,9 @@ impl ToolOptions {
     #[must_use]
     pub const fn can_reach_model_surface(&self) -> bool {
         let live = match self.availability {
-            ToolAvailability::Enabled | ToolAvailability::Dynamic => true,
+            ToolAvailability::Enabled
+            | ToolAvailability::Dynamic
+            | ToolAvailability::DynamicForProtocol => true,
             ToolAvailability::Disabled => false,
         };
         let reachable = match self.exposure {

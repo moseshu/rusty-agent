@@ -1,4 +1,4 @@
-//! R3-0 contracts for the fixed preparation order before a model call.
+//! Contracts for the fixed preparation order before a model call.
 
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +172,22 @@ impl Tool for RecordingTool {
 
     fn options(&self) -> ToolOptions {
         self.options.clone()
+    }
+
+    async fn is_enabled_for_protocol(
+        &self,
+        _: &RunContext,
+        _: &ra_core::tool::ToolServices,
+        protocol: ApiProtocol,
+    ) -> Result<bool> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("protocol:{}:{protocol:?}", self.origin.name()));
+        match &self.dynamic_result {
+            Ok(value) => Ok(*value),
+            Err(error) => Err(Error::caller(error.to_string())),
+        }
     }
 
     async fn is_enabled(&self, context: &RunContext) -> Result<bool> {
@@ -1788,4 +1804,493 @@ async fn tool_choice_reset_policy_belongs_to_the_public_agent() {
             }
         );
     }
+}
+
+#[tokio::test]
+async fn protocol_availability_runs_after_model_resolution_once_and_keeps_declaration_order() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let late: Arc<dyn Tool> = Arc::new(RecordingTool::new(
+        "late",
+        ToolAvailability::DynamicForProtocol,
+        log.clone(),
+        Ok(true),
+    ));
+    let omitted: Arc<dyn Tool> = Arc::new(RecordingTool::new(
+        "omitted",
+        ToolAvailability::DynamicForProtocol,
+        log.clone(),
+        Ok(false),
+    ));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("protocol"))
+        .name("Protocol")
+        .tools([late, dynamic_tool("early", &log, true), omitted])
+        .build()
+        .unwrap();
+    let prepared = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &RecordingResolver::new(log.clone()),
+        &host(&agent),
+        &CancelScope::root(),
+        &ToolUseTracker::new(),
+        vec![],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        events(&log),
+        [
+            "is_enabled:early",
+            "resolve_model",
+            "protocol:late:OpenAiResponses",
+            "protocol:omitted:OpenAiResponses"
+        ]
+    );
+    assert_eq!(
+        prepared
+            .request()
+            .tools()
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>(),
+        ["late", "early"]
+    );
+}
+
+#[tokio::test]
+async fn ordinary_availability_errors_still_precede_model_resolution_with_a_late_candidate() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("protocol-error"))
+        .name("Protocol")
+        .tool(Arc::new(RecordingTool::new(
+            "late",
+            ToolAvailability::DynamicForProtocol,
+            log.clone(),
+            Ok(true),
+        )))
+        .tool(Arc::new(RecordingTool::new(
+            "early",
+            ToolAvailability::Dynamic,
+            log.clone(),
+            Err(Error::caller("early failure")),
+        )))
+        .build()
+        .unwrap();
+    let error = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &RecordingResolver::new(log.clone()),
+        &host(&agent),
+        &CancelScope::root(),
+        &ToolUseTracker::new(),
+        vec![],
+    ))
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("early failure"));
+    assert_eq!(events(&log), ["is_enabled:early"]);
+}
+
+#[tokio::test]
+async fn protocol_availability_errors_propagate_after_model_resolution() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("protocol-error"))
+        .name("Protocol")
+        .tool(Arc::new(RecordingTool::new(
+            "late",
+            ToolAvailability::DynamicForProtocol,
+            log.clone(),
+            Err(Error::caller("late failure")),
+        )))
+        .build()
+        .unwrap();
+    let error = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &RecordingResolver::new(log.clone()),
+        &host(&agent),
+        &CancelScope::root(),
+        &ToolUseTracker::new(),
+        vec![],
+    ))
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("late failure"));
+    assert_eq!(
+        events(&log),
+        ["resolve_model", "protocol:late:OpenAiResponses"]
+    );
+}
+
+#[tokio::test]
+async fn protocol_dependent_deferred_tools_build_discovery_only_after_enablement() {
+    for enabled in [false, true] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tool = RecordingTool::new(
+            "late",
+            ToolAvailability::DynamicForProtocol,
+            log.clone(),
+            Ok(enabled),
+        )
+        .with_options(
+            ToolOptions::new()
+                .with_availability(ToolAvailability::DynamicForProtocol)
+                .with_exposure(ToolExposure::Deferred),
+        );
+        let agent = AgentSpec::builder()
+            .id(AgentId::new("discovery"))
+            .name("Discovery")
+            .tool(Arc::new(tool))
+            .build()
+            .unwrap();
+        let turn = prepare_turn(TurnPreparationRequest::new(
+            &direct(&agent),
+            &RecordingResolver::new(log.clone()),
+            &host(&agent),
+            &CancelScope::root(),
+            &ToolUseTracker::new(),
+            vec![],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            turn.request()
+                .tools()
+                .iter()
+                .any(|tool| tool.kind().is_tool_search()),
+            enabled
+        );
+        let error = prepare_turn(
+            TurnPreparationRequest::new(
+                &direct(&agent),
+                &RecordingResolver::new(log),
+                &host(&agent),
+                &CancelScope::root(),
+                &ToolUseTracker::new(),
+                vec![],
+            )
+            .with_action_surface_budget(ActionSurfaceBudget::new(0)),
+        )
+        .await;
+        assert_eq!(error.is_err(), enabled);
+    }
+}
+
+struct BrokenResolver(Events);
+impl ModelResolver for BrokenResolver {
+    fn resolve_model(&self, _: Option<&str>) -> Result<ResolvedModel> {
+        self.0.lock().unwrap().push("resolve_model_failed".into());
+        Err(Error::config("model resolution failed"))
+    }
+}
+
+#[tokio::test]
+async fn model_resolution_failure_precedes_protocol_callback() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("protocol-model-error"))
+        .name("Protocol")
+        .tools([
+            dynamic_tool("early", &log, true),
+            Arc::new(RecordingTool::new(
+                "late",
+                ToolAvailability::DynamicForProtocol,
+                log.clone(),
+                Ok(true),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let error = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &BrokenResolver(log.clone()),
+        &host(&agent),
+        &CancelScope::root(),
+        &ToolUseTracker::new(),
+        vec![],
+    ))
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("model resolution failed"));
+    assert_eq!(events(&log), ["is_enabled:early", "resolve_model_failed"]);
+}
+
+struct BlockingProtocolTool {
+    inner: RecordingTool,
+    started: Arc<tokio::sync::Notify>,
+}
+#[async_trait]
+impl Tool for BlockingProtocolTool {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+    fn options(&self) -> ToolOptions {
+        self.inner.options()
+    }
+    async fn call(&self, _: ToolContext<'_>) -> Result<ToolOutput> {
+        unreachable!()
+    }
+    async fn is_enabled_for_protocol(
+        &self,
+        _: &RunContext,
+        _: &ra_core::tool::ToolServices,
+        _: ApiProtocol,
+    ) -> Result<bool> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_protocol_availability_after_model_resolution() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("protocol-cancel"))
+        .name("Protocol")
+        .tool(Arc::new(BlockingProtocolTool {
+            inner: RecordingTool::new(
+                "late",
+                ToolAvailability::DynamicForProtocol,
+                log.clone(),
+                Ok(true),
+            ),
+            started: started.clone(),
+        }))
+        .build()
+        .unwrap();
+    let cancel = CancelScope::root();
+    let binding = direct(&agent);
+    let resolver = RecordingResolver::new(log.clone());
+    let context = host(&agent);
+    let tracker = ToolUseTracker::new();
+    let prepare = prepare_turn(TurnPreparationRequest::new(
+        &binding,
+        &resolver,
+        &context,
+        &cancel,
+        &tracker,
+        vec![],
+    ));
+    let interrupt = async {
+        started.notified().await;
+        cancel.cancel(CancelReason::UserInterrupt);
+    };
+    let (result, ()) = tokio::join!(prepare, interrupt);
+    assert!(matches!(result.unwrap_err(), Error::Cancelled { .. }));
+    assert_eq!(events(&log), ["resolve_model"]);
+}
+
+struct DiscoveryInventory {
+    tools: Vec<Arc<dyn Tool>>,
+    log: Events,
+}
+#[async_trait]
+impl ra_core::tool::ToolResolver for DiscoveryInventory {
+    async fn get_tools(
+        &self,
+        _: &RunContext,
+        _: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>> {
+        self.log.lock().unwrap().push("discover".into());
+        Ok(self.tools.clone())
+    }
+}
+
+#[tokio::test]
+async fn late_candidates_share_one_discovery_snapshot_and_collision_order() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let late: Arc<dyn Tool> = Arc::new(RecordingTool::new(
+        "same",
+        ToolAvailability::DynamicForProtocol,
+        log.clone(),
+        Ok(true),
+    ));
+    let discovered: Arc<dyn Tool> = Arc::new(RecordingTool::new(
+        "same",
+        ToolAvailability::Enabled,
+        log.clone(),
+        Ok(true),
+    ));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("protocol-collision"))
+        .name("Protocol")
+        .tool(late.clone())
+        .tool_resolver(Arc::new(DiscoveryInventory {
+            tools: vec![discovered],
+            log: log.clone(),
+        }))
+        .build()
+        .unwrap();
+    let turn = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &RecordingResolver::new(log.clone()),
+        &host(&agent),
+        &CancelScope::root(),
+        &ToolUseTracker::new(),
+        vec![],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        events(&log),
+        ["discover", "resolve_model", "protocol:same:OpenAiResponses"]
+    );
+    assert_eq!(turn.tools().len(), 1);
+    assert!(Arc::ptr_eq(&turn.tools()[0], &late));
+}
+
+#[tokio::test]
+async fn mixed_inventories_finalize_ordinary_collisions_and_budgets_after_model_resolution() {
+    use ra_runtime::turn::prepare::ToolNameCollisionPolicy;
+
+    for collision in [false, true] {
+        for model_fails in [false, true] {
+            let log: Events = Arc::new(Mutex::new(Vec::new()));
+            let ordinary: Arc<dyn Tool> = Arc::new(RecordingTool::new(
+                "ordinary",
+                ToolAvailability::Enabled,
+                log.clone(),
+                Ok(true),
+            ));
+            let discovered = if collision {
+                vec![ordinary.clone()]
+            } else {
+                vec![]
+            };
+            let agent = AgentSpec::builder()
+                .id(AgentId::new("mixed-errors"))
+                .name("Mixed")
+                .tools([
+                    ordinary,
+                    Arc::new(RecordingTool::new(
+                        "late",
+                        ToolAvailability::DynamicForProtocol,
+                        log.clone(),
+                        Ok(false),
+                    )),
+                ])
+                .tool_resolver(Arc::new(DiscoveryInventory {
+                    tools: discovered,
+                    log: log.clone(),
+                }))
+                .build()
+                .unwrap();
+            let resolver: Box<dyn ModelResolver> = if model_fails {
+                Box::new(BrokenResolver(log.clone()))
+            } else {
+                Box::new(RecordingResolver::new(log.clone()))
+            };
+            let budget = if collision {
+                ActionSurfaceBudget::new(10)
+            } else {
+                ActionSurfaceBudget::new(0)
+            };
+            let error = prepare_turn(
+                TurnPreparationRequest::new(
+                    &direct(&agent),
+                    resolver.as_ref(),
+                    &host(&agent),
+                    &CancelScope::root(),
+                    &ToolUseTracker::new(),
+                    vec![],
+                )
+                .with_tool_name_collision_policy(ToolNameCollisionPolicy::Error)
+                .with_action_surface_budget(budget),
+            )
+            .await
+            .unwrap_err();
+            if model_fails {
+                assert!(error.to_string().contains("model resolution failed"));
+                assert_eq!(events(&log), ["discover", "resolve_model_failed"]);
+            } else {
+                let message = error.to_string();
+                if collision {
+                    assert!(
+                        message.contains("ordinary") && message.contains("more than once"),
+                        "{message}"
+                    );
+                } else {
+                    assert!(message.contains("advertises 1 model actions"), "{message}");
+                }
+                assert_eq!(
+                    events(&log),
+                    ["discover", "resolve_model", "protocol:late:OpenAiResponses"]
+                );
+            }
+        }
+    }
+}
+
+struct ChangingAvailability {
+    inner: RecordingTool,
+    changed: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl Tool for ChangingAvailability {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_availability(
+            if self.changed.load(std::sync::atomic::Ordering::SeqCst) {
+                ToolAvailability::DynamicForProtocol
+            } else {
+                ToolAvailability::Dynamic
+            },
+        )
+    }
+    async fn call(&self, _: ToolContext<'_>) -> Result<ToolOutput> {
+        unreachable!()
+    }
+    async fn is_enabled(&self, _: &RunContext) -> Result<bool> {
+        self.changed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .events
+            .lock()
+            .unwrap()
+            .push("ordinary_once".into());
+        Ok(true)
+    }
+    async fn is_enabled_for_protocol(
+        &self,
+        _: &RunContext,
+        _: &ra_core::tool::ToolServices,
+        _: ApiProtocol,
+    ) -> Result<bool> {
+        panic!("a callback cannot change its already-frozen preparation phase");
+    }
+}
+
+#[tokio::test]
+async fn callback_mutation_cannot_schedule_a_second_availability_evaluation() {
+    let log = Arc::new(Mutex::new(vec![]));
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("snapshot"))
+        .name("Snapshot")
+        .tool(Arc::new(ChangingAvailability {
+            inner: RecordingTool::new("changes", ToolAvailability::Dynamic, log.clone(), Ok(true)),
+            changed: std::sync::atomic::AtomicBool::new(false),
+        }))
+        .build()
+        .unwrap();
+    let turn = prepare_turn(TurnPreparationRequest::new(
+        &direct(&agent),
+        &RecordingResolver::new(log.clone()),
+        &host(&agent),
+        &CancelScope::root(),
+        &ToolUseTracker::new(),
+        vec![],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(turn.request().tools().len(), 1);
+    assert_eq!(events(&log), ["ordinary_once", "resolve_model"]);
 }

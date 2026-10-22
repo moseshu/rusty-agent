@@ -879,18 +879,28 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let agent = request.agent.execution();
 
     // Resolve discovery and dynamic availability first. Later stages observe this exact snapshot.
-    let mut surface = resolve_action_surface(
+    let inventory = resolve_action_inventory(
         request.agent,
         request.run,
         request.services,
         request.cancel,
         request.agent_registry,
-        request.collision_policy,
         ActionSurfaceMode::Normal,
     )
     .await?;
-    // Fail early when local actions alone exceed the budget; hosted declarations are added below.
-    request.action_surface_budget.validate(&surface)?;
+    // Without protocol-dependent candidates, preserve the existing early surface errors.
+    // A mixed inventory is finalized as a whole after model resolution: even a collision or
+    // budget error involving only ordinary tools belongs to that later finalization.
+    let (mut surface, pending_inventory) = if inventory.needs_protocol() {
+        (
+            TurnActionSurface::new(Vec::new(), Vec::new())?,
+            Some(inventory),
+        )
+    } else {
+        let surface = inventory.into_surface(request.agent, request.collision_policy)?;
+        request.action_surface_budget.validate(&surface)?;
+        (surface, None)
+    };
 
     // 3. Project the public structured-output promise after handoffs. A prepared execution
     // instance may alter its tools or model, but it must not silently downgrade the output
@@ -906,6 +916,17 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     request.cancel.ensure_not_cancelled()?;
     let model_name = request.model_override.as_deref().or(agent.model());
     let resolved_model = request.model_resolver.resolve_model(model_name)?;
+    if let Some(mut inventory) = pending_inventory {
+        inventory
+            .resolve_protocol(
+                request.run,
+                request.services,
+                request.cancel,
+                resolved_model.selector().protocol(),
+            )
+            .await?;
+        surface = inventory.into_surface(request.agent, request.collision_policy)?;
+    }
     resolve_hosted_declarations(
         &mut surface,
         agent,
@@ -990,12 +1011,68 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
 
 struct EnabledTools {
     advertised: Vec<Arc<dyn Tool>>,
+    protocol_tools: BTreeSet<usize>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActionSurfaceMode {
     Normal,
     Resume,
+}
+
+struct LocalActionInventory {
+    tools: Vec<Arc<dyn Tool>>,
+    handoffs: Vec<PreparedHandoff>,
+    protocol_tools: BTreeSet<usize>,
+}
+
+impl LocalActionInventory {
+    fn needs_protocol(&self) -> bool {
+        !self.protocol_tools.is_empty()
+    }
+
+    async fn resolve_protocol(
+        &mut self,
+        context: &RunContext,
+        services: &ToolServices,
+        cancel: &CancelScope,
+        protocol: ApiProtocol,
+    ) -> Result<()> {
+        let decisions = cancel
+            .run(try_join_all(self.tools.iter().enumerate().map(
+                |(index, tool)| {
+                    let needs_protocol = self.protocol_tools.contains(&index);
+                    async move {
+                        if needs_protocol {
+                            tool.is_enabled_for_protocol(context, services, protocol)
+                                .await
+                        } else {
+                            Ok(true)
+                        }
+                    }
+                },
+            )))
+            .await??;
+        self.tools = self
+            .tools
+            .drain(..)
+            .zip(decisions)
+            .filter_map(|(tool, enabled)| enabled.then_some(tool))
+            .collect();
+        self.protocol_tools.clear();
+        Ok(())
+    }
+
+    fn into_surface(
+        self,
+        agent: &AgentBinding,
+        policy: ToolNameCollisionPolicy,
+    ) -> Result<TurnActionSurface> {
+        let mut surface =
+            TurnActionSurface::new_with_collision_policy(self.tools, self.handoffs, policy)?;
+        surface.tool_search = agent.tool_search_cache.get_or_build(surface.tools())?;
+        Ok(surface)
+    }
 }
 
 pub(crate) async fn resolve_action_surface(
@@ -1007,6 +1084,19 @@ pub(crate) async fn resolve_action_surface(
     collision_policy: ToolNameCollisionPolicy,
     mode: ActionSurfaceMode,
 ) -> Result<TurnActionSurface> {
+    resolve_action_inventory(agent, context, services, cancel, registry, mode)
+        .await?
+        .into_surface(agent, collision_policy)
+}
+
+async fn resolve_action_inventory(
+    agent: &AgentBinding,
+    context: &RunContext,
+    services: &ToolServices,
+    cancel: &CancelScope,
+    registry: Option<&AgentRegistry>,
+    mode: ActionSurfaceMode,
+) -> Result<LocalActionInventory> {
     let execution = agent.execution();
     let handoff_snapshot = if mode == ActionSurfaceMode::Resume {
         Some(resolve_handoffs(execution, context, cancel, registry).await?)
@@ -1034,21 +1124,19 @@ pub(crate) async fn resolve_action_surface(
         }
         let mut tools = cancel.run(resolver.get_tools(context, &reserved)).await??;
         tools.extend(execution.tools().iter().cloned());
-        resolve_enabled_inventory(&tools, context, services, cancel).await?
+        resolve_enabled_inventory(&tools, context, services, cancel, mode).await?
     } else {
-        resolve_enabled_tools(execution, context, services, cancel).await?
+        resolve_enabled_tools(execution, context, services, cancel, mode).await?
     };
     let handoffs = match handoff_snapshot {
         Some(handoffs) => handoffs,
         None => resolve_handoffs(execution, context, cancel, registry).await?,
     };
-    let mut surface = TurnActionSurface::new_with_collision_policy(
-        enabled.advertised,
+    Ok(LocalActionInventory {
+        tools: enabled.advertised,
         handoffs,
-        collision_policy,
-    )?;
-    surface.tool_search = agent.tool_search_cache.get_or_build(surface.tools())?;
-    Ok(surface)
+        protocol_tools: enabled.protocol_tools,
+    })
 }
 
 fn resolve_hosted_declarations(
@@ -1069,7 +1157,9 @@ fn resolve_hosted_declarations(
         match declaration {
             AgentTool::DynamicHosted { preview, resolver } => {
                 cancel.ensure_not_cancelled()?;
-                if let Some(tool) = resolver.resolve(context, protocol)? {
+                if let Some(tool) =
+                    resolver.resolve_with_tools(context, protocol, surface.tools())?
+                {
                     if !tool.is_hosted()
                         || tool.name() != preview.name()
                         || tool.namespace().is_some()
@@ -1088,6 +1178,14 @@ fn resolve_hosted_declarations(
                 .declarations
                 .push(PreparedToolDeclaration::Hosted(Box::new(tool.clone()))),
             AgentTool::Local(tool) => {
+                // A withheld declaration does not own an enabled resolver tool's same-name slot.
+                if !surface
+                    .tools()
+                    .iter()
+                    .any(|enabled| Arc::ptr_eq(enabled, tool))
+                {
+                    continue;
+                }
                 let definition = tool.model_definition();
                 surface.declarations.push(PreparedToolDeclaration::Local {
                     name: definition.qualified_name(),
@@ -1105,8 +1203,9 @@ async fn resolve_enabled_tools(
     context: &RunContext,
     services: &ToolServices,
     cancel: &CancelScope,
+    mode: ActionSurfaceMode,
 ) -> Result<EnabledTools> {
-    resolve_enabled_inventory(agent.tools(), context, services, cancel).await
+    resolve_enabled_inventory(agent.tools(), context, services, cancel, mode).await
 }
 
 async fn resolve_enabled_inventory(
@@ -1114,34 +1213,55 @@ async fn resolve_enabled_inventory(
     context: &RunContext,
     services: &ToolServices,
     cancel: &CancelScope,
+    mode: ActionSurfaceMode,
 ) -> Result<EnabledTools> {
+    // Freeze phase selection before entering callbacks: a callback may mutate a shared tool,
+    // but it cannot cause that tool to be evaluated again in a later phase of this preparation.
+    let policies: Vec<_> = tools
+        .iter()
+        .map(|tool| tool.options().availability())
+        .collect();
     let decisions = cancel
-        .run(try_join_all(tools.iter().map(|tool| async move {
-            match tool.options().availability() {
-                ToolAvailability::Enabled => Ok(true),
-                ToolAvailability::Disabled => Ok(false),
-                ToolAvailability::Dynamic => tool.is_enabled_with_services(context, services).await,
-                _ => Err(Error::caller(format!(
-                    "tool `{}` uses an unsupported availability policy",
-                    tool.origin().qualified_name()
-                ))),
-            }
-        })))
+        .run(try_join_all(tools.iter().zip(&policies).map(
+            |(tool, policy)| async move {
+                match policy {
+                    ToolAvailability::Disabled => Ok(false),
+                    ToolAvailability::Dynamic => {
+                        tool.is_enabled_with_services(context, services).await
+                    }
+                    ToolAvailability::Enabled => Ok(true),
+                    // Issued protocol-dependent local calls are recovered by identity separately;
+                    // adding their candidates here could shadow an approved discovery recipient.
+                    ToolAvailability::DynamicForProtocol => Ok(mode == ActionSurfaceMode::Normal),
+                    _ => Err(Error::caller(format!(
+                        "tool `{}` uses an unsupported availability policy",
+                        tool.origin().qualified_name()
+                    ))),
+                }
+            },
+        )))
         .await??;
 
     let mut advertised = Vec::new();
-    for (tool, enabled) in tools.iter().zip(decisions) {
+    let mut protocol_tools = BTreeSet::new();
+    for ((tool, enabled), policy) in tools.iter().zip(decisions).zip(policies) {
         if !enabled {
             continue;
         }
         if tool.options().is_advertised() || tool.options().is_discoverable() {
+            if policy == ToolAvailability::DynamicForProtocol {
+                protocol_tools.insert(advertised.len());
+            }
             advertised.push(Arc::clone(tool));
         }
         // Hidden tools remain registered for host/programmatic dispatch but are deliberately
         // absent from every model-owned surface.
     }
 
-    Ok(EnabledTools { advertised })
+    Ok(EnabledTools {
+        advertised,
+        protocol_tools,
+    })
 }
 
 async fn resolve_handoffs(

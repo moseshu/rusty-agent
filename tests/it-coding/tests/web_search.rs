@@ -136,7 +136,7 @@ async fn native_search_assembles_without_webaccess_and_is_counted_in_inventory()
         .to_owned();
     assert!(!instructions.contains("web_search"), "{instructions}");
     assert!(!instructions.contains("web_fetch"), "{instructions}");
-    assert!(instructions.contains("any built-in provider tool included in this request"));
+    assert!(instructions.contains("tools actually declared in this request"));
     let binding = AgentBinding::direct(agent.agent().clone());
     let context = RunContext::new(RunId::new("native"), agent.agent().as_ref());
     let turn = prepare_turn(
@@ -276,8 +276,71 @@ fn permission_profile_and_provider_limits_use_codex_fallback_order() {
             ..config
         }
         .mode_for_turn(true),
-        Disabled
+        Live
     );
+}
+
+#[tokio::test]
+async fn native_search_without_fallback_withholds_disabled_provider_capabilities() {
+    for config in [
+        CodingWebSearch {
+            supported: false,
+            ..Default::default()
+        },
+        CodingWebSearch {
+            enabled: false,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(config.mode_for_turn(false), WebSearchMode::Cached);
+        assert!(config.definition_for_turn(false).unwrap().is_none());
+        for profile in [CodingProfile::CodexLike, CodingProfile::Full] {
+            let workspace = TempDir::new().unwrap();
+            let services = Arc::new(configured_host::Services::default());
+            let host = services
+                .install(CodingHost::open(workspace.path()).unwrap())
+                .with_web_search(config.clone());
+            let assembled = host_backed_surface(&PromptRole::Main, &host, profile)
+                .await
+                .unwrap();
+            assert!(assembled.tool_surface().hosted_tools().is_empty());
+            assert!(
+                !assembled
+                    .tool_surface()
+                    .advertised_names()
+                    .any(|name| matches!(name, "web_search" | "web_fetch"))
+            );
+            let agent = build_agent_with_control(
+                AgentId::new("disabled-native"),
+                "Native",
+                &PromptRole::Main,
+                &host,
+                profile,
+            )
+            .await
+            .unwrap()
+            .agent()
+            .clone();
+            let turn = prepare_turn(TurnPreparationRequest::new(
+                &AgentBinding::direct(agent.clone()),
+                &Resolver,
+                &RunContext::new(RunId::new("disabled-native"), agent.as_ref()),
+                &CancelScope::root(),
+                &ToolUseTracker::new(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+            assert!(native(turn.request()).is_none());
+            assert!(
+                !turn
+                    .request()
+                    .tools()
+                    .iter()
+                    .any(|tool| matches!(tool.name(), "web_search" | "web_fetch"))
+            );
+        }
+    }
 }
 
 #[test]

@@ -242,6 +242,19 @@ pub(crate) async fn assemble_agent(
     let capabilities = assembled.runtime_capabilities.clone();
     let capability_tools = assembled.tool_surface().tools().to_vec();
     let hosted = assembled.tool_surface().hosted_tools().to_vec();
+    // The profile selects one logical search slot. Its local candidate is the assembly
+    // representative; the hosted candidate is kept here, outside the executable registry.
+    let fallback_search = host
+        .has_web_fallback()
+        .then(|| {
+            assembled
+                .tool_surface()
+                .tools()
+                .iter()
+                .find(|tool| tool.origin().name() == "web_search")
+                .cloned()
+        })
+        .flatten();
     let mut builder = AgentSpec::builder()
         .id(id)
         .name(name)
@@ -253,6 +266,17 @@ pub(crate) async fn assemble_agent(
         } else {
             builder.hosted_tool(tool)
         };
+    }
+    if let (Some(standalone), Some(config)) = (fallback_search, host.web_search()) {
+        let preview = ra_model::openai::responses::web_search::ResponsesWebSearchTool::default()
+            .to_definition()?;
+        builder = builder.hosted_tool_resolver(
+            preview,
+            Arc::new(crate::web_search::SearchResolver {
+                config: config.clone(),
+                standalone,
+            }),
+        );
     }
     if let Some(runtime) = host.mcp_runtime() {
         runtime.start_background();
@@ -423,6 +447,33 @@ pub async fn host_backed_surface(
     let budget = *profile.budget();
     let tool_surface =
         registry.assemble_with_hosted_tools(&profile, &capabilities.hosted_tools()?)?;
+    // A fallback uses one search slot, but either backend can determine its largest wire cost.
+    // Check the hosted projections independently rather than charging both candidates together.
+    if host.has_web_fallback()
+        && let Some(config) = host.web_search()
+        && tool_surface
+            .tools()
+            .iter()
+            .any(|tool| tool.origin().name() == "web_search")
+    {
+        for sandbox_disabled in [false, true] {
+            if let Some(hosted) = config.definition_for_turn(sandbox_disabled)? {
+                let mut definitions = tool_surface.model_definitions();
+                definitions.retain(|tool| !matches!(tool.name(), "web_search" | "web_fetch"));
+                definitions.push(hosted);
+                let bytes =
+                    ra_core::model::ModelToolDefinition::advertised_table_bytes(&definitions)?;
+                if budget
+                    .max_advertised_bytes()
+                    .is_some_and(|maximum| bytes > maximum)
+                {
+                    return Err(ra_core::error::Error::config(
+                        "hosted search alternative exceeds the coding profile's schema-byte budget",
+                    ));
+                }
+            }
+        }
+    }
     let contributions = capabilities.contributions_for(&tool_surface).await?;
     Ok(HostBackedSurface {
         tool_surface,

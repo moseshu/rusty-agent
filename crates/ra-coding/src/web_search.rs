@@ -22,7 +22,7 @@ use crate::thread_settings::CodingThreadSettings;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchMode {
-    /// Do not advertise hosted web search.
+    /// Do not advertise either coding-product search shape.
     Disabled,
     /// Search cached content without live fetches.
     #[default]
@@ -107,6 +107,10 @@ impl WebSearchToolConfig {
 /// Access constraints affect search declarations; network authorization is a separate product policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Independent provider and product feature gates retain the upstream field meanings"
+)]
 pub struct CodingWebSearch {
     /// Preferred mode, cached by default.
     pub mode: WebSearchMode,
@@ -116,6 +120,10 @@ pub struct CodingWebSearch {
     pub tool_type: WebSearchToolType,
     /// Whether the selected endpoint supports hosted search.
     pub supported: bool,
+    /// Common provider capability gate for both hosted and fallback search.
+    pub enabled: bool,
+    /// Prefer the explicitly installed standalone backend even on Responses turns.
+    pub prefer_standalone: bool,
     /// Whether the endpoint supports live or indexed external access.
     pub external_web_access: bool,
     /// Modes permitted by product configuration.
@@ -131,6 +139,8 @@ impl Default for CodingWebSearch {
             tools: WebSearchToolConfig::default(),
             tool_type: WebSearchToolType::Text,
             supported: true,
+            enabled: true,
+            prefer_standalone: false,
             external_web_access: true,
             allowed_modes: vec![
                 WebSearchMode::Disabled,
@@ -148,9 +158,6 @@ impl CodingWebSearch {
     #[must_use]
     pub fn mode_for_turn(&self, sandbox_disabled: bool) -> WebSearchMode {
         use WebSearchMode::{Cached, Disabled, Indexed, Live};
-        if !self.supported {
-            return Disabled;
-        }
         let allowed = |mode| {
             (self.external_web_access || !matches!(mode, Live | Indexed))
                 && self.allowed_modes.contains(&mode)
@@ -176,6 +183,9 @@ impl CodingWebSearch {
         sandbox_disabled: bool,
     ) -> Result<Option<ModelToolDefinition>> {
         use WebSearchMode::{Cached, Disabled, Indexed, Live};
+        if !self.enabled || !self.supported {
+            return Ok(None);
+        }
         let (external, indexed) = match self.mode_for_turn(sandbox_disabled) {
             Disabled => return Ok(None),
             Cached => (false, None),
@@ -209,6 +219,16 @@ impl CodingWebSearch {
     }
 }
 
+impl CodingWebSearch {
+    pub(crate) fn sandbox_disabled_for_context(&self, context: &RunContext) -> bool {
+        context
+            .app_context::<CodingThreadSettings>()
+            .map_or(self.sandbox_disabled, |settings| {
+                matches!(settings.sandbox_policy(), SandboxPolicy::DangerFullAccess)
+            })
+    }
+}
+
 impl HostedToolResolver for CodingWebSearch {
     fn resolve(
         &self,
@@ -218,11 +238,11 @@ impl HostedToolResolver for CodingWebSearch {
         if protocol != ApiProtocol::OpenAiResponses {
             return Ok(None);
         }
-        let sandbox_disabled = context
-            .app_context::<CodingThreadSettings>()
-            .map_or(self.sandbox_disabled, |settings| {
-                matches!(settings.sandbox_policy(), SandboxPolicy::DangerFullAccess)
-            });
+        let sandbox_disabled = self.sandbox_disabled_for_context(context);
         self.definition_for_turn(sandbox_disabled)
     }
 }
+
+mod fallback;
+pub(crate) use fallback::{FallbackCapability, SearchResolver, UnrestrictedWebAccess};
+pub use fallback::{WebSearchFallbackAdapter, WebSearchPolicy};

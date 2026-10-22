@@ -77,6 +77,7 @@ pub(crate) struct RoleCapabilities {
     withheld: Vec<Arc<dyn Capability>>,
     native_web: Option<crate::web_search::CodingWebSearch>,
     native_web_offered: bool,
+    web_fallback: bool,
 }
 
 pub(crate) struct SurfaceContributions {
@@ -115,7 +116,7 @@ impl RoleCapabilities {
             Arc::new(host.shell_capability()?),
         ];
         if let Some(capability) = host.web_capability()? {
-            declared.push(Arc::new(capability));
+            declared.push(capability);
         }
         if let Some(capability) = host.skills_capability()? {
             declared.push(Arc::new(capability));
@@ -153,11 +154,15 @@ impl RoleCapabilities {
             withheld,
             native_web: host.web_search().cloned(),
             native_web_offered: !role.is_one_off(),
+            web_fallback: host.has_web_fallback(),
         })
     }
 
     /// Native declarations selected by the role; tiers select them with the ordinary profile.
     pub(crate) fn hosted_tools(&self) -> Result<Vec<ra_core::model::ModelToolDefinition>> {
+        if self.web_fallback {
+            return Ok(Vec::new());
+        }
         match &self.native_web {
             Some(config) if self.native_web_offered => Ok(config
                 .definition_for_turn(config.sandbox_disabled)?
@@ -169,11 +174,16 @@ impl RoleCapabilities {
 
     fn native_withheld_keys(&self) -> BTreeSet<ToolLookupKey> {
         let mut keys = BTreeSet::new();
+        if self.web_fallback {
+            return keys;
+        }
         if let Some(config) = &self.native_web {
             if let Ok(key) = ToolLookupKey::for_call("web_fetch", None) {
                 keys.insert(key);
             }
             if (!self.native_web_offered
+                || !config.enabled
+                || !config.supported
                 || config.mode_for_turn(config.sandbox_disabled)
                     == crate::web_search::WebSearchMode::Disabled)
                 && let Ok(key) = ToolLookupKey::for_call("web_search", None)

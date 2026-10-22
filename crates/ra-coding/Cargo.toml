@@ -15,6 +15,7 @@ test-api = []
 
 [dependencies]
 globset = { workspace = true }
+url = { workspace = true }
 ra-core = { workspace = true }
 ra-model = { workspace = true }
 ra-runtime = { workspace = true }

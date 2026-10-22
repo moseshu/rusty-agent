@@ -7,6 +7,56 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Per-turn coding search fallback
+
+`CodingHost::with_web_access` preserves the released local-function behavior on every protocol.
+`with_web_access_fallback(access)` instead keeps native Responses search and selects local
+`web_search`/`web_fetch` on Chat and Anthropic turns. It preserves existing `with_web_search`
+settings; calling `with_web_search` afterward updates settings without removing the fallback.
+Selecting legacy `with_web_access` removes both native configuration and the fallback. Selecting
+fallback afterward restores default native settings if needed.
+
+Cached remains the default. A plain `WebAccess` fallback can satisfy only Live mode without
+additional search options. It does not automatically turn Cached into Live; the existing
+permission-profile mode resolution still applies. Use `with_web_access_fallback_adapter` and
+`WebSearchFallbackAdapter` for a backend that explicitly supports Cached, Indexed, domain filters,
+location or context settings. The adapter receives `WebSearchPolicy` and returns an implementation
+bound to the complete policy. Cached does not expose `web_fetch` or recommend it in result guidance.
+`WebSearchTool::with_fetch_guidance(false)` supports search-only result guidance while preserving
+the default web pair. Fetch domain restrictions are a
+Rusty product policy, including adapter enforcement during redirects. Unsupported policies omit
+the local candidates while retaining available native Responses search.
+
+`CodingWebSearch::enabled` is the common capability gate (default true); `supported` continues to
+mean hosted endpoint support. `mode_for_turn` now returns only the effective permission-resolved
+mode, independent of either support gate. `prefer_standalone` explicitly selects an available
+fallback even on Responses turns. An unrelated same-name dynamic/MCP function does not suppress
+hosted search. Hosted history replay into Chat remains unsupported.
+
+`ToolAvailability::DynamicForProtocol` and `Tool::is_enabled_for_protocol` are opt-in extensions.
+Ordinary callbacks retain their existing order before model resolution. The new callback runs
+once after model resolution, before final collision handling, discovery caching and budgeting.
+Agents without protocol-dependent candidates retain the original early collision/discovery/budget
+error order. For an agent with any such candidate, the entire frozen inventory is finalized after
+model resolution, including errors involving only ordinary tools. A model-resolution failure can
+therefore precede an ordinary-tool collision or budget error in that explicitly selected path.
+Approval recovery resolves an already-issued local candidate by its original lookup key and
+recipient binding without reselecting its protocol shape. Protocol-dependent candidates do not
+participate in the reconstructed discovery surface, so they cannot shadow an approved MCP tool.
+The coding fallback candidates carry the adapter-owned binding
+`{"coding_web_fallback":"web_search"}` or `{"coding_web_fallback":"web_fetch"}`. This distinguishes
+their approvals from same-name resolver functions that have no recipient binding. The marker stays
+in approval checkpoints; it does not change model tool definitions or replay input.
+Fallback recovery also checks the current common capability gate, effective mode and domain scope
+before binding the backend. If current access constraints no longer permit the issued policy, the
+call fails closed. Otherwise it retains the issued policy, including its location/context guidance;
+loosening current settings does not widen an approved call. This is a coding-product policy.
+`HostedToolResolver::resolve_with_tools` defaults to the existing
+resolver and optionally exposes the actual enabled local handlers to product adapters.
+
+Protocol-selected search candidates are omitted from the stable inventory. Tool Use now permits
+the tools actually declared in the request, changing the stable prefix hash. Schema revision is 11.
+
 ### Native Responses web search declarations
 
 Use `ra_model::openai::responses::web_search::WebSearchTool::to_definition()` with
@@ -35,8 +85,7 @@ Each turn resolves native search against its selected protocol: coding hosts omi
 and Anthropic. Explicit framework Responses declarations still fail on those adapters.
 Use the WebAccess extension to select local web functions for those protocols.
 The coding prompt's stable "Available tools" inventory lists only local entries, because whether
-a turn declares hosted search depends on its protocol. Its Tool Use rule now also permits any
-built-in provider tool included in the request, which changes the stable prefix hash.
+a turn declares hosted search depends on its protocol. Its Tool Use rule permits tools actually declared in the request, which changes the stable prefix hash.
 
 These changes are implemented and awaiting review. No release version has been selected.
 

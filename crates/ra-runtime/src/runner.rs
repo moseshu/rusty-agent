@@ -3959,11 +3959,12 @@ async fn execute_resumed_call(
     agent: &AgentBinding,
     state: &mut RunState,
     lifecycle: &LifecycleHooks,
-    call: ResumedCall<'_>,
+    mut call: ResumedCall<'_>,
 ) -> Result<ResumedOutcome> {
+    let tool = resolve_resumed_tool(context, agent, state, &mut call).await?;
     let ResumedCall {
         key,
-        surface,
+        surface: _,
         recipient_binding,
         kind,
         call_id,
@@ -3971,7 +3972,6 @@ async fn execute_resumed_call(
         nested,
         resume,
     } = call;
-    let tool = resolve_resumed_tool(context, agent, state, key, kind, call_id, surface).await?;
     if recipient_binding != tool.recipient_binding().as_ref() {
         return Err(Error::caller(
             "Cannot resume a tool call with a missing or different recipient binding. Restore the original tool configuration, or start a new run.",
@@ -4093,11 +4093,26 @@ async fn resolve_resumed_tool(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     state: &RunState,
-    key: &ToolLookupKey,
-    kind: ra_core::item::ToolCallKind,
-    call_id: &CallId,
-    cached_surface: &mut Option<Arc<TurnActionSurface>>,
+    call: &mut ResumedCall<'_>,
 ) -> Result<Arc<dyn Tool>> {
+    let key = call.key;
+    let kind = call.kind;
+    let call_id = call.call_id;
+    let recipient_binding = call.recipient_binding;
+    let cached_surface = &mut *call.surface;
+    // An issued local call keeps its handler identity across a protocol change. In particular,
+    // installing MCP discovery must not make recovery reselect a product's hosted alternative.
+    // The recorded recipient distinguishes an MCP tool from a local candidate with the same key.
+    if kind != ra_core::item::ToolCallKind::ToolSearch
+        && let Some(tool) = agent.execution().tools().iter().find(|tool| {
+            tool.origin().lookup_key() == key
+                && tool.options().availability()
+                    == ra_core::tool::ToolAvailability::DynamicForProtocol
+                && tool.recipient_binding().as_ref() == recipient_binding
+        })
+    {
+        return Ok(Arc::clone(tool));
+    }
     let tool = if agent.execution().tool_resolver().is_some()
         || kind == ra_core::item::ToolCallKind::ToolSearch
     {
