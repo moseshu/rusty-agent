@@ -5,10 +5,9 @@ surface changes incompatibly only in a new `0.x` release, and every such change 
 with what to do about it. Upgrade all crates together: crates from two tags are two copies of
 `ra-core`, and their types do not interoperate.
 
-## 0.3.0 (unreleased)
+## 0.3.0
 
-This section lists the incompatible changes from 0.2.x. All workspace crates now use 0.3.0;
-the release tag and publication are still pending.
+This section lists the incompatible changes from 0.2.x.
 
 ### Model settings resolve by named layer
 
