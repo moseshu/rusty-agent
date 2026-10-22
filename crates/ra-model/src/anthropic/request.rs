@@ -81,6 +81,11 @@ pub(crate) async fn build_request_body(
 }
 
 fn reject_unsupported(request: &ModelRequest) -> Result<()> {
+    if request.tools().iter().any(ModelToolDefinition::is_hosted) {
+        return Err(Error::caller(
+            "Responses hosted tools are not supported by this model protocol",
+        ));
+    }
     if !matches!(request.continuation(), ConversationContinuation::None) {
         return Err(Error::caller(
             "Anthropic Messages has no server-managed conversation state; pass the full history instead of a continuation handle",

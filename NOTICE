@@ -61,6 +61,10 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-protocol/src/server.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/main.rs; src/in_process.rs; src/message_processor.rs |
 | `crates/ra-protocol/src/server/session_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs (SessionSource, InternalSessionSource, SubAgentSource, from_startup_arg); codex-rs/app-server/src/main.rs |
 | `tests/it-protocol/tests/session_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs (session_source_from_startup_arg tests); codex-rs/app-server/src/main.rs |
+| `crates/ra-model/src/openai/responses/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/tools/src/tool_spec.rs (WebSearch); src/agents/tool.py and src/agents/models/openai_responses.py in the Agents SDK |
+| `crates/ra-coding/src/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/hosted_spec.rs; codex-rs/protocol/src/config_types.rs; codex-rs/core/src/config/mod.rs (resolve_web_search_mode_for_turn) |
+| `tests/it-model/tests/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/tools/src/tool_spec_tests.rs (web_search wire); Agents SDK tests/models/test_openai_responses_converter.py and test_openai_responses.py |
+| `tests/it-coding/tests/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/web_search.rs; codex-rs/core/src/tools/hosted_spec_tests.rs; codex-rs/core/src/config/config_tests.rs (web search mode) |
 
 The metadata/title resolution, URL display-name behavior, and bare function-tool naming
 (original names and include_server_in_tool_names prefixes) in crates/ra-mcp/src/catalog.rs,
@@ -169,3 +173,13 @@ src/agents/{run,run_config,run_state}.py, src/agents/run_internal/agent_runner_h
 src/agents/tracing/{context,traces}.py, tests/test_agent_tracing.py,
 tests/tracing/test_traces_impl.py and tests/tracing/test_trace_context.py (MIT).
 See the retained license above.
+
+The hosted tool declaration union, native WebSearchTool configuration and Responses converter
+in crates/ra-core/src/{agent,model/request,tool}.rs,
+crates/ra-model/src/openai/responses/{request,web_search}.rs,
+crates/ra-runtime/src/turn/prepare.rs, and tests/it-model/tests/{web_search,hosted_tool_items}.rs
+also adapt openai/openai-agents-python, revision
+f53c62451c7f34c15f0c87fa745e05404025420f, src/agents/{agent,tool,items}.py,
+src/agents/models/openai_responses.py, tests/models/test_openai_responses_converter.py,
+tests/models/test_openai_responses.py and tests/test_run_step_processing.py (MIT).
+See third_party/openai-agents-python.LICENSE for the retained license.

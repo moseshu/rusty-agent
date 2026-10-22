@@ -196,6 +196,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
         "ra-coding",
         &[
             "ra-core",
+            "ra-model",
             "ra-runtime",
             "ra-prompt",
             "ra-context",

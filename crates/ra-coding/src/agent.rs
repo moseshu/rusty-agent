@@ -241,11 +241,19 @@ pub(crate) async fn assemble_agent(
     });
     let capabilities = assembled.runtime_capabilities.clone();
     let capability_tools = assembled.tool_surface().tools().to_vec();
+    let hosted = assembled.tool_surface().hosted_tools().to_vec();
     let mut builder = AgentSpec::builder()
         .id(id)
         .name(name)
         .instructions(prefix.system_instructions())
         .tools(assembled.into_tool_surface().into_tools());
+    for tool in hosted {
+        builder = if let Some(config) = host.web_search().filter(|_| tool.name() == "web_search") {
+            builder.hosted_tool_resolver(tool, Arc::new(config.clone()))
+        } else {
+            builder.hosted_tool(tool)
+        };
+    }
     if let Some(runtime) = host.mcp_runtime() {
         runtime.start_background();
         builder = builder.tool_resolver(runtime.clone());
@@ -413,7 +421,8 @@ pub async fn host_backed_surface(
         host.collaboration_namespace()?.as_ref(),
     )?;
     let budget = *profile.budget();
-    let tool_surface = registry.assemble(&profile)?;
+    let tool_surface =
+        registry.assemble_with_hosted_tools(&profile, &capabilities.hosted_tools()?)?;
     let contributions = capabilities.contributions_for(&tool_surface).await?;
     Ok(HostBackedSurface {
         tool_surface,

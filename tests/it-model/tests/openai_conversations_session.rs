@@ -616,7 +616,7 @@ async fn hosted_tool_and_server_search_history_roundtrips_through_conversations(
     let fake = Fake::start().await;
     let originals = vec![
         json!({"id":"file", "type":"file_search_call", "status":"completed", "queries":["query"], "results":[]}),
-        json!({"id":"web", "type":"web_search_call", "status":"completed", "action":{"type":"search", "query":"query"}}),
+        json!({"id":"web", "type":"web_search_call", "status":"completed", "action":{"type":"search", "query":"query", "sources":[{"url":"https://example.test"}]}, "results":[{"type":"image", "url":"https://example.test/image.png", "caption":false}], "future_field":{"retained":true}}),
         json!({"id":"image", "type":"image_generation_call", "status":"completed", "result":"image-data"}),
         json!({"id":"code", "type":"code_interpreter_call", "status":"completed", "code":"print(1)", "outputs":[]}),
         json!({"id":"search", "type":"tool_search_call", "execution":"server", "arguments":{"query":"query"}, "created_by":"server"}),

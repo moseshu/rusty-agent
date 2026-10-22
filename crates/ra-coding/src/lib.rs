@@ -38,6 +38,7 @@ pub mod shell_command;
 pub(crate) mod spawned;
 pub mod thread_factory;
 pub mod thread_items;
+pub mod web_search;
 
 pub use agent::{
     HOST_BACKED_PROFILE, HostBackedSurface, InstalledCapability, StandaloneCodingAgent,

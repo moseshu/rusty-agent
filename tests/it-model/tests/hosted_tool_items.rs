@@ -21,7 +21,10 @@ use ra_core::{
     step::ProcessedResponse,
     tool::{Tool, ToolContext, ToolOrigin, ToolOutput, ToolSchema},
 };
-use ra_model::openai::{auth::OpenAiAuth, responses::OpenAiResponsesModel};
+use ra_model::openai::{
+    auth::OpenAiAuth,
+    responses::{OpenAiResponsesModel, web_search::WebSearchTool},
+};
 use ra_runtime::{
     agent::AgentBinding,
     runner::{RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner},
@@ -108,7 +111,7 @@ impl ModelResolver for Resolver {
                 ApiProtocol::OpenAiResponses,
             ),
             self.0.clone(),
-            settings(),
+            ModelSettings::new(),
             ModelSettings::new(),
         ))
     }
@@ -196,10 +199,7 @@ fn agent(reset: bool) -> Arc<AgentSpec> {
     AgentSpec::builder()
         .id(AgentId::new("worker"))
         .name("Worker")
-        .tool(Arc::new(SearchFunction {
-            origin: ToolOrigin::new("unused").unwrap(),
-            schema: ToolSchema::loose("unused", json!({"type":"object"})).unwrap(),
-        }))
+        .hosted_tool(WebSearchTool::default().to_definition().unwrap())
         .model_settings(ModelSettings::new().with_tool_choice(ToolChoice::Required))
         .reset_tool_choice(reset)
         .build()
@@ -657,4 +657,87 @@ async fn hosted_and_server_search_items_enforce_the_upstream_caller_contract() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn native_web_search_preserves_first_choice_and_replays_actions_and_image_results() {
+    for streamed in [false, true] {
+        for choice in [
+            ToolChoice::Auto,
+            ToolChoice::Required,
+            ToolChoice::Tool("web_search".into()),
+        ] {
+            for action in [
+                json!({"type":"search","query":"bridge","sources":[{"url":"https://example.test"}]}),
+                json!({"type":"open_page","url":"https://example.test"}),
+                json!({"type":"find","url":"https://example.test","pattern":"bridge"}),
+            ] {
+                let raw = json!({"id":"web-results","type":"web_search_call","status":"completed","action":action,"results":[{"type":"image","url":"https://example.test/bridge.png","caption":"A bridge","provider_extension":7}],"created_by":"server","future_field":{"retained":true}});
+                let (server, model) =
+                    model(vec![vec![raw.clone()], vec![message()]], streamed).await;
+                let agent = agent(true)
+                    .to_builder()
+                    .model_settings(ModelSettings::new().with_tool_choice(choice.clone()))
+                    .build()
+                    .unwrap();
+                assert!(agent.tools().is_empty());
+                let session = Arc::new(InMemorySession::new("native-web"));
+                let (result, _) = drive(
+                    request(agent, model.clone()).with_session(session.clone()),
+                    streamed,
+                )
+                .await;
+                assert_eq!(
+                    *model.choices.lock().unwrap(),
+                    vec![Some(choice.clone()), None]
+                );
+                assert_eq!(result.new_items().len(), 2);
+                assert_eq!(
+                    session.get_items(None).await.unwrap()[0]
+                        .raw_provider_item()
+                        .unwrap()
+                        .payload(),
+                    &raw
+                );
+                let bodies = bodies(&server).await;
+                assert_eq!(bodies[1]["input"][0], replay(&raw));
+                assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 1);
+                assert_eq!(bodies[0]["tools"][0]["type"], "web_search");
+                if matches!(choice, ToolChoice::Tool(_)) {
+                    assert_eq!(bodies[0]["tool_choice"], json!({"type":"web_search"}));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn interleaved_declaration_order_survives_handler_replacement() {
+    let (server, model) = model(vec![vec![message()]], false).await;
+    let first: Arc<dyn Tool> = Arc::new(SearchFunction {
+        origin: ToolOrigin::new("first").unwrap(),
+        schema: ToolSchema::loose("first", json!({"type":"object"})).unwrap(),
+    });
+    let last: Arc<dyn Tool> = Arc::new(SearchFunction {
+        origin: ToolOrigin::new("last").unwrap(),
+        schema: ToolSchema::loose("last", json!({"type":"object"})).unwrap(),
+    });
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("ordered"))
+        .name("Ordered")
+        .tool(first.clone())
+        .hosted_tool(WebSearchTool::default().to_definition().unwrap())
+        .tool(last.clone())
+        .build()
+        .unwrap();
+    let replaced = agent
+        .to_builder()
+        .replace_tools(vec![first, last])
+        .build()
+        .unwrap();
+    drive(request(replaced, model), false).await;
+    let bodies = bodies(&server).await;
+    assert_eq!(bodies[0]["tools"][0]["name"], "first");
+    assert_eq!(bodies[0]["tools"][1]["type"], "web_search");
+    assert_eq!(bodies[0]["tools"][2]["name"], "last");
 }

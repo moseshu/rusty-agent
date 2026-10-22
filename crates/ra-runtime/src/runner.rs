@@ -2900,7 +2900,7 @@ fn replace_preinstalled_capability_tools(
              tool objects already installed on its execution surface",
         ));
     }
-    agent.to_builder().clear_tools().tools(tools).build()
+    agent.to_builder().replace_tools(tools).build()
 }
 
 /// Settles host answers that were checkpointed with an interrupted run before another model call.

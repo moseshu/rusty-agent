@@ -7,6 +7,39 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Native Responses web search declarations
+
+Use `ra_model::openai::responses::web_search::WebSearchTool::to_definition()` with
+`AgentSpecBuilder::hosted_tool` to declare native search. The framework constructor preserves
+`search_context_size="medium"`, optional filters and location, explicit `external_web_access=false`,
+content kinds and image settings. Image search automatically includes `web_search_call.results`.
+Hosted declarations participate in the real request tool table, budgets and tool-choice
+reconciliation. A hosted-only agent retains `auto`/`required` before its first request;
+`ToolChoice::Tool("web_search".into())` produces the native built-in selector, as in the SDK.
+That selector is reserved even when an ordinary function has the same name.
+
+`AgentSpec::tools()` remains the local-handler projection for compatibility;
+`declared_tools()` exposes the ordered local/hosted union. `clear_tools()` clears both kinds,
+while `clear_hosted_tools()` removes only hosted declarations. Runtime handler replacement
+preserves interleaving. `ToolSurface::tools()`/`into_tools()` likewise project local handlers;
+use `hosted_tools()` and `model_definitions()` when inspecting the complete advertised table.
+
+Coding hosts now assemble native Responses search by default. `with_web_search(CodingWebSearch)`
+selects disabled, cached (default), live or indexed mode, configured context/domains/location and
+explicit model/endpoint capabilities. Codex's per-turn permission-profile resolution is preserved:
+unrestricted execution prefers permitted live search, and endpoints without external access fall
+back to cached search or disable it. This does not add network authorization policy.
+`with_web_access` explicitly selects the existing local `web_search`/`web_fetch` extension.
+Native assembly does not require that backend or advertise a separate `web_fetch` function.
+Each turn resolves native search against its selected protocol: coding hosts omit it for Chat
+and Anthropic. Explicit framework Responses declarations still fail on those adapters.
+Use the WebAccess extension to select local web functions for those protocols.
+The coding prompt's stable "Available tools" inventory lists only local entries, because whether
+a turn declares hosted search depends on its protocol. Its Tool Use rule now also permits any
+built-in provider tool included in the request, which changes the stable prefix hash.
+
+These changes are implemented and awaiting review. No release version has been selected.
+
 ### Hosted tool records and tool-choice resets
 
 Responses now retains file search, web search, image generation, code interpreter, and
@@ -22,12 +55,10 @@ a response containing only `mcp_call` (previously it ended with empty final outp
 Reset policy belongs to the public agent and uses its cumulative run usage, including hosted
 calls but excluding server tool search records. Set it to `false` to retain an explicit choice.
 A reset clears every resolved choice to `None`, including `auto` and `none`; layers are unchanged.
-Tool-surface reconciliation is unchanged: dynamic availability that leaves no local tools
-continues to drop `auto`/`required` before calling an adapter. This slice does not change
-cross-provider empty-tool-table behavior. As a consequence, an agent with no local tools whose
-hosted tools are declared only through `extra_body` loses `auto`/`required` before its first
-request, so the reset has nothing to release for it; that limitation is resolved when hosted
-tool declarations are ported.
+Tool-surface reconciliation preserves declared hosted entries as well as local tools. With no
+formal declarations, the existing dynamic-availability downgrade remains unchanged across
+providers. Hosted tools supplied only through legacy `extra_body` remain invisible to this
+neutral inventory; use the formal WebSearch declaration to avoid losing `auto`/`required`.
 
 The generic context estimator still counts image-generation base64 results as text. Large image
 results can therefore inflate token estimates; porting the adapter's fixed image estimate remains

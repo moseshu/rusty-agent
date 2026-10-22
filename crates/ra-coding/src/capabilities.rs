@@ -75,6 +75,8 @@ use crate::{agent::InstalledCapability, host::CodingHost};
 pub(crate) struct RoleCapabilities {
     installed: CapabilityPlan,
     withheld: Vec<Arc<dyn Capability>>,
+    native_web: Option<crate::web_search::CodingWebSearch>,
+    native_web_offered: bool,
 }
 
 pub(crate) struct SurfaceContributions {
@@ -149,7 +151,37 @@ impl RoleCapabilities {
         Ok(Self {
             installed: CapabilityPlan::resolve(installed)?,
             withheld,
+            native_web: host.web_search().cloned(),
+            native_web_offered: !role.is_one_off(),
         })
+    }
+
+    /// Native declarations selected by the role; tiers select them with the ordinary profile.
+    pub(crate) fn hosted_tools(&self) -> Result<Vec<ra_core::model::ModelToolDefinition>> {
+        match &self.native_web {
+            Some(config) if self.native_web_offered => Ok(config
+                .definition_for_turn(config.sandbox_disabled)?
+                .into_iter()
+                .collect()),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn native_withheld_keys(&self) -> BTreeSet<ToolLookupKey> {
+        let mut keys = BTreeSet::new();
+        if let Some(config) = &self.native_web {
+            if let Ok(key) = ToolLookupKey::for_call("web_fetch", None) {
+                keys.insert(key);
+            }
+            if (!self.native_web_offered
+                || config.mode_for_turn(config.sandbox_disabled)
+                    == crate::web_search::WebSearchMode::Disabled)
+                && let Ok(key) = ToolLookupKey::for_call("web_search", None)
+            {
+                keys.insert(key);
+            }
+        }
+        keys
     }
 
     /// The tools the installed set contributes, in assembly order.
@@ -170,6 +202,7 @@ impl RoleCapabilities {
             .iter()
             .flat_map(|capability| capability.tools())
             .map(|tool| tool.origin().lookup_key().clone())
+            .chain(self.native_withheld_keys())
             .collect()
     }
 
@@ -183,6 +216,7 @@ impl RoleCapabilities {
             .flat_map(|capability| capability.tools())
             .filter(|tool| tool.options().is_advertised_to_model())
             .map(|tool| tool.origin().lookup_key().clone())
+            .chain(self.native_withheld_keys())
             .collect()
     }
 
@@ -194,6 +228,10 @@ impl RoleCapabilities {
         self.withheld
             .iter()
             .map(|capability| capability.kind())
+            .chain(
+                (self.native_web.is_some() && !self.native_web_offered)
+                    .then_some(CapabilityFamily::WEB),
+            )
             .collect()
     }
 
@@ -248,6 +286,7 @@ impl RoleCapabilities {
             .tools()
             .iter()
             .map(|tool| tool.origin().lookup_key().clone())
+            .chain(self.native_withheld_keys())
             .collect();
         for capability in self.installed.capabilities() {
             let tools = capability.tools();
@@ -321,6 +360,16 @@ impl RoleCapabilities {
                 orphan.name(),
                 orphan.source()
             )));
+        }
+        if !self.hosted_tools()?.is_empty() {
+            installed.push(InstalledCapability::new(
+                CapabilityFamily::WEB,
+                surface
+                    .hosted_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_owned())
+                    .collect(),
+            ));
         }
         Ok(SurfaceContributions {
             sections: kept,

@@ -11,8 +11,26 @@
 use async_trait::async_trait;
 use std::{collections::BTreeSet, sync::Arc};
 
-use crate::{context::RunContext, error::Result, model::ModelToolDefinition};
+use crate::{
+    context::RunContext,
+    error::Result,
+    model::{ApiProtocol, ModelToolDefinition},
+};
 use serde_json::Value;
+
+/// Resolves a provider-executed declaration against the turn's context and resolved protocol.
+///
+/// Implementations may select an access mode or omit the tool. They never execute a model call.
+pub trait HostedToolResolver: Send + Sync + 'static {
+    /// Returns this turn's declaration, or no declaration when unavailable.
+    ///
+    /// `protocol` comes from the resolved model, including any per-run model override.
+    fn resolve(
+        &self,
+        context: &RunContext,
+        protocol: ApiProtocol,
+    ) -> Result<Option<ModelToolDefinition>>;
+}
 
 pub use crate::permission::ActionClass;
 

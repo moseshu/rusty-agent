@@ -39,6 +39,11 @@ pub struct ToolRegistry {
     entries: BTreeMap<ToolLookupKey, Arc<dyn Tool>>,
 }
 
+struct SelectedTools {
+    tools: Vec<Arc<dyn Tool>>,
+    hosted: Vec<ModelToolDefinition>,
+}
+
 impl ToolRegistry {
     /// Starts an empty builder.
     pub fn builder() -> ToolRegistryBuilder {
@@ -100,6 +105,25 @@ impl ToolRegistry {
     /// restated only because this is the point that can name the profile and both colliding
     /// lookup keys.
     pub fn assemble(&self, profile: &ToolProfile) -> Result<ToolSurface> {
+        self.assemble_with_hosted_tools(profile, &[])
+    }
+
+    fn select_tools(
+        &self,
+        profile: &ToolProfile,
+        hosted: &[ModelToolDefinition],
+    ) -> Result<SelectedTools> {
+        let mut selected_hosted = Vec::new();
+        for tool in hosted {
+            if !tool.is_hosted() {
+                return Err(Error::config("hosted inventory contains a local tool"));
+            }
+            if self.entries.contains_key(&tool.lookup_key()?) {
+                return Err(Error::config(
+                    "local and hosted declarations share a profile selection key; select a distinct product backend or namespace",
+                ));
+            }
+        }
         let id = profile.id();
         let tools: Vec<Arc<dyn Tool>> = match profile.selection() {
             ToolSelection::Explicit(keys) => {
@@ -112,7 +136,17 @@ impl ToolRegistry {
                 for key in keys {
                     match self.entries.get(key) {
                         Some(tool) => selected.push(Arc::clone(tool)),
-                        None => missing.push(render_lookup_key(key)),
+                        None => {
+                            if let Some(tool) = hosted.iter().find(|tool| {
+                                tool.lookup_key()
+                                    .as_ref()
+                                    .is_ok_and(|candidate| candidate == key)
+                            }) {
+                                selected_hosted.push(tool.clone());
+                            } else {
+                                missing.push(render_lookup_key(key));
+                            }
+                        }
                     }
                 }
                 if !missing.is_empty() {
@@ -125,8 +159,30 @@ impl ToolRegistry {
                 }
                 selected
             }
-            ToolSelection::AllRegistered => self.entries.values().map(Arc::clone).collect(),
+            ToolSelection::AllRegistered => {
+                selected_hosted.extend_from_slice(hosted);
+                self.entries.values().map(Arc::clone).collect()
+            }
         };
+
+        Ok(SelectedTools {
+            tools,
+            hosted: selected_hosted,
+        })
+    }
+
+    /// Selects and budgets local tools and adapter-owned hosted declarations together.
+    /// Hosted entries have selection identities, but are never registered for local dispatch.
+    pub fn assemble_with_hosted_tools(
+        &self,
+        profile: &ToolProfile,
+        hosted: &[ModelToolDefinition],
+    ) -> Result<ToolSurface> {
+        let id = profile.id();
+        let SelectedTools {
+            tools,
+            hosted: selected_hosted,
+        } = self.select_tools(profile, hosted)?;
 
         let mut names: BTreeMap<String, Vec<(&ToolLookupKey, ToolLookupKey)>> = BTreeMap::new();
         let mut advertised = Vec::new();
@@ -167,6 +223,11 @@ impl ToolRegistry {
             }
         }
 
+        for tool in &selected_hosted {
+            advertised_name_chars += tool.name().chars().count();
+            advertised.push(tool.name().to_owned());
+            definitions.push(tool.clone());
+        }
         let advertised_bytes = ModelToolDefinition::advertised_table_bytes(&definitions)?;
         let advertised_count = advertised.len();
         let budget = profile.budget();
@@ -206,6 +267,7 @@ impl ToolRegistry {
             tools,
             advertised,
             advertised_bytes,
+            selected_hosted,
         ))
     }
 }

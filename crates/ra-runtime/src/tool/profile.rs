@@ -30,6 +30,7 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use ra_core::{
     error::{Error, Result},
+    model::ModelToolDefinition,
     tool::{Tool, ToolLookupKey},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -338,7 +339,7 @@ impl ToolProfileBuilder {
     }
 }
 
-/// One agent's assembled tool surface: the executable tools plus what they cost.
+/// One agent's assembled local and hosted declarations, plus what they cost.
 ///
 /// The tools are in lookup-key order rather than the order they were registered or listed in. Two
 /// hosts that install the same tools in different orders therefore advertise byte-identical tool
@@ -349,6 +350,7 @@ pub struct ToolSurface {
     tools: Vec<Arc<dyn Tool>>,
     advertised: Vec<String>,
     advertised_bytes: usize,
+    hosted: Vec<ModelToolDefinition>,
 }
 
 impl ToolSurface {
@@ -357,12 +359,14 @@ impl ToolSurface {
         tools: Vec<Arc<dyn Tool>>,
         advertised: Vec<String>,
         advertised_bytes: usize,
+        hosted: Vec<ModelToolDefinition>,
     ) -> Self {
         Self {
             profile,
             tools,
             advertised,
             advertised_bytes,
+            hosted,
         }
     }
 
@@ -372,13 +376,30 @@ impl ToolSurface {
         &self.profile
     }
 
-    /// Every selected tool, advertised or not, in lookup-key order.
+    /// Selected local handlers, advertised or not, in lookup-key order.
     #[must_use]
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
     }
 
-    /// Takes the tools, for handing to an agent declaration.
+    /// Selected provider-executed declarations, separate from local dispatch entries.
+    #[must_use]
+    pub fn hosted_tools(&self) -> &[ModelToolDefinition] {
+        &self.hosted
+    }
+
+    /// Every advertised declaration, including hosted tools, for model requests and snapshots.
+    #[must_use]
+    pub fn model_definitions(&self) -> Vec<ModelToolDefinition> {
+        self.tools
+            .iter()
+            .filter(|tool| is_advertised(tool.as_ref()))
+            .map(|tool| tool.model_definition())
+            .chain(self.hosted.iter().cloned())
+            .collect()
+    }
+
+    /// Takes the local tools. Hosted declarations remain available through `hosted_tools`.
     #[must_use]
     pub fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         self.tools
@@ -415,16 +436,16 @@ impl ToolSurface {
         self.advertised_bytes
     }
 
-    /// How many tools the surface holds in total, advertised or not.
+    /// Number of selected local and hosted entries, advertised or not.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.tools.len() + self.hosted.len()
     }
 
     /// Whether the surface holds no tools at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools.is_empty() && self.hosted.is_empty()
     }
 }
 

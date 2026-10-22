@@ -9,7 +9,7 @@ use std::{borrow::Borrow, collections::BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::ResolvedModelSettings;
+use super::{ApiProtocol, ResolvedModelSettings};
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
@@ -206,6 +206,15 @@ pub enum ModelToolKind {
     },
     /// Searches tool definitions. Client execution is supplied by the runtime.
     ToolSearch,
+    /// An adapter-owned declaration executed by the provider, never by a local handler.
+    Hosted {
+        /// The wire protocol that understands the opaque declaration.
+        protocol: ApiProtocol,
+        /// An owned adapter payload. The kernel never interprets its fields.
+        declaration: Value,
+        /// Opaque result projections required by the adapter.
+        includes: Vec<String>,
+    },
 }
 
 impl ModelToolKind {
@@ -232,7 +241,7 @@ impl ModelToolKind {
     pub const fn custom_format(&self) -> Option<&CustomToolFormat> {
         match self {
             Self::Custom { format } => format.as_ref(),
-            Self::Function | Self::ToolSearch => None,
+            Self::Function | Self::ToolSearch | Self::Hosted { .. } => None,
         }
     }
 }
@@ -246,9 +255,9 @@ pub fn custom_tool_input_schema() -> Value {
     serde_json::json!({"type": "string"})
 }
 
-/// Model-facing projection of an executable tool.
+/// Model-facing projection of a local tool or an opaque provider-executed declaration.
 ///
-/// [`Tool`](crate::tool::Tool) and its [`ToolOptions`](crate::tool::ToolOptions) own invocation,
+/// Local [`Tool`](crate::tool::Tool) values and their [`ToolOptions`](crate::tool::ToolOptions) own invocation,
 /// approval, timeout, guards, and identity. None of those are provider request fields, so the
 /// model boundary receives only this advertiseable definition.
 ///
@@ -283,6 +292,31 @@ const fn model_tool_definition_schema_version() -> SchemaVersion {
 }
 
 impl ModelToolDefinition {
+    /// Creates an opaque, provider-executed tool declaration supplied by an adapter.
+    ///
+    /// This entry has no local arguments schema or invocation lifecycle. Provider-specific
+    /// configuration and validation belong to the adapter constructing the payload.
+    #[must_use]
+    pub fn hosted(
+        name: impl Into<String>,
+        protocol: ApiProtocol,
+        declaration: Value,
+        includes: Vec<String>,
+    ) -> Self {
+        let mut definition = Self::new(name, Value::Null);
+        definition.kind = ModelToolKind::Hosted {
+            protocol,
+            declaration,
+            includes,
+        };
+        definition
+    }
+
+    /// Whether the provider executes this declaration without a local handler.
+    #[must_use]
+    pub const fn is_hosted(&self) -> bool {
+        matches!(self.kind, ModelToolKind::Hosted { .. })
+    }
     /// Creates a model-facing tool definition.
     #[must_use]
     pub fn new(name: impl Into<String>, input_schema: Value) -> Self {
@@ -453,7 +487,7 @@ impl ModelToolDefinition {
         self.description.as_deref()
     }
 
-    /// Provider-neutral JSON input schema.
+    /// Provider-neutral JSON input schema, or null for a provider-executed declaration.
     #[must_use]
     pub const fn input_schema(&self) -> &Value {
         &self.input_schema
@@ -528,6 +562,13 @@ impl ModelToolDefinition {
         let mut namespaces = BTreeSet::new();
         let mut total = 0_usize;
         for tool in tools {
+            if let ModelToolKind::Hosted { declaration, .. } = tool.kind() {
+                let rendered = declaration.to_string();
+                total = total.checked_add(measure(&rendered)).ok_or_else(|| {
+                    Error::config("the advertised model-tool table is too large to measure")
+                })?;
+                continue;
+            }
             let mut rendered = render_advertised_definition(
                 tool.name(),
                 tool.description(),
@@ -614,7 +655,7 @@ impl ModelHandoffDefinition {
         self.description.as_deref()
     }
 
-    /// Provider-neutral JSON input schema.
+    /// Provider-neutral JSON input schema, or null for a provider-executed declaration.
     #[must_use]
     pub const fn input_schema(&self) -> &Value {
         &self.input_schema

@@ -46,6 +46,7 @@ pub struct CodingHost {
     event_sink: Arc<dyn HostEventSink>,
     exec_permission_approvals: bool,
     web: Option<Arc<dyn WebAccess>>,
+    web_search: Option<crate::web_search::CodingWebSearch>,
     skills: Option<Arc<dyn SkillCatalog>>,
     user_input: Option<Arc<dyn UserInputPort>>,
     request_user_input: bool,
@@ -104,6 +105,7 @@ impl CodingHost {
             event_sink: Arc::new(NoopHostEventSink),
             exec_permission_approvals: false,
             web: None,
+            web_search: Some(crate::web_search::CodingWebSearch::default()),
             skills: None,
             user_input: None,
             request_user_input: false,
@@ -124,11 +126,25 @@ impl CodingHost {
         }
     }
 
-    /// Installs the shared backend used by both web tools.
+    /// Explicitly selects the `WebAccess` function-tool product extension.
     #[must_use]
     pub fn with_web_access(mut self, access: Arc<dyn WebAccess>) -> Self {
         self.web = Some(access);
+        self.web_search = None;
         self
+    }
+
+    /// Selects the native Responses search configuration instead of the `WebAccess` extension.
+    #[must_use]
+    pub fn with_web_search(mut self, config: crate::web_search::CodingWebSearch) -> Self {
+        self.web_search = Some(config);
+        self
+    }
+
+    /// Native Responses search configuration, absent when the `WebAccess` extension is selected.
+    #[must_use]
+    pub const fn web_search(&self) -> Option<&crate::web_search::CodingWebSearch> {
+        self.web_search.as_ref()
     }
 
     /// Installs the catalog used by the skills listing and the skill-loading tool.
@@ -248,6 +264,9 @@ impl CodingHost {
     }
 
     pub(crate) fn web_capability(&self) -> ra_core::error::Result<Option<WebCapability>> {
+        if self.web_search.is_some() {
+            return Ok(None);
+        }
         self.web.clone().map(WebCapability::new).transpose()
     }
 

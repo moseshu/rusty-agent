@@ -65,6 +65,29 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
 /// names the upstream type it mirrors.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
+    // Agents SDK WebSearchTool, its image settings and OpenAI filter/location records. Their
+    // public fields preserve the upstream configuration surface and forward-compatible filters.
+    (
+        "crates/ra-model/src/openai/responses/web_search.rs",
+        "WebSearchTool",
+    ),
+    (
+        "crates/ra-model/src/openai/responses/web_search.rs",
+        "WebSearchToolImageSettings",
+    ),
+    (
+        "crates/ra-model/src/openai/responses/web_search.rs",
+        "WebSearchFilters",
+    ),
+    (
+        "crates/ra-model/src/openai/responses/web_search.rs",
+        "WebSearchUserLocation",
+    ),
+    // Codex ToolSpec::WebSearch fields, with the framework's optional image settings.
+    (
+        "crates/ra-model/src/openai/responses/web_search.rs",
+        "ResponsesWebSearchTool",
+    ),
     // The exact optional keyword record from `memory/session.py`,
     // `OpenAIResponsesCompactionArgs`; provider mode remains in its adapter.
     (

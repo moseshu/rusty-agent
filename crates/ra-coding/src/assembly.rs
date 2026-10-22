@@ -134,7 +134,17 @@ fn declared_surface(
         .build()?;
     Ok(DeclaredSurface {
         profile,
-        registered_keys: registry.keys().cloned().collect(),
+        registered_keys: registry
+            .keys()
+            .cloned()
+            .chain(
+                capabilities
+                    .hosted_tools()?
+                    .iter()
+                    .map(ra_core::model::ModelToolDefinition::lookup_key)
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .collect(),
     })
 }
 

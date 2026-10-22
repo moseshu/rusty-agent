@@ -10,6 +10,8 @@
 //! Separate, but not independent: the two are assembled together, because a rule about which entry
 //! to pick is addressed to an agent that has entries. The text below therefore points at the
 //! `Available tools` heading the inventory renders, and says so in the inventory's own words.
+//! Built-in provider tools are the exception it names: the stable inventory leaves them out because
+//! each turn decides from its resolved protocol whether the request declares them.
 
 use ra_core::error::Result;
 use ra_core::prompt::{
@@ -40,9 +42,9 @@ impl ToolUsePromptBuilder {
             SectionStability::Stable,
             SectionPosition::Prefix,
             "Tool Use:\n\
-             - Use only the entries listed under Available tools. Choose the entry whose \
-             documented capability and schema fit the task; do not infer or invoke an unlisted \
-             capability.\n\
+             - Use only the entries listed under Available tools and any built-in provider tool \
+             included in this request. Choose the entry whose documented capability and schema \
+             fit the task; do not infer or invoke an unlisted capability.\n\
              - Prefer an advertised specialist that returns the needed structured observation. \
              When the surface offers a command-execution entry, use it for long-tail command-line \
              work rather than searching for separate tools for individual commands or utilities.",

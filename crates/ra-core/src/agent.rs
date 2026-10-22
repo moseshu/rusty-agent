@@ -27,7 +27,7 @@ use crate::{
     guardrail::{InputGuardrail, OutputGuardrail},
     item::{CallId, RunItem, ToolCallOutput},
     lifecycle::LifecycleHook,
-    model::ModelSettings,
+    model::{ModelSettings, ModelToolDefinition},
     output::OutputSchema,
     prompt::{DynamicPromptHandler, ResolvedPrompt},
     sandbox::SandboxAgentConfig,
@@ -628,6 +628,7 @@ pub struct AgentSpec {
     model_settings: ModelSettings,
     output_schema: OutputSchema,
     tools: Vec<Arc<dyn Tool>>,
+    declared_tools: Vec<AgentTool>,
     tool_resolver: Option<Arc<dyn ToolResolver>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
@@ -645,6 +646,39 @@ pub struct AgentSpec {
 /// configuration file, a plugin, or an API request without introducing a second mutable object
 /// beside the runner's existing declaration.
 pub type AgentDefinition = AgentSpec;
+
+/// A tool declaration in its original order, like the framework's tool union.
+///
+/// Executable tools retain their shared handlers; hosted declarations carry only an owned
+/// adapter projection. They never acquire a dummy local handler or an invocation schema.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum AgentTool {
+    /// A locally executable tool.
+    Local(Arc<dyn Tool>),
+    /// A provider-executed declaration.
+    Hosted(ModelToolDefinition),
+    /// A declaration resolved for each turn, with its assembly-time projection.
+    DynamicHosted {
+        /// The declaration used for construction-time inventory and budgeting.
+        preview: ModelToolDefinition,
+        /// The application-context resolver used before each model call.
+        resolver: Arc<dyn crate::tool::HostedToolResolver>,
+    },
+}
+
+impl fmt::Debug for AgentTool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(tool) => formatter.debug_tuple("Local").field(tool.origin()).finish(),
+            Self::Hosted(tool) => formatter.debug_tuple("Hosted").field(tool).finish(),
+            Self::DynamicHosted { preview, .. } => formatter
+                .debug_tuple("DynamicHosted")
+                .field(preview)
+                .finish(),
+        }
+    }
+}
 
 impl AgentSpec {
     /// Whether tool use releases the resolved tool choice. Defaults to true.
@@ -672,6 +706,7 @@ impl AgentSpec {
             model_settings: self.model_settings.clone(),
             output_schema: self.output_schema.clone(),
             tools: self.tools.clone(),
+            declared_tools: self.declared_tools.clone(),
             tool_resolver: self.tool_resolver.clone(),
             handoffs: self.handoffs.clone(),
             tool_use_behavior: self.tool_use_behavior.clone(),
@@ -681,6 +716,12 @@ impl AgentSpec {
             lifecycle_hooks: self.lifecycle_hooks.clone(),
             sandbox: self.sandbox.clone(),
         }
+    }
+
+    /// Direct tool declarations in their original order, including hosted entries.
+    #[must_use]
+    pub fn declared_tools(&self) -> &[AgentTool] {
+        &self.declared_tools
     }
 
     /// Stable agent identity.
@@ -827,6 +868,7 @@ impl fmt::Debug for AgentSpec {
             .field("model", &self.model)
             .field("output_schema", &self.output_schema)
             .field("tools", &tools)
+            .field("declared_tools", &self.declared_tools)
             .field("has_tool_resolver", &self.tool_resolver.is_some())
             .field("handoffs", &self.handoffs)
             .field("tool_use_behavior", &self.tool_use_behavior)
@@ -871,6 +913,7 @@ pub struct AgentSpecBuilder {
     model_settings: ModelSettings,
     output_schema: OutputSchema,
     tools: Vec<Arc<dyn Tool>>,
+    declared_tools: Vec<AgentTool>,
     tool_resolver: Option<Arc<dyn ToolResolver>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
@@ -899,6 +942,7 @@ impl AgentSpecBuilder {
             model_settings: ModelSettings::new(),
             output_schema: OutputSchema::default(),
             tools: Vec::new(),
+            declared_tools: Vec::new(),
             tool_resolver: None,
             handoffs: Vec::new(),
             tool_use_behavior: ToolUseBehavior::default(),
@@ -1034,19 +1078,73 @@ impl AgentSpecBuilder {
 
     /// Adds one directly declared tool.
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.declared_tools
+            .push(AgentTool::Local(Arc::clone(&tool)));
         self.tools.push(tool);
         self
     }
 
     /// Adds directly declared tools in iteration order.
     pub fn tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        self.tools.extend(tools);
+        for tool in tools {
+            self = self.tool(tool);
+        }
         self
     }
 
-    /// Removes tools inherited through [`AgentSpec::to_builder`].
+    /// Replaces local handlers while retaining surviving declarations' positions beside hosted tools.
+    ///
+    /// Runtime capability binding uses routing identity to replace handlers without moving the
+    /// provider's tool table. Newly contributed local tools follow existing declarations.
+    pub fn replace_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        let mut remaining = tools.clone();
+        let mut declarations = Vec::new();
+        for declaration in self.declared_tools {
+            match declaration {
+                AgentTool::Local(previous) => {
+                    if let Some(index) = remaining.iter().position(|tool| {
+                        tool.origin().lookup_key() == previous.origin().lookup_key()
+                    }) {
+                        declarations.push(AgentTool::Local(remaining.remove(index)));
+                    }
+                }
+                hosted => declarations.push(hosted),
+            }
+        }
+        declarations.extend(remaining.into_iter().map(AgentTool::Local));
+        self.tools = tools;
+        self.declared_tools = declarations;
+        self
+    }
+
+    /// Adds a provider-executed tool at this position in the declaration order.
+    pub fn hosted_tool(mut self, tool: ModelToolDefinition) -> Self {
+        self.declared_tools.push(AgentTool::Hosted(tool));
+        self
+    }
+
+    /// Adds an adapter declaration whose effective options are resolved for each turn.
+    pub fn hosted_tool_resolver(
+        mut self,
+        preview: ModelToolDefinition,
+        resolver: Arc<dyn crate::tool::HostedToolResolver>,
+    ) -> Self {
+        self.declared_tools
+            .push(AgentTool::DynamicHosted { preview, resolver });
+        self
+    }
+
+    /// Removes inherited provider-executed declarations.
+    pub fn clear_hosted_tools(mut self) -> Self {
+        self.declared_tools
+            .retain(|tool| matches!(tool, AgentTool::Local(_)));
+        self
+    }
+
+    /// Removes all direct tool declarations inherited through [`AgentSpec::to_builder`].
     pub fn clear_tools(mut self) -> Self {
         self.tools.clear();
+        self.declared_tools.clear();
         self
     }
     /// Installs the resolver for external tools, preserving direct tools as a separate declaration.
@@ -1216,6 +1314,17 @@ impl AgentSpecBuilder {
             owners.push(model_key);
         }
 
+        for declaration in &self.declared_tools {
+            if let AgentTool::Hosted(tool) | AgentTool::DynamicHosted { preview: tool, .. } =
+                declaration
+                && (!tool.is_hosted() || tool.namespace().is_some() || tool.defer_loading())
+            {
+                return Err(Error::config(
+                    "a hosted declaration must be provider-executed, top-level, and eagerly advertised",
+                ));
+            }
+        }
+
         for handoff in &self.handoffs {
             handoff.validate()?;
             // Enablement can remove a colliding declaration. The runtime applies the configured
@@ -1234,6 +1343,7 @@ impl AgentSpecBuilder {
             model_settings: self.model_settings,
             output_schema: self.output_schema,
             tools: self.tools,
+            declared_tools: self.declared_tools,
             tool_resolver: self.tool_resolver,
             handoffs: self.handoffs,
             tool_use_behavior: self.tool_use_behavior,

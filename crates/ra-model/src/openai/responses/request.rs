@@ -9,8 +9,8 @@ use ra_core::{
         ModelInputItem, OutputPhase, ToolCallKind,
     },
     model::{
-        ConversationContinuation, CustomToolFormat, Effort, ModelHandoffDefinition, ModelRequest,
-        ModelToolDefinition, ToolChoice,
+        ApiProtocol, ConversationContinuation, CustomToolFormat, Effort, ModelHandoffDefinition,
+        ModelRequest, ModelToolDefinition, ModelToolKind, ToolChoice,
     },
     prompt::{CachePlan, MIN_CACHEABLE_PREFIX_TOKENS, estimate_tokens},
     tool::{ToolCaller, ToolOutput, ToolOutputBlock},
@@ -44,7 +44,10 @@ pub(crate) async fn build_request_body(
         "input".to_owned(),
         Value::Array(lower_input(request).await?),
     );
-    body.insert("include".to_owned(), required_includes(&body)?);
+    body.insert(
+        "include".to_owned(),
+        required_includes(&body, request.tools())?,
+    );
 
     if let Some(instructions) = request.system_instructions() {
         body.insert(
@@ -131,8 +134,8 @@ pub(crate) async fn build_request_body(
 ///
 /// **Called after the tool table is merged, and that ordering is load bearing.** The cached prefix
 /// is the instructions *plus the whole tool table*, and the table is only complete here: hosted
-/// tools — web search, file search, hosted MCP — have no protocol-neutral representation and arrive
-/// through `extra_body`, so no earlier layer can see them. Measuring before the merge would judge a
+/// tools include formal opaque declarations and legacy `extra_body` entries. Only this adapter
+/// sees their final merged wire form. Measuring before the merge would judge a
 /// short instruction block sitting in front of a large tool table as not worth caching, denying the
 /// discount to precisely the requests that most need it.
 ///
@@ -302,7 +305,7 @@ fn reject_unsupported_settings(request: &ModelRequest) -> Result<()> {
 /// not exist yet (see R1-3a / R1-13): deriving it from the request instead — "only ask for
 /// encrypted reasoning once reasoning is visible" — silently breaks the first turn of every
 /// reasoning model, because that turn is exactly where the replay material is first issued.
-fn required_includes(body: &Map<String, Value>) -> Result<Value> {
+fn required_includes(body: &Map<String, Value>, tools: &[ModelToolDefinition]) -> Result<Value> {
     let mut includes = BTreeSet::new();
     if let Some(existing) = body.get("include") {
         let Some(values) = existing.as_array() else {
@@ -318,6 +321,14 @@ fn required_includes(body: &Map<String, Value>) -> Result<Value> {
         }
     }
     includes.insert(ENCRYPTED_REASONING_INCLUDE.to_owned());
+    for tool in tools {
+        if let ModelToolKind::Hosted {
+            includes: required, ..
+        } = tool.kind()
+        {
+            includes.extend(required.iter().cloned());
+        }
+    }
     Ok(Value::Array(
         includes.into_iter().map(Value::String).collect(),
     ))
@@ -663,12 +674,11 @@ async fn lower_tool_output(payload: &Value) -> Result<Value> {
     Ok(Value::Array(parts))
 }
 
-/// Appends the protocol-neutral tools and handoffs to any hosted tools from `extra_body`.
+/// Appends declared local and hosted tools, then handoffs, to legacy `extra_body` entries.
 ///
-/// Hosted tools (web search, file search, hosted MCP) have no protocol-neutral representation and
-/// can only be requested through `extra_body`. Replacing the array would make the two mutually
-/// exclusive; the names are checked across both sources so a collision fails locally instead of
-/// producing an ambiguous call. Returns whether the merged array is non-empty.
+/// Hosted payloads are opaque until this adapter lowers them. Replacing the legacy array would
+/// discard other hosted capabilities that still use that escape hatch. Function names keep the
+/// existing collision checks; native built-in selectors remain distinct from function selectors.
 struct MergedTools {
     populated: bool,
     function_names: BTreeSet<String>,
@@ -716,6 +726,9 @@ fn merge_tools(
     // handoffs come after the tools, and discovery results retain their BM25 order.
     let mut namespaces = Namespaces::default();
     for tool in tools {
+        if append_hosted_tool(tool, &mut lowered)? {
+            continue;
+        }
         if tool.kind().is_tool_search() {
             lowered.push(json!({"type": "tool_search", "execution": "client",
                 "description": tool.description(), "parameters": tool.input_schema()}));
@@ -789,6 +802,27 @@ fn merge_tools(
         namespaced_names: namespaces.qualified_names,
         namespace_parts: namespaces.parts,
     })
+}
+
+fn append_hosted_tool(tool: &ModelToolDefinition, lowered: &mut Vec<Value>) -> Result<bool> {
+    let ModelToolKind::Hosted {
+        protocol,
+        declaration,
+        ..
+    } = tool.kind()
+    else {
+        return Ok(false);
+    };
+    if *protocol != ApiProtocol::OpenAiResponses {
+        return Err(Error::caller(
+            "hosted tool declaration belongs to a different protocol",
+        ));
+    }
+    if !declaration.is_object() || declaration.get("type").and_then(Value::as_str).is_none() {
+        return Err(Error::caller("invalid Responses hosted tool declaration"));
+    }
+    lowered.push(declaration.clone());
+    Ok(true)
 }
 
 fn configured_function_tool(tool: &ModelToolDefinition) -> Result<Value> {
@@ -1080,6 +1114,9 @@ fn lower_tool_choice(choice: Option<&ToolChoice>, tools: &MergedTools) -> Result
         ToolChoice::Auto => Ok(Value::String("auto".to_owned())),
         ToolChoice::Required => Ok(Value::String("required".to_owned())),
         ToolChoice::None => Ok(Value::String("none".to_owned())),
+        ToolChoice::Tool(name) if name == "web_search" || name == "web_search_preview" => {
+            Ok(json!({"type": name}))
+        }
         ToolChoice::Tool(name) if tools.namespaced_names.contains(name) => {
             Ok(json!({"type": "function", "name": name}))
         }

@@ -35,7 +35,7 @@ use crate::profile::MAX_ADVERTISED_NAME_CHARS;
 /// Raise this value whenever any model-facing name, description, strictness flag, or input schema
 /// changes. The tool-surface snapshot rejects a changed fingerprint with an unchanged revision,
 /// so a reviewer can distinguish a deliberately invalidated tool table from an accidental edit.
-pub(crate) const TOOL_SCHEMA_REVISION: u32 = 9;
+pub(crate) const TOOL_SCHEMA_REVISION: u32 = 10;
 
 /// Cached-prefix allowance for this section, in estimated tokens.
 ///
@@ -76,11 +76,23 @@ impl ToolSurfacePromptBuilder {
     ///
     /// Returns a configuration error naming both sides of the disagreement, plus the inventory
     /// failures described on [`Self::build_tool_surface_section`].
+    ///
+    /// Provider-hosted declarations take part in the check but are not returned for rendering.
+    /// They are resolved against each turn's protocol and may be omitted from a request, while
+    /// this inventory is a stable prefix fixed at assembly. Like both upstreams, the model learns
+    /// about a hosted tool from the request's tool table rather than from instruction text.
     pub(crate) fn reconcile_with_surface(
         surface: &ToolSurface,
     ) -> Result<BTreeMap<String, ContentHash>> {
         let rendered = advertised_entries(surface.tools())?;
-        let inventoried: BTreeSet<&str> = rendered.keys().map(String::as_str).collect();
+        let mut inventoried: BTreeSet<&str> = rendered.keys().map(String::as_str).collect();
+        for tool in surface.hosted_tools() {
+            if !inventoried.insert(tool.name()) {
+                return Err(Error::config(
+                    "native hosted search and a local tool claim the same coding inventory name",
+                ));
+            }
+        }
         let charged: BTreeSet<&str> = surface.advertised_names().collect();
         if inventoried == charged {
             return Ok(rendered);

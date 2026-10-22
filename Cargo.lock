@@ -2953,6 +2953,7 @@ dependencies = [
  "ra-exec",
  "ra-execpolicy",
  "ra-mcp",
+ "ra-model",
  "ra-patch",
  "ra-prompt",
  "ra-protocol",

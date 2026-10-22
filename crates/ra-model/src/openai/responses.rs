@@ -24,6 +24,7 @@ pub(crate) mod convert;
 pub(crate) mod mcp;
 pub(crate) mod request;
 pub(crate) mod stream;
+pub mod web_search;
 
 /// `OpenAI` Responses provider with a shared HTTP client and per-model instance cache.
 pub struct OpenAiResponsesProvider {

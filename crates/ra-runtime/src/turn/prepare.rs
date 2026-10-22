@@ -25,13 +25,13 @@ use std::{
 
 use futures::future::try_join_all;
 use ra_core::{
-    agent::{AgentSpec, HandoffSpec, ResolvedInstructions},
+    agent::{AgentSpec, AgentTool, HandoffSpec, ResolvedInstructions},
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result},
     item::{AgentId, ModelInputItem},
     model::{
-        Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
+        ApiProtocol, Model, ModelHandoffDefinition, ModelOutputSchema, ModelRequest, ModelResolver,
         ModelSelector, ModelSettings, ModelToolDefinition, ModelTracing,
     },
     output::OutputSchema,
@@ -482,6 +482,11 @@ impl fmt::Debug for PreparedHandoff {
     }
 }
 
+enum PreparedToolDeclaration {
+    Local { name: String, defer_loading: bool },
+    Hosted(Box<ModelToolDefinition>),
+}
+
 /// What one turn advertised, retained across the model call.
 ///
 /// The model answers with names, and settlement has to map each name back to the exact object the
@@ -491,6 +496,7 @@ impl fmt::Debug for PreparedHandoff {
 /// removes every non-winning action before this snapshot is built.
 #[non_exhaustive]
 pub struct TurnActionSurface {
+    declarations: Vec<PreparedToolDeclaration>,
     tools: Vec<Arc<dyn Tool>>,
     /// Each tool's qualified model-facing name, which collisions are judged by.
     tool_names: Vec<String>,
@@ -611,6 +617,7 @@ impl TurnActionSurface {
             .filter_map(|(handoff, retained)| retained.then_some(handoff))
             .collect();
         Ok(Self {
+            declarations: Vec::new(),
             tools,
             tool_names: retained_tool_names,
             tool_keys: retained_tool_keys,
@@ -632,12 +639,58 @@ impl TurnActionSurface {
     /// provider as an ambiguous table.
     #[must_use]
     pub fn tool_definitions(&self) -> Vec<ModelToolDefinition> {
-        self.tools
+        let mut definitions: Vec<_> = self
+            .tools
             .iter()
             .filter(|tool| tool.options().is_advertised())
             .chain(self.tool_search.iter())
             .map(|tool| tool.model_definition())
-            .collect()
+            .collect();
+        if !self
+            .declarations
+            .iter()
+            .any(|tool| matches!(tool, PreparedToolDeclaration::Hosted(_)))
+        {
+            return definitions;
+        }
+        let local_names: BTreeSet<_> = self
+            .declarations
+            .iter()
+            .filter_map(|tool| match tool {
+                PreparedToolDeclaration::Local { name, .. } => Some(name.as_str()),
+                PreparedToolDeclaration::Hosted(_) => None,
+            })
+            .collect();
+        // Resolver entries precede direct declarations; discovery follows them. Disabled local
+        // entries have no slot. Hosted entries preserve the original direct declaration order.
+        let mut ordered = Vec::new();
+        let mut index = 0;
+        while index < definitions.len() {
+            if !local_names.contains(definitions[index].qualified_name().as_str())
+                && !definitions[index].kind().is_tool_search()
+            {
+                ordered.push(definitions.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        for declaration in &self.declarations {
+            match declaration {
+                PreparedToolDeclaration::Hosted(tool) => ordered.push((**tool).clone()),
+                PreparedToolDeclaration::Local {
+                    name,
+                    defer_loading,
+                } => {
+                    if let Some(index) = definitions.iter().position(|tool| {
+                        tool.qualified_name() == *name && tool.defer_loading() == *defer_loading
+                    }) {
+                        ordered.push(definitions.remove(index));
+                    }
+                }
+            }
+        }
+        ordered.extend(definitions);
+        ordered
     }
 
     /// Handoffs this turn advertised, each bound to the agent it would transfer control to.
@@ -667,6 +720,11 @@ impl TurnActionSurface {
             .filter(|tool| tool.options().is_advertised())
             .count()
             + usize::from(self.tool_search.is_some())
+            + self
+                .declarations
+                .iter()
+                .filter(|tool| matches!(tool, PreparedToolDeclaration::Hosted(_)))
+                .count()
             + self.handoffs.len()
     }
 
@@ -751,6 +809,10 @@ impl TurnActionSurface {
             .map(|(name, _)| name)
             .map(String::as_str)
             .chain(self.handoffs.iter().map(PreparedHandoff::name))
+            .chain(self.declarations.iter().filter_map(|tool| match tool {
+                PreparedToolDeclaration::Hosted(tool) => Some(tool.name()),
+                PreparedToolDeclaration::Local { .. } => None,
+            }))
     }
 }
 
@@ -817,7 +879,7 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     let agent = request.agent.execution();
 
     // Resolve discovery and dynamic availability first. Later stages observe this exact snapshot.
-    let surface = resolve_action_surface(
+    let mut surface = resolve_action_surface(
         request.agent,
         request.run,
         request.services,
@@ -827,8 +889,8 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         ActionSurfaceMode::Normal,
     )
     .await?;
+    // Fail early when local actions alone exceed the budget; hosted declarations are added below.
     request.action_surface_budget.validate(&surface)?;
-    let tool_definitions = surface.tool_definitions();
 
     // 3. Project the public structured-output promise after handoffs. A prepared execution
     // instance may alter its tools or model, but it must not silently downgrade the output
@@ -839,13 +901,23 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         request.output_schema_override.as_ref(),
     );
 
-    // 4. Resolve the provider and model only after the advertised action surface is stable.
+    // 4. Resolve the provider and model after local availability, then project hosted declarations
+    // against the selected protocol. The complete surface is stable before settings resolution.
     request.cancel.ensure_not_cancelled()?;
     let model_name = request.model_override.as_deref().or(agent.model());
     let resolved_model = request.model_resolver.resolve_model(model_name)?;
+    resolve_hosted_declarations(
+        &mut surface,
+        agent,
+        request.run,
+        request.cancel,
+        resolved_model.selector().protocol(),
+    )?;
+    request.action_surface_budget.validate(&surface)?;
+    let tool_definitions = surface.tool_definitions();
 
     // 5. Complete provider -> model -> agent -> run settings resolution, then reconcile the result
-    // against the surface stages 1 and 2 produced. This is the stage that makes the order load
+    // against the complete action surface. This is the stage that makes the order load
     // bearing rather than merely conventional: `tool_choice` and `parallel_tool_calls` cannot be
     // settled before the turn knows which tools it will advertise.
     //
@@ -917,8 +989,8 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
         //
         // The plan is attached unconditionally, with no judgement about whether it is worth
         // acting on. That judgement needs the whole cached prefix — instructions plus the final
-        // tool table, hosted tools included — and hosted tools have no protocol-neutral form: they
-        // exist only after the adapter merges them into the wire request. Deciding here would mean
+        // tool table, including formal hosted declarations and legacy adapter entries. Only the
+        // adapter sees their final merged wire form. Deciding here would mean
         // deciding on the instructions alone, which denies caching to precisely the requests that
         // most need it.
         let cache_plan = CachePlan::for_prefix(&instructions, Some(request.run.run_id().as_str()));
@@ -999,6 +1071,55 @@ pub(crate) async fn resolve_action_surface(
     )?;
     surface.tool_search = agent.tool_search_cache.get_or_build(surface.tools())?;
     Ok(surface)
+}
+
+fn resolve_hosted_declarations(
+    surface: &mut TurnActionSurface,
+    execution: &AgentSpec,
+    context: &RunContext,
+    cancel: &CancelScope,
+    protocol: ApiProtocol,
+) -> Result<()> {
+    if execution
+        .declared_tools()
+        .iter()
+        .all(|tool| matches!(tool, AgentTool::Local(_)))
+    {
+        return Ok(());
+    }
+    for declaration in execution.declared_tools() {
+        match declaration {
+            AgentTool::DynamicHosted { preview, resolver } => {
+                cancel.ensure_not_cancelled()?;
+                if let Some(tool) = resolver.resolve(context, protocol)? {
+                    if !tool.is_hosted()
+                        || tool.name() != preview.name()
+                        || tool.namespace().is_some()
+                        || tool.defer_loading()
+                    {
+                        return Err(Error::config(
+                            "hosted resolver changed the declaration identity or returned a local, namespaced, or deferred tool",
+                        ));
+                    }
+                    surface
+                        .declarations
+                        .push(PreparedToolDeclaration::Hosted(Box::new(tool)));
+                }
+            }
+            AgentTool::Hosted(tool) => surface
+                .declarations
+                .push(PreparedToolDeclaration::Hosted(Box::new(tool.clone()))),
+            AgentTool::Local(tool) => {
+                let definition = tool.model_definition();
+                surface.declarations.push(PreparedToolDeclaration::Local {
+                    name: definition.qualified_name(),
+                    defer_loading: definition.defer_loading(),
+                });
+            }
+            _ => return Err(Error::config("unsupported agent tool declaration")),
+        }
+    }
+    Ok(())
 }
 
 async fn resolve_enabled_tools(

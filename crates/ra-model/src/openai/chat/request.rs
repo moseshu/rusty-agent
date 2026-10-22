@@ -108,6 +108,11 @@ async fn lower_messages(codec: &ChatCodec, request: &ModelRequest) -> Result<Vec
 
 /// Refuses a setting this protocol has nowhere to put.
 fn reject_unsupported_settings(codec: &ChatCodec, request: &ModelRequest) -> Result<()> {
+    if request.tools().iter().any(ModelToolDefinition::is_hosted) {
+        return Err(Error::caller(
+            "Responses hosted tools are not supported by this model protocol",
+        ));
+    }
     // The framework owns this field whenever it can send one, so a static value underneath it is
     // rejected rather than silently overridden. `extra_body` is provider *registration* data,
     // shared by every run of that provider, while a cache scope has a session lifetime; a static
