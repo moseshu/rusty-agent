@@ -808,6 +808,22 @@ impl Error {
         matches!(self.recoverability(), Recoverability::Cancelled)
     }
 
+    /// Whether this is a control signal: a cancellation, an exhausted budget, or a tripped
+    /// guardrail.
+    ///
+    /// A control signal stops or closes out the run, so a tool's failure handling must let it
+    /// reach the runner rather than turn it into an observation for the model. A retained
+    /// checkpoint does not change that: [`Self::with_run_state`] keeps the original error's
+    /// classification, and this reads through it.
+    #[must_use]
+    pub const fn is_control_signal(&self) -> bool {
+        match self {
+            Self::Run { error, .. } => error.is_control_signal(),
+            Self::Budget { .. } | Self::Guardrail { .. } => true,
+            _ => self.is_cancelled(),
+        }
+    }
+
     /// Stable machine-readable identity, shaped like `provider.rate_limit` or `tool.timeout`.
     ///
     /// Used for trace labels, eval attribution, and metric aggregation. **It is part of the

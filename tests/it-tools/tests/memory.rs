@@ -11,7 +11,7 @@ use ra_core::{
         MemoryRecordKind, MemoryRevision, MemorySearchRequest, MemoryStore, MemoryStoreError,
         memory_response_json,
     },
-    state::RunId,
+    state::{RunId, RunState},
     tool::{Tool, ToolContext, ToolOutput},
 };
 use ra_tools::memory::{MemoryLimits, MemoryListTool, MemoryReadTool, MemorySearchTool};
@@ -379,7 +379,7 @@ async fn memory_tools_preserve_control_errors_instead_of_returning_observations(
         Box::new(MemorySearchTool::new(store.clone()).unwrap()),
         Box::new(MemoryListTool::new(store).unwrap()),
     ];
-    let errors = [
+    let mut errors = vec![
         Error::budget(BudgetKind::Tokens, "token budget exhausted"),
         Error::guardrail(GuardrailStage::ToolOutput, "memory-policy", "stop"),
         Error::cancelled("user stopped the run"),
@@ -390,6 +390,13 @@ async fn memory_tools_preserve_control_errors_instead_of_returning_observations(
             },
         ),
     ];
+    // A turn-limit error leaves a run with its checkpoint attached; the signal is still a stop.
+    errors.extend([
+        Error::budget(BudgetKind::MaxTurns, "turn limit exhausted")
+            .with_run_state(RunState::start(RunId::new("nested-run"))),
+        Error::guardrail(GuardrailStage::ToolOutput, "memory-policy", "stop")
+            .with_run_state(RunState::start(RunId::new("nested-run"))),
+    ]);
     let agent = AgentSpec::builder()
         .id(AgentId::new("probe"))
         .name("Probe")

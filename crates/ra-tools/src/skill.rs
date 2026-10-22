@@ -317,7 +317,7 @@ const fn catalog_next_step(failure: &SkillCatalogError) -> &'static str {
 /// so a catalog reporting in its own vocabulary would take down a whole run over instructions the
 /// run can proceed without.
 fn failure_output(error: &Error) -> Option<ToolOutput> {
-    if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+    if error.is_control_signal() {
         return None;
     }
     if let Some(failure) = SkillToolFailure::of(error) {

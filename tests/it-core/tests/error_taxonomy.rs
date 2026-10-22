@@ -428,3 +428,18 @@ fn a_run_checkpoint_preserves_error_classification_and_source() {
     assert!(error.is_cancelled());
     assert_eq!(error.code(), "cancelled");
 }
+
+#[test]
+fn control_signals_are_recognized_through_a_retained_checkpoint() {
+    use ra_core::state::{RunId, RunState};
+    for error in all_errors() {
+        let expected = error.is_cancelled()
+            || matches!(error.code().split('.').next(), Some("budget" | "guardrail"));
+        assert_eq!(error.is_control_signal(), expected, "{}", error.code());
+        let code = error.code();
+        let wrapped = error.with_run_state(RunState::start(RunId::new("checkpointed")));
+        assert_eq!(wrapped.is_control_signal(), expected, "wrapped {code}");
+        let rewrapped = wrapped.with_run_state(RunState::start(RunId::new("outer")));
+        assert_eq!(rewrapped.is_control_signal(), expected, "rewrapped {code}");
+    }
+}

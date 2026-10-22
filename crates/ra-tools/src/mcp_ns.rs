@@ -441,7 +441,7 @@ fn options() -> ToolOptions {
 /// returned verbatim, while lookup and remote failures carry the `{method} failed:` prefix.
 /// Messages come from the framework error's model-safe text, never its host-facing display.
 fn failure(tool: &str, method: &str, error: &Error) -> Option<ToolOutput> {
-    if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+    if error.is_control_signal() {
         return None;
     }
     let message = match error {

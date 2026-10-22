@@ -446,7 +446,7 @@ impl Tool for UpdatePlanTool {
     ) -> Result<Option<ToolOutput>> {
         // Control signals must reach the runner rather than becoming an observation: they stop or
         // close out work instead of describing a plan that was not recorded.
-        if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+        if error.is_control_signal() {
             return Ok(None);
         }
         Ok(PlanFailure::of(error).map(|failure| {

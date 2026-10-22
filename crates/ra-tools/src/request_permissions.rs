@@ -182,7 +182,7 @@ impl Tool for RequestPermissionsTool {
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
         // Control signals stop or close out the run rather than becoming an observation.
-        if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+        if error.is_control_signal() {
             return Ok(None);
         }
         Ok(std::error::Error::source(error)

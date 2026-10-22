@@ -324,7 +324,7 @@ const fn store_next_step(failure: &MemoryStoreError) -> &'static str {
 fn failure_output(error: &Error) -> Option<ToolOutput> {
     // Control signals must reach the runner, even when they carry a store-specific cause.
     // They stop or close out work rather than describe an optional lookup that failed.
-    if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+    if error.is_control_signal() {
         return None;
     }
     if let Some(failure) = MemoryToolFailure::of(error) {

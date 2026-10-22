@@ -251,7 +251,7 @@ const fn access_next_step(failure: &WebAccessError) -> &'static str {
 /// developer-facing string this crate did not write and cannot vouch for, and it may name a proxy,
 /// a credential, or an internal host.
 fn failure_output(error: &Error) -> Option<ToolOutput> {
-    if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+    if error.is_control_signal() {
         return None;
     }
     if let Some(failure) = WebToolFailure::of(error) {

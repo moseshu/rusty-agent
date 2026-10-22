@@ -446,7 +446,7 @@ impl Tool for ViewImageTool {
     ) -> Result<Option<ToolOutput>> {
         // Control signals must reach the runner rather than becoming an observation: they stop or
         // close out work instead of describing an attachment that did not happen.
-        if error.is_cancelled() || matches!(error, Error::Budget { .. } | Error::Guardrail { .. }) {
+        if error.is_control_signal() {
             return Ok(None);
         }
         Ok(ViewImageFailure::of(error).map(|failure| {
