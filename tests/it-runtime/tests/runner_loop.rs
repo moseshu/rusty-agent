@@ -4472,29 +4472,27 @@ async fn forced_tool_choice_resets_after_the_model_uses_a_tool() {
 }
 
 #[tokio::test]
-async fn a_host_that_disabled_tool_calls_keeps_them_disabled() {
-    // The model called a tool it was told not to call. Treating that as consent to lift the
-    // restriction would let the model's own misbehaviour rewrite the host's setting for the rest
-    // of the run, which is the opposite of what a forced-choice release is for.
+async fn a_choice_of_none_is_reset_after_recorded_tool_use() {
+    // The reference clears every resolved choice after tool use when reset_tool_choice is true.
+    // A literal "none" is reset too.
     let tool = Arc::new(ScriptedTool::new("write_file"));
     let model = ScriptedModel::new(vec![
         ModelResponse::new(vec![tool_call("c-1", "call-1", "write_file")]),
         ModelResponse::new(vec![message("msg-1", "done")]),
     ]);
     let cancel = CancelScope::root();
+    let settings = ModelSettings::new().with_tool_choice(ToolChoice::None);
 
     Runner::run(
-        request(vec![tool], &model, &cancel).with_config(
-            RunConfig::new()
-                .with_model_settings(ModelSettings::new().with_tool_choice(ToolChoice::None)),
-        ),
+        request(vec![tool], &model, &cancel)
+            .with_config(RunConfig::new().with_model_settings(settings)),
     )
     .await
     .unwrap();
 
     assert_eq!(
         model.tool_choices.lock().unwrap().clone(),
-        [Some(ToolChoice::None), Some(ToolChoice::None)]
+        [Some(ToolChoice::None), None]
     );
 }
 
