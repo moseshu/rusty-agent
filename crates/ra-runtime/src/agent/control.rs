@@ -683,6 +683,7 @@ impl PausedAgentRun {
 pub struct AgentHandle {
     tree: Weak<Tree>,
     node: Arc<AgentNode>,
+    pending_input: Option<crate::runner::PendingInput>,
 }
 
 impl AgentHandle {
@@ -690,7 +691,17 @@ impl AgentHandle {
         Self {
             tree: Arc::downgrade(tree),
             node,
+            pending_input: None,
         }
+    }
+
+    /// Binds the active run's existing input queue without changing the tree-owned handle.
+    pub(crate) fn with_pending_input(
+        mut self,
+        pending: Option<crate::runner::PendingInput>,
+    ) -> Self {
+        self.pending_input = pending;
+        self
     }
 
     /// The agent this handle acts for.
@@ -1046,7 +1057,10 @@ impl AgentControlPort for AgentHandle {
     }
 
     async fn wait_for_mailbox(&self, timeout: Duration) -> WaitOutcome {
-        self.node.mailbox.wait(timeout).await
+        self.node
+            .mailbox
+            .wait(timeout, self.pending_input.as_ref())
+            .await
     }
 
     fn agent_session_id(&self, path: &AgentPath) -> Option<SessionId> {
@@ -2032,15 +2046,38 @@ impl Mailbox {
             .any(|mail| mail.communication.trigger_turn())
     }
 
-    async fn wait(&self, timeout: Duration) -> WaitOutcome {
-        // Subscribed before the queue is read, so a delivery between the two is not missed.
+    async fn wait(
+        &self,
+        timeout: Duration,
+        pending: Option<&crate::runner::PendingInput>,
+    ) -> WaitOutcome {
+        // Subscribe to both existing queues before inspecting them, so no arrival is lost.
         let mut activity = self.activity.subscribe();
+        let mut steering = pending.map(crate::runner::PendingInput::subscribe_activity);
+        // Codex reports pending turn input before pending mailbox input.
+        if pending.is_some_and(|input| !input.is_empty()) {
+            return WaitOutcome::Steered;
+        }
         if self.has_pending() {
             return WaitOutcome::MailboxActivity;
         }
-        match tokio::time::timeout(timeout, activity.changed()).await {
-            Ok(Ok(())) => WaitOutcome::MailboxActivity,
-            Ok(Err(_)) | Err(_) => WaitOutcome::TimedOut,
+        let wait = async {
+            if let Some(steering) = steering.as_mut() {
+                tokio::select! {
+                    biased;
+                    result = steering.changed() => if result.is_ok() { WaitOutcome::Steered } else { WaitOutcome::TimedOut },
+                    result = activity.changed() => if result.is_ok() { WaitOutcome::MailboxActivity } else { WaitOutcome::TimedOut },
+                }
+            } else {
+                match activity.changed().await {
+                    Ok(()) => WaitOutcome::MailboxActivity,
+                    Err(_) => WaitOutcome::TimedOut,
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(outcome) => outcome,
+            Err(_) => WaitOutcome::TimedOut,
         }
     }
 }

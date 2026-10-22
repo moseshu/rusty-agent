@@ -623,13 +623,11 @@ impl TodoCapability {
 /// Cached-prefix allowance for the plan fragment, in estimated tokens.
 const TODO_TOKEN_BUDGET: usize = 96;
 
-/// What the board is and what one call to it does, which the schema states once and the model has
-/// to believe every turn.
+/// Product prompt describing the plan board and complete replacement on each update.
 ///
-/// The replacement rule is here as well as in the schema because it is the one that is expensive to
-/// get wrong: an agent that believes a call *appends* will send one new step and silently discard
-/// the rest of its plan. Nothing about that failure is visible in the result, which reports a plan
-/// of one step exactly as if that were what was meant.
+/// This is the only prompt text that states the replacement rule. An agent that believes a call
+/// appends will send one new step and silently discard the rest of its plan. The tool only
+/// acknowledges the update, so its result cannot reveal the accidental loss.
 ///
 /// It says nothing about *when* to plan, or how large a task has to be to deserve one. That is a
 /// product's policy — Codex tells its agents to skip the board on simple work — and it lives in the

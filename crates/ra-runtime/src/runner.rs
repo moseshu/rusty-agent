@@ -1961,7 +1961,9 @@ async fn run_loop_inner(
         state.set_max_turns(config.max_turns());
     }
     let services = match &agent_handle {
-        Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
+        Some(handle) => services.with_agent_control(Arc::new(
+            handle.clone().with_pending_input(pending_input.clone()),
+        )),
         None => services,
     };
     // Codex drains pending input before the first model call only when the turn brought none of

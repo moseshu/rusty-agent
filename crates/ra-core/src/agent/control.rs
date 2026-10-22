@@ -664,6 +664,8 @@ impl InterAgentMessageKind {
 pub enum WaitOutcome {
     /// The caller's mailbox has something for it.
     MailboxActivity,
+    /// New user input was steered into the caller's active run.
+    Steered,
     /// Nothing arrived before the timeout.
     TimedOut,
 }
@@ -730,8 +732,8 @@ pub trait AgentControlPort: Send + Sync {
     /// Agents in the tree, the root first, optionally only those at or below `path_prefix`.
     async fn list(&self, path_prefix: Option<&str>) -> Result<Vec<LiveAgent>, AgentControlError>;
 
-    /// Waits until the caller's mailbox has something, or `timeout` elapses. Returns at once when
-    /// mail is already pending. The mail itself reaches the caller's model at its next model call.
+    /// Waits for mail, new input steered into the active run, or the timeout. Returns at once when
+    /// input is already pending. Waiting leaves the input for the caller's next model call.
     async fn wait_for_mailbox(&self, timeout: Duration) -> WaitOutcome;
 
     /// Whether an agent the caller spawned would be deeper than the tree allows.

@@ -52,6 +52,9 @@ use ra_runtime::{
 use serde_json::{Value, json};
 use tokio::{sync::Notify, time::timeout};
 
+#[path = "agent_thread/wait_input.rs"]
+mod wait_input;
+
 /// How long a case waits for any one event.
 const PATIENCE: Duration = Duration::from_secs(10);
 

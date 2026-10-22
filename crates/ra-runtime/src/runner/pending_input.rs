@@ -15,14 +15,25 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ra_core::item::Message;
+use tokio::sync::watch;
 
 /// Input waiting to be delivered into a running run.
 ///
 /// Cloning shares the queue: the host keeps one handle to push through, and the run is given
 /// another with [`RunRequest::with_pending_input`](super::RunRequest::with_pending_input).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PendingInput {
     state: Arc<Mutex<PendingInputState>>,
+    activity: watch::Sender<u64>,
+}
+
+impl Default for PendingInput {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(PendingInputState::default())),
+            activity: watch::Sender::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -49,8 +60,17 @@ impl PendingInput {
         if state.closed {
             return Err(messages);
         }
-        state.messages.extend(messages);
+        if !messages.is_empty() {
+            state.messages.extend(messages);
+            self.activity
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
         Ok(())
+    }
+
+    /// Subscribes before inspecting pending input, as Codex's input queue does.
+    pub(crate) fn subscribe_activity(&self) -> watch::Receiver<u64> {
+        self.activity.subscribe()
     }
 
     /// Whether nothing is pending.

@@ -4,6 +4,8 @@ use std::{path::PathBuf, sync::Arc};
 
 #[path = "../../support/configured_coding_host.rs"]
 mod configured_host;
+#[path = "tool_schema_dump/discovery.rs"]
+mod discovery;
 
 use ra_coding::{CodingHost, CodingProfile};
 use ra_core::{
@@ -113,6 +115,11 @@ async fn tool_definitions(
             .into_iter()
             .map(|tool| tool.model_definition()),
     );
+    // Native client discovery is Responses-only. Exercise the conditional runtime surface in
+    // that provider's wire snapshot; the other providers' refusal is covered in it-model.
+    if matches!(collaboration, Collaboration::Namespaced) {
+        definitions.push(discovery::definition().await);
+    }
     definitions
 }
 
@@ -229,7 +236,8 @@ async fn render_snapshot() -> String {
 /// The profile's provider-neutral budget deliberately excludes envelopes because they differ by
 /// endpoint. This complementary check keeps that abstraction honest: a provider serializer cannot
 /// grow the configured product's wire table past the product ceiling unnoticed. Every static
-/// standard tool and all three MCP resource schemas are measured on each provider path.
+/// standard tool and all three MCP resource schemas are measured on each provider path. The
+/// Responses table also includes the runtime-generated native discovery schema.
 #[tokio::test]
 async fn test_current_provider_tool_tables_fit_the_coding_byte_budget() {
     let workspace = tempfile::tempdir().expect("workspace");

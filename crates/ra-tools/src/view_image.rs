@@ -11,11 +11,9 @@
 //! a rendering that has to be compared against what it was supposed to be. Codex advertises both for
 //! that reason, and it is the cheapest way to make "show me" expressible at all.
 //!
-//! The second is what each does with a path that is not an image. `read_file` reads it as text,
-//! which is correct for a read and useless for a look: a model that asked to see `chart.svg` and
-//! received markup has to work out from the result that its request was reinterpreted. This entry
-//! refuses instead, and names what it found, so the next call is either the right path or
-//! `read_file`.
+//! The second is what each does with invalid image data. This tool decodes the bytes as Codex's
+//! `core/src/tools/handlers/view_image.rs` does before returning an image block. Invalid data becomes
+//! the same model-visible error rather than a malformed image in the next provider request.
 //!
 //! # What it does not do
 //!
@@ -42,7 +40,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt as _;
 
-use crate::rooted::{Media, RootedRefusal, relative_in_root};
+use crate::rooted::{RootedRefusal, relative_in_root};
+
+const INVALID_IMAGE: &str = "unable to process image: invalid or unsupported image data";
 
 /// The advertised name. Identity and schema must agree on it or [`Tool::validate`] refuses.
 const TOOL_NAME: &str = "view_image";
@@ -51,12 +51,11 @@ const TOOL_NAME: &str = "view_image";
 /// front.
 const INITIAL_READ_BUFFER_CAPACITY: usize = 64 * 1024;
 
-// The doc comment below is the model-facing description. One sentence, because the entry does one
-// thing and the interesting half — what happens to a path that is not an image — is a failure the
-// model reads when it happens rather than a rule it carries every turn.
+// The model-facing description is copied verbatim from Codex. Keep it on one doc-comment line:
+// multiple lines are joined with newline characters and would change the upstream text.
 #[derive(Debug, Deserialize, JsonSchema, ToolInput)]
 #[serde(deny_unknown_fields)]
-/// Attaches a workspace image so it can be looked at. PNG, JPEG, GIF, WebP, and BMP.
+/// View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.
 struct ViewImageInput {
     /// Image to look at. A relative path resolves against the workspace root.
     path: String,
@@ -181,18 +180,6 @@ impl ViewImageTool {
                 }
             })?;
 
-        // Classified before the file is opened, so a request for a text file costs a match on an
-        // extension rather than a read of whatever size the file happens to be.
-        // A PDF is refused with the same sentence as a text file, and the next step is the same
-        // one: `read_file` is the entry that returns it. Splitting the refusal would tell the model
-        // which of two entries it wants twice over.
-        let media_type = match Media::of(&relative) {
-            Media::Image(media_type) => media_type,
-            Media::Pdf | Media::Text => {
-                return Err(ViewImageFailure::NotAnImage(input.path.clone()));
-            }
-        };
-
         let mut file = self.open(&input.path, relative).await?;
         let metadata = file
             .metadata()
@@ -204,9 +191,15 @@ impl ViewImageTool {
         let bytes = self
             .read_whole(&input.path, &mut file, metadata.len())
             .await?;
-        if bytes.is_empty() {
-            return Err(ViewImageFailure::Empty(input.path.clone()));
-        }
+        // Decode before attaching, retaining the original bytes rather than re-encoding them.
+        // Unlike Codex's data URL wrapper, ImageBlock also needs the actual media type.
+        let (bytes, media_type) = tokio::task::spawn_blocking(move || {
+            image::load_from_memory(&bytes).map_err(|_| ViewImageFailure::InvalidImage)?;
+            let format = image::guess_format(&bytes).map_err(|_| ViewImageFailure::InvalidImage)?;
+            Ok::<_, ViewImageFailure>((bytes, format.to_mime_type()))
+        })
+        .await
+        .map_err(|_| ViewImageFailure::InvalidImage)??;
 
         Ok(ToolOutput::block(ToolOutputBlock::Image(ImageBlock::new(
             ImageSource::base64(media_type, BASE64.encode(bytes)),
@@ -301,10 +294,8 @@ enum ViewImageFailure {
     AmbiguousParent(String),
     /// It exists and could not be opened.
     Unreadable(String, std::io::ErrorKind),
-    /// It is a file and it is not an image this entry can attach.
-    NotAnImage(String),
-    /// It is an image file of zero length, which no provider will accept as a block.
-    Empty(String),
+    /// Codex's model-correctable invalid or unsupported image data error.
+    InvalidImage,
     /// Larger than the ceiling.
     TooLarge {
         path: String,
@@ -330,8 +321,7 @@ impl ViewImageFailure {
             | Self::NotAFile(_)
             | Self::OutsideRoot(_)
             | Self::AmbiguousParent(_)
-            | Self::NotAnImage(_)
-            | Self::Empty(_) => ToolErrorKind::InvalidInput,
+            | Self::InvalidImage => ToolErrorKind::InvalidInput,
             Self::Unreadable(..) | Self::TooLarge { .. } => ToolErrorKind::ExecutionFailed,
         }
     }
@@ -344,10 +334,10 @@ impl ViewImageFailure {
         std::error::Error::source(error).and_then(<dyn std::error::Error + 'static>::downcast_ref)
     }
 
-    /// The next step that follows the diagnosis, kept out of [`fmt::Display`] so a log line gets the
-    /// fact without an instruction addressed to a model.
-    const fn next_step(&self) -> &'static str {
-        match self {
+    /// An optional next step, kept out of [`fmt::Display`] so a log line gets the fact without an
+    /// instruction addressed to a model. Invalid images retain Codex's plain error response.
+    const fn next_step(&self) -> Option<&'static str> {
+        Some(match self {
             Self::BadArguments(_) => "Send `path` and nothing else.",
             Self::NotFound(_) | Self::OutsideRoot(_) => {
                 "Check the path, or search for the file before opening it."
@@ -355,10 +345,9 @@ impl ViewImageFailure {
             Self::AmbiguousParent(_) => "Send the path without `..`.",
             Self::NotAFile(_) => "Name a file rather than a directory.",
             Self::Unreadable(..) => "Look at something else, or ask the user to grant access.",
-            Self::NotAnImage(_) => "Read it with `read_file` instead.",
-            Self::Empty(_) => "The file holds no image; check that it was written completely.",
+            Self::InvalidImage => return None,
             Self::TooLarge { .. } => "Look at a smaller image.",
-        }
+        })
     }
 }
 
@@ -378,12 +367,7 @@ impl fmt::Display for ViewImageFailure {
                 )
             }
             Self::Unreadable(path, kind) => write!(formatter, "`{path}` cannot be read: {kind}."),
-            Self::NotAnImage(path) => write!(
-                formatter,
-                "`{path}` is not an image this entry can attach; it takes PNG, JPEG, GIF, WebP, \
-                 and BMP."
-            ),
-            Self::Empty(path) => write!(formatter, "`{path}` is empty (0 bytes)."),
+            Self::InvalidImage => formatter.write_str(INVALID_IMAGE),
             Self::TooLarge {
                 path,
                 bytes,
@@ -450,8 +434,13 @@ impl Tool for ViewImageTool {
             return Ok(None);
         }
         Ok(ViewImageFailure::of(error).map(|failure| {
-            ToolOutput::text(failure.to_string())
-                .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step()))
+            let output = ToolOutput::text(failure.to_string());
+            match failure.next_step() {
+                Some(guidance) => {
+                    output.with_metadata(ObservationMetadata::new().with_guidance(guidance))
+                }
+                None => output,
+            }
         }))
     }
 }

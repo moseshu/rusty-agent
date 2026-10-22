@@ -875,8 +875,8 @@ async fn spawn_and_message_refusals_use_codex_wording() {
             "agent_name must use only lowercase letters, digits, and underscores".to_owned(),
             "Empty message can't be sent to an agent".to_owned(),
             "collab spawn failed: unknown agent_type `nobody`".to_owned(),
-            "fork_turns must be `none`, `all`, or a positive integer string".to_owned(),
-            "fork_turns must be `none`, `all`, or a positive integer string".to_owned(),
+            "fork_turns must be `none` or `all`".to_owned(),
+            "fork_turns must be `none` or `all`".to_owned(),
             "Follow-up tasks can't target the root agent".to_owned(),
             "live agent path `/root/ghost` not found".to_owned(),
             "root is not a spawned agent".to_owned(),
@@ -1291,7 +1291,7 @@ fn spawn_with_fork(id: &str, task_name: &str, fork_turns: Option<&str>) -> RunIt
 }
 
 #[tokio::test]
-async fn fork_turns_selects_how_much_of_the_conversation_a_child_inherits() {
+async fn fork_turns_legacy_counts_inherit_full_history_like_all() {
     let scripts = Arc::new(Scripts::default());
     let control = AgentControl::new();
     let mut tools = collaboration();
@@ -1329,7 +1329,7 @@ async fn fork_turns_selects_how_much_of_the_conversation_a_child_inherits() {
         "lead",
         Step::Respond(ModelResponse::new(vec![
             spawn_with_fork("l-2a", "none_fork", Some("none")),
-            spawn_with_fork("l-2b", "last_turn", Some("1")),
+            spawn_with_fork("l-2b", "legacy_count", Some("1")),
             spawn_with_fork("l-2c", "everything", None),
         ])),
     );
@@ -1359,7 +1359,7 @@ async fn fork_turns_selects_how_much_of_the_conversation_a_child_inherits() {
     .with_config(RunConfig::new().with_agent_registry(registry))
     .with_agent_control(control.root());
     Runner::run(request).await.unwrap();
-    for name in ["none_fork", "last_turn", "everything"] {
+    for name in ["none_fork", "legacy_count", "everything"] {
         eventually_status(&control, &AgentPath::root().join(name).unwrap(), |status| {
             matches!(status, AgentStatus::Completed(_))
         })
@@ -1383,8 +1383,13 @@ async fn fork_turns_selects_how_much_of_the_conversation_a_child_inherits() {
     };
     assert_eq!(child("none_fork"), vec![task("none_fork")]);
     assert_eq!(
-        child("last_turn"),
-        vec!["second ask".to_owned(), task("last_turn")]
+        child("legacy_count"),
+        vec![
+            "first ask".to_owned(),
+            "first answer".to_owned(),
+            "second ask".to_owned(),
+            task("legacy_count")
+        ]
     );
     assert_eq!(
         child("everything"),

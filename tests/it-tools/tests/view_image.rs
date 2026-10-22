@@ -13,12 +13,8 @@ use ra_tools::view_image::{ViewImageLimits, ViewImageTool};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-/// Four bytes that are not a PNG and do not need to be.
-///
-/// The entry classifies by extension and never decodes, deliberately: sniffing content would let a
-/// `.rs` file that happens to start with a magic number come back as an image. So a fixture only
-/// has to be non-empty, and a test that produced a real PNG would be testing an encoder.
-const IMAGE_BYTES: &[u8] = b"\x89PNG";
+/// A complete, decodable one-pixel PNG.
+const IMAGE_BYTES: &[u8] = include_bytes!("fixtures/view_image/pixel.png");
 
 fn workspace_with(name: &str, contents: impl AsRef<[u8]>) -> TempDir {
     let directory = tempfile::tempdir().expect("a temporary workspace");
@@ -90,9 +86,9 @@ async fn test_the_image_entry_advertises_a_strict_schema_and_shares_the_workspac
     assert_eq!(tool.options().resource_claims().len(), 1);
 }
 
-/// A workspace image comes back as one inline image block with the type its extension names.
+/// A workspace image comes back as one inline image block with its decoded media type.
 #[tokio::test]
-async fn test_an_image_is_attached_with_the_media_type_its_extension_names() {
+async fn test_an_image_is_attached_with_its_decoded_media_type() {
     let directory = workspace_with("diagram.png", IMAGE_BYTES);
     let output = observe(&tool(&directory), &json!({ "path": "diagram.png" })).await;
 
@@ -126,31 +122,57 @@ async fn test_an_absolute_path_inside_the_workspace_is_accepted() {
     let absolute = tool.root().join("diagram.jpg");
     let output = observe(&tool, &json!({ "path": absolute.to_string_lossy() })).await;
 
-    assert_eq!(attached(&output).0, "image/jpeg");
+    assert_eq!(attached(&output).0, "image/png");
 }
 
-/// A file that is not an image is refused, and the refusal names the entry that would read it.
-///
-/// This is the whole reason the entry exists beside `read_file`, which would have returned the
-/// markup as text and left the model to work out that its request had been reinterpreted.
+/// Codex rejects invalid image data before returning an image block.
 #[tokio::test]
-async fn test_a_file_that_is_not_an_image_is_refused_and_names_the_reading_entry() {
-    let directory = workspace_with("chart.svg", "<svg></svg>");
-    let output = observe(&tool(&directory), &json!({ "path": "chart.svg" })).await;
+async fn invalid_or_unsupported_data_never_reaches_an_image_block() {
+    for (path, bytes) in [
+        ("chart.svg", b"<svg></svg>".as_slice()),
+        ("broken.png", b"\x89PNG".as_slice()),
+        ("empty.png", b"".as_slice()),
+        ("invalid-image.json", br#"{"message":"hello"}"#.as_slice()),
+    ] {
+        let directory = workspace_with(path, bytes);
+        let output = observe(&tool(&directory), &json!({"path":path})).await;
+        assert_eq!(
+            refusal(&output),
+            "unable to process image: invalid or unsupported image data"
+        );
+        assert!(output.metadata().guidance().is_empty());
+    }
+}
 
-    assert!(
-        refusal(&output).contains("not an image"),
-        "{}",
-        refusal(&output)
-    );
-    assert!(
-        output
-            .metadata()
-            .guidance()
-            .join(" ")
-            .contains("`read_file`"),
-        "{:?}",
-        output.metadata().guidance()
+/// A valid BMP is unsupported, even when its filename claims a provider-supported format.
+#[tokio::test]
+async fn valid_bmp_is_rejected_before_an_image_block_is_created() {
+    // A one-pixel, uncompressed 24-bit BMP with a complete file and bitmap header.
+    let bytes = include_bytes!("fixtures/view_image/pixel.bmp");
+    for path in ["image.bmp", "disguised.png"] {
+        let directory = workspace_with(path, bytes);
+        let output = observe(&tool(&directory), &json!({"path":path})).await;
+        assert_eq!(
+            refusal(&output),
+            "unable to process image: invalid or unsupported image data"
+        );
+        assert!(output.metadata().guidance().is_empty());
+    }
+}
+
+/// Valid image bytes do not depend on a matching filename extension.
+#[tokio::test]
+async fn image_data_is_decoded_even_without_an_image_extension() {
+    use base64::Engine as _;
+    let directory = workspace_with("image.data", IMAGE_BYTES);
+    let output = observe(&tool(&directory), &json!({"path":"image.data"})).await;
+    let (media_type, data) = attached(&output);
+    assert_eq!(media_type, "image/png");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        IMAGE_BYTES
     );
 }
 
@@ -182,7 +204,10 @@ async fn test_the_two_path_refusals_say_different_things() {
 async fn test_an_empty_or_oversized_image_is_refused() {
     let directory = workspace_with("blank.png", "");
     let empty = observe(&tool(&directory), &json!({ "path": "blank.png" })).await;
-    assert!(refusal(&empty).contains("empty"), "{}", refusal(&empty));
+    assert_eq!(
+        refusal(&empty),
+        "unable to process image: invalid or unsupported image data"
+    );
 
     let directory = workspace_with("large.png", vec![0_u8; 64]);
     let workspace = Workspace::open(directory.path()).expect("workspace opens");

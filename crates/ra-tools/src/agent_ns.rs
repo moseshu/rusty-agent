@@ -8,9 +8,10 @@
 //! collaboration is not enabled, not a failed turn.
 //!
 //! Together they are how a parent stops waiting on a stalled child: `wait_agent` returns when the
-//! parent's mailbox receives something *or* when its timeout elapses, after which the parent can
-//! redirect the child with `followup_task` or `send_message` — delivered at the child's next model
-//! call — stop its current run with `interrupt_agent`, or carry on without it.
+//! parent's mailbox receives something, new user input is steered into its active run, or its
+//! timeout elapses, after which the parent can redirect the child with `followup_task` or
+//! `send_message` — delivered at the child's next model call — stop its current run with
+//! `interrupt_agent`, or carry on without it.
 //!
 //! A successful `spawn_agent`, `send_message`, `followup_task` or `interrupt_agent` records a
 //! [`SubAgentActivityEvent`] on the caller's host timeline, keyed by the call's id, as Codex's
@@ -199,7 +200,7 @@ const FOLLOWUP_TASK_DESCRIPTION: &str = "Send a follow-up task to an existing no
 
 const INTERRUPT_AGENT_DESCRIPTION: &str = "Interrupt an agent's current turn, if any, and return its previous status. The agent remains available for messages and follow-up tasks.";
 
-const WAIT_AGENT_DESCRIPTION: &str = "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any) or a timeout summary if no activity arrives before the deadline.";
+const WAIT_AGENT_DESCRIPTION: &str = "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline.";
 
 const LIST_AGENTS_DESCRIPTION: &str =
     "List live agents in the current root thread tree. Optionally filter by task-path prefix.";
@@ -218,8 +219,7 @@ struct SpawnAgentInput {
     /// Agent type override for the new agent. Omit unless explicitly asked. The selected role
     /// applies regardless of how much parent history is inherited.
     agent_type: Option<String>,
-    /// Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive
-    /// integer string such as `3` to fork only the most recent turns.
+    /// Parent history to inherit. Defaults to `all`; use `none` to start without parent history. Only `all` and `none` are supported.
     fork_turns: Option<String>,
 }
 
@@ -235,13 +235,13 @@ impl SpawnAgentInput {
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
         }
-        if fork_turns.eq_ignore_ascii_case("all") {
+        // Codex accepts legacy positive turn counts without limiting inherited history.
+        if fork_turns.eq_ignore_ascii_case("all")
+            || fork_turns.parse::<std::num::NonZeroUsize>().is_ok()
+        {
             return Ok(Some(SpawnAgentForkMode::FullHistory));
         }
-        match fork_turns.parse::<usize>() {
-            Ok(turns) if turns > 0 => Ok(Some(SpawnAgentForkMode::LastNTurns(turns))),
-            _ => Err("fork_turns must be `none`, `all`, or a positive integer string"),
-        }
+        Err("fork_turns must be `none` or `all`")
     }
 }
 
@@ -338,20 +338,34 @@ impl CollaborationTool {
             ),
             CollaborationKind::WaitAgent => (
                 FuncSchema::for_input::<WaitAgentInput>(name)?,
-                format!(
-                    "{WAIT_AGENT_DESCRIPTION} Timeout in milliseconds defaults to {}, min {}, max {}.",
-                    wait.default, wait.min, wait.max
-                ),
+                WAIT_AGENT_DESCRIPTION.to_owned(),
             ),
             CollaborationKind::ListAgents => (
                 FuncSchema::for_input::<ListAgentsInput>(name)?,
                 LIST_AGENTS_DESCRIPTION.to_owned(),
             ),
         };
-        let schema = func_schema
-            .tool_schema()
-            .clone()
-            .with_description(description);
+        let schema = if kind == CollaborationKind::WaitAgent {
+            // Preserve Codex's native schema and configurable field description while retaining
+            // the existing typed decoder for execution.
+            ToolSchema::loose(
+                name,
+                json!({
+                    "type":"object", "properties": {
+                        "timeout_ms": {"type":"number", "description":format!(
+                            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+                            wait.default, wait.min, wait.max
+                        )}
+                    }, "additionalProperties":false
+                }),
+            )?
+            .with_description(description)
+        } else {
+            func_schema
+                .tool_schema()
+                .clone()
+                .with_description(description)
+        };
         // Observing the tree changes nothing; starting or steering an agent sets work in motion
         // that can run any of that agent's tools.
         let action_class = match kind {
@@ -584,10 +598,10 @@ impl WaitAgentResult {
         timeout_ms: i64,
     ) -> Self {
         let timed_out = outcome == WaitOutcome::TimedOut;
-        let message = if timed_out {
-            "Wait timed out."
-        } else {
-            "Wait completed."
+        let message = match outcome {
+            WaitOutcome::Steered => "Wait interrupted by new input.",
+            WaitOutcome::TimedOut => "Wait timed out.",
+            _ => "Wait completed.",
         };
         let message = match requested_timeout_ms {
             Some(requested) if requested < timeout_ms => format!(

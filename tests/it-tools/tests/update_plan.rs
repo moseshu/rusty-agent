@@ -1,4 +1,4 @@
-//! `update_plan`: the plan board, and the four shapes it refuses to record.
+//! Codex's plan schema, permissive default acceptance and argument-error contract.
 
 use ra_core::{
     agent::AgentSpec,
@@ -11,19 +11,15 @@ use ra_core::{
 use ra_tools::update_plan::{PlanLimits, UpdatePlanTool};
 use serde_json::{Value, json};
 
-/// The run a direct call is made inside. The entry reads neither the run nor host state, but a call
-/// always belongs to one, and the context is what says so.
 fn run() -> RunContext {
     let agent = AgentSpec::builder()
         .id(AgentId::new("planner"))
         .name("Planner")
         .build()
-        .expect("an agent");
+        .unwrap();
     RunContext::new(RunId::new("run-update-plan"), agent.as_ref())
 }
 
-/// Runs the call and, when it fails, the tool's own failure shaping — the path the dispatcher takes
-/// for a tool declaring `ToolFailureHandling::Custom`.
 async fn observe(tool: &UpdatePlanTool, arguments: &Value) -> ToolOutput {
     let call_id = CallId::new("call-plan");
     let run = run();
@@ -33,192 +29,119 @@ async fn observe(tool: &UpdatePlanTool, arguments: &Value) -> ToolOutput {
         Err(error) => tool
             .handle_failure(&context(), &error)
             .await
-            .expect("failure shaping must not fail")
-            .expect("update_plan shapes every failure it produces"),
+            .unwrap()
+            .unwrap(),
     }
 }
 
-fn body(output: &ToolOutput) -> &str {
-    output.as_text().expect("a single text block")
-}
-
-fn guidance(output: &ToolOutput) -> String {
-    output.metadata().guidance().join(" ")
-}
-
 fn step(text: &str, status: &str) -> Value {
-    json!({ "step": text, "status": status })
+    json!({"step":text, "status":status})
 }
 
-/// The entry advertises what it is, and its schema refuses anything it did not name.
-#[tokio::test]
-async fn test_the_plan_entry_advertises_a_strict_schema_and_a_read_only_scope() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-
-    tool.validate().expect("identity and schema must agree");
+#[test]
+fn schema_preserves_codex_optional_explanation_and_non_strictness() {
+    let tool = UpdatePlanTool::new().unwrap();
+    tool.validate().unwrap();
     assert_eq!(tool.origin().qualified_name(), "update_plan");
-    assert!(tool.schema().strict_json_schema());
-    assert_eq!(tool.schema().input_schema()["additionalProperties"], false);
-    assert_eq!(tool.schema().input_schema()["required"], json!(["plan"]));
-
-    // Read scope and parallel execution, because recording a plan reaches nothing: no workspace, no
-    // process, no network. A role that withholds everything with a side effect keeps this one.
+    assert!(!tool.schema().strict_json_schema());
+    let schema = tool.schema().input_schema();
+    assert_eq!(schema["required"], json!(["plan"]));
+    assert_eq!(
+        schema["properties"]["explanation"],
+        json!({
+            "type":"string", "description":"Optional explanation for this plan update."
+        })
+    );
+    assert_eq!(
+        schema["properties"]["plan"]["items"]["required"],
+        json!(["step", "status"])
+    );
     assert_eq!(
         tool.options().action_classes(),
         &[ActionClass::from("read")]
     );
-    assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
+    assert_eq!(tool.options().concurrency(), ToolConcurrency::Exclusive);
 }
 
-/// A recorded plan is answered with its own counts and the step being worked on.
 #[tokio::test]
-async fn test_a_recorded_plan_is_summarized_rather_than_echoed() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-
-    let output = observe(
-        &tool,
-        &json!({
-            "plan": [
-                step("read the failing test", "completed"),
-                step("fix the parser", "in_progress"),
-                step("run the suite", "pending"),
-            ]
-        }),
-    )
-    .await;
-
-    let text = body(&output);
-    assert!(text.contains("3 steps"), "{text}");
-    assert!(text.contains("1 completed"), "{text}");
-    assert!(text.contains("In progress: fix the parser"), "{text}");
-    // The plan itself is in the call's arguments, which the model can already see. Repeating it
-    // would put two copies of one list in one turn, and pay for the longer one on every request
-    // that carries the history afterwards.
-    assert!(
-        !text.contains("run the suite"),
-        "the result echoed the whole plan: {text}"
-    );
+async fn optional_explanation_is_accepted_without_extra_guidance_or_plan_echo() {
+    let tool = UpdatePlanTool::new().unwrap();
+    for explanation in [None, Some(Value::Null), Some(json!("The parser changed."))] {
+        let mut arguments = json!({"plan":[step("fix the parser", "in_progress")]});
+        if let Some(explanation) = explanation {
+            arguments["explanation"] = explanation;
+        }
+        let output = observe(&tool, &arguments).await;
+        assert_eq!(output.as_text(), Some("Plan updated"));
+        assert!(output.metadata().guidance().is_empty());
+    }
 }
 
-/// A plan with work left and nobody working is recorded, and told what is missing.
-///
-/// A refusal would be wrong here: "I have a plan and have not started" is a state a run passes
-/// through legitimately, on the turn it plans and before the turn it acts.
 #[tokio::test]
-async fn test_a_plan_with_nothing_in_progress_is_recorded_with_a_note() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-
-    let output = observe(
-        &tool,
-        &json!({ "plan": [step("read the failing test", "pending")] }),
-    )
-    .await;
-
-    assert!(body(&output).contains("1 steps"), "{}", body(&output));
-    assert!(
-        guidance(&output).contains("in_progress"),
-        "{}",
-        guidance(&output)
-    );
+async fn default_acceptance_preserves_plans_codex_does_not_reject() {
+    let tool = UpdatePlanTool::new().unwrap();
+    let oversized_steps = (0..25)
+        .map(|_| step(&"x".repeat(201), "pending"))
+        .collect::<Vec<_>>();
+    for plan in [
+        json!([]),
+        json!([step("   ", "pending")]),
+        json!([step("first", "in_progress"), step("second", "in_progress")]),
+        json!([step("waiting", "pending")]),
+        json!([step("finished", "completed")]),
+        json!(oversized_steps),
+    ] {
+        let output = observe(&tool, &json!({"plan":plan})).await;
+        assert_eq!(output.as_text(), Some("Plan updated"));
+        assert!(output.metadata().guidance().is_empty());
+    }
 }
 
-/// A finished plan is recorded without being told to start something.
 #[tokio::test]
-async fn test_a_finished_plan_is_recorded_without_a_note() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-
-    let output = observe(
-        &tool,
-        &json!({ "plan": [step("read the failing test", "completed")] }),
-    )
-    .await;
-
-    assert!(body(&output).contains("1 completed"), "{}", body(&output));
-    assert!(
-        guidance(&output).is_empty(),
-        "a completed plan was told to start something: {}",
-        guidance(&output)
-    );
+async fn malformed_arguments_return_codex_parse_error_prefix() {
+    let tool = UpdatePlanTool::new().unwrap();
+    for (arguments, reason) in [
+        (json!({"plan":[], "other":true}), "unknown field `other`"),
+        (json!({"explanation":"why"}), "missing field `plan`"),
+        (
+            json!({"plan":[step("x", "unknown")]}),
+            "unknown variant `unknown`",
+        ),
+        (json!({"plan":[], "explanation":5}), "invalid type: integer"),
+        (
+            json!({"plan":[{"step":"x", "status":"pending", "other":true}]}),
+            "unknown field `other`",
+        ),
+    ] {
+        let output = observe(&tool, &arguments).await;
+        let text = output.as_text().unwrap();
+        assert!(
+            text.starts_with("failed to parse function arguments: "),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+        assert!(output.metadata().guidance().is_empty());
+    }
 }
 
-/// Two steps in progress is refused, because the board would then describe two agents.
 #[tokio::test]
-async fn test_two_steps_in_progress_are_refused() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-
-    let output = observe(
-        &tool,
-        &json!({
-            "plan": [
-                step("fix the parser", "in_progress"),
-                step("run the suite", "in_progress"),
-            ]
-        }),
-    )
-    .await;
-
-    assert!(body(&output).contains("in_progress"), "{}", body(&output));
-    assert!(
-        guidance(&output).contains("exactly one"),
-        "{}",
-        guidance(&output)
-    );
-}
-
-/// An empty plan, a blank step, and an oversized one are each refused with their own next step.
-#[tokio::test]
-async fn test_a_plan_nobody_could_act_on_is_refused() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-
-    let empty = observe(&tool, &json!({ "plan": [] })).await;
-    assert!(body(&empty).contains("no steps"), "{}", body(&empty));
-
-    let blank = observe(&tool, &json!({ "plan": [step("   ", "pending")] })).await;
-    assert!(body(&blank).contains("Step 1"), "{}", body(&blank));
-
+async fn size_limits_are_only_enforced_when_the_host_selects_them() {
     let narrow = UpdatePlanTool::new()
-        .expect("update_plan builds")
+        .unwrap()
         .with_limits(PlanLimits::new().with_max_step_chars(8));
     let long = observe(
         &narrow,
-        &json!({ "plan": [step("a step far longer than eight", "pending")] }),
+        &json!({"plan":[step("a long plan step", "pending")]}),
     )
     .await;
-    assert!(body(&long).contains("over the limit"), "{}", body(&long));
-
+    assert!(long.as_text().unwrap().contains("over the limit of 8"));
     let crowded = UpdatePlanTool::new()
-        .expect("update_plan builds")
+        .unwrap()
         .with_limits(PlanLimits::new().with_max_steps(1));
     let many = observe(
         &crowded,
-        &json!({ "plan": [step("one", "pending"), step("two", "pending")] }),
+        &json!({"plan":[step("one", "pending"),step("two", "pending")]}),
     )
     .await;
-    assert!(body(&many).contains("2 steps"), "{}", body(&many));
-}
-
-/// Arguments the schema does not name are refused before the entry runs.
-#[tokio::test]
-async fn test_arguments_outside_the_schema_are_refused_with_the_decoder_s_words() {
-    let tool = UpdatePlanTool::new().expect("update_plan builds");
-    let arguments = json!({ "plan": [step("a step", "pending")], "explanation": "why" });
-
-    let error = tool
-        .decode_input(&arguments)
-        .expect_err("an unknown field must fail before the tool body runs");
-    let run = run();
-    let output = tool
-        .handle_failure(
-            &ToolContext::new(&run, &tool, &CallId::new("call-invalid"), &arguments),
-            &error,
-        )
-        .await
-        .expect("failure shaping must not fail")
-        .expect("update_plan shapes a decode failure");
-
-    assert!(
-        body(&output).contains("Invalid arguments"),
-        "{}",
-        body(&output)
-    );
+    assert!(many.as_text().unwrap().contains("over the limit of 1"));
 }
