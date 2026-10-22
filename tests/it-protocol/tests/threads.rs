@@ -43,7 +43,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
         ResolvedModel,
     },
-    permission::{PermissionDecision, PermissionMode, PermissionRule},
+    permission::{PermissionDecision, PermissionRule},
     session::{
         SessionId,
         rollout::{
@@ -77,7 +77,7 @@ use ra_protocol::{
 };
 use ra_runtime::{
     agent::{AgentBinding, AgentRegistry},
-    permission::PermissionEngine,
+    permission::{ActionClassPolicy, PermissionEngine},
     runner::RunConfig,
     thread::AgentThread,
 };
@@ -3207,7 +3207,7 @@ fn last_tool_output(script: &Script) -> Value {
 async fn static_approval_checks_preserve_effective_permission_decisions() {
     for (permission, runs) in [
         (
-            PermissionEngine::new(PermissionMode::BypassPermissions),
+            PermissionEngine::new().with_policy(ActionClassPolicy::new().with_auto_allow_all(true)),
             true,
         ),
         (
@@ -3223,7 +3223,10 @@ async fn static_approval_checks_preserve_effective_permission_decisions() {
             ]),
             false,
         ),
-        (PermissionEngine::new(PermissionMode::DontAsk), false),
+        (
+            PermissionEngine::new().with_policy(ActionClassPolicy::new().with_prompts(false)),
+            false,
+        ),
     ] {
         let script = Arc::new(Script::default());
         let factory = Arc::new(Factory::running(

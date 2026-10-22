@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(14);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(15);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -192,10 +192,16 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          the host supplies the group again.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(14),
         "Persisted the run's turn limit, including an explicitly unlimited run, so a resumed run \
          keeps the limit it started with. An older runtime keeps it as an unknown field and \
          resumes under whatever limit the host supplies.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the agent that owns each sticky permission rule, so an `always` answer covers \
+         only that agent's later calls. Reading an older checkpoint drops its ownerless sticky \
+         rules and asks again. An older runtime cannot read a session rule that carries an owner.",
     ),
 ];
 
@@ -1280,7 +1286,7 @@ impl TryFrom<RunStateRecord> for RunState {
             pending_interruption_resolutions,
             started_tool_continuations,
             tool_output_settlement_pending,
-            permission_rules,
+            mut permission_rules,
             input_history_is_complete,
             handoff_projection,
             pending_handoff,
@@ -1299,6 +1305,10 @@ impl TryFrom<RunStateRecord> for RunState {
             .map(sanitize_sandbox_envelope)
             .transpose()?;
 
+        if schema_version <= SchemaVersion::new(14) {
+            // Older rules cannot prove which agent owned the host answer.
+            permission_rules.retain(|rule| rule.agent_id().is_some());
+        }
         let schema_version = if schema_version <= RUN_STATE_SCHEMA_VERSION {
             RUN_STATE_SCHEMA_VERSION
         } else {
@@ -2170,7 +2180,11 @@ impl RunState {
     ///
     /// An approval raised inside a paused agent-tool run is answered on that run's own state, as
     /// the reference routes it: an `always` answer there becomes a rule of the nested run, and
-    /// never one of this run.
+    /// never one of this run. Sticky answers require agent provenance; missing ownership returns
+    /// a caller error without recording an answer. Exact answers remain available.
+    ///
+    /// Ownership uses the registry-unique `AgentId` across persistence, adapting the reference
+    /// SDK's live object identity to Rust's serializable agent registry.
     pub fn approve(&mut self, item: &RunItem, always: bool) -> Result<()> {
         let owner = self.interruption_owner(item)?;
         self.owner_mut(&owner).approve_own(item, always)
@@ -2178,7 +2192,8 @@ impl RunState {
 
     /// Rejects a pending tool approval and retains that answer for resume.
     ///
-    /// Routed to the run that raised the approval, as [`Self::approve`] is.
+    /// Routed to the run that raised the approval, as [`Self::approve`] is. Sticky answers
+    /// require agent provenance and return a caller error if it is absent.
     pub fn reject(&mut self, item: &RunItem, always: bool) -> Result<()> {
         let owner = self.interruption_owner(item)?;
         self.owner_mut(&owner).answer_interruption(
@@ -2382,7 +2397,15 @@ impl RunState {
         resolution: InterruptionResolution,
         rejection_message: Option<String>,
     ) -> Result<()> {
-        let authoritative = self.authoritative_tool_approval(item)?.clone();
+        let (authoritative_item, authoritative_approval) =
+            self.authoritative_tool_approval_item(item)?;
+        let authoritative_item = authoritative_item.clone();
+        let authoritative = authoritative_approval.clone();
+        if resolution.always() && authoritative_item.provenance().is_none() {
+            return Err(Error::caller(
+                "a sticky approval requires provenance identifying its owning agent",
+            ));
+        }
         self.set_interruption_answer(item.id(), resolution, rejection_message.clone());
         if !resolution.always() {
             // An exact answer is an exception for this call alone. The reference keeps the sticky
@@ -2393,10 +2416,12 @@ impl RunState {
         // its approval record, and settles every other call of that action still waiting here:
         // the reference's sticky value supersedes their exact entries. A rejection keeps their
         // own rejection text, an approval clears it.
-        let rule =
-            session_rule(&authoritative, resolution).with_rejection_message(rejection_message);
-        self.permission_rules
-            .retain(|existing| !targets_same_action(existing, &rule));
+        let rule = session_rule(&authoritative_item, &authoritative, resolution)
+            .map(|rule| rule.with_rejection_message(rejection_message));
+        if let Some(rule) = &rule {
+            self.permission_rules
+                .retain(|existing| !targets_same_action(existing, rule));
+        }
         let derived = match resolution {
             InterruptionResolution::Approve { .. } => {
                 InterruptionResolution::Approve { always: false }
@@ -2405,24 +2430,25 @@ impl RunState {
                 InterruptionResolution::Reject { always: false }
             }
         };
-        let same_action: Vec<ItemId> = self
-            .pending_interruptions
-            .iter()
-            .filter(|id| *id != item.id())
-            .filter(|id| {
-                self.generated_items
-                    .iter()
-                    .find(|stored| stored.id() == *id)
-                    .and_then(|stored| match stored.kind() {
-                        RunItemKind::ToolApproval(approval) => Some(approval),
-                        _ => None,
-                    })
-                    .is_some_and(|approval| {
-                        targets_same_action(&session_rule(approval, resolution), &rule)
-                    })
-            })
-            .cloned()
-            .collect();
+        let same_action: Vec<ItemId> = rule.as_ref().map_or_else(Vec::new, |rule| {
+            self.pending_interruptions
+                .iter()
+                .filter(|id| *id != item.id())
+                .filter(|id| {
+                    self.generated_items
+                        .iter()
+                        .find(|stored| stored.id() == *id)
+                        .and_then(|stored| match stored.kind() {
+                            RunItemKind::ToolApproval(approval) => {
+                                session_rule(stored, approval, resolution)
+                            }
+                            _ => None,
+                        })
+                        .is_some_and(|candidate| targets_same_action(&candidate, rule))
+                })
+                .cloned()
+                .collect()
+        });
         for id in same_action {
             let kept = match derived {
                 InterruptionResolution::Reject { .. } => self
@@ -2437,7 +2463,9 @@ impl RunState {
             };
             self.set_interruption_answer(&id, derived, kept);
         }
-        self.permission_rules.push(rule);
+        if let Some(rule) = rule {
+            self.permission_rules.push(rule);
+        }
         Ok(())
     }
 
@@ -2479,15 +2507,14 @@ impl RunState {
         if let Some(message) = answer.rejection_message.as_deref() {
             return Some(message);
         }
-        let RunItemKind::ToolApproval(approval) = self
+        let stored = self
             .generated_items
             .iter()
-            .find(|stored| stored.id() == item_id)?
-            .kind()
-        else {
+            .find(|stored| stored.id() == item_id)?;
+        let RunItemKind::ToolApproval(approval) = stored.kind() else {
             return None;
         };
-        let identity = session_rule(approval, answer.resolution);
+        let identity = session_rule(stored, approval, answer.resolution)?;
         self.permission_rules
             .iter()
             .rev()
@@ -2497,6 +2524,14 @@ impl RunState {
     }
 
     fn authoritative_tool_approval(&self, item: &RunItem) -> Result<&ToolApproval> {
+        self.authoritative_tool_approval_item(item)
+            .map(|(_, approval)| approval)
+    }
+
+    fn authoritative_tool_approval_item(
+        &self,
+        item: &RunItem,
+    ) -> Result<(&RunItem, &ToolApproval)> {
         if !self.pending_interruptions.iter().any(|id| id == item.id()) {
             return Err(Error::caller(format!(
                 "interruption `{}` is not pending",
@@ -2519,7 +2554,7 @@ impl RunState {
                 item.id()
             )));
         };
-        Ok(approval)
+        Ok((authoritative, approval))
     }
 
     /// Answers that have not yet been settled into model-visible history.
@@ -2905,19 +2940,26 @@ impl RunState {
 /// would extend it to every namespace that happens to advertise the same name. The unpinned
 /// fallback is reachable only for a rejection of a record written before routing identities were
 /// stored — [`RunState::approve`] refuses that case outright — and it errs toward denying more.
-fn session_rule(approval: &ToolApproval, resolution: InterruptionResolution) -> PermissionRule {
+fn session_rule(
+    item: &RunItem,
+    approval: &ToolApproval,
+    resolution: InterruptionResolution,
+) -> Option<PermissionRule> {
+    let agent_id = item.provenance()?.agent_id().clone();
     let decision = match resolution {
         InterruptionResolution::Approve { .. } => PermissionDecision::Allow,
         InterruptionResolution::Reject { .. } => PermissionDecision::Deny,
     };
-    let mut rule = PermissionRule::new(decision).with_tool_name(approval.tool_name());
+    let mut rule = PermissionRule::new(decision)
+        .with_tool_name(approval.tool_name())
+        .with_agent_id(agent_id);
     if let Some(namespace) = approval.namespace() {
         rule = rule.with_namespace(namespace);
     }
     if let Some(lookup_key) = approval.lookup_key() {
         rule = rule.with_lookup_key(lookup_key.clone());
     }
-    rule
+    Some(rule)
 }
 
 /// Whether two session rules speak about the same action, whatever they decide about it.
@@ -2928,6 +2970,7 @@ fn targets_same_action(rule: &PermissionRule, other: &PermissionRule) -> bool {
     rule.tool_name() == other.tool_name()
         && rule.namespace() == other.namespace()
         && rule.lookup_key() == other.lookup_key()
+        && rule.agent_id() == other.agent_id()
 }
 
 fn validate_interruption_resolutions(

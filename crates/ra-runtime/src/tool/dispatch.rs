@@ -631,9 +631,11 @@ async fn run_chain(
     let continuation_denied = continuation
         && request.nested_resume.is_none()
         && matches!(
-            request
-                .permission
-                .fixed_decision(options.permission_scope(), tool.origin()),
+            request.permission.fixed_decision(
+                options.action_classes(),
+                tool.origin(),
+                request.run.agent_id()
+            ),
             Some(PermissionDecision::Deny)
         );
     if (!continuation || continuation_denied)
@@ -931,10 +933,11 @@ async fn admit_permission(
             );
             // A deny rule left by an `always` rejection keeps the host's text, which every call it
             // refuses returns, as the reference reuses a sticky rejection message.
-            if let Some(message) = request
-                .permission
-                .rejection_message(options.permission_scope(), tool.origin())
-            {
+            if let Some(message) = request.permission.rejection_message(
+                options.action_classes(),
+                tool.origin(),
+                request.run.agent_id(),
+            ) {
                 let output = ToolCallOutput::new(
                     request.call_id.clone(),
                     serde_json::Value::String(message.to_owned()),
@@ -1024,9 +1027,10 @@ async fn resolve_permission(
     request: &ToolDispatchRequest,
 ) -> Result<PermissionDecision> {
     let origin = tool.origin();
-    if let Some(decision) = request
-        .permission
-        .fixed_decision(options.permission_scope(), origin)
+    if let Some(decision) =
+        request
+            .permission
+            .fixed_decision(options.action_classes(), origin, request.run.agent_id())
     {
         if request.approval_granted && matches!(decision, PermissionDecision::Ask) {
             return Ok(PermissionDecision::Allow);
@@ -1042,9 +1046,12 @@ async fn resolve_permission(
     } else {
         PermissionDecision::Allow
     };
-    Ok(request
-        .permission
-        .evaluate(options.permission_scope(), origin, fallback))
+    Ok(request.permission.evaluate(
+        options.action_classes(),
+        origin,
+        request.run.agent_id(),
+        fallback,
+    ))
 }
 
 /// Invokes the tool, applying its per-call time limit.

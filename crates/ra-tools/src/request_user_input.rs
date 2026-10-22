@@ -30,7 +30,6 @@ use async_trait::async_trait;
 use ra_core::{
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     tool::{
         Tool, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
@@ -230,7 +229,7 @@ impl RequestUserInputTool {
                 .with_description(request_user_input_tool_description(&available_modes)),
             options: ToolOptions::new()
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_permission_scope(PermissionScope::Read),
+                .with_action_classes([crate::action_classes::READ]),
             available_modes,
         })
     }

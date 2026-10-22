@@ -1,5 +1,7 @@
 //! Contracts for a transfer of control inside the run loop.
 
+#[path = "agent_handoff/approval_ownership.rs"]
+mod approval_ownership;
 #[path = "agent_handoff/structured_output.rs"]
 mod structured_output;
 
@@ -703,6 +705,128 @@ async fn approvals_defer_the_transfer_and_resume_it_once_without_another_source_
             1
         );
     }
+}
+
+/// A sticky approval belongs to the agent that received the approval. A handoff to another agent
+/// with a tool of the same name must still ask that agent about its own call.
+#[tokio::test]
+async fn sticky_approval_does_not_authorize_the_same_named_tool_after_handoff() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let target_calls = Arc::new(AtomicUsize::new(0));
+    let target = reviewer(Vec::new())
+        .to_builder()
+        .tool(Arc::new(ApprovalProbe {
+            origin: ra_core::tool::ToolOrigin::new("probe").unwrap(),
+            schema: ToolSchema::new(
+                "probe",
+                json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+            )
+            .unwrap(),
+            calls: Arc::clone(&target_calls),
+        }))
+        .build()
+        .unwrap();
+    let source = planner(
+        target.as_handoff().unwrap(),
+        Vec::new(),
+    )
+    .to_builder()
+    .tool(Arc::new(ApprovalProbe {
+        origin: ra_core::tool::ToolOrigin::new("probe").unwrap(),
+        schema: ToolSchema::new(
+            "probe",
+            json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+        )
+        .unwrap(),
+        calls: Arc::clone(&source_calls),
+    }))
+    .build()
+    .unwrap();
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            item(
+                "source-probe-item",
+                RunItemKind::ToolCall(ToolCall::new(
+                    CallId::new("source-probe"),
+                    "probe",
+                    json!({}),
+                )),
+            ),
+            transfer_call("transfer-call", "transfer"),
+        ]),
+        ModelResponse::new(vec![item(
+            "target-probe-item",
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new("target-probe"),
+                "probe",
+                json!({}),
+            )),
+        )]),
+        ModelResponse::new(vec![message("done", "reviewed")]),
+    ]);
+    let first = Runner::run(run_request(
+        Arc::clone(&source),
+        Arc::clone(&target),
+        &model,
+        RunConfig::new(),
+    ))
+    .await
+    .unwrap();
+    let ra_runtime::runner::RunOutcome::Interrupted { items } = first.outcome() else {
+        panic!("expected the source approval");
+    };
+    assert_eq!(items.len(), 1);
+    let mut source_state = first.state().clone();
+    source_state.approve(&items[0], true).unwrap();
+    let second = Runner::run(
+        RunRequest::new(
+            AgentBinding::direct(source),
+            Arc::new(FixedResolver {
+                model: Arc::clone(&model),
+            }),
+            RunId::new("run-handoff"),
+            CancelScope::root(),
+            Vec::new(),
+        )
+        .with_state(source_state)
+        .with_config(
+            RunConfig::new().with_agent_registry(
+                AgentRegistry::builder()
+                    .register(Arc::clone(&target))
+                    .build()
+                    .unwrap(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    let ra_runtime::runner::RunOutcome::Interrupted { items } = second.outcome() else {
+        panic!("expected the target approval");
+    };
+    assert_eq!(items.len(), 1);
+    let RunItemKind::ToolApproval(approval) = items[0].kind() else {
+        panic!("expected the target tool approval");
+    };
+    assert_eq!(approval.tool_name(), "probe");
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(target_calls.load(Ordering::SeqCst), 0);
+
+    let mut target_state = second.state().clone();
+    target_state.approve(&items[0], false).unwrap();
+    let resumed = Runner::run(
+        RunRequest::new(
+            AgentBinding::direct(target),
+            Arc::new(FixedResolver { model }),
+            RunId::new("run-handoff"),
+            CancelScope::root(),
+            Vec::new(),
+        )
+        .with_state(target_state),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.final_text(), "reviewed");
+    assert_eq!(target_calls.load(Ordering::SeqCst), 1);
 }
 
 /// A model that replays a fixed script and records what each call was handed.

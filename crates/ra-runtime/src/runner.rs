@@ -75,7 +75,7 @@ use ra_core::{
         RetryBackoff, RetryDecision, RetryPolicyContext, replay_safety_of, stamp_replay_safety,
     },
     output::{OutputSchema, OutputValue},
-    permission::{PermissionMode, PermissionRule},
+    permission::PermissionRule,
     prompt::CachePlan,
     session::{
         InterruptedTurnHistoryMarker, Session, SessionInputCallback, SessionSettings,
@@ -131,7 +131,7 @@ use crate::{
     guardrail::{InputGuardrailCheck, StageOutcome, run_output_guardrails},
     hook::{UserHookRegistration, UserHooks},
     lifecycle::{LifecycleHooks, dispatch as lifecycle_dispatch},
-    permission::PermissionEngine,
+    permission::{ActionClassPolicy, PermissionEngine},
     tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
     tool::guardrail::ToolGuardrails,
     turn::{
@@ -676,9 +676,9 @@ impl RunConfig {
         }
     }
 
-    /// Selects the base permission mode used for every tool call in this run.
-    pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
-        self.permission = self.permission.with_mode(mode);
+    /// Installs the optional action-class policy used for tool calls in this run.
+    pub fn with_permission_policy(mut self, policy: ActionClassPolicy) -> Self {
+        self.permission = self.permission.with_policy(policy);
         self
     }
 
@@ -687,7 +687,7 @@ impl RunConfig {
         mut self,
         rules: impl IntoIterator<Item = PermissionRule>,
     ) -> Self {
-        self.permission = PermissionEngine::new(self.permission.mode()).with_rules(rules);
+        self.permission = self.permission.clone().with_rules(rules);
         self
     }
 

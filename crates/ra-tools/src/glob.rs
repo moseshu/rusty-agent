@@ -5,7 +5,6 @@ use std::{fmt, path::Path, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
         ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
@@ -250,7 +249,7 @@ impl Tool for GlobTool {
 fn base_options() -> ToolOptions {
     ToolOptions::new()
         .with_failure_handling(ToolFailureHandling::Custom)
-        .with_permission_scope(PermissionScope::Read)
+        .with_action_classes([crate::action_classes::READ])
         .with_concurrency(ToolConcurrency::Parallel)
 }
 #[derive(Debug)]

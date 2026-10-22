@@ -27,3 +27,5 @@ ra-execpolicy = { path = "../../crates/ra-execpolicy" }
 ra-protocol = { path = "../../crates/ra-protocol" }
 ra-model = { path = "../../crates/ra-model", features = ["anthropic"] }
 wiremock = "0.6"
+
+ra-sandbox = { path = "../../crates/ra-sandbox" }

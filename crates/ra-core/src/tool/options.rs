@@ -9,11 +9,11 @@ use super::{ResourceClaim, ToolCaller};
 use crate::{
     compat::{SchemaVersion, Unknown},
     error::{Error, Result},
-    permission::PermissionScope,
+    permission::ActionClass,
 };
 
 /// Current tool-options schema version.
-pub const TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+pub const TOOL_OPTIONS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
 
 /// The repeat threshold a tool usually wants when it opts into the loop breaker.
 ///
@@ -125,6 +125,24 @@ pub enum ToolApprovalPolicy {
     Dynamic,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyPermissionScope {
+    Read,
+    Edit,
+    Execute,
+}
+
+impl LegacyPermissionScope {
+    fn into_action_class(self) -> ActionClass {
+        match self {
+            Self::Read => ActionClass::new("read"),
+            Self::Edit => ActionClass::new("edit"),
+            Self::Execute => ActionClass::new("execute"),
+        }
+    }
+}
+
 /// How executor-generated invocation failures become run outcomes.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -203,8 +221,8 @@ pub struct ToolOptions {
     availability: ToolAvailability,
     #[serde(default)]
     approval: ToolApprovalPolicy,
-    #[serde(default)]
-    permission_scope: PermissionScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    action_classes: Vec<ActionClass>,
     #[serde(default)]
     exposure: ToolExposure,
     #[serde(default)]
@@ -244,7 +262,9 @@ struct ToolOptionsWire {
     #[serde(default)]
     approval: ToolApprovalPolicy,
     #[serde(default)]
-    permission_scope: PermissionScope,
+    action_classes: Vec<ActionClass>,
+    #[serde(default)]
+    permission_scope: Option<LegacyPermissionScope>,
     #[serde(default)]
     exposure: ToolExposure,
     #[serde(default)]
@@ -286,16 +306,50 @@ impl<'de> Deserialize<'de> for ToolOptions {
                 "`defer_loading` was replaced by `exposure`: use \"deferred\" or \"hidden\"",
             ));
         }
+        let mut action_classes = wire.action_classes;
+        let schema_version = match wire.schema_version.get() {
+            1 => {
+                if !action_classes.is_empty() {
+                    return Err(D::Error::custom(
+                        "tool-options schema v1 cannot contain `action_classes`",
+                    ));
+                }
+                action_classes.push(
+                    wire.permission_scope
+                        .unwrap_or(LegacyPermissionScope::Execute)
+                        .into_action_class(),
+                );
+                TOOL_OPTIONS_SCHEMA_VERSION
+            }
+            2 => {
+                if wire.permission_scope.is_some() {
+                    return Err(D::Error::custom(
+                        "tool-options schema v2 cannot contain legacy `permission_scope`",
+                    ));
+                }
+                wire.schema_version
+            }
+            _ => {
+                if action_classes.is_empty()
+                    && let Some(scope) = wire.permission_scope
+                {
+                    action_classes.push(scope.into_action_class());
+                }
+                wire.schema_version
+            }
+        };
+        action_classes.sort_unstable();
+        action_classes.dedup();
         let mut allowed_callers = wire.allowed_callers;
         if let Some(callers) = &mut allowed_callers {
             callers.sort_unstable();
             callers.dedup();
         }
         let options = Self {
-            schema_version: wire.schema_version,
+            schema_version,
             availability: wire.availability,
             approval: wire.approval,
-            permission_scope: wire.permission_scope,
+            action_classes,
             exposure: wire.exposure,
             concurrency: wire.concurrency,
             resource_claims: ResourceClaim::deduplicate(wire.resource_claims),
@@ -320,7 +374,7 @@ impl Default for ToolOptions {
             schema_version: TOOL_OPTIONS_SCHEMA_VERSION,
             availability: ToolAvailability::Enabled,
             approval: ToolApprovalPolicy::Never,
-            permission_scope: PermissionScope::Execute,
+            action_classes: Vec::new(),
             exposure: ToolExposure::Advertised,
             concurrency: ToolConcurrency::Exclusive,
             resource_claims: Vec::new(),
@@ -358,14 +412,17 @@ impl ToolOptions {
         self
     }
 
-    /// Declares the action class the permission engine evaluates.
+    /// Declares the open set of action classes evaluated by an installed policy.
     ///
-    /// The default is [`PermissionScope::Execute`], the conservative class. Tools that are safe
-    /// to use in plan mode must opt into [`PermissionScope::Read`] explicitly; a newly added tool
-    /// must not become plan-safe merely because its author omitted a declaration.
+    /// The default is empty. Unclassified tools do not implicitly inherit a class.
     #[must_use]
-    pub const fn with_permission_scope(mut self, permission_scope: PermissionScope) -> Self {
-        self.permission_scope = permission_scope;
+    pub fn with_action_classes(
+        mut self,
+        action_classes: impl IntoIterator<Item = impl Into<ActionClass>>,
+    ) -> Self {
+        self.action_classes = action_classes.into_iter().map(Into::into).collect();
+        self.action_classes.sort_unstable();
+        self.action_classes.dedup();
         self
     }
 
@@ -513,10 +570,10 @@ impl ToolOptions {
         self.approval
     }
 
-    /// Action class the permission engine evaluates for this tool.
+    /// Declared action classes, in stable sorted order.
     #[must_use]
-    pub const fn permission_scope(&self) -> PermissionScope {
-        self.permission_scope
+    pub fn action_classes(&self) -> &[ActionClass] {
+        &self.action_classes
     }
 
     /// Model-surface exposure.

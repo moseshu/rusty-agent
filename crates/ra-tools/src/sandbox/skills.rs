@@ -1196,6 +1196,7 @@ impl Tool for LoadSkillTool {
 
     fn options(&self) -> ToolOptions {
         sandbox_tool_options(&self.needs_approval)
+            .with_action_classes([crate::action_classes::READ])
     }
 
     async fn call(&self, mut context: ToolContext<'_>) -> Result<ToolOutput> {

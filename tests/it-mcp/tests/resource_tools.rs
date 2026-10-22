@@ -11,7 +11,7 @@ use ra_core::{
     context::RunContext,
     error::Result,
     item::CallId,
-    permission::PermissionScope,
+    permission::ActionClass,
     state::RunId,
     tool::{Tool as CoreTool, ToolConcurrency, ToolContext, ToolOutput},
 };
@@ -192,7 +192,7 @@ fn resource_schemas_preserve_the_three_upstream_public_contracts() {
             tool.validate().unwrap();
             assert!(!tool.schema().strict_json_schema());
             assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
-            assert_eq!(tool.options().permission_scope(), PermissionScope::Read);
+            assert_eq!(tool.options().action_classes(), &[ActionClass::from("read")]);
             json!({"name":tool.schema().name(), "description":tool.schema().description(),
                 "parameters":tool.schema().input_schema(), "strict":tool.schema().strict_json_schema()})
         })

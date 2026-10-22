@@ -1,53 +1,176 @@
 //! Runtime permission evaluation for tool dispatch.
 //!
-//! The core owns the serializable policy vocabulary. This module combines that vocabulary with a
-//! tool's declared effect and its normal approval result; it neither parses provider payloads nor
-//! enforces a sandbox boundary.
+//! The core owns the provider-neutral approval and rule vocabulary. This module preserves tool
+//! approval behavior by default and optionally applies open action-class policy before it.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use ra_core::{
-    permission::{PermissionDecision, PermissionMode, PermissionRule, PermissionScope},
+    item::AgentId,
+    permission::{ActionClass, PermissionDecision, PermissionRule},
     tool::ToolOrigin,
 };
+use serde::{Deserialize, Serialize};
 
-/// Immutable rule evaluator applied to every tool call in a run.
+/// Optional runtime policy over the open action classes tools declare.
 ///
-/// Rules are evaluated in reverse declaration order: the last matching rule is the most specific
-/// configuration the host supplied. Mode restrictions still apply around that result. In
-/// particular, plan mode cannot be opened up to edits or commands by a rule, and `DontAsk` turns
-/// any would-be prompt into a denial.
-#[derive(Debug, Clone, Default)]
-pub struct PermissionEngine {
-    mode: PermissionMode,
-    rules: Arc<[PermissionRule]>,
-    // Where the rules a run's own answers left begin, after the configured ones.
-    answered_from: Option<usize>,
+/// This is a Rusty extension. With no policy installed, tools retain their normal approval
+/// behavior. When installed, `allow_only` is a hard boundary, ordered rules can refine the allowed
+/// surface, and `auto_allow` can suppress framework-generated approval prompts for matching
+/// classes. It does not bypass approval requested from inside a tool or any sandbox check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionClassPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow_only: Option<BTreeSet<ActionClass>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    auto_allow: BTreeSet<ActionClass>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    auto_allow_all: bool,
+    #[serde(default = "default_prompts_enabled")]
+    prompts: bool,
 }
 
-/// What a call the host rejected returns to the model when the host gave no text of its own: the
-/// reference's `DEFAULT_APPROVAL_REJECTION_MESSAGE`.
-pub const DEFAULT_APPROVAL_REJECTION_MESSAGE: &str = "Tool execution was not approved.";
+const fn default_prompts_enabled() -> bool {
+    true
+}
 
-impl PermissionEngine {
-    /// Creates an evaluator under `mode` with no rule exceptions.
+impl ActionClassPolicy {
+    /// Creates an unrestricted policy that preserves normal tool approval behavior.
     #[must_use]
-    pub fn new(mode: PermissionMode) -> Self {
-        Self {
-            mode,
-            rules: Arc::from([]),
-            answered_from: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Switches the base mode without copying the rule table.
+    /// Restricts all actions to the supplied classes.
+    ///
+    /// Every class declared by a tool must be present. A tool with no declared classes is denied
+    /// while this restriction is active.
     #[must_use]
-    pub fn with_mode(mut self, mode: PermissionMode) -> Self {
-        self.mode = mode;
+    pub fn with_allow_only(
+        mut self,
+        classes: impl IntoIterator<Item = impl Into<ActionClass>>,
+    ) -> Self {
+        self.allow_only = Some(classes.into_iter().map(Into::into).collect());
         self
     }
 
-    /// Replaces the ordered rule set.
+    /// Automatically approves framework-level requests for the supplied classes after rules.
+    ///
+    /// Every class declared by a tool must be listed. Unclassified tools do not match.
+    #[must_use]
+    pub fn with_auto_allow(
+        mut self,
+        classes: impl IntoIterator<Item = impl Into<ActionClass>>,
+    ) -> Self {
+        self.auto_allow = classes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Automatically approves every action after rules, including unclassified actions.
+    ///
+    /// This is intended for explicit product modes such as a coding product's full-bypass mode.
+    /// Sandbox enforcement and approval requests made by the tool itself remain active.
+    #[must_use]
+    pub const fn with_auto_allow_all(mut self, enabled: bool) -> Self {
+        self.auto_allow_all = enabled;
+        self
+    }
+
+    /// Enables or disables framework approval prompts without changing class restrictions or
+    /// automatic approvals. Disabling prompts converts `Ask` to `Deny` after policy evaluation.
+    #[must_use]
+    pub const fn with_prompts(mut self, enabled: bool) -> Self {
+        self.prompts = enabled;
+        self
+    }
+
+    /// Classes that are the only permitted classes, if restricted.
+    #[must_use]
+    pub const fn allow_only(&self) -> Option<&BTreeSet<ActionClass>> {
+        self.allow_only.as_ref()
+    }
+
+    /// Classes that bypass framework-generated approval prompts.
+    #[must_use]
+    pub const fn auto_allow(&self) -> &BTreeSet<ActionClass> {
+        &self.auto_allow
+    }
+
+    /// Whether every action bypasses framework-generated approval prompts.
+    #[must_use]
+    pub const fn auto_allow_all(&self) -> bool {
+        self.auto_allow_all
+    }
+
+    /// Whether framework-generated approval prompts are enabled.
+    #[must_use]
+    pub const fn prompts(&self) -> bool {
+        self.prompts
+    }
+
+    fn permits_classes(&self, classes: &[ActionClass]) -> bool {
+        self.allow_only.as_ref().is_none_or(|allowed| {
+            !classes.is_empty() && classes.iter().all(|class| allowed.contains(class))
+        })
+    }
+
+    fn automatically_allows(&self, classes: &[ActionClass]) -> bool {
+        self.auto_allow_all
+            || (!classes.is_empty() && classes.iter().all(|class| self.auto_allow.contains(class)))
+    }
+
+    const fn normalize(&self, decision: PermissionDecision) -> PermissionDecision {
+        if !self.prompts && matches!(decision, PermissionDecision::Ask) {
+            PermissionDecision::Deny
+        } else {
+            decision
+        }
+    }
+}
+
+impl Default for ActionClassPolicy {
+    fn default() -> Self {
+        Self {
+            allow_only: None,
+            auto_allow: BTreeSet::new(),
+            auto_allow_all: false,
+            prompts: true,
+        }
+    }
+}
+
+/// Immutable rule evaluator applied to every tool call in a run.
+///
+/// An optional action-class policy runs before ordered rules. Rules are evaluated in reverse
+/// declaration order, and a matching rule takes precedence over automatic approval. Without a
+/// class policy, the engine resolves only configured or session rules and otherwise returns the
+/// tool's normal approval decision.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionEngine {
+    policy: Option<ActionClassPolicy>,
+    rules: Arc<[PermissionRule]>,
+    answered_from: Option<usize>,
+}
+
+/// What a call the host rejected returns to the model when the host gave no text of its own.
+pub const DEFAULT_APPROVAL_REJECTION_MESSAGE: &str = "Tool execution was not approved.";
+
+impl PermissionEngine {
+    /// Creates an evaluator with no class policy and no rule exceptions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs or replaces the optional action-class policy.
+    #[must_use]
+    pub fn with_policy(mut self, policy: ActionClassPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Replaces the ordered rule set while preserving the installed policy.
     #[must_use]
     pub fn with_rules(mut self, rules: impl IntoIterator<Item = PermissionRule>) -> Self {
         self.rules = rules.into_iter().collect::<Vec<_>>().into();
@@ -55,14 +178,11 @@ impl PermissionEngine {
         self
     }
 
-    /// Appends the session rules a run's `always` answers left (see
-    /// [`RunState::permission_rules`](ra_core::state::RunState::permission_rules)) after the
-    /// configured ones, so they take precedence.
+    /// Appends the session rules a run's `always` answers left after configured rules.
     ///
-    /// They decide like any rule. What differs is what a call one of their deny rules refuses
-    /// returns: the host's rejection text, or [`DEFAULT_APPROVAL_REJECTION_MESSAGE`] when it gave
-    /// none, as the reference answers a call its sticky rejection covers. A configured deny rule
-    /// keeps the runtime's own refusal.
+    /// A sticky rejection carries the host's rejection text, or
+    /// [`DEFAULT_APPROVAL_REJECTION_MESSAGE`] when it supplied none. Configured deny rules retain
+    /// the normal runtime refusal.
     #[must_use]
     pub fn with_answered_rules(mut self, rules: impl IntoIterator<Item = PermissionRule>) -> Self {
         let mut all = self.rules.to_vec();
@@ -73,10 +193,21 @@ impl PermissionEngine {
         self
     }
 
-    /// Selected base mode.
+    /// Installed action-class policy, if any.
     #[must_use]
-    pub const fn mode(&self) -> PermissionMode {
-        self.mode
+    pub const fn policy(&self) -> Option<&ActionClassPolicy> {
+        self.policy.as_ref()
+    }
+
+    /// Returns this evaluator with framework prompts enabled or disabled.
+    ///
+    /// Turning prompts off creates an otherwise unrestricted policy if none was installed. It
+    /// does not remove an existing class restriction or automatic approval list.
+    #[must_use]
+    pub fn with_prompts(mut self, enabled: bool) -> Self {
+        let policy = self.policy.take().unwrap_or_default().with_prompts(enabled);
+        self.policy = Some(policy);
+        self
     }
 
     /// Ordered rule set. Later matching entries take precedence.
@@ -86,59 +217,64 @@ impl PermissionEngine {
     }
 
     /// Resolves a call after the tool's declaration supplied its normal decision.
-    ///
-    /// The fallback is normally `Allow` for a tool that does not need approval and `Ask` for one
-    /// that does. Keeping the dynamic tool callback outside this pure evaluator means matching is
-    /// deterministic and testable without handing the policy engine executable tool objects.
     #[must_use]
     pub fn evaluate(
         &self,
-        scope: PermissionScope,
+        classes: &[ActionClass],
         origin: &ToolOrigin,
+        agent_id: &AgentId,
         fallback: PermissionDecision,
     ) -> PermissionDecision {
-        self.fixed_decision(scope, origin)
+        self.fixed_decision(classes, origin, agent_id)
             .unwrap_or_else(|| self.normalize(fallback))
     }
 
-    /// Resolves a call when mode or a matching rule already decides it.
+    /// Resolves a call when its classes, a matching rule, or automatic approval already decides it.
     ///
-    /// Dispatch uses this before asking a dynamically-configured tool whether it needs approval,
-    /// so an explicitly denied call does not invoke third-party policy code just to be refused.
+    /// Dispatch calls this before consulting a tool's dynamic approval callback, so a hard
+    /// classification denial does not invoke product code for a call that cannot proceed.
     #[must_use]
     pub fn fixed_decision(
         &self,
-        scope: PermissionScope,
+        classes: &[ActionClass],
         origin: &ToolOrigin,
+        agent_id: &AgentId,
     ) -> Option<PermissionDecision> {
-        if matches!(self.mode, PermissionMode::Plan) && !matches!(scope, PermissionScope::Read) {
+        if self
+            .policy
+            .as_ref()
+            .is_some_and(|policy| !policy.permits_classes(classes))
+        {
             return Some(PermissionDecision::Deny);
         }
 
-        if let Some(decision) = self.matching_rule(origin) {
-            return Some(self.normalize(decision));
+        if let Some(rule) = self.matching_rule(origin, agent_id) {
+            return Some(self.normalize(rule));
         }
 
-        if matches!(self.mode, PermissionMode::BypassPermissions)
-            || (matches!(self.mode, PermissionMode::AcceptEdits)
-                && matches!(scope, PermissionScope::Edit))
+        if self
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.automatically_allows(classes))
         {
-            Some(PermissionDecision::Allow)
-        } else {
-            None
+            return Some(PermissionDecision::Allow);
         }
+        None
     }
 
-    /// The text a call refused by a matching deny rule returns to the model: the rule's own text
-    /// (see [`PermissionRule::rejection_message`]), or [`DEFAULT_APPROVAL_REJECTION_MESSAGE`] for
-    /// a rule a run's answer left without one (see [`Self::with_answered_rules`]).
-    ///
-    /// `None` for a configured deny rule without text, and whenever something other than a rule
-    /// decides the call: plan mode refuses before any rule is consulted, and `DontAsk` turns an
-    /// `Ask` rule into a denial of its own.
+    /// Rejection text from a matching sticky deny rule, if that rule decides this call.
     #[must_use]
-    pub fn rejection_message(&self, scope: PermissionScope, origin: &ToolOrigin) -> Option<&str> {
-        if matches!(self.mode, PermissionMode::Plan) && !matches!(scope, PermissionScope::Read) {
+    pub fn rejection_message(
+        &self,
+        classes: &[ActionClass],
+        origin: &ToolOrigin,
+        agent_id: &AgentId,
+    ) -> Option<&str> {
+        if self
+            .policy
+            .as_ref()
+            .is_some_and(|policy| !policy.permits_classes(classes))
+        {
             return None;
         }
         let (index, rule) = self
@@ -146,28 +282,24 @@ impl PermissionEngine {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, rule)| rule.matches_origin(origin))
+            .find(|(_, rule)| rule.matches_origin_for_agent(origin, agent_id))
             .filter(|(_, rule)| matches!(rule.decision(), PermissionDecision::Deny))?;
         let answered = self.answered_from.is_some_and(|start| index >= start);
         rule.rejection_message()
             .or_else(|| answered.then_some(DEFAULT_APPROVAL_REJECTION_MESSAGE))
     }
 
-    fn matching_rule(&self, origin: &ToolOrigin) -> Option<PermissionDecision> {
+    fn matching_rule(&self, origin: &ToolOrigin, agent_id: &AgentId) -> Option<PermissionDecision> {
         self.rules
             .iter()
             .rev()
-            .find(|rule| rule.matches_origin(origin))
+            .find(|rule| rule.matches_origin_for_agent(origin, agent_id))
             .map(PermissionRule::decision)
     }
 
-    const fn normalize(&self, decision: PermissionDecision) -> PermissionDecision {
-        if matches!(self.mode, PermissionMode::DontAsk)
-            && matches!(decision, PermissionDecision::Ask)
-        {
-            PermissionDecision::Deny
-        } else {
-            decision
-        }
+    fn normalize(&self, decision: PermissionDecision) -> PermissionDecision {
+        self.policy
+            .as_ref()
+            .map_or(decision, |policy| policy.normalize(decision))
     }
 }

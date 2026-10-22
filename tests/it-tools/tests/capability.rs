@@ -14,7 +14,7 @@ use ra_core::{
         MemoryRecord, MemoryRecordId, MemoryRecordKind, MemorySearchRequest, MemoryStore,
     },
     model::ModelSettings,
-    permission::PermissionScope,
+    permission::ActionClass,
     state::RunId,
     tool::{Tool, ToolContext, ToolOutput},
 };
@@ -239,8 +239,8 @@ fn test_a_capability_is_uniform_in_what_its_entries_may_do() {
     for capability in &observing {
         for tool in capability.tools() {
             assert_eq!(
-                tool.options().permission_scope(),
-                PermissionScope::Read,
+                tool.options().action_classes(),
+                &[ActionClass::from("read")],
                 "`{}` contributes `{}`, which is not read-only",
                 capability.kind(),
                 tool.origin().qualified_name()
@@ -263,8 +263,8 @@ fn test_a_capability_is_uniform_in_what_its_entries_may_do() {
     for capability in &changing {
         for tool in capability.tools() {
             assert_ne!(
-                tool.options().permission_scope(),
-                PermissionScope::Read,
+                tool.options().action_classes(),
+                &[ActionClass::from("read")],
                 "`{}` contributes `{}`, which would survive a read-only filter",
                 capability.kind(),
                 tool.origin().qualified_name()

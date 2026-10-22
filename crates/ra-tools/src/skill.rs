@@ -26,7 +26,6 @@ use std::{
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     prompt::estimate_tokens,
     skill::{SkillCatalog, SkillCatalogError, SkillId, SkillSummary},
     tool::{
@@ -235,7 +234,7 @@ impl SkillTool {
             func_schema: FuncSchema::for_input::<SkillInput>(TOOL_NAME)?,
             options: ToolOptions::new()
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_permission_scope(PermissionScope::Read)
+                .with_action_classes([crate::action_classes::READ])
                 .with_concurrency(ToolConcurrency::Parallel),
             catalog,
             limits: SkillLimits::new(),

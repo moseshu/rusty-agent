@@ -296,11 +296,13 @@ impl DynamicTool {
             origin,
             schema,
             calls: Arc::clone(calls),
-            options: ToolOptions::new().with_exposure(if function.defer_loading() {
-                ToolExposure::Deferred
-            } else {
-                ToolExposure::Advertised
-            }),
+            options: ToolOptions::new()
+                .with_action_classes(["execute"])
+                .with_exposure(if function.defer_loading() {
+                    ToolExposure::Deferred
+                } else {
+                    ToolExposure::Advertised
+                }),
         })
     }
 }

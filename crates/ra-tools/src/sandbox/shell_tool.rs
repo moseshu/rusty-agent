@@ -661,6 +661,7 @@ impl Tool for ExecCommandTool {
 
     fn options(&self) -> ToolOptions {
         sandbox_tool_options(&self.needs_approval)
+            .with_action_classes([crate::action_classes::EXECUTE])
     }
 
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
@@ -794,6 +795,7 @@ impl Tool for WriteStdinTool {
 
     fn options(&self) -> ToolOptions {
         sandbox_tool_options(&self.needs_approval)
+            .with_action_classes([crate::action_classes::EXECUTE])
     }
 
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {

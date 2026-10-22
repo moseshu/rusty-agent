@@ -10,7 +10,6 @@ use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     model::ModelToolDefinition,
-    permission::PermissionScope,
     tool::{Tool, ToolConcurrency, ToolContext, ToolOptions, ToolOrigin, ToolOutput, ToolSchema},
 };
 use serde::Deserialize;
@@ -141,7 +140,7 @@ impl Tool for ToolSearchHandler {
     }
     fn options(&self) -> ToolOptions {
         ToolOptions::new()
-            .with_permission_scope(PermissionScope::Read)
+            .with_action_classes(["read"])
             .with_concurrency(ToolConcurrency::Parallel)
     }
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {

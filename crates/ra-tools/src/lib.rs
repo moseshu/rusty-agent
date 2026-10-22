@@ -54,6 +54,7 @@
 //! wire format the moment a model sees it. The `Tool` trait it implements is `ra-core`'s and is
 //! `Stable`.
 
+pub mod action_classes;
 pub mod agent_ns;
 pub mod apply_patch;
 pub mod capability;

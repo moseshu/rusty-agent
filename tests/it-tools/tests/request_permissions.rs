@@ -8,8 +8,9 @@ use ra_core::{
     agent::AgentSpec,
     context::RunContext,
     item::{AgentId, CallId},
+    permission::ActionClass,
     state::RunId,
-    tool::{PermissionScope, Tool, ToolConcurrency, ToolContext, ToolOutput},
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput},
 };
 use ra_tools::request_permissions::{RequestPermissionsPolicy, RequestPermissionsTool};
 use serde_json::{Value, json};
@@ -130,7 +131,10 @@ fn request_permissions_tool_includes_full_permission_schema() {
         })
     );
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Exclusive);
-    assert_eq!(tool.options().permission_scope(), PermissionScope::Read);
+    assert_eq!(
+        tool.options().action_classes(),
+        &[ActionClass::from("read")]
+    );
 }
 
 /// The policy is handed the call's arguments, and the model is given what it returns.

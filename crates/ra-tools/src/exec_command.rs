@@ -1141,6 +1141,7 @@ impl Tool for ExecCommandTool {
 
 fn base_options() -> ToolOptions {
     ToolOptions::new()
+        .with_action_classes([crate::action_classes::EXECUTE])
         .with_approval(ToolApprovalPolicy::Always)
         .with_failure_handling(ToolFailureHandling::Custom)
         .with_concurrency(ToolConcurrency::Parallel)

@@ -25,7 +25,6 @@ use ra_core::{
         FileEvent,
         file::{FileChangeKind, FileChangedEvent},
     },
-    permission::PermissionScope,
     tool::{
         ResourceClaim, Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolInput as _,
         ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
@@ -121,7 +120,7 @@ impl ApplyPatchTool {
 fn base_options() -> ToolOptions {
     ToolOptions::new()
         .with_approval(ToolApprovalPolicy::Always)
-        .with_permission_scope(PermissionScope::Edit)
+        .with_action_classes([crate::action_classes::EDIT])
 }
 
 #[async_trait]

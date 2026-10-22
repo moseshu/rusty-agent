@@ -14,7 +14,6 @@ use ra_core::{
         MemoryListRequest, MemoryListing, MemoryMatchMode, MemoryReadRequest, MemoryRecordId,
         MemoryRecordKind, MemorySearchRequest, MemoryStore, MemoryStoreError, memory_response_json,
     },
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, Tool, ToolArgumentDecodeError,
         ToolConcurrency, ToolContext, ToolFailureHandling, ToolInput, ToolOptions, ToolOrigin,
@@ -217,7 +216,7 @@ fn entry<I: ToolInput>(name: &'static str) -> Result<(ToolOrigin, FuncSchema, To
         FuncSchema::for_input::<I>(name)?,
         ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
-            .with_permission_scope(PermissionScope::Read)
+            .with_action_classes([crate::action_classes::READ])
             .with_concurrency(ToolConcurrency::Parallel),
     ))
 }

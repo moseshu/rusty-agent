@@ -11,8 +11,9 @@ use ra_core::{
     context::RunContext,
     error::Result,
     item::{AgentId, CallId},
+    permission::ActionClass,
     state::RunId,
-    tool::{PermissionScope, Tool, ToolConcurrency, ToolContext, ToolOutput, TruncationStage},
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, TruncationStage},
     web::{
         WebAccess, WebAccessError, WebDocument, WebFetchRequest, WebResult, WebSearchRequest,
         WebSearchResults,
@@ -141,7 +142,7 @@ async fn test_the_web_entries_declare_an_external_side_effect() {
     assert_eq!(search.origin().qualified_name(), "web_search");
     assert_eq!(fetch.origin().qualified_name(), "web_fetch");
     for options in [search.options(), fetch.options()] {
-        assert_eq!(options.permission_scope(), PermissionScope::Execute);
+        assert_eq!(options.action_classes(), &[ActionClass::from("execute")]);
         assert_eq!(options.concurrency(), ToolConcurrency::Parallel);
         assert!(
             options.resource_claims().is_empty(),

@@ -1114,8 +1114,8 @@ async fn raw_prepared_capabilities_reject_changed_or_duplicate_bound_declaration
             .unwrap();
         }
         if change == "options" {
-            bound.options = ToolOptions::new()
-                .with_permission_scope(ra_core::permission::PermissionScope::Edit);
+            bound.options =
+                ToolOptions::new().with_action_classes([ra_tools::action_classes::EDIT]);
         }
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(bound)];
         if change == "removed" {

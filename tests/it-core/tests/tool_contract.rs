@@ -388,6 +388,64 @@ fn test_tool_contract_11() {
     assert!(error.to_string().contains("exposure"), "{error}");
 }
 
+#[test]
+fn tool_options_v1_scope_migrates_to_v2_action_classes() {
+    let migrated: ToolOptions = serde_json::from_value(json!({
+        "schema_version": 1,
+        "permission_scope": "edit",
+        "future_tool_hint": {"tier": 2}
+    }))
+    .expect("v1 options must remain readable");
+
+    assert_eq!(migrated.schema_version().get(), 2);
+    assert_eq!(
+        migrated.action_classes(),
+        [ra_core::permission::ActionClass::new("edit")]
+    );
+    assert_eq!(
+        migrated.unknown().get("future_tool_hint"),
+        Some(&json!({"tier": 2}))
+    );
+    assert_eq!(
+        serde_json::to_value(&migrated).unwrap(),
+        json!({
+            "schema_version": 2,
+            "availability": "enabled",
+            "approval": "never",
+            "action_classes": ["edit"],
+            "exposure": "advertised",
+            "concurrency": "exclusive",
+            "timeout_behavior": "model_visible",
+            "failure_handling": "model_visible",
+            "max_no_progress_streak": 3,
+            "future_tool_hint": {"tier": 2}
+        })
+    );
+
+    let defaulted: ToolOptions = serde_json::from_value(json!({"schema_version": 1}))
+        .expect("the v1 default scope must remain readable");
+    assert_eq!(defaulted.schema_version().get(), 2);
+    assert_eq!(
+        defaulted.action_classes(),
+        [ra_core::permission::ActionClass::new("execute")]
+    );
+
+    assert!(
+        serde_json::from_value::<ToolOptions>(json!({
+            "schema_version": 1,
+            "action_classes": ["read"]
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ToolOptions>(json!({
+            "schema_version": 2,
+            "permission_scope": "read"
+        }))
+        .is_err()
+    );
+}
+
 #[derive(Debug)]
 struct HostContext {
     prefix: &'static str,

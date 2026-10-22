@@ -17,7 +17,6 @@ use std::{collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc}
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     tool::{
         Tool, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin,
         ToolOutput, ToolSchema,
@@ -433,7 +432,7 @@ fn encode(tool: &str, payload: &impl Serialize) -> Result<String> {
 
 fn options() -> ToolOptions {
     ToolOptions::new()
-        .with_permission_scope(PermissionScope::Read)
+        .with_action_classes([crate::action_classes::READ])
         .with_concurrency(ToolConcurrency::Parallel)
         .with_failure_handling(ToolFailureHandling::Custom)
 }

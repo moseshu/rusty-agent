@@ -396,7 +396,7 @@ impl AgentToolBuilder {
     }
 
     /// Sets the remaining tool policies — exposure, concurrency, timeout, guardrails, permission
-    /// scope.
+    /// classes.
     ///
     /// Availability, approval, and failure handling are decided by the dedicated setters above and
     /// override whatever these options say about them.
@@ -525,7 +525,7 @@ impl AgentTool {
             include_input_schema: false,
             on_stream: None,
             on_stream_max_pending_events: Some(DEFAULT_ON_STREAM_MAX_PENDING_EVENTS),
-            options: ToolOptions::default(),
+            options: ToolOptions::default().with_action_classes(["execute"]),
         }
     }
 

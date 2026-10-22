@@ -149,6 +149,7 @@ impl McpTool {
             ToolConcurrency::Exclusive
         };
         let mut options = ToolOptions::new()
+            .with_action_classes(["execute"])
             .with_approval(
                 policy
                     .require_approval()

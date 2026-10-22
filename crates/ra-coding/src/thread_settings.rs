@@ -106,7 +106,6 @@ use crate::request_permissions::{PolicyPaths, ThreadPermissions, wire_additional
 use ra_core::{
     error::{Error, Result},
     item::{CallId, RunItemKind, ToolApproval},
-    permission::PermissionMode,
     state::{ArgumentFingerprint, RunId},
     tool::{Tool, ToolContext, ToolLookupKey},
 };
@@ -696,13 +695,12 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
 }
 
 fn install(config: RunConfig, settings: CodingThreadSettings) -> RunConfig {
-    // Never suppresses prompts rather than granting tools, so explicit denials keep their meaning.
-    let no_prompts = matches!(settings.approval_policy, AskForApproval::Never);
-    let permission = settings.base_permission.clone().with_mode(if no_prompts {
-        PermissionMode::DontAsk
+    // Never disables framework prompts without changing the selected class policy or rules.
+    let permission = if matches!(settings.approval_policy, AskForApproval::Never) {
+        settings.base_permission.clone().with_prompts(false)
     } else {
-        settings.base_permission.mode()
-    });
+        settings.base_permission.clone()
+    };
     config
         .with_permission_engine(permission)
         .with_app_context(Arc::new(settings))

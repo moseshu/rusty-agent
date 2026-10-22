@@ -340,6 +340,7 @@ impl Tool for ViewImageTool {
 
     fn options(&self) -> ToolOptions {
         sandbox_tool_options(&self.needs_approval)
+            .with_action_classes([crate::action_classes::READ])
     }
 
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {

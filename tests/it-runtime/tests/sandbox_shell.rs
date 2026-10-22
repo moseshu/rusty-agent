@@ -34,6 +34,7 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
+    permission::ActionClassPolicy,
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
     sandbox::SandboxRunConfig,
 };
@@ -254,6 +255,41 @@ fn in_session(session: &Arc<dyn SandboxSession>, cwd: &str) -> RunConfig {
             .with_cwd(cwd)
             .unwrap(),
     )
+}
+
+#[tokio::test]
+async fn framework_permission_bypass_keeps_the_sandbox_boundary() {
+    let (directory, root, session) = live_session().await;
+    std::fs::create_dir_all(root.join("tasks")).unwrap();
+    let outside = directory.path().join("outside.txt");
+    let model = ScriptedModel::new(vec![
+        call(
+            "outside_write",
+            "exec_command",
+            json!({"cmd": "printf escaped > ../../outside.txt", "login": false}),
+        ),
+        answer("outside_write_message"),
+    ]);
+
+    let result = Runner::run(request(
+        shell_agent("sandbox-boundary", Shell::new()),
+        &model,
+        "run-sandbox-boundary",
+        in_session(&session, "tasks")
+            .with_permission_policy(ActionClassPolicy::new().with_auto_allow_all(true)),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    let output = tool_output(result.new_items(), "outside_write");
+    assert!(
+        output.output()["blocks"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Process exited with code"))
+    );
+    assert!(!outside.exists());
+    model.assert_complete();
 }
 
 // `test_resumed_run_rebinds_cwd_to_pending_sandbox_tool`

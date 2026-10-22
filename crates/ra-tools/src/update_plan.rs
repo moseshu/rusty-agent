@@ -32,7 +32,6 @@ use std::fmt::{self, Write as _};
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, Tool, ToolArgumentDecodeError,
         ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin, ToolOutput,
@@ -211,7 +210,7 @@ impl UpdatePlanTool {
     /// Creates the plan entry.
     ///
     /// It takes no workspace, no store, and no manager: recording a plan reaches nothing outside the
-    /// conversation, which is also why its permission scope is [`PermissionScope::Read`] rather than
+    /// conversation, which is also why its action class is `read` rather than
     /// something a read-only role would have to withhold.
     ///
     /// # Errors
@@ -223,7 +222,7 @@ impl UpdatePlanTool {
             func_schema: FuncSchema::for_input::<UpdatePlanInput>(TOOL_NAME)?,
             options: ToolOptions::new()
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_permission_scope(PermissionScope::Read)
+                .with_action_classes([crate::action_classes::READ])
                 .with_concurrency(ToolConcurrency::Parallel),
             limits: PlanLimits::new(),
         })

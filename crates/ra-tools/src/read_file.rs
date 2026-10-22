@@ -51,7 +51,6 @@ use ra_core::{
     error::{Error, Result, ToolErrorKind},
     event::{FileEvent, file::FileReadEvent},
     item::{Base64FileSource, FileBlock, FileSource, ImageBlock, ImageSource},
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
         ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
@@ -205,7 +204,7 @@ impl ReadFileTool {
     pub fn new() -> Result<Self> {
         let options = ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
-            .with_permission_scope(PermissionScope::Read)
+            .with_action_classes([crate::action_classes::READ])
             .with_concurrency(ToolConcurrency::Parallel);
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
@@ -239,7 +238,7 @@ impl ReadFileTool {
     pub fn for_workspace(workspace: &Workspace) -> Result<Self> {
         let options = ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
-            .with_permission_scope(PermissionScope::Read)
+            .with_action_classes([crate::action_classes::READ])
             .with_concurrency(ToolConcurrency::Parallel)
             .with_resource_claim(ResourceClaim::shared(workspace.resource_id().clone()));
         Ok(Self {

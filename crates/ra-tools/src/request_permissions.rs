@@ -15,7 +15,6 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     tool::{
         Tool, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
@@ -130,7 +129,7 @@ impl RequestPermissionsTool {
                 .with_description(REQUEST_PERMISSIONS_TOOL_DESCRIPTION),
             options: ToolOptions::new()
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_permission_scope(PermissionScope::Read),
+                .with_action_classes([crate::action_classes::READ]),
             policy,
         })
     }

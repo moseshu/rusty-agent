@@ -9,8 +9,8 @@ use ra_core::{
     context::RunContext,
     finish::FinishReason,
     item::{
-        AgentId, CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem,
-        RunItemKind, ToolApproval,
+        AgentId, CallId, ItemId, ItemProvenance, Message, ModelInputItem, ModelResponse,
+        OutputPhase, RunItem, RunItemKind, ToolApproval,
     },
     permission::PermissionDecision,
     state::{
@@ -312,6 +312,10 @@ fn test_run_state_drops_invalid_trace_group_and_preserves_unknown_settings() {
 }
 
 fn approval_item(id: &str, call: &str) -> RunItem {
+    approval_item_for_agent(id, call, "coder")
+}
+
+fn approval_item_for_agent(id: &str, call: &str, agent: &str) -> RunItem {
     RunItem::new(
         ItemId::new(id),
         RunItemKind::ToolApproval(
@@ -323,6 +327,7 @@ fn approval_item(id: &str, call: &str) -> RunItem {
             .with_tool_origin(&ToolOrigin::new("exec_command").unwrap()),
         ),
     )
+    .with_provenance(ItemProvenance::new(AgentId::new(agent)))
 }
 
 fn commentary_item(id: &str, text: &str) -> RunItem {
@@ -456,6 +461,69 @@ fn test_run_state_retains_approval_answers_and_exact_always_rules() {
     assert_eq!(restored.permission_rules(), state.permission_rules());
 }
 
+#[test]
+fn test_sticky_approval_is_scoped_to_its_agent_and_survives_checkpoint() {
+    let first = approval_item_for_agent("approval-first", "call-first", "first");
+    let second = approval_item_for_agent("approval-second", "call-second", "second");
+    let mut state = RunState::start(RunId::new("run-agent-scoped-approval"));
+    state
+        .begin_segment(AgentId::new("first"), Vec::new())
+        .expect("first segment must initialize the history");
+    state.record_generated_items([first.clone(), second.clone()]);
+    state
+        .set_pending_interruptions(&[first.clone(), second.clone()])
+        .expect("both approvals must be pending");
+
+    state
+        .approve(&first, true)
+        .expect("the first agent's sticky answer must be retained");
+    assert_eq!(state.permission_rules().len(), 1);
+    assert_eq!(
+        state.permission_rules()[0].agent_id(),
+        Some(&AgentId::new("first"))
+    );
+    assert!(
+        state
+            .pending_interruption_resolutions()
+            .iter()
+            .all(|answer| answer.item_id() != second.id()),
+        "a same-named approval owned by another agent must remain unanswered"
+    );
+
+    let restored: RunState =
+        serde_json::from_value(serde_json::to_value(&state).expect("state must serialize"))
+            .expect("state must deserialize");
+    assert_eq!(restored.permission_rules(), state.permission_rules());
+    let rule = &restored.permission_rules()[0];
+    let origin = ToolOrigin::new("exec_command").expect("origin must build");
+    assert!(rule.matches_origin_for_agent(&origin, &AgentId::new("first")));
+    assert!(!rule.matches_origin_for_agent(&origin, &AgentId::new("second")));
+}
+
+#[test]
+fn test_legacy_sticky_rules_without_agent_identity_are_dropped_on_restore() {
+    let approval = approval_item("approval-legacy-rule", "call-legacy-rule");
+    let mut state = state_awaiting("run-legacy-rule", std::slice::from_ref(&approval));
+    state
+        .approve(&approval, true)
+        .expect("the sticky answer must be retained");
+
+    // Schema 14 is the last one written before rules carried an owner.
+    for legacy_schema in [12, 14] {
+        let mut wire = serde_json::to_value(&state).expect("state must serialize");
+        wire["schema_version"] = json!(legacy_schema);
+        for rule in wire["permission_rules"].as_array_mut().unwrap() {
+            rule.as_object_mut().unwrap().remove("agent_id");
+        }
+
+        let restored: RunState = serde_json::from_value(wire).expect("legacy state must load");
+        assert!(
+            restored.permission_rules().is_empty(),
+            "a schema {legacy_schema} sticky decision without an owner must require approval again"
+        );
+    }
+}
+
 /// Ported from the reference's `test_latest_approval_decision_wins_for_call_id` and
 /// `test_matching_exact_call_decisions_preserve_sticky_defaults`: a later exact answer decides its
 /// own call, and leaves the sticky default for the others; a later sticky answer replaces it.
@@ -559,7 +627,8 @@ fn test_run_state_refuses_to_approve_an_approval_without_a_routing_identity() {
             "exec_command",
             json!({"cmd": "git status"}),
         )),
-    );
+    )
+    .with_provenance(ItemProvenance::new(AgentId::new("coder")));
     let mut state = RunState::start(RunId::new("run-approval-legacy"));
     state
         .begin_segment(AgentId::new("coder"), Vec::new())
@@ -2065,6 +2134,46 @@ fn pending_tool_output_settlement_survives_a_checkpoint_and_defaults_off_for_leg
     let restored: RunState = serde_json::from_value(legacy).unwrap();
     assert!(!restored.tool_output_settlement_pending());
     assert_eq!(restored.schema_version(), RUN_STATE_SCHEMA_VERSION);
+}
+
+#[test]
+fn sticky_answers_require_agent_provenance_without_mutating_state() {
+    for reject in [false, true] {
+        let approval = approval_item("unowned", "unowned-call");
+        let approval = RunItem::new(approval.id().clone(), approval.kind().clone());
+        let mut state = state_awaiting("unowned-run", std::slice::from_ref(&approval));
+        let before = state.clone();
+        let result = if reject {
+            state.reject_with_message(&approval, true, "denied")
+        } else {
+            state.approve(&approval, true)
+        };
+        assert!(result.unwrap_err().to_string().contains("provenance"));
+        assert_eq!(state, before);
+        if reject {
+            state.reject(&approval, false).unwrap();
+        } else {
+            state.approve(&approval, false).unwrap();
+        }
+        assert!(
+            !state.pending_interruption_resolutions()[0]
+                .resolution()
+                .always()
+        );
+    }
+}
+
+#[test]
+fn current_schema_preserves_ownerless_rules_instead_of_applying_legacy_migration() {
+    let mut wire = serde_json::to_value(RunState::start(RunId::new("current-rules"))).unwrap();
+    wire["permission_rules"] = json!([{"decision":"deny", "tool_name":"operate"}]);
+    let state: RunState = serde_json::from_value(wire).unwrap();
+    assert_eq!(state.permission_rules().len(), 1);
+    assert_eq!(
+        RUN_STATE_SCHEMA_VERSION,
+        ra_core::compat::SchemaVersion::new(15)
+    );
+    assert_eq!(state.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }
 
 #[test]

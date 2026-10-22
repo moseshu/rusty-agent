@@ -824,6 +824,7 @@ impl Tool for SandboxApplyPatchTool {
 
     fn options(&self) -> ToolOptions {
         ToolOptions::new()
+            .with_action_classes([crate::action_classes::EDIT])
             .with_approval(self.needs_approval.policy())
             .with_concurrency(ToolConcurrency::Parallel)
     }

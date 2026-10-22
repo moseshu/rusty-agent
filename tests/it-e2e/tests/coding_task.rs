@@ -23,7 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use ra_coding::{CodingHost, build_agent_with_host};
+use ra_coding::{CodingHost, CodingPermissionMode, build_agent_with_host};
 use ra_core::{
     agent::AgentId,
     cancel::CancelScope,
@@ -36,7 +36,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ProviderKey,
         ResolvedModel,
     },
-    permission::{PermissionDecision, PermissionMode, PermissionRule},
+    permission::{PermissionDecision, PermissionRule},
     prompt::PromptRole,
     state::RunId,
 };
@@ -322,7 +322,7 @@ async fn the_three_tools_complete_a_multi_file_task_on_one_workspace() {
             // A host carrying out an approved task answers that gate, and this test answers it the
             // way such a host does, so that what it measures is the three tools finishing the work
             // rather than the gate in front of them.
-            .with_permission_mode(PermissionMode::AcceptEdits)
+            .with_permission_policy(CodingPermissionMode::AcceptEdits.policy())
             .with_permission_rules([
                 PermissionRule::new(PermissionDecision::Allow).with_tool_name("exec_command"),
                 PermissionRule::new(PermissionDecision::Allow).with_tool_name("write_stdin"),

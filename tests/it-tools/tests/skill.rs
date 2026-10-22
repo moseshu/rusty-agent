@@ -8,10 +8,11 @@ use ra_core::{
     context::RunContext,
     error::Result,
     item::{AgentId, CallId},
+    permission::ActionClass,
     prompt::estimate_tokens,
     skill::{SkillCatalog, SkillCatalogError, SkillDocument, SkillId, SkillSummary},
     state::RunId,
-    tool::{PermissionScope, Tool, ToolConcurrency, ToolContext, ToolOutput, TruncationStage},
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, TruncationStage},
 };
 use ra_tools::skill::{SkillLimits, SkillListingLimits, SkillTool, render_catalog_listing};
 use serde_json::{Value, json};
@@ -113,7 +114,10 @@ async fn test_the_skill_entry_advertises_a_strict_schema_and_a_read_only_scope()
     );
     // Read, unlike the web entries: a catalog is the host's own material, reached without anything
     // leaving the machine.
-    assert_eq!(tool.options().permission_scope(), PermissionScope::Read);
+    assert_eq!(
+        tool.options().action_classes(),
+        &[ActionClass::from("read")]
+    );
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
 }
 

@@ -9,8 +9,9 @@ use ra_core::{
     agent::AgentSpec,
     context::RunContext,
     item::{AgentId, CallId},
+    permission::ActionClass,
     state::RunId,
-    tool::{PermissionScope, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolServices},
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolServices},
     user_input::{
         RequestUserInputAnswer, RequestUserInputArgs, RequestUserInputQuestion,
         RequestUserInputQuestionOption, RequestUserInputResponse, UserInputPort,
@@ -184,7 +185,10 @@ fn request_user_input_tool_includes_questions_schema() {
     );
     // Codex's tools run alone unless they declare parallel calls, and asking reaches only the user.
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Exclusive);
-    assert_eq!(tool.options().permission_scope(), PermissionScope::Read);
+    assert_eq!(
+        tool.options().action_classes(),
+        &[ActionClass::from("read")]
+    );
 }
 
 /// Codex's `request_user_input_unavailable_messages_respect_default_mode_feature_flag`.

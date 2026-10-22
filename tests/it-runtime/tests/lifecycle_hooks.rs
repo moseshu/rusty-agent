@@ -26,7 +26,6 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelStreamEvent, ProviderKey, ResolvedModel,
     },
-    permission::PermissionMode,
     state::{RunId, RunState},
     tool::{
         Tool, ToolApprovalPolicy, ToolContext, ToolGuardrailId, ToolOptions, ToolOrigin,
@@ -38,7 +37,7 @@ use ra_runtime::{
     agent::AgentBinding,
     hook::{UserHookRegistration, UserHooks},
     lifecycle::LifecycleHooks,
-    permission::PermissionEngine,
+    permission::{ActionClassPolicy, PermissionEngine},
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
     tool::dispatch::{CallHistory, ToolDispatch, ToolDispatchRequest, dispatch_tool},
 };
@@ -955,7 +954,7 @@ async fn the_model_call_is_announced_once_per_turn_and_its_end_reads_the_spend_i
     let tool = CountingTool::plain("apply_patch");
     let config = RunConfig::new()
         .with_lifecycle_hook(hooks.clone())
-        .with_permission_mode(PermissionMode::BypassPermissions);
+        .with_permission_policy(ActionClassPolicy::new().with_auto_allow_all(true));
     let started = run(
         agent_with(vec![tool.clone() as Arc<dyn Tool>], Vec::new()),
         vec![calling("apply_patch", "call-1"), answering("done")],
@@ -991,7 +990,7 @@ async fn the_tool_bracket_reaches_a_call_the_loop_made_and_closes_before_the_nex
     let tool = CountingTool::plain("apply_patch");
     let config = RunConfig::new()
         .with_lifecycle_hook(hooks.clone())
-        .with_permission_mode(PermissionMode::BypassPermissions);
+        .with_permission_policy(ActionClassPolicy::new().with_auto_allow_all(true));
     let started = run(
         agent_with(vec![tool as Arc<dyn Tool>], Vec::new()),
         vec![calling("apply_patch", "call-1"), answering("done")],
@@ -1078,7 +1077,7 @@ async fn a_cancelled_run_is_never_announced_as_one_that_ended() {
     let cancel = CancelScope::root();
     let config = RunConfig::new()
         .with_lifecycle_hook(hooks.clone())
-        .with_permission_mode(PermissionMode::BypassPermissions);
+        .with_permission_policy(ActionClassPolicy::new().with_auto_allow_all(true));
     let started = run_in(
         agent_with(vec![tool as Arc<dyn Tool>], Vec::new()),
         vec![calling("apply_patch", "call-1"), answering("done")],

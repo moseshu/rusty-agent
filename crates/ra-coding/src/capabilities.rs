@@ -5,11 +5,11 @@
 //! content: the capabilities themselves would serve a data-analysis agent unchanged, while "a
 //! read-only specialist gets discovery and nothing that writes" is a statement about this product.
 //!
-//! # Why the role filter reads permission scopes instead of listing names
+//! # Why the role filter reads action classes instead of listing names
 //!
 //! A read-only role's own prompt says it has no editing tools and that an edit will fail. The set
 //! that keeps that promise is exactly the capabilities whose every tool declares
-//! [`PermissionScope::Read`], read from each tool's own declaration rather than from a second list
+//! the `read` action class, read from each tool's own declaration rather than from a second list
 //! maintained here — a hand-written survivor list disagrees with the tools the first time one is
 //! added, and the disagreement shows up as a prompt that denies an entry the request carries.
 //!
@@ -57,7 +57,6 @@ use async_trait::async_trait;
 use ra_core::{
     capability::{Capability, CapabilityFamily},
     error::{Error, Result},
-    permission::PermissionScope,
     prompt::{PromptRole, PromptSection},
     tool::{Tool, ToolLookupKey, ToolNamespace},
 };
@@ -422,8 +421,12 @@ fn render_names(names: &[String]) -> String {
 /// A capability that contributes no tool passes: there is nothing in it to withhold from a
 /// read-only agent.
 fn only_observes(capability: &Arc<dyn Capability>) -> bool {
-    capability
-        .tools()
-        .iter()
-        .all(|tool| tool.options().permission_scope() == PermissionScope::Read)
+    capability.tools().iter().all(|tool| {
+        let options = tool.options();
+        let classes = options.action_classes();
+        !classes.is_empty()
+            && classes
+                .iter()
+                .all(|class| class.as_str() == ra_tools::action_classes::READ)
+    })
 }

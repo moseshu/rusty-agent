@@ -4,8 +4,9 @@ use ra_core::{
     agent::AgentSpec,
     context::RunContext,
     item::{AgentId, CallId, ImageSource},
+    permission::ActionClass,
     state::RunId,
-    tool::{PermissionScope, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolOutputBlock},
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolOutputBlock},
 };
 use ra_exec::fs::Workspace;
 use ra_tools::view_image::{ViewImageLimits, ViewImageTool};
@@ -79,7 +80,10 @@ async fn test_the_image_entry_advertises_a_strict_schema_and_shares_the_workspac
     assert_eq!(tool.origin().qualified_name(), "view_image");
     assert!(tool.schema().strict_json_schema());
     assert_eq!(tool.schema().input_schema()["required"], json!(["path"]));
-    assert_eq!(tool.options().permission_scope(), PermissionScope::Read);
+    assert_eq!(
+        tool.options().action_classes(),
+        &[ActionClass::from("read")]
+    );
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
     // A shared claim rather than none: reads run alongside each other, and alongside anything else
     // that only observes the same workspace.

@@ -46,7 +46,6 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
     event::{AgentEvent, SubAgentActivityEvent, SubAgentActivityKind},
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, Tool, ToolAvailability, ToolContext, ToolFailureHandling,
         ToolInput, ToolNamespace, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolServices,
@@ -355,9 +354,11 @@ impl CollaborationTool {
             .with_description(description);
         // Observing the tree changes nothing; starting or steering an agent sets work in motion
         // that can run any of that agent's tools.
-        let scope = match kind {
-            CollaborationKind::WaitAgent | CollaborationKind::ListAgents => PermissionScope::Read,
-            _ => PermissionScope::Execute,
+        let action_class = match kind {
+            CollaborationKind::WaitAgent | CollaborationKind::ListAgents => {
+                crate::action_classes::READ
+            }
+            _ => crate::action_classes::EXECUTE,
         };
         Ok(Self {
             kind,
@@ -368,7 +369,7 @@ impl CollaborationTool {
             options: ToolOptions::new()
                 .with_availability(ToolAvailability::Dynamic)
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_permission_scope(scope),
+                .with_action_classes([action_class]),
             wait,
         })
     }

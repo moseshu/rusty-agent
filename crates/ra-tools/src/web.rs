@@ -30,7 +30,6 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, Tool, ToolArgumentDecodeError,
         ToolConcurrency, ToolContext, ToolFailureHandling, ToolInput, ToolOptions, ToolOrigin,
@@ -158,7 +157,7 @@ fn count(requested: Option<u32>, ceiling: usize) -> usize {
 
 /// Shared construction for the two entries: one identity, one schema, one set of options.
 ///
-/// **Both are [`PermissionScope::Execute`], not `Read`**, and the reason is in the scope's own
+/// **Both declare the `execute` action class**, and the reason is in the declaration's own
 /// definition: `Read` observes data *without invoking an external action*, and a lookup leaves the
 /// machine. What goes out is the query — which carries whatever the run put in it — and what comes
 /// back was written by a third party. Neither is true of reading a file, and a role that withholds
@@ -173,7 +172,7 @@ fn entry<I: ToolInput>(name: &'static str) -> Result<(ToolOrigin, FuncSchema, To
         FuncSchema::for_input::<I>(name)?,
         ToolOptions::new()
             .with_failure_handling(ToolFailureHandling::Custom)
-            .with_permission_scope(PermissionScope::Execute)
+            .with_action_classes([crate::action_classes::EXECUTE])
             .with_concurrency(ToolConcurrency::Parallel),
     ))
 }

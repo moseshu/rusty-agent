@@ -30,7 +30,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ra_core::{
     error::{Error, Result, ToolErrorKind},
     item::{ImageBlock, ImageSource},
-    permission::PermissionScope,
     tool::{
         DecodedToolInput, FuncSchema, ObservationMetadata, ResourceClaim, Tool,
         ToolArgumentDecodeError, ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions,
@@ -145,7 +144,7 @@ impl ViewImageTool {
             func_schema: FuncSchema::for_input::<ViewImageInput>(TOOL_NAME)?,
             options: ToolOptions::new()
                 .with_failure_handling(ToolFailureHandling::Custom)
-                .with_permission_scope(PermissionScope::Read)
+                .with_action_classes([crate::action_classes::READ])
                 .with_concurrency(ToolConcurrency::Parallel)
                 .with_resource_claim(ResourceClaim::shared(workspace.resource_id().clone())),
             root: workspace.root().to_path_buf(),

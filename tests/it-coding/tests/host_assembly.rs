@@ -105,8 +105,7 @@ impl Capability for ProfileCapability {
                 json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
             )
             .unwrap(),
-            options: ToolOptions::new()
-                .with_permission_scope(ra_core::permission::PermissionScope::Edit),
+            options: ToolOptions::new().with_action_classes([ra_tools::action_classes::EDIT]),
             bound: self.bound,
         })]
     }
@@ -418,13 +417,11 @@ async fn configured_profiles_preserve_independent_tools_and_role_boundaries() {
                 }
             }
             if role.is_read_only() {
-                assert!(
-                    agent
-                        .tools()
-                        .iter()
-                        .all(|tool| tool.options().permission_scope()
-                            == ra_core::permission::PermissionScope::Read)
-                );
+                assert!(agent.tools().iter().all(|tool| {
+                    let options = tool.options();
+                    let classes = options.action_classes();
+                    !classes.is_empty() && classes.iter().all(|class| class.as_str() == "read")
+                }));
                 assert!(!names.contains(&spawn.as_str()));
             }
         }
@@ -870,7 +867,7 @@ async fn thread_control_keeps_children_across_turns_and_isolates_other_threads()
 /// them.
 #[tokio::test]
 async fn a_spawned_agent_is_assembled_with_its_own_processes_and_tool_plan() {
-    use ra_core::permission::{PermissionDecision, PermissionMode, PermissionRule};
+    use ra_core::permission::{PermissionDecision, PermissionRule};
     use ra_runtime::permission::PermissionEngine;
     let workspace = tempfile::tempdir().unwrap();
     let host = Arc::new(configured_host::Services::default())
@@ -902,12 +899,11 @@ async fn a_spawned_agent_is_assembled_with_its_own_processes_and_tool_plan() {
     let (agent, control) = configured_agent(&host, &PromptRole::Main).await;
     // The worker runs on the configuration of the run that spawned it, which lets the command
     // through without asking.
-    let config = host.build_run_config().with_permission_engine(
-        PermissionEngine::new(PermissionMode::Default)
-            .with_rules([
-                PermissionRule::new(PermissionDecision::Allow).with_tool_name("exec_command")
-            ]),
-    );
+    let config =
+        host.build_run_config()
+            .with_permission_engine(PermissionEngine::new().with_rules([
+                PermissionRule::new(PermissionDecision::Allow).with_tool_name("exec_command"),
+            ]));
     let thread = AgentThread::builder(
         SessionId::new("processes"),
         AgentBinding::direct(agent),
@@ -1046,7 +1042,7 @@ async fn thread_shutdown_cancels_and_waits_for_a_running_child() {
 
 #[tokio::test]
 async fn an_approval_resume_keeps_the_thread_bound_to_its_control_tree() {
-    use ra_core::permission::{PermissionDecision, PermissionMode, PermissionRule};
+    use ra_core::permission::{PermissionDecision, PermissionRule};
     use ra_runtime::permission::PermissionEngine;
     let workspace = tempfile::tempdir().unwrap();
     let host = Arc::new(configured_host::Services::default())
@@ -1058,11 +1054,9 @@ async fn an_approval_resume_keeps_the_thread_bound_to_its_control_tree() {
         .unwrap()
         .extend([collab("list_agents", json!({})), answer("resumed")]);
     let config = host.build_run_config().with_permission_engine(
-        PermissionEngine::new(PermissionMode::Default).with_rules([PermissionRule::new(
-            PermissionDecision::Ask,
-        )
-        .with_tool_name("list_agents")
-        .with_namespace(COLLABORATION)]),
+        PermissionEngine::new().with_rules([PermissionRule::new(PermissionDecision::Ask)
+            .with_tool_name("list_agents")
+            .with_namespace(COLLABORATION)]),
     );
     let (agent, control) = configured_agent(&host, &PromptRole::Main).await;
     let thread = AgentThread::builder(

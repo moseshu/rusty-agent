@@ -136,17 +136,19 @@ pub(crate) fn check_approval_requests(
     let unasked = declared_tools(builder)
         .into_iter()
         .filter(|tool| {
+            let (tool, agent_id) = tool;
             let options = tool.options();
             options.approval() == ToolApprovalPolicy::Always
                 && options.availability() != ToolAvailability::Disabled
                 && builder.config().permission().evaluate(
-                    options.permission_scope(),
+                    options.action_classes(),
                     tool.origin(),
+                    agent_id,
                     PermissionDecision::Ask,
                 ) == PermissionDecision::Ask
                 && !adapter.is_some_and(|adapter| adapter.requests_approval_for(tool.as_ref()))
         })
-        .map(|tool| format!("`{}`", tool.origin().qualified_name()))
+        .map(|(tool, _)| format!("`{}`", tool.origin().qualified_name()))
         .collect::<BTreeSet<_>>();
     if unasked.is_empty() {
         return Ok(());
@@ -159,14 +161,20 @@ pub(crate) fn check_approval_requests(
 
 /// The tools a thread's runs can call as `builder` prepares it: its agent's, those of every agent
 /// its handoffs reach. Run-bound capability tools are not available at this lifecycle stage.
-fn declared_tools(builder: &AgentThreadBuilder) -> Vec<Arc<dyn Tool>> {
+fn declared_tools(builder: &AgentThreadBuilder) -> Vec<(Arc<dyn Tool>, ra_core::item::AgentId)> {
     let config = builder.config();
     let start = builder.agent().execution();
     let mut reached = BTreeSet::from([start.id().clone()]);
     let mut agents = vec![Arc::clone(start)];
     let mut tools = Vec::new();
     while let Some(agent) = agents.pop() {
-        tools.extend(agent.tools().iter().cloned());
+        tools.extend(
+            agent
+                .tools()
+                .iter()
+                .cloned()
+                .map(|tool| (tool, agent.id().clone())),
+        );
         for handoff in agent.handoffs() {
             if reached.insert(handoff.target_agent().clone())
                 && let Some(target) = config.agent_registry().get(handoff.target_agent())

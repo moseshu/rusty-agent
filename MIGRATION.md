@@ -100,6 +100,50 @@ has already used 10 or more turns fails with the turn-limit error as soon as it 
 resume such a run under its original default, configure `with_max_turns(32)` for that
 continuation.
 
+### Coding permission modes move out of core
+
+Replace `ra_core::permission::PermissionMode` with `ra_coding::CodingPermissionMode` in
+coding products. Its labels, Display output and camelCase serde spellings are unchanged.
+Replace `with_permission_mode(mode)` with `with_permission_policy(mode.policy())`.
+Provider-neutral hosts can omit the policy entirely to retain normal SDK approval behavior.
+
+`PermissionScope` and `ToolOptions::with_permission_scope` are replaced by the open
+`ActionClass` identifier and `ToolOptions::with_action_classes([class, ...])`. The plural
+builder sorts and deduplicates classes. An empty list is unclassified; it does not inherit
+Execute. ToolOptions schema 2 reads legacy schema 1 `permission_scope`, including the old
+implicit Execute default. Built-in adapter constants are in `ra_tools::action_classes`:
+`READ`, `EDIT`, and `EXECUTE`. Generic adapters below ra-tools declare their local effects
+without depending upward on the coding product's vocabulary module.
+
+`ActionClassPolicy` is an optional local runtime extension, separate from the framework
+approval contract. `allow_only` checks every declared class before rules; matching rules
+precede `auto_allow` and `auto_allow_all`. Restricted and class-based automatic approvals
+require a nonempty class list. Disabling prompts changes only `prompts`: it preserves the
+restriction, automatic approvals and rules. Coding settings apply this overlay only for
+`AskForApproval::Never`; other policies preserve the base engine, including an absent policy
+and DontAsk. Framework automatic approval does not bypass tool-internal approval or sandbox checks.
+
+The unused callback types `ToolApprovalHandler`, `ToolApprovalDecision`, `ToolApprovalAllow`,
+`ToolApprovalDeny`, `ToolPermissionContext` and `PermissionUpdate*` have been removed without replacements. Use the existing tool approval
+contract and pending interruption APIs.
+
+### Sticky decisions belong to their agent
+
+An `always` answer now binds the exact tool identity and its owning agent, across handoffs and
+JSON checkpoints. `matches_origin_for_agent` evaluates these rules. Name-only `matches` and
+`matches_origin` return false for agent-owned rules, because their inputs cannot prove ownership.
+Configured rules without an owner retain their wildcard behavior.
+
+Rust uses the registry-unique `AgentId` as durable ownership rather than Python object identity.
+Hosts must preserve those IDs when rebuilding an agent registry; assigning an existing ID to a
+new capability intentionally reuses that logical identity. This is the necessary adaptation for
+an owned, serializable Rust agent graph. Sticky answers without agent provenance return a caller
+error before recording any answer; the host may still answer that call once.
+
+RunState schema 15 records the new rule field. Reading schemas through 14 drops ownerless
+session rules, so future calls require fresh approval. Exact pending-call answers remain intact.
+The migration runs only for old schemas. A current-schema rule is not silently discarded.
+
 ### Dynamic instructions are system instructions
 
 Static, synchronous, and asynchronous instruction callbacks now all supply the model's system

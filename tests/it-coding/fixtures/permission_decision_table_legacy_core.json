@@ -1,0 +1,722 @@
+[
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "default",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "default",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "default",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "default",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "default",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "default",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "default",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "default",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "default",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "default",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "acceptEdits",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "acceptEdits",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "acceptEdits",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "acceptEdits",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "acceptEdits",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "acceptEdits",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "allow",
+    "mode": "bypassPermissions",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "ask",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "plan",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "dontAsk",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "edit",
+    "tool": "apply_patch",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "dontAsk",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "execute",
+    "tool": "exec_command",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "glob",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "grep",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "read",
+    "tool": "read_file",
+    "tool_approval_policy": "never"
+  },
+  {
+    "approval_result": "allow",
+    "decision": "allow",
+    "mode": "dontAsk",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "ask",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  },
+  {
+    "approval_result": "deny",
+    "decision": "deny",
+    "mode": "dontAsk",
+    "permission_scope": "execute",
+    "tool": "write_stdin",
+    "tool_approval_policy": "dynamic"
+  }
+]

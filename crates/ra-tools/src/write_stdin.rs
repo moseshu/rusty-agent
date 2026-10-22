@@ -217,6 +217,7 @@ impl WriteStdinTool {
             origin: ToolOrigin::new(TOOL_NAME)?,
             func_schema: FuncSchema::for_input::<WriteStdinInput>(TOOL_NAME)?,
             options: ToolOptions::new()
+                .with_action_classes([crate::action_classes::EXECUTE])
                 .with_approval(ToolApprovalPolicy::Always)
                 .with_failure_handling(ToolFailureHandling::Custom)
                 .with_concurrency(ToolConcurrency::Parallel),

@@ -4,8 +4,9 @@ use ra_core::{
     agent::AgentSpec,
     context::RunContext,
     item::{AgentId, CallId},
+    permission::ActionClass,
     state::RunId,
-    tool::{PermissionScope, Tool, ToolConcurrency, ToolContext, ToolOutput},
+    tool::{Tool, ToolConcurrency, ToolContext, ToolOutput},
 };
 use ra_tools::update_plan::{PlanLimits, UpdatePlanTool};
 use serde_json::{Value, json};
@@ -62,7 +63,10 @@ async fn test_the_plan_entry_advertises_a_strict_schema_and_a_read_only_scope() 
 
     // Read scope and parallel execution, because recording a plan reaches nothing: no workspace, no
     // process, no network. A role that withholds everything with a side effect keeps this one.
-    assert_eq!(tool.options().permission_scope(), PermissionScope::Read);
+    assert_eq!(
+        tool.options().action_classes(),
+        &[ActionClass::from("read")]
+    );
     assert_eq!(tool.options().concurrency(), ToolConcurrency::Parallel);
 }
 

@@ -28,7 +28,7 @@ use ra_core::{
         ApiProtocol, Model, ModelRequest, ModelResolver, ModelSelector, ModelSettings, ModelStream,
         ModelStreamEvent, ProviderKey, ResolvedModel, RunItemStreamEvent,
     },
-    permission::{PermissionDecision, PermissionMode, PermissionRule},
+    permission::{PermissionDecision, PermissionRule},
     session::SessionId,
     state::{RunId, RunState},
     tool::{
@@ -39,6 +39,7 @@ use ra_core::{
 use ra_runtime::{
     agent::AgentBinding,
     hook::{UserHookRegistration, UserHooks},
+    permission::ActionClassPolicy,
     runner::{RunConfig, RunOutcome, RunRequest, Runner},
 };
 use serde_json::{Value, json};
@@ -391,7 +392,7 @@ async fn permission_denial_beats_a_peer_grant_and_dont_ask_is_not_overridden() {
             .with_user_hook(allow.register(HookEventName::PermissionRequest))
             .with_user_hook(refuse.register(HookEventName::PermissionRequest));
         if dont_ask {
-            config = config.with_permission_mode(PermissionMode::DontAsk);
+            config = config.with_permission_policy(ActionClassPolicy::new().with_prompts(false));
         }
         Runner::run(request(
             &model,

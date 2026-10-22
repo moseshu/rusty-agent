@@ -14,7 +14,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use crate::{context::RunContext, error::Result, model::ModelToolDefinition};
 use serde_json::Value;
 
-pub use crate::permission::PermissionScope;
+pub use crate::permission::ActionClass;
 
 /// Resolves an agent's external tools for each model call, as Python's `Agent.get_mcp_tools`.
 ///
