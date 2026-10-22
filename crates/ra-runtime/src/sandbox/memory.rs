@@ -30,9 +30,9 @@
 //!   or record, and `UserError` for conflicting managers; these are configuration errors here,
 //!   with the reference's wording. A session's failure travels as the sandbox error it is.
 //! - **A run is classified by how it ended, not by an exception.** The reference's runs end either
-//!   with a result or by raising; a run here can also stop softly with a result on its turn cap, a
-//!   cancellation or a tripped guardrail, and [`rollouts::terminal_metadata_for_result`] reads
-//!   those from its finish reason. A failed run's exception type is its error's stable code.
+//!   with a result or by raising; an unhandled turn cap raises here too. A handled budget stop
+//!   or a tripped guardrail can return a result, and [`rollouts::terminal_metadata_for_result`]
+//!   reads its finish reason. A failed run's exception type is its error's stable code.
 //! - **A segment's input is the run's own input.** The reference records the items its SDK session
 //!   saved for the run, or the caller's input to a server-managed conversation; a run here has
 //!   neither, so the segment records the input the run started from.

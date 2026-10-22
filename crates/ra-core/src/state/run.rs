@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(13);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(14);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -186,10 +186,16 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          has been removed and call the model instead of concluding from the saved output.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(13),
         "Persisted the trace settings a resumed run falls back to, currently its trace group. An \
          older runtime keeps them as an unknown field but resumes without a trace group unless \
          the host supplies the group again.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the run's turn limit, including an explicitly unlimited run, so a resumed run \
+         keeps the limit it started with. An older runtime keeps it as an unknown field and \
+         resumes under whatever limit the host supplies.",
     ),
 ];
 
@@ -1041,6 +1047,16 @@ pub struct RunState {
     parent_run_id: Option<RunId>,
     #[serde(default)]
     budget: BudgetSnapshot,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_turn_limit"
+    )]
+    #[allow(
+        clippy::option_option,
+        reason = "missing legacy field differs from a saved unlimited limit"
+    )]
+    max_turns: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     finish_reason: Option<FinishReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1156,6 +1172,16 @@ struct RunStateRecord {
     parent_run_id: Option<RunId>,
     #[serde(default)]
     budget: BudgetSnapshot,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_turn_limit"
+    )]
+    #[allow(
+        clippy::option_option,
+        reason = "missing legacy field differs from a saved unlimited limit"
+    )]
+    max_turns: Option<Option<u32>>,
     #[serde(default)]
     finish_reason: Option<FinishReason>,
     #[serde(default)]
@@ -1228,6 +1254,7 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_failure,
             tool_output_references,
             mut budget,
+            max_turns,
             memory_exposures,
             input_guardrail_results,
             output_guardrail_results,
@@ -1380,6 +1407,7 @@ impl TryFrom<RunStateRecord> for RunState {
             subagent_started,
             parent_run_id,
             budget,
+            max_turns,
             finish_reason,
             nested_runs,
             workspace_lease,
@@ -1412,6 +1440,19 @@ impl TryFrom<RunStateRecord> for RunState {
 }
 
 impl RunState {
+    /// Saved turn limit: absent for an older checkpoint, `Some(None)` for unlimited.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn max_turns(&self) -> Option<Option<u32>> {
+        self.max_turns
+    }
+
+    /// Saves the configured turn limit before the run starts sampling.
+    #[doc(hidden)]
+    pub fn set_max_turns(&mut self, max_turns: Option<u32>) {
+        self.max_turns = Some(max_turns);
+    }
+
     /// Creates empty state for a new run with the specified run identity.
     #[must_use]
     pub fn start(run_id: RunId) -> Self {
@@ -1433,6 +1474,7 @@ impl RunState {
             subagent_started: false,
             parent_run_id: None,
             budget: BudgetSnapshot::new(),
+            max_turns: None,
             finish_reason: None,
             nested_runs: Vec::new(),
             workspace_lease: None,
@@ -3030,4 +3072,15 @@ fn validate_pending_interruptions(ids: &[ItemId], generated: &[RunItem]) -> Resu
 
 const fn run_state_schema_version() -> SchemaVersion {
     RUN_STATE_SCHEMA_VERSION
+}
+
+// A present null means explicitly unlimited, whereas a missing field is a legacy checkpoint.
+#[allow(
+    clippy::option_option,
+    reason = "serde distinguishes a missing legacy field from explicit null"
+)]
+fn deserialize_turn_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(deserializer).map(Some)
 }

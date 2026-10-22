@@ -345,7 +345,11 @@ fn root_request(
         CancelScope::root(),
         vec![ModelInputItem::Message(Message::user("do the work"))],
     )
-    .with_config(RunConfig::new().with_agent_registry(registry))
+    .with_config(
+        RunConfig::new()
+            .with_max_turns(32)
+            .with_agent_registry(registry),
+    )
     .with_agent_control(control.root())
 }
 

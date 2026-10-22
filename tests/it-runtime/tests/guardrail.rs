@@ -1168,7 +1168,7 @@ async fn output_guardrails_are_not_asked_when_the_run_was_stopped_from_outside()
         "write_file",
     )])]);
 
-    let result = Runner::run(
+    let error = Runner::run(
         Setup::default()
             .agent_input(input.clone())
             .agent_output(output.clone())
@@ -1177,17 +1177,11 @@ async fn output_guardrails_are_not_asked_when_the_run_was_stopped_from_outside()
             .request(&model),
     )
     .await
-    .expect("an exhausted turn cap ends the run softly");
+    .unwrap_err();
 
-    assert!(matches!(
-        result.outcome(),
-        RunOutcome::Completed {
-            reason: FinishReason::MaxTurns
-        }
-    ));
+    assert_eq!(error.code(), "budget.max_turns");
     assert_eq!(input.calls(), 1, "the input was still examined");
     assert_eq!(output.calls(), 0);
-    assert!(result.output_guardrail_results().is_empty());
 }
 
 /// Nothing about the two stages is coupled: the input check ran and passed, so the output check is
@@ -1224,14 +1218,14 @@ async fn resumed_tool_stop_checks_the_current_segments_output() {
     let first = Runner::run(
         Setup::default()
             .tool(Arc::new(lookup))
-            .max_turns(1)
+            .tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
             .request(&first_model),
     )
     .await
     .unwrap();
     assert_eq!(
         first.outcome().finish_reason(),
-        Some(FinishReason::MaxTurns)
+        Some(FinishReason::ToolStop)
     );
     let state = serde_json::from_value(serde_json::to_value(first.state()).unwrap()).unwrap();
     let check = Arc::new(RecordingOutput::new("check"));

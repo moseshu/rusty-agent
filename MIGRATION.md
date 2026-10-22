@@ -60,6 +60,46 @@ settings are upgraded to version 2 for subsequent writes. Schema version 2 empty
 clear inherited values. Resolved trace settings retain their own schema version because their
 shape did not change.
 
+### Run limits follow the framework defaults
+
+`ra_runtime::runner::DEFAULT_MAX_TURNS` is now 10 (previously 32). An exhausted turn
+limit returns `Error::Budget { kind: BudgetKind::MaxTurns, .. }` before the next model
+request. The existing `Error::Run` checkpoint wrapper retains that classification and exposes
+the generated history through `error.run_state()`, adapting the SDK error's `run_data`.
+A final answer on the last allowed turn still succeeds. Install a `RunErrorHandler`
+to produce a final delivery on exhaustion; returning `None` from the handler preserves the error.
+`AgentTool` defaults to 10 nested turns and applies its failure policy to exhaustion.
+
+`RunConfig::with_max_turns` accepts either a number or `None` for unlimited turns.
+`AgentToolBuilder::max_turns` accepts a number; `None` selects the default 10 turns,
+matching the SDK's `as_tool(max_turns=None)`. Omitting the call also keeps 10.
+Both builders accept zero, which exhausts before any model request, and are no longer
+`const fn`. `RunConfig::max_turns()` now returns `Option<u32>`; callers must handle `None`.
+
+`RunConfig::with_budget` keeps the configured turn limit when the supplied `BudgetLimit` has
+none, so setting only a token ceiling no longer drops the turn limit. A turn limit in the
+supplied budget still replaces the configured one; use `with_max_turns(None)` for unlimited
+turns.
+
+Function-tool concurrency is unlimited by default. `with_max_function_tool_concurrency`
+accepts a positive number or `None`; its getter now returns `Option<usize>`, and its builder
+is no longer `const fn`. This changes the global dispatch cap only: bare `ToolOptions`
+remain `Exclusive`, while macro-generated function tools remain `Parallel`.
+
+`CodingHost::build_run_config()` explicitly selects the product's 32 turns and concurrency 8.
+Other hosts can select those limits with `with_max_turns(32)` and
+`with_max_function_tool_concurrency(8)`.
+
+RunState schema 14 saves the turn limit, including explicitly unlimited runs. A resumed run
+uses its saved limit and spent turns even if the new request supplies a different limit.
+Tokens and deadlines remain configuration supplied on each continuation.
+
+Checkpoints written before schema 14 carry no turn limit, so they resume under the limit the
+request supplies, which is then saved. With the new default of 10, an older paused run that
+has already used 10 or more turns fails with the turn-limit error as soon as it resumes. To
+resume such a run under its original default, configure `with_max_turns(32)` for that
+continuation.
+
 ### Dynamic instructions are system instructions
 
 Static, synchronous, and asynchronous instruction callbacks now all supply the model's system

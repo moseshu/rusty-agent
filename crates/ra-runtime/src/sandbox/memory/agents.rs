@@ -139,9 +139,9 @@ impl fmt::Debug for MemoryRunConfig {
 /// The run, when it concluded on its own; an error saying how it stopped otherwise.
 ///
 /// The reference's runner raises when a run hits its turn cap or trips a guardrail, and the
-/// generation manager treats that as the phase failing. A run here reports those — and an
-/// interruption, a cancellation, an exhausted budget or an error handler's closeout — as a result
-/// that stopped without the agent's own answer, so a phase checks that its run concluded before its
+/// generation manager treats that as the phase failing. Unhandled turn exhaustion propagates
+/// here too; a guardrail stop, interruption, exhausted token budget or explicit error closeout
+/// can instead return a result without the agent's own answer. A phase checks completion before its
 /// output is used. A consolidation cut off at its turn cap has not consolidated, and recording its
 /// selection as the last successful one would take those rollouts out of the next consolidation's
 /// "added" list.

@@ -6,7 +6,8 @@
 //!
 //! The split is also what keeps the snapshot honest across a checkpoint. Every ceiling — including
 //! the wall clock, whose monotonic instant cannot be restored in another process — lives on the
-//! limit, which is configuration and is never persisted. The snapshot therefore holds spent
+//! limit. `RunState` separately saves the turn limit for framework-compatible recovery; token
+//! ceilings and deadlines remain continuation configuration. The snapshot therefore holds spent
 //! counters and nothing else: it serializes completely, and two snapshots that compare equal really
 //! do describe the same spend.
 //!
@@ -69,6 +70,13 @@ impl BudgetLimit {
         self
     }
 
+    /// Removes the model turn limit while retaining other budget dimensions.
+    #[must_use]
+    pub const fn without_max_turns(mut self) -> Self {
+        self.max_turns = None;
+        self
+    }
+
     /// Sets the maximum total token usage reported by model responses.
     #[must_use]
     pub const fn with_max_tokens(mut self, max_tokens: u64) -> Self {
@@ -107,18 +115,12 @@ impl BudgetLimit {
         self.deadline.map(Deadline::remaining)
     }
 
-    /// Rejects zero-valued ceilings, which would otherwise look like an unlimited budget in many
-    /// caller-side calculations while allowing no useful work.
+    /// Rejects a zero token ceiling. A zero turn limit is valid and exhausts before sampling.
     pub fn validate(&self) -> crate::error::Result<()> {
-        for (name, value) in [
-            ("max_turns", self.max_turns.map(u64::from)),
-            ("max_tokens", self.max_tokens),
-        ] {
-            if value == Some(0) {
-                return Err(crate::error::Error::config(format!(
-                    "`{name}` must be at least 1 when configured"
-                )));
-            }
+        if self.max_tokens == Some(0) {
+            return Err(crate::error::Error::config(
+                "`max_tokens` must be at least 1 when configured",
+            ));
         }
         Ok(())
     }

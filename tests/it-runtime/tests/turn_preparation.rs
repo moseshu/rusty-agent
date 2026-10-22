@@ -320,20 +320,14 @@ async fn test_turn_preparation_01() {
 
     let settings = prepared.request().model_settings();
     assert_eq!(settings.temperature(), Some(0.3));
-    assert_eq!(settings.max_tokens(), Some(1_000));
+    assert_eq!(settings.max_tokens(), Some(2_000));
     assert_eq!(settings.tool_choice(), Some(&ToolChoice::Required));
     assert_eq!(
         settings.metadata().get("provider").map(String::as_str),
-        Some("yes")
+        None
     );
-    assert_eq!(
-        settings.metadata().get("agent").map(String::as_str),
-        Some("yes")
-    );
-    assert_eq!(
-        settings.metadata().get("model").map(String::as_str),
-        Some("yes")
-    );
+    assert_eq!(settings.metadata().get("agent").map(String::as_str), None);
+    assert_eq!(settings.metadata().get("model").map(String::as_str), None);
     assert_eq!(
         settings.metadata().get("run").map(String::as_str),
         Some("yes")

@@ -302,6 +302,7 @@ async fn default_history_and_typed_callbacks_survive_ordinary_streaming_and_chec
                 &model,
                 RunConfig::new()
                     .with_max_turns(1)
+                    .with_error_handler(Arc::new(CheckpointCloseout))
                     .with_partial_messages(true),
             )
             .with_session(session.clone()),
@@ -311,8 +312,9 @@ async fn default_history_and_typed_callbacks_survive_ordinary_streaming_and_chec
         .unwrap();
         assert_eq!(callbacks.load(Ordering::SeqCst), 1);
         assert_eq!(paused.last_agent().id(), target.id());
-        let checkpoint: RunState =
+        let mut checkpoint: RunState =
             serde_json::from_value(serde_json::to_value(paused.state()).unwrap()).unwrap();
+        checkpoint.set_max_turns(Some(10));
         let resumed = drive(
             RunRequest::new(
                 AgentBinding::direct(target),
@@ -1068,7 +1070,9 @@ async fn the_projection_survives_a_checkpoint_and_governs_the_next_segment() {
         ),
         reviewer(Vec::new()),
         &model,
-        RunConfig::new().with_max_turns(1),
+        RunConfig::new()
+            .with_max_turns(1)
+            .with_error_handler(Arc::new(CheckpointCloseout)),
     ))
     .await
     .unwrap();
@@ -1087,7 +1091,7 @@ async fn the_projection_survives_a_checkpoint_and_governs_the_next_segment() {
 
     // The first segment stopped on its turn cap, with control already transferred.
     assert_eq!(paused.state().current_agent().unwrap().as_str(), "reviewer");
-    let restored: RunState =
+    let mut restored: RunState =
         serde_json::from_value(serde_json::to_value(paused.state()).unwrap()).unwrap();
     let (base, carried) = restored.model_input_base().unwrap();
     assert_eq!(base.len(), 2);
@@ -1095,6 +1099,7 @@ async fn the_projection_survives_a_checkpoint_and_governs_the_next_segment() {
 
     // A continuation from that checkpoint builds its request from the projection rather than from
     // the history the session kept.
+    restored.set_max_turns(Some(10));
     let resumed = Runner::run(
         RunRequest::new(
             AgentBinding::direct(reviewer(Vec::new())),
@@ -1265,7 +1270,7 @@ impl ra_runtime::runner::result::RunErrorHandler for ProjectedCloseout {
 #[tokio::test]
 async fn budget_closeout_respects_the_receiving_agents_projection() {
     let calls = Arc::new(AtomicUsize::new(0));
-    Runner::run(run_request(
+    let error = Runner::run(run_request(
         planner(
             HandoffSpec::new(AgentId::new("reviewer"), handoff_schema())
                 .with_history_projection(HistoryProjection::None),
@@ -1280,8 +1285,9 @@ async fn budget_closeout_respects_the_receiving_agents_projection() {
             })),
     ))
     .await
-    .unwrap();
+    .unwrap_err();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(error.code(), "budget.max_turns");
 }
 
 /// The reference's `remove_all_tools` shape: drops every call and output it is handed.
@@ -2002,5 +2008,22 @@ async fn staged_approval_outputs_are_published_once_before_the_transfer() {
                     .any(|item| item.id().as_str() == "second.output")
             );
         }
+    }
+}
+
+struct CheckpointCloseout;
+#[async_trait]
+impl ra_runtime::runner::result::RunErrorHandler for CheckpointCloseout {
+    async fn handle(
+        &self,
+        _: ra_runtime::runner::result::RunErrorHandlerInput<'_>,
+    ) -> Result<Option<ra_runtime::runner::result::RunErrorHandlerResult>> {
+        Ok(Some(
+            ra_runtime::runner::result::RunErrorHandlerResult::new(Message::assistant(
+                "checkpoint",
+                OutputPhase::Final,
+            ))
+            .with_write_to_history(false),
+        ))
     }
 }

@@ -629,7 +629,7 @@ async fn a_nested_run_that_hits_its_turn_cap_fails_the_call_visibly() {
     let outputs = tool_output_texts(&resolver.calls()[2].input);
     assert_eq!(outputs.len(), 1);
     // Model-visible failures are rendered as a stable code, never as framework prose.
-    assert!(outputs[0].contains("tool.execution_failed"), "{outputs:?}");
+    assert!(outputs[0].contains("budget.max_turns"), "{outputs:?}");
 }
 
 #[tokio::test]
@@ -2012,13 +2012,12 @@ async fn cancelling_the_parent_reaches_the_nested_run() {
 }
 
 #[test]
-fn zero_max_turns_is_rejected_at_build() {
-    let error = agent("nested", "Nested", "n")
+fn zero_max_turns_is_a_valid_agent_tool_configuration() {
+    agent("nested", "Nested", "n")
         .as_tool()
         .max_turns(0)
         .build()
-        .unwrap_err();
-    assert!(matches!(error, Error::Config { .. }), "{error:?}");
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3584,4 +3583,84 @@ async fn a_committed_nested_output_reaches_the_stop_policy_after_extraction_fail
     assert_eq!(resolver.calls().len(), 3);
     assert_eq!(extractions.load(Ordering::SeqCst), 1);
     assert!(!result.state().tool_output_settlement_pending());
+}
+
+#[tokio::test]
+async fn nested_runs_use_ten_turns_when_omitted_or_reset_with_none() {
+    for configuration in ["omitted", "none", "reset"] {
+        let nested = AgentSpec::builder()
+            .id(AgentId::new("looper"))
+            .name("Looper")
+            .tool(Arc::new(ProbeTool::new("step", "stepped")))
+            .build()
+            .unwrap();
+        let builder = nested.as_tool();
+        let tool = match configuration {
+            "omitted" => builder,
+            "none" => builder.max_turns(None),
+            _ => builder.max_turns(3).max_turns(None),
+        }
+        .build()
+        .unwrap();
+        let mut script = vec![tool_call(
+            "parent-call",
+            "parent",
+            "looper",
+            json!({"input":"work"}),
+        )];
+        script.extend((0..10).map(|i| {
+            tool_call(
+                &format!("nested-{i}"),
+                &format!("nested-call-{i}"),
+                "step",
+                json!({}),
+            )
+        }));
+        script.push(final_message("parent-done", "done"));
+        let resolver = ScriptedResolver::new(script);
+        let result = Runner::run(request(orchestrator(tool), &resolver))
+            .await
+            .unwrap_or_else(|error| panic!("configuration {configuration}: {error:?}"));
+        assert_eq!(result.final_text(), "done");
+        let calls = resolver.calls();
+        let outputs = tool_output_texts(&calls.last().unwrap().input);
+        assert_eq!(calls.len(), 12, "configuration {configuration}");
+        assert_eq!(outputs.len(), 1, "configuration {configuration}");
+        assert!(outputs[0].contains("budget.max_turns"));
+    }
+}
+
+#[tokio::test]
+async fn nested_turn_exhaustion_reaches_custom_failure_handling_or_propagates() {
+    for custom in [false, true] {
+        let nested = agent("nested", "Nested", "n");
+        let builder = nested.as_tool().max_turns(0);
+        let tool = if custom {
+            builder.failure_error_function(Arc::new(Apologize))
+        } else {
+            builder.propagate_failures()
+        }
+        .build()
+        .unwrap();
+        let mut steps = vec![tool_call(
+            "parent-call",
+            "parent",
+            "nested",
+            json!({"input":"work"}),
+        )];
+        if custom {
+            steps.push(final_message("done", "done"));
+        }
+        let resolver = ScriptedResolver::new(steps);
+        let result = Runner::run(request(orchestrator(tool), &resolver)).await;
+        if custom {
+            assert_eq!(result.unwrap().final_text(), "done");
+            assert_eq!(
+                tool_output_texts(&resolver.calls()[1].input),
+                ["nested could not answer: budget.max_turns"]
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), "budget.max_turns");
+        }
+    }
 }

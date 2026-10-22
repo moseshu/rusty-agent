@@ -1262,9 +1262,12 @@ async fn resumable_budget_stops_do_not_end_the_agent() {
                 .with_lifecycle_hook(hooks.clone()),
             prompt(),
         );
-        Runner::run(started.request)
-            .await
-            .expect("a soft budget stop");
+        let result = Runner::run(started.request).await;
+        if budget.max_turns() == Some(1) {
+            assert_eq!(result.unwrap_err().code(), "budget.max_turns");
+        } else {
+            result.expect("a token budget stop remains resumable");
+        }
         assert_eq!(started.model_calls.load(Ordering::SeqCst), 1);
         assert!(
             !hooks

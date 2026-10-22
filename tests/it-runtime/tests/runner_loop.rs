@@ -194,14 +194,16 @@ mod memory_feedback {
             request(vec![tool.clone()], &model, &cancel).with_config(
                 RunConfig::new()
                     .with_max_turns(1)
+                    .with_error_handler(Arc::new(super::FixtureCheckpoint))
                     .with_memory_usage_sink(sink.clone()),
             ),
         )
         .await
         .unwrap();
         assert!(sink.events.lock().unwrap().is_empty());
-        let state: RunState =
+        let mut state: RunState =
             serde_json::from_value(serde_json::to_value(first.state()).unwrap()).unwrap();
+        state.set_max_turns(Some(10));
         let result = Runner::run(
             resume_request(vec![tool], &model, &cancel, state)
                 .with_config(RunConfig::new().with_memory_usage_sink(sink.clone())),
@@ -262,7 +264,7 @@ use ra_runtime::{
     agent::AgentBinding,
     runner::{
         ContinuationInput, RunConfig, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult,
-        RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner, TurnRecord,
+        RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
     },
 };
 use serde_json::{Value, json};
@@ -2557,56 +2559,45 @@ async fn only_last_message_is_delivery_when_commentary_and_delivery_coexist_in_t
 }
 
 #[tokio::test]
-async fn run_hitting_turn_limit_has_no_delivery_message() {
-    // The cap fires between turns, so the last thing the model said is still work in progress.
-    // R3-8's error handler is what turns that into a delivered result; until then this has to be
-    // `None` rather than promoting a progress update to the run's conclusion.
-    let tool = Arc::new(ScriptedTool::new("write_file"));
-    let model = ScriptedModel::new(
-        (0..8)
-            .map(|turn| {
-                ModelResponse::new(vec![
-                    message_with_phase(
-                        &format!("msg-{turn}"),
-                        "我接着写下一个文件",
-                        OutputPhase::Final,
-                    ),
-                    tool_call(&format!("c-{turn}"), &format!("call-{turn}"), "write_file"),
-                ])
-            })
-            .collect(),
-    );
-    let cancel = CancelScope::root();
-
-    let result = Runner::run(
-        request(vec![tool], &model, &cancel).with_config(RunConfig::new().with_max_turns(2)),
-    )
-    .await
-    .unwrap();
-
-    assert!(matches!(
-        result.outcome(),
-        RunOutcome::Completed {
-            reason: FinishReason::MaxTurns
-        }
-    ));
-    assert_eq!(
-        phases(&result),
-        [OutputPhase::Commentary, OutputPhase::Commentary]
-    );
-    assert!(result.final_message().is_none());
-    // Empty rather than the last thing the model happened to say: nothing was delivered, and
-    // promoting a progress update to the run's conclusion is what this projection must not do.
-    assert!(result.final_text().is_empty());
-
-    // No turn ended this run — the cap did, between two of them. Both records still say the turn
-    // asked for another, and the reason lives on the outcome instead.
-    let codes = result
-        .turn_records()
-        .iter()
-        .map(TurnRecord::next_step_code)
-        .collect::<Vec<_>>();
-    assert_eq!(codes, ["run_again", "run_again"]);
+async fn run_hitting_turn_limit_returns_a_budget_error() {
+    for streamed in [false, true] {
+        let tool = Arc::new(ScriptedTool::new("write_file"));
+        let model = ScriptedModel::new(
+            (0..3)
+                .map(|turn| {
+                    ModelResponse::new(vec![tool_call(
+                        &format!("c-{turn}"),
+                        &format!("call-{turn}"),
+                        "write_file",
+                    )])
+                })
+                .collect(),
+        );
+        let cancel = CancelScope::root();
+        let request =
+            request(vec![tool], &model, &cancel).with_config(RunConfig::new().with_max_turns(2));
+        let error = if streamed {
+            Runner::run_streamed(request).finish().await.unwrap_err()
+        } else {
+            Runner::run(request).await.unwrap_err()
+        };
+        assert_eq!(error.code(), "budget.max_turns");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+        let state = error
+            .run_state()
+            .expect("turn exhaustion retains generated history");
+        assert_eq!(state.budget().turns_used(), 2);
+        assert_eq!(state.model_responses().len(), 2);
+        assert_eq!(state.max_turns(), Some(Some(2)));
+        assert_eq!(
+            state
+                .generated_items()
+                .iter()
+                .filter(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(_)))
+                .count(),
+            2
+        );
+    }
 }
 
 #[tokio::test]
@@ -2625,38 +2616,43 @@ async fn final_message_does_not_treat_non_assistant_message_as_delivery() {
 }
 
 #[tokio::test]
-async fn reaching_turn_limit_ends_softly_instead_of_erroring() {
-    let tool = Arc::new(ScriptedTool::new("write_file"));
-    // The model requests a tool on every turn and never concludes.
-    let model = ScriptedModel::new(
-        (0..8)
-            .map(|turn| {
-                ModelResponse::new(vec![tool_call(
-                    &format!("c-{turn}"),
-                    &format!("call-{turn}"),
-                    "write_file",
-                )])
-            })
-            .collect(),
-    );
-    let cancel = CancelScope::root();
-
-    let result = Runner::run(
-        request(vec![tool], &model, &cancel).with_config(RunConfig::new().with_max_turns(3)),
-    )
-    .await
-    .unwrap();
-
-    // The limit is the loop's termination condition, not a failure; the host still receives the
-    // items already produced.
-    assert_eq!(result.turns(), 3);
-    assert!(matches!(
-        result.outcome(),
-        RunOutcome::Completed {
-            reason: FinishReason::MaxTurns
+async fn default_turn_limit_and_explicitly_unlimited_runs_follow_the_framework_contract() {
+    for streamed in [false, true] {
+        for unlimited in [false, true] {
+            let tool = Arc::new(ScriptedTool::new("write_file"));
+            let mut steps: Vec<_> = (0..11)
+                .map(|turn| {
+                    ModelResponse::new(vec![tool_call(
+                        &format!("c-{turn}"),
+                        &format!("call-{turn}"),
+                        "write_file",
+                    )])
+                })
+                .collect();
+            steps.push(ModelResponse::new(vec![message("done", "done")]));
+            let model = ScriptedModel::new(steps);
+            let cancel = CancelScope::root();
+            let config = if unlimited {
+                RunConfig::new().with_max_turns(None)
+            } else {
+                RunConfig::new()
+            };
+            assert_eq!(config.max_turns(), if unlimited { None } else { Some(10) });
+            let request = request(vec![tool], &model, &cancel).with_config(config);
+            let result = if streamed {
+                Runner::run_streamed(request).finish().await
+            } else {
+                Runner::run(request).await
+            };
+            if unlimited {
+                assert_eq!(result.unwrap().final_text(), "done");
+                assert_eq!(model.calls.load(Ordering::SeqCst), 12);
+            } else {
+                assert_eq!(result.unwrap_err().code(), "budget.max_turns");
+                assert_eq!(model.calls.load(Ordering::SeqCst), 10);
+            }
         }
-    ));
-    assert_eq!(result.model_responses().len(), 3);
+    }
 }
 
 /// The remaining allowance is told to the model at the **tail of the input**, never in the system
@@ -2936,7 +2932,7 @@ async fn a_handler_that_declines_leaves_the_run_untouched() {
     let seen = Arc::new(AtomicUsize::new(0));
     let tool_for_run: Arc<dyn Tool> = Arc::clone(&tool) as Arc<dyn Tool>;
 
-    let result = Runner::run(
+    let error = Runner::run(
         request(vec![tool_for_run], &model, &cancel).with_config(
             RunConfig::new()
                 .with_max_turns(1)
@@ -2946,17 +2942,10 @@ async fn a_handler_that_declines_leaves_the_run_untouched() {
         ),
     )
     .await
-    .unwrap();
+    .unwrap_err();
 
     assert_eq!(seen.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        result.outcome(),
-        RunOutcome::Completed {
-            reason: FinishReason::MaxTurns
-        }
-    ));
-    assert!(result.final_message().is_none());
-    assert_eq!(result.new_items().len(), 2);
+    assert_eq!(error.code(), "budget.max_turns");
 }
 
 #[tokio::test]
@@ -3144,26 +3133,53 @@ async fn a_continuation_is_measured_against_what_an_earlier_segment_spent() {
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }
 
-/// The turn cap is the loop's own termination condition, so the one call that can drop it has to
-/// answer for it.
 #[tokio::test]
-async fn a_budget_without_a_turn_cap_is_rejected() {
-    let model = ScriptedModel::new(Vec::new());
+async fn a_budget_without_a_turn_cap_can_finish() {
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("done", "done")])]);
     let cancel = CancelScope::root();
-
-    let error = Runner::run(
+    let result = Runner::run(
         request(Vec::new(), &model, &cancel)
             .with_config(RunConfig::new().with_budget(BudgetLimit::new().with_max_tokens(100))),
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(result.final_text(), "done");
+}
 
-    assert!(matches!(error, Error::Config { .. }));
-    assert!(error.to_string().contains("max_turns"));
+#[test]
+fn a_budget_without_a_turn_limit_keeps_the_configured_one() {
+    let tokens_only = BudgetLimit::new().with_max_tokens(100);
+    let defaulted = RunConfig::new().with_budget(tokens_only);
+    assert_eq!(
+        defaulted.max_turns(),
+        Some(ra_runtime::runner::DEFAULT_MAX_TURNS)
+    );
+    assert_eq!(defaulted.budget().max_tokens(), Some(100));
+    assert_eq!(
+        RunConfig::new()
+            .with_max_turns(3)
+            .with_budget(tokens_only)
+            .max_turns(),
+        Some(3)
+    );
+    assert_eq!(
+        RunConfig::new()
+            .with_max_turns(None)
+            .with_budget(tokens_only)
+            .max_turns(),
+        None
+    );
+    assert_eq!(
+        RunConfig::new()
+            .with_max_turns(3)
+            .with_budget(BudgetLimit::new().with_max_turns(7))
+            .max_turns(),
+        Some(7)
+    );
 }
 
 #[tokio::test]
-async fn zero_turn_limit_is_rejected_instead_of_treated_as_unlimited() {
+async fn zero_turn_limit_exhausts_before_the_first_model_call() {
     let model = ScriptedModel::new(Vec::new());
     let cancel = CancelScope::root();
 
@@ -3173,7 +3189,7 @@ async fn zero_turn_limit_is_rejected_instead_of_treated_as_unlimited() {
     .await
     .unwrap_err();
 
-    assert!(error.to_string().contains("max_turns"));
+    assert_eq!(error.code(), "budget.max_turns");
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -5540,4 +5556,82 @@ async fn neutral_narration_respects_partial_messages_and_retry_consumption(
         model.calls.load(Ordering::SeqCst),
         if partial { 1 } else { 2 }
     );
+}
+
+#[tokio::test]
+async fn final_answer_on_the_last_allowed_turn_succeeds() {
+    for streamed in [false, true] {
+        let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("done", "done")])]);
+        let cancel = CancelScope::root();
+        let request =
+            request(Vec::new(), &model, &cancel).with_config(RunConfig::new().with_max_turns(1));
+        let result = if streamed {
+            Runner::run_streamed(request).finish().await.unwrap()
+        } else {
+            Runner::run(request).await.unwrap()
+        };
+        assert_eq!(result.final_text(), "done");
+    }
+}
+
+#[tokio::test]
+async fn resumed_runs_keep_the_saved_turn_limit_and_used_turn_count() {
+    for saved in [None, Some(1), Some(3)] {
+        let model = ScriptedModel::new(vec![ModelResponse::new(vec![message("done", "done")])]);
+        let cancel = CancelScope::root();
+        let mut spent = BudgetSnapshot::new();
+        spent.record_turn();
+        let mut state = RunState::start(RunId::new("run-loop")).with_budget(spent);
+        state.set_max_turns(saved);
+        let state: RunState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let result = Runner::run(
+            request(Vec::new(), &model, &cancel)
+                .with_state(state)
+                .with_config(RunConfig::new().with_max_turns(if saved == Some(1) {
+                    100
+                } else {
+                    0
+                })),
+        )
+        .await;
+        if saved == Some(1) {
+            assert_eq!(result.unwrap_err().code(), "budget.max_turns");
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.final_text(), "done");
+            assert_eq!(result.state().budget().turns_used(), 2);
+            assert_eq!(result.state().max_turns(), Some(saved));
+        }
+    }
+}
+
+struct FixtureCheckpoint;
+#[async_trait]
+impl RunErrorHandler for FixtureCheckpoint {
+    async fn handle(&self, _: RunErrorHandlerInput<'_>) -> Result<Option<RunErrorHandlerResult>> {
+        Ok(Some(
+            RunErrorHandlerResult::new(Message::assistant("checkpoint", OutputPhase::Final))
+                .with_write_to_history(false),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_zero_turn_run_can_be_closed_by_an_explicit_handler_without_sampling() {
+    let model = ScriptedModel::new(Vec::new());
+    let cancel = CancelScope::root();
+    let result = Runner::run(
+        request(Vec::new(), &model, &cancel).with_config(
+            RunConfig::new()
+                .with_max_turns(0)
+                .with_error_handler(Arc::new(FixtureCheckpoint)),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.final_text(), "checkpoint");
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert!(result.new_items().is_empty());
 }

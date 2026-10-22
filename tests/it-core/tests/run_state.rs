@@ -2066,3 +2066,22 @@ fn pending_tool_output_settlement_survives_a_checkpoint_and_defaults_off_for_leg
     assert!(!restored.tool_output_settlement_pending());
     assert_eq!(restored.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }
+
+#[test]
+fn saved_turn_limits_distinguish_legacy_and_explicitly_unlimited_checkpoints() {
+    for limit in [None, Some(0), Some(10)] {
+        let mut state = RunState::start(RunId::new("saved-limit"));
+        assert_eq!(state.max_turns(), None);
+        state.set_max_turns(limit);
+        let restored: RunState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.max_turns(), Some(limit));
+    }
+
+    let mut legacy = serde_json::to_value(RunState::start(RunId::new("legacy-limit"))).unwrap();
+    legacy["schema_version"] = json!(13);
+    assert!(legacy.get("max_turns").is_none());
+    let restored: RunState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.max_turns(), None);
+    assert_eq!(restored.schema_version(), RUN_STATE_SCHEMA_VERSION);
+}

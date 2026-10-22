@@ -707,11 +707,9 @@ impl RunResult {
     /// available separately from [`Self::final_output`], including tool-promoted values.
     ///
     /// **`None` is a real answer, not just "the model said nothing".** A run that stopped for an
-    /// approval has not delivered anything yet, and neither has one that hit
-    /// [`FinishReason::MaxTurns`] — the cap fires between turns, so the last thing the model said
-    /// was work in progress. A configured [`RunErrorHandler`] can turn that condition into an
-    /// explicit delivery; otherwise a host that needs to show *something* reads
-    /// [`Self::new_items`].
+    /// approval or an unfinished token budget stop has not delivered anything yet. Exceeding
+    /// the turn limit returns an error unless a configured [`RunErrorHandler`] produces an
+    /// explicit delivery. The last progress message is never promoted to a final answer.
     #[must_use]
     pub fn final_message(&self) -> Option<&Message> {
         self.final_message.as_ref()

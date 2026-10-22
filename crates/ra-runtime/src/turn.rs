@@ -68,7 +68,7 @@ pub struct TurnSettlementRequest<'a> {
     tool_use: &'a mut ToolUseTracker,
     tool_failure: &'a mut ToolFailureTracker,
     services: ToolServices,
-    max_function_tool_concurrency: usize,
+    max_function_tool_concurrency: Option<usize>,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
@@ -155,8 +155,8 @@ impl<'a> TurnSettlementRequest<'a> {
     }
 
     /// Sets the per-turn cap for concurrently dispatched function tools.
-    pub const fn with_max_function_tool_concurrency(mut self, max: usize) -> Self {
-        self.max_function_tool_concurrency = max;
+    pub fn with_max_function_tool_concurrency(mut self, max: impl Into<Option<usize>>) -> Self {
+        self.max_function_tool_concurrency = max.into();
         self
     }
 

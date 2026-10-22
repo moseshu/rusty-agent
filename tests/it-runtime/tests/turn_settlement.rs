@@ -2201,3 +2201,46 @@ async fn test_turn_settlement_26() {
 fn context_is_thread_safe(_context: &RunContext) {
     let _guard: Mutex<()> = Mutex::new(());
 }
+
+#[tokio::test]
+async fn default_function_dispatch_starts_more_than_eight_parallel_calls() {
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let tool: Arc<dyn Tool> = Arc::new(GatedTool::new(
+        "parallel",
+        ToolConcurrency::Parallel,
+        entered.clone(),
+        release.clone(),
+        completed.clone(),
+        "done",
+    ));
+    let task = tokio::spawn(async move {
+        let binding = binding();
+        let surface = surface(vec![tool]);
+        let response = ModelResponse::new(
+            (0..12)
+                .map(|i| tool_call(&format!("item-{i}"), &format!("call-{i}"), "parallel"))
+                .collect(),
+        );
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        settle_turn(TurnSettlementRequest::new(
+            &binding,
+            &response,
+            &surface,
+            run(),
+            &cancel,
+            &mut tracker,
+            &mut ToolFailureTracker::new(),
+            Default::default(),
+        ))
+        .await
+    });
+    wait_for_count(&entered, 12).await;
+    assert_eq!(entered.load(Ordering::SeqCst), 12);
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+    task.await.unwrap().unwrap();
+    assert_eq!(completed.load(Ordering::SeqCst), 12);
+}

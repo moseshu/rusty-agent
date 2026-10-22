@@ -36,7 +36,6 @@ use ra_core::{
     agent::{AgentId, AgentSpec, ToolUseBehavior},
     cancel::{CancelReason, CancelScope},
     error::{Error, ProviderErrorKind, Result, ToolErrorKind},
-    finish::FinishReason,
     hook::{HookDecision, HookEvent, HookEventName, UserHook, UserHookContext},
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
@@ -61,7 +60,7 @@ use ra_runtime::{
         tool::{AgentAsTool, AgentToolStreamEvent},
     },
     hook::UserHookRegistration,
-    runner::{RunConfig, RunOutcome, RunRequest, Runner},
+    runner::{RunConfig, RunRequest, Runner},
 };
 use serde_json::json;
 use tracing::{
@@ -680,22 +679,17 @@ async fn budget_termination_names_the_exhausted_dimension() {
     let cancel = CancelScope::root();
     let (spans, _text, guard) = capture();
 
-    let result = Runner::run(
+    let error = Runner::run(
         request(vec![tool], &model, &cancel).with_config(RunConfig::new().with_max_turns(1)),
     )
     .await
-    .unwrap();
+    .unwrap_err();
     drop(guard);
 
-    assert!(matches!(
-        result.outcome(),
-        RunOutcome::Completed {
-            reason: FinishReason::MaxTurns
-        }
-    ));
+    assert_eq!(error.code(), "budget.max_turns");
     let agent = spans.only("agent");
-    assert_eq!(agent.field("outcome"), Some("ok"));
-    assert_eq!(agent.field("finish.reason"), Some("max_turns"));
+    assert_eq!(agent.field("outcome"), Some("error"));
+    assert_eq!(agent.field("error.code"), Some("budget.max_turns"));
     // `FinishReason` folds tokens, cost and wall clock into one `budget_exhausted`, so which
     // allowance ran out is only recoverable from this field.
     assert_eq!(agent.field("budget.kind"), Some("max_turns"));

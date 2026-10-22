@@ -73,10 +73,9 @@ use crate::tool::guardrail::ToolGuardrails;
 
 /// Default cap for all function-tool dispatch chains in one model response.
 ///
-/// Eight keeps the default comfortably below typical process and connection limits while still
-/// allowing independent reads, searches, and MCP calls to overlap. Hosts that know their resource
-/// budget can set a different value through [`RunConfig`](crate::runner::RunConfig).
-pub(crate) const DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY: usize = 8;
+/// The framework imposes no global cap by default. Tool-level exclusive/resource admission
+/// remains active; products can select a cap through [`RunConfig`](crate::runner::RunConfig).
+pub(crate) const DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY: Option<usize> = None;
 
 /// Position a dispatch carries until the terminal response names one for it.
 ///
@@ -260,7 +259,7 @@ pub struct TurnExecutionRequest<'a> {
     run: Arc<RunContext>,
     cancel: &'a CancelScope,
     services: ToolServices,
-    max_function_tool_concurrency: usize,
+    max_function_tool_concurrency: Option<usize>,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
@@ -323,8 +322,8 @@ impl<'a> TurnExecutionRequest<'a> {
     }
 
     /// Sets the cap for concurrently dispatched function tools in this response.
-    pub const fn with_max_function_tool_concurrency(mut self, max: usize) -> Self {
-        self.max_function_tool_concurrency = max;
+    pub fn with_max_function_tool_concurrency(mut self, max: impl Into<Option<usize>>) -> Self {
+        self.max_function_tool_concurrency = max.into();
         self
     }
 
@@ -355,7 +354,7 @@ pub async fn execute_actions(mut request: TurnExecutionRequest<'_>) -> Result<Tu
     let processed = request.processed;
     let mut execution = TurnExecution::default();
 
-    if request.max_function_tool_concurrency == 0 {
+    if request.max_function_tool_concurrency == Some(0) {
         if let Some(dispatches) = streamed_dispatches.take() {
             dispatches.cancel_and_drain().await;
         }
@@ -570,7 +569,7 @@ impl StreamedFunctionDispatches {
         run: Arc<RunContext>,
         cancel: CancelScope,
         services: ToolServices,
-        max_function_tool_concurrency: usize,
+        max_function_tool_concurrency: Option<usize>,
         permission: PermissionEngine,
         guardrails: ToolGuardrails,
         user_hooks: UserHooks,
@@ -582,7 +581,9 @@ impl StreamedFunctionDispatches {
             tool_scopes: Vec::new(),
             started: HashMap::new(),
             gate: ResourceAdmissionGate::new(),
-            slots: Arc::new(Semaphore::new(max_function_tool_concurrency)),
+            slots: Arc::new(Semaphore::new(
+                max_function_tool_concurrency.unwrap_or(Semaphore::MAX_PERMITS),
+            )),
             agent_id,
             tool_use,
             tool_failure,
@@ -770,7 +771,13 @@ fn spawn_function_dispatches(
         .as_ref()
         .map_or_else(ResourceAdmissionGate::new, |streamed| streamed.gate.clone());
     let slots = streamed.as_ref().map_or_else(
-        || Arc::new(Semaphore::new(request.max_function_tool_concurrency)),
+        || {
+            Arc::new(Semaphore::new(
+                request
+                    .max_function_tool_concurrency
+                    .unwrap_or(Semaphore::MAX_PERMITS),
+            ))
+        },
         |streamed| Arc::clone(&streamed.slots),
     );
     let mut dispatches = streamed.as_mut().map_or_else(JoinSet::new, |streamed| {

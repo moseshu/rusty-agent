@@ -317,9 +317,10 @@ impl AgentToolBuilder {
         self
     }
 
-    /// Sets the nested run's turn cap. Defaults to [`DEFAULT_MAX_TURNS`].
-    pub const fn max_turns(mut self, max_turns: u32) -> Self {
-        self.max_turns = Some(max_turns);
+    /// Sets the nested run's turn cap. `None` selects [`DEFAULT_MAX_TURNS`], as does
+    /// omitting this call. Zero exhausts before the first nested model call.
+    pub fn max_turns(mut self, max_turns: impl Into<Option<u32>>) -> Self {
+        self.max_turns = Some(max_turns.into().unwrap_or(DEFAULT_MAX_TURNS));
         self
     }
 
@@ -409,11 +410,7 @@ impl AgentToolBuilder {
         let name = self
             .tool_name
             .unwrap_or_else(|| transform_string_function_style(self.agent.name()));
-        if self.max_turns == Some(0) {
-            return Err(Error::config(format!(
-                "agent tool `{name}` sets max_turns to zero"
-            )));
-        }
+
         if self.on_stream_max_pending_events == Some(0) {
             return Err(Error::config(format!(
                 "agent tool `{name}`: on_stream_max_pending_events must be a positive integer or None"
@@ -518,7 +515,7 @@ impl AgentTool {
             enablement: None,
             run_config: None,
             session: None,
-            max_turns: None,
+            max_turns: Some(DEFAULT_MAX_TURNS),
             propagate_failures: false,
             error_function: None,
             needs_approval: None,
@@ -591,7 +588,7 @@ impl AgentTool {
                     .clone()
                     .inherited_by(&self.agent, parent.initial_agent())
             })
-            .with_max_turns(self.max_turns.unwrap_or(DEFAULT_MAX_TURNS));
+            .with_max_turns(self.max_turns);
         // A resumed call continues the nested run it paused on, from that run's checkpoint and
         // with its history, as the reference passes the saved state where a fresh call passes
         // input. Its parent was recorded when it first started.
@@ -674,8 +671,7 @@ impl AgentTool {
                 state: Box::new(result.state().clone()),
             }));
         }
-        // The reference raises when a nested run runs out of turns; this runner ends such a run
-        // softly instead, so the stop is turned back into the failure the calling model is shown.
+        // A budget closeout without a final delivery is a nested tool failure.
         if let Some(reason @ (FinishReason::MaxTurns | FinishReason::BudgetExhausted)) =
             result.outcome().finish_reason()
             && result.final_message().is_none()

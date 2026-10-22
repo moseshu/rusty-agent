@@ -534,21 +534,17 @@ async fn repeated_stop_blocks_consume_the_existing_turn_budget() {
     let config = RunConfig::new()
         .with_max_turns(2)
         .with_user_hook(hook.register(HookEventName::Stop));
-    let result = Runner::run(request(
+    let error = Runner::run(request(
         &model,
         agent(None, false),
         config,
         CancelScope::root(),
     ))
     .await
-    .unwrap();
+    .unwrap_err();
     assert_eq!(model.calls(), 2);
     assert_eq!(hook.count(), 2);
-    assert!(
-        result.final_message().is_none(),
-        "blocked candidates are not budget closeouts"
-    );
-    assert!(!result.outcome().finish_reason().unwrap().is_complete());
+    assert_eq!(error.code(), "budget.max_turns");
 }
 
 struct FinalCheck(Mutex<Vec<String>>);

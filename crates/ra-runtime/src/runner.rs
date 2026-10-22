@@ -153,7 +153,7 @@ use crate::sandbox::{SandboxRunConfig, SandboxRuntime};
 ///
 /// It exists to stop a loop, not to size a task: a model that keeps calling the same tool has to
 /// hit something. Sizing the work is what the rest of [`BudgetLimit`] is for.
-pub const DEFAULT_MAX_TURNS: u32 = 32;
+pub const DEFAULT_MAX_TURNS: u32 = 10;
 
 /// Stack budget for a thread that polls agent runs: Codex's `THREAD_STACK_SIZE_BYTES`, 16 MiB.
 ///
@@ -209,7 +209,7 @@ impl PreinstalledCapabilityTool {
 pub struct RunConfig {
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     budget: BudgetLimit,
-    max_function_tool_concurrency: usize,
+    max_function_tool_concurrency: Option<usize>,
     model: Option<String>,
     model_settings: ModelSettings,
     tracing: ModelTracing,
@@ -390,21 +390,25 @@ impl RunConfig {
         self.group_id.as_deref()
     }
 
-    /// Sets the turn cap. Zero is rejected when the run starts rather than silently meaning
-    /// "unlimited".
-    pub const fn with_max_turns(mut self, max_turns: u32) -> Self {
-        self.budget = self.budget.with_max_turns(max_turns);
+    /// Sets the turn limit, or removes it with `None`. Zero exhausts before any model call.
+    pub fn with_max_turns(mut self, max_turns: impl Into<Option<u32>>) -> Self {
+        self.budget = match max_turns.into() {
+            Some(max) => self.budget.with_max_turns(max),
+            None => self.budget.without_max_turns(),
+        };
         self
     }
 
-    /// Replaces every budget dimension at once.
+    /// Replaces the token and deadline dimensions, and the turn limit when `budget` sets one.
     ///
-    /// The supplied limit must carry a turn cap. This is the one entry point that can drop the
-    /// default one, and a loop with no cap of its own can only be stopped from outside — so a
-    /// budget without one is rejected when the run starts rather than turning a scripted test or a
-    /// looping model into a hang.
+    /// A budget without a turn limit keeps the configured one rather than silently removing it:
+    /// the reference makes a run unlimited only when the caller passes `max_turns=None`. Use
+    /// [`Self::with_max_turns`] with `None` for that.
     pub const fn with_budget(mut self, budget: BudgetLimit) -> Self {
-        self.budget = budget;
+        self.budget = match (budget.max_turns(), self.budget.max_turns()) {
+            (None, Some(configured)) => budget.with_max_turns(configured),
+            _ => budget,
+        };
         self
     }
 
@@ -424,13 +428,11 @@ impl RunConfig {
         self
     }
 
-    /// Sets the maximum number of function-tool dispatch chains one turn may run at once.
+    /// Sets the per-turn function-tool dispatch cap, or removes it with `None`.
     ///
-    /// This caps the whole dispatch chain, rather than only a particular tool implementation, so
-    /// a model response cannot exhaust file descriptors, child-process slots, or MCP connections
-    /// by naming an unbounded number of `Parallel` tools. Zero is rejected when the run starts.
-    pub const fn with_max_function_tool_concurrency(mut self, max: usize) -> Self {
-        self.max_function_tool_concurrency = max;
+    /// The default is unlimited. A configured zero is rejected when the run starts.
+    pub fn with_max_function_tool_concurrency(mut self, max: impl Into<Option<usize>>) -> Self {
+        self.max_function_tool_concurrency = max.into();
         self
     }
 
@@ -733,20 +735,15 @@ impl RunConfig {
 
     /// The configured turn cap.
     ///
-    /// This compatibility accessor retains the original public signature. `0` means a caller
-    /// replaced the budget with one that has no turn cap; [`Runner::run`] rejects that invalid
-    /// configuration before making a model call.
+    /// `None` means unlimited turns.
     #[must_use]
-    pub const fn max_turns(&self) -> u32 {
-        match self.budget.max_turns() {
-            Some(max_turns) => max_turns,
-            None => 0,
-        }
+    pub const fn max_turns(&self) -> Option<u32> {
+        self.budget.max_turns()
     }
 
-    /// The per-turn function-tool dispatch cap.
+    /// The per-turn function-tool dispatch cap, or `None` for unlimited.
     #[must_use]
-    pub const fn max_function_tool_concurrency(&self) -> usize {
+    pub const fn max_function_tool_concurrency(&self) -> Option<usize> {
         self.max_function_tool_concurrency
     }
 
@@ -1943,7 +1940,7 @@ async fn run_loop_inner(
         app_context,
         cancel,
         input: requested_input,
-        config,
+        mut config,
         mut state,
         services,
         event_seqs,
@@ -1958,6 +1955,11 @@ async fn run_loop_inner(
         live_settings,
         output_schema,
     } = request;
+    if let Some(saved) = state.max_turns() {
+        config = config.with_max_turns(saved);
+    } else {
+        state.set_max_turns(config.max_turns());
+    }
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(handle.clone())),
         None => services,
@@ -4151,7 +4153,17 @@ fn terminal_failure(
     if let Some(checkpoint) = error.run_state_mut() {
         *checkpoint = state.clone();
         error
-    } else if state.has_session_write_checkpoint() {
+    } else if state.has_session_write_checkpoint()
+        || matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::MaxTurns,
+                ..
+            }
+        )
+    {
+        // Like the reference error's run_data, a turn-limit error keeps the history already
+        // produced. The existing checkpoint wrapper preserves its budget classification.
         error.with_run_state(state.clone())
     } else {
         error
@@ -6103,7 +6115,7 @@ struct StreamedDispatchInput {
     run: Arc<RunContext>,
     cancel: CancelScope,
     services: ToolServices,
-    max_function_tool_concurrency: usize,
+    max_function_tool_concurrency: Option<usize>,
     permission: PermissionEngine,
     guardrails: ToolGuardrails,
     user_hooks: UserHooks,
@@ -6659,13 +6671,17 @@ async fn resolve_budget_closeout(
     progress: &mut TurnLoopProgress,
     state: &mut RunState,
 ) -> Result<()> {
-    let (Some(kind), Some(_handler)) =
-        (progress.budget_stop, context.config.error_handler.as_ref())
-    else {
+    let Some(kind) = progress.budget_stop else {
         return Ok(());
     };
-
     let error = Error::budget(kind, "the configured run budget was exhausted");
+    if context.config.error_handler.is_none() {
+        return if kind == BudgetKind::MaxTurns {
+            Err(error)
+        } else {
+            Ok(())
+        };
+    }
     let Some(closeout) = output::call_handler(
         context,
         agent,
@@ -6677,7 +6693,11 @@ async fn resolve_budget_closeout(
     )
     .await?
     else {
-        return Ok(());
+        return if kind == BudgetKind::MaxTurns {
+            Err(error)
+        } else {
+            Ok(())
+        };
     };
     progress.final_output = Some(output::validate_handler_message(
         context,
@@ -6712,13 +6732,7 @@ fn next_error_item_id(items: &[RunItem], turns: u32) -> ItemId {
 
 fn validate_config(config: &RunConfig) -> Result<()> {
     config.budget.validate()?;
-    if config.budget.max_turns().is_none() {
-        return Err(Error::config(
-            "`max_turns` must be set; it is the loop's own termination condition, and a run that \
-             can only be stopped from outside is a hang whenever the model keeps calling tools",
-        ));
-    }
-    if config.max_function_tool_concurrency == 0 {
+    if config.max_function_tool_concurrency == Some(0) {
         return Err(Error::config(
             "`max_function_tool_concurrency` must be at least 1; zero would permanently queue \
              every tool call",
