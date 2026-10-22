@@ -3,9 +3,9 @@
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     item::{
-        CallId, ContentBlock, HandoffCall, ItemId, Message, MessageRole, ModelResponse,
-        OutputPhase, ProviderCompaction, RawProviderItem, Reasoning, RunItem, RunItemKind,
-        ToolCall, ToolCallKind, ToolCallOutput,
+        CallId, ContentBlock, HandoffCall, HostedToolCall, ItemId, Message, MessageRole,
+        ModelResponse, OutputPhase, ProviderCompaction, RawProviderItem, Reasoning, RunItem,
+        RunItemKind, ToolCall, ToolCallKind, ToolCallOutput,
     },
     model::{CustomToolFormat, ModelHandoffDefinition, ModelToolDefinition, ProviderKey},
     tool::ToolOutput,
@@ -38,14 +38,17 @@ pub(crate) fn convert_response(
         .ok_or_else(|| behavior_error("OpenAI response.output must be an array"))?;
     let mut items = Vec::with_capacity(output.len());
     for (index, item) in output.iter().enumerate() {
-        items.push(convert_output_item(
-            item,
-            response_id,
-            index,
-            handoffs,
-            provider,
-            model,
-        )?);
+        if let Some(converted) =
+            convert_output_item(item, response_id, index, handoffs, provider, model)?
+        {
+            items.push(converted);
+        } else {
+            // Processing happens once per completed response, including streamed responses.
+            tracing::warn!(
+                item_type = required_str(item, "type", "response output item")?,
+                "Unexpected output type, ignoring"
+            );
+        }
     }
 
     let usage = convert_usage(payload.get("usage"));
@@ -106,8 +109,9 @@ pub(crate) fn convert_output_item(
     handoffs: &[ModelHandoffDefinition],
     provider: &ProviderKey,
     model: &str,
-) -> Result<RunItem> {
+) -> Result<Option<RunItem>> {
     let item_type = required_str(item, "type", "response output item")?;
+    reject_unsupported_item(item)?;
     let item_id = item.get("id").and_then(Value::as_str).map_or_else(
         || ItemId::new(format!("{response_id}:{index}:{item_type}")),
         ItemId::new,
@@ -117,30 +121,112 @@ pub(crate) fn convert_output_item(
         "reasoning" => RunItemKind::Reasoning(convert_reasoning(item, model)),
         "function_call" => convert_function_call(item, handoffs)?,
         "custom_tool_call" => convert_custom_tool_call(item)?,
-        "tool_search_call" => convert_tool_search_call(item)?,
-        "tool_search_output" => convert_tool_search_output(item)?,
-        "mcp_list_tools" => RunItemKind::McpListTools(super::mcp::lift_list(item)),
-        "mcp_call" => RunItemKind::McpCall(super::mcp::lift_call(item)?),
-        "compaction" => RunItemKind::ProviderCompaction(convert_compaction(item, provider)),
-        // Other hosted-tool items (web search, file search, image generation) have no
-        // protocol-neutral payload yet. They can only appear when `extra_body.tools` requested
-        // them, so the message names the item rather than silently dropping part of the turn.
-        other => {
-            return Err(behavior_error(format!(
-                "OpenAI response output item `{other}` has no provider-neutral item type"
-            )));
+        "tool_search_call" => {
+            ensure_direct_tool_caller(item, "tool_search")?;
+            convert_tool_search_call(item, provider)?
         }
+        "tool_search_output" => {
+            ensure_direct_tool_caller(item, "tool_search")?;
+            convert_tool_search_output(item, provider)?
+        }
+        "mcp_list_tools" => {
+            ensure_direct_tool_caller(item, "hosted_mcp")?;
+            RunItemKind::McpListTools(super::mcp::lift_list(item))
+        }
+        "mcp_call" => {
+            ensure_direct_tool_caller(item, "hosted_mcp")?;
+            RunItemKind::McpCall(super::mcp::lift_call(item)?)
+        }
+        "compaction" => RunItemKind::ProviderCompaction(convert_compaction(item, provider)),
+        "file_search_call"
+        | "web_search_call"
+        | "image_generation_call"
+        | "code_interpreter_call" => {
+            ensure_direct_tool_caller(item, item_type.strip_suffix("_call").unwrap_or(item_type))?;
+            convert_hosted_tool_call(item, item_type, provider)
+        }
+        _ => return Ok(None),
     };
-    Ok(RunItem::new(item_id, kind)
-        .with_raw_provider_item(RawProviderItem::new(provider.as_str(), item.clone())))
+    Ok(Some(RunItem::new(item_id, kind).with_raw_provider_item(
+        RawProviderItem::new(provider.as_str(), item.clone()),
+    )))
+}
+
+/// Known action families must not fall through the forward-compatible unknown-item branch.
+fn reject_unsupported_item(item: &Value) -> Result<()> {
+    let item_type = required_str(item, "type", "response output item")?;
+    reject_program_owned_item(item)?;
+    if matches!(
+        item_type,
+        "computer_call"
+            | "mcp_approval_request"
+            | "local_shell_call"
+            | "shell_call"
+            | "shell_call_output"
+            | "apply_patch_call"
+            | "program"
+            | "program_output"
+    ) {
+        return Err(behavior_error(format!(
+            "OpenAI response output item `{item_type}` is not supported"
+        )));
+    }
+    Ok(())
+}
+
+/// No entry point may accept program-owned calls before their parent lifecycle is ported.
+pub(crate) fn reject_program_owned_item(item: &Value) -> Result<()> {
+    let item_type = required_str(item, "type", "response item")?;
+    if item.pointer("/caller/type").and_then(Value::as_str) == Some("program") {
+        return Err(behavior_error(format!(
+            "OpenAI program-owned `{item_type}` items are not supported"
+        )));
+    }
+    Ok(())
+}
+
+/// The upstream caller contract defaults absent/null callers to direct and rejects other kinds.
+/// Program-owned items have already failed the unported parent-lifecycle check above.
+fn ensure_direct_tool_caller(item: &Value, tool_name: &str) -> Result<()> {
+    let Some(caller) = item.get("caller").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if caller.get("type").and_then(Value::as_str) == Some("direct") {
+        return Ok(());
+    }
+    let caller_type = match caller.get("type") {
+        None | Some(Value::Null) => "None".to_owned(),
+        Some(Value::String(kind)) => format!("'{kind}'"),
+        Some(value) => value.to_string(),
+    };
+    Err(behavior_error(format!(
+        "Model invoked tool {tool_name} with unsupported caller type {caller_type}."
+    )))
+}
+
+/// Records a hosted invocation without interpreting its provider-specific action or result.
+pub(crate) fn convert_hosted_tool_call(
+    item: &Value,
+    item_type: &str,
+    provider: &ProviderKey,
+) -> RunItemKind {
+    let name = item_type.strip_suffix("_call").unwrap_or(item_type);
+    RunItemKind::HostedToolCall(HostedToolCall::new(
+        name,
+        RawProviderItem::new(provider.as_str(), item.clone()),
+    ))
 }
 
 /// Lifts Codex's client search call through the ordinary invocation lifecycle.
-pub(crate) fn convert_tool_search_call(item: &Value) -> Result<RunItemKind> {
+pub(crate) fn convert_tool_search_call(
+    item: &Value,
+    provider: &ProviderKey,
+) -> Result<RunItemKind> {
     if item.get("execution").and_then(Value::as_str) != Some("client") {
-        return Err(behavior_error(
-            "server-executed tool search is not supported by this client search runtime",
-        ));
+        return Ok(RunItemKind::ToolSearchCall(RawProviderItem::new(
+            provider.as_str(),
+            item.clone(),
+        )));
     }
     let call_id = CallId::new(required_str(item, "call_id", "tool_search_call")?);
     let arguments = item
@@ -153,11 +239,15 @@ pub(crate) fn convert_tool_search_call(item: &Value) -> Result<RunItemKind> {
 }
 
 /// Reconstructs client discovery output when a provider-managed history is read.
-pub(crate) fn convert_tool_search_output(item: &Value) -> Result<RunItemKind> {
+pub(crate) fn convert_tool_search_output(
+    item: &Value,
+    provider: &ProviderKey,
+) -> Result<RunItemKind> {
     if item.get("execution").and_then(Value::as_str) != Some("client") {
-        return Err(behavior_error(
-            "server-executed tool search is not supported by this client search runtime",
-        ));
+        return Ok(RunItemKind::ToolSearchOutput(RawProviderItem::new(
+            provider.as_str(),
+            item.clone(),
+        )));
     }
     let tools = item
         .get("tools")

@@ -440,10 +440,23 @@ pub(crate) async fn lower_input_item(
         ModelInputItem::ProviderCompaction(compaction) => Ok(compaction.payload().clone()),
         ModelInputItem::McpListTools(list) => super::mcp::lower_list(list),
         ModelInputItem::McpCall(call) => super::mcp::lower_call(call),
+        ModelInputItem::HostedToolCall(call) => Ok(lower_hosted_record(call.raw())),
+        ModelInputItem::ToolSearchCall(raw) | ModelInputItem::ToolSearchOutput(raw) => {
+            Ok(lower_hosted_record(raw))
+        }
         _ => Err(Error::caller(
             "unsupported model-input item for OpenAI Responses",
         )),
     }
+}
+
+/// The upstream input projection removes output-only metadata without mutating the raw record.
+fn lower_hosted_record(raw: &ra_core::item::RawProviderItem) -> Value {
+    let mut payload = raw.payload().clone();
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("created_by");
+    }
+    payload
 }
 
 /// A function call, handed back as the model made it, namespace and all.

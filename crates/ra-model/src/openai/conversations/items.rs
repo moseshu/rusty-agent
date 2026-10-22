@@ -20,7 +20,8 @@ use crate::openai::{
     responses::{
         convert::{
             convert_compaction, convert_custom_tool_call, convert_function_call,
-            convert_tool_search_call, convert_tool_search_output, required_str, text_segments,
+            convert_hosted_tool_call, convert_tool_search_call, convert_tool_search_output,
+            reject_program_owned_item, required_str, text_segments,
         },
         request::lower_input_item,
     },
@@ -154,13 +155,18 @@ pub(crate) fn lift_history_item(
     id: ItemId,
 ) -> Result<RunItem> {
     let item_type = required_str(item, "type", "conversation item")?;
+    reject_program_owned_item(item)?;
     let kind = match item_type {
+        "file_search_call"
+        | "web_search_call"
+        | "image_generation_call"
+        | "code_interpreter_call" => convert_hosted_tool_call(item, item_type, provider),
         "message" => RunItemKind::Message(lift_message(item)?),
         "reasoning" => RunItemKind::Reasoning(lift_reasoning(item)),
         "function_call" => convert_function_call(item, &[])?,
         "custom_tool_call" => convert_custom_tool_call(item)?,
-        "tool_search_call" => convert_tool_search_call(item)?,
-        "tool_search_output" => convert_tool_search_output(item)?,
+        "tool_search_call" => convert_tool_search_call(item, provider)?,
+        "tool_search_output" => convert_tool_search_output(item, provider)?,
         "function_call_output" => {
             RunItemKind::ToolCallOutput(lift_tool_output(item, ToolCallKind::Function)?)
         }

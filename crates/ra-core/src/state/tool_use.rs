@@ -1,7 +1,7 @@
 //! What each agent has already asked for, recorded on identities that cannot collide.
 //!
 //! Four later stages ask a question about the past rather than about this response:
-//! `reset_tool_choice` asks whether the agent used anything at all this turn, the semantic loop
+//! `reset_tool_choice` asks whether the agent used a resettable tool during the run, the semantic loop
 //! breaker asks whether the same call is being repeated, tool-use behavior asks which tools have
 //! run, and an audit asks for the whole trail. Answering each from a different ad-hoc counter is how
 //! four subsystems end up disagreeing about what happened, so all four read this one record.
@@ -67,6 +67,8 @@ pub const TOOL_USE_RECENT_LIMIT: usize = 8;
 pub enum ToolUse {
     /// A local tool, identified by its collision-free routing key.
     Tool(ToolLookupKey),
+    /// A provider-executed tool, identified separately from local function tools.
+    Hosted(String),
     /// A control transfer to another agent.
     Handoff(AgentId),
     /// A hosted MCP tool on a named server.
@@ -395,9 +397,9 @@ impl AgentToolUse {
 
     /// Whether the agent asked for anything at all this turn.
     ///
-    /// This is the question `reset_tool_choice` answers: a forced `tool_choice` that stays
-    /// forced after the model complied is how a run spends every remaining turn calling the same
-    /// tool. Unresolved names count — the model tried.
+    /// This is the current-turn view for diagnostics. Tool-choice resets use cumulative run
+    /// usage instead, so a later discovery-only turn does not restore a forced selection.
+    /// Unresolved names count — the model tried.
     #[must_use]
     pub fn used_any_this_turn(&self) -> bool {
         self.entries.iter().any(|entry| entry.turn_calls() > 0)
@@ -660,6 +662,10 @@ pub(crate) fn update_identity_digest(digest: &mut Sha256, identity: &ToolUse) {
                 b"namespace",
                 key.namespace().map_or("", |namespace| namespace.as_str()),
             );
+        }
+        ToolUse::Hosted(name) => {
+            update_digest(digest, b"type", b"hosted");
+            update_digest(digest, b"name", name);
         }
         ToolUse::Handoff(agent) => {
             update_digest(digest, b"type", b"handoff");

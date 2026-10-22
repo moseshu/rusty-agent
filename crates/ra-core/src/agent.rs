@@ -631,6 +631,7 @@ pub struct AgentSpec {
     tool_resolver: Option<Arc<dyn ToolResolver>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
+    reset_tool_choice: bool,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
@@ -646,6 +647,12 @@ pub struct AgentSpec {
 pub type AgentDefinition = AgentSpec;
 
 impl AgentSpec {
+    /// Whether tool use releases the resolved tool choice. Defaults to true.
+    #[must_use]
+    pub const fn reset_tool_choice(&self) -> bool {
+        self.reset_tool_choice
+    }
+
     /// Starts an empty builder.
     pub fn builder() -> AgentSpecBuilder {
         AgentSpecBuilder::new()
@@ -668,6 +675,7 @@ impl AgentSpec {
             tool_resolver: self.tool_resolver.clone(),
             handoffs: self.handoffs.clone(),
             tool_use_behavior: self.tool_use_behavior.clone(),
+            reset_tool_choice: self.reset_tool_choice,
             input_guardrails: self.input_guardrails.clone(),
             output_guardrails: self.output_guardrails.clone(),
             lifecycle_hooks: self.lifecycle_hooks.clone(),
@@ -822,6 +830,7 @@ impl fmt::Debug for AgentSpec {
             .field("has_tool_resolver", &self.tool_resolver.is_some())
             .field("handoffs", &self.handoffs)
             .field("tool_use_behavior", &self.tool_use_behavior)
+            .field("reset_tool_choice", &self.reset_tool_choice)
             .field(
                 "input_guardrails",
                 &self
@@ -865,6 +874,7 @@ pub struct AgentSpecBuilder {
     tool_resolver: Option<Arc<dyn ToolResolver>>,
     handoffs: Vec<HandoffSpec>,
     tool_use_behavior: ToolUseBehavior,
+    reset_tool_choice: bool,
     input_guardrails: Vec<Arc<dyn InputGuardrail>>,
     output_guardrails: Vec<Arc<dyn OutputGuardrail>>,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
@@ -872,6 +882,12 @@ pub struct AgentSpecBuilder {
 }
 
 impl AgentSpecBuilder {
+    /// Controls whether tool use resets the resolved tool choice. Defaults to true.
+    pub fn reset_tool_choice(mut self, reset: bool) -> Self {
+        self.reset_tool_choice = reset;
+        self
+    }
+
     /// Creates an empty builder.
     pub fn new() -> Self {
         Self {
@@ -886,6 +902,7 @@ impl AgentSpecBuilder {
             tool_resolver: None,
             handoffs: Vec::new(),
             tool_use_behavior: ToolUseBehavior::default(),
+            reset_tool_choice: true,
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
             lifecycle_hooks: Vec::new(),
@@ -1220,6 +1237,7 @@ impl AgentSpecBuilder {
             tool_resolver: self.tool_resolver,
             handoffs: self.handoffs,
             tool_use_behavior: self.tool_use_behavior,
+            reset_tool_choice: self.reset_tool_choice,
             input_guardrails: self.input_guardrails,
             output_guardrails: self.output_guardrails,
             lifecycle_hooks: self.lifecycle_hooks,

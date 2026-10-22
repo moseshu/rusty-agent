@@ -238,9 +238,9 @@ impl AgentBinding {
     /// advertised surface from the public agent instead would offer tools the prepared instance
     /// cannot run, and the mismatch would only surface when the model called one of them.
     ///
-    /// The declared output form is the one documented exception, and it is exactly the inverse
-    /// argument: a delivery promise is not an execution capability, so it is read from
-    /// [`Self::public`] — see [`AgentSpec::output_schema`].
+    /// The declared output form and tool-choice reset policy are read from [`Self::public`].
+    /// They are public configuration promises rather than execution capabilities, matching the
+    /// framework's public/execution agent split.
     #[must_use]
     pub const fn execution(&self) -> &Arc<AgentSpec> {
         &self.execution

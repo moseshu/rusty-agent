@@ -19,6 +19,7 @@ pub mod compaction;
 pub mod content;
 pub mod estimate;
 pub mod handoff;
+pub mod hosted;
 pub mod mcp;
 pub mod message;
 #[doc(hidden)]
@@ -36,6 +37,7 @@ pub use content::{
     ThinkingBlock, UrlSource,
 };
 pub use handoff::{HandoffCall, HandoffOutput};
+pub use hosted::HostedToolCall;
 pub use mcp::McpCall;
 pub use mcp::{McpApprovalRequest, McpApprovalResponse, McpListTools, McpTool};
 pub use message::{Message, MessageRole, ModelResponse};
@@ -190,9 +192,10 @@ impl ItemProvenance {
 
 /// Isolated copy of a raw provider item.
 ///
-/// This supports exact replay and diagnostics but never becomes next-turn input directly. The
-/// adapter must lower a [`ModelInputItem`] again. `provider` is a registry alias, not a protocol
-/// enum.
+/// This supports exact replay and diagnostics. Hosted records carry this opaque envelope through
+/// [`ModelInputItem`]; the adapter owns validation and input projection, including output-only
+/// metadata removal. Other records project their neutral payload without the raw envelope.
+/// `provider` is a registry alias, not a protocol enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawProviderItem {
     schema_version: SchemaVersion,
@@ -284,6 +287,12 @@ pub enum RunItemKind {
     Reasoning(Reasoning),
     /// Tool call.
     ToolCall(ToolCall),
+    /// A provider-executed invocation that requires no local action.
+    HostedToolCall(HostedToolCall),
+    /// Server-executed tool discovery call, excluded from tool-choice reset tracking.
+    ToolSearchCall(RawProviderItem),
+    /// Server-executed tool discovery output, excluded from tool-choice reset tracking.
+    ToolSearchOutput(RawProviderItem),
     /// Tool-call output.
     ToolCallOutput(ToolCallOutput),
     /// Handoff call.
@@ -314,6 +323,9 @@ impl RunItemKind {
             Self::Message(_) => "message",
             Self::Reasoning(_) => "reasoning",
             Self::ToolCall(_) => "tool_call",
+            Self::HostedToolCall(_) => "hosted_tool_call",
+            Self::ToolSearchCall(_) => "tool_search_call",
+            Self::ToolSearchOutput(_) => "tool_search_output",
             Self::ToolCallOutput(_) => "tool_call_output",
             Self::HandoffCall(_) => "handoff_call",
             Self::HandoffOutput(_) => "handoff_output",
@@ -340,6 +352,9 @@ impl RunItemKind {
             Self::ToolApproval(_) | Self::McpApprovalRequest(_) => true,
             Self::Message(_)
             | Self::Reasoning(_)
+            | Self::HostedToolCall(_)
+            | Self::ToolSearchCall(_)
+            | Self::ToolSearchOutput(_)
             | Self::ToolCall(_)
             | Self::ToolCallOutput(_)
             | Self::HandoffCall(_)
@@ -369,6 +384,9 @@ impl RunItemKind {
             Self::ToolCall(_) | Self::HandoffCall(_) | Self::McpApprovalRequest(_) => true,
             Self::Message(_)
             | Self::Reasoning(_)
+            | Self::HostedToolCall(_)
+            | Self::ToolSearchCall(_)
+            | Self::ToolSearchOutput(_)
             | Self::ToolCallOutput(_)
             | Self::HandoffOutput(_)
             | Self::McpListTools(_)
@@ -550,6 +568,11 @@ impl RunItem {
             RunItemKind::Message(item) => Some(ModelInputItem::Message(item.clone())),
             RunItemKind::Reasoning(item) => Some(ModelInputItem::Reasoning(item.clone())),
             RunItemKind::ToolCall(item) => Some(ModelInputItem::ToolCall(item.clone())),
+            RunItemKind::HostedToolCall(item) => Some(ModelInputItem::HostedToolCall(item.clone())),
+            RunItemKind::ToolSearchCall(item) => Some(ModelInputItem::ToolSearchCall(item.clone())),
+            RunItemKind::ToolSearchOutput(item) => {
+                Some(ModelInputItem::ToolSearchOutput(item.clone()))
+            }
             RunItemKind::ToolCallOutput(item) => Some(ModelInputItem::ToolCallOutput(
                 item.clone().without_custom_data(),
             )),
@@ -579,6 +602,9 @@ impl From<ModelInputItem> for RunItemKind {
             ModelInputItem::Message(item) => Self::Message(item),
             ModelInputItem::Reasoning(item) => Self::Reasoning(item),
             ModelInputItem::ToolCall(item) => Self::ToolCall(item),
+            ModelInputItem::HostedToolCall(item) => Self::HostedToolCall(item),
+            ModelInputItem::ToolSearchCall(item) => Self::ToolSearchCall(item),
+            ModelInputItem::ToolSearchOutput(item) => Self::ToolSearchOutput(item),
             ModelInputItem::ToolCallOutput(item) => Self::ToolCallOutput(item),
             ModelInputItem::HandoffCall(item) => Self::HandoffCall(item),
             ModelInputItem::HandoffOutput(item) => Self::HandoffOutput(item),
@@ -594,9 +620,9 @@ impl From<ModelInputItem> for RunItemKind {
 
 /// A provider-neutral input item that may be sent to a model.
 ///
-/// This type intentionally carries no `ItemId`, provenance, raw provider payload, or session data;
-/// none of them are model input. It also intentionally has no `ToolApproval` variant, preventing
-/// adapters from forgetting to filter approval records.
+/// This type carries no `ItemId`, provenance, or session data. Hosted tool records carry only
+/// their adapter-owned raw replay envelope, not arbitrary session metadata. It also has no
+/// `ToolApproval` variant, preventing adapters from forgetting to filter approval records.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -607,6 +633,12 @@ pub enum ModelInputItem {
     Reasoning(Reasoning),
     /// Tool call.
     ToolCall(ToolCall),
+    /// A provider-executed invocation and its opaque replay material.
+    HostedToolCall(HostedToolCall),
+    /// Server-executed discovery call and its opaque replay material.
+    ToolSearchCall(RawProviderItem),
+    /// Server-executed discovery output and its opaque replay material.
+    ToolSearchOutput(RawProviderItem),
     /// Tool output.
     ToolCallOutput(ToolCallOutput),
     /// Handoff call.
@@ -635,6 +667,9 @@ impl ModelInputItem {
             Self::Message(_) => "message",
             Self::Reasoning(_) => "reasoning",
             Self::ToolCall(_) => "tool_call",
+            Self::HostedToolCall(_) => "hosted_tool_call",
+            Self::ToolSearchCall(_) => "tool_search_call",
+            Self::ToolSearchOutput(_) => "tool_search_output",
             Self::ToolCallOutput(_) => "tool_call_output",
             Self::HandoffCall(_) => "handoff_call",
             Self::HandoffOutput(_) => "handoff_output",

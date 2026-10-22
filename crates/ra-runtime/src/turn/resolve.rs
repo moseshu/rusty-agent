@@ -16,7 +16,7 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result},
     finish::FinishReason,
-    item::{ItemId, ItemProvenance, RunItem},
+    item::{ItemId, ItemProvenance, RunItem, RunItemKind},
     output::OutputValue,
     step::{NextStep, ProcessedResponse, resolve_output_phases},
 };
@@ -84,10 +84,16 @@ pub(super) async fn resolve_next_step_with_output(
         return Ok((NextStep::RunAgain, None));
     }
 
-    // The model asked for nothing further. This is deliberately *not* keyed on message content or
-    // on an output phase: "no actions requested" is a structural fact every provider expresses the
-    // same way, while reading intent out of the text would make the loop's own control flow depend
-    // on how a model happened to word its answer.
+    // Provider-executed tools can finish without producing a message. The framework contract
+    // asks the model for another turn in that case rather than delivering an empty final output.
+    let has_message = processed
+        .new_items()
+        .iter()
+        .any(|item| matches!(item.kind(), RunItemKind::Message(_)));
+    if !has_message && !processed.tools_used().is_empty() {
+        return Ok((NextStep::RunAgain, None));
+    }
+
     Ok((
         NextStep::FinalOutput {
             reason: FinishReason::Final,

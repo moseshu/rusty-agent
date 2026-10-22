@@ -303,7 +303,10 @@ fn dedupe_key(item: &ModelInputItem) -> Option<DedupeKey> {
         ModelInputItem::Message(_)
         | ModelInputItem::McpListTools(_)
         | ModelInputItem::Compaction(_)
-        | ModelInputItem::ProviderCompaction(_) => None,
+        | ModelInputItem::ProviderCompaction(_)
+        | ModelInputItem::HostedToolCall(_)
+        | ModelInputItem::ToolSearchCall(_)
+        | ModelInputItem::ToolSearchOutput(_) => None,
     }
 }
 

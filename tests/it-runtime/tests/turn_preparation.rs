@@ -1744,3 +1744,48 @@ async fn test_short_instructions_with_a_large_tool_table_still_carry_a_cache_pla
     assert_eq!(plan.cache_scope(), Some("run-preparation"));
     assert_eq!(prepared.request().tools().len(), 12);
 }
+
+#[tokio::test]
+async fn tool_choice_reset_policy_belongs_to_the_public_agent() {
+    for reset in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let public = AgentSpec::builder()
+            .id(AgentId::new("worker"))
+            .name("Worker")
+            .tool(dynamic_tool("write_file", &events, true))
+            .model_settings(ModelSettings::new().with_tool_choice(ToolChoice::Required))
+            .reset_tool_choice(reset)
+            .build()
+            .unwrap();
+        let execution = public
+            .to_builder()
+            .id(AgentId::new("execution"))
+            .reset_tool_choice(!reset)
+            .build()
+            .unwrap();
+        let binding = AgentBinding::prepared(public.clone(), execution);
+        let resolver = RecordingResolver::new(events);
+        let context = host(&public);
+        let cancel = CancelScope::root();
+        let mut tracker = ToolUseTracker::new();
+        tracker.record_turn(public.id(), [write_file_attempt("used")]);
+        let prepared = prepare_turn(TurnPreparationRequest::new(
+            &binding,
+            &resolver,
+            &context,
+            &cancel,
+            &tracker,
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.request().model_settings().tool_choice(),
+            if reset {
+                None
+            } else {
+                Some(&ToolChoice::Required)
+            }
+        );
+    }
+}

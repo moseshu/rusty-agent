@@ -353,7 +353,7 @@ impl ProcessedResponse {
             || !self.tools_not_found.is_empty()
     }
 
-    /// Every call the model made, in response order, ready for
+    /// Every resettable call the model made, in response order, ready for
     /// [`ToolUseTracker::record_turn`](crate::state::ToolUseTracker::record_turn).
     ///
     /// This is the one walk that sees each attempt exactly once and in the order the model produced
@@ -363,17 +363,17 @@ impl ProcessedResponse {
     /// layout rather than of what the model did.
     #[must_use]
     pub fn attempts(&self) -> Vec<ToolUseAttempt> {
-        self.ordered_actions()
+        self.ordered_actions(false)
             .into_iter()
             .map(|action| ToolUseAttempt::new(action.identity, action.call_id, &action.arguments))
             .collect()
     }
 
-    /// Action identities invoked this turn, in response order, without repeats.
+    /// Tool activity this turn, including server discovery, in response order without repeats.
     #[must_use]
     pub fn tools_used(&self) -> Vec<ToolUse> {
         let mut seen = BTreeSet::new();
-        self.ordered_actions()
+        self.ordered_actions(true)
             .into_iter()
             .filter(|action| seen.insert(action.identity.clone()))
             .map(|action| action.identity)
@@ -388,7 +388,7 @@ impl ProcessedResponse {
     ///
     /// Local action identities come from their own `identity()` methods. Hosted executions have
     /// no local action and are read directly from their stored call records.
-    fn ordered_actions(&self) -> Vec<OrderedAction<'_>> {
+    fn ordered_actions(&self, include_search: bool) -> Vec<OrderedAction<'_>> {
         let mut by_item: BTreeMap<&ItemId, OrderedAction<'_>> = BTreeMap::new();
         for action in &self.functions {
             by_item.insert(
@@ -437,6 +437,25 @@ impl ProcessedResponse {
         self.new_items
             .iter()
             .filter_map(|item| {
+                match item.kind() {
+                    RunItemKind::HostedToolCall(call) => {
+                        return Some(OrderedAction {
+                            identity: ToolUse::Hosted(call.name().to_owned()),
+                            call_id: CallId::new(item.id().as_str()),
+                            arguments: Cow::Borrowed(call.raw().payload()),
+                        });
+                    }
+                    RunItemKind::ToolSearchCall(raw) | RunItemKind::ToolSearchOutput(raw)
+                        if include_search =>
+                    {
+                        return Some(OrderedAction {
+                            identity: ToolUse::Hosted("tool_search".to_owned()),
+                            call_id: CallId::new(item.id().as_str()),
+                            arguments: Cow::Borrowed(raw.payload()),
+                        });
+                    }
+                    _ => {}
+                }
                 if let RunItemKind::McpCall(call) = item.kind() {
                     return Some(OrderedAction {
                         identity: ToolUse::Mcp {

@@ -595,15 +595,66 @@ async fn instruction_messages_read_back_as_system_messages() {
 }
 
 #[tokio::test]
-async fn a_hosted_tool_item_in_the_history_is_an_error() {
+async fn an_unsupported_action_in_the_history_is_an_error() {
     let fake = Fake::start().await;
-    fake.seed(
-        "conv_x",
-        vec![json!({"type": "web_search_call", "status": "completed"})],
-    );
-    let session = fake.session().with_conversation_id("conv_x");
-    let error = session.get_items(None).await.unwrap_err();
-    assert!(error.to_string().contains("web_search_call"), "{error}");
+    for wire in [
+        json!({"type":"computer_call", "status":"completed"}),
+        json!({"type":"web_search_call", "status":"completed", "caller":{"type":"program", "id":"parent"}}),
+        json!({"type":"tool_search_call", "execution":"server", "caller":{"type":"program", "id":"parent"}}),
+        json!({"type":"function_call", "name":"lookup", "call_id":"child", "arguments":"{}", "caller":{"type":"program", "id":"parent"}}),
+    ] {
+        let item_type = wire["type"].as_str().unwrap().to_owned();
+        fake.seed("conv_x", vec![wire]);
+        let session = fake.session().with_conversation_id("conv_x");
+        let error = session.get_items(None).await.unwrap_err();
+        assert!(error.to_string().contains(&item_type), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn hosted_tool_and_server_search_history_roundtrips_through_conversations() {
+    let fake = Fake::start().await;
+    let originals = vec![
+        json!({"id":"file", "type":"file_search_call", "status":"completed", "queries":["query"], "results":[]}),
+        json!({"id":"web", "type":"web_search_call", "status":"completed", "action":{"type":"search", "query":"query"}}),
+        json!({"id":"image", "type":"image_generation_call", "status":"completed", "result":"image-data"}),
+        json!({"id":"code", "type":"code_interpreter_call", "status":"completed", "code":"print(1)", "outputs":[]}),
+        json!({"id":"search", "type":"tool_search_call", "execution":"server", "arguments":{"query":"query"}, "created_by":"server"}),
+        json!({"id":"search-output", "type":"tool_search_output", "execution":"server", "tools":[], "created_by":"server"}),
+    ];
+    fake.seed("source", originals.clone());
+    let source = fake.session().with_conversation_id("source");
+    let items = source.get_items(None).await.unwrap();
+    for (item, original) in items.iter().zip(&originals) {
+        assert_eq!(item.raw_provider_item().unwrap().payload(), original);
+        assert!(!item.kind().requires_action_binding());
+    }
+    fake.seed("target", vec![]);
+    let target = fake.session().with_conversation_id("target");
+    target.add_items(items).await.unwrap();
+    let created = fake.created_items();
+    assert_eq!(created.len(), 1);
+    for (wire, original) in created[0].1.iter().zip(originals) {
+        let mut expected = original;
+        expected.as_object_mut().unwrap().remove("created_by");
+        // Conversations assigns discovery ids, while the four hosted call types require ids.
+        if expected["type"]
+            .as_str()
+            .unwrap()
+            .starts_with("tool_search_")
+        {
+            expected.as_object_mut().unwrap().remove("id");
+        }
+        assert_eq!(wire, &expected);
+    }
+    let restored = target.get_items(None).await.unwrap();
+    assert_eq!(restored.len(), 6);
+    assert!(matches!(restored[0].kind(), RunItemKind::HostedToolCall(_)));
+    assert!(matches!(restored[4].kind(), RunItemKind::ToolSearchCall(_)));
+    assert!(matches!(
+        restored[5].kind(),
+        RunItemKind::ToolSearchOutput(_)
+    ));
 }
 
 #[tokio::test]
@@ -941,7 +992,7 @@ async fn pop_of_an_unreadable_item_deletes_nothing() {
     let fake = Fake::start().await;
     fake.seed(
         "test_id",
-        vec![json!({"type": "web_search_call", "status": "completed"})],
+        vec![json!({"type": "computer_call", "status": "completed"})],
     );
     let session = fake.session().with_conversation_id("test_id");
     assert!(session.pop_item().await.is_err());

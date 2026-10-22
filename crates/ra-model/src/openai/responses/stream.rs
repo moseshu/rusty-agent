@@ -205,8 +205,9 @@ impl StreamDriver {
                 }
             }
             OUTPUT_ITEM_DONE => {
-                let event = self.lift_output_item(frame)?;
-                self.pending.push_back(Ok(event));
+                if let Some(event) = self.lift_output_item(frame)? {
+                    self.pending.push_back(Ok(event));
+                }
             }
             COMPLETED => {
                 let event = self.settle(frame)?;
@@ -261,7 +262,7 @@ impl StreamDriver {
     }
 
     /// Publishes a finished output item on the normalized channel.
-    fn lift_output_item(&mut self, frame: &Value) -> Result<ModelStreamEvent> {
+    fn lift_output_item(&mut self, frame: &Value) -> Result<Option<ModelStreamEvent>> {
         let item = frame
             .get("item")
             .ok_or_else(|| behavior_error("OpenAI response.output_item.done has no item"))?;
@@ -269,18 +270,21 @@ impl StreamDriver {
             .get("output_index")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        let run_item = convert::convert_output_item(
+        let Some(run_item) = convert::convert_output_item(
             item,
             self.response_id.as_deref().unwrap_or_default(),
             usize::try_from(index).unwrap_or(usize::MAX),
             &self.handoffs,
             &self.provider,
             &self.model,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         let name = run_item.kind().label();
-        Ok(ModelStreamEvent::RunItem(RunItemStreamEvent::new(
+        Ok(Some(ModelStreamEvent::RunItem(RunItemStreamEvent::new(
             name, run_item,
-        )))
+        ))))
     }
 
     /// Lifts the finished response object the terminal frame carries.

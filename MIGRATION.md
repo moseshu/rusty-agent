@@ -5,6 +5,36 @@ surface changes incompatibly only in a new `0.x` release, and every such change 
 with what to do about it. Upgrade all crates together: crates from two tags are two copies of
 `ra-core`, and their types do not interoperate.
 
+## Unreleased
+
+### Hosted tool records and tool-choice resets
+
+Responses now retains file search, web search, image generation, code interpreter, and
+server-executed tool search items in history. Replays preserve their provider payloads except
+for output-only `created_by`, which the upstream input projection removes. Unknown output
+types warn and are skipped; known unsupported actions, approval requests, and program items
+still fail. Input-only computer, MCP approval, local shell, and apply-patch output items also
+warn and are skipped when returned as model output, matching the framework contract.
+Provider-executed tool activity without a message now requests another model turn, including
+a response containing only `mcp_call` (previously it ended with empty final output).
+
+`AgentSpecBuilder::reset_tool_choice(bool)` defaults to `true`, matching the framework contract.
+Reset policy belongs to the public agent and uses its cumulative run usage, including hosted
+calls but excluding server tool search records. Set it to `false` to retain an explicit choice.
+A reset clears every resolved choice to `None`, including `auto` and `none`; layers are unchanged.
+Tool-surface reconciliation is unchanged: dynamic availability that leaves no local tools
+continues to drop `auto`/`required` before calling an adapter. This slice does not change
+cross-provider empty-tool-table behavior. As a consequence, an agent with no local tools whose
+hosted tools are declared only through `extra_body` loses `auto`/`required` before its first
+request, so the reset has nothing to release for it; that limitation is resolved when hosted
+tool declarations are ported.
+
+The generic context estimator still counts image-generation base64 results as text. Large image
+results can therefore inflate token estimates; porting the adapter's fixed image estimate remains
+follow-up work.
+
+These changes are implemented and awaiting review; no release version has been selected.
+
 ## 0.3.0
 
 This section lists the incompatible changes from 0.2.x.

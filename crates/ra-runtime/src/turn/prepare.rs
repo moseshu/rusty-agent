@@ -169,10 +169,11 @@ impl<'a> TurnPreparationRequest<'a> {
     /// implementations, so a caller that could omit the scope would have a run that cannot be
     /// interrupted while a tool decides whether it is available.
     ///
-    /// `tool_use` is required for the same class of reason. It is what releases a forced
-    /// `tool_choice` after the model has complied, and a caller allowed to omit it would have a
-    /// run that forces the same call on every turn until the turn cap — silently, and only when a
-    /// forced selection is configured.
+    /// `tool_use` is required for the same class of reason. It records the public agent's
+    /// cumulative tool use for this run, which is what resets the resolved `tool_choice` once
+    /// that agent has used a resettable tool. A caller allowed to omit it would have a run that
+    /// forces the same call on every turn until the turn cap — silently, and only when a forced
+    /// selection is configured.
     ///
     /// `run` is the same live context this turn's tools are later handed. Dynamic availability is
     /// the first stage that enters third-party code, and it has to read the run from the same place
@@ -811,8 +812,8 @@ impl fmt::Debug for TurnActionSurface {
 pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<PreparedTurn> {
     // Execution-owned stages read the **execution** instance. Preparation decides which tools,
     // model, and settings the model receives, and taking those from the public agent would offer
-    // capabilities the prepared instance may no longer run. The output schema is the deliberate
-    // exception below: it is a public delivery promise, not an execution capability.
+    // capabilities the prepared instance may no longer run. The output schema and reset policy
+    // are public configuration promises and are read from the public agent below.
     let agent = request.agent.execution();
 
     // Resolve discovery and dynamic availability first. Later stages observe this exact snapshot.
@@ -848,17 +849,21 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     // bearing rather than merely conventional: `tool_choice` and `parallel_tool_calls` cannot be
     // settled before the turn knows which tools it will advertise.
     //
-    // Releasing a forced selection belongs to the same stage and to the resolved value, never to
-    // one of the four input layers: a layer carries the caller's standing intent, while this is a
-    // fact about the turn just settled. The two must not be conflated, or complying once would
-    // permanently overwrite what the agent asked for.
+    // The tool-choice reset belongs to the same stage and to the resolved value, never to one of
+    // the four input layers: a layer carries the caller's standing intent, while the reset is a
+    // fact about this run so far. When the public agent enables it and has used a resettable tool
+    // earlier in the run, any resolved choice, including `auto` and `none`, becomes `None`. The
+    // two must not be conflated, or complying once would overwrite what the agent asked for in
+    // later runs.
     let mut model_settings = resolved_model
         .resolve_settings(agent.model_settings(), &request.model_settings)
         .reconcile_tool_surface(surface.advertised_names());
     resolved_model.validate_settings(&model_settings)?;
-    if request
-        .tool_use
-        .used_any_this_turn(request.agent.public_id())
+    if request.agent.public().reset_tool_choice()
+        && request
+            .tool_use
+            .agent(request.agent.public_id())
+            .is_some_and(|usage| usage.run_calls() > 0)
     {
         model_settings = model_settings.reset_tool_choice();
     }
