@@ -20,8 +20,9 @@ yanked = "deny"
 # 技能 frontmatter 使用 Codex 同版本 serde_yaml，以保留其 YAML 与修复错误语义；
 # Codex 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 的 codex-rs/deny.toml 同样精确忽略
 # RUSTSEC-2024-0449。没有修复版；这只是停止维护告警，不放宽其他依赖或已知漏洞。
+# 2026-10-23 由维护者明确接受本条精确例外；退出 serde_yaml/unsafe-libyaml 后撤销。
 ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "Ported Codex skill parser uses serde_yaml 0.9.34 -> unsafe-libyaml 0.2.11; upstream Codex has this same unmaintained advisory exception, with no patched release; remove when the port migrates off this parser" },
+    { id = "RUSTSEC-2024-0449", reason = "Maintainer explicitly accepted this exact exception on 2026-10-23. Ported Codex skill parser uses serde_yaml 0.9.34 -> unsafe-libyaml 0.2.11; upstream Codex has this same unmaintained advisory exception, with no patched release; remove when the port migrates off this parser" },
     { id = "RUSTSEC-2024-0388", reason = "derivative 不再维护；依赖链 ra-execpolicy -> starlark / starlark_syntax 0.14.2 -> derivative 2.2.0；codex deny.toml 同样忽略；starlark 去掉它后撤销" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash 不再维护；依赖链 ra-execpolicy -> starlark 0.14.2 -> starlark_map 0.14.2 -> fxhash 0.2.1；codex deny.toml 同样忽略；starlark_map 去掉它后撤销" },
     { id = "RUSTSEC-2024-0436", reason = "paste 不再维护；依赖链 ra-execpolicy -> starlark 0.14.2 -> paste 1.0.15；codex deny.toml 同样忽略；starlark 去掉它后撤销" },
