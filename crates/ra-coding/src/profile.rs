@@ -129,6 +129,7 @@ impl CodingProfile {
             &BTreeSet::new(),
             &BTreeSet::new(),
             Some(&default_collaboration_namespace()?),
+            false,
         )
     }
 
@@ -154,20 +155,29 @@ impl CodingProfile {
         withheld: &BTreeSet<ToolLookupKey>,
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
+        skills_namespace: bool,
     ) -> Result<ToolProfile> {
         // A narrowed tier is a different profile and says so. The identity reaches assembly errors
         // and the surface's own record, and `core` naming three entries would read there as the
         // tier having quietly shrunk.
-        let narrowed = self.declared_keys(collaboration_namespace)?.map_or_else(
-            || !withheld.is_empty(),
-            |keys| keys.iter().any(|key| withheld.contains(key)),
-        );
+        let narrowed = self
+            .declared_keys(collaboration_namespace, skills_namespace)?
+            .map_or_else(
+                || !withheld.is_empty(),
+                |keys| keys.iter().any(|key| withheld.contains(key)),
+            );
         let id = if narrowed {
             format!("{}-{}", self.tier_name(), role.role_name())
         } else {
             self.tier_name().to_owned()
         };
-        self.narrowed(id, withheld, withheld_advertised, collaboration_namespace)
+        self.narrowed(
+            id,
+            withheld,
+            withheld_advertised,
+            collaboration_namespace,
+            skills_namespace,
+        )
     }
 
     /// Profile identity of the tier as declared, before any role narrows it.
@@ -206,13 +216,26 @@ impl CodingProfile {
     fn declared_keys(
         self,
         collaboration_namespace: Option<&ToolNamespace>,
+        skills_namespace: bool,
     ) -> Result<Option<Vec<ToolLookupKey>>> {
         Ok(match self {
             Self::Core => Some(lookup_keys(&CORE)?),
             Self::CodexLike => Some(
                 lookup_keys(&CORE)?
                     .into_iter()
-                    .chain(lookup_keys(&CODEX_LIKE_EXTRA)?)
+                    .chain(
+                        lookup_keys(&CODEX_LIKE_EXTRA)?
+                            .into_iter()
+                            .filter(|key| !skills_namespace || key.name() != "skill"),
+                    )
+                    .chain(if skills_namespace {
+                        vec![
+                            ToolLookupKey::namespaced(ToolNamespace::new("skills")?, "list")?,
+                            ToolLookupKey::namespaced(ToolNamespace::new("skills")?, "read")?,
+                        ]
+                    } else {
+                        Vec::new()
+                    })
                     .chain(collaboration_keys(collaboration_namespace)?)
                     .collect(),
             ),
@@ -233,9 +256,13 @@ impl CodingProfile {
         withheld: &BTreeSet<ToolLookupKey>,
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
+        skills_namespace: bool,
     ) -> Result<ToolProfile> {
-        let declared = self.declared_keys(collaboration_namespace)?;
-        let (floor, ceiling) = self.band();
+        let declared = self.declared_keys(collaboration_namespace, skills_namespace)?;
+        let (mut floor, ceiling) = self.band();
+        if skills_namespace && self != Self::Core {
+            floor += 1;
+        }
         // What the tier would have advertised and this role does not. `full` names nothing of its
         // own, so every withheld advertised entry is one it would otherwise have taken.
         let given_up = match &declared {

@@ -424,12 +424,16 @@ pub(crate) fn convert_function_call(
     let call_id = CallId::new(required_str(item, "call_id", "function_call")?);
     let name = required_str(item, "name", "function_call")?;
     let arguments_text = required_str(item, "arguments", "function_call")?;
-    let arguments: Value = serde_json::from_str(arguments_text).map_err(|error| {
-        behavior_error(format!(
-            "OpenAI function `{name}` returned invalid JSON arguments"
-        ))
-        .with_source(error)
-    })?;
+    let arguments: Value = if arguments_text.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(arguments_text).map_err(|error| {
+            behavior_error(format!(
+                "OpenAI function `{name}` returned invalid JSON arguments"
+            ))
+            .with_source(error)
+        })?
+    };
     // The reference's `get_tool_call_namespace`: a call of a namespace's function names it, and an
     // empty one names none.
     let namespace = item

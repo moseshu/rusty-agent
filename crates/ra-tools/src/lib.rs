@@ -71,6 +71,7 @@ pub mod sandbox;
 mod search;
 mod session_return;
 pub mod skill;
+pub mod skills_ns;
 pub mod tool_search;
 pub mod update_plan;
 pub mod view_image;

@@ -121,6 +121,9 @@ impl RoleCapabilities {
         if let Some(capability) = host.skills_capability()? {
             declared.push(Arc::new(capability));
         }
+        if let Some(capability) = host.skills_ns_capability()? {
+            declared.push(Arc::new(capability));
+        }
         if host.request_user_input_enabled() {
             declared.push(Arc::new(ControlCapability::user_input()?));
         }

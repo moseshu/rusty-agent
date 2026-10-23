@@ -65,6 +65,30 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
 /// names the upstream type it mirrors.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
+    // Codex skill catalog and callback records retain the upstream public field surface.
+    ("crates/ra-tools/src/skills_ns/catalog.rs", "SkillAuthority"),
+    ("crates/ra-tools/src/skills_ns/catalog.rs", "SkillPackageId"),
+    (
+        "crates/ra-tools/src/skills_ns/catalog.rs",
+        "SkillCatalogEntry",
+    ),
+    ("crates/ra-tools/src/skills_ns/catalog.rs", "SkillCatalog"),
+    (
+        "crates/ra-tools/src/skills_ns/catalog.rs",
+        "SkillReadResult",
+    ),
+    (
+        "crates/ra-tools/src/skills_ns/catalog.rs",
+        "SkillProviderError",
+    ),
+    (
+        "crates/ra-tools/src/skills_ns/provider.rs",
+        "SkillListQuery",
+    ),
+    (
+        "crates/ra-tools/src/skills_ns/provider.rs",
+        "SkillReadRequest",
+    ),
     // Agents SDK WebSearchTool, its image settings and OpenAI filter/location records. Their
     // public fields preserve the upstream configuration surface and forward-compatible filters.
     (

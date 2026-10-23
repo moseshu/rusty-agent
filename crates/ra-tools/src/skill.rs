@@ -1,4 +1,7 @@
-//! Loading one installed skill's instructions.
+//! Explicit compatibility extension for loading one host-catalog skill.
+//!
+//! This merged entry predates the Codex namespace port in [`crate::skills_ns`]. It preserves the
+//! published host catalog API; it is not the authority-routed `skills.list` / `skills.read` contract.
 //!
 //! # The entry is the second half of a mechanism whose first half is prompt text
 //!

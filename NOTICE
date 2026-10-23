@@ -40,6 +40,18 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-tools/src/skills_ns.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/mod.rs; state.rs |
+| `crates/ra-tools/src/skills_ns/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/catalog.rs |
+| `crates/ra-tools/src/skills_ns/provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/provider.rs; provider/executor.rs; sources.rs |
+| `crates/ra-tools/src/skills_ns/aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/aliases.rs |
+| `crates/ra-tools/src/skills_ns/list.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/list.rs |
+| `crates/ra-tools/src/skills_ns/read.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/read.rs; render.rs::build_alias_plan |
+| `crates/ra-tools/src/skills_ns/schema.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/schema.rs |
+| `crates/ra-tools/src/skills_ns/render.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/render.rs |
+| `crates/ra-tools/src/skills_ns/warnings.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/warnings.rs |
+| `tests/it-tools/tests/skills_ns/aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/aliases_tests.rs |
+| `tests/it-tools/tests/skills_ns/list.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/tests/skills_extension.rs::skills_list_only_returns_model_visible_bounded_metadata |
+| `tests/it-tools/tests/skills_ns/read.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/skills_extension.rs; codex-rs/app-server/tests/suite/v2/executor_skills.rs |
 | `crates/ra-core/src/session/rollout/trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/raw_event.rs; bundle.rs |
 | `crates/ra-runtime/src/runner/trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/inference.rs |
 | `crates/ra-eval/src/trace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rollout-trace/src/writer.rs; raw_event.rs |

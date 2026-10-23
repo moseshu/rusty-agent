@@ -818,7 +818,7 @@ impl Capability for WebCapability {
     }
 }
 
-/// The instruction documents a host installed, listed cheaply and loaded on demand.
+/// Explicit compatibility extension for host-catalog instructions, listed and loaded on demand.
 ///
 /// One entry and a listing, which is the whole of progressive disclosure: the summaries are what
 /// makes a skill reachable and the body is what makes it useful, and only the first is paid for by
@@ -934,5 +934,60 @@ impl Capability for SkillsCapability {
             &content,
             SKILLS_PREAMBLE_TOKEN_BUDGET.saturating_add(self.listing.max_tokens()),
         )
+    }
+}
+
+/// The explicitly selected Codex skills namespace over authority-routed providers.
+///
+/// Shares the skills family with [`SkillsCapability`] and sandbox skills, so assembly rejects
+/// simultaneous sources. Catalog prompt rendering is supplied by a separate integration.
+#[derive(Clone)]
+pub struct SkillsNsCapability {
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl fmt::Debug for SkillsNsCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SkillsNsCapability")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SkillsNsCapability {
+    /// Builds the pair with one snapshot slot and independent grants keyed by executor authority.
+    /// Executor discovery requires a provider and at least one root; cloud needs no executor
+    /// roots. With neither source available, the capability contributes no tools.
+    ///
+    /// The byte budget must also fit the host projector's token ceiling after conversion to bytes.
+    pub fn new(
+        providers: crate::skills_ns::SkillProviders,
+        executor_roots: std::collections::BTreeMap<String, Workspace>,
+        response_byte_budget: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            tools: crate::skills_ns::skill_tools(providers, executor_roots, response_byte_budget)?,
+        })
+    }
+
+    /// The discovery tool, absent when no supported source is available.
+    #[must_use]
+    pub fn list(&self) -> Option<Arc<dyn Tool>> {
+        self.tools.first().cloned()
+    }
+
+    /// The resource reader, absent without an available source, sharing this pair's snapshot.
+    #[must_use]
+    pub fn read(&self) -> Option<Arc<dyn Tool>> {
+        self.tools.get(1).cloned()
+    }
+}
+
+impl Capability for SkillsNsCapability {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::SKILLS
+    }
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.clone()
     }
 }

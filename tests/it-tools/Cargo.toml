@@ -19,6 +19,9 @@ ra-patch = { path = "../../crates/ra-patch" }
 ra-sandbox = { path = "../../crates/ra-sandbox" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ra-context = { path = "../../crates/ra-context" }
+ra-model = { path = "../../crates/ra-model", features = ["anthropic"] }
+wiremock = "0.6"
 # The custom-tool tests go through the runtime's dispatch, which owns how a failure is reported.
 ra-runtime = { path = "../../crates/ra-runtime" }
 base64 = "0.22"

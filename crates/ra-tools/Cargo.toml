@@ -33,3 +33,4 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 # 文件事实进宿主事件通道时，通道拒收要留痕：已经写盘的修改不能因为记不下来就变成没发生。
 tracing = { workspace = true }
+thiserror = { workspace = true }

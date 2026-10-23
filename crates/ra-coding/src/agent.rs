@@ -443,6 +443,7 @@ pub async fn host_backed_surface(
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
         host.collaboration_namespace()?.as_ref(),
+        host.uses_skills_namespace(),
     )?;
     let budget = *profile.budget();
     let tool_surface =

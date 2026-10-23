@@ -1,6 +1,6 @@
 //! Product host assembly, workspace capability binding, and event routing.
 
-use std::{fmt, io, path::Path, sync::Arc};
+use std::{collections::BTreeMap, fmt, io, path::Path, sync::Arc};
 
 use ra_context::{
     budget::ToolResultBudget, compaction::CompactionCapability,
@@ -25,7 +25,7 @@ use ra_runtime::runner::RunConfig;
 use ra_tools::agent_ns::COLLABORATION_NAMESPACE;
 use ra_tools::capability::{
     ApplyPatchCapability, FilesystemCapability, SearchCapability, ShellCapability,
-    SkillsCapability, TodoCapability, ViewImageCapability, WebCapability,
+    SkillsCapability, SkillsNsCapability, TodoCapability, ViewImageCapability, WebCapability,
 };
 
 /// The host runtime context and capabilities for the coding agent.
@@ -49,6 +49,8 @@ pub struct CodingHost {
     web_fallback: Option<Arc<dyn crate::web_search::WebSearchFallbackAdapter>>,
     web_search: Option<crate::web_search::CodingWebSearch>,
     skills: Option<Arc<dyn SkillCatalog>>,
+    skill_providers: Option<ra_tools::skills_ns::SkillProviders>,
+    skill_roots: BTreeMap<String, Workspace>,
     user_input: Option<Arc<dyn UserInputPort>>,
     request_user_input: bool,
     collaboration: Option<Collaboration>,
@@ -109,6 +111,8 @@ impl CodingHost {
             web_fallback: None,
             web_search: Some(crate::web_search::CodingWebSearch::default()),
             skills: None,
+            skill_providers: None,
+            skill_roots: BTreeMap::new(),
             user_input: None,
             request_user_input: false,
             collaboration: None,
@@ -180,11 +184,38 @@ impl CodingHost {
         self.web_search.as_ref()
     }
 
-    /// Installs the catalog used by the skills listing and the skill-loading tool.
+    /// Selects the merged `skill` compatibility extension.
+    /// Configuring an available namespace source as well fails agent assembly.
     #[must_use]
     pub fn with_skill_catalog(mut self, catalog: Arc<dyn SkillCatalog>) -> Self {
         self.skills = Some(catalog);
         self
+    }
+
+    /// Selects the Codex `skills.list` / `skills.read` interface with independently granted skill
+    /// roots. Map each executor `authority.id` to its root, which may be outside the coding
+    /// workspace. The default result budget bounds pages before output projection.
+    /// Executor discovery requires a provider and at least one granted root; a cloud provider
+    /// needs no executor roots. Configuring the merged catalog and an available namespace source
+    /// together fails assembly. With neither source available, no tools are installed.
+    /// This does not discover disk skills or render a catalog prompt; models must currently
+    /// discover packages through `skills.list`.
+    #[must_use]
+    pub fn with_skill_providers(
+        mut self,
+        providers: ra_tools::skills_ns::SkillProviders,
+        executor_roots: BTreeMap<String, Workspace>,
+    ) -> Self {
+        self.skill_providers = Some(providers);
+        self.skill_roots = executor_roots;
+        self
+    }
+
+    pub(crate) fn uses_skills_namespace(&self) -> bool {
+        self.skill_providers.as_ref().is_some_and(|providers| {
+            (providers.has_executor_provider() && !self.skill_roots.is_empty())
+                || providers.has_cloud_provider()
+        })
     }
 
     /// Adds an explicitly selected product capability. Roles and tiers select its tools together
@@ -316,7 +347,33 @@ impl CodingHost {
     }
 
     pub(crate) fn skills_capability(&self) -> ra_core::error::Result<Option<SkillsCapability>> {
+        if self.skills.is_some() && self.uses_skills_namespace() {
+            return Err(ra_core::error::Error::config(
+                "configure either the merged skill catalog or skills namespace providers, not both",
+            ));
+        }
         self.skills.clone().map(SkillsCapability::new).transpose()
+    }
+
+    pub(crate) fn skills_ns_capability(
+        &self,
+    ) -> ra_core::error::Result<Option<SkillsNsCapability>> {
+        let budget = ToolResultBudget::default();
+        self.skill_providers
+            .clone()
+            .filter(|_| self.uses_skills_namespace())
+            .map(|providers| {
+                SkillsNsCapability::new(
+                    providers,
+                    self.skill_roots.clone(),
+                    budget.max_bytes().min(
+                        budget
+                            .max_tokens()
+                            .saturating_mul(ra_core::prompt::CHARS_PER_TOKEN),
+                    ),
+                )
+            })
+            .transpose()
     }
 
     /// Lets `exec_command` ask for permissions of its own: Codex's `exec_permission_approvals`
